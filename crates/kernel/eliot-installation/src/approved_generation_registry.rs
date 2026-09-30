@@ -24,8 +24,9 @@ use super::{
     InstallerServiceRegistrationApproval, InstallerServiceRole, PHASE_B_PENDING_MARKER,
     PHASE_B_PENDING_SCM_DIGEST, PlatformAgentBridgeSecurityConvergenceReceipt,
     PlatformAgentBridgeStagePrepared, PlatformAgentBridgeStagingReceipt, PlatformHandle,
-    ProvisionedSupervisionAuthority, ResourceGeneration, RuntimeLaunchDescriptor, StateFence,
-    canonical_json_bytes, handle, sha256_handle, sha256_hex, text,
+    PreparedDestinationAdmission, ProvisionedSupervisionAuthority, ResourceGeneration,
+    RuntimeLaunchDescriptor, StateFence, canonical_json_bytes, handle, sha256_handle, sha256_hex,
+    text,
 };
 
 #[cfg(test)]
@@ -2803,6 +2804,25 @@ pub struct ApprovedGenerationRegistry {
     /// `INSTALLATION_REGISTRY_WIRE_VERSION`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) committed_cutover_activation: Option<CommittedCutoverActivation>,
+    /// Destination installations this authority allocated and admitted as
+    /// PREPARED but never activated (issue #958, I5.13 `restore to isolated
+    /// root;`).
+    ///
+    /// This is deliberately a separate member rather than a row in
+    /// `generations`: every row there carries an
+    /// `InstallationActivationApproval` whose only production issuer is the
+    /// signed activation bridge, so admitting a prepared destination through
+    /// that collection would mean activating it. A prepared destination is
+    /// allocated and fenced, never approved and never active, and this member is
+    /// where that state is represented.
+    ///
+    /// `skip_serializing_if` plus `default` is the wire-compatibility mechanism
+    /// for the same reason it is on `committed_cutover_activation`:
+    /// `registry_projection_identity` hashes the whole serialized registry, so a
+    /// member that always serialized would change the identity of every registry
+    /// written before this one and invalidate already-staged activation intents.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) prepared_isolated_destinations: Vec<PreparedDestinationAdmission>,
 }
 
 impl Default for ApprovedGenerationRegistry {
@@ -3138,6 +3158,7 @@ impl ApprovedGenerationRegistry {
             aborted_activation_receipts: Vec::new(),
             active_phase_b_rebind: None,
             committed_cutover_activation: None,
+            prepared_isolated_destinations: Vec::new(),
         }
     }
 
@@ -3682,6 +3703,136 @@ impl ApprovedGenerationRegistry {
             .ok_or(InstallationError::IdentityConflict)?;
         self.validate()?;
         Ok(recorded)
+    }
+
+    /// Returns the retained prepared-destination admission for one operation,
+    /// when this authority holds one.
+    ///
+    /// This is the idempotency read a repeated request uses: the same operation
+    /// resolves the same destination here instead of allocating a second
+    /// installation, and the CONTENT comparison happens in
+    /// [`Self::record_prepared_isolated_destination_unchecked`], not in this
+    /// accessor.
+    #[must_use]
+    pub fn prepared_isolated_destination(
+        &self,
+        operation_id: &PlatformHandle,
+    ) -> Option<&PreparedDestinationAdmission> {
+        self.prepared_isolated_destinations
+            .iter()
+            .find(|admission| &admission.operation_id == operation_id)
+    }
+
+    /// Every prepared-destination admission this authority currently retains.
+    ///
+    /// Cleanup uses this set rather than a caller-supplied list: a destination
+    /// whose operation this projection does not own is preserved, never removed
+    /// by path name.
+    #[must_use]
+    pub fn prepared_isolated_destinations(&self) -> &[PreparedDestinationAdmission] {
+        &self.prepared_isolated_destinations
+    }
+
+    /// Records one prepared, UNACTIVATED destination installation.
+    ///
+    /// This is the crate's only representation of "allocated but not yet
+    /// approved". It is deliberately not an `ApprovedGeneration` row: such a row
+    /// requires an `InstallationActivationApproval`, whose only production issuer
+    /// is the signed activation bridge and which additionally demands a stopped
+    /// SCM contour — that is the activation boundary, and staging one here would
+    /// activate a destination this issue forbids activating.
+    ///
+    /// The CONTENT comparison is what makes the seam an admission rather than an
+    /// existence check: the incoming record is validated, and an operation this
+    /// projection already holds is idempotent only when the whole record is
+    /// equal. Any other record for the same operation is an
+    /// [`InstallationError::IdentityConflict`], and a destination this
+    /// projection already holds under a different operation is refused outright,
+    /// because two operations may never share one destination.
+    pub(crate) fn record_prepared_isolated_destination_unchecked(
+        &mut self,
+        admission: &PreparedDestinationAdmission,
+    ) -> Result<PreparedDestinationAdmission, InstallationError> {
+        self.validate()?;
+        if admission
+            .validate()
+            .map_err(|error| InstallationError::InvalidField {
+                field: "prepared_isolated_destination".to_owned(),
+                reason: error.to_string(),
+            })?;
+        // An active/source installation is never a destination. The owner can
+        // tell because the destination identity would then be a generation THIS
+        // projection already approves and, if it is the active one, an
+        // installation that is currently serving effects.
+        if let Some(active) = self.active_generation.as_ref() {
+            if &admission.destination_installation == active
+                || admission.approved_target_build == *active
+            {
+                return Err(InstallationError::Duplicate {
+                    kind: "active installation offered as an isolated destination".to_owned(),
+                    identity: admission.destination_installation.as_str().to_owned(),
+                });
+            }
+        }
+        if self
+            .generations
+            .iter()
+            .any(|generation| generation.manifest.generation == admission.destination_installation)
+        {
+            return Err(InstallationError::Duplicate {
+                kind: "approved generation offered as an isolated destination".to_owned(),
+                identity: admission.destination_installation.as_str().to_owned(),
+            });
+        }
+        if let Some(existing) = self.prepared_isolated_destination(&admission.operation_id) {
+            if existing == admission {
+                return Ok(existing.clone());
+            }
+            return Err(InstallationError::IdentityConflict);
+        }
+        if self.prepared_isolated_destinations.iter().any(|held| {
+            held.destination_installation == admission.destination_installation
+        }) {
+            return Err(InstallationError::IdentityConflict);
+        }
+        self.prepared_isolated_destinations.push(admission.clone());
+        self.validate()?;
+        Ok(admission.clone())
+    }
+
+    /// Forgets one exact prepared-destination admission during cleanup.
+    ///
+    /// Only an explicitly owned, never-activated destination may be forgotten:
+    /// an operation that has since been activated is refused rather than
+    /// dropped, so cleanup can never orphan an installation this authority now
+    /// considers real.
+    pub(crate) fn forget_prepared_isolated_destination_unchecked(
+        &mut self,
+        admission: &PreparedDestinationAdmission,
+    ) -> Result<(), InstallationError> {
+        self.validate()?;
+        admission
+            .validate()
+            .map_err(|error| InstallationError::InvalidField {
+                field: "prepared_isolated_destination".to_owned(),
+                reason: error.to_string(),
+            })?;
+        if self.active_generation.as_ref() == Some(&admission.approved_target_build) {
+            return Err(InstallationError::IdentityConflict);
+        }
+        let Some(index) = self
+            .prepared_isolated_destinations
+            .iter()
+            .position(|held| held == admission)
+        else {
+            return Err(InstallationError::IncompleteObservation(
+                "this authority retains no prepared isolated destination for that operation"
+                    .to_owned(),
+            ));
+        };
+        self.prepared_isolated_destinations.remove(index);
+        self.validate()?;
+        Ok(())
     }
 
     pub(crate) fn record_pending_phase_b_agent_bridge_stage_prepared_unchecked(
@@ -4664,6 +4815,49 @@ impl ApprovedGenerationRegistry {
                 field: "registry.revision".to_owned(),
                 reason: "must be non-zero".to_owned(),
             });
+        }
+        // Prepared, never-activated destinations are checked for SELF-consistency
+        // and against the approved collection, not admitted into it: each record
+        // must validate on its own terms, no two may share an operation or a
+        // destination, and no destination may be an installation this projection
+        // already approves or currently has active. That last pair is the durable
+        // half of "a client-supplied arbitrary path, active/source installation
+        // or preexisting foreign owner is rejected": a hand-edited registry row
+        // naming the active installation fails here even though its own digest
+        // was recomputed correctly.
+        let mut prepared_operations = BTreeSet::new();
+        let mut prepared_destinations = BTreeSet::new();
+        for admission in &self.prepared_isolated_destinations {
+            admission
+                .validate()
+                .map_err(|error| InstallationError::InvalidField {
+                    field: "registry.prepared_isolated_destinations".to_owned(),
+                    reason: error.to_string(),
+                })?;
+            if !prepared_operations.insert(admission.operation_id.as_str()) {
+                return Err(InstallationError::Duplicate {
+                    kind: "prepared isolated destination operation".to_owned(),
+                    identity: admission.operation_id.as_str().to_owned(),
+                });
+            }
+            if !prepared_destinations.insert(admission.destination_installation.as_str()) {
+                return Err(InstallationError::Duplicate {
+                    kind: "prepared isolated destination installation".to_owned(),
+                    identity: admission.destination_installation.as_str().to_owned(),
+                });
+            }
+            if self.active_generation.as_ref() == Some(&admission.destination_installation)
+                || self.active_generation.as_ref() == Some(&admission.approved_target_build)
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+            if self
+                .generations
+                .iter()
+                .any(|generation| generation.manifest.generation == admission.destination_installation)
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
         }
         let mut identities = BTreeSet::new();
         let mut service_identities = BTreeSet::new();
