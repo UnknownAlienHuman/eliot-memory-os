@@ -3923,8 +3923,8 @@ pub struct PeerReviewObligation {
     /// on this read.
     pub reviewer_principal_id: String,
     /// Reviewed operation identity exactly as the retained record carries it.
-    /// This is the only operation/WorkScope-adjacent fact the owner retains:
-    /// no recipient, role, WorkScope, or task fact is retained on the record,
+    /// This is the only operation/`WorkScope`-adjacent fact the owner retains:
+    /// no recipient, role, `WorkScope`, or task fact is retained on the record,
     /// so none is reported here and none may be inferred (I11.8).
     pub operation: String,
     pub target_kind: ReviewTargetKind,

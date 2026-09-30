@@ -158,8 +158,8 @@ pub struct ControlBoardReviewBatchObligation {
     /// Author of this obligation.
     pub reviewer_session_id: String,
     /// Reviewed operation identity exactly as the owner retains it. This is
-    /// the only operation/WorkScope-adjacent fact the owner retains; no
-    /// recipient, role, WorkScope, or task fact is carried because the owner
+    /// the only operation/`WorkScope`-adjacent fact the owner retains; no
+    /// recipient, role, `WorkScope`, or task fact is carried because the owner
     /// retains none, and none is invented here (I11.8).
     pub operation: String,
     /// What kind of target this obligation reviews; one item's kind never
