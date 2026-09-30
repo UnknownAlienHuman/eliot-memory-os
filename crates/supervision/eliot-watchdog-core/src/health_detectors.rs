@@ -1063,7 +1063,7 @@ pub fn compile_health_brief(
         HEALTH_BRIEF_REVISION.to_string(),
         persistence.as_str().to_owned(),
     ];
-    identity_fields.extend(member_ids.into_iter());
+    identity_fields.extend(member_ids);
     Ok(HealthDiagnosticBrief {
         brief_id: encode_identity(&identity_fields),
         question,
@@ -1132,9 +1132,9 @@ fn degraded_route_for_ineffective_history(
         return route;
     }
     match route {
-        RiskRoute::Observe => RiskRoute::Observe,
-        RiskRoute::RequestResync => RiskRoute::Observe,
-        RiskRoute::CheapDiagnosis => RiskRoute::Observe,
+        RiskRoute::Observe | RiskRoute::RequestResync | RiskRoute::CheapDiagnosis => {
+            RiskRoute::Observe
+        }
         RiskRoute::StrongDiagnosis => RiskRoute::CheapDiagnosis,
         RiskRoute::Concilium => RiskRoute::StrongDiagnosis,
         RiskRoute::PreauthorizedContainment => RiskRoute::Concilium,

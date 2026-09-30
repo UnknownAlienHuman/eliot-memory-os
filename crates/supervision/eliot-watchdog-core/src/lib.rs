@@ -445,12 +445,17 @@ pub use rules::{
 };
 
 pub use health_detectors::{
-    AgentLoopSignal, ContextQualityBounds, ContextQualityDrift, ContextQualityObservation,
-    CountDelta, CoverageGapExplanation, HealthDetection, HealthEvidenceHandles,
-    HealthNoSignalReason, HealthObservationPair, HealthOutputFamily, HealthSignalContext,
+    AgentLoopSignal, BriefBuildError, BriefPersistence, ContextQualityBounds,
+    ContextQualityCanonicalContext, ContextQualityDrift, ContextQualityObservation, CountDelta,
+    CoverageGapExplanation, CoverageManifestMismatch, CoverageManifestProjection,
+    FeedbackPlacement, HUMAN_REVIEW_AFTER_INEFFECTIVE_ANALYSES, HealthAnalysisRequest,
+    HealthDetection, HealthDiagnosticBrief, HealthEvidenceHandles, HealthNoSignalReason,
+    HealthObservationPair, HealthOutputFamily, HealthSignalContext, MAX_BRIEF_SIGNALS,
     MaintenanceDebt, MaintenanceDebtInput, MemoryUtilityDeltas, MemoryUtilityDrift,
     ObservationCoverageGap, ObservationCoverageInput, PolicyBound, ProhibitedEffectAttempt,
-    ProhibitedEffectClass, ProhibitedEffectDenial, StateDeltaPresence, evaluate_agent_loop,
-    evaluate_context_quality, evaluate_maintenance_debt, evaluate_memory_utility,
-    evaluate_observation_coverage,
+    ProhibitedEffectClass, ProhibitedEffectDenial, SafetyFloorPresence, StateDeltaPresence,
+    compile_health_brief, evaluate_agent_loop, evaluate_context_quality,
+    evaluate_context_quality_with_canonical_context, evaluate_maintenance_debt,
+    evaluate_memory_utility, evaluate_observation_coverage, request_health_analysis,
+    validate_observation_coverage_against_manifest,
 };
