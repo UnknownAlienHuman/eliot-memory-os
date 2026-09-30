@@ -598,7 +598,7 @@ impl CanaryRemovalPlan {
             });
         }
         let mut identities = BTreeSet::new();
-        let mut categories = BTreeSet::new();
+        let mut registry_records = 0u32;
         for effect in &self.effects {
             effect.validate()?;
             if !identities.insert(effect.effect_id.as_str()) {
@@ -627,9 +627,9 @@ impl CanaryRemovalPlan {
                 return Err(InstallationError::IdentityConflict);
             }
         }
-        if !categories.contains(&CanaryRemovalResource::GenerationRegistryRecord) {
+        if registry_records != 1 {
             return Err(InstallationError::IncompleteObservation(
-                "the terminal registry record must stay inside the removal denominator".to_owned(),
+                "the terminal registry record must appear exactly once inside the removal denominator".to_owned(),
             ));
         }
         if self.computed_digest()? != self.plan_digest {
