@@ -8249,7 +8249,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             canonical_operation_id,
             canonical_request_identity,
             operation,
-        )?;
+        )
+        .map_err(|error| PendingCanonicalHandoff {
+            phase: CanonicalRevocationPhase::ClosureReadback,
+            error,
+        })?;
         // The Kernel already fenced the complete declared closure. Fence the
         // exact same declared members in this projection so an already-issued
         // narrower descendant cannot keep reading an effective right out of the
@@ -8292,18 +8296,39 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         // revalidated this exact field under the closure receipt contract, and
         // an adapter that needs a typed ORS operation identity rebuilds it from
         // these same bytes at the boundary that actually calls the store.
+        let closure_projection =
+            Self::link_closure_second_phase(durable_link, &closure, &receipt_identity)?;
+        Ok(AuthorityRevocationReconciliation {
+            authority_receipt: authority_receipt.clone(),
+            canonical_receipt,
+            closure_projection,
+        })
+    }
+
+    /// Links the canonical second phase of one grant revocation through the
+    /// durable boundary and proves the read-back.
+    ///
+    /// The owner-side link is keyed by the ORIGINAL recorded first-phase
+    /// operation identity, never a re-derived or freshly minted one. The
+    /// read-back is compared by CONTENT on the owner's committed bytes, never
+    /// by existence and never by shape: the linked operation identity, the
+    /// whole declared closure membership, and the exact linked canonical
+    /// receipt. A disagreement is the second-phase refusal the saga retains a
+    /// pending stricter revocation for.
+    fn link_closure_second_phase<L: GrantClosureCanonicalLinkPort + ?Sized>(
+        durable_link: &L,
+        closure: &GrantClosureReceipt,
+        receipt_identity: &ReceiptIdentity,
+    ) -> Result<GrantClosureSecondPhaseLink, PendingCanonicalHandoff> {
         let closure_projection = durable_link
-            .link_grant_closure_canonical_receipt(closure.operation_id.as_str(), &receipt_identity)
+            .link_grant_closure_canonical_receipt(closure.operation_id.as_str(), receipt_identity)
             .map_err(|error| PendingCanonicalHandoff {
                 phase: CanonicalRevocationPhase::SecondPhaseLink,
                 error: CompositionError::Owner(error.to_string()),
             })?;
-        // Content equality on the owner's committed bytes, never existence and
-        // never shape: the linked operation identity, the whole declared
-        // closure membership, and the exact linked canonical receipt.
         if closure_projection.closure().operation_id != closure.operation_id
             || closure_projection.closure().declaration != closure.declaration
-            || closure_projection.canonical_receipt() != &receipt_identity
+            || closure_projection.canonical_receipt() != receipt_identity
         {
             return Err(PendingCanonicalHandoff {
                 phase: CanonicalRevocationPhase::SecondPhaseLink,
@@ -8313,11 +8338,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 ),
             });
         }
-        Ok(AuthorityRevocationReconciliation {
-            authority_receipt: authority_receipt.clone(),
-            canonical_receipt,
-            closure_projection,
-        })
+        Ok(closure_projection)
     }
 
     /// Prepares the authority crate's canonical revocation transition over
@@ -8381,7 +8402,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         canonical_operation_id: &OperationId,
         canonical_request_identity: &RequestIdentity,
         operation: &RevocationOperationIdentity,
-    ) -> Result<(), PendingCanonicalHandoff> {
+    ) -> Result<(), CompositionError> {
         let origin = RevocationOrigin::Grant(request.grant_id.clone());
         let prepared = self
             .owners
@@ -8402,10 +8423,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 },
                 None,
             )
-            .map_err(|error| PendingCanonicalHandoff {
-                phase: CanonicalRevocationPhase::ClosureReadback,
-                error: CompositionError::Owner(error.to_string()),
-            })?;
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
         // The whole re-derived membership and the authority epoch every member
         // was proven under. Any disagreement is a reconciliation refusal, not a
         // widening and not a silent repair.
@@ -8416,14 +8434,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 .authority_epoch()
                 .is_same_authority(&closure.authority_receipt.authority_epoch)
         {
-            return Err(PendingCanonicalHandoff {
-                phase: CanonicalRevocationPhase::ClosureReadback,
-                error: CompositionError::Recovery(
-                    "prepared authority revocation transition does not bind the durable \
-                     closure membership and authority epoch"
-                        .to_owned(),
-                ),
-            });
+            return Err(CompositionError::Recovery(
+                "prepared authority revocation transition does not bind the durable closure \
+                 membership and authority epoch"
+                    .to_owned(),
+            ));
         }
         Ok(())
     }
