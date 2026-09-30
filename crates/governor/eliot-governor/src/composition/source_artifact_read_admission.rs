@@ -1,6 +1,8 @@
 //! Original-owner READ admission for one retained source-artifact Blob pointer.
 
-use eliot_authority::{ActionContract, ImpactClass, LeaseId, ReceiptObligation, SnapshotId};
+use eliot_authority::{
+    ActionContract, ImpactClass, LeaseId, ReceiptObligation, SnapshotId,
+};
 use eliot_contracts::{
     ClockReading, OperationId, RequestId, ResourceGeneration, StateFence, TaskRevision,
     canonical_json_bytes,
@@ -13,10 +15,7 @@ use eliot_receipts::{
 use eliot_store_api::NamedReadOperation;
 
 use super::{CompositionReadiness, GovernorComposition, KernelGenerationPort};
-use crate::{
-    SourceArtifactAdmission, SourceArtifactAdmissionError, SourceArtifactAdmissionRequest,
-    scope_identity_admission::ensure_snapshot_fresh,
-};
+use crate::{SourceArtifactAdmission, SourceArtifactAdmissionError, SourceArtifactAdmissionRequest};
 
 const LSP_OBSERVATION_RECEIPT_KIND: &str = "instrument.lsp_observation.v1";
 const CONTEXT_RECONSTRUCTION_REQUEST_PREFIX: &str = "eliotd:context-reconstruction:";
@@ -44,15 +43,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         let original = validate_original_read_request(&input, &fence)?;
         let owners = read_current_owner_bindings(self, &input, &original, &fence)?;
         let admission = source_artifact_read_admission_request(&input, &original, owners, &fence)?;
-        let authority_snapshot = self
-            .owners
-            .authority
-            .snapshot()
-            .map_err(|error| SourceArtifactAdmissionError::Owner(error.to_string()))?;
-        if authority_snapshot.state_fence != fence {
-            return Err(SourceArtifactAdmissionError::Owner(
-                "source-artifact AuthorityOwner is stale against the current Governor fence"
-                    .to_owned(),
+        if self.owners.authority.state_fence() != &fence {
+            return Err(SourceArtifactAdmissionError::Binding(
+                "source-artifact AuthorityOwner is stale against the current Governor fence",
             ));
         }
         crate::issue_source_artifact_admission(&mut self.owners.authority, admission)
@@ -76,24 +69,13 @@ fn validate_original_read_request<'a>(
     input: &'a crate::SourceArtifactReadRequest,
     fence: &StateFence,
 ) -> Result<OriginalReadRequestContext<'a>, SourceArtifactAdmissionError> {
-    input
-        .envelope
-        .validate()
-        .map_err(|_| SourceArtifactAdmissionError::Binding("host envelope is invalid"))?;
-    input
-        .attempt
-        .validate()
-        .map_err(|_| SourceArtifactAdmissionError::Binding("local-read attempt is invalid"))?;
-    input
-        .payload_ref
-        .validate()
-        .map_err(|error| SourceArtifactAdmissionError::Owner(error.to_string()))?;
+    input.envelope.validate()?;
+    input.attempt.validate()?;
+    input.payload_ref.validate()?;
 
     let host_operation_id = host_request_operation_id(&input.envelope);
-    let expected_request_id = RequestId::new(format!(
-        "{CONTEXT_RECONSTRUCTION_REQUEST_PREFIX}{host_operation_id}"
-    ))
-    .map_err(|_| SourceArtifactAdmissionError::Binding("context request identity is invalid"))?;
+    let expected_request_id =
+        RequestId::new(format!("{CONTEXT_RECONSTRUCTION_REQUEST_PREFIX}{host_operation_id}"))?;
     let identity = &input.envelope.identity;
     let metadata = &input.request_metadata;
     let work_scope_ref = identity
@@ -103,19 +85,16 @@ fn validate_original_read_request<'a>(
         .ok_or(SourceArtifactAdmissionError::Binding(
             "context reconstruction request lacks its original WorkScope identity",
         ))?;
-    let metadata_task = metadata
-        .task_id
-        .as_ref()
-        .ok_or(SourceArtifactAdmissionError::Binding(
+    let metadata_task = metadata.task_id.as_ref().ok_or(
+        SourceArtifactAdmissionError::Binding(
             "context reconstruction metadata lacks its task identity",
-        ))?;
-    let metadata_session =
-        metadata
-            .session_id
-            .as_ref()
-            .ok_or(SourceArtifactAdmissionError::Binding(
-                "context reconstruction metadata lacks its session identity",
-            ))?;
+        ),
+    )?;
+    let metadata_session = metadata.session_id.as_ref().ok_or(
+        SourceArtifactAdmissionError::Binding(
+            "context reconstruction metadata lacks its session identity",
+        ),
+    )?;
 
     if identity.capability != "eliot.query"
         || identity.request_id.as_str().trim().is_empty()
@@ -151,9 +130,7 @@ fn validate_original_read_request<'a>(
         deadline_unix_ms: identity.deadline_unix_ms,
         cancellation_id: identity.cancellation_id.clone(),
     };
-    request_identity.validate().map_err(|_| {
-        SourceArtifactAdmissionError::Binding("original request identity is invalid")
-    })?;
+    request_identity.validate()?;
 
     let task_frame = &input.task_frame_readback;
     let task_frame_principal = task_frame.principal();
@@ -195,17 +172,10 @@ fn read_current_owner_bindings<P: KernelGenerationPort + ?Sized>(
     original: &OriginalReadRequestContext<'_>,
     fence: &StateFence,
 ) -> Result<CurrentOwnerBindings, SourceArtifactAdmissionError> {
-    let work_scope_owner = composition.owners.work_scope.as_ref().ok_or_else(|| {
-        SourceArtifactAdmissionError::Owner("current WorkScope owner is unbound".to_owned())
-    })?;
-    let current_scope = work_scope_owner
-        .read_current(fence)
-        .map_err(|error| SourceArtifactAdmissionError::Owner(error.to_string()))?;
-    ensure_snapshot_fresh(
-        &current_scope,
-        "source-artifact READ WorkScope is not fresh",
-    )
-    .map_err(|error| SourceArtifactAdmissionError::Owner(error.to_string()))?;
+    let work_scope_owner = composition.owners.work_scope.as_ref().ok_or(
+        SourceArtifactAdmissionError::Binding("current WorkScope owner is unbound"),
+    )?;
+    let current_scope = work_scope_owner.read_current(fence)?;
     let current_scope_identity = &current_scope.binding.scope;
     if current_scope.state_fence != *fence
         || current_scope_identity.scope_ref != original.work_scope_ref
@@ -216,35 +186,33 @@ fn read_current_owner_bindings<P: KernelGenerationPort + ?Sized>(
         ));
     }
     let work_scope = WorkScopeBinding {
-        scope_id: WorkScopeId::new(current_scope_identity.scope_ref.clone())
-            .map_err(|error| SourceArtifactAdmissionError::Owner(error.to_string()))?,
+        scope_id: WorkScopeId::new(current_scope_identity.scope_ref.clone())?,
         product_id: input.request_metadata.product_id.clone(),
-        resource_generation: ResourceGeneration::new(current_scope_identity.generation)
-            .map_err(|error| SourceArtifactAdmissionError::Owner(error.to_string()))?,
+        resource_generation: ResourceGeneration::new(current_scope_identity.generation)?,
         state_fence: fence.clone(),
     };
 
-    let metadata_task =
-        input
-            .request_metadata
-            .task_id
-            .as_ref()
-            .ok_or(SourceArtifactAdmissionError::Binding(
-                "context reconstruction metadata lacks its task identity",
-            ))?;
-    let metadata_session =
-        input
-            .request_metadata
-            .session_id
-            .as_ref()
-            .ok_or(SourceArtifactAdmissionError::Binding(
-                "context reconstruction metadata lacks its session identity",
-            ))?;
+    let metadata_task = input
+        .request_metadata
+        .task_id
+        .as_ref()
+        .ok_or(SourceArtifactAdmissionError::Binding(
+            "context reconstruction metadata lacks its task identity",
+        ))?;
+    let metadata_session = input
+        .request_metadata
+        .session_id
+        .as_ref()
+        .ok_or(SourceArtifactAdmissionError::Binding(
+            "context reconstruction metadata lacks its session identity",
+        ))?;
     let current_task = composition
         .owners
         .task
         .task(metadata_task)
-        .ok_or_else(|| SourceArtifactAdmissionError::Owner("task is absent".to_owned()))?;
+        .ok_or(SourceArtifactAdmissionError::Binding(
+            "current Task owner lacks the requested task",
+        ))?;
     if !current_task.state.is_active() || current_task.state_fence != *fence {
         return Err(SourceArtifactAdmissionError::Binding(
             "current Task owner is not active under the admitted request fence",
@@ -252,8 +220,7 @@ fn read_current_owner_bindings<P: KernelGenerationPort + ?Sized>(
     }
     let task = TaskBinding {
         task_id: current_task.task_id.clone(),
-        task_revision: TaskRevision::new(current_task.revision)
-            .map_err(|error| SourceArtifactAdmissionError::Owner(error.to_string()))?,
+        task_revision: TaskRevision::new(current_task.revision)?,
         state_fence: current_task.state_fence.clone(),
     };
 
@@ -261,7 +228,9 @@ fn read_current_owner_bindings<P: KernelGenerationPort + ?Sized>(
         .owners
         .session
         .session(metadata_session)
-        .ok_or_else(|| SourceArtifactAdmissionError::Owner("session is absent".to_owned()))?;
+        .ok_or(SourceArtifactAdmissionError::Binding(
+            "current Session owner lacks the requested session",
+        ))?;
     if current_session.status != eliot_session::SessionState::Active
         || current_session.state_fence != *fence
         || current_session.authority_epoch != fence.authority_epoch
@@ -295,8 +264,7 @@ fn source_artifact_read_admission_request(
 ) -> Result<SourceArtifactAdmissionRequest, SourceArtifactAdmissionError> {
     let operation_name = input.envelope.identity.capability.clone();
     let operation = OperationBinding {
-        operation_id: OperationId::new(original.host_operation_id.clone())
-            .map_err(|error| SourceArtifactAdmissionError::Owner(error.to_string()))?,
+        operation_id: OperationId::new(original.host_operation_id.clone())?,
         request_id: input.request_metadata.request_id.clone(),
         idempotency_key: input.envelope.identity.idempotency_key.clone(),
         operation_kind: operation_name.clone(),
@@ -304,11 +272,7 @@ fn source_artifact_read_admission_request(
         state_fence: fence.clone(),
     };
     let resource_ref = input.payload_ref.ready_receipt_id.clone();
-    let pointer_json = String::from_utf8(
-        canonical_json_bytes(&input.payload_ref)
-            .map_err(|error| SourceArtifactAdmissionError::Owner(error.to_string()))?,
-    )
-    .map_err(|error| SourceArtifactAdmissionError::Owner(error.to_string()))?;
+    let pointer_json = String::from_utf8(canonical_json_bytes(&input.payload_ref)?)?;
     let contract = ActionContract::new(
         format!("source-artifact-read:{}", original.host_operation_id),
         owners.task.task_id.to_string(),
@@ -326,8 +290,7 @@ fn source_artifact_read_admission_request(
             "current_request_fence_mismatch".to_owned(),
             "blob_owner_readback_refused".to_owned(),
         ],
-    )
-    .map_err(|error| SourceArtifactAdmissionError::Owner(error.to_string()))?;
+    )?;
     Ok(SourceArtifactAdmissionRequest {
         snapshot_id: SnapshotId::new(format!(
             "source-artifact-read:{}",

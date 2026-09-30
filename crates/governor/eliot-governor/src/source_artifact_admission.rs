@@ -193,6 +193,20 @@ impl SourceArtifactAdmission {
 pub enum SourceArtifactAdmissionError {
     #[error("source effect admission refused: {0}")]
     Authority(#[from] AuthorityError),
+    #[error(transparent)]
+    Protocol(#[from] eliot_protocol::ProtocolError),
+    #[error(transparent)]
+    Store(#[from] eliot_store_api::StoreError),
+    #[error(transparent)]
+    WorkScope(#[from] eliot_workscope::WorkScopeError),
+    #[error(transparent)]
+    Receipt(#[from] eliot_receipts::ReceiptError),
+    #[error(transparent)]
+    Contract(#[from] eliot_contracts::ContractError),
+    #[error(transparent)]
+    ContractEncoding(#[from] serde_json::Error),
+    #[error(transparent)]
+    TextEncoding(#[from] std::string::FromUtf8Error),
     #[error("source effect admission binding refused: {0}")]
     Binding(&'static str),
     #[error("source effect admission could not encode the current State Fence")]
