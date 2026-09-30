@@ -1,8 +1,9 @@
 //! Durable non-truth observability contracts.
 
 use crate::{
-    MemoryInfluenceAckInput, MemoryInfluenceClass, MemoryInfluenceTrace, MemoryRevision, ProjectId,
-    SessionId, TaskId, WriteId, ul::injection::MEMORY_INFLUENCE_ACK_FIELDS,
+    ActivationTrace, InjectionReceipt, MemoryInfluenceAckInput, MemoryInfluenceClass,
+    MemoryInfluenceTrace, MemoryRevision, PredictionRecord, ProjectId, SessionId, TaskId,
+    UlExamRecord, WriteId, ul::injection::MEMORY_INFLUENCE_ACK_FIELDS,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -71,19 +72,20 @@ pub struct MemoryGrantOfferRecord {
 // Durable non-truth observability write envelope.
 //
 // The envelope fields are closed: an unknown envelope key cannot ride along
-// with an accepted observability write. `payload` itself is a protected typed
-// payload whose owner re-decodes it into the exact record kind named by
-// `kind` (`MemoryGrantOfferRecord`, `InjectionReceipt`,
-// `MemoryInfluenceTrace`); it is not inert data, and a `Value` intermediate
-// cannot prove the absence of duplicate keys in the original bytes.
+// with an accepted observability write, and a repeated key is refused before
+// any value is stored. `payload` is a protected typed payload under its actual
+// owner, not inert data. The decoder reads the whole envelope once and then
+// re-decodes `payload` through the owner type that `kind` names — the record
+// type the store itself later persists — so an observation that does not carry
+// its record kind is refused here rather than reaching the store as an untyped
+// blob. The published field stays the `Value` it has always been, so the wire
+// spelling and the `input_hash` digest material are byte-identical.
 //
 // The prose here is deliberately a plain comment: this type derives
 // `JsonSchema`, and a doc comment would become the published schema
 // `description`, which the wire compatibility boundary must not change.
-#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, JsonSchema, Serialize)]
 pub struct ObservabilityWriteEnvelope {
-    #[serde(deserialize_with = "deserialize_observability_schema_version")]
     pub schema_version: String,
     pub write_id: WriteId,
     pub project_id: ProjectId,
@@ -98,6 +100,157 @@ pub struct ObservabilityWriteEnvelope {
     pub created_at: OffsetDateTime,
 }
 
+/// The exact declared field set of [`ObservabilityWriteEnvelope`], reused as the
+/// `deserialize_struct` hint so a refusal names the owning contract rather than
+/// a second, drifting list of field names.
+const OBSERVABILITY_WRITE_ENVELOPE_FIELDS: &[&str] = &[
+    "schema_version",
+    "write_id",
+    "project_id",
+    "task_id",
+    "session_id",
+    "kind",
+    "record_id",
+    "payload",
+    "input_hash",
+    "created_at",
+];
+
+impl<'de> Deserialize<'de> for ObservabilityWriteEnvelope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_struct(
+            "ObservabilityWriteEnvelope",
+            OBSERVABILITY_WRITE_ENVELOPE_FIELDS,
+            ObservabilityWriteEnvelopeVisitor,
+        )
+    }
+}
+
+/// Single-pass decoder for [`ObservabilityWriteEnvelope`].
+///
+/// A repeated key is refused before any value is stored, an unrecognised key is
+/// refused against the declared field set before the typed envelope is
+/// returned, and `payload` is refused unless the record kind the envelope names
+/// actually accepts it.
+struct ObservabilityWriteEnvelopeVisitor;
+
+impl<'de> serde::de::Visitor<'de> for ObservabilityWriteEnvelopeVisitor {
+    type Value = ObservabilityWriteEnvelope;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a durable observability write envelope")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut schema_version: Option<String> = None;
+        let mut write_id: Option<WriteId> = None;
+        let mut project_id: Option<ProjectId> = None;
+        let mut task_id: Option<Option<TaskId>> = None;
+        let mut session_id: Option<Option<SessionId>> = None;
+        let mut kind: Option<ObservabilityKind> = None;
+        let mut record_id: Option<String> = None;
+        let mut payload: Option<Value> = None;
+        let mut input_hash: Option<String> = None;
+        let mut created_at: Option<OffsetDateTime> = None;
+
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "schema_version" => {
+                    let value = map.next_value::<String>()?;
+                    check_observability_schema_version(&value)?;
+                    set_once(&mut schema_version, value, "schema_version")?;
+                }
+                "write_id" => set_once(&mut write_id, map.next_value()?, "write_id")?,
+                "project_id" => set_once(&mut project_id, map.next_value()?, "project_id")?,
+                "task_id" => set_once(&mut task_id, map.next_value()?, "task_id")?,
+                "session_id" => set_once(&mut session_id, map.next_value()?, "session_id")?,
+                "kind" => set_once(&mut kind, map.next_value()?, "kind")?,
+                "record_id" => set_once(&mut record_id, map.next_value()?, "record_id")?,
+                "payload" => set_once(&mut payload, map.next_value()?, "payload")?,
+                "input_hash" => set_once(&mut input_hash, map.next_value()?, "input_hash")?,
+                "created_at" => {
+                    let value = map.next_value::<String>()?;
+                    let parsed = OffsetDateTime::parse(&value, &time::format_description::well_known::Rfc3339)
+                        .map_err(serde::de::Error::custom)?;
+                    set_once(&mut created_at, parsed, "created_at")?;
+                }
+                _ => {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                    return Err(serde::de::Error::unknown_field(
+                        key.as_str(),
+                        OBSERVABILITY_WRITE_ENVELOPE_FIELDS,
+                    ));
+                }
+            }
+        }
+
+        let envelope = ObservabilityWriteEnvelope {
+            schema_version: required(schema_version, "schema_version")?,
+            write_id: required(write_id, "write_id")?,
+            project_id: required(project_id, "project_id")?,
+            task_id: task_id.unwrap_or_default(),
+            session_id: session_id.unwrap_or_default(),
+            kind: required(kind, "kind")?,
+            record_id: required(record_id, "record_id")?,
+            payload: required(payload, "payload")?,
+            input_hash: required(input_hash, "input_hash")?,
+            created_at: required(created_at, "created_at")?,
+        };
+
+        bind_observability_payload(envelope.kind, &envelope.payload)
+            .map_err(serde::de::Error::custom)?;
+
+        Ok(envelope)
+    }
+}
+
+/// Refuse a payload that is not the record type its envelope's `kind` names.
+///
+/// This is the owner binding, not a shape approximation: each arm is the owning
+/// record type's own `Deserialize`, so an unknown key, a duplicate key, a wrong
+/// variant or a missing protected field inside the payload is refused by the
+/// owner that defines it. The six kinds resolve to six existing owner decoders —
+/// no new record type and no new decoder framework is introduced here, and
+/// `MemoryGrantOfferRecord` keeps its grant/token semantics untouched.
+///
+/// Residual, owned by the producers rather than by this leaf: the published
+/// `payload` field is still the `Value` every producer constructs through
+/// `serde_json::to_value`, because re-typing it would change the `input_hash`
+/// digest material and force a matching change in the six
+/// `submit_observability` producers outside this file. Binding therefore happens
+/// where bytes enter, at `deserialize`, not where the struct literal is built.
+fn bind_observability_payload(
+    kind: ObservabilityKind,
+    payload: &Value,
+) -> Result<(), serde_json::Error> {
+    match kind {
+        ObservabilityKind::MemoryGrantOffer => {
+            serde_json::from_value::<MemoryGrantOfferRecord>(payload.clone()).map(|_owner| ())
+        }
+        ObservabilityKind::InjectionReceipt => {
+            serde_json::from_value::<InjectionReceipt>(payload.clone()).map(|_owner| ())
+        }
+        ObservabilityKind::MemoryInfluenceTrace => {
+            serde_json::from_value::<MemoryInfluenceTrace>(payload.clone()).map(|_owner| ())
+        }
+        ObservabilityKind::ActivationTrace => {
+            serde_json::from_value::<ActivationTrace>(payload.clone()).map(|_owner| ())
+        }
+        ObservabilityKind::PredictionRecord => {
+            serde_json::from_value::<PredictionRecord>(payload.clone()).map(|_owner| ())
+        }
+        ObservabilityKind::ExamRecord => {
+            serde_json::from_value::<UlExamRecord>(payload.clone()).map(|_owner| ())
+        }
+    }
+}
+
 /// Bounded refusal for an observability envelope schema version this build
 /// does not own. The message is fixed and never echoes the received value.
 fn unsupported_observability_schema_version<E>(expected: &str) -> E
@@ -107,13 +260,18 @@ where
     E::custom(format!("unsupported schema version; expected {expected}"))
 }
 
-fn deserialize_observability_schema_version<'de, D>(deserializer: D) -> Result<String, D::Error>
+/// Refuse an envelope whose `schema_version` is not the one this build owns.
+///
+/// This keeps the bound the field's former `deserialize_with` enforced. The
+/// accepted spelling is unchanged — exactly one version value decodes — but note
+/// that the refusal is now raised as soon as the key is read rather than after
+/// the whole map has been consumed.
+fn check_observability_schema_version<E>(value: &str) -> Result<(), E>
 where
-    D: serde::Deserializer<'de>,
+    E: serde::de::Error,
 {
-    let value = String::deserialize(deserializer)?;
     if value == OBSERVABILITY_SCHEMA_VERSION {
-        Ok(value)
+        Ok(())
     } else {
         Err(unsupported_observability_schema_version(
             OBSERVABILITY_SCHEMA_VERSION,
