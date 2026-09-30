@@ -5815,16 +5815,20 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
                         read_back_served_result(&directory, &identity)
                 {
                     let mut replay_owner = DeliverySetChannel::replay_only();
+                    // The tracked cleanup runs on both edges of this one
+                    // emission. A publication failure can retain a still
+                    // blocked writer in `pending_helper` (a bounded caller
+                    // timeout is a timeout, never bounded termination of the
+                    // writer), so the failure edge runs the same cleanup the
+                    // success edge does instead of returning into the drop
+                    // below, which would discard a live helper handle and
+                    // report a clean stop. Containment outranks the bare
+                    // publication error, exactly as the ordinary edge does.
                     let terminal = replay_owner
                         .publish_retained_sequence(&events)
-                        .map_err(OrdinaryDriveError::Loop)?;
-                    // Tracked termination of the replay emission: a helper
-                    // still holding stdout is reported to the process owner
-                    // rather than reported as a clean republication.
-                    replay_owner
-                        .cleanup_output_helper()
-                        .map_err(OrdinaryDriveError::Loop)?;
-                    return Ok(terminal);
+                        .map_err(OrdinaryDriveError::Loop)
+                        .or_else(|| replay_owner.cleanup_output_helper().ok());
+                    return Ok(terminal?);
                 }
                 // The classifier also treats a differing identity under the
                 // same spent grant as Replay, and an InFlight-named set as
