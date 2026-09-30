@@ -346,7 +346,7 @@ pub enum MaintenanceTriggerIntakeError {
         operation_hash: String,
         /// Exact binding refusal; changed content conflicts.
         #[source]
-        source: ProtocolError,
+        source: Box<ProtocolError>,
     },
     /// The ORS owner could not durably stage the complete opaque input
     /// (capacity, key, integrity, or durable-write refusal).
@@ -358,7 +358,7 @@ pub enum MaintenanceTriggerIntakeError {
         operation_hash: String,
         /// Exact owner refusal; no receipt was issued.
         #[source]
-        source: OrsError,
+        source: Box<OrsError>,
     },
     /// The Kernel delivery owner refused admission of the staged trigger.
     #[error("maintenance trigger intake admission refused for trigger {trigger_id}: {source}")]
@@ -369,7 +369,7 @@ pub enum MaintenanceTriggerIntakeError {
         operation_hash: String,
         /// Exact owner refusal; nothing was admitted.
         #[source]
-        source: MaintenanceTriggerDeliveryError,
+        source: Box<MaintenanceTriggerDeliveryError>,
     },
 }
 
@@ -412,7 +412,7 @@ impl MaintenanceTriggerIntakeError {
 /// is not a complete durable payload, so both arms fail without a receipt —
 /// the retained arm on a missing envelope or hash mismatch, the opaque arm
 /// on envelope validation — and I05.02 applies verbatim: "if ORS cannot
-/// durably stage the complete opaque operation, accepted_pending is
+/// durably stage the complete opaque operation, `accepted_pending` is
 /// forbidden".
 ///
 /// Completeness is proven against the owner read-back, not the staged bytes
@@ -456,7 +456,7 @@ pub fn admit_maintenance_trigger_intake(
         return Err(MaintenanceTriggerIntakeError::BindingConflict {
             trigger_id: record.trigger_id.clone(),
             operation_hash: record.operation_hash.clone(),
-            source: ProtocolError::ReplayConflict,
+            source: Box::new(ProtocolError::ReplayConflict),
         });
     }
     let retry_id = (record.trigger_id.clone(), record.operation_hash.clone());
@@ -469,7 +469,7 @@ pub fn admit_maintenance_trigger_intake(
         MaintenanceTriggerIntakeError::Staging {
             trigger_id: retry_id.0.clone(),
             operation_hash: retry_id.1.clone(),
-            source,
+            source: Box::new(source),
         }
     })?;
     // Admit the staged record into the owned delivery ledger. The owner entry
@@ -482,6 +482,6 @@ pub fn admit_maintenance_trigger_intake(
         .map_err(|source| MaintenanceTriggerIntakeError::Admission {
             trigger_id: retry_id.0,
             operation_hash: retry_id.1,
-            source,
+            source: Box::new(source),
         })
 }
