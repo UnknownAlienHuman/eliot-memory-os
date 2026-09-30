@@ -7412,9 +7412,12 @@ impl KernelComposition {
             }
         };
         let runtime = UserAutomationOperatorRuntime::new(client);
-        let answer = Box::pin(
-            gateway.publish_due_wake_horizon_advance(request, resolution, &publication, &runtime),
-        )
+        let answer = Box::pin(gateway.publish_due_wake_horizon_advance(
+            request,
+            resolution,
+            &publication,
+            &runtime,
+        ))
         .await;
         match answer {
             // A retained obligation is present exactly when a durable record backs
