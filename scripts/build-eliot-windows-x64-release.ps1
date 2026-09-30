@@ -22,7 +22,7 @@ param(
 $ErrorActionPreference = 'Stop'
 # Issue #2968: Governor retirement is a detached, owner-issued release
 # transition, never a tracked source fact. The approval contract
-# (`GovernorRetirementApprovalV1`), the independent consumer-closure verifier,
+# (`GovernorRetirementApprovalV2`), the independent consumer-closure verifier,
 # the issuer seam, and the offline trust admission live in
 # scripts/lib/governor-retirement-approval.ps1, OUTSIDE the retiring facade
 # package. A tracked source file may describe the expected contract, but no
@@ -41,9 +41,9 @@ $ErrorActionPreference = 'Stop'
 # Resolve-GovernorDisposition returns a typed disposition (Retained /
 # RetirementCandidate / Retired / MalformedOrAmbiguous). Retained stages
 # today's slice unchanged; Retired stages only from a detached owner-issued
-# approval R(C) that verifies for the exact release candidate commit AND tree
-# against the owner-pinned independent consumer closure (fail closed while no
-# owner-issued approval exists);
+# approval R(C, P) that verifies for exact candidate C AND tree while P
+# separately pins the pre-deletion identity and consumer denominator (fail
+# closed while no owner-issued approval exists);
 # RetirementCandidate and MalformedOrAmbiguous abort plan/stage explicitly.
 # Already-generated self-declared retired plans/bundles are
 # simulated/unadmitted, must be rebuilt, and are never grandfathered.
@@ -865,9 +865,11 @@ function Resolve-GovernorRetirementTrustPolicy([string]$Repo, [string]$SourceCom
 function Resolve-GovernorDisposition([object]$Metadata, [string]$Repo, [string]$SourceCommit, [object]$ApprovalInput, [object]$TrustPolicy, [object]$Issuer) {
     # Typed disposition resolver (issues #2892/#2968). Returns Kind in
     # { Retained, RetirementCandidate, Retired, MalformedOrAmbiguous }.
-    # Retired requires a DETACHED, owner-issued approval R(C) that verifies for
-    # the exact candidate commit AND tree, under an owner-admitted issuer and
-    # trust policy, against an independently recomputed consumer closure.
+    # Retired requires a DETACHED, owner-issued approval R(C, P) that verifies
+    # for this exact candidate C commit AND tree. P separately pins the source
+    # used to validate old identity and consumer proofs; it cannot substitute
+    # for C or widen exact replay. Both closures and the current transition are
+    # recomputed under the owner-admitted issuer and trust policy.
     # Shape alone, a candidate-controlled body, a nonblank approval_identity and
     # the existing Authenticode signer are never authority. Retained stages
     # today's slice unchanged; RetirementCandidate and MalformedOrAmbiguous
@@ -902,7 +904,7 @@ function Resolve-GovernorDisposition([object]$Metadata, [string]$Repo, [string]$
     }
     $approvalReference = New-GovernorRetirementApprovalReference $binding ([string]$ApprovalInput.sha256) ([string]$TrustPolicy.sha256)
     $retiredEvidence = New-GovernorRetiredGovernorEvidence $SourceCommit $approvalReference
-    $retiredDisposition = "retired (detached owner approval R(C) $($approvalReference.content_sha256) issued by $($approvalReference.issuer) for candidate commit $SourceCommit tree $($approvalReference.candidate_tree); independent closure $($approvalReference.closure_digest_sha256) covers $($approvalReference.closure_count) classified tracked references under rule set $($approvalReference.closure_rule_set); the governor executable, the gated legacy include, and the Codex plugin leave the release together so no shipped plugin names a missing command; the Claude legacy path is unavailable - select agent-bridge; ceiling: $($approvalReference.proof_ceiling))"
+    $retiredDisposition = "retired (detached owner approval R(C, P) $($approvalReference.content_sha256) issued by $($approvalReference.issuer) for exact candidate commit $SourceCommit tree $($approvalReference.candidate_tree), with pre-deletion proof source $($approvalReference.pre_deletion_source_commit) tree $($approvalReference.pre_deletion_source_tree); approved denominator closure $($approvalReference.closure_digest_sha256) covers $($approvalReference.closure_count) classified tracked references and candidate closure $($approvalReference.candidate_closure_digest_sha256) covers $($approvalReference.candidate_closure_count) under rule set $($approvalReference.closure_rule_set); the governor executable, the gated legacy include, and the Codex plugin leave the release together so no shipped plugin names a missing command; the Claude legacy path is unavailable - select agent-bridge; ceiling: $($approvalReference.proof_ceiling))"
     return [pscustomobject]@{ Kind = 'Retired'; Reason = $null; Identity = $cargo; Evidence = $retiredEvidence; Disposition = $retiredDisposition; ApprovalReference = $approvalReference }
 }
 function Assert-NoRetiredLaunchReferences([string]$BundlePath, [object[]]$LiveReferences) {
@@ -965,7 +967,9 @@ function Assert-GovernorApprovalIdentityAgreement([object]$Recomputed, [object]$
     if (-not $Carried) {
         throw "$Purpose omits the governor_approval identity that authorized the retired disposition"
     }
-    foreach ($field in @('content_sha256', 'candidate_commit', 'candidate_tree', 'closure_digest_sha256',
+    foreach ($field in @('content_sha256', 'candidate_commit', 'candidate_tree',
+            'pre_deletion_source_commit', 'pre_deletion_source_tree',
+            'closure_digest_sha256', 'candidate_closure_digest_sha256', 'candidate_closure_status',
             'closure_declaration_blob', 'canonical_request_hash', 'operation_id',
             'approval_file_sha256', 'trust_file_sha256', 'issuer', 'issuer_state',
             'issuer_evidence_sha256', 'release_policy_revision', 'proof_ceiling')) {
@@ -975,6 +979,9 @@ function Assert-GovernorApprovalIdentityAgreement([object]$Recomputed, [object]$
     }
     if ([int64](Read-ObjectProperty $Carried 'closure_count') -ne [int64](Read-ObjectProperty $Recomputed 'closure_count')) {
         throw "$Purpose carries a different approved consumer denominator than the independently recomputed closure"
+    }
+    if ([int64](Read-ObjectProperty $Carried 'candidate_closure_count') -ne [int64](Read-ObjectProperty $Recomputed 'candidate_closure_count')) {
+        throw "$Purpose carries a different exact-candidate closure than the independently recomputed closure"
     }
     return $true
 }
@@ -993,7 +1000,8 @@ function Assert-GovernorApprovalReferenceShape([object]$Reference, [string]$Sour
     if ([string](Read-ObjectProperty $Reference 'candidate_commit') -cne $SourceCommit) {
         throw 'governor_approval identity is bound to a different release candidate'
     }
-    foreach ($field in @('content_sha256', 'candidate_tree', 'closure_digest_sha256',
+    foreach ($field in @('content_sha256', 'candidate_tree', 'pre_deletion_source_commit',
+            'pre_deletion_source_tree', 'closure_digest_sha256', 'candidate_closure_digest_sha256',
             'closure_declaration_blob', 'issuer_evidence_sha256', 'approval_file_sha256', 'trust_file_sha256')) {
         if ([string](Read-ObjectProperty $Reference $field) -cnotmatch '^[0-9a-f]{40,64}$') {
             throw "governor_approval identity is missing its $field binding"
@@ -1010,6 +1018,10 @@ function Assert-GovernorApprovalReferenceShape([object]$Reference, [string]$Sour
     }
     if ([int64](Read-ObjectProperty $Reference 'closure_count') -le 0) {
         throw 'governor_approval identity carries an empty approved denominator'
+    }
+    if ([int64](Read-ObjectProperty $Reference 'candidate_closure_count') -le 0 -or
+        [string](Read-ObjectProperty $Reference 'candidate_closure_status') -cne 'COMPLETE') {
+        throw 'governor_approval identity carries no complete exact-candidate closure'
     }
     return $true
 }
@@ -1073,7 +1085,7 @@ function Assert-GovernorRetirementEvidence([object]$Release, [string]$BundlePath
     }
     if ($disposition -clike 'retired*') {
         if (-not $bound -or [string](Read-ObjectProperty $bound 'kind') -cne 'retired' -or [string](Read-ObjectProperty $bound 'evidence_sha256') -cnotmatch '^[0-9a-f]{64}$') {
-            throw 'release bundle carries a self-declared retired governor disposition without verifiable owner evidence (SIMULATED_NOT_ADMITTED): already-generated retired plans/bundles are never grandfathered; rebuild from a detached owner approval R(C) (issue #2968)'
+            throw 'release bundle carries a self-declared retired governor disposition without verifiable owner evidence (SIMULATED_NOT_ADMITTED): already-generated retired plans/bundles are never grandfathered; rebuild from a detached owner approval R(C, P) (issue #2968)'
         }
         [void](Assert-GovernorApprovalReferenceShape $carried $sourceCommit)
         $recomputed = Resolve-PinnedGovernorEvidence $repo $sourceCommit $ApprovalInput $TrustPolicy $Issuer
@@ -3146,7 +3158,7 @@ function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [obj
         # their digests are bound by SHA256SUMS.json like every other entry.
         $entries += [ordered]@{
             path = $script:GovernorRetirementBundleApprovalFile
-            selection = 'detached owner approval R(C) issued outside the candidate tree; the exact approved artifact set'
+            selection = 'detached owner approval R(C, P) issued outside the candidate tree; the exact approved artifact set'
             owner = 'root-owned release policy; issued for this exact candidate commit and tree'
             install_destination = './'
             generation = $SourceCommit
@@ -3157,7 +3169,7 @@ function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [obj
         }
         $entries += [ordered]@{
             path = $script:GovernorRetirementBundleTrustFile
-            selection = 'root-owned retirement-approval trust policy admitted for the release policy revision; the offline trust material for R(C)'
+            selection = 'root-owned retirement-approval trust policy admitted for the release policy revision; the offline trust material for R(C, P)'
             owner = 'scripts/lib/governor-retirement-approval-trust.json'
             install_destination = './'
             generation = $SourceCommit
@@ -3307,8 +3319,9 @@ function Test-ReleaseBundle([string]$Path, [string]$GovernorRetirementApproval) 
     # governor executable nor the Codex plugin subtree (the plugin leaves the
     # release together with the binary so no shipped plugin names a missing
     # command). The disposition is certified by RE-RESOLVING the detached
-    # approval R(C) from the explicit input against the pinned candidate commit,
-    # candidate tree and the independently recomputed consumer closure: this
+    # approval R(C, P) from the explicit input against exact candidate C/tree,
+    # pinned pre-deletion source P/tree, and both independently recomputed
+    # closures: this
     # verifier never trusts the builder-written disposition string, a copied
     # approval body inside the bundle, or a candidate-controlled disposition
     # value. Signing the remaining files cannot manufacture that approval.
@@ -4111,9 +4124,9 @@ $frontDoorBridgePlan = Get-FrontDoorBridgePlan $cargoMetadata $ClaudeCodeFrontDo
 # the only caller-supplied retirement artifact; the trust root is one exact
 # root-owned policy inside the candidate tree, so the same caller can never
 # supply both an arbitrary approval and an arbitrary trust root. Only Retained
-# (legacy source still valid, no owner-issued R(C)) and Retired (a detached
-# owner approval verified for the exact candidate commit AND tree against the
-# independently recomputed consumer closure) proceed; RetirementCandidate and
+# (legacy source still valid, no owner-issued R(C, P)) and Retired (a detached
+# owner approval verified for exact candidate C/tree and pre-deletion source
+# P/tree against both independently recomputed closures) proceed; RetirementCandidate and
 # MalformedOrAmbiguous abort explicitly. Presence keeps today's retained slice
 # byte-identical.
 $sourceCommit = (& git -C $repo rev-parse HEAD 2>$null | Out-String).Trim()
@@ -4748,7 +4761,7 @@ try {
     }
     else {
         # Issue #2968 step 10: the retired bundle carries the immutable
-        # detached approval R(C) and the exact root-owned trust policy it was
+        # detached approval R(C, P) and the exact root-owned trust policy it was
         # admitted under, byte-for-byte, so the Authenticode finalizer can
         # re-verify the same approval identity offline. These are the verified
         # bytes already resolved through the release safe path/handle reader;
