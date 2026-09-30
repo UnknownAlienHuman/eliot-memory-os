@@ -307,6 +307,20 @@ impl MaintenanceTriggerInput {
 pub struct AutomationTriggerDecision {
     /// Trigger identity.
     pub trigger_id: String,
+    /// Origin of the observation that produced this trigger.
+    ///
+    /// Carried verbatim from [`MaintenanceTriggerInput::trigger`], which is the
+    /// caller-observed origin of that trigger: this evaluator copies the
+    /// observed value and never selects, widens, or defaults one, so a decision
+    /// cannot claim an origin the evaluated trigger did not carry.
+    ///
+    /// The field exists because I12.24:54 closes the trigger set with
+    /// "Dreamer/Watchdog/Concilium suggestion": a downstream classifier has to
+    /// read which kind of observation produced a decision, and the family alone
+    /// cannot say that. `MaintenanceTrigger` names the origins this contract
+    /// expresses today — a Concilium suggestion is not one of them yet, so this
+    /// field widens no vocabulary and asserts none.
+    pub trigger: MaintenanceTrigger,
     /// Selected family and scope.
     pub family: MaintenanceFamily,
     /// Affected scope.
@@ -742,6 +756,10 @@ impl<S: MaintenanceStateStore> MaintenanceController<S> {
         if let Some(active) = &input.active_job_id {
             return Ok(AutomationTriggerDecision {
                 trigger_id: input.trigger_id.clone(),
+                // The observed origin travels with the suppressed decision too:
+                // duplicate suppression says an equivalent request already owns
+                // this work, it does not change where the trigger came from.
+                trigger: input.trigger,
                 family: input.family,
                 scope_ref: input.scope_ref.clone(),
                 decision: AutomationDecision::SuppressDuplicate,
@@ -1102,6 +1120,7 @@ impl<S: MaintenanceStateStore> MaintenanceController<S> {
     ) -> AutomationTriggerDecision {
         AutomationTriggerDecision {
             trigger_id: input.trigger_id.clone(),
+            trigger: input.trigger,
             family: input.family,
             scope_ref: input.scope_ref.clone(),
             decision,
