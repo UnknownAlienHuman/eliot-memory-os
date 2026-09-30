@@ -2135,13 +2135,11 @@ pub fn admit_bootstrap_context(
     };
     match selection_response_for_receipt(receipt)? {
         TaskSelectionResponse::Absent(intake) => Ok(BootstrapAdmission::IntakeRequired(intake)),
-        TaskSelectionResponse::Ambiguous(candidate_handles) => {
-            Ok(BootstrapAdmission::Diagnostic {
-                reason: "task selection is ambiguous; answer with the bounded eligible handles",
-                next_safe_action: receipt.next_safe_action.clone(),
-                selection: TaskSelectionResponse::Ambiguous(candidate_handles),
-            })
-        }
+        TaskSelectionResponse::Ambiguous(candidate_handles) => Ok(BootstrapAdmission::Diagnostic {
+            reason: "task selection is ambiguous; answer with the bounded eligible handles",
+            next_safe_action: receipt.next_safe_action.clone(),
+            selection: TaskSelectionResponse::Ambiguous(candidate_handles),
+        }),
         TaskSelectionResponse::Exploratory {
             task_ref,
             task_revision,
