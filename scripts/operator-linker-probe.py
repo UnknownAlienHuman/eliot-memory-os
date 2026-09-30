@@ -27,6 +27,11 @@ SDK_KEYS = frozenset(key.casefold() for key in (
     "UniversalCRTSdkDir", "UCRTVersion", "DevEnvDir", "ExtensionSdkDir", "NETFXSDKDir",
     "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432",
 ))
+DISCOVERY_KEYS = frozenset(key.casefold() for key in (
+    "VisualStudioVersion", "ComSpec", "PATHEXT", "SystemDrive", "ProgramData",
+    "ALLUSERSPROFILE", "LOCALAPPDATA", "APPDATA", "PROCESSOR_ARCHITECTURE",
+    "PROCESSOR_ARCHITEW6432", "OS",
+))
 DIAGNOSTIC_LINE = re.compile(
     r"(?i)\b(error|fatal|cannot|could not|not found|invalid|unrecognized|failed|"
     r"extra operand|not recognized|operable|LNK[0-9]{4})\b"
@@ -141,7 +146,16 @@ def identity_ready(identity):
             and "host: x86_64-pc-windows-msvc" in identity["version_lines"])
 
 
+def restoration_values(normal, filtered, allowed):
+    """Fixed nonsecret discovery names only; values never enter report fields."""
+    present = {key.casefold() for key in filtered}
+    return {key: value for key, value in normal.items()
+            if key.casefold() in allowed and key.casefold() not in present
+            and len(value) <= 32768}
+
+
 def main():
+    deadline = time.monotonic() + 8 * 60
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
@@ -159,13 +173,15 @@ def main():
     inventory = load_inventory(root)
     filtered = actual_inventory_environment(inventory, root)
     normal = os.environ.copy()
-    restored = {key: value for key, value in normal.items()
-                if key.casefold() in SDK_KEYS and key not in filtered and len(value) <= 32768}
+    restored = restoration_values(normal, filtered, SDK_KEYS)
+    discovery = restoration_values(normal, filtered, DISCOVERY_KEYS)
+    combined = {**restored, **discovery}
     record = {"proof_ceiling": CEILING, "source": sha,
               "os_identity": {"system": platform.system(), "release": platform.release(),
                               "version": platform.version(), "machine": platform.machine()},
               "inventory_sha256": hashlib.sha256((root / "scripts/integration/ignored_test_inventory.py").read_bytes()).hexdigest(),
               "whitelist_key_names": sorted(filtered), "restorable_sdk_key_names": sorted(restored),
+              "restorable_discovery_key_names": sorted(discovery),
               "source_text": "fn main() {}\n", "runs": []}
     result_path = output / "result.json"
     try:
@@ -190,29 +206,49 @@ def main():
         work = Path(scratch)
         source = work / "main.rs"
         source.write_text(record["source_text"], encoding="utf-8")
-        environments = [("normal", normal), ("inventory_whitelist", filtered)]
-        for name, env in environments:
+        environments = [("normal", normal, []), ("inventory_whitelist", filtered, [])]
+        for name, env, restored_names in environments:
             target = work / name
             target.mkdir()
             command = ["rustc", "--crate-name", "eliot_linker_probe", "--edition=2024",
                        "--error-format=json", str(source), "-o", str(target / "probe.exe")]
             try:
-                result, stdout, stderr = bounded_run(command, root, env)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    result = dict(exit_code=None, elapsed_seconds=0,
+                                  limit_or_cleanup="NOT_EXECUTED_GLOBAL_BUDGET")
+                    stdout, stderr = b"", b""
+                else:
+                    result, stdout, stderr = bounded_run(command, root, env, min(TIMEOUT_SECONDS, remaining))
             except (OSError, subprocess.SubprocessError) as error:
                 result = dict(exit_code=None, elapsed_seconds=None,
                               limit_or_cleanup=type(error).__name__)
                 stdout, stderr = b"", b""
-            result.update(name=name, command=command, executable_exists=(target / "probe.exe").is_file(),
+            result.update(name=name, command=command, restored_key_names=restored_names,
+                          executable_exists=(target / "probe.exe").is_file(),
                           stdout_retained_bytes=len(stdout), stderr_retained_bytes=len(stderr),
                           diagnostics=diagnostic_projection(stderr, inventory._redact_detail))
             record["runs"].append(result)
             result_path.write_text(json.dumps(record, indent=2), encoding="utf-8")
             print(json.dumps({"probe": name, "exit_code": result["exit_code"],
                               "limit_or_cleanup": result["limit_or_cleanup"]}), flush=True)
-            if name == "inventory_whitelist" and restored and record["runs"][0]["exit_code"] == 0 and result["exit_code"] != 0:
-                environments.append(("inventory_whitelist_plus_sdk", {**filtered, **restored}))
+            if (name == "inventory_whitelist" and record["runs"][0]["exit_code"] == 0
+                    and result["exit_code"] not in (None, 0) and result["limit_or_cleanup"] is None):
+                if restored:
+                    environments.append(("inventory_whitelist_plus_sdk", {**filtered, **restored}, sorted(restored)))
+                if combined:
+                    environments.append(("inventory_whitelist_plus_discovery_group", {**filtered, **combined}, sorted(combined)))
+            if name == "inventory_whitelist_plus_discovery_group" and result["exit_code"] == 0 and result["limit_or_cleanup"] is None:
+                # Only a proven sufficient fixed group enables individual-key
+                # comparisons. Failure of all singles leaves combinations unknown.
+                for index, (key, value) in enumerate(sorted(combined.items())):
+                    environments.append((f"inventory_whitelist_plus_key_{index:02}",
+                                         {**filtered, key: value}, [key]))
         record["comparison"] = "direct_synthetic_rustc_linking_normal_vs_inventory_projection_not_cargo_graph_proof"
-        record["sdk_restore_attempted"] = len(record["runs"]) == 3
+        record["sdk_restore_attempted"] = any(row["name"] == "inventory_whitelist_plus_sdk" for row in record["runs"])
+        record["single_key_successes"] = [row["restored_key_names"][0] for row in record["runs"]
+                                           if row["name"].startswith("inventory_whitelist_plus_key_")
+                                           and row["exit_code"] == 0 and row["limit_or_cleanup"] is None]
         record["no_product_or_governed_acceptance"] = True
         result_path.write_text(json.dumps(record, indent=2), encoding="utf-8")
     # A retained negative is useful diagnosis, but remains an explicit failed

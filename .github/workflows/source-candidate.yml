@@ -13,6 +13,11 @@ on:
         required: false
         default: false
         type: boolean
+      operator_ui_diagnostic:
+        description: Also run the separate locked Operator build and headless harness
+        required: false
+        default: false
+        type: boolean
       require_live_windows_scenarios:
         description: Require the live Windows scenario harness
         required: false
@@ -33,7 +38,7 @@ env:
 
 jobs:
   source-candidate-gate:
-    if: ${{ !inputs.operator_audit_diagnostic && !inputs.operator_linker_probe }}
+    if: ${{ !inputs.operator_audit_diagnostic && !inputs.operator_linker_probe && !inputs.operator_ui_diagnostic }}
     runs-on: windows-latest
     timeout-minutes: 180
 
@@ -395,7 +400,7 @@ jobs:
   # Explicit user-authorized temporary audit mode. Never a Review, MergeCompile,
   # release, installed-runtime or Product acceptance receipt. Normal job unchanged.
   operator-audit-diagnostic:
-    if: ${{ inputs.operator_audit_diagnostic && !inputs.operator_linker_probe && github.ref == 'refs/heads/Operator_tests' }}
+    if: ${{ inputs.operator_audit_diagnostic && !inputs.operator_linker_probe && !inputs.operator_ui_diagnostic && !inputs.require_live_windows_scenarios && github.ref == 'refs/heads/Operator_tests' }}
     runs-on: windows-latest
     timeout-minutes: 180
     env:
@@ -426,7 +431,7 @@ jobs:
           retention-days: 14
 
   operator-audit-ref-guard:
-    if: ${{ ((inputs.operator_audit_diagnostic || inputs.operator_linker_probe) && github.ref != 'refs/heads/Operator_tests') || (inputs.operator_audit_diagnostic && inputs.operator_linker_probe) || (inputs.operator_linker_probe && inputs.require_live_windows_scenarios) }}
+    if: ${{ ((inputs.operator_audit_diagnostic || inputs.operator_linker_probe || inputs.operator_ui_diagnostic) && (github.ref != 'refs/heads/Operator_tests' || inputs.require_live_windows_scenarios)) || (inputs.operator_audit_diagnostic && inputs.operator_linker_probe) || (inputs.operator_ui_diagnostic && !inputs.operator_linker_probe) }}
     runs-on: windows-latest
     timeout-minutes: 2
     steps:
@@ -462,7 +467,7 @@ jobs:
 
 
   operator-ui-diagnostic:
-    if: ${{ inputs.operator_linker_probe && !inputs.operator_audit_diagnostic && !inputs.require_live_windows_scenarios && github.ref == 'refs/heads/Operator_tests' }}
+    if: ${{ inputs.operator_linker_probe && inputs.operator_ui_diagnostic && !inputs.operator_audit_diagnostic && !inputs.require_live_windows_scenarios && github.ref == 'refs/heads/Operator_tests' }}
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
