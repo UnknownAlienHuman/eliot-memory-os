@@ -56,6 +56,12 @@ Enforces that:
     lock, toolchain, source manifests, and event/fork trust class on every
     cache step of every workflow, so a cache hit never crosses a trust,
     source or toolchain boundary (AC10).
+14. Workflow-oracle changes are reported, never self-certified (issue #1225
+    step 10, I18.27): --oracle-base compares the candidate against a
+    materialized base tree and reports every mutated oracle path (GWF-022),
+    so a weakened verifier cannot pass its own candidate; acceptance for
+    such a candidate comes only from the merge owner's blind-reviewer
+    envelope for that exact candidate.
 """
 
 from __future__ import annotations
@@ -1919,6 +1925,120 @@ def verify_all(root: Path) -> list[Finding]:
     return findings
 
 
+# ---------------------------------------------------------------------------
+# Workflow-oracle change protection (issue #1225 step 10, I18.27).
+#
+# A change to workflow YAML, this verifier, profile definitions, lock
+# validation or the repository-policy denominator cannot use only its newly
+# modified oracle as acceptance: the candidate tree's own verdict on such a
+# candidate is never sufficient. The merge owner
+# (scripts/work_unit_gate/doc_read_evidence.py, blind-reviewer envelope
+# `eliot-oracle-blind-review-v1`) records the independent evidence for the
+# exact candidate, recomputed from the UNCHANGED base tree. This module only
+# names the oracle set and reports the tripwire (GWF-022); it never
+# authenticates a reviewer, because a candidate-tree file check is exactly
+# the self-certification the rule forbids. The merge harness runs the BASE
+# tree copy of this module as
+# `verify-github-workflows.py --root <candidate> --oracle-base <base>`
+# and routes a GWF-022 candidate to blind review before any result counts.
+# ---------------------------------------------------------------------------
+
+# Workflow YAML: every repository workflow file.
+ORACLE_PATH_PREFIXES = (".github/workflows/",)
+# This verifier, the profile definitions, lock validation and the
+# repository-policy denominator inputs this issue governs. The merge-gate
+# owner mirrors this set for the blind-reviewer decision; keep the two
+# identical.
+ORACLE_PATH_FILES = (
+    "scripts/verify-github-workflows.py",
+    "scripts/verify.ps1",
+    "scripts/verify-dependency-policy.py",
+    "scripts/requirements-verification.txt",
+    "apps/Eliot.Operator/packages.lock.json",
+    "tests/Eliot.Operator.Tests/packages.lock.json",
+    "global.json",
+)
+
+
+def _is_oracle_path(relative: str) -> bool:
+    if relative in ORACLE_PATH_FILES:
+        return True
+    return any(relative.startswith(prefix) for prefix in ORACLE_PATH_PREFIXES)
+
+
+def _read_tree_bytes(path: Path) -> bytes | None:
+    try:
+        return path.read_bytes()
+    except OSError:
+        return None
+
+
+def _normalized_tree_bytes(path: Path) -> bytes | None:
+    """File bytes with CRLF normalized to LF (missing stays missing).
+
+    The comparison mirrors git text=auto worktree comparison, so a
+    Windows checkout of an unchanged oracle file is not reported as a
+    change against a materialized base tree.
+    """
+    data = _read_tree_bytes(path)
+    if data is None:
+        return None
+    return data.replace(b"\r\n", b"\n")
+
+
+def oracle_paths_changed(base_root: Path, candidate_root: Path) -> list[str]:
+    """Oracle paths whose bytes differ between two materialized trees.
+
+    Both roots are read as plain directories (a base materialization and the
+    candidate tree). No expectation is derived from either tree's own
+    verdicts; only normalized file bytes are compared. A path present on
+    one side only counts as changed.
+    """
+    relatives: set[str] = set()
+    for root in (base_root, candidate_root):
+        for prefix in ORACLE_PATH_PREFIXES:
+            directory = root / prefix
+            if not directory.is_dir():
+                continue
+            for path in sorted(directory.rglob("*")):
+                if path.is_file():
+                    relatives.add(path.relative_to(root).as_posix())
+        for relative in ORACLE_PATH_FILES:
+            if (root / relative).exists():
+                relatives.add(relative)
+    changed = []
+    for relative in sorted(relatives):
+        if _normalized_tree_bytes(base_root / relative) != _normalized_tree_bytes(candidate_root / relative):
+            changed.append(relative)
+    return changed
+
+
+def check_oracle_change_protection(base_root: Path, candidate_root: Path) -> list[Finding]:
+    """Fail a candidate that mutates the workflow oracle (GWF-022).
+
+    One typed finding per changed oracle path. There is deliberately no
+    evidence override here: acceptance for an oracle-touching candidate comes
+    only from the merge owner's blind-reviewer envelope for the exact
+    candidate (I18.27), never from this module's own verdict on that same
+    candidate.
+    """
+    findings = []
+    for relative in oracle_paths_changed(base_root, candidate_root):
+        findings.append(
+            Finding(
+                "GWF-022",
+                relative,
+                0,
+                "workflow oracle changed: a candidate that mutates workflow YAML, "
+                "this verifier, profile definitions, lock validation or the "
+                "repository-policy denominator cannot use its newly modified "
+                "oracle as acceptance (I18.27); route this candidate to blind "
+                "review before any result counts",
+            )
+        )
+    return findings
+
+
 def run_self_tests() -> int:
     import tempfile
 
@@ -2430,12 +2550,289 @@ def run_self_tests() -> int:
             print(f"SELF_TEST_FAILURE: hash-locked pip install produced unexpected findings: {findings}", file=sys.stderr)
             return 1
 
+    # Fail-closed privilege, locked restore, SDK identity and NuGet graph
+    # (issue #1225 N_step9). Each rejection is judged by its own rule, and
+    # the exact findings must also reappear through the shared dispatch, so
+    # removing a rule from verify_all fails the self-test instead of passing
+    # vacuously. Exact-finding inclusion (not bare code membership) is what
+    # proves dispatch: GWF-021 is also emitted by the manifest-coverage rule,
+    # which fires on these roots for the missing Cargo.toml.
+    checkout_conforming = (
+        "      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683\n"
+        "        with:\n"
+        "          persist-credentials: false\n"
+    )
+
+    def privilege_workflow(extra: str, permissions: str = "contents: read") -> str:
+        return (
+            "name: Manual Gate\non:\n  workflow_dispatch:\npermissions:\n  "
+            + permissions
+            + "\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n"
+            + checkout_conforming
+            + extra
+        )
+
+    def restore_workflow(run_line: str) -> str:
+        return (
+            "name: Manual Gate\non:\n  workflow_dispatch:\npermissions:\n  contents: read\n"
+            "jobs:\n  t:\n    runs-on: windows-latest\n    steps:\n"
+            + checkout_conforming
+            + run_line
+        )
+
+    sdk_csproj = (
+        "<Project><PropertyGroup><TargetFramework>net10.0</TargetFramework>"
+        "</PropertyGroup></Project>"
+    )
+    sdk_global_matching = (
+        '{"sdk": {"version": "10.0.100", "rollForward": "latestFeature", '
+        '"allowPrerelease": false}}'
+    )
+    nuget_csproj = (
+        "<Project><PropertyGroup><TargetFramework>net10.0</TargetFramework>"
+        "<RestorePackagesWithLockFile>true</RestorePackagesWithLockFile></PropertyGroup>"
+        '<ItemGroup><PackageReference Include="Acme.Lib" Version="2.0.0" />'
+        "</ItemGroup></Project>"
+    )
+
+    def nuget_lock(resolved: str) -> str:
+        return (
+            '{"version": 1, "dependencies": {"net10.0": '
+            '{"Acme.Lib": {"resolved": "' + resolved + '"}}}}'
+        )
+
+    # (name, tree files, rule under test, expected finding or None for clean).
+    dispatch_cases = [
+        (
+            "privilege_persisted_credentials_rejected",
+            {
+                ".github/workflows/test.yml": privilege_workflow("").replace(
+                    "persist-credentials: false", "persist-credentials: true"
+                )
+            },
+            check_fail_closed_privilege,
+            "GWF-021",
+        ),
+        (
+            "privilege_elevated_permission_rejected",
+            {
+                ".github/workflows/test.yml": privilege_workflow(
+                    "", permissions="contents: write"
+                )
+            },
+            check_fail_closed_privilege,
+            "GWF-021",
+        ),
+        (
+            "privilege_oidc_authority_rejected",
+            {
+                ".github/workflows/test.yml": privilege_workflow(
+                    "", permissions="contents: read\n  id-token: write"
+                )
+            },
+            check_fail_closed_privilege,
+            "GWF-021",
+        ),
+        (
+            "privilege_secret_interpolation_rejected",
+            {
+                ".github/workflows/test.yml": privilege_workflow(
+                    "      - run: echo ${{ secrets.DEPLOY_TOKEN }}\n"
+                )
+            },
+            check_fail_closed_privilege,
+            "GWF-021",
+        ),
+        (
+            "privilege_conforming_accepted",
+            {
+                ".github/workflows/test.yml": privilege_workflow(
+                    "      - run: echo hello\n"
+                )
+            },
+            check_fail_closed_privilege,
+            None,
+        ),
+        (
+            "restore_unlocked_rejected",
+            {
+                ".github/workflows/test.yml": restore_workflow(
+                    "      - run: dotnet restore apps/Eliot.Operator/Eliot.Operator.csproj\n"
+                )
+            },
+            check_dotnet_restore_lock,
+            "GWF-012",
+        ),
+        (
+            "restore_locked_accepted",
+            {
+                ".github/workflows/test.yml": restore_workflow(
+                    "      - run: dotnet restore apps/Eliot.Operator/Eliot.Operator.csproj --locked-mode\n"
+                )
+            },
+            check_dotnet_restore_lock,
+            None,
+        ),
+        (
+            "sdk_identity_missing_rejected",
+            {
+                "tests/Eliot.Operator.Tests/Eliot.Operator.Tests.csproj": sdk_csproj,
+            },
+            check_dotnet_sdk_identity,
+            "GWF-014",
+        ),
+        (
+            "sdk_band_mismatch_rejected",
+            {
+                "tests/Eliot.Operator.Tests/Eliot.Operator.Tests.csproj": sdk_csproj,
+                "global.json": '{"sdk": {"version": "9.0.100", '
+                '"rollForward": "latestFeature", "allowPrerelease": false}}',
+            },
+            check_dotnet_sdk_identity,
+            "GWF-014",
+        ),
+        (
+            "sdk_identity_accepted",
+            {
+                "tests/Eliot.Operator.Tests/Eliot.Operator.Tests.csproj": sdk_csproj,
+                "global.json": sdk_global_matching,
+            },
+            check_dotnet_sdk_identity,
+            None,
+        ),
+        (
+            "nuget_stale_graph_rejected",
+            {
+                "apps/Eliot.Operator/Eliot.Operator.csproj": nuget_csproj,
+                "apps/Eliot.Operator/packages.lock.json": nuget_lock("1.0.0"),
+            },
+            check_nuget_lock,
+            "GWF-013",
+        ),
+        (
+            "nuget_graph_accepted",
+            {
+                "apps/Eliot.Operator/Eliot.Operator.csproj": nuget_csproj,
+                "apps/Eliot.Operator/packages.lock.json": nuget_lock("2.0.0"),
+            },
+            check_nuget_lock,
+            None,
+        ),
+    ]
+    for name, tree_files, rule, expected_code in dispatch_cases:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_root = Path(tmpdir)
+            for relative, body in tree_files.items():
+                target = tmp_root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(body, encoding="utf-8")
+            rule_findings = rule(tmp_root)
+            if expected_code is None:
+                if rule_findings:
+                    print(
+                        f"SELF_TEST_FAILURE in {name}: conforming input produced unexpected findings: {rule_findings}",
+                        file=sys.stderr,
+                    )
+                    return 1
+            else:
+                if not any(f.code == expected_code for f in rule_findings):
+                    print(
+                        f"SELF_TEST_FAILURE in {name}: expected {expected_code}, got {rule_findings}",
+                        file=sys.stderr,
+                    )
+                    return 1
+                dispatched = verify_all(tmp_root)
+                not_dispatched = [
+                    finding
+                    for finding in rule_findings
+                    if finding.code == expected_code and finding not in dispatched
+                ]
+                if not_dispatched:
+                    print(
+                        f"SELF_TEST_FAILURE in {name}: rule findings bypassed by the shared dispatch: {not_dispatched}",
+                        file=sys.stderr,
+                    )
+                    return 1
+
+    # Oracle-change tripwire (issue #1225 step 10). The guard compares two
+    # materialized trees, so its fixtures build a base/candidate pair: an
+    # unchanged pair stays clean, any mutated oracle path (verifier,
+    # workflow YAML, or deletion) is a GWF-022 finding, and a non-oracle
+    # change alone stays clean. A CRLF checkout of an unchanged oracle file
+    # stays clean too: the comparison mirrors git text=auto, so Windows
+    # checkouts are not reported as oracle changes.
+    oracle_base_files = {
+        "scripts/verify-github-workflows.py": "# base oracle\n",
+        ".github/workflows/test.yml": "name: Manual Gate\n",
+        "docs/note.md": "base note\n",
+    }
+
+    def write_tree(root: Path, files: dict) -> None:
+        for relative, body in files.items():
+            target = root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(body, encoding="utf-8")
+
+    oracle_only_workflow = dict(oracle_base_files)
+    oracle_only_workflow[".github/workflows/test.yml"] = "name: Changed Gate\n"
+    oracle_deleted_verifier = {
+        relative: body
+        for relative, body in oracle_base_files.items()
+        if relative != "scripts/verify-github-workflows.py"
+    }
+    oracle_only_note = dict(oracle_base_files)
+    oracle_only_note["docs/note.md"] = "changed note\n"
+    oracle_cases = [
+        ("oracle_unchanged_accepted", dict(oracle_base_files), None),
+        ("oracle_crlf_checkout_accepted", dict(oracle_base_files), None),
+        (
+            "oracle_verifier_weakened_rejected",
+            {
+                **oracle_base_files,
+                "scripts/verify-github-workflows.py": "# weakened oracle\n",
+            },
+            "GWF-022",
+        ),
+        ("oracle_workflow_mutated_rejected", oracle_only_workflow, "GWF-022"),
+        ("oracle_verifier_deleted_rejected", oracle_deleted_verifier, "GWF-022"),
+        ("oracle_non_oracle_change_accepted", oracle_only_note, None),
+    ]
+    for name, candidate_files, expected_code in oracle_cases:
+        with tempfile.TemporaryDirectory() as base_tmp:
+            with tempfile.TemporaryDirectory() as candidate_tmp:
+                base_root = Path(base_tmp)
+                candidate_root = Path(candidate_tmp)
+                write_tree(base_root, oracle_base_files)
+                write_tree(candidate_root, candidate_files)
+                if name == "oracle_crlf_checkout_accepted":
+                    (base_root / "scripts/verify-github-workflows.py").write_bytes(
+                        b"# base oracle\n"
+                    )
+                guard_findings = check_oracle_change_protection(
+                    base_root, candidate_root
+                )
+                if expected_code is None:
+                    if guard_findings:
+                        print(
+                            f"SELF_TEST_FAILURE in {name}: unchanged oracle produced unexpected findings: {guard_findings}",
+                            file=sys.stderr,
+                        )
+                        return 1
+                elif not any(f.code == expected_code for f in guard_findings):
+                    print(
+                        f"SELF_TEST_FAILURE in {name}: expected {expected_code}, got {guard_findings}",
+                        file=sys.stderr,
+                    )
+                    return 1
+
     # 31 single-file workflow cases + 2 cross-workflow divergence cases
     # + 1 derived-identity case + 7 rule-level cases below, plus the two
     # cache-key groups (issue #1923). The reported count is derived from the
     # case lists themselves: a hardcoded total would keep reporting PASS with
     # the same number after a case group was added, which is the count reading
-    # as evidence when it is not counting the cases that actually ran.
+    # as evidence when it is not counting the cases that actually ran. Every
+    # executed group below contributes its own len(...) term to the sum, so an
+    # added group that forgot its term would undercount a PASS it did not earn.
     case_count = (
         len(test_cases)
         + len(divergence_cases)
@@ -2445,6 +2842,8 @@ def run_self_tests() -> int:
         + len(second_step_cases)
         + len(coverage_cases)
         + 1
+        + len(dispatch_cases)
+        + len(oracle_cases)
     )
     print(f"GITHUB_WORKFLOW_VERIFIER_SELF_TEST: PASS ({case_count}/{case_count} cases verified)")
     return 0
@@ -2455,6 +2854,11 @@ def main() -> int:
     parser.add_argument("--root", default=".", help="Repository root directory")
     parser.add_argument("--json-out", help="Write findings to JSON output file")
     parser.add_argument("--self-test", action="store_true", help="Run internal self-tests")
+    parser.add_argument(
+        "--oracle-base",
+        help="Materialized base tree for oracle-change protection (issue #1225 step 10): "
+        "report GWF-022 when the candidate under --root mutates the workflow oracle",
+    )
     args = parser.parse_args()
 
     if args.self_test:
@@ -2462,6 +2866,10 @@ def main() -> int:
 
     root = Path(args.root).resolve()
     findings = verify_all(root)
+    if args.oracle_base is not None:
+        findings.extend(
+            check_oracle_change_protection(Path(args.oracle_base).resolve(), root)
+        )
 
     if args.json_out:
         out_path = Path(args.json_out)
