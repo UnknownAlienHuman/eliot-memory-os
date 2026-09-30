@@ -52,10 +52,10 @@
 //! profile revision. Full installed-saturation proof stays #11 Product scope.
 
 use std::num::NonZeroU64;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
-use eliot_contracts::{ArtifactId, OperationId};
+use eliot_contracts::{ArtifactId, AuthorityEpoch, OperationId};
 use eliot_runtime_contracts::{
     AffectedOperationClass, BackpressureDisposition, BottleneckAvailability,
     BottleneckCapacityProfile, BottleneckCoverageState, BottleneckObservationV1,
@@ -149,6 +149,12 @@ struct IpcReserveInner {
     protected_capacity: u64,
     normal_in_flight: AtomicU64,
     protected_in_flight: AtomicU64,
+    /// Restart seal flag: while set, every acquisition fails closed with its
+    /// typed exhaustion disposition and unknown held capacity stays excluded.
+    restart_sealed: AtomicBool,
+    /// Epoch observed at the restart seal; unsealing requires the epoch to
+    /// have advanced past it (stale ownership fenced).
+    sealed_epoch: Mutex<Option<AuthorityEpoch>>,
 }
 
 /// The IPC control reserve: disjoint normal/protected byte partitions for the
@@ -295,6 +301,8 @@ impl IpcReserve {
                 protected_capacity: protected_bytes.get(),
                 normal_in_flight: AtomicU64::new(0),
                 protected_in_flight: AtomicU64::new(0),
+                restart_sealed: AtomicBool::new(false),
+                sealed_epoch: Mutex::new(None),
             }),
         }
     }
@@ -327,6 +335,85 @@ impl IpcReserve {
             .saturating_sub(self.inner.protected_in_flight.load(Ordering::Acquire))
     }
 
+    /// Returns whether the reserve is sealed after a restart.
+    ///
+    /// While sealed, every acquisition fails closed with its typed exhaustion
+    /// disposition: unknown held capacity stays excluded until the epoch
+    /// advances past the seal (see [`Self::unseal_after_epoch_advance`]).
+    #[must_use]
+    pub fn restart_sealed(&self) -> bool {
+        self.inner.restart_sealed.load(Ordering::Acquire)
+    }
+
+    /// Seals the reserve at a restart boundary: restart never restores
+    /// capacity by resetting a local counter.
+    ///
+    /// Both in-flight counters are pinned to their full partition capacity,
+    /// so no new acquisition can succeed on the back of a zeroed counter,
+    /// and the sealing epoch is recorded. Unknown held capacity stays
+    /// excluded until [`Self::unseal_after_epoch_advance`] observes an
+    /// advanced epoch (stale ownership fenced). The embedding owner calls
+    /// this exactly once when it detects an unclean restart before admitting
+    /// new work (STITCH).
+    pub fn seal_after_restart(&self, epoch: AuthorityEpoch) {
+        self.inner
+            .normal_in_flight
+            .fetch_max(self.inner.normal_capacity, Ordering::AcqRel);
+        self.inner
+            .protected_in_flight
+            .fetch_max(self.inner.protected_capacity, Ordering::AcqRel);
+        *self
+            .inner
+            .sealed_epoch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(epoch);
+        self.inner.restart_sealed.store(true, Ordering::Release);
+    }
+
+    /// Reconciles the restart seal after the durable recovery epoch is
+    /// established.
+    ///
+    /// Succeeds only when the current epoch has advanced past the sealing
+    /// epoch: the advance fences the stale ownership, so the pinned counters
+    /// can be released to zero and the seal lifted. Refuses otherwise, so
+    /// held capacity is never restored while stale ownership is unfenced.
+    /// The caller must have synchronized the front-door fence to the durable
+    /// recovery epoch first (STITCH).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IpcReserveError::InvalidField`] when no restart seal is held,
+    /// or when the epoch has not advanced past the seal.
+    pub fn unseal_after_epoch_advance(
+        &self,
+        current: AuthorityEpoch,
+    ) -> Result<(), IpcReserveError> {
+        let mut sealed = self
+            .inner
+            .sealed_epoch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match *sealed {
+            None => Err(IpcReserveError::InvalidField {
+                field: "ipc_reserve.restart_seal",
+                reason: "no restart seal is held; nothing to reconcile",
+            }),
+            Some(sealed_epoch) if sealed_epoch == current => Err(IpcReserveError::InvalidField {
+                field: "ipc_reserve.restart_seal",
+                reason: "epoch has not advanced; stale ownership is not fenced, held capacity stays excluded",
+            }),
+            Some(_) => {
+                self.inner.normal_in_flight.store(0, Ordering::Release);
+                self.inner
+                    .protected_in_flight
+                    .store(0, Ordering::Release);
+                *sealed = None;
+                self.inner.restart_sealed.store(false, Ordering::Release);
+                Ok(())
+            }
+        }
+    }
+
     /// Attempts to acquire `bytes` normal pipe bytes without blocking.
     ///
     /// Only [`NormalWorkClass`] operations typecheck here, so protected IPC
@@ -348,6 +435,14 @@ impl IpcReserve {
     ) -> Result<IpcPermit, IpcReserveError> {
         validate_owner_text(owner, "ipc_permit.owner")?;
         validate_owner_text(operation_id, "ipc_permit.operation_id")?;
+        if self.inner.restart_sealed.load(Ordering::Acquire) {
+            return Err(IpcReserveError::NormalCapacityExhausted {
+                bottleneck: IPC_PIPE_BYTES_BOTTLENECK,
+                work_class: work,
+                operation_id: operation_id.to_owned(),
+                owner: owner.to_owned(),
+            });
+        }
         if !cas_add(
             &self.inner.normal_in_flight,
             self.inner.normal_capacity,
@@ -392,6 +487,14 @@ impl IpcReserve {
     ) -> Result<IpcPermit, IpcReserveError> {
         validate_owner_text(owner, "ipc_permit.owner")?;
         validate_owner_text(operation_id, "ipc_permit.operation_id")?;
+        if self.inner.restart_sealed.load(Ordering::Acquire) {
+            return Err(IpcReserveError::ProtectedReserveExhausted {
+                bottleneck: IPC_PIPE_BYTES_BOTTLENECK,
+                operation,
+                operation_id: operation_id.to_owned(),
+                owner: owner.to_owned(),
+            });
+        }
         if !cas_add(
             &self.inner.protected_in_flight,
             self.inner.protected_capacity,

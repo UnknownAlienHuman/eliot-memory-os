@@ -23,6 +23,14 @@
 //! the live reserve it reports and refuses while that reserve still admits
 //! the request, so pressure evidence is never manufactured.
 //!
+//! Each claimed dimension publishes its live partition evidence through
+//! [`OrsReserve::publish_claimed_row`] as a validated
+//! [`BottleneckCapacityProfile`] row for the Kernel profile composition to
+//! join in frozen contract order. Durably staged work renders as
+//! `ACCEPTED_PENDING` through [`OrsReserve::durable_stage_pending_response`]
+//! only against the staging path's receipt, with poll/reconcile and no blind
+//! retry.
+//!
 //! This module has no production caller yet (STITCH): it publishes the owner
 //! evidence the Kernel profile composition will join. There is no emergency
 //! partition here; recording reserve loss stays with the front-door
@@ -33,18 +41,19 @@
 //! profile revision. Full installed-saturation proof stays #11 Product scope.
 
 use std::num::NonZeroU64;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
-use eliot_contracts::{ArtifactId, OperationId};
+use eliot_contracts::{ArtifactId, AuthorityEpoch, OperationId, ReceiptId};
 use eliot_runtime_contracts::{
     AffectedOperationClass, BackpressureDisposition, BottleneckAvailability,
-    BottleneckCoverageState, BottleneckObservationV1, CapacityBottleneck, CapacityClass,
-    ControlOperationClass, EarliestRecoveryCondition, EvidenceCoverageState,
-    HumanActionRequirement, I14_BACKPRESSURE_RESPONSE_VERSION, I14BackpressureCause,
-    I14BackpressureResponseV1, I14CurrentnessState, I14EscalationCondition, I14ForbiddenAction,
-    I14RecoveryAction, I14RecoveryDirectiveV1, I14RequiredAuthority, I14ResolutionState,
-    I14WorkOutcome, NormalWorkClass, RecoveryCommitStatus, StatePreservationStatus,
+    BottleneckCapacityProfile, BottleneckCoverageState, BottleneckObservationV1, CapacityBottleneck,
+    CapacityClass, CapacityEnforcement, CapacityLimit, ControlOperationClass,
+    EarliestRecoveryCondition, EvidenceCoverageState, HumanActionRequirement,
+    I14_BACKPRESSURE_RESPONSE_VERSION, I14BackpressureCause, I14BackpressureResponseV1,
+    I14CurrentnessState, I14EscalationCondition, I14ForbiddenAction, I14RecoveryAction,
+    I14RecoveryDirectiveV1, I14RequiredAuthority, I14ResolutionState, I14WorkOutcome,
+    NormalWorkClass, RecoveryCommitStatus, StatePreservationStatus, frozen_bottleneck_owner_map,
 };
 use thiserror::Error;
 
@@ -157,6 +166,12 @@ struct OrsReserveInner {
     transaction_protected_in_flight: AtomicU64,
     durable_normal_in_flight_bytes: AtomicU64,
     durable_protected_in_flight_bytes: AtomicU64,
+    /// Restart seal flag: while set, every acquisition fails closed with its
+    /// typed exhaustion disposition and unknown held capacity stays excluded.
+    restart_sealed: AtomicBool,
+    /// Epoch observed at the restart seal; unsealing requires the epoch to
+    /// have advanced past it (stale ownership fenced).
+    sealed_epoch: Mutex<Option<AuthorityEpoch>>,
 }
 
 /// The ORS control reserve: disjoint normal/protected partitions for the two
@@ -311,6 +326,8 @@ impl OrsReserve {
                 transaction_protected_in_flight: AtomicU64::new(0),
                 durable_normal_in_flight_bytes: AtomicU64::new(0),
                 durable_protected_in_flight_bytes: AtomicU64::new(0),
+                restart_sealed: AtomicBool::new(false),
+                sealed_epoch: Mutex::new(None),
             }),
         })
     }
@@ -379,6 +396,101 @@ impl OrsReserve {
         )
     }
 
+    /// Returns whether the reserve is sealed after a restart.
+    ///
+    /// While sealed, every acquisition fails closed with its typed exhaustion
+    /// disposition: unknown held capacity stays excluded until the epoch
+    /// advances past the seal (see [`Self::unseal_after_epoch_advance`]).
+    #[must_use]
+    pub fn restart_sealed(&self) -> bool {
+        self.inner.restart_sealed.load(Ordering::Acquire)
+    }
+
+    /// Seals the reserve at a restart boundary: restart never restores
+    /// capacity by resetting a local counter.
+    ///
+    /// Every in-flight counter is pinned to its full partition capacity, so
+    /// no new acquisition can succeed on the back of a zeroed counter, and
+    /// the sealing epoch is recorded. Unknown held capacity stays excluded
+    /// until [`Self::unseal_after_epoch_advance`] observes an advanced epoch
+    /// (stale ownership fenced). The embedding owner calls this exactly once
+    /// when it detects an unclean restart before admitting new work (STITCH).
+    pub fn seal_after_restart(&self, epoch: AuthorityEpoch) {
+        self.inner
+            .transaction_normal_in_flight
+            .fetch_max(self.inner.transaction_normal_capacity, Ordering::AcqRel);
+        self.inner
+            .transaction_protected_in_flight
+            .fetch_max(self.inner.transaction_protected_capacity, Ordering::AcqRel);
+        self.inner
+            .durable_normal_in_flight_bytes
+            .fetch_max(self.inner.durable_normal_capacity_bytes, Ordering::AcqRel);
+        self.inner
+            .durable_protected_in_flight_bytes
+            .fetch_max(
+                self.inner.durable_protected_capacity_bytes,
+                Ordering::AcqRel,
+            );
+        *self
+            .inner
+            .sealed_epoch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(epoch);
+        self.inner.restart_sealed.store(true, Ordering::Release);
+    }
+
+    /// Reconciles the restart seal after the durable recovery epoch is
+    /// established.
+    ///
+    /// Succeeds only when the current epoch has advanced past the sealing
+    /// epoch: the advance fences the stale ownership, so the pinned counters
+    /// can be released to zero and the seal lifted. Refuses otherwise, so
+    /// held capacity is never restored while stale ownership is unfenced.
+    /// The caller must have synchronized the front-door fence to the durable
+    /// recovery epoch first (STITCH).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OrsReserveError::InvalidField`] when no restart seal is held,
+    /// or when the epoch has not advanced past the seal.
+    pub fn unseal_after_epoch_advance(
+        &self,
+        current: AuthorityEpoch,
+    ) -> Result<(), OrsReserveError> {
+        let mut sealed = self
+            .inner
+            .sealed_epoch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match *sealed {
+            None => Err(OrsReserveError::InvalidField {
+                field: "ors_reserve.restart_seal",
+                reason: "no restart seal is held; nothing to reconcile",
+            }),
+            Some(sealed_epoch) if sealed_epoch == current => Err(OrsReserveError::InvalidField {
+                field: "ors_reserve.restart_seal",
+                reason: "epoch has not advanced; stale ownership is not fenced, held capacity stays excluded",
+            }),
+            Some(_) => {
+                self.inner
+                    .transaction_normal_in_flight
+                    .store(0, Ordering::Release);
+                self.inner
+                    .transaction_protected_in_flight
+                    .store(0, Ordering::Release);
+                self.inner
+                    .durable_normal_in_flight_bytes
+                    .store(0, Ordering::Release);
+                self.inner
+                    .durable_protected_in_flight_bytes
+                    .store(0, Ordering::Release);
+                *sealed = None;
+                self.inner.restart_sealed.store(false, Ordering::Release);
+                Ok(())
+            }
+        }
+    }
+
     /// Attempts to acquire one normal transaction slot without blocking.
     ///
     /// Only [`NormalWorkClass`] operations typecheck here, so protected ORS
@@ -406,6 +518,14 @@ impl OrsReserve {
                 reason: "must be non-blank",
             }
         })?;
+        if self.inner.restart_sealed.load(Ordering::Acquire) {
+            return Err(OrsReserveError::NormalCapacityExhausted {
+                bottleneck: ORS_TRANSACTION_BOTTLENECK,
+                work_class: work,
+                operation_id: operation_id.to_owned(),
+                owner: owner.to_owned(),
+            });
+        }
         if !cas_add(
             &self.inner.transaction_normal_in_flight,
             self.inner.transaction_normal_capacity,
@@ -458,6 +578,14 @@ impl OrsReserve {
                 reason: "must be non-blank",
             }
         })?;
+        if self.inner.restart_sealed.load(Ordering::Acquire) {
+            return Err(OrsReserveError::NormalCapacityExhausted {
+                bottleneck: ORS_DURABLE_BYTES_BOTTLENECK,
+                work_class: work,
+                operation_id: operation_id.to_owned(),
+                owner: owner.to_owned(),
+            });
+        }
         if !cas_add(
             &self.inner.durable_normal_in_flight_bytes,
             self.inner.durable_normal_capacity_bytes,
@@ -511,6 +639,14 @@ impl OrsReserve {
                 reason: "must be non-blank",
             }
         })?;
+        if self.inner.restart_sealed.load(Ordering::Acquire) {
+            return Err(OrsReserveError::ProtectedReserveExhausted {
+                bottleneck: ORS_TRANSACTION_BOTTLENECK,
+                operation,
+                operation_id: operation_id.to_owned(),
+                owner: owner.to_owned(),
+            });
+        }
         if !cas_add(
             &self.inner.transaction_protected_in_flight,
             self.inner.transaction_protected_capacity,
@@ -563,6 +699,14 @@ impl OrsReserve {
                 reason: "must be non-blank",
             }
         })?;
+        if self.inner.restart_sealed.load(Ordering::Acquire) {
+            return Err(OrsReserveError::ProtectedReserveExhausted {
+                bottleneck: ORS_DURABLE_BYTES_BOTTLENECK,
+                operation,
+                operation_id: operation_id.to_owned(),
+                owner: owner.to_owned(),
+            });
+        }
         if !cas_add(
             &self.inner.durable_protected_in_flight_bytes,
             self.inner.durable_protected_capacity_bytes,
@@ -691,6 +835,197 @@ impl OrsReserve {
             I14WorkOutcome::NotAccepted,
             RecoveryCommitStatus::None,
         )
+    }
+
+    /// Publishes the live partition evidence for one ORS dimension as a
+    /// claimed [`BottleneckCapacityProfile`] row.
+    ///
+    /// The row names the frozen owner the contract binds to this dimension,
+    /// the exact bottleneck unit, the physical total and the disjoint normal
+    /// and protected partitions read from this reserve. There is no emergency
+    /// partition here, so none is claimed. The owner generation, proof
+    /// profile, evidence and invalidation references are composition-supplied
+    /// metadata echoed into the row; the Kernel composition wraps this row in
+    /// its own evidence record with the configuration snapshot and Authority
+    /// Epoch it resolved.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OrsReserveError::InvalidField`] for a blank metadata
+    /// reference or when the partition accounting cannot be represented, or
+    /// [`OrsReserveError::Contract`] when the assembled row fails the
+    /// existing contract validation.
+    pub fn publish_claimed_row(
+        &self,
+        dimension: OrsDimension,
+        owner_generation_ref: &str,
+        proof_profile_ref: &str,
+        evidence_ref: &str,
+        invalidation_ref: &str,
+    ) -> Result<BottleneckCapacityProfile, OrsReserveError> {
+        for (value, field) in [
+            (owner_generation_ref, "ors_evidence.owner_generation_ref"),
+            (proof_profile_ref, "ors_evidence.proof_profile_ref"),
+            (evidence_ref, "ors_evidence.evidence_ref"),
+            (invalidation_ref, "ors_evidence.invalidation_ref"),
+        ] {
+            validate_text(value, field).map_err(|_| OrsReserveError::InvalidField {
+                field,
+                reason: "must be non-blank",
+            })?;
+        }
+        let bottleneck = dimension.bottleneck();
+        let bound = frozen_bottleneck_owner_map()
+            .into_iter()
+            .find(|bound| bound.bottleneck == bottleneck)
+            .ok_or(OrsReserveError::InvalidField {
+                field: "ors_evidence.bottleneck",
+                reason: "the frozen owner map binds no owner to this ORS dimension",
+            })?;
+        let (normal_capacity, protected_capacity) = match dimension {
+            OrsDimension::TransactionSlots => (
+                self.inner.transaction_normal_capacity,
+                self.inner.transaction_protected_capacity,
+            ),
+            OrsDimension::DurableQueueBytes => (
+                self.inner.durable_normal_capacity_bytes,
+                self.inner.durable_protected_capacity_bytes,
+            ),
+        };
+        let physical_total = normal_capacity
+            .checked_add(protected_capacity)
+            .and_then(NonZeroU64::new)
+            .ok_or(OrsReserveError::InvalidField {
+                field: "ors_evidence.physical_total_limit",
+                reason: "the disjoint partition sum is not a positive capacity",
+            })?;
+        let unit = bottleneck.unit();
+        let limit = |quantity: u64| {
+            NonZeroU64::new(quantity)
+                .map(|quantity| CapacityLimit { unit, quantity })
+                .ok_or(OrsReserveError::InvalidField {
+                    field: "ors_evidence.partition_limit",
+                    reason: "a claimed partition is not a positive capacity",
+                })
+        };
+        let row = BottleneckCapacityProfile {
+            bottleneck,
+            coverage_state: BottleneckCoverageState::Claimed,
+            owner_ref: bound.owner.to_owned(),
+            owner_generation_ref: owner_generation_ref.to_owned(),
+            unit,
+            physical_total_limit: Some(CapacityLimit {
+                unit,
+                quantity: physical_total,
+            }),
+            normal_work_applicable: true,
+            normal_limit: Some(limit(normal_capacity)?),
+            protected_limit: Some(limit(protected_capacity)?),
+            emergency_limit: None,
+            enforcement: Some(CapacityEnforcement::ConfigurationPartition),
+            proof_profile_ref: proof_profile_ref.to_owned(),
+            evidence_refs: vec![evidence_ref.to_owned()],
+            invalidation_set: vec![invalidation_ref.to_owned()],
+        };
+        row.validate()
+            .map_err(|error| OrsReserveError::Contract(error.to_string()))?;
+        Ok(row)
+    }
+
+    /// Reports durably staged ORS work as an `ACCEPTED_PENDING` response.
+    ///
+    /// `ACCEPTED_PENDING` is emitted only for a durably staged identity: the
+    /// caller presents the stage receipt the ORS durable staging path minted
+    /// for `operation_id` with `staged_bytes` durably held, and the response
+    /// carries that receipt as its staged evidence with a poll/reconcile
+    /// instruction under the operation's own authority. Possible
+    /// commit/effect never authorizes blind retry: the directive forbids
+    /// [`I14ForbiddenAction::BlindRetryAfterPossibleEffect`] and resolves to
+    /// [`I14ResolutionState::AwaitingReconciliation`], never to safe retry.
+    /// The bottleneck observation is the live normal durable partition read at
+    /// call time, so the response reports owner-observed evidence rather than
+    /// a manufactured claim.
+    ///
+    /// This constructor validates the receipt shape and the assembled
+    /// directive with the existing contract check; it never stages work
+    /// itself. The composition wires the receipt from the real durable
+    /// staging path (STITCH).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OrsReserveError::InvalidField`] when the operation identity
+    /// or stage receipt is malformed, or [`OrsReserveError::Contract`] when
+    /// the assembled directive fails the existing contract validation.
+    pub fn durable_stage_pending_response(
+        &self,
+        work: NormalWorkClass,
+        operation_id: &str,
+        stage_receipt: &str,
+        staged_bytes: NonZeroU64,
+        profile_revision: ArtifactId,
+    ) -> Result<I14BackpressureResponseV1, OrsReserveError> {
+        let operation =
+            OperationId::new(operation_id).map_err(|_| OrsReserveError::InvalidField {
+                field: "ors_staged.operation_id",
+                reason: "must be a bounded non-blank reference",
+            })?;
+        let receipt = ReceiptId::new(stage_receipt).map_err(|_| OrsReserveError::InvalidField {
+            field: "ors_staged.stage_receipt",
+            reason: "must be a bounded non-blank reference",
+        })?;
+        let available = self.available_normal_durable_bytes();
+        let availability = if available >= staged_bytes.get() {
+            BottleneckAvailability::Available {
+                available_amount: available,
+            }
+        } else {
+            BottleneckAvailability::Exhausted {
+                available_amount: available,
+            }
+        };
+        let response = I14BackpressureResponseV1 {
+            contract_version: I14_BACKPRESSURE_RESPONSE_VERSION,
+            disposition: BackpressureDisposition::AcceptedPending,
+            directive: I14RecoveryDirectiveV1 {
+                cause: I14BackpressureCause::DurableStagePending,
+                affected_operation_class: AffectedOperationClass::Normal(work),
+                bottlenecks: vec![BottleneckObservationV1 {
+                    bottleneck: ORS_DURABLE_BYTES_BOTTLENECK,
+                    unit: ORS_DURABLE_BYTES_BOTTLENECK.unit(),
+                    requested_amount: staged_bytes.get(),
+                    availability,
+                    coverage_state: BottleneckCoverageState::Claimed,
+                }],
+                work_outcome: I14WorkOutcome::Staged,
+                commit_status: RecoveryCommitStatus::Staged,
+                state_preservation: StatePreservationStatus::Preserved,
+                operation_id: Some(operation),
+                preserve_operation_id: true,
+                stage_receipt: Some(receipt.clone()),
+                rollback_receipt: None,
+                retry_strategy: I14RecoveryAction::PollOperation,
+                earliest_permitted_condition: EarliestRecoveryCondition::NoWaitRequired,
+                earliest_permitted_unix_millis: None,
+                actions_temporarily_forbidden: vec![
+                    I14ForbiddenAction::BlindRetryAfterPossibleEffect,
+                ],
+                safe_fallback: None,
+                required_authority: I14RequiredAuthority::ExistingOperationAuthority,
+                human_action_required: HumanActionRequirement::NoneRequired,
+                evidence_refs: vec![receipt],
+                evidence_coverage: EvidenceCoverageState::Partial,
+                escalation_condition: I14EscalationCondition::None,
+                resolution_state: I14ResolutionState::AwaitingReconciliation,
+                currentness: I14CurrentnessState::Current,
+                profile_revision,
+                state_fence: None,
+                authority_epoch: None,
+            },
+        };
+        response
+            .validate()
+            .map_err(|error| OrsReserveError::Contract(error.to_string()))?;
+        Ok(response)
     }
 }
 
