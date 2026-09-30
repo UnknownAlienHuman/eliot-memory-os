@@ -1,51 +1,41 @@
-//! Governor-owned canonical projection composer (CC-004).
+//! Governor-owned canonical projection producer (CC-004).
 //!
-//! Pure deterministic composer from the four Governor snapshots to the
-//! owner-neutral projection set consumed through contracts. It takes only
-//! shared references (`TaskLifecycleSnapshot`, `SessionLifecycleSnapshot`,
-//! `WorkScopeBindingSnapshot`, and `ObservationJournalEntry` slices), enforces
-//! one fence via [`eliot_contracts::fences_match_exact`], and reports gaps as
-//! explicit [`ProjectionOmission`] records. It opens no store, touches no
-//! Kernel port, and defines no new port: the output is data for the Smart
-//! contract set, never an effect.
+//! `produce_canonical_projections` accepts one admitted context binding,
+//! owner-supplied projection members and immutable owner source snapshots. It
+//! returns the strict four-member set only when every required member/source
+//! is present under that exact binding and fence. Otherwise it returns a
+//! typed partial or missing readback. It opens no store and performs no effect.
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeSet;
-
-use eliot_contracts::{StateFence, TaskId, fences_match_exact};
-use eliot_observation::{ObservationAdmissionResult, ObservationJournalEntry};
+use eliot_context_contracts::{
+    AffordanceProjection, CanonicalProjectionMember, CanonicalProjectionOmission,
+    CanonicalProjectionOmissionReason, CanonicalProjectionOmissionStatus,
+    CanonicalProjectionOutcome, CanonicalProjectionReadback,
+    CanonicalProjectionSourceReadback, CanonicalProjectionSourceRole,
+    CanonicalProjectionSourceSnapshot, ContextBinding, ContinuityProjection,
+    SafetyProjection, TaskProjection, CANONICAL_PROJECTION_SOURCE_DENOMINATOR,
+};
+use eliot_contracts::fences_match_exact;
+use eliot_observation::ObservationJournalEntry;
 use eliot_session::SessionLifecycleSnapshot;
-use eliot_task::{TaskLifecycleSnapshot, TaskState};
+use eliot_task::TaskLifecycleSnapshot;
 use eliot_workscope::WorkScopeBindingSnapshot;
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// Exact schema version accepted by the projection shapes.
-pub const GOVERNOR_PROJECTIONS_SCHEMA_VERSION: u32 = 1;
-/// Maximum negative-memory triggers carried by one safety projection.
-pub const MAX_SAFETY_TRIGGERS: usize = 64;
-/// Maximum affordances carried by one affordance projection.
-pub const MAX_AFFORDANCES: usize = 64;
-/// Maximum omissions carried by one set.
-pub const MAX_PROJECTION_OMISSIONS: usize = 64;
-/// Maximum bytes of one projection text field.
-pub const MAX_PROJECTION_TEXT: usize = 1024;
-
-/// Fail-closed errors from the pure composer.
+/// Fail-closed errors from the pure owner producer.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum GovernorProjectionError {
     /// The supplied fence is invalid.
     #[error("governor projection fence is invalid")]
     InvalidFence,
-    /// A canonical fence does not match the requested fence.
+    /// A canonical fence does not match the admitted binding.
     #[error("governor projection fence mismatch")]
     FenceMismatch,
     /// A canonical snapshot failed its own validation.
     #[error("governor projection snapshot is invalid: {0}")]
     InvalidSnapshot(&'static str),
-    /// A projection text field is malformed or over bound.
+    /// A projection field or owner relationship is malformed.
     #[error("governor projection field is invalid: {0}")]
     InvalidField(&'static str),
     /// A repeated field exceeds its bound or carries duplicates.
@@ -53,474 +43,393 @@ pub enum GovernorProjectionError {
     Bounds(&'static str),
 }
 
-fn check_text(value: &str, field: &'static str) -> Result<(), GovernorProjectionError> {
-    if value.trim().is_empty() || value.chars().any(char::is_control) {
-        return Err(GovernorProjectionError::InvalidField(field));
-    }
-    if value.len() > MAX_PROJECTION_TEXT {
-        return Err(GovernorProjectionError::Bounds(field));
-    }
-    Ok(())
-}
-
-fn check_entries(values: &[String], field: &'static str) -> Result<(), GovernorProjectionError> {
-    if values.len() > MAX_SAFETY_TRIGGERS.max(MAX_AFFORDANCES) {
-        return Err(GovernorProjectionError::Bounds(field));
-    }
-    let mut seen = BTreeSet::new();
-    for value in values {
-        check_text(value, field)?;
-        if !seen.insert(value.clone()) {
-            return Err(GovernorProjectionError::Bounds(field));
-        }
-    }
-    Ok(())
-}
-
-fn check_version(version: u32) -> Result<(), GovernorProjectionError> {
-    if version != GOVERNOR_PROJECTIONS_SCHEMA_VERSION {
-        return Err(GovernorProjectionError::InvalidField(
-            "projections.schema_version",
-        ));
-    }
-    Ok(())
-}
-
-/// Canonical task/goal projection composed from one [`TaskRecord`].
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct GovernorTaskProjection {
-    /// Exact schema version; must be 1.
-    pub schema_version: u32,
-    /// Projected task identity.
-    pub task_id: TaskId,
-    /// Goal copied verbatim from the canonical record.
-    pub goal: String,
-    /// State copied verbatim from the canonical record.
-    pub state: TaskState,
-    /// Revision copied verbatim from the canonical record.
-    pub revision: u64,
-}
-
-impl GovernorTaskProjection {
-    /// Validates intrinsic bounds.
-    pub fn validate(&self) -> Result<(), GovernorProjectionError> {
-        check_version(self.schema_version)?;
-        check_text(&self.goal, "task.goal")?;
-        if self.revision == 0 {
-            return Err(GovernorProjectionError::InvalidField("task.revision"));
-        }
-        Ok(())
-    }
-}
-
-/// Continuity/plan projection composed from task plus session liveness.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct GovernorContinuityProjection {
-    /// Exact schema version; must be 1.
-    pub schema_version: u32,
-    /// Projected task identity.
-    pub task_id: TaskId,
-    /// Mechanical plan state (`<STATE-WIRE>:rev<N>:<K>-open`).
-    pub plan_state: String,
-    /// Non-terminal sessions bound to this task.
-    pub open_sessions: u64,
-    /// Last task sequence observed in the snapshot.
-    pub last_sequence: u64,
-}
-
-impl GovernorContinuityProjection {
-    /// Validates intrinsic bounds.
-    pub fn validate(&self) -> Result<(), GovernorProjectionError> {
-        check_version(self.schema_version)?;
-        check_text(&self.plan_state, "continuity.plan_state")?;
-        Ok(())
-    }
-}
-
-/// Safety projection with exact negative-memory triggers.
+/// Actual canonical member readbacks supplied by their Governor owners.
 ///
-/// Triggers are the verbatim contract-error strings from rejected journal
-/// entries; this composer never invents trigger prose.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct GovernorSafetyProjection {
-    /// Exact schema version; must be 1.
-    pub schema_version: u32,
-    /// Projected task identity.
-    pub task_id: TaskId,
-    /// Mechanical safety note (counts only, no new prose).
-    pub safety_note: String,
-    /// Exact negative-memory trigger identities from rejections.
-    pub negative_memory_triggers: Vec<String>,
+/// Each member is optional because the current task/session/WorkScope owners
+/// do not expose all fields required by the strict CC-004 shapes.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CanonicalProjectionOwnerMembers {
+    pub task: Option<TaskProjection>,
+    pub continuity: Option<ContinuityProjection>,
+    pub safety: Option<SafetyProjection>,
+    pub affordance: Option<AffordanceProjection>,
 }
 
-impl GovernorSafetyProjection {
-    /// Validates intrinsic bounds.
-    pub fn validate(&self) -> Result<(), GovernorProjectionError> {
-        check_version(self.schema_version)?;
-        check_text(&self.safety_note, "safety.safety_note")?;
-        if self.negative_memory_triggers.len() > MAX_SAFETY_TRIGGERS {
-            return Err(GovernorProjectionError::Bounds(
-                "safety.negative_memory_triggers",
+/// Inputs to the Governor-owned CC-004 production readback.
+pub struct CanonicalProjectionOwnerInputs<'a> {
+    /// Binding admitted for this exact task, WorkScope, decision and fence.
+    pub binding: &'a ContextBinding,
+    /// Task owner snapshot, when available.
+    pub task_snapshot: Option<&'a TaskLifecycleSnapshot>,
+    /// Session owner snapshot, when available.
+    pub session_snapshot: Option<&'a SessionLifecycleSnapshot>,
+    /// Admitted WorkScope binding, when available.
+    pub scope_snapshot: Option<&'a WorkScopeBindingSnapshot>,
+    /// Existing observations are unscoped by task and are never projected as
+    /// task safety, even when supplied.
+    pub observation_journal: Option<&'a [ObservationJournalEntry]>,
+    /// Complete member values, copied only from their semantic owners.
+    pub members: CanonicalProjectionOwnerMembers,
+    /// Owner-issued immutable source snapshots tied to the same binding.
+    pub source_snapshots: Vec<CanonicalProjectionSourceSnapshot>,
+}
+
+fn source_has_role(
+    sources: &CanonicalProjectionSourceReadback,
+    member: CanonicalProjectionMember,
+    role: CanonicalProjectionSourceRole,
+) -> bool {
+    sources
+        .snapshots
+        .iter()
+        .any(|source| source.member == member && source.role == role)
+}
+
+fn source_complete_for_member(
+    sources: &CanonicalProjectionSourceReadback,
+    member: CanonicalProjectionMember,
+) -> bool {
+    CANONICAL_PROJECTION_SOURCE_DENOMINATOR
+        .iter()
+        .filter(|required| required.member == member)
+        .all(|required| source_has_role(sources, required.member, required.role))
+}
+
+fn source_snapshot_for<'a>(
+    sources: &'a CanonicalProjectionSourceReadback,
+    member: CanonicalProjectionMember,
+    role: CanonicalProjectionSourceRole,
+) -> Option<&'a CanonicalProjectionSourceSnapshot> {
+    sources
+        .snapshots
+        .iter()
+        .find(|source| source.member == member && source.role == role)
+}
+
+fn omission(
+    member: CanonicalProjectionMember,
+    status: CanonicalProjectionOmissionStatus,
+    reason: CanonicalProjectionOmissionReason,
+    role: Option<CanonicalProjectionSourceRole>,
+    sources: &CanonicalProjectionSourceReadback,
+) -> CanonicalProjectionOmission {
+    let source = role.and_then(|source_role| source_snapshot_for(sources, member, source_role));
+    CanonicalProjectionOmission {
+        member,
+        status,
+        reason,
+        source_role: role,
+        source_snapshot_id: source.map(|entry| entry.snapshot.snapshot_id.clone()),
+        source_revision: source.map(|entry| entry.snapshot.revision.clone()),
+    }
+}
+
+fn append_source_gaps(
+    omissions: &mut Vec<CanonicalProjectionOmission>,
+    member: CanonicalProjectionMember,
+    status: CanonicalProjectionOmissionStatus,
+    sources: &CanonicalProjectionSourceReadback,
+) {
+    for requirement in CANONICAL_PROJECTION_SOURCE_DENOMINATOR
+        .iter()
+        .filter(|required| required.member == member)
+    {
+        if !source_has_role(sources, member, requirement.role) {
+            omissions.push(omission(
+                member,
+                status,
+                CanonicalProjectionOmissionReason::SourceSnapshotUnavailable,
+                Some(requirement.role),
+                sources,
             ));
         }
-        check_entries(
-            &self.negative_memory_triggers,
-            "safety.negative_memory_triggers",
-        )?;
-        Ok(())
     }
 }
 
-/// Affordance projection composed from the current `WorkScope` binding.
+fn validate_member_binding(
+    binding: &ContextBinding,
+    projection_binding: &ContextBinding,
+) -> Result<(), GovernorProjectionError> {
+    if projection_binding != binding
+        || !fences_match_exact(&projection_binding.state_fence, &binding.state_fence)
+    {
+        return Err(GovernorProjectionError::FenceMismatch);
+    }
+    Ok(())
+}
+
+/// Produces the actual CC-004 owner outcome under one admitted binding.
 ///
-/// Affordances are the verbatim scope/instance identities from the admitted
-/// binding; capability is never invented here.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct GovernorAffordanceProjection {
-    /// Exact schema version; must be 1.
-    pub schema_version: u32,
-    /// Projected task identity.
-    pub task_id: TaskId,
-    /// Scope the affordances are authorized for.
-    pub scope_ref: String,
-    /// Authorized scope/instance identities.
-    pub affordances: Vec<String>,
-}
+/// The strict `CanonicalProjectionSet` is returned only when all four
+/// owner-supplied members, all eight expected member/source records and their
+/// exact binding/fence validate. Incomplete owner state becomes a typed
+/// readback. The unscoped observation journal is deliberately not inspected:
+/// it cannot establish task-specific negative-memory triggers.
+pub fn produce_canonical_projections(
+    input: CanonicalProjectionOwnerInputs<'_>,
+) -> Result<CanonicalProjectionOutcome, GovernorProjectionError> {
+    input
+        .binding
+        .validate()
+        .map_err(|_| GovernorProjectionError::InvalidField("context.binding"))?;
 
-impl GovernorAffordanceProjection {
-    /// Validates intrinsic bounds.
-    pub fn validate(&self) -> Result<(), GovernorProjectionError> {
-        check_version(self.schema_version)?;
-        check_text(&self.scope_ref, "affordance.scope_ref")?;
-        if self.affordances.is_empty() || self.affordances.len() > MAX_AFFORDANCES {
-            return Err(GovernorProjectionError::Bounds("affordance.affordances"));
+    let task_record = input
+        .task_snapshot
+        .and_then(|snapshot| snapshot.tasks.get(&input.binding.task_id));
+    if let Some(record) = task_record {
+        if !fences_match_exact(&record.state_fence, &input.binding.state_fence) {
+            return Err(GovernorProjectionError::FenceMismatch);
         }
-        check_entries(&self.affordances, "affordance.affordances")?;
-        Ok(())
-    }
-}
-
-/// Explicit omission for one missing projection.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ProjectionOmission {
-    /// Which projection is missing (`task`, `continuity`, `safety`, `affordance`).
-    pub missing: String,
-    /// Stable reason class (`task-not-found`, `fence-filtered`, ...).
-    pub reason: String,
-}
-
-impl ProjectionOmission {
-    /// Validates the omission record.
-    pub fn validate(&self) -> Result<(), GovernorProjectionError> {
-        match self.missing.as_str() {
-            "task" | "continuity" | "safety" | "affordance" => {}
-            _ => {
-                return Err(GovernorProjectionError::InvalidField("omission.missing"));
-            }
-        }
-        check_text(&self.reason, "omission.reason")?;
-        Ok(())
-    }
-}
-
-/// One composed set under a single shared fence.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct GovernorProjectionSet {
-    /// Exact schema version; must be 1.
-    pub schema_version: u32,
-    /// Shared fence every composed value satisfies.
-    pub fence: StateFence,
-    /// Projected task identity.
-    pub task_id: TaskId,
-    /// Scope the affordances are authorized for.
-    pub scope_ref: String,
-    /// Task projection when the record exists under this fence.
-    pub task: Option<GovernorTaskProjection>,
-    /// Continuity projection when the task exists under this fence.
-    pub continuity: Option<GovernorContinuityProjection>,
-    /// Safety projection with exact rejection triggers.
-    pub safety: Option<GovernorSafetyProjection>,
-    /// Affordance projection from the current scope binding.
-    pub affordance: Option<GovernorAffordanceProjection>,
-    /// Explicit omissions, one per missing projection.
-    pub omissions: Vec<ProjectionOmission>,
-}
-
-impl GovernorProjectionSet {
-    /// Returns whether one fence can share this set's decision scope.
-    ///
-    /// Exact in both directions, so an absent optional revision on the
-    /// presented fence is not a wildcard for this set's revision.
-    #[must_use]
-    pub fn is_compatible_with(&self, fence: &StateFence) -> bool {
-        fences_match_exact(&self.fence, fence)
     }
 
-    /// Validates the set: versions, fence, members, and omission coverage.
-    pub fn validate(&self) -> Result<(), GovernorProjectionError> {
-        check_version(self.schema_version)?;
-        self.fence
+    if let Some(scope) = input.scope_snapshot {
+        scope
             .validate()
-            .map_err(|_| GovernorProjectionError::InvalidFence)?;
-        check_text(&self.scope_ref, "projections.scope_ref")?;
-        if self.omissions.len() > MAX_PROJECTION_OMISSIONS {
-            return Err(GovernorProjectionError::Bounds("projections.omissions"));
-        }
-        for omission in &self.omissions {
-            omission.validate()?;
-        }
-        if let Some(task) = &self.task {
-            task.validate()?;
-            if task.task_id != self.task_id {
-                return Err(GovernorProjectionError::InvalidField("task.task_id"));
-            }
-        }
-        if let Some(continuity) = &self.continuity {
-            continuity.validate()?;
-            if continuity.task_id != self.task_id {
-                return Err(GovernorProjectionError::InvalidField("continuity.task_id"));
-            }
-        }
-        if let Some(safety) = &self.safety {
-            safety.validate()?;
-            if safety.task_id != self.task_id {
-                return Err(GovernorProjectionError::InvalidField("safety.task_id"));
-            }
-        }
-        if let Some(affordance) = &self.affordance {
-            affordance.validate()?;
-            if affordance.task_id != self.task_id {
-                return Err(GovernorProjectionError::InvalidField("affordance.task_id"));
-            }
-            if affordance.scope_ref != self.scope_ref {
-                return Err(GovernorProjectionError::InvalidField(
-                    "affordance.scope_ref",
-                ));
-            }
-        }
-        for name in ["task", "continuity", "safety", "affordance"] {
-            let present = match name {
-                "task" => self.task.is_some(),
-                "continuity" => self.continuity.is_some(),
-                "safety" => self.safety.is_some(),
-                "affordance" => self.affordance.is_some(),
-                _ => false,
-            };
-            let omitted = self.omissions.iter().any(|o| o.missing == name);
-            if !present && !omitted {
-                return Err(GovernorProjectionError::InvalidField(
-                    "projections.omissions",
-                ));
-            }
-            if present && omitted {
-                return Err(GovernorProjectionError::InvalidField(
-                    "projections.omissions",
-                ));
-            }
-        }
-        Ok(())
-    }
-}
-
-fn state_wire(state: TaskState) -> Result<String, GovernorProjectionError> {
-    let value = serde_json::to_value(state)
-        .map_err(|_| GovernorProjectionError::InvalidField("task.state"))?;
-    value
-        .as_str()
-        .map(str::to_owned)
-        .ok_or(GovernorProjectionError::InvalidField("task.state"))
-}
-
-fn rejection_triggers(
-    journal: &[ObservationJournalEntry],
-) -> Result<Vec<String>, GovernorProjectionError> {
-    let mut triggers = BTreeSet::new();
-    for entry in journal {
-        if let ObservationAdmissionResult::Rejected { rejection } = &entry.result {
-            for error in &rejection.all_contract_errors {
-                check_text(error, "safety.negative_memory_triggers")?;
-                triggers.insert(error.clone());
-            }
+            .map_err(|_| GovernorProjectionError::InvalidSnapshot("workscope"))?;
+        if !fences_match_exact(&scope.state_fence, &input.binding.state_fence)
+            || scope.binding.scope.scope_ref != input.binding.scope_id.as_str()
+        {
+            return Err(GovernorProjectionError::FenceMismatch);
         }
     }
-    let collected: Vec<String> = triggers.into_iter().collect();
-    if collected.len() > MAX_SAFETY_TRIGGERS {
-        return Err(GovernorProjectionError::Bounds(
-            "safety.negative_memory_triggers",
-        ));
-    }
-    Ok(collected)
-}
 
-fn project_task(
-    task_snapshot: &TaskLifecycleSnapshot,
-    task_id: &TaskId,
-    fence: &StateFence,
-    omissions: &mut Vec<ProjectionOmission>,
-) -> Result<Option<GovernorTaskProjection>, GovernorProjectionError> {
-    let Some(record) = task_snapshot.tasks.get(task_id) else {
-        omissions.push(ProjectionOmission {
-            missing: "task".to_owned(),
-            reason: "task-not-found".to_owned(),
-        });
-        return Ok(None);
+    let sources = CanonicalProjectionSourceReadback {
+        expected: CANONICAL_PROJECTION_SOURCE_DENOMINATOR.to_vec(),
+        snapshots: input.source_snapshots,
     };
-    if !fences_match_exact(&record.state_fence, fence) {
-        return Err(GovernorProjectionError::FenceMismatch);
-    }
-    check_text(&record.goal, "task.goal")?;
-    Ok(Some(GovernorTaskProjection {
-        schema_version: GOVERNOR_PROJECTIONS_SCHEMA_VERSION,
-        task_id: task_id.clone(),
-        goal: record.goal.clone(),
-        state: record.state,
-        revision: record.revision,
-    }))
-}
-
-fn project_continuity(
-    task: Option<&GovernorTaskProjection>,
-    session_snapshot: &SessionLifecycleSnapshot,
-    task_snapshot: &TaskLifecycleSnapshot,
-    task_id: &TaskId,
-    fence: &StateFence,
-    omissions: &mut Vec<ProjectionOmission>,
-) -> Result<Option<GovernorContinuityProjection>, GovernorProjectionError> {
-    let Some(projected) = task else {
-        omissions.push(ProjectionOmission {
-            missing: "continuity".to_owned(),
-            reason: "task-not-found".to_owned(),
-        });
-        return Ok(None);
-    };
-    let wanted = task_id.as_str().to_owned();
-    let mut open: u64 = 0;
-    for session in session_snapshot.sessions.values() {
-        if session.task_scope.as_deref() != Some(wanted.as_str()) {
-            continue;
-        }
-        if fences_match_exact(&session.state_fence, fence) && !session.status.terminal() {
-            open = open.saturating_add(1);
-        }
-    }
-    let wire = state_wire(projected.state)?;
-    check_text(&wire, "continuity.plan_state")?;
-    let plan_state = std::format!("{}:rev{}:{}-open", wire, projected.revision, open);
-    check_text(&plan_state, "continuity.plan_state")?;
-    let last_sequence = task_snapshot.next_sequence.saturating_sub(1);
-    Ok(Some(GovernorContinuityProjection {
-        schema_version: GOVERNOR_PROJECTIONS_SCHEMA_VERSION,
-        task_id: task_id.clone(),
-        plan_state,
-        open_sessions: open,
-        last_sequence,
-    }))
-}
-
-fn project_safety(
-    journal: &[ObservationJournalEntry],
-    task_id: &TaskId,
-) -> Result<GovernorSafetyProjection, GovernorProjectionError> {
-    let triggers = rejection_triggers(journal)?;
-    let safety_note = if triggers.is_empty() {
-        "no negative triggers observed".to_owned()
-    } else {
-        std::format!("{} negative triggers observed", triggers.len())
-    };
-    check_text(&safety_note, "safety.safety_note")?;
-    Ok(GovernorSafetyProjection {
-        schema_version: GOVERNOR_PROJECTIONS_SCHEMA_VERSION,
-        task_id: task_id.clone(),
-        safety_note,
-        negative_memory_triggers: triggers,
-    })
-}
-
-fn project_affordance(
-    scope_snapshot: &WorkScopeBindingSnapshot,
-    scope_ref: &str,
-    task_id: &TaskId,
-) -> Result<GovernorAffordanceProjection, GovernorProjectionError> {
-    let instance_ref = scope_snapshot.binding.scope.instance_ref.clone();
-    check_text(&instance_ref, "affordance.scope_ref")?;
-    let mut affordances = vec![scope_ref.to_owned()];
-    if instance_ref != scope_ref {
-        affordances.push(instance_ref);
-    }
-    affordances.sort();
-    affordances.dedup();
-    check_entries(&affordances, "affordance.affordances")?;
-    Ok(GovernorAffordanceProjection {
-        schema_version: GOVERNOR_PROJECTIONS_SCHEMA_VERSION,
-        task_id: task_id.clone(),
-        scope_ref: scope_ref.to_owned(),
-        affordances,
-    })
-}
-
-/// Composes the canonical projection set from four snapshot references.
-///
-/// The function is pure and deterministic: same snapshots always yield the
-/// same ordered set. It enforces one fence — the scope binding fence and the
-/// task record fence must each be compatible with `fence` in both directions
-/// — and reports missing task/continuity data as explicit omissions instead
-/// of filler. No store, Kernel, network, or clock is touched.
-///
-/// # Errors
-///
-/// Returns [`GovernorProjectionError`] when the fence is invalid, the scope
-/// snapshot is invalid, a fence gate fails, or a composed text/bound rule
-/// fails.
-pub fn compose_canonical_projections(
-    task_snapshot: &TaskLifecycleSnapshot,
-    session_snapshot: &SessionLifecycleSnapshot,
-    scope_snapshot: &WorkScopeBindingSnapshot,
-    journal: &[ObservationJournalEntry],
-    task_id: &TaskId,
-    fence: &StateFence,
-) -> Result<GovernorProjectionSet, GovernorProjectionError> {
-    fence
-        .validate()
-        .map_err(|_| GovernorProjectionError::InvalidFence)?;
-    scope_snapshot
-        .validate()
-        .map_err(|_| GovernorProjectionError::InvalidSnapshot("workscope"))?;
-    if !fences_match_exact(&scope_snapshot.state_fence, fence) {
-        return Err(GovernorProjectionError::FenceMismatch);
-    }
-    let scope_ref = scope_snapshot.binding.scope.scope_ref.clone();
-    check_text(&scope_ref, "projections.scope_ref")?;
+    sources
+        .validate(input.binding)
+        .map_err(|_| GovernorProjectionError::InvalidSnapshot("projection-sources"))?;
 
     let mut omissions = Vec::new();
-    let task = project_task(task_snapshot, task_id, fence, &mut omissions)?;
-    let continuity = project_continuity(
-        task.as_ref(),
-        session_snapshot,
-        task_snapshot,
-        task_id,
-        fence,
-        &mut omissions,
-    )?;
-    let safety = Some(project_safety(journal, task_id)?);
-    let affordance = Some(project_affordance(scope_snapshot, &scope_ref, task_id)?);
+    let mut task = None;
+    let mut continuity = None;
+    let mut safety = None;
+    let mut affordance = None;
 
-    let set = GovernorProjectionSet {
-        schema_version: GOVERNOR_PROJECTIONS_SCHEMA_VERSION,
-        fence: fence.clone(),
-        task_id: task_id.clone(),
-        scope_ref,
+    if let Some(projection) = input.members.task.as_ref() {
+        projection
+            .validate()
+            .map_err(|_| GovernorProjectionError::InvalidField("task.projection"))?;
+        validate_member_binding(&input.binding, &projection.binding)?;
+        if task_record.is_some_and(|record| record.goal != projection.goal)
+            || task_record.is_none()
+        {
+            return Err(GovernorProjectionError::InvalidField("task.owner_readback"));
+        }
+        if source_complete_for_member(&sources, CanonicalProjectionMember::Task) {
+            task = Some(projection.clone());
+        } else {
+            append_source_gaps(
+                &mut omissions,
+                CanonicalProjectionMember::Task,
+                CanonicalProjectionOmissionStatus::Partial,
+                &sources,
+            );
+        }
+    } else if task_record.is_some() {
+        append_source_gaps(
+            &mut omissions,
+            CanonicalProjectionMember::Task,
+            CanonicalProjectionOmissionStatus::Partial,
+            &sources,
+        );
+        omissions.push(omission(
+            CanonicalProjectionMember::Task,
+            CanonicalProjectionOmissionStatus::Partial,
+            CanonicalProjectionOmissionReason::RequiredFieldUnavailable,
+            Some(CanonicalProjectionSourceRole::TaskCommitments),
+            &sources,
+        ));
+    } else {
+        omissions.push(omission(
+            CanonicalProjectionMember::Task,
+            CanonicalProjectionOmissionStatus::Missing,
+            CanonicalProjectionOmissionReason::OwnerSnapshotUnavailable,
+            Some(CanonicalProjectionSourceRole::TaskLifecycle),
+            &sources,
+        ));
+        omissions.push(omission(
+            CanonicalProjectionMember::Task,
+            CanonicalProjectionOmissionStatus::Missing,
+            CanonicalProjectionOmissionReason::OwnerSnapshotUnavailable,
+            Some(CanonicalProjectionSourceRole::TaskCommitments),
+            &sources,
+        ));
+    }
+
+    if let Some(projection) = input.members.continuity.as_ref() {
+        projection
+            .validate()
+            .map_err(|_| GovernorProjectionError::InvalidField("continuity.projection"))?;
+        validate_member_binding(&input.binding, &projection.binding)?;
+        if task_record.is_none()
+            || input.session_snapshot.is_none()
+            || !source_complete_for_member(&sources, CanonicalProjectionMember::Continuity)
+        {
+            append_source_gaps(
+                &mut omissions,
+                CanonicalProjectionMember::Continuity,
+                CanonicalProjectionOmissionStatus::Partial,
+                &sources,
+            );
+        } else {
+            continuity = Some(projection.clone());
+        }
+    } else {
+        let status = if task_record.is_some() && input.session_snapshot.is_some() {
+            CanonicalProjectionOmissionStatus::Partial
+        } else {
+            CanonicalProjectionOmissionStatus::Missing
+        };
+        append_source_gaps(
+            &mut omissions,
+            CanonicalProjectionMember::Continuity,
+            status,
+            &sources,
+        );
+        omissions.push(omission(
+            CanonicalProjectionMember::Continuity,
+            status,
+            if status == CanonicalProjectionOmissionStatus::Partial {
+                CanonicalProjectionOmissionReason::RequiredFieldUnavailable
+            } else {
+                CanonicalProjectionOmissionReason::OwnerSnapshotUnavailable
+            },
+            Some(CanonicalProjectionSourceRole::ContinuityNote),
+            &sources,
+        ));
+    }
+
+    if let Some(projection) = input.members.safety.as_ref() {
+        projection
+            .validate()
+            .map_err(|_| GovernorProjectionError::InvalidField("safety.projection"))?;
+        validate_member_binding(&input.binding, &projection.binding)?;
+        if source_complete_for_member(&sources, CanonicalProjectionMember::Safety) {
+            safety = Some(projection.clone());
+        } else {
+            append_source_gaps(
+                &mut omissions,
+                CanonicalProjectionMember::Safety,
+                CanonicalProjectionOmissionStatus::Unknown,
+                &sources,
+            );
+        }
+    } else {
+        omissions.push(omission(
+            CanonicalProjectionMember::Safety,
+            CanonicalProjectionOmissionStatus::Unknown,
+            if input.observation_journal.is_some() {
+                CanonicalProjectionOmissionReason::SourceNotTaskScoped
+            } else {
+                CanonicalProjectionOmissionReason::OwnerSnapshotUnavailable
+            },
+            Some(CanonicalProjectionSourceRole::TaskScopedSafety),
+            &sources,
+        ));
+    }
+
+    if let Some(projection) = input.members.affordance.as_ref() {
+        projection
+            .validate()
+            .map_err(|_| GovernorProjectionError::InvalidField("affordance.projection"))?;
+        validate_member_binding(&input.binding, &projection.binding)?;
+        if input.scope_snapshot.is_none() {
+            return Err(GovernorProjectionError::InvalidSnapshot("workscope"));
+        }
+        if source_complete_for_member(&sources, CanonicalProjectionMember::Affordance) {
+            affordance = Some(projection.clone());
+        } else {
+            append_source_gaps(
+                &mut omissions,
+                CanonicalProjectionMember::Affordance,
+                CanonicalProjectionOmissionStatus::Unknown,
+                &sources,
+            );
+        }
+    } else {
+        if input.scope_snapshot.is_none() {
+            omissions.push(omission(
+                CanonicalProjectionMember::Affordance,
+                CanonicalProjectionOmissionStatus::Missing,
+                CanonicalProjectionOmissionReason::OwnerSnapshotUnavailable,
+                Some(CanonicalProjectionSourceRole::WorkScopeBinding),
+                &sources,
+            ));
+        }
+        omissions.push(omission(
+            CanonicalProjectionMember::Affordance,
+            CanonicalProjectionOmissionStatus::Unknown,
+            CanonicalProjectionOmissionReason::AuthorizedAffordancesUnavailable,
+            Some(CanonicalProjectionSourceRole::AuthorizedAffordances),
+            &sources,
+        ));
+        append_source_gaps(
+            &mut omissions,
+            CanonicalProjectionMember::Affordance,
+            CanonicalProjectionOmissionStatus::Unknown,
+            &sources,
+        );
+    }
+
+    if let (Some(task), Some(continuity), Some(safety), Some(affordance)) =
+        (task.clone(), continuity.clone(), safety.clone(), affordance.clone())
+    {
+        if !sources.is_complete() || !omissions.is_empty() {
+            return Err(GovernorProjectionError::InvalidField(
+                "projections.complete_source_closure",
+            ));
+        }
+        let set = eliot_context_contracts::CanonicalProjectionSet {
+            binding: input.binding.clone(),
+            task,
+            continuity,
+            safety,
+            affordance,
+            omissions: Vec::new(),
+        };
+        set.validate()
+            .map_err(|_| GovernorProjectionError::InvalidField("projections.complete_set"))?;
+        let outcome = CanonicalProjectionOutcome::Complete { set, sources };
+        outcome
+            .validate()
+            .map_err(|_| GovernorProjectionError::InvalidField("projections.complete_outcome"))?;
+        return Ok(outcome);
+    }
+
+    let readback = CanonicalProjectionReadback {
+        binding: input.binding.clone(),
+        sources,
         task,
         continuity,
         safety,
         affordance,
         omissions,
     };
-    set.validate()?;
-    Ok(set)
+    readback
+        .validate()
+        .map_err(|_| GovernorProjectionError::InvalidField("projections.owner_readback"))?;
+    let has_observed_owner_state = task_record.is_some()
+        || input.session_snapshot.is_some()
+        || input.scope_snapshot.is_some()
+        || input.observation_journal.is_some()
+        || input.members.task.is_some()
+        || input.members.continuity.is_some()
+        || input.members.safety.is_some()
+        || input.members.affordance.is_some()
+        || !readback.sources.snapshots.is_empty()
+        || readback.task.is_some()
+        || readback.continuity.is_some()
+        || readback.safety.is_some()
+        || readback.affordance.is_some();
+    let outcome = if has_observed_owner_state {
+        CanonicalProjectionOutcome::Partial(readback)
+    } else {
+        CanonicalProjectionOutcome::Missing(readback)
+    };
+    outcome
+        .validate()
+        .map_err(|_| GovernorProjectionError::InvalidField("projections.owner_outcome"))?;
+    Ok(outcome)
 }

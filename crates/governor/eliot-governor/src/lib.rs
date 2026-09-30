@@ -139,10 +139,8 @@ pub use campaign_task_sources::{
     build_task_controller_campaign_sources,
 };
 pub use canonical_projections::{
-    GOVERNOR_PROJECTIONS_SCHEMA_VERSION, GovernorAffordanceProjection,
-    GovernorContinuityProjection, GovernorProjectionError, GovernorProjectionSet,
-    GovernorSafetyProjection, GovernorTaskProjection, ProjectionOmission,
-    compose_canonical_projections,
+    CanonicalProjectionOwnerInputs, CanonicalProjectionOwnerMembers,
+    GovernorProjectionError, produce_canonical_projections,
 };
 pub use capability_evidence::{
     CapabilityEvidenceRecord, CapabilityRegistry, CapabilitySource, CapabilityStatus,

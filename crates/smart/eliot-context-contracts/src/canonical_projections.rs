@@ -14,7 +14,7 @@
 
 #![forbid(unsafe_code)]
 
-use eliot_contracts::{StateFence, fences_match_exact};
+use eliot_contracts::{ArtifactId, StateFence, fences_match_exact};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -234,5 +234,311 @@ impl CanonicalProjectionSet {
             omission.validate(&self.binding)?;
         }
         Ok(())
+    }
+}
+
+/// Projection member names used by typed owner readbacks and omissions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CanonicalProjectionMember {
+    Task,
+    Continuity,
+    Safety,
+    Affordance,
+}
+
+/// Source roles required to build the canonical projections.
+///
+/// These roles remain in the expected denominator even when an owner has not
+/// supplied a snapshot for the role yet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CanonicalProjectionSourceRole {
+    TaskLifecycle,
+    TaskCommitments,
+    SessionLifecycle,
+    ContinuityNote,
+    TaskScopedSafety,
+    WorkScopeBinding,
+    AuthorizedAffordances,
+}
+
+/// One member/source pair in the immutable expected source denominator.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalProjectionSourceRequirement {
+    pub member: CanonicalProjectionMember,
+    pub role: CanonicalProjectionSourceRole,
+}
+
+/// Fixed CC-004 source denominator. Callers cannot reduce it to the sources
+/// that happened to be supplied.
+pub const CANONICAL_PROJECTION_SOURCE_DENOMINATOR:
+    [CanonicalProjectionSourceRequirement; 8] = [
+    CanonicalProjectionSourceRequirement {
+        member: CanonicalProjectionMember::Task,
+        role: CanonicalProjectionSourceRole::TaskLifecycle,
+    },
+    CanonicalProjectionSourceRequirement {
+        member: CanonicalProjectionMember::Task,
+        role: CanonicalProjectionSourceRole::TaskCommitments,
+    },
+    CanonicalProjectionSourceRequirement {
+        member: CanonicalProjectionMember::Continuity,
+        role: CanonicalProjectionSourceRole::TaskLifecycle,
+    },
+    CanonicalProjectionSourceRequirement {
+        member: CanonicalProjectionMember::Continuity,
+        role: CanonicalProjectionSourceRole::SessionLifecycle,
+    },
+    CanonicalProjectionSourceRequirement {
+        member: CanonicalProjectionMember::Continuity,
+        role: CanonicalProjectionSourceRole::ContinuityNote,
+    },
+    CanonicalProjectionSourceRequirement {
+        member: CanonicalProjectionMember::Safety,
+        role: CanonicalProjectionSourceRole::TaskScopedSafety,
+    },
+    CanonicalProjectionSourceRequirement {
+        member: CanonicalProjectionMember::Affordance,
+        role: CanonicalProjectionSourceRole::WorkScopeBinding,
+    },
+    CanonicalProjectionSourceRequirement {
+        member: CanonicalProjectionMember::Affordance,
+        role: CanonicalProjectionSourceRole::AuthorizedAffordances,
+    },
+];
+
+/// Bounded owner-issued source record tied to one exact context binding.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalProjectionSourceSnapshot {
+    pub member: CanonicalProjectionMember,
+    pub role: CanonicalProjectionSourceRole,
+    pub binding: ContextBinding,
+    pub snapshot: crate::SourceSnapshot,
+}
+
+/// Fixed denominator plus the owner snapshots actually supplied for it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalProjectionSourceReadback {
+    pub expected: Vec<CanonicalProjectionSourceRequirement>,
+    pub snapshots: Vec<CanonicalProjectionSourceSnapshot>,
+}
+
+impl CanonicalProjectionSourceReadback {
+    /// Validate exact source denominator, snapshot bindings, and revision
+    /// identities. Missing snapshots are valid here and remain explicit in
+    /// the enclosing owner readback.
+    pub fn validate(&self, binding: &ContextBinding) -> Result<(), ContextError> {
+        if self.expected.as_slice() != CANONICAL_PROJECTION_SOURCE_DENOMINATOR.as_slice() {
+            return Err(ContextError::InvalidField("projections.source_denominator"));
+        }
+        if self.snapshots.len() > CANONICAL_PROJECTION_SOURCE_DENOMINATOR.len() {
+            return Err(ContextError::Bounds {
+                field: "projections.source_snapshots",
+            });
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for source in &self.snapshots {
+            if source.binding != *binding {
+                return Err(ContextError::InvalidFence);
+            }
+            source.binding.validate()?;
+            source.snapshot.validate()?;
+            if !CANONICAL_PROJECTION_SOURCE_DENOMINATOR
+                .iter()
+                .any(|required| required.member == source.member && required.role == source.role)
+            {
+                return Err(ContextError::InvalidField("projections.source_role"));
+            }
+            if !seen.insert((source.member, source.role)) {
+                return Err(ContextError::Duplicate("projections.source_role"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns true only when every required owner source has supplied its
+    /// owner-issued snapshot.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.snapshots.len() == CANONICAL_PROJECTION_SOURCE_DENOMINATOR.len()
+            && CANONICAL_PROJECTION_SOURCE_DENOMINATOR.iter().all(|required| {
+                self.snapshots.iter().any(|source| {
+                    source.member == required.member && source.role == required.role
+                })
+            })
+    }
+}
+
+/// Typed extent of one incomplete projection member.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CanonicalProjectionOmissionStatus {
+    Missing,
+    Partial,
+    Unknown,
+}
+
+/// Stable typed reason that an owner projection is unavailable or incomplete.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CanonicalProjectionOmissionReason {
+    OwnerSnapshotUnavailable,
+    RequiredFieldUnavailable,
+    SourceSnapshotUnavailable,
+    SourceNotTaskScoped,
+    AuthorizedAffordancesUnavailable,
+}
+
+/// One member-specific omission tied to its source revision when known.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalProjectionOmission {
+    pub member: CanonicalProjectionMember,
+    pub status: CanonicalProjectionOmissionStatus,
+    pub reason: CanonicalProjectionOmissionReason,
+    pub source_role: Option<CanonicalProjectionSourceRole>,
+    pub source_snapshot_id: Option<ArtifactId>,
+    pub source_revision: Option<String>,
+}
+
+impl CanonicalProjectionOmission {
+    /// Validate omission bounds and references against one readback's sources.
+    pub fn validate(
+        &self,
+        sources: &CanonicalProjectionSourceReadback,
+    ) -> Result<(), ContextError> {
+        if self.source_snapshot_id.is_some() != self.source_revision.is_some() {
+            return Err(ContextError::InvalidField("projections.omission.source"));
+        }
+        if let (Some(snapshot_id), Some(revision)) =
+            (&self.source_snapshot_id, &self.source_revision)
+        {
+            validate_text(revision, "projections.omission.source_revision")?;
+            if !sources.snapshots.iter().any(|source| {
+                source.member == self.member
+                    && Some(source.role) == self.source_role
+                    && &source.snapshot.snapshot_id == snapshot_id
+                    && &source.snapshot.revision == revision
+            }) {
+                return Err(ContextError::InvalidField("projections.omission.source"));
+            }
+        }
+        if self.reason == CanonicalProjectionOmissionReason::SourceSnapshotUnavailable
+            && self.source_role.is_none()
+        {
+            return Err(ContextError::MissingField(
+                "projections.omission.source_role",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Owner readback that can preserve full members and exact typed gaps without
+/// changing the strict four-member v1 set.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalProjectionReadback {
+    pub binding: ContextBinding,
+    pub sources: CanonicalProjectionSourceReadback,
+    pub task: Option<TaskProjection>,
+    pub continuity: Option<ContinuityProjection>,
+    pub safety: Option<SafetyProjection>,
+    pub affordance: Option<AffordanceProjection>,
+    pub omissions: Vec<CanonicalProjectionOmission>,
+}
+
+impl CanonicalProjectionReadback {
+    /// Validate exact shared binding/fence, source denominator and omissions.
+    pub fn validate(&self) -> Result<(), ContextError> {
+        self.binding.validate()?;
+        self.sources.validate(&self.binding)?;
+        for (member, present) in [
+            (CanonicalProjectionMember::Task, self.task.as_ref()),
+            (CanonicalProjectionMember::Continuity, self.continuity.as_ref()),
+            (CanonicalProjectionMember::Safety, self.safety.as_ref()),
+            (CanonicalProjectionMember::Affordance, self.affordance.as_ref()),
+        ] {
+            if let Some(projection) = present {
+                projection.validate()?;
+                if projection.binding != self.binding
+                    || !self.sources.is_complete_for_member(member)
+                {
+                    return Err(ContextError::InvalidFence);
+                }
+            }
+        }
+        if self.omissions.len() > MAX_SET_OMISSIONS {
+            return Err(ContextError::Bounds {
+                field: "projections.omissions",
+            });
+        }
+        for omission in &self.omissions {
+            omission.validate(&self.sources)?;
+        }
+        for (member, present) in [
+            (CanonicalProjectionMember::Task, self.task.is_some()),
+            (CanonicalProjectionMember::Continuity, self.continuity.is_some()),
+            (CanonicalProjectionMember::Safety, self.safety.is_some()),
+            (CanonicalProjectionMember::Affordance, self.affordance.is_some()),
+        ] {
+            let has_gap = self.omissions.iter().any(|omission| omission.member == member);
+            if present && has_gap {
+                return Err(ContextError::InvalidField("projections.omissions"));
+            }
+            if !present && !has_gap {
+                return Err(ContextError::MissingField("projections.omissions"));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl CanonicalProjectionSourceReadback {
+    fn is_complete_for_member(&self, member: CanonicalProjectionMember) -> bool {
+        CANONICAL_PROJECTION_SOURCE_DENOMINATOR
+            .iter()
+            .filter(|required| required.member == member)
+            .all(|required| {
+                self.snapshots.iter().any(|source| {
+                    source.member == required.member && source.role == required.role
+                })
+            })
+    }
+}
+
+/// Complete canonical members or an exact owner readback of partial/missing
+/// members. Only `Complete` exposes a `CanonicalProjectionSet` to consumers.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", tag = "disposition", deny_unknown_fields)]
+pub enum CanonicalProjectionOutcome {
+    Complete {
+        set: CanonicalProjectionSet,
+        sources: CanonicalProjectionSourceReadback,
+    },
+    Partial(CanonicalProjectionReadback),
+    Missing(CanonicalProjectionReadback),
+}
+
+impl CanonicalProjectionOutcome {
+    /// Validate outcome shape without resolving or synthesizing owner state.
+    pub fn validate(&self) -> Result<(), ContextError> {
+        match self {
+            Self::Complete { set, sources } => {
+                set.validate()?;
+                sources.validate(&set.binding)?;
+                if !sources.is_complete() {
+                    return Err(ContextError::MissingField(
+                        "projections.source_snapshots",
+                    ));
+                }
+                Ok(())
+            }
+            Self::Partial(readback) | Self::Missing(readback) => readback.validate(),
+        }
     }
 }
