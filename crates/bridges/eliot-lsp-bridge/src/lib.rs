@@ -37,33 +37,32 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 
-pub use eliot_artifact::{ArtifactOwner, ArtifactReadReceipt, ArtifactReference, VerifiedArtifact};
 use eliot_artifact::{ArtifactError, ArtifactKind};
+pub use eliot_artifact::{ArtifactOwner, ArtifactReadReceipt, ArtifactReference, VerifiedArtifact};
 use eliot_blob_api::{BlobError, BlobReadChunk};
 pub use eliot_build_test_graph::{BuildFingerprint, CandidateIdentity};
-pub use eliot_contracts::{ClockReading, RequestMetadata};
 use eliot_contracts::{ArtifactId, ContractId, ContractVersion, sha256_hex};
+pub use eliot_contracts::{ClockReading, RequestMetadata};
 use eliot_evidence::{
     AbsenceVerdict, EvidenceCoverage, EvidenceFreshness, UnknownOutcome,
     check_absence_preconditions,
 };
-pub use eliot_git_bridge::{
-    AsyncProcessRunner as GitProcessRunner, RepoRoot, SourceTreeSnapshot,
-};
 use eliot_git_bridge::GitSnapshotError;
+pub use eliot_git_bridge::{AsyncProcessRunner as GitProcessRunner, RepoRoot, SourceTreeSnapshot};
 pub use eliot_instrument_api::InstrumentInvocation;
-use eliot_instrument_api::{InstrumentContractError, InstrumentKind, RawEvidence, RawEvidenceSource};
+use eliot_instrument_api::{
+    InstrumentContractError, InstrumentKind, RawEvidence, RawEvidenceSource,
+};
+use eliot_instrument_runner::profile::{BUILTIN_PARSER_GENERATION, DIAGNOSTIC_PARSER_CONTRACT};
 pub use eliot_instrument_runner::{
     InstrumentSpec, InstrumentSpecParams, RegistryEntry, ResolvedExecutableIdentity,
 };
-use eliot_instrument_runner::profile::{BUILTIN_PARSER_GENERATION, DIAGNOSTIC_PARSER_CONTRACT};
 use eliot_instrument_scip::{SCIP_INSTRUMENT, ScipIndex};
 pub use eliot_platform_windows::OwnedDirectoryPublication;
 use eliot_process::{
     CancellationReceipt, ContractError as ProcessContractError, ExitDisposition,
-    ProcessEvidenceSink, ProcessExecutionError,
-    ProcessExecutor, ProcessIntent, ProcessRequest, ProcessStreamKind,
-    StreamPreviewRepresentation,
+    ProcessEvidenceSink, ProcessExecutionError, ProcessExecutor, ProcessIntent, ProcessRequest,
+    ProcessStreamKind, StreamPreviewRepresentation,
 };
 pub use eliot_process::{
     OperationId, ProcessEvidence, ProcessExecutionAdmissionRequest, ProcessExecutionView,
@@ -2669,7 +2668,9 @@ impl<P: LspProcessOwnerPort, G: GitProcessRunner> LspCurrentBridge<P, G> {
     /// source readback is unavailable, `None` still retains the original
     /// observation as Stale.
     #[allow(clippy::too_many_arguments)]
-    pub async fn retain_reconciled_result_with_source_artifact_proof<P: LspCapturePublicationPort>(
+    pub async fn retain_reconciled_result_with_source_artifact_proof<
+        P: LspCapturePublicationPort,
+    >(
         &self,
         started: LspStartedInvocation,
         source_scope_after_run: Option<&GovernedGitScope>,
@@ -2688,7 +2689,8 @@ impl<P: LspProcessOwnerPort, G: GitProcessRunner> LspCurrentBridge<P, G> {
             .await
             .map_err(BridgeError::ProcessOwner)?;
         validate_process_owner_readback(&started, &process_evidence)?;
-        let raw_outputs = capture_live_raw_outputs(&started, &process_evidence, invoked_at_unix_ms)?;
+        let raw_outputs =
+            capture_live_raw_outputs(&started, &process_evidence, invoked_at_unix_ms)?;
         let mut retained = Self::retain_result(
             &started,
             process_evidence,
@@ -2756,8 +2758,7 @@ impl<P: LspProcessOwnerPort, G: GitProcessRunner> LspCurrentBridge<P, G> {
         current_source_proof: Option<LspSourceArtifactProof>,
     ) -> Result<LspAdoptionProjection, BridgeError> {
         let (record, result) = adopt_captured_observation_from_blob_readback(readback)?;
-        if !projection.matches_retained_observation(&record)
-            || projection.observation() != &result
+        if !projection.matches_retained_observation(&record) || projection.observation() != &result
         {
             return Err(BridgeError::InconsistentBinding(
                 "received Blob observation differs from the original live capture projection"
@@ -3854,14 +3855,17 @@ fn capture_live_raw_outputs(
             .scip_output_owner
             .as_ref()
             .ok_or(BridgeError::ScipArtifactNotInvocationOwned)?;
-        let source = owner
-            .trusted_source_bundle()
+        let source =
+            owner
+                .trusted_source_bundle()
+                .map_err(|error| BridgeError::SidecarUnreadable {
+                    detail: error.to_string(),
+                })?;
+        let observed = source
+            .observe()
             .map_err(|error| BridgeError::SidecarUnreadable {
                 detail: error.to_string(),
             })?;
-        let observed = source.observe().map_err(|error| BridgeError::SidecarUnreadable {
-            detail: error.to_string(),
-        })?;
         let process_succeeded = process_succeeded(
             process_evidence_completed(process_evidence),
             process_evidence_exit_code(process_evidence),
@@ -3905,8 +3909,8 @@ fn live_raw_output(
     truncated: bool,
     captured_at_unix_ms: u64,
 ) -> Result<LspRawOutput, BridgeError> {
-    let captured_at = i64::try_from(captured_at_unix_ms)
-        .map_err(|_| BridgeError::InvalidCaptureClock)?;
+    let captured_at =
+        i64::try_from(captured_at_unix_ms).map_err(|_| BridgeError::InvalidCaptureClock)?;
     let channel = match kind {
         LspRawOutputKind::Stdout => "stdout",
         LspRawOutputKind::Stderr => "stderr",
@@ -4326,11 +4330,12 @@ fn validate_invocation_sidecar(
     if expected_path.to_str() != Some(path) {
         return Err(BridgeError::ScipArtifactNotInvocationOwned);
     }
-    let source = output_owner
-        .trusted_source_bundle()
-        .map_err(|error| BridgeError::SidecarUnreadable {
-            detail: error.to_string(),
-        })?;
+    let source =
+        output_owner
+            .trusted_source_bundle()
+            .map_err(|error| BridgeError::SidecarUnreadable {
+                detail: error.to_string(),
+            })?;
     let observed = source
         .observe()
         .map_err(|error| BridgeError::SidecarUnreadable {

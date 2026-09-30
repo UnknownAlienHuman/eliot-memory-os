@@ -15,6 +15,7 @@ use eliot_security_contracts::{EffectCeiling, RevocationReason};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::leases::{ActionLease, LeaseId};
 use crate::quarantine_evidence::{QuarantineDisposition, VerifiedQuarantineBinding};
 use crate::revocation_history::{
     AdmittedRevocationClosure, AuthorityRootRef, ClosureIdentityConflict, OriginTargetMismatch,
@@ -24,7 +25,6 @@ use crate::revocation_history::{
 use crate::root_transition::{
     AdmittedRootTransition, AdmittedRootTransitionRecord, RootTransitionDisposition,
 };
-use crate::leases::{ActionLease, LeaseId};
 use crate::{
     AuthorityError, GrantRestoreOutcome, RevocationHistoryError, validate_digest, validate_text,
 };
@@ -908,11 +908,7 @@ impl EffectiveCapabilitySnapshot {
         let operation = operation.into();
         let resource = resource.into();
         let path = self.supporting_path(&operation, &resource, effect)?;
-        let authority_set = AuthoritySet::new(
-            [operation],
-            [resource],
-            effect,
-        )?;
+        let authority_set = AuthoritySet::new([operation], [resource], effect)?;
         ActionLease::new(
             lease_id,
             self.holder.clone(),
