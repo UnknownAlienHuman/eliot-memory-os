@@ -167,6 +167,7 @@ class EvidenceFailure(str, Enum):
     ATTESTATION_MISSING = "ATTESTATION_MISSING"
     CHECKLIST_REQUIRED_MISSING = "CHECKLIST_REQUIRED_MISSING"
     LOCAL_EVIDENCE_COMMITTED = "LOCAL_EVIDENCE_COMMITTED"
+    ORACLE_BLIND_REVIEW_MISMATCH = "ORACLE_BLIND_REVIEW_MISMATCH"
 
 
 class ChecklistState(str, Enum):
@@ -788,6 +789,143 @@ def _shape(envelope: dict[str, Any]) -> dict[str, Any]:
     if unknown:
         _fail(EvidenceFailure.MALFORMED_EVIDENCE_BLOCK, f"unknown field(s): {','.join(unknown)}")
     return envelope
+
+
+# ---------------------------------------------------------------------------
+# Workflow-oracle change protection# Workflow-oracle change protection (issue #1225 step 10, I18.27).
+#
+# A change to workflow YAML, the workflow verifier, profile definitions, lock
+# validation or the repository-policy denominator cannot use only its newly
+# modified oracle as acceptance. When the base->candidate change touches the
+# oracle set below, the merge requires a blind-reviewer envelope bound to the
+# EXACT candidate: the recorded trees, paths and digest are recomputed here
+# from the immutable git objects, never taken on assertion (I18.27: the
+# oracle must be mechanically derived from the same unchanged source, else a
+# blind reviewer verifies the oracle delta before the result is considered).
+#
+# The oracle set mirrors scripts/verify-github-workflows.py
+# (ORACLE_PATH_PREFIXES/ORACLE_PATH_FILES, which is primary for the
+# workflow-oracle meaning); keep the two identical.
+# ---------------------------------------------------------------------------
+
+ORACLE_REVIEW_SCHEMA = "eliot-oracle-blind-review-v1"
+ORACLE_REVIEW_START = "<!-- eliot-oracle-blind-review-v1:start -->"
+ORACLE_REVIEW_END = "<!-- eliot-oracle-blind-review-v1:end -->"
+ORACLE_REVIEW_FIELDS = (
+    "schema", "base_tree", "candidate_tree", "oracle_paths",
+    "oracle_digest", "reviewer", "decision", "statement",
+)
+ORACLE_PATH_PREFIXES = (".github/workflows/",)
+ORACLE_PATH_FILES = (
+    "scripts/verify-github-workflows.py",
+    "scripts/verify.ps1",
+    "scripts/verify-dependency-policy.py",
+    "scripts/requirements-verification.txt",
+    "apps/Eliot.Operator/packages.lock.json",
+    "tests/Eliot.Operator.Tests/packages.lock.json",
+    "global.json",
+)
+_ORACLE_DIFF_FLAGS = ("--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/")
+_FULL_TREE_HEX = re.compile(r"\A[0-9a-f]{40}\Z")
+
+
+def _is_oracle_path(path: str) -> bool:
+    if path in ORACLE_PATH_FILES:
+        return True
+    return any(path.startswith(prefix) for prefix in ORACLE_PATH_PREFIXES)
+
+
+def _oracle_digest(root: Path, base_tree: str, candidate_tree: str, oracle_changed: Sequence[str]) -> str:
+    """Hex sha256 over the deterministic base->candidate diff of the oracle paths.
+
+    Recipe (reproducible by the blind reviewer):
+    git diff --no-ext-diff --no-textconv --src-prefix=a/ --dst-prefix=b/
+        <base_tree> <candidate_tree> -- <sorted oracle paths>
+    """
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(root), "diff", *_ORACLE_DIFF_FLAGS,
+             base_tree, candidate_tree, "--", *sorted(oracle_changed)],
+            capture_output=True, timeout=GIT_TIMEOUT_S, check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        _fail(EvidenceFailure.ORACLE_BLIND_REVIEW_MISMATCH, f"cannot diff oracle paths ({type(exc).__name__})")
+    if completed.returncode != 0:
+        _fail(EvidenceFailure.ORACLE_BLIND_REVIEW_MISMATCH, "cannot diff oracle paths against the base tree")
+    return hashlib.sha256(completed.stdout or b"").hexdigest()
+
+
+def _extract_oracle_review(pr_body: str) -> dict[str, Any]:
+    starts = pr_body.count(ORACLE_REVIEW_START)
+    ends = pr_body.count(ORACLE_REVIEW_END)
+    if starts == 0 and ends == 0:
+        _fail(
+            EvidenceFailure.ORACLE_BLIND_REVIEW_MISMATCH,
+            "candidate mutates the workflow oracle but records no blind-reviewer evidence block",
+        )
+    if starts != 1 or ends != 1:
+        _fail(
+            EvidenceFailure.ORACLE_BLIND_REVIEW_MISMATCH,
+            f"expected exactly one blind-reviewer block, found {starts} start / {ends} end markers",
+        )
+    if pr_body.index(ORACLE_REVIEW_END) < pr_body.index(ORACLE_REVIEW_START):
+        _fail(EvidenceFailure.ORACLE_BLIND_REVIEW_MISMATCH, "overlapping blind-reviewer block markers")
+    inner = pr_body[pr_body.index(ORACLE_REVIEW_START) + len(ORACLE_REVIEW_START):pr_body.index(ORACLE_REVIEW_END)]
+    fences = re.findall(r"```[ \t]*([A-Za-z0-9_+-]*)[ \t]*\r?\n(.*?)```", inner, re.DOTALL)
+    if len(fences) != 1:
+        _fail(
+            EvidenceFailure.ORACLE_BLIND_REVIEW_MISMATCH,
+            f"blind-reviewer block must contain exactly one fenced payload, found {len(fences)}",
+        )
+    if fences[0][0] not in ("", "json"):
+        _fail(EvidenceFailure.ORACLE_BLIND_REVIEW_MISMATCH, "blind-reviewer fence must be canonical JSON")
+    try:
+        record = json.loads(fences[0][1])
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        _fail(EvidenceFailure.ORACLE_BLIND_REVIEW_MISMATCH, f"blind-reviewer block is not valid JSON: {exc}")
+    if type(record) is not dict:
+        _fail(EvidenceFailure.ORACLE_BLIND_REVIEW_MISMATCH, "blind-reviewer block is not a JSON object")
+    return record
+
+
+def _require_oracle_blind_review(
+    root: Path, pr_body: str, base_tree: str, candidate_tree: str, oracle_changed: Sequence[str]
+) -> None:
+    """Enforce I18.27 for an oracle-touching candidate. Returns None on accept."""
+    record = _extract_oracle_review(pr_body)
+    missing = [key for key in ORACLE_REVIEW_FIELDS if key not in record]
+    if missing:
+        _fail(EvidenceFailure.ORACLE_BLIND_REVIEW_MISMATCH, f"missing blind-reviewer field(s): {','.join(missing)}")
+    unknown = sorted(set(record) - set(ORACLE_REVIEW_FIELDS))
+    if unknown:
+        _fail(EvidenceFailure.ORACLE_BLIND_REVIEW_MISMATCH, f"unknown blind-reviewer field(s): {','.join(unknown)}")
+    if record["schema"] != ORACLE_REVIEW_SCHEMA:
+        _fail(EvidenceFailure.ORACLE_BLIND_REVIEW_MISMATCH, f"schema must be {ORACLE_REVIEW_SCHEMA}")
+    for field, actual in (("base_tree", base_tree), ("candidate_tree", candidate_tree)):
+        value = record[field]
+        if type(value) is not str or not _FULL_TREE_HEX.fullmatch(value):
+            _fail(EvidenceFailure.ORACLE_BLIND_REVIEW_MISMATCH, f"{field} must be a full git tree object id")
+        if value != actual:
+            _fail(EvidenceFailure.ORACLE_BLIND_REVIEW_MISMATCH, f"{field} is not bound to the verified {field}")
+    recorded_paths = record["oracle_paths"]
+    if (
+        type(recorded_paths) is not list
+        or any(type(entry) is not str for entry in recorded_paths)
+        or sorted(recorded_paths) != sorted(oracle_changed)
+    ):
+        _fail(
+            EvidenceFailure.ORACLE_BLIND_REVIEW_MISMATCH,
+            "oracle_paths does not match the recomputed oracle change set",
+        )
+    digest = record["oracle_digest"]
+    if type(digest) is not str or not _SHA256_HEX.fullmatch(digest):
+        _fail(EvidenceFailure.ORACLE_BLIND_REVIEW_MISMATCH, "oracle_digest must be <64 hex>")
+    if digest != _oracle_digest(root, base_tree, candidate_tree, oracle_changed):
+        _fail(EvidenceFailure.ORACLE_BLIND_REVIEW_MISMATCH, "oracle_digest does not match the recomputed oracle delta")
+    _text(record["reviewer"], "reviewer", EvidenceFailure.ORACLE_BLIND_REVIEW_MISMATCH)
+    if record["decision"] != "accept":
+        _fail(EvidenceFailure.ORACLE_BLIND_REVIEW_MISMATCH, 'decision must be "accept"')
+    _text(record["statement"], "statement", EvidenceFailure.ORACLE_BLIND_REVIEW_MISMATCH, descriptive=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1488,6 +1626,13 @@ def verify(
     changed = _changed_paths(root, base_tree, candidate_tree)
     if not changed:
         _fail(EvidenceFailure.UNCOVERED_CHANGED_PATH, "base and candidate differ in no tracked path")
+    # Issue #1225 step 10 (I18.27): an oracle-touching candidate cannot
+    # use its newly modified oracle as acceptance. The blind-reviewer
+    # envelope is required only when the decision crosses the oracle
+    # boundary; anything else ignores it entirely.
+    oracle_changed = sorted({path for path in changed if _is_oracle_path(path)})
+    if oracle_changed:
+        _require_oracle_blind_review(root, pr_body, base_tree, candidate_tree, oracle_changed)
 
     topic = _text(envelope["topic"], "topic", EvidenceFailure.ROUTER_INPUT_MISMATCH, descriptive=True)
     candidate_root, recomputed = _recompute_final(root, candidate_tree, changed, topic)
