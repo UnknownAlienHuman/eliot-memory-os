@@ -1002,6 +1002,22 @@ fn p07_cause_classification(
             Directive::OwnerEscalation,
             TransportError::SessionFenced,
         ),
+        // Issue #1679 A9-4 P07 (caller STITCH): the versioned I14
+        // backpressure directive for these capacity causes is whole-or-null,
+        // and at this call site it is honestly null. This classifier is a
+        // pure function of the proven cause: it holds no front-door reserve
+        // handle, no owner-measured partition reading, no operation
+        // identity, no profile revision, and no state fence, so naming an
+        // exhausted bottleneck dimension or a revision here would fabricate
+        // capacity evidence this path never observed (cf. the owner-side
+        // `control_reserve_rejection` builders, which refuse to emit unless
+        // the live partition actually reads saturated). The typed
+        // `OwnerEscalation` directive, disposition, and reason code below
+        // are unchanged. A later slice threads the reserve owner's live
+        // measurement into the `p07_refusal_response` `"recovery"` slot;
+        // until that owner call site exists the answer keeps this
+        // disposition and code with a null versioned directive rather than
+        // a partial one.
         Cause::ControlReserveExhausted
         | Cause::NormalCapacityExhausted
         | Cause::ProtectedReserveExhausted
@@ -1011,6 +1027,16 @@ fn p07_cause_classification(
             Directive::OwnerEscalation,
             TransportError::SessionFenced,
         ),
+        // Issue #1679 A9-4 P07 (caller STITCH): same whole-or-null seam as
+        // the capacity arm above. Guarantee loss and recovery failure carry
+        // no owner-measured observation at this pure-cause call site — no
+        // last-resort path reading, no recording operation identity, no
+        // profile revision, no state fence — so the versioned directive is
+        // honestly null here rather than a fabricated guarantee-loss
+        // record. Placement is the same `p07_refusal_response` `"recovery"`
+        // slot, fed later by the reserve owner's `guarantee_lost_response`
+        // measurement; the typed `OwnerEscalation` directive, disposition,
+        // and code below are unchanged.
         Cause::ControlGuaranteeLost | Cause::RecoveryUnavailable | Cause::RecoveryStateFailure => (
             "RECOVERY_REQUIRED",
             P07_DISPOSITION_RECOVERY_REQUIRED,
