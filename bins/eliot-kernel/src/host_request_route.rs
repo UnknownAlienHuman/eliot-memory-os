@@ -1541,6 +1541,116 @@ impl KernelComposition {
         Ok(stored)
     }
 
+    /// Projects the durable stage for an original `accept_after_stage`
+    /// observation submission into the existing host-request readback.
+    ///
+    /// The stage is reconstructed only after the protected original
+    /// StoreApplyOperation and its ORS reservation pass the same full
+    /// validation used by the result-submit path. This is a read-only view:
+    /// it does not advance the host-request row or imply a terminal receipt.
+    fn validated_original_staged_observe_submission(
+        &self,
+        record: &HostRequestRecord,
+    ) -> Result<Option<eliot_store_api::WriteSubmission>, TransportError> {
+        if record.capability_ref.as_str() != OBSERVE_CAPABILITY {
+            return Ok(None);
+        }
+        let input = record
+            .executable_input
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        let (envelope, tool_request) = self.read_observe_executable_input(record)?;
+        let arguments = tool_request.get("arguments").and_then(serde_json::Value::as_object);
+        if arguments.and_then(|value| value.get("kind")).and_then(serde_json::Value::as_str)
+            != Some("observation")
+            || !arguments.is_some_and(|value| value.contains_key("write_submission"))
+        {
+            return Ok(None);
+        }
+        let original_submission =
+            Self::original_write_submission_from_tool_request(&tool_request)?;
+        if original_submission.response_mode != "accept_after_stage" {
+            return Ok(None);
+        }
+        let operation_identity = OperationIdentity::new(record.operation_id.as_str())
+            .map_err(|_| TransportError::SessionFenced)?;
+        if self
+            .generation_gateway
+            .ors
+            .load_write_reservation_by_operation(&operation_identity)
+            .map_err(|_| TransportError::SessionFenced)?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let (operation, _, _) =
+            self.validate_original_staged_observe_plan(record, input, &operation_identity)?;
+        let original_source: RequestIdentity = serde_json::from_value(
+            input.application_binding.source_request_identity.clone(),
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        let operation_id = operation
+            .transition
+            .identity
+            .operation_id
+            .as_str();
+        if operation.original_write_submission.as_ref() != Some(&original_submission)
+            || host_request_operation_id(&envelope) != record.operation_id.as_str()
+            || operation_id != record.operation_id.as_str()
+            || operation.transition.identity.idempotency_key.as_str()
+                != record.idempotency_key.as_str()
+            || original_source.request.metadata.request_id.as_str() != record.request_id.as_str()
+            || original_source.idempotency_key.as_str() != record.idempotency_key.as_str()
+            || original_source.deadline_unix_ms != record.deadline_unix_ms
+            || original_source.cancellation_id.as_str() != record.cancellation_id.as_str()
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        use eliot_store_api::{
+            STAGED_NEXT_ALLOWED_ACTION, STAGED_RETRY_IDENTITY_RULE, WriteSubmissionState,
+            derive_submission_id,
+        };
+        let transition_identity = &operation.transition.identity;
+        let reservation = self
+            .generation_gateway
+            .ors
+            .load_write_reservation_by_operation(&operation_identity)
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::SessionFenced)?;
+        let write_binding = reservation
+            .token
+            .write_binding
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        if reservation.token.operation_id != operation_identity
+            || write_binding.operation_id != operation_identity
+            || write_binding.idempotency_key.as_str() != record.idempotency_key.as_str()
+            || write_binding.canonical_request_sha256
+                != operation.transition.identity.canonical_request_hash
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        let submission = eliot_store_api::WriteSubmission {
+            submission_id: derive_submission_id(
+                &transition_identity.operation_id,
+                &transition_identity.canonical_request_hash,
+            )
+            .map_err(|_| TransportError::SessionFenced)?,
+            operation_id: transition_identity.operation_id.clone(),
+            request_hash: transition_identity.canonical_request_hash.clone(),
+            state: WriteSubmissionState::Staged,
+            reason_codes: Vec::new(),
+            ors_stage_ref: Some(reservation.token.reservation_id.as_str().to_owned()),
+            canonical_receipt_ref: None,
+            retry_identity_rule: STAGED_RETRY_IDENTITY_RULE.to_owned(),
+            next_allowed_action: STAGED_NEXT_ALLOWED_ACTION.to_owned(),
+        };
+        submission
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(Some(submission))
+    }
+
     /// Resolves one logical host request or one exact operation handle
     /// without staging or dispatch (issue #2571).
     ///
@@ -7143,7 +7253,9 @@ impl KernelComposition {
         {
             return Err(TransportError::IdentityConflict);
         }
-        if binding.task_ref.as_ref().map(OpaqueLabel::as_str) != transition.task_id.as_deref()
+        if transition.task_id.as_deref().is_some_and(|task_id| {
+            binding.task_ref.as_ref().map(OpaqueLabel::as_str) != Some(task_id)
+        })
             || binding.task_ref.is_some()
                 && binding.task_revision != transition.state_fence.task_revision
         {
@@ -7184,7 +7296,10 @@ impl KernelComposition {
             || transition.state_fence != binding.state_fence
             || context_session != semantic_session
             || context_task != semantic_task
-            || semantic_task != transition.task_id.as_deref()
+            || transition
+                .task_id
+                .as_deref()
+                .is_some_and(|task_id| semantic_task != Some(task_id))
             || application_origin != binding.principal_ref.is_some()
             || application_origin != binding.session_ref.is_some()
         {
@@ -7976,7 +8091,8 @@ impl KernelComposition {
                 AGENT_HOST_REQUEST_REHYDRATE_OPERATION => {
                     let receipt = host_request_receipt_from_payload(payload)?;
                     let record = self.rehydrate_host_request(envelope, &receipt)?;
-                    host_request_rehydrated_response(&record)
+                    let stage = self.validated_original_staged_observe_submission(&record)?;
+                    host_request_rehydrated_response(&record, stage.as_ref())
                 }
                 AGENT_HOST_REQUEST_RESOLVE_OPERATION => {
                     let query = payload
@@ -10826,13 +10942,17 @@ pub(crate) fn host_request_admitted_response(
 
 /// Typed answer for a rehydrated host request, served from the durable ORS
 /// record without advancing lifecycle state. No new receipt is issued.
-pub(crate) fn host_request_rehydrated_response(record: &HostRequestRecord) -> serde_json::Value {
+pub(crate) fn host_request_rehydrated_response(
+    record: &HostRequestRecord,
+    stage: Option<&eliot_store_api::WriteSubmission>,
+) -> serde_json::Value {
     serde_json::json!({
         "status": "known",
         "value": {
             "accepted": true,
             "operation_id": record.operation_id.as_str(),
             "record": record,
+            "stage": stage,
         },
         "recovery": null,
     })
