@@ -1335,8 +1335,12 @@ mod authority_revocation_tests {
             ResourceGeneration::new(1).expect("generation"),
         );
         assert!(
-            decode_revocation_history_evidence(&history_response(&fence), &other_fence, "root:alpha")
-                .is_err()
+            decode_revocation_history_evidence(
+                &history_response(&fence),
+                &other_fence,
+                "root:alpha"
+            )
+            .is_err()
         );
         let mut bad_version = history_response(&fence);
         bad_version.payload["version"] = serde_json::json!(999);
