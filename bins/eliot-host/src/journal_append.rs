@@ -689,7 +689,7 @@ pub(super) fn persist_store_rebind_disposition<B: JournalBackend>(
 /// branch: the Watchdog is an SCM-owned sibling, and Host never stops it
 /// merely because one module drains while its own obligations remain (I1.5
 /// step 7: Watchdog persists cursors and stops through SCM when no
-/// SupervisionLease remains).
+/// `SupervisionLease` remains).
 ///
 /// An unknown capability or an empty admitted set fails closed: unknown work
 /// is retained as a visible recovery obligation, never silently omitted from

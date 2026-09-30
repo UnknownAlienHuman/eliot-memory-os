@@ -484,9 +484,8 @@ impl HostComposition {
                 "drain retirement barrier has no durable Host activation".to_owned(),
             )
         })?;
-        let commit = match state.drain_commit.as_ref() {
-            Some(commit) => commit,
-            None => return Ok(()),
+        let Some(commit) = state.drain_commit.as_ref() else {
+            return Ok(());
         };
         if commit.fence != activation.fence {
             return Err(HostError::RecoveryRequired(
