@@ -774,20 +774,27 @@ impl KernelComposition {
             _ => None,
         };
         // I18.53 ACT-1 (#1918 A4): a granted activation issues its durable
-        // runtime lease. The row is keyed by the stable activation operation
-        // identity, fenced exactly like the activation itself, and expires
-        // after the validity window; the retirement census reads it back
-        // through the canonical ORS owner. No lock is held across the ORS
-        // write: the service lock above is released before this statement.
+        // runtime lease. The row is keyed by the generation-bound identity
+        // [`runtime_lease_id_for_candidate`] derives from the validated
+        // candidate — the same `runtime-lease:<activation>:<lineage>:<seq>`
+        // spelling the Host holds and names
+        // (`bins/eliot-host/src/activation_lifecycle.rs::runtime_lease_id_for`),
+        // so issuance, renewal, revocation, and the census resolve one
+        // identity through the ORS owner. The row is fenced exactly like the
+        // activation itself, and expires after the validity window; the
+        // retirement census reads it back through the canonical ORS owner. No
+        // lock is held across the ORS write: the service lock above is
+        // released before this statement.
         if let (KernelControlCommand::Activate(_), Some(receipt)) =
             (&request.command, &activation_receipt)
         {
             let fence = StateFence::new(request.candidate.kernel_epoch.clone(), request.generation);
+            let lease_id = runtime_lease_id_for_candidate(&request.candidate)?;
             let expires_at_ms = crate::unix_ms()
                 .checked_add(RUNTIME_LEASE_VALIDITY_MS)
                 .ok_or(TransportError::SessionFenced)?;
             let lease = RuntimeLease {
-                lease_id: receipt.operation_id.as_str().to_owned(),
+                lease_id: lease_id.clone(),
                 scope_ref: request.candidate.activation_id.as_str().to_owned(),
                 authority_epoch: receipt.authority_epoch.clone(),
                 state_fence: fence.clone(),
@@ -810,7 +817,7 @@ impl KernelComposition {
                 superseded: self.supersede_stale_runtime_leases(
                     &fence,
                     request.candidate.activation_id.as_str(),
-                    receipt.operation_id.as_str(),
+                    lease_id.as_str(),
                 )?,
                 ..Default::default()
             };
@@ -1548,6 +1555,47 @@ fn runtime_lease_is_terminal(state: LeaseState) -> bool {
             | LeaseState::Superseded
             | LeaseState::Closed
     )
+}
+
+/// Durable identity prefix for one activation-generation runtime lease.
+///
+/// Byte-identical to the Host projection
+/// (`bins/eliot-host/src/activation_lifecycle.rs::RUNTIME_LEASE_ID_PREFIX`):
+/// one spelling owned by the two lanes' shared journal content, never a
+/// second scheme beside the ORS family.
+const RUNTIME_LEASE_ID_PREFIX: &str = "runtime-lease";
+
+/// Derives the generation-bound [`RuntimeLease`] identity for the validated
+/// candidate contour (I1.5 W4, #1751).
+///
+/// The identity is built from the candidate's activation identity and the
+/// journal-read activation-generation lineage/sequence the Host bound into
+/// `supervision_incarnation` — the same content Host's
+/// (`bins/eliot-host/src/activation_lifecycle.rs::runtime_lease_id_for`)
+/// formats from its journal record, so the issued ORS row, the Host-held
+/// reference, the renewal tick, the supersede comparison, the census rows,
+/// and the explicit `RevokeRuntimeLease` name all resolve to one identity
+/// through the ORS owner. The incarnation is re-validated through its
+/// existing owner `validate()` (which binds the generation content to the
+/// derived supervision identity), and the contour activation identity must
+/// agree with the incarnation's journal-read one; anything else fails the
+/// request closed instead of issuing under a second scheme.
+fn runtime_lease_id_for_candidate(
+    candidate: &HostKernelCandidateBinding,
+) -> Result<String, TransportError> {
+    let incarnation = &candidate.supervision_incarnation;
+    incarnation
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
+    if incarnation.activation_id != candidate.activation_id.as_str() {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(format!(
+        "{RUNTIME_LEASE_ID_PREFIX}:{}:{}:{}",
+        candidate.activation_id.as_str(),
+        incarnation.activation_generation.lineage_id,
+        incarnation.activation_generation.sequence,
+    ))
 }
 
 impl KernelComposition {

@@ -54,18 +54,20 @@
 //! to the `Revoked` terminal through the owner `transition_to` legality and
 //! re-records it through the canonical ORS owner — explicit-command-only, so
 //! drain and stop never revoke, and the unauthenticated service transition
-//! refuses the command with a typed `InvalidField`. The one remainder is the
-//! owner-scope identity decision below (STITCH, out of contour, through the
-//! ORS owner, never a sidecar).
+//! refuses the command with a typed `InvalidField`. The owner-scope identity
+//! decision has landed there too:
+//! `bins/eliot-kernel/src/control_plane.rs::runtime_lease_id_for_candidate`
+//! keys issued rows by the generation-bound identity derived from the
+//! validated candidate (`runtime-lease:<activation>:<lineage>:<seq>`), which
+//! is the same spelling [`runtime_lease_id_for`] builds from the Host journal
+//! record — one identity through the ORS owner, never a sidecar.
 //! The Host half below is durable and complete on its own side:
 //! the current activation generation holds its generation-bound `RuntimeLease`
 //! reference (issued, renewed, and released here from fresh admitting
 //! observations), the idle-drain gate reads exactly those held references
 //! plus the published supervision mirror, and [`project_runtime_lease`]
-//! projects the owner-validated row content for the held identity — but the
-//! landed writer keys rows by `receipt.operation_id`, not by that identity,
-//! so the two schemes still need the owner-scope identity decision (STITCH,
-//! never a sidecar, never beside the ORS family). A `StoppedClean` terminal releases
+//! projects the owner-validated row content for the held identity. A
+//! `StoppedClean` terminal releases
 //! the held references (`transition_activation_record` clears them once the
 //! `DrainCommitRecord` snapshot carries the obligations, proven by
 //! [`prove_terminal_runtime_release`]); recovery terminals
@@ -816,9 +818,10 @@ impl HostComposition {
     /// instead of vanishing into a live state.
     ///
     /// The durable writer is the journal append the caller performs with this
-    /// revision; the ORS row commit for the projected
-    /// [`project_runtime_lease`] content stays STITCH with the crates-side
-    /// writer lane (see that function for the named adopters).
+    /// revision; the ORS row for the projected [`project_runtime_lease`]
+    /// content is committed by the Kernel writer lane under the same
+    /// generation-bound identity
+    /// (`bins/eliot-kernel/src/control_plane.rs::runtime_lease_id_for_candidate`).
     ///
     /// # Errors
     ///
@@ -1192,15 +1195,14 @@ pub(super) fn prove_terminal_runtime_release(
 /// runs before return. The contour fence is caller-supplied: the writer lane
 /// owns the live contour, so the Host never invents it here.
 ///
-/// STITCH, out of contour (other lane): the durable row commit has landed
+/// Committed by the other lane: the durable row commit has landed
 /// (`bins/eliot-kernel/src/control_plane.rs` issuance into
-/// `RedbRecoveryStore::record_runtime_lease_current`, keyed by
-/// `receipt.operation_id`) together with the renewal/expiry/supersede tick
-/// beside it and the explicit-command-only `RevokeRuntimeLease` arm (named
+/// `RedbRecoveryStore::record_runtime_lease_current`, keyed by the
+/// generation-bound [`runtime_lease_id_for`] identity through
+/// `runtime_lease_id_for_candidate`) together with the renewal/expiry/supersede
+/// tick beside it and the explicit-command-only `RevokeRuntimeLease` arm (named
 /// exact-fence row to the `Revoked` terminal through the owner
-/// `transition_to` legality, re-recorded through the ORS owner). Only the
-/// owner-scope identity decision is still STITCH there, through the ORS
-/// owner.
+/// `transition_to` legality, re-recorded through the ORS owner).
 /// Validity window in milliseconds for a Host-projected runtime lease
 /// (issue #1751 W4; I1.5). Mirrors the Kernel
 /// `RUNTIME_LEASE_VALIDITY_MS` and the supervision renewal policy's
@@ -1219,10 +1221,12 @@ const RUNTIME_LEASE_VALIDITY_MS: u64 = 60_000;
 /// `supersede_stale_runtime_leases`, `renew_runtime_leases_for_probe`) plus
 /// the explicit-command-only `RevokeRuntimeLease` arm renew, expire,
 /// supersede, and revoke rows through the owner `RuntimeLease::transition_to`
-/// legality. What keeps this projection unadopted is identity, not plumbing:
-/// the landed writer keys rows by `receipt.operation_id`, not by the
-/// [`runtime_lease_id_for`] identity built here — that identity decision
-/// belongs beside the issuance site (STITCH). No mirror or queued `WakeIntent`
+/// legality. The identity the landed writer keys rows by is the
+/// [`runtime_lease_id_for`] identity built here, derived there from the
+/// validated candidate contour
+/// (`bins/eliot-kernel/src/control_plane.rs::runtime_lease_id_for_candidate`)
+/// — that owner-scope identity decision is what adopted this projection. No
+/// mirror or queued `WakeIntent`
 /// can reactivate a terminal
 /// revision: revision chaining through the owner `transition_to` legality is
 /// the writer lane's own commit rule.
