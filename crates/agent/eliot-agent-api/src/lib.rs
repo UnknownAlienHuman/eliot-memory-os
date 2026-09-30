@@ -456,7 +456,7 @@ pub enum QuotaKnowledge {
 ///   restore.
 /// - direct/internal binary entrypoints: producer `ActionEnvelope` presenter
 ///   (`bins/eliot-native-worker/src/governed_action.rs::EXTERNAL_ADAPTER_OPS`:
-///   register/claim/reconcile/start_claimed/serve_stdio) → `Harness`
+///   `register/claim/reconcile/start_claimed/serve_stdio`) → `Harness`
 ///   `validate_envelope` then governor `ActionContract` → Kernel (permits) +
 ///   Governor (effect) → exact executor `run_governed_external_op` adapter
 ///   closure → persisted `RecordedEffect` + governor receipt → recovery Kernel
