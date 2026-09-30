@@ -1,4 +1,5 @@
 use crate::EngineError;
+use eliot_context_measurement::stu_for_bytes;
 use eliot_types::{
     CanonicalMemoryUtilityLedger, ForgettingOperator, MemoryCompressionArtifact,
     MemoryDistillationAction, MemoryDistillationApplyReceipt, MemoryDistillationApplySelection,
@@ -42,9 +43,13 @@ impl MemoryDistillationService {
                             target_ref,
                             ..MemoryUtilityLedgerEntry::default()
                         });
+                // True KiB maintenance cost: `serialized_bytes / 1024` rounded up
+                // stays in its own storage unit and is never converted to a
+                // token or STU count. A record that occupies zero bytes
+                // contributes zero KiB; there is no minimum-one estimate.
                 entry.maintenance_cost_units = entry
                     .maintenance_cost_units
-                    .saturating_add(record.serialized_bytes.div_ceil(1024).max(1));
+                    .saturating_add(record.serialized_bytes.div_ceil(1024));
                 for signal in &signals {
                     apply_utility_signal(entry, *signal, &record.payload);
                 }
@@ -198,7 +203,10 @@ impl MemoryDistillationService {
             .filter(|candidate| candidate.automatic_apply_allowed)
             .filter_map(|candidate| candidate.target_refs.first())
             .filter_map(|target| input.items.iter().find(|item| item.target_ref == *target))
-            .map(|item| -i64::try_from(item.token_units.saturating_mul(4)).unwrap_or(i64::MAX))
+            .map(|item| {
+                -i64::try_from(canonical_bytes_for_measured_units(item.token_units))
+                    .unwrap_or(i64::MAX)
+            })
             .sum();
         let plan_material = (
             input.project_id,
@@ -584,9 +592,15 @@ fn apply_utility_signal(
             entry.repeated_low_delta_loads = entry.repeated_low_delta_loads.saturating_add(1);
         }
         MemoryUtilitySignalKind::ContextTokenCost => {
-            entry.context_cost_tokens = entry
-                .context_cost_tokens
-                .saturating_add(payload_u64(payload, "estimated_tokens").unwrap_or(1));
+            // Closed versioned adapter, not a field probe. Only a payload that
+            // declares the accepted current measurement revision and carries
+            // the canonical #704 unvalidated STU is admitted; the legacy bare
+            // `estimated_tokens` integer is no longer decoded. A malformed or
+            // unversioned payload contributes nothing rather than a minimum-one
+            // estimate, so unknown cost is never cheap.
+            if let Some(value) = canonical_context_cost_from_payload(payload) {
+                entry.context_cost_tokens = entry.context_cost_tokens.saturating_add(value);
+            }
         }
         MemoryUtilitySignalKind::MaintenanceCost => {}
         MemoryUtilitySignalKind::RestoreRegret => {
@@ -849,7 +863,9 @@ fn corpus_profile(
             MemoryDistillationService::tier(item, utility.get(item.target_ref.as_str()).copied());
         *tier_counts.entry(tier).or_insert(0) += 1;
         if matches!(tier, MemoryTier::Hot | MemoryTier::Warm) {
-            active_bytes = active_bytes.saturating_add(item.token_units.saturating_mul(4));
+            active_bytes = active_bytes.saturating_add(canonical_bytes_for_measured_units(
+                item.token_units,
+            ));
         }
     }
     MemoryDistillationCorpusProfile {
@@ -861,7 +877,7 @@ fn corpus_profile(
             .len(),
         total_bytes: items
             .iter()
-            .map(|item| item.token_units.saturating_mul(4))
+            .map(|item| canonical_bytes_for_measured_units(item.token_units))
             .sum(),
         active_bytes,
         tier_counts,
@@ -918,14 +934,57 @@ fn payload_string(value: &Value, key: &str) -> Option<String> {
         })
 }
 
-fn payload_u64(value: &Value, key: &str) -> Option<u64> {
-    value.get(key).and_then(Value::as_u64).or_else(|| {
-        value
-            .as_object()
-            .into_iter()
-            .flat_map(|object| object.values())
-            .find_map(|nested| payload_u64(nested, key))
-    })
+/// Accepted revision of the semantic Context-cost measurement adapter.
+///
+/// A payload that does not declare exactly this revision is not measured. There
+/// is no trial decoding, serde default or alias that invents evidence.
+const CONTEXT_COST_ADAPTER_REVISION: &str = "eliot-context-cost/v1";
+
+/// Closed versioned adapter from a canonical #704 measurement payload to the
+/// unvalidated STU recorded in `MemoryUtilityLedgerEntry::context_cost_tokens`.
+///
+/// Admitted only when the payload declares the accepted revision, names the
+/// canonical serializer, reports the #704 `conservative_stu` status, and
+/// carries an `actual_tokens` field. Absent or mismatched evidence yields
+/// `None` (unknown), never zero, one, or a legacy bare estimate. A stale
+/// legacy `estimated_tokens` value is never decoded as current tokens.
+fn canonical_context_cost_from_payload(payload: &Value) -> Option<u64> {
+    let measure = payload.get("measurement")?;
+    if measure.get("adapter_revision")?.as_str()? != CONTEXT_COST_ADAPTER_REVISION {
+        return None;
+    }
+    if measure.get("serializer_id")?.as_str()? != "serde_json" {
+        return None;
+    }
+    if measure.get("measurement_status")?.as_str()? != "conservative_stu" {
+        return None;
+    }
+    // An actual-token claim requires its own exact route/model/tokenizer
+    // binding over these bytes. Without one it must be explicitly null, never
+    // a synthesized count.
+    if !measure.get("actual_tokens").is_some_and(Value::is_null) {
+        return None;
+    }
+    measure.get("stu_estimate")?.get("value")?.as_u64()
+}
+
+/// Canonical #704 byte length for one measured corpus unit count.
+///
+/// `MemoryDistillationCorpusItem::token_units` is a measured unit count, and
+/// the byte fields (`total_bytes`, `active_bytes`, `expected_active_bytes_delta`)
+/// are true storage metrics that stay in bytes. The previous local `* 4` ratio
+/// is not a byte count and is removed; the byte figure is now the exact inverse
+/// of the normative `STU(bytes) = ceil(bytes / 3)` unit owned by #704, so a
+/// measured unit count maps to the smallest canonical byte length whose STU
+/// covers it. One integer never silently means two units, and this conversion
+/// never produces a token or STU claim.
+///
+/// Corrected-evidence note: for a corpus whose unit counts are exact byte
+/// multiples, the canonical byte figure is `3x` where the removed local ratio
+/// reported `4x`. No threshold, retention or distillation policy is retuned;
+/// only the unit conversion is corrected.
+fn canonical_bytes_for_measured_units(measured_units: u64) -> u64 {
+    stu_for_bytes(measured_units).unwrap_or(0).saturating_mul(3)
 }
 
 fn normalize(value: &str) -> String {
