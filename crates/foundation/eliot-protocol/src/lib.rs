@@ -1600,6 +1600,183 @@ impl AgentBridgeClientDeclaration {
     }
 }
 
+/// Stable module identity of the interactive User Broker front door.
+pub const USER_BROKER_MODULE_ID: &str = "eliot-user-broker";
+/// Stable identity of the protected User Broker client declaration.
+pub const USER_BROKER_CLIENT_DECLARATION_WIRE_ID: &str =
+    "eliot.protocol.user-broker-client-declaration";
+/// Current protected User Broker client declaration version.
+pub const USER_BROKER_CLIENT_DECLARATION_WIRE_VERSION: u16 = 1;
+/// Stable runtime protocol advertised in the broker module contract.
+pub const USER_BROKER_RUNTIME_PROTOCOL: &str = "eliot.user-broker.v1";
+/// The exact operation selectors a `eliot-user-broker` front door may request.
+///
+/// I7.3 fixes the `ClientHello` shape: the client states its capabilities and
+/// the serving Kernel admits the exact set it binds. This is the installed
+/// statement of the set the interactive User Broker presents at its front
+/// door. The two serving declarations of the same values are
+/// `bins/eliot-kernel/src/user_broker_registration_route.rs` (the dedicated
+/// broker matrix the Kernel admits) and
+/// `bins/eliot-user-broker/src/operation_identity.rs` (the broker's own
+/// operation-identity issuer). They are three views of one installation-pinned
+/// set, not three sets: a broker presenting anything else is refused at session
+/// bind, which is the intended fail-closed outcome.
+pub const USER_BROKER_FRONT_DOOR_OPERATIONS: [&str; 4] = [
+    "eliot.user-broker.register",
+    "eliot.user-broker.heartbeat",
+    "eliot.user-broker.fence",
+    "eliot.user-broker.validate-native-resource-selection-current",
+];
+
+/// Immutable protected client declaration for one installed User Broker
+/// front door.
+///
+/// This is the User Broker's counterpart of
+/// [`AgentBridgeClientDeclaration`] and uses the same scheme: the installation
+/// owner builds the static template, the canonical bytes are hashed, and
+/// `declaration_sha256` records that hash so [`Self::validate`] re-proves the
+/// recorded value instead of accepting a recomputed substitute.
+///
+/// It is a distinct record, not a second scheme, because the User Broker is a
+/// distinct module with a distinct module identity and a distinct wire id; an
+/// agent-bridge declaration names `eliot-agent-bridge` and is validated against
+/// that identity. It deliberately carries no `expected_kernel_*` block: the
+/// serving Kernel's own authority epoch, generation, artifact, and config
+/// snapshot are the Kernel's to state, and are compared by the Kernel, never
+/// asserted here. `launch_nonce` is correlation-only connection data and is
+/// absent from the declaration for the same reason
+/// [`AgentBridgeClientDeclaration::client_hello`] excludes it: a nonce must
+/// not be able to change the declaration digest.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UserBrokerClientDeclaration {
+    /// Declaration wire identity.
+    pub wire_id: String,
+    /// Declaration wire version.
+    pub wire_version: u16,
+    /// Exact module identity (`eliot-user-broker`).
+    pub module_id: String,
+    /// Stable protected profile identity assigned by the installation owner.
+    pub profile_id: String,
+    /// Protocol range advertised by each materialized client hello.
+    pub protocol_range: ProtocolRange,
+    /// Registered immutable module contract advertised by each client hello.
+    pub module_contract: ModuleContract,
+    /// Exact immutable runtime generation advertised by each client hello.
+    pub module_generation: ModuleGeneration,
+    /// Exact operation selectors this profile may request during handshake.
+    pub capabilities: Vec<String>,
+    /// Privacy classes this profile may carry during handshake.
+    pub privacy_classes: Vec<String>,
+    /// Maximum frame body accepted by the profile.
+    pub max_frame: u32,
+    /// Lowercase SHA-256 over every declaration field except this field.
+    pub declaration_sha256: String,
+}
+
+impl UserBrokerClientDeclaration {
+    /// Current declaration contract version.
+    pub const CONTRACT_VERSION: u16 = USER_BROKER_CLIENT_DECLARATION_WIRE_VERSION;
+
+    /// Returns deterministic bytes covered by `declaration_sha256`.
+    pub fn canonical_unsigned_bytes(&self) -> Result<Vec<u8>, ProtocolError> {
+        let mut unsigned = self.clone();
+        unsigned.declaration_sha256.clear();
+        canonical_json_bytes(&unsigned).map_err(|error| ProtocolError::Json(error.to_string()))
+    }
+
+    /// Computes the canonical declaration digest.
+    pub fn compute_digest(&self) -> Result<String, ProtocolError> {
+        Ok(eliot_contracts::sha256_hex(
+            &self.canonical_unsigned_bytes()?,
+        ))
+    }
+
+    /// Populates the canonical declaration digest.
+    pub fn with_computed_digest(mut self) -> Result<Self, ProtocolError> {
+        self.declaration_sha256 = self.compute_digest()?;
+        Ok(self)
+    }
+
+    /// Materializes and validates a dynamic `ClientHello` from this static
+    /// installed declaration.
+    ///
+    /// `launch_nonce` is correlation-only connection data. It is deliberately
+    /// absent from this declaration and therefore cannot change its digest or
+    /// act as an authority-bearing identity.
+    pub fn client_hello(
+        &self,
+        launch_nonce: impl Into<String>,
+    ) -> Result<ClientHello, ProtocolError> {
+        let hello = ClientHello {
+            protocol_range: self.protocol_range,
+            module_bridge_identity: self.module_id.clone(),
+            artifact_hash: self.module_contract.artifact_id.clone(),
+            module_contract: self.module_contract.clone(),
+            module_generation: self.module_generation.clone(),
+            launch_nonce: launch_nonce.into(),
+            capabilities: self.capabilities.clone(),
+            privacy_classes: self.privacy_classes.clone(),
+            max_frame: self.max_frame,
+            authority_epoch: self.module_generation.state_fence.authority_epoch.clone(),
+        };
+        hello.validate()?;
+        Ok(hello)
+    }
+
+    /// Validates the protected declaration without opening a transport or
+    /// issuing authority.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.wire_id != USER_BROKER_CLIENT_DECLARATION_WIRE_ID
+            || self.wire_version != Self::CONTRACT_VERSION
+            || self.module_id != USER_BROKER_MODULE_ID
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "user_broker_client.wire",
+                reason: "unsupported user-broker client declaration",
+            });
+        }
+        text(&self.profile_id, "user_broker_client.profile_id")?;
+        self.protocol_range.validate()?;
+        self.module_contract
+            .validate()
+            .map_err(|error| provider_error("eliot-runtime-contracts", error))?;
+        self.module_generation
+            .validate()
+            .map_err(|error| provider_error("eliot-runtime-contracts", error))?;
+        if self.module_contract.module_id.as_str() != self.module_id
+            || self.module_generation.module_id != self.module_contract.module_id
+            || self.module_generation.artifact_id != self.module_contract.artifact_id
+            || self.module_generation.generation
+                != self.module_generation.state_fence.resource_generation
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "user_broker_client.module_generation",
+                reason: "must match the exact user-broker module contract and generation fence",
+            });
+        }
+        unique_texts(&self.capabilities, "user_broker_client.capabilities")?;
+        unique_texts(&self.privacy_classes, "user_broker_client.privacy_classes")?;
+        if self.max_frame == 0 || self.max_frame > MAX_FRAME_BYTES_U32 {
+            return Err(ProtocolError::InvalidField {
+                field: "user_broker_client.max_frame",
+                reason: "must be within the admitted frame limit",
+            });
+        }
+        lowercase_sha256(
+            &self.declaration_sha256,
+            "user_broker_client.declaration_sha256",
+        )?;
+        if self.declaration_sha256 != self.compute_digest()? {
+            return Err(ProtocolError::InvalidField {
+                field: "user_broker_client.declaration_sha256",
+                reason: "declaration digest mismatch",
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Kernel-issued, one-shot correlation challenge for one bridge connection.
 ///
 /// This is a transport-neutral packet. `challenge_nonce` is correlation-only:
