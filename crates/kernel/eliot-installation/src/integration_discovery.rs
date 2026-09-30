@@ -1054,12 +1054,8 @@ pub fn survey_accepted_installation(
     source: &dyn SurveyObservationSource,
 ) -> Result<AcceptedInstallationSurvey, CatalogueAdmissionError> {
     let accepted = load_accepted_catalogue(context)?;
-    let survey = super::survey_installation(
-        accepted.catalogue(),
-        context.observed_platform,
-        source,
-        &[],
-    )?;
+    let survey =
+        super::survey_installation(accepted.catalogue(), context.observed_platform, source, &[])?;
     // The probe stage is deliberately answered with an empty answer set: this
     // coordinator runs no process, so the mandatory `I3.3` order ends in
     // `Withheld` for every identity rather than in a probe nobody executed.
