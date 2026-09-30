@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::dispatch_stage::CurationExecutionCarrier;
 use crate::kernel_port::{ClaimTransport, KernelClaimTransport};
+use crate::model_route::ModelRouteExecution;
 use crate::production_orientation::OrientationSupply;
 
 mod admitted_material;
@@ -25,6 +26,7 @@ mod dispatch_stage;
 mod error;
 mod grounding_stage;
 pub(crate) mod kernel_port;
+mod model_route;
 mod model_stage;
 mod production_orientation;
 mod pulse;
@@ -161,13 +163,18 @@ pub trait CurationCarrierSource {
     ) -> Result<CurationExecutionCarrier<'s>, DreamerError>;
 }
 
-/// Governor injection point for the Orientation owner supply.
+/// Governor injection point for the CC-004 Orientation owner supply.
 ///
-/// Production carries no source: the CC-002 model-route execution and the
-/// CC-004 canonical projection set are owned outside this binary, so without a
-/// Governor-wired source there is nothing to compose from and Orientation
-/// returns the typed blocked result. The Governor (or a test harness) supplies a
-/// source via
+/// The CC-002 model-route request and outcome are deliberately NOT supplied
+/// here: they are the runtime route's own admitted values, built in-binary by
+/// [`model_route::model_route_of`] from the Kernel-proved cancellation
+/// observation and the admitted pair. This channel carries only what the
+/// Governor owns — the exact `CanonicalProjectionSet` and every stage's
+/// owner-built input record.
+///
+/// Until the Governor wires a source there is nothing to compose CC-004 from,
+/// so Orientation returns the typed blocked result naming the absent boundary
+/// and stage owners. The Governor supplies a source via
 /// [`AuthenticatedKernelJobPort::with_orientation_source`], and `submit`
 /// resolves the owner records from the admitted pair before running the
 /// admitted pipeline.
@@ -387,6 +394,30 @@ impl<'a> AuthenticatedKernelJobPort<'a> {
         }
     }
 
+    /// Resolves the admitted CC-002 model route for one Orientation job.
+    ///
+    /// The cancellation flag is the port's own Kernel-proved claimed-job view,
+    /// read here rather than re-derived: cancellation is Kernel-owned, this
+    /// role admits no cancel origination, and the view is the only observation
+    /// of it this process holds. Non-Orientation jobs never resolve a route.
+    ///
+    /// `None` is the honest answer whenever the Kernel has proved no
+    /// cancellation: this binary performs no provider round trip, so it has no
+    /// completed/partial/malformed outcome and no measured timeout to report,
+    /// and the typed blocked result names the absent provider execution rather
+    /// than a fabricated receipt.
+    fn resolve_orientation_route(
+        &self,
+        admission: &KernelJobAdmission,
+        job: &DreamJobInput,
+    ) -> Result<Option<ModelRouteExecution>, DreamerError> {
+        if job.job_class != JobClass::Orientation {
+            return Ok(None);
+        }
+        let (_, bundle, _) = dispatch_stage::orientation_admitted_pair(admission, job)?;
+        model_route::model_route_of(admission, job, &bundle, self.view.state == JobState::Cancelled)
+    }
+
     /// Resolves the Governor-injected Orientation owner supply, if any.
     ///
     /// Same shape as [`Self::resolve_curation_carrier`]: the source reference
@@ -394,7 +425,7 @@ impl<'a> AuthenticatedKernelJobPort<'a> {
     /// rather than this port, and `submit` consumes it inside the pipeline call
     /// before observing the live view. `None` (production) flows to the
     /// carrier resolution inside dispatch, which returns the typed blocked
-    /// Orientation result naming the absent CC-002/CC-004 boundaries.
+    /// Orientation result naming the absent CC-004 boundary.
     ///
     /// Non-Orientation jobs never consult the source: the supply is only
     /// resolved for the Orientation class, where the admitted pair is re-derived
@@ -606,7 +637,8 @@ fn run_admitted_pipeline(
     admission: &KernelJobAdmission,
     job: &DreamJobInput,
     curation_carrier: Option<dispatch_stage::CurationExecutionCarrier<'_>>,
-    orientation_supply: Option<OrientationSupply<'_>>,
+    orientation_route: Option<&ModelRouteExecution>,
+    orientation_supply: Option<&OrientationSupply<'_>>,
 ) -> Result<DreamResult, DreamerError> {
     let screen = curation_screen_stage::resolve_screen_inputs(admission, job)?;
     if job.job_class == JobClass::Curation {
@@ -650,10 +682,13 @@ fn run_admitted_pipeline(
         job,
         screen_binding,
         None,
-        None,
+        dispatch_stage::OwnerCarriers {
+            curation: curation_carrier,
+            route: orientation_route,
+            orientation: orientation_supply,
+        },
         job.job_class,
         Some(&validated),
-        orientation_supply.as_ref(),
     )
 }
 
@@ -702,7 +737,7 @@ impl KernelJobPort for AuthenticatedKernelJobPort<'_> {
                 }
             };
             let carrier = self.resolve_curation_carrier(&binding, admission, job)?;
-            let result = run_admitted_pipeline(admission, job, carrier, None)?;
+            let result = run_admitted_pipeline(admission, job, carrier, None, None)?;
             return self.finish_with_result(result);
         }
         let (state, observed, policy, observation_time_ms) =
@@ -711,8 +746,12 @@ impl KernelJobPort for AuthenticatedKernelJobPort<'_> {
             controller::step_admitted_cycle(&state, &observed, &policy, observation_time_ms)?;
         let request = bundle_stage::resolve_bundle_request(admission, job)?;
         let _plan = bundle_stage::plan_admitted_bundle(request)?;
+        // The CC-002 route is this runtime's own admitted value, so it is
+        // resolved before the Governor supply and owned by `submit` for the
+        // whole synchronous pipeline call; the composer only borrows it.
+        let route = self.resolve_orientation_route(admission, job)?;
         let supply = self.resolve_orientation_supply(admission, job)?;
-        let result = run_admitted_pipeline(admission, job, None, supply)?;
+        let result = run_admitted_pipeline(admission, job, None, route.as_ref(), supply.as_ref())?;
         self.finish_with_result(result)
     }
 

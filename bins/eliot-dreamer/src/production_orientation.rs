@@ -12,9 +12,9 @@
 //!
 //! | Responsibility | Actual runtime owner | Status |
 //! |---|---|---|
-//! | Construct/admit `ModelRouteRequest` | the owner supply channel ([`OrientationSupplySource`](crate::OrientationSupplySource)), which resolves it from admitted material | wired through [`resolve_production_inputs`] |
-//! | Execute the admitted provider route, return `ModelRouteOutcome` | the same supply channel; provider text lives outside the dreamer binary | wired through [`resolve_production_inputs`] |
-//! | Read/build the exact `CanonicalProjectionSet` from Governor/canonical owners | `eliot_governor::GovernorComposition::canonical_projections`, supplied by the same channel | wired through [`resolve_production_inputs`] |
+//! | Construct/admit `ModelRouteRequest` | [`model_route::model_route_of`](crate::model_route::model_route_of), from the admitted pair | wired: reached from the production chain |
+//! | Execute the admitted provider route, return `ModelRouteOutcome` | the same runtime route owner; no provider round trip happens in this binary, so only the pre-dispatch `Cancelled` terminal is reportable and the other dispositions stay blocked rather than invented | wired |
+//! | Read/build the exact `CanonicalProjectionSet` from Governor/canonical owners | `eliot_governor::GovernorComposition::canonical_projections`, handed over by [`OrientationSupplySource`](crate::OrientationSupplySource) | wired through [`resolve_production_inputs`] |
 //! | Acquire each mandatory stage's owner input/receipt | the same supply channel, carrying each stage's owner-built record | wired through [`resolve_production_inputs`] |
 //! | Invoke the pure composer | [`compose_production_result`] below (this module) | reachable: `dispatch_stage::dispatch_orientation` calls it on the resolved carrier |
 //! | Publish the typed result | `dispatch_stage::dispatch_orientation` as `DreamResult::Orientation` | all three dispositions reachable |
@@ -54,6 +54,7 @@ use eliot_dreamer_orientation::{
 use eliot_dreamer_probe_plan::ProbePlanParams;
 use eliot_epistemic::PositionRequest;
 
+use crate::model_route::ModelRouteExecution;
 use crate::pulse::{
     CEILING_BLOCKED, CEILING_CANDIDATE_ONLY, CONFLICT_OUTPUT_QUALIFIED, CandidateStage,
     ClassificationStage, ConflictStage, CueActivationStage, MANDATORY_DENOMINATOR, PulseError,
@@ -162,25 +163,25 @@ pub(crate) struct ProductionOrientationInputs<'a> {
 /// Governor-resolved owner records for one admitted Orientation pulse.
 ///
 /// The carrier's mandatory members are owner values, not derivations: the
-/// CC-002 outcome carries provider text and observed usage that live outside
-/// this binary, the CC-004 set is composed by
+/// CC-004 set is composed by
 /// `eliot_governor::GovernorComposition::canonical_projections`, and every
 /// stage input is an owner-built record. This is the one shape that carries
-/// all of them
+/// them
 /// across the process boundary, mirroring the Curation
 /// [`CurationExecutionCarrier`](crate::dispatch_stage::CurationExecutionCarrier)
 /// exactly: an owned value the source hands out per admission, which the
 /// composer then borrows for the life of one synchronous composition.
+///
+/// The CC-002 request and outcome are deliberately absent: those are the
+/// runtime route's own admitted values ([`ModelRouteExecution`]), not a
+/// Governor supply, so they cannot arrive through this channel even in
+/// principle.
 ///
 /// Identity is not carried here. `operation_id`, `task_id`, `scope_id`, and
 /// `state_fence` are read from the admitted job, which
 /// [`validate_identity_closure`] already proves equal to the bundle, the frame,
 /// and the semantic job, so a second copy in the supply could only disagree.
 pub(crate) struct OrientationSupply<'a> {
-    /// CC-002 admitted model-route request (denominator, timeout, privacy).
-    pub model_request: ModelRouteRequest,
-    /// CC-002 admitted model-route outcome (mandatory boundary).
-    pub model_outcome: ModelRouteOutcome,
     /// CC-004 canonical projection set (mandatory boundary).
     pub projections: CanonicalProjectionSet,
     /// Governor-resolved epistemic-position handles for the packet.
@@ -203,33 +204,35 @@ pub(crate) struct OrientationSupply<'a> {
     pub probes: ProbePlanParams<'a>,
     /// Context-candidate stage inputs.
     pub candidates: CandidateStage<'a>,
-    /// True when cancellation was observed by the owner before composition.
-    pub cancelled: bool,
 }
 
-/// Resolves the production carrier from admitted dispatch artifacts plus the
-/// owner supply.
+/// Resolves the production carrier from admitted dispatch artifacts, the
+/// runtime CC-002 route, and the Governor CC-004 supply.
 ///
 /// The identity half (operation/task/scope/fence) is read from the admitted job
 /// and the deadline from the Kernel admission, so it cannot drift from the
-/// records it is re-proved against. Every other member is the owner value the
-/// supply handed over verbatim: nothing here synthesizes an outcome, projects
-/// an empty set, fills a usage receipt, or builds a lookalike stage record, so
-/// a missing supply member is the typed blocked result rather than filler.
+/// records it is re-proved against. The CC-002 request and outcome are the
+/// runtime's own admitted route ([`ModelRouteExecution`]), and every other
+/// member is the owner value the supply handed over verbatim: nothing here
+/// synthesizes an outcome, projects an empty set, fills a usage receipt, or
+/// builds a lookalike stage record, so a missing member is the typed blocked
+/// result rather than filler.
 ///
 /// # Errors
 ///
 /// Returns the typed blocked [`OrientationPulseResult`] naming the absent
-/// boundaries and every stage owner when `supply` is [`None`].
+/// boundaries and every stage owner when either the runtime route or the
+/// Governor supply is absent.
 pub(crate) fn resolve_production_inputs<'a>(
     admission: &'a KernelJobAdmission,
     admitted_job: &'a AdmittedOrientationJob,
     candidate: &'a ValidatedCandidate,
     bundle: &'a DreamInputBundle,
     policy: &'a OrientationPolicy,
+    route: Option<&'a ModelRouteExecution>,
     supply: Option<&'a OrientationSupply<'a>>,
 ) -> Result<ProductionOrientationInputs<'a>, Box<OrientationPulseResult>> {
-    let Some(supply) = supply else {
+    let (Some(route), Some(supply)) = (route, supply) else {
         return Err(Box::new(missing_prerequisites_blocked(
             admission,
             admitted_job,
@@ -245,8 +248,8 @@ pub(crate) fn resolve_production_inputs<'a>(
         bundle,
         validated_candidate: candidate,
         policy,
-        model_request: &supply.model_request,
-        model_outcome: &supply.model_outcome,
+        model_request: &route.request,
+        model_outcome: &route.outcome,
         projections: &supply.projections,
         cep_handles: &supply.cep_handles,
         // Each stage input is copied out of the supply field by field: the
@@ -309,7 +312,10 @@ pub(crate) fn resolve_production_inputs<'a>(
         scope_id: job.scope_id.clone(),
         state_fence: job.state_fence.clone(),
         deadline_unix_ms: admission.deadline_unix_ms,
-        cancelled: supply.cancelled,
+        // One observation, read from the route that carries it: the admitted
+        // request's own pre-call cancellation flag. The Governor supply cannot
+        // restate it, so the two halves of the carrier cannot disagree.
+        cancelled: route.request.cancelled,
     })
 }
 

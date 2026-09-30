@@ -79,6 +79,7 @@ use crate::admitted_material::{
 use crate::controller::verify_admitted_binding;
 use crate::curation_pulse::compose_curation_pulse;
 use crate::curation_screen_stage::{CurationProtection, CurationProtectionSet, ProtectionClass};
+use crate::model_route::ModelRouteExecution;
 use crate::production_orientation::OrientationSupply;
 use crate::{
     CurationCandidate, DreamJobInput, DreamPacket, DreamResult, DreamerError, Interpretation,
@@ -152,6 +153,23 @@ pub struct CurationExecutionCarrier<'a> {
     pub ports: NativeCurationPortSet<'a>,
 }
 
+/// The per-job owner carriers one admitted dispatch may carry.
+///
+/// Curation and Orientation are the two admitted classes whose owner records
+/// live outside this binary: Curation needs its validated batch plus one live
+/// port per owner family, Orientation needs its admitted CC-002 model route
+/// plus the Governor-resolved CC-004 owner supply. Each stays an independent
+/// optional so one class's absence never implies another's.
+pub(crate) struct OwnerCarriers<'a> {
+    /// Curation owner records, present only for an admitted Curation job.
+    pub curation: Option<CurationExecutionCarrier<'a>>,
+    /// Admitted CC-002 model route, present only for an admitted Orientation
+    /// job whose terminal disposition the runtime could report honestly.
+    pub route: Option<&'a ModelRouteExecution>,
+    /// Orientation owner records, present only for an admitted Orientation job.
+    pub orientation: Option<&'a OrientationSupply<'a>>,
+}
+
 /// Maps a native owner refusal to a typed fail-closed refusal.
 ///
 /// Every mapping is [`DreamerError::InvalidAdmission`] (request-rejected code),
@@ -220,10 +238,9 @@ pub(crate) fn dispatch_admitted(
     job: &DreamJobInput,
     screen: Option<ScreenBinding>,
     curation_protection: Option<CurationProtectionSet>,
-    curation_carrier: Option<CurationExecutionCarrier<'_>>,
+    carriers: OwnerCarriers<'_>,
     job_class: JobClass,
     validated: Option<&ValidatedGroundingCandidate>,
-    orientation_supply: Option<&OrientationSupply<'_>>,
 ) -> Result<DreamResult, DreamerError> {
     verify_admitted_binding(admission, job)?;
     if job.job_class != job_class {
@@ -236,7 +253,7 @@ pub(crate) fn dispatch_admitted(
         // the precise carrier refusal names the missing governed input
         // even when the screen is absent too.
         JobClass::Curation => {
-            let Some(carrier) = curation_carrier else {
+            let Some(carrier) = carriers.curation else {
                 return Err(DreamerError::InvalidAdmission(CURATION_CARRIER_REFUSAL));
             };
             let Some(binding) = screen else {
@@ -256,7 +273,7 @@ pub(crate) fn dispatch_admitted(
             let Some(candidate) = validated else {
                 return Err(DreamerError::InvalidAdmission(VALIDATION_RECEIPT_REFUSAL));
             };
-            dispatch_orientation(admission, job, candidate, orientation_supply)
+            dispatch_orientation(admission, job, candidate, carriers.route, carriers.orientation)
         }
         // Native owner: eliot-dreamer-research-synthesis `synthesize`. The
         // owner takes its own `SynthesisRequest` vocabulary (a
@@ -362,6 +379,7 @@ fn dispatch_orientation(
     admission: &KernelJobAdmission,
     job: &DreamJobInput,
     validated: &ValidatedGroundingCandidate,
+    route: Option<&ModelRouteExecution>,
     supply: Option<&OrientationSupply<'_>>,
 ) -> Result<DreamResult, DreamerError> {
     require_validated_binding(admission, job, validated)?;
@@ -397,6 +415,7 @@ fn dispatch_orientation(
         &candidate,
         &bundle,
         &policy,
+        route,
         supply,
     ) {
         Ok(inputs) => crate::production_orientation::compose_production_result(inputs, job)
