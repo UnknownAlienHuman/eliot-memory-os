@@ -280,6 +280,32 @@ impl RestoreRecordClass {
             Self::OutboxEvent => crate::schema::table::OUTBOX_EVENT,
         }
     }
+
+    /// The store-owned key column that names one record of this class.
+    ///
+    /// The canonical write path binds exactly this column beside `body` for this
+    /// table ([`crate::schema::TX_CREATE_RECEIPT`],
+    /// [`crate::schema::TX_CREATE_REVISION`], [`crate::schema::TX_CREATE_EVENT`],
+    /// [`crate::schema::TX_CREATE_PROJECTION`],
+    /// [`crate::schema::TX_CREATE_RELATION`],
+    /// [`crate::schema::TX_CREATE_OUTBOX`]) and the canonical read paths select on
+    /// it ([`crate::schema::READ_RECEIPT_BY_OPERATION`],
+    /// [`crate::schema::READ_REVISION_HEADS_BY_KEYS`],
+    /// [`crate::schema::READ_ORDERING_HEADS_BY_SCOPES`]). It is the same
+    /// declaration the capture side reads as this class's key
+    /// (`crate::backup_snapshot::CANONICAL_SOURCE_CLASSES`), so a restored row
+    /// carries the column the destination actually reads it by.
+    const fn key_field(self) -> &'static str {
+        match self {
+            Self::WriteReceipt => "operation_id",
+            Self::RevisionHead => "revision_key",
+            Self::OrderingHead => "ordering_scope",
+            Self::CanonicalEvent => "event_id",
+            Self::ProjectionRecord => "publication_id",
+            Self::RelationRecord => "relation_id",
+            Self::OutboxEvent => "outbox_id",
+        }
+    }
 }
 
 /// One archive/artifact owner carrier row for a single canonical member.
@@ -4645,7 +4671,8 @@ fn bookkeeping_bindings(
 /// Each expected head travels as its key and the exact revision or sequence the
 /// batch was admitted against, each observed purge obligation as its row address
 /// and its observed revision, and each resolved canonical record as its class
-/// table, its record address and its payload.
+/// table, its record address and the record document the destination's own
+/// canonical read path selects by.
 fn precondition_bindings(
     batch: &CanonicalRestoreBatch,
     purge_observed: &[(String, u64)],
@@ -4699,9 +4726,21 @@ fn precondition_bindings(
             format!("restore_class_row_id{index}"),
             serde_json::Value::String(member.record_id.clone()),
         );
+        // The record document is the class's own key column beside the admitted
+        // logical body, which is the exact shape the canonical write path stores
+        // and the exact shape the destination's canonical read paths select and
+        // project. Binding `body` alone would create a row the destination
+        // cannot read back by its own key, so the readback would report the
+        // member unresolved for a row that did commit.
+        let mut document = serde_json::Map::new();
+        document.insert(
+            member.class.key_field().to_owned(),
+            serde_json::Value::String(member.record_id.clone()),
+        );
+        document.insert("body".to_owned(), member.payload.clone());
         bindings.insert(
-            format!("restore_class_record{index}"),
-            member.payload.clone(),
+            format!("restore_class_document{index}"),
+            serde_json::Value::Object(document),
         );
     }
     Ok(())
