@@ -4031,9 +4031,7 @@ impl KernelMcpForwardingPort {
         // recorded successor this offer proves; field writes only.
         for (stream_id, identity) in &stream_identities {
             let adopted_matches = owner.owner_identity.get(stream_id) == Some(identity);
-            if adopted_matches
-                && let Some(ledger) = owner.incarnation_ledger.get_mut(stream_id)
-            {
+            if adopted_matches && let Some(ledger) = owner.incarnation_ledger.get_mut(stream_id) {
                 ledger.retire_if_successor_confirmed(identity);
             }
         }
@@ -4658,10 +4656,8 @@ impl McpForwardingPort for KernelMcpForwardingPort {
         // owner call follows on the commit path.
         let mut retired_successors: Vec<(String, OwnerStreamIdentity)> = Vec::new();
         if let Some(offer) = offer_snapshot.as_ref()
-            && (matches!(
-                offer.disposition,
-                ConsumedOfferDisposition::OwnerConfirmed
-            ) || offer_proven)
+            && (matches!(offer.disposition, ConsumedOfferDisposition::OwnerConfirmed)
+                || offer_proven)
         {
             for (stream_id, identity) in &offer.stream_identities {
                 let successor_adopted = owner_identity.get(stream_id) == Some(identity);
