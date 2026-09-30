@@ -82,9 +82,9 @@ use crate::store_write_reservation::{
     retain_unsupported_prepared_plan, writer_epoch_for_fence_from_epoch,
 };
 use crate::user_automation_execution::{
-    UserAutomationDueWakeResolution, UserAutomationDurableJobMaterial, UserAutomationExecutionError,
-    UserAutomationExecutionOutcome, UserAutomationExecutionRequest, UserAutomationRemovalResult,
-    UserAutomationRuntimeAdmission, UserAutomationWakeCancellation,
+    UserAutomationDueWakeResolution, UserAutomationDurableJobMaterial,
+    UserAutomationExecutionError, UserAutomationExecutionOutcome, UserAutomationExecutionRequest,
+    UserAutomationRemovalResult, UserAutomationRuntimeAdmission, UserAutomationWakeCancellation,
     UserAutomationWakeCancellationTarget, UserAutomationWakeEnumerationReceipt,
     UserAutomationWakePublication, UserAutomationWakeTargetEnumeration,
     read_retirement_wake_targets, retirement_wake_enumeration_request,
@@ -3899,7 +3899,9 @@ impl KernelStoreGateway {
         // this read only has to prove it still reads the same admitted state.
         // Anything else is a refusal the deterministic preflight re-derives,
         // not one asserted here.
-        let config_snapshot = self.read_user_automation_policy_snapshot(state_fence).await?;
+        let config_snapshot = self
+            .read_user_automation_policy_snapshot(state_fence)
+            .await?;
         // This read refuses rather than answering "no admitted job" when the
         // owner cannot prove the occurrence denominator complete, and that refusal
         // carries the durable query handle the caller needs to finish enumerating
@@ -3912,15 +3914,13 @@ impl KernelStoreGateway {
         if execution.history_query_ref != owner.revision.execution_history_query_ref {
             return Err(UserAutomationRuntimeError::IdentityConflict);
         }
-        let normalization_receipts =
-            select_retained_normalization_receipts(state_fence, &owner).map_err(|assembly| {
-                match assembly {
-                    RunNowPreflightAssembly::Unknown(reason) => {
-                        UserAutomationRuntimeError::UnknownOutcome(reason)
-                    }
-                    RunNowPreflightAssembly::Unavailable(reason) => {
-                        UserAutomationRuntimeError::Unavailable(reason)
-                    }
+        let normalization_receipts = select_retained_normalization_receipts(state_fence, &owner)
+            .map_err(|assembly| match assembly {
+                RunNowPreflightAssembly::Unknown(reason) => {
+                    UserAutomationRuntimeError::UnknownOutcome(reason)
+                }
+                RunNowPreflightAssembly::Unavailable(reason) => {
+                    UserAutomationRuntimeError::Unavailable(reason)
                 }
             })?;
         if normalization_receipts.is_empty() {
@@ -4047,12 +4047,8 @@ impl KernelStoreGateway {
         // owner's answer is back, so this contour's future stays bounded.
         let outcome = match durable_job {
             Some(material) => {
-                Box::pin(service.execute_occurrence_with_durable_job(
-                    occurrence,
-                    material,
-                    runtime,
-                ))
-                .await
+                Box::pin(service.execute_occurrence_with_durable_job(occurrence, material, runtime))
+                    .await
             }
             None => Box::pin(service.execute_occurrence(occurrence, runtime)).await,
         };

@@ -6873,7 +6873,10 @@ impl KernelComposition {
                     &request,
                     &readback,
                     client,
-                    DecidedDisposition { outcome: "rejected", reason },
+                    DecidedDisposition {
+                        outcome: "rejected",
+                        reason,
+                    },
                 )
                 .await;
             }
@@ -7077,7 +7080,8 @@ impl KernelComposition {
         request: &UserAutomationRuntimeAdmission,
         resolution: &UserAutomationDueWakeResolution,
         readback: &UserAutomationWakeReadback,
-    ) -> Result<eliot_kernel_service::UserAutomationExecutionOutcome, UserAutomationRuntimeError> {
+    ) -> Result<eliot_kernel_service::UserAutomationExecutionOutcome, UserAutomationRuntimeError>
+    {
         let gateway = self.retained_store_gateway().map_err(|_| {
             UserAutomationRuntimeError::Unavailable(
                 "canonical UserAutomation Store owner is unavailable".to_owned(),
