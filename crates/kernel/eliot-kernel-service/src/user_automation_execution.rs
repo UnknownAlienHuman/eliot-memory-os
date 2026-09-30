@@ -3351,6 +3351,19 @@ pub trait UserAutomationWakePort: Send + Sync {
     /// never proof that publication did not occur. A contour with no schedule
     /// owner reports typed unavailability and cannot turn a retained horizon
     /// into a possible-effect or published claim.
+    ///
+    /// The vocabulary here is deliberately one-sided, and the missing half is a
+    /// gap rather than an oversight a caller may fill in. `Ok` is a proven
+    /// answer and is the ONLY value that may close a question, which is why a
+    /// routed obligation consults this seam and settles on it. The negative side
+    /// is scoped to the owner's CURRENT activation generation — the Host journal
+    /// clears its whole wake projection at an activation cutover — so
+    /// [`UserAutomationRuntimeError::NotRetained`] is a complete negative about
+    /// the present projection and nothing more. A caller therefore has no value
+    /// with which to ask the stronger question "was this ever applied under any
+    /// earlier generation", and must not approximate it by reading the negative as
+    /// reissue permission. Splitting that is a change to the owner's error
+    /// contract, not to a caller.
     async fn read_wake_horizon_publication(
         &self,
         _request: impl Into<Box<UserAutomationWakeHorizonPublication>>,
