@@ -75,6 +75,7 @@ use eliot_agent_coordinator::{
     ModelRole, PlanGap, StaffingPlanCandidate, StaffingPlanRequest,
 };
 use eliot_agent_opencode::{OpenCodeClient, OpenCodeRouteAdmission};
+use eliot_read::LocalReadPort;
 use eliot_contracts::{ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence};
 use eliot_governor::{CompositionError, CompositionReadiness, RouteScopeFingerprint};
 use eliot_protocol::ContinuityKind;
@@ -150,9 +151,9 @@ impl<'a> ConfiguredDreamerOrientationModelOwner<'a> {
     /// OpenCode route owner. The worker returns the exact owner outcome or
     /// typed refusal with any already-observed raw bytes, usage, and route
     /// receipts still attached.
-    pub async fn execute_admitted_orientation(
+    pub async fn execute_admitted_orientation<R: LocalReadPort>(
         &self,
-        input: super::dreamer_orientation_model_worker::DreamerOrientationModelWorkerInput<'_>,
+        input: super::dreamer_orientation_model_worker::DreamerOrientationModelWorkerInput<'_, R>,
     ) -> Result<
         super::dreamer_orientation_model::DreamerOrientationModelAttempt,
         super::dreamer_orientation_model_worker::DreamerOrientationModelWorkerError,

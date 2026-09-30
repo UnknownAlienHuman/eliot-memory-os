@@ -69,6 +69,7 @@ use eliot_agent_coordinator::{
     ProviderIdentity, ProviderSelectionHealth, SchedulingProfile, StaffingPlanCandidate,
     StaffingPlanRequest, SwarmDefinitionAdmissionPrep, WorkClass,
 };
+use eliot_agent_opencode::{AdmittedAttemptError, AdmittedOpenCodeAttempt, ModelSelection};
 #[cfg(test)]
 use eliot_agent_coordinator::{OwnerCurrentness, PresentedClaimMaterial};
 use eliot_contracts::{EpochId, StateFence, fences_match_exact};
@@ -1166,6 +1167,27 @@ pub enum FabricError {
     MissingPrerequisite(Box<MissingPortResidual>),
 }
 
+/// Typed failures while projecting the exact original coordinator attempt
+/// into OpenCode's admitted read-only execution edge.
+#[derive(Debug, Error)]
+pub enum AdmittedOpenCodeAttemptProjectionError {
+    /// No original coordinator attempt exists for this identity.
+    #[error("coordinator attempt is unknown")]
+    UnknownAttempt,
+    /// The selected route is not the route stored by the coordinator.
+    #[error("selected route differs from the original coordinator attempt")]
+    RouteMismatch,
+    /// The original coordinator attempt has no owner-recorded execution binding.
+    #[error("original coordinator attempt has no owner-recorded provider binding")]
+    MissingProviderBinding,
+    /// Coordinator refused the original attempt projection.
+    #[error(transparent)]
+    Coordinator(#[from] CoordinatorError),
+    /// OpenCode's original admission, binding, attempt or model validation refused.
+    #[error(transparent)]
+    OpenCode(#[from] AdmittedAttemptError),
+}
+
 /// Maps a semantic contract rejection onto the fabric vocabulary.
 ///
 /// Owner-identity failures keep their typed meaning (`SemanticDrift`,
@@ -1799,6 +1821,42 @@ impl AgentFabric {
     #[must_use]
     pub const fn config(&self) -> &CoordinatorConfig {
         &self.config
+    }
+
+    /// Projects an OpenCode execution input from the original coordinator
+    /// attempt record. The route receipt and provider binding are cloned only
+    /// from the owner record and revalidated by `AdmittedOpenCodeAttempt::new`;
+    /// no caller-provided receipt, binding, effect ceiling, or generation is
+    /// accepted. `current_fence` is the live Kernel fence observed for this
+    /// operation, while runtime generation is taken from the recorded binding.
+    pub fn admitted_open_code_attempt(
+        &self,
+        attempt_id: &AttemptId,
+        selected_route: &RouteFingerprint,
+        model: ModelSelection,
+        current_fence: &StateFence,
+    ) -> Result<AdmittedOpenCodeAttempt, AdmittedOpenCodeAttemptProjectionError> {
+        let record = self
+            .coordinator
+            .attempt(attempt_id)
+            .ok_or(AdmittedOpenCodeAttemptProjectionError::UnknownAttempt)?;
+        if record.route != *selected_route {
+            return Err(AdmittedOpenCodeAttemptProjectionError::RouteMismatch);
+        }
+        let route_receipt = record.admitted_route.clone();
+        let binding = record.provider_binding.clone().ok_or_else(|| {
+            AdmittedOpenCodeAttemptProjectionError::MissingProviderBinding
+        })?;
+        let runtime_generation = binding.runtime_generation.clone();
+        let attempt = self.coordinator.binding_subject(attempt_id)?;
+        Ok(AdmittedOpenCodeAttempt::new(
+            route_receipt,
+            binding,
+            attempt,
+            model,
+            current_fence,
+            runtime_generation,
+        )?)
     }
 
     /// Returns the ordered call ledger.
