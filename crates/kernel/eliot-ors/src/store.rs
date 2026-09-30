@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::ops::Bound;
 use std::path::Path;
 use std::sync::Arc;
@@ -16634,11 +16635,11 @@ impl RedbRecoveryStore {
     ) -> String {
         let predecessor_len = predecessor_commitment.len();
         let mut canonical = String::new();
-        let _ = std::fmt::Write::write!(canonical, "{predecessor_len}:{predecessor_commitment};");
+        let _ = write!(canonical, "{predecessor_len}:{predecessor_commitment};");
         for (sequence, event_id, envelope_sha256, reconcile_key) in leaves {
             let event_len = event_id.len();
             let reconcile_len = reconcile_key.len();
-            let _ = std::fmt::Write::write!(
+            let _ = write!(
                 canonical,
                 "{sequence:020}:{event_len}:{event_id}:{envelope_sha256}:{reconcile_len}:{reconcile_key};"
             );
