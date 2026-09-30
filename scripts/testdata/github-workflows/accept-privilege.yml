@@ -1,0 +1,16 @@
+name: Manual Gate
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  t:
+    runs-on: ubuntu-latest
+    steps:
+      # N_step9 accepted fixture: pinned checkout with persist-credentials
+      # disabled in its own step block, least-privilege contents, no secret
+      # or OIDC material. check_fail_closed_privilege must stay silent.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false

@@ -2430,12 +2430,127 @@ def run_self_tests() -> int:
             print(f"SELF_TEST_FAILURE: hash-locked pip install produced unexpected findings: {findings}", file=sys.stderr)
             return 1
 
+    # Fail-closed privilege, locked restore, SDK identity and lock-graph drift
+    # (issue #1225 N_step9). These four production rules decide
+    # `persist-credentials: false`, least-privilege contents, `--locked-mode`
+    # restore and the .NET SDK band, yet the self-test never judged them, so
+    # deleting them left the suite printing a full PASS. Every body below is
+    # read from a committed file under scripts/testdata/github-workflows/, and
+    # every refusal is judged twice: once against its own rule and once
+    # through verify_all, so removing the rule from the production dispatch
+    # fails the suite even when the rule itself still works.
+    fixture_dir = Path(__file__).resolve().parent / "testdata" / "github-workflows"
+
+    def fixture_body(name: str) -> str:
+        return (fixture_dir / name).read_text(encoding="utf-8")
+
+    def materialize(tmp_root: Path, rel_path: str, body: str) -> None:
+        target = tmp_root / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(body, encoding="utf-8")
+
+    def setup_workflow(tmp_root: Path, fixture_name: str) -> None:
+        materialize(tmp_root, ".github/workflows/test.yml", fixture_body(fixture_name))
+
+    def setup_sdk(tmp_root: Path, fixture_name: str) -> None:
+        materialize(
+            tmp_root,
+            "apps/Eliot.Operator/Eliot.Operator.csproj",
+            fixture_body("operator-net10.csproj"),
+        )
+        materialize(tmp_root, "global.json", fixture_body(fixture_name))
+
+    def setup_lock_graph(tmp_root: Path, fixture_name: str) -> None:
+        materialize(
+            tmp_root,
+            "apps/Eliot.Operator/Eliot.Operator.csproj",
+            fixture_body(fixture_name),
+        )
+        materialize(
+            tmp_root,
+            "apps/Eliot.Operator/packages.lock.json",
+            fixture_body("lock-stale.packages.lock.json"),
+        )
+
+    fail_closed_tables = [
+        (
+            "GWF-021",
+            check_fail_closed_privilege,
+            setup_workflow,
+            [
+                ("privilege_persist_credentials_rejected", "reject-persist-credentials.yml", True),
+                ("privilege_overbroad_permission_rejected", "reject-overbroad-permissions.yml", True),
+                ("privilege_secret_interpolation_rejected", "reject-secret-interpolation.yml", True),
+                ("privilege_oidc_token_rejected", "reject-oidc-token.yml", True),
+                ("privilege_clean_accepted", "accept-privilege.yml", False),
+            ],
+        ),
+        (
+            "GWF-012",
+            check_dotnet_restore_lock,
+            setup_workflow,
+            [
+                ("restore_unlocked_rejected", "reject-unlocked-restore.yml", True),
+                ("restore_locked_accepted", "accept-locked-restore.yml", False),
+            ],
+        ),
+        (
+            "GWF-014",
+            check_dotnet_sdk_identity,
+            setup_sdk,
+            [
+                ("sdk_identity_drift_rejected", "global-drift.json", True),
+                ("sdk_identity_accepted", "global-accept.json", False),
+            ],
+        ),
+        (
+            "GWF-013",
+            check_nuget_lock,
+            setup_lock_graph,
+            [
+                ("nuget_lock_graph_stale_rejected", "lock-stale.csproj", True),
+                ("nuget_lock_graph_fresh_accepted", "operator-net10.csproj", False),
+            ],
+        ),
+    ]
+    dispatch_probes = 0
+    for expected_code, rule, setup, cases in fail_closed_tables:
+        for name, fixture_name, expect_finding in cases:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp_root = Path(tmpdir)
+                setup(tmp_root, fixture_name)
+                direct = rule(tmp_root)
+                if expect_finding:
+                    if not any(f.code == expected_code for f in direct):
+                        print(
+                            f"SELF_TEST_FAILURE in {name}: expected {expected_code}, got {direct}",
+                            file=sys.stderr,
+                        )
+                        return 1
+                    dispatched = {f.code for f in verify_all(tmp_root)}
+                    if expected_code not in dispatched:
+                        print(
+                            f"SELF_TEST_FAILURE in {name}: {expected_code} missing from "
+                            f"the production dispatch, got {sorted(dispatched)}",
+                            file=sys.stderr,
+                        )
+                        return 1
+                    dispatch_probes += 1
+                elif direct:
+                    print(
+                        f"SELF_TEST_FAILURE in {name}: expected clean, got {direct}",
+                        file=sys.stderr,
+                    )
+                    return 1
+
     # 31 single-file workflow cases + 2 cross-workflow divergence cases
     # + 1 derived-identity case + 7 rule-level cases below, plus the two
-    # cache-key groups (issue #1923). The reported count is derived from the
-    # case lists themselves: a hardcoded total would keep reporting PASS with
-    # the same number after a case group was added, which is the count reading
-    # as evidence when it is not counting the cases that actually ran.
+    # cache-key groups (issue #1923) and the four fail-closed rule tables
+    # (issue #1225 N_step9), each judged directly with every refusal re-judged
+    # through verify_all (dispatch_probes). The reported count is derived from
+    # the case lists themselves: a hardcoded total would keep reporting PASS
+    # with the same number after a case group was added, which is the count
+    # reading as evidence when it is not counting the cases that actually ran.
     case_count = (
         len(test_cases)
         + len(divergence_cases)
@@ -2445,6 +2560,8 @@ def run_self_tests() -> int:
         + len(second_step_cases)
         + len(coverage_cases)
         + 1
+        + sum(len(cases) for _, _, _, cases in fail_closed_tables)
+        + dispatch_probes
     )
     print(f"GITHUB_WORKFLOW_VERIFIER_SELF_TEST: PASS ({case_count}/{case_count} cases verified)")
     return 0

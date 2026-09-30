@@ -1,0 +1,13 @@
+name: Manual Gate
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  t:
+    runs-on: windows-latest
+    steps:
+      # N_step9 negative fixture: a restore without --locked-mode may silently
+      # resolve a new graph instead of failing on drift, so
+      # check_dotnet_restore_lock must refuse it with GWF-012.
+      - run: dotnet restore apps/Eliot.Operator/Eliot.Operator.csproj

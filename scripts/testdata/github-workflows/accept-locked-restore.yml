@@ -1,0 +1,12 @@
+name: Manual Gate
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  t:
+    runs-on: windows-latest
+    steps:
+      # N_step9 accepted fixture: locked-mode restore against the checked-in
+      # packages.lock.json. check_dotnet_restore_lock must stay silent.
+      - run: dotnet restore apps/Eliot.Operator/Eliot.Operator.csproj --locked-mode
