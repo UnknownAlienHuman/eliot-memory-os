@@ -1199,6 +1199,18 @@ pub fn ensure_eligible(
     Ok(owner.ors.mark_eligible(token)?)
 }
 
+/// Waits for one exact staged reservation to pass the durable eligibility
+/// transition, using the current identity owned by this composition binding.
+pub async fn wait_until_eligible(
+    owner: &CompositionReservation,
+    token: &WriterReservationToken,
+) -> Result<ReservationRecord, ReservationWriteError> {
+    Ok(owner
+        .ors
+        .wait_until_eligible(token, owner.writer_identity())
+        .await?)
+}
+
 /// Starts execution only after the single Store send resolved, under the
 /// exact immutable writer epoch.
 ///
