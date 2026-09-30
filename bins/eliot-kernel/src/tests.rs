@@ -3160,7 +3160,10 @@ async fn daemon_readiness_requires_fresh_running_executor_receipt() {
         state.receipt = Some(receipt.clone());
     }
 
-    let inspection = gateway.inspect_exact_running_receipt(&receipt).await;
+    let context = ProcessExecutionGateway::operation_context_for(&owner, receipt.operation_id());
+    let inspection = gateway
+        .inspect_exact_running_receipt_in_context(&receipt, &context)
+        .await;
     assert!(
         inspection.is_ok(),
         "gateway exact inspection must accept the live receipt: {inspection:?}"
