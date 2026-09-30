@@ -9474,7 +9474,7 @@ impl KernelComposition {
         for readback in actual_ordering_heads {
             let head = readback.head;
             head.validate().map_err(|error| error.to_string())?;
-            if !seen_ordering_scopes.insert(head.scope.as_str()) {
+            if !seen_ordering_scopes.insert(head.scope.clone()) {
                 return Err("canonical ordering-head observation contains duplicates".to_owned());
             }
             let canonical_head =

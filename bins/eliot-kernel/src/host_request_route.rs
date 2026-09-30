@@ -68,8 +68,8 @@ use eliot_kernel_service::{
 };
 use eliot_observability_runtime::{ModuleIdentity, WorkClass};
 use eliot_ors::{
-    CONTRACT_VERSION as ORS_CONTRACT_VERSION, HostRequestAttempt, HostRequestEffectEvidence,
-    HostRequestObserveResult,
+    CONTRACT_VERSION as ORS_CONTRACT_VERSION, HostRequestAttempt, HostRequestAttemptPhase,
+    HostRequestEffectEvidence, HostRequestObserveResult,
     HostRequestApplicationBinding, HostRequestExecutableInput,
     HostRequestExecutableInputEncoding,
     HostRequestKind as OrsHostRequestKind, HostRequestRecord, HostRequestRetainedLineage,
@@ -5116,7 +5116,7 @@ impl KernelComposition {
             let admitted = self.admit_host_request_envelope_with_observe_input_under_transition(
                 envelope,
                 task_relative_tool,
-                tool,
+                Some(tool),
                 source_request_identity,
             )?;
             self.remove_observe_pair_if_not_executable(
@@ -5133,7 +5133,7 @@ impl KernelComposition {
         let admitted = match self.admit_host_request_envelope_with_observe_input_under_transition(
             envelope,
             task_relative_tool,
-            tool,
+            Some(tool),
             source_request_identity,
         ) {
             Ok(admitted) => admitted,
@@ -5313,6 +5313,8 @@ impl KernelComposition {
                     return Err(TransportError::IdentityConflict);
                 }
                 let scope = observation_owner_scope_ref(&readback.owner_projection_value)?;
+                let owner_scope = OpaqueLabel::new(scope.to_owned())
+                    .map_err(|_| TransportError::SessionFenced)?;
                 if envelope.identity.work_scope_id.as_deref().is_some_and(|claimed| claimed != scope) {
                     return Err(TransportError::IdentityConflict);
                 }
@@ -5322,7 +5324,7 @@ impl KernelComposition {
                     None,
                     None,
                     None,
-                    Some(OpaqueLabel::new(scope.to_owned()).map_err(|_| TransportError::SessionFenced)?),
+                    Some(owner_scope),
                     None,
                     None,
                     None,
@@ -6162,6 +6164,12 @@ impl KernelComposition {
                     owner_launch_nonce: durable_attempt.owner_launch_nonce.as_str().to_owned(),
                     owner_session_epoch: durable_attempt.owner_session_epoch,
                 };
+                let claimed_record = self
+                    .generation_gateway
+                    .ors
+                    .load_host_request(&operation_id, &request_digest)
+                    .map_err(|_| TransportError::SessionFenced)?
+                    .ok_or(TransportError::UnknownRequest)?;
                 let owner_scope = claimed_record
                     .scope_ref
                     .as_ref()
@@ -6186,16 +6194,10 @@ impl KernelComposition {
                     owner_scope,
                     host_peer_origin,
                 )?;
-                let claimed_record = self
-                    .generation_gateway
-                    .ors
-                    .load_host_request(&operation_id, &request_digest)
-                    .map_err(|_| TransportError::SessionFenced)?
-                    .ok_or(TransportError::UnknownRequest)?;
                 let claimed_durable_attempt = claimed_record
                     .attempt
                     .as_ref()
-                    .filter(|stored_attempt| stored_attempt == &durable_attempt)
+                    .filter(|stored_attempt| **stored_attempt == durable_attempt)
                     .cloned()
                     .ok_or(TransportError::SessionFenced)?;
                 claimed_record
@@ -6417,7 +6419,7 @@ impl KernelComposition {
                     || (!host_peer_origin
                         && (presented.wire_version != LocalReadAttempt::CONTRACT_VERSION
                             || presented.session_id.as_deref() != expected_session))
-                    || provenance.effect_evidence != stored.effect_evidence
+                    || provenance.effect_evidence != stored.result_evidence
                     || provenance.result_lineage != stored.result_lineage
                 {
                     return Err(TransportError::IdentityConflict);
@@ -6698,7 +6700,7 @@ impl KernelComposition {
             .generation_gateway
             .ors
             .persist_host_request_observe_result(
-                &HostRequestObserveResult {
+                HostRequestObserveResult {
                     operation_id: &operation_id,
                     request_digest: &body.request_sha256,
                     attempt: &durable_attempt,
