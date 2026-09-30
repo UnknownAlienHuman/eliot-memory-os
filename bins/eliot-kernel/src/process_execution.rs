@@ -310,6 +310,11 @@ pub(crate) struct GovernedProcessEffectSource {
 /// governed change reconciles it. A transition the adapter cannot confirm
 /// keeps the retained digest for the next capture instead of advancing
 /// past evidence the ledger never admitted.
+/// Fail-closed ordering (#1824 defect 4): `read_after` never publishes;
+/// `ingest` advances a target's retained digest only after
+/// [`change_monitor::confirm_hint`] admits its transition, so a
+/// conflicted or refused ingest leaves the prior digest current and the
+/// next capture still observes the unadmitted delta.
 /// Per-artifact last-observed
 /// digests are retained here under one mutex (atomic publish); the ledger
 /// itself stays the only acceptance gate.
@@ -344,6 +349,21 @@ impl KernelGovernedProcessEffectPort {
             target_digest.clone(),
             format!("process-target/{target_digest}"),
         )
+    }
+
+    /// Advances the retained last-observed digest for one tracked resource
+    /// after the ledger confirmed its transition (publish-after-ingest,
+    /// I10.21 fail-closed ordering). Called only when
+    /// [`change_monitor::confirm_hint`] admits the transition: a hint
+    /// conflict (`continue` before confirmation) or a typed confirmation
+    /// refusal never reaches it, so the prior digest stays current, the
+    /// next capture still observes the unadmitted delta, and acceptance
+    /// stays blocked. A poisoned mutex publishes nothing; the next capture
+    /// retries instead of fencing the tool.
+    fn publish_observed(&self, resource: &str, after_digest: &str) {
+        if let Ok(mut last) = self.last_observed.lock() {
+            last.insert(resource.to_owned(), after_digest.to_owned());
+        }
     }
 
     /// Confirms one unexplained tracked-source transition through the
@@ -647,9 +667,11 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
                 observe_process("kernel.process.effect_readback_failed", "unobserved");
                 continue;
             };
-            if let Ok(mut last) = self.last_observed.lock() {
-                last.insert(base.resource.clone(), first_digest.clone());
-            }
+            // Fail-closed ordering (#1824 defect 4): readback only collects
+            // evidence and never advances the retained digest. Publication
+            // happens in `ingest` after the ledger confirms the transition,
+            // so a refused or swallowed ingest leaves the prior digest
+            // current and the next capture still observes the delta.
             targets.push(EffectTargetReceipt {
                 path: base.path.clone(),
                 after_bytes,
@@ -716,6 +738,7 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
             };
             match change_monitor::confirm_hint(&hint_id, &verification) {
                 Ok(change_monitor::HintConfirmation::VerifiedImmaterial) => {
+                    self.publish_observed(&base.resource, &back.after_first_digest);
                     observe_process("kernel.process.effect_observed", "immaterial");
                 }
                 Ok(change_monitor::HintConfirmation::MaterialRecorded {
@@ -727,6 +750,12 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
                     // record. A refused record reconciles nothing: the
                     // unknown-origin change stays unreconciled and keeps
                     // blocking governed acceptance until reconciled.
+                    // Publish-after-ingest: the ledger admitted the transition
+                    // (reconciled, or a blocking unknown-origin record when
+                    // unreconciled), so the retained digest may advance. A
+                    // refused confirmation below never reaches this arm and
+                    // keeps the prior digest for the next capture.
+                    self.publish_observed(&base.resource, &back.after_first_digest);
                     let mut outcome = if reconciled { "reconciled" } else { "material" };
                     if !reconciled
                         && let Some(transition) = recorded_transition.as_deref()
