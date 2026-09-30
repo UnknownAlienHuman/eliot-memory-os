@@ -29,15 +29,15 @@ use eliot_kernel_service::{
     AuthenticatedUserAutomationHostExecutionTransport, NamedReadGatewayError, PreStageRejection,
     StoreApplyRefusal, UserAutomationDueWakeRejection, UserAutomationDueWakeResolution,
     UserAutomationDurableJobPort, UserAutomationHorizonOutcome, UserAutomationHorizonPhase,
-    UserAutomationHorizonTrigger, UserAutomationHostExecutionClient,
-    UserAutomationHostExecutionOperation, UserAutomationHostExecutionTransport,
-    UserAutomationOperatorRuntime, UserAutomationOwnerLookup, UserAutomationRuntimeAdmission,
-    UserAutomationRuntimeError, UserAutomationWakeCancellation,
-    UserAutomationWakeEnumerationReceipt, UserAutomationWakeEnumerationRequest,
-    UserAutomationWakeHorizonPublication, UserAutomationWakeOccurrenceDisposition,
-    UserAutomationWakePort, UserAutomationWakePublication, UserAutomationWakeReadRequest,
-    UserAutomationWakeReadback, advance_wake_horizon, horizon_retry_handle, refuse_consumed_wake,
-    resolve_due_wake,
+    UserAutomationHorizonPublicationRefusal, UserAutomationHorizonTrigger,
+    UserAutomationHostExecutionClient, UserAutomationHostExecutionOperation,
+    UserAutomationHostExecutionTransport, UserAutomationOperatorRuntime, UserAutomationOwnerLookup,
+    UserAutomationRuntimeAdmission, UserAutomationRuntimeError, UserAutomationRuntimeObligation,
+    UserAutomationWakeCancellation, UserAutomationWakeEnumerationReceipt,
+    UserAutomationWakeEnumerationRequest, UserAutomationWakeHorizonPublication,
+    UserAutomationWakeOccurrenceDisposition, UserAutomationWakePort, UserAutomationWakePublication,
+    UserAutomationWakeReadRequest, UserAutomationWakeReadback, advance_wake_horizon,
+    horizon_retry_handle, refuse_consumed_wake, resolve_due_wake,
 };
 use eliot_kernel_service::{
     IrreversibleStorageEffect, StorageReplacement, StorageReplacementCutoverReceipt,
@@ -6810,6 +6810,20 @@ impl KernelComposition {
             UserAutomationDueWakeRead::Proven(readback) => readback,
             UserAutomationDueWakeRead::Answer(answer) => return Ok(answer),
         };
+        // The occurrence is proved from here on: the resolution above is the
+        // canonical revision this carrier was read against and the readback
+        // above is the schedule owner's own pending record for it. Every step
+        // below reports, joins or advances THIS occurrence, so the six facts
+        // that identify it are bound once here instead of being restated as
+        // trailing parameters on each of those steps.
+        let proven = UserAutomationProvenDueWake {
+            session,
+            occurrence_id: &occurrence_id,
+            client,
+            request: &request,
+            resolution: &resolution,
+            readback: &readback,
+        };
         // One stable occurrence may produce at most one admitted job/effect. The
         // carrier is the same owner-issued admission `run-now` uses, so the
         // Durable Job owner's own operation identity is the at-most-once
@@ -6866,19 +6880,15 @@ impl KernelComposition {
             // effect provably landed. Those keep the pre-existing fail-closed
             // projection and do not advance.
             Err(UserAutomationRuntimeError::Rejected(reason)) => {
-                return Self::user_automation_due_wake_decided_response(
-                    session,
-                    &resolution,
-                    &occurrence_id,
-                    &request,
-                    &readback,
-                    client,
-                    DecidedDisposition {
-                        outcome: "rejected",
-                        reason,
-                    },
-                )
-                .await;
+                return self
+                    .user_automation_due_wake_decided_response(
+                        &proven,
+                        DecidedDisposition {
+                            outcome: "rejected",
+                            reason,
+                        },
+                    )
+                    .await;
             }
             Err(error) => {
                 // No owner acknowledged a disposition, so the recurring horizon
@@ -6893,16 +6903,8 @@ impl KernelComposition {
         // owner decided before any effect, or the one execution reference the
         // owner issued is validated against the occurrence the schedule owner
         // resolved and the recurring horizon advances beside it.
-        Self::user_automation_due_wake_execution_response(
-            session,
-            &occurrence_id,
-            client,
-            &request,
-            &resolution,
-            &readback,
-            outcome,
-        )
-        .await
+        self.user_automation_due_wake_execution_response(&proven, outcome)
+            .await
     }
 
     /// Materialises the execution join's own answer into this route's response
@@ -6933,58 +6935,45 @@ impl KernelComposition {
     /// order.
     #[cfg(windows)]
     async fn user_automation_due_wake_execution_response(
-        session: &Session,
-        occurrence_id: &str,
-        client: &UserAutomationHostExecutionClient<
-            AuthenticatedUserAutomationHostExecutionTransport,
-        >,
-        request: &UserAutomationRuntimeAdmission,
-        resolution: &UserAutomationDueWakeResolution,
-        readback: &UserAutomationWakeReadback,
+        &self,
+        proven: &UserAutomationProvenDueWake<'_>,
         outcome: eliot_kernel_service::UserAutomationExecutionOutcome,
     ) -> Result<serde_json::Value, TransportError> {
+        let occurrence_id = proven.occurrence_id;
         let execution = match outcome {
             eliot_kernel_service::UserAutomationExecutionOutcome::Admitted {
                 execution, ..
             } => execution,
             eliot_kernel_service::UserAutomationExecutionOutcome::Deferred { reason, .. } => {
-                return Self::user_automation_due_wake_decided_response(
-                    session,
-                    resolution,
-                    occurrence_id,
-                    request,
-                    readback,
-                    client,
-                    DecidedDisposition {
-                        outcome: "deferred",
-                        reason: format!(
-                            "the deterministic preflight deferred occurrence {occurrence_id} with \
-                             reason {reason:?}, before any model or provider call"
-                        ),
-                    },
-                )
-                .await;
+                return self
+                    .user_automation_due_wake_decided_response(
+                        proven,
+                        DecidedDisposition {
+                            outcome: "deferred",
+                            reason: format!(
+                                "the deterministic preflight deferred occurrence {occurrence_id} \
+                                 with reason {reason:?}, before any model or provider call"
+                            ),
+                        },
+                    )
+                    .await;
             }
             eliot_kernel_service::UserAutomationExecutionOutcome::BlockedConfig {
                 failure, ..
             } => {
-                return Self::user_automation_due_wake_decided_response(
-                    session,
-                    resolution,
-                    occurrence_id,
-                    request,
-                    readback,
-                    client,
-                    DecidedDisposition {
-                        outcome: "blocked_config",
-                        reason: format!(
-                            "occurrence {occurrence_id} entered blocked_config under failure \
-                             fingerprint {} before any model call",
-                            failure.failure_fingerprint
-                        ),
-                    },
-                )
-                .await;
+                return self
+                    .user_automation_due_wake_decided_response(
+                        proven,
+                        DecidedDisposition {
+                            outcome: "blocked_config",
+                            reason: format!(
+                                "occurrence {occurrence_id} entered blocked_config under failure \
+                                 fingerprint {} before any model call",
+                                failure.failure_fingerprint
+                            ),
+                        },
+                    )
+                    .await;
             }
         };
         if let Err(error) = execution.validate() {
@@ -6997,16 +6986,9 @@ impl KernelComposition {
                 UserAutomationRuntimeError::IdentityConflict,
             ));
         }
-        Ok(Self::user_automation_due_wake_admitted_value(
-            session,
-            resolution,
-            occurrence_id,
-            request,
-            readback,
-            client,
-            execution,
-        )
-        .await)
+        Ok(self
+            .user_automation_due_wake_admitted_value(proven, execution)
+            .await)
     }
 
     /// Advances the recurring horizon after an owner-acknowledged admission and
@@ -7019,35 +7001,29 @@ impl KernelComposition {
     /// also reports a settled answer, because the resolved revision owns no wake
     /// horizon after the admitted occurrence rather than because an owner was
     /// missing.
+    ///
+    /// The durable obligation the advance retained is reported beside that phase
+    /// under its ORIGINAL owner operation identity, so a horizon whose owner
+    /// answer was lost is reported as an outstanding durable record a later
+    /// attempt resumes, not only as a phase whose remainder has to be re-derived
+    /// from the committed configuration.
     #[cfg(windows)]
     async fn user_automation_due_wake_admitted_value(
-        session: &Session,
-        resolution: &UserAutomationDueWakeResolution,
-        occurrence_id: &str,
-        request: &UserAutomationRuntimeAdmission,
-        readback: &UserAutomationWakeReadback,
-        client: &UserAutomationHostExecutionClient<
-            AuthenticatedUserAutomationHostExecutionTransport,
-        >,
+        &self,
+        proven: &UserAutomationProvenDueWake<'_>,
         execution: eliot_kernel_core::user_automation::AutomationExecutionReference,
     ) -> serde_json::Value {
-        let advance = Self::user_automation_due_wake_horizon(
-            session,
-            resolution,
-            occurrence_id,
-            request,
-            client,
-        )
-        .await;
+        let advance = self.user_automation_due_wake_horizon(proven).await;
         let recovery = Self::user_automation_horizon_recovery(&advance);
         serde_json::json!({
             "status": if recovery.is_none() { "known" } else { "unknown" },
             "value": {
                 "outcome": "admitted",
                 "execution": execution,
-                "resolution": resolution,
-                "wake_readback": readback,
+                "resolution": proven.resolution,
+                "wake_readback": proven.readback,
                 "horizon": Self::user_automation_horizon_value(&advance),
+                "horizon_obligation": Self::user_automation_horizon_obligation(&advance),
             },
             "recovery": recovery,
         })
@@ -7122,26 +7098,19 @@ impl KernelComposition {
     /// consumed horizon owes the caller nothing, which is the same convention
     /// `user_automation_runtime_error_response` already uses for
     /// `UserAutomationRuntimeError::Rejected`.
+    ///
+    /// The durable obligation the advance retained is reported beside that phase
+    /// under its ORIGINAL owner operation identity, for the same reason the
+    /// admitted arm reports it: a decided occurrence still advances a real wake
+    /// horizon, and an advance whose owner answer was lost is an outstanding
+    /// durable record rather than only a remainder.
     #[cfg(windows)]
     async fn user_automation_due_wake_decided_response(
-        session: &Session,
-        resolution: &UserAutomationDueWakeResolution,
-        occurrence_id: &str,
-        request: &UserAutomationRuntimeAdmission,
-        readback: &UserAutomationWakeReadback,
-        client: &UserAutomationHostExecutionClient<
-            AuthenticatedUserAutomationHostExecutionTransport,
-        >,
+        &self,
+        proven: &UserAutomationProvenDueWake<'_>,
         disposition: DecidedDisposition<'_>,
     ) -> Result<serde_json::Value, TransportError> {
-        let advance = Self::user_automation_due_wake_horizon(
-            session,
-            resolution,
-            occurrence_id,
-            request,
-            client,
-        )
-        .await;
+        let advance = self.user_automation_due_wake_horizon(proven).await;
         let recovery = Self::user_automation_horizon_recovery(&advance);
         Ok(serde_json::json!({
             "status": if recovery.is_none() { "known" } else { "unknown" },
@@ -7149,10 +7118,11 @@ impl KernelComposition {
                 "accepted": false,
                 "outcome": disposition.outcome,
                 "reason": disposition.reason,
-                "occurrence_id": occurrence_id,
-                "resolution": resolution,
-                "wake_readback": readback,
+                "occurrence_id": proven.occurrence_id,
+                "resolution": proven.resolution,
+                "wake_readback": proven.readback,
                 "horizon": Self::user_automation_horizon_value(&advance),
+                "horizon_obligation": Self::user_automation_horizon_obligation(&advance),
             },
             "recovery": recovery,
         }))
@@ -7270,16 +7240,45 @@ impl KernelComposition {
     /// failure projection below can consequently always be handed a non-empty
     /// remainder; an empty set there would claim that nothing is outstanding,
     /// which is the one answer this contour cannot prove.
+    ///
+    /// **The slice leaves this contour as a durable obligation, not as a bare
+    /// owner call.** The advance is issued through
+    /// `KernelStoreGateway::publish_due_wake_horizon_advance`, which retains the
+    /// publication's intent in the composition-bound durable outbox under the
+    /// admitted due-wake carrier's own parent identity BEFORE anything is handed
+    /// to the schedule owner, and settles the owner's answer as that record's
+    /// retained body. A lost response therefore leaves a record that a later
+    /// attempt of the same parent operation finds, and a later calendar
+    /// occurrence advances a different slice and so keys a different record -
+    /// I11.12's "a later calendar occurrence is a different identity" held in the
+    /// durable store rather than only in the compiler. The obligation the route
+    /// returns travels in the response beside the phase so an outstanding record
+    /// and its original owner operation identity are reportable.
     #[cfg(windows)]
     async fn user_automation_due_wake_horizon(
-        session: &Session,
-        resolution: &UserAutomationDueWakeResolution,
-        occurrence_id: &str,
-        request: &UserAutomationRuntimeAdmission,
-        client: &UserAutomationHostExecutionClient<
-            AuthenticatedUserAutomationHostExecutionTransport,
-        >,
+        &self,
+        proven: &UserAutomationProvenDueWake<'_>,
     ) -> UserAutomationHorizonAdvance {
+        // The advance is issued for the occurrence the schedule owner still
+        // offers as a pending wake, and that proof is what the resolution above
+        // was reached under. The readback BODY is not read again here: it names
+        // the intent this slice supersedes, and the publication request already
+        // carries that through the carrier, so re-reading it would be a second
+        // derivation rather than a fact.
+        let UserAutomationProvenDueWake {
+            session,
+            occurrence_id,
+            request,
+            resolution,
+            client,
+            readback: _,
+        } = *proven;
+        // The two refusals below keep their `Err` binding inside the divergent
+        // arm, because each one quotes the compiler's own closed reason in the
+        // text a caller reads, and a `let...else` cannot carry that binding
+        // across the divergence. They are `match`es by necessity, not by
+        // preference; the Store-owner arm further down has no such binding and
+        // is written as the `let...else` it is.
         let identities = match resolution.revision.compile_occurrence_identities() {
             Ok(identities) => identities,
             Err(error) => {
@@ -7315,8 +7314,8 @@ impl KernelComposition {
         ) {
             Ok(publication) => publication,
             Err(error) => {
-                return UserAutomationHorizonAdvance::Answered(
-                    Self::user_automation_unacknowledged_horizon(
+                return UserAutomationHorizonAdvance::Answered {
+                    phase: Box::new(Self::user_automation_unacknowledged_horizon(
                         resolution,
                         &denominator_occurrence_ids,
                         &request.identity,
@@ -7325,38 +7324,171 @@ impl KernelComposition {
                              compiled from its own normalized contract: {error}"
                         ),
                         false,
-                    ),
-                );
+                    )),
+                    // The slice was refused before this contour could hand one to
+                    // the retained-obligation route, so nothing was retained and
+                    // there is no record to report.
+                    obligation: None,
+                };
             }
         };
-        let requested_occurrence_ids = publication.requested_occurrence_ids();
         // No empty-slice guard is needed and none is kept: the compiler refuses
         // an exhausted cursor before it builds entries, and a consumed occurrence
         // that is not a member of the denominator is refused as a binding
         // mismatch, so a publication reaching this point always carries at least
         // one occurrence. An empty requested set here would be a claim that the
-        // revision is finished, which this contour does not decide.
-        match UserAutomationWakePort::publish_wake_horizon(client, publication.clone()).await {
-            Ok(acknowledgement) => {
-                UserAutomationHorizonAdvance::Answered(Self::user_automation_acknowledged_horizon(
+        // revision is finished, which this contour does not decide. The requested
+        // set itself is now the retained route's own input, so this arm does not
+        // recompute it a second time.
+        //
+        // The slice is issued through the canonical Store owner's retained
+        // obligation route, not by calling the schedule owner from here. That
+        // route - `KernelStoreGateway::publish_due_wake_horizon_advance` - is the
+        // SAME `retain_and_publish_wake_horizon` the operator route runs for a
+        // committed `Create`/`Resume`/`Edit`, over the SAME composition-bound
+        // durable outbox and the SAME `retained_user_automation_obligation` ->
+        // possible-effect marking -> acknowledgement settlement sequence. Calling
+        // `UserAutomationWakePort::publish_wake_horizon` from this composition
+        // binary, as this arm did, reached the owner with no retained record
+        // behind it, so a lost response to a post-disposition slice had nothing to
+        // resume from: that is the issue #2806 `W8` and lost-response `A3` gap,
+        // and re-deriving the obligation here instead would be a second durable
+        // write path and a second copy of the classification, which
+        // `bins/AGENTS.md` forbids in a composition root.
+        //
+        // The composition gateway is read and the lock released before the await,
+        // exactly as `user_automation_due_wake_join` does for the execution join,
+        // so no composition mutex is held across the owner call. The future is
+        // boxed for the same reason: the compiled denominator and the bounded
+        // publication both live across it.
+        let Ok(gateway) = self.retained_store_gateway() else {
+            // The route that retains this obligation is the canonical Store
+            // owner itself, so without it nothing can be retained and no
+            // schedule owner may be asked. That is not a clean absence: the
+            // whole compiled denominator is still owed, and it is reported
+            // under the exact remaining set and replay handle with an unknown
+            // outcome, so the response owes the caller a recovery directive
+            // rather than reporting the horizon finished.
+            return UserAutomationHorizonAdvance::Answered {
+                phase: Box::new(Self::user_automation_unacknowledged_horizon(
                     resolution,
-                    &publication,
-                    &requested_occurrence_ids,
-                    &acknowledgement,
-                ))
-            }
-            Err(error) => {
-                let reason = error.to_string();
-                let unknown = !matches!(error, UserAutomationRuntimeError::Unavailable(_));
-                UserAutomationHorizonAdvance::Answered(
-                    Self::user_automation_unacknowledged_horizon(
+                    &denominator_occurrence_ids,
+                    &request.identity,
+                    "the canonical UserAutomation Store owner that retains this advance's \
+                     obligation is unavailable, so nothing was retained, no schedule owner \
+                     was asked and nothing was issued",
+                    true,
+                )),
+                obligation: None,
+            };
+        };
+        let runtime = UserAutomationOperatorRuntime::new(client);
+        let answer = Box::pin(gateway.publish_due_wake_horizon_advance(
+            request,
+            resolution,
+            &publication,
+            &runtime,
+        ))
+        .await;
+        Self::user_automation_horizon_owner_answer(
+            answer,
+            resolution,
+            &denominator_occurrence_ids,
+            &request.identity,
+        )
+    }
+
+    /// Projects the canonical Store owner's own answer to one retained bounded
+    /// slice request into the closed advance vocabulary.
+    ///
+    /// The two arms are answers from the same owner about the same slice, and
+    /// both are projected over the SAME exact remaining occurrence set and the
+    /// replay handle derived from the immutable revision, so neither is a clean
+    /// absence of outstanding work.
+    #[cfg(windows)]
+    fn user_automation_horizon_owner_answer(
+        answer: Result<
+            (
+                Option<UserAutomationRuntimeObligation>,
+                UserAutomationHorizonPhase,
+            ),
+            UserAutomationHorizonPublicationRefusal,
+        >,
+        resolution: &UserAutomationDueWakeResolution,
+        denominator_occurrence_ids: &[String],
+        identity: &OperationIdentity,
+    ) -> UserAutomationHorizonAdvance {
+        match answer {
+            // A retained obligation is present exactly when a durable record backs
+            // this publication. It is reported under its ORIGINAL owner operation
+            // identity, which is the due-wake carrier's own parent identity rather
+            // than an identity minted for the advance, so a later attempt of the
+            // same parent operation resumes this record instead of publishing the
+            // slice a second time.
+            //
+            // A horizon phase alone could not carry that: it names the remaining
+            // set and a replay handle derived from the immutable revision, not the
+            // owner operation identity the record is written and reconciled
+            // under. Both travel together, or the caller could not tell a
+            // retained obligation from one that was never written.
+            Ok((obligation, phase)) => UserAutomationHorizonAdvance::Answered {
+                phase: Box::new(phase),
+                obligation,
+            },
+            // This refusal is a slice the retained route could not bind, name or
+            // project: a fence, carrier or revision-relative mismatch, a durable
+            // write that failed, or an owner answer it could not turn into a
+            // phase. It is projected as an unknown outcome over the exact
+            // remaining set, never as a clean absence.
+            //
+            // The two arms are NOT the same fact and must not render one claim.
+            // `Retained` means the durable record was written and its owner
+            // answer settled before this projection step failed: the record
+            // exists, it lives under the ORIGINAL owner operation identity the
+            // route derived, and it is the only handle that can reconcile it.
+            // `NothingRetained` means the route failed before that identity
+            // existed, so nothing was ever created and nothing needs deleting.
+            // Rendering one sentence for both is the defect this arm exists to
+            // remove: a status line that denies a retained record while the
+            // record sits behind it leaves the slice permanently unreconcilable,
+            // which is exactly what I14.21 forbids.
+            //
+            // `detail` is rendered BEFORE the move, so both arms quote the
+            // route's own closed reason verbatim rather than a paraphrase.
+            Err(refusal) => {
+                // The route's own rendering is taken BY REFERENCE first, because
+                // the typed arm is consumed on the next line and a `Display` text
+                // about a record that exists must not be re-derived by hand here.
+                // On `Retained` this text already ends with the owner operation
+                // identity the record lives under; on `NothingRetained` it is the
+                // bare closed reason.
+                let detail = refusal.to_string();
+                let obligation = refusal.into_retained_obligation();
+                UserAutomationHorizonAdvance::Answered {
+                    phase: Box::new(Self::user_automation_unacknowledged_horizon(
                         resolution,
-                        &denominator_occurrence_ids,
-                        &request.identity,
-                        &reason,
-                        unknown,
-                    ),
-                )
+                        denominator_occurrence_ids,
+                        identity,
+                        &match obligation {
+                            None => format!(
+                                "the canonical UserAutomation Store owner returned no retained \
+                                 obligation for this bounded slice and established no owner \
+                                 operation identity for it, so no record exists to reconcile: \
+                                 {detail}"
+                            ),
+                            Some(ref retained) => format!(
+                                "the canonical UserAutomation Store owner retained this bounded \
+                                 slice under owner operation identity {} and settled the owner's \
+                                 answer into it, so the record must be reported and reconciled \
+                                 under that original identity and must not be re-issued: \
+                                 {detail}",
+                                retained.owner_operation_id
+                            ),
+                        },
+                        true,
+                    )),
+                    obligation,
+                }
             }
         }
     }
@@ -7440,109 +7572,6 @@ impl KernelComposition {
         }
     }
 
-    /// Projects one owner-acknowledged horizon answer.
-    ///
-    /// A published horizon is an owner acknowledgement of every requested
-    /// occurrence. A partial answer keeps the exact remaining set and the owner's
-    /// own replay handle beside the reason, so it can never be read as a
-    /// published wake set. An answer that does not account for the request is
-    /// treated as unknown rather than as a partial success, because a
-    /// mismatched remainder is not evidence about any occurrence.
-    #[cfg(windows)]
-    fn user_automation_acknowledged_horizon(
-        resolution: &UserAutomationDueWakeResolution,
-        publication: &UserAutomationWakeHorizonPublication,
-        requested_occurrence_ids: &[String],
-        acknowledgement: &UserAutomationWakePublication,
-    ) -> UserAutomationHorizonPhase {
-        if let Err(error) = acknowledgement.validate_for(publication) {
-            return Self::user_automation_unacknowledged_horizon(
-                resolution,
-                requested_occurrence_ids,
-                &publication.identity,
-                &format!(
-                    "the schedule owner answer does not account for the requested horizon: {error}"
-                ),
-                true,
-            );
-        }
-        // One flight is bounded (issue #2806 item 10): the owner acknowledged
-        // only the requested prefix, so the denominator tail past this flight
-        // is still owed. It joins the owner's own remaining set, and a
-        // non-empty combined remainder forces `Partial` with a handle over the
-        // exact combined set — never a `Published` horizon for occurrences that
-        // were never sent.
-        let tail = match publication.uncapped_tail_ids() {
-            Ok(tail) => tail,
-            Err(error) => {
-                return Self::user_automation_unacknowledged_horizon(
-                    resolution,
-                    requested_occurrence_ids,
-                    &publication.identity,
-                    &format!(
-                        "the bounded horizon slice after the admitted occurrence does not account \
-                         for its own denominator tail: {error}"
-                    ),
-                    true,
-                );
-            }
-        };
-        let mut remaining_occurrence_ids = acknowledgement.remaining_occurrence_ids.clone();
-        remaining_occurrence_ids.extend(tail.iter().cloned());
-        let publication_operation_id = Box::new(acknowledgement.publication_operation_id.clone());
-        let (outcome, retry_handle) = if remaining_occurrence_ids.is_empty()
-            && acknowledgement.acknowledged_all()
-        {
-            (
-                UserAutomationHorizonOutcome::Published {
-                    publication_operation_id,
-                },
-                acknowledgement.retry_handle.clone(),
-            )
-        } else {
-            let retry_handle = match publication.retry_handle(&remaining_occurrence_ids) {
-                Ok(retry_handle) => retry_handle,
-                Err(error) => {
-                    return Self::user_automation_unacknowledged_horizon(
-                        resolution,
-                        requested_occurrence_ids,
-                        &publication.identity,
-                        &format!(
-                            "the combined horizon remainder after the admitted occurrence cannot \
-                             be named for replay: {error}"
-                        ),
-                        true,
-                    );
-                }
-            };
-            (
-                UserAutomationHorizonOutcome::Partial {
-                    publication_operation_id,
-                    reason: format!(
-                        "the schedule owner acknowledged {} of the {} requested occurrences that \
-                         follow the admitted one; {} further occurrence(s) past the single-flight \
-                         bound were never sent; the exact remaining set is retained and must be \
-                         replayed under its handle",
-                        acknowledgement.acknowledged_occurrence_ids.len(),
-                        requested_occurrence_ids.len(),
-                        tail.len()
-                    ),
-                },
-                retry_handle,
-            )
-        };
-        UserAutomationHorizonPhase {
-            trigger: publication.trigger,
-            automation_id: publication.automation_id.clone(),
-            automation_revision: publication.automation_revision.clone(),
-            revision_digest: publication.revision_digest.clone(),
-            remaining_occurrence_ids,
-            requested_occurrence_ids: requested_occurrence_ids.to_vec(),
-            retry_handle,
-            outcome,
-        }
-    }
-
     /// Projects the recovery directive of one post-disposition horizon advance,
     /// including the exact remaining occurrence set and the replay handle the
     /// caller must use.
@@ -7561,7 +7590,7 @@ impl KernelComposition {
         advance: &UserAutomationHorizonAdvance,
     ) -> Option<serde_json::Value> {
         let horizon = match advance {
-            UserAutomationHorizonAdvance::Answered(horizon) => horizon,
+            UserAutomationHorizonAdvance::Answered { phase, .. } => phase,
             // The resolved revision's complete normalized denominator is
             // consumed at this occurrence, so this advance owns no wake-horizon
             // obligation and there is no owner effect to reconcile. A recovery
@@ -7606,7 +7635,41 @@ impl KernelComposition {
         advance: &UserAutomationHorizonAdvance,
     ) -> Option<&UserAutomationHorizonPhase> {
         match advance {
-            UserAutomationHorizonAdvance::Answered(horizon) => Some(horizon),
+            UserAutomationHorizonAdvance::Answered { phase, .. } => Some(phase.as_ref()),
+            UserAutomationHorizonAdvance::Exhausted
+            | UserAutomationHorizonAdvance::Unresolved { .. } => None,
+        }
+    }
+
+    /// Projects the durable obligation one post-disposition horizon advance
+    /// retained, beside that advance's own phase.
+    ///
+    /// The advance now issues its slice through the canonical Store owner's
+    /// retained-obligation route, and that route returns the obligation it
+    /// actually wrote. Reporting only the phase would drop the one field that
+    /// says WHICH record exists: `owner_operation_id` is the original owner
+    /// operation identity the record is written and reconciled under, and the
+    /// horizon phase carries only a replay handle derived from the immutable
+    /// revision. A caller that lost a publication response needs both to resume
+    /// the same record rather than re-derive a handle from the committed
+    /// configuration.
+    ///
+    /// `None` is reported as an explicit absence of a REPORTED record, not as an
+    /// implied settled horizon, and it is the honest answer for the arms that
+    /// never reach the owner at all: a consumed denominator, a revision that
+    /// cannot compile its own denominator, and a canonical Store owner that could
+    /// not be reached all retain nothing, so there is no record a reconciliation
+    /// could read. A slice the retained route refused is reported the same way,
+    /// because that route returned no obligation - the accompanying reason says
+    /// so rather than claiming that no record was written. Those arms still owe
+    /// the caller their exact remaining set and recovery directive through the
+    /// phase.
+    #[cfg(windows)]
+    fn user_automation_horizon_obligation(
+        advance: &UserAutomationHorizonAdvance,
+    ) -> Option<&UserAutomationRuntimeObligation> {
+        match advance {
+            UserAutomationHorizonAdvance::Answered { obligation, .. } => obligation.as_ref(),
             UserAutomationHorizonAdvance::Exhausted
             | UserAutomationHorizonAdvance::Unresolved { .. } => None,
         }
@@ -11404,7 +11467,32 @@ enum UserAutomationDueWakeRead {
 #[cfg(windows)]
 enum UserAutomationHorizonAdvance {
     /// The schedule owner answered one bounded slice request.
-    Answered(UserAutomationHorizonPhase),
+    ///
+    /// The phase and the obligation travel together because neither identifies
+    /// the publication on its own. The phase names WHAT is still owed; the
+    /// obligation names the durable record that was written for it, under the
+    /// ORIGINAL owner operation identity the record is issued and reconciled
+    /// under. A later attempt of the same parent operation resumes that record
+    /// instead of publishing the slice again, so a response that reported only
+    /// the phase would name a remaining set with no record to resume from.
+    Answered {
+        /// The schedule owner's own horizon phase, or the refusal projection
+        /// this contour composes when no such answer arrived.
+        ///
+        /// Boxed so the closed advance stays a value this contour can hold, move
+        /// and return the way the other two arms are, instead of making every
+        /// `Answered` move carry the whole compiled phase inline while
+        /// `Exhausted` and `Unresolved` carry almost nothing. The box is an
+        /// allocation detail only: `Box<T>` serializes and deserializes exactly
+        /// as `T`, so the reported `horizon` value is byte-identical, and this
+        /// enum derives no schema of its own - the phase is projected into
+        /// `serde_json::json!` by reference, through
+        /// [`Self::user_automation_horizon_value`], so no wire output moves.
+        phase: Box<UserAutomationHorizonPhase>,
+        /// The retained obligation, or `None` when this answer was reached before
+        /// anything was retained and therefore wrote no record.
+        obligation: Option<UserAutomationRuntimeObligation>,
+    },
     /// The resolved revision's complete normalized denominator is consumed at
     /// this occurrence, so this advance owns no wake-horizon obligation.
     Exhausted,
@@ -11414,6 +11502,47 @@ enum UserAutomationHorizonAdvance {
         /// Closed reason the horizon could not be composed at all.
         reason: String,
     },
+}
+
+/// The owner-proven resolution of exactly one due authenticated wake.
+///
+/// A due wake is proved once, in two steps no later step repeats:
+/// `revalidate_user_automation_due_wake` resolves the carrier against the
+/// canonical revision the Store owner currently retains, and
+/// `user_automation_due_wake_readback` proves the schedule owner still offers
+/// this occurrence as a pending wake. Everything downstream of that proof - the
+/// horizon advance, the execution join and both response projections - reads
+/// the same facts about the same occurrence, and spelling them out as five
+/// trailing parameters on each of those steps is what pushed three of them past
+/// the arity the compiler accepts. Binding them once names the thing they
+/// already are rather than inventing a carrier for them.
+///
+/// `session` and `client` are part of the proof and not ambient context: the
+/// State Fence in `session` is the fence the resolution and the readback were
+/// read at, and `client` is the already-authenticated Host channel the two
+/// owners answered on. A step handed a resolution without them could name a
+/// different fence, or ask a different channel, than the one that proved it.
+///
+/// `occurrence_id` is the occurrence re-derived from the resolved revision's
+/// own normalized denominator and proved against the owner's journal. It is
+/// carried rather than re-derived because re-deriving it per step would be a
+/// second derivation of an identity the contour has already fixed, and every
+/// step here reports that exact id as the occurrence the answer is about.
+#[cfg(windows)]
+struct UserAutomationProvenDueWake<'a> {
+    /// Authenticated session both proofs were read under.
+    session: &'a Session,
+    /// Exact occurrence the schedule owner still offers as a pending wake.
+    occurrence_id: &'a str,
+    /// Authenticated Host execution channel bound to the current State Fence.
+    client:
+        &'a UserAutomationHostExecutionClient<AuthenticatedUserAutomationHostExecutionTransport>,
+    /// The admitted due-wake carrier this occurrence was proved from.
+    request: &'a UserAutomationRuntimeAdmission,
+    /// The owner-proven resolution of that carrier against the canonical revision.
+    resolution: &'a UserAutomationDueWakeResolution,
+    /// The schedule owner's own retained record read back for this occurrence.
+    readback: &'a UserAutomationWakeReadback,
 }
 
 /// The decided disposition one terminal due-wake occurrence reports.
