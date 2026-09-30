@@ -160,7 +160,9 @@ use eliot_governor::{
 use eliot_integration_coverage::{GovernanceProfile, IntegrationCoverageProfile};
 use eliot_observation::TaskSelectionEvidence;
 use eliot_ors::{
-    OrsError, ScanDisclosureOrsRecord, ScanDisclosureRecordOwner, ScanDisclosureStageOutcome,
+    ColdStartReadinessClaim, ColdStartReadinessOrsRecord, ColdStartReadinessRecordOwner,
+    ColdStartReadinessStageOutcome, ColdStartReadinessTerminalDisposition, OrsError,
+    ScanDisclosureOrsRecord, ScanDisclosureRecordOwner, ScanDisclosureStageOutcome,
 };
 use eliot_protocol::{
     AgentActivationCandidateCoverage, AgentActivationResolutionDisposition,
@@ -258,6 +260,57 @@ enum ScanDisclosureOwnerRpcResult {
     },
     Records {
         records: Vec<ScanDisclosureOrsRecord>,
+    },
+}
+
+#[derive(serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct ColdStartReadinessOwnerRpcRequest<'a> {
+    wire_version: u16,
+    application_connection_id: &'a str,
+    activation_ticket_id: &'a str,
+    #[serde(flatten)]
+    action: ColdStartReadinessOwnerRpcAction<'a>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+enum ColdStartReadinessOwnerRpcAction<'a> {
+    ReadinessClaim {
+        claim: &'a ColdStartReadinessClaim,
+    },
+    ReadinessPublish {
+        record_key: &'a str,
+        binding_digest: &'a str,
+        lease_ref: &'a str,
+        disposition: ColdStartReadinessTerminalDisposition,
+        receipt_ref: &'a str,
+        receipt_bytes: &'a str,
+    },
+    ReadinessLoad {
+        record_key: &'a str,
+    },
+    ReadinessLoadForBinding {
+        binding_digest: &'a str,
+    },
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ColdStartReadinessOwnerRpcResponse {
+    wire_version: u16,
+    #[serde(flatten)]
+    result: ColdStartReadinessOwnerRpcResult,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
+enum ColdStartReadinessOwnerRpcResult {
+    ReadinessClaimed {
+        outcome: ColdStartReadinessStageOutcome,
+    },
+    ReadinessRecord {
+        record: Option<ColdStartReadinessOrsRecord>,
     },
 }
 
@@ -479,6 +532,121 @@ impl ScanDisclosureRecordOwner for KernelScanDisclosureRecordOwner {
             ScanDisclosureOwnerRpcResult::Records { records } => Ok(records),
             _ => Err(OrsError::Contract(
                 "Kernel returned an invalid scan-disclosure list result".to_owned(),
+            )),
+        }
+    }
+}
+
+/// Daemon-side adapter for the authenticated Kernel route that owns durable
+/// cold-start readiness leases and terminal receipts. This deliberately has
+/// no scan-disclosure binding: readiness rows have a separate ORS lifecycle,
+/// while the route authenticates the application connection and activation
+/// ticket and checks the full claim against its retained activation.
+pub struct KernelColdStartReadinessRecordOwner {
+    kernel: Arc<super::DaemonKernelClient>,
+    application_connection_id: String,
+    activation_ticket_id: String,
+}
+
+impl KernelColdStartReadinessRecordOwner {
+    pub fn new(
+        kernel: Arc<super::DaemonKernelClient>,
+        application_connection_id: String,
+        activation_ticket_id: String,
+    ) -> Self {
+        Self {
+            kernel,
+            application_connection_id,
+            activation_ticket_id,
+        }
+    }
+
+    fn request(
+        &self,
+        action: ColdStartReadinessOwnerRpcAction<'_>,
+    ) -> Result<ColdStartReadinessOwnerRpcResult, OrsError> {
+        let payload = serde_json::to_value(ColdStartReadinessOwnerRpcRequest {
+            wire_version: SCAN_DISCLOSURE_OWNER_WIRE_VERSION,
+            application_connection_id: &self.application_connection_id,
+            activation_ticket_id: &self.activation_ticket_id,
+            action,
+        })
+        .map_err(|error| OrsError::Contract(error.to_string()))?;
+        let value = self
+            .kernel
+            .request_blocking(SCAN_DISCLOSURE_OWNER_OPERATION, payload)
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
+        let response: ColdStartReadinessOwnerRpcResponse =
+            serde_json::from_value(value).map_err(|error| OrsError::Contract(error.to_string()))?;
+        if response.wire_version != SCAN_DISCLOSURE_OWNER_WIRE_VERSION {
+            return Err(OrsError::Contract(
+                "unsupported cold-start readiness owner response version".to_owned(),
+            ));
+        }
+        Ok(response.result)
+    }
+}
+
+impl ColdStartReadinessRecordOwner for KernelColdStartReadinessRecordOwner {
+    fn claim_cold_start_readiness(
+        &self,
+        claim: &ColdStartReadinessClaim,
+        _now: u64,
+    ) -> Result<ColdStartReadinessStageOutcome, OrsError> {
+        match self.request(ColdStartReadinessOwnerRpcAction::ReadinessClaim { claim })? {
+            ColdStartReadinessOwnerRpcResult::ReadinessClaimed { outcome } => Ok(outcome),
+            _ => Err(OrsError::Contract(
+                "Kernel returned an invalid cold-start readiness claim result".to_owned(),
+            )),
+        }
+    }
+
+    fn publish_cold_start_readiness(
+        &self,
+        record_key: &str,
+        binding_digest: &str,
+        lease_ref: &str,
+        disposition: ColdStartReadinessTerminalDisposition,
+        receipt_ref: &str,
+        receipt_bytes: &str,
+    ) -> Result<Option<ColdStartReadinessOrsRecord>, OrsError> {
+        match self.request(ColdStartReadinessOwnerRpcAction::ReadinessPublish {
+            record_key,
+            binding_digest,
+            lease_ref,
+            disposition,
+            receipt_ref,
+            receipt_bytes,
+        })? {
+            ColdStartReadinessOwnerRpcResult::ReadinessRecord { record } => Ok(record),
+            _ => Err(OrsError::Contract(
+                "Kernel returned an invalid cold-start readiness publish result".to_owned(),
+            )),
+        }
+    }
+
+    fn load_cold_start_readiness(
+        &self,
+        record_key: &str,
+    ) -> Result<Option<ColdStartReadinessOrsRecord>, OrsError> {
+        match self.request(ColdStartReadinessOwnerRpcAction::ReadinessLoad { record_key })? {
+            ColdStartReadinessOwnerRpcResult::ReadinessRecord { record } => Ok(record),
+            _ => Err(OrsError::Contract(
+                "Kernel returned an invalid cold-start readiness load result".to_owned(),
+            )),
+        }
+    }
+
+    fn load_cold_start_readiness_for_binding(
+        &self,
+        binding_digest: &str,
+    ) -> Result<Option<ColdStartReadinessOrsRecord>, OrsError> {
+        match self.request(ColdStartReadinessOwnerRpcAction::ReadinessLoadForBinding {
+            binding_digest,
+        })? {
+            ColdStartReadinessOwnerRpcResult::ReadinessRecord { record } => Ok(record),
+            _ => Err(OrsError::Contract(
+                "Kernel returned an invalid cold-start readiness binding read result".to_owned(),
             )),
         }
     }
@@ -2645,13 +2813,17 @@ pub fn observe_and_admit_task(
 ///
 /// The producer remains the authenticated attach/onboarding owner. The type
 /// itself does not authenticate these values; a caller must pass the exact
-/// owner-issued lease/surface pair and the fence it observed at the same
-/// boundary. Without that producer, there is deliberately no live daemon
+/// owner-issued lease/surface/claim tuple and the fence it observed at the
+/// same boundary. Without that producer, there is deliberately no live daemon
 /// caller.
 #[derive(Clone, Debug)]
 pub struct ColdStartAttachInput {
     /// The exact single-flight lease whose terminal is being attached.
     pub lease: OnboardingLease,
+    /// Full Governor-built ORS claim for the exact lease identity and fence.
+    /// Partial lease fields are never sufficient for a durable readiness
+    /// readback.
+    pub readiness_claim: ColdStartReadinessClaim,
     /// The complete prior projection returned by the Governor for this lease.
     pub expected_surface: ColdStartSurfaceView,
     /// Fence observed by the authenticated attach boundary.
@@ -2673,6 +2845,19 @@ impl ColdStartAttachInput {
                 == self.lease.workspace_instance_candidate_ref
             && self.expected_surface.governing_source_generation
                 == self.lease.governing_source_generation
+            && self.readiness_claim.lease_ref == self.lease.lease_ref
+            && self.readiness_claim.lease_deadline == self.lease.deadline
+            && self.readiness_claim.key.lineage_candidate_ref == self.lease.lineage_candidate_ref
+            && self.readiness_claim.key.workspace_instance_candidate_ref
+                == self.lease.workspace_instance_candidate_ref
+            && self.readiness_claim.key.privacy_class == self.lease.privacy_class
+            && self.readiness_claim.key.governing_source_generation
+                == self.lease.governing_source_generation
+            && self.expected_surface.governing_source_set_ref
+                == self.readiness_claim.key.governing_source_set_ref
+            && self.expected_surface.governing_source_generation
+                == self.readiness_claim.key.governing_source_generation
+            && self.readiness_claim.key.state_fence == self.state_fence
     }
 }
 

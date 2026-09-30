@@ -1993,6 +1993,24 @@ impl DaemonComposition {
         Self::project_cold_start_question(result, scan)
     }
 
+    /// Binds the accepted activation's authenticated Kernel readiness owner
+    /// to the exact installation contour. The adapter carries only the
+    /// retained connection/ticket envelope; claim construction and durable
+    /// lease decisions remain in Governor after complete evidence is
+    /// available.
+    pub fn bind_cold_start_readiness_owner(
+        &mut self,
+        contour: &eliot_governor::InstallationScanContour,
+        owner: Arc<dyn eliot_ors::ColdStartReadinessRecordOwner>,
+    ) -> Result<(), DaemonError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        self.governor
+            .bind_cold_start_readiness_owner(contour, owner)
+            .map_err(DaemonError::Composition)
+    }
+
     /// Projects one storeless scan outcome onto the resolved activation.
     ///
     /// Issue #2900 B6: the question travels on the result; a completed scan
@@ -3738,10 +3756,12 @@ impl DaemonComposition {
     /// boundary (issue #1746 W5; #8 W1).
     ///
     /// This is an owner readback adapter, not a second cold-start compiler:
-    /// the input must carry the Governor-issued lease and its complete prior
-    /// surface. The method checks the full lease key/epoch/deadline/terminal
-    /// state, compares the supplied fence to the Governor's current snapshot, then
-    /// asks the Governor for the exact terminal under that key. It returns the
+    /// the input must carry the Governor-issued lease, its complete prior
+    /// surface, and the full Governor-built ORS claim. Partial lease fields
+    /// cannot identify a durable readiness row. The method checks the claim,
+    /// full lease key/epoch/deadline/terminal state, compares the supplied
+    /// fence to the Governor's current snapshot, then asks the Governor for
+    /// the exact terminal under that claim. It returns the
     /// surface only if every projected frozen field is equal to the expected
     /// owner projection. Expiry uses the daemon's internal Unix-millisecond
     /// clock, so the caller cannot extend a lease by supplying an older tick. A moved fence, changed receipt,
@@ -3750,9 +3770,10 @@ impl DaemonComposition {
     /// correlation identity.
     ///
     /// `caller: STITCH`. The authenticated Kernel/attach producer must supply
-    /// the actual lease/surface pair and observed fence; the current activation
-    /// route does not carry those semantic owner values. This method never
-    /// derives them from host fields or creates a replacement receipt.
+    /// the actual lease/surface/full-claim tuple and observed fence; the
+    /// current activation route does not carry those semantic owner values.
+    /// This method never derives them from host fields or creates a replacement
+    /// receipt.
     pub fn read_cold_start_surface_for_attach(
         &self,
         input: &task_binding_admission::ColdStartAttachInput,
@@ -3777,22 +3798,26 @@ impl DaemonComposition {
             ));
         }
 
+        input.readiness_claim.validate().map_err(|error| {
+            DaemonError::Composition(CompositionError::Recovery(format!(
+                "cold-start attach readiness claim is invalid: {error}"
+            )))
+        })?;
+        let now = unix_ms();
         let live_fence = self.governor.kernel_snapshot().state_fence();
         if input.state_fence != live_fence
             || input.expected_surface.state_fence != live_fence
-            || input.expected_surface.lease_deadline < unix_ms()
+            || input.expected_surface.lease_deadline < now
+            || !input.matches_lease()
         {
             return Err(DaemonError::Composition(
                 CompositionError::ActivationStaleFence,
             ));
         }
 
-        let (current_lease, current_surface) = self.governor.cold_start_owner_readback_for_lease(
-            &input.lease.lineage_candidate_ref,
-            &input.lease.workspace_instance_candidate_ref,
-            input.lease.privacy_class,
-            input.lease.governing_source_generation,
-        )?;
+        let (current_lease, current_surface) = self
+            .governor
+            .cold_start_owner_readback_for_claim(&input.readiness_claim, now)?;
         if current_lease != input.lease || current_surface != input.expected_surface {
             return Err(DaemonError::Composition(
                 CompositionError::ActivationStaleFence,
@@ -3895,7 +3920,7 @@ impl DaemonComposition {
     ///
     /// The daemon adds no resolver of its own: it asks the Governor for the
     /// activation snapshot and the owner-compiled readiness receipt through
-    /// [`eliot_governor::GovernorComposition::current_task_selection`] — the
+    /// [`eliot_governor::GovernorComposition::current_task_selection_for_claim`] — the
     /// unique live work lease, the live owner session, the durable
     /// `TaskContract` revision, the installed `MATCHED` `WorkScope`, and the
     /// receipt whose `task_binding` carries the acceptance digest and the
@@ -3917,33 +3942,25 @@ impl DaemonComposition {
     ///
     /// # Live status
     ///
-    /// `caller: STITCH`. The dispatch ingresses that would supply the lease
-    /// key terms are owned by the attach-transport and operation-wiring issues
-    /// (`GovernorComposition::current_task_selection` is reached from no live
-    /// path because the retained cold-start lease itself has no producer yet).
-    /// No synthetic caller was added.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "selection resolution joins the activation route, the compiled receipt, and the live fence in one fail-closed entry"
-    )]
+    /// The exact full claim is required so durable readiness readback binds
+    /// the complete identity, source-digest set, and fence. A caller with only
+    /// partial lease key terms cannot reach Governor task selection.
     pub fn resolve_current_task_selection(
         &self,
         now: u64,
-        lineage_candidate_ref: &str,
-        workspace_instance_candidate_ref: &str,
-        privacy_class: eliot_security_contracts::PrivacyClass,
-        governing_source_generation: u64,
+        claim: &eliot_ors::ColdStartReadinessClaim,
     ) -> Result<task_binding_admission::TaskSelectionResponse, DaemonError> {
         if self.readiness() != CompositionReadiness::Ready {
             return Err(DaemonError::Composition(CompositionError::NotReady));
         }
-        let (activation, receipt) = self.governor.current_task_selection(
-            now,
-            lineage_candidate_ref,
-            workspace_instance_candidate_ref,
-            privacy_class,
-            governing_source_generation,
-        )?;
+        claim.validate().map_err(|error| {
+            DaemonError::Composition(CompositionError::Recovery(format!(
+                "current-task readiness claim is invalid: {error}"
+            )))
+        })?;
+        let (activation, receipt) = self
+            .governor
+            .current_task_selection_for_claim(now, claim)?;
         let live_fence = self.governor.kernel_snapshot().state_fence();
         match task_binding_admission::bind_current_task_selection(
             activation.as_ref(),
