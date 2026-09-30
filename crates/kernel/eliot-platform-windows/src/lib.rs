@@ -106,6 +106,7 @@ mod platform_security;
 mod process_identity;
 mod process_job;
 mod process_path_lease;
+pub mod profile_supervision;
 mod protected_path;
 mod runtime_receipt_publication;
 pub mod scm_entry;
@@ -286,9 +287,17 @@ pub use service_registration::{
     ServiceStartMode, ServiceStartOutcome, ServiceStopOutcome,
 };
 pub use supervision_authority_key::{
-    SealedSupervisionAuthorityKey, SupervisionAuthorityKeyError,
-    SupervisionAuthorityKeyStoreRequest, WindowsSupervisionAuthorityKeyProvider,
-    WindowsSupervisionAuthorityKeyStore,
+    PortableDevSupervisionAuthorityKeyObservation, PortableDevSupervisionAuthorityKeyReceipt,
+    PortableDevSupervisionAuthorityKeyRequest, PortableDevSupervisionAuthorityKeyTargetObservation,
+    PortableDevSupervisionAuthorityKeyWriteOutcome, PreparedPortableDevSupervisionAuthorityKey,
+    PreparedUserModeSupervisionAuthorityCredential, SealedSupervisionAuthorityKey,
+    SupervisionAuthorityKeyError, SupervisionAuthorityKeyStoreRequest,
+    UserModeSupervisionAuthorityCredentialObservation,
+    UserModeSupervisionAuthorityCredentialReceipt, UserModeSupervisionAuthorityCredentialRequest,
+    UserModeSupervisionAuthorityCredentialTargetObservation,
+    UserModeSupervisionAuthorityCredentialWriteOutcome,
+    WindowsPortableDevSupervisionAuthorityKeyProvider, WindowsSupervisionAuthorityKeyProvider,
+    WindowsSupervisionAuthorityKeyStore, WindowsUserModeSupervisionAuthorityCredentialProvider,
 };
 pub use tcp_listener_owner::{
     TcpConnectionPeerOwnerObservation, TcpListenerOwnerError, TcpListenerOwnerObservation,
@@ -740,6 +749,28 @@ fn observe_fixed_local_app_data_config(
 #[derive(Clone, Copy)]
 enum KnownFolder {
     LocalAppData,
+    ProgramFiles,
+}
+
+/// Resolves the machine's canonical `%ProgramFiles%` root without applying an
+/// ACL or accepting a caller-authored fallback.
+///
+/// This is the OS anchor the I3.1 `system_service` immutable-artifacts row
+/// names. It is read from the Windows known-folder API, never from a process
+/// environment variable, so a caller cannot point the production profile at a
+/// contour the OS does not resolve. The returned root is not writable by an
+/// ordinary user; the installer, not this function, decides that.
+///
+/// # Errors
+///
+/// Returns an error when the OS known-folder lookup is unavailable, the root
+/// cannot be canonicalized, or its contour contains a reparse point.
+pub fn program_files_root() -> Result<PathBuf, ProtectedPathError> {
+    let raw = known_folder_path(KnownFolder::ProgramFiles)?;
+    reject_reparse_chain(&raw, true)?;
+    let canonical = canonical_windows_path(&raw)?;
+    validate_directory_no_reparse(&canonical)?;
+    Ok(canonical)
 }
 
 #[cfg(windows)]
@@ -756,10 +787,13 @@ fn known_folder_path(folder: KnownFolder) -> Result<PathBuf, ProtectedPathError>
     use std::os::windows::ffi::OsStringExt;
     use windows_sys::Win32::Foundation::S_OK;
     use windows_sys::Win32::System::Com::CoTaskMemFree;
-    use windows_sys::Win32::UI::Shell::{FOLDERID_LocalAppData, SHGetKnownFolderPath};
+    use windows_sys::Win32::UI::Shell::{
+        FOLDERID_LocalAppData, FOLDERID_ProgramFiles, SHGetKnownFolderPath,
+    };
 
     let folder_id = match folder {
         KnownFolder::LocalAppData => &FOLDERID_LocalAppData,
+        KnownFolder::ProgramFiles => &FOLDERID_ProgramFiles,
     };
     let mut path = std::ptr::null_mut();
     let status = unsafe {
