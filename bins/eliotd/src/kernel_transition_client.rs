@@ -22,10 +22,9 @@ use eliot_store_api::{
     CampaignSourceRevisionRead, CanonicalRequestView, NamedReadOperation, NamedReadRequest,
     OrderingHeadExpectation, OriginalWriteSubmission, PreparedTransition, PreparedWriteOutcome,
     ReadConsistency, RevisionHeadExpectation, ScopeId, StoreHealth, TaskContractAcceptanceSet,
-    WriteReceipt,
-    decode_task_contract_acceptance_set,
-    generated_operation_manifests, task_contract_acceptance_read_request,
-    validate_store_receipt_envelope, verify_canonical_request_hash,
+    WriteReceipt, decode_task_contract_acceptance_set, generated_operation_manifests,
+    task_contract_acceptance_read_request, validate_store_receipt_envelope,
+    verify_canonical_request_hash,
 };
 use tracing::Instrument as _;
 
@@ -398,9 +397,9 @@ fn decode_reserved_apply_outcome(
             }
             Ok(PreparedWriteOutcome::Staged(Box::new(submission)))
         }
-        WireOutcome::Error { code, reason } => Err(kernel_port_error(
-            KernelClientError::Contract(format!("{code}: {reason}")),
-        )),
+        WireOutcome::Error { code, reason } => Err(kernel_port_error(KernelClientError::Contract(
+            format!("{code}: {reason}"),
+        ))),
         WireOutcome::Partial { reason, .. } | WireOutcome::Unknown { reason } => {
             Err(kernel_port_error(KernelClientError::Unknown(reason)))
         }
