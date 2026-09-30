@@ -31,9 +31,14 @@
 //! exists in this package (ARCH-MOD-03 explicit statelessness).
 //!
 //! The exhaustive, code-derived form of this inventory is
-//! [`owner_inventory::read_owner_inventory`], which resolves every row below at
-//! call time from the Store declaration tables and this crate's own predicates.
-//! It is the machine-checkable copy; the list here is its human-readable summary.
+//! [`owner_inventory::read_owner_inventory`], which resolves every row below
+//! from the Store declaration tables and this crate's own predicates. It is the
+//! machine-checkable copy; the list here is its human-readable summary. It has
+//! no caller in this repository — the read path resolves the rows it needs
+//! through [`owner_inventory::local_read_port_binding`] and
+//! [`owner_inventory::compare_operation_with_store_read_model`] instead, so
+//! resolving the aggregate proves the declared surface is resolvable, not that
+//! any read was served.
 //!
 //! Two statements in that list are bounded on purpose. `ReadApi`, `LocalReadPort`
 //! and `ReadService` are the only construction and dispatch points of this
@@ -191,13 +196,22 @@
 //! # Disposition: one declared read owner with one live production consumer (A1)
 //!
 //! Disposition (a): this package is the declared Governor read owner and is
-//! retained. `cargo metadata` reports three workspace members with an edge onto
-//! it; searching the current source for a non-test call site gives:
+//! retained. The implementation of that owner is [`ReadService::execute`], the
+//! single read engine; the production caller that reaches it is
+//! `eliotd::serve_context_reconstruction`
+//! (`bins/eliotd/src/context_reconstruction_route.rs:203`), invoked from
+//! `daemon_runtime::run_local_read_poll`
+//! (`bins/eliotd/src/daemon_runtime.rs:4467`). That call chain is the A1
+//! evidence; [`owner_inventory::read_owner_inventory`] is not part of it and has
+//! no caller.
+//!
+//! `cargo metadata` reports three workspace members with an edge onto
+//! this crate; searching the current source for a non-test call site gives:
 //!
 //! | member | declared edge | what that member does with it |
 //! |---|---|---|
-//! | `eliot-governor` | normal | production `ReadApi` implementor: `GovernorContextInputs<'_, R: ReadApi + ?Sized>` (`context_inputs.rs:391`) issues the seven role reads through `ReadApi::bound_state` / `bound_query` and classifies each [`ReadOutcome`]; its call site is `KernelContextReadClient::reconstruct_context_inputs` (`bins/eliotd/src/kernel_context_read_client.rs:737`), which composes the one `ReadService` over the retained authenticated Kernel handle; |
-//! | `eliotd` | normal | the live production edge: `context_reconstruction_route::serve_context_reconstruction` (`bins/eliotd/src/context_reconstruction_route.rs:203`) is invoked by `daemon_runtime::run_local_read_poll` (`bins/eliotd/src/daemon_runtime.rs:4443`) for an admitted `eliot.query` pair whose explicit intent mode is `context_reconstruction`, and that leg is on the run loop — `main.rs` -> `daemon_runtime::run` -> `run_loop` -> `start_tick_work` -> `maybe_start_local_read_poll` -> `start_local_read_poll` -> `run_local_read_poll`. This crate's [`ReadService`] is what serves it; |
+//! | `eliot-governor` | normal | production `ReadApi` implementor: `GovernorContextInputs<'_, R: ReadApi + ?Sized>` (`crates/governor/eliot-governor/src/context_inputs.rs:379`) issues the seven role reads through `ReadApi::bound_state` / `bound_query` and classifies each [`ReadOutcome`]; its call site is `KernelContextReadClient::reconstruct_context_inputs` (`bins/eliotd/src/kernel_context_read_client.rs:741`), which composes the one `ReadService` over the retained authenticated Kernel handle; |
+//! | `eliotd` | normal | the live production edge: `context_reconstruction_route::serve_context_reconstruction` (`bins/eliotd/src/context_reconstruction_route.rs:203`) is invoked by `daemon_runtime::run_local_read_poll` (`bins/eliotd/src/daemon_runtime.rs:4467`) for an admitted `eliot.query` pair whose explicit intent mode is `context_reconstruction`, and that leg is on the run loop — `main.rs:121` -> `daemon_runtime::run` -> `run_loop` -> `start_tick_work` -> `maybe_start_local_read_poll` -> `start_local_read_poll` -> `run_local_read_poll`. This crate's [`ReadService`] is what serves it; |
 //! | `eliot-kernel-service` | **dev-dependency only** | uses `ReadService` inside `mod live_surreal_evidence_pack_e2e` in `store_gateway.rs`. Not in the production graph. |
 //!
 //! So the reconstruction route is a real, process-reachable read: an `eliot.query`
