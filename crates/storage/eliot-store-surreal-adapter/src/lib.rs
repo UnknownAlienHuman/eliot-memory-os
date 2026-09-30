@@ -50,19 +50,19 @@ pub use config::{
     ADAPTER_NAME, ClientSetLimits, ConfigError, MAX_CLIENT_SET_SESSIONS_PER_ROLE,
     PINNED_SURREALDB_MAJOR, SchemaGeneration, SchemaGenerationError, SurrealAdapterConfig,
 };
-use eliot_contracts::ResourceGeneration;
 use eliot_platform::ClockObservation;
 use eliot_platform_windows::RetainedProcessPathLease;
 use eliot_store_api::{
     CAPABILITY_RESERVED_WRITE, CanonicalSnapshotPort, CanonicalStoreClient,
     CanonicalValidationSnapshot, ExactJsonBytes, GENESIS_MANIFEST_NAME, NamedOperationManifest,
     NamedReadRequest, NamedReadResponse, OperationId, OrderingHead, OrderingHeadExpectation,
-    OrderingHeadReadback, OrderingScopeId, PreparedTransition, RequestMeta, ReservedWriteRequest,
-    RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView,
-    SnapshotBeginRequest, SnapshotCursor, SnapshotEndReceipt, SnapshotHandle, SnapshotPage,
+    OrderingHeadReadback, OrderingScopeId, PreparedTransition, RequestMeta,
+    ReservedWriteRequest, RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId,
+    ScopeRevisionView, SnapshotBeginRequest,
+    SnapshotCursor, SnapshotEndReceipt, SnapshotHandle, SnapshotPage, ResourceGeneration,
     StateFence, StoreError, StoreGenesisRequest, StoreHealth, StoreRecoveryRequest,
-    StoreRecoverySnapshot, WriteReceipt, generated_operation_manifests,
-    operation_manifest_set_digest,
+    StoreRecoverySnapshot, WriteReceipt,
+    generated_operation_manifests, operation_manifest_set_digest,
 };
 pub use error::AdapterError;
 pub use health::{AdapterAvailability, AdapterHealth, ProviderHealth};
