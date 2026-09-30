@@ -58,12 +58,13 @@ use eliot_runtime_contracts::{
 use eliot_store_api::{
     CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, NamedReadRequest,
     NamedReadResponse, OperationIdentity, OrderingHead, OrderingHeadExpectation,
-    OrderingHeadReadback, OrderingScopeId, PreparedTransition, RecoveryRecord, RecoveryRecordKey,
-    RequestMeta, ReservedWriteRequest, RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId,
-    ScopeRevisionView, StoreError, StoreGenesisRequest, StoreHealth, StoreRecoveryRequest,
-    StoreRecoverySnapshot, WriteReceipt, WriteReceiptStatus, WriteSubmission,
-    admit_write_submission, canonical_request_hash, dreamer_job_queue_key,
-    generated_operation_manifests, operation_manifest_set_digest, verify_canonical_request_hash,
+    OrderingHeadReadback, OrderingScopeId,
+    OriginalWriteSubmission, PreparedTransition, RecoveryRecord, RecoveryRecordKey, RequestMeta, ReservedWriteRequest,
+    RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, StoreError,
+    StoreGenesisRequest, StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt,
+    WriteReceiptStatus, WriteSubmission, admit_write_submission, canonical_request_hash,
+    dreamer_job_queue_key, generated_operation_manifests, operation_manifest_set_digest,
+    verify_canonical_request_hash,
 };
 use serde::{Deserialize, Serialize};
 
@@ -74,11 +75,13 @@ use crate::commit_recovery::{
     resolve_open_record, verify_dreamer_canonical_request_hash, verify_receipt_binding,
     verify_retained_binding, verify_terminal_evidence,
 };
+use crate::canonical_store_evidence::CanonicalStoreEvidence;
 use crate::store_client::DreamerCommitEvidence;
 use crate::store_write_reservation::{
     CompositionReservation, ReservationSeed, ReservedSubmission, ResolvedSendOutcome,
     StagedWriteRecovery, begin_execute_after_send, cancel_before_send, ensure_eligible,
     finalize_reservation, mark_unknown_outcome, reconcile_receipt, reserve_for_transition,
+    reserve_for_transition_with_original_submission,
     retain_unsupported_prepared_plan, writer_epoch_for_fence_from_epoch,
 };
 use crate::user_automation_execution::{
@@ -801,6 +804,10 @@ pub struct KernelStoreGateway {
     /// (tests, or a composition that cannot open ORS) degrades recovery to
     /// fail-closed errors without staging, pause, or disposition.
     commit_ors: Option<Arc<RedbRecoveryStore>>,
+    /// Shared with the ORS opened by the composition. This bridge contains no
+    /// durable truth; it carries authenticated owner observations only during
+    /// the local ORS transaction that consumes them.
+    canonical_store_evidence: Option<Arc<CanonicalStoreEvidence>>,
     /// In-process mirror of the ordering scopes paused by open
     /// unknown-commit records, with per-entry source, observation revision
     /// and explicit coverage (issue #2763). The durable open set in ORS is
@@ -986,6 +993,35 @@ impl KernelStoreGateway {
         route: GenerationRoute,
         commit_ors: Option<Arc<RedbRecoveryStore>>,
     ) -> Self {
+        Self::new_inner(service, store, route, commit_ors, None)
+    }
+
+    /// Constructs the production gateway with the exact canonical evidence
+    /// provider already bound into its ORS handle.
+    #[doc(hidden)]
+    pub fn new_with_evidence(
+        service: Arc<Mutex<KernelService>>,
+        store: Arc<EbpCanonicalStoreClient<NamedPipeTransport>>,
+        route: GenerationRoute,
+        commit_ors: Option<Arc<RedbRecoveryStore>>,
+        canonical_store_evidence: Arc<CanonicalStoreEvidence>,
+    ) -> Self {
+        Self::new_inner(
+            service,
+            store,
+            route,
+            commit_ors,
+            Some(canonical_store_evidence),
+        )
+    }
+
+    fn new_inner(
+        service: Arc<Mutex<KernelService>>,
+        store: Arc<EbpCanonicalStoreClient<NamedPipeTransport>>,
+        route: GenerationRoute,
+        commit_ors: Option<Arc<RedbRecoveryStore>>,
+        canonical_store_evidence: Option<Arc<CanonicalStoreEvidence>>,
+    ) -> Self {
         // Bind the route to the live lineage at composition (Implements #64).
         // `GenerationRoute` carries its own complete `(lineage_id, sequence)`
         // tuple, so this gateway keeps no second epoch mirror: route currency
@@ -999,6 +1035,7 @@ impl KernelStoreGateway {
             route,
             flight: GatewayFlight::new(),
             commit_ors,
+            canonical_store_evidence,
             // Uninitialized evidence, never an observed clear ledger: the
             // first admission decision reads an authoritative owner
             // observation, and until one succeeds a negative mirror answer
@@ -1272,6 +1309,48 @@ impl KernelStoreGateway {
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
         seed: ReservationSeed,
     ) -> Result<WriteReceipt, String> {
+        self.apply_reserved_inner(
+            context,
+            transition,
+            expected_revision_heads,
+            expected_ordering_heads,
+            seed,
+            None,
+        )
+        .await
+    }
+
+    /// Applies a CaptureObservation through ORS while retaining and forwarding
+    /// the exact source submission received by the public Observe boundary.
+    pub async fn apply_reserved_with_original_submission(
+        &self,
+        context: &RequestMetadata,
+        transition: PreparedTransition,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+        seed: ReservationSeed,
+        original_submission: &OriginalWriteSubmission,
+    ) -> Result<WriteReceipt, String> {
+        self.apply_reserved_inner(
+            context,
+            transition,
+            expected_revision_heads,
+            expected_ordering_heads,
+            seed,
+            Some(original_submission),
+        )
+        .await
+    }
+
+    async fn apply_reserved_inner(
+        &self,
+        context: &RequestMetadata,
+        transition: PreparedTransition,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+        seed: ReservationSeed,
+        original_submission: Option<&OriginalWriteSubmission>,
+    ) -> Result<WriteReceipt, String> {
         let _flight = self.flight.enter()?;
         if self.is_fenced() {
             return Err("canonical-store gateway is fenced for rebind".to_owned());
@@ -1297,19 +1376,68 @@ impl KernelStoreGateway {
             "reserved writes require the composition-bound ORS; refusing without unreserved Apply fallback"
                 .to_owned()
         })?;
+        let evidence = self.canonical_store_evidence.as_ref().ok_or_else(|| {
+            "reserved writes require the shared canonical Store evidence provider".to_owned()
+        })?;
+        // Store owns the canonical head bytes and digest. Read them through
+        // the retained authenticated client before staging, then recheck the
+        // active generation after the RPC. No provider scope or ORS transaction
+        // is held across this await.
+        self.require_active_store_generation()
+            .map_err(|error| error.to_string())?;
+        let ordering_scopes = expected_ordering_heads
+            .iter()
+            .map(|head| head.scope.clone())
+            .collect::<Vec<_>>();
+        let ordering_readbacks = self
+            .store
+            .ordering_head_readbacks(ordering_scopes)
+            .await
+            .map_err(|error| error.to_string())?;
+        self.require_active_store_generation()
+            .map_err(|error| error.to_string())?;
+        if self.is_fenced() {
+            return Err("canonical-store gateway is fenced for rebind".to_owned());
+        }
+        // Rejoin the request fence to the current Kernel authority and route
+        // after the async owner readback. The gateway flight prevents a rebind
+        // from completing during this operation, and this check refuses a
+        // changed or fenced composition before ORS sees the observation.
         let owner = self.bind_reservation_owner(&commit_ors, context, &transition)?;
         // Reservation and eligibility run without any admission lease: queued
         // normal work holds no provider permit, Kernel lock, or
         // protected-control resource while awaiting a predecessor (I14.3).
-        let sealed = reserve_for_transition(
-            &owner,
-            &seed,
-            context,
-            &transition,
-            &expected_revision_heads,
-            &expected_ordering_heads,
-        )
-        .map_err(|error| error.to_string())?;
+        let transition_digest = eliot_store_api::prepared_transition_digest(&transition)
+            .map_err(|error| error.to_string())?;
+        let reserve = || match original_submission {
+            Some(source) => reserve_for_transition_with_original_submission(
+                &owner,
+                &seed,
+                context,
+                &transition,
+                &expected_revision_heads,
+                &expected_ordering_heads,
+                source,
+            ),
+            None => reserve_for_transition(
+                &owner,
+                &seed,
+                context,
+                &transition,
+                &expected_revision_heads,
+                &expected_ordering_heads,
+            ),
+        };
+        let sealed = evidence
+            .with_ordering_readbacks(
+                transition.identity.operation_id.as_str(),
+                &transition_digest,
+                &context.state_fence,
+                &ordering_readbacks,
+                reserve,
+            )
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
         ensure_eligible(&owner, &sealed.token).map_err(|error| error.to_string())?;
         // Bounded send window: one normal admission lease, mirroring `apply`
         // (Slices A+B, #65). Cancellation and reconciliation stay on the
@@ -1323,13 +1451,23 @@ impl KernelStoreGateway {
         // reserved submission (issue #2031): the exact `#990` projection plus
         // the boundary validation, so the production path and the tested
         // projection share one constructor and one serializer.
-        let submission = ReservedSubmission::from_sealed(
-            &sealed,
-            context,
-            &transition,
-            expected_revision_heads,
-            expected_ordering_heads,
-        )
+        let submission = match original_submission {
+            Some(source) => ReservedSubmission::from_sealed_with_original_submission(
+                &sealed,
+                context,
+                &transition,
+                expected_revision_heads,
+                expected_ordering_heads,
+                source,
+            ),
+            None => ReservedSubmission::from_sealed(
+                &sealed,
+                context,
+                &transition,
+                expected_revision_heads,
+                expected_ordering_heads,
+            ),
+        }
         .map_err(|error| error.to_string())?;
         let outcome = self
             .store
@@ -1350,7 +1488,12 @@ impl KernelStoreGateway {
                 })?;
                 let reconciliation = reconcile_receipt(&sealed.token, &receipt)
                     .map_err(|error| error.to_string())?;
-                finalize_reservation(&owner, &reconciliation).map_err(|error| error.to_string())?;
+                evidence
+                    .with_store_receipt(&sealed.token, &reconciliation, &receipt, || {
+                        finalize_reservation(&owner, &reconciliation)
+                    })
+                    .map_err(|error| error.to_string())?
+                    .map_err(|error| error.to_string())?;
                 drop(lease);
                 Ok(receipt)
             }
@@ -1438,8 +1581,15 @@ impl KernelStoreGateway {
         let writer_epoch =
             writer_epoch_for_fence_from_epoch(&fence.authority_epoch).map_err(|e| e.to_string())?;
         drop(service);
-        CompositionReservation::bind(Arc::clone(commit_ors), writer_epoch)
-            .map_err(|error| error.to_string())
+        match &self.canonical_store_evidence {
+            Some(evidence) => CompositionReservation::bind_with_evidence(
+                Arc::clone(commit_ors),
+                writer_epoch,
+                Arc::clone(evidence),
+            ),
+            None => CompositionReservation::bind(Arc::clone(commit_ors), writer_epoch),
+        }
+        .map_err(|error| error.to_string())
     }
 
     /// Acquires the one normal admission lease for the bounded send window.
