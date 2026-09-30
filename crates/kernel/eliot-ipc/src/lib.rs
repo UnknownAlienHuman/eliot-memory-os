@@ -24,8 +24,8 @@ mod role_lease;
 mod session_lifecycle;
 
 pub use control_reserve::{
-    IPC_HANDLE_BOTTLENECK, IPC_PIPE_BOTTLENECK, IpcDimension, IpcPermit, IpcPermitOperation,
-    IpcReserve, IpcReserveError,
+    IPC_HANDLE_BOTTLENECK, IPC_PIPE_BOTTLENECK, IpcDimension, IpcOwnerEvidenceContext, IpcPermit,
+    IpcPermitOperation, IpcReserve, IpcReserveError,
 };
 pub use frame_codec::{FrameDecoder, decode_frame, encode_frame};
 pub use host_conformance::{
