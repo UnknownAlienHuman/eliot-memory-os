@@ -586,14 +586,20 @@ pub(super) fn census_in_read(
                 ));
             }
             builder.observe("activation_lifecycles", key.value(), value.value())?;
-            if !matches!(
-                record.state,
-                crate::ActivationLifecycleState::ResultAccepted
-                    | crate::ActivationLifecycleState::Cancelled
-                    | crate::ActivationLifecycleState::Expired
-            ) {
-                builder.counts.activation_lifecycles =
-                    increment(builder.counts.activation_lifecycles)?;
+            match record.state {
+                crate::ActivationLifecycleState::Pending
+                | crate::ActivationLifecycleState::Claimed
+                | crate::ActivationLifecycleState::Reconciling => {
+                    builder.counts.activation_lifecycles =
+                        increment(builder.counts.activation_lifecycles)?;
+                }
+                // This immutable predecessor result may schedule a successor
+                // on a later activation, but it carries no live Store work.
+                // Retaining it must not keep the Store branch alive by itself.
+                crate::ActivationLifecycleState::DeferredNotReady
+                | crate::ActivationLifecycleState::ResultAccepted
+                | crate::ActivationLifecycleState::Cancelled
+                | crate::ActivationLifecycleState::Expired => {}
             }
         }
     }

@@ -4861,6 +4861,15 @@ impl KernelComposition {
             .store_stop_obligations()
             .cloned()
             .ok_or_else(|| DrainHalt::new("store-stop-obligation-census-unavailable"))?;
+        if owner_census.state_fence != admission.state_fence
+            || owner_census.activation_id.as_deref() != Some(admission.activation_id.as_str())
+            || owner_census.activation_generation != admission.state_fence.resource_generation
+        {
+            return Err(DrainHalt::with_pending(
+                "store-owner-activation-or-fence-mismatch",
+                vec![census.observation_code().to_owned()],
+            ));
+        }
 
         let revalidated = self
             .drain_admission_coherence(coordinator)
@@ -4998,15 +5007,7 @@ impl KernelComposition {
     ) -> Result<DrainAdmissionCoherence, &'static str> {
         let drain_generation = coordinator.drain_generation();
         let state_fence = match self.front_door_policy.lock() {
-            Ok(policy) => {
-                let fence = &policy.module_generation.state_fence;
-                format!(
-                    "{}:{}@{}",
-                    fence.authority_epoch.lineage_id,
-                    fence.authority_epoch.sequence,
-                    fence.resource_generation.value()
-                )
-            }
+            Ok(policy) => policy.module_generation.state_fence.clone(),
             Err(_) => return Err("authority-fence-unavailable"),
         };
         // The activation generation of the live admitted candidate contour, in
@@ -5015,15 +5016,18 @@ impl KernelComposition {
         // has admitted no activation yet has no such contour, which is the
         // genesis case the I1.5 pairing leaves unfenced rather than a second
         // opinion about the live one.
-        let activation_generation = match self.service.lock() {
+        let (activation_id, activation_generation) = match self.service.lock() {
             Ok(service) => {
                 let candidate = service
                     .candidate_binding()
                     .ok_or("activation-contour-unavailable")?;
-                candidate
-                    .supervision_incarnation
-                    .activation_generation
-                    .clone()
+                (
+                    candidate.activation_id.clone(),
+                    candidate
+                        .supervision_incarnation
+                        .activation_generation
+                        .clone(),
+                )
             }
             Err(_) => return Err("activation-contour-unavailable"),
         };
@@ -5050,6 +5054,7 @@ impl KernelComposition {
         Ok(DrainAdmissionCoherence {
             drain_generation,
             state_fence,
+            activation_id,
             activation_generation,
             service_state,
             bridge_sessions,
@@ -5136,8 +5141,11 @@ struct DrainAdmissionCoherence {
     /// The drain generation the census is taken under and the commit is
     /// consumed for.
     drain_generation: String,
-    /// The front-door `StateFence` binding (`lineage:sequence@resource`).
-    state_fence: String,
+    /// The exact front-door `StateFence` binding used by the ORS owner read.
+    state_fence: eliot_contracts::StateFence,
+    /// The admitted candidate activation identity, distinct from the fence's
+    /// resource generation and required to bind the ORS owner projection.
+    activation_id: String,
     /// The activation generation of the admitted candidate contour this sample
     /// observed, in the same `SupervisionJournalEpoch` domain a waking
     /// activation presents.

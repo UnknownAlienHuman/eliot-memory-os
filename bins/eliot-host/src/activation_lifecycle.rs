@@ -64,17 +64,17 @@
 //! The Host half below is durable and complete on its own side:
 //! the current activation generation holds its generation-bound `RuntimeLease`
 //! reference (issued, renewed, and released here from fresh admitting
-//! observations). The Host idle-drain mirror checks those references and the
-//! published supervision mirror alongside the same authenticated typed ORS
+//! observations). The Host idle-drain mirror reconciles those references to
+//! exact-fence owner rows and consumes the same authenticated typed ORS
 //! Store-stop census the Kernel consumes. A
 //! `StoppedClean` terminal releases
 //! the held references (`transition_activation_record` clears them once the
 //! `DrainCommitRecord` snapshot carries the obligations, proven by
 //! [`prove_terminal_runtime_release`]); recovery terminals
-//! keep them because reconciliation is still owed. The supervision leg re-uses
-//! the one published, Kernel-signed supervision-lease mirror Host already
-//! commits and verifies for the Watchdog spool
-//! (`watchdog_publication::live_supervision_obligation`).
+//! keep them because reconciliation is still owed. Supervision stop status is
+//! projected from the current ORS owner row; the separately published,
+//! Kernel-signed Watchdog mirror remains a coverage input, not an alternate
+//! lease terminal authority.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -251,13 +251,13 @@ pub enum IdleLeaseCensus {
         /// Typed Kernel/ORS projection also consumed by retirement admission.
         owner_census: eliot_kernel_service::RuntimeLeaseCensus,
     },
-    /// The current generation still holds runtime-lease references.
+    /// A Host-held reference resolves to a non-terminal exact-fence owner row.
     RuntimeLeased {
         refs: Vec<PlatformHandle>,
         /// Same exact-fence owner read used by the Kernel and stop gate.
         owner_census: eliot_kernel_service::RuntimeLeaseCensus,
     },
-    /// A published supervision lease still requires live sensing/containment.
+    /// The exact current ORS supervision lease remains non-terminal.
     Supervised {
         lease_ref: PlatformHandle,
         /// Same exact-fence owner read used by the Kernel and stop gate.
@@ -973,27 +973,48 @@ impl HostComposition {
                 });
             }
         };
-        if !activation.runtime_lease_refs.is_empty() {
+        let mut active_runtime_lease_refs = Vec::new();
+        for lease_ref in &activation.runtime_lease_refs {
+            let Some(lease) = owner_census
+                .runtime_leases
+                .iter()
+                .find(|lease| lease.lease_id.as_str() == lease_ref.as_str())
+            else {
+                // A Host reference is only a mirror. If its exact-fence owner
+                // row is missing, the complete census cannot prove whether
+                // that referenced lease reached a legal terminal transition.
+                return Ok(IdleLeaseCensus::Unavailable {
+                    reason: "host-runtime-lease-reference-missing-from-owner-census",
+                });
+            };
+            if !runtime_lease_is_terminal(lease.state) {
+                active_runtime_lease_refs.push(lease_ref.clone());
+            }
+        }
+        if !active_runtime_lease_refs.is_empty() {
             return Ok(IdleLeaseCensus::RuntimeLeased {
-                refs: activation.runtime_lease_refs.clone(),
+                refs: active_runtime_lease_refs,
                 owner_census,
             });
         }
-        let obligation = self
-            .live_supervision_obligation_for(activation)
-            .map_err(|error| IdleLeaseCensus::Unavailable {
-                reason: lease_census_reason(&error),
-            });
-        match obligation {
-            Ok(Some(lease_ref)) => Ok(IdleLeaseCensus::Supervised {
-                lease_ref,
+        let supervision = &owner_census.supervision_lease.record;
+        if !runtime_lease_is_terminal(supervision.state) {
+            return Ok(IdleLeaseCensus::Supervised {
+                lease_ref: match PlatformHandle::new(supervision.lease_id.as_str()) {
+                    Ok(lease_ref) => lease_ref,
+                    Err(_) => {
+                        return Ok(IdleLeaseCensus::Unavailable {
+                            reason: "owner-supervision-lease-identity-invalid",
+                        });
+                    }
+                },
                 owner_census,
-            }),
-            Ok(None) if owner_census.is_fully_retired() => {
-                Ok(IdleLeaseCensus::Idle { owner_census })
-            }
-            Ok(None) => Ok(IdleLeaseCensus::StoreObligationLeased { owner_census }),
-            Err(census) => Ok(census),
+            });
+        }
+        if owner_census.is_fully_retired() {
+            Ok(IdleLeaseCensus::Idle { owner_census })
+        } else {
+            Ok(IdleLeaseCensus::StoreObligationLeased { owner_census })
         }
     }
 
@@ -1398,6 +1419,17 @@ pub(super) fn is_fresh_admitting_observation(
 /// # Errors
 ///
 /// Returns an error when a held reference is not this generation's lease.
+fn runtime_lease_is_terminal(state: eliot_runtime_contracts::LeaseState) -> bool {
+    matches!(
+        state,
+        eliot_runtime_contracts::LeaseState::Released
+            | eliot_runtime_contracts::LeaseState::Expired
+            | eliot_runtime_contracts::LeaseState::Revoked
+            | eliot_runtime_contracts::LeaseState::Superseded
+            | eliot_runtime_contracts::LeaseState::Closed
+    )
+}
+
 pub(super) fn prove_terminal_runtime_release(
     current: &EliotActivationRecord,
 ) -> Result<(), HostError> {
