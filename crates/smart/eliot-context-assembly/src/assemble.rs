@@ -7,6 +7,7 @@ use eliot_context_contracts::{
     QualityOperation, QualityRefusal, QualityRefusalKind, QualityScorecard,
     SerializedContextMeasurement,
 };
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{AssemblyError, boundary, bounds, measurement, render};
@@ -15,7 +16,24 @@ use crate::{AssemblyError, boundary, bounds, measurement, render};
 pub const ASSEMBLY_ORDERING_REVISION: &str = "a18.role-provider-atom.v1";
 
 /// Caller-owned immutable parameters for one A-18 projection.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// Every field is bounded scalar text, a byte ceiling, or the route's own
+/// [`MeasurementStatus`], so the whole record is data and crosses a wire
+/// without a callback: the understanding stage of the production Orientation
+/// carrier (`bins/eliot-dreamer`) receives this policy from the Governor
+/// supply channel rather than building one locally, and an in-process
+/// reference cannot express that. `deny_unknown_fields` keeps a decoded record
+/// from silently dropping a field this revision does not define.
+///
+/// Decoding proves nothing. A value read off a wire is untrusted input and
+/// reaches [`assemble_active_view`] through [`AssemblyPolicy::validate`], which
+/// re-proves the ORIGINAL RECORDED bytes of the decoded record — its fence
+/// digest form, its non-zero ceiling, its bounded identity text, and its exact
+/// measurement status. The same values are then re-compared against the
+/// independently recorded measurement by `measurement::verify`, so a forged
+/// ceiling or serializer identity is refused rather than admitted.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AssemblyPolicy {
     /// Digest of the state fence used by the admission decision.
     pub fence_digest: String,
@@ -37,7 +55,25 @@ pub struct AssemblyPolicy {
 }
 
 impl AssemblyPolicy {
-    fn validate(&self) -> Result<(), AssemblyError> {
+    /// Re-proves one assembly policy against the closed owner bounds.
+    ///
+    /// This is the single validator for this record: it validates the ORIGINAL
+    /// RECORDED field values of whichever instance it is called on, whether that
+    /// instance was constructed in process or decoded from a wire. It re-reads no
+    /// external state and recomputes no identity, so exposing it cannot create a
+    /// second, weaker check. [`assemble_active_view`] runs it for every caller
+    /// through `preflight`; a caller that decodes this record first validates it
+    /// here so an unproved policy is refused at the boundary rather than
+    /// surfacing later as an assembly failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AssemblyError::Bounds`] when `fence_digest` is not a
+    /// well-formed digest or `max_serialized_bytes` is zero, and
+    /// [`AssemblyError::Contract`] when an identity string is empty, oversized,
+    /// or control-bearing, or when `measurement_status` is not the exact UTF-8
+    /// status this projection supports.
+    pub fn validate(&self) -> Result<(), AssemblyError> {
         validate_digest(&self.fence_digest, "assembly.fence_digest")?;
         if self.max_serialized_bytes == 0 {
             return Err(AssemblyError::Bounds("assembly.max_serialized_bytes"));
