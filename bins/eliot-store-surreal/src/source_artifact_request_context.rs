@@ -4,10 +4,9 @@
 //! does not create a Blob receipt context, a causal sequence, or source/effect
 //! authority. Those bindings must come from their original owners.
 
-use eliot_protocol::{
-    Frame, ProtocolModuleGeneration, ProtocolVersion, RequestIdentity, RequestId, StateFence,
-};
-use eliot_store_api::{ExactJsonBytes, Request, decode_request_frame_with_authority};
+use eliot_contracts::{RequestId, StateFence};
+use eliot_protocol::{Frame, ProtocolModuleGeneration, ProtocolVersion, RequestIdentity};
+use eliot_store_api::{ExactJsonBytes, StoreRequest, decode_request_frame_with_authority};
 use std::collections::BTreeSet;
 
 /// Authenticated Store session identity retained after request admission.
@@ -110,7 +109,7 @@ impl AdmittedStoreRequestContext {
     /// validator has admitted the decoded request and the live session.
     pub(crate) fn from_validated_parts(
         frame: &Frame,
-        admitted_request: &Request,
+        admitted_request: &StoreRequest,
         session: AdmittedStoreSessionProjection,
     ) -> Result<Self, String> {
         let (request_id, identity, decoded_request, payload_authorities) =
