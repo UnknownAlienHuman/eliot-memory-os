@@ -708,7 +708,7 @@ pub fn commit_grant_closure_canonical_link(
         &operation_id,
         &request.canonical_receipt,
     )
-    .map_err(closure_link_store_error)?;
+    .map_err(|error| closure_link_store_error(&error))?;
     let commit = projection.commit();
     if commit.operation_id != operation_id.as_str()
         || projection.second_phase() != Some(&request.canonical_receipt)
@@ -728,7 +728,7 @@ pub fn commit_grant_closure_canonical_link(
 /// Maps one ORS refusal on the canonical second-phase link to the typed store
 /// failure, keeping determinate contract conflicts integrity-visible rather
 /// than transient.
-fn closure_link_store_error(error: eliot_ors::OrsError) -> StoreError {
+fn closure_link_store_error(error: &eliot_ors::OrsError) -> StoreError {
     match error {
         eliot_ors::OrsError::IntegrityProblem { .. }
         | eliot_ors::OrsError::DuplicateConflict
