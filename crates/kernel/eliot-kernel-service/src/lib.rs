@@ -25,8 +25,8 @@ pub use commit_recovery::{
     PausedScopeSnapshot, classify_commit_receipt, paused_ordering_scope_view,
     paused_scopes_snapshot, receipt_evidence_digest, recover_commit,
 };
-mod capacity_evidence;
 mod canonical_store_evidence;
+mod capacity_evidence;
 mod contract_rejection_gate;
 mod doctor;
 mod doctor_front_door;
@@ -73,12 +73,12 @@ mod wasm_control;
 mod wasm_dispatch;
 mod write_coordinator;
 
+pub use canonical_store_evidence::CanonicalStoreEvidence;
 pub use capacity_evidence::{
     BoundaryOptimizationProposal, CAPACITY_EVIDENCE_SCHEMA_VERSION, CanonicalWriteLatencyProfile,
     CapacityEnvelope, CapacityEvidenceError, CorpusScaleProfile, EvidenceClass,
     LatencyDistribution, MIN_PERCENTILE_SAMPLES, OptimizationQualification, UnqualifiedReason,
 };
-pub use canonical_store_evidence::CanonicalStoreEvidence;
 pub use contract_rejection_gate::{
     PRE_STAGE_RETRY_RULE, PreStageDecision, PreStageIdentityCache, PreStageIdentitySnapshot,
     PreStageJournalReadiness, PreStageRejection, PreStageState, VerifiedCorrectionLink,

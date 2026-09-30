@@ -151,8 +151,8 @@ use eliot_ors::{
 use eliot_platform::SecretReference;
 use eliot_receipts::ReceiptDispositionKind;
 use eliot_store_api::{
-    CAPABILITY_RESERVED_WRITE, CanonicalRequestView, OperationId, OrderingHeadExpectation,
-    NamedMutationOperation, OrderingScopeId, OriginalWriteSubmission, PreparedTransition,
+    CAPABILITY_RESERVED_WRITE, CanonicalRequestView, NamedMutationOperation, OperationId,
+    OrderingHeadExpectation, OrderingScopeId, OriginalWriteSubmission, PreparedTransition,
     ReceiptEnvelope, ReservedScopeBinding, ReservedWriteRequest, RevisionHeadExpectation,
     WriteAdmissionParams, WriteAdmissionProjection, WriteReceipt, WriteReceiptStatus,
     WriterEpochBinding, prepared_transition_digest, sha256_hex, verify_canonical_request_hash,
@@ -790,8 +790,9 @@ fn reserve_for_transition_inner(
         (true, None) => {
             return Err(ReservationWriteError::Admission {
                 operation_id,
-                detail: "CaptureObservation reservation requires its original public Observe submission"
-                    .to_owned(),
+                detail:
+                    "CaptureObservation reservation requires its original public Observe submission"
+                        .to_owned(),
             });
         }
         (false, Some(_)) => {
@@ -801,12 +802,14 @@ fn reserve_for_transition_inner(
                     .to_owned(),
             });
         }
-        (_, Some(source)) => source.validate().map_err(|error| {
-            ReservationWriteError::Admission {
-                operation_id: operation_id.clone(),
-                detail: format!("original Observe submission is invalid: {error}"),
-            }
-        })?,
+        (_, Some(source)) => {
+            source
+                .validate()
+                .map_err(|error| ReservationWriteError::Admission {
+                    operation_id: operation_id.clone(),
+                    detail: format!("original Observe submission is invalid: {error}"),
+                })?
+        }
         (false, None) => {}
     }
     validate_admitted(
@@ -861,13 +864,9 @@ fn reserve_for_transition_inner(
     .map_err(ReservationWriteError::Ors)?;
     let transition_digest = prepared_transition_digest(transition)?;
     let envelope = match original_submission {
-        Some(source) => bind_original_write_submission(
-            envelope,
-            source,
-            owner,
-            transition,
-            &transition_digest,
-        )?,
+        Some(source) => {
+            bind_original_write_submission(envelope, source, owner, transition, &transition_digest)?
+        }
         None => envelope,
     };
     let mut scopes: Vec<ScopeReservationRequest> = seed
@@ -959,7 +958,9 @@ fn bind_original_write_submission(
         payload_key_reference: key.clone(),
         write_response_mode: Some(source.response_mode.clone()),
     };
-    write_binding.validate().map_err(ReservationWriteError::Ors)?;
+    write_binding
+        .validate()
+        .map_err(ReservationWriteError::Ors)?;
     envelope
         .with_write_binding(write_binding)
         .map_err(ReservationWriteError::Ors)
@@ -1879,10 +1880,9 @@ async fn reconcile_one_record(
                 "startup receipt has no shared canonical Store evidence provider".to_owned(),
             ))
         })?;
-        evidence
-            .with_store_receipt(token, &reconciliation, &receipt, || {
-                finalize_reservation(owner, &reconciliation)
-            })?
+        evidence.with_store_receipt(token, &reconciliation, &receipt, || {
+            finalize_reservation(owner, &reconciliation)
+        })?
     });
     match finalized {
         Ok(_) => Ok(StartupRecordOutcome::Resolved),
