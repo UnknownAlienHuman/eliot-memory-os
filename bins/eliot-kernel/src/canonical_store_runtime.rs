@@ -44,11 +44,11 @@ use eliot_ipc::NamedPipeTransport;
 #[cfg(windows)]
 use eliot_kernel_core::RouteScope;
 #[cfg(windows)]
-use std::fmt;
-#[cfg(windows)]
 use eliot_kernel_service::{EbpCanonicalStoreClient, StoreClientError};
 #[cfg(windows)]
 use eliot_platform_windows::{NamedPipePeerExpectation, observe_named_pipe_peer_process_in_job};
+#[cfg(windows)]
+use std::fmt;
 
 /// Maps one Store bootstrap/build failure to its stable owner-typed code.
 ///
@@ -656,24 +656,24 @@ impl KernelComposition {
         // unset, and comparing those would report a fresh Store as stale.
         // A snapshot outside that tuple is stale truth: refused, named as
         // stale, and never reported as an outage.
-        let semantic_freshness =
-            if eliot_contracts::StateFence::authorizes_canonical(
-                &snapshot.state_fence.authority_epoch,
-                &request_fence.authority_epoch,
-            ) && snapshot.state_fence.resource_generation == request_fence.resource_generation
-            {
-                observe_entrypoint_with_detail(
-                    EntrypointStage::StoreBootstrap,
-                    "kernel.store.availability:fresh",
-                );
-                StoreSemanticFreshness::Fresh
-            } else {
-                observe_entrypoint_with_detail(
-                    EntrypointStage::StoreBootstrap,
-                    "kernel.store.availability:stale",
-                );
-                StoreSemanticFreshness::Stale
-            };
+        let semantic_freshness = if eliot_contracts::StateFence::authorizes_canonical(
+            &snapshot.state_fence.authority_epoch,
+            &request_fence.authority_epoch,
+        ) && snapshot.state_fence.resource_generation
+            == request_fence.resource_generation
+        {
+            observe_entrypoint_with_detail(
+                EntrypointStage::StoreBootstrap,
+                "kernel.store.availability:fresh",
+            );
+            StoreSemanticFreshness::Fresh
+        } else {
+            observe_entrypoint_with_detail(
+                EntrypointStage::StoreBootstrap,
+                "kernel.store.availability:stale",
+            );
+            StoreSemanticFreshness::Stale
+        };
         // Complete again: connectivity is `Attached` because this helper is
         // only reached after the retained owner was read and held an unfenced
         // transport, and the two facts above are assigned on every path. The
@@ -1298,10 +1298,20 @@ impl fmt::Display for StoreFactRefusal {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotEstablished { owner, reason } => {
-                write!(formatter, "{} not established: {}", owner.as_str(), reason.as_str())
+                write!(
+                    formatter,
+                    "{} not established: {}",
+                    owner.as_str(),
+                    reason.as_str()
+                )
             }
             Self::OwnerUnreadable { owner, reason } => {
-                write!(formatter, "{} owner unreadable: {}", owner.as_str(), reason.as_str())
+                write!(
+                    formatter,
+                    "{} owner unreadable: {}",
+                    owner.as_str(),
+                    reason.as_str()
+                )
             }
         }
     }

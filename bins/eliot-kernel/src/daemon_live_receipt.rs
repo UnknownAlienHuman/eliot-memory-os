@@ -6,6 +6,8 @@
 //! Forbidden authority: must not self-author readiness without authenticated evidence, semantic oracle, or alternate authority; this module remains evidence-gated, renewal-gated, and supervision-checked.
 
 #[cfg(windows)]
+use super::canonical_store_runtime::StoreTruthEvidence;
+#[cfg(windows)]
 use super::kernel_audit::AuditEventDraft;
 use super::{
     DaemonRuntimeStatus, DaemonSupervisionContour, EliotdLaunchDescriptor, Generation,
@@ -14,8 +16,6 @@ use super::{
     eliotd_launch_attempt_identity, eliotd_operation_id, observe_named_pipe_peer_process,
     probe_ready_state_admitted, sha256_json, unix_ms,
 };
-#[cfg(windows)]
-use super::canonical_store_runtime::StoreTruthEvidence;
 #[cfg(windows)]
 use super::{
     EliotdLiveReadyEvidence, EliotdLiveReceipt, EliotdLiveReceiptDisposition, HealthVector,
