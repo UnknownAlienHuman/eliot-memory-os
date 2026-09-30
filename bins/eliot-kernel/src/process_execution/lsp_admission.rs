@@ -75,7 +75,6 @@ pub(super) fn validate_current_source_request(
     if identity.request.state_fence != session.module_generation.state_fence
         || identity.request.metadata.state_fence != identity.request.state_fence
         || identity.request.metadata.task_id.as_ref() != Some(admitted_task_id)
-        || identity.idempotency_key != operation_id.as_str()
         || identity.request.metadata.request_id.as_str() != operation_id.as_str()
     {
         return Err(reject(
