@@ -68,6 +68,9 @@ pub(crate) const HEARTBEAT_OPERATION: &str = "eliot.user-broker.heartbeat";
 pub(crate) const AUTHORIZE_LAUNCH_OPERATION: &str = "eliot.user-broker.authorize-launch";
 /// Canonical Kernel operation selectors issued through this broker.
 pub(crate) const FENCE_OPERATION: &str = "eliot.user-broker.fence";
+/// Canonical read-only Kernel selector for receipt-bound native resource currentness.
+pub(crate) const VALIDATE_NATIVE_RESOURCE_SELECTION_CURRENT_OPERATION: &str =
+    "eliot.user-broker.validate-native-resource-selection-current";
 
 /// Stable broker product/source binding carried by every minted identity.
 const BROKER_PRODUCT_ID: &str = "eliot-user-broker";
@@ -91,6 +94,7 @@ pub(crate) enum BrokerOperation {
     HeartbeatRenewal,
     AuthorizeLaunch,
     FenceLogoff,
+    ValidateNativeResourceSelectionCurrent,
 }
 
 impl BrokerOperation {
@@ -102,6 +106,9 @@ impl BrokerOperation {
             Self::HeartbeatRenewal => HEARTBEAT_OPERATION,
             Self::AuthorizeLaunch => AUTHORIZE_LAUNCH_OPERATION,
             Self::FenceLogoff => FENCE_OPERATION,
+            Self::ValidateNativeResourceSelectionCurrent => {
+                VALIDATE_NATIVE_RESOURCE_SELECTION_CURRENT_OPERATION
+            }
         }
     }
 
@@ -112,6 +119,7 @@ impl BrokerOperation {
             Self::HeartbeatRenewal => "heartbeat",
             Self::AuthorizeLaunch => "authorize-launch",
             Self::FenceLogoff => "fence",
+            Self::ValidateNativeResourceSelectionCurrent => "resource-currentness",
         }
     }
 }
@@ -797,6 +805,24 @@ impl OperationIdentityIssuer {
             })?;
         }
         Ok(issued)
+    }
+
+    /// Issues (or exactly retries) a read-only native resource currentness
+    /// identity. Its distinct selector and idempotency namespace prevent it
+    /// from sharing an identity with registration, launch, heartbeat, or fence
+    /// operations. The payload includes the exact receipt, selection, and
+    /// caller-observed time that Kernel must revalidate against ORS.
+    pub(crate) fn issue_native_resource_selection_currentness(
+        &mut self,
+        payload: &Value,
+        now_unix_ms: u64,
+    ) -> Result<IssuedIdentity, OperationIdentityError> {
+        self.issue(
+            BrokerOperation::ValidateNativeResourceSelectionCurrent,
+            payload,
+            now_unix_ms,
+            &CallerLink::none(),
+        )
     }
 
     /// Issues (or idempotently retries) the fence/logoff identity. The fence

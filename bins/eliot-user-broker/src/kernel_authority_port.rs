@@ -23,6 +23,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use eliot_protocol::RequestIdentity;
+use eliot_security_contracts::NativeResourceSelection;
 use eliot_user_broker_core::{
     AuthorityPort, LaunchGrant, LaunchRequest, PortError, RegistrationFenceReceipt,
     RegistrationFenceRequest, RegistrationGrant, RegistrationReceipt, RegistrationRequest,
@@ -32,6 +33,7 @@ use super::SharedKernelClient;
 use crate::operation_identity::{
     AUTHORIZE_LAUNCH_OPERATION, BrokerOperation, FENCE_OPERATION, HEARTBEAT_OPERATION,
     IssuerHandle, OperationIdentityError, REGISTER_OPERATION,
+    VALIDATE_NATIVE_RESOURCE_SELECTION_CURRENT_OPERATION,
 };
 
 fn kernel_port_error(error: eliot_cli::kernel_client::KernelClientError) -> PortError {
@@ -112,6 +114,8 @@ impl KernelAuthorityPort {
             BrokerOperation::Register => guard.issue_register(payload, now),
             BrokerOperation::HeartbeatRenewal => guard.issue_heartbeat(payload, now),
             BrokerOperation::FenceLogoff => guard.issue_fence(payload, now),
+            BrokerOperation::ValidateNativeResourceSelectionCurrent => guard
+                .issue_native_resource_selection_currentness(payload, now),
             BrokerOperation::AuthorizeLaunch => {
                 return Err(PortError::Invalid(
                     "authorize-launch requires its caller launch binding".to_owned(),
@@ -178,6 +182,32 @@ impl AuthorityPort for KernelAuthorityPort {
         kernel_call(&self.client, AUTHORIZE_LAUNCH_OPERATION, payload, identity).and_then(|value| {
             serde_json::from_value(value)
                 .map_err(|error| PortError::Invalid(format!("decode launch grant: {error}")))
+        })
+    }
+
+    fn validate_native_resource_selection_current(
+        &mut self,
+        receipt: &RegistrationReceipt,
+        selection: &NativeResourceSelection,
+        observed_at: u64,
+    ) -> Result<(), PortError> {
+        let payload = serde_json::json!({
+            "registration": receipt,
+            "selection": selection,
+            "observed_at": observed_at,
+        });
+        let identity = self.issue(
+            BrokerOperation::ValidateNativeResourceSelectionCurrent,
+            &payload,
+        )?;
+        let response = kernel_call(
+            &self.client,
+            VALIDATE_NATIVE_RESOURCE_SELECTION_CURRENT_OPERATION,
+            payload,
+            identity,
+        )?;
+        serde_json::from_value::<()>(response).map_err(|error| {
+            PortError::Invalid(format!("decode native resource currentness: {error}"))
         })
     }
 
