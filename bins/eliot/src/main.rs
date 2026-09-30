@@ -18,9 +18,9 @@ use eliot_installation::{
     InstallationProfile, InstallationStage, InstallationStepOutcome, InstallationTransaction,
     InstallationTransactionStore, PlatformHandle, PostBootstrapRejectionClass, ProfileRootAnchors,
     ProfileSelectionInput, RedbInstallationRegistry, RedbInstallationTransactionStore,
-    WindowsInstallationCoordinator, compose_profile_launch,
-    parse_installation_transaction_id, post_bootstrap_rejection_pending_ref,
-    require_published_source_bundle_journal, validate_installation_transaction_json,
+    WindowsInstallationCoordinator, compose_profile_launch, parse_installation_transaction_id,
+    post_bootstrap_rejection_pending_ref, require_published_source_bundle_journal,
+    validate_installation_transaction_json,
 };
 use eliot_kernel_core::KernelRuntimeHealthEvidence;
 use eliot_live_canary::{
