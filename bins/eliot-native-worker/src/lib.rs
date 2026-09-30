@@ -1204,9 +1204,11 @@ impl PresentationEchoAdmission {
         if let Ok(mut binding) = self.lifecycle_binding.lock() {
             *binding = None;
         }
-        Ok(eliot_native_worker_core::AdmissionLivenessOutcome::Rejected {
-            reason: reason.into(),
-        })
+        Ok(
+            eliot_native_worker_core::AdmissionLivenessOutcome::Rejected {
+                reason: reason.into(),
+            },
+        )
     }
 
     /// Returns the exact admission facts this port returned, if it admitted.

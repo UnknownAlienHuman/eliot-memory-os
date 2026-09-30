@@ -567,8 +567,8 @@ mod tests {
     use eliot_native_worker::{
         AdmittedLifecycle, BoundedEvidenceSink, KernelReplayPort, KernelReplayTransport,
         NativeWorker, NativeWorkerDispatchAuthority, NativeWorkerError, ValidatedDispatchGrant,
-        derive_admitted_intent, drive_admitted_claimed,
-        governed_action::ActionEnvelope, require_launch_grant, select_factory_for_admitted,
+        derive_admitted_intent, drive_admitted_claimed, governed_action::ActionEnvelope,
+        require_launch_grant, select_factory_for_admitted,
     };
     use eliot_native_worker_core::{
         ActionEnvelopeCarrier, AdmissionLivenessFacts, AdmissionLivenessOutcome, AuthorityEnvelope,
