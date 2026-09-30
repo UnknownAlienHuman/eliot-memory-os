@@ -72,9 +72,11 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use eliot_agent_api::{AttemptId, RouteFingerprint};
+#[cfg(test)]
+use eliot_agent_coordinator::AdmittedProviderCapability;
 use eliot_agent_coordinator::{
-    AdmissionId, AdmittedProviderCapability, CandidateId, RUNTIME_PROFILE_FILE_NAME,
-    SchedulingProfile, StaffingPlanRequest, load_runtime_scheduling_profile,
+    AdmissionId, CandidateId, RUNTIME_PROFILE_FILE_NAME, SchedulingProfile, StaffingPlanRequest,
+    load_runtime_scheduling_profile,
 };
 use eliot_contracts::{StateFence, fences_match_exact, sha256_hex};
 use serde::{Deserialize, Serialize};
@@ -806,7 +808,6 @@ fn solo_dispatch_identity(attempt_id: &str, admission_id: &str) -> String {
 }
 
 /// Derives the deterministic solo cancellation identity.
-#[cfg(test)]
 fn solo_cancellation_identity(operation_id: &str) -> String {
     format!("{operation_id}-cancel")
 }
@@ -1132,6 +1133,7 @@ fn guard_solo_plan(plan: &StaffingPlanRequest) -> Result<(), FabricError> {
 ///
 /// Returns the readiness, intake, solo-shape, or capability owner rejection
 /// unchanged.
+#[cfg(test)]
 fn verify_solo_provider_binding(
     composition: &DaemonComposition,
     kernel: &Arc<DaemonKernelClient>,
@@ -1422,6 +1424,120 @@ pub fn prepare_solo_drive(
 /// fabric-chain, persistence, or live-slot rejection unchanged. A missing
 /// downstream owner port blocks typed with its prerequisite residual; the
 /// intake stays queued and nothing is dispatched.
+///
+/// Re-checks readiness, intake shape, the live fence against the prepared
+/// expectation, and the single live slot; any move refuses typed and applies
+/// nothing. Returns the live fence the adopt run binds.
+fn revalidate_solo_adopt(
+    composition: &DaemonComposition,
+    kernel: &Arc<DaemonKernelClient>,
+    intake: &SoloDelegateIntake,
+    expected_fence: &StateFence,
+    operation_id: &str,
+) -> Result<StateFence, DaemonError> {
+    if composition.readiness() != CompositionReadiness::Ready {
+        return Err(DaemonError::Composition(CompositionError::NotReady));
+    }
+    intake
+        .validate(crate::unix_ms())
+        .map_err(DaemonError::ProviderAdmission)?;
+    let live_fence = kernel.kernel_fence();
+    if !fences_match_exact(&live_fence, expected_fence) {
+        return Err(DaemonError::ProviderAdmission(FabricError::StaleFence(
+            "solo drive refuses a fence moved during owner verification".to_owned(),
+        )));
+    }
+    {
+        let state = composition.solo_state.lock().map_err(|_| {
+            DaemonError::Composition(CompositionError::Recovery(
+                "solo driver state lock poisoned".to_owned(),
+            ))
+        })?;
+        if let Some(live) = state.live_operation.as_ref()
+            && live != operation_id
+        {
+            return Err(DaemonError::ProviderAdmission(FabricError::Contract(
+                format!("solo slice holds live attempt {live}; settle or cancel it first"),
+            )));
+        }
+    }
+    Ok(live_fence)
+}
+
+/// Builds the test-only solo ports over one preloaded route (issue #2567).
+#[cfg(test)]
+fn solo_adopt_test_ports(
+    intake: &SoloDelegateIntake,
+    staffed: &crate::staffing_policy::StaffedLane,
+    live_fence: &StateFence,
+    attempt_id: &AttemptId,
+    kernel: &Arc<DaemonKernelClient>,
+) -> Result<FabricPorts, DaemonError> {
+    let registry = SoloModelRegistryPort::new();
+    registry
+        .preload(PreloadedRoute {
+            role: intake.requirements.role.clone(),
+            competence: intake.requirements.competence.clone(),
+            route: staffed.route.clone(),
+        })
+        .map_err(DaemonError::ProviderAdmission)?;
+    let definition_digest = crate::agent_fabric::frozen_definition_digest(&intake.plan)
+        .map_err(DaemonError::ProviderAdmission)?;
+    Ok(solo_fabric_ports(
+        SoloVerifiedContext {
+            definition_id: intake.plan.candidate_id.clone(),
+            definition_digest,
+            work_class: intake.plan.work_class,
+            fence: live_fence.clone(),
+            epoch: live_fence.authority_epoch.clone(),
+            attempt_id: attempt_id.clone(),
+        },
+        kernel,
+        registry,
+    ))
+}
+
+/// Builds the retained dispatch record for one admitted solo drive.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one flat dispatch-record constructor over already-resolved adopt parts; grouping would invent a second record beside SoloDispatchRecord"
+)]
+fn solo_dispatch_record(
+    operation_id: &str,
+    attempt_id: &AttemptId,
+    intake: &SoloDelegateIntake,
+    route: &RouteFingerprint,
+    staffed: &crate::staffing_policy::StaffedLane,
+    intent: &DispatchIntent,
+    dispatch_id: &str,
+) -> SoloDispatchRecord {
+    SoloDispatchRecord {
+        dispatch_id: dispatch_id.to_owned(),
+        claim_id: intake.claimed.claim_id.clone(),
+        attempt_id: attempt_id.as_str().to_owned(),
+        operation_id: operation_id.to_owned(),
+        task_id: intake.plan.launch.task_id.as_str().to_owned(),
+        route: route.clone(),
+        route_class: staffed.route_class.clone(),
+        worker_generation: intake.claimed.worker_generation,
+        binding_digest: intake.claimed.binding_digest.clone(),
+        executable_digest: intake.claimed.executable_digest.clone(),
+        expected_result_schema: intake.delegate.expected_result.clone(),
+        deadline_unix_ms: intake.deadline_unix_ms,
+        cancellation_id: solo_cancellation_identity(operation_id),
+        fence: intent.fence.clone(),
+        epoch: intent.epoch.clone(),
+        worker_completed_fields: vec![
+            "registration_id".to_owned(),
+            "executable_binding".to_owned(),
+            "decision_id".to_owned(),
+            "parent_job_id".to_owned(),
+            "work_scope_id".to_owned(),
+            "expected_result_schema_version".to_owned(),
+        ],
+    }
+}
+
 pub fn adopt_solo_drive(
     composition: &DaemonComposition,
     kernel: &Arc<DaemonKernelClient>,
@@ -1435,32 +1551,8 @@ pub fn adopt_solo_drive(
         expected_fence,
         receipt,
     } = prepared;
-    if composition.readiness() != CompositionReadiness::Ready {
-        return Err(DaemonError::Composition(CompositionError::NotReady));
-    }
-    intake
-        .validate(crate::unix_ms())
-        .map_err(DaemonError::ProviderAdmission)?;
-    let live_fence = kernel.kernel_fence();
-    if !fences_match_exact(&live_fence, &expected_fence) {
-        return Err(DaemonError::ProviderAdmission(FabricError::StaleFence(
-            "solo drive refuses a fence moved during owner verification".to_owned(),
-        )));
-    }
-    {
-        let state = composition.solo_state.lock().map_err(|_| {
-            DaemonError::Composition(CompositionError::Recovery(
-                "solo driver state lock poisoned".to_owned(),
-            ))
-        })?;
-        if let Some(live) = state.live_operation.as_ref()
-            && live != &operation_id
-        {
-            return Err(DaemonError::ProviderAdmission(FabricError::Contract(
-                format!("solo slice holds live attempt {live}; settle or cancel it first"),
-            )));
-        }
-    }
+    let _live_fence =
+        revalidate_solo_adopt(composition, kernel, &intake, &expected_fence, &operation_id)?;
     let capability = composition.agent_fabric_verified_capability(kernel, material)?;
     let attempt_id = AttemptId::new(attempt_id)
         .map_err(|error| DaemonError::ProviderAdmission(contract(error)))?;
@@ -1473,30 +1565,7 @@ pub fn adopt_solo_drive(
     // without an accepted interface revision blocks typed instead of
     // inventing authority. Unit tests bind the preloaded solo fakes.
     #[cfg(test)]
-    let ports = {
-        let registry = SoloModelRegistryPort::new();
-        registry
-            .preload(PreloadedRoute {
-                role: intake.requirements.role.clone(),
-                competence: intake.requirements.competence.clone(),
-                route: staffed.route.clone(),
-            })
-            .map_err(DaemonError::ProviderAdmission)?;
-        let definition_digest = crate::agent_fabric::frozen_definition_digest(&intake.plan)
-            .map_err(DaemonError::ProviderAdmission)?;
-        solo_fabric_ports(
-            SoloVerifiedContext {
-                definition_id: intake.plan.candidate_id.clone(),
-                definition_digest,
-                work_class: intake.plan.work_class,
-                fence: live_fence.clone(),
-                epoch: live_fence.authority_epoch.clone(),
-                attempt_id: attempt_id.clone(),
-            },
-            kernel,
-            registry,
-        )
-    };
+    let ports = solo_adopt_test_ports(&intake, staffed, &_live_fence, &attempt_id, kernel)?;
     #[cfg(not(test))]
     let ports = composition.production_fabric_ports()?;
     let config = daemon_coordinator_config()?;
@@ -1516,31 +1585,15 @@ pub fn adopt_solo_drive(
     let _evidence = fabric.activate(&admission.admission_id, &attempt_id)?;
     let dispatch_id = solo_dispatch_identity(attempt_id.as_str(), admission.admission_id.as_str());
     let intent = fabric.dispatch(&admission.admission_id, &attempt_id, &dispatch_id)?;
-    let dispatch = SoloDispatchRecord {
-        dispatch_id: dispatch_id.clone(),
-        claim_id: intake.claimed.claim_id.clone(),
-        attempt_id: attempt_id.as_str().to_owned(),
-        operation_id: operation_id.clone(),
-        task_id: intake.plan.launch.task_id.as_str().to_owned(),
-        route: route.clone(),
-        route_class: staffed.route_class.clone(),
-        worker_generation: intake.claimed.worker_generation,
-        binding_digest: intake.claimed.binding_digest.clone(),
-        executable_digest: intake.claimed.executable_digest.clone(),
-        expected_result_schema: intake.delegate.expected_result.clone(),
-        deadline_unix_ms: intake.deadline_unix_ms,
-        cancellation_id: solo_cancellation_identity(&operation_id),
-        fence: intent.fence.clone(),
-        epoch: intent.epoch.clone(),
-        worker_completed_fields: vec![
-            "registration_id".to_owned(),
-            "executable_binding".to_owned(),
-            "decision_id".to_owned(),
-            "parent_job_id".to_owned(),
-            "work_scope_id".to_owned(),
-            "expected_result_schema_version".to_owned(),
-        ],
-    };
+    let dispatch = solo_dispatch_record(
+        &operation_id,
+        &attempt_id,
+        &intake,
+        &route,
+        staffed,
+        &intent,
+        &dispatch_id,
+    );
     let snapshot = fabric.snapshot()?;
     let projection = SoloPersistedAttempt {
         operation_id: operation_id.clone(),
@@ -1776,13 +1829,13 @@ fn restore_solo_fabric(
     let ports = composition.production_fabric_ports()?;
     let material = composition.resolve_verified_material(kernel, projection.claimed.material())?;
     let config = daemon_coordinator_config()?;
+    let revisions =
+        crate::semantic_revision_store::SemanticRevisionStore::new(composition.state_root());
     let mut fabric = AgentFabric::restore_verified(
         projection.snapshot.clone(),
         config,
         ports,
-        Some(crate::semantic_revision_store::SemanticRevisionStore::new(
-            composition.state_root(),
-        )),
+        Some(&revisions),
         material,
     )
     .map_err(DaemonError::ProviderAdmission)?;

@@ -584,6 +584,7 @@ fn digest_json<T: Serialize>(value: &T) -> Result<String, FabricError> {
 ///
 /// Returns [`FabricError::Contract`] when the request cannot be canonically
 /// encoded.
+#[cfg(test)]
 pub(crate) fn frozen_definition_digest(
     request: &StaffingPlanRequest,
 ) -> Result<String, FabricError> {
@@ -3861,7 +3862,7 @@ impl AgentFabric {
         snapshot: FabricSnapshot,
         config: CoordinatorConfig,
         ports: FabricPorts,
-        semantic_revisions: Option<SemanticRevisionStore>,
+        semantic_revisions: Option<&SemanticRevisionStore>,
         material: VerifiedProviderMaterial,
     ) -> Result<Self, FabricError> {
         let capability = build_admitted_provider_capability(material)?;
@@ -3869,7 +3870,7 @@ impl AgentFabric {
             snapshot,
             config,
             ports,
-            semantic_revisions.as_ref(),
+            semantic_revisions,
             capability,
         )
     }

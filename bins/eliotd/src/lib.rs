@@ -3253,13 +3253,13 @@ impl DaemonComposition {
         let _span = tracing::info_span!("eliotd.fabric_restore_verified").entered();
         let material = self.resolve_verified_material(kernel, material)?;
         let config = daemon_coordinator_config()?;
+        let revisions =
+            crate::semantic_revision_store::SemanticRevisionStore::new(self.state_root());
         Ok(AgentFabric::restore_verified(
             snapshot,
             config,
             ports,
-            Some(crate::semantic_revision_store::SemanticRevisionStore::new(
-                self.state_root(),
-            )),
+            Some(&revisions),
             material,
         )?)
     }
