@@ -38,7 +38,13 @@ use eliot_ors::{
     RedbRecoveryStore, ReservationRecord, UnknownCommitOutcome, UnknownCommitRecord,
     WriterReservationToken,
 };
+use eliot_ors::{OrsError, prove_maintenance_trigger_staging};
 use eliot_protocol::dreamer_job::{DurableJobRequest, DurableJobResponse, JobOperation};
+use eliot_protocol::{
+    MaintenanceTriggerAck, MaintenanceTriggerClaim, MaintenanceTriggerDecisionReceipt,
+    MaintenanceTriggerGapKind, MaintenanceTriggerIntakeReceipt, MaintenanceTriggerPage,
+    MaintenanceTriggerRecord, MaintenanceTriggerRevocation, ProtocolError,
+};
 use eliot_runtime_contracts::{
     AffectedOperationClass, BackpressureDisposition, BottleneckAvailability,
     BottleneckCoverageState, BottleneckObservationV1, CapacityBottleneck,
@@ -93,15 +99,24 @@ use crate::user_automation_orchestration::{
     runtime_obligation_payload_digest,
 };
 use crate::{
-    CanonicalUserAutomationStore, EbpCanonicalStoreClient, EbpStoreTransport, KernelService,
-    StoreClientFault, StoreClientFaultHarness, UserAutomationConfigurationPhase,
-    UserAutomationExecutionPhase, UserAutomationHorizonOutcome, UserAutomationHorizonPhase,
-    UserAutomationHorizonTrigger, UserAutomationMutationResult, UserAutomationOperatorTransition,
-    UserAutomationOwnerLookup, UserAutomationOwnerSnapshot, UserAutomationReadResult,
-    UserAutomationRuntimeError, UserAutomationRuntimePort, UserAutomationService,
-    UserAutomationServiceRequest, UserAutomationStoreOutcome, UserAutomationStoreRequest,
-    UserAutomationWakeHorizonPublication, UserAutomationWakePhase, UserAutomationWakePort,
-    committed_configuration_state, compile_wake_horizon, run_now_wake_read_request,
+    AuthenticatedMaintenanceTriggerSession, CanonicalUserAutomationStore, EbpCanonicalStoreClient,
+    EbpStoreTransport, KernelService, KernelServiceError, MaintenanceTriggerClaimRequest,
+    MaintenanceTriggerDeliveryError, MaintenanceTriggerDeliveryLedger,
+    MaintenanceTriggerDeliveryRow, StoreClientFault, StoreClientFaultHarness,
+    UserAutomationConfigurationPhase, UserAutomationExecutionPhase, UserAutomationHorizonOutcome,
+    UserAutomationHorizonPhase, UserAutomationHorizonTrigger, UserAutomationMutationResult,
+    UserAutomationOperatorTransition, UserAutomationOwnerLookup, UserAutomationOwnerSnapshot,
+    UserAutomationReadResult, UserAutomationRuntimeError, UserAutomationRuntimePort,
+    UserAutomationService, UserAutomationServiceRequest, UserAutomationStoreOutcome,
+    UserAutomationStoreRequest, UserAutomationWakeHorizonPublication, UserAutomationWakePhase,
+    UserAutomationWakePort, committed_configuration_state, compile_wake_horizon,
+    handle_maintenance_trigger_ack, handle_maintenance_trigger_claim,
+    handle_maintenance_trigger_decision, handle_maintenance_trigger_expiry,
+    handle_maintenance_trigger_gap, handle_maintenance_trigger_mark_ambiguous,
+    handle_maintenance_trigger_pending_page, handle_maintenance_trigger_release_expired,
+    handle_maintenance_trigger_replacement_pending_set, handle_maintenance_trigger_revocation,
+    handle_maintenance_trigger_supersession, recover_maintenance_trigger_commit,
+    replay_maintenance_trigger_after_crash, run_now_wake_read_request,
 };
 use eliot_kernel_core::user_automation::UserAutomationExecutionProjection;
 
@@ -792,6 +807,16 @@ pub struct KernelStoreGateway {
     /// observation and never answers on its own. Its initial state is
     /// uninitialized evidence, not an observed clear ledger.
     paused_scopes: PausedScopeMirror,
+    /// The one Kernel-owned retained maintenance-trigger delivery ledger
+    /// (issue #1694). Every ledger transition is performed through this
+    /// owner: the intake/claim/decision/ack and recovery seams below lock it
+    /// together with the service guard (service-first, ledger-second) and
+    /// snapshot its durable rows on every transition. There is no second
+    /// ledger, database, or poller; row durability rides the ORS staging
+    /// proof (intake) and the committed named Store transaction the decision
+    /// receipt binds (decision), and startup restores through
+    /// [`Self::restore_maintenance_trigger_ledger`].
+    maintenance_triggers: Mutex<MaintenanceTriggerDeliveryLedger>,
 }
 
 impl std::fmt::Debug for KernelStoreGateway {
@@ -970,6 +995,10 @@ impl KernelStoreGateway {
             // observation, and until one succeeds a negative mirror answer
             // is unavailable rather than clear.
             paused_scopes: PausedScopeMirror::new(),
+            // One delivery ledger per gateway: the owner of every retained
+            // maintenance trigger row. It starts empty; the startup path
+            // restores it before any claim is served.
+            maintenance_triggers: Mutex::new(MaintenanceTriggerDeliveryLedger::new()),
         }
     }
 
@@ -1635,6 +1664,491 @@ impl KernelStoreGateway {
         )
         .await
         .map_err(|error| error.to_string())
+    }
+
+    /// Locks the Kernel service for one maintenance-trigger owner step.
+    ///
+    /// Guards are always taken service-first, ledger-second, and no guard is
+    /// ever held across ORS or Store IO: IO runs guard-free before the
+    /// transition, then the transition runs under both guards.
+    fn lock_maintenance_service(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, KernelService>, MaintenanceTriggerDeliveryError> {
+        self.service.lock().map_err(|_| {
+            MaintenanceTriggerDeliveryError::OwnerUnavailable(
+                "Kernel service lock poisoned".to_owned(),
+            )
+        })
+    }
+
+    /// Locks the owned delivery ledger; always after the service guard.
+    fn lock_maintenance_ledger(
+        &self,
+    ) -> Result<
+        std::sync::MutexGuard<'_, MaintenanceTriggerDeliveryLedger>,
+        MaintenanceTriggerDeliveryError,
+    > {
+        self.maintenance_triggers.lock().map_err(|_| {
+            MaintenanceTriggerDeliveryError::OwnerUnavailable(
+                "maintenance trigger ledger lock poisoned".to_owned(),
+            )
+        })
+    }
+
+    /// Binds one maintenance-trigger session from live Kernel authority.
+    ///
+    /// The principal reference comes from the authenticated composition
+    /// boundary, never from a request DTO. The guard is released before any
+    /// IO the caller performs afterwards; the transition re-proves liveness
+    /// under a fresh guard.
+    fn bind_maintenance_session(
+        &self,
+        principal_ref: &str,
+    ) -> Result<AuthenticatedMaintenanceTriggerSession, MaintenanceTriggerDeliveryError> {
+        let service = self.lock_maintenance_service()?;
+        AuthenticatedMaintenanceTriggerSession::bind(&service, principal_ref)
+            .map_err(MaintenanceTriggerDeliveryError::Service)
+    }
+
+    /// Admits one retained maintenance trigger into the owned delivery ledger
+    /// (issue #1694).
+    ///
+    /// The complete opaque input must already be staged through the ORS
+    /// owner: staging is proven with no owner guard held (the service lock
+    /// is never held across ORS work anywhere in this module), then the
+    /// session is bound, liveness re-proved, and the row admitted under both
+    /// guards. The returned rows are the ledger's durable snapshot after
+    /// this transition. `handle_maintenance_trigger_intake` stays the seam
+    /// for guard-free front-door callers (STITCH): this owner entry proves
+    /// staging first so no guard is ever held across the ORS read.
+    pub fn admit_maintenance_trigger(
+        &self,
+        principal_ref: &str,
+        record: MaintenanceTriggerRecord,
+    ) -> Result<
+        (
+            MaintenanceTriggerIntakeReceipt,
+            Vec<MaintenanceTriggerDeliveryRow>,
+        ),
+        MaintenanceTriggerDeliveryError,
+    > {
+        let session = self.bind_maintenance_session(principal_ref)?;
+        let commit_ors = self.commit_ors.clone().ok_or_else(|| {
+            MaintenanceTriggerDeliveryError::StagingProof(OrsError::IntegrityProblem {
+                record_type: "maintenance_trigger_delivery",
+                reason: "maintenance trigger intake requires the composition-bound ORS".to_owned(),
+            })
+        })?;
+        prove_maintenance_trigger_staging(
+            &*commit_ors,
+            &record.payload.envelope_reference,
+            &record.payload.payload_hash,
+        )
+        .map_err(MaintenanceTriggerDeliveryError::StagingProof)?;
+        let service = self.lock_maintenance_service()?;
+        session
+            .service_context(&service)
+            .map_err(MaintenanceTriggerDeliveryError::Service)?;
+        let mut ledger = self.lock_maintenance_ledger()?;
+        let receipt = ledger.admit_intake(record)?;
+        Ok((receipt, ledger.durable_rows()))
+    }
+
+    /// Issues one finite fenced claim from the owned delivery ledger (issue
+    /// #1694).
+    ///
+    /// Binds the session from live authority, then issues the claim bound to
+    /// the current compatible daemon generation/session, trigger revision,
+    /// and delivery identity through the existing ledger seam. The returned
+    /// rows are the durable snapshot after this transition.
+    pub fn claim_maintenance_trigger(
+        &self,
+        principal_ref: &str,
+        request: MaintenanceTriggerClaimRequest,
+    ) -> Result<
+        (MaintenanceTriggerClaim, Vec<MaintenanceTriggerDeliveryRow>),
+        MaintenanceTriggerDeliveryError,
+    > {
+        let session = self.bind_maintenance_session(principal_ref)?;
+        let service = self.lock_maintenance_service()?;
+        let mut ledger = self.lock_maintenance_ledger()?;
+        let claim = handle_maintenance_trigger_claim(&service, &session, &mut ledger, request)?;
+        Ok((claim, ledger.durable_rows()))
+    }
+
+    /// Releases one expired claim back under the same trigger identity
+    /// (issue #1694).
+    ///
+    /// A timed-out `Claimed` row returns to `Pending`; a `DecisionRecorded`
+    /// row with a lapsed claim moves to `Reconciling` with its committed
+    /// receipt preserved. Redelivery always needs a fresh finite claim,
+    /// never a new trigger ID. The returned rows are the durable snapshot
+    /// after this transition.
+    pub fn release_expired_maintenance_trigger_claim(
+        &self,
+        principal_ref: &str,
+        trigger_id: &str,
+        now_unix_ms: u64,
+    ) -> Result<Vec<MaintenanceTriggerDeliveryRow>, MaintenanceTriggerDeliveryError> {
+        let session = self.bind_maintenance_session(principal_ref)?;
+        let service = self.lock_maintenance_service()?;
+        let mut ledger = self.lock_maintenance_ledger()?;
+        handle_maintenance_trigger_release_expired(
+            &service,
+            &session,
+            &mut ledger,
+            trigger_id,
+            now_unix_ms,
+        )?;
+        Ok(ledger.durable_rows())
+    }
+
+    /// Enumerates one bounded pending page from the owned delivery ledger
+    /// (issue #1694).
+    ///
+    /// A read: no ledger transition, so no rows snapshot. A reconnect
+    /// resumes from its cursor and never resets progress to a guessed
+    /// complete-empty set.
+    pub fn maintenance_trigger_pending_page(
+        &self,
+        principal_ref: &str,
+        continuation: Option<&str>,
+        now_unix_ms: u64,
+    ) -> Result<MaintenanceTriggerPage, MaintenanceTriggerDeliveryError> {
+        let session = self.bind_maintenance_session(principal_ref)?;
+        let service = self.lock_maintenance_service()?;
+        let ledger = self.lock_maintenance_ledger()?;
+        handle_maintenance_trigger_pending_page(
+            &service,
+            &session,
+            &ledger,
+            continuation,
+            now_unix_ms,
+        )
+    }
+
+    /// Records one daemon decision into the owned delivery ledger against
+    /// its committed named Store transaction (issue #1694).
+    ///
+    /// The authenticated daemon submits its decision through the Governor
+    /// `PreparedTransition` → Kernel → named Store transaction; that
+    /// transaction's committed [`WriteReceipt`] is the durability the
+    /// ledger row rides on. This owner entry re-reads the exact receipt
+    /// through the existing Store client, requires `Committed` status,
+    /// re-proves the canonical-bytes digest the decision receipt binds, and
+    /// requires the receipt fence to match live service authority — an
+    /// arbitrary receipt ID or transport `Ok(())` can never complete this
+    /// transition. Only then is the decision recorded; the returned rows
+    /// are the durable snapshot after the transition. A lost or ambiguous
+    /// commit stays pending/reconciling through
+    /// [`Self::mark_maintenance_trigger_commit_ambiguous`]: receipt absence
+    /// here is never reported as proof of non-commit.
+    pub async fn record_maintenance_trigger_decision(
+        &self,
+        principal_ref: &str,
+        trigger_id: &str,
+        receipt: MaintenanceTriggerDecisionReceipt,
+    ) -> Result<Vec<MaintenanceTriggerDeliveryRow>, MaintenanceTriggerDeliveryError> {
+        let _flight = self
+            .flight
+            .enter()
+            .map_err(MaintenanceTriggerDeliveryError::OwnerUnavailable)?;
+        receipt.validate()?;
+        let session = self.bind_maintenance_session(principal_ref)?;
+        let operation_id =
+            OperationId::new(receipt.canonical_receipt_ref.clone()).map_err(|_| {
+                MaintenanceTriggerDeliveryError::Protocol(ProtocolError::InvalidField {
+                    field: "maintenance_trigger_decision_receipt.canonical_receipt_ref",
+                    reason: "decision receipt names no well-formed canonical receipt",
+                })
+            })?;
+        let stored = self.store.receipt(operation_id).await?;
+        let stored = stored.ok_or(MaintenanceTriggerDeliveryError::Protocol(
+            ProtocolError::InvalidField {
+                field: "maintenance_trigger_decision_receipt.canonical_receipt_ref",
+                reason: "no committed Store receipt answers this decision",
+            },
+        ))?;
+        stored.validate()?;
+        if stored.status != WriteReceiptStatus::Committed {
+            return Err(MaintenanceTriggerDeliveryError::Protocol(
+                ProtocolError::InvalidField {
+                    field: "maintenance_trigger_decision_receipt.canonical_receipt_ref",
+                    reason: "the bound Store transaction was not committed",
+                },
+            ));
+        }
+        let receipt_bytes = canonical_json_bytes(&stored)
+            .map_err(|error| StoreError::Serialization(error.to_string()))?;
+        if sha256_hex(&receipt_bytes) != receipt.receipt_digest {
+            return Err(MaintenanceTriggerDeliveryError::Protocol(
+                ProtocolError::InvalidField {
+                    field: "maintenance_trigger_decision_receipt.receipt_digest",
+                    reason: "the receipt digest does not bind this operation",
+                },
+            ));
+        }
+        let service = self.lock_maintenance_service()?;
+        let context = session
+            .service_context(&service)
+            .map_err(MaintenanceTriggerDeliveryError::Service)?;
+        if !stored
+            .state_fence
+            .authority_epoch
+            .is_same_authority(&context.authority_epoch)
+            || stored.state_fence.resource_generation.value() != context.generation
+        {
+            return Err(MaintenanceTriggerDeliveryError::Service(
+                KernelServiceError::HandshakeMismatch {
+                    field: "maintenance_trigger.fence",
+                },
+            ));
+        }
+        let mut ledger = self.lock_maintenance_ledger()?;
+        handle_maintenance_trigger_decision(&service, &session, &mut ledger, trigger_id, receipt)?;
+        Ok(ledger.durable_rows())
+    }
+
+    /// Acknowledges one delivery against the exact committed decision
+    /// receipt (issue #1694).
+    ///
+    /// The ack must echo the live claim exactly and embed the committed
+    /// receipt byte for byte; a stale consumer cannot ack after revocation.
+    /// The returned rows are the durable snapshot after this transition.
+    pub fn acknowledge_maintenance_trigger(
+        &self,
+        principal_ref: &str,
+        ack: &MaintenanceTriggerAck,
+        current_fence: &StateFence,
+        now_unix_ms: u64,
+    ) -> Result<Vec<MaintenanceTriggerDeliveryRow>, MaintenanceTriggerDeliveryError> {
+        let session = self.bind_maintenance_session(principal_ref)?;
+        let service = self.lock_maintenance_service()?;
+        let mut ledger = self.lock_maintenance_ledger()?;
+        handle_maintenance_trigger_ack(
+            &service,
+            &session,
+            &mut ledger,
+            ack,
+            current_fence,
+            now_unix_ms,
+        )?;
+        Ok(ledger.durable_rows())
+    }
+
+    /// Replays one retained trigger after a pre-commit crash, without
+    /// minting new state (issue #1694).
+    ///
+    /// A read: the caller re-presents the exact retained record to the
+    /// evaluator under the same identity.
+    pub fn replay_maintenance_trigger_after_crash(
+        &self,
+        principal_ref: &str,
+        trigger_id: &str,
+    ) -> Result<MaintenanceTriggerRecord, MaintenanceTriggerDeliveryError> {
+        let session = self.bind_maintenance_session(principal_ref)?;
+        let service = self.lock_maintenance_service()?;
+        let ledger = self.lock_maintenance_ledger()?;
+        replay_maintenance_trigger_after_crash(&service, &session, &ledger, trigger_id)
+    }
+
+    /// Recovers one committed decision receipt after a post-commit crash
+    /// (issue #1694).
+    ///
+    /// A read: the caller acknowledges this exact receipt without a new
+    /// job, recommendation, or wake.
+    pub fn recover_maintenance_trigger_commit(
+        &self,
+        principal_ref: &str,
+        trigger_id: &str,
+    ) -> Result<MaintenanceTriggerDecisionReceipt, MaintenanceTriggerDeliveryError> {
+        let session = self.bind_maintenance_session(principal_ref)?;
+        let service = self.lock_maintenance_service()?;
+        let ledger = self.lock_maintenance_ledger()?;
+        recover_maintenance_trigger_commit(&service, &session, &ledger, trigger_id)
+    }
+
+    /// Marks one lost or ambiguous commit as reconciling (issue #1694).
+    ///
+    /// Receipt absence during an outage is not proof of non-commit: the
+    /// trigger stays open, gains an `AmbiguousCommit` gap record, and must
+    /// be reconciled by receipt lookup before any further effect. The
+    /// returned rows are the durable snapshot after this transition.
+    pub fn mark_maintenance_trigger_commit_ambiguous(
+        &self,
+        principal_ref: &str,
+        trigger_id: &str,
+        now_unix_ms: u64,
+    ) -> Result<Vec<MaintenanceTriggerDeliveryRow>, MaintenanceTriggerDeliveryError> {
+        let session = self.bind_maintenance_session(principal_ref)?;
+        let service = self.lock_maintenance_service()?;
+        let mut ledger = self.lock_maintenance_ledger()?;
+        handle_maintenance_trigger_mark_ambiguous(
+            &service,
+            &session,
+            &mut ledger,
+            trigger_id,
+            now_unix_ms,
+        )?;
+        Ok(ledger.durable_rows())
+    }
+
+    /// Revokes one daemon generation/session's trigger-consumer authority
+    /// (issue #1694).
+    ///
+    /// Pending claims return under the same identity for the replacement
+    /// generation, committed rows move to `Reconciling` with receipts
+    /// preserved, and every later old-generation claim or ack fails. The
+    /// returned rows are the durable snapshot after this transition.
+    pub fn revoke_maintenance_trigger_consumer(
+        &self,
+        principal_ref: &str,
+        revocation: MaintenanceTriggerRevocation,
+    ) -> Result<Vec<MaintenanceTriggerDeliveryRow>, MaintenanceTriggerDeliveryError> {
+        let session = self.bind_maintenance_session(principal_ref)?;
+        let service = self.lock_maintenance_service()?;
+        let mut ledger = self.lock_maintenance_ledger()?;
+        handle_maintenance_trigger_revocation(&service, &session, &mut ledger, revocation)?;
+        Ok(ledger.durable_rows())
+    }
+
+    /// Surfaces the bounded pending set to a replacement generation (issue
+    /// #1694).
+    ///
+    /// A read: after replacement authentication plus the required mirror
+    /// recovery, the replacement sees the bounded pending set before
+    /// reconciliation may be claimed complete. Ordinary pending debt
+    /// acquires no runtime lease here.
+    pub fn maintenance_trigger_replacement_pending_set(
+        &self,
+        principal_ref: &str,
+        continuation: Option<&str>,
+        mirror_recovered: bool,
+        now_unix_ms: u64,
+    ) -> Result<MaintenanceTriggerPage, MaintenanceTriggerDeliveryError> {
+        let session = self.bind_maintenance_session(principal_ref)?;
+        let service = self.lock_maintenance_service()?;
+        let ledger = self.lock_maintenance_ledger()?;
+        handle_maintenance_trigger_replacement_pending_set(
+            &service,
+            &session,
+            &ledger,
+            continuation,
+            mirror_recovered,
+            now_unix_ms,
+        )
+    }
+
+    /// Records terminal expiry for a past-window trigger (issue #1694).
+    ///
+    /// Expired eligibility blocks stale execution but never deletes the row,
+    /// its record, or its evidence locators. The returned rows are the
+    /// durable snapshot after this transition.
+    pub fn expire_maintenance_trigger(
+        &self,
+        principal_ref: &str,
+        trigger_id: &str,
+        reason: &str,
+        now_unix_ms: u64,
+    ) -> Result<Vec<MaintenanceTriggerDeliveryRow>, MaintenanceTriggerDeliveryError> {
+        let session = self.bind_maintenance_session(principal_ref)?;
+        let service = self.lock_maintenance_service()?;
+        let mut ledger = self.lock_maintenance_ledger()?;
+        handle_maintenance_trigger_expiry(
+            &service,
+            &session,
+            &mut ledger,
+            trigger_id,
+            reason,
+            now_unix_ms,
+        )?;
+        Ok(ledger.durable_rows())
+    }
+
+    /// Records supersession by an explicitly linked successor trigger
+    /// (issue #1694).
+    ///
+    /// The successor is named, both rows stay readable, and materially new
+    /// evidence arrives as a new trigger rather than an overwrite. The
+    /// returned rows are the durable snapshot after this transition.
+    pub fn supersede_maintenance_trigger(
+        &self,
+        principal_ref: &str,
+        trigger_id: &str,
+        successor_trigger_id: &str,
+        reason: &str,
+        now_unix_ms: u64,
+    ) -> Result<Vec<MaintenanceTriggerDeliveryRow>, MaintenanceTriggerDeliveryError> {
+        let session = self.bind_maintenance_session(principal_ref)?;
+        let service = self.lock_maintenance_service()?;
+        let mut ledger = self.lock_maintenance_ledger()?;
+        handle_maintenance_trigger_supersession(
+            &service,
+            &session,
+            &mut ledger,
+            trigger_id,
+            successor_trigger_id,
+            reason,
+            now_unix_ms,
+        )?;
+        Ok(ledger.durable_rows())
+    }
+
+    /// Records a visible recovery gap for unrepairable damage (issue #1694).
+    ///
+    /// Missing keys, corrupt payloads, inaccessible sources, and incomplete
+    /// enumeration produce this record — never a plaintext fallback and
+    /// never silent deletion. The returned rows are the durable snapshot
+    /// after this transition.
+    pub fn record_maintenance_trigger_gap(
+        &self,
+        principal_ref: &str,
+        trigger_id: &str,
+        kind: MaintenanceTriggerGapKind,
+        detail: &str,
+        now_unix_ms: u64,
+    ) -> Result<Vec<MaintenanceTriggerDeliveryRow>, MaintenanceTriggerDeliveryError> {
+        let session = self.bind_maintenance_session(principal_ref)?;
+        let service = self.lock_maintenance_service()?;
+        let mut ledger = self.lock_maintenance_ledger()?;
+        handle_maintenance_trigger_gap(
+            &service,
+            &session,
+            &mut ledger,
+            trigger_id,
+            kind,
+            detail,
+            now_unix_ms,
+        )?;
+        Ok(ledger.durable_rows())
+    }
+
+    /// Restores the owned delivery ledger from previously persisted durable
+    /// rows (issue #1694).
+    ///
+    /// Runs once at startup before any claim is served: refuses when the
+    /// owner already holds rows, then every row is revalidated through the
+    /// existing validators before entering the ledger — a damaged row fails
+    /// the restore instead of entering as a guessed-complete entry. The
+    /// rows source is the startup composition's read-back of the persisted
+    /// rows through the Store-lane rows backend (STITCH): this entry owns
+    /// the restore, not the read-back. The returned rows are the restored
+    /// durable snapshot.
+    pub fn restore_maintenance_trigger_ledger(
+        &self,
+        rows: Vec<MaintenanceTriggerDeliveryRow>,
+    ) -> Result<Vec<MaintenanceTriggerDeliveryRow>, MaintenanceTriggerDeliveryError> {
+        let mut ledger = self.lock_maintenance_ledger()?;
+        if !ledger.durable_rows().is_empty() {
+            return Err(MaintenanceTriggerDeliveryError::Protocol(
+                ProtocolError::InvalidField {
+                    field: "maintenance_trigger_delivery.ledger",
+                    reason: "restore runs once at startup before any claim is served",
+                },
+            ));
+        }
+        ledger.restore_rows(rows)?;
+        Ok(ledger.durable_rows())
     }
 
     /// Reads one bounded, opaque Store recovery snapshot through the active
