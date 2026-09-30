@@ -1420,20 +1420,7 @@ pub struct PacketAdmissionBundle {
 /// through its owner's own `validate` and proves closure over one
 /// compilation. Grouped so the builder takes an owner-pieces value instead
 /// of a long argument list.
-pub struct PacketAdmissionParts {
-    /// Owner-minted protected floor identity.
-    pub floor: SafetyFloorIdentity,
-    /// Owner-minted priority policy identity.
-    pub priority: PriorityPolicyIdentity,
-    /// Owner-minted admission rule identity.
-    pub rule: AdmissionRuleIdentity,
-    /// Owner-minted measurement composition profile.
-    pub measurement_profile: MeasurementCompositionProfile,
-    /// Caller-supplied omission bindings the decision must close over.
-    pub supplied_omissions: Vec<SuppliedOmissionBinding>,
-    /// Caller-supplied measurements the decision must close over.
-    pub measurements: Vec<AdmissionMeasurement>,
-}
+pub use eliot_context_contracts::PacketAdmissionParts;
 
 impl PacketAdmissionBundle {
     /// Builds the one validated admission closure for a packet compilation

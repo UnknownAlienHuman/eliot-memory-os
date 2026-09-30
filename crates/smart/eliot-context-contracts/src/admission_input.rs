@@ -1073,3 +1073,21 @@ impl AdmissionResult {
         Ok(())
     }
 }
+
+/// Exact owner-supplied floor, policy, omissions and measurements retained
+/// before the admission owner validates the compilation closure.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct PacketAdmissionParts {
+    /// Owner-minted protected floor identity.
+    pub floor: SafetyFloorIdentity,
+    /// Owner-minted priority policy identity.
+    pub priority: PriorityPolicyIdentity,
+    /// Owner-minted admission rule identity.
+    pub rule: AdmissionRuleIdentity,
+    /// Owner-minted measurement composition profile.
+    pub measurement_profile: MeasurementCompositionProfile,
+    /// Caller-supplied omission bindings the decision must close over.
+    pub supplied_omissions: Vec<SuppliedOmissionBinding>,
+    /// Caller-supplied measurements the decision must close over.
+    pub measurements: Vec<AdmissionMeasurement>,
+}
