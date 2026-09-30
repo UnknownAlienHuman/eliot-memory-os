@@ -1152,9 +1152,29 @@ impl Problem {
     ///
     /// The absence is the finding: the record becomes explicitly unassigned
     /// under [`OwnerLossReason::LegacyRecordWithoutLease`] with a visible
-    /// escalation obligation, and never a synthesized live lease. A legacy
-    /// record that already looks assigned is refused, because that would mean
-    /// inventing a lease for a record whose lease was never issued.
+    /// escalation obligation, and never a synthesized live lease.
+    ///
+    /// The admission is "carried no lease", and it is checked against the
+    /// record's own retained ownership rather than assumed. A record with a live
+    /// assignment is refused, because its retained [`AssignedOwnership::lease`]
+    /// says a lease was issued and migrating it would claim the opposite. A
+    /// record already migrated is idempotent and restates its identical
+    /// obligation rather than raising a second one for the same absent lease.
+    ///
+    /// A record that already retains an *observed* owner loss is refused too. It
+    /// holds the exact [`UnassignedOwnership::lost_lease`] that died together
+    /// with the evidence for that loss, so it is not a record without a lease:
+    /// migrating it would discard the persisted loss evidence and replace the
+    /// one outstanding obligation with a different one derived from the record
+    /// revision rather than from the lease that actually died. That erases a
+    /// committed owner loss instead of migrating a legacy record, and I13.9
+    /// requires the unresolved Problem and its outstanding obligation to survive
+    /// the loss — so this entry refuses rather than removing them.
+    ///
+    /// The caller supplies only the principal the legacy record was last held
+    /// by, which the migration retains as the fenced holder. That is not a
+    /// claim of ownership: the migrated record has no lease, so it has no
+    /// principal any owner-scoped transition can present.
     pub fn migrate_legacy_without_lease(
         &mut self,
         expected_fence: &StateFence,
@@ -1163,6 +1183,14 @@ impl Problem {
         same_fence(expected_fence, &self.state_fence)?;
         legacy_holder.validate()?;
         if self.ownership.is_assigned() {
+            return Err(ProblemError::OwnerLeaseMismatch);
+        }
+        if let Ownership::Unassigned(unassigned) = &self.ownership
+            // A committed owner loss is the finding, not an absent lease. Its
+            // retained identity, evidence and obligation are what must survive,
+            // so this migration is refused instead of replacing them.
+            && unassigned.lost_lease.is_some()
+        {
             return Err(ProblemError::OwnerLeaseMismatch);
         }
         if let Ownership::Unassigned(unassigned) = &self.ownership
