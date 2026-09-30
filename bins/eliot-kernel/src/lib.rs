@@ -2424,8 +2424,7 @@ impl KernelComposition {
         }
         let evidence = self
             .canonical_store_evidence
-            .as_ref()
-            .cloned()
+            .clone()
             .ok_or_else(|| {
                 KernelBuildError::Service(
                     "canonical Store evidence provider is unavailable".to_owned(),
