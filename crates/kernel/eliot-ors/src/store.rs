@@ -317,12 +317,13 @@ impl StoreObjectIdentityRecord {
     }
 
     fn installed_identity(&self) -> Result<OrsStoreIdentity, OrsError> {
-        let installation_id = self.installation_id.clone().ok_or_else(|| {
-            OrsError::IntegrityProblem {
-                record_type: "ors_store_object_identity",
-                reason: "ORS database is not bound to an installed identity".to_owned(),
-            }
-        })?;
+        let installation_id =
+            self.installation_id
+                .clone()
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "ors_store_object_identity",
+                    reason: "ORS database is not bound to an installed identity".to_owned(),
+                })?;
         Ok(OrsStoreIdentity {
             installation_id,
             ors_generation: self.ors_generation,
@@ -6130,8 +6131,7 @@ impl RedbRecoveryStore {
         if installation_id != store_identity.installation_id() {
             return Err(OrsError::IntegrityProblem {
                 record_type: "ors_store_object_identity",
-                reason: "scan disclosure listing does not match the durable ORS binding"
-                    .to_owned(),
+                reason: "scan disclosure listing does not match the durable ORS binding".to_owned(),
             });
         }
         let table = read.open_table(SCAN_DISCLOSURE_RECORDS).map_err(storage)?;
@@ -24992,11 +24992,8 @@ impl RedbRecoveryStore {
         path: impl AsRef<Path>,
         installation_id: &str,
     ) -> Result<(Self, OrsStoreIdentity), OrsError> {
-        let (store, record) = Self::open_inner(
-            path,
-            Arc::new(RejectUnboundEvidence),
-            Some(installation_id),
-        )?;
+        let (store, record) =
+            Self::open_inner(path, Arc::new(RejectUnboundEvidence), Some(installation_id))?;
         Ok((store, record.installed_identity()?))
     }
 
@@ -25086,8 +25083,7 @@ impl RedbRecoveryStore {
             {
                 return Err(OrsError::IntegrityProblem {
                     record_type: "ors_store_object_identity",
-                    reason: "ORS database is bound to a different installation identity"
-                        .to_owned(),
+                    reason: "ORS database is bound to a different installation identity".to_owned(),
                 });
             }
         }
@@ -25145,13 +25141,12 @@ impl RedbRecoveryStore {
                         reason: "store-object identity row is not canonically encoded".to_owned(),
                     });
                 }
-                record.ors_generation = record
-                    .ors_generation
-                    .checked_add(1)
-                    .ok_or_else(|| OrsError::IntegrityProblem {
+                record.ors_generation = record.ors_generation.checked_add(1).ok_or_else(|| {
+                    OrsError::IntegrityProblem {
                         record_type: "ors_store_object_identity",
                         reason: "store-object generation is exhausted".to_owned(),
-                    })?;
+                    }
+                })?;
                 record
             }
             (Some(_), None) | (None, Some(_)) => {

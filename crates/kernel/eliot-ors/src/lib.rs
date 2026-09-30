@@ -122,8 +122,7 @@ pub use status_projection::{
 };
 pub use store::{
     CanonicalEvidenceProvider, OperationalRecoveryStore, OrsCoordinator, OrsStoreIdentity,
-    RedbRecoveryStore,
-    RuntimeLeaseCensusRows, ScanDisclosureRecordOwner,
+    RedbRecoveryStore, RuntimeLeaseCensusRows, ScanDisclosureRecordOwner,
 };
 pub use user_broker::{UserBrokerHeartbeat, UserBrokerRegistrationSnapshot};
 pub use versioned_artifact::{
