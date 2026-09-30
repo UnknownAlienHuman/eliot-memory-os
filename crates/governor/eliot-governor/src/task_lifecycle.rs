@@ -262,6 +262,7 @@ impl<'a, P: ?Sized> GovernorTaskLifecycle<'a, P> {
         let sources =
             build_task_controller_campaign_sources(&event, &record, recipe, source_heads)?;
         let envelope = task_envelope(
+            self.canonical,
             identity,
             operation_id,
             &event,
@@ -301,6 +302,7 @@ impl<'a, P: ?Sized> GovernorTaskLifecycle<'a, P> {
             build_task_controller_campaign_sources(&event, &record, recipe, source_heads)?;
         let publications = complete_campaign_publications(&sources, owner_publications)?;
         let envelope = task_envelope(
+            self.canonical,
             identity,
             operation_id,
             &event,
@@ -330,6 +332,7 @@ impl<'a, P: ?Sized> GovernorTaskLifecycle<'a, P> {
         let sources =
             build_task_controller_campaign_sources(&event, &record, recipe, source_heads)?;
         let envelope = task_envelope(
+            self.canonical,
             identity,
             operation_id,
             &event,
@@ -361,6 +364,7 @@ impl<'a, P: ?Sized> GovernorTaskLifecycle<'a, P> {
             build_task_controller_campaign_sources(&event, &record, recipe, source_heads)?;
         let publications = complete_campaign_publications(&sources, owner_publications)?;
         let envelope = task_envelope(
+            self.canonical,
             identity,
             operation_id,
             &event,
@@ -399,6 +403,7 @@ impl<'a, P: ?Sized> GovernorTaskLifecycle<'a, P> {
             .map(|values| complete_campaign_publications(&sources, values))
             .transpose()?;
         let mut envelope = task_envelope(
+            self.canonical,
             identity,
             operation_id,
             &event,
@@ -632,6 +637,7 @@ fn state_wire(state: TaskState) -> Result<String, TaskLifecycleError> {
     reason = "the envelope binds every admitted identity field explicitly; grouping them would hide a binding"
 )]
 fn task_envelope(
+    canonical: &CanonicalAdmissionOwner,
     identity: &eliot_protocol::RequestIdentity,
     operation_id: OperationId,
     event: &TaskLifecycleEvent,
@@ -661,6 +667,22 @@ fn task_envelope(
         .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?;
     let ordering_scope = OrderingScopeId::new(GOVERNOR_ORDERING_SCOPE)
         .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?;
+    let expected_ordering_sequence = canonical
+        .scope()
+        .ordering_heads
+        .iter()
+        .find(|head| head.scope.as_str() == GOVERNOR_ORDERING_SCOPE)
+        .filter(|head| head.state_fence == *fence)
+        .map(|head| head.sequence)
+        .ok_or_else(|| {
+            TaskLifecycleError::Composition(CompositionError::Recovery(
+                "current Governor ordering head is unavailable at the Task fence".to_owned(),
+            ))
+        })?;
+    let admission_digest = sha256_hex(
+        &canonical_json_bytes(event)
+            .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?,
+    );
     let mut parameters = BTreeMap::new();
     parameters.insert(
         "task_id".to_owned(),
@@ -761,7 +783,7 @@ fn task_envelope(
         expected_revision_heads: Vec::new(),
         expected_ordering_heads: vec![OrderingHeadExpectation {
             scope: ordering_scope,
-            expected_sequence: 1,
+            expected_sequence: expected_ordering_sequence,
             state_fence: fence.clone(),
         }],
     };
@@ -977,6 +999,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
         })?;
         let manifest_digest = production_manifest_digest()?;
         let envelope = task_envelope(
+            self.canonical,
             identity,
             operation_id.clone(),
             &event,
@@ -1027,6 +1050,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
         let sources =
             build_task_controller_campaign_sources(&event, &record, recipe, source_heads)?;
         let envelope = task_envelope(
+            self.canonical,
             identity,
             operation_id.clone(),
             &event,
@@ -1079,6 +1103,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
             build_task_controller_campaign_sources(&event, &record, recipe, source_heads)?;
         let publications = complete_campaign_publications(&sources, owner_publications)?;
         let envelope = task_envelope(
+            self.canonical,
             identity,
             operation_id.clone(),
             &event,
@@ -1145,6 +1170,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
         })?;
         let manifest_digest = production_manifest_digest()?;
         let envelope = task_envelope(
+            self.canonical,
             identity,
             operation_id.clone(),
             &event,
@@ -1199,6 +1225,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
             build_task_controller_campaign_sources(&event, &record, recipe, source_heads)?;
         let publications = complete_campaign_publications_from_builder(&sources, owner_builder)?;
         let envelope = task_envelope(
+            self.canonical,
             identity,
             operation_id.clone(),
             &event,
@@ -1261,6 +1288,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
         let sources =
             build_task_controller_campaign_sources(&event, &record, recipe, source_heads)?;
         let envelope = task_envelope(
+            self.canonical,
             identity,
             operation_id.clone(),
             &event,
@@ -1324,6 +1352,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
             build_task_controller_campaign_sources(&event, &record, recipe, source_heads)?;
         let publications = complete_campaign_publications(&sources, owner_publications)?;
         let envelope = task_envelope(
+            self.canonical,
             identity,
             operation_id.clone(),
             &event,
@@ -1391,6 +1420,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
             build_task_controller_campaign_sources(&event, &record, recipe, source_heads)?;
         let publications = complete_campaign_publications_from_builder(&sources, owner_builder)?;
         let envelope = task_envelope(
+            self.canonical,
             identity,
             operation_id.clone(),
             &event,
