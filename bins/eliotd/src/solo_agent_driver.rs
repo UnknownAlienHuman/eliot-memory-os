@@ -1493,7 +1493,7 @@ pub async fn solo_fair_pull_recovery(
     let mut fabric = restore_solo_fabric(&composition, kernel, &projection)?;
     let profile = load_scheduling_profile(&composition)?;
     let outcome = fabric.drive_fair_pull(&profile, true)?;
-    repersist_after_control(&composition, &mut fabric, &mut projection)?;
+    repersist_after_control(&composition, &fabric, &mut projection)?;
     let started = outcome.started.len();
     tracing::debug!(
         algorithm = outcome.algorithm,
@@ -1513,7 +1513,6 @@ pub async fn solo_fair_pull_recovery(
         })
     }
 }
-
 
 ///
 /// Serves the persisted projection when no live slot exists, so inspect

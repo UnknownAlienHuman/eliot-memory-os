@@ -48,10 +48,10 @@
 //! Three facts make that a real join rather than a restatement:
 //!
 //! 1. **The wake is a coordinator transition, not a separate notification.**
-//!   The event that releases the slot is the same event that arms the drive,
-//!   so there is no second wake channel that could disagree with the
-//!   projection. The arm is a latch and an evidence counter, never an
-//!   authority: `take_wake` returning `None` does not stop the drive.
+//!    The event that releases the slot is the same event that arms the drive,
+//!    so there is no second wake channel that could disagree with the
+//!    projection. The arm is a latch and an evidence counter, never an
+//!    authority: `take_wake` returning `None` does not stop the drive.
 //! 2. **The cursor is the durable event log.** The published cursor is
 //!    `events.len()` at the newest observed selection-input change, so
 //!    `AgentCoordinator::replay_snapshot_events` re-derives it by running the
