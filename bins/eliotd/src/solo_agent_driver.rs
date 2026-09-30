@@ -1362,15 +1362,29 @@ async fn drive_solo_delegate_verified_async(
         cancellation_evidence: None,
     };
     persist_projection(composition.state_root(), &projection)?;
-    let ack = fabric.emit(&dispatch_id)?;
-    if !ack.retained || ack.dispatch_id != dispatch_id {
+    // Issue #1108 W3 (acceptance A3/A7/A10/A11): the verified-path
+    // production caller of the provider-capability frame. The frame binds
+    // the recorded intent's operation/attempt identity, the admitted
+    // provider identity from the verified coordinator binding, and the
+    // canonical payload digest, then emits through the existing
+    // DispatchEgressPort under the FabricOperation::Emit gate — the same
+    // egress with identity bound, never a second dispatch scheme. Until
+    // the executor-daemon bind (#874) lands, the gate refuses typed and
+    // the head stays queued.
+    let frame = fabric.dispatch_provider_capability_frame(&dispatch_id)?;
+    if frame.dispatch_id != dispatch_id {
         return Err(DaemonError::ProviderAdmission(FabricError::Contract(
-            "solo egress acknowledgement does not retain the intent".to_owned(),
+            "solo provider capability frame does not address the dispatched intent".to_owned(),
         )));
     }
     let mut projection = projection;
     projection.emitted = true;
     projection.snapshot = fabric.snapshot()?;
+    if projection.snapshot.provider_frames.get(&dispatch_id) != Some(&frame) {
+        return Err(DaemonError::ProviderAdmission(FabricError::Contract(
+            "solo provider capability frame was not recorded for the dispatched intent".to_owned(),
+        )));
+    }
     persist_projection(composition.state_root(), &projection)?;
     {
         let mut state = composition.solo_state.lock().map_err(|_| {
@@ -1386,7 +1400,10 @@ async fn drive_solo_delegate_verified_async(
         dispatch_id,
         admission_id: admission.admission_id.as_str().to_owned(),
         route,
-        retained: ack.retained,
+        // Retention is established above: the frame call emitted through
+        // the DispatchEgressPort under the Emit gate with the ack identity
+        // verified inside, and the recorded frame read back exactly.
+        retained: true,
         dispatch,
     })
 }
