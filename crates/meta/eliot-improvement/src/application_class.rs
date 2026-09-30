@@ -22,7 +22,10 @@
 //! - `target_surface` is recorded on every [`crate::ImprovementCandidate`].
 //! - `touches_protected` is [`is_prohibited_tuning_surface`] over that recorded
 //!   surface, so it is a comparison against the owner's closed rule rather than
-//!   a spelled constant.
+//!   a spelled constant. [`ChangeDescriptor::validate`] re-checks that
+//!   agreement, and refuses a hand-built descriptor whose `touches_protected`
+//!   or tuning/work-item flags contradict its recorded surface, so the class a
+//!   descriptor reaches cannot be one its surface forbids.
 //! - `bounded_tuning` stands for the DECLARED SAFE RANGE of I12.24:85, and the
 //!   I12.24:20-38 candidate schema lists no such field. A descriptor therefore
 //!   cannot honestly assert it.
@@ -89,7 +92,8 @@ impl ChangeDescriptor {
     /// contain. A descriptor built here is consequently always
     /// [`ApplicationClass::Advisory`] or [`ApplicationClass::Protected`]; the
     /// two evidence-bound classes stay unreachable until a candidate carries
-    /// that evidence.
+    /// that evidence. Because every field is the closed rule over the recorded
+    /// surface, a descriptor built here also passes [`Self::validate`].
     pub fn from_recorded_surface(target_surface: ImprovementSurface) -> Self {
         Self {
             target_surface,
@@ -99,7 +103,41 @@ impl ChangeDescriptor {
         }
     }
 
+    /// Fail-closed check of the descriptor's OWN internal consistency.
+    ///
+    /// This runs before every class arm, so it must not depend on the class
+    /// the caller believes the descriptor has. It derives everything from the
+    /// recorded `target_surface` and the owner's closed rules already in this
+    /// module:
+    ///
+    /// 1. `touches_protected` MUST equal
+    ///    [`is_prohibited_tuning_surface`] over `target_surface`. Under-claiming
+    ///    it on a `Verifier`/`Scheduler` surface would classify as
+    ///    [`ApplicationClass::Advisory`] or
+    ///    [`ApplicationClass::PreAuthorizedTuning`] and escape the
+    ///    owner-decision path of I12.24:93-94 entirely; over-claiming it would
+    ///    route an ordinary surface into that path.
+    /// 2. `bounded_tuning` MUST NOT be asserted on a prohibited surface.
+    ///    I12.24:87 admits pre-authorized tuning only where it "never changes
+    ///    authority, privacy, finish semantics, Decision Safety Floor,
+    ///    ContextAtomPolicy, verifier definition, canonical durability,
+    ///    Kernel/Watchdog reserve or last-resort recovery capacity", and
+    ///    [`is_prohibited_tuning_surface`] is this crate's own encoding of
+    ///    exactly that rule for the surfaces it records.
+    /// 3. `has_work_item_ref` MUST NOT be asserted on a prohibited surface
+    ///    either. [`classify`] gives `touches_protected` precedence, so such a
+    ///    descriptor is classified [`ApplicationClass::Protected`] and the
+    ///    work-item claim is silently discarded; a verifier/scheduler change is
+    ///    delivered as the explicit owner decision and migration/proof of
+    ///    I12.24:93-94, not as the work item of I12.24:90-91.
     pub fn validate(&self) -> Result<(), ImprovementError> {
+        let prohibited = is_prohibited_tuning_surface(self.target_surface);
+        if self.touches_protected != prohibited {
+            return Err(ImprovementError::ApplicationClassViolation);
+        }
+        if prohibited && (self.bounded_tuning || self.has_work_item_ref) {
+            return Err(ImprovementError::ApplicationClassViolation);
+        }
         Ok(())
     }
 }
@@ -146,6 +184,10 @@ pub fn is_prohibited_tuning_surface(surface: ImprovementSurface) -> bool {
 /// reference and a non-empty rollback reference. Protected changes require
 /// explicit owner approval plus a present non-empty migration/proof
 /// reference.
+///
+/// [`ChangeDescriptor::validate`] runs first, so a descriptor inconsistent
+/// with its recorded surface is refused for every class, including
+/// [`ApplicationClass::Advisory`].
 pub fn check_class_gate(
     class: ApplicationClass,
     change: &ChangeDescriptor,
