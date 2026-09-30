@@ -77,6 +77,8 @@ eliot-canonical = { path = "../../crates/governor/eliot-canonical", version = "0
 eliot-context-contracts.workspace = true
 eliot-config.workspace = true
 eliot-controlboard.workspace = true
+eliot-cue-activation = { path = "../../crates/smart/eliot-cue-activation", version = "0.1.0" }
+eliot-cue-contracts = { path = "../../crates/smart/eliot-cue-contracts", version = "0.1.0" }
 eliot-doctor-core.workspace = true
 eliot-dreamer-failure = { path = "../../crates/smart/eliot-dreamer-failure", version = "0.1.0" }
 eliot-dreamer-contracts.workspace = true
