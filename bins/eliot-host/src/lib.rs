@@ -7709,7 +7709,7 @@ impl HostComposition {
         // false-success. Single terminal for the Unknown outcome.
         host_lifecycle_observe_scm(BOUNDARY_PHASE_B_FINALIZE_REQUESTED);
         let mut resume_terminal_emitted = false;
-        let result = (|| {
+        let result: Result<HostPhaseBMaterializationReceipt, HostError> = (|| {
             let pending =
                 self.validate_phase_b_finalization(intent, credential_receipt, final_receipt)?;
             let host_capability = self.owner_lease.activation_capability();
