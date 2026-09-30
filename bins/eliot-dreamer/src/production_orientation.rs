@@ -555,7 +555,7 @@ pub(crate) fn compose_production_result(
         inputs.model_outcome,
         inputs.projections,
         semantic_job,
-        &packet,
+        packet,
         records,
     )
 }
@@ -565,10 +565,10 @@ fn finish_projection_result(
     model_outcome: &ModelRouteOutcome,
     projections: &CanonicalProjectionSet,
     semantic_job: &DreamJobInput,
-    packet: &OrientationPacketCandidate,
+    mut packet: OrientationPacketCandidate,
     records: Vec<OrientationStageRecord>,
 ) -> OrientationPulseResult {
-    let dream_packet = crate::dispatch_stage::map_orientation_packet(packet, semantic_job);
+    let dream_packet = crate::dispatch_stage::map_orientation_packet(&packet, semantic_job);
     let mut omissions = Vec::new();
     if !CONFLICT_OUTPUT_QUALIFIED {
         omissions.push(CONFLICT_UNQUALIFIED.to_owned());
@@ -603,6 +603,7 @@ fn finish_projection_result(
         projections: prefix.projections,
         admitted: prefix.admitted,
         packet: Some(dream_packet),
+        owner_closure: packet.owner_closure.take(),
         omissions,
         missing_owners: Vec::new(),
     }
@@ -944,7 +945,7 @@ fn packet_stage_record(
         required: true,
         disposition: OrientationStageDisposition::Executed,
         expected_input: PulseStageId::Packet.expected_input().to_owned(),
-        input_commitment: Some(PulseStageId::Packet.expected_input().to_owned()),
+        input_commitment: Some(packet.input_digest.clone()),
         output_commitment: Some(commitment),
         proof_ceiling: CEILING_CANDIDATE_ONLY.to_owned(),
         reason: None,
@@ -1061,6 +1062,7 @@ fn terminal_pulse_result(parts: BlockedParts) -> OrientationPulseResult {
         projections: parts.projections,
         admitted: parts.admitted,
         packet: None,
+        owner_closure: None,
         omissions: parts.omissions,
         missing_owners: parts.missing_owners,
     }

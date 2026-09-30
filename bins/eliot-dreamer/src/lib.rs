@@ -930,7 +930,7 @@ pub struct CurationCandidate {
 }
 
 /// Exact schema version accepted by [`OrientationPulseResult`].
-pub const ORIENTATION_PULSE_RESULT_SCHEMA_VERSION: u32 = 2;
+pub const ORIENTATION_PULSE_RESULT_SCHEMA_VERSION: u32 = 3;
 
 /// Closed per-stage disposition for one Orientation pulse member (issue #2901).
 ///
@@ -1025,7 +1025,7 @@ pub struct OrientationAdmittedPrefix {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OrientationPulseResult {
-    /// Exact schema version; must be 2.
+    /// Exact schema version; must be 3.
     pub schema_version: u32,
     /// Overall pulse disposition (`Complete`, `Partial`, or `Blocked`).
     pub disposition: OrientationDisposition,
@@ -1053,6 +1053,9 @@ pub struct OrientationPulseResult {
     pub admitted: OrientationAdmittedPrefix,
     /// Projected packet; present exactly when the pulse composed one.
     pub packet: Option<DreamPacket>,
+    /// Exact native packet owner closure, retained without losing original boundary or stage records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_closure: Option<eliot_dreamer_orientation::projection::OrientationOwnerClosure>,
     /// Bounded static omission/qualification codes.
     pub omissions: Vec<String>,
     /// Static owner identities absent from this pulse.
