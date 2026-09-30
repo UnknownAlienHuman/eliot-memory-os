@@ -499,7 +499,7 @@ impl HostCredentialControl {
                     })?;
                     launch
                         .profile_governed_roots
-                        .validate_profile_selection_receipt(&launch, &selected)
+                        .validate_profile_selection_receipt(launch, &selected)
                         .map_err(|error| error.to_string())?;
                     let selected_profile = match launch.profile {
                         InstallationProfile::UserMode => ProfileSelection::UserMode,
