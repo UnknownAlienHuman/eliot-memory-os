@@ -31,9 +31,10 @@ use eliot_process::{
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::thread::{self, JoinHandle};
@@ -66,6 +67,13 @@ const WATCH_INTERVAL: Duration = Duration::from_millis(25);
 const STREAM_CHUNK_BYTES: usize = 8192;
 const STREAM_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 const STREAM_JOIN_POLL: Duration = Duration::from_millis(5);
+/// One queued frame plus one frame in the writer thread is the complete live
+/// stdin buffer. The producer never blocks waiting for pipe capacity.
+#[cfg(windows)]
+const LIVE_STDIN_QUEUE_CAPACITY: usize = 1;
+/// EBP v1's four-byte little-endian length prefix plus its 4 MiB body ceiling.
+#[cfg(windows)]
+const LIVE_STDIN_MAX_FRAME_BYTES: usize = 4 + 4 * 1024 * 1024;
 /// Bounded sink-pressure isolation ceiling: bytes of observed stream after
 /// which P-04 records that persistence pressure was shed while the pipe kept
 /// draining. Sized well above the focused proof volumes so ordinary streams
@@ -1124,10 +1132,82 @@ impl Drop for DeadlineWatcher {
 }
 
 #[cfg(windows)]
+struct LiveStdinWriter {
+    sender: Option<SyncSender<Vec<u8>>>,
+    failed: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+#[cfg(windows)]
+impl LiveStdinWriter {
+    fn spawn(mut stdin: std::fs::File) -> std::io::Result<Self> {
+        let (sender, receiver) = sync_channel(LIVE_STDIN_QUEUE_CAPACITY);
+        let failed = Arc::new(AtomicBool::new(false));
+        let thread_failed = Arc::clone(&failed);
+        let thread = thread::Builder::new()
+            .name("eliot-p04-live-stdin".to_owned())
+            .spawn(move || {
+                while let Ok(frame) = receiver.recv() {
+                    if stdin.write_all(&frame).is_err() {
+                        thread_failed.store(true, Ordering::Release);
+                        break;
+                    }
+                }
+            })?;
+        Ok(Self {
+            sender: Some(sender),
+            failed,
+            thread: Some(thread),
+        })
+    }
+
+    fn enqueue_frame(&self, frame: &[u8]) -> Result<(), ProcessExecutionError> {
+        if frame.is_empty() || frame.len() > LIVE_STDIN_MAX_FRAME_BYTES {
+            return Err(unavailable(format!(
+                "live stdin frame must contain 1..={LIVE_STDIN_MAX_FRAME_BYTES} bytes"
+            )));
+        }
+        if self.failed.load(Ordering::Acquire) {
+            return Err(ProcessExecutionError::UnknownOutcome);
+        }
+        let Some(sender) = self.sender.as_ref() else {
+            return Err(ProcessExecutionError::UnknownOutcome);
+        };
+        sender.try_send(frame.to_vec()).map_err(|error| match error {
+            TrySendError::Full(_) => unavailable("live stdin writer queue is full"),
+            TrySendError::Disconnected(_) => ProcessExecutionError::UnknownOutcome,
+        })
+    }
+
+    /// Closes the producer side and joins after the child has been contained.
+    /// Returns true when a frame write or the writer thread had an unknown
+    /// outcome.
+    fn close_and_join(&mut self) -> bool {
+        let _ = self.sender.take();
+        if let Some(thread) = self.thread.take()
+            && thread.join().is_err()
+        {
+            self.failed.store(true, Ordering::Release);
+        }
+        self.failed.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for LiveStdinWriter {
+    fn drop(&mut self) {
+        let _ = self.close_and_join();
+    }
+}
+
+#[cfg(windows)]
 struct Operation {
     state: ProcessState,
     sink: Arc<dyn ProcessEvidenceSink>,
+    // Drop the child before joining its stdin writer so a blocked pipe write
+    // is released only after the owned process lifecycle has been contained.
     child: Option<RunningJobChild<ValidatedDispatch>>,
+    stdin_writer: Option<LiveStdinWriter>,
     stdout: Arc<Mutex<CaptureSession>>,
     stderr: Arc<Mutex<CaptureSession>>,
     stdout_thread: Option<JoinHandle<()>>,
@@ -1435,7 +1515,7 @@ impl WindowsProcessExecutor {
         sink: Arc<dyn ProcessEvidenceSink>,
         outer_binding: RecoverableJobBinding,
     ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
-        self.start_inner(request, sink, Some(outer_binding), None)
+        self.start_inner(request, sink, Some(outer_binding), None, false)
     }
 
     /// Starts one Kernel child with the exact one-shot standard-input bytes the
@@ -1460,7 +1540,70 @@ impl WindowsProcessExecutor {
         sink: Arc<dyn ProcessEvidenceSink>,
         stdin_payload: Option<&[u8]>,
     ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
-        self.start_inner(request, sink, None, stdin_payload)
+        self.start_inner(request, sink, None, stdin_payload, false)
+    }
+
+    /// Starts one admitted Kernel child with a retained live standard-input
+    /// stream. The exact outer Kernel Job binding is required for the launch;
+    /// frames are queued later against the returned operation identity.
+    ///
+    /// This starts process mechanics only. `enqueue_live_stdin_frame` accepts
+    /// one already-encoded EBP frame at a time and reports queue acceptance,
+    /// not child processing or an Execute result.
+    #[cfg(windows)]
+    pub fn start_with_live_stdin(
+        &self,
+        request: ProcessRequest,
+        sink: Arc<dyn ProcessEvidenceSink>,
+        outer_binding: RecoverableJobBinding,
+    ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
+        self.start_inner(request, sink, Some(outer_binding), None, true)
+    }
+
+    /// Queues one complete, already-encoded EBP frame for the exact running
+    /// process operation. The per-operation channel holds one waiting frame;
+    /// the writer thread may hold one more frame while writing. `Ok(())` means
+    /// the frame was accepted into that bounded queue, not that the child read,
+    /// executed, or acknowledged it.
+    ///
+    /// A full queue returns `Unavailable` without accepting the frame. A
+    /// closed or failed writer returns `UnknownOutcome`. The operation must
+    /// still be running before its deadline and outside cancellation/cleanup.
+    ///
+    /// # Errors
+    /// Returns `NotFound` for an unknown operation, `Unavailable` for a frame
+    /// that is empty, over the EBP v1 wire bound, or not currently admissible,
+    /// and `UnknownOutcome` when the writer may have partially written data.
+    #[cfg(windows)]
+    pub fn enqueue_live_stdin_frame(
+        &self,
+        operation_id: &OperationId,
+        frame: &[u8],
+    ) -> Result<(), ProcessExecutionError> {
+        if frame.is_empty() || frame.len() > LIVE_STDIN_MAX_FRAME_BYTES {
+            return Err(unavailable(format!(
+                "live stdin EBP frame must contain 1..={LIVE_STDIN_MAX_FRAME_BYTES} bytes"
+            )));
+        }
+        let operation = self.operation(operation_id)?;
+        let guard = operation
+            .lock()
+            .map_err(|_| unavailable("operation lock poisoned"))?;
+        if guard.state.view().lifecycle() != ProcessLifecycle::Running
+            || guard.timed_out
+            || guard.cleanup_required
+            || Instant::now() >= guard.deadline
+        {
+            return Err(unavailable(
+                "live stdin is closed outside the running operation deadline",
+            ));
+        }
+        let Some(writer) = guard.stdin_writer.as_ref() else {
+            return Err(unavailable(
+                "operation was not admitted with a retained live stdin writer",
+            ));
+        };
+        writer.enqueue_frame(frame)
     }
 
     /// Creates one executor around the P-07 authority composition.
@@ -2003,8 +2146,14 @@ impl WindowsProcessExecutor {
         sink: Arc<dyn ProcessEvidenceSink>,
         outer_binding: Option<KernelOuterJobBinding>,
         stdin_payload: Option<&[u8]>,
+        retain_stdin_writer: bool,
     ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
         request.validate()?;
+        if retain_stdin_writer && stdin_payload.is_some() {
+            return Err(unavailable(
+                "live stdin cannot be combined with one-shot stdin payload bytes",
+            ));
+        }
         if self.kernel_outer_binding_required && outer_binding.is_none() {
             return Err(unavailable(
                 "Kernel process start requires the current Host Kernel Job binding",
@@ -2015,7 +2164,7 @@ impl WindowsProcessExecutor {
 
         #[cfg(not(windows))]
         {
-            let _ = (request, sink, outer_binding, stdin_payload);
+            let _ = (request, sink, outer_binding, stdin_payload, retain_stdin_writer);
             return Err(unavailable(
                 "Windows ProcessExecutor is unavailable on this target",
             ));
@@ -2048,9 +2197,13 @@ impl WindowsProcessExecutor {
                 environment,
             )
             .map_err(unavailable)?;
-            let spec = match stdin_payload {
-                None => spec,
-                Some(payload) => spec.with_stdin(payload.to_vec()).map_err(unavailable)?,
+            let spec = if retain_stdin_writer {
+                spec.with_live_stdin().map_err(unavailable)?
+            } else {
+                match stdin_payload {
+                    None => spec,
+                    Some(payload) => spec.with_stdin(payload.to_vec()).map_err(unavailable)?,
+                }
             };
             let active_limit = request
                 .resource_limits()
@@ -2157,6 +2310,27 @@ impl WindowsProcessExecutor {
                     Some("P-02 suspended launch and resume observed".to_owned()),
                 )?,
             )?;
+            let (stdin_writer, stdin_writer_setup_error) = if retain_stdin_writer {
+                match running.take_stdin_writer() {
+                    Some(stdin) => match LiveStdinWriter::spawn(stdin) {
+                        Ok(writer) => (Some(writer), None),
+                        Err(error) => (
+                            None,
+                            Some(unavailable(format!(
+                                "live stdin writer thread could not start: {error}"
+                            ))),
+                        ),
+                    },
+                    None => (
+                        None,
+                        Some(unavailable(
+                            "live stdin was requested but the resumed child had no writer handle",
+                        )),
+                    ),
+                }
+            } else {
+                (None, None)
+            };
             let stdout = Arc::new(Mutex::new(CaptureSession::new(
                 "stdout",
                 retention(stdout_limit, self.capture_limit),
@@ -2273,6 +2447,7 @@ impl WindowsProcessExecutor {
                 state,
                 sink,
                 child: Some(running),
+                stdin_writer,
                 stdout,
                 stderr,
                 stdout_thread,
@@ -2290,12 +2465,13 @@ impl WindowsProcessExecutor {
                 termination: None,
                 capture_failures: capture_failure.into_iter().collect(),
             }));
-            if capture_spawn_error.is_some() {
-                let Some(error) = capture_spawn_error else {
-                    // The flag above is only set together with the error; a
-                    // missing error here means a logic break, fenced locally.
-                    return Err(ProcessExecutionError::UnknownOutcome);
-                };
+            let post_resume_setup_error = capture_spawn_error
+                .map(|error| (error, CAPTURE_EVIDENCE_GAP))
+                .or_else(|| {
+                    stdin_writer_setup_error
+                        .map(|error| (error, LIVE_STDIN_EVIDENCE_GAP))
+                });
+            if let Some((error, evidence_gap)) = post_resume_setup_error {
                 // Fail closed AFTER resume (issue #84 §2): the child is already
                 // running, so retain the Job/process owner, stop new effect
                 // authority (the op is fenced and never gets a receipt),
@@ -2316,13 +2492,12 @@ impl WindowsProcessExecutor {
                     let finalize_result =
                         finalize_operation(&mut guard, ExitDisposition::Unknown, false);
                     quarantine_operation(&mut guard);
-                    let _ = quarantine_snapshot(&operation_id, &guard, CAPTURE_EVIDENCE_GAP);
+                    let _ = quarantine_snapshot(&operation_id, &guard, evidence_gap);
                     finalize_result
                 };
-                // `finalize_operation` joins the surviving capture thread, so
-                // the half-installed capture owner cannot leak: when stdout
-                // spawned but stderr failed, the stdout thread is joined above
-                // and its drained bytes stay on the retained op for reconcile.
+                // `finalize_operation` joins every installed stream and stdin
+                // writer owner before returning. Any half-installed control
+                // path stays attached to this operation for reconciliation.
                 if self
                     .operations
                     .lock()
@@ -2755,7 +2930,7 @@ impl ProcessExecutor for WindowsProcessExecutor {
         request: ProcessRequest,
         sink: Arc<dyn ProcessEvidenceSink>,
     ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
-        self.start_inner(request, sink, None, None)
+        self.start_inner(request, sink, None, None, false)
     }
 
     async fn inspect(
@@ -2883,6 +3058,10 @@ fn finalize_operation(
     let termination = child
         .terminate_in_place(JOB_TERMINATION_CODE)
         .map_err(unavailable)?;
+    let stdin_write_unknown = operation
+        .stdin_writer
+        .take()
+        .is_some_and(|mut writer| writer.close_and_join());
     let observed_exit_code = termination.observed_exit_code();
     let history = termination.history().clone();
     let ids = history
@@ -2929,7 +3108,7 @@ fn finalize_operation(
             return Err(error.into());
         }
     };
-    let actual_disposition = if !complete || !tree_terminated {
+    let actual_disposition = if !complete || !tree_terminated || stdin_write_unknown {
         ExitDisposition::Unknown
     } else if observed_root_exit.is_some() {
         ExitDisposition::Completed
@@ -3018,6 +3197,9 @@ fn quarantine_operation(operation: &mut Operation) {
 /// Exact evidence-gap labels surfaced per quarantined operation.
 #[cfg(windows)]
 const CAPTURE_EVIDENCE_GAP: &str = "capture-thread spawn failed";
+
+#[cfg(windows)]
+const LIVE_STDIN_EVIDENCE_GAP: &str = "live stdin writer thread spawn failed";
 #[cfg(windows)]
 const SINK_EVIDENCE_GAP: &str = "initial evidence sink publication failed";
 #[cfg(windows)]
