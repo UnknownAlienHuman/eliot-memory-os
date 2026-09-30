@@ -58,8 +58,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use eliot_contracts::{ArtifactId, OperationId};
 use eliot_runtime_contracts::{
     AffectedOperationClass, BackpressureDisposition, BottleneckAvailability,
-    BottleneckCapacityProfile, BottleneckCoverageState, BottleneckObservationV1, CapacityBottleneck,
-    CapacityClass, CapacityEnforcement, CapacityLimit, ControlOperationClass,
+    BottleneckCapacityProfile, BottleneckCoverageState, BottleneckObservationV1,
+    CapacityBottleneck, CapacityClass, CapacityEnforcement, CapacityLimit, ControlOperationClass,
     EarliestRecoveryCondition, EvidenceCoverageState, HumanActionRequirement,
     I14_BACKPRESSURE_RESPONSE_VERSION, I14BackpressureCause, I14BackpressureResponseV1,
     I14CurrentnessState, I14EscalationCondition, I14ForbiddenAction, I14RecoveryAction,
@@ -145,10 +145,10 @@ impl IpcPermitOperation {
 
 #[derive(Debug)]
 struct IpcReserveInner {
-    normal_capacity_bytes: u64,
-    protected_capacity_bytes: u64,
-    normal_in_flight_bytes: AtomicU64,
-    protected_in_flight_bytes: AtomicU64,
+    normal_capacity: u64,
+    protected_capacity: u64,
+    normal_in_flight: AtomicU64,
+    protected_in_flight: AtomicU64,
 }
 
 /// The IPC control reserve: disjoint normal/protected byte partitions for the
@@ -222,9 +222,9 @@ impl IpcPermit {
 impl Drop for IpcPermit {
     fn drop(&mut self) {
         let slot = match self.class {
-            CapacityClass::NormalWorkload => &self.inner.normal_in_flight_bytes,
+            CapacityClass::NormalWorkload => &self.inner.normal_in_flight,
             CapacityClass::ProtectedControl | CapacityClass::EmergencyLastResort => {
-                &self.inner.protected_in_flight_bytes
+                &self.inner.protected_in_flight
             }
         };
         debug_assert!(
@@ -291,10 +291,10 @@ impl IpcReserve {
     pub fn partitioned(normal_bytes: NonZeroU64, protected_bytes: NonZeroU64) -> Self {
         Self {
             inner: Arc::new(IpcReserveInner {
-                normal_capacity_bytes: normal_bytes.get(),
-                protected_capacity_bytes: protected_bytes.get(),
-                normal_in_flight_bytes: AtomicU64::new(0),
-                protected_in_flight_bytes: AtomicU64::new(0),
+                normal_capacity: normal_bytes.get(),
+                protected_capacity: protected_bytes.get(),
+                normal_in_flight: AtomicU64::new(0),
+                protected_in_flight: AtomicU64::new(0),
             }),
         }
     }
@@ -302,29 +302,29 @@ impl IpcReserve {
     /// Returns the configured normal byte partition capacity.
     #[must_use]
     pub fn normal_byte_capacity(&self) -> u64 {
-        self.inner.normal_capacity_bytes
+        self.inner.normal_capacity
     }
 
     /// Returns the configured protected byte partition capacity.
     #[must_use]
     pub fn protected_byte_capacity(&self) -> u64 {
-        self.inner.protected_capacity_bytes
+        self.inner.protected_capacity
     }
 
     /// Returns the currently available normal pipe bytes.
     #[must_use]
     pub fn available_normal_bytes(&self) -> u64 {
         self.inner
-            .normal_capacity_bytes
-            .saturating_sub(self.inner.normal_in_flight_bytes.load(Ordering::Acquire))
+            .normal_capacity
+            .saturating_sub(self.inner.normal_in_flight.load(Ordering::Acquire))
     }
 
     /// Returns the currently available protected pipe bytes.
     #[must_use]
     pub fn available_protected_bytes(&self) -> u64 {
         self.inner
-            .protected_capacity_bytes
-            .saturating_sub(self.inner.protected_in_flight_bytes.load(Ordering::Acquire))
+            .protected_capacity
+            .saturating_sub(self.inner.protected_in_flight.load(Ordering::Acquire))
     }
 
     /// Attempts to acquire `bytes` normal pipe bytes without blocking.
@@ -349,8 +349,8 @@ impl IpcReserve {
         validate_owner_text(owner, "ipc_permit.owner")?;
         validate_owner_text(operation_id, "ipc_permit.operation_id")?;
         if !cas_add(
-            &self.inner.normal_in_flight_bytes,
-            self.inner.normal_capacity_bytes,
+            &self.inner.normal_in_flight,
+            self.inner.normal_capacity,
             bytes.get(),
         ) {
             return Err(IpcReserveError::NormalCapacityExhausted {
@@ -393,8 +393,8 @@ impl IpcReserve {
         validate_owner_text(owner, "ipc_permit.owner")?;
         validate_owner_text(operation_id, "ipc_permit.operation_id")?;
         if !cas_add(
-            &self.inner.protected_in_flight_bytes,
-            self.inner.protected_capacity_bytes,
+            &self.inner.protected_in_flight,
+            self.inner.protected_capacity,
             bytes.get(),
         ) {
             return Err(IpcReserveError::ProtectedReserveExhausted {
@@ -454,7 +454,9 @@ impl IpcReserve {
                 bottleneck: IPC_PIPE_BYTES_BOTTLENECK,
                 unit: IPC_PIPE_BYTES_BOTTLENECK.unit(),
                 requested_amount: requested_bytes.get(),
-                availability: BottleneckAvailability::Exhausted { available_amount: available },
+                availability: BottleneckAvailability::Exhausted {
+                    available_amount: available,
+                },
                 coverage_state: BottleneckCoverageState::Claimed,
             },
             operation_id: Some(operation),
@@ -506,8 +508,8 @@ impl IpcReserve {
             })?;
         let physical_total = self
             .inner
-            .normal_capacity_bytes
-            .checked_add(self.inner.protected_capacity_bytes)
+            .normal_capacity
+            .checked_add(self.inner.protected_capacity)
             .and_then(NonZeroU64::new)
             .ok_or(IpcReserveError::InvalidField {
                 field: "ipc_evidence.physical_total_limit",
@@ -533,8 +535,8 @@ impl IpcReserve {
                 quantity: physical_total,
             }),
             normal_work_applicable: true,
-            normal_limit: Some(limit(self.inner.normal_capacity_bytes)?),
-            protected_limit: Some(limit(self.inner.protected_capacity_bytes)?),
+            normal_limit: Some(limit(self.inner.normal_capacity)?),
+            protected_limit: Some(limit(self.inner.protected_capacity)?),
             emergency_limit: None,
             enforcement: Some(CapacityEnforcement::ConfigurationPartition),
             proof_profile_ref: proof_profile_ref.to_owned(),
