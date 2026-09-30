@@ -23,11 +23,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub use eliot_host_service::runtime_control::{
-    BackupRuntimeControlRequest, BackupRuntimeControlResponse,
-    HOST_RUNTIME_CONTROL_PRODUCTION_DISCRIMINATOR, HostKernelRestartReceipt,
-    HostReactiveContextRuntimeRequest, HostRuntimeControlOperation, HostRuntimeControlRequest,
-    HostRuntimeControlResponse, HostStoreRecoveryReceipt, backup_response_frame,
-    backup_response_matches_request, decode_backup_request_frame,
+    BackupOperationBody, BackupOwnerOutcome, BackupRetainedOperation, BackupRuntimeControlRequest,
+    BackupRuntimeControlResponse, HOST_RUNTIME_CONTROL_PRODUCTION_DISCRIMINATOR,
+    HostKernelRestartReceipt, HostReactiveContextRuntimeRequest, HostRuntimeControlOperation,
+    HostRuntimeControlRequest, HostRuntimeControlResponse, HostStoreRecoveryReceipt,
+    backup_response_frame, backup_response_matches_request, decode_backup_request_frame,
     decode_runtime_control_request_frame, runtime_control_response_frame,
     runtime_control_unknown_ref,
 };
@@ -423,15 +423,21 @@ impl HostRuntimeControl {
     /// without its separate installation-authority admission are all refused
     /// here, so none of them can be reported as a no-op/zero/default success.
     ///
-    /// The answer is built by the owner of the `#954` bridge
-    /// ([`BackupRuntimeControlResponse::backup_response_for`]) and validated
-    /// against the exact request with the existing
-    /// [`backup_response_matches_request`] before it is serialized, so the
-    /// response's operation/source/destination/owner identity is exact.
+    /// The answer is the owner's own typed outcome, bound to the exact
+    /// admitted request by [`BackupRuntimeControlResponse::backup_response_for`]
+    /// and validated with the existing [`backup_response_matches_request`]
+    /// before it is serialized. That constructor supplies the correlation
+    /// portion only: the pending/completed/possible-effect disposition, the
+    /// retained operation, the owner's phase attestation, and any prepared
+    /// destination handle all come from the owner, never from the request. A
+    /// response therefore cannot exist without an owner outcome, and
+    /// correlation alone is never reported as backup semantic success.
     ///
-    /// The refusal is the typed [`BackupDispatchRefusal`] and stays typed all
-    /// the way to the caller; it is rendered to text exactly once, at the
-    /// endpoint's own pre-existing `Result<(), String>` boundary.
+    /// A pre-effect [`BackupDispatchRefusal`] stays typed all the way to the
+    /// caller; it is rendered to text exactly once, at the endpoint's own
+    /// pre-existing `Result<(), String>` boundary. A refusal is only ever
+    /// produced by a gate that ran before the owner was called, so no
+    /// response is fabricated for a request that may already have effected.
     ///
     /// # Errors
     ///
@@ -507,11 +513,17 @@ impl HostRuntimeControl {
                 "registered cutover admission diverges from the accepted Host backup table",
             ));
         }
-        // 5. Route to the one registered owner operation.
-        registration.dispatch(request)?;
-        // 6. Exact-identity answer. A transport acknowledgement is never
+        // 5. Route to the one registered owner operation. Its typed outcome
+        //    is the only source of the answer's disposition: pending,
+        //    completed with the owner's receipt, or possible-effect. A
+        //    pre-effect refusal of the owner stays a refusal.
+        let outcome = registration.dispatch(request)?;
+        // 6. Exact-identity answer. Correlation comes from the request and
+        //    the disposition from the owner; the two are re-validated
+        //    together, so a transport acknowledgement, a foreign retained
+        //    operation, or a phase this operation cannot establish is never
         //    reported as backup semantic success.
-        let response = BackupRuntimeControlResponse::backup_response_for(request);
+        let response = BackupRuntimeControlResponse::backup_response_for(request, outcome);
         if !backup_response_matches_request(request, &response) {
             return Err(refusal(
                 operation,
@@ -586,9 +598,11 @@ impl HostRuntimeControl {
                 if let Ok(backup_request) = decode_backup_request_frame(&frame) {
                     // The typed refusal is rendered to text exactly once,
                     // here, at the endpoint's pre-existing `Result<(), String>`
-                    // boundary. No backup request is answered with a success
-                    // frame unless every gate admitted it and the registered
-                    // owner performed the exact operation.
+                    // boundary. No backup request is answered with a frame
+                    // unless every gate admitted it and the registered owner
+                    // returned its own outcome; the frame states that outcome,
+                    // so a pending or possibly-effected operation stays
+                    // visible as such instead of collapsing into a refusal.
                     let backup_response = self
                         .handle_backup_operation(&backup_request)
                         .map_err(|refused| refused.to_string())?;

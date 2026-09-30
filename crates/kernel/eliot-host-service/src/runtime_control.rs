@@ -21,6 +21,11 @@ use eliot_kernel_service::{
     UserAutomationHostExecutionResponse,
 };
 use eliot_platform::PlatformHandle;
+use eliot_protocol::backup::{
+    BackupArtifactHandle, BackupCutoverAdmission, BackupIsolatedRestorePrepare,
+    BackupOperationKind, BackupPhaseAttestation, BackupRequestIdentity, BackupRestoreReconcile,
+    BackupRestoreStatus, BackupStage, attesting_roles, operation_for_phase,
+};
 use eliot_protocol::{
     EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload, ProtocolVersion,
     ReactiveContextStage, RequestIdentity,
@@ -1513,10 +1518,18 @@ pub fn decode_runtime_control_response_frame(
 // is introduced and no version distinction is widened.
 // ---------------------------------------------------------------------------
 
-/// Stable wire identifier for Host backup runtime-control envelopes.
-/// Distinct from [`HOST_RUNTIME_CONTROL_WIRE`]; existing v2 version
-/// distinctions are unchanged.
-pub const HOST_BACKUP_RUNTIME_CONTROL_WIRE: &str = "eliot.host.backup-control.v1";
+/// Retired wire identifier of the header-only backup carrier.
+///
+/// That carrier carried correlation only: an operation, a role, and
+/// digest-shaped strings, with no operation body at all. It is refused
+/// explicitly by both decoders and is never reinterpreted as an executable
+/// body by the current carrier.
+pub const HOST_BACKUP_RUNTIME_CONTROL_LEGACY_HEADER_WIRE: &str = "eliot.host.backup-control.v1";
+/// Stable wire identifier for Host backup runtime-control envelopes that
+/// carry the exact `#954` operation body. Distinct from
+/// [`HOST_RUNTIME_CONTROL_WIRE`]; existing v2 version distinctions are
+/// unchanged.
+pub const HOST_BACKUP_RUNTIME_CONTROL_WIRE: &str = "eliot.host.backup-control.v2";
 /// Maximum canonical JSON bytes accepted for one backup envelope payload.
 /// Reuses the closed #954 bound.
 pub const MAX_BACKUP_RUNTIME_CONTROL_PAYLOAD_BYTES: usize =
@@ -1526,6 +1539,10 @@ pub const MAX_BACKUP_RUNTIME_CONTROL_PAYLOAD_BYTES: usize =
 pub const MAX_BACKUP_RUNTIME_CONTROL_TEXT_BYTES: usize =
     eliot_protocol::backup::MAX_BACKUP_TEXT_BYTES;
 const BACKUP_WIRE: &str = HOST_BACKUP_RUNTIME_CONTROL_WIRE;
+const BACKUP_LEGACY_HEADER_WIRE: &str = HOST_BACKUP_RUNTIME_CONTROL_LEGACY_HEADER_WIRE;
+
+/// Bounded refusal reason for the retired header-only backup carrier.
+const BACKUP_LEGACY_HEADER_REFUSAL: &str = "legacy header-only backup carrier is unsupported";
 
 /// Closed capability projection for one #954 backup operation. The envelope
 /// capability is always derived from the operation; a stored capability that
@@ -1547,6 +1564,16 @@ fn backup_capability_for_operation(
     }
 }
 
+/// Envelope mutation identity: the transport fields of one carrier plus the
+/// request digest of the exact operation body it carries.
+///
+/// The body's own request digest is included as a single committed value, not
+/// as a second digest domain derived here. The body commits its own identity
+/// and its operation-specific fields; this digest commits that body to this
+/// envelope's operation, session, nonce, generation, fence, source,
+/// destination and owner. Deriving the body's request digest from the header
+/// instead would let a header and a body be independently well-formed while
+/// together committing to something neither describes.
 fn backup_mutation_digest_for(
     wire: &PlatformHandle,
     operation: &eliot_protocol::backup::BackupOperationKind,
@@ -1558,10 +1585,11 @@ fn backup_mutation_digest_for(
     source: &PlatformHandle,
     destination: &PlatformHandle,
     owner: &PlatformHandle,
+    body_request_digest: &str,
 ) -> String {
     sha256_hex(
         format!(
-            "{}:backup:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            "{}:backup:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
             wire.as_str(),
             operation.as_str(),
             request_id.as_str(),
@@ -1571,7 +1599,8 @@ fn backup_mutation_digest_for(
             fence.as_str(),
             source.as_str(),
             destination.as_str(),
-            owner.as_str()
+            owner.as_str(),
+            body_request_digest
         )
         .as_bytes(),
     )
@@ -1605,6 +1634,252 @@ fn backup_bounded_text(value: &PlatformHandle, field: &'static str) -> Result<()
     Ok(())
 }
 
+/// The exact `#954` operation body carried by the backup carrier.
+///
+/// The carrier header (wire, operation, role, capability, source,
+/// destination, owner, session, nonce, generation, fence and digests) is
+/// correlation only. This body is the operation itself: it commits the
+/// complete preparation/cutover/status/reconcile request, its source and
+/// destination installations, its operation, its class, its state fence, and
+/// the admission authority, scope, capability and receipt that admitted it. A
+/// role enum plus a digest-shaped string is not that body, so this field is
+/// required: a payload without one does not decode into a backup request.
+///
+/// The bodies are the canonical `#954` per-operation request types, consumed
+/// from their single owner. This module introduces no second backup operation
+/// vocabulary: each variant is validated by that type's own contract, and the
+/// operation is bound by the serialization tag as well as by the body.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "operation",
+    content = "body",
+    rename_all = "SCREAMING_SNAKE_CASE"
+)]
+pub enum BackupOperationBody {
+    /// `PREPARE_ISOLATED_RESTORE`: the destination-only preparation request.
+    PrepareIsolatedRestore(BackupIsolatedRestorePrepare),
+    /// `ADMIT_CUTOVER`: the separately admitted installation cutover request.
+    AdmitCutover(BackupCutoverAdmission),
+    /// `RESTORE_STATUS`: the read-only restore status query.
+    RestoreStatus(BackupRestoreStatus),
+    /// `RECONCILE_RESTORE`: the reconcile query over the retained operation.
+    ReconcileRestore(BackupRestoreReconcile),
+}
+
+impl BackupOperationBody {
+    /// Returns the operation this body is the request for.
+    #[must_use]
+    pub fn operation(&self) -> BackupOperationKind {
+        match self {
+            Self::PrepareIsolatedRestore(_) => BackupOperationKind::PrepareIsolatedRestore,
+            Self::AdmitCutover(_) => BackupOperationKind::AdmitCutover,
+            Self::RestoreStatus(_) => BackupOperationKind::RestoreStatus,
+            Self::ReconcileRestore(_) => BackupOperationKind::ReconcileRestore,
+        }
+    }
+
+    /// Returns the shared request identity every `#954` body binds. It carries
+    /// the principal, fence, class, source/destination installations and the
+    /// admission authority, scope, capability and receipt of this operation.
+    #[must_use]
+    pub fn identity(&self) -> &BackupRequestIdentity {
+        match self {
+            Self::PrepareIsolatedRestore(body) => &body.identity,
+            Self::AdmitCutover(body) => &body.identity,
+            Self::RestoreStatus(body) => &body.identity,
+            Self::ReconcileRestore(body) => &body.identity,
+        }
+    }
+
+    /// Returns the canonical request digest of the exact body.
+    ///
+    /// This is the body's own `#954` request identity, not a digest derived
+    /// by this carrier, and not the shared request-identity digest. The
+    /// carrier commits it; it never recomputes or replaces it.
+    #[must_use]
+    pub fn request_digest(&self) -> &str {
+        match self {
+            Self::PrepareIsolatedRestore(body) => &body.request_digest,
+            Self::AdmitCutover(body) => &body.request_digest,
+            Self::RestoreStatus(body) => &body.request_digest,
+            Self::ReconcileRestore(body) => &body.request_digest,
+        }
+    }
+
+    /// Validates the body through its own canonical `#954` contract.
+    pub fn validate(&self) -> Result<(), String> {
+        let validated = match self {
+            Self::PrepareIsolatedRestore(body) => body.validate(),
+            Self::AdmitCutover(body) => body.validate(),
+            Self::RestoreStatus(body) => body.validate(),
+            Self::ReconcileRestore(body) => body.validate(),
+        };
+        validated.map_err(|error| error.to_string())
+    }
+}
+
+/// The retained operation one owner outcome refers to.
+///
+/// This is the owner's own record of the admitted operation, not a requester
+/// retry token. It names the operation, the retained `#954` request identity
+/// digest that binds the original admitted request, and the owner retaining
+/// it, so a pending or possibly-effected answer identifies the exact original
+/// operation to reconcile instead of asking for a blind new attempt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupRetainedOperation {
+    /// The operation the owner retained.
+    pub operation: BackupOperationKind,
+    /// Retained request identity digest of that exact operation.
+    pub identity_digest: PlatformHandle,
+    /// Identity of the owner retaining the operation.
+    pub owner: PlatformHandle,
+}
+
+impl BackupRetainedOperation {
+    /// Validates the bounded shape of one retained-operation reference.
+    pub fn validate(&self) -> Result<(), String> {
+        if !is_sha256_digest(&self.identity_digest) {
+            return Err("backup retained identity_digest must be lowercase sha256".to_owned());
+        }
+        backup_bounded_text(&self.owner, "retained owner")
+    }
+}
+
+/// The typed owner outcome of one admitted backup dispatch.
+///
+/// A pre-effect refusal is deliberately not an outcome: it is the typed
+/// `BackupDispatchRefusal` error the owner returns before it has done
+/// anything. Everything an owner that reached its operation can report is one
+/// of these three variants, and they are not collapsible into one another,
+/// because they are three different facts with three different next actions:
+/// read the retained operation, accept the owner's receipt, or reconcile the
+/// original operation. An owner that may already have effected must return
+/// [`BackupOwnerOutcome::PossibleEffect`]; it can never report its failure as
+/// an effect-free refusal.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "disposition", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BackupOwnerOutcome {
+    /// Admitted and pending: the owner retained the exact operation and is
+    /// still executing it. No stage is claimed and no receipt exists yet, so
+    /// the requester reads this same retained operation instead of
+    /// resubmitting.
+    Admitted { retained: BackupRetainedOperation },
+    /// Completed: the owner performed the operation and issued its own phase
+    /// attestation. A produced destination or artifact travels as a bounded
+    /// immutable handle, never as a path, a URL, or an inline body.
+    Completed {
+        attestation: BackupPhaseAttestation,
+        handle: Option<BackupArtifactHandle>,
+    },
+    /// Possible effect: the owner retained the exact operation but cannot say
+    /// whether the effect committed. The same operation must be reconciled;
+    /// this outcome is never success and never authorizes a second effect.
+    PossibleEffect { retained: BackupRetainedOperation },
+}
+
+impl BackupOwnerOutcome {
+    /// Validates the owner outcome on its own terms.
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::Admitted { retained } | Self::PossibleEffect { retained } => retained.validate(),
+            Self::Completed {
+                attestation,
+                handle,
+            } => {
+                attestation.validate().map_err(|error| error.to_string())?;
+                match handle {
+                    Some(handle) => handle
+                        .validate("backup_owner_outcome.handle")
+                        .map_err(|error| error.to_string()),
+                    None => Ok(()),
+                }
+            }
+        }
+    }
+
+    /// Validates this owner outcome against the exact admitted request.
+    ///
+    /// A retained reference must name the admitted operation, the admitted
+    /// request's own identity digest, and the admitted owner. A completion
+    /// attestation must be bound to the admitted archive, fence and deadline,
+    /// must be issued by an attesting role admitted for its own phase, and
+    /// must attest a phase the admitted operation can actually establish.
+    /// Correlation alone never passes.
+    pub fn validate_against_request(
+        &self,
+        request: &BackupRuntimeControlRequest,
+    ) -> Result<(), String> {
+        self.validate()?;
+        let identity = request.body.identity();
+        match self {
+            Self::Admitted { retained } | Self::PossibleEffect { retained } => {
+                if retained.operation != request.operation
+                    || retained.identity_digest.as_str() != identity.identity_digest.as_str()
+                    || retained.owner != request.owner
+                {
+                    return Err(
+                        "backup retained operation does not match the admitted request".to_owned(),
+                    );
+                }
+                Ok(())
+            }
+            Self::Completed { attestation, .. } => {
+                if attestation.archive_id != identity.archive_id
+                    || attestation.fence != identity.fence
+                {
+                    return Err(
+                        "backup owner attestation does not match the admitted request".to_owned(),
+                    );
+                }
+                if attestation.observed_at_unix_ms > identity.deadline_unix_ms {
+                    return Err("backup owner attestation is no longer current".to_owned());
+                }
+                if !attestation.owner_role.is_attesting_role()
+                    || !attesting_roles(attestation.phase).contains(&attestation.owner_role)
+                    || !attestation
+                        .owner_role
+                        .permits(operation_for_phase(attestation.phase))
+                    || !backup_phase_matches_operation(request.operation, attestation.phase)
+                {
+                    return Err(
+                        "backup owner attestation does not attest the admitted operation"
+                            .to_owned(),
+                    );
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Returns whether a completed owner attestation may carry `phase` for
+/// `operation`.
+///
+/// A read-only status query advances no stage of its own: it reports the
+/// stage the retained restore operation has reached, so any restore stage is
+/// admissible there and nothing else is. Every other accepted operation
+/// establishes exactly one stage, and the capture and rehearsal stages belong
+/// to operations the Host does not serve.
+fn backup_phase_matches_operation(operation: BackupOperationKind, phase: BackupStage) -> bool {
+    match operation {
+        BackupOperationKind::PrepareIsolatedRestore => phase == BackupStage::RestorePrepared,
+        BackupOperationKind::AdmitCutover => phase == BackupStage::CutoverAdmitted,
+        BackupOperationKind::ReconcileRestore => phase == BackupStage::Reconciled,
+        BackupOperationKind::RestoreStatus => matches!(
+            phase,
+            BackupStage::RestorePrepared
+                | BackupStage::RestoreStepApplied
+                | BackupStage::Reconciled
+        ),
+        BackupOperationKind::RequestCapture
+        | BackupOperationKind::ReadSnapshotPage
+        | BackupOperationKind::VerifyArchive
+        | BackupOperationKind::RestoreStep
+        | BackupOperationKind::CompleteRehearsal => false,
+    }
+}
+
 /// Authenticated backup envelope binding one closed #954 operation to its
 /// session, nonce, generation, fence, and installation identities.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1624,27 +1899,48 @@ pub struct BackupRuntimeControlRequest {
     pub fence: PlatformHandle,
     pub mutation_digest: PlatformHandle,
     pub request_digest: PlatformHandle,
+    /// The exact `#954` operation body this envelope admits. Required: a
+    /// header-only payload is the retired carrier and does not decode.
+    pub body: BackupOperationBody,
 }
 
 impl BackupRuntimeControlRequest {
-    /// Construct an authenticated backup envelope. The role/capability gate
-    /// runs before any digest is minted, so an unsupported method or a role
-    /// without the operation errors before effects.
+    /// Construct an authenticated backup envelope around one exact `#954`
+    /// operation body.
+    ///
+    /// The operation, role, source, destination, and session are read from
+    /// the body, never supplied beside it, so a caller cannot present a header
+    /// that describes an operation the body does not carry. The caller
+    /// supplies only what the body does not own: the owner, the transport
+    /// request identity, the nonce, the generation, and the fence. The
+    /// envelope mutation digest then commits the body's own request digest
+    /// together with those transport fields.
+    ///
+    /// The body is validated first, so an unsupported method, a role without
+    /// the operation, or a body that is not the exact `#954` request for its
+    /// own identity errors before any digest is minted, and therefore before
+    /// effects.
     pub fn new_backup(
-        operation: eliot_protocol::backup::BackupOperationKind,
-        role: eliot_protocol::backup::BackupRole,
-        source: PlatformHandle,
-        destination: PlatformHandle,
+        body: BackupOperationBody,
         owner: PlatformHandle,
         request_id: PlatformHandle,
-        session_id: PlatformHandle,
         nonce: PlatformHandle,
         generation: PlatformHandle,
         fence: PlatformHandle,
     ) -> Result<Self, String> {
+        body.validate()?;
+        let identity = body.identity();
+        let operation = body.operation();
+        let role = identity.principal.role;
         if !role.permits(operation) {
             return Err("backup role does not permit operation".to_owned());
         }
+        let source =
+            PlatformHandle::new(identity.source_installation.clone()).map_err(|e| e.to_string())?;
+        let destination =
+            PlatformHandle::new(identity.dest_installation.clone()).map_err(|e| e.to_string())?;
+        let session_id = PlatformHandle::new(identity.principal.session_id.clone())
+            .map_err(|e| e.to_string())?;
         let wire = PlatformHandle::new(BACKUP_WIRE.to_owned()).map_err(|e| e.to_string())?;
         let mutation_digest = PlatformHandle::new(backup_mutation_digest_for(
             &wire,
@@ -1657,6 +1953,7 @@ impl BackupRuntimeControlRequest {
             &source,
             &destination,
             &owner,
+            body.request_digest(),
         ))
         .map_err(|e| e.to_string())?;
         let request_digest = PlatformHandle::new(backup_request_digest_for(
@@ -1681,12 +1978,16 @@ impl BackupRuntimeControlRequest {
             fence,
             mutation_digest,
             request_digest,
+            body,
         };
         value.validate()?;
         Ok(value)
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if self.wire.as_str() == BACKUP_LEGACY_HEADER_WIRE {
+            return Err(BACKUP_LEGACY_HEADER_REFUSAL.to_owned());
+        }
         if self.wire.as_str() != BACKUP_WIRE {
             return Err("unsupported backup wire".to_owned());
         }
@@ -1734,6 +2035,7 @@ impl BackupRuntimeControlRequest {
             &self.source,
             &self.destination,
             &self.owner,
+            self.body.request_digest(),
         );
         if expected_mutation != self.mutation_digest.as_str() {
             return Err("backup mutation_digest mismatch".to_owned());
@@ -1747,13 +2049,48 @@ impl BackupRuntimeControlRequest {
         if expected != self.request_digest.as_str() {
             return Err("backup request_digest mismatch".to_owned());
         }
+        self.validate_body_binding()?;
+        Ok(())
+    }
+
+    /// Joins the correlation header to the exact `#954` operation body.
+    ///
+    /// The header cannot describe an operation the body does not carry, and
+    /// it cannot name a different source, destination, role, session, or
+    /// capability than the body commits. Every effect-relevant value lives in
+    /// the body, which validates itself through its own canonical contract;
+    /// these joins are what make the header a faithful correlation of that
+    /// body rather than a second, self-consistent claim about a different one.
+    ///
+    /// The body is additionally committed by the envelope mutation digest,
+    /// which is checked above over the body's own request digest, so a
+    /// swapped body cannot keep a valid header.
+    fn validate_body_binding(&self) -> Result<(), String> {
+        self.body.validate()?;
+        let identity = self.body.identity();
+        if self.body.operation() != self.operation || identity.mutation.operation != self.operation
+        {
+            return Err("backup operation does not match the carried operation body".to_owned());
+        }
+        if identity.source_installation != self.source.as_str()
+            || identity.dest_installation != self.destination.as_str()
+        {
+            return Err("backup installations do not match the carried operation body".to_owned());
+        }
+        if identity.principal.role != self.role
+            || identity.principal.session_id != self.session_id.as_str()
+        {
+            return Err("backup principal does not match the carried operation body".to_owned());
+        }
         Ok(())
     }
 }
 
 /// Authenticated backup answer bound to one [`BackupRuntimeControlRequest`].
 /// The operation, source, destination, owner, and digest identities must
-/// match the request exactly; see [`backup_response_matches_request`].
+/// match the request exactly, and the carried [`BackupOwnerOutcome`] must
+/// validate against that exact request; see
+/// [`backup_response_matches_request`].
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BackupRuntimeControlResponse {
@@ -1764,11 +2101,22 @@ pub struct BackupRuntimeControlResponse {
     pub owner: PlatformHandle,
     pub mutation_digest: PlatformHandle,
     pub request_digest: PlatformHandle,
+    /// What the owner actually did. The correlation fields above say which
+    /// request this answers; only this says whether the operation is pending,
+    /// completed with its receipt, or possibly effected. A transport
+    /// acknowledgement is never this field's value.
+    pub outcome: BackupOwnerOutcome,
 }
 
 impl BackupRuntimeControlResponse {
-    /// Bind a backup answer to its exact request identity.
-    pub fn backup_response_for(request: &BackupRuntimeControlRequest) -> Self {
+    /// Bind a backup answer to its exact request identity and the owner's own
+    /// outcome. This constructor supplies the correlation portion only: the
+    /// outcome is never derived from the request, so no answer can be built
+    /// without one.
+    pub fn backup_response_for(
+        request: &BackupRuntimeControlRequest,
+        outcome: BackupOwnerOutcome,
+    ) -> Self {
         Self {
             wire: request.wire.clone(),
             operation: request.operation,
@@ -1777,10 +2125,14 @@ impl BackupRuntimeControlResponse {
             owner: request.owner.clone(),
             mutation_digest: request.mutation_digest.clone(),
             request_digest: request.request_digest.clone(),
+            outcome,
         }
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if self.wire.as_str() == BACKUP_LEGACY_HEADER_WIRE {
+            return Err(BACKUP_LEGACY_HEADER_REFUSAL.to_owned());
+        }
         if self.wire.as_str() != BACKUP_WIRE {
             return Err("unsupported backup wire".to_owned());
         }
@@ -1800,18 +2152,22 @@ impl BackupRuntimeControlResponse {
         if !is_sha256_digest(&self.request_digest) {
             return Err("backup request_digest must be lowercase sha256".to_owned());
         }
-        Ok(())
+        self.outcome.validate()
     }
 }
 
 /// Check the backup answer against the exact request identity. The
-/// operation, source, destination, owner, and both digests must match; any
-/// substitution fails closed.
+/// operation, source, destination, owner, and both digests must match, and
+/// the carried owner outcome must validate against that exact admitted
+/// request; any substitution, and any outcome that describes another
+/// operation, another retained identity, or a phase this operation cannot
+/// establish, fails closed.
 pub fn backup_response_matches_request(
     request: &BackupRuntimeControlRequest,
     response: &BackupRuntimeControlResponse,
 ) -> bool {
-    if response.validate().is_err() {
+    let outcome = response.outcome.validate_against_request(request);
+    if response.validate().is_err() || outcome.is_err() {
         return false;
     }
     response.operation == request.operation
@@ -1820,6 +2176,17 @@ pub fn backup_response_matches_request(
         && response.owner == request.owner
         && response.mutation_digest == request.mutation_digest
         && response.request_digest == request.request_digest
+}
+
+/// Returns whether `payload` presents the retired header-only backup
+/// carrier.
+///
+/// That wire identity never carried an operation body, so it is refused by
+/// name here rather than being left to a field check: a decoder must never
+/// be able to reinterpret it as an executable body of a newer carrier.
+fn backup_legacy_header_only_payload(payload: &serde_json::Value) -> bool {
+    payload.get("wire").and_then(serde_json::Value::as_str) == Some(BACKUP_LEGACY_HEADER_WIRE)
+        && payload.get("body").is_none()
 }
 
 fn backup_frame_payload_len(payload: &serde_json::Value) -> Result<usize, String> {
@@ -1865,6 +2232,11 @@ pub fn decode_backup_request_frame(frame: &Frame) -> Result<BackupRuntimeControl
     };
     if backup_frame_payload_len(payload)? > MAX_BACKUP_RUNTIME_CONTROL_PAYLOAD_BYTES {
         return Err("SessionFenced".to_owned());
+    }
+    // The retired header-only carrier is refused explicitly: it carried no
+    // operation body, so it is never decoded into a runnable request.
+    if backup_legacy_header_only_payload(payload) {
+        return Err(BACKUP_LEGACY_HEADER_REFUSAL.to_owned());
     }
     // Closed vocabulary with `deny_unknown_fields`: payload overrides,
     // oversize text, malformed shapes, and duplicate fields fail here,
@@ -1936,6 +2308,11 @@ pub fn decode_backup_response_frame(frame: &Frame) -> Result<BackupRuntimeContro
     };
     if backup_frame_payload_len(payload)? > MAX_BACKUP_RUNTIME_CONTROL_PAYLOAD_BYTES {
         return Err("SessionFenced".to_owned());
+    }
+    // The retired header-only carrier is refused explicitly here too: a
+    // requester must never read one as an owner outcome of this carrier.
+    if backup_legacy_header_only_payload(payload) {
+        return Err(BACKUP_LEGACY_HEADER_REFUSAL.to_owned());
     }
     let response: BackupRuntimeControlResponse =
         serde_json::from_value(payload.clone()).map_err(|_| "SessionFenced".to_owned())?;
