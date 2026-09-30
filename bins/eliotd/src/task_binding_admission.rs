@@ -23,25 +23,23 @@
 //! stays cold. A contaminated selection (canonical crossover marker) never
 //! promotes: captures stay cold and task-bound promotion rejects.
 //!
-//! # Daemon ingress entries, and which of them are live (issue #1929)
+//! # Daemon ingress entries (issue #1929)
 //!
-//! Without an entry below this module was unreachable from the daemon: the
-//! `eliotd` ingress admitted a capture or a task-relative write and only the
-//! downstream store gate could object, so the daemon itself was a bypass
-//! around I5.5. Three entries were added to close that chain:
+//! The admission entries are deliberately split by the evidence each edge
+//! owns:
 //!
 //! - [`admit_canonical_write`] — the composition-root named-mutation intake.
 //!   The caller presents its compiled
-//!   [`OnboardingReadinessReceipt`](eliot_workscope::OnboardingReadinessReceipt),
-//!   so this is the only entry that can see its task binding. A
+//!   [`OnboardingReadinessReceipt`](eliot_workscope::OnboardingReadinessReceipt)
+//!   for canonical-envelope admission. A
 //!   `CurrentTaskContract` binding is admitted only from the owner-proven
 //!   selection evidence retained on that same receipt. No source is synthesized
 //!   from an unrelated profile or receipt handle. I5.6 step 4 verbatim —
 //!   "resolve `TaskSelectionEvidence`
 //!   and `TaskContract` compatibility when the command is task-relative".
-//! - [`admit_named_mutation_capture`] — the transport edge
-//!   (`DaemonKernelClient::apply_prepared`). No typed selection exists there, so
-//!   a task-free `CaptureObservation` is admitted here as a cold unbound
+//! - [`admit_named_mutation_capture`] — the capture-only transport edge
+//!   (`DaemonKernelClient::apply_prepared`). A task-free `CaptureObservation` is
+//!   admitted here as a cold unbound
 //!   candidate and is never treated as task-bound, while any transition naming
 //!   a task — with or without a capture — is reported as task-relative for the
 //!   selection-owning ingress and the store gate. It deliberately does not
@@ -49,6 +47,11 @@
 //!   writes; that rule belongs to
 //!   `eliot-store-surreal::task_binding_gate`, which re-derives it from the
 //!   opaque proof handles before provider I/O. Neither replaces the other.
+//! - [`admit_prepared_transition_with_retained_selection`] — the task-relative
+//!   prepared-transition edge. It receives the exact retained readiness receipt,
+//!   owner `WorkScopeBindingSnapshot`, explicit observed scope resources, and
+//!   live fence.
+//!   Task-free capture retains the cold path above.
 //! - [`observe_explicit_workspace`] — the daemon half of the `WorkScope`
 //!   attach trigger. The daemon observes the explicit root mechanically; the
 //!   Governor stays the receipt/admission owner
@@ -64,63 +67,17 @@
 //! No entry creates a second write path, re-derives a downstream layer's
 //! decision, or accepts a task the caller did not name.
 //!
-//! # Measured reachability (issue #1929)
+//! # Evidence ownership at ingress (issue #1929)
 //!
-//! Recorded because a checklist item satisfied against call-graph-dead code is
-//! exactly the defect this issue audits. Measured on this tree by symbol, not
-//! inferred:
-//!
-//! - [`admit_canonical_write`] has **one** production call site:
-//!   [`DaemonComposition::commit_canonical_and_refresh`](super::DaemonComposition).
-//!   An earlier revision of this file recorded *zero* call sites for it; that
-//!   was false and is corrected here.
-//! - `DaemonComposition::commit_canonical_and_refresh` itself has **zero**
-//!   production call sites — its only in-tree mentions are documentation and a
-//!   source-string assertion in `bins/eliotd/tests/agent_fabric_wiring.rs`. It
-//!   is the composition-root canonical-commit entry and nothing in production
-//!   calls it yet, so the typed evidence leg this module owns is reached from
-//!   no live daemon path.
-//! - [`admit_named_mutation_capture`] **is** live, through the neutral
-//!   transport port: `PreparedKernelExchange::exchange` calls
-//!   `KernelTransitionPort::apply_prepared`, implemented by
-//!   `DaemonKernelClient` in `bins/eliotd/src/kernel_transition_client.rs`,
-//!   whose `check_identity_binding` calls this entry before any transport is
-//!   touched. The daemon run loop drives that port for its `TestD` terminal
-//!   finish legs.
-//! - [`observe_and_admit_task`] has **zero call sites**, so
-//!   [`admit_task_bound_with_observed_scope`] is transitively dead with it.
-//! - [`DaemonComposition::admit_scope_attach`](super::DaemonComposition) — the
-//!   only caller of [`ScopeAttachIngress`] — has **zero call sites**, and
-//!   `GovernorComposition::admit_observed_scope_attach` fails closed unless a
-//!   `WorkScope` owner is *already* retained, so the entry is additionally
-//!   circular: its only producer of the state it requires is itself.
-//!
-//! The single blocking symbol for the evidence leg is the compiled readiness
-//! receipt. `TaskSelectionEvidence` needs a non-zero `task_revision` and a
-//! lowercase `acceptance_digest`, and this repository has exactly one
-//! production constructor of [`OnboardingReadinessReceipt`](eliot_workscope::OnboardingReadinessReceipt):
-//! `eliot_workscope::ColdStartController::compile`. Its only production caller
-//! is `eliot_workscope::OnboardingSingleFlight::compile_and_publish`, so the
-//! receipt is reachable only through
-//! `eliot_governor::GovernorComposition::compile_cold_start_at_trigger`, which
-//! itself has zero call sites. No carrier on the write path holds the receipt
-//! or the evidence: `eliot_protocol::RequestIdentity`,
-//! `eliot_store_api::PreparedTransition`, `eliot_canonical::CanonicalWriteEnvelope`,
-//! `DaemonKernelClient`, and `GovernorComposition`'s retained
-//! `WorkScopeBindingOwner` all carry at most a bare `task_id`, and
-//! `WorkScopeBindingSnapshot` is documented as carrying "no task, plan, session,
-//! principal or kernel-generation authority".
-//!
-//! Consequence, stated rather than hidden: because `commit_canonical_and_refresh`
-//! is not called, the typed task-bound leg of [`admit_canonical_write`] is
-//! currently unreachable from the daemon. The two stable codes remain enforced
-//! on the real write path by `eliot_store_surreal::task_binding_gate::gate_apply`,
-//! which re-derives them from the opaque proof handles the transition actually
-//! carries, and the live transport edge reports `ColdUnbound`, which is the
-//! complete and honest answer for a task-free capture. Threading a selection
-//! onto the transport edge requires the receipt owner above to exist first; it
-//! must never be filled with a synthesized, reconstructed, or defaulted
-//! selection.
+//! `RequestIdentity` and `PreparedTransition` carry request and operation
+//! terms, not task-selection authority. A task-bound prepared transition must
+//! therefore receive the owner-compiled [`OnboardingReadinessReceipt`]
+//! separately, along with the retained `ScopeBinding`, an explicit observed
+//! scope, and the live fence. This module validates the receipt's original
+//! evidence against its independently retained task contract and fence, then
+//! admits against the request task, operation scope, observed scope and live
+//! fence. It never constructs evidence from the request or selects a task by
+//! recency. Task-free raw captures continue through the cold-unbound path.
 //!
 //! # Where a cold unbound candidate is retained (issue #1929)
 //!
@@ -149,7 +106,7 @@ use eliot_bootstrap::capture::{
     observe_workspace_source_candidates,
 };
 use eliot_contracts::sha256_hex;
-use eliot_contracts::{RequestMetadata, StateFence, TaskId};
+use eliot_contracts::{RequestMetadata, SessionId, StateFence, TaskId};
 use eliot_governor::{
     CanonicalWriteEnvelope, ColdStartSurfaceView, GoverningSourceSet, PrivacyProfile, ScopeBinding,
     WorkScopeDescriptor, derive_observed_resources,
@@ -172,7 +129,7 @@ use eliot_workscope::{
     DiscoveryRead, DiscoveryReadLease, GoverningSourceCandidateEvidence, GoverningSourceRole,
     ManifestEvidence, ObservedScopeResources, OnboardingLease, OnboardingReadinessReceipt,
     ReadinessLifecycle, ScopeBindingDisposition, ScopeResolutionState, TaskBindingState,
-    issue_discovery_lease, task_selection_required,
+    WorkScopeBindingSnapshot, issue_discovery_lease, task_selection_required,
 };
 
 /// Authenticated activation's bounded filesystem/VCS observation and its
@@ -1636,7 +1593,7 @@ pub fn resolve_task_selection(
                 || evidence.task_revision != *task_revision
                 || evidence.acceptance_digest != *acceptance_digest
                 || evidence.work_scope_ref != receipt.scope.scope_ref
-                || receipt.state_fence.task_revision.map(|revision| revision.value())
+                || receipt.state_fence.task_revision.map(eliot_contracts::TaskRevision::value)
                     != Some(evidence.task_revision)
             {
                 return Err(TaskBindingError::scope_incompatible(
@@ -2098,13 +2055,10 @@ fn compatibility_for(
 /// Admits one daemon named-mutation write at the composition-root ingress
 /// (issue #1929, I5.5 capture/promotion split, I5.6 step 4).
 ///
-/// This is the composition-root named-mutation intake, and the only entry that
-/// consumes a caller-presented [`OnboardingReadinessReceipt`]. Its one
-/// production call site is
-/// [`DaemonComposition::commit_canonical_and_refresh`](super::DaemonComposition);
-/// that caller itself has zero production call sites, so the entry is not yet
-/// reached in production. See the module's "Measured reachability" section for
-/// the exact measurement. The write is split by what it actually is:
+/// This is the composition-root named-mutation intake for canonical envelopes.
+/// Prepared transitions use
+/// [`admit_prepared_transition_with_retained_selection`]. The write is split by
+/// what it actually is:
 ///
 /// - a capture naming no task — the capture-first case — goes through
 ///   [`admit_capture`] and is returned as
@@ -2700,22 +2654,15 @@ pub fn revalidate_task_bound_for_effect(
 /// It never selects the most recent or open task and never falls back to
 /// resolver output.
 ///
-/// # Why this entry has no `selection` parameter (issue #1929)
+/// # Why this capture-only entry has no `selection` parameter (issue #1929)
 ///
-/// This edge is reached from `DaemonKernelClient::apply_prepared`, which
-/// receives only a `PreparedTransition` and an `eliot_protocol::RequestIdentity`.
-/// Neither carries a compiled readiness receipt or a `TaskSelectionEvidence`,
-/// and neither does `DaemonKernelClient` or the retained Governor
-/// `WorkScopeBindingOwner`; a `TaskSelectionEvidence` additionally requires a
-/// non-zero `task_revision` and an `acceptance_digest` that this edge has no
-/// legitimate source for. Adding the parameter anyway and passing `None` would
-/// reproduce the present state under a new name, and synthesizing those two
-/// fields would turn every typed rejection on this path into a rejection of
-/// fabricated evidence — strictly worse than the `ColdUnbound` this edge
-/// reports. The signature therefore has no selection parameter, which makes the
-/// missing evidence owner structural rather than an assertion. The ingress that
-/// would carry it, [`admit_canonical_write`], does have a production call site,
-/// but that caller has none; see the module's "Measured reachability" section.
+/// `DaemonKernelClient::apply_prepared` may use this narrow entry when it owns
+/// only a `PreparedTransition` and `RequestIdentity`. Task-relative prepared
+/// work uses [`admit_prepared_transition_with_retained_selection`] instead,
+/// with the owner receipt, retained `ScopeBinding`, live observed scope, and
+/// current fence supplied explicitly. This entry never accepts fabricated
+/// evidence or treats an absent selection as compatible; a task-free raw
+/// capture remains cold.
 pub fn admit_named_mutation_capture(
     context: &RequestMetadata,
     transition: &PreparedTransition,
@@ -2773,6 +2720,122 @@ pub fn admit_named_mutation_capture(
     }
 }
 
+/// Admits one prepared transition with the original retained task evidence and
+/// an independently observed WorkScope (issue #1929, W2/W3/W4).
+///
+/// Task-free raw captures preserve the existing `ColdUnbound` result without
+/// requiring task evidence. A task-relative transition must carry the exact
+/// readiness receipt plus the owner-retained `WorkScopeBindingSnapshot`,
+/// Host-observed scope resources, and current owner fence. This entry checks
+/// the evidence against the receipt, request/transition task,
+/// receipt/transition scope, and presented/live fences before it seals the same
+/// evidence for dispatch. It
+/// never derives an expected task or scope from the evidence itself.
+pub fn admit_prepared_transition_with_retained_selection(
+    context: &RequestMetadata,
+    transition: &PreparedTransition,
+    receipt: Option<&OnboardingReadinessReceipt>,
+    expected_scope: Option<&WorkScopeBindingSnapshot>,
+    observed_scope: Option<&ObservedScopeResources>,
+    live_fence: &StateFence,
+) -> Result<TaskBindingAdmission, TaskBindingError> {
+    match admit_named_mutation_capture(context, transition)? {
+        TaskBindingAdmission::ColdUnbound(candidate) => {
+            return Ok(TaskBindingAdmission::ColdUnbound(candidate));
+        }
+        TaskBindingAdmission::NotTaskRelative => {
+            return Ok(TaskBindingAdmission::NotTaskRelative);
+        }
+        TaskBindingAdmission::TaskBound(binding) => {
+            return Ok(TaskBindingAdmission::TaskBound(binding));
+        }
+        TaskBindingAdmission::TaskRelative => {}
+    }
+
+    let receipt = receipt.ok_or_else(|| {
+        TaskBindingError::selection_required(
+            "task-relative prepared transition has no retained readiness receipt",
+        )
+    })?;
+    let expected_scope = expected_scope.ok_or_else(|| {
+        TaskBindingError::scope_incompatible(
+            "task-relative prepared transition has no owner-retained WorkScope binding",
+        )
+    })?;
+    expected_scope.validate().map_err(|error| {
+        TaskBindingError::scope_incompatible(format!(
+            "owner-retained WorkScope binding is invalid: {error}"
+        ))
+    })?;
+    let observed_scope = observed_scope.ok_or_else(|| {
+        TaskBindingError::scope_incompatible(
+            "task-relative prepared transition has no explicit observed WorkScope",
+        )
+    })?;
+    let evidence = match resolve_task_selection(receipt)? {
+        TaskSelectionDisposition::Current(evidence) => evidence,
+        TaskSelectionDisposition::Absent
+        | TaskSelectionDisposition::Exploratory { .. }
+        | TaskSelectionDisposition::Ambiguous(_)
+        | TaskSelectionDisposition::Stale { .. } => {
+            return Err(TaskBindingError::selection_required(
+                "task-relative prepared transition requires one current retained task selection",
+            ));
+        }
+    };
+    refuse_ready_string_without_evidence(receipt, true)?;
+
+    let admitted_task_ref = refuse_task_identity_conflict(
+        context.task_id.as_ref().map(TaskId::as_str),
+        transition.task_id.as_deref(),
+    )?;
+    let context_session_ref = context.session_id.as_ref().map(SessionId::as_str);
+    if context_session_ref != Some(receipt.session_ref.as_str()) {
+        return Err(TaskBindingError::scope_incompatible(
+            "prepared transition readiness receipt belongs to another session",
+        ));
+    }
+    let operation_scope_ref = transition.scope_id.as_str();
+    if receipt.scope.scope_ref != operation_scope_ref
+        || expected_scope.binding.scope.scope_ref != receipt.scope.scope_ref
+        || !eliot_contracts::fences_match_exact(&expected_scope.state_fence, live_fence)
+    {
+        return Err(TaskBindingError::scope_incompatible(
+            "prepared transition scope differs from the retained task selection WorkScope",
+        ));
+    }
+    if !eliot_contracts::fences_match_exact(&receipt.state_fence, live_fence)
+        || !eliot_contracts::fences_match_exact(&context.state_fence, live_fence)
+        || !eliot_contracts::fences_match_exact(&transition.state_fence, live_fence)
+    {
+        return Err(TaskBindingError::scope_incompatible(
+            "retained task selection, request, prepared transition, and live fence do not match",
+        ));
+    }
+
+    admit_task_bound_with_observed_scope(
+        Some(&evidence),
+        &admitted_task_ref,
+        &expected_scope.binding,
+        observed_scope,
+        live_fence,
+        CompatibilityDisposition::Compatible,
+    )?;
+    let binding = seal_dispatched_binding(
+        evidence,
+        &admitted_task_ref,
+        operation_scope_ref,
+        &receipt.principal_ref,
+        &receipt.session_ref,
+        live_fence,
+        receipt.receipt_revision,
+        &receipt.governance_profile_ref,
+        receipt.projection_generation,
+        transition.identity.operation_id.as_str().to_owned(),
+    )?;
+    Ok(TaskBindingAdmission::TaskBound(binding))
+}
+
 /// Observes one explicit workspace root and admits one task-relative
 /// transition against the live observation.
 ///
@@ -2785,23 +2848,13 @@ pub fn admit_named_mutation_capture(
 /// binding, fails closed with `TASK_SCOPE_INCOMPATIBLE`; the retained
 /// binding, task state, and project memory are untouched. The root is always
 /// explicit — the daemon never infers a workspace from cwd, proximity, or
-/// recency. Live status: no live caller threads an explicit root yet; awaiting
-/// the attach-transport owner (BLOCKED-BY attach-transport).
+/// recency.
 ///
 /// Ported-from: work/1787-workscope-identity@443e39841049b0f80a25bebca813f470f8ad311c.
 ///
-/// # Not yet reached (issue #1929)
-///
-/// This entry takes a caller-presented selection rather than owning one, and it
-/// currently has zero call sites, which also makes
-/// [`admit_task_bound_with_observed_scope`] transitively dead. Its two
-/// remaining inputs are the reason: the daemon holds no retained
-/// `ScopeBinding` (that requires `DaemonComposition::admit_scope_attach`, which
-/// is itself uncalled and circular) and no explicit user workspace root — only
-/// its own config and state directories, which are not a user `WorkScope` and
-/// must never be attached as one. A production caller therefore needs the
-/// attach-transport ingress named in the module's "Measured reachability"
-/// section.
+/// The caller supplies the explicit user workspace root and exact retained
+/// binding from its owning attach/claim path. The daemon's own config or state
+/// directories are never substituted for a user `WorkScope`.
 pub fn observe_and_admit_task(
     workspace_root: &Path,
     selection: Option<&TaskSelectionEvidence>,
