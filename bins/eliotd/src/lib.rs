@@ -115,7 +115,12 @@ mod kernel_recovery_client;
 mod kernel_transition_client;
 pub mod maintenance_dispatch;
 pub mod maintenance_family_catalog;
-mod maintenance_trigger_evaluator;
+// Public because `daemon_runtime` lives in the `eliotd` binary crate and
+// reaches the maintenance publication owner through it, exactly as it reaches
+// `maintenance_dispatch` and `maintenance_family_catalog` beside it. The
+// previous private declaration made that reach a compile error the Governor
+// failure had masked.
+pub mod maintenance_trigger_evaluator;
 mod negative_memory_action_gate;
 pub mod notification_acknowledge_emit;
 pub mod notification_board_attach;

@@ -460,7 +460,7 @@ impl DaemonComposition {
     /// path and returns the exact store receipt.
     ///
     /// This is the production caller of
-    /// [`admit_maintenance_result`](crate::observation_adapters::ForwardingObservationReconciliation::admit_maintenance_result).
+    /// `observation_adapters::ForwardingObservationReconciliation::admit_maintenance_result`.
     /// The maintained subsystem's owner produces the obligation, the owner
     /// validates and projects it into the observation-family record, the
     /// Governor checks authority, fence and identity, and the Store returns its
