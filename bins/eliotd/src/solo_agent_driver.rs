@@ -1291,7 +1291,7 @@ async fn drive_solo_delegate_verified_async(
             "solo staffing receipt staffed no lane".to_owned(),
         ))
     })?;
-    // Issue #1108 W4/A2: the verified-construct site. Production ports plus
+    // Issue #1108 W1/W4/A2: the verified-construct site. Production ports plus
     // the driver's claimed halves enter the async seam; the seam resolves
     // the session halves over the live authenticated session, verifies the
     // binding through the Kernel provider-admission verifier, and builds
@@ -1561,7 +1561,7 @@ fn restore_solo_fabric(
 }
 
 /// Restores the solo fabric through the verified async seam (issue #1108
-/// A8/A9, production restore caller for the async path).
+/// A6/A8/A9, production restore caller for the async path).
 ///
 /// Production counterpart of the test-only synchronous `restore_solo_fabric`:
 /// builds the closed production ports through
