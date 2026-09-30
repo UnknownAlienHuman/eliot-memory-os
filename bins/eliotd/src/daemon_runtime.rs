@@ -4910,7 +4910,7 @@ async fn run_observe_poll(kernel: &DaemonKernelClient) -> Result<ObserveStep, St
         .claim_observe_pair_async()
         .await
         .map_err(|error| format!("Kernel observe pair claim: {error}"))?;
-    let Some((envelope, tool, attempt)) = pair else {
+    let Some(claimed) = pair else {
         return Ok(ObserveStep {
             outcome: ObservePollOutcome::IdleBackoff,
             suboperation: None,
@@ -4919,9 +4919,12 @@ async fn run_observe_poll(kernel: &DaemonKernelClient) -> Result<ObserveStep, St
             resume: None,
         });
     };
-    let operation_id = host_request_operation_id(&envelope);
+    let envelope = &claimed.envelope;
+    let tool = &claimed.tool;
+    let attempt = &claimed.attempt;
+    let operation_id = host_request_operation_id(envelope);
     let request_digest = envelope.envelope_sha256.clone();
-    let deferral = serve_admitted_observe(&envelope, &tool, &attempt)
+    let deferral = serve_admitted_observe(envelope, tool, attempt)
         .map_err(|error| format!("daemon observe serve: {error}"))?;
     let step = |outcome: ObservePollOutcome| ObserveStep {
         outcome,
@@ -4931,7 +4934,7 @@ async fn run_observe_poll(kernel: &DaemonKernelClient) -> Result<ObserveStep, St
         resume: Some(deferral.resume),
     };
     let outcome =
-        match defer_observe_pair_idempotent(kernel, &operation_id, &request_digest, &attempt)
+        match defer_observe_pair_idempotent(kernel, &operation_id, &request_digest, attempt)
             .await?
         {
             ObserveDeferOutcome::Deferred => ObservePollOutcome::Deferred,
