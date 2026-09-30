@@ -35,10 +35,15 @@
 //! delivery, strict Finish, and Product Pulse remain separate.
 
 use eliot_agent_contracts::RevisionId;
+use eliot_receipts::ReceiptEnvelope;
 use eliot_swarm::{
-    ProviderRequest, RootContextRevision, SealedIndependentMaps, SwarmPlanProposal,
-    plan_admission_request,
+    AdmittedSwarmPlan, AgentRouteProvider, ExecutionState, ProviderRequest,
+    ReceiptVerificationPort, RootContextRevision, SealedIndependentMaps, SwarmError,
+    SwarmPlanProposal, admit_plan, begin_execution, plan_admission_request,
 };
+use eliot_swarm::adapter_launch::{SealedChildInputs, SealedChildLaunch, launch_sealed_child};
+use eliot_swarm::durable_dispatch::DurableJobAttachment;
+use eliot_swarm::durable_work::{DurableWorkStore, WorkExecutor};
 use serde::Serialize;
 
 use crate::model::{CoordinatorConfig, CoordinatorError};
@@ -181,4 +186,128 @@ pub fn compile_swarm_definition_admission(
         per_route_wip: proposal.per_route_wip,
         admission_request,
     })
+}
+
+/// Maps one swarm-owner failure onto the coordinator boundary without
+/// flattening it: lineage, partition, binding, receipt, replay and route
+/// failures keep their exact coordinator variant, and anything outside the
+/// coordinator vocabulary keeps its message inside `ProviderContract` rather
+/// than becoming a pretended admission or a generic serialization string.
+fn swarm_error(error: SwarmError) -> CoordinatorError {
+    match error {
+        SwarmError::Blank(field)
+        | SwarmError::ControlCharacter(field)
+        | SwarmError::Empty(field) => CoordinatorError::InvalidField(field),
+        SwarmError::Duplicate(field) => CoordinatorError::DuplicateIdentity(field),
+        SwarmError::StaleLineage => CoordinatorError::IdentityConflict("swarm_lineage"),
+        SwarmError::WrongPartition | SwarmError::OmittedLane => {
+            CoordinatorError::IdentityConflict("swarm_partition")
+        }
+        SwarmError::BindingMismatch
+        | SwarmError::AssignmentMismatch
+        | SwarmError::LineageMismatch => {
+            CoordinatorError::IdentityConflict("swarm_admission_binding")
+        }
+        SwarmError::InvalidReceipt => {
+            CoordinatorError::ProviderVerification("swarm admission receipt".to_owned())
+        }
+        SwarmError::OwnershipConflict => CoordinatorError::IdentityConflict("swarm_attachment"),
+        SwarmError::PayloadConflict => CoordinatorError::IdempotencyConflict,
+        SwarmError::RouteBlocked => CoordinatorError::RouteEvidence,
+        SwarmError::BudgetExceeded => CoordinatorError::BudgetExceeded,
+        SwarmError::Serialization => {
+            CoordinatorError::Serialization("swarm plan admission".to_owned())
+        }
+        other => CoordinatorError::ProviderContract(other.to_string()),
+    }
+}
+
+/// Admits one prepared swarm definition through the Governor admission owner
+/// (issue #1699 R2).
+///
+/// Fail-closed gate order:
+///
+/// 1. the prep binds this exact definition: proposal plan and root-context
+///    revisions plus the sealed-map digest equal the prep, otherwise
+///    `CoordinatorError::IdentityConflict`;
+/// 2. the exact Governor admission artifact is admitted through the existing
+///    `eliot_swarm::admit_plan` owner entrypoint with the Governor receipt
+///    and the injected receipt verifier.
+///
+/// A missing verifier, a forged or mismatched receipt, or any unavailable
+/// prerequisite port fails typed through [`swarm_error`]: the definition is
+/// never presented as admitted, so an unavailable prerequisite stays a typed
+/// residual instead of a pretended admission. This performs no durable write,
+/// owns no task store, attempt journal, scheduler, write authority, or
+/// recovery path.
+///
+/// # Errors
+///
+/// Returns `CoordinatorError::IdentityConflict` when the prep does not bind
+/// the presented definition, or the typed [`swarm_error`] mapping of the
+/// owner admission failure otherwise.
+pub fn admit_swarm_definition(
+    prep: &SwarmDefinitionAdmissionPrep,
+    proposal: &SwarmPlanProposal,
+    maps: &SealedIndependentMaps,
+    admission_receipt: ReceiptEnvelope,
+    verifier: Option<&dyn ReceiptVerificationPort>,
+) -> Result<AdmittedSwarmPlan, CoordinatorError> {
+    if proposal.plan_revision != *prep.plan_revision()
+        || proposal.root_context_revision != *prep.root_context_revision()
+        || maps.digest() != prep.maps_digest()
+    {
+        return Err(CoordinatorError::IdentityConflict("swarm_lineage"));
+    }
+    admit_plan(proposal.clone(), maps, admission_receipt, verifier).map_err(swarm_error)
+}
+
+/// Begins provider-owned P3 execution for one admitted swarm plan through the
+/// injected A-02 activation port (issue #1699 R2).
+///
+/// This delegates to the existing `eliot_swarm::begin_execution` owner
+/// entrypoint: the provider seals the first execution state over the injected
+/// `AgentRouteProvider`, bound by the injected receipt verifier to the plan
+/// admission. A missing route provider or verifier fails typed through
+/// [`swarm_error`]; this performs no durable write and starts no process.
+///
+/// # Errors
+///
+/// Returns the typed [`swarm_error`] mapping of the owner activation failure.
+pub fn begin_swarm_execution(
+    plan: &AdmittedSwarmPlan,
+    a02: Option<&dyn AgentRouteProvider>,
+    verifier: Option<&dyn ReceiptVerificationPort>,
+) -> Result<ExecutionState, CoordinatorError> {
+    begin_execution(plan, a02, verifier).map_err(swarm_error)
+}
+
+/// Dispatches one sealed swarm child through the existing injected
+/// dispatch ports (issue #1699 R2).
+///
+/// This delegates to the existing `eliot_swarm::adapter_launch` owner path
+/// (`launch_sealed_child`): sealed-denominator membership and the
+/// plan/attachment owner binding are proved before the dispatch is built and
+/// the full envelope is re-verified after. The returned intent is
+/// candidate-only: the daemon composition persists it through the owner-side
+/// append path (`DurableWorkStore` append) BEFORE calling the executor, so no
+/// launched child is omitted from restart accounting. `store` and `executor`
+/// pin that feeding seam only; this helper performs no store append and no
+/// executor call, owns no scheduler, and inserts nothing into the Ready
+/// Queue.
+///
+/// # Errors
+///
+/// Returns the typed [`swarm_error`] mapping of the owner dispatch failure:
+/// a revoked or stale route is `RouteEvidence` with no fallback, a
+/// same-identity changed payload is `IdempotencyConflict`, and an
+/// attach-once refusal names the binding conflict.
+pub fn launch_swarm_child(
+    plan: &AdmittedSwarmPlan,
+    attachment: &DurableJobAttachment,
+    inputs: SealedChildInputs<'_>,
+    store: &dyn DurableWorkStore,
+    executor: &dyn WorkExecutor,
+) -> Result<SealedChildLaunch, CoordinatorError> {
+    launch_sealed_child(store, executor, plan, attachment, inputs).map_err(swarm_error)
 }
