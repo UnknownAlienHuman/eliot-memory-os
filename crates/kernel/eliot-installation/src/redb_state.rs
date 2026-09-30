@@ -815,34 +815,6 @@ impl RedbInstallationTransactionStore {
         Ok(transaction)
     }
 
-    /// Captures the original `SystemService` Host-root identity in the exact
-    /// transaction store while the retained no-follow root lease is live.
-    /// The existing transaction file is opened by its exact caller-selected
-    /// path; no file or parent is created.
-    pub fn record_system_service_host_root_receipt_at_exact_path(
-        path: impl AsRef<Path>,
-        transaction_id: &PlatformHandle,
-        root: &ProtectedRootLease,
-    ) -> Result<InstallationTransaction, InstallationError> {
-        let mut store = Self::open_existing_exact_path(path)?;
-        let mut transaction =
-            store
-                .load(transaction_id)?
-                .ok_or_else(|| InstallationError::TransactionNotFound {
-                    transaction_id: transaction_id.as_str().to_owned(),
-                })?;
-        let expected = TransactionVersion::of(&transaction)?;
-        transaction.record_system_service_host_root_receipt(root)?;
-        if transaction.revision != expected.revision {
-            <Self as transaction_store_private::Sealed>::compare_and_save(
-                &mut store,
-                expected,
-                &transaction,
-            )?;
-        }
-        Ok(transaction)
-    }
-
     /// Rehydrates a `SystemService` transaction from the exact immutable receipt
     /// already retained by its installation registry. The current Host-root
     /// lease is compared with that receipt before the transaction CAS.

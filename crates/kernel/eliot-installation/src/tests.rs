@@ -2725,6 +2725,7 @@ fn matching(disposition: InstallationEffectDisposition) -> InstallationEffectObs
         credential_receipt: None,
         staging_receipt: None,
         phase_b_receipt: None,
+        system_service_host_root_receipt: None,
         service_runtime_lineage: None,
     }
 }
@@ -2743,6 +2744,7 @@ fn matching_service_runtime(
         credential_receipt: None,
         staging_receipt: None,
         phase_b_receipt: None,
+        system_service_host_root_receipt: None,
         service_runtime_lineage: Some(InstallationServiceProcessLineage {
             process_id: 17,
             start_time_100ns: 23,
@@ -2776,6 +2778,7 @@ fn matching_for(
         credential_receipt: None,
         staging_receipt: None,
         phase_b_receipt: None,
+        system_service_host_root_receipt: None,
         service_runtime_lineage: None,
     }
 }
@@ -3809,6 +3812,7 @@ fn host_service_registration_requires_installer_policy_dacl_proof() {
             credential_receipt: None,
             staging_receipt: None,
             phase_b_receipt: None,
+            system_service_host_root_receipt: None,
             service_runtime_lineage: None,
         }
     };

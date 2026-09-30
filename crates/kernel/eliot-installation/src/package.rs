@@ -801,6 +801,7 @@ fn package_matching_observation(
         credential_receipt: None,
         staging_receipt: Some(receipt),
         phase_b_receipt: None,
+        system_service_host_root_receipt: None,
         service_runtime_lineage: None,
     })
 }

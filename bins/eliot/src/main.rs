@@ -3606,16 +3606,71 @@ fn ensure_system_service_host_root_receipt_before_effects(
         )
     });
     if progressed {
+        if recover && is_legacy_first_install_host_root_receipt_gap(transaction) {
+            // Legacy first-install transactions may have committed the Host
+            // root effect before the later receipt CAS existed. Let recovery
+            // durably enter RollbackRequired; it must not infer a receipt from
+            // whichever object now occupies the planned path.
+            return Ok(transaction.clone());
+        }
         return Err(missing_system_service_host_root_receipt(
             "resumed SystemService transaction has progressed effects but no original Host-root receipt",
         ));
     }
 
     // Only a fresh, still-pending first install can reach the Host bootstrap
-    // prefix without an existing receipt. Its first receipt is captured from
-    // the retained root immediately after that prefix and before registry
-    // creation or projection.
+    // prefix without an existing receipt. Its receipt is committed with the
+    // Applied transition for the ownership-marker-verified CreateRoot effect.
     Ok(transaction.clone())
+}
+
+fn is_legacy_first_install_host_root_receipt_gap(transaction: &InstallationTransaction) -> bool {
+    if transaction.profile != InstallationProfile::SystemService
+        || transaction.current_active_manifest.is_some()
+        || transaction.system_service_host_root_receipt().is_some()
+        || transaction.stage() != InstallationStage::Registering
+        || transaction.has_activation_projection_intent()
+    {
+        return false;
+    }
+
+    let host_state_root = Path::new(
+        transaction
+            .candidate_manifest
+            .runtime_launch
+            .runtime_state_roots
+            .host_state_root
+            .as_str(),
+    );
+    transaction
+        .installer_effects
+        .iter()
+        .zip(transaction.effect_progress())
+        .any(|(effect, progress)| {
+            let is_host_state_root = matches!(
+                effect,
+                eliot_installation::InstallerEffectPlan::CreateRoot { root, .. }
+                    if eliot_platform_windows::windows_paths_equal(
+                        Path::new(root.as_str()),
+                        host_state_root,
+                    )
+            );
+            let ownership_proven_or_reconcilable = match &progress.state {
+                eliot_installation::InstallationEffectProgressState::Applied {
+                    disposition:
+                        eliot_installation::InstallationEffectDisposition::CreatedByTransaction,
+                    ..
+                } => progress.ownership_secret.as_ref().is_some_and(|ownership| {
+                    ownership.create_disposition
+                        == eliot_installation::InstallationCreateDisposition::Created
+                }),
+                eliot_installation::InstallationEffectProgressState::IntentCommitted {
+                    attempt, ..
+                } => *attempt > 0 && progress.ownership_secret.is_some(),
+                _ => false,
+            };
+            is_host_state_root && ownership_proven_or_reconcilable
+        })
 }
 
 #[cfg(windows)]
@@ -4557,22 +4612,40 @@ fn run_installation_effect(
         return Ok(installation_command_exit_code(status));
     }
 
-    let preflight_guard = match validate_installation_runtime_preflight(&preflight_transaction) {
-        Ok(guard) => guard,
-        Err(error) => {
-            let (code, detail, reference) = installation_preflight_error(recover, &error);
-            if let Some(reference) = reference {
-                write_installation_error_with_reference(&code, &detail, &reference);
-            } else {
-                write_installation_error(&code, &detail);
+    let legacy_first_install_root_gap =
+        recover && is_legacy_first_install_host_root_receipt_gap(&preflight_transaction);
+    let preflight_guard = if legacy_first_install_root_gap {
+        // Recovery below uses the original CreateRoot intent and owner-marker
+        // readback. Package-source preflight is unrelated to that rollback and
+        // must not prevent the missing receipt from becoming durable.
+        None
+    } else {
+        Some(match validate_installation_runtime_preflight(&preflight_transaction) {
+            Ok(guard) => guard,
+            Err(error) => {
+                let (code, detail, reference) = installation_preflight_error(recover, &error);
+                if let Some(reference) = reference {
+                    write_installation_error_with_reference(&code, &detail, &reference);
+                } else {
+                    write_installation_error(&code, &detail);
+                }
+                return Ok(INVALID_REQUEST_EXIT);
             }
-            return Ok(INVALID_REQUEST_EXIT);
-        }
+        })
     };
     let mut coordinator = WindowsInstallationCoordinator::new(store);
     let mut user_owned_profile_pending = false;
     let outcome = if recover {
-        if preflight_transaction.has_activation_projection_intent() {
+        if legacy_first_install_root_gap {
+            let pending_ref = post_bootstrap_rejection_pending_ref(
+                &transaction_id,
+                PostBootstrapRejectionClass::HostRootReceiptMissing,
+            )?;
+            match coordinator.persist_non_effect_rejection(&transaction_id, pending_ref) {
+                Ok(_) => coordinator.rollback(&transaction_id),
+                Err(error) => Err(error),
+            }
+        } else if preflight_transaction.has_activation_projection_intent() {
             rollback_with_activation_owner(
                 &mut coordinator,
                 &preflight_transaction,
@@ -4584,13 +4657,12 @@ fn run_installation_effect(
     } else if preflight_transaction.profile == InstallationProfile::SystemService {
         match coordinator.drive_until_host_bootstrap(&transaction_id) {
             Ok(InstallationStepOutcome::Applied { .. }) => {
-                // The bootstrap prefix applied, so the Host root and the
-                // CreatedByTransaction service registrations may already
-                // exist. Both readback failures below are reported truthfully:
-                // a missing record cannot be rejected durably because there is
-                // nothing left to reject, and a failed read cannot be rejected
-                // durably because the store is what failed. Neither may claim a
-                // recoverable rollback it did not establish.
+                // The bootstrap prefix applied, so the original Host-root
+                // receipt must already be durable with its CreateRoot effect.
+                // A missing transaction or failed transaction readback cannot
+                // establish a rollback disposition. A root reopen failure or
+                // missing receipt is persisted as a typed rejection and never
+                // recaptured from the path.
                 let current = match coordinator.store().load(&transaction_id) {
                     Ok(Some(transaction)) => transaction,
                     Ok(None) => {
@@ -4651,29 +4723,14 @@ fn run_installation_effect(
                         }
                         current
                     }
-                    None if current.current_active_manifest.is_some() => {
-                        write_installation_error(
-                            "INSTALLATION_APPLY_RECOVERY_REQUIRED",
-                            "SystemService update reached bootstrap without inheriting its validated registry Host-root receipt",
-                        );
-                        return Ok(UNKNOWN_OUTCOME_EXIT);
-                    }
-                    None => match RedbInstallationTransactionStore::record_system_service_host_root_receipt_at_exact_path(
-                            store_path,
+                    None => {
+                        return Ok(report_post_bootstrap_failure(
+                            &mut coordinator,
                             &transaction_id,
-                            &host_root,
-                        ) {
-                        Ok(transaction) => transaction,
-                        Err(error) => {
-                            write_installation_error(
-                                "INSTALLATION_APPLY_RECOVERY_REQUIRED",
-                                &format!(
-                                    "Host bootstrap applied but its retained Host-root receipt could not be persisted before registry creation: {error}"
-                                ),
-                            );
-                            return Ok(UNKNOWN_OUTCOME_EXIT);
-                        }
-                    },
+                            PostBootstrapRejectionClass::HostRootReceiptMissing,
+                            "Host bootstrap applied without its CreateRoot-bound original Host-root receipt; path recapture is forbidden",
+                        ));
+                    }
                 };
                 let Some(recorded_root_receipt) = recorded.system_service_host_root_receipt() else {
                     write_installation_error(
@@ -5034,12 +5091,14 @@ fn run_installation_effect(
         }
     };
     drop(coordinator);
-    if let Err(error) = preflight_guard.revalidate(&preflight_transaction) {
-        write_installation_error(
-            "POST_EFFECT_RUNTIME_GUARD_UNKNOWN",
-            &format!("post-coordinator runtime lease revalidation failed: {error}"),
-        );
-        return Ok(UNKNOWN_OUTCOME_EXIT);
+    if let Some(preflight_guard) = preflight_guard {
+        if let Err(error) = preflight_guard.revalidate(&preflight_transaction) {
+            write_installation_error(
+                "POST_EFFECT_RUNTIME_GUARD_UNKNOWN",
+                &format!("post-coordinator runtime lease revalidation failed: {error}"),
+            );
+            return Ok(UNKNOWN_OUTCOME_EXIT);
+        }
     }
     let store = match RedbInstallationTransactionStore::open_existing_exact_path(store_path) {
         Ok(store) => store,
