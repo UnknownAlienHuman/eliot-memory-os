@@ -304,8 +304,8 @@ use daemon_supervision::{DaemonRuntimeState, DaemonRuntimeStatus, daemon_status_
 #[cfg(windows)]
 use daemon_supervision::{
     DaemonSupervisionContour, DaemonSupervisionProgressState, EliotdLiveReceiptDisposition,
-    classify_eliotd_live_receipt_transition, daemon_refuses_replacement,
-    daemon_restart_refusal_reason,
+    classify_eliotd_live_receipt_transition, daemon_class_withholds_replacement,
+    daemon_refuses_replacement, daemon_restart_refusal_reason,
 };
 use generation_recovery::OrsGenerationCoordinator;
 #[cfg(test)]
@@ -492,6 +492,8 @@ use eliot_protocol::{
     EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload, RequestIdentity,
 };
 use eliot_runtime::{Runtime, RuntimeConfig, ShutdownOutcome};
+#[cfg(windows)]
+use eliot_runtime_contracts::RestartPolicyV1;
 #[cfg(test)]
 pub use eliot_runtime_contracts::SupervisionLeasePredecessorIdentity;
 #[cfg(windows)]
@@ -644,6 +646,14 @@ pub struct KernelComposition {
     /// after the previous process effect is known terminal; the original
     /// Host-approved descriptor remains retained in `daemon_launch`.
     daemon_active_launch: Mutex<Option<EliotdLaunchDescriptor>>,
+    /// The admitted restart policy for the Kernel-supervised `eliotd` child
+    /// (I14.10, I08.12), validated at assembly. `recover_eliotd` consults the
+    /// shared class rule against this exact declaration on the reconciled exit
+    /// evidence, and `None` means no versioned policy was admitted, so the
+    /// child is not automatically restarted at all. Immutable after
+    /// construction, like the launch descriptor it describes.
+    #[cfg(windows)]
+    daemon_restart_policy: Option<RestartPolicyV1>,
     kernel_artifact_sha256: Option<String>,
     eliotd_descriptor_artifact_sha256: Option<String>,
     /// Host-approved WASM-host executable path retained for the grant-arm

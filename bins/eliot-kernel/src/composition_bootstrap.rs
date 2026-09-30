@@ -1128,6 +1128,8 @@ impl KernelComposition {
         let work_root = config.work_root.clone();
         let store_bootstrap = config.store_bootstrap.clone();
         let daemon_launch = config.daemon_launch.clone();
+        #[cfg(windows)]
+        let daemon_restart_policy = config.daemon_restart_policy.clone();
         let kernel_artifact_sha256 = config.kernel_artifact_sha256.clone();
         let eliotd_descriptor_artifact_sha256 = config.eliotd_descriptor_artifact_sha256.clone();
         let wasm_host_executable_path = config.wasm_host_executable_path.clone();
@@ -1333,6 +1335,24 @@ impl KernelComposition {
             .map_err(|error| KernelBuildError::Service(error.to_string()))?;
         let module_id =
             ContractId::new("eliotd").map_err(|error| KernelBuildError::Core(error.to_string()))?;
+        // I14.10 / I8.12: an admitted restart policy is proved here, once,
+        // against the shared contract's own validator, and bound to the child it
+        // names. A declaration this contract does not admit, or one admitted
+        // for a different supervised child, is refused at startup rather than
+        // discovered at the first failed restart. An absent declaration stays
+        // absent and withholds automatic restart; it is never widened into an
+        // unlimited budget.
+        #[cfg(windows)]
+        if let Some(policy) = &daemon_restart_policy {
+            policy
+                .validate()
+                .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+            if policy.subject_id != module_id.as_str() {
+                return Err(KernelBuildError::Service(
+                    "admitted eliotd restart policy names a different supervised child".to_owned(),
+                ));
+            }
+        }
         let artifact_id = daemon_launch
             .as_ref()
             .map_or_else(
@@ -1633,6 +1653,8 @@ impl KernelComposition {
             store_bootstrap,
             daemon_active_launch: Mutex::new(daemon_launch.clone()),
             daemon_launch,
+            #[cfg(windows)]
+            daemon_restart_policy,
             eliotd_receipt_binding,
             kernel_artifact_sha256,
             eliotd_descriptor_artifact_sha256,
