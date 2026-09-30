@@ -127,7 +127,7 @@ fn native_worker_cell_expectation() -> Result<CapabilityCellExpectation, Capabil
 
 /// Parses the declared support claim through #13's own closed vocabulary.
 ///
-/// The generated constant carries the SCREAMING_SNAKE spelling the record's wire
+/// The generated constant carries the `SCREAMING_SNAKE` spelling the record's wire
 /// form uses, so it is parsed through that same spelling rather than matched
 /// against a second local list. An unknown spelling is a refusal, never a
 /// default.
