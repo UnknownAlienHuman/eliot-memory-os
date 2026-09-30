@@ -3391,16 +3391,29 @@ fn require_object<'a>(
 ///
 /// ## The execution identity: what is owner-derived and what is only re-proved
 ///
-/// The frame's `idempotency_key` is correlation only and is echoed back
-/// unchanged; it selects nothing here. The execution identity is
-/// [`OrsRestoreBinding`], which has exactly one constructor, and whose
-/// `installation_ref` is read from the live `crate::dispatch_contour` cell
-/// rather than settable by any caller — so no frame, payload or spelling of the
-/// key can name the INSTALLATION this restore runs against. One of the other
-/// three arguments is the Kernel's own writer identity,
-/// [`RESTORE_JOURNAL_WRITER_ID`], and two are the archive's OWN manifest fields:
-/// the source archive identity and the class are read out of the decoded
-/// bundle, never out of a second request field that could disagree with it.
+/// The frame's `idempotency_key` is the correlated operation identity. It is
+/// echoed back unchanged AND it is now what the durable journal stream is keyed
+/// by: it is carried on [`OrsRestoreBinding::operation_id`] and on
+/// [`RestorePorts::operation_id`], and the two owner types fold it into the
+/// plan identity that `eliot-backup` derives the stream key and transaction
+/// from
+/// ([`KernelBackupRestore::bind_plan_operation`](super::backup_restore::KernelBackupRestore)).
+/// Without that, two frames with byte-identical bundles and DIFFERENT
+/// `idempotency_key`s derived one stream, and the second read back the first's
+/// completed `final_receipt` while answering under its own key. It selects
+/// nothing else here: it names no installation, no archive and no destination,
+/// and it is compared as a value between the two owner types rather than
+/// trusted because it was presented.
+///
+/// The rest of the execution identity is [`OrsRestoreBinding`], which has
+/// exactly one constructor, and whose `installation_ref` is read from the live
+/// `crate::dispatch_contour` cell rather than settable by any caller — so no
+/// frame, payload or spelling of the key can name the INSTALLATION this restore
+/// runs against. One of the other arguments is the Kernel's own writer
+/// identity, [`RESTORE_JOURNAL_WRITER_ID`], and two are the archive's OWN
+/// manifest fields: the source archive identity and the class are read out of
+/// the decoded bundle, never out of a second request field that could disagree
+/// with it.
 ///
 /// ## The destination is the one conjunct this route does not own
 ///
@@ -3541,6 +3554,7 @@ fn handle_backup_restore_test(
         restore_journal_archive_class(bundle.manifest.class),
         admitted.target.target_id.clone(),
         RESTORE_JOURNAL_WRITER_ID.to_owned(),
+        idempotency_key.to_owned(),
     ) {
         Ok(identity) => identity,
         Err(error) => return refuse(&error, &gates_passed, &gates_not_admitted),
@@ -3563,6 +3577,7 @@ fn handle_backup_restore_test(
     gates_passed.push("journal-admission");
     let ports = RestorePorts {
         journal_admission: &journal_admission,
+        operation_id: idempotency_key,
         kernel_fence: fence,
         keys: None,
         blob_scope: None,

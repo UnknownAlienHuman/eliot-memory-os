@@ -56,10 +56,12 @@
 //! refuses a production restore for not naming. The admission and the ORS
 //! namespace the adapter actually writes are therefore the same owner channel.
 //! It is deliberately NOT the per-execution stream key
-//! (`sha256(plan_id, bundle_sha256)`, different for every plan/bundle pair): one
-//! field cannot carry both, so the channel is checked here against the constant
-//! and the per-execution stream is checked where it is derived, by
-//! `binds_owner_record` reading the live journal under this plan's own stream.
+//! (`sha256(plan_id, bundle_sha256)`, different for every plan/bundle pair AND
+//! every operation identity, because `plan_id` carries the correlated
+//! `idempotency_key` this restore runs under): one field cannot carry both, so
+//! the channel is checked here against the constant and the per-execution
+//! stream is checked where it is derived, by `binds_owner_record` reading the
+//! live journal under this plan's own stream.
 //! An admission is never taken as proof of durability on its own.
 //! [`PinnedDestinationAdmission`] likewise pins the rehearsal posture at
 //! prepare, so a rehearsal cannot be re-presented as a production run and
@@ -104,7 +106,9 @@ use eliot_security_contracts::{InstructionTaint, PrivacyClass};
 /// ## What it is not
 ///
 /// It is not the per-execution stream key, which is
-/// `sha256(plan_id, bundle_sha256)` and different for every plan/bundle pair.
+/// `sha256(plan_id, bundle_sha256)` and different for every plan/bundle pair
+/// and for every operation identity, because `plan_id` carries the correlated
+/// `idempotency_key` this restore runs under.
 /// A fixed channel name and a per-execution digest cannot occupy one field, so
 /// `journal_identity_ref` carries the CHANNEL and is compared against this
 /// constant, while the per-execution stream is proved where it is derived: by
@@ -629,6 +633,31 @@ pub fn require_production_admitted(
 pub struct RestorePorts<'a> {
     /// Owner-issued journal admission for the injected durable journal.
     pub journal_admission: &'a RestoreJournalAdmission,
+    /// The correlated operation identity this execution runs under, and the
+    /// one the caller holds to reconcile this exact operation later.
+    ///
+    /// It is the frame's own `idempotency_key` — the identity the transport
+    /// already proved the request and the answer share — and it is folded into
+    /// the plan identity before the journal engine is entered
+    /// (`KernelBackupRestore::bind_plan_operation`), so it is part of the
+    /// durable journal stream key and of the transaction identity rather than
+    /// a field that merely travels beside them.
+    ///
+    /// This is what makes a retry distinguishable from a fresh request. The
+    /// stream key is `sha256(plan_id, bundle_sha256)`, and `plan_id` is
+    /// `restore-plan-<backup_id>` until this identity is bound into it, so two
+    /// frames with byte-identical bundles and DIFFERENT identities used to
+    /// derive one stream: the second loaded the first's completed record and
+    /// read back the first's `final_receipt` under its own correlated key.
+    /// With the identity bound, the two derive different streams and the
+    /// second starts its own.
+    ///
+    /// It is compared with THIS execution, never inferred from one: the same
+    /// value is carried by [`OrsRestoreBinding::operation_id`], and
+    /// `check_ors_journal_binding` refuses typed when the two disagree, so a
+    /// caller cannot present one operation's identity beside another
+    /// operation's binding.
+    pub operation_id: &'a str,
     /// The Kernel's current authority fence (never caller arithmetic).
     pub kernel_fence: &'a StateFence,
     /// Admitted wrapped-key manifest for blob-carrying archives.
@@ -662,6 +691,11 @@ impl RestorePorts<'_> {
         self.journal_admission
             .validate()
             .map_err(|error| KernelRestoreError::OwnerEvidenceInvalid(error.to_string()))?;
+        // The operation identity is part of the durable stream key, so a blank
+        // or control-bearing one would collapse distinct operations onto one
+        // stream. It is refused here, before any plan is compiled, rather than
+        // being sanitised into something a journal could address.
+        non_blank(self.operation_id, "restore.operation_id")?;
         if let Some(evidence) = self.manifest_evidence.as_ref() {
             evidence.validate()?;
         }
@@ -725,6 +759,7 @@ impl RestorePorts<'_> {
         )?;
         Ok(Self {
             journal_admission: self.journal_admission,
+            operation_id: self.operation_id,
             kernel_fence: self.kernel_fence,
             keys: self.keys,
             blob_scope: self.blob_scope,
@@ -987,6 +1022,25 @@ pub struct OrsRestoreBinding {
     /// comparison against the live composition cell, which is a composition
     /// fact, not a durable one.
     installation_ref: String,
+    /// The correlated operation identity this stream belongs to: the caller's
+    /// own `idempotency_key`, the same value [`RestorePorts::operation_id`]
+    /// carries.
+    ///
+    /// It is the KEY half of this stream's identity. The ORS stream-binding row
+    /// binds a transaction, and the transaction identity is derived from the
+    /// plan, whose `plan_id` carries this value
+    /// ([`KernelBackupRestore::bind_plan_operation`](super::backup_restore::KernelBackupRestore)).
+    /// So two operations over byte-identical bundles bind different
+    /// transactions, and a stream already bound to one operation refuses the
+    /// other through the existing [`OrsRestoreBinding::stream_binding`] comparison
+    /// rather than by a second scheme beside it.
+    ///
+    /// It is compared as a value, never inferred from one. A stream whose
+    /// recorded transaction disagrees with the transaction this binding
+    /// presents is [`BackupError::RestoreJournalMismatch`], which crosses the
+    /// seam as the typed [`KernelRestoreError::JournalBindingConflict`] — never
+    /// a silent reuse of another operation's stream.
+    operation_id: String,
 }
 
 impl OrsRestoreBinding {
@@ -996,7 +1050,8 @@ impl OrsRestoreBinding {
     /// string into `installation_ref`.
     ///
     /// Refuses [`KernelRestoreError::InvalidInput`] for a blank or
-    /// control-character source archive, destination or writer identity, and
+    /// control-character source archive, destination, writer or operation
+    /// identity, and
     /// [`KernelRestoreError::OwnerEvidenceInvalid`] when the dispatch contour is
     /// not composed, because an uncomposed Kernel has no installation identity
     /// to admit a journal against.
@@ -1005,6 +1060,7 @@ impl OrsRestoreBinding {
         archive_class: RestoreJournalArchiveClass,
         destination_ref: String,
         writer_id: String,
+        operation_id: String,
     ) -> Result<Self, KernelRestoreError> {
         for (value, field) in [
             (
@@ -1016,6 +1072,10 @@ impl OrsRestoreBinding {
                 "restore.journal_admission.destination_ref",
             ),
             (writer_id.as_str(), "restore.journal_admission.writer_id"),
+            (
+                operation_id.as_str(),
+                "restore.journal_admission.operation_id",
+            ),
         ] {
             non_blank(value, field)?;
         }
@@ -1025,6 +1085,7 @@ impl OrsRestoreBinding {
             destination_ref,
             writer_id,
             installation_ref: live_installation_id()?.to_owned(),
+            operation_id,
         })
     }
 
@@ -1057,6 +1118,15 @@ impl OrsRestoreBinding {
     #[must_use]
     pub fn installation_ref(&self) -> &str {
         &self.installation_ref
+    }
+
+    /// The correlated operation identity this stream belongs to. Compared by
+    /// `check_ors_journal_binding` against the value
+    /// [`RestorePorts::operation_id`] presents, so the two owner types cannot
+    /// disagree about which operation they are running.
+    #[must_use]
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
     }
 
     fn stream_binding(
@@ -1203,8 +1273,9 @@ fn require_live_installation(binding: &OrsRestoreBinding) -> Result<(), KernelRe
 ///   Kernel-owned constant and what the coordinator's channel check in
 ///   [`KernelBackupRestore::admit_restore_journal`](super::backup_restore::KernelBackupRestore::admit_restore_journal)
 ///   requires. It is deliberately NOT the per-execution stream key: that key is
-///   `sha256(plan_id, bundle_sha256)`, different for every plan/bundle pair, so
-///   the two can never occupy one field. The stream this record was read under
+///   `sha256(plan_id, bundle_sha256)`, different for every plan/bundle pair and
+///   every operation identity, so the two can never occupy one field. The stream
+///   this record was read under
 ///   is the `journal_key` argument, and it is proved exactly by that read plus
 ///   [`matches_stream`], which compares the persisted binding's source archive,
 ///   class, destination, writer identity and writer fence digest against this

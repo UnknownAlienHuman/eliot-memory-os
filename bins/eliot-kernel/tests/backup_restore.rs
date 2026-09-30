@@ -230,12 +230,18 @@ impl RestoreJournalPort for FixtureFileJournal {
     }
 }
 
+/// The correlated operation identity these fixtures restore under. It is
+/// folded into the plan identity the journal stream key is derived from, so it
+/// is part of the durable key rather than a value that merely travels beside it.
+const OPERATION_ID: &str = "operation-960-fixture";
+
 fn production_ports<'a>(
     admission: &'a RestoreJournalAdmission,
     fence: &'a StateFence,
 ) -> RestorePorts<'a> {
     RestorePorts {
         journal_admission: admission,
+        operation_id: OPERATION_ID,
         kernel_fence: fence,
         keys: None,
         blob_scope: None,
@@ -297,6 +303,7 @@ fn foreign_or_stale_destination_refused() {
     let first_evidence = manifest_evidence(&root);
     let first_ports = RestorePorts {
         journal_admission: &admission,
+        operation_id: OPERATION_ID,
         kernel_fence: &fence,
         keys: None,
         blob_scope: None,
@@ -319,6 +326,7 @@ fn foreign_or_stale_destination_refused() {
     second_evidence.registry_revision += 1;
     let second_ports = RestorePorts {
         journal_admission: &admission,
+        operation_id: OPERATION_ID,
         kernel_fence: &fence,
         keys: None,
         blob_scope: None,
@@ -334,6 +342,7 @@ fn foreign_or_stale_destination_refused() {
     foreign_evidence.kernel_work_root = foreign_root.clone();
     let foreign_ports = RestorePorts {
         journal_admission: &admission,
+        operation_id: OPERATION_ID,
         kernel_fence: &fence,
         keys: None,
         blob_scope: None,
@@ -394,6 +403,7 @@ fn missing_class_crypto_purge_capability_refuses_without_fallback() {
     };
     let surplus_ports = RestorePorts {
         journal_admission: &admission,
+        operation_id: OPERATION_ID,
         kernel_fence: &fence,
         keys: Some(&surplus),
         blob_scope: None,
@@ -470,7 +480,11 @@ fn absent_provider_cannot_produce_ok_or_known_zero() {
         evidence.obligations.watchdog_signals.state,
         RestoreObligationState::MissingCapability
     );
-    let plan = KernelBackupRestore::compile_plan(&bundle, context).expect("plan compiles");
+    let mut plan = KernelBackupRestore::compile_plan(&bundle, context).expect("plan compiles");
+    // The receipt names the plan the engine ran under, and that plan carries the
+    // correlated operation identity in its `plan_id`. The comparison here is
+    // exact agreement, so it must present that same bound plan.
+    KernelBackupRestore::bind_plan_operation(&mut plan, OPERATION_ID).expect("plan binds operation");
     let auth = CutoverAuthorization {
         plan_id: plan.plan_id.clone(),
         bundle_sha256: plan.bundle_sha256.clone(),
@@ -630,6 +644,7 @@ fn kernel_effect_fence_required_before_any_phase() {
     let admission = production_admission();
     let ports = RestorePorts {
         journal_admission: &admission,
+        operation_id: OPERATION_ID,
         kernel_fence: &foreign_fence,
         keys: None,
         blob_scope: None,
@@ -908,6 +923,7 @@ fn rehearsal_cannot_activate_cutover_or_retire_source() {
     let fixture = fixture_admission();
     let ports = RestorePorts {
         journal_admission: &fixture,
+        operation_id: OPERATION_ID,
         kernel_fence: &fence,
         keys: None,
         blob_scope: None,
