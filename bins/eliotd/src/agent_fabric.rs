@@ -3312,11 +3312,21 @@ impl AgentFabric {
     /// rebind, so the durable record and the published revision stay the same
     /// bytes.
     ///
+    /// #1702 W7: a new coordinator epoch binds the RETAINED work; it is not a
+    /// way to reopen it. A wave whose definition has been replaced under
+    /// `CANCEL` or `SUPERSEDE` keeps its records, its partial results and its
+    /// unknown effects, but those are reconciliation material — handing them
+    /// to a new owner epoch as live work would be exactly the silent revival
+    /// of a revoked wave that item 5 forbids. A `DRAIN`ed wave is still live
+    /// and is rebound normally, which is the disposition that exists to let a
+    /// wave finish under fresh ownership.
+    ///
     /// # Errors
     ///
     /// Returns [`FabricError::Contract`] for an unknown execution,
     /// [`FabricError::StaleOwnerLease`] for a presenter outside the incoming
-    /// lease or a non-advancing epoch, [`FabricError::RevisionNotDurable`]
+    /// lease or a non-advancing epoch, [`FabricError::Superseded`] for a wave
+    /// whose replacement disposition revoked it, [`FabricError::RevisionNotDurable`]
     /// when the durable commit is absent or does not bind this exact owner
     /// stream and revision, or the mapped semantic rejection otherwise.
     pub fn reassign_semantic_coordinator(
@@ -3339,6 +3349,27 @@ impl AgentFabric {
         if stored.coordinator == *new_coordinator {
             self.record("semantic_coordinator_reassigned_replayed", &key);
             return Ok(());
+        }
+        // #1702 W7: the retained work must still be live work. Reading the
+        // disposition from the stored supersession link — not from a
+        // caller-supplied label — is what makes this reachable: a real `CANCEL`
+        // or `SUPERSEDE` link naming this execution's definition refuses, while
+        // an unreplaced definition, a `DRAIN`ed one, and a replacement that has
+        // not been proposed yet all rebind normally.
+        let definition_key = stored.definition_id.as_str();
+        if let Some(link) = self
+            .semantic_supersessions
+            .values()
+            .find(|link| link.prior_definition_id.as_str() == definition_key)
+        {
+            if matches!(
+                link.disposition,
+                OldWaveDisposition::Cancel | OldWaveDisposition::Supersede
+            ) {
+                return Err(FabricError::Superseded(format!(
+                    "semantic execution {key} belongs to a wave revoked by disposition; reconcile it under the replacement instead of reassigning it"
+                )));
+            }
         }
         let next = reassign_coordinator(&stored, new_coordinator).map_err(contract_rejection)?;
         let record = serde_json::to_value(&next).map_err(|error| {
