@@ -3474,12 +3474,12 @@ fn handle_backup_restore_test(
     match composition.backup_restore_with_ors_journal(&bundle, admitted.target, &ports, &identity) {
         Ok(outcome) => {
             gates_passed.push("isolated-rehearsal");
-            rehearsed_reply(
+            Ok(rehearsed_reply(
                 idempotency_key,
                 &outcome,
                 &gates_passed,
                 &gates_not_admitted,
-            )
+            ))
         }
         Err(error) => refuse(&error, &gates_passed, &gates_not_admitted),
     }
@@ -3524,7 +3524,7 @@ fn rehearsed_reply(
     outcome: &KernelRestoreOutcome,
     gates_passed: &[&str],
     gates_not_admitted: &[&str],
-) -> Result<Value, TransportError> {
+) -> Value {
     // A receipt that cannot be projected is a projection failure, not a
     // transport one: it answers with the same bounded `refused` envelope the
     // other refusals on this operation use, carrying the gates that really ran
@@ -3549,7 +3549,7 @@ fn rehearsed_reply(
     };
     let receipt = match serde_json::to_value(&outcome.receipt) {
         Ok(value) => value,
-        Err(error) => return Ok(unprojectable(&error)),
+        Err(error) => return unprojectable(&error),
     };
     // Absent means the owner observed none: a run that did not execute finalize
     // reports no evidence, and a resumed run's file is re-validated by the owner
@@ -3558,11 +3558,11 @@ fn rehearsed_reply(
     let evidence = match outcome.evidence.as_ref() {
         Some(evidence) => match serde_json::to_value(evidence) {
             Ok(value) => value,
-            Err(error) => return Ok(unprojectable(&error)),
+            Err(error) => return unprojectable(&error),
         },
         None => Value::Null,
     };
-    Ok(backup_reply(
+    backup_reply(
         BACKUP_RESTORE_TEST_OPERATION,
         "ok",
         idempotency_key,
@@ -3595,7 +3595,7 @@ fn rehearsed_reply(
             ("gates_passed", gate_values(gates_passed)),
             ("gates_not_admitted", gate_values(gates_not_admitted)),
         ],
-    ))
+    )
 }
 
 /// Answers one typed restore-owner refusal, keeping the executed route.
@@ -3629,7 +3629,7 @@ fn restore_test_refusal(
         // `RESTORE_TEST_ABSENT_OWNER_CAPABILITIES` falls through to the typed
         // refusal below rather than being reported as an absent owner.
         KernelRestoreError::CapabilityMissing { capability }
-            if RESTORE_TEST_ABSENT_OWNER_CAPABILITIES.contains(&capability) =>
+            if RESTORE_TEST_ABSENT_OWNER_CAPABILITIES.contains(capability) =>
         {
             let mut fields = vec![
                 ("code", Value::String("plan_gap".to_owned())),
