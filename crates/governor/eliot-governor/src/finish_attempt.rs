@@ -540,13 +540,13 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
         let coordination = self.read_current_finish_projection(task_id, fence)?;
 
         let mut observation_refs = BTreeSet::new();
-        // Issue #325 P1, I7.9: the contract acceptance digest is rehydrated from
+        // Issue #325 P1, I7.9: the acceptance-set commitment is rehydrated from
         // the task-selection evidence the contract owner admitted for this exact
         // task revision — a different owner than the canonical plan. It is the
         // only thing that makes the plan's declared item set the contract's
         // obligation set rather than the plan's own list, so a plan that names
-        // fewer obligations than the contract carries is refused below instead
-        // of shrinking the denominator the gate is computed over.
+        // fewer obligations than the set the owner committed to is refused below
+        // instead of shrinking the denominator the gate is computed over.
         let contract_acceptance_digest = self.rehydrate_contract_acceptance_digest(
             task_id,
             task,
@@ -559,6 +559,24 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
                 "canonical plan has no verifier binding".to_owned(),
             ))
         })?;
+        // The enumeration travels from the plan because that is where it is
+        // written, but it is not trusted for being a plan's own list: the gate
+        // below recomputes the acceptance-set commitment from these exact ids and
+        // refuses unless it reproduces the digest rehydrated above. A narrowed
+        // list therefore cannot ride under a digest issued for a larger set.
+        //
+        // RESIDUAL OWNER GAP (unreachable from this crate, not a caller
+        // assertion to be worked around): the enumerated `TaskContract`
+        // acceptance items are owned by `eliot-store`'s `CanonicalStore`
+        // (`task_contract_by_id` -> `TaskContract.acceptance_items`). This crate
+        // declares `eliot-store-api` but not `eliot-store`, so the chain
+        // terminates at the task-selection owner's commitment rather than at the
+        // contract owner's enumeration. The digest that arrives here is
+        // format-checked by `eliot-observation` and is caller-stated at intake
+        // (or `sha256_hex` over the task goal in the exploratory branch of
+        // `eliot-workscope`), so the owner-side derivation from
+        // `acceptance_items` needs the store edge and is left named rather than
+        // faked with a fence or a proof argument.
         let contract_acceptance = CanonicalContractAcceptance {
             task_id: task_id.as_str().to_owned(),
             task_revision: task.revision,
