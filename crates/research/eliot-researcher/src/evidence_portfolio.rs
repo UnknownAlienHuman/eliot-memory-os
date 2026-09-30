@@ -7552,10 +7552,13 @@ fn audit_claim_with_retained(
         // supplied. I21.8's `excerpt_supports_requirement` is the separate
         // obligation that catches exactly this, and an admitted source containing
         // relevant material with an insufficient or wrong excerpt must not yield
-        // a supported claim. This sits after the support-gap arms so a claim that
-        // is *also* missing a whole source still reports the missing source as
-        // the more specific finding; it sits before the `stale_hit` arm so a
-        // stale source is not reported when the quote is additionally wrong.
+        // a supported claim. It sits BEFORE the support-gap arm, not after it: an
+        // excerpt that does not verify is a finding about the claim's own quoted
+        // words, and it is reported in preference to a missing or weightless
+        // source, because a reader who is handed a citation the claim does not
+        // quote has been misdirected more precisely than one handed a citation
+        // of the wrong kind. It also sits before the `stale_hit` arm, so a stale
+        // source is not reported when the quote is additionally wrong.
         ClaimOutcome::PartiallySupported
     } else if lineage_gap || precision_gap || support_gap {
         if stale_hit && supporting.is_empty() {
