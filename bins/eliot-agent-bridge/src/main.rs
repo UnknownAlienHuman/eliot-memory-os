@@ -3018,8 +3018,7 @@ fn run_host_events_front_door(runner: &mut BridgeRunner) -> i32 {
         .attach_view()
         .map_or(0, |view| view.binding().activation_generation().get());
     let (_stop, stop_receiver) = tokio::sync::watch::channel(false);
-    let (_generation, active_generation_receiver) =
-        tokio::sync::watch::channel(active_generation);
+    let (_generation, active_generation_receiver) = tokio::sync::watch::channel(active_generation);
     match opencode_host_events::serve_host_events(
         runner,
         opencode_host_events::BridgeIntroductionStore::new(),
