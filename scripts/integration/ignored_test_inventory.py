@@ -281,6 +281,8 @@ _REDACTED_SECRET: Final = "<redacted-secret>"
 _REDACTED_USER_PATH: Final = "<redacted-user-path>"
 _STDERR_PRE_WINDOW: Final = 8192
 _STDERR_TAIL_CHARS: Final = 4096
+_COMPILER_MESSAGE_BYTES: Final = 65536
+_COMPILER_MESSAGE_COUNT: Final = 8
 
 
 def _redact_detail(text: str) -> str:
@@ -290,6 +292,36 @@ def _redact_detail(text: str) -> str:
     redacted = _REDACT_BEARER_TOKEN.sub("Bearer " + _REDACTED_SECRET, redacted)
     redacted = _REDACT_OPAQUE_CREDENTIAL.sub(_REDACTED_SECRET, redacted)
     return _REDACT_USER_HOME.sub(_REDACTED_USER_PATH, redacted)
+
+
+def _compiler_failure_detail(stdout: bytes, stderr: bytes) -> str:
+    """Keep bounded Cargo error messages, never rendered source/span payloads."""
+    messages: list[str] = []
+    for line in stdout.splitlines():
+        if len(line) > _COMPILER_MESSAGE_BYTES:
+            continue
+        try:
+            record = json.loads(line)
+        except (ValueError, UnicodeError, RecursionError):
+            continue
+        if not isinstance(record, dict) or record.get("reason") != "compiler-message":
+            continue
+        diagnostic = record.get("message")
+        if not isinstance(diagnostic, dict) or diagnostic.get("level") != "error":
+            continue
+        message = diagnostic.get("message")
+        if not isinstance(message, str):
+            continue
+        # Redact complete bounded fields before truncation can split a secret.
+        messages.append(_redact_detail(message)[:_STDERR_TAIL_CHARS])
+        if len(messages) >= _COMPILER_MESSAGE_COUNT:
+            break
+    tail = _redact_detail(stderr[-_STDERR_PRE_WINDOW:].decode("utf-8", errors="replace"))
+    if not messages:
+        return tail[-_STDERR_TAIL_CHARS:]
+    compiler = "\n".join(messages)[:_STDERR_TAIL_CHARS // 2]
+    detail = f"compiler diagnostics: {compiler}\nstderr: {tail[-_STDERR_TAIL_CHARS // 2:]}"
+    return detail[:_STDERR_TAIL_CHARS]
 
 
 def _run_fixed(root: Path, argv: Sequence[str], timeout: int | None = None) -> CommandResult:
@@ -332,6 +364,8 @@ def _run_fixed(root: Path, argv: Sequence[str], timeout: int | None = None) -> C
     if completed.returncode != 0:
         tail = completed.stderr[-_STDERR_PRE_WINDOW:].decode("utf-8", errors="replace")
         detail = _redact_detail(tail)[-_STDERR_TAIL_CHARS:]
+        if "--message-format=json" in argv:
+            detail = _compiler_failure_detail(completed.stdout, completed.stderr)
         raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", f"fixed command exited {completed.returncode}: {detail}")
     return CommandResult(completed.stdout, completed.stderr)
 

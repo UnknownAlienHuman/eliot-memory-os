@@ -344,6 +344,8 @@ jobs:
           ) -join "`n"
           $redacted = Get-IntegrationHarnessRedactedText -Text $manifest -MaxBytes 65536
           $receiptPath = Join-Path $env:GITHUB_WORKSPACE '.eliot/evidence-receipt.txt'
+          # This finalizer has its own fresh checkout, not the upstream job's directories.
+          [System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($receiptPath)) | Out-Null
           [System.IO.File]::WriteAllText($receiptPath, [string]$redacted)
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value '### Integration evidence receipt (redacted, bounded)'
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ([string]$redacted)

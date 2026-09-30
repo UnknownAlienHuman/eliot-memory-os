@@ -394,7 +394,6 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 180
     env:
-      CARGO_TARGET_DIR: ${{ runner.temp }}\eliot-operator-audit-target
       CARGO_INCREMENTAL: '0'
       CARGO_BUILD_JOBS: '2'
       CARGO_PROFILE_DEV_DEBUG: '0'
@@ -408,6 +407,7 @@ jobs:
       - name: Native Windows diagnostic build and tests (not governed acceptance)
         shell: pwsh
         run: |
+          $env:CARGO_TARGET_DIR = Join-Path $env:RUNNER_TEMP 'eliot-operator-audit-target'
           python scripts/operator-audit-diagnostic.py --output "$env:RUNNER_TEMP\eliot-operator-audit-evidence"
           exit $LASTEXITCODE
       - name: Preserve exact diagnostic commands, exits and logs
