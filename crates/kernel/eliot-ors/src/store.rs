@@ -4832,6 +4832,7 @@ fn validate_observe_receipt_binding(
 pub struct RedbRecoveryStore {
     database: Database,
     evidence: Arc<dyn CanonicalEvidenceProvider>,
+    reservation_lifecycle_changed: tokio::sync::Notify,
     #[cfg(feature = "test-support")]
     authority_handoff_failpoint:
         std::sync::Mutex<Option<Arc<crate::test_support::AuthorityHandoffPersistenceFailpoint>>>,
@@ -27853,6 +27854,29 @@ impl RedbRecoveryStore {
         Ok(store)
     }
 
+    /// Waits until this reservation passes the store's durable eligibility
+    /// transition, preserving its exact token and writer epoch throughout the
+    /// wait. A pending predecessor is rechecked after every committed
+    /// predecessor closure; no polling delay or replacement deadline is added.
+    pub async fn wait_until_eligible(
+        &self,
+        token: &WriterReservationToken,
+        writer_epoch: &EpochIdentity,
+    ) -> Result<ReservationRecord, OrsError> {
+        require_writer_epoch(token, writer_epoch)?;
+        loop {
+            let notified = self.reservation_lifecycle_changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            match <Self as OperationalRecoveryStore>::mark_eligible(self, token) {
+                Ok(record) => return Ok(record),
+                Err(OrsError::PredecessorPending) => notified.await,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     /// Reads the installed identity and object generation from durable ORS metadata.
     ///
     /// This is a readback of the store-owned binding, not a cached or caller-
@@ -27876,6 +27900,7 @@ impl RedbRecoveryStore {
         let store = Self {
             database,
             evidence,
+            reservation_lifecycle_changed: tokio::sync::Notify::new(),
             #[cfg(feature = "test-support")]
             authority_handoff_failpoint: std::sync::Mutex::new(None),
         };
@@ -34949,6 +34974,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         Self::record_scope_terminals(&write, reconciliation)?;
         Self::clear_recovery_blocks(&write, &record)?;
         write.commit().map_err(storage)?;
+        self.reservation_lifecycle_changed.notify_waiters();
         Ok(record)
     }
 
@@ -34979,6 +35005,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         }
         Self::bump_recovery_inventory_revision(&write, RecoveryInventorySource::Reservations)?;
         write.commit().map_err(storage)?;
+        self.reservation_lifecycle_changed.notify_waiters();
         Ok(record)
     }
 
