@@ -7,7 +7,8 @@
 
 #![forbid(unsafe_code)]
 
-use eliot_build_test_graph::{
+pub use eliot_build_test_graph::{
+    BUILD_ROOT_DIRECTORY, BuildFingerprint, BuildMode, CARGO_HOME_ENV, CARGO_TARGET_DIR_ENV,
     CandidateIdentity, GovernedWorkEnvelope, LaneIdentity, RuntimeEnvironmentLease,
 };
 use eliot_contracts::{
@@ -49,7 +50,8 @@ pub use resources::{
 };
 pub use target_layout::{
     BoundTargetRoots, BuildClass, TARGET_LAYOUT_REVISION, TargetLayoutBinding,
-    bound_roots_conflict, derive_layout_path, verify_layout_binding,
+    bound_roots_conflict, derive_layout_path, verify_envelope_layout_binding,
+    verify_layout_binding,
 };
 pub use typed_evidence::{
     EphemeralSourceBytes, ProcessStreamSourceReadbackObservation, ProcessStreamSourceReadbackPort,
@@ -2261,6 +2263,15 @@ pub struct RawArtifact {
     /// Clock captured by TestD at the stream-retention boundary.
     #[serde(default)]
     pub captured_at: ClockReading,
+    /// Retained lane identity this artifact was emitted under (issue #1897).
+    /// `None` while a stream is captured, because capture has no job; the
+    /// artifact-admission seam stamps it from the retained envelope, and
+    /// `VerificationReceipt::validate` refuses an enveloped job whose emitted
+    /// artifact records do not all carry the retained candidate and contract
+    /// revision. Presence alone is never accepted — the content is compared
+    /// against the envelope's own `candidate_identity()`.
+    #[serde(default)]
+    pub lane_identity: Option<CandidateIdentity>,
 }
 
 impl RawArtifact {
@@ -2283,6 +2294,9 @@ impl RawArtifact {
             capture_sequence: 0,
             stream: RawArtifactStream::Unknown,
             captured_at: ClockReading::default(),
+            // Capture has no job, so no retained lane identity exists yet. The
+            // artifact-admission seam binds it before the record is emitted.
+            lane_identity: None,
         };
         artifact.validate()?;
         Ok(artifact)
@@ -2700,9 +2714,11 @@ impl VerificationReceipt {
     /// Validates identity and exact raw-handle lineage before publication.
     pub fn validate(&self, job: &TestJob) -> Result<(), TestdError> {
         job.target_roots.validate()?;
-        if let Some(layout) = job.target_layout.as_ref() {
-            verify_layout_binding(&job.target_roots, layout)?;
-        }
+        verify_job_lane(
+            &job.target_roots,
+            job.target_layout.as_ref(),
+            job.work_envelope.as_ref(),
+        )?;
         let binding = self.binding();
         validate_receipt_binding(job, &binding)?;
         // Issue #1897 (W5): the emitted result carries the exact lane
@@ -2717,6 +2733,17 @@ impl VerificationReceipt {
                     .map_err(|_| TestdError::InvalidBinding)?;
                 if identity != &expected {
                     return Err(TestdError::InvalidBinding);
+                }
+                // Issue #1897 (W5, audit Exit): every emitted ARTIFACT record
+                // carries the same retained candidate and contract revision as
+                // the result, compared by content. An artifact that names
+                // another lane, or names none, refuses: an artifact produced
+                // under one candidate cannot be published under another one's
+                // verdict.
+                for artifact in &self.raw_artifacts {
+                    if artifact.lane_identity.as_ref() != Some(&expected) {
+                        return Err(TestdError::InvalidBinding);
+                    }
                 }
             }
             (Some(_), None) | (None, Some(_)) => return Err(TestdError::InvalidBinding),
@@ -2943,6 +2970,17 @@ impl EvidenceCollector {
             .raw_artifacts
             .lock()
             .map_or_else(|_| BTreeMap::new(), |artifacts| artifacts.clone());
+        // Issue #1897 (W5): the artifact-admission seam is the one place in the
+        // capture path that holds the job, so it is where every emitted
+        // `RawArtifact` record is bound to the retained lane identity. Capture
+        // itself has no job and deliberately leaves the field absent; the
+        // receipt never publishes an unbound artifact for an enveloped job,
+        // because `VerificationReceipt::validate` compares each artifact's
+        // identity with the retained envelope's own value.
+        let lane_identity = job
+            .work_envelope
+            .as_ref()
+            .and_then(|envelope| envelope.candidate_identity().ok());
         let mut raw_artifacts = Vec::new();
         let mut handles = BTreeSet::new();
         for record in &records {
@@ -2953,7 +2991,9 @@ impl EvidenceCollector {
                 if handles.insert(handle.to_owned())
                     && let Some(artifact) = raw.get(handle)
                 {
-                    raw_artifacts.push(artifact.clone());
+                    let mut artifact = artifact.clone();
+                    artifact.lane_identity.clone_from(&lane_identity);
+                    raw_artifacts.push(artifact);
                 }
             }
         }
@@ -2998,15 +3038,13 @@ impl EvidenceCollector {
             raw_artifacts,
             normalized,
             typed_evidence: self.typed_bundles(),
-            // Issue #1897 (W5): attach the allocated lane identity to the
-            // emitted result. The envelope was validated when the job row
-            // committed, so identity derivation fails only on a corrupt
-            // row; that failure still refuses loudly at `finish` instead
-            // of emitting an unattributed result for an enveloped job.
-            lane_identity: job
-                .work_envelope
-                .as_ref()
-                .and_then(|envelope| envelope.candidate_identity().ok()),
+            // Issue #1897 (W5): attach the retained lane identity to the
+            // emitted result, from the same value every emitted artifact
+            // record was bound to above. The envelope was validated when the
+            // job row committed, so identity derivation fails only on a
+            // corrupt row; that failure still refuses loudly at `finish`
+            // instead of emitting an unattributed result for an enveloped job.
+            lane_identity,
         }
     }
 }
@@ -4024,50 +4062,23 @@ impl TestdStore {
                 return Err(TestdError::InvalidBinding);
             }
         }
-        // Issue #1897 (W1): the lane's checkout and workspace identity must BE the
-        // admitted ones, not a caller-asserted pair beside them. The layout
-        // binding already derived its workspace component from the
-        // Governor-issued project identity and its checkout component from the
-        // canonical source root; an allocated lane naming different values would
-        // place the governed build root in a lane that is not the admitted
-        // checkout. Comparing them here makes the main checkout's identity the
-        // one the lane runs under.
-        if let (Some(envelope), Some(layout)) = (work_envelope.as_ref(), target_layout.as_ref())
-            && (envelope.workspace_id != layout.workspace_id
-                || envelope.worktree_id != layout.checkout_id)
-        {
-            return Err(TestdError::InvalidBinding);
-        }
-        // Issue #1897 (W3), and the layout reconciliation the I2.22 target-root
-        // rule needs: an allocated lane is the ONE target-root authority for
-        // this job. `TargetRoots` (issue #1806) and `TargetLayoutBinding` are a
-        // second, competing derivation; leaving both in place lets a governed
-        // invocation run in the layout root while its result is attributed to
-        // the lane's root. The two are therefore reconciled here rather than by
-        // weakening either rule: the persisted target root must be exactly the
-        // lane's governed root, and `TargetRoots::validate` keeps its existing
+        // Issue #1897 (W1/W3/AUD4): an allocated lane is the ONE target-root
+        // authority for this job. `TargetRoots` (issue #1806) and
+        // `TargetLayoutBinding` are a second, competing derivation, so for an
+        // enveloped job the layout contributes the admitted build root and the
+        // workspace/checkout identity only, and the envelope contributes the
+        // whole governed root. `TargetRoots::validate` keeps its existing
         // `cache_root == target_root` equality and its strict-descendant
-        // requirement — so this adds no distinctness on either side, it refuses
-        // the disagreement. `cache_root` equality follows from the same check,
-        // so the cache and the target can never be one governed root here and
-        // two elsewhere.
+        // requirement — this adds no distinctness on either side, it refuses
+        // the disagreement.
         let mut target_roots = target_roots;
-        if let Some(envelope) = work_envelope.as_ref() {
-            let governed = envelope
-                .derive_target_root()
-                .map_err(|error| TestdError::Contract(error.to_string()))?;
-            if Path::new(&target_roots.target_root) != governed.as_path() {
-                return Err(TestdError::Invalid {
-                    field: "target_roots.target_root",
-                    reason: "must be the governed work envelope's allocated target root",
-                });
-            }
-        }
         target_roots.allowed_contour_root = grant.contour_root.clone();
         target_roots.validate()?;
-        if let Some(layout) = target_layout.as_ref() {
-            verify_layout_binding(&target_roots, layout)?;
-        }
+        verify_job_lane(
+            &target_roots,
+            target_layout.as_ref(),
+            work_envelope.as_ref(),
+        )?;
         let digest = payload_digest(
             &invocation,
             &process,
@@ -4416,9 +4427,11 @@ impl TestdStore {
             .get(job_id)?
             .ok_or_else(|| TestdError::Corrupt("job not found".to_owned()))?;
         job.target_roots.validate()?;
-        if let Some(layout) = job.target_layout.as_ref() {
-            verify_layout_binding(&job.target_roots, layout)?;
-        }
+        verify_job_lane(
+            &job.target_roots,
+            job.target_layout.as_ref(),
+            job.work_envelope.as_ref(),
+        )?;
         // Issue #1897 (W1/W5): requalify the retained envelope with its owner
         // before this attempt starts. The row just read is the durable
         // authority — this method never re-derives a tuple from the current
@@ -4448,6 +4461,36 @@ impl TestdStore {
             .non_secret()
             .get("CARGO_HOME")
             .ok_or(TestdError::InvalidBinding)?;
+        // Issue #1897 (W3): the governed Cargo invocation must run under the
+        // target root this work item was admitted with. The two values read
+        // above are the invocation's own `CARGO_TARGET_DIR` and `CARGO_HOME`;
+        // they are compared against the environment derived from the RETAINED
+        // envelope, never against a tuple rebuilt from the current ambient
+        // environment. An enveloped job therefore cannot execute in the
+        // repository `target/`, in the user-global Cargo home, or in any root
+        // other than the one its persisted envelope allocated. Both sides bind
+        // the same directory, so this adds no distinctness: the existing
+        // `cache_root == target_root` rule stays the single cache/target
+        // relation, and the process environment resolver that emitted these
+        // values (`TestdProcessToolIntent::validate_for_roots`) already refused
+        // any other pairing.
+        if let Some(envelope) = job.work_envelope.as_ref() {
+            let governed = envelope
+                .cargo_environment()
+                .map_err(|_| TestdError::InvalidBinding)?;
+            for (variable, expected) in [
+                (CARGO_TARGET_DIR_ENV, target_root.as_str()),
+                (CARGO_HOME_ENV, cache_root.as_str()),
+            ] {
+                let bound = governed
+                    .iter()
+                    .find(|(name, _)| name == variable)
+                    .map(|(_, value)| value.as_str());
+                if bound != Some(expected) {
+                    return Err(TestdError::InvalidBinding);
+                }
+            }
+        }
         let expected = ClaimBindingExpectation {
             operation_id: request.operation_id().as_str(),
             process_tree_id: request.process_tree_id().as_str(),
@@ -4775,6 +4818,18 @@ impl TestdStore {
         }
         validate_cancellation_lease(&job, lease, actor, now)?;
         validate_text(actor, "actor")?;
+        // Issue #1897 (AUD6): cancellation reads the same retained envelope as
+        // admission and execution. It requalifies the tuple before the worker
+        // fence is cleared, so a cancelled attempt can only stop work whose
+        // retained lease record is its own. A record naming another holder is a
+        // copied DTO and refuses here instead of releasing a resource the
+        // requesting transport never actually held. Nothing is re-derived from
+        // the current ambient environment.
+        if let Some(envelope) = job.work_envelope.as_ref() {
+            envelope
+                .requalify()
+                .map_err(|_| TestdError::InvalidBinding)?;
+        }
         let previous = job.state;
         let was_running = previous == JobState::Running;
         job.state = JobState::Cancelled;
@@ -4969,6 +5024,49 @@ fn project_head_blocked<'a>(
                 && other_sequence < project_sequence
                 && !other_state.is_terminal()
         })
+}
+
+/// The one lane-root check every lifecycle stage runs.
+///
+/// A job admitted without a lane keeps the pre-lane layout authority: the
+/// owner-issued binding resolves its own root. A job that carries a retained
+/// [`GovernedWorkEnvelope`] has exactly one root authority — the envelope's
+/// governed root — so the layout is verified against the envelope rather than
+/// deriving a second root from its build-class level. Both branches keep the
+/// `cache_root == target_root` relation of
+/// [`TargetRoots::validate`] untouched and add no distinctness.
+///
+/// # Errors
+///
+/// Returns the first [`TestdError`] the selected verification raises.
+fn verify_job_lane(
+    target_roots: &TargetRoots,
+    layout: Option<&TargetLayoutBinding>,
+    envelope: Option<&GovernedWorkEnvelope>,
+) -> Result<(), TestdError> {
+    match (layout, envelope) {
+        (Some(layout), Some(envelope)) => {
+            verify_envelope_layout_binding(target_roots, layout, envelope).map(|_| ())
+        }
+        (Some(layout), None) => verify_layout_binding(target_roots, layout).map(|_| ()),
+        // A lane without an owner-issued binding still has exactly one root:
+        // the one its retained envelope derives. The strict-descendant and
+        // `TargetRoots` gates above already bound it to the granted contour.
+        (None, Some(envelope)) => {
+            let governed = envelope
+                .derive_target_root()
+                .map_err(|error| TestdError::Contract(error.to_string()))?;
+            let canonical =
+                validate_root_identity(&governed.to_string_lossy(), "work_envelope.governed_root")?;
+            let target =
+                validate_root_identity(&target_roots.target_root, "target_roots.target_root")?;
+            if canonical != target {
+                return Err(TestdError::InvalidBinding);
+            }
+            Ok(())
+        }
+        (None, None) => Ok(()),
+    }
 }
 
 fn payload_digest(
