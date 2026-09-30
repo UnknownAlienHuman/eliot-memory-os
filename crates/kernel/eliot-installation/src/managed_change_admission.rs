@@ -84,7 +84,9 @@ pub struct RequalificationBinding {
 /// Each variant names one thing the live survey did **not** establish. They are
 /// never collapsed into "unavailable": an unproved qualification and an absent
 /// installation are different facts, and only the first is a qualification gap.
-#[derive(Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum MissingQualification {
     /// The accepted revision declares no bounded probe for this exact identity.
