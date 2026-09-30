@@ -10,10 +10,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use eliot_contracts::{OperationId, TaskId, canonical_json_bytes};
 use eliot_governor::{
     CanonicalPlanBinding, FinishAttemptDraft, PreparedFinishDecision, PreparedKernelExchange,
+    RehydratedContractAcceptanceSet,
 };
 use eliot_instrument_api::InstrumentInvocation;
 use eliot_protocol::RequestIdentity;
-use eliot_store_api::{TaskContractAcceptanceSet, WriteReceipt, WriteReceiptStatus};
+use eliot_store_api::{WriteReceipt, WriteReceiptStatus};
 use eliot_testd_core::{
     JobState as TestdJobState, TestJob, TestdPendingVerifierDispatch, TestdStore,
     TestdTerminalCompletionEvidence, TestdTerminalCompletionNotice, TestdVerifierDispatchBinding,
@@ -463,7 +464,7 @@ impl DaemonComposition {
         identity: &RequestIdentity,
         operation_id: &OperationId,
         draft: &FinishAttemptDraft,
-        contract_acceptance: &TaskContractAcceptanceSet,
+        contract_acceptance: &RehydratedContractAcceptanceSet,
     ) -> Result<Option<PreparedKernelExchange>, DaemonError> {
         self.governor
             .prepare_finish_evidence(identity, operation_id, draft, contract_acceptance)

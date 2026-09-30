@@ -25,8 +25,8 @@ use eliot_protocol::RequestIdentity;
 use eliot_store_api::{
     EffectClass, EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
     OperationManifestDigest, OrderingHeadExpectation, PreparedTransition, RevisionHeadExpectation,
-    ScopeId, SecurityContext, StoreFailure, TaskContractAcceptanceSet, TransitionClass,
-    WriteReceipt, WriteReceiptStatus, generated_operation_manifests, operation_manifest_set_digest,
+    ScopeId, SecurityContext, StoreFailure, TransitionClass, WriteReceipt, WriteReceiptStatus,
+    generated_operation_manifests, operation_manifest_set_digest,
 };
 use eliot_task::{TaskCommand, TaskLifecycleOwner, TaskRecord, TaskState};
 use eliot_testd_core::{
@@ -39,7 +39,8 @@ use crate::{
     AcceptanceDenominatorError, CanonicalAdmissionOwner, CanonicalAdmissionSnapshot,
     CanonicalFinishEvidence, CanonicalPlanBinding, CanonicalVerifierExecutionFact,
     CompositionError, GovernorOwners, KernelPortError, KernelTransitionPort,
-    acceptance_coverage_from_verifier_fact, evaluate_testd_verification_current,
+    RehydratedContractAcceptanceSet, acceptance_coverage_from_verifier_fact,
+    evaluate_testd_verification_current, task_acceptance_set_commitment,
 };
 
 /// The Governor's own canonical store scope identity.
@@ -359,11 +360,16 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
     /// this fails closed rather than picking one.
     ///
     /// The acceptance identity carried on those receipts is NOT the finish
-    /// denominator. It is a caller-stated selection receipt field
-    /// (`eliot-workscope` fills it with `sha256_hex` over the task goal on the
-    /// exploratory branch), and an owner enumeration is now rehydrated through
-    /// [`Self::rehydrate_task_contract_acceptance`] instead. This walk therefore
-    /// no longer returns a digest; it only joins the receipts.
+    /// denominator: the denominator is the contract owner's own enumeration,
+    /// rehydrated through [`Self::rehydrate_task_contract_acceptance`]. The
+    /// receipt digest is a second, independent owner of the same fact, and
+    /// this walk returns it so the caller can require it to commit to the
+    /// enumerated set. Before the owner-enumeration change that commitment was
+    /// forced implicitly, because the receipt digest *was* the denominator's
+    /// digest and `ContractAcceptanceDenominator::admits` recomputed the
+    /// commitment over the enumeration retained beside it. Keeping the
+    /// commitment as an explicit additional conjunct preserves that refusal
+    /// instead of leaving the receipt digest agreeing only with other receipts.
     fn rehydrate_task_bound_observation_refs(
         &self,
         task_id: &TaskId,
@@ -371,7 +377,7 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
         plan: &CanonicalPlanBinding,
         fence: &StateFence,
         observation_refs: &mut BTreeSet<String>,
-    ) -> Result<(), FinishAttemptError> {
+    ) -> Result<String, FinishAttemptError> {
         let mut selection_identity: Option<String> = None;
         for entry in self.observation.snapshot() {
             let receipt = match &entry.result {
@@ -404,13 +410,12 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
             selection_identity = Some(selection.acceptance_digest.clone());
             observation_refs.insert(receipt.record_id.clone());
         }
-        if selection_identity.is_none() {
-            return Err(FinishAttemptError::Composition(CompositionError::Recovery(
+        selection_identity.ok_or_else(|| {
+            FinishAttemptError::Composition(CompositionError::Recovery(
                 "canonical finish evidence has no accepted task-and-plan-bound observation"
                     .to_owned(),
-            )));
-        }
-        Ok(())
+            ))
+        })
     }
 
     /// Reads the canonical owner fact that is the ONLY source of verifier
@@ -524,7 +529,7 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
         task: &TaskRecord,
         fence: &StateFence,
         plan: &CanonicalPlanBinding,
-        contract_acceptance_set: &TaskContractAcceptanceSet,
+        contract_acceptance_set: &RehydratedContractAcceptanceSet,
     ) -> Result<ProducedFinishEvidence, FinishAttemptError> {
         let (frame_refs, finish_authority_ref) =
             self.scan_task_frame_and_authority(task_id, task, fence);
@@ -555,10 +560,11 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
         let mut observation_refs = BTreeSet::new();
         // The task-and-plan-bound observation receipts are joined here so their
         // record ids enter the artifact evidence. They are not the acceptance
-        // denominator: their recorded selection identity is caller-stated at
-        // intake, so the denominator is rehydrated from the contract owner
-        // instead.
-        self.rehydrate_task_bound_observation_refs(
+        // denominator: the denominator is rehydrated from the contract owner
+        // instead. The digest they jointly record is still a second owner of
+        // the same fact, so it is returned and required below to commit to the
+        // enumerated set.
+        let selection_acceptance_digest = self.rehydrate_task_bound_observation_refs(
             task_id,
             task,
             plan,
@@ -589,11 +595,23 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
             verifier_plan,
         )?;
 
-        let acceptance = acceptance_coverage_from_verifier_fact(
-            &contract_acceptance.denominator(),
-            plan,
-            &verifier_fact,
-        )?;
+        let denominator = contract_acceptance.denominator();
+
+        // The additional conjunct: the task-selection owner evidence must also
+        // commit to the enumerated set. `bind` has already refused unless the
+        // plan's declared ids and the contract owner's ids are the same set, so
+        // recomputing the commitment over the denominator's own `item_ids` is
+        // the commitment over the plan's list as well. This is the check the
+        // pre-owner-enumeration design got implicitly, when the receipt digest
+        // *was* this denominator's digest; restoring it as an explicit
+        // conjunct keeps the prior refusal instead of trading it away, and it
+        // is an addition to `bind`, never a replacement for it.
+        if task_acceptance_set_commitment(&denominator.item_ids)? != selection_acceptance_digest {
+            return Err(AcceptanceDenominatorError::SelectionEvidenceDisagrees.into());
+        }
+
+        let acceptance =
+            acceptance_coverage_from_verifier_fact(&denominator, plan, &verifier_fact)?;
         let stale_verifier_run_refs = if verifier_fact.certifies_completion() {
             Vec::new()
         } else {
@@ -722,7 +740,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
         &self,
         task_id: &TaskId,
         task_revision: u64,
-    ) -> Result<TaskContractAcceptanceSet, FinishAttemptError> {
+    ) -> Result<RehydratedContractAcceptanceSet, FinishAttemptError> {
         let fence = self.canonical.state_fence().clone();
         if fence
             .task_revision
@@ -747,7 +765,12 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
         }
         set.validate()
             .map_err(|error| AcceptanceDenominatorError::Malformed(error.to_string()))?;
-        Ok(set)
+        // Admitted here and nowhere else. This is the single production site
+        // that can produce a `RehydratedContractAcceptanceSet`, and it produces
+        // one only from the value the owner's neutral read returned. Every
+        // downstream phase therefore receives a set whose provenance is the
+        // type, not a convention its callers are trusted to honour.
+        Ok(RehydratedContractAcceptanceSet::admit_owner_read(set))
     }
 
     /// Rehydrates and publishes the verifier-execution owner from the
@@ -1063,7 +1086,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
         identity: &RequestIdentity,
         operation_id: &OperationId,
         draft: &FinishAttemptDraft,
-        contract_acceptance_set: &TaskContractAcceptanceSet,
+        contract_acceptance_set: &RehydratedContractAcceptanceSet,
     ) -> Result<Option<PreparedKernelExchange>, FinishAttemptError> {
         validate_identity(identity)?;
         draft.validate().map_err(FinishError::from)?;

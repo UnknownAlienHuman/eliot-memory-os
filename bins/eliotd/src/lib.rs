@@ -17,6 +17,7 @@ use eliot_governor::{
     CompositionError, CompositionReadiness, FinishAttemptDraft, FinishAttemptError,
     GovernorActivationOutcome, GovernorComposition, GovernorLaunchConfig, KernelGenerationPort,
     KernelGenerationSnapshotProvider, PreparedFinishDecision, PreparedKernelExchange, QueueLimits,
+    RehydratedContractAcceptanceSet,
 };
 use eliot_kernel_core::Notification;
 use eliot_platform_windows::{ProtectedPathError, ProtectedRuntimePathLease};
@@ -1619,7 +1620,7 @@ impl DaemonComposition {
         &self,
         task_id: &eliot_contracts::TaskId,
         task_revision: u64,
-    ) -> Result<eliot_store_api::TaskContractAcceptanceSet, FinishAttemptError> {
+    ) -> Result<RehydratedContractAcceptanceSet, FinishAttemptError> {
         if self.readiness() != CompositionReadiness::Ready {
             return Err(FinishAttemptError::Composition(CompositionError::NotReady));
         }
@@ -1632,7 +1633,9 @@ impl DaemonComposition {
     ///
     /// `contract_acceptance` is the contract owner's rehydrated enumeration from
     /// [`Self::rehydrate_task_contract_acceptance`], passed in so this phase
-    /// stays synchronous and pure.
+    /// stays synchronous and pure. It is a `RehydratedContractAcceptanceSet`, so
+    /// this binary cannot assemble a denominator of its own to pass here even if
+    /// it wanted to.
     ///
     /// Runtime callers hold the composition lock only for this synchronous phase,
     /// then exchange the immutable plan through Kernel after releasing the lock.
@@ -1641,7 +1644,7 @@ impl DaemonComposition {
         identity: &RequestIdentity,
         operation_id: &OperationId,
         draft: &FinishAttemptDraft,
-        contract_acceptance: &eliot_store_api::TaskContractAcceptanceSet,
+        contract_acceptance: &RehydratedContractAcceptanceSet,
     ) -> Result<Option<PreparedKernelExchange>, FinishAttemptError> {
         if self.readiness() != CompositionReadiness::Ready {
             return Err(FinishAttemptError::Composition(CompositionError::NotReady));

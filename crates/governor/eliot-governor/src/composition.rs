@@ -2708,7 +2708,14 @@ const TASK_ACCEPTANCE_SET_DOMAIN: &str = "eliot/task-acceptance-set/v1";
 /// # Errors
 ///
 /// Returns [`CompositionError::Recovery`] when the set cannot be canonicalized.
-fn task_acceptance_set_commitment(item_ids: &BTreeSet<String>) -> Result<String, CompositionError> {
+///
+/// Crate-private rather than private to this module so the finish owner can
+/// re-derive the same commitment over its own rehydrated enumeration. It is a
+/// pure hash of the set it is handed: it admits nothing, mints no identity, and
+/// cannot by itself satisfy any check that compares its result.
+pub(crate) fn task_acceptance_set_commitment(
+    item_ids: &BTreeSet<String>,
+) -> Result<String, CompositionError> {
     #[derive(Serialize)]
     struct Commitment<'a> {
         domain: &'a str,
@@ -2793,6 +2800,59 @@ impl ContractAcceptanceDenominator {
     }
 }
 
+/// One contract-owner acceptance-item set, admitted only by the owner's own
+/// neutral read.
+///
+/// This type exists to carry *provenance* rather than data. The neutral
+/// [`TaskContractAcceptanceSet`] is a store-neutral wire payload with public
+/// fields and a self-satisfiable `validate()`, and any store adapter has to be
+/// able to decode one — so it can never be the thing the finish path trusts.
+/// Handing that payload to [`AcceptanceDenominatorError::bind`] as a plain
+/// reference let a caller mint a set whose `items` equal the canonical plan's
+/// declared list and whose `acceptance_digest` equals the plan's own
+/// `task_acceptance_digest`, which is already forced to equal
+/// `task_acceptance_set_commitment(plan_ids)`. That is a self-satisfiable
+/// input: the comparison in `bind` was correct and the value being compared
+/// was caller-authored, so the owner was never actually consulted.
+///
+/// The field is private, there is no `Default`, no `From`, no `Deserialize` and
+/// no public constructor, so the only way to obtain one of these values is to
+/// await [`KernelTransitionPort::task_contract_acceptance_set`] and admit the
+/// result. I7.9 requires the Finish service to *rehydrate* the current
+/// `TaskContract` and its acceptance items; a type whose construction is
+/// unreachable except through the owner read is what makes "rehydrated" an
+/// enforced property instead of a convention.
+#[derive(Clone, Debug)]
+pub struct RehydratedContractAcceptanceSet {
+    /// Private on purpose: an accessible field would restore the very bypass
+    /// this type exists to close, because a caller could then write into it.
+    owner_set: TaskContractAcceptanceSet,
+}
+
+impl RehydratedContractAcceptanceSet {
+    /// The only constructor, and it is crate-private on purpose.
+    ///
+    /// Its single production caller is
+    /// `GovernorFinishAttempt::rehydrate_task_contract_acceptance`, which is the
+    /// one place the finish path performs the owner's named read. Nothing in
+    /// this crate can build this value from a literal, and nothing outside this
+    /// crate can build it at all.
+    pub(crate) const fn admit_owner_read(owner_set: TaskContractAcceptanceSet) -> Self {
+        Self { owner_set }
+    }
+
+    /// The owner's own payload, exactly as the read returned it.
+    ///
+    /// This is the only way to read the admitted set, and it is crate-private:
+    /// a consumer outside `eliot-governor` can pass one of these values on but
+    /// cannot take one apart and reassemble a self-satisfiable payload for
+    /// [`AcceptanceDenominatorError::bind`], because `bind` accepts only this
+    /// type.
+    pub(crate) const fn owner_set(&self) -> &TaskContractAcceptanceSet {
+        &self.owner_set
+    }
+}
+
 /// Closed failure set of the contract-owner acceptance denominator join.
 ///
 /// Every arm is a refusal: no arm has a success meaning, and no arm names a
@@ -2816,6 +2876,21 @@ pub enum AcceptanceDenominatorError {
     /// The owner set does not validate against the closed owner contract.
     #[error("the rehydrated contract acceptance set is malformed: {0}")]
     Malformed(String),
+    /// The task-selection owner evidence does not commit to the enumerated set.
+    ///
+    /// This is the additional conjunct the design enforced before the
+    /// owner-enumeration rehydration landed, and which that change dropped: the
+    /// accepted task-and-plan-bound observation receipts' recorded
+    /// `acceptance_digest` had to reproduce `task_acceptance_set_commitment`
+    /// over the enumerated obligation set. The receipt digest is still
+    /// cross-checked between receipts for mutual agreement, but on its own that
+    /// only proves the receipts agree with each other, not that either commits
+    /// to the denominator. Restoring the commitment keeps a receipt whose digest
+    /// was issued for a different set from riding under an owner enumeration.
+    #[error(
+        "task-bound observation evidence does not commit to the enumerated acceptance item set"
+    )]
+    SelectionEvidenceDisagrees,
     /// The plan's declared enumeration is not the contract owner's enumeration.
     ///
     /// Reported item by item, never as a count alone, so the mismatch names
@@ -2852,12 +2927,22 @@ impl AcceptanceDenominatorError {
     /// value commits to the owner enumeration retained beside it, so a
     /// caller-stated digest issued for a different (larger) set cannot ride
     /// under an owner enumeration.
+    ///
+    /// `owner_set` is a [`RehydratedContractAcceptanceSet`], not the neutral
+    /// payload. That is the whole enforcement: this signature has no arm that
+    /// accepts a caller-assembled set, so a caller that narrows the
+    /// denominator cannot reach this comparison at all — it cannot produce the
+    /// argument. Before the parameter carried the neutral payload, a caller
+    /// could build `items` equal to the plan's list and `acceptance_digest`
+    /// equal to the plan's own `task_acceptance_digest` and pass here with
+    /// zero owner involvement.
     pub(crate) fn bind(
         task_id: &str,
         task_revision: u64,
-        owner_set: &TaskContractAcceptanceSet,
+        owner_set: &RehydratedContractAcceptanceSet,
         verifier_plan: &CanonicalVerifierPlanBinding,
     ) -> Result<CanonicalContractAcceptance, Self> {
+        let owner_set = owner_set.owner_set();
         owner_set
             .validate()
             .map_err(|error| Self::Malformed(error.to_string()))?;
@@ -6165,7 +6250,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         &self,
         task_id: &TaskId,
         task_revision: u64,
-    ) -> Result<TaskContractAcceptanceSet, FinishAttemptError> {
+    ) -> Result<RehydratedContractAcceptanceSet, FinishAttemptError> {
         if self.readiness != CompositionReadiness::Ready {
             return Err(FinishAttemptError::Composition(CompositionError::NotReady));
         }
@@ -6179,9 +6264,12 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// the derived image is already current, so nothing is owed.
     ///
     /// `contract_acceptance` is the contract owner's rehydrated enumeration
-    /// from [`Self::rehydrate_task_contract_acceptance`]. The caller supplies
-    /// it rather than this method reading it, so the whole preparation stays
-    /// pure and no composition borrow crosses the read.
+    /// from [`Self::rehydrate_task_contract_acceptance`], carried as a
+    /// [`RehydratedContractAcceptanceSet`]. The caller supplies that value
+    /// rather than this method reading it, so the whole preparation stays pure
+    /// and no composition borrow crosses the read — and it can only supply one
+    /// that the owner read produced, because the type has no public
+    /// constructor.
     ///
     /// This method transports nothing, so the caller may hold its composition
     /// borrow for this call alone. The refresh that publishes the evidence leg's
@@ -6191,7 +6279,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         identity: &RequestIdentity,
         operation_id: &OperationId,
         draft: &FinishAttemptDraft,
-        contract_acceptance: &TaskContractAcceptanceSet,
+        contract_acceptance: &RehydratedContractAcceptanceSet,
     ) -> Result<Option<PreparedKernelExchange>, FinishAttemptError> {
         if self.readiness != CompositionReadiness::Ready {
             return Err(FinishAttemptError::Composition(CompositionError::NotReady));
