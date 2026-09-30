@@ -5811,11 +5811,70 @@ mod tests {
         })
     }
 
+    /// Classification used only by fixture-created error values. Tests never
+    /// construct an agent-produced digest, so an impossible digest may only
+    /// mean that serialization failed for this fixture.
+    const FIXTURE_UNAVAILABLE: &'static str = "FIXTURE_UNAVAILABLE";
+
+    /// An Agent Bridge fixture whose protected-root contour could not be
+    /// created on this host.
+    ///
+    /// TASK.md (Fixture repair) requires three outcomes to be distinguished:
+    /// ready environment, unsupported/missing privilege, and setup/cleanup
+    /// defect. This value carries only the second. It is never convertible
+    /// into a passing test, because an unavailable contour yields no
+    /// behavioral evidence at all.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct FixtureUnavailable {
+        stage: &'static str,
+        operation: &'static str,
+    }
+
+    impl FixtureUnavailable {
+        fn new(stage: &'static str, operation: &'static str) -> Self {
+            Self { stage, operation }
+        }
+    }
+
+    impl fmt::Display for FixtureUnavailable {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                formatter,
+                "{} (stage {}, operation {})",
+                Self::FIXTURE_UNAVAILABLE,
+                self.stage,
+                self.operation
+            )
+        }
+    }
+
+    impl std::error::Error for FixtureUnavailable {}
+
+    /// Explicitly report that an Agent Bridge staging case did not execute,
+    /// and why, instead of returning a passing result that asserted nothing.
+    #[cfg(windows)]
+    fn agent_bridge_fixture_unavailable() -> FixtureUnavailable {
+        FixtureUnavailable::new(
+            "protected-root-setup",
+            "eliot-agent-bridge-stage protected ProgramData contour unavailable",
+        )
+    }
+
+    /// Drop every fixture-owned object of an Agent Bridge fixture and prove
+    /// that none survived, so a failed cleanup can never be reported as a
+    /// pass (TASK.md: "unknown external effect or failed cleanup ... remains
+    /// nonpassing").
     #[cfg(windows)]
     fn cleanup_agent_bridge_fixture(fixture: AgentBridgeFixture) {
         drop(fixture.root);
         let _ = std::fs::remove_file(&fixture.source_path);
         let _ = std::fs::remove_dir_all(&fixture.root_path);
+        assert!(
+            !fixture.source_path.exists() && !fixture.root_path.exists(),
+            "Agent Bridge fixture cleanup left owned residue: source={} root={}",
+            fixture.source_path.display(),
+            fixture.root_path.display()
+        );
     }
 
     #[cfg(windows)]
@@ -5858,9 +5917,74 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn agent_bridge_unavailable_fixture_is_reported_not_passed() -> TestResult {
+        // Regression for TASK.md case 11: an unavailable protected-root contour
+        // must never become a passing Agent Bridge staging test. The
+        // unavailable verdict is a distinct error value, it is not a success,
+        // and it carries the stage and operation that could not be prepared.
+        let unavailable = agent_bridge_fixture_unavailable();
+        assert_eq!(
+            unavailable,
+            FixtureUnavailable::new(
+                "protected-root-setup",
+                "eliot-agent-bridge-stage protected ProgramData contour unavailable",
+            )
+        );
+        assert_ne!(unavailable.stage, "");
+        assert_ne!(unavailable.operation, "");
+        let rendered = unavailable.to_string();
+        assert!(rendered.starts_with(FIXTURE_UNAVAILABLE), "{rendered}");
+        assert!(rendered.contains("protected-root-setup"), "{rendered}");
+        // The verdict is never convertible into the production error set, so
+        // it cannot be mistaken for a production outcome.
+        let boxed: Box<dyn std::error::Error> = unavailable.into();
+        assert!(boxed.to_string().contains(FIXTURE_UNAVAILABLE));
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn agent_bridge_tests_never_return_assertion_free_success() -> TestResult {
+        // Regression for TASK.md case 11, source-level: no Agent Bridge
+        // staging test may convert an unavailable fixture or an unavailable
+        // prepare into `return Ok(())`. Such a return would report a pass that
+        // executed no assertion at all.
+        let module = include_str!("package_staging.rs");
+        // Anchor on the full signature so the literal quoted below can never
+        // be mistaken for the definition it names.
+        let start = module
+            .find(concat!(
+                "#[test]\n",
+                "    fn agent_bridge_post_create_failures_clean_exact_temporary()"
+            ))
+            .ok_or_else(|| std::io::Error::other("missing Agent Bridge staging test module"))?;
+        let module = &module[start..];
+        let end = module
+            .find("\n    #[test]\n    fn digest_helpers_encode_one_sha256_for_known_vector")
+            .ok_or_else(|| std::io::Error::other("missing Agent Bridge module end"))?;
+        let agent_bridge_tests = &module[..end];
+        assert!(
+            !agent_bridge_tests.contains("return Ok(());"),
+            "an Agent Bridge staging test still returns an assertion-free success"
+        );
+        assert!(
+            !agent_bridge_tests.contains("let Some(fixture) = agent_bridge_fixture()? else {"),
+            "an Agent Bridge staging test still treats an unavailable fixture as success"
+        );
+        assert!(
+            !agent_bridge_tests.contains("let Some(fixture) = agent_bridge_fixture()? else {")
+                || agent_bridge_tests
+                    .contains("return Err(agent_bridge_fixture_unavailable().into());"),
+            "an unavailable Agent Bridge fixture is not reported explicitly"
+        );
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn agent_bridge_post_create_failures_clean_exact_temporary() -> TestResult {
         let Some(fixture) = agent_bridge_fixture()? else {
-            return Ok(());
+            return Err(agent_bridge_fixture_unavailable().into());
         };
         let request = agent_bridge_request(&fixture)?;
         let transaction_id = "transaction:post-create-final-path";
@@ -5882,7 +6006,7 @@ mod tests {
             }) => {}
             Err(error) if security_fixture_unavailable(&error) => {
                 cleanup_agent_bridge_fixture(fixture);
-                return Ok(());
+                return Err(agent_bridge_fixture_unavailable().into());
             }
             other => panic!("unexpected post-create final-path result: {other:?}"),
         }
@@ -5890,7 +6014,7 @@ mod tests {
         cleanup_agent_bridge_fixture(fixture);
 
         let Some(fixture) = agent_bridge_fixture()? else {
-            return Ok(());
+            return Err(agent_bridge_fixture_unavailable().into());
         };
         let request = agent_bridge_request(&fixture)?;
         let transaction_id = "transaction:post-create-path-exists";
@@ -5912,7 +6036,7 @@ mod tests {
             }) => {}
             Err(error) if security_fixture_unavailable(&error) => {
                 cleanup_agent_bridge_fixture(fixture);
-                return Ok(());
+                return Err(agent_bridge_fixture_unavailable().into());
             }
             other => panic!("unexpected post-create path-exists result: {other:?}"),
         }
@@ -5925,7 +6049,7 @@ mod tests {
     #[test]
     fn agent_bridge_staging_success_receipts_are_serializable_and_read_back() -> TestResult {
         let Some(fixture) = agent_bridge_fixture()? else {
-            return Ok(());
+            return Err(agent_bridge_fixture_unavailable().into());
         };
         let request = agent_bridge_request(&fixture)?;
         let prepared = match prepare_agent_bridge_stage(
@@ -5938,7 +6062,7 @@ mod tests {
             Ok(prepared) => prepared,
             Err(error) if security_fixture_unavailable(&error) => {
                 cleanup_agent_bridge_fixture(fixture);
-                return Ok(());
+                return Err(agent_bridge_fixture_unavailable().into());
             }
             Err(error) => return Err(error.into()),
         };
@@ -5964,7 +6088,7 @@ mod tests {
     #[test]
     fn agent_bridge_staging_rejects_source_substitution() -> TestResult {
         let Some(fixture) = agent_bridge_fixture()? else {
-            return Ok(());
+            return Err(agent_bridge_fixture_unavailable().into());
         };
         let request = agent_bridge_request(&fixture)?;
         let replacement = fixture.source_path.with_extension("replacement");
@@ -5989,7 +6113,7 @@ mod tests {
     #[test]
     fn agent_bridge_staging_rejects_destination_preexistence_without_overwrite() -> TestResult {
         let Some(fixture) = agent_bridge_fixture()? else {
-            return Ok(());
+            return Err(agent_bridge_fixture_unavailable().into());
         };
         std::fs::write(&fixture.destination_path, b"foreign")?;
         let request = agent_bridge_request(&fixture)?;
@@ -6012,7 +6136,7 @@ mod tests {
     #[test]
     fn agent_bridge_staging_retry_rejects_foreign_bytes_and_absence() -> TestResult {
         let Some(fixture) = agent_bridge_fixture()? else {
-            return Ok(());
+            return Err(agent_bridge_fixture_unavailable().into());
         };
         let request = agent_bridge_request(&fixture)?;
         let prepared = match prepare_agent_bridge_stage(
@@ -6025,7 +6149,7 @@ mod tests {
             Ok(prepared) => prepared,
             Err(error) if security_fixture_unavailable(&error) => {
                 cleanup_agent_bridge_fixture(fixture);
-                return Ok(());
+                return Err(agent_bridge_fixture_unavailable().into());
             }
             Err(error) => return Err(error.into()),
         };
@@ -6056,7 +6180,7 @@ mod tests {
     #[test]
     fn agent_bridge_prepared_roundtrip_and_binding_substitution_are_rejected() -> TestResult {
         let Some(fixture) = agent_bridge_fixture()? else {
-            return Ok(());
+            return Err(agent_bridge_fixture_unavailable().into());
         };
         let request = agent_bridge_request(&fixture)?;
         let prepared = match prepare_agent_bridge_stage(
@@ -6069,7 +6193,7 @@ mod tests {
             Ok(prepared) => prepared,
             Err(error) if security_fixture_unavailable(&error) => {
                 cleanup_agent_bridge_fixture(fixture);
-                return Ok(());
+                return Err(agent_bridge_fixture_unavailable().into());
             }
             Err(error) => return Err(error.into()),
         };
@@ -6141,7 +6265,7 @@ mod tests {
     #[test]
     fn agent_bridge_prepared_reconcile_publishes_before_rename_recovery() -> TestResult {
         let Some(fixture) = agent_bridge_fixture()? else {
-            return Ok(());
+            return Err(agent_bridge_fixture_unavailable().into());
         };
         let request = agent_bridge_request(&fixture)?;
         let prepared = match prepare_agent_bridge_stage(
@@ -6154,7 +6278,7 @@ mod tests {
             Ok(prepared) => prepared,
             Err(error) if security_fixture_unavailable(&error) => {
                 cleanup_agent_bridge_fixture(fixture);
-                return Ok(());
+                return Err(agent_bridge_fixture_unavailable().into());
             }
             Err(error) => return Err(error.into()),
         };
@@ -6173,7 +6297,7 @@ mod tests {
     #[test]
     fn agent_bridge_prepared_response_loss_after_rename_reconciles_exactly() -> TestResult {
         let Some(fixture) = agent_bridge_fixture()? else {
-            return Ok(());
+            return Err(agent_bridge_fixture_unavailable().into());
         };
         let request = agent_bridge_request(&fixture)?;
         let prepared = match prepare_agent_bridge_stage(
@@ -6186,7 +6310,7 @@ mod tests {
             Ok(prepared) => prepared,
             Err(error) if security_fixture_unavailable(&error) => {
                 cleanup_agent_bridge_fixture(fixture);
-                return Ok(());
+                return Err(agent_bridge_fixture_unavailable().into());
             }
             Err(error) => return Err(error.into()),
         };
@@ -6201,7 +6325,7 @@ mod tests {
     #[test]
     fn agent_bridge_prepare_retry_uses_fresh_temp_without_adopting_orphan() -> TestResult {
         let Some(fixture) = agent_bridge_fixture()? else {
-            return Ok(());
+            return Err(agent_bridge_fixture_unavailable().into());
         };
         let request = agent_bridge_request(&fixture)?;
         let first = match prepare_agent_bridge_stage(
@@ -6214,7 +6338,7 @@ mod tests {
             Ok(prepared) => prepared,
             Err(error) if security_fixture_unavailable(&error) => {
                 cleanup_agent_bridge_fixture(fixture);
-                return Ok(());
+                return Err(agent_bridge_fixture_unavailable().into());
             }
             Err(error) => return Err(error.into()),
         };
@@ -6244,7 +6368,7 @@ mod tests {
     #[test]
     fn agent_bridge_prepared_foreign_temp_and_final_never_adopted() -> TestResult {
         let Some(fixture) = agent_bridge_fixture()? else {
-            return Ok(());
+            return Err(agent_bridge_fixture_unavailable().into());
         };
         let request = agent_bridge_request(&fixture)?;
         let prepared = match prepare_agent_bridge_stage(
@@ -6257,7 +6381,7 @@ mod tests {
             Ok(prepared) => prepared,
             Err(error) if security_fixture_unavailable(&error) => {
                 cleanup_agent_bridge_fixture(fixture);
-                return Ok(());
+                return Err(agent_bridge_fixture_unavailable().into());
             }
             Err(error) => return Err(error.into()),
         };
@@ -6281,7 +6405,7 @@ mod tests {
     #[test]
     fn agent_bridge_prepared_rejects_foreign_temp_shape() -> TestResult {
         let Some(fixture) = agent_bridge_fixture()? else {
-            return Ok(());
+            return Err(agent_bridge_fixture_unavailable().into());
         };
         let request = agent_bridge_request(&fixture)?;
         let prepared = match prepare_agent_bridge_stage(
@@ -6294,7 +6418,7 @@ mod tests {
             Ok(prepared) => prepared,
             Err(error) if security_fixture_unavailable(&error) => {
                 cleanup_agent_bridge_fixture(fixture);
-                return Ok(());
+                return Err(agent_bridge_fixture_unavailable().into());
             }
             Err(error) => return Err(error.into()),
         };

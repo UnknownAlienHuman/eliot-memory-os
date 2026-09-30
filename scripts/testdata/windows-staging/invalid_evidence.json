@@ -1,0 +1,1942 @@
+{
+  "schema": "eliot.windows-staging.invalid-evidence.v1",
+  "issue": 846,
+  "purpose": "Finite, inert negative source/run evidence fixtures for the #846 Agent Bridge package-staging acceptance predicates. Each fixture is a complete literal evidence record that the acceptance gate must reject for exactly one named reason. No fixture is a real run, and no fixture establishes any staging evidence.",
+  "inertness": {
+    "executes_code": false,
+    "spawns_processes": false,
+    "performs_io": false,
+    "opens_network": false,
+    "reads_clock": false,
+    "reads_ambient_environment": false,
+    "expands_placeholders": false,
+    "unbounded_generators": false,
+    "record_count": 26,
+    "note": "Every value in this file is a literal. There are no ranges, repeat counts, wildcards, templates, format strings or environment references to expand, so the record set is finite by construction. The file is data only; nothing here is executed, contacted or applied to a real environment."
+  },
+  "rejection_contract": {
+    "gate": "scripts.tests.test_windows_staging_acceptance.validate_source_run_evidence",
+    "accepted_proof_level": "package-test",
+    "note": "A fixture is valid test data only when the gate rejects it and names the documented reason. A synthetic rejection cannot satisfy any actual Windows staging case."
+  },
+  "fixtures": [
+    {
+      "id": "wrong-record-version",
+      "case": 33,
+      "expected_reason": "R-RECORD-VERSION",
+      "defect": "The record declares an evidence schema version this acceptance suite does not implement, so none of its field meanings can be trusted.",
+      "evidence": {
+        "record_version": "eliot.windows-staging.evidence.v0",
+        "issue": 846,
+        "scope": "package-staging-agent-bridge",
+        "source": {
+          "path": "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "blob_sha256": "c7b2183682fb830caf19201dca61eda400057d7fdc769be59e34f92a8400bd14",
+          "assignment_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        "environment": {
+          "os": "Windows",
+          "windows_build": "10.0.26100",
+          "runner": "controller-windows",
+          "toolchain": "rustc 1.90.0",
+          "elevated": true,
+          "privilege_facts_recorded": true,
+          "protected_program_data_contour": "C:\\ProgramData",
+          "protected_root_disposition": "available",
+          "fixture_setup_disposition": "ready",
+          "protected_root_lease_verified": true
+        },
+        "run": {
+          "filtered_invocation": "package_staging::tests::agent_bridge_",
+          "selected_tests": [
+            "agent_bridge_post_create_failures_clean_exact_temporary",
+            "agent_bridge_staging_success_receipts_are_serializable_and_read_back",
+            "agent_bridge_staging_rejects_source_substitution",
+            "agent_bridge_staging_rejects_destination_preexistence_without_overwrite",
+            "agent_bridge_staging_retry_rejects_foreign_bytes_and_absence",
+            "agent_bridge_prepared_roundtrip_and_binding_substitution_are_rejected",
+            "agent_bridge_prepared_reconcile_publishes_before_rename_recovery",
+            "agent_bridge_prepared_response_loss_after_rename_reconciles_exactly",
+            "agent_bridge_prepare_retry_uses_fresh_temp_without_adopting_orphan",
+            "agent_bridge_prepared_foreign_temp_and_final_never_adopted",
+            "agent_bridge_prepared_rejects_foreign_temp_shape"
+          ],
+          "selected_count": 11,
+          "fault_subcases": [
+            "AGENT_BRIDGE_FAIL_FINAL_PATH",
+            "AGENT_BRIDGE_FAIL_DESTINATION_EXISTS"
+          ],
+          "assertions_executed": 96,
+          "outcome": "passed",
+          "cleanup_status": "clean",
+          "unaccounted_residue": [],
+          "unrelated_failures": []
+        },
+        "privileged": {
+          "required": true,
+          "supported_environment": true,
+          "environment_owner": "#911",
+          "provenance": {
+            "windows_identity": "10.0.26100",
+            "runner": "controller-windows",
+            "elevation": "administrator",
+            "captured_by": "D-INT Windows topology owner"
+          }
+        },
+        "clippy": {
+          "broad_suppression": false
+        },
+        "proof_level": "package-test",
+        "changed_paths": [
+          "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "scripts/tests/test_windows_staging_acceptance.py",
+          "scripts/testdata/windows-staging/invalid_evidence.json"
+        ]
+      }
+    },
+    {
+      "id": "wrong-issue-record",
+      "case": 2,
+      "expected_reason": "R-ISSUE-MISMATCH",
+      "defect": "The record is filed under a different work-unit id than #846, so its reconciliation counts cannot answer the #846 denominator obligation.",
+      "evidence": {
+        "record_version": "eliot.windows-staging.evidence.v1",
+        "issue": 847,
+        "scope": "package-staging-agent-bridge",
+        "source": {
+          "path": "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "blob_sha256": "c7b2183682fb830caf19201dca61eda400057d7fdc769be59e34f92a8400bd14",
+          "assignment_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        "environment": {
+          "os": "Windows",
+          "windows_build": "10.0.26100",
+          "runner": "controller-windows",
+          "toolchain": "rustc 1.90.0",
+          "elevated": true,
+          "privilege_facts_recorded": true,
+          "protected_program_data_contour": "C:\\ProgramData",
+          "protected_root_disposition": "available",
+          "fixture_setup_disposition": "ready",
+          "protected_root_lease_verified": true
+        },
+        "run": {
+          "filtered_invocation": "package_staging::tests::agent_bridge_",
+          "selected_tests": [
+            "agent_bridge_post_create_failures_clean_exact_temporary",
+            "agent_bridge_staging_success_receipts_are_serializable_and_read_back",
+            "agent_bridge_staging_rejects_source_substitution",
+            "agent_bridge_staging_rejects_destination_preexistence_without_overwrite",
+            "agent_bridge_staging_retry_rejects_foreign_bytes_and_absence",
+            "agent_bridge_prepared_roundtrip_and_binding_substitution_are_rejected",
+            "agent_bridge_prepared_reconcile_publishes_before_rename_recovery",
+            "agent_bridge_prepared_response_loss_after_rename_reconciles_exactly",
+            "agent_bridge_prepare_retry_uses_fresh_temp_without_adopting_orphan",
+            "agent_bridge_prepared_foreign_temp_and_final_never_adopted",
+            "agent_bridge_prepared_rejects_foreign_temp_shape"
+          ],
+          "selected_count": 11,
+          "fault_subcases": [
+            "AGENT_BRIDGE_FAIL_FINAL_PATH",
+            "AGENT_BRIDGE_FAIL_DESTINATION_EXISTS"
+          ],
+          "assertions_executed": 96,
+          "outcome": "passed",
+          "cleanup_status": "clean",
+          "unaccounted_residue": [],
+          "unrelated_failures": []
+        },
+        "privileged": {
+          "required": true,
+          "supported_environment": true,
+          "environment_owner": "#911",
+          "provenance": {
+            "windows_identity": "10.0.26100",
+            "runner": "controller-windows",
+            "elevation": "administrator",
+            "captured_by": "D-INT Windows topology owner"
+          }
+        },
+        "clippy": {
+          "broad_suppression": false
+        },
+        "proof_level": "package-test",
+        "changed_paths": [
+          "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "scripts/tests/test_windows_staging_acceptance.py",
+          "scripts/testdata/windows-staging/invalid_evidence.json"
+        ]
+      }
+    },
+    {
+      "id": "unknown-source-path",
+      "case": 33,
+      "expected_reason": "R-SOURCE-PATH-UNKNOWN",
+      "defect": "The record binds its source proof to a path outside the #846 exclusive mutable scope, so the staging source it claims to describe is not the subject of this acceptance suite.",
+      "evidence": {
+        "record_version": "eliot.windows-staging.evidence.v1",
+        "issue": 846,
+        "scope": "package-staging-agent-bridge",
+        "source": {
+          "path": "crates/kernel/eliot-installation/src/approved_generation_registry.rs",
+          "blob_sha256": "c7b2183682fb830caf19201dca61eda400057d7fdc769be59e34f92a8400bd14",
+          "assignment_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        "environment": {
+          "os": "Windows",
+          "windows_build": "10.0.26100",
+          "runner": "controller-windows",
+          "toolchain": "rustc 1.90.0",
+          "elevated": true,
+          "privilege_facts_recorded": true,
+          "protected_program_data_contour": "C:\\ProgramData",
+          "protected_root_disposition": "available",
+          "fixture_setup_disposition": "ready",
+          "protected_root_lease_verified": true
+        },
+        "run": {
+          "filtered_invocation": "package_staging::tests::agent_bridge_",
+          "selected_tests": [
+            "agent_bridge_post_create_failures_clean_exact_temporary",
+            "agent_bridge_staging_success_receipts_are_serializable_and_read_back",
+            "agent_bridge_staging_rejects_source_substitution",
+            "agent_bridge_staging_rejects_destination_preexistence_without_overwrite",
+            "agent_bridge_staging_retry_rejects_foreign_bytes_and_absence",
+            "agent_bridge_prepared_roundtrip_and_binding_substitution_are_rejected",
+            "agent_bridge_prepared_reconcile_publishes_before_rename_recovery",
+            "agent_bridge_prepared_response_loss_after_rename_reconciles_exactly",
+            "agent_bridge_prepare_retry_uses_fresh_temp_without_adopting_orphan",
+            "agent_bridge_prepared_foreign_temp_and_final_never_adopted",
+            "agent_bridge_prepared_rejects_foreign_temp_shape"
+          ],
+          "selected_count": 11,
+          "fault_subcases": [
+            "AGENT_BRIDGE_FAIL_FINAL_PATH",
+            "AGENT_BRIDGE_FAIL_DESTINATION_EXISTS"
+          ],
+          "assertions_executed": 96,
+          "outcome": "passed",
+          "cleanup_status": "clean",
+          "unaccounted_residue": [],
+          "unrelated_failures": []
+        },
+        "privileged": {
+          "required": true,
+          "supported_environment": true,
+          "environment_owner": "#911",
+          "provenance": {
+            "windows_identity": "10.0.26100",
+            "runner": "controller-windows",
+            "elevation": "administrator",
+            "captured_by": "D-INT Windows topology owner"
+          }
+        },
+        "clippy": {
+          "broad_suppression": false
+        },
+        "proof_level": "package-test",
+        "changed_paths": [
+          "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "scripts/tests/test_windows_staging_acceptance.py",
+          "scripts/testdata/windows-staging/invalid_evidence.json"
+        ]
+      }
+    },
+    {
+      "id": "stale-source-digest",
+      "case": 33,
+      "expected_reason": "R-STALE-SOURCE-DIGEST",
+      "defect": "The recorded blob digest is the SHA-256 of empty input and therefore does not match the current package_staging.rs bytes; the evidence was produced against a different (or unrecorded) source revision.",
+      "evidence": {
+        "record_version": "eliot.windows-staging.evidence.v1",
+        "issue": 846,
+        "scope": "package-staging-agent-bridge",
+        "source": {
+          "path": "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "blob_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "assignment_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        "environment": {
+          "os": "Windows",
+          "windows_build": "10.0.26100",
+          "runner": "controller-windows",
+          "toolchain": "rustc 1.90.0",
+          "elevated": true,
+          "privilege_facts_recorded": true,
+          "protected_program_data_contour": "C:\\ProgramData",
+          "protected_root_disposition": "available",
+          "fixture_setup_disposition": "ready",
+          "protected_root_lease_verified": true
+        },
+        "run": {
+          "filtered_invocation": "package_staging::tests::agent_bridge_",
+          "selected_tests": [
+            "agent_bridge_post_create_failures_clean_exact_temporary",
+            "agent_bridge_staging_success_receipts_are_serializable_and_read_back",
+            "agent_bridge_staging_rejects_source_substitution",
+            "agent_bridge_staging_rejects_destination_preexistence_without_overwrite",
+            "agent_bridge_staging_retry_rejects_foreign_bytes_and_absence",
+            "agent_bridge_prepared_roundtrip_and_binding_substitution_are_rejected",
+            "agent_bridge_prepared_reconcile_publishes_before_rename_recovery",
+            "agent_bridge_prepared_response_loss_after_rename_reconciles_exactly",
+            "agent_bridge_prepare_retry_uses_fresh_temp_without_adopting_orphan",
+            "agent_bridge_prepared_foreign_temp_and_final_never_adopted",
+            "agent_bridge_prepared_rejects_foreign_temp_shape"
+          ],
+          "selected_count": 11,
+          "fault_subcases": [
+            "AGENT_BRIDGE_FAIL_FINAL_PATH",
+            "AGENT_BRIDGE_FAIL_DESTINATION_EXISTS"
+          ],
+          "assertions_executed": 96,
+          "outcome": "passed",
+          "cleanup_status": "clean",
+          "unaccounted_residue": [],
+          "unrelated_failures": []
+        },
+        "privileged": {
+          "required": true,
+          "supported_environment": true,
+          "environment_owner": "#911",
+          "provenance": {
+            "windows_identity": "10.0.26100",
+            "runner": "controller-windows",
+            "elevation": "administrator",
+            "captured_by": "D-INT Windows topology owner"
+          }
+        },
+        "clippy": {
+          "broad_suppression": false
+        },
+        "proof_level": "package-test",
+        "changed_paths": [
+          "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "scripts/tests/test_windows_staging_acceptance.py",
+          "scripts/testdata/windows-staging/invalid_evidence.json"
+        ]
+      }
+    },
+    {
+      "id": "zero-selected-tests",
+      "case": 35,
+      "expected_reason": "R-ZERO-SELECTED-TESTS",
+      "defect": "The run record selected zero Agent Bridge staging tests, so it establishes no staging evidence at all.",
+      "evidence": {
+        "record_version": "eliot.windows-staging.evidence.v1",
+        "issue": 846,
+        "scope": "package-staging-agent-bridge",
+        "source": {
+          "path": "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "blob_sha256": "c7b2183682fb830caf19201dca61eda400057d7fdc769be59e34f92a8400bd14",
+          "assignment_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        "environment": {
+          "os": "Windows",
+          "windows_build": "10.0.26100",
+          "runner": "controller-windows",
+          "toolchain": "rustc 1.90.0",
+          "elevated": true,
+          "privilege_facts_recorded": true,
+          "protected_program_data_contour": "C:\\ProgramData",
+          "protected_root_disposition": "available",
+          "fixture_setup_disposition": "ready",
+          "protected_root_lease_verified": true
+        },
+        "run": {
+          "filtered_invocation": "package_staging::tests::agent_bridge_",
+          "selected_tests": [],
+          "selected_count": 0,
+          "fault_subcases": [
+            "AGENT_BRIDGE_FAIL_FINAL_PATH",
+            "AGENT_BRIDGE_FAIL_DESTINATION_EXISTS"
+          ],
+          "assertions_executed": 96,
+          "outcome": "passed",
+          "cleanup_status": "clean",
+          "unaccounted_residue": [],
+          "unrelated_failures": []
+        },
+        "privileged": {
+          "required": true,
+          "supported_environment": true,
+          "environment_owner": "#911",
+          "provenance": {
+            "windows_identity": "10.0.26100",
+            "runner": "controller-windows",
+            "elevation": "administrator",
+            "captured_by": "D-INT Windows topology owner"
+          }
+        },
+        "clippy": {
+          "broad_suppression": false
+        },
+        "proof_level": "package-test",
+        "changed_paths": [
+          "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "scripts/tests/test_windows_staging_acceptance.py",
+          "scripts/testdata/windows-staging/invalid_evidence.json"
+        ]
+      }
+    },
+    {
+      "id": "forged-selection-denominator",
+      "case": 1,
+      "expected_reason": "R-FORGED-SELECTION",
+      "defect": "The run record claims a nine-test denominator that is not the eleven-function set the issue requires, so the recorded pass cannot reconcile the historical baseline.",
+      "evidence": {
+        "record_version": "eliot.windows-staging.evidence.v1",
+        "issue": 846,
+        "scope": "package-staging-agent-bridge",
+        "source": {
+          "path": "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "blob_sha256": "c7b2183682fb830caf19201dca61eda400057d7fdc769be59e34f92a8400bd14",
+          "assignment_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        "environment": {
+          "os": "Windows",
+          "windows_build": "10.0.26100",
+          "runner": "controller-windows",
+          "toolchain": "rustc 1.90.0",
+          "elevated": true,
+          "privilege_facts_recorded": true,
+          "protected_program_data_contour": "C:\\ProgramData",
+          "protected_root_disposition": "available",
+          "fixture_setup_disposition": "ready",
+          "protected_root_lease_verified": true
+        },
+        "run": {
+          "filtered_invocation": "package_staging::tests::agent_bridge_",
+          "selected_tests": [
+            "agent_bridge_post_create_failures_clean_exact_temporary",
+            "agent_bridge_staging_success_receipts_are_serializable_and_read_back",
+            "agent_bridge_staging_rejects_source_substitution",
+            "agent_bridge_staging_rejects_destination_preexistence_without_overwrite",
+            "agent_bridge_staging_retry_rejects_foreign_bytes_and_absence",
+            "agent_bridge_prepared_roundtrip_and_binding_substitution_are_rejected",
+            "agent_bridge_prepared_reconcile_publishes_before_rename_recovery",
+            "agent_bridge_prepared_response_loss_after_rename_reconciles_exactly",
+            "agent_bridge_prepare_retry_uses_fresh_temp_without_adopting_orphan"
+          ],
+          "selected_count": 9,
+          "fault_subcases": [
+            "AGENT_BRIDGE_FAIL_FINAL_PATH",
+            "AGENT_BRIDGE_FAIL_DESTINATION_EXISTS"
+          ],
+          "assertions_executed": 96,
+          "outcome": "passed",
+          "cleanup_status": "clean",
+          "unaccounted_residue": [],
+          "unrelated_failures": []
+        },
+        "privileged": {
+          "required": true,
+          "supported_environment": true,
+          "environment_owner": "#911",
+          "provenance": {
+            "windows_identity": "10.0.26100",
+            "runner": "controller-windows",
+            "elevation": "administrator",
+            "captured_by": "D-INT Windows topology owner"
+          }
+        },
+        "clippy": {
+          "broad_suppression": false
+        },
+        "proof_level": "package-test",
+        "changed_paths": [
+          "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "scripts/tests/test_windows_staging_acceptance.py",
+          "scripts/testdata/windows-staging/invalid_evidence.json"
+        ]
+      }
+    },
+    {
+      "id": "fault-subcase-not-exercised",
+      "case": 28,
+      "expected_reason": "R-SUBCASE-NOT-EXERCISED",
+      "defect": "The run record omits AGENT_BRIDGE_FAIL_DESTINATION_EXISTS, so one of the two separately asserted post-create fault subcases was never run even though the function count looks complete.",
+      "evidence": {
+        "record_version": "eliot.windows-staging.evidence.v1",
+        "issue": 846,
+        "scope": "package-staging-agent-bridge",
+        "source": {
+          "path": "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "blob_sha256": "c7b2183682fb830caf19201dca61eda400057d7fdc769be59e34f92a8400bd14",
+          "assignment_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        "environment": {
+          "os": "Windows",
+          "windows_build": "10.0.26100",
+          "runner": "controller-windows",
+          "toolchain": "rustc 1.90.0",
+          "elevated": true,
+          "privilege_facts_recorded": true,
+          "protected_program_data_contour": "C:\\ProgramData",
+          "protected_root_disposition": "available",
+          "fixture_setup_disposition": "ready",
+          "protected_root_lease_verified": true
+        },
+        "run": {
+          "filtered_invocation": "package_staging::tests::agent_bridge_",
+          "selected_tests": [
+            "agent_bridge_post_create_failures_clean_exact_temporary",
+            "agent_bridge_staging_success_receipts_are_serializable_and_read_back",
+            "agent_bridge_staging_rejects_source_substitution",
+            "agent_bridge_staging_rejects_destination_preexistence_without_overwrite",
+            "agent_bridge_staging_retry_rejects_foreign_bytes_and_absence",
+            "agent_bridge_prepared_roundtrip_and_binding_substitution_are_rejected",
+            "agent_bridge_prepared_reconcile_publishes_before_rename_recovery",
+            "agent_bridge_prepared_response_loss_after_rename_reconciles_exactly",
+            "agent_bridge_prepare_retry_uses_fresh_temp_without_adopting_orphan",
+            "agent_bridge_prepared_foreign_temp_and_final_never_adopted",
+            "agent_bridge_prepared_rejects_foreign_temp_shape"
+          ],
+          "selected_count": 11,
+          "fault_subcases": [
+            "AGENT_BRIDGE_FAIL_FINAL_PATH"
+          ],
+          "assertions_executed": 96,
+          "outcome": "passed",
+          "cleanup_status": "clean",
+          "unaccounted_residue": [],
+          "unrelated_failures": []
+        },
+        "privileged": {
+          "required": true,
+          "supported_environment": true,
+          "environment_owner": "#911",
+          "provenance": {
+            "windows_identity": "10.0.26100",
+            "runner": "controller-windows",
+            "elevation": "administrator",
+            "captured_by": "D-INT Windows topology owner"
+          }
+        },
+        "clippy": {
+          "broad_suppression": false
+        },
+        "proof_level": "package-test",
+        "changed_paths": [
+          "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "scripts/tests/test_windows_staging_acceptance.py",
+          "scripts/testdata/windows-staging/invalid_evidence.json"
+        ]
+      }
+    },
+    {
+      "id": "assertion-free-success",
+      "case": 11,
+      "expected_reason": "R-ASSERTION-FREE-SUCCESS",
+      "defect": "The run record reports passed with zero executed assertions, which is exactly the assertion-free success the issue forbids for an unavailable Agent Bridge fixture.",
+      "evidence": {
+        "record_version": "eliot.windows-staging.evidence.v1",
+        "issue": 846,
+        "scope": "package-staging-agent-bridge",
+        "source": {
+          "path": "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "blob_sha256": "c7b2183682fb830caf19201dca61eda400057d7fdc769be59e34f92a8400bd14",
+          "assignment_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        "environment": {
+          "os": "Windows",
+          "windows_build": "10.0.26100",
+          "runner": "controller-windows",
+          "toolchain": "rustc 1.90.0",
+          "elevated": true,
+          "privilege_facts_recorded": true,
+          "protected_program_data_contour": "C:\\ProgramData",
+          "protected_root_disposition": "available",
+          "fixture_setup_disposition": "ready",
+          "protected_root_lease_verified": true
+        },
+        "run": {
+          "filtered_invocation": "package_staging::tests::agent_bridge_",
+          "selected_tests": [
+            "agent_bridge_post_create_failures_clean_exact_temporary",
+            "agent_bridge_staging_success_receipts_are_serializable_and_read_back",
+            "agent_bridge_staging_rejects_source_substitution",
+            "agent_bridge_staging_rejects_destination_preexistence_without_overwrite",
+            "agent_bridge_staging_retry_rejects_foreign_bytes_and_absence",
+            "agent_bridge_prepared_roundtrip_and_binding_substitution_are_rejected",
+            "agent_bridge_prepared_reconcile_publishes_before_rename_recovery",
+            "agent_bridge_prepared_response_loss_after_rename_reconciles_exactly",
+            "agent_bridge_prepare_retry_uses_fresh_temp_without_adopting_orphan",
+            "agent_bridge_prepared_foreign_temp_and_final_never_adopted",
+            "agent_bridge_prepared_rejects_foreign_temp_shape"
+          ],
+          "selected_count": 11,
+          "fault_subcases": [
+            "AGENT_BRIDGE_FAIL_FINAL_PATH",
+            "AGENT_BRIDGE_FAIL_DESTINATION_EXISTS"
+          ],
+          "assertions_executed": 0,
+          "outcome": "passed",
+          "cleanup_status": "clean",
+          "unaccounted_residue": [],
+          "unrelated_failures": []
+        },
+        "privileged": {
+          "required": true,
+          "supported_environment": true,
+          "environment_owner": "#911",
+          "provenance": {
+            "windows_identity": "10.0.26100",
+            "runner": "controller-windows",
+            "elevation": "administrator",
+            "captured_by": "D-INT Windows topology owner"
+          }
+        },
+        "clippy": {
+          "broad_suppression": false
+        },
+        "proof_level": "package-test",
+        "changed_paths": [
+          "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "scripts/tests/test_windows_staging_acceptance.py",
+          "scripts/testdata/windows-staging/invalid_evidence.json"
+        ]
+      }
+    },
+    {
+      "id": "missing-environment-facts",
+      "case": 5,
+      "expected_reason": "R-MISSING-ENVIRONMENT-FACTS",
+      "defect": "The environment record does not record the privilege facts, so the reader cannot tell ready environment from missing privilege.",
+      "evidence": {
+        "record_version": "eliot.windows-staging.evidence.v1",
+        "issue": 846,
+        "scope": "package-staging-agent-bridge",
+        "source": {
+          "path": "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "blob_sha256": "c7b2183682fb830caf19201dca61eda400057d7fdc769be59e34f92a8400bd14",
+          "assignment_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        "environment": {
+          "os": "Windows",
+          "windows_build": "10.0.26100",
+          "runner": "controller-windows",
+          "toolchain": "rustc 1.90.0",
+          "elevated": true,
+          "privilege_facts_recorded": false,
+          "protected_program_data_contour": "C:\\ProgramData",
+          "protected_root_disposition": "available",
+          "fixture_setup_disposition": "ready",
+          "protected_root_lease_verified": true
+        },
+        "run": {
+          "filtered_invocation": "package_staging::tests::agent_bridge_",
+          "selected_tests": [
+            "agent_bridge_post_create_failures_clean_exact_temporary",
+            "agent_bridge_staging_success_receipts_are_serializable_and_read_back",
+            "agent_bridge_staging_rejects_source_substitution",
+            "agent_bridge_staging_rejects_destination_preexistence_without_overwrite",
+            "agent_bridge_staging_retry_rejects_foreign_bytes_and_absence",
+            "agent_bridge_prepared_roundtrip_and_binding_substitution_are_rejected",
+            "agent_bridge_prepared_reconcile_publishes_before_rename_recovery",
+            "agent_bridge_prepared_response_loss_after_rename_reconciles_exactly",
+            "agent_bridge_prepare_retry_uses_fresh_temp_without_adopting_orphan",
+            "agent_bridge_prepared_foreign_temp_and_final_never_adopted",
+            "agent_bridge_prepared_rejects_foreign_temp_shape"
+          ],
+          "selected_count": 11,
+          "fault_subcases": [
+            "AGENT_BRIDGE_FAIL_FINAL_PATH",
+            "AGENT_BRIDGE_FAIL_DESTINATION_EXISTS"
+          ],
+          "assertions_executed": 96,
+          "outcome": "passed",
+          "cleanup_status": "clean",
+          "unaccounted_residue": [],
+          "unrelated_failures": []
+        },
+        "privileged": {
+          "required": true,
+          "supported_environment": true,
+          "environment_owner": "#911",
+          "provenance": {
+            "windows_identity": "10.0.26100",
+            "runner": "controller-windows",
+            "elevation": "administrator",
+            "captured_by": "D-INT Windows topology owner"
+          }
+        },
+        "clippy": {
+          "broad_suppression": false
+        },
+        "proof_level": "package-test",
+        "changed_paths": [
+          "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "scripts/tests/test_windows_staging_acceptance.py",
+          "scripts/testdata/windows-staging/invalid_evidence.json"
+        ]
+      }
+    },
+    {
+      "id": "privileged-unsupported-environment",
+      "case": 14,
+      "expected_reason": "R-UNSUPPORTED-ENVIRONMENT-AS-EVIDENCE",
+      "defect": "The privileged staging cases are marked required while the record simultaneously reports that no supported environment provided them; missing setup must stay incomplete, never a simulated pass.",
+      "evidence": {
+        "record_version": "eliot.windows-staging.evidence.v1",
+        "issue": 846,
+        "scope": "package-staging-agent-bridge",
+        "source": {
+          "path": "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "blob_sha256": "c7b2183682fb830caf19201dca61eda400057d7fdc769be59e34f92a8400bd14",
+          "assignment_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        "environment": {
+          "os": "Windows",
+          "windows_build": "10.0.26100",
+          "runner": "controller-windows",
+          "toolchain": "rustc 1.90.0",
+          "elevated": true,
+          "privilege_facts_recorded": true,
+          "protected_program_data_contour": "C:\\ProgramData",
+          "protected_root_disposition": "available",
+          "fixture_setup_disposition": "ready",
+          "protected_root_lease_verified": true
+        },
+        "run": {
+          "filtered_invocation": "package_staging::tests::agent_bridge_",
+          "selected_tests": [
+            "agent_bridge_post_create_failures_clean_exact_temporary",
+            "agent_bridge_staging_success_receipts_are_serializable_and_read_back",
+            "agent_bridge_staging_rejects_source_substitution",
+            "agent_bridge_staging_rejects_destination_preexistence_without_overwrite",
+            "agent_bridge_staging_retry_rejects_foreign_bytes_and_absence",
+            "agent_bridge_prepared_roundtrip_and_binding_substitution_are_rejected",
+            "agent_bridge_prepared_reconcile_publishes_before_rename_recovery",
+            "agent_bridge_prepared_response_loss_after_rename_reconciles_exactly",
+            "agent_bridge_prepare_retry_uses_fresh_temp_without_adopting_orphan",
+            "agent_bridge_prepared_foreign_temp_and_final_never_adopted",
+            "agent_bridge_prepared_rejects_foreign_temp_shape"
+          ],
+          "selected_count": 11,
+          "fault_subcases": [
+            "AGENT_BRIDGE_FAIL_FINAL_PATH",
+            "AGENT_BRIDGE_FAIL_DESTINATION_EXISTS"
+          ],
+          "assertions_executed": 96,
+          "outcome": "passed",
+          "cleanup_status": "clean",
+          "unaccounted_residue": [],
+          "unrelated_failures": []
+        },
+        "privileged": {
+          "required": true,
+          "supported_environment": false,
+          "environment_owner": "#911",
+          "provenance": {
+            "windows_identity": "10.0.26100",
+            "runner": "controller-windows",
+            "elevation": "administrator",
+            "captured_by": "D-INT Windows topology owner"
+          }
+        },
+        "clippy": {
+          "broad_suppression": false
+        },
+        "proof_level": "package-test",
+        "changed_paths": [
+          "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "scripts/tests/test_windows_staging_acceptance.py",
+          "scripts/testdata/windows-staging/invalid_evidence.json"
+        ]
+      }
+    },
+    {
+      "id": "privileged-owner-missing",
+      "case": 12,
+      "expected_reason": "R-ENVIRONMENT-OWNER-MISSING",
+      "defect": "The privileged case names no D-INT environment owner, so an irreducibly privileged scenario has no exact accountable owner.",
+      "evidence": {
+        "record_version": "eliot.windows-staging.evidence.v1",
+        "issue": 846,
+        "scope": "package-staging-agent-bridge",
+        "source": {
+          "path": "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "blob_sha256": "c7b2183682fb830caf19201dca61eda400057d7fdc769be59e34f92a8400bd14",
+          "assignment_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        "environment": {
+          "os": "Windows",
+          "windows_build": "10.0.26100",
+          "runner": "controller-windows",
+          "toolchain": "rustc 1.90.0",
+          "elevated": true,
+          "privilege_facts_recorded": true,
+          "protected_program_data_contour": "C:\\ProgramData",
+          "protected_root_disposition": "available",
+          "fixture_setup_disposition": "ready",
+          "protected_root_lease_verified": true
+        },
+        "run": {
+          "filtered_invocation": "package_staging::tests::agent_bridge_",
+          "selected_tests": [
+            "agent_bridge_post_create_failures_clean_exact_temporary",
+            "agent_bridge_staging_success_receipts_are_serializable_and_read_back",
+            "agent_bridge_staging_rejects_source_substitution",
+            "agent_bridge_staging_rejects_destination_preexistence_without_overwrite",
+            "agent_bridge_staging_retry_rejects_foreign_bytes_and_absence",
+            "agent_bridge_prepared_roundtrip_and_binding_substitution_are_rejected",
+            "agent_bridge_prepared_reconcile_publishes_before_rename_recovery",
+            "agent_bridge_prepared_response_loss_after_rename_reconciles_exactly",
+            "agent_bridge_prepare_retry_uses_fresh_temp_without_adopting_orphan",
+            "agent_bridge_prepared_foreign_temp_and_final_never_adopted",
+            "agent_bridge_prepared_rejects_foreign_temp_shape"
+          ],
+          "selected_count": 11,
+          "fault_subcases": [
+            "AGENT_BRIDGE_FAIL_FINAL_PATH",
+            "AGENT_BRIDGE_FAIL_DESTINATION_EXISTS"
+          ],
+          "assertions_executed": 96,
+          "outcome": "passed",
+          "cleanup_status": "clean",
+          "unaccounted_residue": [],
+          "unrelated_failures": []
+        },
+        "privileged": {
+          "required": true,
+          "supported_environment": true,
+          "environment_owner": null,
+          "provenance": {
+            "windows_identity": "10.0.26100",
+            "runner": "controller-windows",
+            "elevation": "administrator",
+            "captured_by": "D-INT Windows topology owner"
+          }
+        },
+        "clippy": {
+          "broad_suppression": false
+        },
+        "proof_level": "package-test",
+        "changed_paths": [
+          "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "scripts/tests/test_windows_staging_acceptance.py",
+          "scripts/testdata/windows-staging/invalid_evidence.json"
+        ]
+      }
+    },
+    {
+      "id": "privileged-owner-unknown",
+      "case": 12,
+      "expected_reason": "R-ENVIRONMENT-OWNER-UNKNOWN",
+      "defect": "The privileged case names an owner outside the documented D-INT environment ownership set, so the scenario has no exact owner.",
+      "evidence": {
+        "record_version": "eliot.windows-staging.evidence.v1",
+        "issue": 846,
+        "scope": "package-staging-agent-bridge",
+        "source": {
+          "path": "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "blob_sha256": "c7b2183682fb830caf19201dca61eda400057d7fdc769be59e34f92a8400bd14",
+          "assignment_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        "environment": {
+          "os": "Windows",
+          "windows_build": "10.0.26100",
+          "runner": "controller-windows",
+          "toolchain": "rustc 1.90.0",
+          "elevated": true,
+          "privilege_facts_recorded": true,
+          "protected_program_data_contour": "C:\\ProgramData",
+          "protected_root_disposition": "available",
+          "fixture_setup_disposition": "ready",
+          "protected_root_lease_verified": true
+        },
+        "run": {
+          "filtered_invocation": "package_staging::tests::agent_bridge_",
+          "selected_tests": [
+            "agent_bridge_post_create_failures_clean_exact_temporary",
+            "agent_bridge_staging_success_receipts_are_serializable_and_read_back",
+            "agent_bridge_staging_rejects_source_substitution",
+            "agent_bridge_staging_rejects_destination_preexistence_without_overwrite",
+            "agent_bridge_staging_retry_rejects_foreign_bytes_and_absence",
+            "agent_bridge_prepared_roundtrip_and_binding_substitution_are_rejected",
+            "agent_bridge_prepared_reconcile_publishes_before_rename_recovery",
+            "agent_bridge_prepared_response_loss_after_rename_reconciles_exactly",
+            "agent_bridge_prepare_retry_uses_fresh_temp_without_adopting_orphan",
+            "agent_bridge_prepared_foreign_temp_and_final_never_adopted",
+            "agent_bridge_prepared_rejects_foreign_temp_shape"
+          ],
+          "selected_count": 11,
+          "fault_subcases": [
+            "AGENT_BRIDGE_FAIL_FINAL_PATH",
+            "AGENT_BRIDGE_FAIL_DESTINATION_EXISTS"
+          ],
+          "assertions_executed": 96,
+          "outcome": "passed",
+          "cleanup_status": "clean",
+          "unaccounted_residue": [],
+          "unrelated_failures": []
+        },
+        "privileged": {
+          "required": true,
+          "supported_environment": true,
+          "environment_owner": "#8",
+          "provenance": {
+            "windows_identity": "10.0.26100",
+            "runner": "controller-windows",
+            "elevation": "administrator",
+            "captured_by": "D-INT Windows topology owner"
+          }
+        },
+        "clippy": {
+          "broad_suppression": false
+        },
+        "proof_level": "package-test",
+        "changed_paths": [
+          "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "scripts/tests/test_windows_staging_acceptance.py",
+          "scripts/testdata/windows-staging/invalid_evidence.json"
+        ]
+      }
+    },
+    {
+      "id": "privileged-provenance-missing",
+      "case": 36,
+      "expected_reason": "R-PROVENANCE-MISSING",
+      "defect": "The privileged run carries no Windows identity, runner or elevation provenance, so it cannot be an actual current privileged run.",
+      "evidence": {
+        "record_version": "eliot.windows-staging.evidence.v1",
+        "issue": 846,
+        "scope": "package-staging-agent-bridge",
+        "source": {
+          "path": "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "blob_sha256": "c7b2183682fb830caf19201dca61eda400057d7fdc769be59e34f92a8400bd14",
+          "assignment_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        "environment": {
+          "os": "Windows",
+          "windows_build": "10.0.26100",
+          "runner": "controller-windows",
+          "toolchain": "rustc 1.90.0",
+          "elevated": true,
+          "privilege_facts_recorded": true,
+          "protected_program_data_contour": "C:\\ProgramData",
+          "protected_root_disposition": "available",
+          "fixture_setup_disposition": "ready",
+          "protected_root_lease_verified": true
+        },
+        "run": {
+          "filtered_invocation": "package_staging::tests::agent_bridge_",
+          "selected_tests": [
+            "agent_bridge_post_create_failures_clean_exact_temporary",
+            "agent_bridge_staging_success_receipts_are_serializable_and_read_back",
+            "agent_bridge_staging_rejects_source_substitution",
+            "agent_bridge_staging_rejects_destination_preexistence_without_overwrite",
+            "agent_bridge_staging_retry_rejects_foreign_bytes_and_absence",
+            "agent_bridge_prepared_roundtrip_and_binding_substitution_are_rejected",
+            "agent_bridge_prepared_reconcile_publishes_before_rename_recovery",
+            "agent_bridge_prepared_response_loss_after_rename_reconciles_exactly",
+            "agent_bridge_prepare_retry_uses_fresh_temp_without_adopting_orphan",
+            "agent_bridge_prepared_foreign_temp_and_final_never_adopted",
+            "agent_bridge_prepared_rejects_foreign_temp_shape"
+          ],
+          "selected_count": 11,
+          "fault_subcases": [
+            "AGENT_BRIDGE_FAIL_FINAL_PATH",
+            "AGENT_BRIDGE_FAIL_DESTINATION_EXISTS"
+          ],
+          "assertions_executed": 96,
+          "outcome": "passed",
+          "cleanup_status": "clean",
+          "unaccounted_residue": [],
+          "unrelated_failures": []
+        },
+        "privileged": {
+          "required": true,
+          "supported_environment": true,
+          "environment_owner": "#911",
+          "provenance": {}
+        },
+        "clippy": {
+          "broad_suppression": false
+        },
+        "proof_level": "package-test",
+        "changed_paths": [
+          "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "scripts/tests/test_windows_staging_acceptance.py",
+          "scripts/testdata/windows-staging/invalid_evidence.json"
+        ]
+      }
+    },
+    {
+      "id": "cleanup-failure-as-success",
+      "case": 10,
+      "expected_reason": "R-CLEANUP-FAILED",
+      "defect": "Cleanup failed while the record still reports passed, which would turn a cleanup failure into an environment-unavailable success.",
+      "evidence": {
+        "record_version": "eliot.windows-staging.evidence.v1",
+        "issue": 846,
+        "scope": "package-staging-agent-bridge",
+        "source": {
+          "path": "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "blob_sha256": "c7b2183682fb830caf19201dca61eda400057d7fdc769be59e34f92a8400bd14",
+          "assignment_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        "environment": {
+          "os": "Windows",
+          "windows_build": "10.0.26100",
+          "runner": "controller-windows",
+          "toolchain": "rustc 1.90.0",
+          "elevated": true,
+          "privilege_facts_recorded": true,
+          "protected_program_data_contour": "C:\\ProgramData",
+          "protected_root_disposition": "available",
+          "fixture_setup_disposition": "ready",
+          "protected_root_lease_verified": true
+        },
+        "run": {
+          "filtered_invocation": "package_staging::tests::agent_bridge_",
+          "selected_tests": [
+            "agent_bridge_post_create_failures_clean_exact_temporary",
+            "agent_bridge_staging_success_receipts_are_serializable_and_read_back",
+            "agent_bridge_staging_rejects_source_substitution",
+            "agent_bridge_staging_rejects_destination_preexistence_without_overwrite",
+            "agent_bridge_staging_retry_rejects_foreign_bytes_and_absence",
+            "agent_bridge_prepared_roundtrip_and_binding_substitution_are_rejected",
+            "agent_bridge_prepared_reconcile_publishes_before_rename_recovery",
+            "agent_bridge_prepared_response_loss_after_rename_reconciles_exactly",
+            "agent_bridge_prepare_retry_uses_fresh_temp_without_adopting_orphan",
+            "agent_bridge_prepared_foreign_temp_and_final_never_adopted",
+            "agent_bridge_prepared_rejects_foreign_temp_shape"
+          ],
+          "selected_count": 11,
+          "fault_subcases": [
+            "AGENT_BRIDGE_FAIL_FINAL_PATH",
+            "AGENT_BRIDGE_FAIL_DESTINATION_EXISTS"
+          ],
+          "assertions_executed": 96,
+          "outcome": "passed",
+          "cleanup_status": "failed",
+          "unaccounted_residue": [],
+          "unrelated_failures": []
+        },
+        "privileged": {
+          "required": true,
+          "supported_environment": true,
+          "environment_owner": "#911",
+          "provenance": {
+            "windows_identity": "10.0.26100",
+            "runner": "controller-windows",
+            "elevation": "administrator",
+            "captured_by": "D-INT Windows topology owner"
+          }
+        },
+        "clippy": {
+          "broad_suppression": false
+        },
+        "proof_level": "package-test",
+        "changed_paths": [
+          "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "scripts/tests/test_windows_staging_acceptance.py",
+          "scripts/testdata/windows-staging/invalid_evidence.json"
+        ]
+      }
+    },
+    {
+      "id": "cleanup-unknown-as-success",
+      "case": 32,
+      "expected_reason": "R-CLEANUP-UNKNOWN",
+      "defect": "Cleanup disposition is unknown, so the record cannot be a passing staging result; unknown external effect is not success.",
+      "evidence": {
+        "record_version": "eliot.windows-staging.evidence.v1",
+        "issue": 846,
+        "scope": "package-staging-agent-bridge",
+        "source": {
+          "path": "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "blob_sha256": "c7b2183682fb830caf19201dca61eda400057d7fdc769be59e34f92a8400bd14",
+          "assignment_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        "environment": {
+          "os": "Windows",
+          "windows_build": "10.0.26100",
+          "runner": "controller-windows",
+          "toolchain": "rustc 1.90.0",
+          "elevated": true,
+          "privilege_facts_recorded": true,
+          "protected_program_data_contour": "C:\\ProgramData",
+          "protected_root_disposition": "available",
+          "fixture_setup_disposition": "ready",
+          "protected_root_lease_verified": true
+        },
+        "run": {
+          "filtered_invocation": "package_staging::tests::agent_bridge_",
+          "selected_tests": [
+            "agent_bridge_post_create_failures_clean_exact_temporary",
+            "agent_bridge_staging_success_receipts_are_serializable_and_read_back",
+            "agent_bridge_staging_rejects_source_substitution",
+            "agent_bridge_staging_rejects_destination_preexistence_without_overwrite",
+            "agent_bridge_staging_retry_rejects_foreign_bytes_and_absence",
+            "agent_bridge_prepared_roundtrip_and_binding_substitution_are_rejected",
+            "agent_bridge_prepared_reconcile_publishes_before_rename_recovery",
+            "agent_bridge_prepared_response_loss_after_rename_reconciles_exactly",
+            "agent_bridge_prepare_retry_uses_fresh_temp_without_adopting_orphan",
+            "agent_bridge_prepared_foreign_temp_and_final_never_adopted",
+            "agent_bridge_prepared_rejects_foreign_temp_shape"
+          ],
+          "selected_count": 11,
+          "fault_subcases": [
+            "AGENT_BRIDGE_FAIL_FINAL_PATH",
+            "AGENT_BRIDGE_FAIL_DESTINATION_EXISTS"
+          ],
+          "assertions_executed": 96,
+          "outcome": "passed",
+          "cleanup_status": "unknown",
+          "unaccounted_residue": [],
+          "unrelated_failures": []
+        },
+        "privileged": {
+          "required": true,
+          "supported_environment": true,
+          "environment_owner": "#911",
+          "provenance": {
+            "windows_identity": "10.0.26100",
+            "runner": "controller-windows",
+            "elevation": "administrator",
+            "captured_by": "D-INT Windows topology owner"
+          }
+        },
+        "clippy": {
+          "broad_suppression": false
+        },
+        "proof_level": "package-test",
+        "changed_paths": [
+          "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "scripts/tests/test_windows_staging_acceptance.py",
+          "scripts/testdata/windows-staging/invalid_evidence.json"
+        ]
+      }
+    },
+    {
+      "id": "unaccounted-fixture-residue",
+      "case": 31,
+      "expected_reason": "R-UNACCOUNTED-RESIDUE",
+      "defect": "The record leaves a fixture-owned temporary directory behind and still reports passed, so owned fixture objects were not cleaned.",
+      "evidence": {
+        "record_version": "eliot.windows-staging.evidence.v1",
+        "issue": 846,
+        "scope": "package-staging-agent-bridge",
+        "source": {
+          "path": "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "blob_sha256": "c7b2183682fb830caf19201dca61eda400057d7fdc769be59e34f92a8400bd14",
+          "assignment_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        "environment": {
+          "os": "Windows",
+          "windows_build": "10.0.26100",
+          "runner": "controller-windows",
+          "toolchain": "rustc 1.90.0",
+          "elevated": true,
+          "privilege_facts_recorded": true,
+          "protected_program_data_contour": "C:\\ProgramData",
+          "protected_root_disposition": "available",
+          "fixture_setup_disposition": "ready",
+          "protected_root_lease_verified": true
+        },
+        "run": {
+          "filtered_invocation": "package_staging::tests::agent_bridge_",
+          "selected_tests": [
+            "agent_bridge_post_create_failures_clean_exact_temporary",
+            "agent_bridge_staging_success_receipts_are_serializable_and_read_back",
+            "agent_bridge_staging_rejects_source_substitution",
+            "agent_bridge_staging_rejects_destination_preexistence_without_overwrite",
+            "agent_bridge_staging_retry_rejects_foreign_bytes_and_absence",
+            "agent_bridge_prepared_roundtrip_and_binding_substitution_are_rejected",
+            "agent_bridge_prepared_reconcile_publishes_before_rename_recovery",
+            "agent_bridge_prepared_response_loss_after_rename_reconciles_exactly",
+            "agent_bridge_prepare_retry_uses_fresh_temp_without_adopting_orphan",
+            "agent_bridge_prepared_foreign_temp_and_final_never_adopted",
+            "agent_bridge_prepared_rejects_foreign_temp_shape"
+          ],
+          "selected_count": 11,
+          "fault_subcases": [
+            "AGENT_BRIDGE_FAIL_FINAL_PATH",
+            "AGENT_BRIDGE_FAIL_DESTINATION_EXISTS"
+          ],
+          "assertions_executed": 96,
+          "outcome": "passed",
+          "cleanup_status": "clean",
+          "unaccounted_residue": [
+            {
+              "path": "C:\\ProgramData\\eliot-agent-bridge-stage-1-2-3",
+              "owner": "fixture",
+              "removed": false
+            }
+          ],
+          "unrelated_failures": []
+        },
+        "privileged": {
+          "required": true,
+          "supported_environment": true,
+          "environment_owner": "#911",
+          "provenance": {
+            "windows_identity": "10.0.26100",
+            "runner": "controller-windows",
+            "elevation": "administrator",
+            "captured_by": "D-INT Windows topology owner"
+          }
+        },
+        "clippy": {
+          "broad_suppression": false
+        },
+        "proof_level": "package-test",
+        "changed_paths": [
+          "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "scripts/tests/test_windows_staging_acceptance.py",
+          "scripts/testdata/windows-staging/invalid_evidence.json"
+        ]
+      }
+    },
+    {
+      "id": "foreign-residue-claimed-as-owned",
+      "case": 30,
+      "expected_reason": "R-FOREIGN-RESIDUE-CLAIMED",
+      "defect": "The record claims an unrelated parent object as fixture-owned cleanup, which would authorise deleting an object the fixture never owned.",
+      "evidence": {
+        "record_version": "eliot.windows-staging.evidence.v1",
+        "issue": 846,
+        "scope": "package-staging-agent-bridge",
+        "source": {
+          "path": "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "blob_sha256": "c7b2183682fb830caf19201dca61eda400057d7fdc769be59e34f92a8400bd14",
+          "assignment_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        "environment": {
+          "os": "Windows",
+          "windows_build": "10.0.26100",
+          "runner": "controller-windows",
+          "toolchain": "rustc 1.90.0",
+          "elevated": true,
+          "privilege_facts_recorded": true,
+          "protected_program_data_contour": "C:\\ProgramData",
+          "protected_root_disposition": "available",
+          "fixture_setup_disposition": "ready",
+          "protected_root_lease_verified": true
+        },
+        "run": {
+          "filtered_invocation": "package_staging::tests::agent_bridge_",
+          "selected_tests": [
+            "agent_bridge_post_create_failures_clean_exact_temporary",
+            "agent_bridge_staging_success_receipts_are_serializable_and_read_back",
+            "agent_bridge_staging_rejects_source_substitution",
+            "agent_bridge_staging_rejects_destination_preexistence_without_overwrite",
+            "agent_bridge_staging_retry_rejects_foreign_bytes_and_absence",
+            "agent_bridge_prepared_roundtrip_and_binding_substitution_are_rejected",
+            "agent_bridge_prepared_reconcile_publishes_before_rename_recovery",
+            "agent_bridge_prepared_response_loss_after_rename_reconciles_exactly",
+            "agent_bridge_prepare_retry_uses_fresh_temp_without_adopting_orphan",
+            "agent_bridge_prepared_foreign_temp_and_final_never_adopted",
+            "agent_bridge_prepared_rejects_foreign_temp_shape"
+          ],
+          "selected_count": 11,
+          "fault_subcases": [
+            "AGENT_BRIDGE_FAIL_FINAL_PATH",
+            "AGENT_BRIDGE_FAIL_DESTINATION_EXISTS"
+          ],
+          "assertions_executed": 96,
+          "outcome": "passed",
+          "cleanup_status": "clean",
+          "unaccounted_residue": [
+            {
+              "path": "C:\\ProgramData\\shared-generation",
+              "owner": "unrelated",
+              "removed": false
+            }
+          ],
+          "unrelated_failures": []
+        },
+        "privileged": {
+          "required": true,
+          "supported_environment": true,
+          "environment_owner": "#911",
+          "provenance": {
+            "windows_identity": "10.0.26100",
+            "runner": "controller-windows",
+            "elevation": "administrator",
+            "captured_by": "D-INT Windows topology owner"
+          }
+        },
+        "clippy": {
+          "broad_suppression": false
+        },
+        "proof_level": "package-test",
+        "changed_paths": [
+          "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "scripts/tests/test_windows_staging_acceptance.py",
+          "scripts/testdata/windows-staging/invalid_evidence.json"
+        ]
+      }
+    },
+    {
+      "id": "protected-root-substituted",
+      "case": 6,
+      "expected_reason": "R-PROTECTED-ROOT-SUBSTITUTED",
+      "defect": "The protected ProgramData contour is replaced by an arbitrary writable temp root, which substitutes the protected installation contour and is never valid OS ACL evidence.",
+      "evidence": {
+        "record_version": "eliot.windows-staging.evidence.v1",
+        "issue": 846,
+        "scope": "package-staging-agent-bridge",
+        "source": {
+          "path": "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "blob_sha256": "c7b2183682fb830caf19201dca61eda400057d7fdc769be59e34f92a8400bd14",
+          "assignment_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        "environment": {
+          "os": "Windows",
+          "windows_build": "10.0.26100",
+          "runner": "controller-windows",
+          "toolchain": "rustc 1.90.0",
+          "elevated": true,
+          "privilege_facts_recorded": true,
+          "protected_program_data_contour": "C:\\Users\\runner\\AppData\\Local\\Temp",
+          "protected_root_disposition": "available",
+          "fixture_setup_disposition": "ready",
+          "protected_root_lease_verified": true
+        },
+        "run": {
+          "filtered_invocation": "package_staging::tests::agent_bridge_",
+          "selected_tests": [
+            "agent_bridge_post_create_failures_clean_exact_temporary",
+            "agent_bridge_staging_success_receipts_are_serializable_and_read_back",
+            "agent_bridge_staging_rejects_source_substitution",
+            "agent_bridge_staging_rejects_destination_preexistence_without_overwrite",
+            "agent_bridge_staging_retry_rejects_foreign_bytes_and_absence",
+            "agent_bridge_prepared_roundtrip_and_binding_substitution_are_rejected",
+            "agent_bridge_prepared_reconcile_publishes_before_rename_recovery",
+            "agent_bridge_prepared_response_loss_after_rename_reconciles_exactly",
+            "agent_bridge_prepare_retry_uses_fresh_temp_without_adopting_orphan",
+            "agent_bridge_prepared_foreign_temp_and_final_never_adopted",
+            "agent_bridge_prepared_rejects_foreign_temp_shape"
+          ],
+          "selected_count": 11,
+          "fault_subcases": [
+            "AGENT_BRIDGE_FAIL_FINAL_PATH",
+            "AGENT_BRIDGE_FAIL_DESTINATION_EXISTS"
+          ],
+          "assertions_executed": 96,
+          "outcome": "passed",
+          "cleanup_status": "clean",
+          "unaccounted_residue": [],
+          "unrelated_failures": []
+        },
+        "privileged": {
+          "required": true,
+          "supported_environment": true,
+          "environment_owner": "#911",
+          "provenance": {
+            "windows_identity": "10.0.26100",
+            "runner": "controller-windows",
+            "elevation": "administrator",
+            "captured_by": "D-INT Windows topology owner"
+          }
+        },
+        "clippy": {
+          "broad_suppression": false
+        },
+        "proof_level": "package-test",
+        "changed_paths": [
+          "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "scripts/tests/test_windows_staging_acceptance.py",
+          "scripts/testdata/windows-staging/invalid_evidence.json"
+        ]
+      }
+    },
+    {
+      "id": "fixture-setup-silently-unavailable",
+      "case": 9,
+      "expected_reason": "R-FIXTURE-SETUP-SILENTLY-UNAVAILABLE",
+      "defect": "The fixture setup is recorded as an unsupported/privateless disposition while the record still reports passed, which is the unavailable-then-Ok path the issue forbids.",
+      "evidence": {
+        "record_version": "eliot.windows-staging.evidence.v1",
+        "issue": 846,
+        "scope": "package-staging-agent-bridge",
+        "source": {
+          "path": "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "blob_sha256": "c7b2183682fb830caf19201dca61eda400057d7fdc769be59e34f92a8400bd14",
+          "assignment_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        "environment": {
+          "os": "Windows",
+          "windows_build": "10.0.26100",
+          "runner": "controller-windows",
+          "toolchain": "rustc 1.90.0",
+          "elevated": true,
+          "privilege_facts_recorded": true,
+          "protected_program_data_contour": "C:\\ProgramData",
+          "protected_root_disposition": "available",
+          "fixture_setup_disposition": "unsupported-privilege",
+          "protected_root_lease_verified": true
+        },
+        "run": {
+          "filtered_invocation": "package_staging::tests::agent_bridge_",
+          "selected_tests": [
+            "agent_bridge_post_create_failures_clean_exact_temporary",
+            "agent_bridge_staging_success_receipts_are_serializable_and_read_back",
+            "agent_bridge_staging_rejects_source_substitution",
+            "agent_bridge_staging_rejects_destination_preexistence_without_overwrite",
+            "agent_bridge_staging_retry_rejects_foreign_bytes_and_absence",
+            "agent_bridge_prepared_roundtrip_and_binding_substitution_are_rejected",
+            "agent_bridge_prepared_reconcile_publishes_before_rename_recovery",
+            "agent_bridge_prepared_response_loss_after_rename_reconciles_exactly",
+            "agent_bridge_prepare_retry_uses_fresh_temp_without_adopting_orphan",
+            "agent_bridge_prepared_foreign_temp_and_final_never_adopted",
+            "agent_bridge_prepared_rejects_foreign_temp_shape"
+          ],
+          "selected_count": 11,
+          "fault_subcases": [
+            "AGENT_BRIDGE_FAIL_FINAL_PATH",
+            "AGENT_BRIDGE_FAIL_DESTINATION_EXISTS"
+          ],
+          "assertions_executed": 96,
+          "outcome": "passed",
+          "cleanup_status": "clean",
+          "unaccounted_residue": [],
+          "unrelated_failures": []
+        },
+        "privileged": {
+          "required": true,
+          "supported_environment": true,
+          "environment_owner": "#911",
+          "provenance": {
+            "windows_identity": "10.0.26100",
+            "runner": "controller-windows",
+            "elevation": "administrator",
+            "captured_by": "D-INT Windows topology owner"
+          }
+        },
+        "clippy": {
+          "broad_suppression": false
+        },
+        "proof_level": "package-test",
+        "changed_paths": [
+          "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "scripts/tests/test_windows_staging_acceptance.py",
+          "scripts/testdata/windows-staging/invalid_evidence.json"
+        ]
+      }
+    },
+    {
+      "id": "protected-root-lease-unverified",
+      "case": 9,
+      "expected_reason": "R-PROTECTED-ROOT-LEASE-UNVERIFIED",
+      "defect": "The ProtectedRootLease open was never verified yet the record claims a ready fixture and a pass, so lease-open failure became invisible.",
+      "evidence": {
+        "record_version": "eliot.windows-staging.evidence.v1",
+        "issue": 846,
+        "scope": "package-staging-agent-bridge",
+        "source": {
+          "path": "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "blob_sha256": "c7b2183682fb830caf19201dca61eda400057d7fdc769be59e34f92a8400bd14",
+          "assignment_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        "environment": {
+          "os": "Windows",
+          "windows_build": "10.0.26100",
+          "runner": "controller-windows",
+          "toolchain": "rustc 1.90.0",
+          "elevated": true,
+          "privilege_facts_recorded": true,
+          "protected_program_data_contour": "C:\\ProgramData",
+          "protected_root_disposition": "available",
+          "fixture_setup_disposition": "ready",
+          "protected_root_lease_verified": false
+        },
+        "run": {
+          "filtered_invocation": "package_staging::tests::agent_bridge_",
+          "selected_tests": [
+            "agent_bridge_post_create_failures_clean_exact_temporary",
+            "agent_bridge_staging_success_receipts_are_serializable_and_read_back",
+            "agent_bridge_staging_rejects_source_substitution",
+            "agent_bridge_staging_rejects_destination_preexistence_without_overwrite",
+            "agent_bridge_staging_retry_rejects_foreign_bytes_and_absence",
+            "agent_bridge_prepared_roundtrip_and_binding_substitution_are_rejected",
+            "agent_bridge_prepared_reconcile_publishes_before_rename_recovery",
+            "agent_bridge_prepared_response_loss_after_rename_reconciles_exactly",
+            "agent_bridge_prepare_retry_uses_fresh_temp_without_adopting_orphan",
+            "agent_bridge_prepared_foreign_temp_and_final_never_adopted",
+            "agent_bridge_prepared_rejects_foreign_temp_shape"
+          ],
+          "selected_count": 11,
+          "fault_subcases": [
+            "AGENT_BRIDGE_FAIL_FINAL_PATH",
+            "AGENT_BRIDGE_FAIL_DESTINATION_EXISTS"
+          ],
+          "assertions_executed": 96,
+          "outcome": "passed",
+          "cleanup_status": "clean",
+          "unaccounted_residue": [],
+          "unrelated_failures": []
+        },
+        "privileged": {
+          "required": true,
+          "supported_environment": true,
+          "environment_owner": "#911",
+          "provenance": {
+            "windows_identity": "10.0.26100",
+            "runner": "controller-windows",
+            "elevation": "administrator",
+            "captured_by": "D-INT Windows topology owner"
+          }
+        },
+        "clippy": {
+          "broad_suppression": false
+        },
+        "proof_level": "package-test",
+        "changed_paths": [
+          "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "scripts/tests/test_windows_staging_acceptance.py",
+          "scripts/testdata/windows-staging/invalid_evidence.json"
+        ]
+      }
+    },
+    {
+      "id": "non-green-run-unowned",
+      "case": 35,
+      "expected_reason": "R-NON-GREEN-UNOWNED",
+      "defect": "The package run is red but the record lists no separately owned failures, so a failing run would read as an unowned green result.",
+      "evidence": {
+        "record_version": "eliot.windows-staging.evidence.v1",
+        "issue": 846,
+        "scope": "package-staging-agent-bridge",
+        "source": {
+          "path": "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "blob_sha256": "c7b2183682fb830caf19201dca61eda400057d7fdc769be59e34f92a8400bd14",
+          "assignment_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        "environment": {
+          "os": "Windows",
+          "windows_build": "10.0.26100",
+          "runner": "controller-windows",
+          "toolchain": "rustc 1.90.0",
+          "elevated": true,
+          "privilege_facts_recorded": true,
+          "protected_program_data_contour": "C:\\ProgramData",
+          "protected_root_disposition": "available",
+          "fixture_setup_disposition": "ready",
+          "protected_root_lease_verified": true
+        },
+        "run": {
+          "filtered_invocation": "package_staging::tests::agent_bridge_",
+          "selected_tests": [
+            "agent_bridge_post_create_failures_clean_exact_temporary",
+            "agent_bridge_staging_success_receipts_are_serializable_and_read_back",
+            "agent_bridge_staging_rejects_source_substitution",
+            "agent_bridge_staging_rejects_destination_preexistence_without_overwrite",
+            "agent_bridge_staging_retry_rejects_foreign_bytes_and_absence",
+            "agent_bridge_prepared_roundtrip_and_binding_substitution_are_rejected",
+            "agent_bridge_prepared_reconcile_publishes_before_rename_recovery",
+            "agent_bridge_prepared_response_loss_after_rename_reconciles_exactly",
+            "agent_bridge_prepare_retry_uses_fresh_temp_without_adopting_orphan",
+            "agent_bridge_prepared_foreign_temp_and_final_never_adopted",
+            "agent_bridge_prepared_rejects_foreign_temp_shape"
+          ],
+          "selected_count": 11,
+          "fault_subcases": [
+            "AGENT_BRIDGE_FAIL_FINAL_PATH",
+            "AGENT_BRIDGE_FAIL_DESTINATION_EXISTS"
+          ],
+          "assertions_executed": 96,
+          "outcome": "failed",
+          "cleanup_status": "clean",
+          "unaccounted_residue": [],
+          "unrelated_failures": []
+        },
+        "privileged": {
+          "required": true,
+          "supported_environment": true,
+          "environment_owner": "#911",
+          "provenance": {
+            "windows_identity": "10.0.26100",
+            "runner": "controller-windows",
+            "elevation": "administrator",
+            "captured_by": "D-INT Windows topology owner"
+          }
+        },
+        "clippy": {
+          "broad_suppression": false
+        },
+        "proof_level": "package-test",
+        "changed_paths": [
+          "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "scripts/tests/test_windows_staging_acceptance.py",
+          "scripts/testdata/windows-staging/invalid_evidence.json"
+        ]
+      }
+    },
+    {
+      "id": "out-of-scope-changed-path",
+      "case": 38,
+      "expected_reason": "R-CHANGED-PATH-OUT-OF-SCOPE",
+      "defect": "The diff includes Cargo.toml, which is outside the test-only exclusive mutable scope for #846 and is forbidden by the issue.",
+      "evidence": {
+        "record_version": "eliot.windows-staging.evidence.v1",
+        "issue": 846,
+        "scope": "package-staging-agent-bridge",
+        "source": {
+          "path": "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "blob_sha256": "c7b2183682fb830caf19201dca61eda400057d7fdc769be59e34f92a8400bd14",
+          "assignment_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        "environment": {
+          "os": "Windows",
+          "windows_build": "10.0.26100",
+          "runner": "controller-windows",
+          "toolchain": "rustc 1.90.0",
+          "elevated": true,
+          "privilege_facts_recorded": true,
+          "protected_program_data_contour": "C:\\ProgramData",
+          "protected_root_disposition": "available",
+          "fixture_setup_disposition": "ready",
+          "protected_root_lease_verified": true
+        },
+        "run": {
+          "filtered_invocation": "package_staging::tests::agent_bridge_",
+          "selected_tests": [
+            "agent_bridge_post_create_failures_clean_exact_temporary",
+            "agent_bridge_staging_success_receipts_are_serializable_and_read_back",
+            "agent_bridge_staging_rejects_source_substitution",
+            "agent_bridge_staging_rejects_destination_preexistence_without_overwrite",
+            "agent_bridge_staging_retry_rejects_foreign_bytes_and_absence",
+            "agent_bridge_prepared_roundtrip_and_binding_substitution_are_rejected",
+            "agent_bridge_prepared_reconcile_publishes_before_rename_recovery",
+            "agent_bridge_prepared_response_loss_after_rename_reconciles_exactly",
+            "agent_bridge_prepare_retry_uses_fresh_temp_without_adopting_orphan",
+            "agent_bridge_prepared_foreign_temp_and_final_never_adopted",
+            "agent_bridge_prepared_rejects_foreign_temp_shape"
+          ],
+          "selected_count": 11,
+          "fault_subcases": [
+            "AGENT_BRIDGE_FAIL_FINAL_PATH",
+            "AGENT_BRIDGE_FAIL_DESTINATION_EXISTS"
+          ],
+          "assertions_executed": 96,
+          "outcome": "passed",
+          "cleanup_status": "clean",
+          "unaccounted_residue": [],
+          "unrelated_failures": []
+        },
+        "privileged": {
+          "required": true,
+          "supported_environment": true,
+          "environment_owner": "#911",
+          "provenance": {
+            "windows_identity": "10.0.26100",
+            "runner": "controller-windows",
+            "elevation": "administrator",
+            "captured_by": "D-INT Windows topology owner"
+          }
+        },
+        "clippy": {
+          "broad_suppression": false
+        },
+        "proof_level": "package-test",
+        "changed_paths": [
+          "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "scripts/tests/test_windows_staging_acceptance.py",
+          "scripts/testdata/windows-staging/invalid_evidence.json",
+          "Cargo.toml"
+        ]
+      }
+    },
+    {
+      "id": "reservation-marker-as-evidence",
+      "case": 38,
+      "expected_reason": "R-CHANGED-PATH-OUT-OF-SCOPE",
+      "defect": "The diff still carries the retired .github/temporary/work-unit-846.md reservation marker; a reservation merge is never test evidence.",
+      "evidence": {
+        "record_version": "eliot.windows-staging.evidence.v1",
+        "issue": 846,
+        "scope": "package-staging-agent-bridge",
+        "source": {
+          "path": "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "blob_sha256": "c7b2183682fb830caf19201dca61eda400057d7fdc769be59e34f92a8400bd14",
+          "assignment_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        "environment": {
+          "os": "Windows",
+          "windows_build": "10.0.26100",
+          "runner": "controller-windows",
+          "toolchain": "rustc 1.90.0",
+          "elevated": true,
+          "privilege_facts_recorded": true,
+          "protected_program_data_contour": "C:\\ProgramData",
+          "protected_root_disposition": "available",
+          "fixture_setup_disposition": "ready",
+          "protected_root_lease_verified": true
+        },
+        "run": {
+          "filtered_invocation": "package_staging::tests::agent_bridge_",
+          "selected_tests": [
+            "agent_bridge_post_create_failures_clean_exact_temporary",
+            "agent_bridge_staging_success_receipts_are_serializable_and_read_back",
+            "agent_bridge_staging_rejects_source_substitution",
+            "agent_bridge_staging_rejects_destination_preexistence_without_overwrite",
+            "agent_bridge_staging_retry_rejects_foreign_bytes_and_absence",
+            "agent_bridge_prepared_roundtrip_and_binding_substitution_are_rejected",
+            "agent_bridge_prepared_reconcile_publishes_before_rename_recovery",
+            "agent_bridge_prepared_response_loss_after_rename_reconciles_exactly",
+            "agent_bridge_prepare_retry_uses_fresh_temp_without_adopting_orphan",
+            "agent_bridge_prepared_foreign_temp_and_final_never_adopted",
+            "agent_bridge_prepared_rejects_foreign_temp_shape"
+          ],
+          "selected_count": 11,
+          "fault_subcases": [
+            "AGENT_BRIDGE_FAIL_FINAL_PATH",
+            "AGENT_BRIDGE_FAIL_DESTINATION_EXISTS"
+          ],
+          "assertions_executed": 96,
+          "outcome": "passed",
+          "cleanup_status": "clean",
+          "unaccounted_residue": [],
+          "unrelated_failures": []
+        },
+        "privileged": {
+          "required": true,
+          "supported_environment": true,
+          "environment_owner": "#911",
+          "provenance": {
+            "windows_identity": "10.0.26100",
+            "runner": "controller-windows",
+            "elevation": "administrator",
+            "captured_by": "D-INT Windows topology owner"
+          }
+        },
+        "clippy": {
+          "broad_suppression": false
+        },
+        "proof_level": "package-test",
+        "changed_paths": [
+          "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "scripts/tests/test_windows_staging_acceptance.py",
+          "scripts/testdata/windows-staging/invalid_evidence.json",
+          ".github/temporary/work-unit-846.md"
+        ]
+      }
+    },
+    {
+      "id": "relabelled-product-proof",
+      "case": 40,
+      "expected_reason": "R-PROOF-RELABELLED",
+      "defect": "A package test result is relabelled ProductProof, which the support and status contract forbids without Product Proof.",
+      "evidence": {
+        "record_version": "eliot.windows-staging.evidence.v1",
+        "issue": 846,
+        "scope": "package-staging-agent-bridge",
+        "source": {
+          "path": "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "blob_sha256": "c7b2183682fb830caf19201dca61eda400057d7fdc769be59e34f92a8400bd14",
+          "assignment_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        "environment": {
+          "os": "Windows",
+          "windows_build": "10.0.26100",
+          "runner": "controller-windows",
+          "toolchain": "rustc 1.90.0",
+          "elevated": true,
+          "privilege_facts_recorded": true,
+          "protected_program_data_contour": "C:\\ProgramData",
+          "protected_root_disposition": "available",
+          "fixture_setup_disposition": "ready",
+          "protected_root_lease_verified": true
+        },
+        "run": {
+          "filtered_invocation": "package_staging::tests::agent_bridge_",
+          "selected_tests": [
+            "agent_bridge_post_create_failures_clean_exact_temporary",
+            "agent_bridge_staging_success_receipts_are_serializable_and_read_back",
+            "agent_bridge_staging_rejects_source_substitution",
+            "agent_bridge_staging_rejects_destination_preexistence_without_overwrite",
+            "agent_bridge_staging_retry_rejects_foreign_bytes_and_absence",
+            "agent_bridge_prepared_roundtrip_and_binding_substitution_are_rejected",
+            "agent_bridge_prepared_reconcile_publishes_before_rename_recovery",
+            "agent_bridge_prepared_response_loss_after_rename_reconciles_exactly",
+            "agent_bridge_prepare_retry_uses_fresh_temp_without_adopting_orphan",
+            "agent_bridge_prepared_foreign_temp_and_final_never_adopted",
+            "agent_bridge_prepared_rejects_foreign_temp_shape"
+          ],
+          "selected_count": 11,
+          "fault_subcases": [
+            "AGENT_BRIDGE_FAIL_FINAL_PATH",
+            "AGENT_BRIDGE_FAIL_DESTINATION_EXISTS"
+          ],
+          "assertions_executed": 96,
+          "outcome": "passed",
+          "cleanup_status": "clean",
+          "unaccounted_residue": [],
+          "unrelated_failures": []
+        },
+        "privileged": {
+          "required": true,
+          "supported_environment": true,
+          "environment_owner": "#911",
+          "provenance": {
+            "windows_identity": "10.0.26100",
+            "runner": "controller-windows",
+            "elevation": "administrator",
+            "captured_by": "D-INT Windows topology owner"
+          }
+        },
+        "clippy": {
+          "broad_suppression": false
+        },
+        "proof_level": "ProductProof",
+        "changed_paths": [
+          "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "scripts/tests/test_windows_staging_acceptance.py",
+          "scripts/testdata/windows-staging/invalid_evidence.json"
+        ]
+      }
+    },
+    {
+      "id": "relabelled-installation-support",
+      "case": 40,
+      "expected_reason": "R-PROOF-RELABELLED",
+      "defect": "A package test result is relabelled installation support, which the issue explicitly says this work unit does not prove.",
+      "evidence": {
+        "record_version": "eliot.windows-staging.evidence.v1",
+        "issue": 846,
+        "scope": "package-staging-agent-bridge",
+        "source": {
+          "path": "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "blob_sha256": "c7b2183682fb830caf19201dca61eda400057d7fdc769be59e34f92a8400bd14",
+          "assignment_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        "environment": {
+          "os": "Windows",
+          "windows_build": "10.0.26100",
+          "runner": "controller-windows",
+          "toolchain": "rustc 1.90.0",
+          "elevated": true,
+          "privilege_facts_recorded": true,
+          "protected_program_data_contour": "C:\\ProgramData",
+          "protected_root_disposition": "available",
+          "fixture_setup_disposition": "ready",
+          "protected_root_lease_verified": true
+        },
+        "run": {
+          "filtered_invocation": "package_staging::tests::agent_bridge_",
+          "selected_tests": [
+            "agent_bridge_post_create_failures_clean_exact_temporary",
+            "agent_bridge_staging_success_receipts_are_serializable_and_read_back",
+            "agent_bridge_staging_rejects_source_substitution",
+            "agent_bridge_staging_rejects_destination_preexistence_without_overwrite",
+            "agent_bridge_staging_retry_rejects_foreign_bytes_and_absence",
+            "agent_bridge_prepared_roundtrip_and_binding_substitution_are_rejected",
+            "agent_bridge_prepared_reconcile_publishes_before_rename_recovery",
+            "agent_bridge_prepared_response_loss_after_rename_reconciles_exactly",
+            "agent_bridge_prepare_retry_uses_fresh_temp_without_adopting_orphan",
+            "agent_bridge_prepared_foreign_temp_and_final_never_adopted",
+            "agent_bridge_prepared_rejects_foreign_temp_shape"
+          ],
+          "selected_count": 11,
+          "fault_subcases": [
+            "AGENT_BRIDGE_FAIL_FINAL_PATH",
+            "AGENT_BRIDGE_FAIL_DESTINATION_EXISTS"
+          ],
+          "assertions_executed": 96,
+          "outcome": "passed",
+          "cleanup_status": "clean",
+          "unaccounted_residue": [],
+          "unrelated_failures": []
+        },
+        "privileged": {
+          "required": true,
+          "supported_environment": true,
+          "environment_owner": "#911",
+          "provenance": {
+            "windows_identity": "10.0.26100",
+            "runner": "controller-windows",
+            "elevation": "administrator",
+            "captured_by": "D-INT Windows topology owner"
+          }
+        },
+        "clippy": {
+          "broad_suppression": false
+        },
+        "proof_level": "installation",
+        "changed_paths": [
+          "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "scripts/tests/test_windows_staging_acceptance.py",
+          "scripts/testdata/windows-staging/invalid_evidence.json"
+        ]
+      }
+    },
+    {
+      "id": "clippy-broad-suppression",
+      "case": 37,
+      "expected_reason": "R-CLIPPY-BROAD-SUPPRESSION",
+      "defect": "The record claims Clippy passed only because broad suppression was applied, which is not an acceptable package Clippy proof.",
+      "evidence": {
+        "record_version": "eliot.windows-staging.evidence.v1",
+        "issue": 846,
+        "scope": "package-staging-agent-bridge",
+        "source": {
+          "path": "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "blob_sha256": "c7b2183682fb830caf19201dca61eda400057d7fdc769be59e34f92a8400bd14",
+          "assignment_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        "environment": {
+          "os": "Windows",
+          "windows_build": "10.0.26100",
+          "runner": "controller-windows",
+          "toolchain": "rustc 1.90.0",
+          "elevated": true,
+          "privilege_facts_recorded": true,
+          "protected_program_data_contour": "C:\\ProgramData",
+          "protected_root_disposition": "available",
+          "fixture_setup_disposition": "ready",
+          "protected_root_lease_verified": true
+        },
+        "run": {
+          "filtered_invocation": "package_staging::tests::agent_bridge_",
+          "selected_tests": [
+            "agent_bridge_post_create_failures_clean_exact_temporary",
+            "agent_bridge_staging_success_receipts_are_serializable_and_read_back",
+            "agent_bridge_staging_rejects_source_substitution",
+            "agent_bridge_staging_rejects_destination_preexistence_without_overwrite",
+            "agent_bridge_staging_retry_rejects_foreign_bytes_and_absence",
+            "agent_bridge_prepared_roundtrip_and_binding_substitution_are_rejected",
+            "agent_bridge_prepared_reconcile_publishes_before_rename_recovery",
+            "agent_bridge_prepared_response_loss_after_rename_reconciles_exactly",
+            "agent_bridge_prepare_retry_uses_fresh_temp_without_adopting_orphan",
+            "agent_bridge_prepared_foreign_temp_and_final_never_adopted",
+            "agent_bridge_prepared_rejects_foreign_temp_shape"
+          ],
+          "selected_count": 11,
+          "fault_subcases": [
+            "AGENT_BRIDGE_FAIL_FINAL_PATH",
+            "AGENT_BRIDGE_FAIL_DESTINATION_EXISTS"
+          ],
+          "assertions_executed": 96,
+          "outcome": "passed",
+          "cleanup_status": "clean",
+          "unaccounted_residue": [],
+          "unrelated_failures": []
+        },
+        "privileged": {
+          "required": true,
+          "supported_environment": true,
+          "environment_owner": "#911",
+          "provenance": {
+            "windows_identity": "10.0.26100",
+            "runner": "controller-windows",
+            "elevation": "administrator",
+            "captured_by": "D-INT Windows topology owner"
+          }
+        },
+        "clippy": {
+          "broad_suppression": true
+        },
+        "proof_level": "package-test",
+        "changed_paths": [
+          "crates/kernel/eliot-platform-windows/src/package_staging.rs",
+          "scripts/tests/test_windows_staging_acceptance.py",
+          "scripts/testdata/windows-staging/invalid_evidence.json"
+        ]
+      }
+    }
+  ]
+}
