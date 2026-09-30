@@ -98,7 +98,7 @@ fn control_request_terminal_code(error: &TransportError) -> &'static str {
 enum ControlRequestFailure {
     Transport(TransportError),
     Transition(KernelServiceError),
-    /// The nested process launch already owns the failed operation terminal.
+    /// A nested operation already owns the failed operation terminal.
     TerminalOwned(TransportError),
 }
 
@@ -647,9 +647,20 @@ impl KernelComposition {
         let is_probe = matches!(&request.command, KernelControlCommand::ProbeReady);
         #[cfg(windows)]
         let supervision_publication = if is_probe {
+            let mut terminal_owned = false;
             Some(
-                self.renew_daemon_supervision_for_probe(&request)
-                    .map_err(|_| TransportError::SessionFenced)?,
+                self.renew_daemon_supervision_for_probe_in_context(
+                    &request,
+                    context,
+                    &mut terminal_owned,
+                )
+                .map_err(|_| {
+                    if terminal_owned {
+                        ControlRequestFailure::TerminalOwned(TransportError::SessionFenced)
+                    } else {
+                        ControlRequestFailure::Transport(TransportError::SessionFenced)
+                    }
+                })?,
             )
         } else {
             None
@@ -727,10 +738,22 @@ impl KernelComposition {
         let receipt = if is_probe {
             #[cfg(windows)]
             {
+                let mut terminal_owned = false;
                 Some(
-                    self.self_authored_ready_receipt_in_context(&request, peer, context)
-                        .await
-                        .map_err(|_| TransportError::SessionFenced)?,
+                    self.self_authored_ready_receipt_in_context(
+                        &request,
+                        peer,
+                        context,
+                        &mut terminal_owned,
+                    )
+                    .await
+                    .map_err(|_| {
+                        if terminal_owned {
+                            ControlRequestFailure::TerminalOwned(TransportError::SessionFenced)
+                        } else {
+                            ControlRequestFailure::Transport(TransportError::SessionFenced)
+                        }
+                    })?,
                 )
             }
             #[cfg(not(windows))]
@@ -872,7 +895,7 @@ impl KernelComposition {
                 .is_some()
         {
             let launched = self
-                .launch_eliotd()
+                .launch_eliotd_in_context(context)
                 .await
                 .map_err(|_| ControlRequestFailure::TerminalOwned(TransportError::SessionFenced))?;
             self.await_daemon_ready(&launched, self.ipc_limits().operation_timeout)

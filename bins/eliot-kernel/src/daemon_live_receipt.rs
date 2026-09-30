@@ -503,26 +503,37 @@ impl KernelComposition {
         receipt: &ProcessStartReceipt,
     ) -> Result<(), KernelServiceError> {
         let context = process_receipt_context(receipt);
+        self.validate_daemon_process_readiness_in_context(launch, receipt, &context)
+            .await
+    }
+
+    #[cfg(windows)]
+    pub(crate) async fn validate_daemon_process_readiness_in_context(
+        &self,
+        launch: &EliotdLaunchDescriptor,
+        receipt: &ProcessStartReceipt,
+        context: &tracing::Span,
+    ) -> Result<(), KernelServiceError> {
         // F-LOG-KERNEL-3 (#901): readiness boundary. A live OS handle is not
         // readiness; exactly one terminal is emitted per failed validation.
         observe_live_receipt(
             "kernel.live_receipt.readiness_requested",
             "attempt",
-            &context,
+            context,
         );
         match self
-            .validate_daemon_process_readiness_inner(launch, receipt, &context)
+            .validate_daemon_process_readiness_inner(launch, receipt, context)
             .await
         {
             Ok(()) => {
-                observe_live_receipt("kernel.live_receipt.readiness_proven", "success", &context);
+                observe_live_receipt("kernel.live_receipt.readiness_proven", "success", context);
                 Ok(())
             }
             Err(error) => {
-                observe_live_receipt("kernel.live_receipt.readiness_rejected", "fenced", &context);
+                observe_live_receipt("kernel.live_receipt.readiness_rejected", "fenced", context);
                 super::kernel_diagnostics::observe_terminal_error_in_context(
                     live_receipt_terminal_code(&error),
-                    &context,
+                    context,
                 );
                 Err(error)
             }
@@ -605,6 +616,7 @@ impl KernelComposition {
         request: &KernelControlRequest,
         peer: &PeerIdentity,
         context: &tracing::Span,
+        terminal_owned: &mut bool,
     ) -> Result<KernelReadyReceipt, KernelServiceError> {
         let candidate: &HostKernelCandidateBinding = &request.candidate;
         let observed_peer = peer.process_binding().ok_or(KernelServiceError::Platform(
@@ -820,12 +832,19 @@ impl KernelComposition {
         } = evidence;
         self.record_startup_evidence(5)?;
         let daemon_evidence = if self.active_daemon_launch()?.is_some() {
-            let daemon_receipt = self.ensure_daemon_ready_for_probe().await?;
+            let daemon_receipt = self
+                .ensure_daemon_ready_for_probe_in_context(context, terminal_owned)
+                .await?;
             let launch = self
                 .active_daemon_launch()?
                 .ok_or(KernelServiceError::ReadinessNotProven)?;
-            self.validate_daemon_process_readiness(&launch, &daemon_receipt)
-                .await?;
+            if let Err(error) = self
+                .validate_daemon_process_readiness_in_context(&launch, &daemon_receipt, context)
+                .await
+            {
+                *terminal_owned = true;
+                return Err(error);
+            }
             Some(
                 eliot_platform::PlatformHandle::new(format!(
                     "eliotd-ready:{}:{}",

@@ -101,26 +101,34 @@ impl KernelComposition {
     #[cfg(windows)]
     pub async fn launch_eliotd(&self) -> Result<ProcessStartReceipt, KernelBuildError> {
         let context = super::kernel_diagnostics::operation_context(None, None, None, None);
+        self.launch_eliotd_in_context(&context).await
+    }
+
+    #[cfg(windows)]
+    pub(crate) async fn launch_eliotd_in_context(
+        &self,
+        context: &tracing::Span,
+    ) -> Result<ProcessStartReceipt, KernelBuildError> {
         // ProcessExecutionGateway owns failures returned by start_in_context;
         // every other error remains owned by this public launch boundary.
         let mut process_owns_terminal = false;
-        observe_daemon_launch("kernel.daemon.launch_requested", "attempt", &context);
+        observe_daemon_launch("kernel.daemon.launch_requested", "attempt", context);
         match self
-            .launch_eliotd_inner(&context, &mut process_owns_terminal)
+            .launch_eliotd_inner(context, &mut process_owns_terminal)
             .await
         {
             Ok(receipt) => {
-                observe_daemon_launch("kernel.daemon.launch_committed", "success", &context);
+                observe_daemon_launch("kernel.daemon.launch_committed", "success", context);
                 // Issue #1837: durable audit evidence for process lifecycle.
                 self.audit_observe(AuditEventDraft::process_launch_committed(&receipt));
                 Ok(receipt)
             }
             Err(error) => {
-                observe_daemon_launch("kernel.daemon.launch_failed", "rejected", &context);
+                observe_daemon_launch("kernel.daemon.launch_failed", "rejected", context);
                 if !process_owns_terminal {
                     super::kernel_diagnostics::observe_terminal_error_in_context(
                         daemon_launch_terminal_code(&error),
-                        &context,
+                        context,
                     );
                 }
                 // Issue #1837: durable audit evidence for process lifecycle.
@@ -359,9 +367,21 @@ impl KernelComposition {
         // OS identity and image digest without another handle/PID/image query.
         let physical = receipt.identity().physical();
         record_launch_context_field(context, "process_id", &physical.process_id().to_string());
-        record_launch_context_field(context, "process_start_100ns", &physical.start_time_100ns().to_string());
-        record_launch_context_field(context, "image_sha256", receipt.identity().executable_sha256());
-        observe_daemon_launch("kernel.daemon.launch_identity_observed", "validated_receipt", context);
+        record_launch_context_field(
+            context,
+            "process_start_100ns",
+            &physical.start_time_100ns().to_string(),
+        );
+        record_launch_context_field(
+            context,
+            "image_sha256",
+            receipt.identity().executable_sha256(),
+        );
+        observe_daemon_launch(
+            "kernel.daemon.launch_identity_observed",
+            "validated_receipt",
+            context,
+        );
         let mut state = self
             .daemon_runtime
             .lock()
