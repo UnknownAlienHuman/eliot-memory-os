@@ -236,7 +236,7 @@ pub struct CoherentSourceExport {
 /// is built. Sections are emitted as canonical NDJSON and blobs as the sealed
 /// bytes their blob owner already produced, so the applied section compression
 /// is the identity codec and no key material is introduced by this exporter.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ExportSectionCodec {
     compression: eliot_ecxf::CompressionProfile,
     encryption: eliot_ecxf::EncryptionProfile,
@@ -276,13 +276,12 @@ impl ExportSectionCodec {
     }
 
     /// The codec itself, for `EcxfArchive::layout`.
-    fn codec(&self) -> &'static dyn eliot_ecxf::SectionCodec {
-        // `IdentitySectionCodec` is a unit struct with no interior state, so a
-        // promoted `'static` reference to it is sound and names the one codec
-        // this exporter applies.
-        const IDENTITY: eliot_ecxf::IdentitySectionCodec = eliot_ecxf::IdentitySectionCodec;
-        &IDENTITY
-    }
+    ///
+    /// `IdentitySectionCodec` is a unit struct with no interior state, so a
+    /// promoted `'static` reference to it is sound and names the one codec this
+    /// exporter applies. It is a `const` rather than a method because it does
+    /// not depend on this codec's declared profiles.
+    const CODEC: &'static dyn eliot_ecxf::SectionCodec = &eliot_ecxf::IdentitySectionCodec;
 }
 
 /// Algorithm label the identity section codec declares (I05-10 manifest
@@ -411,7 +410,9 @@ pub async fn export_ecxf_package<S: EcxfSourceStore + ?Sized>(
     // `layout` re-validates the whole archive against its own emitted bytes and
     // returns the complete package in memory, so no byte is written before the
     // fence, residency, checksum and integrity proofs have all held.
-    let files = archive.layout(codec.codec()).map_err(ecxf_error)?;
+    let files = archive
+        .layout(ExportSectionCodec::CODEC)
+        .map_err(ecxf_error)?;
     publish_package(&files, out_dir, &export_id)?;
     // The rename has already made the destination exist, so every refusal from
     // here on is a publication/reconciliation outcome carrying the published
