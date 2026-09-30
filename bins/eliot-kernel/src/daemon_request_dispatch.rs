@@ -41,8 +41,9 @@ use eliot_kernel_service::{
     horizon_retry_handle, refuse_consumed_wake, resolve_due_wake,
 };
 use eliot_kernel_service::{
-    IrreversibleStorageEffect, StorageReplacement, StorageReplacementCutoverReceipt,
-    StorageReplacementStage, StorageReplacementTransfer, StorageRollbackDisposition,
+    BorrowedCanonicalStoreClient, IrreversibleStorageEffect, ObservedHead, ReservationSeed,
+    StorageReplacement, StorageReplacementCutoverReceipt, StorageReplacementStage,
+    StorageReplacementTransfer, StorageRollbackDisposition, gateway_seed,
 };
 use eliot_process::{
     OperationId, OriginChallengeRequest, OriginControlGrant, OriginControlOperation,
@@ -63,7 +64,7 @@ use eliot_runtime_contracts::{
     DaemonSupervisionRenewalReceipt, SupervisionLeasePredecessorProof,
 };
 use eliot_store_api::{
-    CampaignLearningStateViewLookup, CampaignLearningStateViewRead,
+    CanonicalStoreClient, CampaignLearningStateViewLookup, CampaignLearningStateViewRead,
     CampaignLearningStateViewReadStatus, CampaignSourcePublication, CampaignSourceRevisionLookup,
     CampaignSourceRevisionRef, CanonicalRequestView, MAX_RECOVERY_OWNER_RECORDS,
     NamedReadOperation, NamedReadRequest, NamedReadResponse, OperationIdentity,
@@ -9092,117 +9093,36 @@ impl KernelComposition {
             ));
         }
         let gateway = self.retained_store_gateway()?;
-        // Reserved-write route boundary (issue #1925, I5.2/I5.5/I5.6; owner
-        // audit comment 5856193606).
-        //
-        // The audit named three defects and all three are STILL OPEN. This
-        // comment records that state; it is not a claim that any of them closed.
-        //
-        // - `KernelStoreGateway::apply_reserved` has no production caller.
-        // - `store_write_reservation::gateway_seed` has no caller at all. It is
-        //   a real function that seals the admitted transition's canonical
-        //   bytes, so the `RecoveryPayload::Encrypted` claim it makes would be
-        //   true, but nothing calls it. `ReservationSeed { .. }` is constructed
-        //   in exactly one production place, inside `gateway_seed` itself, so no
-        //   envelope is produced on any route. "Reachable through
-        //   `KernelComposition::platform`" is reachability, not a caller.
-        // - therefore the live canonical write below reaches no recovery
-        //   seed/reservation envelope.
-        //
-        // The reservation cannot be staged on this route even with a caller
-        // written today, for four independent code facts, each verified by a
-        // searched negative rather than an owner decision:
-        //
-        // 1. Store-side execution generation. `KernelStoreGateway::apply_reserved`
-        //    ends in the Store's `ReservedWrite` wire operation. On the store
-        //    side `SurrealStoreAdapter::apply_reserved_write`
-        //    (`crates/storage/eliot-store-surreal-adapter/src/apply.rs:780`)
-        //    takes the `execution_handle()` `None` arm at `:785` and returns
-        //    `StoreError::UnknownOperation` before any provider I/O. The two
-        //    methods that can install a generation,
-        //    `SurrealStoreAdapter::install_concurrent_execution`
-        //    (`crates/storage/eliot-store-surreal-adapter/src/lib.rs:269`) and
-        //    `install_serial_execution` (`:296`), have no non-test caller
-        //    anywhere in the workspace; the only production construction path,
-        //    `StoreComposition::new` (`bins/eliot-store-surreal/src/lib.rs`),
-        //    builds the adapter there and never installs one. Routing live
-        //    writes through `apply_reserved` today would therefore refuse
-        //    every production canonical write.
-        // 2. Store-side capability advertisement. `CAPABILITY_RESERVED_WRITE`
-        //    (`crates/storage/eliot-store-api/src/wire.rs:49`) is mapped to the
-        //    `ReservedWrite` operation at `wire.rs:353`, but is absent from the
-        //    advertised `CAPABILITIES` array at `wire.rs:85`, so the handshake
-        //    never admits the capability this wire would select. The Kernel
-        //    consumes that same static array on its own side: the session
-        //    hello it sends declares
-        //    `allowed_capabilities: CAPABILITIES`
-        //    (`crates/kernel/eliot-kernel-service/src/store_client.rs:1290`),
-        //    so a `ReservedWrite` request this Kernel submits would sit outside
-        //    the admitted set for the session even against a fully installed
-        //    Store generation. The honest dynamic advertisement already exists
-        //    on the adapter
-        //    (`SurrealStoreAdapter::reserved_write_capability`,
-        //    `crates/storage/eliot-store-surreal-adapter/src/lib.rs:324`) and
-        //    correctly returns `None` until a concurrent generation owns the
-        //    adapter, but it has no non-test caller, so the Kernel can never
-        //    learn a reserved-write Store is present.
-        // 3. No production source for the observed ordering-head digest.
-        //    `ReservationSeed::heads` requires
-        //    `ObservedHead::expected_head_digest`
-        //    (`crates/kernel/eliot-kernel-service/src/store_write_reservation.rs:351`),
-        //    documented there as the digest of the exact observed canonical head
-        //    bytes, and it is forwarded verbatim to ORS as
-        //    `ExpectedOrderingHead::head_sha256` at `:804`. The only store-side
-        //    ordering-head read, `eliot_store_api::OrderingHead`
-        //    (`crates/storage/eliot-store-api/src/lib.rs:4082`), carries
-        //    `scope`/`sequence`/`state_fence` and no head hash, so no
-        //    production caller can supply that value honestly.
-        // 4. ORS canonical-evidence binding. `reserve_for_transition` reaches
-        //    `RedbRecoveryStore::stage_and_reserve`, whose
-        //    `self.evidence.verify_ordering_heads(&request.scopes)?`
-        //    (`crates/kernel/eliot-ors/src/store.rs:28006`) fails closed while the
-        //    bound provider is `RejectUnboundEvidence` (`store.rs:2777`, whose
-        //    `verify_ordering_heads` at `store.rs:2780` returns
-        //    `OrsError::CanonicalEvidence` at `store.rs:2784`). This composition
-        //    opens its production ORS with `RedbRecoveryStore::open`
-        //    (`bins/eliot-kernel/src/composition_bootstrap.rs:197`, `:247`,
-        //    `:355`), whose production default binds that rejecting provider at
-        //    `store.rs:21803`; the only `open_with_evidence` (`store.rs:21813`)
-        //    call site is the `new_with_adapters` path at
-        //    `composition_bootstrap.rs:997`/`:1007`, which production composition
-        //    never takes. So even a correct seed would be refused by ORS before it
-        //    could reserve. No production `CanonicalEvidenceProvider`
-        //    implementation exists: the only ones are `eliot_ors` test support
-        //    and test files.
-        //
-        // Facts 1-2 and 4 live in the storage/store-bridge and ORS owners, which
-        // is what this issue's `## Scope and owner` ("Kernel / ORS `redb` owner")
-        // excludes. Fact 3 is the write-side half of the Kernel's own gap and is
-        // not closed by this delivery either. Nothing here works around any of the
-        // four, and there is no configuration switch, second route or
-        // `attach_*` probe that manufactures one call.
-        //
-        // `store.apply` is also a wait-for-commit request: `StoreApplyOperation`
-        // carries no `response_mode` and the route returns the canonical
-        // `WriteReceipt`, so it never observes or claims `ACCEPTED_PENDING`
-        // (I5.5). I5.2 forbids `accepted_pending` outright when ORS cannot
-        // durably stage the complete opaque operation, and a live write that
-        // could not stage must not report it. This is not a silent fallback for
-        // `accept_after_stage`: there is no `accept_after_stage` request on this
-        // wire to fall back from. The startup recovery owner
-        // (`store_recovery_operation` -> `KernelStoreGateway::reconcile_staged_writes`)
-        // enumerates, revalidates by the envelope's recorded hash, and reconciles
-        // by operation identity into either the canonical receipt or a durable
-        // Recovery Problem whenever ORS does hold one.
-        match gateway
-            .apply(
-                &operation.context,
-                operation.transition,
-                operation.expected_revision_heads,
-                operation.expected_ordering_heads,
-            )
-            .await
-        {
+        let reserved_seed = match self.observe_reservation_seed(&gateway, &operation).await {
+            Ok(seed) => seed,
+            Err(error) => return Ok(Self::store_error_response_text("write_receipt", &error)),
+        };
+        let apply_result = if let Some(seed) = reserved_seed {
+            gateway
+                .apply_reserved(
+                    &operation.context,
+                    operation.transition,
+                    operation.expected_revision_heads,
+                    operation.expected_ordering_heads,
+                    seed,
+                )
+                .await
+                .map_err(|error| Self::store_error_response_text("write_receipt", &error))
+        } else {
+            match gateway
+                .apply(
+                    &operation.context,
+                    operation.transition,
+                    operation.expected_revision_heads,
+                    operation.expected_ordering_heads,
+                )
+                .await
+            {
+                Ok(receipt) => Ok(receipt),
+                Err(error) => Err(Self::store_apply_refusal_response("write_receipt", &error)),
+            }
+        };
+        match apply_result {
             Ok(receipt) => {
                 if !campaign_source_publications.is_empty() {
                     if receipt.status == WriteReceiptStatus::Committed {
@@ -9237,8 +9157,189 @@ impl KernelComposition {
                     journal_issue,
                 ))
             }
-            Err(error) => Ok(Self::store_apply_refusal_response("write_receipt", &error)),
+            Err(response) => Ok(response),
         }
+    }
+
+    /// Builds a reserved-write seed only for a protected, durably claimed
+    /// Observe submission. Its canonical head evidence comes from current
+    /// Store owner readbacks, while its access class and deadline are copied
+    /// from the exact retained host request.
+    #[cfg(windows)]
+    async fn observe_reservation_seed(
+        &self,
+        gateway: &Arc<KernelStoreGateway>,
+        operation: &StoreApplyOperation,
+    ) -> Result<Option<ReservationSeed>, String> {
+        let transition = &operation.transition;
+        let operation_identity =
+            eliot_ors::OperationIdentity::new(transition.identity.operation_id.as_str())
+                .map_err(|error| error.to_string())?;
+        let Some(record) = self
+            .generation_gateway
+            .ors
+            .load_host_request_by_operation(&operation_identity)
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(None);
+        };
+        let Some(input) = record.executable_input.as_ref() else {
+            if record.kind == eliot_ors::HostRequestKind::Invocation
+                && record.capability_ref.as_str() == "eliot.observe"
+            {
+                return Err("Observe request has no retained executable input".to_owned());
+            }
+            return Ok(None);
+        };
+
+        record.validate().map_err(|error| error.to_string())?;
+        input
+            .validate_for(&record)
+            .map_err(|error| error.to_string())?;
+        let attempt = record
+            .attempt
+            .as_ref()
+            .ok_or_else(|| "protected Observe row has no durable claim attempt".to_owned())?;
+        if record.kind != eliot_ors::HostRequestKind::Invocation
+            || record.capability_ref.as_str() != "eliot.observe"
+            || record.state != eliot_ors::HostRequestState::Submitted
+            || attempt.phase != eliot_ors::HostRequestAttemptPhase::Claimed
+            || attempt.input_commitment_sha256.as_deref()
+                != Some(input.commitment_sha256.as_str())
+        {
+            return Err(
+                "protected Observe row is not the exact durably claimed submission".to_owned(),
+            );
+        }
+        let app = &input.application_binding;
+        let scope_ref = record
+            .scope_ref
+            .as_ref()
+            .ok_or_else(|| "protected Observe row has no owner-resolved scope".to_owned())?;
+        if record.operation_id.as_str() != transition.identity.operation_id.as_str()
+            || record.idempotency_key.as_str() != transition.identity.idempotency_key.as_str()
+            || app.state_fence != operation.context.state_fence
+            || app.state_fence != transition.state_fence
+            || transition.scope_id.as_str() != scope_ref.as_str()
+            || app.scope_ref.as_ref() != Some(scope_ref)
+            || transition.transition_class != eliot_store_api::TransitionClass::CaptureCandidate
+            || transition.named_operations.len() != 1
+            || transition.named_operations[0].operation
+                != eliot_store_api::NamedMutationOperation::CaptureObservation
+        {
+            return Err(
+                "prepared observation does not match the retained host request binding".to_owned(),
+            );
+        }
+
+        let current_time_ms = unix_ms();
+        if current_time_ms >= record.deadline_unix_ms {
+            return Err("protected Observe request deadline has expired".to_owned());
+        }
+        let created_at_ms = i64::try_from(current_time_ms)
+            .map_err(|_| "Kernel clock is outside the reservation time range".to_owned())?;
+        let expires_at_ms = i64::try_from(record.deadline_unix_ms)
+            .map_err(|_| "host request deadline is outside the reservation time range".to_owned())?;
+
+        let store = BorrowedCanonicalStoreClient::new(gateway);
+        let actual_revision_heads = store
+            .revision_heads(
+                operation
+                    .expected_revision_heads
+                    .iter()
+                    .map(|head| head.key.clone())
+                    .collect(),
+            )
+            .await
+            .map_err(|error| format!("could not observe canonical revision heads: {error}"))?;
+        if actual_revision_heads.len() != operation.expected_revision_heads.len() {
+            return Err("canonical revision-head observation is incomplete".to_owned());
+        }
+        let expected_revisions: BTreeMap<_, _> = operation
+            .expected_revision_heads
+            .iter()
+            .map(|head| (head.key.as_str(), (head.expected_revision, &head.state_fence)))
+            .collect();
+        let mut seen_revision_keys = BTreeSet::new();
+        for head in &actual_revision_heads {
+            head.validate().map_err(|error| error.to_string())?;
+            if !seen_revision_keys.insert(head.key.as_str()) {
+                return Err("canonical revision-head observation contains duplicates".to_owned());
+            }
+            if expected_revisions
+                .get(head.key.as_str())
+                .map_or(true, |(revision, fence)| {
+                    *revision != head.revision || **fence != head.state_fence
+                })
+            {
+                return Err("canonical revision heads changed before reservation".to_owned());
+            }
+        }
+        if seen_revision_keys.len() != expected_revisions.len() {
+            return Err("canonical revision-head observation does not cover the admitted keys".to_owned());
+        }
+
+        let actual_ordering_heads = store
+            .ordering_head_readbacks(transition.ordering_scopes.clone())
+            .await
+            .map_err(|error| format!("could not observe canonical ordering heads: {error}"))?;
+        if actual_ordering_heads.len() != operation.expected_ordering_heads.len() {
+            return Err("canonical ordering-head observation is incomplete".to_owned());
+        }
+        let expected_ordering: BTreeMap<_, _> = operation
+            .expected_ordering_heads
+            .iter()
+            .map(|head| (head.scope.as_str(), (head.expected_sequence, &head.state_fence)))
+            .collect();
+        let mut observed_heads = Vec::with_capacity(actual_ordering_heads.len());
+        let mut seen_ordering_scopes = BTreeSet::new();
+        for readback in actual_ordering_heads {
+            let head = readback.head;
+            head.validate().map_err(|error| error.to_string())?;
+            if !seen_ordering_scopes.insert(head.scope.as_str()) {
+                return Err("canonical ordering-head observation contains duplicates".to_owned());
+            }
+            let canonical_head =
+                canonical_json_bytes(&head).map_err(|error| error.to_string())?;
+            if canonical_head != readback.canonical_bytes
+                || sha256_hex(&readback.canonical_bytes) != readback.canonical_sha256
+                || head.state_fence != operation.context.state_fence
+                || expected_ordering
+                    .get(head.scope.as_str())
+                    .map_or(true, |(sequence, fence)| {
+                        *sequence != head.sequence || **fence != head.state_fence
+                    })
+            {
+                return Err("canonical ordering heads changed or failed exact readback".to_owned());
+            }
+            observed_heads.push(ObservedHead {
+                scope: head.scope.as_str().to_owned(),
+                expected_sequence: head.sequence,
+                expected_head_digest: readback.canonical_sha256,
+                revision_head: None,
+            });
+        }
+        if seen_ordering_scopes.len() != expected_ordering.len() {
+            return Err("canonical ordering-head observation does not cover admitted scopes".to_owned());
+        }
+
+        let access = input
+            .protected_envelope
+            .privacy_and_visibility_class
+            .clone();
+        access.validate().map_err(|error| error.to_string())?;
+        let seed = gateway_seed(
+            self.platform.as_ref(),
+            transition,
+            "kernel-composition",
+            created_at_ms,
+            created_at_ms,
+            expires_at_ms,
+            access,
+            &observed_heads,
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(Some(seed))
     }
 
     /// Resolves an already-committed `Apply` receipt for this exact operation
