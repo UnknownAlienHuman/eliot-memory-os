@@ -10,7 +10,7 @@
 #![warn(missing_docs)]
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
@@ -590,6 +590,44 @@ fn runtime_sha256_handle(value: &PlatformHandle, field: &str) -> Result<(), Inst
     sha256_handle(value, field)
 }
 
+/// Returns the canonical bytes covered by a profile's self digest.
+///
+/// `digest_key` is the JSON member stripped before hashing and `field` is the
+/// error label reported for every failure. Both are supplied by the caller so
+/// each profile record keeps its own wire key and error field path.
+fn canonical_profile_unsigned_bytes(
+    profile: &impl Serialize,
+    digest_key: &str,
+    field: &str,
+) -> Result<Vec<u8>, InstallationError> {
+    let mut unsigned =
+        serde_json::to_value(profile).map_err(|error| InstallationError::InvalidField {
+            field: field.to_owned(),
+            reason: error.to_string(),
+        })?;
+    unsigned
+        .as_object_mut()
+        .ok_or_else(|| InstallationError::InvalidField {
+            field: field.to_owned(),
+            reason: "profile projection is not an object".to_owned(),
+        })?
+        .remove(digest_key)
+        .ok_or_else(|| InstallationError::InvalidField {
+            field: field.to_owned(),
+            reason: "profile digest field is missing".to_owned(),
+        })?;
+    canonical_json_bytes(&unsigned).map_err(|error| InstallationError::InvalidField {
+        field: field.to_owned(),
+        reason: error.to_string(),
+    })
+}
+
+/// Computes the lowercase SHA-256 digest of one canonical unsigned projection.
+fn compute_profile_digest(unsigned_bytes: &[u8]) -> Result<PlatformHandle, InstallationError> {
+    PlatformHandle::new(sha256_hex(unsigned_bytes))
+        .map_err(|error| InstallationError::Platform(error.to_string()))
+}
+
 fn validate_eliotd_launch_nonce(
     value: &PlatformHandle,
     field: &str,
@@ -640,6 +678,26 @@ fn approved_path(value: &PlatformHandle, field: &str) -> Result<(), Installation
     }
     Ok(())
 }
+
+/// Rejects a protected root that is relative or lexically unnormalized.
+///
+/// Every installation-owned profile record derives its protected paths from
+/// exactly one approved root, so one definition serves the agent bridge and
+/// the user broker rather than a byte-identical private copy in each module.
+fn validate_absolute_root(root: &Path, field: &str) -> Result<(), InstallationError> {
+    if !root.is_absolute()
+        || root
+            .components()
+            .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
+    {
+        return Err(InstallationError::InvalidField {
+            field: field.to_owned(),
+            reason: "must be an absolute normalized protected root".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn lexical_windows_path(value: &str) -> Option<String> {
     let mut value = value.replace('/', "\\");
     let lower = value.to_ascii_lowercase();

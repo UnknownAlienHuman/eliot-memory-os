@@ -22,7 +22,10 @@ use eliot_runtime_contracts::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{InstallationError, PlatformHandle, handle, sha256_handle, text};
+use crate::{
+    InstallationError, PlatformHandle, canonical_profile_unsigned_bytes, compute_profile_digest,
+    handle, sha256_handle, text, validate_absolute_root,
+};
 
 /// Stable module identity bound by the installation profile.
 pub const AGENT_BRIDGE_MODULE_ID: &str = "eliot-agent-bridge";
@@ -829,32 +832,12 @@ impl AgentBridgeInstallationProfile {
 
     /// Returns canonical bytes covered by `profile_sha256`.
     pub fn canonical_unsigned_bytes(&self) -> Result<Vec<u8>, InstallationError> {
-        let mut unsigned =
-            serde_json::to_value(self).map_err(|error| InstallationError::InvalidField {
-                field: "profile_sha256".to_owned(),
-                reason: error.to_string(),
-            })?;
-        unsigned
-            .as_object_mut()
-            .ok_or_else(|| InstallationError::InvalidField {
-                field: "profile_sha256".to_owned(),
-                reason: "profile projection is not an object".to_owned(),
-            })?
-            .remove("profile_sha256")
-            .ok_or_else(|| InstallationError::InvalidField {
-                field: "profile_sha256".to_owned(),
-                reason: "profile digest field is missing".to_owned(),
-            })?;
-        canonical_json_bytes(&unsigned).map_err(|error| InstallationError::InvalidField {
-            field: "profile_sha256".to_owned(),
-            reason: error.to_string(),
-        })
+        canonical_profile_unsigned_bytes(self, "profile_sha256", "profile_sha256")
     }
 
     /// Computes the lowercase SHA-256 profile digest.
     pub fn compute_digest(&self) -> Result<PlatformHandle, InstallationError> {
-        PlatformHandle::new(sha256_hex(&self.canonical_unsigned_bytes()?))
-            .map_err(|error| InstallationError::Platform(error.to_string()))
+        compute_profile_digest(&self.canonical_unsigned_bytes()?)
     }
 
     /// Validates the complete immutable profile and all derived bindings.
@@ -1103,20 +1086,6 @@ fn staged_executable_path(root: &str, generation: ResourceGeneration) -> String 
         .join("eliot-agent-bridge.exe")
         .to_string_lossy()
         .into_owned()
-}
-
-fn validate_absolute_root(root: &Path, field: &str) -> Result<(), InstallationError> {
-    if !root.is_absolute()
-        || root
-            .components()
-            .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
-    {
-        return Err(InstallationError::InvalidField {
-            field: field.to_owned(),
-            reason: "must be an absolute normalized protected root".to_owned(),
-        });
-    }
-    Ok(())
 }
 
 fn validate_absolute_source_executable(path: &Path) -> Result<(), InstallationError> {
