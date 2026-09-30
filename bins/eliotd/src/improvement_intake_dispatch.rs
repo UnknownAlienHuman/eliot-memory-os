@@ -860,24 +860,28 @@ pub fn assemble_improvement_artifact(
     // candidate exists on this pass, and I12.24:74 requires the evidence to be
     // readable without searching raw metrics. `None` leaves every field exactly
     // as it was, so a pass with no recorded repeat is unchanged.
-    let repeat_clause = repeated_failure.as_ref().map_or_else(String::new, |failure| {
-        format!(
-            "; verifier {} failed repeatedly on attempt {} of campaign {} and that repeat is \
+    let repeat_clause = repeated_failure
+        .as_ref()
+        .map_or_else(String::new, |failure| {
+            format!(
+                "; verifier {} failed repeatedly on attempt {} of campaign {} and that repeat is \
              retained in durable delta {} (digest {})",
-            failure.verifier_ref,
-            failure.attempt_id,
-            failure.campaign_id,
-            failure.lineage_artifact,
-            failure.lineage_digest,
-        )
-    });
-    let next_step_clause = repeated_failure.as_ref().map_or_else(String::new, |failure| {
-        format!(
-            " after triage: read the retained repeat of verifier {} on attempt {} of campaign \
+                failure.verifier_ref,
+                failure.attempt_id,
+                failure.campaign_id,
+                failure.lineage_artifact,
+                failure.lineage_digest,
+            )
+        });
+    let next_step_clause = repeated_failure
+        .as_ref()
+        .map_or_else(String::new, |failure| {
+            format!(
+                " after triage: read the retained repeat of verifier {} on attempt {} of campaign \
              {}, which is the recorded evidence this brief rests on",
-            failure.verifier_ref, failure.attempt_id, failure.campaign_id
-        )
-    });
+                failure.verifier_ref, failure.attempt_id, failure.campaign_id
+            )
+        });
 
     // Why the brief names the OBSERVED principal, and which brief fields the
     // closure record cannot supply, is stated in the module documentation
@@ -1393,10 +1397,7 @@ fn maintenance_sourced_evidence(
     validity_scope: &str,
     repeated_failure: Option<&RepeatedVerifierFailure>,
 ) -> Result<SourcedEvidence, ImprovementDispatchError> {
-    match (
-        maintenance_evidence_source(decision),
-        repeated_failure,
-    ) {
+    match (maintenance_evidence_source(decision), repeated_failure) {
         (EvidenceSource::ConformanceDiagnosis, _) => {
             conformance_diagnosis_evidence(decision, trigger, validity_scope, observed)
         }
@@ -1420,9 +1421,12 @@ fn maintenance_sourced_evidence(
             // bundle is revalidated afterwards, so this composition cannot
             // produce a bundle the constructor would have refused.
             let already: BTreeSet<String> = evidence.evidence_refs.iter().cloned().collect();
-            evidence
-                .evidence_refs
-                .extend(evidence_refs.iter().filter(|r| !already.contains(r)).cloned());
+            evidence.evidence_refs.extend(
+                evidence_refs
+                    .iter()
+                    .filter(|r| !already.contains(r))
+                    .cloned(),
+            );
             evidence.validate()?;
             Ok(evidence)
         }
