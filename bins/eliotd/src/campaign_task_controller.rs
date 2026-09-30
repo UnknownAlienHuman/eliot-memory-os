@@ -506,8 +506,8 @@ pub async fn prepare_task_controller_claim(
         PreparedTaskControllerAction::Apply(_) => {
             match task_controller_selection_admission(kernel, composition, &claimed).await {
                 Ok(selection) => Some(selection),
-                Err(reason) => {
-                    let code = task_binding_reason_code(&reason).unwrap_or("transition_rejected");
+                Err(error) => {
+                    let code = error.reason_code().unwrap_or("transition_rejected");
                     return Ok(TaskControllerClaimPreparation::Rejected(Box::new(
                         task_controller_rejection(&claimed, code)?,
                     )));
@@ -543,32 +543,32 @@ async fn task_controller_selection_admission(
     kernel: &dyn KernelTransitionPort,
     composition: &tokio::sync::Mutex<DaemonComposition>,
     claimed: &TaskControllerClaimedInvocation,
-) -> Result<TaskControllerSelectionAdmission, String> {
+) -> Result<TaskControllerSelectionAdmission, TaskControllerSelectionError> {
     let identity = &claimed.envelope.identity;
     let session_ref = identity
         .session_id
         .as_deref()
-        .ok_or_else(|| "TASK_SELECTION_REQUIRED: Task Controller request has no session".to_owned())?;
+        .ok_or(TaskControllerSelectionError::Required)?;
     let scope_ref = identity
         .work_scope_id
         .as_deref()
-        .ok_or_else(|| "TASK_SCOPE_INCOMPATIBLE: Task Controller request has no WorkScope".to_owned())?;
+        .ok_or(TaskControllerSelectionError::ScopeIncompatible)?;
     let task_ref = identity
         .task_id
         .as_deref()
-        .ok_or_else(|| "TASK_SELECTION_REQUIRED: Task Controller request has no task".to_owned())?;
+        .ok_or(TaskControllerSelectionError::Required)?;
     let fence = &claimed.envelope.state_fence;
     let now = u64::try_from(
         SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|error| format!("TASK_SELECTION_REQUIRED: daemon clock is invalid: {error}"))?
+        .map_err(|_| TaskControllerSelectionError::Required)?
         .as_millis(),
     )
-    .map_err(|_| "TASK_SELECTION_REQUIRED: daemon clock exceeds owner range".to_owned())?;
+    .map_err(|_| TaskControllerSelectionError::Required)?;
     let pending = {
         let guard = composition.lock().await;
         if !eliot_contracts::fences_match_exact(&guard.governor_kernel_fence(), fence) {
-            return Err("TASK_SCOPE_INCOMPATIBLE: Task Controller request fence is stale".to_owned());
+            return Err(TaskControllerSelectionError::ScopeIncompatible);
         }
         guard
             .prepare_task_selection_for_request(
@@ -579,7 +579,7 @@ async fn task_controller_selection_admission(
                 scope_ref,
                 fence,
             )
-            .map_err(task_selection_composition_error)?
+            .map_err(TaskControllerSelectionError::Composition)?
     };
     let acceptance_set = kernel
         .task_contract_acceptance_set(
@@ -588,35 +588,33 @@ async fn task_controller_selection_admission(
             pending.state_fence(),
         )
         .await
-        .map_err(|error| {
-            format!("TASK_SELECTION_REQUIRED: exact TaskContract acceptance read failed: {error}")
-        })?;
+        .map_err(TaskControllerSelectionError::Kernel)?;
     let now_after_kernel_read = u64::try_from(
         SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|error| format!("TASK_SELECTION_REQUIRED: daemon clock is invalid: {error}"))?
+        .map_err(|_| TaskControllerSelectionError::Required)?
         .as_millis(),
     )
-    .map_err(|_| "TASK_SELECTION_REQUIRED: daemon clock exceeds owner range".to_owned())?;
+    .map_err(|_| TaskControllerSelectionError::Required)?;
     let (owner, explicit_root, live_fence) = {
         let guard = composition.lock().await;
         let owner = guard
             .finish_task_selection_for_request(pending, now_after_kernel_read, acceptance_set)
-            .map_err(task_selection_composition_error)?;
+            .map_err(TaskControllerSelectionError::Composition)?;
         let live_fence = guard.governor_kernel_fence();
         if !eliot_contracts::fences_match_exact(owner.state_fence(), &live_fence) {
-            return Err("TASK_SCOPE_INCOMPATIBLE: Task Controller selection fence moved".to_owned());
+            return Err(TaskControllerSelectionError::ScopeIncompatible);
         }
         let explicit_root = guard
             .activation_workspace_locator_for_selection(&owner)
-            .map_err(|error| error.to_string())?;
+            .map_err(TaskControllerSelectionError::Binding)?;
         (owner, explicit_root, live_fence)
     };
     let observed_scope = crate::task_binding_admission::observe_explicit_workspace(
         &explicit_root,
         &live_fence,
     )
-    .map_err(|error| format!("TASK_SCOPE_INCOMPATIBLE: Host workspace observation failed: {error}"))?;
+    .map_err(TaskControllerSelectionError::Binding)?;
     Ok(TaskControllerSelectionAdmission {
         owner,
         observed_scope,
@@ -624,19 +622,41 @@ async fn task_controller_selection_admission(
     })
 }
 
-fn task_selection_composition_error(error: eliot_governor::CompositionError) -> String {
-    let code = match &error {
+#[derive(Debug)]
+enum TaskControllerSelectionError {
+    Required,
+    ScopeIncompatible,
+    Composition(eliot_governor::CompositionError),
+    Kernel(KernelPortError),
+    Binding(crate::task_binding_admission::TaskBindingError),
+}
+
+impl TaskControllerSelectionError {
+    fn reason_code(&self) -> Option<&'static str> {
+        match self {
+            Self::Required => Some("TASK_SELECTION_REQUIRED"),
+            Self::ScopeIncompatible => Some("TASK_SCOPE_INCOMPATIBLE"),
+            Self::Composition(error) => task_selection_composition_reason_code(error),
+            Self::Kernel(_) => None,
+            Self::Binding(error) => Some(error.code()),
+        }
+    }
+}
+
+fn task_selection_composition_reason_code(
+    error: &eliot_governor::CompositionError,
+) -> Option<&'static str> {
+    match error {
         eliot_governor::CompositionError::ActivationTaskSelectionRequired
         | eliot_governor::CompositionError::ActivationScopeAmbiguous { .. } => {
-            "TASK_SELECTION_REQUIRED"
+            Some("TASK_SELECTION_REQUIRED")
         }
         eliot_governor::CompositionError::ActivationScopeSelectionRequired
         | eliot_governor::CompositionError::ActivationStaleFence => {
-            "TASK_SCOPE_INCOMPATIBLE"
+            Some("TASK_SCOPE_INCOMPATIBLE")
         }
-        _ => "TASK_SELECTION_REQUIRED",
-    };
-    format!("{code}: {error}")
+        _ => None,
+    }
 }
 
 fn decode_task_controller_action(
@@ -704,7 +724,7 @@ pub fn prepare_task_controller_transition(
             ),
         (PreparedTaskControllerAction::Apply(guarded), owner_publications) => {
             let Some(selection) = selection.as_ref() else {
-                return match task_controller_rejection(&claimed, "transition_rejected") {
+                return match task_controller_rejection(&claimed, "TASK_SELECTION_REQUIRED") {
                     Ok(body) => TaskControllerTransitionPreparation::Rejected(Box::new(body)),
                     Err(error) => TaskControllerTransitionPreparation::Failed(error),
                 };
@@ -729,6 +749,14 @@ pub fn prepare_task_controller_transition(
                 transition,
                 selection,
             }))
+        }
+        Err(eliot_governor::TaskLifecycleError::Composition(error)) => {
+            let code = task_selection_composition_reason_code(&error)
+                .unwrap_or("transition_rejected");
+            match task_controller_rejection(&claimed, code) {
+                Ok(body) => TaskControllerTransitionPreparation::Rejected(Box::new(body)),
+                Err(error) => TaskControllerTransitionPreparation::Failed(error),
+            }
         }
         Err(_) => match task_controller_rejection(&claimed, "transition_rejected") {
             Ok(body) => TaskControllerTransitionPreparation::Rejected(Box::new(body)),
@@ -763,26 +791,10 @@ pub async fn exchange_task_controller_transition(
     };
     let receipt = match receipt {
         Ok(receipt) => receipt,
-        Err(eliot_governor::TaskLifecycleError::Kernel(KernelPortError::Contract(reason))) => {
-            if let Some(code) = task_binding_reason_code(&reason) {
-                return task_controller_rejection(&execution.claimed, code);
-            }
-            return task_controller_rejection(&execution.claimed, "transition_rejected");
-        }
         Err(_) => return task_controller_rejection(&execution.claimed, "transition_rejected"),
     };
     task_controller_result_body(
         &execution.claimed,
         json!({ "status": "committed", "receipt": receipt }),
     )
-}
-
-fn task_binding_reason_code(reason: &str) -> Option<&'static str> {
-    if reason.starts_with("TASK_SELECTION_REQUIRED") {
-        Some("TASK_SELECTION_REQUIRED")
-    } else if reason.starts_with("TASK_SCOPE_INCOMPATIBLE") {
-        Some("TASK_SCOPE_INCOMPATIBLE")
-    } else {
-        None
-    }
 }
