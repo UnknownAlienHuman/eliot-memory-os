@@ -25,9 +25,9 @@ use super::diagnostic_brief::DiagnosticTrigger;
 use super::kernel_audit::{AuditEventDraft, AuditEventKind};
 use super::{
     ACTIVE_DAEMON_CALLER, DaemonRuntimeStatus, ELIOTD_MAX_RECOVERY_ATTEMPTS, KernelBuildError,
-    KernelComposition, daemon_refuses_replacement, daemon_restart_refusal_reason,
-    daemon_status_proves_ready, eliotd_launch_attempt_identity, eliotd_operation_id,
-    fresh_eliotd_launch_descriptor, probe_ready_state_admitted, sha256_hex,
+    KernelComposition, daemon_class_withholds_replacement, daemon_refuses_replacement,
+    daemon_restart_refusal_reason, daemon_status_proves_ready, eliotd_launch_attempt_identity,
+    eliotd_operation_id, fresh_eliotd_launch_descriptor, probe_ready_state_admitted, sha256_hex,
     stable_owner_principal_digest,
 };
 
@@ -576,15 +576,30 @@ impl KernelComposition {
         // being replaced: after its process is proven terminal and before any
         // replacement is launched. An exit the process owner could not
         // classify is not read as a normal exit and cannot buy a replacement.
-        // Which classifiable exit may restart is the class rule's own decision
-        // and stays with `decide_automatic_restart` once an admitted restart
-        // policy exists for this child.
+        //
+        // A classifiable exit is the other case: the process owner did establish
+        // what happened, so the admitted restart class for this child decides
+        // whether that class of exit may buy a replacement. The rule is the
+        // shared `decide_automatic_restart`, evaluated against
+        // `KernelConfig::daemon_restart_policy`; this module only supplies the
+        // owner lifecycle and the exit/health evidence. No policy means no
+        // class, and an absent declaration is refused rather than widened into
+        // an unlimited budget.
         if let Some(receipt) = previous_receipt.as_ref() {
             let closed = match self.close_previous_daemon_process(&launch, receipt).await {
                 Ok(closed) => closed,
                 Err(error) => return Err(self.daemon_failure_error(error.to_string())),
             };
             if let Some(refusal) = daemon_refuses_replacement(service_state, &closed) {
+                let reason = daemon_restart_refusal_reason(&refusal);
+                observe_daemon_runtime("kernel.daemon.restart_refused", reason);
+                let reason = format!("eliotd automatic restart refused: {reason}");
+                return Err(self.daemon_failure_error(reason));
+            }
+            let restart_policy = self.daemon_restart_policy.as_ref();
+            if let Some(refusal) =
+                daemon_class_withholds_replacement(restart_policy, service_state, &status, &closed)
+            {
                 let reason = daemon_restart_refusal_reason(&refusal);
                 observe_daemon_runtime("kernel.daemon.restart_refused", reason);
                 let reason = format!("eliotd automatic restart refused: {reason}");
