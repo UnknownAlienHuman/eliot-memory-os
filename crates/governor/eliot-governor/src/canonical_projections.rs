@@ -37,7 +37,7 @@ use eliot_context_contracts::{
     ContextBinding, ContextError, ContinuityProjection, SafetyProjection, TaskProjection,
 };
 use eliot_contracts::{StateFence, TaskId, fences_match_exact};
-use eliot_observation::{ObservationAdmissionResult, ObservationJournalEntry};
+use eliot_observation::ObservationJournalEntry;
 use eliot_session::SessionLifecycleSnapshot;
 use eliot_task::{TaskLifecycleSnapshot, TaskState};
 use eliot_workscope::WorkScopeBindingSnapshot;
@@ -383,27 +383,6 @@ fn state_wire(state: TaskState) -> Result<String, GovernorProjectionError> {
         .ok_or(GovernorProjectionError::InvalidField("task.state"))
 }
 
-fn rejection_triggers(
-    journal: &[ObservationJournalEntry],
-) -> Result<Vec<String>, GovernorProjectionError> {
-    let mut triggers = BTreeSet::new();
-    for entry in journal {
-        if let ObservationAdmissionResult::Rejected { rejection } = &entry.result {
-            for error in &rejection.all_contract_errors {
-                check_text(error, "safety.negative_memory_triggers")?;
-                triggers.insert(error.clone());
-            }
-        }
-    }
-    let collected: Vec<String> = triggers.into_iter().collect();
-    if collected.len() > MAX_SAFETY_TRIGGERS {
-        return Err(GovernorProjectionError::Bounds(
-            "safety.negative_memory_triggers",
-        ));
-    }
-    Ok(collected)
-}
-
 fn project_task(
     task_snapshot: &TaskLifecycleSnapshot,
     task_id: &TaskId,
@@ -470,21 +449,19 @@ fn project_continuity(
 }
 
 fn project_safety(
-    journal: &[ObservationJournalEntry],
     task_id: &TaskId,
 ) -> Result<GovernorSafetyProjection, GovernorProjectionError> {
-    let triggers = rejection_triggers(journal)?;
-    let safety_note = if triggers.is_empty() {
-        "no negative triggers observed".to_owned()
-    } else {
-        std::format!("{} negative triggers observed", triggers.len())
-    };
+    // Rejection diagnostics remain in the retained ObservationJournal, but a
+    // rejection carries no exact task-selection evidence to bind it to this
+    // requested task. Do not promote cold, ambiguous, or otherwise unbound
+    // observation errors into task-specific safety/influence triggers.
+    let safety_note = "no governed task-bound negative triggers observed".to_owned();
     check_text(&safety_note, "safety.safety_note")?;
     Ok(GovernorSafetyProjection {
         schema_version: GOVERNOR_PROJECTIONS_SCHEMA_VERSION,
         task_id: task_id.clone(),
         safety_note,
-        negative_memory_triggers: triggers,
+        negative_memory_triggers: Vec::new(),
     })
 }
 
@@ -527,7 +504,7 @@ pub fn compose_canonical_projections(
     task_snapshot: &TaskLifecycleSnapshot,
     session_snapshot: &SessionLifecycleSnapshot,
     scope_snapshot: &WorkScopeBindingSnapshot,
-    journal: &[ObservationJournalEntry],
+    _journal: &[ObservationJournalEntry],
     task_id: &TaskId,
     fence: &StateFence,
 ) -> Result<GovernorProjectionSet, GovernorProjectionError> {
@@ -553,7 +530,7 @@ pub fn compose_canonical_projections(
         fence,
         &mut omissions,
     )?;
-    let safety = Some(project_safety(journal, task_id)?);
+    let safety = Some(project_safety(task_id)?);
     let affordance = Some(project_affordance(scope_snapshot, &scope_ref, task_id)?);
 
     let set = GovernorProjectionSet {
