@@ -1283,6 +1283,7 @@ fn restore_solo_fabric(
     let ports = solo_fabric_ports(context, kernel, registry);
     let mut fabric = composition.agent_fabric_restore_verified(
         kernel,
+        &load_scheduling_profile(composition)?,
         projection.snapshot.clone(),
         ports,
         projection.claimed.material(),

@@ -172,6 +172,8 @@ pub use agent_fabric::{
     prereq_ports,
 };
 use agent_fabric::{FabricOperation, FabricPortId, MissingPortResidual, PortBindingState};
+#[cfg(test)]
+use eliot_agent_coordinator::SchedulingProfile;
 
 pub use authority_revocation_ingress::{
     AUTHORITY_REVOCATION_RESUME_BLOCKED, AuthorityRevocationIngressPlan,
@@ -3231,6 +3233,7 @@ impl DaemonComposition {
     pub fn agent_fabric_restore_verified(
         &self,
         kernel: &Arc<DaemonKernelClient>,
+        profile: &SchedulingProfile,
         snapshot: FabricSnapshot,
         ports: FabricPorts,
         material: VerifiedProviderMaterial,
@@ -3239,6 +3242,7 @@ impl DaemonComposition {
         let material = self.resolve_verified_material(kernel, material)?;
         let config = daemon_coordinator_config()?;
         Ok(AgentFabric::restore_verified(
+            profile,
             snapshot,
             config,
             ports,

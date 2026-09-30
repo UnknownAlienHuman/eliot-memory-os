@@ -3936,6 +3936,7 @@ impl AgentFabric {
     /// retained semantic records stay readable history, but publishing a new
     /// one is refused typed until a store is attached.
     pub fn restore(
+        profile: &SchedulingProfile,
         snapshot: FabricSnapshot,
         config: CoordinatorConfig,
         ports: FabricPorts,
@@ -3961,6 +3962,7 @@ impl AgentFabric {
         let coordinator = AgentCoordinator::restore(
             snapshot.coordinator_snapshot.clone(),
             config.clone(),
+            profile,
             PlanGap::G11Unavailable {
                 reason: FABRIC_PLAN_GAP_REASON.to_owned(),
             },
@@ -4029,6 +4031,7 @@ impl AgentFabric {
     /// Returns the coordinator owner restore rejection, a stale-config
     /// conflict, or a stale/revoked binding rejection unchanged.
     pub fn restore_with_admitted_provider(
+        profile: &SchedulingProfile,
         snapshot: FabricSnapshot,
         config: CoordinatorConfig,
         ports: FabricPorts,
@@ -4049,6 +4052,7 @@ impl AgentFabric {
         let coordinator = AgentCoordinator::restore_with_admitted_provider(
             snapshot.coordinator_snapshot.clone(),
             config.clone(),
+            profile,
             capability,
         )?;
         let mut definition_bytes = BTreeMap::new();
@@ -4123,6 +4127,7 @@ impl AgentFabric {
     /// restore rejection, or a stale-config conflict unchanged.
     #[cfg(test)]
     pub(crate) fn restore_verified(
+        profile: &SchedulingProfile,
         snapshot: FabricSnapshot,
         config: CoordinatorConfig,
         ports: FabricPorts,
@@ -4131,6 +4136,7 @@ impl AgentFabric {
     ) -> Result<Self, FabricError> {
         let capability = build_admitted_provider_capability(material)?;
         Self::restore_with_admitted_provider(
+            profile,
             snapshot,
             config,
             ports,

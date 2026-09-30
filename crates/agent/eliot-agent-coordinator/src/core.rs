@@ -3258,7 +3258,12 @@ impl AgentCoordinator {
         gap: PlanGap,
     ) -> Result<Self, CoordinatorError> {
         gap.validate()?;
-        Self::restore_with_provider(snapshot, live_config, profile, Box::new(GapProvider { gap }))
+        Self::restore_with_provider(
+            snapshot,
+            live_config,
+            profile,
+            Box::new(GapProvider { gap }),
+        )
     }
 
     /// Closed production restore on freshly supplied Kernel admission (T9-05,

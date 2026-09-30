@@ -36,8 +36,8 @@ use crate::{
     ProviderReassignmentReceipt, ProviderUnknownOutcomeReconciliation, ProviderWorkerFenceReceipt,
     ReassignmentId, RecipeId, RecipeManifest, ResultSubmission, RoleProfileId, RoleProfileManifest,
     RouteCandidateEvidence, SchedulingProfile, StaffingLaneRequest, StaffingPlanCandidate,
-    StaffingPlanRequest, SubmissionId, UnknownOutcomeResolution, WipPartitionKey, WipPartitionLimit,
-    WorkClass, WorkerId,
+    StaffingPlanRequest, SubmissionId, UnknownOutcomeResolution, WipPartitionKey,
+    WipPartitionLimit, WorkClass, WorkerId,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -1137,7 +1137,10 @@ fn live_capacity_evidence_limits_admission_and_reassignment() -> TestResult {
     second_request.lanes[0].route_candidates[0].capacity_limit = 1;
     let second_candidate = coordinator.plan(second_request)?;
     assert_eq!(
-        coordinator.admit(&profile(), provider_receipt(&second_candidate, "cap-second")?),
+        coordinator.admit(
+            &profile(),
+            provider_receipt(&second_candidate, "cap-second")?
+        ),
         Err(CoordinatorError::Backpressure {
             active: 1,
             requested: 1,
@@ -1431,7 +1434,7 @@ fn snapshot_binds_sequence_digest_capacity_and_provider_identity() -> TestResult
     let restored = AgentCoordinator::restore_with_provider(
         snapshot.clone(),
         cfg.clone(),
-    &profile(),
+        &profile(),
         Box::new(verifier(&proofs, snapshot.event_sequence)),
     )?;
     assert_eq!(restored.events(), coordinator.events());
@@ -1442,7 +1445,7 @@ fn snapshot_binds_sequence_digest_capacity_and_provider_identity() -> TestResult
         AgentCoordinator::restore_with_provider(
             rollback,
             cfg.clone(),
-    &profile(),
+            &profile(),
             Box::new(verifier(&proofs, 0))
         )
         .err(),
@@ -1454,7 +1457,7 @@ fn snapshot_binds_sequence_digest_capacity_and_provider_identity() -> TestResult
         AgentCoordinator::restore_with_provider(
             widened,
             cfg.clone(),
-    &profile(),
+            &profile(),
             Box::new(verifier(&proofs, 0))
         )
         .err(),
@@ -1464,7 +1467,7 @@ fn snapshot_binds_sequence_digest_capacity_and_provider_identity() -> TestResult
         AgentCoordinator::restore_with_provider(
             snapshot.clone(),
             cfg.clone(),
-    &profile(),
+            &profile(),
             Box::new(verifier(&proofs, snapshot.event_sequence + 1))
         )
         .err(),
@@ -1473,8 +1476,13 @@ fn snapshot_binds_sequence_digest_capacity_and_provider_identity() -> TestResult
     let mut tampered = snapshot;
     tampered.event_digest = "0".repeat(64);
     assert_eq!(
-        AgentCoordinator::restore_with_provider(tampered, cfg, &profile(), Box::new(verifier(&proofs, 0)))
-            .err(),
+        AgentCoordinator::restore_with_provider(
+            tampered,
+            cfg,
+            &profile(),
+            Box::new(verifier(&proofs, 0))
+        )
+        .err(),
         Some(CoordinatorError::SnapshotDigest)
     );
     Ok(())
@@ -1678,7 +1686,7 @@ fn coordinator_case_15_snapshot_v4_roundtrip_binds_all_properties() -> TestResul
     let restored = AgentCoordinator::restore_with_provider(
         snapshot.clone(),
         config(2, 2),
-    &profile(),
+        &profile(),
         Box::new(verifier(
             &["proof-admission-case-15"],
             snapshot.event_sequence,
@@ -1734,7 +1742,7 @@ fn coordinator_case_16_snapshot_v3_and_v4_legacy_fence_reject_before_replay() ->
         AgentCoordinator::restore_json(
             &v3.to_string(),
             config(2, 2),
-    &profile(),
+            &profile(),
             PlanGap::G11Unavailable {
                 reason: "fixture".to_owned()
             }
@@ -1748,7 +1756,7 @@ fn coordinator_case_16_snapshot_v3_and_v4_legacy_fence_reject_before_replay() ->
         AgentCoordinator::restore_json(
             &legacy.to_string(),
             config(2, 2),
-    &profile(),
+            &profile(),
             PlanGap::G11Unavailable {
                 reason: "fixture".to_owned()
             }
@@ -1912,7 +1920,7 @@ fn coordinator_case_19_replay_conflict_and_snapshot_forgery_fail_closed() -> Tes
         AgentCoordinator::restore_with_provider(
             snapshot,
             config(2, 2),
-    &profile(),
+            &profile(),
             Box::new(verifier(&proofs, 0))
         )
         .err(),
@@ -2383,7 +2391,7 @@ fn binding_snapshot_restore_preserves_binding_and_absent_stays_unresolved() -> T
     let restored_pre = AgentCoordinator::restore_with_provider(
         pre_binding.clone(),
         config(4, 4),
-    &profile(),
+        &profile(),
         Box::new(verifier(&proofs, pre_binding.event_sequence)),
     )?;
     assert_eq!(
@@ -2405,7 +2413,7 @@ fn binding_snapshot_restore_preserves_binding_and_absent_stays_unresolved() -> T
     let restored_post = AgentCoordinator::restore_with_provider(
         post_binding.clone(),
         config(4, 4),
-    &profile(),
+        &profile(),
         Box::new(verifier(&proofs, post_binding.event_sequence)),
     )?;
     assert_eq!(
@@ -2770,7 +2778,7 @@ fn s5_stored_admission_closes_binding_and_forged_digest_rejects() -> TestResult 
     let mut restored = AgentCoordinator::restore_with_provider(
         snapshot.clone(),
         config(4, 4),
-    &profile(),
+        &profile(),
         Box::new(verifier(&proofs, snapshot.event_sequence)),
     )?;
     assert_eq!(
@@ -3678,7 +3686,7 @@ fn observe_e2e_lost_ack_reconstruct_replay_once_without_duplicate_effects() -> T
     let mut coordinator = AgentCoordinator::restore_with_admitted_provider(
         pre_snapshot.clone(),
         cfg.clone(),
-    &profile(),
+        &profile(),
         admitted_capability(pre_snapshot.event_sequence)?,
     )?;
     assert_eq!(coordinator.events().len(), event_count_before);
@@ -3693,7 +3701,7 @@ fn observe_e2e_lost_ack_reconstruct_replay_once_without_duplicate_effects() -> T
     let mut restored = AgentCoordinator::restore_with_admitted_provider(
         durable.clone(),
         cfg.clone(),
-    &profile(),
+        &profile(),
         admitted_capability(durable.event_sequence)?,
     )?;
     assert_eq!(restored.events(), coordinator.events());
@@ -4030,7 +4038,10 @@ fn production_stale_route_capacity_epoch_fail_closed() -> TestResult {
     )?)?;
     assert_eq!(
         coordinator
-            .admit(&profile(), provider_receipt(&candidate, "prod-stale-route")?)
+            .admit(
+                &profile(),
+                provider_receipt(&candidate, "prod-stale-route")?
+            )
             .err(),
         Some(CoordinatorError::RouteEvidence)
     );
@@ -4058,7 +4069,10 @@ fn production_stale_route_capacity_epoch_fail_closed() -> TestResult {
     )?)?;
     assert_eq!(
         coordinator
-            .admit(&profile(), provider_receipt(&candidate, "prod-stale-epoch")?)
+            .admit(
+                &profile(),
+                provider_receipt(&candidate, "prod-stale-epoch")?
+            )
             .err(),
         Some(CoordinatorError::StaleController)
     );
@@ -4137,7 +4151,7 @@ fn production_restore_reverifies_against_fresh_kernel_evidence() -> TestResult {
     let restored = AgentCoordinator::restore_with_admitted_provider(
         snapshot.clone(),
         cfg.clone(),
-    &profile(),
+        &profile(),
         admitted_capability(snapshot.event_sequence)?,
     )?;
     assert_eq!(restored.events(), coordinator.events());
@@ -4145,7 +4159,7 @@ fn production_restore_reverifies_against_fresh_kernel_evidence() -> TestResult {
         AgentCoordinator::restore_with_admitted_provider(
             snapshot.clone(),
             cfg.clone(),
-    &profile(),
+            &profile(),
             admitted_capability_for(
                 provider_identity(),
                 true,
@@ -4165,7 +4179,7 @@ fn production_restore_reverifies_against_fresh_kernel_evidence() -> TestResult {
         AgentCoordinator::restore_with_admitted_provider(
             snapshot.clone(),
             cfg.clone(),
-    &profile(),
+            &profile(),
             admitted_capability(snapshot.event_sequence + 1)?,
         )
         .err(),
@@ -4179,7 +4193,7 @@ fn production_restore_reverifies_against_fresh_kernel_evidence() -> TestResult {
         AgentCoordinator::restore_with_admitted_provider(
             snapshot,
             cfg,
-    &profile(),
+            &profile(),
             admitted_capability_for(
                 foreign_identity,
                 false,
