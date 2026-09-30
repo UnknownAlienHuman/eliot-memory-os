@@ -60,9 +60,21 @@ pub const USER_AUTOMATION_RUNTIME_CHANNEL: &str = "USER_AUTOMATION_RUNTIME_OPERA
 /// Closed kind of the runtime effect one committed operator operation owns.
 ///
 /// Each variant names exactly one boundary at which a response can be lost
-/// after the effect may already have been issued. A `RunNow` occurrence and a
-/// read carry no kind here: neither owns an outbound effect on this route, so
-/// neither retains an obligation.
+/// after the effect may already have been issued. The three members this
+/// vocabulary has are all wake-side boundaries, and a read issues no owner
+/// effect at all, so a read carries no kind here and retains no obligation.
+///
+/// A committed `RunNow` occurrence does own an outbound effect on this route.
+/// `KernelStoreGateway::run_now_handoff` reaches the Durable Job owner through
+/// `UserAutomationOperatorRuntime::admit_occurrence`, and that answer can be
+/// lost after the job was admitted, which is the boundary shape every member
+/// above exists for. No member names it, so a `RunNow` answer retains no
+/// obligation here: its admission is reconciled through the Durable Job owner's
+/// own durable record, not through this record. That is a gap in the vocabulary,
+/// not a property of the route. The serialized variants of this kind are
+/// mirrored into the generated Operator schedule contract under `apps/`, so
+/// naming this boundary means changing that generated mirror as well, which is
+/// why a `crates/**` writer cannot add the member here.
 #[derive(
     Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
 )]

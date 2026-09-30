@@ -2410,9 +2410,13 @@ impl KernelStoreGateway {
     /// The record binds the parent operation, the exact digest of the committed
     /// canonical receipt, the immutable automation/revision those obligations
     /// belong to, and the State Fence every phase was observed under. An
-    /// operation that retained no obligation owns no orchestration: that is a
-    /// complete answer about an obligation that never existed, not an empty
-    /// record, so a read-only answer and a `RunNow` answer carry none.
+    /// operation that retained no obligation owns no orchestration, which is an
+    /// absent answer rather than an empty record. For a read-only answer that is
+    /// complete, because a read issues no owner effect. For a `RunNow` answer it
+    /// is not: that operation reaches the Durable Job owner through
+    /// [`Self::run_now_handoff`] and retains no obligation for that boundary, so
+    /// the absence names an unrecorded owner effect rather than an obligation
+    /// that never existed.
     fn compose_user_automation_orchestration(
         sealed: &UserAutomationServiceRequest,
         configuration: &UserAutomationConfigurationPhase,
@@ -4321,9 +4325,12 @@ impl KernelStoreGateway {
 
     /// Routes one committed operator operation to its runtime handoff phases.
     ///
-    /// Every leg that may issue an owner effect retains its obligation in the
-    /// composition-bound durable outbox first and appends it to `obligations`,
-    /// so the parent transition reports exactly the obligations it retained.
+    /// Every leg that may issue a wake-owner effect retains its obligation in
+    /// the composition-bound durable outbox first and appends it to
+    /// `obligations`, so the parent transition reports exactly the obligations
+    /// it retained. The `RunNow` leg is named here rather than implied: it takes
+    /// no `obligations`, and it crosses the Durable Job owner through
+    /// [`Self::run_now_handoff`] without retaining that boundary in this record.
     ///
     /// Classification and revalidation (issue #2806 item 2): read-only answers
     /// own no handoff; a changed or rejected configuration never reaches this
