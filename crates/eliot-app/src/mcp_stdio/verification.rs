@@ -2798,6 +2798,7 @@ pub(super) fn materialize_managed_candidate(
         work_item_id: intent.work_item_id,
         base_commit: intent.baseline_commit.clone(),
         worktree_head: Some(commit_ref.clone()),
+        source_snapshot: None,
         diff_hash: managed
             .candidate_diff_hash
             .strip_prefix("blake3:")
