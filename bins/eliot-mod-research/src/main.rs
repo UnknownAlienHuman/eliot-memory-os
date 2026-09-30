@@ -22,6 +22,7 @@ use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::sync::Arc;
 
+use eliot_contracts::CapabilityCellProof;
 use eliot_kernel_service::{RESEARCH_PROVIDER_DISPATCH_OPERATION, ResearchProviderDispatch};
 use eliot_mod_research::AdmittedResearchBridge;
 use eliot_mod_research::admission::ProviderAdmission;
@@ -161,7 +162,7 @@ fn run() -> Result<String, Failure> {
     let client_receipt = client
         .dispatch(&admitted.dispatch, RESEARCH_PROVIDER_DISPATCH_OPERATION)
         .map_err(|error| Failure::NoAdmission(format!("kernel dispatch: {error}")))?;
-    let admission = admit(&admitted, &client_receipt)?;
+    let (admission, capability_cell_proof) = admit(&admitted, &client_receipt)?;
 
     // 4. Dependency wiring. The dispatch authority is ephemeral and in-process;
     //    its key never crosses the front-door boundary.
@@ -234,6 +235,7 @@ fn run() -> Result<String, Failure> {
             &admitted,
             &client_receipt,
             &admission,
+            &capability_cell_proof,
             raw.as_ref(),
             &observation,
             cancellation.cloned(),
@@ -268,6 +270,7 @@ fn run() -> Result<String, Failure> {
         &admitted,
         &client_receipt,
         &admission,
+        &capability_cell_proof,
         &mut bridge,
         records,
     )
@@ -296,6 +299,7 @@ fn report_failed_operation(
     admitted: &AdmittedOperation,
     client_receipt: &eliot_kernel_service::ResearchProviderDispatchReceipt,
     admission: &ProviderAdmission,
+    capability_cell_proof: &CapabilityCellProof,
     bridge: &mut AdmittedResearchBridge,
     records: Vec<eliot_mod_research::ProviderEvidenceRecord>,
 ) -> Result<String, Failure> {
@@ -320,6 +324,7 @@ fn report_failed_operation(
         admitted,
         client_receipt,
         admission,
+        capability_cell_proof,
         bridge.last_evidence(),
         &observation,
         bridge.last_cancellation().cloned(),
@@ -469,7 +474,8 @@ fn report_admitted_inquiry(
     }
 }
 
-/// Seals one verified Kernel dispatch receipt into a local admission.
+/// Seals one verified Kernel dispatch receipt into a local admission and binds
+/// it to the generated #13 capability-cell record.
 ///
 /// The receipt was already re-proved against the presented dispatch by the wire
 /// owner's `verify_echo`. The local admission is built only from fields that
@@ -481,15 +487,22 @@ fn report_admitted_inquiry(
 /// every fact the exchange request does not carry against the Kernel's own
 /// attested content by value.
 ///
+/// The returned [`CapabilityCellProof`] is #13's proof surface for the generated
+/// capability cell the sealed `module_id` names. It is produced here, before any
+/// port, authority, or executor exists, and travels onto the terminal receipt so
+/// the run states which compiled capability cell admitted it and which proof
+/// entrypoint is independently invokable for that cell.
+///
 /// # Errors
 ///
 /// Returns [`Failure::NoAdmission`] when the admitted material cannot be turned
-/// into a local admission, or when the sealed record is not the record of the
-/// dispatch that receipt was issued for.
+/// into a local admission, when the sealed record is not the record of the
+/// dispatch that receipt was issued for, or when the sealed Module/Capability
+/// Registry reference names no declared cell with a current proof surface.
 fn admit(
     admitted: &AdmittedOperation,
     client_receipt: &eliot_kernel_service::ResearchProviderDispatchReceipt,
-) -> Result<ProviderAdmission, Failure> {
+) -> Result<(ProviderAdmission, CapabilityCellProof), Failure> {
     let dispatch: &ResearchProviderDispatch = &admitted.dispatch;
     let bridge = BridgeIdentity::new(
         dispatch.executable_path.clone(),
@@ -550,14 +563,16 @@ fn admit(
         .bind_admitted_dispatch(dispatch, client_receipt)
         .map_err(|error| Failure::NoAdmission(format!("admission refused: {}", error.reason())))?;
     // The Module/Capability Registry reference the record seals is bound to the
-    // generated #13 cell record before any port, authority, or executor exists.
-    // A Kernel that admitted a module id this package does not declare, or a
-    // declared cell whose proof surface is stale, is refused here rather than
-    // after a provider process was started: there is no executor contact for a
-    // cell this process cannot name.
-    resolve_admitted_cell(&admission)
+    // generated #13 cell record before any port, authority, or executor exists,
+    // and the resolved record's own proof surface is returned so the run can
+    // receipt which compiled capability cell answered it. A Kernel that
+    // admitted a module id this package does not declare, or a declared cell
+    // whose proof surface is stale, is refused here rather than after a provider
+    // process was started: there is no executor contact for a cell this process
+    // cannot name.
+    let capability_cell_proof = resolve_admitted_cell(&admission)
         .map_err(|error| Failure::NoAdmission(format!("admission refused: {}", error.reason())))?;
-    Ok(admission)
+    Ok((admission, capability_cell_proof))
 }
 
 /// Asks the Kernel owner what it still holds for this operation, and records
@@ -681,6 +696,7 @@ fn terminal_receipt(
     admitted: &AdmittedOperation,
     client_receipt: &eliot_kernel_service::ResearchProviderDispatchReceipt,
     admission: &ProviderAdmission,
+    capability_cell_proof: &CapabilityCellProof,
     raw: Option<&RawProviderEvidence>,
     observation: &EvidenceObservation,
     cancellation: Option<CancellationEvidence>,
@@ -718,6 +734,7 @@ fn terminal_receipt(
         admission_receipt_sha256: client_receipt.receipt_digest.clone(),
         executable_sha256: admission.bridge().executable_sha256().to_owned(),
         module_generation_id: dispatch.module_generation_id.clone(),
+        capability_cell_proof: capability_cell_proof.clone(),
         process_generation: dispatch.process_generation,
         disclosure: dispatch.disclosure.clone(),
         budget_units: dispatch.budget_units,

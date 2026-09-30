@@ -747,6 +747,173 @@ impl fmt::Display for CellClassificationError {
 
 impl std::error::Error for CellClassificationError {}
 
+/// One fail-closed refusal when a caller asks this registry to prove that a
+/// presented cell identity names a declared cell with a current proof surface.
+///
+/// Every variant names its cause and refuses the request. No variant is
+/// downgraded to a warning, and none is answered with a default cell: a
+/// registry that cannot prove the presented identity proves nothing about it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CapabilityCellProofError {
+    /// The registry failed its own typed validation, so no record in it is proven.
+    InvalidRegistry,
+    /// No declared record carries the presented cell identity.
+    UndeclaredCell {
+        /// Presented cell identity the registry does not declare.
+        cell: String,
+    },
+    /// More than one record claims the presented cell identity.
+    AmbiguousCell {
+        /// Cell identity claimed by more than one record.
+        cell: String,
+    },
+    /// The single record for this cell names a different source crate than the
+    /// caller presented. Packaging never transfers authority, so a record
+    /// resolved for another crate is not this crate's proof.
+    SourceCrateMismatch {
+        /// Cell identity whose record names another source crate.
+        cell: String,
+        /// Source crate the single declared record names.
+        declared: String,
+        /// Source crate the caller presented.
+        presented: String,
+    },
+    /// The declared record carries no independently invokable proof entrypoint.
+    MissingProofEntrypoint {
+        /// Cell identity whose record has no proof entrypoint.
+        cell: String,
+    },
+    /// The declared record's current-support claim is stale or suspended, or it
+    /// names an invalidation reason, so its proof surface is not current.
+    StaleProofSurface {
+        /// Cell identity whose record support claim is not current.
+        cell: String,
+    },
+}
+
+impl fmt::Display for CapabilityCellProofError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRegistry => {
+                write!(formatter, "capability cell registry failed typed validation")
+            }
+            Self::UndeclaredCell { cell } => {
+                write!(formatter, "capability cell registry declares no cell '{cell}'")
+            }
+            Self::AmbiguousCell { cell } => {
+                write!(formatter, "capability cell '{cell}' is claimed by more than one record")
+            }
+            Self::SourceCrateMismatch {
+                cell,
+                declared,
+                presented,
+            } => write!(
+                formatter,
+                "capability cell '{cell}' record names source crate '{declared}', not '{presented}'"
+            ),
+            Self::MissingProofEntrypoint { cell } => write!(
+                formatter,
+                "capability cell '{cell}' declares no independently invokable proof entrypoint"
+            ),
+            Self::StaleProofSurface { cell } => write!(
+                formatter,
+                "capability cell '{cell}' proof surface is not currently supported"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CapabilityCellProofError {}
+
+/// The typed proof surface this registry publishes for exactly one resolved
+/// cell.
+///
+/// A proof record is what a caller receipts after resolving its own presented
+/// cell identity through [`CapabilityCellRegistry::resolve_cell_proof`]: it
+/// names the record's own identity, revision, contract digest and source crate,
+/// the single proof entrypoint that is independently invokable for it, its
+/// current support, and the digest of the exact registry value the record was
+/// resolved from. The registry digest is what lets a consumer say *which*
+/// compiled record answered it, rather than only that some record with a
+/// matching name existed.
+///
+/// The record carries no authority, mints nothing, and promotes no support
+/// claim: it is evidence about one declared cell, produced only after the whole
+/// registry passed [`CapabilityCellRegistry::validate`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapabilityCellProof {
+    cell: CapabilityCellId,
+    cell_revision: ContractVersion,
+    contract_digest: ContractDigest,
+    contract_digest_source: DigestSourceRef,
+    source_crate: SourceCrateRef,
+    lifecycle_owner: CellOwnerRef,
+    proof_entrypoint: ProofEntrypointRef,
+    current_support: SupportStatus,
+    registry_digest: String,
+}
+
+impl CapabilityCellProof {
+    /// Returns the declared cell identity this proof is for.
+    #[must_use]
+    pub fn cell(&self) -> &CapabilityCellId {
+        &self.cell
+    }
+
+    /// Returns the revision of the cell contract surface that was proven.
+    #[must_use]
+    pub fn cell_revision(&self) -> ContractVersion {
+        self.cell_revision
+    }
+
+    /// Returns the digest of the proven cell's public contract surface.
+    #[must_use]
+    pub fn contract_digest(&self) -> &ContractDigest {
+        &self.contract_digest
+    }
+
+    /// Returns where the contract digest was observed.
+    #[must_use]
+    pub fn contract_digest_source(&self) -> &DigestSourceRef {
+        &self.contract_digest_source
+    }
+
+    /// Returns the Cargo package whose source the proven record names.
+    #[must_use]
+    pub fn source_crate(&self) -> &SourceCrateRef {
+        &self.source_crate
+    }
+
+    /// Returns the owner accountable for the proven cell's lifecycle.
+    #[must_use]
+    pub fn lifecycle_owner(&self) -> &CellOwnerRef {
+        &self.lifecycle_owner
+    }
+
+    /// Returns the independently invokable proof entrypoint for the proven cell.
+    #[must_use]
+    pub fn proof_entrypoint(&self) -> &ProofEntrypointRef {
+        &self.proof_entrypoint
+    }
+
+    /// Returns the current-support claim the proven record carries.
+    #[must_use]
+    pub fn current_support(&self) -> SupportStatus {
+        self.current_support
+    }
+
+    /// Returns the digest of the exact registry value the record was resolved from.
+    ///
+    /// This is the digest of the original recorded registry — the value that
+    /// decoded from the generated bytes and then passed
+    /// [`CapabilityCellRegistry::validate`] — never a digest of a copy, a
+    /// re-serialized projection, or a subset of the roster.
+    #[must_use]
+    pub fn registry_digest(&self) -> &str {
+        &self.registry_digest
+    }
+}
+
 #[derive(Serialize)]
 struct RegistryDigestInput<'a> {
     namespace: &'static str,
@@ -895,6 +1062,92 @@ impl CapabilityCellRegistry {
             }
         }
         Ok(())
+    }
+
+    /// Resolves one presented cell identity into this registry's typed proof
+    /// surface for it.
+    ///
+    /// This is the single resolution path every caller shares, so no consumer
+    /// restates the record-side checks and no second cell schema exists. It
+    /// fails closed at every step:
+    ///
+    /// - the whole registry must first pass [`Self::validate`]; a registry with
+    ///   any diagnostic proves nothing about any of its records;
+    /// - exactly one record may claim the presented cell identity — an absent
+    ///   cell and a duplicated cell are both refusals, never "the first match";
+    /// - that single record must name the presented `expected_source_crate`.
+    ///   Packaging never transfers authority, so a record generated for another
+    ///   crate is not this caller's proof even when the cell id matches;
+    /// - the record must carry an independently invokable proof entrypoint, and
+    ///   its current-support claim must be neither stale nor suspended with no
+    ///   invalidation reason pending, because a cell whose proof surface is not
+    ///   current proves nothing now.
+    ///
+    /// The returned [`CapabilityCellProof`] carries the digest of *this*
+    /// registry value, computed from the same validated value the record was
+    /// read out of, so a caller can receipt exactly which generated record
+    /// admitted it. No default cell, no name-derived classification, and no
+    /// partial acceptance.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CapabilityCellProofError::InvalidRegistry`] when this registry
+    /// fails its own validation, `UndeclaredCell` when it declares no such cell,
+    /// `AmbiguousCell` when more than one record claims it,
+    /// `SourceCrateMismatch` when the single record names another source crate,
+    /// `MissingProofEntrypoint` when the record has no proof entrypoint, and
+    /// `StaleProofSurface` when its current-support claim is not current.
+    pub fn resolve_cell_proof(
+        &self,
+        presented_cell: &CapabilityCellId,
+        expected_source_crate: &SourceCrateRef,
+    ) -> Result<CapabilityCellProof, CapabilityCellProofError> {
+        self.validate()
+            .map_err(|_| CapabilityCellProofError::InvalidRegistry)?;
+        let cell = presented_cell.as_str().to_owned();
+        let mut matching = self
+            .cells
+            .iter()
+            .filter(|record| record.cell.as_str() == presented_cell.as_str());
+        let record = matching
+            .next()
+            .ok_or_else(|| CapabilityCellProofError::UndeclaredCell { cell: cell.clone() })?;
+        if matching.next().is_some() {
+            return Err(CapabilityCellProofError::AmbiguousCell { cell });
+        }
+        if record.source_crate != *expected_source_crate {
+            return Err(CapabilityCellProofError::SourceCrateMismatch {
+                cell,
+                declared: record.source_crate.as_str().to_owned(),
+                presented: expected_source_crate.as_str().to_owned(),
+            });
+        }
+        let proof_entrypoint = record.proof_entrypoint.clone().ok_or_else(|| {
+            CapabilityCellProofError::MissingProofEntrypoint { cell: cell.clone() }
+        })?;
+        if matches!(
+            record.freshness.current_support,
+            SupportStatus::Stale | SupportStatus::Suspended
+        ) || !record.freshness.invalidation.is_empty()
+        {
+            return Err(CapabilityCellProofError::StaleProofSurface { cell });
+        }
+        // The digest is taken from this same validated value, so the proof and
+        // the bytes it was read from cannot disagree.
+        let registry_digest = self
+            .registry_digest()
+            .map_err(|_| CapabilityCellProofError::InvalidRegistry)?;
+        Ok(CapabilityCellProof {
+            cell: record.cell.clone(),
+            cell_revision: record.cell_revision,
+            contract_digest: record.contract_digest.clone(),
+            contract_digest_source: record.contract_digest_source.clone(),
+            source_crate: record.source_crate.clone(),
+            lifecycle_owner: record.lifecycle_owner.clone(),
+            proof_entrypoint,
+            current_support: record.freshness.current_support,
+            registry_digest,
+        })
     }
 
     /// Returns, for every declared cell, the admitted production target that

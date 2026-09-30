@@ -8,6 +8,7 @@
 //! this record carries exact digests so the Governor-owned Blob path can bind
 //! the raw artifacts without trusting a claim about them.
 
+use eliot_contracts::CapabilityCellProof;
 use eliot_process::{ExitDisposition, ExitStatus, ProcessEvidence, ProcessExecutionView};
 use eliot_process_executor::CapturedStream;
 use sha2::{Digest, Sha256};
@@ -360,6 +361,17 @@ pub struct ProviderExecutionReceipt {
     pub executable_sha256: String,
     /// Admitted provider module generation reference.
     pub module_generation_id: String,
+    /// The #13 capability-cell proof surface the admitted module reference was
+    /// bound to before this operation was admitted.
+    ///
+    /// This is #13's own typed [`eliot_contracts::CapabilityCellProof`] for the
+    /// generated registry record this package declares, so the receipt states
+    /// *which compiled capability cell* answered the dispatch, which proof
+    /// entrypoint is independently invokable for it, and the digest of the
+    /// exact registry value the record was resolved from. A dispatch whose
+    /// sealed `module_id` names no declared cell never reaches this receipt at
+    /// all: the binding runs before any port, authority or executor is built.
+    pub capability_cell_proof: CapabilityCellProof,
     /// Admitted process generation.
     pub process_generation: u64,
     /// Admitted privacy/data class wire name (no silent widening).
@@ -426,7 +438,10 @@ impl std::fmt::Display for ProviderExecutionReceipt {
         write!(
             formatter,
             "operation={} exchange={} cancellation={} dispatch={} admission_receipt={} \
-             executable={} module_generation={} process_generation={} disclosure={} \
+             executable={} module_generation={} \
+             capability_cell={} capability_cell_contract={} capability_cell_registry={} \
+             capability_cell_proof={:?} capability_cell_source_crate={} \
+             process_generation={} disclosure={} \
              budget_units={} deadline_ms={} inquiry={} denominator={} \
              submit_envelope={} submit_binding={} outcome={:?} \
              process_disposition={:?} stream_readback={} \
@@ -445,6 +460,11 @@ impl std::fmt::Display for ProviderExecutionReceipt {
             self.admission_receipt_sha256,
             self.executable_sha256,
             self.module_generation_id,
+            self.capability_cell_proof.cell().as_str(),
+            self.capability_cell_proof.contract_digest().as_str(),
+            self.capability_cell_proof.registry_digest(),
+            self.capability_cell_proof.current_support(),
+            self.capability_cell_proof.source_crate().as_str(),
             self.process_generation,
             self.disclosure,
             self.budget_units,
