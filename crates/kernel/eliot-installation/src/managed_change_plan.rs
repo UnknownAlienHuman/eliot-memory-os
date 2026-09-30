@@ -264,7 +264,14 @@ impl ManagedEnvironmentChangePlan {
 /// The digest covers the survey's complete canonical content, so a survey that
 /// gained, lost or changed any observation, stage result or candidate is a
 /// different digest rather than the same label.
-fn survey_content_digest(survey: &InstallationSurvey) -> Result<PlatformHandle, InstallationError> {
+///
+/// This is the crate's only computation of a survey content digest. The
+/// requalification path reuses it rather than defining a second one, so the
+/// digest a plan records and the digest a live advertisement carries are
+/// comparable by construction rather than by two implementations agreeing.
+pub(crate) fn survey_content_digest(
+    survey: &InstallationSurvey,
+) -> Result<PlatformHandle, InstallationError> {
     let bytes =
         super::canonical_json_bytes(survey).map_err(|error| InstallationError::InvalidField {
             field: "survey".to_owned(),
