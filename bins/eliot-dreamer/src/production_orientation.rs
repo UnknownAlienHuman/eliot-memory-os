@@ -69,8 +69,10 @@ use eliot_dreamer_orientation::{
 };
 use eliot_dreamer_probe_plan::ProbePlanParams;
 use eliot_dreamer_rival_model::RivalPolicy;
-use eliot_epistemic::PositionRequest;
-use eliot_epistemic_contracts::{ConflictSet, CurrentEpistemicPosition as AdmittedPosition};
+use eliot_epistemic::{ObservationRecord, PositionRequest};
+use eliot_epistemic_contracts::{
+    ConflictSet, CurrentEpistemicPosition as AdmittedPosition, EpistemicPositionCandidate,
+};
 
 use crate::orientation_owner_inputs::{OrientationOwnerInputs, run_mandatory_stages};
 use crate::pulse::{
@@ -86,7 +88,7 @@ use crate::{
 };
 
 /// Exact schema version accepted by [`ProductionOrientationInputs`].
-pub(crate) const PRODUCTION_ORIENTATION_INPUTS_SCHEMA_VERSION: u32 = 1;
+pub(crate) const PRODUCTION_ORIENTATION_INPUTS_SCHEMA_VERSION: u32 = 2;
 /// Blocked reason when the CC-004 projection set is absent.
 pub(crate) const CC004_MISSING: &str = "production orientation requires a canonical projection set";
 /// Blocked reason naming the absent Governor supply channel.
@@ -122,7 +124,7 @@ pub type MeasureFn = fn(&[u8]) -> Result<SerializedContextMeasurement, ContextEr
 /// stage runs. Budget travels on the admitted job; deadline and cancellation
 /// travel as scalars observed before composition.
 pub(crate) struct ProductionOrientationInputs<'a> {
-    /// Exact schema version; must be 1.
+    /// Exact schema version; must be 2.
     pub schema_version: u32,
     /// Admitted Orientation job with frame, evidence, and denominator.
     pub admitted_job: &'a AdmittedOrientationJob,
@@ -146,6 +148,10 @@ pub(crate) struct ProductionOrientationInputs<'a> {
     pub cue_activation: CueActivationStage<'a>,
     /// Epistemic resolution request over admitted records.
     pub epistemic: &'a PositionRequest,
+    /// Original candidate retained by the Governor readback owner.
+    pub admitted_candidate: &'a EpistemicPositionCandidate,
+    /// Original source observation retained by that same owner.
+    pub source_observation: &'a ObservationRecord,
     /// Understanding stage inputs with the route measurement.
     pub understanding: UnderstandingStage<'a, MeasureFn>,
     /// Claim-grounding request (cloned; the owner takes owned input).
@@ -200,6 +206,10 @@ pub struct OrientationSupply<'a> {
     pub cue_profile: &'a ActivationProfile,
     /// Epistemic resolver request over admitted records.
     pub epistemic: &'a PositionRequest,
+    /// Original candidate retained by the Governor readback owner.
+    pub admitted_candidate: &'a EpistemicPositionCandidate,
+    /// Original source observation retained by that same owner.
+    pub source_observation: &'a ObservationRecord,
     /// Exact admitted context set to project (understanding stage).
     pub admitted_context_set: &'a AdmittedContextSet,
     /// Recipe the admitted set must satisfy (understanding stage).
@@ -269,6 +279,10 @@ pub(crate) struct ProductionOrientationOwnerInputs<'a> {
     pub cue_activation: CueActivationStage<'a>,
     /// Epistemic resolution request over admitted records.
     pub epistemic: &'a PositionRequest,
+    /// Original candidate retained by the Governor readback owner.
+    pub admitted_candidate: &'a EpistemicPositionCandidate,
+    /// Original source observation retained by that same owner.
+    pub source_observation: &'a ObservationRecord,
     /// Understanding stage inputs with the route measurement.
     pub understanding: UnderstandingStage<'a, MeasureFn>,
     /// Claim-grounding request (the owner takes an owned clone).
@@ -314,6 +328,9 @@ pub(crate) fn borrow_governor_supply<'a>(
     admission: &KernelJobAdmission,
     supply: &'a OrientationSupply<'a>,
 ) -> ProductionOrientationSupply<'a> {
+    if supply.projections.binding.state_fence != admission.state_fence {
+        return ProductionOrientationSupply::Stale;
+    }
     ProductionOrientationSupply::Ready(ProductionOrientationOwnerInputs {
         model_request: supply.model_request,
         model_outcome: supply.model_outcome,
@@ -330,6 +347,8 @@ pub(crate) fn borrow_governor_supply<'a>(
             profile: supply.cue_profile,
         },
         epistemic: supply.epistemic,
+        admitted_candidate: supply.admitted_candidate,
+        source_observation: supply.source_observation,
         understanding: UnderstandingStage {
             admitted: supply.admitted_context_set,
             recipe: supply.recipe,
@@ -424,6 +443,8 @@ pub(crate) fn resolve_production_inputs<'a>(
         classification: owner.classification,
         cue_activation: owner.cue_activation,
         epistemic: owner.epistemic,
+        admitted_candidate: owner.admitted_candidate,
+        source_observation: owner.source_observation,
         understanding: owner.understanding,
         grounding: owner.grounding,
         rivals: owner.rivals,
@@ -482,6 +503,8 @@ pub(crate) fn compose_production_result(
         classification: inputs.classification,
         cue_activation: inputs.cue_activation,
         epistemic: inputs.epistemic,
+        admitted_candidate: inputs.admitted_candidate,
+        source_observation: inputs.source_observation,
         understanding: inputs.understanding,
         grounding: inputs.grounding,
         rivals: inputs.rivals,
