@@ -978,9 +978,7 @@ pub(super) fn run() -> Result<(), String> {
                 ),
             ))
         }
-        (Ok(RunLoopExit::Shutdown), Err(error)) => {
-            Err(report_terminal_failure(&kernel, error))
-        }
+        (Ok(RunLoopExit::Shutdown), Err(error)) => Err(report_terminal_failure(&kernel, error)),
         (Err(failure), Ok(())) => {
             shutdown_activation_unknown = failure.activation_unknown.is_some();
             Err(report_terminal_failure(&kernel, failure.message))
