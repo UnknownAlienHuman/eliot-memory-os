@@ -2282,7 +2282,7 @@ fn revision_with_owner_normalization_receipt(
             field: "automation.schedule.normalization_receipt",
             reason: "owner-issued normalization receipt was refused",
         })?;
-    if retained.identity.receipt_id.as_str() != receipt.receipt_id {
+    if retained.identity.receipt_id.as_str() != receipt.receipt_id.as_str() {
         return Err(StoreError::InvalidField {
             field: "automation.schedule.normalization_receipt",
             reason: "retained normalization envelope is not the identity the revision names",
