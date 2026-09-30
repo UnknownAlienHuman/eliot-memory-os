@@ -145,6 +145,7 @@ impl std::error::Error for ChangeMonitorError {}
 pub(crate) enum HintOrigin {
     HostEvent,
     FilesystemNotification,
+    PollReconcile,
 }
 
 /// Untrusted host event: a re-check hint, never a Material observation by
@@ -300,6 +301,27 @@ fn read_head_in(git_dir: &Path) -> Option<(String, String)> {
         return Some(("DETACHED".to_owned(), head));
     }
     None
+}
+
+/// Reports whether the repository claim over one tracked path changed
+/// between two HEAD reads: presence flipped (a repository claimed the path
+/// and now none does, or vice versa) or a different repository claims it.
+/// A bare commit movement under the same repository is not a claim change:
+/// concurrent commits are recorded truthfully in `head_before`/`head_after`
+/// instead of refused. The effect lane fails closed on a claim change for
+/// a previously observed resource instead of confirming past the retained
+/// tip on missing Git evidence (I10.21 W2, audit 5910747803 AUD2).
+///
+/// Caller: `crate::process_execution::KernelGovernedProcessEffectPort::ingest`.
+pub(crate) fn repository_claim_changed(
+    before: Option<&GitHeadRead>,
+    after: Option<&GitHeadRead>,
+) -> bool {
+    match (before, after) {
+        (None, None) => false,
+        (Some(before), Some(after)) => before.repository != after.repository,
+        (None, Some(_)) | (Some(_), None) => true,
+    }
 }
 
 /// Readback evidence bound to the same hinted artifact as the two direct
@@ -586,12 +608,17 @@ pub(crate) fn host_hint_id(operation_id: &str, target_digest: &str) -> String {
     format!("cmh:{operation_id}:{target_digest}")
 }
 
-/// Builds the hint identity for one filesystem-observed artifact
-/// transition: the lane-stable artifact digest plus the exact before digest
-/// the transition leaves. A later transition from a new before digest is a
-/// new hint, so a second uncorrelated mutation is never swallowed by the
-/// first confirmation.
-pub(crate) fn filesystem_hint_id(artifact_digest: &str, before_digest: &str) -> String {
+/// Builds the idempotent hint identity for one poll-reconciled tracked
+/// transition: the lane-stable artifact digest plus the exact before
+/// digest the transition leaves. A later transition from a new before
+/// digest is a new hint, so a second uncorrelated mutation is never
+/// swallowed by the first confirmation.
+///
+/// Wire stability: the `cmf:` prefix predates the honest `PollReconcile`
+/// naming and is frozen — persisted sidecars and crash-window recovery
+/// reproduce the same identity from the same inputs, and renaming the
+/// bytes would orphan pending hints into a permanent block.
+pub(crate) fn poll_reconcile_hint_id(artifact_digest: &str, before_digest: &str) -> String {
     format!("cmf:{artifact_digest}:{before_digest}")
 }
 
