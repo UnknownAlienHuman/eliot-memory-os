@@ -1147,10 +1147,13 @@ impl OriginChallengeAuthority {
         request_nonce: &str,
     ) -> Result<OriginGrantEffectOutcome, ContractError> {
         let consumed = self.consumed_nonces.contains(request_nonce);
-        let entry = self.issued.get_mut(request_nonce).ok_or(ContractError::InvalidValue {
-            field: "request_nonce",
-            reason: "unknown challenge nonce",
-        })?;
+        let entry = self
+            .issued
+            .get_mut(request_nonce)
+            .ok_or(ContractError::InvalidValue {
+                field: "request_nonce",
+                reason: "unknown challenge nonce",
+            })?;
         if !consumed {
             return Err(ContractError::InvalidValue {
                 field: "request_nonce",
@@ -1178,10 +1181,13 @@ impl OriginChallengeAuthority {
         &self,
         request_nonce: &str,
     ) -> Result<OriginGrantEffectOutcome, ContractError> {
-        let entry = self.issued.get(request_nonce).ok_or(ContractError::InvalidValue {
-            field: "request_nonce",
-            reason: "unknown challenge nonce",
-        })?;
+        let entry = self
+            .issued
+            .get(request_nonce)
+            .ok_or(ContractError::InvalidValue {
+                field: "request_nonce",
+                reason: "unknown challenge nonce",
+            })?;
         if !self.consumed_nonces.contains(request_nonce) {
             return Err(ContractError::InvalidValue {
                 field: "request_nonce",
