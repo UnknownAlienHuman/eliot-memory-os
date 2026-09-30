@@ -133,6 +133,7 @@ pub mod provider_transport_policy;
 mod reactive_feed;
 mod route_execution_identity;
 mod route_receipts;
+pub mod semantic_revision_store;
 mod skill_acceptance_read;
 mod skill_bridge_adapter;
 pub mod skill_dispatch;
@@ -3236,7 +3237,13 @@ impl DaemonComposition {
         let material = self.resolve_verified_material(kernel, material)?;
         let config = daemon_coordinator_config()?;
         Ok(AgentFabric::restore_verified(
-            snapshot, config, ports, material,
+            snapshot,
+            config,
+            ports,
+            Some(crate::semantic_revision_store::SemanticRevisionStore::new(
+                self.state_root(),
+            )),
+            material,
         )?)
     }
 

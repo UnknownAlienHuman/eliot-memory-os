@@ -1428,7 +1428,10 @@ fn dispatch_unavailability_loss_and_restart_retain_operation() -> TestResult {
             as Arc<dyn ActivationAuthorityPort>,
         dispatch_egress: Arc::clone(&restored_world.egress) as Arc<dyn DispatchEgressPort>,
     };
-    let restored = AgentFabric::restore(snapshot, config, ports)?;
+    // #1702 W2: this is a plan-only restore with no daemon state root, so no
+    // durable revision store is supplied. Retained semantic records stay
+    // readable history; publishing a NEW one here would be refused typed.
+    let restored = AgentFabric::restore(snapshot, config, ports, None)?;
     assert_eq!(
         restored.attempt_of(&attempt),
         Some(AttemptLifecycle::Dispatched)
@@ -1523,7 +1526,9 @@ fn restart_reconstructs_one_owner_with_revisions_and_leases() -> TestResult {
         activation_authority: Arc::clone(&fresh.activation) as Arc<dyn ActivationAuthorityPort>,
         dispatch_egress: Arc::clone(&fresh.egress) as Arc<dyn DispatchEgressPort>,
     };
-    let restored = AgentFabric::restore(snapshot, config, ports)?;
+    // #1702 W2: plan-only restore with no daemon state root; see the sibling
+    // case above. Retained semantic records stay readable as history.
+    let restored = AgentFabric::restore(snapshot, config, ports, None)?;
     assert_eq!(restored.coordinator_count(), 1);
     let stored = restored
         .snapshot()?

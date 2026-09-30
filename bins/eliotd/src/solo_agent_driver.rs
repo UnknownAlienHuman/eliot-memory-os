@@ -1056,6 +1056,12 @@ pub fn drive_solo_delegate(
     let ports = solo_fabric_ports(context, kernel, registry);
     let mut fabric = AgentFabric::new_with_admitted_provider(config, ports, capability)
         .map_err(DaemonError::ProviderAdmission)?;
+    // Issue #1702 W2: the drive runs against the daemon state root, so every
+    // owner-separated revision published on this fabric is committed and
+    // verified durably before anything reports it current. Attaching the store
+    // before the first semantic write is what makes the ordering property
+    // reachable from the production path instead of a separate test seam.
+    fabric.attach_semantic_revision_store(composition.state_root());
     let evidence = composition.capability_admission()?;
     let route = fabric.require_model_route(
         &intake.requirements,
@@ -1281,6 +1287,19 @@ fn restore_solo_fabric(
         ports,
         projection.claimed.material(),
     )?;
+    // #1702 W2: every production solo operation restores through this one
+    // seam -- the fair-pull recovery poll, cancellation request, terminal
+    // reconciliation and worker-result ingest all call `restore_solo_fabric`
+    // and drive the fabric it returns. Binding the daemon state root to the
+    // fabric HERE is what makes the ordering property hold on the production
+    // path rather than only under `cfg(test)`: `agent_fabric_restore_verified`
+    // is itself a test-only helper, so it carries no store of its own on this
+    // seam, and without this attach the restored fabric would refuse every
+    // owner-separated revision with `DurabilityUnproven`. Attaching before
+    // the first semantic write means each publish is committed and verified
+    // durably before it is readable as current, across restart, for the
+    // retained history of all three owners.
+    fabric.attach_semantic_revision_store(composition.state_root());
     // Reconcile the unknown: an emitted dispatch with no ingested result
     // cannot relaunch and cannot release; its outcome stays unknown until
     // the worker observation arrives through the ingest leg.
