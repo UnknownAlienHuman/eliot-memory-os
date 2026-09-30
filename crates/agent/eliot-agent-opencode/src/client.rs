@@ -6,7 +6,8 @@ use crate::{
     LoopbackEndpoint, LoopbackHttpClient, LoopbackHttpError, ModelSelection, NoAuthorityRunResult,
     OPENCODE_ADMITTED_ATTEMPT_EDGE_CANDIDATE, OPENCODE_ROUTE_RECONCILIATION_REF, OpenCodeEvent,
     OpenCodeObservationConversionError, OpenCodeWireRouteReceipt, PhysicalObservationBody,
-    ProviderCatalog, QuotaAvailability, ReadOnlyRunRequest, RunRequestError, RunStatus,
+    ProviderCatalog, ProviderOutputObservation, QuotaAvailability, ReadOnlyRunRequest,
+    RunRequestError, RunStatus,
     SealedRouteDisposition, Session, SessionDiff, SessionStatus, SessionStatusMap, SseConnection,
     SseDecodeError, SseDecoder, SseEvent, SseLimits, UnknownFields, UsageAvailability,
     UsageTelemetry, OPENCODE_PROVIDER_RAW_OUTPUT_UTF8_KEY, bound_session_identity,
@@ -223,6 +224,22 @@ pub enum OpenCodeRunError {
         cause: String,
         reconciliation: String,
     },
+    #[error("OpenCode output was observed but route reconciliation failed: {reconciliation}")]
+    ObservedOutputFailure(Box<ObservedOutputFailure>),
+}
+
+/// Typed failure envelope for route-owner paths that already observed output
+/// before a later reconciliation or candidate-seal step failed. It carries
+/// the original typed cause and only the receipts/candidate already produced
+/// by their owning validators; it never completes, repairs, or reseals them.
+#[derive(Debug)]
+pub struct ObservedOutputFailure {
+    /// Original typed route-owner failure.
+    pub cause: Box<OpenCodeRunError>,
+    /// Exact provider bytes/telemetry and any route receipts already observed.
+    pub observation: Box<ProviderOutputObservation>,
+    /// Boundary whose failure kept the result from becoming a completed run.
+    pub reconciliation: String,
 }
 
 /// Outcome of one admitted read-only attempt: the supervised wire result plus
@@ -449,10 +466,15 @@ enum CommittedPrior {
     Absent,
     /// The committed message already carries a terminal assistant; the
     /// previous execution is reused without redispatching.
-    Complete { assistant_id: String },
+    Complete {
+        assistant_id: String,
+        observation: Option<ProviderOutputObservation>,
+    },
     /// The committed message exists without a terminal assistant;
     /// reconcile without redispatching.
-    Unresolved,
+    Unresolved {
+        observation: Option<ProviderOutputObservation>,
+    },
 }
 
 /// Returns true when a recorded assistant message is a terminal,
@@ -491,6 +513,145 @@ fn committed_assistant_terminal(message: &Value, requested: &ModelSelection) -> 
             })
         });
     info.get("finish").and_then(Value::as_str) == Some("stop") || parts_terminal
+}
+
+fn provider_output_observation_from_message(
+    message: &Value,
+    requested: &ModelSelection,
+) -> Option<ProviderOutputObservation> {
+    let info = message.get("info").and_then(Value::as_object)?;
+    if info.get("role").and_then(Value::as_str) != Some("assistant") {
+        return None;
+    }
+    let observed_model = attest_message_route(info, requested).ok();
+    let raw_output = message
+        .get("parts")
+        .and_then(Value::as_array)
+        .map(|parts| {
+            let mut saw_text = false;
+            let mut text = String::new();
+            for part in parts {
+                if part.get("type").and_then(Value::as_str) == Some("text")
+                    && let Some(value) = part.get("text").and_then(Value::as_str)
+                {
+                    saw_text = true;
+                    text.push_str(value);
+                }
+            }
+            saw_text.then_some(text)
+        })
+        .flatten();
+    let usage = info
+        .get("tokens")
+        .and_then(Value::as_object)
+        .map(|tokens| UsageTelemetry {
+            input_tokens: tokens.get("input").and_then(Value::as_u64),
+            output_tokens: tokens.get("output").and_then(Value::as_u64),
+            total_tokens: tokens.get("total").and_then(Value::as_u64),
+            cost_usd: info.get("cost").and_then(Value::as_f64),
+            extra: UnknownFields::new(),
+        });
+    let observation = ProviderOutputObservation {
+        observed_model,
+        raw_output,
+        usage,
+        usage_availability: None,
+        terminal: committed_assistant_terminal(message, requested),
+        events: Vec::new(),
+        actual_route: None,
+        physical_route: None,
+    };
+    observation.has_evidence().then_some(observation)
+}
+
+fn provider_output_observation_from_events(
+    events: &[OpenCodeEvent],
+    session_id: &str,
+    user_message_id: &str,
+    requested: &ModelSelection,
+    terminal: bool,
+) -> Option<ProviderOutputObservation> {
+    let mut assistant_ids = BTreeSet::new();
+    let mut observed_model = None;
+    let mut usage = None;
+    for event in events {
+        if event.event_type == "message.updated"
+            && event
+                .properties
+                .get("sessionID")
+                .and_then(Value::as_str)
+                == Some(session_id)
+        {
+            if let Some(info) = event.properties.get("info").and_then(Value::as_object)
+                && info.get("role").and_then(Value::as_str) == Some("assistant")
+                && info.get("parentID").and_then(Value::as_str) == Some(user_message_id)
+            {
+                if let Some(assistant_id) = info.get("id").and_then(Value::as_str) {
+                    assistant_ids.insert(assistant_id.to_owned());
+                }
+                observed_model = attest_message_route(info, requested).ok();
+                usage = info
+                    .get("tokens")
+                    .and_then(Value::as_object)
+                    .map(|tokens| UsageTelemetry {
+                        input_tokens: tokens.get("input").and_then(Value::as_u64),
+                        output_tokens: tokens.get("output").and_then(Value::as_u64),
+                        total_tokens: tokens.get("total").and_then(Value::as_u64),
+                        cost_usd: info.get("cost").and_then(Value::as_f64),
+                        extra: UnknownFields::new(),
+                    });
+            }
+        }
+    }
+    let evidence_events = events
+        .iter()
+        .filter(|event| {
+            if event.event_type == "message.updated" {
+                event
+                    .properties
+                    .get("info")
+                    .and_then(Value::as_object)
+                    .is_some_and(|info| {
+                        info.get("role").and_then(Value::as_str) == Some("assistant")
+                            && info.get("parentID").and_then(Value::as_str)
+                                == Some(user_message_id)
+                            && info.get("sessionID").and_then(Value::as_str)
+                                == Some(session_id)
+                    })
+            } else if event.event_type == "message.part.updated"
+                && event
+                    .properties
+                    .get("sessionID")
+                    .and_then(Value::as_str)
+                    == Some(session_id)
+            {
+                event
+                    .properties
+                    .pointer("/part/messageID")
+                    .and_then(Value::as_str)
+                    .is_some_and(|message_id| assistant_ids.contains(message_id))
+            } else {
+                false
+            }
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if evidence_events.is_empty() {
+        return None;
+    }
+    Some(ProviderOutputObservation {
+        observed_model,
+        // A stream event may carry a part update, not the exact final message
+        // body. Keep the typed event evidence intact; never re-encode it as
+        // provider output bytes.
+        raw_output: None,
+        usage,
+        usage_availability: None,
+        terminal,
+        events: evidence_events,
+        actual_route: None,
+        physical_route: None,
+    })
 }
 
 struct CorrelatedEventState {
@@ -820,6 +981,7 @@ impl OpenCodeClient {
                     &prepared.session.id,
                     &prepared.message_id,
                     &prepared.baseline_diff,
+                    &request.model,
                     error,
                 )
                 .await;
@@ -859,6 +1021,7 @@ impl OpenCodeClient {
                         &prepared.session.id,
                         &prepared.message_id,
                         &prepared.baseline_diff,
+                        &request.model,
                         failure.error,
                     )
                     .await;
@@ -977,7 +1140,10 @@ impl OpenCodeClient {
                 .dispatch_admitted(&prepared, request, deadline)
                 .await
                 .map_err(AdmittedAttemptError::Run)?,
-            CommittedPrior::Complete { assistant_id } => {
+            CommittedPrior::Complete {
+                assistant_id,
+                observation,
+            } => {
                 let reconciled = timeout_at(
                     deadline,
                     self.reconcile_success(
@@ -991,13 +1157,21 @@ impl OpenCodeClient {
                 )
                 .await
                 .map_err(|_| {
-                    AdmittedAttemptError::Run(admitted_deadline_unknown(
-                        "completed-message reconciliation",
-                        "a previously committed assistant outcome could not be fully reconciled",
+                    AdmittedAttemptError::Run(retain_observed_output_failure(
+                        admitted_deadline_unknown(
+                            "completed-message reconciliation",
+                            "a previously committed assistant outcome could not be fully reconciled",
+                        ),
+                        observation.clone(),
+                        "a committed terminal assistant message was already observed",
                     ))
                 })?
                 .map_err(|error| {
-                    AdmittedAttemptError::Run(map_admitted_post_claim_error(error))
+                    AdmittedAttemptError::Run(retain_observed_output_failure(
+                        map_admitted_post_claim_error(error),
+                        observation.clone(),
+                        "a committed terminal assistant message was already observed",
+                    ))
                 })?;
                 let (projection, statuses) = reconciled;
                 (
@@ -1005,7 +1179,7 @@ impl OpenCodeClient {
                     statuses,
                 )
             }
-            CommittedPrior::Unresolved => {
+            CommittedPrior::Unresolved { observation } => {
                 let reconciled = timeout_at(
                     deadline,
                     self.reconcile_success(
@@ -1019,13 +1193,21 @@ impl OpenCodeClient {
                 )
                 .await
                 .map_err(|_| {
-                    AdmittedAttemptError::Run(admitted_deadline_unknown(
-                        "unresolved-message reconciliation",
-                        "the admitted slot already had unresolved provider work",
+                    AdmittedAttemptError::Run(retain_observed_output_failure(
+                        admitted_deadline_unknown(
+                            "unresolved-message reconciliation",
+                            "the admitted slot already had unresolved provider work",
+                        ),
+                        observation.clone(),
+                        "an assistant payload was already observed on the committed slot",
                     ))
                 })?
                 .map_err(|error| {
-                    AdmittedAttemptError::Run(map_admitted_post_claim_error(error))
+                    AdmittedAttemptError::Run(retain_observed_output_failure(
+                        map_admitted_post_claim_error(error),
+                        observation.clone(),
+                        "an assistant payload was already observed on the committed slot",
+                    ))
                 })?;
                 let (projection, statuses) = reconciled;
                 (
@@ -1145,6 +1327,8 @@ impl OpenCodeClient {
             ));
         }
         let mut terminal_assistant: Option<String> = None;
+        let mut terminal_observation = None;
+        let mut unresolved_observation = None;
         for message in messages {
             let Some(info) = message.get("info").and_then(Value::as_object) else {
                 continue;
@@ -1159,13 +1343,34 @@ impl OpenCodeClient {
             else {
                 continue;
             };
+            let observation = provider_output_observation_from_message(message, &request.model);
             if committed_assistant_terminal(message, &request.model) {
                 terminal_assistant = Some(assistant_id);
+                if let Some(observation) = observation {
+                    if let Some(retained) = &mut terminal_observation {
+                        merge_provider_output_observation(retained, observation);
+                    } else {
+                        terminal_observation = Some(observation);
+                    }
+                }
+            } else if observation.is_some() {
+                if let Some(observation) = observation {
+                    if let Some(retained) = &mut unresolved_observation {
+                        merge_provider_output_observation(retained, observation);
+                    } else {
+                        unresolved_observation = Some(observation);
+                    }
+                }
             }
         }
         match terminal_assistant {
-            Some(assistant_id) => Ok(CommittedPrior::Complete { assistant_id }),
-            None => Ok(CommittedPrior::Unresolved),
+            Some(assistant_id) => Ok(CommittedPrior::Complete {
+                assistant_id,
+                observation: terminal_observation,
+            }),
+            None => Ok(CommittedPrior::Unresolved {
+                observation: unresolved_observation,
+            }),
         }
     }
 
@@ -1215,6 +1420,7 @@ impl OpenCodeClient {
                     &prepared.session.id,
                     &prepared.message_id,
                     &prepared.baseline_diff,
+                    &request.model,
                     error,
                 )
                 .await
@@ -1248,6 +1454,14 @@ impl OpenCodeClient {
         {
             Ok(collection) => collection,
             Err(failure) => {
+                let observation = provider_output_observation_from_events(
+                    &failure.events,
+                    &prepared.session.id,
+                    &prepared.message_id,
+                    &request.model,
+                    false,
+                );
+                let mut cause = failure.error;
                 if failure.may_reconcile_success {
                     match timeout_at(
                         deadline,
@@ -1263,19 +1477,11 @@ impl OpenCodeClient {
                     .await
                     {
                         Err(_) => {
-                            let cause = failure.error.to_string();
-                            return self
-                                .fail_after_dispatch(
-                                    &prepared.session.id,
-                                    &prepared.message_id,
-                                    &prepared.baseline_diff,
-                                    admitted_deadline_unknown(
-                                        "post-dispatch message reconciliation",
-                                        &cause,
-                                    ),
-                                )
-                                .await
-                                .map_err(map_admitted_post_claim_error);
+                            let detail = cause.to_string();
+                            cause = admitted_deadline_unknown(
+                                "post-dispatch message reconciliation",
+                                &detail,
+                            );
                         }
                         Ok(Ok((projection, statuses))) => {
                             return Ok((
@@ -1286,21 +1492,36 @@ impl OpenCodeClient {
                         Ok(Err(error @ OpenCodeRunError::MalformedStructuredOutput(_))) => {
                             return Err(error);
                         }
-                        Ok(Err(_)) => {}
+                        Ok(Err(error)) => cause = error,
                     }
                 }
-                return self
+                let failed = self
                     .fail_after_dispatch(
                         &prepared.session.id,
                         &prepared.message_id,
                         &prepared.baseline_diff,
-                        failure.error,
+                        &request.model,
+                        cause,
                     )
                     .await
                     .map_err(map_admitted_post_claim_error);
+                return failed.map_err(|error| {
+                    retain_observed_output_failure(
+                        error,
+                        observation,
+                        "SSE failure after assistant provider events were observed",
+                    )
+                });
             }
         };
 
+        let observation = provider_output_observation_from_events(
+            &collection.events,
+            &prepared.session.id,
+            &prepared.message_id,
+            &request.model,
+            true,
+        );
         let reconciled = timeout_at(
             deadline,
             self.reconcile_success(
@@ -1312,14 +1533,27 @@ impl OpenCodeClient {
                 &prepared.baseline_diff,
             ),
         )
-            .await
-            .map_err(|_| {
-                admitted_deadline_unknown(
+        .await;
+        let reconciled = match reconciled {
+            Err(_) => {
+                return Err(retain_observed_output_failure(
+                    admitted_deadline_unknown(
                     "terminal-message reconciliation",
                     "a terminal assistant event was observed but its full owner result was not reconciled",
-                )
-            })?
-            .map_err(map_admitted_post_claim_error)?;
+                    ),
+                    observation,
+                    "terminal assistant events were observed before reconciliation stopped",
+                ));
+            }
+            Ok(Err(error)) => {
+                return Err(retain_observed_output_failure(
+                    map_admitted_post_claim_error(error),
+                    observation,
+                    "terminal assistant events were observed before reconciliation stopped",
+                ));
+            }
+            Ok(Ok(reconciled)) => reconciled,
+        };
         let (projection, statuses) = reconciled;
         Ok((
             self.success_result(request, prepared, projection, collection.events),
@@ -1589,12 +1823,36 @@ impl OpenCodeClient {
             requested_model,
             expected_output_schema,
         )?;
+        let observation = provider_output_observation_from_projection(&projection);
         let diff = timeout(RECONCILIATION_CALL_TIMEOUT, self.diff(session_id))
             .await
             .map_err(|_| OpenCodeRunError::Timeout {
                 phase: "diff reconciliation",
-            })??;
-        attest_unchanged_diff(baseline_diff, &diff)?;
+            });
+        let diff = match diff {
+            Ok(Ok(diff)) => diff,
+            Ok(Err(error)) => {
+                return Err(retain_observed_output_failure(
+                    error,
+                    Some(observation),
+                    "assistant output was reconciled before diff validation failed",
+                ));
+            }
+            Err(error) => {
+                return Err(retain_observed_output_failure(
+                    error,
+                    Some(observation),
+                    "assistant output was reconciled before diff validation timed out",
+                ));
+            }
+        };
+        if let Err(error) = attest_unchanged_diff(baseline_diff, &diff) {
+            return Err(retain_observed_output_failure(
+                error,
+                Some(observation),
+                "assistant output was reconciled before mutation attestation failed",
+            ));
+        }
         Ok((projection, statuses))
     }
 
@@ -1652,18 +1910,28 @@ impl OpenCodeClient {
         session_id: &str,
         user_message_id: &str,
         baseline_diff: &[SessionDiff],
+        requested_model: &ModelSelection,
         cause: OpenCodeRunError,
     ) -> Result<T, OpenCodeRunError> {
         match self
-            .abort_and_reconcile(session_id, user_message_id, baseline_diff)
+            .abort_and_reconcile(session_id, user_message_id, baseline_diff, requested_model)
             .await
         {
-            Ok(()) => Err(cause),
+            Ok(observation) => Err(retain_observed_output_failure(
+                cause,
+                observation,
+                "post-dispatch failure was followed by an owner-reconciled abort",
+            )),
             Err(
                 error @ (OpenCodeRunError::MutationObserved { .. }
                 | OpenCodeRunError::CompletedAfterAbort { .. }
-                | OpenCodeRunError::Provider { .. }),
-            ) => Err(error),
+                | OpenCodeRunError::Provider { .. }
+                | OpenCodeRunError::ObservedOutputFailure(_)),
+            ) => Err(retain_observed_output_failure(
+                map_admitted_post_claim_error(error),
+                None,
+                &format!("original admitted dispatch failure: {cause}"),
+            )),
             Err(error) => Err(OpenCodeRunError::UnknownOutcome {
                 cause: cause.to_string(),
                 reconciliation: error.to_string(),
@@ -1676,7 +1944,8 @@ impl OpenCodeClient {
         session_id: &str,
         user_message_id: &str,
         baseline_diff: &[SessionDiff],
-    ) -> Result<(), OpenCodeRunError> {
+        requested_model: &ModelSelection,
+    ) -> Result<Option<ProviderOutputObservation>, OpenCodeRunError> {
         timeout(RECONCILIATION_CALL_TIMEOUT, self.abort(session_id))
             .await
             .map_err(|_| OpenCodeRunError::Timeout {
@@ -1693,13 +1962,58 @@ impl OpenCodeClient {
                 "post-abort messages response is not an array".to_owned(),
             ));
         }
+        let observation = messages.as_array().and_then(|messages| {
+            messages
+                .iter()
+                .rev()
+                .find(|message| {
+                    message.pointer("/info/role").and_then(Value::as_str) == Some("assistant")
+                        && message.pointer("/info/sessionID").and_then(Value::as_str)
+                            == Some(session_id)
+                        && message.pointer("/info/parentID").and_then(Value::as_str)
+                            == Some(user_message_id)
+                })
+                .and_then(|message| {
+                    provider_output_observation_from_message(message, requested_model)
+                })
+        });
         let diff = timeout(RECONCILIATION_CALL_TIMEOUT, self.diff(session_id))
             .await
             .map_err(|_| OpenCodeRunError::Timeout {
                 phase: "post-abort diff reconciliation",
-            })??;
-        attest_unchanged_diff(baseline_diff, &diff)?;
-        attest_aborted_messages(&messages, session_id, user_message_id)
+            });
+        let diff = match diff {
+            Ok(Ok(diff)) => diff,
+            Ok(Err(error)) => {
+                return Err(retain_observed_output_failure(
+                    error,
+                    observation,
+                    "post-abort assistant output was read before diff reconciliation failed",
+                ));
+            }
+            Err(error) => {
+                return Err(retain_observed_output_failure(
+                    error,
+                    observation,
+                    "post-abort assistant output was read before diff reconciliation timed out",
+                ));
+            }
+        };
+        if let Err(error) = attest_unchanged_diff(baseline_diff, &diff) {
+            return Err(retain_observed_output_failure(
+                error,
+                observation,
+                "post-abort assistant output was read before mutation attestation failed",
+            ));
+        }
+        match attest_aborted_messages(&messages, session_id, user_message_id) {
+            Ok(()) => Ok(observation),
+            Err(error) => Err(retain_observed_output_failure(
+                error,
+                observation,
+                "post-abort assistant output was read before semantic terminality refused",
+            )),
+        }
     }
 
     fn success_result(
@@ -2007,9 +2321,15 @@ fn seal_admitted_outcome(
     statuses: &SessionStatusMap,
 ) -> Result<AdmittedAttemptOutcome, AdmittedAttemptError> {
     let Some(session_id) = run.session_id.clone() else {
-        return Err(AdmittedAttemptError::Run(OpenCodeRunError::Protocol(
-            "admitted run returned no session identity".to_owned(),
-        )));
+        return Err(retain_sealed_run_failure(
+            AdmittedAttemptError::Run(OpenCodeRunError::Protocol(
+                "admitted run returned no session identity".to_owned(),
+            )),
+            &run,
+            None,
+            "sealed run had no session identity",
+            None,
+        ));
     };
     let children: Vec<(String, bool)> = statuses
         .iter()
@@ -2019,7 +2339,15 @@ fn seal_admitted_outcome(
             (id.clone(), is_open)
         })
         .collect();
-    crate::ensure_no_open_child_sessions(&session_id, &children)?;
+    crate::ensure_no_open_child_sessions(&session_id, &children).map_err(|error| {
+        retain_sealed_run_failure(
+            error,
+            &run,
+            None,
+            "open child-session validation",
+            None,
+        )
+    })?;
     // Attempt-bound heartbeat/progress/quota summaries sealed into the
     // result extra, reusing the already-reconciled status map with no new
     // HTTP call.
@@ -2043,15 +2371,29 @@ fn seal_admitted_outcome(
             format!("{:?}", run.quota),
         ),
     ];
-    run.extra.insert(
-        "admitted_observations".to_owned(),
-        serde_json::to_value(&observations)
-            .map_err(|error| AdmittedAttemptError::DigestFailed(error.to_string()))?,
-    );
+    let observation_value = serde_json::to_value(&observations).map_err(|error| {
+        retain_sealed_run_failure(
+            AdmittedAttemptError::DigestFailed(error.to_string()),
+            &run,
+            None,
+            "admitted observation serialization",
+            None,
+        )
+    })?;
+    run.extra
+        .insert("admitted_observations".to_owned(), observation_value);
     // The edge marker is recorded only behind the deterministic proof gate
     // over the reconciled execution state — never unconditionally — so the
     // marker rides the seal digest below.
-    crate::admitted_edge_proof_gate(&session_id, statuses)?;
+    crate::admitted_edge_proof_gate(&session_id, statuses).map_err(|error| {
+        retain_sealed_run_failure(
+            error,
+            &run,
+            None,
+            "candidate edge-proof gate",
+            None,
+        )
+    })?;
     run.extra.insert(
         "edge".to_owned(),
         Value::String(OPENCODE_ADMITTED_ATTEMPT_EDGE_CANDIDATE.to_owned()),
@@ -2063,44 +2405,84 @@ fn seal_admitted_outcome(
     // conflict does not erase the retained provider output: the candidate
     // still seals below, but under a digest-bound conflict disposition rather
     // than an indistinguishable stronger success.
-    let route = seal_route_disposition(admitted, &run, message_id)?;
+    let route = seal_route_disposition(admitted, &run, message_id).map_err(|error| {
+        retain_sealed_run_failure(
+            error,
+            &run,
+            None,
+            "physical route-observation validation",
+            None,
+        )
+    })?;
     // The disposition summary rides the run extra before sealing, so the
     // candidate `result_digest` binds the final route disposition, its
     // evidence/recovery references, and the #2645 staging columns: a consumer
     // cannot drop the disposition and retain an indistinguishable stronger
     // candidate.
-    run.extra.insert(
-        "route_disposition".to_owned(),
-        route.summary_value(admitted.admission())?,
-    );
-    let mut candidate = AdmittedAttemptCandidate::seal(admitted, &run)?;
+    let route_summary = route.summary_value(admitted.admission()).map_err(|error| {
+        retain_sealed_run_failure(
+            error,
+            &run,
+            Some(&route),
+            "route-disposition summary validation",
+            None,
+        )
+    })?;
+    run.extra
+        .insert("route_disposition".to_owned(), route_summary);
+    let mut candidate = AdmittedAttemptCandidate::seal(admitted, &run).map_err(|error| {
+        retain_sealed_run_failure(
+            error,
+            &run,
+            Some(&route),
+            "original candidate digest sealing",
+            None,
+        )
+    })?;
     // The typed route disposition computed and validated above is bound into
     // the sealed candidate artifact itself (issue #2902 items 8 and 11): the
     // published artifact carries the exact disposition, so a consumer can
     // classify it — and a legacy artifact predating this field decodes as
     // explicitly unverified rather than a current receipt.
     candidate.route_disposition = Some(route.clone());
-    slot.confirm(admitted, &session_id, message_id)?;
+    slot.confirm(admitted, &session_id, message_id).map_err(|error| {
+        retain_sealed_run_failure(
+            error,
+            &run,
+            Some(&route),
+            "admitted slot confirmation after original candidate seal",
+            Some(&candidate),
+        )
+    })?;
     // The terminal observation is emitted bound to the exact attempt,
     // quoting the seal it follows; the seal digest covers the run at seal
     // time, and this observation references that digest instead of
     // reopening it.
+    let candidate_digest = candidate.compute_digest().map_err(|error| {
+        retain_sealed_run_failure(
+            AdmittedAttemptError::DigestFailed(error.to_string()),
+            &run,
+            Some(&route),
+            "original candidate digest reference",
+            Some(&candidate),
+        )
+    })?;
     let terminal = AdmittedObservation::new(
         admitted,
         AdmittedObservationKind::Terminal,
-        format!(
-            "sealed candidate {}",
-            candidate
-                .compute_digest()
-                .map_err(|error| AdmittedAttemptError::DigestFailed(error.to_string()))?
-                .as_str()
-        ),
+        format!("sealed candidate {}", candidate_digest.as_str()),
     );
-    run.extra.insert(
-        "admitted_terminal_observation".to_owned(),
-        serde_json::to_value(&terminal)
-            .map_err(|error| AdmittedAttemptError::DigestFailed(error.to_string()))?,
-    );
+    let terminal_value = serde_json::to_value(&terminal).map_err(|error| {
+        retain_sealed_run_failure(
+            AdmittedAttemptError::DigestFailed(error.to_string()),
+            &run,
+            Some(&route),
+            "terminal observation serialization after original candidate seal",
+            Some(&candidate),
+        )
+    })?;
+    run.extra
+        .insert("admitted_terminal_observation".to_owned(), terminal_value);
     // Canonical route-observation disposition (issue #2902): the typed
     // disposition computed before sealing travels on the outcome. The
     // retained wire receipt stays the downstream normalization evidence, and
@@ -2222,22 +2604,126 @@ fn attest_supervised_owner(error: LoopbackHttpError) -> OpenCodeRunError {
 /// Positively reconciled facts (provider verdicts, observed mutations,
 /// completed-after-abort evidence, already-unknown outcomes) cross unchanged.
 fn map_admitted_post_claim_error(error: OpenCodeRunError) -> OpenCodeRunError {
-    let uncertain = matches!(
-        error,
-        OpenCodeRunError::Timeout { .. }
-            | OpenCodeRunError::Http(_)
-            | OpenCodeRunError::Sse(_)
-            | OpenCodeRunError::Protocol(_)
-    );
-    if uncertain {
-        OpenCodeRunError::UnknownOutcome {
-            cause: error.to_string(),
-            reconciliation: "the admitted edge seals only reconciled terminal candidates; an unreconciled failure after the slot claim never seals"
-                .to_owned(),
+    match error {
+        OpenCodeRunError::ObservedOutputFailure(mut failure) => {
+            failure.cause = Box::new(map_admitted_post_claim_error(*failure.cause));
+            OpenCodeRunError::ObservedOutputFailure(failure)
         }
-    } else {
-        error
+        error => {
+            let uncertain = matches!(
+                &error,
+                OpenCodeRunError::Timeout { .. }
+                    | OpenCodeRunError::Http(_)
+                    | OpenCodeRunError::Sse(_)
+                    | OpenCodeRunError::Protocol(_)
+            );
+            if uncertain {
+                OpenCodeRunError::UnknownOutcome {
+                    cause: error.to_string(),
+                    reconciliation: "the admitted edge seals only reconciled terminal candidates; an unreconciled failure after the slot claim never seals"
+                        .to_owned(),
+                }
+            } else {
+                error
+            }
+        }
     }
+}
+
+fn retain_observed_output_failure(
+    cause: OpenCodeRunError,
+    observation: Option<ProviderOutputObservation>,
+    reconciliation: &str,
+) -> OpenCodeRunError {
+    if matches!(&cause, OpenCodeRunError::MalformedStructuredOutput(_)) {
+        return cause;
+    }
+    match cause {
+        OpenCodeRunError::ObservedOutputFailure(mut existing) => {
+            if let Some(observation) = observation.filter(ProviderOutputObservation::has_evidence) {
+                merge_provider_output_observation(&mut existing.observation, observation);
+            }
+            if !reconciliation.is_empty() && !existing.reconciliation.contains(reconciliation) {
+                existing.reconciliation.push_str("; ");
+                existing.reconciliation.push_str(reconciliation);
+            }
+            OpenCodeRunError::ObservedOutputFailure(existing)
+        }
+        cause => {
+            let Some(observation) = observation.filter(ProviderOutputObservation::has_evidence)
+            else {
+                return cause;
+            };
+            OpenCodeRunError::ObservedOutputFailure(Box::new(ObservedOutputFailure {
+                cause: Box::new(cause),
+                observation: Box::new(observation),
+                reconciliation: reconciliation.to_owned(),
+            }))
+        }
+    }
+}
+
+fn merge_provider_output_observation(
+    retained: &mut ProviderOutputObservation,
+    newer: ProviderOutputObservation,
+) {
+    if let Some(raw_output) = newer.raw_output {
+        retained.raw_output = Some(raw_output);
+        retained.observed_model = newer.observed_model;
+    } else if retained.raw_output.is_none() {
+        retained.observed_model = newer.observed_model.or_else(|| retained.observed_model.clone());
+    }
+    retained.usage = newer.usage.or_else(|| retained.usage.clone());
+    retained.usage_availability = newer
+        .usage_availability
+        .or_else(|| retained.usage_availability.clone());
+    retained.terminal |= newer.terminal;
+    for event in newer.events {
+        if !retained.events.contains(&event) {
+            retained.events.push(event);
+        }
+    }
+    retained.actual_route = newer.actual_route.or_else(|| retained.actual_route.clone());
+    retained.physical_route = newer.physical_route.or_else(|| retained.physical_route.clone());
+}
+
+fn provider_output_observation_from_run(run: &NoAuthorityRunResult) -> ProviderOutputObservation {
+    ProviderOutputObservation {
+        observed_model: run.actual_route.observed.clone(),
+        raw_output: run
+            .extra
+            .get(OPENCODE_PROVIDER_RAW_OUTPUT_UTF8_KEY)
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        usage: run.usage.value.clone(),
+        usage_availability: Some(run.usage.clone()),
+        terminal: run.extra.get("observed_completed_at_ms").is_some(),
+        events: run.events.clone(),
+        actual_route: Some(run.actual_route.clone()),
+        physical_route: None,
+    }
+}
+
+fn retain_sealed_run_failure(
+    cause: AdmittedAttemptError,
+    run: &NoAuthorityRunResult,
+    route: Option<&SealedRouteDisposition>,
+    reconciliation: &str,
+    candidate: Option<&AdmittedAttemptCandidate>,
+) -> AdmittedAttemptError {
+    let mut observation = provider_output_observation_from_run(run);
+    observation.physical_route = route.and_then(SealedRouteDisposition::receipt).cloned();
+    if !observation.has_evidence() {
+        return cause;
+    }
+    AdmittedAttemptError::ObservedOutputFailure(Box::new(
+        crate::AdmittedAttemptOutputFailure {
+            cause: Box::new(cause),
+            observation: Box::new(observation),
+            candidate: candidate.cloned().map(Box::new),
+            reconciliation: reconciliation.to_owned(),
+        },
+    ))
 }
 
 /// A wall-budget expiry after an admitted slot may have had provider work is
@@ -2567,6 +3053,21 @@ struct MessageProjection {
     completed_at_ms: u64,
 }
 
+fn provider_output_observation_from_projection(
+    projection: &MessageProjection,
+) -> ProviderOutputObservation {
+    ProviderOutputObservation {
+        observed_model: Some(projection.observed_model.clone()),
+        raw_output: Some(projection.raw_output.clone()),
+        usage: projection.usage.clone(),
+        usage_availability: None,
+        terminal: true,
+        events: Vec::new(),
+        actual_route: None,
+        physical_route: None,
+    }
+}
+
 fn inspect_messages(
     messages: &Value,
     session_id: &str,
@@ -2610,6 +3111,8 @@ fn inspect_messages(
                 "session has no assistant correlated to the submitted prompt".to_owned(),
             )
         })?;
+    let observation = provider_output_observation_from_message(assistant, requested);
+    let projection = (|| {
     let info = assistant
         .get("info")
         .and_then(Value::as_object)
@@ -2669,6 +3172,14 @@ fn inspect_messages(
         raw_output,
         usage,
         completed_at_ms,
+    })
+    })();
+    projection.map_err(|error| {
+        retain_observed_output_failure(
+            error,
+            observation,
+            "correlated assistant output was read before message validation refused",
+        )
     })
 }
 
