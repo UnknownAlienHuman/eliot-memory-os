@@ -1763,18 +1763,7 @@ impl KernelContextReadClient {
             ledger: headroom_ledger,
             now_ms: observed_now_ms,
         };
-        request
-            .validate()
-            .map_err(|error| PacketCompositionError::Candidates(Box::new(error)))?;
-        recipe
-            .validate()
-            .map_err(|error| PacketCompositionError::Candidates(Box::new(error)))?;
-        policy
-            .validate()
-            .map_err(|error| PacketCompositionError::Candidates(Box::new(error)))?;
-        floor
-            .validate()
-            .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
+        validate_composition_inputs(request, recipe, policy, floor)?;
         Self::require_campaign_view_for_admission(
             request,
             campaign_view,
@@ -1859,21 +1848,53 @@ impl KernelContextReadClient {
         assembled
             .verify_boundaries()
             .map_err(|error| PacketCompositionError::Assembly(Box::new(error)))?;
-        // Recheck the actual rendered output and handoff against the same
-        // reservation before the packet becomes action-ready. The typed refusal
-        // preserves the attempted recipe and the exact omissions and carries the
-        // owner's outstanding release instructions; nothing here releases a
-        // permit, because the non-clone permit handle stays with its issuer.
-        recheck_headroom_handoff(
-            &assembled,
-            recipe,
-            headroom_request,
-            headroom_result,
-            observed_now_ms,
-        )
-        .map_err(|refusal| PacketCompositionError::HeadroomHandoff(Box::new(refusal)))?;
+        recheck_packet_headroom(&assembled, recipe, &headroom)?;
         Ok((assembled, delivery))
     }
+}
+
+/// Validates the four compilation inputs before any candidate is constructed.
+///
+/// The order is the composition's own and is unchanged by this extraction:
+/// candidate request, recipe, candidate policy, then the admission floor. Each
+/// failure crosses as the same typed variant its owner raised, so no input is
+/// validated later than it was and none is skipped.
+fn validate_composition_inputs(
+    request: &CandidateRequest,
+    recipe: &ContextRecipe,
+    policy: &CandidatePolicy,
+    floor: &SafetyFloorIdentity,
+) -> Result<(), PacketCompositionError> {
+    request.validate().map_err(|error| PacketCompositionError::Candidates(Box::new(error)))?;
+    recipe.validate().map_err(|error| PacketCompositionError::Candidates(Box::new(error)))?;
+    policy.validate().map_err(|error| PacketCompositionError::Candidates(Box::new(error)))?;
+    floor.validate().map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
+    Ok(())
+}
+
+/// Rechecks the assembled packet against the reservation it was compiled under.
+///
+/// #1725: the actual rendered output and handoff are re-proved against the same
+/// owner evidence the admission ran under before the packet becomes
+/// action-ready. The typed refusal preserves the attempted recipe and the exact
+/// omissions and carries the owner's outstanding release instructions; nothing
+/// here releases a permit, because the non-clone permit handle stays with its
+/// issuer.
+///
+/// The recheck reads the request, the owner-issued result and the observed clock
+/// out of the same [`HeadroomContext`] this composition handed to admission, so
+/// the handoff can never be proved against evidence other than the evidence the
+/// admission was admitted under. It returns the composition's own existing
+/// error type rather than a new one, so the refusal still crosses as
+/// [`PacketCompositionError::HeadroomHandoff`] carrying the assembly owner's
+/// typed refusal.
+fn recheck_packet_headroom(
+    assembled: &ActiveUnderstandingViewResult,
+    recipe: &ContextRecipe,
+    headroom: &HeadroomContext<'_>,
+) -> Result<(), PacketCompositionError> {
+    recheck_headroom_handoff(assembled, recipe, headroom.request, headroom.result, headroom.now_ms)
+        .map_err(|refusal| PacketCompositionError::HeadroomHandoff(Box::new(refusal)))
 }
 
 /// Closes the candidate stage's set and the owner's admission pieces into the
