@@ -11,17 +11,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{HARD_STRUCTURED_RESPONSE_BYTES, MAX_FRAME_BYTES, ProtocolError};
-use crate::dreamer_job::{DurableJobRequest, JobOperation, JobRole};
+use crate::dreamer_job::{DurableJobRequest, JobOperation, JobRole, OpaqueContentRef};
 
 /// Stable wire identity for one admitted Task Controller invocation.
 pub const TASK_CONTROLLER_INVOCATION_WIRE_ID: &str = "eliot.protocol.task-controller-invocation";
 /// Current Task Controller invocation wire version.
 ///
-/// `3` adds the explicit `DREAMER_ORIENTATION` action and its typed payload.
-/// Version `2` remains accepted for the existing Propose/Apply actions, and
-/// still requires `context_campaign_recipe_policy` (#1724 W1). Orientation is
-/// accepted only at version `3`.
-pub const TASK_CONTROLLER_INVOCATION_WIRE_VERSION: u16 = 3;
+/// `4` adds the initial owner-publication action. The already-sealed
+/// `DREAMER_ORIENTATION` consumer remains on its original version `3` payload.
+/// Versions `2` and `3` remain accepted for the existing Propose/Apply actions.
+pub const TASK_CONTROLLER_INVOCATION_WIRE_VERSION: u16 = 4;
+/// Wire version of the already-sealed Orientation consumer.
+pub const TASK_CONTROLLER_INVOCATION_ORIENTATION_WIRE_VERSION: u16 = 3;
 /// Previous invocation version retained for existing Propose and Apply claims.
 pub const TASK_CONTROLLER_INVOCATION_LEGACY_WIRE_VERSION: u16 = 2;
 /// Stable wire identity for the Kernel-issued Task Controller attempt.
@@ -104,6 +105,57 @@ pub enum TaskControllerAction {
     Apply,
     /// Submit one already-sealed Orientation job with its declared semantic source.
     DreamerOrientation,
+    /// Admit and publish one new Orientation job from original owner publications.
+    PrepareDreamerOrientation,
+}
+
+/// Exact original canonical bytes paired with their owner-issued content reference.
+///
+/// This transport wrapper does not issue an artifact identity or interpret the
+/// referenced contract. The daemon checks the declared contract at its native
+/// owner boundary and preserves both members unchanged through the initial
+/// Orientation publication.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TaskControllerCanonicalSourcePublication {
+    /// Original owner-issued content reference.
+    pub reference: OpaqueContentRef,
+    /// Exact canonical bytes named by `reference`.
+    pub canonical_bytes: Vec<u8>,
+}
+
+impl TaskControllerCanonicalSourcePublication {
+    /// Verifies the original reference, exact bytes, and canonical JSON encoding.
+    pub fn validate(&self, field: &'static str) -> Result<(), ProtocolError> {
+        self.reference
+            .validate(field)
+            .map_err(|_| ProtocolError::InvalidField {
+                field,
+                reason: "must carry a valid original content reference",
+            })?;
+        self.reference
+            .validate_original_bytes(&self.canonical_bytes)
+            .map_err(|_| ProtocolError::InvalidField {
+                field,
+                reason: "original bytes do not match the owner-issued reference",
+            })?;
+        let value: Value = serde_json::from_slice(&self.canonical_bytes).map_err(|_| {
+            ProtocolError::InvalidField {
+                field,
+                reason: "original bytes must contain canonical JSON",
+            }
+        })?;
+        let canonical = canonical_json_bytes(&value).map_err(|error| {
+            ProtocolError::Json(error.to_string())
+        })?;
+        if canonical != self.canonical_bytes || !value.is_object() {
+            return Err(ProtocolError::InvalidField {
+                field,
+                reason: "original bytes must be one canonical JSON object",
+            });
+        }
+        Ok(())
+    }
 }
 
 /// A source claim carried by an explicit Orientation invocation.
@@ -124,6 +176,64 @@ pub struct TaskControllerOrientationSourceClaim {
     pub privacy_class: String,
     /// Closed source route class.
     pub route_class: String,
+}
+
+fn validate_orientation_source_claims(
+    semantic: &TaskControllerOrientationSourceClaim,
+    schema: &TaskControllerOrientationSourceClaim,
+    materials: &[TaskControllerOrientationSourceClaim],
+    budget: TaskControllerOrientationMaterialBudget,
+    field_prefix: &'static str,
+) -> Result<(), ProtocolError> {
+    let claims = std::iter::once(semantic)
+        .chain(std::iter::once(schema))
+        .chain(materials.iter())
+        .collect::<Vec<_>>();
+    if budget.max_sources == 0
+        || budget.max_source_bytes == 0
+        || budget.max_total_bytes == 0
+        || claims.len() > budget.max_sources as usize
+    {
+        return Err(ProtocolError::InvalidField {
+            field: field_prefix,
+            reason: "source count and byte bounds must admit the complete declared set",
+        });
+    }
+
+    let mut handles = std::collections::HashSet::with_capacity(claims.len());
+    let mut total_bytes = 0_u64;
+    for claim in claims {
+        for (field, value) in [
+            ("source_handle", claim.source_handle.as_str()),
+            ("privacy_class", claim.privacy_class.as_str()),
+            ("route_class", claim.route_class.as_str()),
+        ] {
+            bounded_text(value, field)?;
+        }
+        lowercase_sha256(&claim.expected_digest, "source_claim.expected_digest")?;
+        if claim.expected_byte_length == 0
+            || claim.expected_byte_length > budget.max_source_bytes
+            || !handles.insert(claim.source_handle.as_str())
+        {
+            return Err(ProtocolError::InvalidField {
+                field: field_prefix,
+                reason: "source claims must be bounded, nonempty, and uniquely named",
+            });
+        }
+        total_bytes = total_bytes
+            .checked_add(claim.expected_byte_length)
+            .ok_or(ProtocolError::InvalidField {
+                field: field_prefix,
+                reason: "declared source byte total overflows its bound",
+            })?;
+        if total_bytes > budget.max_total_bytes {
+            return Err(ProtocolError::InvalidField {
+                field: field_prefix,
+                reason: "declared source bytes exceed the owner-issued total bound",
+            });
+        }
+    }
+    Ok(())
 }
 
 /// First-profile byte and material bounds for a declared Orientation submit.
@@ -250,6 +360,214 @@ impl TaskControllerOrientationCueAdmissionInputV1 {
         }
         Ok(())
     }
+}
+
+/// Initial Orientation publication inputs before the first Durable Job seal.
+///
+/// Every content reference and byte string is an original owner publication.
+/// The daemon validates each contract at the native boundary, obtains a fresh
+/// Governor decision, publishes the independent Orientation owner rows, and
+/// only then seals the first Durable Job request. This shape alone grants no
+/// admission and cannot be used to rewrite an existing request.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TaskControllerOrientationPrepareInputV1 {
+    /// Closed wire version for this original source bundle.
+    pub schema_version: u16,
+    /// Original canonical DreamJobInput reference.
+    pub semantic_input: OpaqueContentRef,
+    /// Exact canonical DreamJobInput bytes named by `semantic_input`.
+    pub semantic_input_bytes: Vec<u8>,
+    /// Original canonical DreamJobAdmission reference.
+    pub job_admission_ref: OpaqueContentRef,
+    /// Exact canonical DreamJobAdmission bytes named by `job_admission_ref`.
+    pub job_admission_bytes: Vec<u8>,
+    /// Original canonical DreamInputBundle reference.
+    pub input_bundle_ref: OpaqueContentRef,
+    /// Exact canonical DreamInputBundle bytes named by `input_bundle_ref`.
+    pub input_bundle_bytes: Vec<u8>,
+    /// Original K0 job-attempt identity issued for this job publication.
+    pub job_attempt_id: eliot_contracts::ArtifactId,
+    /// Original admitted WorkScope binding, checked again by Governor.
+    pub work_scope: eliot_receipts::WorkScopeBinding,
+    /// Original OutputSchema artifact reference from the job recipe.
+    pub output_contract: OpaqueContentRef,
+    /// Exact original OutputSchema recipe tuple.
+    pub output_schema_recipe: TaskControllerOrientationOutputSchemaRecipe,
+    /// Original named-read claim for the semantic source.
+    pub semantic_source: TaskControllerOrientationSourceClaim,
+    /// Original named-read claim for the output schema bytes.
+    pub schema_source: TaskControllerOrientationSourceClaim,
+    /// Original evidence-material named-read claims.
+    pub materials: Vec<TaskControllerOrientationSourceClaim>,
+    /// Original bounds admitted for source reads.
+    pub budget: TaskControllerOrientationMaterialBudget,
+    /// Original authenticated Context reconstruction result.
+    pub context_reconstruction_result: crate::HostRequestResultBody,
+    /// Original versioned Context compiler supplier profile.
+    pub context_compilation_input: Value,
+    /// Original current Orientation classification source readback.
+    pub orientation_classification_source_readback: Value,
+    /// Original A-12/A-10 supplier values for the Governor cue issuer.
+    pub cue_admission_input: TaskControllerOrientationCueAdmissionInputV1,
+    /// Original provider staffing source publication.
+    pub provider_staffing_source: TaskControllerCanonicalSourcePublication,
+}
+
+impl TaskControllerOrientationPrepareInputV1 {
+    /// Checks transport integrity and original-value pairing only. Native
+    /// semantic contracts and live owner admission remain downstream.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.schema_version != 1 {
+            return Err(ProtocolError::InvalidField {
+                field: "task_controller_invocation.orientation_prepare.schema_version",
+                reason: "must use OrientationPrepareInputV1",
+            });
+        }
+        self.validate_original_content()?;
+        self.validate_scope_and_output_contract()?;
+        self.validate_owner_publications()?;
+        validate_orientation_source_claims(
+            &self.semantic_source,
+            &self.schema_source,
+            &self.materials,
+            self.budget,
+            "task_controller_invocation.orientation_prepare",
+        )?;
+        let bytes = canonical_json_bytes(self)
+            .map_err(|error| ProtocolError::Json(error.to_string()))?;
+        if bytes.len() > MAX_TASK_CONTROLLER_VALUE_BYTES {
+            return Err(ProtocolError::InvalidField {
+                field: "task_controller_invocation.orientation_prepare",
+                reason: "exceeds the bounded JSON value size",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_original_content(&self) -> Result<(), ProtocolError> {
+        self.semantic_input
+            .validate("task_controller_invocation.orientation_prepare.semantic_input")
+            .map_err(|_| ProtocolError::InvalidField {
+                field: "task_controller_invocation.orientation_prepare.semantic_input",
+                reason: "must carry a valid original content reference",
+            })?;
+        self.semantic_input
+            .validate_semantic_input_bytes(&self.semantic_input_bytes)
+            .map_err(|_| ProtocolError::InvalidField {
+                field: "task_controller_invocation.orientation_prepare.semantic_input_bytes",
+                reason: "must match the original semantic reference",
+            })?;
+        validate_original_canonical_object(
+            &self.job_admission_ref,
+            &self.job_admission_bytes,
+            "task_controller_invocation.orientation_prepare.job_admission",
+        )?;
+        validate_original_canonical_object(
+            &self.input_bundle_ref,
+            &self.input_bundle_bytes,
+            "task_controller_invocation.orientation_prepare.input_bundle",
+        )?;
+        Ok(())
+    }
+
+    fn validate_scope_and_output_contract(&self) -> Result<(), ProtocolError> {
+        if self.work_scope.scope_id.as_str().trim().is_empty()
+            || self.work_scope.product_id.as_str().trim().is_empty()
+            || self.work_scope.state_fence.resource_generation
+                != self.work_scope.resource_generation
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "task_controller_invocation.orientation_prepare.work_scope",
+                reason: "must carry one original, internally bound WorkScope",
+            });
+        }
+        self.work_scope
+            .state_fence
+            .validate()
+            .map_err(ProtocolError::Foundation)?;
+        self.output_contract
+            .validate("task_controller_invocation.orientation_prepare.output_contract")
+            .map_err(|_| ProtocolError::InvalidField {
+                field: "task_controller_invocation.orientation_prepare.output_contract",
+                reason: "must carry the original OutputSchema artifact reference",
+            })?;
+        if self.output_schema_recipe.schema_version != 2
+            || self.output_schema_recipe.schema_digest != self.output_contract.sha256
+            || self.output_contract.artifact_id.as_ref()
+                != Some(&self.output_schema_recipe.schema_id)
+            || self.semantic_source.expected_digest != self.semantic_input.sha256
+            || self.semantic_source.expected_byte_length != self.semantic_input.byte_length
+            || self.schema_source.expected_digest != self.output_contract.sha256
+            || self.schema_source.expected_byte_length != self.output_contract.byte_length
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "task_controller_invocation.orientation_prepare.source_binding",
+                reason: "source claims must bind the original semantic and OutputSchema references",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_owner_publications(&self) -> Result<(), ProtocolError> {
+        self.context_reconstruction_result
+            .validate_local_read_submission()?;
+        structured_object(
+            &self.context_compilation_input,
+            "task_controller_invocation.orientation_prepare.context_compilation_input",
+        )?;
+        if self
+            .context_compilation_input
+            .get("schema_version")
+            .and_then(Value::as_u64)
+            != Some(1)
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "task_controller_invocation.orientation_prepare.context_compilation_input",
+                reason: "must use ContextCompilerSupplierProfileV1",
+            });
+        }
+        structured_object(
+            &self.orientation_classification_source_readback,
+            "task_controller_invocation.orientation_prepare.classification_source_readback",
+        )?;
+        self.cue_admission_input.validate()?;
+        self.provider_staffing_source
+            .validate("task_controller_invocation.orientation_prepare.provider_staffing_source")?;
+        Ok(())
+    }
+}
+
+fn validate_original_canonical_object(
+    reference: &OpaqueContentRef,
+    bytes: &[u8],
+    field: &'static str,
+) -> Result<(), ProtocolError> {
+    reference.validate(field).map_err(|_| ProtocolError::InvalidField {
+        field,
+        reason: "must carry a valid original content reference",
+    })?;
+    reference
+        .validate_original_bytes(bytes)
+        .map_err(|_| ProtocolError::InvalidField {
+            field,
+            reason: "original bytes do not match the owner-issued reference",
+        })?;
+    let value: Value = serde_json::from_slice(bytes).map_err(|_| ProtocolError::InvalidField {
+        field,
+        reason: "original bytes must contain canonical JSON",
+    })?;
+    if !value.is_object()
+        || canonical_json_bytes(&value)
+            .map_err(|error| ProtocolError::Json(error.to_string()))?
+            != bytes
+    {
+        return Err(ProtocolError::InvalidField {
+            field,
+            reason: "original bytes must be one canonical JSON object",
+        });
+    }
+    Ok(())
 }
 
 /// Typed Task Controller payload for the explicit Orientation operation.
@@ -539,9 +857,13 @@ impl TaskControllerInvocation {
         let version_supported = match self.action {
             TaskControllerAction::Propose | TaskControllerAction::Apply => {
                 self.wire_version == TASK_CONTROLLER_INVOCATION_LEGACY_WIRE_VERSION
+                    || self.wire_version == TASK_CONTROLLER_INVOCATION_ORIENTATION_WIRE_VERSION
                     || self.wire_version == TASK_CONTROLLER_INVOCATION_WIRE_VERSION
             }
             TaskControllerAction::DreamerOrientation => {
+                self.wire_version == TASK_CONTROLLER_INVOCATION_ORIENTATION_WIRE_VERSION
+            }
+            TaskControllerAction::PrepareDreamerOrientation => {
                 self.wire_version == TASK_CONTROLLER_INVOCATION_WIRE_VERSION
             }
         };
@@ -581,41 +903,66 @@ impl TaskControllerInvocation {
     }
 
     fn validate_orientation_payload(&self) -> Result<(), ProtocolError> {
-        if self.action == TaskControllerAction::DreamerOrientation {
-            let orientation: TaskControllerOrientationInput =
-                serde_json::from_value(self.task_input.clone()).map_err(|_| {
-                    ProtocolError::InvalidField {
-                        field: "task_controller_invocation.task_input",
-                        reason: "must match the typed Orientation submit contract",
-                    }
-                })?;
-            orientation.validate()?;
-            let JobOperation::Submit { submission } = &orientation.request.operation else {
-                return Err(ProtocolError::InvalidField {
-                    field: "task_controller_invocation.task_input",
-                    reason: "must carry the original Orientation submit request",
-                });
-            };
-            let runtime_input = submission
-                .decode_runtime_owner_execution_input()
-                .map_err(|_| ProtocolError::InvalidField {
-                    field: "task_controller_invocation.runtime_owner_execution_input",
-                    reason: "must retain the original runtime owner publication",
-                })?
-                .ok_or(ProtocolError::InvalidField {
-                    field: "task_controller_invocation.runtime_owner_execution_input",
-                    reason: "is required for Orientation",
-                })?;
-            if runtime_input.context_input != self.context_input
-                || runtime_input.context_campaign_recipe != self.context_campaign_recipe
-                || runtime_input.context_campaign_recipe_policy
-                    != self.context_campaign_recipe_policy
-            {
-                return Err(ProtocolError::InvalidField {
-                    field: "task_controller_invocation.runtime_owner_execution_input",
-                    reason: "must preserve exact original Context owner inputs",
-                });
+        match self.action {
+            TaskControllerAction::DreamerOrientation => self.validate_sealed_orientation_payload(),
+            TaskControllerAction::PrepareDreamerOrientation => {
+                self.validate_orientation_prepare_payload()
             }
+            TaskControllerAction::Propose | TaskControllerAction::Apply => Ok(()),
+        }
+    }
+
+    fn validate_sealed_orientation_payload(&self) -> Result<(), ProtocolError> {
+        let orientation: TaskControllerOrientationInput =
+            serde_json::from_value(self.task_input.clone()).map_err(|_| {
+                ProtocolError::InvalidField {
+                    field: "task_controller_invocation.task_input",
+                    reason: "must match the typed Orientation submit contract",
+                }
+            })?;
+        orientation.validate()?;
+        let JobOperation::Submit { submission } = &orientation.request.operation else {
+            return Err(ProtocolError::InvalidField {
+                field: "task_controller_invocation.task_input",
+                reason: "must carry the original Orientation submit request",
+            });
+        };
+        let runtime_input = submission
+            .decode_runtime_owner_execution_input()
+            .map_err(|_| ProtocolError::InvalidField {
+                field: "task_controller_invocation.runtime_owner_execution_input",
+                reason: "must retain the original runtime owner publication",
+            })?
+            .ok_or(ProtocolError::InvalidField {
+                field: "task_controller_invocation.runtime_owner_execution_input",
+                reason: "is required for Orientation",
+            })?;
+        if runtime_input.context_input != self.context_input
+            || runtime_input.context_campaign_recipe != self.context_campaign_recipe
+            || runtime_input.context_campaign_recipe_policy != self.context_campaign_recipe_policy
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "task_controller_invocation.runtime_owner_execution_input",
+                reason: "must preserve exact original Context owner inputs",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_orientation_prepare_payload(&self) -> Result<(), ProtocolError> {
+        let input: TaskControllerOrientationPrepareInputV1 =
+            serde_json::from_value(self.task_input.clone()).map_err(|_| {
+                ProtocolError::InvalidField {
+                    field: "task_controller_invocation.task_input",
+                    reason: "must match the typed Orientation prepare contract",
+                }
+            })?;
+        input.validate()?;
+        if input.work_scope.scope_id.as_str() != self.work_scope_id.as_str() {
+            return Err(ProtocolError::InvalidField {
+                field: "task_controller_invocation.task_input.work_scope",
+                reason: "must preserve the exact admitted Task Controller scope",
+            });
         }
         Ok(())
     }
