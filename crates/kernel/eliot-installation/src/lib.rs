@@ -138,12 +138,12 @@ mod survey;
 mod transaction;
 
 pub use guard_containment::RetainedGuardRevert;
-pub use installation_registry::{RedbInstallationRegistry, validate_installation_host_root};
 #[cfg(test)]
 use installation_registry::classify_registry_table;
 use installation_registry::{
     LEGACY_REGISTRY_TABLE, REGISTRY_RELATIVE_PATH, REGISTRY_TABLE, installation_registry_path,
 };
+pub use installation_registry::{RedbInstallationRegistry, validate_installation_host_root};
 
 #[cfg(feature = "test-support")]
 use approved_generation_registry::validate_approval_against_manifest;
@@ -152,9 +152,9 @@ pub use approved_generation_registry::{
     ActivePhaseBRebindReceipt, ActivePhaseBRebindRecovery, AgentBridgePhaseBBinding,
     AgentBridgePreparedBinding, AgentBridgeSecurityContour, AgentBridgeStagePrepared,
     ApprovedGeneration, ApprovedGenerationRegistry, CommittedCutoverActivation,
-    HostPhaseBPreparedMaterialization, HostPhaseBPreparedReceipt, InstallationActivationApproval,
-    IsolatedInstallationAllocation, PendingActivation, PendingActivationState, PhaseBDigestState,
-    PhaseBLiveBinding, phase_b_digest_state, phase_b_scm_selector,
+    HostPhaseBPreparedMaterialization, IsolatedInstallationAllocation, PendingActivation,
+    PendingActivationState, PhaseBDigestState, PhaseBLiveBinding, phase_b_digest_state,
+    phase_b_scm_selector,
 };
 use approved_generation_registry::{
     ActiveVerifiedReceiptBinding, PendingActivationAbortReceipt, PendingActivationTerminal,

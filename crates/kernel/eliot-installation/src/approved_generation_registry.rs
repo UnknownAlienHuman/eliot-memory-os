@@ -2784,12 +2784,14 @@ fn installation_host_root_key(
     super::validate_installation_host_root(Path::new(root.as_str()))?;
     let identity = super::WindowsPathIdentity::parse_root(root.as_str(), field)?;
     let key_index = identity.components.len().saturating_sub(2);
-    identity.components.get(key_index).cloned().ok_or_else(|| {
-        InstallationError::InvalidField {
+    identity
+        .components
+        .get(key_index)
+        .cloned()
+        .ok_or_else(|| InstallationError::InvalidField {
             field: field.to_owned(),
             reason: "retained root must be an installation Host root".to_owned(),
-        }
-    })
+        })
 }
 
 /// Owner record of one isolated destination installation that has been
