@@ -41,8 +41,9 @@ use eliot_store_api::{
     StoreRecoveryRequest, StoreRecoverySnapshot, TransitionClass, WriteReceipt, WriteReceiptStatus,
     audit_heads_digest, bind_issue18_receipt, bind_policy_config_schema_versions,
     canonical_json_bytes, canonical_request_hash, decode_automation_mutation,
-    decode_erasure_surfaces, decode_notification_mutation, decode_reactive_mutation,
-    decode_resource_content, generated_operation_manifests, genesis_manifest, genesis_transition,
+    decode_erasure_surfaces, decode_instrument_registry_mutation, decode_notification_mutation,
+    decode_reactive_mutation, decode_resource_content, generated_operation_manifests,
+    genesis_manifest, genesis_transition,
     is_genesis_fence, issue_genesis_receipt_envelope, issue_store_receipt_envelope,
     named_mutation_operation_name, sha256_hex, validate_automation_read_params,
     validate_genesis_receipt_envelope, validate_reactive_ledger_read_params,
@@ -397,6 +398,12 @@ impl MemoryStore {
         // the learning legs and before the receipt is built, so the row, the
         // receipt, and the outbox intents still commit atomically below.
         dispatch_apply_capability_evidence(&mut state, &transition, &mut plan)?;
+        // Issue #1814 W1.2: admitted instrument-registry legs execute here,
+        // beside the capability-evidence legs and before the receipt is
+        // built, so the receipt's outbox references include the appended
+        // instrument-registry outbox intents. Head, receipt, and outbox
+        // still commit atomically below.
+        dispatch_apply_instrument_registry_state(&mut state, &transition, &mut plan)?;
         dispatch_apply_module_registry_snapshot(&mut state, &transition)?;
         dispatch_apply_finish_evidence(&mut state, &transition)?;
         dispatch_apply_finish_decision(&mut state, &transition)?;
@@ -1089,6 +1096,90 @@ fn dispatch_apply_reactive_state(
         outbox.validate()?;
         plan.outbox_records.push(outbox);
         reactive_index = reactive_index.saturating_add(1);
+    }
+    Ok(())
+}
+
+/// Executes admitted instrument-registry legs on already-locked state
+/// (issue #1814 W1.2).
+///
+/// Runs beside [`dispatch_apply_reactive_state`] under the same lock as
+/// the receipt commit: one identity, one receipt, recoverable replay
+/// without duplicate work. Each apply replaces the singleton snapshot
+/// head verbatim with a bumped store revision; the bytes stay opaque
+/// here (the store never interprets instrument admission) and each
+/// command appends one outbox intent bound to the resulting bytes, so
+/// the head and its outbox intents commit atomically via
+/// [`commit_transaction`]. Non-instrument transitions are a no-op here.
+fn dispatch_apply_instrument_registry_state(
+    state: &mut MemoryState,
+    transition: &PreparedTransition,
+    plan: &mut TransactionPlan,
+) -> Result<(), StoreError> {
+    let has_instrument_op = transition
+        .named_operations
+        .iter()
+        .any(|command| command.operation == NamedMutationOperation::ApplyInstrumentRegistryState);
+    if !has_instrument_op {
+        return Ok(());
+    }
+    if transition.transition_class != TransitionClass::InstrumentRegistry {
+        return Err(StoreError::TransitionClassExceeded);
+    }
+    let operation_key = transition.identity.operation_id.to_string();
+    let mut instrument_index = 0_usize;
+    for command in &transition.named_operations {
+        if command.operation != NamedMutationOperation::ApplyInstrumentRegistryState {
+            continue;
+        }
+        let snapshot_json = decode_instrument_registry_mutation(&command.parameters)?;
+        let revision = match state.instrument_registry.as_ref() {
+            Some(existing) => {
+                if existing.state_fence != transition.state_fence {
+                    return Err(StoreError::FenceMismatch);
+                }
+                existing
+                    .revision
+                    .checked_add(1)
+                    .ok_or(StoreError::InvalidField {
+                        field: "instrument_registry.revision",
+                        reason: "owner revision overflow",
+                    })?
+            }
+            None => 1,
+        };
+        let row = InstrumentRegistryRow {
+            snapshot_json: snapshot_json.clone(),
+            revision,
+            state_fence: transition.state_fence.clone(),
+            scope_id: transition.scope_id.to_string(),
+            task_id: transition.task_id.clone(),
+        };
+        state.instrument_registry = Some(row);
+        let row_json = serde_json::to_value(&snapshot_json)
+            .map_err(|error| StoreError::Serialization(error.to_string()))?;
+        let payload_digest = sha256_hex(
+            &canonical_json_bytes(&row_json)
+                .map_err(|error| StoreError::Serialization(error.to_string()))?,
+        );
+        let sequence = plan.next_outbox_sequence;
+        plan.next_outbox_sequence =
+            checked_increment(sequence, "outbox.sequence", "sequence overflow")?;
+        let outbox = OutboxIntent {
+            outbox_id: OutboxId::new(format!(
+                "outbox-{operation_key}-instrument-registry-{instrument_index}"
+            ))?,
+            operation_id: transition.identity.operation_id.clone(),
+            sequence,
+            payload_digest,
+            state_fence: transition.state_fence.clone(),
+            arrival_fence: format!("arrival-{operation_key}"),
+            claim_fence: None,
+            state: OutboxState::Arrived,
+        };
+        outbox.validate()?;
+        plan.outbox_records.push(outbox);
+        instrument_index = instrument_index.saturating_add(1);
     }
     Ok(())
 }
@@ -2359,6 +2450,30 @@ fn resource_snapshot_payload(
         "uri": uri,
         "content_sha256": content_sha256,
         "content_base64": content_base64,
+        "revision": revision,
+        "state_fence": fence,
+    }))
+}
+
+/// Builds the same-fence instrument-registry read payload (issue #1814 W1.2).
+///
+/// Same error contract as [`reactive_ledger_payload`]: parameters are
+/// pre-validated by the catalogue gate (this read declares none), and an
+/// absent head (or a head from another fence) projects explicit absence,
+/// never fabricated bytes. The snapshot travels verbatim (a JSON string),
+/// identically to the Surreal contour, so a readback is byte-identical to
+/// the admitted write.
+fn instrument_registry_payload(
+    state: &MemoryState,
+    _query: &NamedReadRequest,
+    fence: &StateFence,
+) -> Result<Value, serde_json::Error> {
+    let (snapshot_json, revision) = match state.instrument_registry.as_ref() {
+        Some(row) if row.state_fence == *fence => (json!(row.snapshot_json), row.revision),
+        _ => (Value::Null, 0),
+    };
+    serde_json::to_value(json!({
+        "snapshot_json": snapshot_json,
         "revision": revision,
         "state_fence": fence,
     }))
@@ -4243,7 +4358,9 @@ impl MemoryStore {
     /// `notification_id` / `include_resolved` / `page_limit` / `cursor`
     /// selectors. Issue #1941 C4 adds `GetReactiveInjectionState` with its
     /// exact `session_id` selector and `GetResourceSnapshot` with its exact
-    /// `uri` selector. Issue #1779 adds `GetUserAutomationState` with its
+    /// `uri` selector. Issue #1814 W1.2 adds `GetInstrumentRegistryState`
+    /// with no selectors (the singleton snapshot head). Issue #1779 adds
+    /// `GetUserAutomationState` with its
     /// closed query discriminator and exact selectors. Issue #223 adds
     /// `GetExperienceBankRange` and `GetAgentFeedbackRange` with the
     /// `max_records` bound, scope-addressed through the request envelope.
@@ -4262,6 +4379,7 @@ impl MemoryStore {
                 | NamedReadOperation::GetNotificationState
                 | NamedReadOperation::GetReactiveInjectionState
                 | NamedReadOperation::GetResourceSnapshot
+                | NamedReadOperation::GetInstrumentRegistryState
                 | NamedReadOperation::GetUserAutomationState
                 | NamedReadOperation::GetExperienceBankRange
                 | NamedReadOperation::GetAgentFeedbackRange
@@ -4355,6 +4473,9 @@ impl MemoryStore {
             }
             NamedReadOperation::GetResourceSnapshot => {
                 resource_snapshot_payload(state, query, fence)
+            }
+            NamedReadOperation::GetInstrumentRegistryState => {
+                instrument_registry_payload(state, query, fence)
             }
             NamedReadOperation::GetExperienceBankRange => {
                 experience_range_payload(state, query, fence, true)
@@ -5301,6 +5422,20 @@ struct ResourceSnapshotRow {
     task_id: Option<String>,
 }
 
+/// One durable instrument-registry snapshot head: the verbatim opaque
+/// snapshot bytes with a store-issued revision, admission fence, and
+/// task-binding provenance (issue #1814 W1.2). The singleton head is
+/// replaced verbatim with a bumped revision on each admitted apply; the
+/// store never interprets instrument admission.
+#[derive(Clone, Debug, PartialEq)]
+struct InstrumentRegistryRow {
+    snapshot_json: String,
+    revision: u64,
+    state_fence: StateFence,
+    scope_id: String,
+    task_id: Option<String>,
+}
+
 /// One immutable experience-bank row: the verbatim Governor-admitted
 /// record document for one handle + owner revision with its presented
 /// digest, admission fence, and task-binding provenance (issue #223).
@@ -5523,6 +5658,11 @@ struct MemoryState {
     /// `revision` the fenced CAS advances, which is the owner-issued
     /// immutable revision the Governor registry orders same-key evidence by.
     capability_evidence_rows: BTreeMap<RecoveryRecordKey, CapabilityEvidenceRow>,
+    /// Durable instrument-registry snapshot head (issue #1814 W1.2).
+    /// Verbatim opaque snapshot bytes with a store-issued revision, driven
+    /// only through the closed instrument-registry legs under the held
+    /// transaction lock.
+    instrument_registry: Option<InstrumentRegistryRow>,
     next_commit_sequence: u64,
     next_outbox_sequence: u64,
 }
@@ -5562,6 +5702,7 @@ impl PartialEq for MemoryState {
             && self.experience_feedback_rows == other.experience_feedback_rows
             && self.learning_record_rows == other.learning_record_rows
             && self.capability_evidence_rows == other.capability_evidence_rows
+            && self.instrument_registry == other.instrument_registry
             && self.next_commit_sequence == other.next_commit_sequence
             && self.next_outbox_sequence == other.next_outbox_sequence
             && self.notifications.iter().collect::<Vec<_>>()
@@ -5607,6 +5748,7 @@ impl Default for MemoryState {
             experience_feedback_rows: BTreeMap::new(),
             learning_record_rows: BTreeMap::new(),
             capability_evidence_rows: BTreeMap::new(),
+            instrument_registry: None,
             next_commit_sequence: 1,
             next_outbox_sequence: 1,
         }
@@ -5633,6 +5775,7 @@ impl MemoryState {
             && self.automation_revisions.is_empty()
             && self.automation_currents.is_empty()
             && self.automation_invocations.is_empty()
+            && self.instrument_registry.is_none()
     }
 
     fn snapshot(&self) -> MemorySnapshot {

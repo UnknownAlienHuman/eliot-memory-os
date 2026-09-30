@@ -696,6 +696,13 @@ pub(crate) const CANONICAL_SOURCE_CLASSES: &[CanonicalSourceClass] = &[
     CanonicalSourceClass::OutsideAdmittedGeneration {
         table: crate::schema::table::LEARNING_RECORD,
     },
+    // The instrument-registry head is created by the closed apply-time
+    // ensure operation (issue #1814 W1.2), never by generation baseline
+    // DDL, so it is declared here and not captured — same disposition as
+    // the other ensure-created singleton heads above.
+    CanonicalSourceClass::OutsideAdmittedGeneration {
+        table: crate::schema::table::INSTRUMENT_REGISTRY,
+    },
 ];
 
 /// The capture-point reads, in the exact order the pinned batches issue them:

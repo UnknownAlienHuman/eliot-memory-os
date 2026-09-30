@@ -90,6 +90,13 @@ pub(crate) mod table {
     /// digest is a new row, never an in-place rewrite.
     pub(crate) const LEARNING_RECORD: &str = "learning_record";
 
+    /// Singleton instrument-registry snapshot head (issue #1814 W1.2). One
+    /// row under the fixed `head` key carrying the verbatim opaque
+    /// snapshot bytes with a store-issued revision. Replaced verbatim
+    /// with a bumped revision on each admitted apply under the same
+    /// fence+revision compare-and-set contract as the reactive tables.
+    pub(crate) const INSTRUMENT_REGISTRY: &str = "instrument_registry";
+
     /// Every physical table *name* this single owner declares, in declaration
     /// order.
     ///
@@ -119,7 +126,7 @@ pub(crate) mod table {
     ///   `automation_continuation` are declared without generation DDL;
     ///   continuations create their schemaless table only during explicit
     ///   truncated-page issuance.
-    pub(crate) const ALL_TABLES: [&str; 25] = [
+    pub(crate) const ALL_TABLES: [&str; 26] = [
         SCHEMA_META,
         WRITE_RECEIPT,
         REVISION_HEAD,
@@ -145,6 +152,7 @@ pub(crate) mod table {
         EXPERIENCE_BANK,
         EXPERIENCE_FEEDBACK,
         LEARNING_RECORD,
+        INSTRUMENT_REGISTRY,
     ];
 }
 
