@@ -33,13 +33,11 @@ use std::collections::BTreeSet;
 
 use eliot_context_candidates::ProjectionState;
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
-use eliot_cue_activation::{
-    ActivationError, ActivationProfile, MatchRule, evaluate_activation,
-};
+use eliot_cue_activation::{ActivationError, ActivationProfile, MatchRule, evaluate_activation};
 use eliot_cue_contracts::{
     ActivationBounds, ActivationBoundsSpec, ActivationRequest, ActivationRequestId,
     ActivationRequestSpec, ActivationStrength, CONTRACT_REVISION, Completeness, CueContractError,
-    CueKind, CueSnapshotBuildCandidate, Digest, MatchMode, MAX_SEEDS, NormalizationOutcome,
+    CueKind, CueSnapshotBuildCandidate, Digest, MAX_SEEDS, MatchMode, NormalizationOutcome,
     NormalizationProfile, NormalizedCue, SnapshotId,
 };
 use eliot_governor::{
@@ -256,7 +254,9 @@ pub fn evaluate_cue_activation(seven: &SevenRoleInputs) -> CueActivationDisposit
     let first = match reconstruct_cue_snapshot(seven, &snapshot_id, &adapter_profile, &mut cache) {
         Ok(reconstruction) => reconstruction.candidate,
         Err(error) => {
-            return CueActivationDisposition::Skipped(CueActivationSkip::ReconstructionFailed(error));
+            return CueActivationDisposition::Skipped(CueActivationSkip::ReconstructionFailed(
+                error,
+            ));
         }
     };
     let adopted = match adopted_capture_profile(&first) {

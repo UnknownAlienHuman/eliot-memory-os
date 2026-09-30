@@ -213,13 +213,13 @@ pub use capability_outcome::{
 pub use context_reconstruction_route::{
     ReconstructionPrerequisite, is_context_reconstruction_query, serve_context_reconstruction,
 };
-pub use cue_activation_route::{
-    CueActivationDisposition, CueActivationSkip, CueActivationSummary, evaluate_cue_activation,
-};
 pub use controlboard_adapters::{
     CONTROLBOARD_READ_CAPABILITY, ControlBoardReadOutcome, ControlBoardRefusal,
     controlboard_notification_refresh_refusal_body, controlboard_result_body,
     is_controlboard_read_tool, serve_controlboard_view,
+};
+pub use cue_activation_route::{
+    CueActivationDisposition, CueActivationSkip, CueActivationSummary, evaluate_cue_activation,
 };
 pub use daemon_config::{DaemonConfig, admit_daemon_module_manifest};
 pub(crate) use daemon_kernel_client::kernel_port_error;
