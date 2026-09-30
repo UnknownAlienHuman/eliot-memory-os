@@ -4290,6 +4290,12 @@ pub trait OperationalRecoveryStore: Send + Sync {
         result_evidence: Option<&crate::HostRequestEffectEvidence>,
         result_lineage: Option<&crate::HostRequestRetainedLineage>,
     ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
+    /// Persists an Observe completion only under the exact current durable
+    /// pair attempt and its protected executable-input commitment.
+    fn persist_host_request_observe_result(
+        &self,
+        result: crate::HostRequestObserveResult<'_>,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
     /// Atomically stores an exact owner result and terminalizes the same
     /// claimed attempt that durably recorded `ResponseReceived`.
     fn persist_claimed_host_request_result(
@@ -4577,6 +4583,107 @@ pub trait OperationalRecoveryStore: Send + Sync {
         stream_id: &str,
         request_id: &str,
     ) -> Result<Option<WorkerReplayRequestRecord>, OrsError>;
+}
+
+struct HostRequestResultPersistence<'a> {
+    operation_id: &'a crate::OperationIdentity,
+    request_digest: &'a str,
+    observe_attempt: Option<&'a crate::HostRequestAttempt>,
+    result_digest: &'a str,
+    result_response: &'a serde_json::Value,
+    result_evidence: Option<&'a crate::HostRequestEffectEvidence>,
+    result_lineage: Option<&'a crate::HostRequestRetainedLineage>,
+}
+
+/// Exact owner-supplied Observe completion retained under its durable claim.
+#[derive(Clone, Copy, Debug)]
+pub struct HostRequestObserveResult<'a> {
+    /// Durable host-request operation identity.
+    pub operation_id: &'a crate::OperationIdentity,
+    /// Exact retained host-request digest.
+    pub request_digest: &'a str,
+    /// Whole current durable attempt returned with the claimed pair.
+    pub attempt: &'a crate::HostRequestAttempt,
+    /// Canonical digest of the exact result response.
+    pub result_digest: &'a str,
+    /// Exact bounded owner response body containing the canonical receipt.
+    pub result_response: &'a serde_json::Value,
+    /// Executor-observed effect evidence, when supplied by the owner.
+    pub result_evidence: Option<&'a crate::HostRequestEffectEvidence>,
+    /// Owner-submitted result lineage, including the original receipt reference.
+    pub result_lineage: Option<&'a crate::HostRequestRetainedLineage>,
+}
+
+fn validate_host_request_result_scope(
+    record: &crate::HostRequestRecord,
+    observe_attempt: Option<&crate::HostRequestAttempt>,
+    response: &serde_json::Value,
+    lineage: Option<&crate::HostRequestRetainedLineage>,
+) -> Result<(), OrsError> {
+    let invalid = || OrsError::InvalidField {
+        field: "host_request_result_observe_binding",
+        reason: "protected Observe results require the exact durable attempt and canonical receipt",
+    };
+    let Some(attempt) = observe_attempt else {
+        if record.executable_input.is_some() {
+            return Err(invalid());
+        }
+        return Ok(());
+    };
+    let input = record.executable_input.as_ref().ok_or_else(invalid)?;
+    if record.send_claim_protocol_version != 0
+        || record.kind != crate::HostRequestKind::Invocation
+        || record.capability_ref.as_str() != "eliot.observe"
+        || !matches!(
+            record.state,
+            crate::HostRequestState::Submitted
+                | crate::HostRequestState::Unknown
+                | crate::HostRequestState::Reconciling
+                | crate::HostRequestState::ResultReceived
+                | crate::HostRequestState::Terminal
+        )
+        || record.attempt.as_ref() != Some(attempt)
+        || attempt.phase != crate::HostRequestAttemptPhase::Claimed
+        || !attempt.transport_observations.is_empty()
+        || attempt.owner_readback.is_some()
+        || attempt.input_commitment_sha256.as_deref() != Some(input.commitment_sha256.as_str())
+    {
+        return Err(invalid());
+    }
+    let lineage = lineage.ok_or_else(invalid)?;
+    if lineage.result_class != crate::HostRequestRetainedResultClass::CanonicalWriteReceipt {
+        return Err(invalid());
+    }
+    let receipt_value = response.get("receipt").cloned().ok_or_else(invalid)?;
+    let receipt: eliot_store_api::WriteReceipt =
+        serde_json::from_value(receipt_value).map_err(|_| invalid())?;
+    receipt.validate().map_err(|_| invalid())?;
+    let envelope = receipt
+        .require_reconciliation_envelope()
+        .map_err(|_| invalid())?;
+    let scope_ref = input.application_binding.scope_ref.as_ref().ok_or_else(invalid)?;
+    let Some(work_scope) = record.scope_ref.as_ref() else {
+        return Err(invalid());
+    };
+    if receipt.status != eliot_store_api::WriteReceiptStatus::Committed
+        || receipt.idempotency_key != record.idempotency_key.as_str()
+        || envelope.core.work_scope.scope_id.as_str() != work_scope.as_str()
+        || envelope.core.work_scope.state_fence != input.application_binding.state_fence
+        || envelope.core.operation.state_fence != input.application_binding.state_fence
+        || scope_ref != work_scope
+        || lineage.semantic_receipt_ref.as_deref()
+            != Some(envelope.identity.receipt_id.as_str())
+    {
+        return Err(invalid());
+    }
+    match (&record.task_ref, input.application_binding.task_revision, &envelope.core.task) {
+        (Some(task_ref), Some(task_revision), Some(receipt_task))
+            if receipt_task.task_id.as_str() == task_ref.as_str()
+                && receipt_task.task_revision.value() == task_revision => {}
+        (None, None, None) => {}
+        _ => return Err(invalid()),
+    }
+    Ok(())
 }
 
 /// redb-backed ORS implementation. Every mutating method commits one short transaction.
@@ -11089,6 +11196,40 @@ impl RedbRecoveryStore {
             return Ok(None);
         };
         record.validate()?;
+        if let Some(input) = record.executable_input.as_ref() {
+            let Some(current) = record.attempt.as_ref() else {
+                return Err(OrsError::InvalidTransition);
+            };
+            if record.send_claim_protocol_version != 0
+                || record.kind != crate::HostRequestKind::Invocation
+                || record.capability_ref.as_str() != "eliot.observe"
+                || current != attempt
+                || current.phase != crate::HostRequestAttemptPhase::Claimed
+                || current.input_commitment_sha256.as_deref()
+                    != Some(input.commitment_sha256.as_str())
+            {
+                return Err(OrsError::InvalidTransition);
+            }
+            if matches!(
+                record.state,
+                crate::HostRequestState::Unknown | crate::HostRequestState::Reconciling
+            ) {
+                write.commit().map_err(storage)?;
+                return Ok(Some(record));
+            }
+            if record.state != crate::HostRequestState::Submitted {
+                return Err(OrsError::InvalidTransition);
+            }
+            record.state = crate::HostRequestState::Unknown;
+            record.validate()?;
+            let payload = encode(&record)?;
+            {
+                let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+                table.insert(key.as_str(), payload.as_str()).map_err(storage)?;
+            }
+            write.commit().map_err(storage)?;
+            return Ok(Some(record));
+        }
         if record.send_claim_protocol_version == crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION {
             return Err(OrsError::InvalidTransition);
         }
@@ -11371,10 +11512,6 @@ impl RedbRecoveryStore {
     /// lineage are written with the result in the same transaction, so the
     /// operation/effect identity and its evidence references are never
     /// separable at the authority boundary.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "the result-retention transaction keeps replay, lifecycle, and immutable-view joins together"
-    )]
     pub fn persist_host_request_result(
         &self,
         operation_id: &crate::OperationIdentity,
@@ -11384,6 +11521,52 @@ impl RedbRecoveryStore {
         result_evidence: Option<&crate::HostRequestEffectEvidence>,
         result_lineage: Option<&crate::HostRequestRetainedLineage>,
     ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        self.persist_host_request_result_inner(HostRequestResultPersistence {
+            operation_id,
+            request_digest,
+            observe_attempt: None,
+            result_digest,
+            result_response,
+            result_evidence,
+            result_lineage,
+        })
+    }
+
+    /// Persists a protected Observe result under its exact durable pair
+    /// attempt. Unlike generic local-read completion, this path accepts only
+    /// the same submitted input commitment and an actual canonical receipt.
+    pub fn persist_host_request_observe_result(
+        &self,
+        result: crate::HostRequestObserveResult<'_>,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        self.persist_host_request_result_inner(HostRequestResultPersistence {
+            operation_id: result.operation_id,
+            request_digest: result.request_digest,
+            observe_attempt: Some(result.attempt),
+            result_digest: result.result_digest,
+            result_response: result.result_response,
+            result_evidence: result.result_evidence,
+            result_lineage: result.result_lineage,
+        })
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the result-retention transaction keeps replay, lifecycle, and immutable-view joins together"
+    )]
+    fn persist_host_request_result_inner(
+        &self,
+        persistence: HostRequestResultPersistence<'_>,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        let HostRequestResultPersistence {
+            operation_id,
+            request_digest,
+            observe_attempt,
+            result_digest,
+            result_response,
+            result_evidence,
+            result_lineage,
+        } = persistence;
         crate::model::validate_digest(result_digest, "host_request_result_digest")?;
         let campaign_view = campaign_view_publication(result_response)?;
         let key = format!("{}::{}", operation_id.as_str(), request_digest);
@@ -11400,6 +11583,12 @@ impl RedbRecoveryStore {
             return Ok(None);
         };
         existing.validate()?;
+        validate_host_request_result_scope(
+            &existing,
+            observe_attempt,
+            result_response,
+            result_lineage,
+        )?;
         if existing.send_claim_protocol_version == crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION {
             return Err(OrsError::InvalidTransition);
         }
@@ -35163,6 +35352,13 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         )
     }
 
+    fn persist_host_request_observe_result(
+        &self,
+        result: crate::HostRequestObserveResult<'_>,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        RedbRecoveryStore::persist_host_request_observe_result(self, result)
+    }
+
     fn persist_claimed_host_request_result(
         &self,
         operation_id: &crate::OperationIdentity,
@@ -35843,6 +36039,14 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
             result_evidence,
             result_lineage,
         )
+    }
+
+    /// Persists a protected Observe result for the exact submitted claim.
+    pub fn persist_host_request_observe_result(
+        &self,
+        result: crate::HostRequestObserveResult<'_>,
+    ) -> Result<Option<HostRequestRecord>, OrsError> {
+        self.store.persist_host_request_observe_result(result)
     }
 
     /// Atomically persists the exact response for the claim whose retained
