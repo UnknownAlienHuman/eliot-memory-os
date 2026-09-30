@@ -47,11 +47,11 @@
 //! [`MaintenanceError`]; no acknowledgement, cursor advance, or compaction
 //! may be emitted from an error.
 
+use super::MaintenanceError;
 use super::trigger_intake::{
     MaintenanceTriggerIntake, TriggerIntakePersistReceipt, TriggerIntakeSourceEvent,
     check_intake_shape,
 };
-use super::MaintenanceError;
 
 /// Explicit successor link for one superseded trigger intake.
 ///
@@ -343,7 +343,11 @@ impl TriggerRetentionDisposition {
         )?;
         require_text(&self.reason, "trigger_retention.reason")?;
         if self.disposition_ref
-            != disposition_ref(&self.trigger_id, self.is_supersession(), &self.payload_binding)
+            != disposition_ref(
+                &self.trigger_id,
+                self.is_supersession(),
+                &self.payload_binding,
+            )
         {
             return Err(MaintenanceError::IdentityConflict);
         }
