@@ -242,6 +242,18 @@ const UNKNOWN_COMMIT_RECOVERY: TableDefinition<&str, &str> =
 /// canonical ordering write attempt.
 const SCAN_DISCLOSURE_RECORDS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_scan_disclosure_v1");
+/// Durable cold-start lease and terminal readiness rows (issue #1790). These
+/// three tables share one readiness owner: immutable revision rows preserve
+/// terminal receipts, the base-identity head allocates the next revision, and
+/// the full-binding index makes an exact restart readback independent of the
+/// current head. Backup census marks the whole family historical so restore
+/// never revives an old lease or readiness decision.
+const COLD_START_READINESS_RECORDS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_cold_start_readiness_v1");
+const COLD_START_READINESS_HEADS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_cold_start_readiness_heads_v1");
+const COLD_START_READINESS_BINDINGS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_cold_start_readiness_bindings_v1");
 /// Durable owner-backed `backup.verify` results (issue #2802; I5.27, I14.21).
 ///
 /// One row per public request operation identity, so an exact replay of the same
@@ -4273,6 +4285,153 @@ pub struct RedbRecoveryStore {
         std::sync::Mutex<Option<Arc<crate::test_support::AuthorityHandoffPersistenceFailpoint>>>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ColdStartReadinessRevisionHead {
+    contract_version: u16,
+    base_identity_digest: String,
+    record_key: String,
+    record_revision: u64,
+}
+
+impl ColdStartReadinessRevisionHead {
+    fn validate(&self) -> Result<(), OrsError> {
+        if self.contract_version != crate::CONTRACT_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        crate::model::validate_digest(
+            &self.base_identity_digest,
+            "cold_start_head_base_identity_digest",
+        )?;
+        if self.record_revision == 0
+            || self.record_key
+                != format!(
+                    "cold-start-readiness:{}:{:020}",
+                    self.base_identity_digest, self.record_revision
+                )
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: crate::COLD_START_READINESS_RECORD_TYPE,
+                reason: "cold-start revision head has an invalid row address".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ColdStartReadinessBindingIndex {
+    contract_version: u16,
+    base_identity_digest: String,
+    binding_digest: String,
+    record_key: String,
+    record_revision: u64,
+}
+
+impl ColdStartReadinessBindingIndex {
+    fn validate(&self) -> Result<(), OrsError> {
+        if self.contract_version != crate::CONTRACT_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        crate::model::validate_digest(
+            &self.base_identity_digest,
+            "cold_start_binding_base_identity_digest",
+        )?;
+        crate::model::validate_digest(&self.binding_digest, "cold_start_binding_digest")?;
+        if self.record_revision == 0
+            || self.record_key
+                != format!(
+                    "cold-start-readiness:{}:{:020}",
+                    self.base_identity_digest, self.record_revision
+                )
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: crate::COLD_START_READINESS_RECORD_TYPE,
+                reason: "cold-start binding index has an invalid row address".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl persistence_codec::PersistedValue for crate::ColdStartReadinessOrsRecord {
+    const RECORD_TYPE: &'static str = crate::COLD_START_READINESS_RECORD_TYPE;
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+impl persistence_codec::PersistedValue for ColdStartReadinessRevisionHead {
+    const RECORD_TYPE: &'static str = "cold_start_readiness_revision_head";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+impl persistence_codec::PersistedValue for ColdStartReadinessBindingIndex {
+    const RECORD_TYPE: &'static str = "cold_start_readiness_binding_index";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+fn validate_cold_start_installation(
+    claim: &crate::ColdStartReadinessClaim,
+    identity: &OrsStoreIdentity,
+) -> Result<(), OrsError> {
+    if claim.key.installation_id != identity.installation_id {
+        return Err(OrsError::IntegrityProblem {
+            record_type: crate::COLD_START_READINESS_RECORD_TYPE,
+            reason: "cold-start readiness installation does not match the durable ORS binding"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Canonical ORS port for durable cold-start lease and terminal receipt rows.
+///
+/// The claim operation is one atomic single-flight decision. Publication is
+/// absorbing once a terminal receipt is present; every read revalidates the
+/// typed identity key, fence, lease bytes, terminal revision, and receipt
+/// digest. This owner is separate from scan-disclosure lifecycle records.
+pub trait ColdStartReadinessRecordOwner: Send + Sync {
+    /// Claims or joins one exact cold-start key; an expired active lease gets
+    /// a new retained revision, while a terminal winner is immutable.
+    fn claim_cold_start_readiness(
+        &self,
+        claim: &crate::ColdStartReadinessClaim,
+        now: u64,
+    ) -> Result<crate::ColdStartReadinessStageOutcome, OrsError>;
+
+    /// Publishes the one immutable terminal receipt for an owned lease.
+    fn publish_cold_start_readiness(
+        &self,
+        record_key: &str,
+        binding_digest: &str,
+        lease_ref: &str,
+        disposition: crate::ColdStartReadinessTerminalDisposition,
+        receipt_ref: &str,
+        receipt_bytes: &str,
+    ) -> Result<Option<crate::ColdStartReadinessOrsRecord>, OrsError>;
+
+    /// Loads one exact durable revision by its owner-issued row key.
+    fn load_cold_start_readiness(
+        &self,
+        record_key: &str,
+    ) -> Result<Option<crate::ColdStartReadinessOrsRecord>, OrsError>;
+
+    /// Loads the latest durable revision for one exact full identity/fence key.
+    fn load_cold_start_readiness_for_binding(
+        &self,
+        binding_digest: &str,
+    ) -> Result<Option<crate::ColdStartReadinessOrsRecord>, OrsError>;
+}
+
 /// Narrow durable port for scan disclosure records (issue #2900).
 ///
 /// The installation-bound scan-disclosure adapter writes, replays, reads and
@@ -4367,6 +4526,50 @@ impl ScanDisclosureRecordOwner for RedbRecoveryStore {
         limit: u16,
     ) -> Result<Vec<crate::ScanDisclosureOrsRecord>, OrsError> {
         RedbRecoveryStore::list_scan_disclosures(self, installation_id, limit)
+    }
+}
+
+impl ColdStartReadinessRecordOwner for RedbRecoveryStore {
+    fn claim_cold_start_readiness(
+        &self,
+        claim: &crate::ColdStartReadinessClaim,
+        now: u64,
+    ) -> Result<crate::ColdStartReadinessStageOutcome, OrsError> {
+        RedbRecoveryStore::claim_cold_start_readiness(self, claim, now)
+    }
+
+    fn publish_cold_start_readiness(
+        &self,
+        record_key: &str,
+        binding_digest: &str,
+        lease_ref: &str,
+        disposition: crate::ColdStartReadinessTerminalDisposition,
+        receipt_ref: &str,
+        receipt_bytes: &str,
+    ) -> Result<Option<crate::ColdStartReadinessOrsRecord>, OrsError> {
+        RedbRecoveryStore::publish_cold_start_readiness(
+            self,
+            record_key,
+            binding_digest,
+            lease_ref,
+            disposition,
+            receipt_ref,
+            receipt_bytes,
+        )
+    }
+
+    fn load_cold_start_readiness(
+        &self,
+        record_key: &str,
+    ) -> Result<Option<crate::ColdStartReadinessOrsRecord>, OrsError> {
+        RedbRecoveryStore::load_cold_start_readiness(self, record_key)
+    }
+
+    fn load_cold_start_readiness_for_binding(
+        &self,
+        binding_digest: &str,
+    ) -> Result<Option<crate::ColdStartReadinessOrsRecord>, OrsError> {
+        RedbRecoveryStore::load_cold_start_readiness_for_binding(self, binding_digest)
     }
 }
 
@@ -5876,6 +6079,333 @@ impl RedbRecoveryStore {
                 record_type: crate::PURGE_LEDGER_RECORD_TYPE,
                 reason: "purge-ledger revision is not an unsigned integer".to_owned(),
             })
+    }
+
+    /// Atomically claims one exact cold-start single-flight key (issue #1790).
+    ///
+    /// A changed workspace, privacy boundary, governing-source generation,
+    /// source digest set, dirty summary or state fence receives a new
+    /// append-only revision under the same base workspace identity. An exact
+    /// replay joins the retained lease until its deadline; after expiry, the
+    /// next lease gets a new revision even when the earlier row is terminal.
+    /// A terminal receipt is never overwritten.
+    pub fn claim_cold_start_readiness(
+        &self,
+        claim: &crate::ColdStartReadinessClaim,
+        now: u64,
+    ) -> Result<crate::ColdStartReadinessStageOutcome, OrsError> {
+        claim.validate()?;
+        if now == 0 || now > claim.lease_deadline {
+            return Err(OrsError::InvalidField {
+                field: "cold_start_claim_now",
+                reason: "claim time must be non-zero and not past the lease deadline",
+            });
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let store_identity = {
+            let meta = write.open_table(META).map_err(storage)?;
+            read_store_object_identity(&meta)?.installed_identity()?
+        };
+        validate_cold_start_installation(claim, &store_identity)?;
+
+        let existing_index = {
+            let indexes = write.open_table(COLD_START_READINESS_BINDINGS).map_err(storage)?;
+            indexes
+                .get(claim.binding_digest.as_str())
+                .map_err(storage)?
+                .map(|value| decode::<ColdStartReadinessBindingIndex>(value.value()))
+                .transpose()?
+        };
+        if let Some(index) = existing_index.as_ref() {
+            index.validate()?;
+            if index.binding_digest != claim.binding_digest
+                || index.base_identity_digest != claim.base_identity_digest
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: crate::COLD_START_READINESS_RECORD_TYPE,
+                    reason: "cold-start binding index disagrees with the presented key".to_owned(),
+                });
+            }
+            let existing = {
+                let records = write.open_table(COLD_START_READINESS_RECORDS).map_err(storage)?;
+                let raw = records
+                    .get(index.record_key.as_str())
+                    .map_err(storage)?
+                    .ok_or_else(|| OrsError::IntegrityProblem {
+                        record_type: crate::COLD_START_READINESS_RECORD_TYPE,
+                        reason: "cold-start binding index points to a missing revision".to_owned(),
+                    })?;
+                decode::<crate::ColdStartReadinessOrsRecord>(raw.value())?
+            };
+            existing.validate()?;
+            validate_cold_start_installation(&existing.claim, &store_identity)?;
+            if existing.claim.binding_digest != claim.binding_digest
+                || !existing.claim.same_key(claim)
+                || existing.record_key != index.record_key
+                || existing.record_revision != index.record_revision
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: crate::COLD_START_READINESS_RECORD_TYPE,
+                    reason: "cold-start binding index does not identify its exact durable key"
+                        .to_owned(),
+                });
+            }
+            if now <= existing.claim.lease_deadline {
+                write.commit().map_err(storage)?;
+                return Ok(crate::ColdStartReadinessStageOutcome::AlreadyBound {
+                    record: Box::new(existing),
+                });
+            }
+        }
+
+        let head = {
+            let heads = write.open_table(COLD_START_READINESS_HEADS).map_err(storage)?;
+            heads
+                .get(claim.base_identity_digest.as_str())
+                .map_err(storage)?
+                .map(|value| decode::<ColdStartReadinessRevisionHead>(value.value()))
+                .transpose()?
+        };
+        let revision = match head.as_ref() {
+            Some(head) => {
+                head.validate()?;
+                if head.base_identity_digest != claim.base_identity_digest {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: crate::COLD_START_READINESS_RECORD_TYPE,
+                        reason: "cold-start revision head disagrees with its table key".to_owned(),
+                    });
+                }
+                let head_record = {
+                    let records = write.open_table(COLD_START_READINESS_RECORDS).map_err(storage)?;
+                    let raw = records
+                        .get(head.record_key.as_str())
+                        .map_err(storage)?
+                        .ok_or_else(|| OrsError::IntegrityProblem {
+                            record_type: crate::COLD_START_READINESS_RECORD_TYPE,
+                            reason: "cold-start revision head points to a missing row".to_owned(),
+                        })?;
+                    decode::<crate::ColdStartReadinessOrsRecord>(raw.value())?
+                };
+                head_record.validate()?;
+                if head_record.record_revision != head.record_revision
+                    || head_record.claim.base_identity_digest != head.base_identity_digest
+                {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: crate::COLD_START_READINESS_RECORD_TYPE,
+                        reason: "cold-start revision head does not match its durable row".to_owned(),
+                    });
+                }
+                head.record_revision
+                    .checked_add(1)
+                    .ok_or(OrsError::ProjectionLimitExceeded)?
+            }
+            None => 1,
+        };
+        let record = crate::ColdStartReadinessOrsRecord::leased(claim.clone(), revision);
+        record.validate()?;
+        let head = ColdStartReadinessRevisionHead {
+            contract_version: crate::CONTRACT_VERSION,
+            base_identity_digest: claim.base_identity_digest.clone(),
+            record_key: record.record_key.clone(),
+            record_revision: revision,
+        };
+        let index = ColdStartReadinessBindingIndex {
+            contract_version: crate::CONTRACT_VERSION,
+            base_identity_digest: claim.base_identity_digest.clone(),
+            binding_digest: claim.binding_digest.clone(),
+            record_key: record.record_key.clone(),
+            record_revision: revision,
+        };
+        head.validate()?;
+        index.validate()?;
+        let record_bytes = encode(&record)?;
+        let head_bytes = encode(&head)?;
+        let index_bytes = encode(&index)?;
+        {
+            let mut records = write.open_table(COLD_START_READINESS_RECORDS).map_err(storage)?;
+            if records
+                .get(record.record_key.as_str())
+                .map_err(storage)?
+                .is_some()
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: crate::COLD_START_READINESS_RECORD_TYPE,
+                    reason: "cold-start revision row already exists without its binding index"
+                        .to_owned(),
+                });
+            }
+            records
+                .insert(record.record_key.as_str(), record_bytes.as_str())
+                .map_err(storage)?;
+        }
+        {
+            let mut heads = write.open_table(COLD_START_READINESS_HEADS).map_err(storage)?;
+            heads
+                .insert(claim.base_identity_digest.as_str(), head_bytes.as_str())
+                .map_err(storage)?;
+        }
+        {
+            let mut indexes = write.open_table(COLD_START_READINESS_BINDINGS).map_err(storage)?;
+            indexes
+                .insert(claim.binding_digest.as_str(), index_bytes.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(crate::ColdStartReadinessStageOutcome::Stored {
+            record: Box::new(record),
+        })
+    }
+
+    /// Publishes one immutable terminal readiness receipt for its claimed row.
+    pub fn publish_cold_start_readiness(
+        &self,
+        record_key: &str,
+        binding_digest: &str,
+        lease_ref: &str,
+        disposition: crate::ColdStartReadinessTerminalDisposition,
+        receipt_ref: &str,
+        receipt_bytes: &str,
+    ) -> Result<Option<crate::ColdStartReadinessOrsRecord>, OrsError> {
+        crate::model::validate_text(record_key, "cold_start_record_key")?;
+        crate::model::validate_digest(binding_digest, "cold_start_binding_digest")?;
+        crate::model::validate_text(lease_ref, "cold_start_lease_ref")?;
+        crate::model::validate_text(receipt_ref, "cold_start_receipt_ref")?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let store_identity = {
+            let meta = write.open_table(META).map_err(storage)?;
+            read_store_object_identity(&meta)?.installed_identity()?
+        };
+        let mut record = {
+            let records = write.open_table(COLD_START_READINESS_RECORDS).map_err(storage)?;
+            let Some(raw) = records.get(record_key).map_err(storage)? else {
+                drop(records);
+                write.commit().map_err(storage)?;
+                return Ok(None);
+            };
+            decode::<crate::ColdStartReadinessOrsRecord>(raw.value())?
+        };
+        record.validate()?;
+        validate_cold_start_installation(&record.claim, &store_identity)?;
+        if record.claim.binding_digest != binding_digest || record.claim.lease_ref != lease_ref {
+            return Err(OrsError::IntegrityProblem {
+                record_type: crate::COLD_START_READINESS_RECORD_TYPE,
+                reason: "terminal readiness publication does not match its lease owner".to_owned(),
+            });
+        }
+        let terminal = crate::ColdStartReadinessTerminalReceipt {
+            disposition,
+            receipt_ref: receipt_ref.to_owned(),
+            receipt_revision: record.record_revision,
+            receipt_digest: crate::model::sha256_hex(receipt_bytes.as_bytes()),
+            receipt_bytes: receipt_bytes.to_owned(),
+        };
+        match record.terminal.as_ref() {
+            Some(existing) if existing == &terminal => {
+                write.commit().map_err(storage)?;
+                Ok(Some(record))
+            }
+            Some(_) => Err(OrsError::IntegrityProblem {
+                record_type: crate::COLD_START_READINESS_RECORD_TYPE,
+                reason: "terminal readiness revision is immutable".to_owned(),
+            }),
+            None => {
+                record.terminal = Some(terminal);
+                record.validate()?;
+                let bytes = encode(&record)?;
+                {
+                    let mut records =
+                        write.open_table(COLD_START_READINESS_RECORDS).map_err(storage)?;
+                    records
+                        .insert(record_key, bytes.as_str())
+                        .map_err(storage)?;
+                }
+                write.commit().map_err(storage)?;
+                Ok(Some(record))
+            }
+        }
+    }
+
+    /// Loads and validates one exact cold-start revision.
+    pub fn load_cold_start_readiness(
+        &self,
+        record_key: &str,
+    ) -> Result<Option<crate::ColdStartReadinessOrsRecord>, OrsError> {
+        crate::model::validate_text(record_key, "cold_start_record_key")?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let store_identity = {
+            let meta = read.open_table(META).map_err(storage)?;
+            read_store_object_identity(&meta)?.installed_identity()?
+        };
+        let records = read.open_table(COLD_START_READINESS_RECORDS).map_err(storage)?;
+        records
+            .get(record_key)
+            .map_err(storage)?
+            .map(|raw| {
+                let record: crate::ColdStartReadinessOrsRecord = decode(raw.value())?;
+                record.validate()?;
+                validate_cold_start_installation(&record.claim, &store_identity)?;
+                if record.record_key != record_key {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: crate::COLD_START_READINESS_RECORD_TYPE,
+                        reason: "cold-start row key does not match its durable record".to_owned(),
+                    });
+                }
+                Ok(record)
+            })
+            .transpose()
+    }
+
+    /// Loads and validates the exact durable revision for one full key digest.
+    pub fn load_cold_start_readiness_for_binding(
+        &self,
+        binding_digest: &str,
+    ) -> Result<Option<crate::ColdStartReadinessOrsRecord>, OrsError> {
+        crate::model::validate_digest(binding_digest, "cold_start_binding_digest")?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let store_identity = {
+            let meta = read.open_table(META).map_err(storage)?;
+            read_store_object_identity(&meta)?.installed_identity()?
+        };
+        let index = {
+            let indexes = read.open_table(COLD_START_READINESS_BINDINGS).map_err(storage)?;
+            indexes
+                .get(binding_digest)
+                .map_err(storage)?
+                .map(|raw| decode::<ColdStartReadinessBindingIndex>(raw.value()))
+                .transpose()?
+        };
+        let Some(index) = index else {
+            return Ok(None);
+        };
+        index.validate()?;
+        if index.binding_digest != binding_digest {
+            return Err(OrsError::IntegrityProblem {
+                record_type: crate::COLD_START_READINESS_RECORD_TYPE,
+                reason: "cold-start binding index key does not match its record".to_owned(),
+            });
+        }
+        let records = read.open_table(COLD_START_READINESS_RECORDS).map_err(storage)?;
+        let raw = records
+            .get(index.record_key.as_str())
+            .map_err(storage)?
+            .ok_or_else(|| OrsError::IntegrityProblem {
+                record_type: crate::COLD_START_READINESS_RECORD_TYPE,
+                reason: "cold-start binding index points to a missing revision".to_owned(),
+            })?;
+        let record: crate::ColdStartReadinessOrsRecord = decode(raw.value())?;
+        record.validate()?;
+        validate_cold_start_installation(&record.claim, &store_identity)?;
+        if record.claim.binding_digest != binding_digest
+            || record.claim.base_identity_digest != index.base_identity_digest
+            || record.record_key != index.record_key
+            || record.record_revision != index.record_revision
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: crate::COLD_START_READINESS_RECORD_TYPE,
+                reason: "cold-start binding index does not match its durable revision".to_owned(),
+            });
+        }
+        Ok(Some(record))
     }
 
     /// Stages one scan disclosure record as `Prepared` (issue #2900).
