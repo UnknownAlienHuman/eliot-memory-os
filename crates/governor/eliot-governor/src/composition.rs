@@ -7685,10 +7685,13 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// surfaces its typed [`WorkScopeError`] cause through
     /// [`CompositionError::ScanDisclosure`] instead of a completed outcome
     /// (issue #2900 B2/B6).
-    /// Live status: owning thin entry for attach/onboarding ingress; no live
-    /// attach ingress builds the scanner inputs yet (BLOCKED-BY
-    /// attach-transport: `bins/eliotd` `ScopeAttachIngress` carries no
-    /// discovery lease).
+    /// Live status: owning thin entry for attach/onboarding ingress. Live
+    /// caller for `AttachOrLaunch`:
+    /// `bins/eliotd/src/daemon_runtime.rs::trigger_cold_start_controller`
+    /// (post-Kernel-ACK); without the owner store/binding and admitted
+    /// privacy it falls through to the storeless question leg. Residual: the
+    /// other five I4.4.1 producers and the owner supply (BLOCKED-BY
+    /// attach-transport/owner-ingress).
     #[allow(
         clippy::too_many_arguments,
         reason = "trigger scan carries the trigger, lease, key, owner store, owner binding, privacy, evidence, and identity inputs in one fail-closed entry"
@@ -8098,9 +8101,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// recompiling; a lease owned by an in-flight trigger returns `Joined`
     /// without a second compilation.
     /// Live status: owning thin entry for attach/onboarding ingress; no live
-    /// attach ingress builds the compilation inputs yet (BLOCKED-BY
-    /// attach-transport: `bins/eliotd` `ScopeAttachIngress` carries no
-    /// discovery or onboarding lease). The return carries the exact validated
+    /// attach ingress builds the compilation inputs yet (same residual as the
+    /// lease join: no admitted privacy/source evidence, BLOCKED-BY
+    /// attach-transport/source-owners). The return carries the exact validated
     /// claim retained by ORS alongside its lease disposition, so a caller can
     /// read back the same terminal without reconstructing the full claim.
     /// Caller: STITCH.
@@ -8308,10 +8311,12 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// readiness, source-status evidence and recovery prompts directly from
     /// that receipt (plus the exact lease deadline). A key with no published
     /// terminal fails closed instead of projecting an uncompiled disposition.
-    /// Live status: owning thin entry for the bridge delivery path; the live
-    /// bridge note path consumes no governor surface yet (BLOCKED-BY
-    /// bridge-transport: `bins/eliot-agent-bridge` `BootstrapContext`
-    /// intake).
+    /// Live status: owning thin entry for the bridge delivery path. Live
+    /// terminal readback: `DaemonComposition::read_cold_start_surface_for_attach`
+    /// serves the claim-keyed surface to the attach path; the bridge note
+    /// path consumes no governor surface yet (BLOCKED-BY bridge-transport:
+    /// `bins/eliot-agent-bridge` `BootstrapContext` intake), so Status
+    /// readers see the retained snapshot preview instead of a fresh terminal.
     pub fn cold_start_surface_for_lease(
         &self,
         lineage_candidate_ref: &str,

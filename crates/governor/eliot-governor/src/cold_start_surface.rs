@@ -20,10 +20,14 @@
 //! identity or generation changes invalidate through a new receipt revision
 //! elsewhere instead.
 //!
-//! Live status: owning delivery legs for the agent and Human paths. The live
-//! bridge note path consumes no governor surface yet (BLOCKED-BY
-//! bridge-transport: `bins/eliot-agent-bridge` intake), same as the terminal
-//! readback these legs reuse. Callers: STITCH (agent-bridge intake for the
+//! Live status: owning delivery legs for the agent and Human paths. Live
+//! terminal readback exists on the daemon side
+//! (`DaemonComposition::read_cold_start_surface_for_attach` through
+//! `cold_start_owner_readback_for_claim`); these legs project that retained
+//! terminal. Residual: the bridge note path consumes no governor surface yet
+//! (BLOCKED-BY bridge-transport: `bins/eliot-agent-bridge` intake), so no
+//! compiled terminal reaches the bridge and Status readers see the retained
+//! snapshot preview instead. Callers: STITCH (agent-bridge intake for the
 //! agent surface, Human board for the board view).
 
 use crate::composition::{

@@ -41,10 +41,17 @@
 //! fails closed before any join or compile, and compilation without the
 //! durable scan receipt is refused by the compile leg.
 //!
-//! Live status: owning driver for attach/onboarding ingress. No live attach
-//! ingress builds the scanner inputs yet (BLOCKED-BY attach-transport:
-//! `bins/eliotd` `ScopeAttachIngress` carries no discovery lease), same as the
-//! sequenced legs. Caller: STITCH.
+//! Live status: owning driver for attach/onboarding ingress. Live caller for
+//! `AttachOrLaunch`: `bins/eliotd/src/daemon_runtime.rs::trigger_cold_start_controller`
+//! (post-Kernel-ACK via `trigger_accepted_cold_start`) drives the sequenced
+//! scan leg; the pre-acceptance question ingress
+//! (`DaemonComposition::attach_cold_start_question`) runs the storeless
+//! scanner leg. Residual: the other five I4.4.1 producers, the owner
+//! store/binding supply, and the lease join/compile evidence (privacy
+//! profile, source-content digests) owned by the attach-transport and
+//! source/owner lanes — same as the sequenced legs. Caller:
+//! `bins/eliotd/src/daemon_runtime.rs::trigger_cold_start_controller` for the
+//! scan leg; STITCH for the full drive.
 
 use crate::composition::{
     ColdStartTriggerCompilation, CompositionError, GovernorComposition, KernelGenerationPort,
