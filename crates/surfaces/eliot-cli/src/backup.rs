@@ -2906,12 +2906,25 @@ struct RestoreTestClaim {
 fn rehearsal_band(level: VerifyClassCeiling) -> (BackupStage, ProofCeiling, EffectClass) {
     match level {
         // Archive/build validity alone: the bytes were checked and nothing was
-        // imported into any root. The furthest lifecycle step that evidences is
-        // the archive itself, so the ladder stops at `Verified` and the strongest
-        // honest reading is a candidate artifact. Placing it higher would claim
-        // a restore step this rung never reached.
+        // imported into any root.
+        //
+        // This rung places NO lifecycle advance, and that is a correction rather
+        // than a stylistic choice. An earlier revision of this table placed it at
+        // `Verified`, on the reading that the archive itself is the furthest
+        // evidenced step. `BackupStage::attesting_roles` says otherwise:
+        // `Verified` is attested by `BackupRole::Verifier`, and this operation is
+        // a restore rehearsal answered by the restore owner, which does not hold
+        // the verifier role. Placing the rung there would have reported a
+        // verifier-attested stage on a path with no verifier behind it — the same
+        // class of claim as a directory that exists being read as an admission.
+        //
+        // So the honest band is the observation floor. The rung still carries its
+        // OWN proof and effect reading (`CandidateArtifact` / `Candidate`), which
+        // is what the owner actually stated about the archive; only the lifecycle
+        // position is withheld, because archive validity evidences no restore
+        // step on this ladder at all.
         VerifyClassCeiling::ArchiveValid => (
-            BackupStage::Verified,
+            BackupStage::Requested,
             ProofCeiling::CandidateArtifact,
             EffectClass::Candidate,
         ),
@@ -3065,11 +3078,22 @@ fn restore_test_claim(
 /// reported. Reachability along the same ladder is what the protocol declares,
 /// and it is read off [`BackupStage`]'s OWN derived ordering, which lists the
 /// stages in ladder order (`Requested` < `Captured` < … < `CutoverAdmitted`) —
-/// the same order [`BackupStage::can_advance`] walks one edge at a time. So this
-/// is not a weaker check substituted for a stronger one: it admits exactly the
-/// rungs the declared ladder contains and still refuses any stage outside it,
-/// and cutover stays unreachable because no rung this route can produce
-/// declares a stage at or above it.
+/// the same order [`BackupStage::can_advance`] walks one edge at a time.
+///
+/// WHAT THIS RELATION DOES AND DOES NOT GUARANTEE, stated exactly because an
+/// earlier version of this comment claimed more than the code delivers. It IS a
+/// strictly wider predicate than the single-edge `can_advance(Requested, stage)`
+/// it replaced: that call admits only `Requested` and `Captured`, so the
+/// replacement admits a superset, and the earlier claim that it was "not a weaker
+/// check substituted for a stronger one" was false as written. What the widening
+/// does NOT do is reach a stage this route cannot attest. The bound is not the
+/// ladder order alone but the ladder order AND
+/// [`BackupStage::attesting_roles`]: each rung's placed stage is checked against
+/// the roles that may attest it, and [`rehearsal_band`] is written so that no rung
+/// places a stage whose attesting role this operation does not hold. That is why
+/// `ArchiveValid` places `Requested` and not `Verified`. Cutover is refused twice
+/// over — by the upper bound here and by the fact that no rung reachable on this
+/// route declares a stage at or above the cutover rung.
 ///
 /// The owner's own `cutover_performed` and `operational_recovery_ready` answers
 /// are compared as content here rather than assumed. They are the owner's claims
