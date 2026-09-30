@@ -265,13 +265,21 @@ fn validate_admission_contract(input: &AdmissionInput) -> Result<(), ContextErro
 ///   [`MaterialRankTraceDelivery`] to the packet composition.
 /// - That call site is not itself reachable from `fn main` yet:
 ///   `KernelContextReadClient::compile_context_packet` has no call site in
-///   the tree. It is also uncallable by construction: its eighth parameter is
-///   `&PacketAdmissionBundle`, and that bundle is defined in
-///   `bins/eliotd/src/kernel_context_read_client.rs` and referenced there but
-///   constructed by no production owner. Its four identity fields
-///   (`SafetyFloorIdentity`, `PriorityPolicyIdentity`, `AdmissionRuleIdentity`,
-///   `MeasurementCompositionProfile`) are minted nowhere outside `tests/`
-///   fixtures. The live `eliot.packet` daemon poller
+///   the tree. It is also uncallable by construction, and not merely unminted:
+///   the composition builds its own `PacketAdmissionBundle` before it
+///   constructs any candidate, while `AdmissionInput::validate` forces
+///   `priority.priorities` and `measurements` to equal the candidate atom set
+///   exactly and `QualityScorecard::output` to name the admitted and rendered
+///   digests that only the stages inside that same function produce. Of its
+///   four identity fields, `SafetyFloorIdentity` now HAS a production source:
+///   the Context owner resolves it through its own publication
+///   (`eliot_context::campaign_publication::context_safety_floor_identity`) on
+///   the live route, and [`check_campaign_view_for_admission`] consumes it.
+///   `PriorityPolicyIdentity`, `AdmissionRuleIdentity` and
+///   `MeasurementCompositionProfile` are still minted nowhere outside `tests/`
+///   fixtures; the per-identity account of what each lacks is recorded on
+///   `bins/eliotd/src/campaign_packet.rs::CampaignPacketGapCode::AdmissionClosureUnbound`.
+///   The live `eliot.packet` daemon poller
 ///   (`daemon_runtime::run_campaign_packet_poll` ->
 ///   `campaign_packet::serve_campaign_packet_pair`) never reaches any context
 ///   admission *decision*: it compiles through the learning-state view owner
@@ -287,8 +295,9 @@ fn validate_admission_contract(input: &AdmissionInput) -> Result<(), ContextErro
 ///   from the same route and from
 ///   `kernel_context_read_client::compile_context_packet`. The two are separate
 ///   comparisons against different bindings, so neither inherits the other.
-///   Neither makes [`admit_context_traced`] reachable: the four admission-closure
-///   identities named above still have no production construction site. The
+///   Neither makes [`admit_context_traced`] reachable: the three
+///   admission-closure identities named above still have no production
+///   construction site. The
 ///   `#40`-frozen
 ///   `eliot_context::ContextCompiler::compile_with_campaign_learning_state`
 ///   named by an earlier revision of this note has NO call site either, so it
