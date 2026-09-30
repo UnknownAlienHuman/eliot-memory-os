@@ -17,9 +17,9 @@ pub use injection_indicators::{
     BroadExtractionEvidence, DroppedEvidenceKind, DroppedEvidenceRecord, ExternalContentRole,
     ExtractionScope, INDICATOR_CLASS_COUNT, IndicatorClass, IndicatorCoverage, IndicatorEvidence,
     IndicatorObservation, IndicatorResolution, IndicatorResponse, IndicatorSourceMap,
-    PersistenceRequest, ProposedSourceRestriction, RepeatedLineageEvidence, RetainedExternalEvidence,
-    SummaryAuthorityEvidence, ToolDefinitionChangeEvidence, ToolDefinitionDelta,
-    UndeclaredEffectEvidence,
+    PersistenceRequest, ProposedSourceRestriction, RepeatedLineageEvidence,
+    RetainedExternalEvidence, SummaryAuthorityEvidence, ToolDefinitionChangeEvidence,
+    ToolDefinitionDelta, UndeclaredEffectEvidence,
 };
 pub use native_resource_lease::{
     NATIVE_RESOURCE_LEASE_VERSION, NativeResourceLease, NativeResourceLeaseBinding,

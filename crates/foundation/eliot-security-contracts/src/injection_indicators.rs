@@ -428,10 +428,7 @@ impl IndicatorEvidence {
     pub const fn has_comparison_inputs(&self) -> bool {
         match self {
             Self::ExternalInstructionAttempt { content_role, .. } => {
-                matches!(
-                    content_role,
-                    ExternalContentRole::DirectInstruction
-                )
+                matches!(content_role, ExternalContentRole::DirectInstruction)
             }
             Self::StandingInstructionOrSecretPersistence { retained, .. } => {
                 !retained.retained_source_ref.is_empty()
@@ -843,7 +840,9 @@ fn validate_tool_definition_change(
 /// Returns an error when the summary reference is blank, when the owner's
 /// permitted-use list is present but empty, or when the claimed use is one the
 /// owner already grants, which is not an escalation at all.
-fn validate_summary_authority(evidence: &SummaryAuthorityEvidence) -> Result<(), SecurityContractError> {
+fn validate_summary_authority(
+    evidence: &SummaryAuthorityEvidence,
+) -> Result<(), SecurityContractError> {
     assessment_text(&evidence.summary_ref, "summary.summary_ref")?;
     if let Some(permitted) = &evidence.owner_permitted_uses {
         if permitted.is_empty() {
@@ -867,7 +866,9 @@ fn validate_summary_authority(evidence: &SummaryAuthorityEvidence) -> Result<(),
 /// Returns an error when the lineage reference is blank, when fewer than two
 /// outputs repeat it, when the output references are duplicated, or when the
 /// transformation record is present but blank.
-fn validate_repeated_lineage(evidence: &RepeatedLineageEvidence) -> Result<(), SecurityContractError> {
+fn validate_repeated_lineage(
+    evidence: &RepeatedLineageEvidence,
+) -> Result<(), SecurityContractError> {
     assessment_text(&evidence.lineage_ref, "lineage.lineage_ref")?;
     if evidence.repeated_output_refs.len() < 2 {
         return Err(SecurityContractError::IndicatorEvidenceUnproven {
@@ -891,7 +892,9 @@ fn validate_repeated_lineage(evidence: &RepeatedLineageEvidence) -> Result<(), S
 /// Returns an error when the request reference is blank, when the admitted
 /// handles are empty or duplicated, when no handle was exceeded, or when the
 /// exceeded handles are duplicated.
-fn validate_broad_extraction(evidence: &BroadExtractionEvidence) -> Result<(), SecurityContractError> {
+fn validate_broad_extraction(
+    evidence: &BroadExtractionEvidence,
+) -> Result<(), SecurityContractError> {
     assessment_text(&evidence.request_ref, "extraction.request_ref")?;
     assessment_refs(
         &evidence.admitted_handle_refs,
@@ -915,7 +918,9 @@ fn validate_broad_extraction(evidence: &BroadExtractionEvidence) -> Result<(), S
 /// Returns an error when the transformation reference is blank, when a declared
 /// kind has no handles, when the handle lists are duplicated, or when the
 /// verified transformation record is present but blank.
-fn validate_dropped_evidence(evidence: &DroppedEvidenceRecord) -> Result<(), SecurityContractError> {
+fn validate_dropped_evidence(
+    evidence: &DroppedEvidenceRecord,
+) -> Result<(), SecurityContractError> {
     assessment_text(&evidence.transformation_ref, "dropped.transformation_ref")?;
     // The declared kind must match what was actually dropped, so a record cannot
     // claim one kind while carrying the other's handles.
@@ -953,7 +958,9 @@ fn validate_dropped_evidence(evidence: &DroppedEvidenceRecord) -> Result<(), Sec
 /// Returns an error when the procedure reference is blank, when the declared
 /// effect list is present but empty, or when the observed effect is one the
 /// candidate already declared, which is not an undeclared effect.
-fn validate_undeclared_effect(evidence: &UndeclaredEffectEvidence) -> Result<(), SecurityContractError> {
+fn validate_undeclared_effect(
+    evidence: &UndeclaredEffectEvidence,
+) -> Result<(), SecurityContractError> {
     assessment_text(&evidence.procedure_ref, "procedure.procedure_ref")?;
     if let Some(declared) = &evidence.declared_effects {
         if declared.is_empty() {
