@@ -1753,6 +1753,12 @@ fn validate_productive_tool_environment(
         TESTD_ENV_TOOLCHAIN,
         TESTD_ENV_PATH,
         "CARGO_TARGET_DIR",
+        // Issue #1897 (W4, AUD #5910637761 defect 2): the governed fixture root
+        // and its namespace are part of the registered productive set, not an
+        // optional extra. A productive run whose environment omits them is
+        // refused here, so the namespace cannot be inert by omission.
+        eliot_testd_core::FIXTURE_ROOT_ENV,
+        eliot_testd_core::FIXTURE_NAMESPACE_ENV,
     ];
     if values.len() != environment.len()
         || values.len() != expected_keys.len()
@@ -2024,6 +2030,7 @@ fn derive_dispatch_process_intent(
         tool.environment,
         &job.target_roots.target_root,
         &job.target_roots.cache_root,
+        job.work_envelope.as_ref(),
     )?;
     // The Kernel-admitted slot suffix and the durable job arguments proved
     // equal at the dispatch agreement gate; the sealed argv derives from
@@ -2213,6 +2220,7 @@ fn bind_tool_environment_to_roots(
     environment: Vec<(String, String)>,
     target_root: &str,
     cache_root: &str,
+    lane: Option<&eliot_testd_core::GovernedWorkEnvelope>,
 ) -> Result<Vec<(String, String)>, TestdError> {
     let mut values = BTreeMap::new();
     for (key, value) in environment {
@@ -2231,6 +2239,25 @@ fn bind_tool_environment_to_roots(
     }
     values.insert("CARGO_TARGET_DIR".to_owned(), target_root.to_owned());
     values.insert("CARGO_HOME".to_owned(), cache_root.to_owned());
+    // Issue #1897 (W4, AUD #5910637761 defect 2): the fixture binding is read
+    // from the RETAINED envelope of this job, over the same
+    // `GovernedWorkEnvelope::fixture_environment()` derivation the Kernel side
+    // composes. Nothing is re-derived locally and nothing is composed from
+    // ambient state, so both sides of the dispatch digest agreement emit the
+    // same pair and the child runs under the fixture root its lane owns.
+    if let Some(lane) = lane {
+        for (key, value) in lane
+            .fixture_environment()
+            .map_err(|error| TestdError::Contract(error.to_string()))?
+        {
+            if values.insert(key.clone(), value).is_some() {
+                return Err(TestdError::Invalid {
+                    field: "tool_environment",
+                    reason: "governed fixture binding collides with a registered key",
+                });
+            }
+        }
+    }
     Ok(values.into_iter().collect())
 }
 

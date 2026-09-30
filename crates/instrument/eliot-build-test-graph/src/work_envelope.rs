@@ -19,7 +19,10 @@
 //!   ([`GovernedWorkEnvelope::derive_target_root`]);
 //! * the fixture namespace, derived from the tuple rather than from the
 //!   worktree, because "a worktree does not isolate runtime resources"
-//!   ([`GovernedWorkEnvelope::fixture_namespace`]);
+//!   ([`GovernedWorkEnvelope::fixture_namespace`]), together with the physical
+//!   fixture root derived from that one namespace and carried into the governed
+//!   child environment ([`GovernedWorkEnvelope::derive_fixture_root`],
+//!   [`GovernedWorkEnvelope::fixture_environment`]);
 //! * the declared resource claims, without which execution is refused
 //!   ([`GovernedWorkEnvelope::admit`]).
 //!
@@ -40,10 +43,11 @@
 //! lane identity to emitted results through [`CandidateIdentity`], which
 //! carries the fingerprint digest, candidate identity, and contract revision
 //! next to the execution's own governed result so a caller can attribute it to
-//! the candidate that produced it. The instrument runner wraps its governed
-//! results with this identity and the test daemon persists it on the
-//! verification receipt; both read it from the one envelope, so the two can
-//! never disagree.
+//! the candidate that produced it. The identity is attached on the ACTUAL
+//! publication paths — every `RawArtifact` and the `VerificationReceipt` the
+//! test daemon emits, and the receipt's own validation compares the content
+//! against the retained envelope rather than accepting presence — and both read
+//! it from the one envelope, so they can never disagree.
 //!
 //! The tuple lives in the build/test graph for the same reason the resource
 //! declaration does: a governed work item is admitted on the instrument plane
@@ -77,6 +81,25 @@ pub const CARGO_TARGET_DIR_ENV: &str = "CARGO_TARGET_DIR";
 /// the user-global Cargo cache instead of its own lane's root.
 pub const CARGO_HOME_ENV: &str = "CARGO_HOME";
 
+/// Directory name under the local application data root that anchors every
+/// governed fixture namespace. I2.22 gives each mutating work item its own
+/// fixture namespace, and a namespace only isolates anything once a physical
+/// root is derived from it.
+pub const FIXTURE_ROOT_DIRECTORY: &str = "fixtures";
+
+/// Environment variable carrying the physical fixture root of one work item.
+///
+/// This is what makes the namespace an input to the fixture owner instead of a
+/// stored label: the child that reads it creates and destroys state under a
+/// directory no other work item can name, so two jobs cannot record different
+/// namespace strings while touching one fixture.
+pub const FIXTURE_ROOT_ENV: &str = "ELIOT_FIXTURE_ROOT";
+
+/// Environment variable carrying the retained fixture namespace itself, beside
+/// its physical root, so the child can name the namespace it was admitted in
+/// without re-deriving it from ambient state.
+pub const FIXTURE_NAMESPACE_ENV: &str = "ELIOT_FIXTURE_NAMESPACE";
+
 /// Target and cache mode of one governed work item.
 ///
 /// I2.22 names three cache modes. They are a closed set because the mode is a
@@ -87,8 +110,37 @@ pub const CARGO_HOME_ENV: &str = "CARGO_HOME";
 pub enum BuildMode {
     /// Separate worktree target, best repeated feedback within one lane.
     InteractiveIncremental,
-    /// Shared non-incremental reuse across agents and worktrees under an
-    /// exact normalized fingerprint.
+    /// Non-incremental, fingerprint-exact lane root within one admitted
+    /// checkout segment.
+    ///
+    /// I2.22 names this mode "shared non-incremental + sccache: reuse across
+    /// agents and worktrees under an exact normalized fingerprint". What the
+    /// implementation actually delivers is the part of that sentence a target
+    /// root can carry, and the rest is spelled out here so no caller reads more
+    /// into the mode than it holds:
+    ///
+    /// * NON-INCREMENTAL — held. `cargo_environment` sets `CARGO_INCREMENTAL`
+    ///   only for [`BuildMode::InteractiveIncremental`], so an invocation in
+    ///   this mode never reuses incremental state.
+    /// * UNDER AN EXACT NORMALIZED FINGERPRINT — held. The governed target root
+    ///   `%LOCALAPPDATA%\Eliot\build\<workspace-id>\<worktree-id>\<build-mode>\
+    ///   \<fingerprint>` ends in the fingerprint digest, so anything reused from
+    ///   it is bound to the exact build inputs.
+    /// * SHARED — held only WITHIN one admitted checkout segment. I2.22's own
+    ///   target-root shape carries `<worktree-id>`, so two admitted checkout
+    ///   segments never receive one shared target root, and this variant must
+    ///   not be read as cross-worktree target reuse.
+    /// * Sccache — NOT held. This crate configures no compiler cache daemon and
+    ///   owns no separate exact-fingerprint shared cache root. `CARGO_HOME` is
+    ///   bound to the same lane root as `CARGO_TARGET_DIR`, which is the TestD
+    ///   `TargetRoots` policy (`cache_root == target_root`) and is not a shared
+    ///   cache, so no caller may read this variant as evidence that
+    ///   cross-checkout reuse exists.
+    ///
+    /// The mode therefore labels safe, exact, non-incremental lane isolation
+    /// that is never the repository `target/` directory. The cross-checkout
+    /// reuse I2.22 describes is a separate exact-fingerprint cache owner, and
+    /// until one exists it is not delivered by this variant.
     SharedNonIncremental,
     /// Locked and declared cache for a release candidate.
     Release,
@@ -312,6 +364,66 @@ pub struct LaneIdentity {
     pub local_app_data: PathBuf,
 }
 
+impl LaneIdentity {
+    /// The fixture namespace this lane identity will own once allocated.
+    ///
+    /// The caller that admits a work item must name the namespace BEFORE the
+    /// envelope exists, because the exclusive fixture claim it declares is
+    /// named from it and the envelope is allocated from that claim set. This is
+    /// the same one derivation
+    /// [`GovernedWorkEnvelope::fixture_namespace`] reads, so the claim a job
+    /// declares and the namespace its envelope records cannot differ.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkEnvelopeError`] when the work-item identity or the
+    /// fingerprint is invalid.
+    pub fn fixture_namespace(&self) -> Result<String, WorkEnvelopeError> {
+        segment(&self.work_item_id, "work_item_id")?;
+        self.fingerprint.validate()?;
+        fixture_namespace_of(&self.work_item_id, self.build_mode, &self.fingerprint)
+    }
+
+    /// The exclusive fixture claim this lane identity must declare.
+    ///
+    /// A mutating test work item touches fixture state, and fixture state is a
+    /// stateful runtime resource: it receives its own lease, allocated
+    /// independently of the worktree by the live
+    /// `eliot_testd_core::ResourceLeaseAllocator`. The claim name IS the
+    /// physical fixture root's final segment, so the leased resource and the
+    /// directory the child is handed are the same thing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkEnvelopeError`] when the namespace cannot be derived.
+    pub fn fixture_claim(&self) -> Result<ResourceClaim, WorkEnvelopeError> {
+        Ok(ResourceClaim {
+            kind: crate::ResourceKind::Fixture,
+            name: self.fixture_namespace()?,
+        })
+    }
+}
+
+/// The one fixture-namespace derivation both the lane identity and the
+/// allocated envelope read.
+///
+/// Work item, build mode, and normalized fingerprint: never the worktree, the
+/// project id, or a counter. Two work items in different worktrees therefore
+/// never share a namespace, and the caller that declares the exclusive claim
+/// and the envelope that records it read the same function.
+fn fixture_namespace_of(
+    work_item_id: &str,
+    build_mode: BuildMode,
+    fingerprint: &BuildFingerprint,
+) -> Result<String, WorkEnvelopeError> {
+    Ok(format!(
+        "fx-{}-{}-{}",
+        work_item_id,
+        build_mode.as_str(),
+        fingerprint.digest()?
+    ))
+}
+
 impl GovernedWorkEnvelope {
     /// Allocates the complete tuple for one mutating work item.
     ///
@@ -523,12 +635,61 @@ impl GovernedWorkEnvelope {
     /// is invalid.
     pub fn fixture_namespace(&self) -> Result<String, WorkEnvelopeError> {
         self.validate()?;
-        Ok(format!(
-            "fx-{}-{}-{}",
-            self.work_item_id,
-            self.build_mode.as_str(),
-            self.normalized_fingerprint()?
-        ))
+        fixture_namespace_of(
+            &self.work_item_id,
+            self.build_mode,
+            &self.fingerprint,
+        )
+    }
+
+    /// The physical directory this work item's fixture state lives under.
+    ///
+    /// Exactly
+    /// `%LOCALAPPDATA%\Eliot\fixtures\<fixture namespace>`. Deriving the
+    /// directory from the namespace is what makes the namespace real
+    /// isolation rather than a stored label: two work items whose namespace
+    /// strings differ cannot name the same directory, because the final path
+    /// segment IS the namespace and the whole path hangs off the one admitted
+    /// application-data root. A namespace recorded but never rooted would let
+    /// two jobs store different strings while touching one fixture.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkEnvelopeError`] when the fingerprint or a tuple element is
+    /// invalid.
+    pub fn derive_fixture_root(&self) -> Result<PathBuf, WorkEnvelopeError> {
+        Ok(self
+            .local_app_data
+            .join("Eliot")
+            .join(FIXTURE_ROOT_DIRECTORY)
+            .join(self.fixture_namespace()?))
+    }
+
+    /// The exact fixture environment a governed child of this work item runs
+    /// with.
+    ///
+    /// Both keys are emitted together from the one retained namespace:
+    /// [`FIXTURE_ROOT_ENV`] carries the physical root the fixture owner must
+    /// create and use, and [`FIXTURE_NAMESPACE_ENV`] carries the namespace that
+    /// produced it. Emitting one without the other is what leaves a namespace
+    /// inert — a child that can read the namespace but not the root keeps
+    /// choosing its own directory — so the pair is produced by a single
+    /// derivation and both sides are bound to the same retained value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkEnvelopeError`] when the fixture root cannot be derived.
+    pub fn fixture_environment(&self) -> Result<Vec<(String, String)>, WorkEnvelopeError> {
+        Ok(vec![
+            (
+                FIXTURE_ROOT_ENV.to_owned(),
+                path_text(&self.derive_fixture_root()?),
+            ),
+            (
+                FIXTURE_NAMESPACE_ENV.to_owned(),
+                self.fixture_namespace()?,
+            ),
+        ])
     }
 
     /// The runtime-environment leases this work item holds, in stable order.

@@ -121,14 +121,15 @@ use eliot_process::{OperationId, ProcessRequest};
 use eliot_protocol::dreamer_job::{DurableJobResponse, JobState};
 use eliot_store_api::{WriteReceipt, WriteReceiptStatus};
 use eliot_testd_core::{
-    BUILD_ROOT_DIRECTORY, BuildClass, BuildFingerprint, BuildMode, GovernedWorkEnvelope,
+    BUILD_ROOT_DIRECTORY, BuildClass, BuildFingerprint, BuildMode, GovernedWorkEnvelope, JobClass,
     JobState as TestdJobState, JobSubmissionMetadata, KernelProcessAdmissionEvidence,
     KernelProcessAdmissionProvider, KernelProcessAdmissionRequest, LaneIdentity, ProcessAdmission,
-    RetryPolicy, TARGET_LAYOUT_REVISION, TESTD_OWNER_SUBMIT_OPERATION,
+    ResourceWeight, RetryPolicy, TARGET_LAYOUT_REVISION, TESTD_OWNER_SUBMIT_OPERATION,
     TESTD_OWNER_SUBMIT_WIRE_VERSION, TESTD_PRODUCTIVE_PROFILE, TargetLayoutBinding, TargetRoots,
     TestdOwnerSubmitDirective, TestdOwnerSubmitRequest, TestdOwnerSubmitResponse, TestdStore,
-    TestdVerifierDispatchBinding, TestdVerifierJobSubmission, issue_process_admission,
-    testd_profile_binding, verification_receipt_sha256, verify_envelope_layout_binding,
+    TestdVerifierDispatchBinding, TestdVerifierJobSubmission, TestResourceProfile,
+    issue_process_admission, testd_profile_binding, verification_receipt_sha256,
+    verify_envelope_layout_binding,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1515,7 +1516,29 @@ pub(crate) async fn submit_testd_owner_job(
     // resource claims the submission carries. The store allocates and persists
     // its own copy from that identity; the two agree because both run the same
     // `derive_target_root` over the same admitted inputs.
-    let submission_metadata = JobSubmissionMetadata::verification();
+    // Issue #1897 (AUD #5910637761 defect 3): the productive job's declaration
+    // must name the stateful runtime resource it actually touches, or the live
+    // `ResourceLeaseAllocator` has nothing to grant and
+    // `GovernedWorkEnvelope::admit` refuses the empty claim set. `cargo
+    // nextest run` creates and destroys mutable fixture state, so the
+    // declaration is an exclusive `Fixture` claim named from the very namespace
+    // the lane owns — read off `LaneIdentity::fixture_claim`, the same
+    // derivation the envelope's `fixture_namespace()` uses — so two concurrent
+    // work items receive two DIFFERENT fixture claims and therefore two
+    // distinct granted leases, and neither can be obtained from a worktree
+    // alone. The job class and weight are unchanged: only the missing
+    // declaration is added.
+    let fixture_claim = lane_identity
+        .fixture_claim()
+        .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
+    let submission_metadata = JobSubmissionMetadata::declared(
+        JobClass::Verification,
+        TestResourceProfile {
+            weight: ResourceWeight::Light,
+            exclusive_resources: vec![fixture_claim],
+            serial_group: String::new(),
+        },
+    );
     let lane_envelope = GovernedWorkEnvelope::allocate(
         lane_identity.clone(),
         submission_metadata
@@ -1535,6 +1558,23 @@ pub(crate) async fn submit_testd_owner_job(
             "Kernel TestD governed lane root is not canonical".to_owned(),
         ));
     }
+    // Issue #1897 (W4, AUD #5910637761 defect 2): materialize the lane's fixture
+    // root HERE, from the envelope's own derivation, and require it to
+    // canonicalize to exactly that path. The directory handed to the child in
+    // `validate_for_roots` is therefore a directory this operation created under
+    // the admitted application-data root, not a predictable name another job
+    // could have chosen first: the final segment is the lane's own namespace,
+    // so two concurrent work items cannot collide on one fixture.
+    let fixture_root = lane_envelope
+        .derive_fixture_root()
+        .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
+    std::fs::create_dir_all(&fixture_root)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    if std::fs::canonicalize(&fixture_root).ok().as_deref() != Some(fixture_root.as_path()) {
+        return Err(DispatchLaunchError::Gate(
+            "Kernel TestD governed fixture root is not canonical".to_owned(),
+        ));
+    }
     let target_roots = TargetRoots::new(
         contour_root.to_string_lossy().into_owned(),
         source_root.to_string_lossy().into_owned(),
@@ -1546,7 +1586,11 @@ pub(crate) async fn submit_testd_owner_job(
         .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
     let environment = request
         .process_tool
-        .validate_for_roots(&target_roots.target_root, &target_roots.cache_root)
+        .validate_for_roots(
+            &target_roots.target_root,
+            &target_roots.cache_root,
+            Some(&lane_envelope),
+        )
         .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
 
     let profile = testd_profile_binding(
@@ -1787,12 +1831,16 @@ fn admitted_lane_identity(input: LaneIdentityInput) -> Result<LaneIdentity, Disp
     fingerprint
         .validate()
         .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
-    // Issue #1897 (W3): the productive nextest binding is a batch verification
-    // run that reuses its lane-local target root across agents and worktrees
-    // under this exact fingerprint, with no incremental flag in its fixed
-    // argv. That is I2.22's shared non-incremental mode; the interactive mode
-    // belongs to a developer's own loop and the release mode to a locked
-    // release candidate.
+    // Issue #1897 (W3, AUD #5910637761 defect 6): the productive nextest
+    // binding is a batch verification run whose fixed argv sets no incremental
+    // flag, which is I2.22's shared NON-INCREMENTAL half, and its target root
+    // ends in this exact fingerprint, which is the exact-normalized half. The
+    // shared half is bounded to the admitted checkout segment: I2.22's root
+    // shape carries the checkout component, there is no compiler cache daemon
+    // configured here, and no separate exact-fingerprint shared cache owner
+    // exists — so this mode is exact non-incremental lane isolation, not
+    // cross-checkout reuse. The interactive mode belongs to a developer's own
+    // loop and the release mode to a locked release candidate.
     Ok(LaneIdentity {
         work_item_id: input.work_item_id,
         workspace_id: input.workspace_id,

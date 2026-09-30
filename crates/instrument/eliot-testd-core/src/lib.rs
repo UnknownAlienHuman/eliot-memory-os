@@ -9,7 +9,8 @@
 
 pub use eliot_build_test_graph::{
     BUILD_ROOT_DIRECTORY, BuildFingerprint, BuildMode, CARGO_HOME_ENV, CARGO_TARGET_DIR_ENV,
-    CandidateIdentity, GovernedWorkEnvelope, LaneIdentity, RuntimeEnvironmentLease,
+    CandidateIdentity, FIXTURE_NAMESPACE_ENV, FIXTURE_ROOT_DIRECTORY, FIXTURE_ROOT_ENV,
+    GovernedWorkEnvelope, LaneIdentity, RuntimeEnvironmentLease,
 };
 use eliot_contracts::{
     ArtifactId, ClockReading, ContractId, EpochId, RequestId, canonical_json_bytes,
@@ -2427,10 +2428,20 @@ impl TestdProcessToolIntent {
     /// Revalidates the tool observation and closed child environment against
     /// the Kernel-selected target/cache roots, then returns the exact
     /// non-inheriting process environment projection.
+    ///
+    /// `lane` is the retained envelope of the work item this invocation runs
+    /// for. When present, its fixture namespace and the physical root derived
+    /// from that one namespace are merged into the SAME map this function
+    /// already builds, so the governed child is handed the fixture directory
+    /// its lane owns instead of choosing its own. This is the single
+    /// environment authority on the Kernel side; the daemon side reads the same
+    /// `GovernedWorkEnvelope::fixture_environment()` call over the same
+    /// retained tuple, so the two projections carry identical values.
     pub fn validate_for_roots(
         &self,
         target_root: &str,
         cache_root: &str,
+        lane: Option<&GovernedWorkEnvelope>,
     ) -> Result<eliot_process::EnvironmentProjection, TestdError> {
         self.observation.validate()?;
         let nextest = validate_canonical_tool_file(&self.observation.nextest_path)?;
@@ -2500,7 +2511,7 @@ impl TestdProcessToolIntent {
             reason: "observed tool directories cannot be composed into PATH",
         })?;
         let path_value = path_value.to_string_lossy().into_owned();
-        let values = BTreeMap::from([
+        let mut values = BTreeMap::from([
             (
                 "NEXTEST_EXPERIMENTAL_LIBTEST_JSON".to_owned(),
                 "1".to_owned(),
@@ -2531,6 +2542,25 @@ impl TestdProcessToolIntent {
             ("PATH".to_owned(), path_value),
             ("CARGO_TARGET_DIR".to_owned(), target_root.to_owned()),
         ]);
+        // Issue #1897 (W4, AUD #5910637761 defect 2): merge the lane's fixture
+        // binding into this same map rather than composing it at a call site.
+        // The physical root is derived from the ONE retained namespace, so a
+        // child handed this environment creates its fixture state under a
+        // directory no other work item can name — two jobs can no longer record
+        // different namespace strings while touching one fixture.
+        if let Some(lane) = lane {
+            for (key, value) in lane
+                .fixture_environment()
+                .map_err(|error| TestdError::Contract(error.to_string()))?
+            {
+                if values.insert(key.clone(), value).is_some() {
+                    return Err(TestdError::Invalid {
+                        field: "process_tool.fixture_environment",
+                        reason: "governed fixture binding collides with a registered key",
+                    });
+                }
+            }
+        }
 
         eliot_process::EnvironmentProjection::new(
             values,
@@ -4460,16 +4490,20 @@ impl TestdStore {
             job.work_envelope.as_ref(),
             job.fixture_namespace.as_deref(),
         )?;
-        // Issue #1897 (W1/W5): requalify the retained envelope with its owner
-        // before this attempt starts. The row just read is the durable
-        // authority — this method never re-derives a tuple from the current
-        // ambient environment — and the retained lease record is checked against
-        // the job that must own it, so a restart cannot execute under a lease
-        // another job holds or under a malformed tuple.
+        // Issue #1897 (W1/W5, AUD #5910637761 defect 4): run the FULL admission
+        // gate here, not `requalify`. This is the last product-owned point
+        // before the child process is issued, so it is where the envelope's
+        // complete claim/lease gate belongs: `admit` requires a non-empty claim
+        // set, every claim covered by a held lease, every held lease backed by a
+        // claim, and every lease granted to this job. `requalify` checks tuple
+        // and holder shape only, so substituting it permitted an empty-claim /
+        // empty-lease productive job to execute. The row just read is the
+        // durable authority — this method never re-derives a tuple from the
+        // current ambient environment — so a restart cannot execute under a
+        // lease another job holds, under an undeclared claim, or without a
+        // declared claim at all.
         if let Some(envelope) = job.work_envelope.as_ref() {
-            envelope
-                .requalify()
-                .map_err(|_| TestdError::InvalidBinding)?;
+            envelope.admit().map_err(|_| TestdError::InvalidBinding)?;
         }
         let request = permit.request();
         request
@@ -4515,6 +4549,26 @@ impl TestdStore {
                     .find(|(name, _)| name == variable)
                     .map(|(_, value)| value.as_str());
                 if bound != Some(expected) {
+                    return Err(TestdError::InvalidBinding);
+                }
+            }
+            // Issue #1897 (W4, AUD #5910637761 defect 2): the fixture binding
+            // this attempt will actually run with is read off the invocation's
+            // OWN environment and compared against the RETAINED envelope's
+            // derivation. Recording a namespace on the row is not the
+            // guarantee; the child running under a root derived from that one
+            // retained namespace is. A job that kept its fixture root elsewhere
+            // — or dropped it — is refused before the process starts.
+            let governed_fixture = envelope
+                .fixture_environment()
+                .map_err(|_| TestdError::InvalidBinding)?;
+            for (variable, expected) in &governed_fixture {
+                let presented = request
+                    .environment()
+                    .non_secret()
+                    .get(variable)
+                    .ok_or(TestdError::InvalidBinding)?;
+                if presented != expected {
                     return Err(TestdError::InvalidBinding);
                 }
             }
