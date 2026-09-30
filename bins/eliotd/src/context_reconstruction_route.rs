@@ -24,7 +24,12 @@
 //!
 //! - **Scope, fence, task, session** come from the admitted envelope and are
 //!   rechecked against the retained Kernel snapshot and the fenced attempt.
-//!   No MCP argument can select another scope or fence.
+//!   No MCP argument can select another scope or fence. The task and
+//!   `WorkScope` are the ones the bridge's activation exchange resolved and
+//!   its `build_invocation_envelope` bound, so on the live route they are the
+//!   authenticated identity rather than an absent value. An envelope that
+//!   genuinely carries no task identity is still refused with
+//!   [`ReconstructionPrerequisite::MissingTaskBinding`] before any read.
 //! - **Dependency heads** are the revision heads the daemon OBSERVED on the
 //!   authenticated campaign owner read under that same admitted fence; the
 //!   scope key is the store's own `scope:<scope_id>` head. They are never
@@ -274,23 +279,35 @@ struct AuthenticatedTaskRecipe {
 /// scope, else its session — never an MCP argument, exactly as the Kernel's
 /// `trusted_local_read_scope` and `KernelContextReadClient::check_local_read_capability`
 /// derive it.
+///
+/// **The work-scope leg is now the live one (#2857).** The only non-test
+/// producer of an `eliot.query` envelope is the agent bridge's
+/// `build_invocation_envelope`, which binds the `WorkScope` its activation
+/// resolved; the session fallback below therefore only applies to a
+/// pre-activation or otherwise work-scope-less envelope, whose reconstruction
+/// is refused earlier by `MissingTaskBinding` anyway. The derivation is kept
+/// identical to the owner's on purpose: the Kernel mints `attempt.scope_id`
+/// with exactly this precedence
+/// (`local_read_attempt_capability`), and the cross-check below compares the
+/// two, so the two implementations must not drift.
 fn trusted_query_scope(
     envelope: &HostRequestEnvelope,
     attempt: &LocalReadAttempt,
 ) -> Result<ScopeId, ReconstructionPrerequisite> {
-    let scope_text = envelope
+    let work_scope = envelope
         .identity
         .work_scope_id
         .as_deref()
-        .filter(|scope| !scope.trim().is_empty())
-        .or_else(|| {
-            envelope
-                .identity
-                .session_id
-                .as_deref()
-                .filter(|scope| !scope.trim().is_empty())
-        })
-        .ok_or(ReconstructionPrerequisite::InvalidInvocation)?;
+        .filter(|scope| !scope.trim().is_empty() && !scope.chars().any(char::is_control));
+    let scope_text = match work_scope {
+        Some(scope) => scope,
+        None => envelope
+            .identity
+            .session_id
+            .as_deref()
+            .filter(|scope| !scope.trim().is_empty() && !scope.chars().any(char::is_control))
+            .ok_or(ReconstructionPrerequisite::InvalidInvocation)?,
+    };
     ScopeId::new(scope_text.to_owned())
         .map_err(|_| ReconstructionPrerequisite::InvalidInvocation)
         .and_then(|scope| {

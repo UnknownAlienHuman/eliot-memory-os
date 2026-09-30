@@ -47,7 +47,7 @@ use eliot_protocol::{
 use eliot_receipts::RequestBinding;
 use serde::Deserialize;
 
-use crate::{KernelTransportOwner, SharedTransport};
+use crate::{ActivatedTaskBinding, KernelTransportOwner, SharedTransport};
 
 /// Closed kernel entry that admits one invocation envelope.
 ///
@@ -171,6 +171,12 @@ pub(super) struct TransportFacts {
     pub(super) descriptor_sha256: String,
     pub(super) receipt_sha256: String,
     pub(super) session: Option<String>,
+    /// The task and `WorkScope` the same activation resolved (#2857).
+    ///
+    /// `None` before a `Resolved` activation, exactly like `session`. This is
+    /// the authenticated identity an invocation envelope binds; it is never
+    /// read from host request text and never defaulted.
+    pub(super) task_binding: Option<ActivatedTaskBinding>,
 }
 
 /// Exact owner-derived facts retained beside one bridge-local resource URI.
@@ -556,6 +562,7 @@ impl KernelTransportOwner {
             descriptor_sha256: self.admitted.receipt.descriptor_sha256.clone(),
             receipt_sha256: self.admitted.receipt.receipt_sha256.clone(),
             session: self.activated_session.clone(),
+            task_binding: self.activated_task_binding.clone(),
         }
     }
 
@@ -882,14 +889,21 @@ impl KernelHostRequestClient {
         };
         match outcome {
             LogicalOwnerOutcome::Resolved(record) => {
+                // The recovered record is the durable winner of the ORIGINAL
+                // invocation, so its `task_ref`/`scope_ref` are the task this
+                // connection is activated for — the same identity the presented
+                // resolve envelope now binds (#2857). Expected from the live
+                // authenticated binding, so a record staged under a different
+                // task still fails the equality check below.
+                let (task_ref, scope_ref) = live_task_refs(facts);
                 verify_resolved_key_commitment(
                     &record,
                     &ResolvedKeyCommitment {
                         key: &logical_key,
                         occurrence: correlation,
                         session: session_id,
-                        task_ref: None,
-                        scope_ref: None,
+                        task_ref,
+                        scope_ref,
                         capability: request.tool.canonical_name(),
                         payload_digest,
                         parent: None,
@@ -1170,14 +1184,20 @@ impl KernelHostRequestClient {
         {
             return Err(unknown());
         }
+        // The parent invocation is now admitted under the live authenticated
+        // task (#2857), so the expected `task_ref`/`scope_ref` are that task
+        // and the identical `is_some()` legs above require this connection to
+        // actually be activated. Pre-activation (`None`) behaviour is
+        // unchanged, because `live_task_refs` then yields `(None, None)`.
+        let (task_ref, scope_ref) = live_task_refs(facts);
         verify_resolved_key_commitment(
             &record,
             &ResolvedKeyCommitment {
                 key: &logical_key,
                 occurrence: parent.request_base.as_str(),
                 session: session_id,
-                task_ref: None,
-                scope_ref: None,
+                task_ref,
+                scope_ref,
                 capability: parent.capability.as_str(),
                 payload_digest: parent.payload_digest.as_str(),
                 parent: None,
@@ -1250,14 +1270,15 @@ impl KernelHostRequestClient {
         };
         match outcome {
             LogicalOwnerOutcome::Resolved(record) => {
+                let (task_ref, scope_ref) = live_task_refs(facts);
                 verify_resolved_key_commitment(
                     &record,
                     &ResolvedKeyCommitment {
                         key: &logical_key,
                         occurrence: cancel_correlation,
                         session: session_id,
-                        task_ref: None,
-                        scope_ref: None,
+                        task_ref,
+                        scope_ref,
                         capability: parent.capability.as_str(),
                         payload_digest: parent.payload_digest.as_str(),
                         parent: Some(parent.handle.as_str()),
@@ -1353,6 +1374,57 @@ impl KernelHostRequestClient {
     }
 }
 
+/// The `task_ref`/`scope_ref` a durable record for this connection must carry.
+///
+/// One owner of the live authenticated task, read from the retained activation
+/// binding and never from host text. Both callers that compare a resolved
+/// record against the presented envelope use this, so the expected value and
+/// the value the envelope actually binds are the SAME authenticated identity —
+/// the equality check is joined to real authority rather than satisfied by a
+/// hardcoded `None`.
+fn live_task_refs(facts: &TransportFacts) -> (Option<&str>, Option<&str>) {
+    match facts.task_binding.as_ref() {
+        Some(binding) => (
+            Some(binding.task_id.as_str()),
+            Some(binding.work_scope_id.as_str()),
+        ),
+        None => (None, None),
+    }
+}
+
+/// Builds one invocation envelope bound to the live authenticated identity.
+///
+/// **Task identity (#2857).** `task_id` and `work_scope_id` are the task and
+/// `WorkScope` the one-shot activation exchange resolved for this connection,
+/// taken from [`TransportFacts::task_binding`]. They were previously pinned to
+/// `None`, which is what made every production `eliot.query` envelope
+/// task-unbound: `eliotd`'s live reconstruction route then refused with
+/// `MissingTaskBinding` before any read, so no `ContextReconstructionRequest`
+/// was ever constructed and `GovernorContextInputs::reconstruct` was
+/// unreachable from a real request.
+///
+/// The values are the Kernel's own resolved strings, never host request text:
+/// `HostInvocationRequest` has no task/scope field at all, and
+/// `scripts/verify-agent-bridge-protocol.py` fails the build if a host request
+/// type ever grows one. The Kernel re-checks both against its retained
+/// `ActivatedApplicationBinding` at admission
+/// (`host_request_application_binding_gate_under_transition`), so a stale or
+/// foreign binding is `IdentityConflict` there, not a silent success here.
+///
+/// **`task_revision` is deliberately NOT promoted into the frame fence.**
+/// `StateFence::I45_KEY_OMISSIONS` gives the revision dimension to
+/// `RevisionHeadExpectation` at the operation's own owner, and the transport
+/// fence this envelope rides structurally carries no task revision
+/// (`host_request_frame_for_envelope` refuses one outright). The task revision
+/// is therefore NOT bound here either: it is resolved and matched by value
+/// where the owner read returns its current head
+/// (`eliotd::context_reconstruction_route::read_authenticated_task_recipe`),
+/// which is that dimension's actual owner.
+///
+/// **Before activation** there is no authenticated task, so the two members
+/// stay `None` exactly as before: the Kernel's own gate refuses a task-bearing
+/// claim with no retained binding, and an unbound read still reaches the
+/// ordinary forwarded path.
 fn build_invocation_envelope(
     request: &HostInvocationRequest,
     facts: &TransportFacts,
@@ -1373,6 +1445,13 @@ fn build_invocation_envelope(
         .correlation_projection
         .clone()
         .ok_or_else(request_failure)?;
+    let (task_id, work_scope_id) = match facts.task_binding.as_ref() {
+        Some(binding) => (
+            Some(binding.task_id.clone()),
+            Some(binding.work_scope_id.clone()),
+        ),
+        None => (None, None),
+    };
     let identity = HostRequestIdentity {
         request_id: RequestId::new(correlation).map_err(|_| request_failure())?,
         correlation_projection: Some(correlation_projection),
@@ -1382,8 +1461,8 @@ fn build_invocation_envelope(
         deadline_unix_ms: deadline,
         capability: request.tool.canonical_name().to_owned(),
         session_id: Some(session_id.to_owned()),
-        task_id: None,
-        work_scope_id: None,
+        task_id,
+        work_scope_id,
         payload_schema_id: match &request.tool {
             // The finish candidate rides its own payload schema so the Kernel
             // finish lane can bind the exact admitted draft bytes (issue
@@ -1518,6 +1597,18 @@ fn resolve_request_label(base: &str) -> String {
 /// handle form names its exact parent (which also satisfies the per-kind
 /// presence rule), while the logical-key form carries the selectors the
 /// owner recomputes the key from and is accepted only on the resolve entry.
+///
+/// **Task identity (#2857).** The resolve envelope carries the SAME live
+/// authenticated task and `WorkScope` the invocation envelope now binds, from
+/// [`TransportFacts::task_binding`]. The owner compares the durable record's
+/// `task_ref`/`scope_ref` against the PRESENTED envelope's
+/// `task_id`/`work_scope_id`
+/// (`resolve_host_request_logical_key`, and `require_host_request_parent_owner`
+/// for the parent forms), so a resolve that omitted them would stop matching
+/// every task-bound record it is trying to recover. This keeps the existing
+/// equality comparison exactly as strict — it is joined to the live
+/// authenticated identity, not relaxed — and a record under a different task
+/// still answers `conflict`.
 fn build_resolve_envelope(
     request_label: &str,
     parent_operation_id: Option<&str>,
@@ -1531,6 +1622,13 @@ fn build_resolve_envelope(
     if deadline == 0 {
         return Err(request_failure());
     }
+    let (task_id, work_scope_id) = match facts.task_binding.as_ref() {
+        Some(binding) => (
+            Some(binding.task_id.clone()),
+            Some(binding.work_scope_id.clone()),
+        ),
+        None => (None, None),
+    };
     let identity = HostRequestIdentity {
         request_id: RequestId::new(request_label).map_err(|_| request_failure())?,
         correlation_projection: None,
@@ -1540,8 +1638,8 @@ fn build_resolve_envelope(
         deadline_unix_ms: deadline,
         capability: capability.to_owned(),
         session_id: Some(session_id.to_owned()),
-        task_id: None,
-        work_scope_id: None,
+        task_id,
+        work_scope_id,
         payload_schema_id: HOST_REQUEST_PAYLOAD_SCHEMA_ID.to_owned(),
         payload_sha256: payload_digest.to_owned(),
     };
@@ -3589,6 +3687,10 @@ mod tests {
             descriptor_sha256: "d".repeat(64),
             receipt_sha256: "e".repeat(64),
             session: Some("kernel-session-1".to_owned()),
+            // The fixture is a PRE-activation transport: no authenticated task
+            // exists, so both members stay absent exactly as they are in
+            // production before a `Resolved` activation.
+            task_binding: None,
         }
     }
 
