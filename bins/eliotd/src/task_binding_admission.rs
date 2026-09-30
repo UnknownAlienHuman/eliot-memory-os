@@ -41,10 +41,12 @@
 //!   and `TaskContract` compatibility when the command is task-relative".
 //! - [`admit_named_mutation_capture`] — the transport edge
 //!   (`DaemonKernelClient::apply_prepared`). No typed selection exists there, so
-//!   this entry only decides the capture leg: a `CaptureObservation` naming no
-//!   task is a cold unbound candidate and is never treated here as task-bound.
-//!   It deliberately does not restate the store bridge's presence/agreement
-//!   rule for task-bearing writes; that rule belongs to
+//!   a task-free `CaptureObservation` is admitted here as a cold unbound
+//!   candidate and is never treated as task-bound, while any transition naming
+//!   a task — with or without a capture — is reported as task-relative for the
+//!   selection-owning ingress and the store gate. It deliberately does not
+//!   restate the store bridge's presence/agreement rule for task-bearing
+//!   writes; that rule belongs to
 //!   `eliot-store-surreal::task_binding_gate`, which re-derives it from the
 //!   opaque proof handles before provider I/O. Neither replaces the other.
 //! - [`observe_explicit_workspace`] — the daemon half of the `WorkScope`
@@ -1393,7 +1395,10 @@ pub fn admit_task_bound_with_observed_scope(
 ///
 /// There is deliberately no latest-task, open-task, or resolver-guess leg here:
 /// ambiguity is reported, never resolved. The task-intake owner producer is
-/// absent pending issue #8.
+/// present (`eliot_workscope::task_selection_required`, consumed by
+/// [`selection_response_for_receipt`]); what is still absent is owner-proven
+/// selection source/evidence on `CurrentTaskContract` receipts, so the current
+/// arm keeps refusing (see [`bind_current_task_selection`]).
 pub fn resolve_task_selection(
     receipt: &OnboardingReadinessReceipt,
 ) -> Result<TaskSelectionDisposition, TaskBindingError> {
@@ -2328,7 +2333,8 @@ pub fn revalidate_task_bound_for_effect(
 /// This is the production entry for `DaemonKernelClient::apply_prepared`'s
 /// pre-transport admission: the last point inside the daemon where a
 /// `CaptureObservation` can still be classified before it reaches Kernel and
-/// the store. Its only decision is the capture leg:
+/// the store. It decides the capture leg and reports task-relative work it
+/// cannot admit:
 ///
 /// - a `CaptureObservation` naming no task on either the admitted context or
 ///   the transition has no unique task selection, so it is admitted through
@@ -2340,7 +2346,14 @@ pub fn revalidate_task_bound_for_effect(
 ///   ([`admit_canonical_write`]) and is re-derived at the store gate from the
 ///   proof handles the transition actually carries. A typed selection is never
 ///   manufactured here, and an absent one is never treated as compatible;
-/// - a transition with no capture at all is
+/// - a transition with no capture that still names a task on either the
+///   admitted context or the transition is equally task-relative work passing
+///   a capture-only edge (issue #1746, A6): it is reported as
+///   [`TaskBindingAdmission::TaskRelative`] — never admitted here and never
+///   labelled [`TaskBindingAdmission::NotTaskRelative`], which would claim no
+///   binding is required. Its binding belongs to the same selection-owning
+///   ingress and store gate as the capture-naming-task arm;
+/// - a transition with no capture and no task on either side is
 ///   [`TaskBindingAdmission::NotTaskRelative`].
 ///
 /// It never selects the most recent or open task and never falls back to
@@ -2370,16 +2383,16 @@ pub fn admit_named_mutation_capture(
         .named_operations
         .iter()
         .any(|named| named.operation == NamedMutationOperation::CaptureObservation);
-    if !captures {
-        return Ok(TaskBindingAdmission::NotTaskRelative);
-    }
     let names_a_task = transition.task_id.is_some() || context.task_id.is_some();
     if names_a_task {
         // Issue #1746, A6: the bridge transport edge enforces the same binding
-        // rule as the direct internal intake — a task-relative effect needs
-        // owner evidence, so its binding decision belongs to the ingress that
-        // owns the exact selection. The terminal arm is unreachable
-        // fail-closed if the frozen table ever stops requiring it.
+        // rule as the direct internal intake — task-relative work needs owner
+        // evidence, so its binding decision belongs to the ingress that owns
+        // the exact selection, whether or not this transition carries a
+        // capture. A task-bearing non-capture transition is reported here,
+        // never admitted and never labelled as needing no binding. The
+        // terminal arm is unreachable fail-closed if the frozen table ever
+        // stops requiring it.
         if entrypoint_requires_binding(
             DispatchEntrypoint::BridgeTransport,
             CanonicalOperationRequirement::TaskRelativeEffectful,
@@ -2389,6 +2402,9 @@ pub fn admit_named_mutation_capture(
         return Err(TaskBindingError::selection_required(
             "bridge transport edge cannot admit a task-relative effect without owner evidence",
         ));
+    }
+    if !captures {
+        return Ok(TaskBindingAdmission::NotTaskRelative);
     }
     match admit_capture(
         transition.identity.operation_id.as_str().to_owned(),
