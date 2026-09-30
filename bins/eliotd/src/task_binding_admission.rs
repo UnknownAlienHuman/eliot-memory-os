@@ -2193,10 +2193,6 @@ fn envelope_is_task_relative(envelope: &CanonicalWriteEnvelope) -> bool {
 /// and the sealed [`DispatchedBinding`] are therefore identical whichever
 /// resolution supplied the selection; only the provenance of the selection
 /// differs.
-#[expect(
-    clippy::too_many_lines,
-    reason = "single dispatch edge sealing identity, scope, fence, and bootstrap revisions; splitting would scatter the conflict/rebind ordering"
-)]
 fn admit_canonical_write_resolved(
     candidate_id: String,
     context: &RequestMetadata,
