@@ -146,12 +146,18 @@ impl RetainedSourceInput {
     /// malformed, or when a partial acquisition fails to name the scope it did
     /// not retain.
     pub fn validate(&self) -> Result<(), crate::SecurityContractError> {
-        assessment_text(&self.retained_input_ref, "retained_input.retained_input_ref")?;
+        assessment_text(
+            &self.retained_input_ref,
+            "retained_input.retained_input_ref",
+        )?;
         match &self.acquisition {
             SourceAcquisition::Retained { digest } => {
                 assessment_digest(digest, "retained_input.acquisition.digest")
             }
-            SourceAcquisition::Partial { digest, unretained_scope_refs } => {
+            SourceAcquisition::Partial {
+                digest,
+                unretained_scope_refs,
+            } => {
                 assessment_digest(digest, "retained_input.acquisition.digest")?;
                 assessment_refs(
                     unretained_scope_refs,
