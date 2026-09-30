@@ -1225,6 +1225,44 @@ impl CoordinationOwner {
         }))
     }
 
+    fn exact_result_replay(
+        &self,
+        draft: &AgentResultDraft,
+    ) -> Result<Option<AgentResultReceipt>, CoordinationError> {
+        let Some(event) = self.event_by_request.get(&draft.request_id) else {
+            return Ok(None);
+        };
+        let exact_event = event.kind == CoordinationEventKind::ResultSubmitted
+            && event.idempotency_key == draft.request_id
+            && event.event_id == format!("{}:{}", draft.work_item_id, draft.request_id)
+            && event.subject_id == draft.work_item_id
+            && event.actor_id == draft.session_id
+            && event
+                .authority_epoch
+                .is_same_authority(&draft.authority_epoch.clone())
+            && event.state_fence == draft.state_fence
+            && event.payload_digest == draft.result_ref;
+        let exact_item = self.work.get(&draft.work_item_id).is_some_and(|item| {
+            item.work_item_id == draft.work_item_id
+                && item.state == WorkState::Submitted
+                && item.result_ref.as_deref() == Some(draft.result_ref.as_str())
+                && item.lease_id.as_deref() == Some(draft.lease_id.as_str())
+                && item.owner_session_id.as_deref() == Some(draft.session_id.as_str())
+                && item.state_fence == draft.state_fence
+        });
+        if !(exact_event && exact_item) {
+            return Err(CoordinationError::IdempotencyConflict(
+                draft.request_id.clone(),
+            ));
+        }
+        Ok(Some(AgentResultReceipt {
+            result_id: draft.result_id.clone(),
+            work_item_id: draft.work_item_id.clone(),
+            ceiling: ResultAdmissionCeiling::CandidateArtifact,
+            event: event.clone(),
+        }))
+    }
+
     #[allow(clippy::unused_self)]
     fn request(&self, id: &str) -> Result<(), CoordinationError> {
         text(id, "request_id")
@@ -1735,15 +1773,34 @@ impl CoordinationOwner {
     /// (lease/session/epoch/fence checks, idempotent commit, ceiling stamp).
     /// The admitted reference stays a candidate event: see
     /// [`ResultAdmissionCeiling`].
-    /// STITCH (#370 W8/W28): the future live caller is the session/work-item
+    ///
+    /// A live at-least-once producer retry under the same request identity
+    /// reads the stored receipt back instead of committing again: the stored
+    /// `ResultSubmitted` event and the owner work item must match this draft
+    /// exactly (request, work item, session, epoch, fence, result reference),
+    /// otherwise the retry fails with
+    /// [`CoordinationError::IdempotencyConflict`]. New submissions against an
+    /// already result-bearing item still fail closed; only the exact prior
+    /// receipt is ever returned, and its ceiling stays
+    /// [`ResultAdmissionCeiling::CandidateArtifact`].
+    /// STITCH (#370 W8/W28/R1): the future live caller is the session/work-item
     /// driver passing a real [`AgentResultDraft`] built from admitted
-    /// work-item/session material; BLOCKED-BY the integration-lane driver
-    /// (no live draft producer exists). Forbidden: a draft built from
+    /// work-item/session material; BLOCKED-BY #22 (native-worker
+    /// provider-result producer) and #1108 (coordinator result integration;
+    /// the residual seam `restore_snapshot_json` stays open there and is only
+    /// named here, never duplicated). Forbidden: a draft built from
     /// fabricated or test-only input to manufacture a caller.
     pub fn admit_candidate_result(
         &mut self,
         draft: AgentResultDraft,
     ) -> Result<AgentResultReceipt, CoordinationError> {
+        if self.event_by_request.contains_key(&draft.request_id) {
+            let receipt = self
+                .exact_result_replay(&draft)?
+                .ok_or(CoordinationError::InvalidState)?;
+            self.common(draft.authority_epoch.clone(), &draft.state_fence)?;
+            return Ok(receipt);
+        }
         let submittable = self.work.get(&draft.work_item_id).is_some_and(|item| {
             matches!(
                 item.state,
