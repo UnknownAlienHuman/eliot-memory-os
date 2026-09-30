@@ -431,7 +431,7 @@ pub const CLOSED_REFERENCE_ROLES: &[ClosedReferenceRole] = &[
     ClosedReferenceRole { path: "tests/cognitive/memory-curation/curation-corpus.json", role: "reference_only:test_data", basis: "curation corpus stores a historical path mention as input data" },
     ClosedReferenceRole { path: "tests/release-security/build-sandbox-cache-tests.ps1", role: "reference_only:audit_fixture", basis: "sandbox cache test uses the name in a synthetic path fixture, not as an executable" },
     ClosedReferenceRole { path: "workspace/tools/eliot-runtime-compiler/src/lib.rs", role: "reference_only:migration_compiler_input", basis: "MIG-05 binds a migration cell to the facade path for analysis, not runtime invocation" },
-    ClosedReferenceRole { path: "integrations/agent-skills/skill-pack.manifest.json", role: "reference_only:skill_manifest", basis: "skill-pack metadata records the source token in its provenance inventory" },
+    ClosedReferenceRole { path: "integrations/agent-skills/skill-pack.manifest.json", role: "live_consumer:build", basis: "eliot-skills validates derived_packages and SkillPackService::sync writes the declared plugin/eliot-governor/skills package" },
     ClosedReferenceRole { path: "plugin/eliot-antigravity-official/shared/ELIOT_TOOL_USAGE.md", role: "reference_only:skill_guidance", basis: "shared skill text mentions the old integration as migration guidance" },
 ];
 
