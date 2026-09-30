@@ -769,9 +769,12 @@ impl StoreComposition {
             .try_acquire(ClientClass::Write)
             .map_err(StoreCompositionError::Store)?;
         let _access = self.connections.validate_lease(&lease)?;
-        let outcome = CanonicalStoreClient::apply_reserved_write(&self.store, request)
-            .await
-            .map_err(StoreCompositionError::Store);
+        let outcome = Box::pin(CanonicalStoreClient::apply_reserved_write(
+            &self.store,
+            request,
+        ))
+        .await
+        .map_err(StoreCompositionError::Store);
         if matches!(
             outcome,
             Err(StoreCompositionError::Store(StoreError::Unavailable))

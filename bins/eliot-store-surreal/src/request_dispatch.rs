@@ -223,6 +223,7 @@ pub(crate) fn failure_context_for_backup(
 /// never a success and never a not-attempted claim. The admitted
 /// `operation_id` in `context` is the sole reconciliation key; no
 /// receipt-carried identity is adopted and no provider prose is attached.
+#[cfg(test)]
 fn response_for_transaction_receipt(
     receipt: WriteReceipt,
     context: StoreFailureIdentityContext,
@@ -269,6 +270,7 @@ fn response_for_transaction_receipt_with_causal(
 /// A missing receipt is a valid empty lookup, not a failure. An invalid or
 /// envelope-less receipt for the admitted operation is an unknown outcome
 /// bound to that exact operation identity, reconciled via receipt query.
+#[cfg(test)]
 fn response_for_receipt_lookup(
     receipt: Option<WriteReceipt>,
     context: StoreFailureIdentityContext,
@@ -663,6 +665,22 @@ pub async fn dispatch_with_log<B: StoreDispatchBackend + ?Sized>(
     response
 }
 
+async fn dispatch_committed_write_result(
+    composition: &StoreComposition,
+    outcome: Result<WriteReceipt, StoreCompositionError>,
+    context: StoreFailureIdentityContext,
+) -> Response {
+    match outcome {
+        Ok(receipt) => match composition.committed_receipt_with_causal(&receipt).await {
+            Ok((receipt, causal)) => {
+                response_for_transaction_receipt_with_causal(receipt, causal, context)
+            }
+            Err(error) => map_store_error(error, context),
+        },
+        Err(error) => map_composition_error(error, context),
+    }
+}
+
 impl StoreDispatchBackend for StoreComposition {
     async fn dispatch_request(&self, request: Request) -> Response {
         // I5.9 compatibility gate (issue #1932). The decision is resolved from
@@ -708,24 +726,14 @@ impl StoreDispatchBackend for StoreComposition {
                     transition.identity.operation_id.clone(),
                     transition.identity.idempotency_key.clone(),
                 );
-                match Box::pin(self.apply(
+                let outcome = Box::pin(self.apply(
                     &context,
                     transition,
                     expected_revision_heads,
                     expected_ordering_heads,
                 ))
-                .await
-                {
-                    Ok(receipt) => match self.committed_receipt_with_causal(&receipt).await {
-                        Ok((receipt, causal)) => response_for_transaction_receipt_with_causal(
-                            receipt,
-                            causal,
-                            failure_context,
-                        ),
-                        Err(error) => map_store_error(error, failure_context),
-                    },
-                    Err(error) => map_composition_error(error, failure_context),
-                }
+                .await;
+                dispatch_committed_write_result(self, outcome, failure_context).await
             }
             Request::Receipt { operation_id } => dispatch_receipt_lookup(self, operation_id).await,
             // Issue #991: one authenticated reserved-write arm. The sealed
@@ -739,17 +747,8 @@ impl StoreDispatchBackend for StoreComposition {
                     request.transition.identity.operation_id.clone(),
                     request.transition.identity.idempotency_key.clone(),
                 );
-                match Box::pin(self.apply_reserved_write(request)).await {
-                    Ok(receipt) => match self.committed_receipt_with_causal(&receipt).await {
-                        Ok((receipt, causal)) => response_for_transaction_receipt_with_causal(
-                            receipt,
-                            causal,
-                            failure_context,
-                        ),
-                        Err(error) => map_store_error(error, failure_context),
-                    },
-                    Err(error) => map_composition_error(error, failure_context),
-                }
+                let outcome = Box::pin(self.apply_reserved_write(request)).await;
+                dispatch_committed_write_result(self, outcome, failure_context).await
             }
             // Issue #975: one authenticated backup arm. The closed envelope
             // carries its fence-bound context beside the operation; the
