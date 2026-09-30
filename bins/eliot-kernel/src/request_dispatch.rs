@@ -299,10 +299,8 @@ const RESTORE_TEST_GATES_ADMITTED: [&str; 6] = [
 /// reported here, in their own field, and the operator surface refuses a reply
 /// that lists the same gate in both sets — that contradiction is the defect this
 /// split exists to make impossible.
-const RESTORE_TEST_GATES_NOT_ADMITTED: [&str; 2] = [
-    "restore-journal-admission",
-    "owner-fence-currency",
-];
+const RESTORE_TEST_GATES_NOT_ADMITTED: [&str; 2] =
+    ["restore-journal-admission", "owner-fence-currency"];
 
 /// Field-bound shape failure, rendered as an `invalid` reply by the handlers.
 struct InvalidShape {

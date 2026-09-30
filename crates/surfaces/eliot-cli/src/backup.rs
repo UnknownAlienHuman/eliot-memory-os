@@ -2472,19 +2472,17 @@ fn apply_accepted_exit(
 /// with the same operation identity, never as a completed rehearsal. The
 /// stable operation identity — the correlated idempotency key, never a value
 /// read back from the reply body — is what the owner lane reconciles.
-pub fn backup_restore_test(
-    client: &mut KernelClient,
-    request: &CommandRequest,
-) -> Result<CommandResponse, BackupClientError> {
-    require_command(request, CommandId::BackupRestoreTest).map_err(BackupClientError::Client)?;
-    let params = restore_test_params(request)?;
-    let operation_id = request.request.idempotency_key.clone();
-    // The rehearsal is the catalogue's candidate row at the candidate-artifact
-    // ceiling: a rehearsal is not a cutover, so the pair is read from the same
-    // row the dispatch path compares against, never restated here.
-    let (effect, proof_ceiling) = catalogued_ceiling(CommandId::BackupRestoreTest)?;
-    client.set_request_identity(request.request.clone());
-    let payload = json!({
+/// The `backup.restore-test` wire payload, built from the validated request
+/// parameters only.
+///
+/// This is a pure projection of what the caller asked for: every field below is
+/// copied from the admitted request, and none is defaulted, derived from an
+/// owner answer, or filled with a placeholder. It exists as a named seam so the
+/// command's own flow - admit, send, read the owner's executed route, grade -
+/// stays readable, and so a future field cannot be added here without the same
+/// scrutiny as the grading that consumes it.
+fn restore_test_payload(params: &BackupRestoreTestParams) -> Value {
+    json!({
         "bundle_hex": params.bundle_hex.as_str(),
         "destination_authorization_hex": params.authorization_hex.as_str(),
         "target": {
@@ -2500,7 +2498,22 @@ pub fn backup_restore_test(
             "capture_operation_id": params.capture_operation_id.as_str(),
         },
         "introductions": Value::Array(params.introductions.clone()),
-    });
+    })
+}
+
+pub fn backup_restore_test(
+    client: &mut KernelClient,
+    request: &CommandRequest,
+) -> Result<CommandResponse, BackupClientError> {
+    require_command(request, CommandId::BackupRestoreTest).map_err(BackupClientError::Client)?;
+    let params = restore_test_params(request)?;
+    let operation_id = request.request.idempotency_key.clone();
+    // The rehearsal is the catalogue's candidate row at the candidate-artifact
+    // ceiling: a rehearsal is not a cutover, so the pair is read from the same
+    // row the dispatch path compares against, never restated here.
+    let (effect, proof_ceiling) = catalogued_ceiling(CommandId::BackupRestoreTest)?;
+    client.set_request_identity(request.request.clone());
+    let payload = restore_test_payload(&params);
     let response = client
         .transact_json(BACKUP_RESTORE_TEST_OPERATION, payload)
         .map_err(BackupClientError::Transport)?;
