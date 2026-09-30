@@ -114,7 +114,7 @@ pub enum DreamerOrientationModelWorkerError {
     Selection(#[from] ModelControlError),
     #[error("provider staffing source is absent from the original runtime input")]
     ProviderStaffingSourceMissing,
-    #[error("original v2 runtime-owner admission/bundle publications are absent or incomplete")]
+    #[error("original v3 runtime-owner admission/bundle/frame/staffing publications are absent or incomplete")]
     RuntimeOwnerSourceMissing,
     #[error("original runtime-owner publication does not bind the decoded job/admission/bundle")]
     RuntimeOwnerSourceBindingMismatch,
@@ -203,7 +203,7 @@ pub async fn execute_admitted_orientation_model(
         return Err(DreamerOrientationModelWorkerError::NonCanonicalSemanticInput);
     }
     let (original_admission, original_bundle, staffing_publication) =
-        decode_v2_runtime_owner_sources(input.runtime_owner_input)?;
+        decode_v3_runtime_owner_sources(input.runtime_owner_input)?;
     if original_admission != *input.admission
         || original_bundle != *input.bundle
         || input.runtime_owner_input.task_id.as_str() != input.admission.task_id.as_str()
@@ -368,7 +368,7 @@ pub async fn execute_admitted_orientation_model(
     .map_err(Into::into)
 }
 
-fn decode_v2_runtime_owner_sources(
+fn decode_v3_runtime_owner_sources(
     runtime: &DurableJobRuntimeOwnerExecutionInput,
 ) -> Result<
     (
@@ -379,7 +379,7 @@ fn decode_v2_runtime_owner_sources(
     DreamerOrientationModelWorkerError,
 > {
     runtime.validate()?;
-    if !runtime.has_v2_owner_publications() {
+    if !runtime.has_v3_owner_publications() {
         return Err(DreamerOrientationModelWorkerError::RuntimeOwnerSourceMissing);
     }
     let admission_identity =
@@ -413,7 +413,7 @@ fn validate_runtime_owner_publication(
         .validate("runtime_owner_execution_input")
         .and_then(|()| reference.validate_original_bytes(bytes))
         .map_err(DreamerOrientationModelWorkerError::RuntimeOwnerReference)?;
-    if reference.contract != DurableJobRuntimeOwnerExecutionInput::contract_identity_v2()? {
+    if reference.contract != DurableJobRuntimeOwnerExecutionInput::contract_identity_v3()? {
         return Err(DreamerOrientationModelWorkerError::RuntimeOwnerSourceContractMismatch);
     }
     let canonical = canonical_json_bytes(runtime)
