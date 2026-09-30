@@ -102,16 +102,16 @@ impl OperatorEndpoint {
     /// `bins/eliot-user-broker/src/main.rs`), and it answers every other
     /// request `BROKER_PROTOCOL_SEQUENCE_REJECTED`.
     ///
-    /// The role-filtered ControlBoard/Operator IPC is a DIFFERENT transport
-    /// owned by the runtime instance, not by this broker: I11.8 binds the
-    /// WinUI client "through the interactive User Broker **and** authenticated
-    /// local IPC", and that owner publishes its own pipe name. A handoff may
-    /// therefore never present a ControlBoard pipe name here, so a name that
-    /// is not this broker's own pipe is refused as its own typed field. Such
-    /// an endpoint was already refused — never admitted — but only later, as a
-    /// `ReplayConflict` from the issued-row equality in [`Self::consume`];
-    /// it is now refused before any ledger lookup, and its stable wire code is
-    /// the not-admitted one rather than the replayed one.
+    /// The role-filtered `ControlBoard`/`Operator` IPC is a DIFFERENT
+    /// transport owned by the runtime instance, not by this broker: I11.8
+    /// binds the `WinUI` client "through the interactive User Broker **and**
+    /// authenticated local IPC", and that owner publishes its own pipe name. A
+    /// handoff may therefore never present a `ControlBoard` pipe name here,
+    /// so a name that is not this broker's own pipe is refused as its own
+    /// typed field. Such an endpoint was already refused — never admitted —
+    /// but only later, as a `ReplayConflict` from the issued-row equality in
+    /// [`Self::consume`]; it is now refused before any ledger lookup, and its
+    /// stable wire code is the not-admitted one rather than the replayed one.
     pub fn validate(&self) -> Result<(), BrokerError> {
         text(&self.pipe_name, "pipe_name")?;
         if self.pipe_name != OPERATOR_PIPE_NAME {

@@ -30,6 +30,16 @@
     <Compile Include="../../apps/Eliot.Operator/Services/OperatorPendingOperationJournal.cs" Link="Services/OperatorPendingOperationJournal.cs" />
     <Compile Include="../../apps/Eliot.Operator/Services/BrokerPipeClient.cs" Link="Services/BrokerPipeClient.cs" />
     <Compile Include="../../apps/Eliot.Operator/Services/GovernorPipeClient.cs" Link="Services/GovernorPipeClient.cs" />
+    <!--
+      Minimum compile closure for the file above. `GovernorPipeClient.cs` now
+      resolves the ControlBoard/Operator IPC pipe through
+      `ControlBoardPipeLocator.ReadPipeName` instead of the broker handoff name,
+      so the linked harness did not compile on that commit without this
+      production source. No assertion, case or SDK was added: this entry only
+      makes the already-committed harness source compile so the locked build
+      gate can run at all.
+    -->
+    <Compile Include="../../apps/Eliot.Operator/Services/ControlBoardPipeLocator.cs" Link="Services/ControlBoardPipeLocator.cs" />
     <Compile Include="../../apps/Eliot.Operator/Services/RuntimeDiscoveryService.cs" Link="Services/RuntimeDiscoveryService.cs" />
     <Compile Include="../../apps/Eliot.Operator/ViewModels/MainViewModel.cs" Link="ViewModels/MainViewModel.cs" />
     <None Include="../../crates/eliot-types/schema/operator-contract-v1.json" Link="operator-contract-v1.json" CopyToOutputDirectory="PreserveNewest" />
