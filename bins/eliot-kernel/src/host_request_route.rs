@@ -5416,10 +5416,7 @@ struct RetainedResultProvenance {
 /// has no same receipt to present. Pure: no IO, no digest recomputation, no
 /// promotion — a mismatch simply declines the replay arm and the submission
 /// falls through to the lineage gate, which fails closed.
-fn same_observe_owner_receipt(
-    stored: &HostRequestRecord,
-    body: &HostRequestResultBody,
-) -> bool {
+fn same_observe_owner_receipt(stored: &HostRequestRecord, body: &HostRequestResultBody) -> bool {
     match (&stored.result_lineage, &body.lineage) {
         (Some(retained), Some(presented)) => {
             presented.output_digest == retained.output_digest
