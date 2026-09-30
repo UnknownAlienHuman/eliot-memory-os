@@ -40,7 +40,6 @@ pub const DEFAULT_PACKET_HARD_CEILING_TOKENS: usize = 4_096;
 
 #[path = "context_contracts.rs"]
 mod context_contracts;
-use context_contracts::{PacketMeasurementAssignmentStatus, packet_serializer_binding};
 pub use context_contracts::{
     PacketBudgetDecision, PacketBudgetPolicy, PacketCandidateOutcome, PacketCompileAudit,
     PacketCompileAuditContext, PacketCompileAuditReport, PacketCompileMode, PacketCompilePlan,
@@ -48,6 +47,7 @@ pub use context_contracts::{
     PacketRenderMode, PacketRenderOutcome, PacketResolvedCues, PacketSourceReadAudit,
     PacketTaskReceiptMetadata,
 };
+use context_contracts::{PacketMeasurementAssignmentStatus, packet_serializer_binding};
 
 #[path = "context/packet_quality.rs"]
 mod packet_quality;
@@ -289,12 +289,12 @@ impl ContextCompiler {
         memory_free_control: bool,
     ) -> Result<PacketCandidateOutcome, EngineError> {
         if memory_free_control {
-            return Ok(Self::compile_control_unfinalized(
+            return Self::compile_control_unfinalized(
                 &plan.request,
                 &plan.codecortex_reports,
                 plan.current_git_scope.as_ref(),
                 plan.material_frame.as_ref(),
-            ));
+            );
         }
         self.compile_unfinalized_with_cues(
             &plan.request,
@@ -416,12 +416,12 @@ impl ContextCompiler {
         memory_exposure: MemoryExposureMode,
     ) -> Result<PacketCandidateOutcome, EngineError> {
         if memory_exposure == MemoryExposureMode::MemoryFreeControl {
-            return Ok(Self::compile_control_unfinalized(
+            return Self::compile_control_unfinalized(
                 request,
                 codecortex_reports,
                 current_git_scope,
                 frame,
-            ));
+            );
         }
 
         self.compile_unfinalized_with_cues(
@@ -479,13 +479,12 @@ impl ContextCompiler {
     /// Constructs the certification control candidate without holding or
     /// consulting a [`ReadService`]. This static path is the provider-free test
     /// seam proving that control compilation cannot perform memory reads.
-    #[must_use]
     pub fn compile_control_unfinalized(
         request: &CompilePacketL3Request,
         codecortex_reports: &[CodeCortexReport],
         current_git_scope: Option<&GovernedGitScope>,
         frame: Option<&MaterialPacketFrame>,
-    ) -> PacketCandidateOutcome {
+    ) -> Result<PacketCandidateOutcome, EngineError> {
         let mut packet = empty_packet(
             request,
             MemoryRevision::new(0),
@@ -499,12 +498,11 @@ impl ContextCompiler {
             current_git_scope,
             frame,
         );
-        packet.token_budget_report.estimated_tokens = estimate_tokens(&packet)
-            .expect("the static candidate serializes as valid JSON before returning");
-        PacketCandidateOutcome {
+        refresh_legacy_packet_stu(&mut packet)?;
+        Ok(PacketCandidateOutcome {
             packet,
             read_audit: PacketSourceReadAudit::default(),
-        }
+        })
     }
 
     pub async fn compile_with_lifecycle_influence(
@@ -1797,7 +1795,7 @@ fn empty_packet(
     memory_confidence: eliot_types::MemoryConfidence,
     retrieval_truncated: bool,
 ) -> ContextPacketL3 {
-    let mut packet = ContextPacketL3 {
+    ContextPacketL3 {
         packet_id: String::new(),
         project_id: request.project_id,
         task_id: request.task_id.clone(),
@@ -1844,12 +1842,7 @@ fn empty_packet(
             limit: request.max_tokens,
             returned: 0,
         },
-    };
-    // This private seed packet is measured before return. Candidate callers
-    // refresh the compatibility projection after adding source-owned content.
-    packet.token_budget_report.estimated_tokens = estimate_tokens(&packet)
-        .expect("the private seed packet serializes as valid JSON");
-    packet
+    }
 }
 
 fn refresh_legacy_packet_stu(packet: &mut ContextPacketL3) -> Result<(), EngineError> {
@@ -3018,19 +3011,23 @@ fn finalize_precompiled_packet_with_policy_and_audit_context(
             budget_metadata_tokens,
         )?;
         PacketQualityService::finalize(&mut rendered_packet, frame)?;
-        let final_serialized_packet = serde_json::to_vec(&rendered_packet)?;
+        let final_serialized_packet =
+            serde_json::to_vec(&rendered_packet).map_err(EngineError::from)?;
         let (rendered_utf8_bytes, stu_estimate, content_digest) =
             canonical_measurement_for_payload(&final_serialized_packet)?;
-        budget.estimated_tokens = usize::try_from(stu_estimate.value).map_err(|_| {
-            EngineError::ServiceNotReady {
+        budget.estimated_tokens =
+            usize::try_from(stu_estimate.value).map_err(|_| EngineError::ServiceNotReady {
                 service: "context-measurement".to_owned(),
                 reason: "STU estimate is not representable as usize".to_owned(),
-            }
-        })?;
+            })?;
         budget.rendered_utf8_bytes = rendered_utf8_bytes;
         budget.stu_estimate = stu_estimate;
-        let (serializer_id, serializer_version, serializer_options_digest, serializer_profile_digest) =
-            packet_serializer_binding();
+        let (
+            serializer_id,
+            serializer_version,
+            serializer_options_digest,
+            serializer_profile_digest,
+        ) = packet_serializer_binding();
         budget.serializer_id = serializer_id;
         budget.serializer_version = serializer_version;
         budget.serializer_options_digest = serializer_options_digest;
@@ -3089,22 +3086,13 @@ fn render_packet_with_budget_policy(
     let (mandatory_floor_packet, mandatory_floor_tokens) =
         mandatory_floor(candidate, &required_handles, total_supplement_tokens)?;
     if mandatory_floor_tokens > policy.hard_ceiling_tokens {
-        let expansion_handles =
-            packet_expansion_handles(&mandatory_floor_packet, &required_handles);
-        let mut section_tokens = packet_section_accounting(&mandatory_floor_packet)?;
-        section_tokens.insert("returned_supplements".to_owned(), policy.supplement_tokens);
-        section_tokens.insert(
-            "packet_budget_decision_and_compile_audit".to_owned(),
+        return Err(packet_hard_ceiling_error(
+            &mandatory_floor_packet,
+            &required_handles,
+            policy,
             budget_metadata_tokens,
-        );
-        return Err(PacketHardCeilingExceeded {
-            preferred_tokens: policy.preferred_tokens,
-            hard_ceiling_tokens: policy.hard_ceiling_tokens,
             mandatory_floor_tokens,
-            section_tokens,
-            expansion_handles,
-        }
-        .into());
+        )?);
     }
 
     let preferred_within_ceiling = policy.preferred_tokens.min(policy.hard_ceiling_tokens);
@@ -3136,37 +3124,25 @@ fn render_packet_with_budget_policy(
         &required_handles,
     )?
     else {
-        let mut section_tokens = packet_section_accounting(&mandatory_floor_packet)?;
-        section_tokens.insert("returned_supplements".to_owned(), policy.supplement_tokens);
-        section_tokens.insert(
-            "packet_budget_decision_and_compile_audit".to_owned(),
+        return Err(packet_hard_ceiling_error(
+            &mandatory_floor_packet,
+            &required_handles,
+            policy,
             budget_metadata_tokens,
-        );
-        return Err(PacketHardCeilingExceeded {
-            preferred_tokens: policy.preferred_tokens,
-            hard_ceiling_tokens: policy.hard_ceiling_tokens,
             mandatory_floor_tokens,
-            section_tokens,
-            expansion_handles: packet_expansion_handles(&mandatory_floor_packet, &required_handles),
-        }
-        .into());
+        )?);
     };
     packet.token_budget_report.max_tokens = effective_tokens;
-    let packet_bytes = serde_json::to_vec(&packet)?;
+    let packet_bytes = serde_json::to_vec(&packet).map_err(EngineError::from)?;
     let (rendered_utf8_bytes, stu_estimate, content_digest) =
         canonical_measurement_for_payload(&packet_bytes)?;
-    let estimated_tokens = usize::try_from(stu_estimate.value).map_err(|_| {
-        EngineError::ServiceNotReady {
+    let estimated_tokens =
+        usize::try_from(stu_estimate.value).map_err(|_| EngineError::ServiceNotReady {
             service: "context-measurement".to_owned(),
             reason: "STU estimate is not representable as usize".to_owned(),
-        }
-    })?;
-    let (
-        serializer_id,
-        serializer_version,
-        serializer_options_digest,
-        serializer_profile_digest,
-    ) = packet_serializer_binding();
+        })?;
+    let (serializer_id, serializer_version, serializer_options_digest, serializer_profile_digest) =
+        packet_serializer_binding();
     let mut section_tokens = packet_section_accounting(&packet)?;
     section_tokens.insert("returned_supplements".to_owned(), policy.supplement_tokens);
     section_tokens.insert(
@@ -3199,6 +3175,29 @@ fn render_packet_with_budget_policy(
             reason,
         },
     ))
+}
+
+fn packet_hard_ceiling_error(
+    packet: &ContextPacketL3,
+    required_handles: &BTreeSet<&String>,
+    policy: PacketBudgetPolicy,
+    budget_metadata_tokens: usize,
+    mandatory_floor_tokens: usize,
+) -> Result<PacketCompileError, EngineError> {
+    let mut section_tokens = packet_section_accounting(packet)?;
+    section_tokens.insert("returned_supplements".to_owned(), policy.supplement_tokens);
+    section_tokens.insert(
+        "packet_budget_decision_and_compile_audit".to_owned(),
+        budget_metadata_tokens,
+    );
+    Ok(PacketHardCeilingExceeded {
+        preferred_tokens: policy.preferred_tokens,
+        hard_ceiling_tokens: policy.hard_ceiling_tokens,
+        mandatory_floor_tokens,
+        section_tokens,
+        expansion_handles: packet_expansion_handles(packet, required_handles),
+    }
+    .into())
 }
 
 fn packet_expansion_handles(
@@ -3548,10 +3547,7 @@ pub fn packet_section_accounting(
         "decision_locality_suffix".to_owned(),
         serialized_stu(&packet.decision_locality_suffix)?,
     );
-    sections.insert(
-        "codecortex".to_owned(),
-        serialized_stu(&packet.codecortex)?,
-    );
+    sections.insert("codecortex".to_owned(), serialized_stu(&packet.codecortex)?);
     sections.insert(
         "continuity".to_owned(),
         serialized_stu(&(
@@ -4202,7 +4198,9 @@ mod current_git_scope_tests {
             validate_packet_compile_plan(&plan).is_ok(),
             "typed unavailable source must be valid input"
         );
-        let packet = ContextCompiler::compile_control_unfinalized(&request, &[], None, None).packet;
+        let packet = ContextCompiler::compile_control_unfinalized(&request, &[], None, None)
+            .expect("control candidate")
+            .packet;
         let gate = packet_gate_candidate(
             &plan.pyramid_source,
             plan.compile_mode,
@@ -4720,7 +4718,8 @@ mod current_git_scope_tests {
             max_tokens: 1_200,
         };
 
-        let outcome = ContextCompiler::compile_control_unfinalized(&request, &[], None, None);
+        let outcome = ContextCompiler::compile_control_unfinalized(&request, &[], None, None)
+            .expect("control candidate");
 
         assert_eq!(outcome.read_audit, PacketSourceReadAudit::default());
         assert_eq!(outcome.packet.at_revision, MemoryRevision::new(0));
@@ -4755,9 +4754,11 @@ mod current_git_scope_tests {
         let current_scope = scope(project_id, SOURCE_COMMIT);
 
         let first =
-            ContextCompiler::compile_control_unfinalized(&request, &[], Some(&current_scope), None);
+            ContextCompiler::compile_control_unfinalized(&request, &[], Some(&current_scope), None)
+                .expect("control candidate");
         let second =
-            ContextCompiler::compile_control_unfinalized(&request, &[], Some(&current_scope), None);
+            ContextCompiler::compile_control_unfinalized(&request, &[], Some(&current_scope), None)
+                .expect("control candidate");
 
         assert_eq!(
             serde_json::to_vec(&first.packet)?,

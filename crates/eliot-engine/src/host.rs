@@ -87,7 +87,9 @@ impl SkillPackEntryReport {
             || self.raw_text_profile_options_digest != profile_options
             || self.raw_text_profile_digest != profile_digest
         {
-            return Err(measurement_error("skill raw-text measurement profile changed"));
+            return Err(measurement_error(
+                "skill raw-text measurement profile changed",
+            ));
         }
         if self.actual_tokens.is_some()
             || self.measured_fit.is_some()
@@ -181,15 +183,12 @@ impl SkillPackService {
             }
             let description_characters = description.chars().count();
             descriptions += description_characters;
-            listing_descriptions.push(description.to_owned());
+            listing_descriptions.push(description.clone());
             let nonblank_lines = body.lines().filter(|line| !line.trim().is_empty()).count();
             let (body_utf8_bytes, stu_estimate, body_content_sha256) =
                 exact_text_measurement(body.as_bytes())?;
-            let (
-                description_utf8_bytes,
-                description_stu_estimate,
-                description_content_sha256,
-            ) = exact_text_measurement(description.as_bytes())?;
+            let (description_utf8_bytes, description_stu_estimate, description_content_sha256) =
+                exact_text_measurement(description.as_bytes())?;
             if nonblank_lines > 100 {
                 errors.push(format!("{name}: body exceeds 100 nonblank lines"));
             }
@@ -266,7 +265,7 @@ impl SkillPackService {
                     ("antigravity".to_owned(), antigravity_parity),
                 ]),
             };
-            entry.validate_contents(&body, description)?;
+            entry.validate_contents(&body, &description)?;
             entries.push(entry);
         }
         let serialized_listing = serde_json::to_vec(&listing_descriptions)?;
@@ -363,13 +362,8 @@ fn exact_text_measurement(bytes: &[u8]) -> Result<(u64, StuEstimate, String), En
         reason: "UTF-8 byte length is not representable as u64".to_owned(),
     })?;
     let content_digest = sha256_hex(bytes);
-    let envelope = validate_envelope(
-        bytes,
-        declared_len,
-        &content_digest,
-        MAX_MEASUREMENT_BYTES,
-    )
-    .map_err(|error| EngineError::ServiceNotReady {
+    let envelope = validate_envelope(bytes, declared_len, &content_digest, MAX_MEASUREMENT_BYTES)
+        .map_err(|error| EngineError::ServiceNotReady {
         service: "context-measurement".to_owned(),
         reason: error.to_string(),
     })?;
@@ -406,12 +400,11 @@ fn validate_exact_text(
         service: "context-measurement".to_owned(),
         reason: error.to_string(),
     })?;
-    let expected_stu = stu_for_bytes(envelope.byte_len).map_err(|error| {
-        EngineError::ServiceNotReady {
+    let expected_stu =
+        stu_for_bytes(envelope.byte_len).map_err(|error| EngineError::ServiceNotReady {
             service: "context-measurement".to_owned(),
             reason: error.to_string(),
-        }
-    })?;
+        })?;
     if recorded_stu.value != expected_stu {
         return Err(measurement_error(
             "unvalidated STU does not match the bound UTF-8 bytes",

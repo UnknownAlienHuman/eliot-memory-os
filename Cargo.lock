@@ -1814,6 +1814,8 @@ dependencies = [
  "blake3",
  "eliot-bootstrap",
  "eliot-build-test-graph",
+ "eliot-context-contracts",
+ "eliot-context-measurement",
  "eliot-contracts",
  "eliot-instrument-api",
  "eliot-instrument-nextest",

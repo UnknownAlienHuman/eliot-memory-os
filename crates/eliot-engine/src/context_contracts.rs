@@ -59,9 +59,9 @@
 
 use std::collections::BTreeMap;
 
-use serde_json::Value;
 use eliot_context_contracts::{MeasurementStatus, StuEstimate};
 use eliot_context_measurement::{MAX_MEASUREMENT_BYTES, stu_for_bytes, validate_envelope};
+use serde_json::Value;
 
 use eliot_types::memory::GovernedGitScope;
 use eliot_types::{
