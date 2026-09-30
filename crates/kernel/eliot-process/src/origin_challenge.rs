@@ -525,8 +525,11 @@ impl OriginControlGrant {
     /// The effect boundary calls this with the identity the authoritative
     /// owner still holds for the same operation, so a grant minted for one
     /// child, one image, one start time, or one generation cannot authorize a
-    /// different or substituted target. A grant is not transferable between
-    /// operations, so this never needs the operation identity to match.
+    /// different or substituted target. This checks identity and generation
+    /// only: a caller about to perform one specific operation class must also
+    /// bind the grant to that class with
+    /// [`Self::binds_target_for_operation`], so a grant minted for one
+    /// operation cannot authorize another.
     pub fn binds_target(
         &self,
         physical: &PhysicalProcessBinding,
@@ -539,6 +542,32 @@ impl OriginControlGrant {
             return Err(ContractError::FenceMismatch);
         }
         Ok(())
+    }
+
+    /// Checks that this grant authorizes exactly the intended operation class
+    /// on exactly the target the caller is about to act on.
+    ///
+    /// The effect boundary calls this with the operation it is about to
+    /// perform and the identity the authoritative owner still holds for the
+    /// same target object, so a grant minted for one operation class (for
+    /// example kill) cannot authorize a different one (for example adoption
+    /// or credential attachment), and a grant minted for one child, one
+    /// image, one start time, or one generation cannot authorize a different
+    /// or substituted target. Uses the same `origin_operation` typed failure
+    /// the authority decision uses for a wrong operation class.
+    pub fn binds_target_for_operation(
+        &self,
+        physical: &PhysicalProcessBinding,
+        generation: Generation,
+        expected_operation: OriginControlOperation,
+    ) -> Result<(), ContractError> {
+        if self.operation != expected_operation {
+            return Err(ContractError::InvalidValue {
+                field: "origin_operation",
+                reason: "grant does not allow this operation class",
+            });
+        }
+        self.binds_target(physical, generation)
     }
 
     fn mint(
