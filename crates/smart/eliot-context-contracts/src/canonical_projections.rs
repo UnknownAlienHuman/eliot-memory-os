@@ -11,6 +11,10 @@
 //! never filler. All projections in one set must share one exact fence via
 //! [`eliot_contracts::fences_match_exact`]; any drift, and any absent optional
 //! revision on only one side, fails closed.
+//!
+//! The separate source-lineage readback is an input gate for the Governor
+//! Orientation join. Its source-only `Complete` disposition does not create or
+//! qualify a [`CanonicalProjectionSet`].
 
 #![forbid(unsafe_code)]
 
@@ -18,7 +22,7 @@ use eliot_contracts::{StateFence, fences_match_exact};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{ContextBinding, ContextError, OmissionRecord, validate_text};
+use crate::{ContextBinding, ContextError, OmissionRecord, SourceSnapshot, validate_text};
 
 /// Exact schema version accepted by the projection shapes.
 pub const CANONICAL_PROJECTIONS_SCHEMA_VERSION: u32 = 1;
@@ -232,6 +236,214 @@ impl CanonicalProjectionSet {
         }
         for omission in &self.omissions {
             omission.validate(&self.binding)?;
+        }
+        Ok(())
+    }
+}
+
+/// Owner-side source role needed to retain immutable lineage for CC-004.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CanonicalProjectionSourceRole {
+    /// Retained task-frame source used to bind task, continuity, and safety.
+    TaskFrame,
+    /// Task-scoped negative-memory source used to ground safety triggers.
+    TaskScopedSafety,
+    /// Exact admitted WorkScope binding used by the affordance join.
+    WorkScopeBinding,
+    /// Authorized capability evidence used by the affordance join.
+    AuthorizedAffordances,
+    /// Owner-retained omission list, including an explicit empty list.
+    OwnerOmissionRecords,
+}
+
+/// Projection or omission surface whose exact owner source is being retained.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CanonicalProjectionSourceTarget {
+    Task,
+    Continuity,
+    Safety,
+    Affordance,
+    Omissions,
+}
+
+/// One required source-lineage pair in the fixed Orientation owner join.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalProjectionSourceRequirement {
+    pub target: CanonicalProjectionSourceTarget,
+    pub role: CanonicalProjectionSourceRole,
+}
+
+/// Immutable lineage denominator consumed by the Orientation projection join.
+/// The task-frame source is repeated for the Task, Continuity, and Safety
+/// targets and must identify the same exact snapshot in each place.
+pub const CANONICAL_PROJECTION_SOURCE_DENOMINATOR: [CanonicalProjectionSourceRequirement; 7] = [
+    CanonicalProjectionSourceRequirement {
+        target: CanonicalProjectionSourceTarget::Task,
+        role: CanonicalProjectionSourceRole::TaskFrame,
+    },
+    CanonicalProjectionSourceRequirement {
+        target: CanonicalProjectionSourceTarget::Continuity,
+        role: CanonicalProjectionSourceRole::TaskFrame,
+    },
+    CanonicalProjectionSourceRequirement {
+        target: CanonicalProjectionSourceTarget::Safety,
+        role: CanonicalProjectionSourceRole::TaskFrame,
+    },
+    CanonicalProjectionSourceRequirement {
+        target: CanonicalProjectionSourceTarget::Safety,
+        role: CanonicalProjectionSourceRole::TaskScopedSafety,
+    },
+    CanonicalProjectionSourceRequirement {
+        target: CanonicalProjectionSourceTarget::Affordance,
+        role: CanonicalProjectionSourceRole::WorkScopeBinding,
+    },
+    CanonicalProjectionSourceRequirement {
+        target: CanonicalProjectionSourceTarget::Affordance,
+        role: CanonicalProjectionSourceRole::AuthorizedAffordances,
+    },
+    CanonicalProjectionSourceRequirement {
+        target: CanonicalProjectionSourceTarget::Omissions,
+        role: CanonicalProjectionSourceRole::OwnerOmissionRecords,
+    },
+];
+
+/// One owner-issued immutable source snapshot for one required target/role.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalProjectionSourceSnapshot {
+    pub target: CanonicalProjectionSourceTarget,
+    pub role: CanonicalProjectionSourceRole,
+    pub snapshot: SourceSnapshot,
+}
+
+/// Source-only disposition. `Complete` means every lineage source is present;
+/// the consuming Orientation join must still validate projection semantics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CanonicalProjectionSourceDisposition {
+    Missing,
+    Partial,
+    Complete,
+}
+
+/// Fixed-denominator lineage readback for the Orientation projection join.
+/// A partial or missing source closure is an explicit value, never an absent
+/// optional field or a strict `CanonicalProjectionSet`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalProjectionSourceReadback {
+    pub binding: ContextBinding,
+    pub expected: Vec<CanonicalProjectionSourceRequirement>,
+    pub snapshots: Vec<CanonicalProjectionSourceSnapshot>,
+    pub missing: Vec<CanonicalProjectionSourceRequirement>,
+    pub disposition: CanonicalProjectionSourceDisposition,
+}
+
+impl CanonicalProjectionSourceReadback {
+    /// Build a bounded readback from owner-issued lineage snapshots. The
+    /// disposition and missing denominator entries are derived, not supplied.
+    pub fn new(
+        binding: ContextBinding,
+        snapshots: Vec<CanonicalProjectionSourceSnapshot>,
+    ) -> Result<Self, ContextError> {
+        if snapshots.len() > CANONICAL_PROJECTION_SOURCE_DENOMINATOR.len() {
+            return Err(ContextError::Bounds {
+                field: "projections.source_snapshots",
+            });
+        }
+        let expected = CANONICAL_PROJECTION_SOURCE_DENOMINATOR.to_vec();
+        let missing = expected
+            .iter()
+            .filter(|required| {
+                !snapshots.iter().any(|source| {
+                    source.target == required.target && source.role == required.role
+                })
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        let disposition = if missing.is_empty() {
+            CanonicalProjectionSourceDisposition::Complete
+        } else if snapshots.is_empty() {
+            CanonicalProjectionSourceDisposition::Missing
+        } else {
+            CanonicalProjectionSourceDisposition::Partial
+        };
+        let readback = Self {
+            binding,
+            expected,
+            snapshots,
+            missing,
+            disposition,
+        };
+        readback.validate(&readback.binding)?;
+        Ok(readback)
+    }
+
+    /// Validate exact ContextBinding/fence, the fixed denominator, owner
+    /// lineage, exact missing set, and source-only disposition.
+    pub fn validate(&self, binding: &ContextBinding) -> Result<(), ContextError> {
+        self.binding.validate()?;
+        if self.binding != *binding
+            || !fences_match_exact(&self.binding.state_fence, &binding.state_fence)
+        {
+            return Err(ContextError::InvalidFence);
+        }
+        if self.expected.as_slice() != CANONICAL_PROJECTION_SOURCE_DENOMINATOR.as_slice() {
+            return Err(ContextError::InvalidField("projections.source_denominator"));
+        }
+        if self.snapshots.len() > CANONICAL_PROJECTION_SOURCE_DENOMINATOR.len() {
+            return Err(ContextError::Bounds {
+                field: "projections.source_snapshots",
+            });
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for source in &self.snapshots {
+            source.snapshot.validate()?;
+            if !CANONICAL_PROJECTION_SOURCE_DENOMINATOR
+                .iter()
+                .any(|required| required.target == source.target && required.role == source.role)
+            {
+                return Err(ContextError::InvalidField("projections.source_role"));
+            }
+            if !seen.insert((source.target, source.role)) {
+                return Err(ContextError::Duplicate("projections.source_role"));
+            }
+        }
+        for source in &self.snapshots {
+            if let Some(shared_role) = self.snapshots.iter().find(|other| {
+                other.role == source.role && other.target != source.target
+            }) {
+                if shared_role.snapshot != source.snapshot {
+                    return Err(ContextError::InvalidField(
+                        "projections.shared_source_lineage",
+                    ));
+                }
+            }
+        }
+        let expected_missing = CANONICAL_PROJECTION_SOURCE_DENOMINATOR
+            .iter()
+            .filter(|required| {
+                !self.snapshots.iter().any(|source| {
+                    source.target == required.target && source.role == required.role
+                })
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        if self.missing != expected_missing {
+            return Err(ContextError::InvalidField("projections.missing_sources"));
+        }
+        let expected_disposition = if self.missing.is_empty() {
+            CanonicalProjectionSourceDisposition::Complete
+        } else if self.snapshots.is_empty() {
+            CanonicalProjectionSourceDisposition::Missing
+        } else {
+            CanonicalProjectionSourceDisposition::Partial
+        };
+        if self.disposition != expected_disposition {
+            return Err(ContextError::InvalidField("projections.source_disposition"));
         }
         Ok(())
     }

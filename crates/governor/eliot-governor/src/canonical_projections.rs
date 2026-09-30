@@ -1,13 +1,9 @@
-//! Governor-owned canonical projection composer (CC-004).
+//! Intermediate Governor projection summary for the Orientation join.
 //!
-//! Pure deterministic composer from the four Governor snapshots to the
-//! owner-neutral projection set consumed through contracts. It takes only
-//! shared references (`TaskLifecycleSnapshot`, `SessionLifecycleSnapshot`,
-//! `WorkScopeBindingSnapshot`, and `ObservationJournalEntry` slices), enforces
-//! one fence via [`eliot_contracts::fences_match_exact`], and reports gaps as
-//! explicit [`ProjectionOmission`] records. It opens no store, touches no
-//! Kernel port, and defines no new port: the output is data for the Smart
-//! contract set, never an effect.
+//! `compose_canonical_projections` returns a `GovernorProjectionSet`, not
+//! the strict owner-neutral `CanonicalProjectionSet`. The Orientation join
+//! must validate it against retained source payloads, TaskCognition fields,
+//! WorkScope, and owner omissions before it can construct the canonical set.
 
 #![forbid(unsafe_code)]
 
@@ -464,13 +460,12 @@ fn project_affordance(
     })
 }
 
-/// Composes the canonical projection set from four snapshot references.
+/// Composes the intermediate Governor projection summary from four snapshots.
 ///
-/// The function is pure and deterministic: same snapshots always yield the
-/// same ordered set. It enforces one fence — the scope binding fence and the
-/// task record fence must each be compatible with `fence` in both directions
-/// — and reports missing task/continuity data as explicit omissions instead
-/// of filler. No store, Kernel, network, or clock is touched.
+/// This output alone does not satisfy CC-004: it has no exact `ContextBinding`
+/// or owner-issued `SourceSnapshot` lineage. The Orientation projection join
+/// must verify the member values and retain the canonical source readback
+/// before publishing a strict set.
 ///
 /// # Errors
 ///

@@ -54,9 +54,13 @@ pub use boundary::{
 };
 
 pub use canonical_projections::{
-    AffordanceProjection, CANONICAL_PROJECTIONS_SCHEMA_VERSION, CanonicalProjectionSet,
-    ContinuityProjection, MAX_PROJECTION_ENTRIES, MAX_PROJECTION_TEXT, MAX_SET_OMISSIONS,
-    SafetyProjection, TaskProjection,
+    AffordanceProjection, CANONICAL_PROJECTIONS_SCHEMA_VERSION,
+    CANONICAL_PROJECTION_SOURCE_DENOMINATOR, CanonicalProjectionSourceDisposition,
+    CanonicalProjectionSourceReadback, CanonicalProjectionSourceRequirement,
+    CanonicalProjectionSourceRole, CanonicalProjectionSourceSnapshot,
+    CanonicalProjectionSourceTarget, CanonicalProjectionSet, ContinuityProjection,
+    MAX_PROJECTION_ENTRIES, MAX_PROJECTION_TEXT, MAX_SET_OMISSIONS, SafetyProjection,
+    TaskProjection,
 };
 pub use decision_lineage::{
     DecisionExecutionLineageRefs, DecisionLineageActionContractRef, DecisionLineageAnchorLink,
