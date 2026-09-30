@@ -379,12 +379,18 @@ fn classify_candidate(
     // before any capability claim, because a refused, unreadable, unattributable
     // or uninspected input proves nothing about the binary.
     //
-    // The candidate's own probe coverage is deliberately not re-derived here.
-    // `InstallationSurvey::validate` already refuses a survey whose candidate
-    // admission, probe outcome and answer set disagree, so by the time a live
-    // survey reaches here the two facts below are already the whole of the
-    // per-identity probe story. Repeating that rule would be a second copy of an
-    // invariant one owner already holds.
+    // The candidate's own probe coverage is deliberately not re-derived here,
+    // and there is no per-candidate coverage guard here because none could ever
+    // fire. `coalesce_candidates` is the only constructor of a
+    // `SurveyCandidate`, and it sets `probe_outcome` from one two-armed match:
+    // `Found` when an admitted executor answered this exact identity, and
+    // `Withheld` when none did. It cannot emit `Denied`, `Unreadable` or
+    // `Ambiguous`, and `InstallationSurvey::validate` then refuses any survey
+    // whose candidate admission, outcome and answer set disagree — so by the
+    // time a live survey reaches here, the two facts read below are already the
+    // whole of the per-identity probe story. A guard for the unreachable
+    // outcomes would be dead code, and repeating the reachable rule would be a
+    // second copy of an invariant one owner already holds.
     let gaps = unreadable_coverage_gaps(family);
     if !gaps.is_empty() {
         return Ok(unsupported(&gaps));
@@ -508,6 +514,14 @@ fn live_binding(
 /// the value is well-formed and that its state agrees with the qualifications it
 /// names, without holding the survey it was derived from.
 ///
+/// Two independent facts are proved, and a caller cannot get one without the
+/// other. This function proves the first: the identities are well-formed
+/// handles, the binding's two revisions are non-zero, the survey content digest
+/// is a digest, and the catalogue acceptance and the installation approval name
+/// the same System Owner. [`validate_advertisement_state`] proves the second —
+/// that the carried state is one the derivation could have produced — and is
+/// called from here rather than left to the caller.
+///
 /// # Errors
 /// Returns [`InstallationError`] when the advertisement is malformed or its
 /// state disagrees with the missing qualifications it carries.
@@ -574,8 +588,29 @@ pub fn validate_advertisement(
     if binding.catalogue_accepted_by != binding.confirmed_owner {
         return Err(InstallationError::IdentityConflict);
     }
+    validate_advertisement_state(&advertisement.state)
+}
 
-    let missing = &advertisement.state.missing;
+/// Proves one state agrees with the missing qualifications it carries.
+///
+/// This is the advertisement's second job, and it is a job about the *state*
+/// alone: the binding proves where the advertisement was derived from, while
+/// this proves the state is the one that derivation could have produced. A
+/// consumer holding only an advertisement — after a restart, say — can run this
+/// without the survey it was derived from, so nothing here may read live state.
+///
+/// Each status is checked against the one missing set that status can honestly
+/// carry. Those sets are not interchangeable: a `Probed` state that still named
+/// a gap, a `Declared` state naming any gap but the unprobed one, a
+/// `Discovered` state naming a gap before any was evaluated, and an
+/// `Unsupported` state whose two copies of its set disagree are four different
+/// ways of reporting a qualification the advertisement did not establish.
+///
+/// # Errors
+/// Returns [`InstallationError`] when a handle is malformed, a list is unsorted
+/// or not distinct, or the status and the missing set disagree.
+fn validate_advertisement_state(state: &ManagedCapabilityState) -> Result<(), InstallationError> {
+    let missing = &state.missing;
     for pair in missing.windows(2) {
         if pair[0] >= pair[1] {
             return Err(InstallationError::InvalidField {
@@ -584,7 +619,7 @@ pub fn validate_advertisement(
             });
         }
     }
-    match &advertisement.state.status {
+    match &state.status {
         ManagedCapabilityStatus::Probed {
             probe_id,
             answer_refs,
