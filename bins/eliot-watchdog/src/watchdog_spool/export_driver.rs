@@ -769,7 +769,10 @@ async fn transact_export_batch(
             "Kernel export response was not JSON".to_owned(),
         ));
     };
-    acknowledgement_from_kernel_outcome(&value, payload, batch.schema_version)
+    // The acknowledgement answers the submitted payload, whose spool revision
+    // is the owner-generated window revision `export_batch_payload` copied from
+    // the batch; this function has no other view of the batch.
+    acknowledgement_from_kernel_outcome(&value, payload, payload.schema_version)
 }
 
 /// Projects one owner-generated export window onto the typed Kernel payload.

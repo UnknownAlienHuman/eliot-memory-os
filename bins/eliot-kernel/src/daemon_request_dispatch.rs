@@ -3760,18 +3760,25 @@ impl KernelComposition {
                     if payload.as_object().is_none_or(|object| object.len() != 1) {
                         return Err(TransportError::SessionFenced);
                     }
-                    match self.claim_watchdog_export_batch(session)? {
-                        Some(batch) => serde_json::json!({
-                            "status": "known",
-                            "value": { "batch": batch },
-                            "recovery": null,
-                        }),
-                        None => serde_json::json!({
-                            "status": "known",
-                            "value": { "batch": null },
-                            "recovery": null,
-                        }),
-                    }
+                    // Every arm of this dispatch match answers with
+                    // `Result<serde_json::Value, TransportError>`, so the
+                    // claim's own refusal is mapped through rather than
+                    // unwrapped: the null poll and the transport refusal keep
+                    // the same decided error type the neighbouring operations
+                    // propagate.
+                    self.claim_watchdog_export_batch(session)
+                        .map(|batch| match batch {
+                            Some(batch) => serde_json::json!({
+                                "status": "known",
+                                "value": { "batch": batch },
+                                "recovery": null,
+                            }),
+                            None => serde_json::json!({
+                                "status": "known",
+                                "value": { "batch": null },
+                                "recovery": null,
+                            }),
+                        })
                 }
                 #[cfg(not(windows))]
                 {

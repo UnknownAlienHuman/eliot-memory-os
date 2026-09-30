@@ -675,7 +675,16 @@ impl WatchdogComposition {
                                     let verified_lease = admission.lease().clone();
                                     let export_lease = admission.lease().clone();
                                     tokio::spawn(async move {
-                                        match reconcile_kernel
+                                        // `KernelWatchdogPort` takes `self:
+                                        // Arc<Self>`, so each call consumes the
+                                        // handle it is given. Both passes run
+                                        // inside this one task, so the intent
+                                        // pass takes a fresh handle and the
+                                        // export pass keeps this binding. Only
+                                        // the `Arc` handle is duplicated; the
+                                        // sensor behind it is shared, never
+                                        // cloned.
+                                        match Arc::clone(&reconcile_kernel)
                                             .reconcile_intents(verified_lease)
                                             .await
                                         {

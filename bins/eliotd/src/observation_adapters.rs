@@ -272,7 +272,7 @@ pub async fn admit_claimed_watchdog_export(
         .map_err(|error| format!("Watchdog drain base operation: {error}"))?;
     let request_id = eliot_contracts::RequestId::new(format!("{operation_text}:admit"))
         .map_err(|error| format!("Watchdog drain request identity: {error}"))?;
-    let metadata = eliot_protocol::RequestMetadata {
+    let metadata = eliot_contracts::RequestMetadata {
         request_id: request_id.clone(),
         session_id: None,
         task_id: None,

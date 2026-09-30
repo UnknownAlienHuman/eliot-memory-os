@@ -5927,6 +5927,26 @@ impl WatchdogSpoolExportBatchPayload {
                 reason: "owner-computed export byte size must be positive",
             });
         }
+        self.validate_covered_entries()?;
+        if self.payload_sha256 != self.compute_digest()? {
+            return Err(ProtocolError::InvalidField {
+                field: "watchdog_spool_export_batch.payload_sha256",
+                reason: "payload digest mismatch",
+            });
+        }
+        Ok(())
+    }
+
+    /// Validates that the covered entry list answers the submitted window.
+    ///
+    /// This is the one concern [`Self::validate`] delegates: the entries must
+    /// individually hold the window's own identity, must be strictly
+    /// consecutive, must continue the predecessor cursor at the first entry, and
+    /// must close exactly on the submitted `last_sequence`. Kept together
+    /// because each check is only meaningful against the others — a consecutive
+    /// list that starts at the wrong cursor, or that ends short of the
+    /// submitted range, is the same defect.
+    fn validate_covered_entries(&self) -> Result<(), ProtocolError> {
         let mut previous: Option<u64> = None;
         for entry in &self.entries {
             entry.validate(&self.installation_id)?;
@@ -5960,12 +5980,6 @@ impl WatchdogSpoolExportBatchPayload {
             return Err(ProtocolError::InvalidField {
                 field: "watchdog_spool_export_batch.last_sequence",
                 reason: "the covered range must answer the submitted window boundaries",
-            });
-        }
-        if self.payload_sha256 != self.compute_digest()? {
-            return Err(ProtocolError::InvalidField {
-                field: "watchdog_spool_export_batch.payload_sha256",
-                reason: "payload digest mismatch",
             });
         }
         Ok(())
