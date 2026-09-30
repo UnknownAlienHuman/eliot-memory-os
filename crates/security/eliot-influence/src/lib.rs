@@ -954,11 +954,12 @@ impl BoundedRevocationOutcome {
         // disposition exactly.
         let mut omitted: BTreeMap<(String, String), OmissionCause> = BTreeMap::new();
         for omission in &self.omissions {
-            let position = (omission.edge_source.clone(), omission.edge_dependent.clone());
+            let position = (
+                omission.edge_source.clone(),
+                omission.edge_dependent.clone(),
+            );
             if omitted.insert(position.clone(), omission.cause).is_some() {
-                return Err(InfluenceError::OutcomeBindingMismatch(
-                    "outcome.omissions",
-                ));
+                return Err(InfluenceError::OutcomeBindingMismatch("outcome.omissions"));
             }
             let declared_cause = declared.cause_at(&position);
             let consistent = match declared_cause {
@@ -971,9 +972,7 @@ impl BoundedRevocationOutcome {
                 }
             };
             if !consistent {
-                return Err(InfluenceError::OutcomeBindingMismatch(
-                    "outcome.omissions",
-                ));
+                return Err(InfluenceError::OutcomeBindingMismatch("outcome.omissions"));
             }
         }
         // On a COMPLETE outcome the recorded omissions must be the whole
@@ -990,17 +989,13 @@ impl BoundedRevocationOutcome {
                     .iter()
                     .any(|(position, cause)| omitted.get(position) != Some(cause))
             {
-                return Err(InfluenceError::OutcomeBindingMismatch(
-                    "outcome.omissions",
-                ));
+                return Err(InfluenceError::OutcomeBindingMismatch("outcome.omissions"));
             }
             // `frontier` is CURRENT unresolved work, not a historical trace,
             // and a traversal that finished within bounds has none. An omitted
             // dependent is named by its omission, not by a residual frontier.
             if !self.frontier.is_empty() {
-                return Err(InfluenceError::OutcomeBindingMismatch(
-                    "outcome.frontier",
-                ));
+                return Err(InfluenceError::OutcomeBindingMismatch("outcome.frontier"));
             }
         }
         Ok(())
@@ -1022,10 +1017,7 @@ struct DeclaredEdgeClosure {
 
 impl DeclaredEdgeClosure {
     /// The disposition the request declared at one exact edge position.
-    fn disposition_at(
-        &self,
-        position: &(String, String),
-    ) -> Option<InfluenceEdgeDisposition> {
+    fn disposition_at(&self, position: &(String, String)) -> Option<InfluenceEdgeDisposition> {
         self.positions.get(position).copied()
     }
 
