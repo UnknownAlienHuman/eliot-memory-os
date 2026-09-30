@@ -436,6 +436,19 @@ pub enum MaintenanceResultPublishError {
     /// value.
     #[error("maintenance result publication protocol: {0}")]
     Protocol(#[from] ProtocolError),
+    /// The canonical route returned a terminal receipt that did not commit, so
+    /// the observation was not admitted and the obligation stays owed.
+    #[error(
+        "maintenance result was not admitted: publication {publication_id} returned {status:?} for {operation_id}"
+    )]
+    NotAdmitted {
+        /// The stable publication identity that was offered.
+        publication_id: String,
+        /// The exact operation the store issued the terminal receipt for.
+        operation_id: OperationId,
+        /// The terminal store status, exactly as issued.
+        status: WriteReceiptStatus,
+    },
     /// The composition, the canonical admission, or the maintenance owner
     /// refused the publication, each in its own typed variant.
     #[error("maintenance result publication: {0}")]
@@ -502,7 +515,56 @@ impl DaemonComposition {
             .admit_maintenance_result(&identity, &base_operation, &record)
             .await
             .map_err(DaemonError::Composition)?;
+        // A terminal non-committed receipt is not publication. The route
+        // returns every terminal status exactly as issued, so this is where a
+        // rejected or dead-lettered observation stops being an admission: it
+        // never becomes a receipt the maintenance owner could record as one.
+        if receipt.status != WriteReceiptStatus::Committed {
+            return Err(MaintenanceResultPublishError::NotAdmitted {
+                publication_id: obligation.publication_id.clone(),
+                operation_id: receipt.operation_id,
+                status: receipt.status,
+            });
+        }
         Ok(MaintenanceResultPublication::Reconciled { receipt })
+    }
+
+    /// Admits the canonical receipt for one published maintenance result onto
+    /// the retained durable job revision.
+    ///
+    /// This is the production call that makes the second of the three states
+    /// durable: the maintenance owner already recorded that the work happened
+    /// and that an observation was owed, and this records that the observation
+    /// was admitted, under the exact receipt the store returned. It settles
+    /// only the delivery state — never the lifecycle state, the outcome
+    /// reference, or any earlier obligation — so a receipt cannot rewrite the
+    /// execution history it observes, and no outcome is ever written here.
+    ///
+    /// Replaying the same receipt is a reconciliation and persists nothing; a
+    /// different receipt under one identity is refused by the owner as a
+    /// conflict rather than replacing the first admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MaintenanceResultPublishError`] when the composition is not
+    /// ready or the retained-job write is refused. The maintenance owner's own
+    /// refusal travels unchanged inside [`DaemonError::Composition`], so a
+    /// dangling publication identity stays distinguishable from a transport
+    /// failure.
+    pub fn admit_maintenance_observation_receipt(
+        &self,
+        job_id: &str,
+        publication_id: &str,
+        observation_receipt_ref: &str,
+    ) -> Result<eliot_maintenance::MaintenanceJob, MaintenanceResultPublishError> {
+        if self.readiness() != eliot_governor::CompositionReadiness::Ready {
+            return Err(MaintenanceResultPublishError::Daemon(
+                DaemonError::Composition(CompositionError::NotReady),
+            ));
+        }
+        self.governor
+            .admit_maintenance_observation_receipt(job_id, publication_id, observation_receipt_ref)
+            .map_err(|error| MaintenanceResultPublishError::Daemon(DaemonError::Composition(error)))
     }
 }
 
