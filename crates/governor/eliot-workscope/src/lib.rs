@@ -1363,9 +1363,7 @@ impl OnboardingReadinessReceipt {
         Ok(())
     }
 
-    fn validate_selected_evidence(
-        evidence: &TaskSelectionEvidence,
-    ) -> Result<(), WorkScopeError> {
+    fn validate_selected_evidence(evidence: &TaskSelectionEvidence) -> Result<(), WorkScopeError> {
         evidence
             .validate()
             .map_err(|_| WorkScopeError::InvalidTaskSelectionEvidence)?;
