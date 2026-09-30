@@ -672,8 +672,6 @@ pub struct VerifiedProviderMaterial {
     pub expectation: ProviderCapabilityExpectation,
     /// Live fence freshly re-queried by the daemon over its session.
     pub live_fence: StateFence,
-    /// Kernel-issued session binding the daemon presented under.
-    pub session_binding: String,
     /// Issue #265 selection/health observation, if any. Input only: never
     /// read by the verifier, never mints admission.
     pub health: Option<ProviderSelectionHealth>,
@@ -720,11 +718,7 @@ pub(crate) fn build_admitted_provider_capability(
         material.worker_generation,
         material.presented_fence,
     )?;
-    let currentness = OwnerCurrentness::new(
-        material.expectation,
-        material.live_fence,
-        material.session_binding,
-    )?;
+    let currentness = OwnerCurrentness::new(material.expectation, material.live_fence)?;
     Ok(AdmittedProviderCapability::new(
         material.identity,
         presented,

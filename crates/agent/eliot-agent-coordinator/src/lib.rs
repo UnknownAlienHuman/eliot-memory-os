@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+mod admitted_provider;
 mod core;
 mod fair_pull_loop;
 mod model;
@@ -24,6 +25,7 @@ mod swarm_staffing;
 #[cfg(test)]
 mod tests;
 
+pub use crate::admitted_provider::{AdmittedProviderFactory, OwnerLoadedClaimRow};
 pub use crate::core::AgentCoordinator;
 pub use crate::fair_pull_loop::{FAIR_PULL_LOOP_PROOF_CEILING, FairPullOutcome, FairPullStart};
 pub use crate::model::*;

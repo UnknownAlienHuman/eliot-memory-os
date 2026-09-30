@@ -140,14 +140,16 @@ impl PresentedClaimMaterial {
 /// half, issue #1108).
 ///
 /// Values the daemon observed over its authenticated Kernel session: the
-/// Governor currentness it holds, the live fence it re-queried, and the
-/// Kernel-issued session binding it presented under. Carries no secret
-/// material (revisions, epoch, fence, identity refs only).
+/// Governor currentness it holds and the live fence it re-queried.
+/// Carries no secret material (revisions, epoch, fence, identity refs only).
+///
+/// The owner half retains no caller-supplied proof strings: session proof
+/// material is resolved live by the daemon at each construction and is never
+/// stored here, so a retained string can never mint trust.
 #[derive(Clone, Debug)]
 pub struct OwnerCurrentness {
     expectation: ProviderCapabilityExpectation,
     live_fence: StateFence,
-    session_binding: String,
 }
 
 impl OwnerCurrentness {
@@ -161,14 +163,11 @@ impl OwnerCurrentness {
     ///
     /// # Errors
     ///
-    /// Returns [`CoordinatorError::InvalidField`] for a blank or
-    /// control-bearing session binding, or
-    /// [`CoordinatorError::ProviderContract`] for a malformed current
+    /// Returns [`CoordinatorError::InvalidField`]     /// [`CoordinatorError::ProviderContract`] for a malformed current
     /// expectation shape or an invalid live fence.
     pub fn new(
         expectation: ProviderCapabilityExpectation,
         live_fence: StateFence,
-        session_binding: String,
     ) -> Result<Self, CoordinatorError> {
         expectation
             .validate()
@@ -176,11 +175,9 @@ impl OwnerCurrentness {
         live_fence
             .validate()
             .map_err(|error| CoordinatorError::ProviderContract(error.to_string()))?;
-        validate_text(&session_binding, "session_binding")?;
         Ok(Self {
             expectation,
             live_fence,
-            session_binding,
         })
     }
 

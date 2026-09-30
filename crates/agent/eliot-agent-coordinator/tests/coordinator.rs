@@ -486,7 +486,6 @@ fn integration_capability(revoked: bool) -> TestResult<AdmittedProviderCapabilit
             revoked,
         },
         fence(),
-        "session-integration-binding".to_owned(),
         None,
         0,
     )?)

@@ -253,9 +253,8 @@ impl SoloClaimedHalves {
             expectation: self.expectation.clone(),
             // Overwritten unconditionally by the session-bound resolution
             // inside `agent_fabric_verified_capability` before any verifier
-            // observes them; never read beforehand.
+            // observes it; never read beforehand.
             live_fence: self.presented_fence.clone(),
-            session_binding: String::new(),
             health: None,
             minimum_event_sequence: self.minimum_event_sequence,
         }
@@ -1720,7 +1719,6 @@ fn restore_solo_fabric(
 fn build_solo_restore_capability(
     material: VerifiedProviderMaterial,
     live_fence: eliot_contracts::StateFence,
-    session_binding: String,
 ) -> Result<AdmittedProviderCapability, FabricError> {
     if !material
         .expectation
@@ -1742,7 +1740,7 @@ fn build_solo_restore_capability(
         material.worker_generation,
         material.presented_fence,
     )?;
-    let currentness = OwnerCurrentness::new(material.expectation, live_fence, session_binding)?;
+    let currentness = OwnerCurrentness::new(material.expectation, live_fence)?;
     Ok(AdmittedProviderCapability::new(
         material.identity,
         presented,
@@ -1803,15 +1801,14 @@ fn restore_solo_fabric(
             "solo restore refuses a fence-moved definition".to_owned(),
         )));
     }
-    let session_binding = composition.owner_session_binding().ok_or_else(|| {
-        DaemonError::Kernel(
+    if composition.owner_session_binding().is_none() {
+        return Err(DaemonError::Kernel(
             "daemon has no validated Kernel session binding; verified provider admission stays plan-only"
                 .to_owned(),
-        )
-    })?;
-    let capability =
-        build_solo_restore_capability(projection.claimed.material(), live_fence, session_binding)
-            .map_err(DaemonError::ProviderAdmission)?;
+        ));
+    }
+    let capability = build_solo_restore_capability(projection.claimed.material(), live_fence)
+        .map_err(DaemonError::ProviderAdmission)?;
     let config = daemon_coordinator_config()?;
     let ports = composition.production_fabric_ports()?;
     let store = SemanticRevisionStore::new(composition.state_root());

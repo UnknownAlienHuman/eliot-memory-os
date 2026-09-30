@@ -212,7 +212,6 @@ impl AdmittedProviderFactory {
         presented_fence: StateFence,
         expectation: ProviderCapabilityExpectation,
         live_fence: StateFence,
-        session_binding: String,
         health: Option<ProviderSelectionHealth>,
         minimum_event_sequence: u64,
     ) -> Result<AdmittedProviderCapability, CoordinatorError> {
@@ -244,7 +243,7 @@ impl AdmittedProviderFactory {
             worker_generation,
             presented_fence,
         )?;
-        let currentness = OwnerCurrentness::new(expectation, live_fence, session_binding)?;
+        let currentness = OwnerCurrentness::new(expectation, live_fence)?;
         AdmittedProviderCapability::new(
             identity,
             presented,

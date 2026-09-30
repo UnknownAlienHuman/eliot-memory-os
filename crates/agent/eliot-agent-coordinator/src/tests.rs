@@ -29,16 +29,15 @@ use eliot_security_contracts::PrivacyClass;
 use crate::core::{ProviderProofKind, ProviderVerifier};
 use crate::{
     AdmissionId, AdmittedLaneReceipt, AdmittedProviderCapability, AdmittedProviderFactory,
-    AgentCoordinator, CancelCommand, CancellationReconciliationId, CandidateId,
-    CoordinatorConfig, CoordinatorError, CoordinatorEvent, DescendantClosureSubmission,
-    ExecutionContext, LearningRole, ObservationId, OperationId, OutcomeReconciliationId,
-    OwnerLoadedClaimRow, PlanGap, ProviderAdmissionReceipt, ProviderBindingSnapshot,
-    ProviderCancellationReconciliation, ProviderExecutionBindingSubmission, ProviderIdentity,
-    ProviderReassignmentReceipt, ProviderUnknownOutcomeReconciliation,
-    ProviderWorkerFenceReceipt, ReassignmentId, RecipeId, RecipeManifest, ResultSubmission,
-    RoleProfileId, RoleProfileManifest, RouteCandidateEvidence, StaffingLaneRequest,
-    StaffingPlanCandidate, StaffingPlanRequest, SubmissionId, UnknownOutcomeResolution,
-    WorkClass, WorkerId,
+    AgentCoordinator, CancelCommand, CancellationReconciliationId, CandidateId, CoordinatorConfig,
+    CoordinatorError, CoordinatorEvent, DescendantClosureSubmission, ExecutionContext,
+    LearningRole, ObservationId, OperationId, OutcomeReconciliationId, OwnerLoadedClaimRow,
+    PlanGap, ProviderAdmissionReceipt, ProviderBindingSnapshot, ProviderCancellationReconciliation,
+    ProviderExecutionBindingSubmission, ProviderIdentity, ProviderReassignmentReceipt,
+    ProviderUnknownOutcomeReconciliation, ProviderWorkerFenceReceipt, ReassignmentId, RecipeId,
+    RecipeManifest, ResultSubmission, RoleProfileId, RoleProfileManifest, RouteCandidateEvidence,
+    StaffingLaneRequest, StaffingPlanCandidate, StaffingPlanRequest, SubmissionId,
+    UnknownOutcomeResolution, WorkClass, WorkerId,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -231,7 +230,6 @@ fn admitted_capability_for(
             revoked,
         },
         fence(),
-        "session-test-binding".to_owned(),
         None,
         minimum_sequence,
     )?)
