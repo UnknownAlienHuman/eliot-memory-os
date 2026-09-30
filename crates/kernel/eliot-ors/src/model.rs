@@ -2005,7 +2005,7 @@ pub struct RecoveryWriteBinding {
     ///
     /// Absent only on legacy retained bindings that predate source retention;
     /// new write reservations require the original value.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub write_response_mode: Option<String>,
     /// Retry identity from the admitted canonical write envelope.
     pub idempotency_key: OpaqueLabel,
