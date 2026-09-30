@@ -4976,9 +4976,7 @@ impl KernelComposition {
             principal_ref: None,
             session_ref: None,
             task_ref: None,
-            scope_ref: Some(
-                OpaqueLabel::new(scope).map_err(|_| TransportError::SessionFenced)?,
-            ),
+            scope_ref: Some(OpaqueLabel::new(scope).map_err(|_| TransportError::SessionFenced)?),
             task_revision: None,
             resolved_binding: None,
             resolved_binding_sha256: None,

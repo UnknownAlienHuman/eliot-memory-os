@@ -28,6 +28,8 @@ use eliot_ors::HostRequestRecord;
 #[cfg(windows)]
 use eliot_kernel_service::MaintenanceTriggerDeliveryError;
 #[cfg(windows)]
+use eliot_kernel_service::StagedReservedWriteError;
+#[cfg(windows)]
 use eliot_kernel_service::{
     AuthenticatedUserAutomationHostExecutionTransport, NamedReadGatewayError, PreStageRejection,
     StoreApplyRefusal, UserAutomationDueWakeRejection, UserAutomationDueWakeResolution,
@@ -42,8 +44,6 @@ use eliot_kernel_service::{
     UserAutomationWakeReadRequest, UserAutomationWakeReadback, advance_wake_horizon,
     horizon_retry_handle, refuse_consumed_wake, resolve_due_wake,
 };
-#[cfg(windows)]
-use eliot_kernel_service::StagedReservedWriteError;
 use eliot_kernel_service::{
     BorrowedCanonicalStoreClient, IrreversibleStorageEffect, ObservedHead, ReservationSeed,
     StorageReplacement, StorageReplacementCutoverReceipt, StorageReplacementStage,
@@ -9323,7 +9323,7 @@ impl KernelComposition {
             heads: observed_heads,
         };
         let seed = gateway_seed_from_protected_original_operation(transition, seed)
-        .map_err(|error| error.to_string())?;
+            .map_err(|error| error.to_string())?;
         Ok(Some((seed, record.deadline_unix_ms)))
     }
 
@@ -9352,12 +9352,10 @@ impl KernelComposition {
             "kernel.observe-reserved-write",
             move |cancellation| async move {
                 if unix_ms() >= deadline_unix_ms {
-                    let _ = staged_sender.send(Err(
-                        StagedReservedWriteError::Refused {
-                            detail: "protected Observe request expired before durable staging"
-                                .to_owned(),
-                        },
-                    ));
+                    let _ = staged_sender.send(Err(StagedReservedWriteError::Refused {
+                        detail: "protected Observe request expired before durable staging"
+                            .to_owned(),
+                    }));
                     return Ok::<(), TaskFailure>(());
                 }
                 let accepted = match gateway
@@ -9384,13 +9382,11 @@ impl KernelComposition {
                     &expected_operation_id,
                     &expected_request_hash,
                 ) {
-                    let _ = staged_sender.send(Err(
-                        StagedReservedWriteError::OutcomeUnknown {
-                            operation_id: expected_operation_id,
-                            detail: "durable Observe stage did not match the original operation"
-                                .to_owned(),
-                        },
-                    ));
+                    let _ = staged_sender.send(Err(StagedReservedWriteError::OutcomeUnknown {
+                        operation_id: expected_operation_id,
+                        detail: "durable Observe stage did not match the original operation"
+                            .to_owned(),
+                    }));
                     return Ok::<(), TaskFailure>(());
                 }
                 let _ = staged_sender.send(Ok(submission));
@@ -9476,12 +9472,13 @@ impl KernelComposition {
         expected_operation_id: &str,
         cancellation: eliot_runtime::CancellationToken,
     ) -> Result<WriteReceipt, StagedReservedWriteError> {
-        let original_submission = operation
-            .original_write_submission
-            .as_ref()
-            .ok_or_else(|| StagedReservedWriteError::Refused {
-                detail: "protected Observe operation has no original write source".to_owned(),
-            })?;
+        let original_submission =
+            operation
+                .original_write_submission
+                .as_ref()
+                .ok_or_else(|| StagedReservedWriteError::Refused {
+                    detail: "protected Observe operation has no original write source".to_owned(),
+                })?;
         let mut result = gateway.execute_staged_reserved(accepted).await;
         loop {
             let pending_operation = match &result {
@@ -9505,8 +9502,7 @@ impl KernelComposition {
             if cancellation.is_cancelled() {
                 return Err(StagedReservedWriteError::OutcomeUnknown {
                     operation_id: expected_operation_id.to_owned(),
-                    detail: "runtime shutdown interrupted the retained predecessor wait"
-                        .to_owned(),
+                    detail: "runtime shutdown interrupted the retained predecessor wait".to_owned(),
                 });
             }
             tokio::select! {
@@ -9526,8 +9522,7 @@ impl KernelComposition {
             if cancellation.is_cancelled() {
                 return Err(StagedReservedWriteError::OutcomeUnknown {
                     operation_id: expected_operation_id.to_owned(),
-                    detail: "runtime shutdown interrupted the retained predecessor wait"
-                        .to_owned(),
+                    detail: "runtime shutdown interrupted the retained predecessor wait".to_owned(),
                 });
             }
             result = gateway
