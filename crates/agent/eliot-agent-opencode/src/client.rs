@@ -435,6 +435,16 @@ struct PreparedRun {
     message_id: String,
 }
 
+struct ReconcileSuccessInput<'a> {
+    session_id: &'a str,
+    user_message_id: &'a str,
+    assistant_message_id: Option<&'a str>,
+    requested_model: &'a ModelSelection,
+    expected_output_schema: &'a Value,
+    baseline_diff: &'a [SessionDiff],
+    admitted_deadline: Option<Instant>,
+}
+
 struct EventCollection {
     events: Vec<OpenCodeEvent>,
     assistant_message_id: String,
@@ -532,7 +542,7 @@ fn provider_output_observation_from_message(
     let raw_output = message
         .get("parts")
         .and_then(Value::as_array)
-        .map(|parts| {
+        .and_then(|parts| {
             let mut saw_text = false;
             let mut text = String::new();
             for part in parts {
@@ -544,8 +554,7 @@ fn provider_output_observation_from_message(
                 }
             }
             saw_text.then_some(text)
-        })
-        .flatten();
+        });
     let usage = info
         .get("tokens")
         .and_then(Value::as_object)
@@ -611,10 +620,10 @@ fn provider_output_observation_from_messages(
             }
         }
     }
-    if assistant_ids.len() > 1 || unidentified_assistant {
-        if let Some(observation) = &mut observation {
-            clear_ambiguous_observation_summary(observation);
-        }
+    if (assistant_ids.len() > 1 || unidentified_assistant)
+        && let Some(observation) = &mut observation
+    {
+        clear_ambiguous_observation_summary(observation);
     }
     (assistant_ids, unidentified_assistant, observation)
 }
@@ -645,38 +654,36 @@ fn provider_output_observation_from_events(
                 .get("sessionID")
                 .and_then(Value::as_str)
                 == Some(session_id)
+            && let Some(info) = event.properties.get("info").and_then(Value::as_object)
+            && info.get("role").and_then(Value::as_str) == Some("assistant")
+            && info.get("parentID").and_then(Value::as_str) == Some(user_message_id)
         {
-            if let Some(info) = event.properties.get("info").and_then(Value::as_object)
-                && info.get("role").and_then(Value::as_str) == Some("assistant")
-                && info.get("parentID").and_then(Value::as_str) == Some(user_message_id)
-            {
-                let message_id = info.get("id").and_then(Value::as_str).map(str::to_owned);
-                if let Some(assistant_id) = message_id.as_deref() {
-                    assistant_ids.insert(assistant_id.to_owned());
-                }
-                let observed_model = attest_message_route(info, requested).ok();
-                let usage = info
-                    .get("tokens")
-                    .and_then(Value::as_object)
-                    .map(|tokens| UsageTelemetry {
-                        input_tokens: tokens.get("input").and_then(Value::as_u64),
-                        output_tokens: tokens.get("output").and_then(Value::as_u64),
-                        total_tokens: tokens.get("total").and_then(Value::as_u64),
-                        cost_usd: info.get("cost").and_then(Value::as_f64),
-                        extra: UnknownFields::new(),
-                    });
-                assistant_messages.push(ProviderAssistantMessageObservation {
-                    message_id,
-                    observed_model,
-                    raw_output: None,
-                    usage,
-                    // The stream-level terminal flag does not identify which
-                    // exact message snapshot established terminality.
-                    terminal: false,
-                    actual_route: None,
-                    physical_route: None,
-                });
+            let message_id = info.get("id").and_then(Value::as_str).map(str::to_owned);
+            if let Some(assistant_id) = message_id.as_deref() {
+                assistant_ids.insert(assistant_id.to_owned());
             }
+            let observed_model = attest_message_route(info, requested).ok();
+            let usage = info
+                .get("tokens")
+                .and_then(Value::as_object)
+                .map(|tokens| UsageTelemetry {
+                    input_tokens: tokens.get("input").and_then(Value::as_u64),
+                    output_tokens: tokens.get("output").and_then(Value::as_u64),
+                    total_tokens: tokens.get("total").and_then(Value::as_u64),
+                    cost_usd: info.get("cost").and_then(Value::as_f64),
+                    extra: UnknownFields::new(),
+                });
+            assistant_messages.push(ProviderAssistantMessageObservation {
+                message_id,
+                observed_model,
+                raw_output: None,
+                usage,
+                // The stream-level terminal flag does not identify which
+                // exact message snapshot established terminality.
+                terminal: false,
+                actual_route: None,
+                physical_route: None,
+            });
         }
     }
     let evidence_events = events
@@ -1099,13 +1106,15 @@ impl OpenCodeClient {
                 if failure.may_reconcile_success
                     && let Ok((projection, statuses)) = self
                         .reconcile_success(
-                            &prepared.session.id,
-                            &prepared.message_id,
-                            None,
-                            &request.model,
-                            &request.output_schema,
-                            &prepared.baseline_diff,
-                            None,
+                            ReconcileSuccessInput {
+                                session_id: &prepared.session.id,
+                                user_message_id: &prepared.message_id,
+                                assistant_message_id: None,
+                                requested_model: &request.model,
+                                expected_output_schema: &request.output_schema,
+                                baseline_diff: &prepared.baseline_diff,
+                                admitted_deadline: None,
+                            },
                         )
                         .await
                 {
@@ -1128,13 +1137,15 @@ impl OpenCodeClient {
 
         let (projection, statuses) = self
             .reconcile_success(
-                &prepared.session.id,
-                &prepared.message_id,
-                Some(&collection.assistant_message_id),
-                &request.model,
-                &request.output_schema,
-                &prepared.baseline_diff,
-                None,
+                ReconcileSuccessInput {
+                    session_id: &prepared.session.id,
+                    user_message_id: &prepared.message_id,
+                    assistant_message_id: Some(&collection.assistant_message_id),
+                    requested_model: &request.model,
+                    expected_output_schema: &request.output_schema,
+                    baseline_diff: &prepared.baseline_diff,
+                    admitted_deadline: None,
+                },
             )
             .await?;
         Ok((
@@ -1245,13 +1256,15 @@ impl OpenCodeClient {
             } => {
                 let reconciled = self
                     .reconcile_success(
-                        &prepared.session.id,
-                        &prepared.message_id,
-                        Some(&assistant_id),
-                        &request.model,
-                        &request.output_schema,
-                        &prepared.baseline_diff,
-                        Some(deadline),
+                        ReconcileSuccessInput {
+                            session_id: &prepared.session.id,
+                            user_message_id: &prepared.message_id,
+                            assistant_message_id: Some(&assistant_id),
+                            requested_model: &request.model,
+                            expected_output_schema: &request.output_schema,
+                            baseline_diff: &prepared.baseline_diff,
+                            admitted_deadline: Some(deadline),
+                        },
                     )
                     .await
                 .map_err(|error| {
@@ -1270,13 +1283,15 @@ impl OpenCodeClient {
             CommittedPrior::Unresolved { observation } => {
                 let reconciled = self
                     .reconcile_success(
-                        &prepared.session.id,
-                        &prepared.message_id,
-                        None,
-                        &request.model,
-                        &request.output_schema,
-                        &prepared.baseline_diff,
-                        Some(deadline),
+                        ReconcileSuccessInput {
+                            session_id: &prepared.session.id,
+                            user_message_id: &prepared.message_id,
+                            assistant_message_id: None,
+                            requested_model: &request.model,
+                            expected_output_schema: &request.output_schema,
+                            baseline_diff: &prepared.baseline_diff,
+                            admitted_deadline: Some(deadline),
+                        },
                     )
                     .await
                 .map_err(|error| {
@@ -1374,7 +1389,18 @@ impl OpenCodeClient {
                     .to_owned(),
             )
         })?;
-        let ours = messages
+        if !Self::committed_user_message_is_present(messages, session_id, message_id)? {
+            return Ok(CommittedPrior::Absent);
+        }
+        Self::reconcile_committed_assistant_messages(messages, session_id, message_id, &request.model)
+    }
+
+    fn committed_user_message_is_present(
+        messages: &[Value],
+        session_id: &str,
+        message_id: &str,
+    ) -> Result<bool, OpenCodeRunError> {
+        let matching = messages
             .iter()
             .filter(|message| {
                 message.pointer("/info/role").and_then(Value::as_str) == Some("user")
@@ -1383,26 +1409,33 @@ impl OpenCodeClient {
                         == Some(session_id)
             })
             .count();
-        if ours == 0 {
-            let foreign = messages.iter().any(|message| {
-                message.pointer("/info/role").and_then(Value::as_str) == Some("user")
-                    && message.pointer("/info/sessionID").and_then(Value::as_str)
-                        == Some(session_id)
-            });
-            if foreign {
-                return Err(OpenCodeRunError::Protocol(
-                    "bound execution session holds a different execution unit; a changed request never redispatches"
-                        .to_owned(),
-                ));
-            }
-            return Ok(CommittedPrior::Absent);
-        }
-        if ours > 1 {
+        if matching > 1 {
             return Err(OpenCodeRunError::Protocol(
                 "committed execution unit message appears more than once; refusing an ambiguous replay"
                     .to_owned(),
             ));
         }
+        if matching == 0
+            && messages.iter().any(|message| {
+                message.pointer("/info/role").and_then(Value::as_str) == Some("user")
+                    && message.pointer("/info/sessionID").and_then(Value::as_str)
+                        == Some(session_id)
+            })
+        {
+            return Err(OpenCodeRunError::Protocol(
+                "bound execution session holds a different execution unit; a changed request never redispatches"
+                    .to_owned(),
+            ));
+        }
+        Ok(matching == 1)
+    }
+
+    fn reconcile_committed_assistant_messages(
+        messages: &[Value],
+        session_id: &str,
+        message_id: &str,
+        requested_model: &ModelSelection,
+    ) -> Result<CommittedPrior, OpenCodeRunError> {
         let mut terminal_assistant: Option<String> = None;
         let mut assistant_ids = BTreeSet::new();
         let mut unidentified_assistant = false;
@@ -1420,7 +1453,8 @@ impl OpenCodeClient {
             let Some(assistant_id) = info.get("id").and_then(Value::as_str).map(str::to_owned)
             else {
                 unidentified_assistant = true;
-                let observation = provider_output_observation_from_message(message, &request.model);
+                let observation =
+                    provider_output_observation_from_message(message, requested_model);
                 if let Some(observation) = observation {
                     if let Some(retained) = &mut assistant_observation {
                         merge_provider_output_observation(retained, observation);
@@ -1431,7 +1465,7 @@ impl OpenCodeClient {
                 continue;
             };
             assistant_ids.insert(assistant_id.clone());
-            let observation = provider_output_observation_from_message(message, &request.model);
+            let observation = provider_output_observation_from_message(message, requested_model);
             if let Some(observation) = observation {
                 if let Some(retained) = &mut assistant_observation {
                     merge_provider_output_observation(retained, observation);
@@ -1439,7 +1473,7 @@ impl OpenCodeClient {
                     assistant_observation = Some(observation);
                 }
             }
-            if committed_assistant_terminal(message, &request.model) {
+            if committed_assistant_terminal(message, requested_model) {
                 terminal_assistant = Some(assistant_id);
             }
         }
@@ -1560,13 +1594,15 @@ impl OpenCodeClient {
                 if failure.may_reconcile_success {
                     match self
                         .reconcile_success(
-                            &prepared.session.id,
-                            &prepared.message_id,
-                            None,
-                            &request.model,
-                            &request.output_schema,
-                            &prepared.baseline_diff,
-                            Some(deadline),
+                            ReconcileSuccessInput {
+                                session_id: &prepared.session.id,
+                                user_message_id: &prepared.message_id,
+                                assistant_message_id: None,
+                                requested_model: &request.model,
+                                expected_output_schema: &request.output_schema,
+                                baseline_diff: &prepared.baseline_diff,
+                                admitted_deadline: Some(deadline),
+                            },
                         )
                         .await
                     {
@@ -1611,13 +1647,15 @@ impl OpenCodeClient {
         );
         let reconciled = self
             .reconcile_success(
-                &prepared.session.id,
-                &prepared.message_id,
-                Some(&collection.assistant_message_id),
-                &request.model,
-                &request.output_schema,
-                &prepared.baseline_diff,
-                Some(deadline),
+                ReconcileSuccessInput {
+                    session_id: &prepared.session.id,
+                    user_message_id: &prepared.message_id,
+                    assistant_message_id: Some(&collection.assistant_message_id),
+                    requested_model: &request.model,
+                    expected_output_schema: &request.output_schema,
+                    baseline_diff: &prepared.baseline_diff,
+                    admitted_deadline: Some(deadline),
+                },
             )
             .await;
         let reconciled = match reconciled {
@@ -1878,25 +1916,22 @@ impl OpenCodeClient {
 
     async fn reconcile_success(
         &self,
-        session_id: &str,
-        user_message_id: &str,
-        assistant_message_id: Option<&str>,
-        requested_model: &ModelSelection,
-        expected_output_schema: &Value,
-        baseline_diff: &[SessionDiff],
-        admitted_deadline: Option<Instant>,
+        request: ReconcileSuccessInput<'_>,
     ) -> Result<(MessageProjection, SessionStatusMap), OpenCodeRunError> {
         let statuses = run_with_optional_deadline(
-            admitted_deadline,
+            request.admitted_deadline,
             "status reconciliation",
-            self.wait_until_idle(session_id),
+            self.wait_until_idle(request.session_id),
         )
         .await?;
         let messages = run_with_optional_deadline(
-            admitted_deadline,
+            request.admitted_deadline,
             "message reconciliation",
             async {
-                timeout(RECONCILIATION_CALL_TIMEOUT, self.messages(session_id))
+                timeout(
+                    RECONCILIATION_CALL_TIMEOUT,
+                    self.messages(request.session_id),
+                )
                     .await
                     .map_err(|_| OpenCodeRunError::Timeout {
                         phase: "message reconciliation",
@@ -1909,9 +1944,9 @@ impl OpenCodeClient {
             .map(|messages| {
                 provider_output_observation_from_messages(
                     messages,
-                    session_id,
-                    user_message_id,
-                    requested_model,
+                    request.session_id,
+                    request.user_message_id,
+                    request.requested_model,
                 )
             })
             .unwrap_or_default();
@@ -1932,11 +1967,11 @@ impl OpenCodeClient {
         }
         let projection = inspect_messages(
             &messages,
-            session_id,
-            user_message_id,
-            assistant_message_id,
-            requested_model,
-            expected_output_schema,
+            request.session_id,
+            request.user_message_id,
+            request.assistant_message_id,
+            request.requested_model,
+            request.expected_output_schema,
         )
         .map_err(|error| {
             retain_observed_output_failure(
@@ -1947,10 +1982,13 @@ impl OpenCodeClient {
         })?;
         let observation = provider_output_observation_from_projection(&projection);
         let diff = run_with_optional_deadline(
-            admitted_deadline,
+            request.admitted_deadline,
             "diff reconciliation",
             async {
-                timeout(RECONCILIATION_CALL_TIMEOUT, self.diff(session_id))
+                timeout(
+                    RECONCILIATION_CALL_TIMEOUT,
+                    self.diff(request.session_id),
+                )
                     .await
                     .map_err(|_| OpenCodeRunError::Timeout {
                         phase: "diff reconciliation",
@@ -1968,7 +2006,7 @@ impl OpenCodeClient {
                 ));
             }
         };
-        if let Err(error) = attest_unchanged_diff(baseline_diff, &diff) {
+        if let Err(error) = attest_unchanged_diff(request.baseline_diff, &diff) {
             return Err(retain_observed_output_failure(
                 error,
                 Some(observation),
@@ -2156,22 +2194,47 @@ impl OpenCodeClient {
         projection: MessageProjection,
         events: Vec<OpenCodeEvent>,
     ) -> NoAuthorityRunResult {
-        // The live locator binds the OBSERVED provider/model (the reconciled
-        // assistant message's identity), never the requested side: the
-        // conversion corroborates it through the shared recipe, so a locator
-        // minted for different live values fails closed there (issue #369
-        // W11/W12).
+        let actual_route = self.success_route_receipt(request, prepared, &projection.observed_model);
+        let usage = projection.usage.map_or_else(
+            || UsageAvailability::unavailable("OpenCode message contained no complete usage"),
+            UsageAvailability::available,
+        );
+        let extra = self.success_result_metadata(prepared, &projection);
+        NoAuthorityRunResult {
+            status: RunStatus::Succeeded,
+            candidate_only: true,
+            authority: AuthorityCeiling::CandidateOnly,
+            actual_route,
+            usage,
+            quota: QuotaAvailability::unavailable(format!(
+                "OpenCode {} public session API did not expose quota/reset telemetry",
+                prepared.health.version
+            )),
+            session_id: Some(prepared.session.id.clone()),
+            output: Some(projection.output),
+            events,
+            diff: Vec::new(),
+            extra,
+        }
+    }
+
+    fn success_route_receipt(
+        &self,
+        request: &ReadOnlyRunRequest,
+        prepared: &PreparedRun,
+        observed_model: &ModelSelection,
+    ) -> OpenCodeWireRouteReceipt {
         let route_fingerprint = wire_route_locator(
             self.endpoint.as_str(),
             &prepared.health.version,
-            &projection.observed_model.provider_id,
-            &projection.observed_model.model_id,
+            &observed_model.provider_id,
+            &observed_model.model_id,
         );
         let mut actual_route = OpenCodeWireRouteReceipt::observed(
             request.model.clone(),
-            projection.observed_model.clone(),
+            observed_model.clone(),
         );
-        actual_route.provider = Some(projection.observed_model.provider_id.clone());
+        actual_route.provider = Some(observed_model.provider_id.clone());
         actual_route.endpoint = Some(self.endpoint.to_string());
         actual_route.route_fingerprint = Some(route_fingerprint);
         actual_route.session_id = Some(prepared.session.id.clone());
@@ -2180,23 +2243,20 @@ impl OpenCodeClient {
         actual_route
             .workspace_id
             .clone_from(&prepared.session.workspace_id);
-        // Production mint validation (issue #369 W13/W38): the emitted wire
-        // receipt is validated before it leaves the adapter. A mint that
-        // fails validation never emits a fabricated observed identity: it
-        // degrades to an explicit `unavailable` record carrying the reason,
-        // which converts to typed `UNOBSERVED` (never
-        // `requested == observed`) via `to_physical_observation`.
-        let actual_route = match actual_route.validate() {
+        match actual_route.validate() {
             Ok(()) => actual_route,
             Err(error) => OpenCodeWireRouteReceipt::unavailable(
                 request.model.clone(),
                 format!("opencode success attestation invalid: {error}"),
             ),
-        };
-        let usage = projection.usage.map_or_else(
-            || UsageAvailability::unavailable("OpenCode message contained no complete usage"),
-            UsageAvailability::available,
-        );
+        }
+    }
+
+    fn success_result_metadata(
+        &self,
+        prepared: &PreparedRun,
+        projection: &MessageProjection,
+    ) -> UnknownFields {
         let mut extra = UnknownFields::new();
         extra.insert(
             "server_version".to_owned(),
@@ -2261,22 +2321,7 @@ impl OpenCodeClient {
             OPENCODE_PROVIDER_RAW_OUTPUT_UTF8_KEY.to_owned(),
             Value::String(projection.raw_output.clone()),
         );
-        NoAuthorityRunResult {
-            status: RunStatus::Succeeded,
-            candidate_only: true,
-            authority: AuthorityCeiling::CandidateOnly,
-            actual_route,
-            usage,
-            quota: QuotaAvailability::unavailable(format!(
-                "OpenCode {} public session API did not expose quota/reset telemetry",
-                prepared.health.version
-            )),
-            session_id: Some(prepared.session.id.clone()),
-            output: Some(projection.output),
-            events,
-            diff: Vec::new(),
-            extra,
-        }
+        extra
     }
 
     fn project_path(&self, path: &str, extra: &[(&str, &str)]) -> Result<String, OpenCodeRunError> {
@@ -2468,34 +2513,31 @@ fn seal_admitted_outcome(
             None,
         ));
     };
+    let route = prepare_admitted_run_for_seal(admitted, &session_id, message_id, &mut run, statuses)?;
+    seal_prepared_admitted_candidate(admitted, slot, &session_id, message_id, run, route)
+}
+
+fn prepare_admitted_run_for_seal(
+    admitted: &AdmittedOpenCodeAttempt,
+    session_id: &str,
+    message_id: &str,
+    run: &mut NoAuthorityRunResult,
+    statuses: &SessionStatusMap,
+) -> Result<SealedRouteDisposition, AdmittedAttemptError> {
     let children: Vec<(String, bool)> = statuses
         .iter()
         .filter(|(id, _)| id.as_str() != session_id)
-        .map(|(id, status)| {
-            let is_open = !matches!(status, SessionStatus::Idle { .. });
-            (id.clone(), is_open)
-        })
+        .map(|(id, status)| (id.clone(), !matches!(status, SessionStatus::Idle { .. })))
         .collect();
-    crate::ensure_no_open_child_sessions(&session_id, &children).map_err(|error| {
-        retain_sealed_run_failure(
-            error,
-            &run,
-            None,
-            "open child-session validation",
-            None,
-        )
+    crate::ensure_no_open_child_sessions(session_id, &children).map_err(|error| {
+        retain_sealed_run_failure(error, run, None, "open child-session validation", None)
     })?;
-    // Attempt-bound heartbeat/progress/quota summaries sealed into the
-    // result extra, reusing the already-reconciled status map with no new
-    // HTTP call.
+
     let observations = vec![
         AdmittedObservation::new(
             admitted,
             AdmittedObservationKind::Heartbeat,
-            format!(
-                "{} correlated events observed; stream complete",
-                run.events.len()
-            ),
+            format!("{} correlated events observed; stream complete", run.events.len()),
         ),
         AdmittedObservation::new(
             admitted,
@@ -2511,7 +2553,7 @@ fn seal_admitted_outcome(
     let observation_value = serde_json::to_value(&observations).map_err(|error| {
         retain_sealed_run_failure(
             AdmittedAttemptError::DigestFailed(error.to_string()),
-            &run,
+            run,
             None,
             "admitted observation serialization",
             None,
@@ -2519,47 +2561,20 @@ fn seal_admitted_outcome(
     })?;
     run.extra
         .insert("admitted_observations".to_owned(), observation_value);
-    // The edge marker is recorded only behind the deterministic proof gate
-    // over the reconciled execution state — never unconditionally — so the
-    // marker rides the seal digest below.
-    crate::admitted_edge_proof_gate(&session_id, statuses).map_err(|error| {
-        retain_sealed_run_failure(
-            error,
-            &run,
-            None,
-            "candidate edge-proof gate",
-            None,
-        )
+    crate::admitted_edge_proof_gate(session_id, statuses).map_err(|error| {
+        retain_sealed_run_failure(error, run, None, "candidate edge-proof gate", None)
     })?;
     run.extra.insert(
         "edge".to_owned(),
         Value::String(OPENCODE_ADMITTED_ATTEMPT_EDGE_CANDIDATE.to_owned()),
     );
-    // Canonical route-observation disposition (issue #2902): computed and
-    // validated BEFORE candidate sealing and slot confirmation, so a
-    // malformed, stale, mismatched, or otherwise unconvertible wire route can
-    // never seal as ordinary success with an unexplained absence. A route
-    // conflict does not erase the retained provider output: the candidate
-    // still seals below, but under a digest-bound conflict disposition rather
-    // than an indistinguishable stronger success.
-    let route = seal_route_disposition(admitted, &run, message_id).map_err(|error| {
-        retain_sealed_run_failure(
-            error,
-            &run,
-            None,
-            "physical route-observation validation",
-            None,
-        )
+    let route = seal_route_disposition(admitted, run, message_id).map_err(|error| {
+        retain_sealed_run_failure(error, run, None, "physical route-observation validation", None)
     })?;
-    // The disposition summary rides the run extra before sealing, so the
-    // candidate `result_digest` binds the final route disposition, its
-    // evidence/recovery references, and the #2645 staging columns: a consumer
-    // cannot drop the disposition and retain an indistinguishable stronger
-    // candidate.
     let route_summary = route.summary_value(admitted.admission()).map_err(|error| {
         retain_sealed_run_failure(
             error,
-            &run,
+            run,
             Some(&route),
             "route-disposition summary validation",
             None,
@@ -2567,6 +2582,17 @@ fn seal_admitted_outcome(
     })?;
     run.extra
         .insert("route_disposition".to_owned(), route_summary);
+    Ok(route)
+}
+
+fn seal_prepared_admitted_candidate(
+    admitted: &AdmittedOpenCodeAttempt,
+    slot: AdmittedSlotConsumption,
+    session_id: &str,
+    message_id: &str,
+    mut run: NoAuthorityRunResult,
+    route: SealedRouteDisposition,
+) -> Result<AdmittedAttemptOutcome, AdmittedAttemptError> {
     let mut candidate = AdmittedAttemptCandidate::seal(admitted, &run).map_err(|error| {
         retain_sealed_run_failure(
             error,
@@ -2576,13 +2602,8 @@ fn seal_admitted_outcome(
             None,
         )
     })?;
-    // The typed route disposition computed and validated above is bound into
-    // the sealed candidate artifact itself (issue #2902 items 8 and 11): the
-    // published artifact carries the exact disposition, so a consumer can
-    // classify it — and a legacy artifact predating this field decodes as
-    // explicitly unverified rather than a current receipt.
     candidate.route_disposition = Some(route.clone());
-    slot.confirm(admitted, &session_id, message_id).map_err(|error| {
+    slot.confirm(admitted, session_id, message_id).map_err(|error| {
         retain_sealed_run_failure(
             error,
             &run,
@@ -2591,10 +2612,6 @@ fn seal_admitted_outcome(
             Some(&candidate),
         )
     })?;
-    // The terminal observation is emitted bound to the exact attempt,
-    // quoting the seal it follows; the seal digest covers the run at seal
-    // time, and this observation references that digest instead of
-    // reopening it.
     let candidate_digest = candidate.compute_digest().map_err(|error| {
         retain_sealed_run_failure(
             AdmittedAttemptError::DigestFailed(error.to_string()),
@@ -2620,12 +2637,6 @@ fn seal_admitted_outcome(
     })?;
     run.extra
         .insert("admitted_terminal_observation".to_owned(), terminal_value);
-    // Canonical route-observation disposition (issue #2902): the typed
-    // disposition computed before sealing travels on the outcome. The
-    // retained wire receipt stays the downstream normalization evidence, and
-    // the digest-bound `route_disposition` summary above names exactly why
-    // conversion produced a receipt, a conflict, or an unknown outcome —
-    // including which owner must reconcile it.
     Ok(AdmittedAttemptOutcome {
         run,
         candidate,
@@ -2853,7 +2864,7 @@ fn provider_output_observation_from_run(run: &NoAuthorityRunResult) -> ProviderO
         observed_model: observed_model.clone(),
         raw_output: raw_output.clone(),
         usage: usage.clone(),
-        terminal: run.extra.get("observed_completed_at_ms").is_some(),
+        terminal: run.extra.contains_key("observed_completed_at_ms"),
         actual_route: Some(run.actual_route.clone()),
         physical_route: None,
     }];
@@ -2862,7 +2873,7 @@ fn provider_output_observation_from_run(run: &NoAuthorityRunResult) -> ProviderO
         raw_output,
         usage,
         usage_availability: Some(run.usage.clone()),
-        terminal: run.extra.get("observed_completed_at_ms").is_some(),
+        terminal: run.extra.contains_key("observed_completed_at_ms"),
         events: run.events.clone(),
         actual_route: Some(run.actual_route.clone()),
         physical_route: None,
@@ -2880,7 +2891,9 @@ fn retain_sealed_run_failure(
     let mut observation = provider_output_observation_from_run(run);
     observation.physical_route = route.and_then(SealedRouteDisposition::receipt).cloned();
     if let Some(message) = observation.assistant_messages.last_mut() {
-        message.physical_route = observation.physical_route.clone();
+        message
+            .physical_route
+            .clone_from(&observation.physical_route);
     }
     if !observation.has_evidence() {
         return cause;
@@ -3291,7 +3304,21 @@ fn inspect_messages(
             )
         })?;
     let observation = provider_output_observation_from_message(assistant, requested);
-    let projection = (|| {
+    let projection = inspect_assistant_projection(assistant, requested, expected_output_schema);
+    projection.map_err(|error| {
+        retain_observed_output_failure(
+            error,
+            observation,
+            "correlated assistant output was read before message validation refused",
+        )
+    })
+}
+
+fn inspect_assistant_projection(
+    assistant: &Value,
+    requested: &ModelSelection,
+    expected_output_schema: &Value,
+) -> Result<MessageProjection, OpenCodeRunError> {
     let info = assistant
         .get("info")
         .and_then(Value::as_object)
@@ -3358,14 +3385,6 @@ fn inspect_messages(
         raw_output,
         usage,
         completed_at_ms,
-    })
-    })();
-    projection.map_err(|error| {
-        retain_observed_output_failure(
-            error,
-            observation,
-            "correlated assistant output was read before message validation refused",
-        )
     })
 }
 

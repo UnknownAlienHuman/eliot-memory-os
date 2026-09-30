@@ -107,7 +107,8 @@ use eliot_kernel_service::{
     AuthenticatedDoctorSession, AuthenticatedTestdSession, ComposedDoctorFrontDoor,
     DoctorRecipeRegistry, DoctorRepairAdmission, DoctorRepairAttemptRequest, DoctorRepairResponse,
     KernelService, KernelServiceError, KernelServiceState, NATIVE_WORKER_CLAIM_WIRE_ID,
-    NativeWorkerClaimReceipt, NativeWorkerClaimRequest, NativeWorkerClaimResponse, TestdAdmission,
+    NativeWorkerClaimReceipt, NativeWorkerClaimRequest, NativeWorkerClaimResponse,
+    NativeWorkerExecutionAdmissionPhase, TestdAdmission,
     TestdAdmissionAttemptRequest, TestdAdmissionEnvelope, TestdAdmissionResponse,
     advertise_doctor_repair, advertise_testd_admission_when_composed, handle_doctor_repair_attempt,
     handle_doctor_repair_cancellation, handle_testd_admission_attempt, handle_testd_cancellation,
@@ -710,6 +711,16 @@ enum LaunchPhase {
     Unreconciled,
     /// The durable outcome converged; the slot is closed.
     Reconciled,
+}
+
+/// The exact original claim request and receipt held by the dispatch owner,
+/// plus its current launch phase. The caller supplies the original claim ID
+/// only as a lookup selector.
+#[derive(Clone, Debug)]
+pub(crate) struct NativeWorkerPrelaunchAdmission {
+    pub request: NativeWorkerClaimRequest,
+    pub claim_receipt: NativeWorkerClaimReceipt,
+    pub phase: NativeWorkerExecutionAdmissionPhase,
 }
 
 /// One retained dispatched attempt, keyed by its original identity
@@ -2364,6 +2375,80 @@ fn launches_table(
         .launches
         .lock()
         .map_err(|_| DispatchLaunchError::Gate("dispatch launch record lock poisoned".to_owned()))
+}
+
+/// Reads the exact original prelaunch admission retained by the Kernel
+/// dispatch owner. `claim_id` is only a selector: this path creates no claim,
+/// receipt, process binding, or launch phase. The claim request and receipt
+/// are returned unchanged after their existing validators and owner-key
+/// linkage checks pass.
+pub(crate) fn native_worker_prelaunch_admission(
+    claim_id: &str,
+) -> Result<NativeWorkerPrelaunchAdmission, DispatchLaunchError> {
+    let contour = DISPATCH_CONTOUR
+        .get()
+        .ok_or(DispatchLaunchError::Uncomposed("native-worker front door"))?;
+    let launches = launches_table(contour)?;
+    let retained = launches
+        .by_identity
+        .get(claim_id)
+        .filter(|record| record.kind == DispatchedWorkerKind::NativeWorker)
+        .ok_or_else(|| {
+            DispatchLaunchError::Inconsistent(
+                "native worker claim has no retained admission record".to_owned(),
+            )
+        })?;
+    let request = retained.native_request.clone().ok_or_else(|| {
+        DispatchLaunchError::Inconsistent(
+            "native worker admission has no original claim request".to_owned(),
+        )
+    })?;
+    let claim_receipt = retained.native_receipt.clone().ok_or_else(|| {
+        DispatchLaunchError::Inconsistent(
+            "native worker admission has no original claim receipt".to_owned(),
+        )
+    })?;
+    request
+        .validate()
+        .and_then(|()| request.validate_canonical_digest())
+        .map_err(|_| {
+            DispatchLaunchError::Inconsistent(
+                "retained native worker claim request is invalid".to_owned(),
+            )
+        })?;
+    claim_receipt.validate().map_err(|_| {
+        DispatchLaunchError::Inconsistent(
+            "retained native worker claim receipt is invalid".to_owned(),
+        )
+    })?;
+    if retained.identity != claim_id
+        || retained.request_digest != request.request_digest
+        || retained.admission_digest != claim_receipt.receipt_digest
+        || request.claim_id != claim_id
+        || claim_receipt.claim_id != request.claim_id
+        || claim_receipt.registration_id != request.registration_id
+        || claim_receipt.attempt_id != request.attempt_id
+        || claim_receipt.operation_id != request.operation_id
+        || claim_receipt.worker_generation != request.worker_generation
+        || claim_receipt.binding_digest != request.binding_digest
+        || claim_receipt.authority_epoch != request.authority_epoch
+        || claim_receipt.state_fence != request.state_fence
+    {
+        return Err(DispatchLaunchError::Inconsistent(
+            "retained native worker request and original receipt do not bind one claim".to_owned(),
+        ));
+    }
+    let phase = match retained.phase {
+        LaunchPhase::Reserved => NativeWorkerExecutionAdmissionPhase::Reserved,
+        LaunchPhase::Launched => NativeWorkerExecutionAdmissionPhase::Launched,
+        LaunchPhase::Unreconciled => NativeWorkerExecutionAdmissionPhase::Unreconciled,
+        LaunchPhase::Reconciled => NativeWorkerExecutionAdmissionPhase::Reconciled,
+    };
+    Ok(NativeWorkerPrelaunchAdmission {
+        request,
+        claim_receipt,
+        phase,
+    })
 }
 
 /// Admits one Doctor attempt and prepares its launch: nonce-bound material

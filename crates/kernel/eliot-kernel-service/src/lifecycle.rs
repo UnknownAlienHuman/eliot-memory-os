@@ -1586,7 +1586,7 @@ fn native_worker_claim_identity<T>(
 ///
 /// Every presented identity is preserved opaquely; digests are recomputed
 /// from the exact presented bytes so replay comparison is byte-exact.
-fn native_worker_claim_staged_record(
+pub(crate) fn native_worker_claim_staged_record(
     request: &NativeWorkerClaimRequest,
 ) -> Result<NativeWorkerClaimRecord, KernelServiceError> {
     Ok(NativeWorkerClaimRecord {

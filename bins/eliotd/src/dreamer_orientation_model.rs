@@ -11,7 +11,8 @@
 use std::time::{Duration, Instant};
 
 use eliot_agent_api::{
-    route_fingerprint_digest_for, AgentResult, CancellationState, EffectCeiling, RouteFingerprint,
+    route_fingerprint_digest_for, AgentResult, CancellationState, EffectCeiling,
+    PhysicalRouteObservationReceipt, RouteFingerprint,
 };
 use eliot_agent_opencode::{
     AdmittedAttemptError, AdmittedAttemptOutcome, AdmittedOpenCodeAttempt,
@@ -64,6 +65,81 @@ pub struct DreamerOrientationModelInput<'a> {
 pub struct DreamerOrientationModelAttempt {
     pub request: ModelRouteRequest,
     pub owner: DreamerOrientationModelOwnerResult,
+}
+
+/// Borrowed view of a completed provider payload after checking that the
+/// exact owner-retained UTF-8 bytes, parsed JSON, native draft, and physical
+/// route projection still agree. It exposes the original receipt and outcome
+/// so consumers can retain lineage instead of rebuilding evidence.
+pub struct CompletedDreamerProviderOutput<'a> {
+    pub raw_output_utf8: &'a str,
+    pub raw_output_bytes: &'a [u8],
+    pub parsed_output: &'a Value,
+    pub draft: &'a ModelDraft,
+    pub execution: &'a ModelRouteExecutionIdentity,
+    pub grounding_route: &'a RouteIdentity,
+    pub physical_route: &'a PhysicalRouteObservationReceipt,
+    pub original: &'a AdmittedAttemptOutcome,
+}
+
+impl DreamerOrientationModelAttempt {
+    /// Returns a borrowing view only when all fields trace to the same
+    /// validated completed provider observation. Partial, malformed,
+    /// unknown, and refused calls remain available through `owner` without
+    /// being promoted by this accessor.
+    pub fn completed_provider_output(&self) -> Option<CompletedDreamerProviderOutput<'_>> {
+        let DreamerOrientationModelOwnerResult::Outcome(outcome) = &self.owner else {
+            return None;
+        };
+        let model_route = outcome.model_route.as_ref().ok()?;
+        if model_route.disposition != ModelRouteDisposition::Completed
+            || outcome.original.run.status != RunStatus::Succeeded
+            || !outcome.original.route.is_observed()
+            || model_route.validate_binding(&self.request).is_err()
+        {
+            return None;
+        }
+        let raw_output_utf8 = outcome
+            .original
+            .run
+            .extra
+            .get(OPENCODE_PROVIDER_RAW_OUTPUT_UTF8_KEY)?
+            .as_str()?;
+        let parsed_output = outcome.original.run.output.as_ref()?;
+        if serde_json::from_str::<Value>(raw_output_utf8).ok()?.ne(parsed_output) {
+            return None;
+        }
+        let draft = model_route.draft.as_ref()?;
+        if serde_json::to_value(draft).ok()?.ne(parsed_output) {
+            return None;
+        }
+        let physical_route = outcome.original.route.receipt()?;
+        let observed_route = physical_route.observed_route.as_ref()?;
+        let execution = model_route.execution.as_ref()?;
+        if execution.route != model_route.provider_route.as_deref()?
+            || !self.request.allowed_routes.contains(&execution.route)
+        {
+            return None;
+        }
+        let grounding_route = execution.grounding_route.as_ref()?;
+        if grounding_route.provider != observed_route.provider
+            || grounding_route.model != observed_route.model
+            || grounding_route.route_revision
+                != route_fingerprint_digest_for(observed_route).ok()?.as_str()
+        {
+            return None;
+        }
+        Some(CompletedDreamerProviderOutput {
+            raw_output_utf8,
+            raw_output_bytes: raw_output_utf8.as_bytes(),
+            parsed_output,
+            draft,
+            execution,
+            grounding_route,
+            physical_route,
+            original: &outcome.original,
+        })
+    }
 }
 
 pub enum DreamerOrientationModelOwnerResult {
