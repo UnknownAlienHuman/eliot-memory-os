@@ -47,6 +47,21 @@
 //! a drain being in progress. That ordering is the linearizability property,
 //! not a check that reports on it.
 //!
+//! The production caller of that classification is named here so it can be
+//! found by a symbol search rather than reconstructed:
+//! [`ShutdownDrainCoordinator::on_activate_request`] is called from
+//! `KernelComposition::apply_control_request_inner` in `control_plane.rs`,
+//! gated on `KernelControlCommand::Activate(_)` and
+//! `KernelControlCommand::ReconcileActivation(_)`, with the presented value
+//! read from `request.candidate.supervision_incarnation.activation_generation`.
+//! `ReconcileActivation` is in that family on purpose: it is the reconcile path
+//! a post-linearization attach uses to *receive* a fresh generation, and
+//! `KernelService::reconcile_activation` answers it by handing back the very
+//! `KernelActivationReceipt` `activate_permit` minted before the drain, which
+//! no drain transition clears. An attach that skipped this gate would therefore
+//! leave with drained authority intact. The gate refuses whenever
+//! [`DrainWakeDisposition::fences_old_authority`] holds.
+//!
 //! Handoffs (recorded, not implemented here): audit/outbox flush is
 //! Governor/`eliotd`-owned — Kernel flushes ORS staged rows and records the
 //! Governor flush as awaited via daemon quiescence; canonical-store internals
