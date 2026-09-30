@@ -3,6 +3,11 @@ name: Manual Source Candidate Gate
 on:
   workflow_dispatch:
     inputs:
+      operator_audit_diagnostic:
+        description: Branch-only non-authoritative Windows build and test diagnostics
+        required: false
+        default: false
+        type: boolean
       require_live_windows_scenarios:
         description: Require the live Windows scenario harness
         required: false
@@ -23,6 +28,7 @@ env:
 
 jobs:
   source-candidate-gate:
+    if: ${{ !inputs.operator_audit_diagnostic }}
     runs-on: windows-latest
     timeout-minutes: 180
 
@@ -378,4 +384,49 @@ jobs:
         shell: pwsh
         run: |
           Write-Error 'CONTRACT_CHALLENGE: the live Windows scenario harness is not integrated; no scenario success is claimed.'
+          exit 1
+
+
+  # Explicit user-authorized temporary audit mode. Never a Review, MergeCompile,
+  # release, installed-runtime or Product acceptance receipt. Normal job unchanged.
+  operator-audit-diagnostic:
+    if: ${{ inputs.operator_audit_diagnostic && github.ref == 'refs/heads/Operator_tests' }}
+    runs-on: windows-latest
+    timeout-minutes: 180
+    env:
+      CARGO_TARGET_DIR: ${{ runner.temp }}\eliot-operator-audit-target
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Native Windows diagnostic build and tests (not governed acceptance)
+        shell: pwsh
+        run: |
+          python scripts/operator-audit-diagnostic.py --output "$env:RUNNER_TEMP\eliot-operator-audit-evidence"
+          exit $LASTEXITCODE
+      - name: Preserve exact diagnostic commands, exits and logs
+        if: always()
+        # Official actions/upload-artifact v4.6.2 commit verified on upstream.
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: operator-audit-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/eliot-operator-audit-evidence/
+          if-no-files-found: error
+          retention-days: 14
+
+  operator-audit-ref-guard:
+    if: ${{ inputs.operator_audit_diagnostic && github.ref != 'refs/heads/Operator_tests' }}
+    runs-on: windows-latest
+    timeout-minutes: 2
+    steps:
+      - name: Reject diagnostics outside the explicitly authorized branch
+        shell: pwsh
+        run: |
+          Write-Error 'Operator audit diagnostics are restricted to Operator_tests.'
           exit 1
