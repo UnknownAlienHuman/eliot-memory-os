@@ -2133,7 +2133,7 @@ pub async fn drive_validated_dispatch_material(
     let receipt = worker::drive_admitted_one_shot_from_store(
         &store,
         presented,
-        worker::GovernedContour::new(
+        &worker::GovernedContour::new(
             executor.as_ref(),
             Some(&*git as &dyn SourceObservationGitPort),
         ),
@@ -2235,7 +2235,7 @@ fn bind_tool_environment_to_roots(
 pub fn run_admitted_one_shot<E: ProcessExecutor + 'static>(
     composition: &TestdComposition,
     presented: kernel_client::PresentedAdmission,
-    contour: worker::GovernedContour<'_, E>,
+    contour: &worker::GovernedContour<'_, E>,
     owner: &str,
     lease_ms: u64,
     now: u64,
