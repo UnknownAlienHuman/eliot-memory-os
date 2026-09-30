@@ -983,6 +983,14 @@ impl KernelContextReadClient {
     /// a successful view, never a silent retry.
     fn map_kernel_error(error: KernelPortError) -> StoreError {
         match error {
+            KernelPortError::TaskSelectionRequired => StoreError::InvalidField {
+                field: "task_binding",
+                reason: "TASK_SELECTION_REQUIRED",
+            },
+            KernelPortError::TaskScopeIncompatible => StoreError::InvalidField {
+                field: "task_binding",
+                reason: "TASK_SCOPE_INCOMPATIBLE",
+            },
             KernelPortError::Contract(reason) | KernelPortError::Unknown(reason) => {
                 StoreError::Serialization(reason)
             }

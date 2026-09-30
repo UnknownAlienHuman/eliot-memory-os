@@ -2413,13 +2413,15 @@ impl DaemonComposition {
                 "accepted activation has no retained authenticated owner readback",
             )
         })?;
-        readback.validate().map_err(|error| {
-            crate::task_binding_admission::TaskBindingError::scope_incompatible(format!(
-                "retained activation owner readback is invalid: {error}"
-            ))
+        readback
+            .validate()
+            .map_err(|error| {
+                crate::task_binding_admission::TaskBindingError::scope_incompatible(format!(
+                    "retained activation owner readback is invalid: {error}"
+                ))
         })?;
         if readback.evidence != *owner_evidence
-            || readback.evidence.binding.as_ref() != binding
+            || readback.evidence.binding.as_ref() != binding.as_ref()
             || result.ticket_id != ticket.ticket_id
             || result.ticket_state_fence != readback.evidence.state_fence
         {
@@ -2494,12 +2496,10 @@ impl DaemonComposition {
             ))
         })?;
         let live_fence = self.governor.kernel_snapshot().state_fence();
-        if !eliot_contracts::fences_match_exact(&work_scope.state_fence, live_fence) {
-            return Err(
-                crate::task_binding_admission::TaskBindingError::scope_incompatible(
-                    "current WorkScope snapshot fence is no longer live",
-                ),
-            );
+        if !eliot_contracts::fences_match_exact(&work_scope.state_fence, &live_fence) {
+            return Err(crate::task_binding_admission::TaskBindingError::scope_incompatible(
+                "current WorkScope snapshot fence is no longer live",
+            ));
         }
         let locator = self.activation_workspace_locator.as_ref().ok_or_else(|| {
             crate::task_binding_admission::TaskBindingError::scope_incompatible(
