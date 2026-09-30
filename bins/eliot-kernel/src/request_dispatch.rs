@@ -3,11 +3,19 @@
 //! Closed backup entry: exactly three operations (`backup.create`,
 //! `backup.verify`, `backup.restore-test`) selected by the operation string,
 //! each validated to its exact payload shape before any owner is named.
-//! `backup.verify` reaches the real capture owner and answers from it; the
-//! other two remain rehearsal-only and perform no capture, no coordination
-//! commit, no store import, and no activation/retirement/cutover. Missing
-//! owners refuse as typed replies (`refused`/`blocked` with
-//! `code = plan_gap`), never as fake success and never silently.
+//! `backup.verify` reaches the real capture owner and answers from it, and
+//! `backup.restore-test` reaches the real restore owner through
+//! [`KernelComposition::backup_restore_with_ors_journal`] and answers with the
+//! owner's own receipt; `backup.create` is the remaining owner-blocked leg.
+//! None of the three performs a coordination commit, and none performs any
+//! activation, retirement or cutover. `backup.restore-test` does perform the
+//! isolated store import — that is what the rehearsal is — and performs it in
+//! rehearsal posture, in which cutover qualification refuses (A13.7: "Cutover
+//! requires separate authority"). Missing owners refuse as typed replies
+//! (`refused`/`blocked` with `code = plan_gap`), never as fake success and
+//! never silently, and on an owner-reaching arm `plan_gap` names only the owner
+//! capability this front door holds no channel to — never the successful
+//! endpoint of an advertised command.
 //!
 //! Why each refusal is honest rather than a validation gap:
 //! - `backup.create` admits bounded capture descriptors, then admits the caller
@@ -118,17 +126,36 @@
 //!   (#959)`, OPEN. What it CAN do, and does, is force the owner to re-decide the
 //!   named operation: nothing here invents
 //!   a capability, a receipt type, or an owner value to paper over that.
-//! - `backup.restore-test` rehearses the shape path reachable without
-//!   owner-held state (bounded decode, exact shapes, digest shapes, lineage
-//!   admissibility, provisioning shape, store-level isolation inequality),
-//!   then returns `blocked` naming the ONE genuinely absent owner capability
-//!   rather than a Governor transition type. That capability is the ORS
-//!   restore-journal STREAM ESTABLISHMENT the owner-issued admission is proved
-//!   against; see [`BACKUP_RESTORE_TEST_MISSING_OWNER`] for the re-measurement
-//!   and the exact seam that would close it. The gates that ran are reported in
-//!   `gates_passed` and the gates that did not run are reported in
-//!   `gates_not_admitted`; the two sets are disjoint, so a gate is never
-//!   reported as passed and as deferred-to-owner at the same time.
+//! - `backup.restore-test` runs the FULL isolated rehearsal, not a shape
+//!   report: the shape gates run for real (bounded decode, exact shapes, digest
+//!   shapes, lineage admissibility, provisioning shape, store-level isolation
+//!   inequality), the archive is decoded and the plan compiled by the owners'
+//!   own gates, the owner-issued `RestoreJournalAdmission` is obtained from the
+//!   durable ORS owner through
+//!   `KernelBackupRestore::admit_restore_journal`, and the engine runs through
+//!   [`KernelComposition::backup_restore_with_ors_journal`] on this
+//!   composition's own durable journal, answering `ok` with the owner's own
+//!   `RestoreReceipt`, its exact `evidence_level`, the evidence document the
+//!   owner finalized and the applied phase log. `plan_gap` survives on this arm
+//!   for exactly ONE genuinely absent owner capability — the destination-side
+//!   key and blob-scope admission named by
+//!   [`BACKUP_RESTORE_TEST_MISSING_OWNER`] — and is never the endpoint of a
+//!   command that reached its owner.
+//!
+//!   Two gates are reported as NOT admitted on every answer this arm gives, and
+//!   they are named rather than implied: `cutover-qualification`, which this
+//!   route never reaches on any posture (A13.7), and
+//!   `destination-manifest-admission`, because #958's owner-issued PREPARED,
+//!   UNACTIVATED destination binding has no channel on this front door to issue
+//!   one. The second is the honest limit of what `backup.restore-test`
+//!   establishes: the declared destination is re-proved by the owner against
+//!   the destination the execution constructs and against the durable stream
+//!   row, but it is not pinned by an owner admission this route can obtain, and
+//!   [`handle_backup_restore_test`] says so where it is implemented rather than
+//!   claiming the conjunct. The gates that ran are reported in `gates_passed`
+//!   and the gates that did not run are reported in `gates_not_admitted`; the
+//!   two sets are disjoint, so a gate is never reported as passed and as
+//!   deferred-to-owner at the same time.
 //!
 //! The dispatch-matrix arm is [`crate::frame_dispatch`]'s closed `backup`
 //! operation gate; this file holds only the route. The arm fences the frame
@@ -138,7 +165,9 @@
 //!
 //! Capability cell: Kernel front-door backup dispatch (bounded backup method
 //! entry). Forbidden authority: no capture orchestration, no coordination
-//! commit, no store import, no activation/retirement/cutover, no second
+//! commit, no import into any live installation or source store (the isolated
+//! rehearsal root is the only destination this route's restore may import into),
+//! no activation/retirement/cutover, no second
 //! dispatch vocabulary.
 
 use std::num::NonZeroU64;
@@ -3313,20 +3342,42 @@ fn require_object<'a>(
 /// owner's own receipt and evidence level, so the reply carries the persisted
 /// rehearsal result rather than a refusal.
 ///
-/// ## The execution identity is the owner's, never the caller's
+/// ## The execution identity: what is owner-derived and what is only re-proved
 ///
 /// The frame's `idempotency_key` is correlation only and is echoed back
 /// unchanged; it selects nothing here. The execution identity is
 /// [`OrsRestoreBinding`], which has exactly one constructor, and whose
 /// `installation_ref` is read from the live `crate::dispatch_contour` cell
 /// rather than settable by any caller — so no frame, payload or spelling of the
-/// key can name the installation, the archive, the destination or the writer of
-/// this restore. Three of its four arguments are facts this route reads from
-/// state the owners hold rather than from the request: the archive identity and
-/// class are the archive's OWN manifest fields, and the destination is the same
-/// validated `RestoreContext` the owner constructs the isolated root under. The
-/// fourth is the Kernel's own writer identity,
-/// [`RESTORE_JOURNAL_WRITER_ID`].
+/// key can name the INSTALLATION this restore runs against. One of the other
+/// three arguments is the Kernel's own writer identity,
+/// [`RESTORE_JOURNAL_WRITER_ID`], and two are the archive's OWN manifest fields:
+/// the source archive identity and the class are read out of the decoded
+/// bundle, never out of a second request field that could disagree with it.
+///
+/// ## The destination is the one conjunct this route does not own
+///
+/// The fourth argument, `destination_ref`, is the DECLARED
+/// `RestoreContext::target_id` of the request's own typed target, and this
+/// route does not dress that up as an owner fact. What keeps it from being a
+/// caller-chosen destination is the owner's own re-proof of it, not a claim
+/// here: `check_ors_journal_binding` (`backup_restore.rs`) refuses any binding
+/// whose `destination_ref` is not exactly the target this execution
+/// constructs, the ORS owner refuses to establish or to append to a stream
+/// whose durable row names another destination, and the shape gate above
+/// refuses a target that is not isolated from the presented destination store.
+/// So a frame that names a destination the engine will not construct under
+/// refuses, rather than restoring somewhere it chose.
+///
+/// What is genuinely absent is the owner-issued PREPARED, UNACTIVATED
+/// destination admission that would make this conjunct owner-held rather than
+/// owner-re-proved: `PinnedDestinationAdmission` (#958) is pinned by prepare
+/// only when `RestorePorts::manifest_evidence` carries Host admission, and this
+/// front door holds no channel that issues it — see
+/// [`RESTORE_TEST_GATES_NOT_ADMITTED`], which names
+/// `destination-manifest-admission` on every answer this route gives rather
+/// than papering over the difference. Opening that seam is #958/A13.7's
+/// governance decision, not a wiring choice made here.
 ///
 /// ## What the ports carry, and what they deliberately do not
 ///
