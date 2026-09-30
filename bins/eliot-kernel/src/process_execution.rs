@@ -1921,12 +1921,8 @@ impl ProcessExecutionGateway {
                 owner: owner.clone(),
             }),
         });
-        let started = self.execute_process_request_on_platform(
-            request,
-            sink,
-            outer_binding,
-            live_stdin,
-        );
+        let started =
+            self.execute_process_request_on_platform(request, sink, outer_binding, live_stdin);
         match started {
             Ok(receipt) => Ok(receipt),
             Err(error) => {
@@ -1974,8 +1970,7 @@ impl ProcessExecutionGateway {
                         if binding.job_identity().name() == candidate.job_object_id.as_str() =>
                     {
                         if live_stdin {
-                            self.executor
-                                .start_with_live_stdin(request, sink, binding)
+                            self.executor.start_with_live_stdin(request, sink, binding)
                         } else {
                             self.executor
                                 .start_with_kernel_outer_job_binding(request, sink, binding)
