@@ -1056,6 +1056,7 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
             &input.identity,
             &input.owner_binding.origin,
             fence,
+            input.task_selection.as_ref().map(|selection| selection.evidence()),
         )?;
         let policy = self.current_ingress_policy()?;
         if !capture_policy_matches_owner(&policy, &input.owner_binding) {
@@ -1273,6 +1274,7 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
             identity,
             &binding.origin,
             &binding.state_fence,
+            prepared.submission.task_selection.as_ref(),
         ) {
             return Err(error);
         }
@@ -1442,6 +1444,7 @@ fn validate_observation_origin_current(
     identity: &eliot_protocol::RequestIdentity,
     origin: &ObservationCaptureOwnerOrigin,
     fence: &StateFence,
+    task_selection: Option<&eliot_observation::TaskSelectionEvidence>,
 ) -> Result<(), CompositionError> {
     match origin {
         ObservationCaptureOwnerOrigin::ApplicationSession {
@@ -1456,16 +1459,11 @@ fn validate_observation_origin_current(
                 .as_ref()
                 .ok_or_else(|| identity_refused("application Observe request has no Session"))?;
             if session_id.as_str() != authenticated_session_ref
-                || identity
-                    .request
-                    .metadata
-                    .task_id
-                    .as_ref()
-                    .map(TaskId::as_str)
-                    != authenticated_task_ref.as_deref()
+                || identity.request.metadata.task_id.as_ref().map(TaskId::as_str)
+                    != task_selection.map(|selection| selection.task_ref.as_str())
             {
                 return Err(identity_refused(
-                    "completed Observe identity differs from its authenticated application origin",
+                    "completed Observe task identity differs from its retained task selection or application origin",
                 ));
             }
             let owner = session_owner.ok_or_else(|| {
@@ -1511,6 +1509,7 @@ fn validate_observation_origin_current(
         } => {
             if identity.request.metadata.session_id.is_some()
                 || identity.request.metadata.task_id.is_some()
+                || task_selection.is_some()
                 || peer_admission_receipt.state_fence != *fence
             {
                 return Err(identity_refused(
