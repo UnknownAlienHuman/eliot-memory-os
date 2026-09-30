@@ -1,0 +1,2 @@
+    Checking eliot-instrument-runner v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1914\crates\instrument\eliot-instrument-runner)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.59s
