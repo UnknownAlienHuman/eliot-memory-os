@@ -1404,9 +1404,28 @@ pub struct TestJob {
     /// Fixture namespace allocated for this work item at admission (issue
     /// #1897, W4), derived by the retained envelope from the whole lane
     /// tuple — work item, build mode, and normalized fingerprint — and never
-    /// from the worktree, the project id, the job id, or a counter. `None`
-    /// preserves the pre-lane authority for rows admitted without a lane; it
-    /// never selects a fallback namespace.
+    /// from the worktree, the project id, or a counter.
+    ///
+    /// The work-item component is the envelope's own `work_item_id`. On the
+    /// Kernel-owned launch route that value is set from the admitted job
+    /// identity (`bins/eliot-kernel/src/dispatch_launch.rs` builds
+    /// `work_item_id` from `job_id`), so the namespace is distinct per work
+    /// item by construction, not because the job id is excluded: two different
+    /// work items cannot share a job id. Stated precisely because claiming the
+    /// job id is never an input would be false.
+    ///
+    /// The namespace is re-derived from the retained envelope and compared
+    /// against this field on every read path (`verify_job_lane`, reached from
+    /// `VerificationReceipt::validate`, `submit_inner` and
+    /// `bind_claimed_process_start`); a mismatch, an enveloped row with no
+    /// namespace, or a lane-less row carrying one is refused, never repaired.
+    /// It is also inside the `payload_digest` tuple, which makes two
+    /// submissions of the same job id idempotent — it is a submit-time
+    /// identity, not a seal over the persisted row, and the re-derivation above
+    /// is what detects a post-admission change.
+    ///
+    /// `None` preserves the pre-lane authority for rows admitted without a
+    /// lane; it never selects a fallback namespace.
     #[serde(default)]
     pub fixture_namespace: Option<String>,
     /// Scheduling priority; larger values run first among ready heads.
@@ -4075,9 +4094,12 @@ impl TestdStore {
         // in the same admitting transaction that allocates and persists its
         // envelope, and take it from the whole lane tuple through the
         // envelope's own derivation. It is never taken from the worktree, the
-        // project id, the job id, or a counter, and it is allocated once per
-        // work item rather than derived on demand at each use, so a restart
-        // consumes the retained value instead of a replacement one.
+        // project id, or a counter, and it is allocated once per work item
+        // rather than derived on demand at each use, so a restart consumes the
+        // retained value instead of a replacement one. Its work-item component
+        // is the envelope's `work_item_id`, which the Kernel launch route sets
+        // from the admitted job identity, so distinctness rests on the work-item
+        // identity being distinct rather than on the job id being excluded.
         let fixture_namespace = work_envelope
             .as_ref()
             .map(|envelope| {
