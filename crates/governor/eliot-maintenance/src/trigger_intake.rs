@@ -439,7 +439,9 @@ impl MaintenanceTriggerIntake {
 /// changed after derivation conflict instead of replaying. Expiry against the
 /// live clock stays with the delivery ledger, which refuses stale
 /// eligibility at admission with the time it owns.
-fn check_intake_shape(intake: &MaintenanceTriggerIntake) -> Result<(), MaintenanceError> {
+pub(crate) fn check_intake_shape(
+    intake: &MaintenanceTriggerIntake,
+) -> Result<(), MaintenanceError> {
     require_text(&intake.trigger_id, "persist.trigger_id")?;
     require_digest(&intake.operation_hash, "persist.operation_hash")?;
     require_text(&intake.operation_label, "persist.operation")?;

@@ -29,6 +29,7 @@ pub mod improvement_pipeline;
 mod outcome_observation;
 pub mod result_obligation;
 mod trigger_intake;
+mod trigger_retention;
 pub mod utility_evaluation;
 
 pub use outcome_observation::{
@@ -100,6 +101,10 @@ pub use trigger_intake::{
     MaintenanceTriggerIntake, TriggerIntakeClasses, TriggerIntakeOperation, TriggerIntakePayload,
     TriggerIntakePersistReceipt, TriggerIntakePosition, TriggerIntakeRequest, TriggerIntakeRouting,
     TriggerIntakeSourceEvent, TriggerIntakeWindow, derive_trigger_intake,
+};
+pub use trigger_retention::{
+    RetentionReleaseProof, RetentionSettlementClass, TriggerDamageGap, TriggerDamageKind,
+    TriggerRetentionDisposition, TriggerRetentionSuccessor,
 };
 
 /// Stable wire name for the maintenance governor contract.
