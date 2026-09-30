@@ -1793,12 +1793,19 @@ fn validate_productive_tool_environment(
         });
     }
     if bound_fixture_keys == fixture_keys.len() {
-        let namespace = values
-            .get(eliot_testd_core::FIXTURE_NAMESPACE_ENV)
-            .expect("checked above");
-        let root = values
-            .get(eliot_testd_core::FIXTURE_ROOT_ENV)
-            .expect("checked above");
+        // Both keys are proven present by the count and membership checks above,
+        // but they are read as an INSEPARABLE PAIR or not at all: binding one
+        // without the other would leave a lane naming a namespace it does not
+        // own a root for, which is the inert-namespace defect this closes.
+        let (Some(namespace), Some(root)) = (
+            values.get(eliot_testd_core::FIXTURE_NAMESPACE_ENV),
+            values.get(eliot_testd_core::FIXTURE_ROOT_ENV),
+        ) else {
+            return Err(TestdError::Invalid {
+                field: "tool_environment",
+                reason: "governed fixture bindings must carry the namespace and its root together",
+            });
+        };
         if namespace.trim().is_empty() || namespace.chars().any(char::is_control) {
             return Err(TestdError::Invalid {
                 field: "tool_environment",
