@@ -318,8 +318,31 @@ impl ProviderBridge {
             .bind(admission, &binding)
             .map_err(|_| BridgeError::ProviderUnavailable)?;
         let bound = self.bind_operation(admission, request, &binding, process_request)?;
-        let view = self.await_terminal(&bound)?;
+        let view = self.await_terminal(&bound, self.admitted_wait_bound(admission))?;
         self.finish_terminal(bound, &view)
+    }
+
+    /// Resolves the terminal-lifecycle wait bound for one admitted operation.
+    ///
+    /// The wait used to be [`BOUND_RUN_DEADLINE`] alone, and
+    /// [`ProviderBridge::with_deadline`] was the only way to change it — a
+    /// builder with no production caller, so every real run waited a fixed
+    /// thirty seconds whatever the Kernel admitted. The admitted deadline was
+    /// compared and receipted but governed nothing this process actually
+    /// enforced, which is a carried value, not a bound one.
+    ///
+    /// The bound is now the **lesser** of the two, so it is a strict tightening
+    /// of the existing horizon rather than a replacement of it: a run can never
+    /// wait past the ceiling the Kernel admitted, and it can never wait longer
+    /// than it did before. A deadline already in the past leaves no remaining
+    /// budget at all, which is reported as zero rather than extended, so an
+    /// expired ceiling ends the wait immediately instead of being ignored.
+    fn admitted_wait_bound(&self, admission: &ProviderAdmission) -> Duration {
+        let remaining = crate::dispatch_authority::remaining_admitted_ms(
+            admission,
+            crate::dispatch_authority::unix_ms(),
+        );
+        Duration::from_millis(remaining).min(self.deadline)
     }
 
     /// Re-validates the minted binding, seals the canonical submit envelope,
@@ -440,6 +463,11 @@ impl ProviderBridge {
     /// evidence, and stays explicit: the outcome is unconfirmed and
     /// reconciliation by operation identity is required before any retry.
     ///
+    /// `wait_bound` is the already-resolved admitted ceiling from
+    /// [`ProviderBridge::admitted_wait_bound`]; it is passed in rather than
+    /// read from `self` so this arm can only ever overrun by a value the
+    /// admission actually carried.
+    ///
     /// The deadline observation is captured FIRST, because it is the primary
     /// cause of this failure. Cancellation and stream readback are then two
     /// independent attempts whose typed outcomes are collected rather than
@@ -451,6 +479,7 @@ impl ProviderBridge {
     fn await_terminal(
         &self,
         bound: &BoundOperation,
+        wait_bound: Duration,
     ) -> Result<eliot_process::ProcessExecutionView, BridgeError> {
         let started = Instant::now();
         loop {
@@ -464,7 +493,7 @@ impl ProviderBridge {
             if view.lifecycle().is_terminal() {
                 return Ok(view);
             }
-            if started.elapsed() >= self.deadline {
+            if started.elapsed() >= wait_bound {
                 // Cancellation and stream readback are independent: each is
                 // attempted and each keeps its own typed outcome. Neither may
                 // erase the deadline, and neither may erase a receipt the other
