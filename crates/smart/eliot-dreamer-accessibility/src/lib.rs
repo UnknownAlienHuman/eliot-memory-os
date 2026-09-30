@@ -2436,12 +2436,17 @@ mod tests {
         }
     }
 
+    // `TaskRevision` is a counter (`counter!`), not a named handle: `new` takes a
+    // `u64` and rejects zero, which is reserved for an absent value. These
+    // fixtures keep the distinct magnitudes their string identities carried
+    // ("task-revision-4", "subject-revision-2"), because what these tests
+    // exercise is two revisions that differ, not the text they once spelled.
     fn test_task_revision() -> TaskRevision {
-        TaskRevision::new("task-revision-4").expect("canonical test task revision")
+        TaskRevision::new(4).expect("canonical test task revision")
     }
 
     fn test_subject_revision() -> TaskRevision {
-        TaskRevision::new("subject-revision-2").expect("canonical test subject revision")
+        TaskRevision::new(2).expect("canonical test subject revision")
     }
 
     fn test_attributed_evaluation() -> AttributedMemoryEvaluation {
