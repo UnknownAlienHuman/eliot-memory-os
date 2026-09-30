@@ -41,15 +41,18 @@ use eliot_evidence::{
     AbsenceVerdict, EvidenceCoverage, EvidenceFreshness, UnknownOutcome,
     check_absence_preconditions,
 };
-use eliot_instrument_api::{InstrumentInvocation, InstrumentKind, RawEvidence, RawEvidenceSource};
+use eliot_instrument_api::{
+    InstrumentContractError, InstrumentInvocation, InstrumentKind, RawEvidence, RawEvidenceSource,
+};
 use eliot_instrument_runner::{
     InstrumentSpec, InstrumentSpecParams, RegistryEntry, ResolvedExecutableIdentity,
 };
 use eliot_instrument_scip::ScipIndex;
 use eliot_process::{
-    CancellationReceipt, ExitDisposition, OperationId, ProcessEvidence, ProcessEvidenceSink,
-    ProcessExecutionError, ProcessExecutionView, ProcessExecutor, ProcessIntent, ProcessRequest,
-    ProcessStartReceipt, ProcessStreamKind, StreamPreviewRepresentation,
+    CancellationReceipt, ContractError as ProcessContractError, ExitDisposition, OperationId,
+    ProcessEvidence, ProcessEvidenceSink, ProcessExecutionError, ProcessExecutionView,
+    ProcessExecutor, ProcessIntent, ProcessRequest, ProcessStartReceipt, ProcessStreamKind,
+    StreamPreviewRepresentation,
 };
 use eliot_types::memory::GovernedGitScope;
 use serde::{Deserialize, Serialize};
@@ -2042,10 +2045,8 @@ impl<E: ProcessExecutor + 'static> LspBridge<E> {
         }
         instrument_invocation
             .validate()
-            .map_err(|error| BridgeError::InstrumentIdentity(error.to_string()))?;
-        request
-            .validate()
-            .map_err(|error| BridgeError::ProcessEvidence(error.to_string()))?;
+            .map_err(BridgeError::InstrumentContract)?;
+        request.validate().map_err(BridgeError::ProcessEvidence)?;
         validate_instrument_process_request(&request, instrument_invocation)?;
         validate_candidate_identity(candidate_identity, build_fingerprint)?;
         registry_entry
@@ -2075,7 +2076,7 @@ impl<E: ProcessExecutor + 'static> LspBridge<E> {
         let process_start = self.launch(command, request, sink).await?;
         process_start
             .validate()
-            .map_err(|error| BridgeError::ProcessEvidence(error.to_string()))?;
+            .map_err(BridgeError::ProcessEvidence)?;
         if process_start.operation_id() != &expected_operation
             || process_start.request_digest() != invocation_digest
             || process_start.accepted_generation().get() != expected_generation
@@ -2117,7 +2118,7 @@ impl<E: ProcessExecutor + 'static> LspBridge<E> {
         let operation = started.process_start.operation_id().clone();
         let process_evidence = self.reconcile(&operation).await?;
         validate_process_owner_readback(started, &process_evidence)?;
-        self.retain_result(
+        Self::retain_result(
             started,
             process_evidence,
             raw_outputs,
@@ -2134,7 +2135,6 @@ impl<E: ProcessExecutor + 'static> LspBridge<E> {
     /// observations or receipts.
     #[allow(clippy::too_many_arguments)]
     fn retain_result(
-        &self,
         started: &LspStartedInvocation,
         process_evidence: ProcessEvidence,
         raw_outputs: Vec<LspRawOutput>,
@@ -2145,7 +2145,7 @@ impl<E: ProcessExecutor + 'static> LspBridge<E> {
     ) -> Result<RetainedLspObservationV1, BridgeError> {
         process_evidence
             .validate()
-            .map_err(|error| BridgeError::ProcessEvidence(error.to_string()))?;
+            .map_err(BridgeError::ProcessEvidence)?;
         let process_start = process_start_binding(&started.process_start)?;
         if process_evidence.request_digest() != started.invocation_digest
             || process_evidence.operation_id() != started.process_intent.operation_id()
@@ -2194,10 +2194,7 @@ impl<E: ProcessExecutor + 'static> LspBridge<E> {
                 .to_owned(),
             instrument_target: started.instrument_invocation.target.clone(),
             instrument_declared_scope: started.instrument_invocation.declared_scope.clone(),
-            instrument_input_artifacts: started
-                .instrument_invocation
-                .input_artifacts
-                .clone(),
+            instrument_input_artifacts: started.instrument_invocation.input_artifacts.clone(),
             process_operation_id: started.process_intent.operation_id().as_str().to_owned(),
             process_generation: started.process_intent.generation().get(),
             process_working_directory: started.process_intent.working_directory().to_owned(),
@@ -2243,8 +2240,7 @@ impl<E: ProcessExecutor + 'static> LspBridge<E> {
         validate_process_owner_readback(started, &process_evidence)?;
         if record.process_evidence != process_evidence {
             return Err(BridgeError::InconsistentBinding(
-                "received process evidence differs from original process-owner readback"
-                    .to_owned(),
+                "received process evidence differs from original process-owner readback".to_owned(),
             ));
         }
 
@@ -2385,7 +2381,7 @@ pub fn adopt_received_result(
     current
         .instrument_invocation
         .validate()
-        .map_err(|error| BridgeError::InstrumentIdentity(error.to_string()))?;
+        .map_err(BridgeError::InstrumentContract)?;
     validate_candidate_identity(current.candidate_identity, current.build_fingerprint)?;
     if let Some(source_scope) = current.source_scope {
         validate_git_scope(source_scope)?;
@@ -2424,8 +2420,7 @@ pub fn adopt_received_result(
     let mut result = record.result;
     result.receipt_mut().freshness = Freshness::Stale {
         reason: if !executable_matches || !profile_matches {
-            "current executable or admitted profile differs from the captured invocation"
-                .to_owned()
+            "current executable or admitted profile differs from the captured invocation".to_owned()
         } else if !source_matches {
             "current source or admitted candidate identity differs from the captured invocation"
                 .to_owned()
@@ -2444,7 +2439,7 @@ fn validate_retained_observation(record: &RetainedLspObservationV1) -> Result<()
     record
         .process_evidence
         .validate()
-        .map_err(|error| BridgeError::ProcessEvidence(error.to_string()))?;
+        .map_err(BridgeError::ProcessEvidence)?;
     validate_record_identities(record, &resolved)?;
     validate_source_binding(source_binding)?;
     validate_process_source_binding(record, source_binding)?;
@@ -2457,7 +2452,8 @@ fn validate_retained_observation(record: &RetainedLspObservationV1) -> Result<()
         false,
     )?;
     let process_completed = process_completed(&record.process_evidence);
-    let process_truncated = process_outputs_incomplete(&record.process_evidence, &record.raw_outputs);
+    let process_truncated =
+        process_outputs_incomplete(&record.process_evidence, &record.raw_outputs);
     let exit_code = process_exit_code(&record.process_evidence);
     validate_recorded_scip_artifact(record, process_completed, exit_code)?;
 
@@ -2515,7 +2511,7 @@ fn validate_retained_request_and_receipt(
     record
         .instrument_invocation
         .validate()
-        .map_err(|error| BridgeError::InstrumentIdentity(error.to_string()))?;
+        .map_err(BridgeError::InstrumentContract)?;
     if !operation_matches_config(&record.operation, &record.config)
         || !candidate_selectors_match_operation(&record.source_candidate, &record.operation)
     {
@@ -2642,7 +2638,7 @@ fn validate_record_identities(
     record
         .process_intent
         .validate()
-        .map_err(|error| BridgeError::ProcessEvidence(error.to_string()))?;
+        .map_err(BridgeError::ProcessEvidence)?;
     validate_instrument_spec(&record.instrument_spec)?;
     let command = command_for(&record.config, &record.source_candidate, &record.operation)?;
     let intent = &record.process_intent;
@@ -2805,7 +2801,10 @@ fn validate_source_binding(binding: &LspSourceBindingV1) -> Result<(), BridgeErr
         binding.build_fingerprint_after_run.as_ref(),
     )?;
     for (value, field) in [
-        (binding.instrument_request_id.as_str(), "instrument_request_id"),
+        (
+            binding.instrument_request_id.as_str(),
+            "instrument_request_id",
+        ),
         (binding.instrument_target.as_str(), "instrument_target"),
         (
             binding.instrument_declared_scope.as_str(),
@@ -2895,10 +2894,8 @@ fn validate_process_owner_readback(
     started
         .process_start
         .validate()
-        .map_err(|error| BridgeError::ProcessEvidence(error.to_string()))?;
-    evidence
-        .validate()
-        .map_err(|error| BridgeError::ProcessEvidence(error.to_string()))?;
+        .map_err(BridgeError::ProcessEvidence)?;
+    evidence.validate().map_err(BridgeError::ProcessEvidence)?;
     if evidence.binding() != started.process_start.binding()
         || evidence.operation_id() != started.process_start.operation_id()
         || evidence.request_digest() != started.invocation_digest
@@ -3021,9 +3018,7 @@ fn validate_candidate_identity(
 fn process_start_binding(
     start: &ProcessStartReceipt,
 ) -> Result<LspProcessStartBindingV1, BridgeError> {
-    start
-        .validate()
-        .map_err(|error| BridgeError::ProcessEvidence(error.to_string()))?;
+    start.validate().map_err(BridgeError::ProcessEvidence)?;
     Ok(LspProcessStartBindingV1 {
         schema_version: 1,
         operation_id: start.operation_id().as_str().to_owned(),
@@ -3058,7 +3053,7 @@ fn validate_raw_outputs(
         output
             .evidence
             .validate()
-            .map_err(|error| BridgeError::RawEvidence(error.to_string()))?;
+            .map_err(BridgeError::RawEvidence)?;
         if output.kind == LspRawOutputKind::ScipSidecar
             && !matches!(
                 operation,
@@ -3223,8 +3218,7 @@ fn validate_instrument_process_request(
     invocation: &InstrumentInvocation,
 ) -> Result<(), BridgeError> {
     if request.operation_id().as_str() != invocation.request.request_id.as_str()
-        || request.generation().get()
-            != invocation.request.state_fence.resource_generation.value()
+        || request.generation().get() != invocation.request.state_fence.resource_generation.value()
         || request.fence().authority_epoch() != &invocation.request.state_fence.authority_epoch
         || invocation
             .request
@@ -3515,11 +3509,13 @@ fn source_binding_matches_current(
         _ => false,
     };
     let request_matches = binding.process_start.schema_version == 1
-        && binding.instrument_request_id == current.instrument_invocation.request.request_id.as_str()
+        && binding.instrument_request_id
+            == current.instrument_invocation.request.request_id.as_str()
         && binding.instrument_target == current.instrument_invocation.target
         && binding.instrument_declared_scope == current.instrument_invocation.declared_scope
         && binding.instrument_input_artifacts == current.instrument_invocation.input_artifacts
-        && binding.process_operation_id == current.instrument_invocation.request.request_id.as_str()
+        && binding.process_operation_id
+            == current.instrument_invocation.request.request_id.as_str()
         && binding.process_generation
             == current
                 .instrument_invocation
@@ -3720,10 +3716,13 @@ pub enum BridgeError {
     UnsupportedObservationSchema,
     /// An original Instrument output artifact failed its owner validation.
     #[error("raw Instrument evidence is invalid: {0}")]
-    RawEvidence(String),
+    RawEvidence(#[source] InstrumentContractError),
     /// Reconciled process evidence failed its owner validation.
     #[error("reconciled process evidence is invalid: {0}")]
-    ProcessEvidence(String),
+    ProcessEvidence(#[source] ProcessContractError),
+    /// The existing Instrument invocation failed its typed owner validation.
+    #[error("instrument invocation is invalid: {0}")]
+    InstrumentContract(#[source] InstrumentContractError),
     /// The existing #1814 executable identity is inconsistent or invalid.
     #[error("resolved executable identity is invalid: {0}")]
     ExecutableIdentity(String),
