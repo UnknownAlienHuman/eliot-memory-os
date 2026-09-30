@@ -622,35 +622,32 @@ fn read_git_head_substrate(
         {
             return Err(ChangeMonitorError::NoGitSubstrate);
         }
-        match std::fs::read(git_dir.join(refname)) {
-            Ok(ref_bytes) => {
-                exact_bytes.extend_from_slice(&ref_bytes);
-                String::from_utf8(ref_bytes)
-                    .map(|contents| contents.trim().to_owned())
-                    .map_err(|_| ChangeMonitorError::NoGitSubstrate)?
-            }
-            Err(_) => {
-                let packed_bytes = std::fs::read(git_dir.join("packed-refs"))
-                    .map_err(|_| ChangeMonitorError::NoGitSubstrate)?;
-                exact_bytes.extend_from_slice(&packed_bytes);
-                let packed = String::from_utf8(packed_bytes)
-                    .map_err(|_| ChangeMonitorError::NoGitSubstrate)?;
-                let mut found = None;
-                for line in packed.lines() {
-                    let line = line.trim();
-                    if line.is_empty() || line.starts_with('#') || line.starts_with('^') {
-                        continue;
-                    }
-                    let mut parts = line.split_whitespace();
-                    if let (Some(sha), Some(name)) = (parts.next(), parts.next())
-                        && name == refname
-                    {
-                        found = Some(sha.to_owned());
-                        break;
-                    }
+        if let Ok(ref_bytes) = std::fs::read(git_dir.join(refname)) {
+            exact_bytes.extend_from_slice(&ref_bytes);
+            String::from_utf8(ref_bytes)
+                .map(|contents| contents.trim().to_owned())
+                .map_err(|_| ChangeMonitorError::NoGitSubstrate)?
+        } else {
+            let packed_bytes = std::fs::read(git_dir.join("packed-refs"))
+                .map_err(|_| ChangeMonitorError::NoGitSubstrate)?;
+            exact_bytes.extend_from_slice(&packed_bytes);
+            let packed =
+                String::from_utf8(packed_bytes).map_err(|_| ChangeMonitorError::NoGitSubstrate)?;
+            let mut found = None;
+            for line in packed.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') || line.starts_with('^') {
+                    continue;
                 }
-                found.ok_or(ChangeMonitorError::NoGitSubstrate)?
+                let mut parts = line.split_whitespace();
+                if let (Some(sha), Some(name)) = (parts.next(), parts.next())
+                    && name == refname
+                {
+                    found = Some(sha.to_owned());
+                    break;
+                }
             }
+            found.ok_or(ChangeMonitorError::NoGitSubstrate)?
         }
     } else {
         head_text
