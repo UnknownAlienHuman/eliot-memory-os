@@ -448,7 +448,7 @@ impl KernelComposition {
                             row.module_id.as_str(),
                         )?
                         .ok_or(TransportError::SessionFenced)?;
-                    if retained.as_ref() != Some(row) {
+                    if &retained != row {
                         return Err(TransportError::SessionFenced.into());
                     }
                 }
