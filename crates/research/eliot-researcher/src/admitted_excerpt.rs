@@ -57,6 +57,8 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeMap;
+
 use crate::evidence_portfolio::{
     PortfolioError, bool_text, digest, freeze, push_count, push_field, text,
 };
@@ -250,7 +252,21 @@ pub struct RetainedSourceRevision {
     pub content_digest: String,
     /// The exact retained bytes.
     pub bytes: Vec<u8>,
-    /// Digest over the four fields above.
+    /// Regions the retaining owner declared to be search-result excerpts rather
+    /// than the source's own prose.
+    ///
+    /// This is a **declared bound, not a guess**: the owner that actually
+    /// retained the bytes is the only party that can say which span of them came
+    /// from a search engine's summary rather than from the page, and an owner that
+    /// declares no region has asserted there are none. The verifier then refuses
+    /// an occurrence that lands inside one, which is I21.8's "a search snippet
+    /// presented as a page quote" refused mechanically instead of by prose.
+    ///
+    /// Each region is re-proved against the retained bytes: an out-of-bounds or
+    /// inverted range is refused at construction, so a region cannot be widened
+    /// to cover the whole document and make the arm permanently pass.
+    pub snippet_regions: Vec<SnippetRegion>,
+    /// Digest over the five fields above.
     pub digest: String,
 }
 
@@ -266,6 +282,8 @@ impl RetainedSourceRevision {
         pub content_digest: String,
         /// The exact retained bytes.
         pub bytes: Vec<u8>,
+        /// Regions the retaining owner declared to be search-result excerpts.
+        pub snippet_regions: Vec<SnippetRegion>,
     }
 
     /// Retains one admitted source revision's exact bytes.
@@ -273,11 +291,13 @@ impl RetainedSourceRevision {
     /// # Errors
     ///
     /// Refuses a blank handle or artifact reference, a malformed
-    /// `content_digest`, and — importantly — bytes that do not hash to the
-    /// `content_digest` they are declared to be. That last refusal is what
-    /// makes this a commitment rather than a label: the bytes are checked
-    /// against the revision identity at construction, so nothing downstream has
-    /// to take the pairing on trust.
+    /// `content_digest`, bytes that do not hash to the `content_digest` they
+    /// are declared to be, and a snippet region that is inverted or reaches past
+    /// the retained bytes. The byte/digest refusal is what makes this a
+    /// commitment rather than a label: the bytes are checked against the
+    /// revision identity at construction, so nothing downstream has to take the
+    /// pairing on trust. The region refusal is what stops the snippet arm being
+    /// neutralised by declaring a region that covers the whole document.
     pub fn retain(params: Params) -> Result<Self, PortfolioError> {
         text(&params.source_handle, "retained.source_handle")?;
         text(&params.artifact_ref, "retained.artifact_ref")?;
@@ -288,11 +308,19 @@ impl RetainedSourceRevision {
                 field: "retained.content_digest",
             });
         }
+        for region in &params.snippet_regions {
+            if region.start >= region.end || region.end > params.bytes.len() {
+                return Err(PortfolioError::Blank {
+                    field: "retained.snippet_regions",
+                });
+            }
+        }
         let mut revision = Self {
             source_handle: params.source_handle,
             artifact_ref: params.artifact_ref,
             content_digest: params.content_digest,
             bytes: params.bytes,
+            snippet_regions: params.snippet_regions,
             digest: String::new(),
         };
         revision.digest = revision.compute_digest();
@@ -309,6 +337,12 @@ impl RetainedSourceRevision {
     /// assurance, while the length is what actually distinguishes "these are
     /// the bytes of that digest" from "this is a shorter body wearing that
     /// digest's name" for a reader checking the record.
+    ///
+    /// The declared snippet regions ARE enumerated, because they change what the
+    /// bytes may legitimately be quoted for: a revision that gains a snippet
+    /// region is a different commitment about the same bytes, and a digest that
+    /// ignored them would let the region set be widened after the fact without
+    /// moving the identity the occurrence check is performed under.
     pub fn compute_digest(&self) -> String {
         let mut preimage = String::from(RETAINED_SOURCE_REVISION_DIGEST_DOMAIN);
         preimage.push(';');
@@ -316,17 +350,24 @@ impl RetainedSourceRevision {
         push_field(&mut preimage, "artifact_ref", &self.artifact_ref);
         push_field(&mut preimage, "content_digest", &self.content_digest);
         push_field(&mut preimage, "byte_length", &self.bytes.len().to_string());
+        push_count(&mut preimage, "snippet_regions", self.snippet_regions.len());
+        for region in &self.snippet_regions {
+            push_field(&mut preimage, "snippet_start", &region.start.to_string());
+            push_field(&mut preimage, "snippet_end", &region.end.to_string());
+        }
         freeze(&preimage)
     }
 
-    /// Re-proves the recorded digest, the artifact reference, and that the
-    /// bytes still hash to the declared content digest.
+    /// Re-proves the recorded digest, the artifact reference, that the bytes
+    /// still hash to the declared content digest, and that every declared
+    /// snippet region is still in range.
     ///
     /// # Errors
     ///
     /// Returns [`PortfolioError::InvalidDigest`] when the recomputed digest
-    /// disagrees with the stored one, when the bytes no longer hash to
-    /// `content_digest`, or when a field is blank.
+    /// disagrees with the stored one or when the bytes no longer hash to
+    /// `content_digest`, and [`PortfolioError::Blank`] for a blank field or an
+    /// out-of-range snippet region.
     pub fn verify_integrity(&self) -> Result<(), PortfolioError> {
         text(&self.source_handle, "retained.source_handle")?;
         text(&self.artifact_ref, "retained.artifact_ref")?;
@@ -335,6 +376,13 @@ impl RetainedSourceRevision {
             return Err(PortfolioError::InvalidDigest {
                 field: "retained.content_digest",
             });
+        }
+        for region in &self.snippet_regions {
+            if region.start >= region.end || region.end > self.bytes.len() {
+                return Err(PortfolioError::Blank {
+                    field: "retained.snippet_regions",
+                });
+            }
         }
         if self.compute_digest() != self.digest {
             return Err(PortfolioError::InvalidDigest {
@@ -447,6 +495,17 @@ pub enum OccurrenceFailure {
     OffsetDoesNotMatch,
     /// The excerpt's own recorded digest does not match its bytes.
     ExcerptDigestMismatch,
+    /// The retained revision is internally consistent but is a different
+    /// revision of the source than the one this audit admitted.
+    ///
+    /// The retained bytes re-prove their own `content_digest`, which shows they
+    /// were not corrupted in transit. It says nothing about *which* revision
+    /// they are. This arm is the comparison against the admitted
+    /// `SourceRecord::content_digest` the governed source-admission owner
+    /// committed, so a revision fetched from the same locator at a different
+    /// time, or carried over from a prior freeze of the same source, is refused
+    /// rather than read as though it were the admitted text.
+    ForeignSourceRevision,
     /// The occurrence is stitched across a section boundary.
     StitchedAcrossSections,
     /// The context window carries no negation or hedge, and the excerpt presents
@@ -488,6 +547,7 @@ impl OccurrenceFailure {
             Self::AbsentFromRevision => "ABSENT_FROM_REVISION",
             Self::OffsetDoesNotMatch => "OFFSET_DOES_NOT_MATCH",
             Self::ExcerptDigestMismatch => "EXCERPT_DIGEST_MISMATCH",
+            Self::ForeignSourceRevision => "FOREIGN_SOURCE_REVISION",
             Self::StitchedAcrossSections => "STITCHED_ACROSS_SECTIONS",
             Self::NegationCropped => "NEGATION_CROPPED",
             Self::SnippetNotQuote => "SNIPPET_NOT_QUOTE",
@@ -744,41 +804,42 @@ fn section_finding(text: &str, quote: &str) -> (ContextFinding, bool) {
 
 /// Verifies one excerpt against the admitted revision it names.
 ///
-/// `admitted_handles` is the set of source handles this audit actually admitted
-/// (the audit's own `evidence_map`), so the handle check is against the
-/// admitted set rather than against a caller-supplied roster. Passing the audit's
-/// own output here is deliberate: a completeness rule that compared two copies
-/// of the same caller list would prove nothing.
+/// `admitted` maps each source handle this audit actually admitted (the audit's
+/// own `evidence_map`, never a caller-supplied roster) to the
+/// `SourceRecord::content_digest` the admitted record commits to. Both halves of
+/// that pair are required: a handle set alone cannot detect a **foreign source
+/// revision**, because a revision that is internally consistent and belongs to a
+/// different revision of the same source would pass every other check on it.
+/// The retained revision's `content_digest` is therefore compared against the
+/// admitted record's own, which is an independent expected value originating
+/// from the governed source-admission owner rather than from the retained bytes.
 ///
-/// `retained` is the retained original for the excerpt's source, supplied by
-/// the governed source-admission/persistence owner. `None` is a real,
-/// reported state (`NoRetainedRevision`), not a skip: an excerpt nobody
-/// compared with the original has not been verified, and the requirement that
-/// depends on it is `Unsatisfied` rather than `Satisfied`.
+/// `retained` is the retained original for the excerpt's source, supplied by the
+/// governed source-admission/persistence owner. `None` is a real, reported state
+/// (`NoRetainedRevision`), not a skip: an excerpt nobody compared with the
+/// original has not been verified, and the requirement that depends on it is
+/// `Unsatisfied` rather than `Satisfied`.
 #[allow(clippy::too_many_lines)]
 pub fn verify_excerpt_occurrence(
     excerpt: &AdmittedExcerpt,
-    admitted_handles: &BTreeSet<String>,
+    admitted: &BTreeMap<String, String>,
     retained: Option<&RetainedSourceRevision>,
 ) -> OccurrenceCheck {
     let mut failures: Vec<OccurrenceFailure> = Vec::new();
     if excerpt.verify_integrity().is_err() {
         failures.push(OccurrenceFailure::ExcerptDigestMismatch);
     }
-    if !admitted_handles.contains(&excerpt.source_handle) {
+    // A handle this audit did not admit is refused before any byte is read: an
+    // excerpt naming an outside handle is I21.8's first failure mode, and
+    // comparing its bytes against whatever revision happened to be supplied
+    // would produce a result about a source this audit never admitted.
+    let Some(admitted_content_digest) = admitted.get(&excerpt.source_handle) else {
         failures.push(OccurrenceFailure::HandleNotAdmitted);
-    }
+        return absent_check(excerpt, failures);
+    };
     let Some(retained) = retained else {
         failures.push(OccurrenceFailure::NoRetainedRevision);
-        return OccurrenceCheck {
-            excerpt: excerpt.clone(),
-            occurred: false,
-            occurrences: 0,
-            stitched: false,
-            cropped_negation: false,
-            context: Vec::new(),
-            failures,
-        };
+        return absent_check(excerpt, failures);
     };
     if retained.verify_integrity().is_err() {
         failures.push(OccurrenceFailure::RetainedRevisionUnproven);
@@ -786,64 +847,81 @@ pub fn verify_excerpt_occurrence(
     if retained.source_handle != excerpt.source_handle {
         failures.push(OccurrenceFailure::RevisionHandleMismatch);
     }
+    // The foreign-revision check. The retained bytes re-prove their own declared
+    // digest, which proves they are internally consistent; it does NOT prove they
+    // are the revision this audit admitted. The admitted record's own
+    // `content_digest` is the independent expected value, so a retained revision
+    // of a different revision of the same source is refused here even though
+    // every other check on it would pass. This is the "foreign source revision"
+    // acceptance case refused mechanically rather than by prose.
+    if &retained.content_digest != admitted_content_digest {
+        failures.push(OccurrenceFailure::ForeignSourceRevision);
+    }
     let Some(text) = retained.as_text() else {
         failures.push(OccurrenceFailure::RevisionNotText);
-        return OccurrenceCheck {
-            excerpt: excerpt.clone(),
-            occurred: false,
-            occurrences: 0,
-            stitched: false,
-            cropped_negation: false,
-            context: Vec::new(),
-            failures,
-        };
+        return absent_check(excerpt, failures);
     };
     // The occurrence positions this check will measure over. An asserted byte
     // offset is checked *at* that offset rather than searched for, because a
     // caller asserting a position is making a falsifiable claim about where the
     // quote came from and the check is what makes it falsifiable.
     let offsets: Vec<usize> = match excerpt.position {
-        ExcerptPosition::Unpositioned => find_all(text, &excerpt.excerpt),
+        ExcerptPosition::Unpositioned => {
+            let found = find_all(text, &excerpt.excerpt);
+            if found.is_empty() {
+                failures.push(OccurrenceFailure::AbsentFromRevision);
+                // A quote that also carries an elision marker is a fragment
+                // presented as a quotation, and the two failures together say
+                // so in a form a reader can act on. The arm cannot fire on a
+                // quote that genuinely occurs, because it is only reachable from
+                // the `AbsentFromRevision` conjunct above.
+                if carries_truncation_marker(&excerpt.excerpt) {
+                    failures.push(OccurrenceFailure::SnippetNotQuote);
+                }
+                return absent_check(excerpt, failures);
+            }
+            found
+        }
         ExcerptPosition::ByteOffset { offset } => {
             let at_offset = text
                 .get(offset..)
                 .is_some_and(|tail| tail.starts_with(excerpt.excerpt.as_str()));
             if at_offset {
-                Vec::new()
+                vec![offset]
             } else {
                 failures.push(OccurrenceFailure::OffsetDoesNotMatch);
-                Vec::new()
+                return absent_check(excerpt, failures);
             }
         }
     };
-    if let ExcerptPosition::ByteOffset { offset } = excerpt.position {
-        // The asserted offset arm resolved by comparing in place, so the
-        // measured positions are the single asserted one.
-        let positions: Vec<usize> = if failures.contains(&OccurrenceFailure::OffsetDoesNotMatch) {
-            Vec::new()
-        } else {
-            vec![offset]
-        };
-        return finish_check(excerpt, text, &positions, failures);
+    finish_check(excerpt, retained, text, &offsets, failures)
+}
+
+/// The check result for an excerpt whose bytes were never located in an admitted
+/// revision, carrying only the failures that explain why.
+///
+/// Context findings are empty rather than fabricated: no occurrence was found,
+/// so there is no admitted text around one to read an axis over. That is a
+/// different state from a found occurrence with an uncarried axis, and
+/// collapsing the two would report a measurement that was never made.
+fn absent_check(excerpt: &AdmittedExcerpt, mut failures: Vec<OccurrenceFailure>) -> OccurrenceCheck {
+    failures.sort();
+    failures.dedup();
+    OccurrenceCheck {
+        excerpt: excerpt.clone(),
+        occurred: false,
+        occurrences: 0,
+        stitched: false,
+        cropped_negation: false,
+        context: Vec::new(),
+        failures,
     }
-    if offsets.is_empty() {
-        failures.push(OccurrenceFailure::AbsentFromRevision);
-        return OccurrenceCheck {
-            excerpt: excerpt.clone(),
-            occurred: false,
-            occurrences: 0,
-            stitched: false,
-            cropped_negation: false,
-            context: Vec::new(),
-            failures,
-        };
-    }
-    finish_check(excerpt, text, &offsets, failures)
 }
 
 /// Completes a check once the occurrence positions are known.
 fn finish_check(
     excerpt: &AdmittedExcerpt,
+    retained: &RetainedSourceRevision,
     text: &str,
     positions: &[usize],
     mut failures: Vec<OccurrenceFailure>,
@@ -888,6 +966,29 @@ fn finish_check(
     };
     if cropped_negation {
         failures.push(OccurrenceFailure::NegationCropped);
+    }
+    // The search-snippet arm. The retaining owner declared byte ranges of this
+    // revision that are search-result excerpts rather than the source's own
+    // prose; an occurrence that falls inside one is not a quotation of the page
+    // however many times its bytes occur. This is measured against the declared
+    // ranges, which are re-proved in range by `verify_integrity` above, so the
+    // arm cannot be widened after the fact.
+    //
+    // The check is per-occurrence, and an excerpt is refused if **any** of its
+    // occurrences lands inside a declared region: a quote that is genuinely in
+    // the page once and in the snippet once has been presented from a source
+    // that is not the page, and the reader cannot tell which occurrence the
+    // author meant.
+    let inside_snippet = positions.iter().any(|position| {
+        let start = *position;
+        let end = start + quote.len();
+        retained
+            .snippet_regions
+            .iter()
+            .any(|region| start < region.end && region.start < end)
+    });
+    if inside_snippet {
+        failures.push(OccurrenceFailure::InsideSnippetRegion);
     }
     for axis in ContextAxis::ALL {
         context.push(match axis {
@@ -941,6 +1042,28 @@ fn finish_check(
 fn contains_marker(window: &str, markers: &[&str]) -> bool {
     let lowered = window.to_lowercase();
     markers.iter().any(|marker| lowered.contains(marker))
+}
+
+/// Whether a quote carries a marker that says a longer passage was elided.
+///
+/// This is deliberately a *string shape* test on the quote itself, not a claim
+/// about the source: the marker's presence only says the author presented the
+/// text as a fragment. It is paired with `AbsentFromRevision` at the call site,
+/// so it never fires on a quote that genuinely occurs in the revision, and it
+/// never asserts that the elision changed the meaning — that remains the
+/// admitted semantic route's question.
+///
+/// The bracketed forms (`[...]`, `[...]`) and the bare ellipsis spellings
+/// (`...`, `…`) are the ones a search engine, a summariser and a transcriber all
+/// emit. The bare spellings are included because they are the ones this check
+/// exists to catch, and because the accompanying `AbsentFromRevision`
+/// conjunct already prevents this from firing on a quote that is genuinely in
+/// the revision — so the cost of a false positive on an in-revision quotation
+/// is exactly zero, and the cost of a false negative on an absent one is an
+/// unreadable reason.
+fn carries_truncation_marker(quote: &str) -> bool {
+    const MARKERS: [&str; 4] = ["[...]", "[…]", "...", "…"];
+    MARKERS.iter().any(|marker| quote.contains(marker))
 }
 
 /// Builds the typed requirement obligation for one set of excerpt checks.
