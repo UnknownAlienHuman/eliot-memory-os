@@ -648,7 +648,10 @@ async fn serve_admitted_bridge_host_requests(
                 return Err(error);
             }
         };
-        if let Err(error) = kernel.await_native_worker_registration_start(&session, &frame).await {
+        if let Err(error) = kernel
+            .await_native_worker_registration_start(&session, &frame)
+            .await
+        {
             kernel.revoke_agent_bridge(&connection_id);
             return Err(error);
         }
