@@ -21,12 +21,13 @@ use eliot_dreamer_orientation::{
 use eliot_dreamer_probe_plan::{ProbePlan, ProbePlanParams};
 use eliot_dreamer_rival_model::RivalModelSet;
 use eliot_dreamer_contracts::rival::RivalModelSet as ProbeRivalModelSet;
-use eliot_epistemic::{CurrentEpistemicPosition, PositionRequest};
+use eliot_epistemic::{CurrentEpistemicPosition, ObservationRecord, PositionRequest};
+use eliot_epistemic_contracts::EpistemicPositionCandidate;
 use serde::Serialize;
 
 use crate::pulse::{
     CandidateStage, ClassificationStage, ConflictStage, CueActivationStage, PulseError,
-    PulseStage, PulseStageId, RivalStage, StageOwnerOutput, UnderstandingStage,
+    EpistemicStage, PulseStage, PulseStageId, RivalStage, StageOwnerOutput, UnderstandingStage,
     check_model_boundary, check_projection_boundary,
     run_candidate_stage, run_classification_stage, run_conflict_stage, run_cue_stage,
     run_epistemic_stage, run_grounding_stage, run_probe_stage, run_rival_stage,
@@ -41,6 +42,10 @@ pub(crate) struct OrientationOwnerInputs<'a> {
     pub classification: ClassificationStage<'a>,
     pub cue_activation: CueActivationStage<'a>,
     pub epistemic: &'a PositionRequest,
+    /// Original candidate retained by the Governor readback owner.
+    pub admitted_candidate: &'a EpistemicPositionCandidate,
+    /// Original source observation retained by the Governor readback owner.
+    pub source_observation: &'a ObservationRecord,
     pub understanding: UnderstandingStage<'a, MeasureFn>,
     pub grounding: &'a GroundingRequest,
     pub rivals: RivalStage<'a>,
@@ -402,8 +407,18 @@ macro_rules! run_and_retain {
         PulseStageId::CueActivation
     );
     run_and_retain!(
-        check_epistemic_binding(inputs.epistemic, bundle),
-        run_epistemic_stage(Some(inputs.epistemic)),
+        check_epistemic_binding(
+            inputs.epistemic,
+            inputs.admitted_candidate,
+            inputs.rivals.current_position,
+            bundle,
+        ),
+        run_epistemic_stage(Some(&EpistemicStage {
+            candidate: inputs.admitted_candidate,
+            admitted_position: inputs.rivals.current_position,
+            observation: inputs.source_observation,
+            request: inputs.epistemic,
+        })),
         PulseStageId::EpistemicPosition
     );
     run_and_retain!(
@@ -423,7 +438,7 @@ macro_rules! run_and_retain {
         PulseStageId::Grounding
     );
     if outputs.grounding.as_ref()
-        != inputs.rivals.validated_draft.input.grounded.as_ref()
+        != Some(inputs.rivals.validated_draft.input.grounded.as_ref())
     {
         return failed_run(
             stages,
@@ -510,7 +525,7 @@ macro_rules! run_and_retain {
     if inputs.candidates.request.binding.task_id.as_str() != bundle.task_id
         || inputs.candidates.request.binding.scope_id.as_str() != bundle.scope_id
         || inputs.candidates.request.binding.state_fence != bundle.state_fence
-        || inputs.candidates.epistemic_position.is_some_and(|view| {
+        || inputs.candidates.epistemic_position.is_none_or(|view| {
             &view.position != inputs.rivals.current_position
                 || view.position.admission.scope != bundle.scope_id
                 || view.position.admission.fence != bundle.state_fence
@@ -602,9 +617,17 @@ fn check_cue_binding(
 
 fn check_epistemic_binding(
     request: &PositionRequest,
+    candidate: &EpistemicPositionCandidate,
+    admitted_position: &eliot_epistemic_contracts::CurrentEpistemicPosition,
     bundle: &DreamInputBundle,
 ) -> Result<(), PulseError> {
-    if request.scope != bundle.scope_id || request.state_fence != bundle.state_fence {
+    if request.scope != bundle.scope_id
+        || request.state_fence != bundle.state_fence
+        || candidate.scope != bundle.scope_id
+        || candidate.fence != bundle.state_fence
+        || admitted_position.admission.scope != bundle.scope_id
+        || admitted_position.admission.fence != bundle.state_fence
+    {
         return Err(PulseError::Boundary("epistemic scope or fence"));
     }
     Ok(())
