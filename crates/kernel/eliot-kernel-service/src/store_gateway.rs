@@ -50,7 +50,7 @@ use eliot_ors::{
     MaintenanceTriggerIntakeStorageRecord, MaintenanceTriggerLifecyclePageProjection,
     MaintenanceTriggerLifecyclePhase, MaintenanceTriggerLifecycleRecord,
     OperationIdentity as OrsOperationIdentity, OperationalRecoveryStore, OrsError,
-    RecoveryPayloadEnvelope, StateFenceSnapshot,
+    RecoveryPayloadEnvelope, StateFenceSnapshot, prove_maintenance_trigger_staging,
 };
 use eliot_protocol::dreamer_job::{DurableJobRequest, DurableJobResponse, JobOperation};
 use eliot_runtime_contracts::{
@@ -68,8 +68,8 @@ use eliot_protocol::{
     MAINTENANCE_TRIGGER_DECISION_RECEIPT_WIRE_VERSION, MAINTENANCE_TRIGGER_PAGE_WIRE_ID,
     MAINTENANCE_TRIGGER_PAGE_WIRE_VERSION, MaintenanceTriggerAck, MaintenanceTriggerClaim,
     MaintenanceTriggerDecisionReceipt, MaintenanceTriggerDisposition, MaintenanceTriggerGap,
-    MaintenanceTriggerPage, MaintenanceTriggerPendingSummary, MaintenanceTriggerRecord,
-    MaintenanceTriggerRevocation, MaintenanceTriggerRoutingClass,
+    MaintenanceTriggerIntakeReceipt, MaintenanceTriggerPage, MaintenanceTriggerPendingSummary,
+    MaintenanceTriggerRecord, MaintenanceTriggerRevocation, MaintenanceTriggerRoutingClass,
     MaintenanceTriggerTerminalDisposition, MaintenanceTriggerTerminalKind, ProtocolError,
 };
 use eliot_store_api::{
@@ -130,6 +130,11 @@ use crate::{
     committed_configuration_state, compile_wake_horizon, run_now_wake_read_request,
 };
 use eliot_kernel_core::user_automation::UserAutomationExecutionProjection;
+#[cfg(windows)]
+use crate::{
+    AuthenticatedMaintenanceTriggerSession, KernelServiceError, MaintenanceTriggerDeliveryError,
+    MaintenanceTriggerDeliveryLedger, MaintenanceTriggerDeliveryRow,
+};
 
 const ACTIVE_DAEMON_CALLER: &str = "eliotd";
 
@@ -2021,6 +2026,13 @@ pub struct KernelStoreGateway {
     /// observation and never answers on its own. Its initial state is
     /// uninitialized evidence, not an observed clear ledger.
     paused_scopes: PausedScopeMirror,
+    /// Owned delivery ledger for retained maintenance triggers (issue #1694
+    /// W2). A row is admitted only after the ORS owner proves the staged
+    /// envelope; the store owner persists `durable_rows` and restores them
+    /// across restart. It indexes delivery metadata only, never a second
+    /// trigger database.
+    #[cfg(windows)]
+    maintenance_triggers: Mutex<MaintenanceTriggerDeliveryLedger>,
 }
 
 impl std::fmt::Debug for KernelStoreGateway {
@@ -2199,6 +2211,8 @@ impl KernelStoreGateway {
             // observation, and until one succeeds a negative mirror answer
             // is unavailable rather than clear.
             paused_scopes: PausedScopeMirror::new(),
+            #[cfg(windows)]
+            maintenance_triggers: Mutex::new(MaintenanceTriggerDeliveryLedger::new()),
         }
     }
 
@@ -2962,6 +2976,112 @@ impl KernelStoreGateway {
             }
         };
         stage_validated_maintenance_trigger_intake(ors, record, &context, retained_intake)
+    }
+
+    /// Admits one retained maintenance trigger into the owned delivery ledger
+    /// before any intake acknowledgement (issue #1694 W2).
+    ///
+    /// I14.22 keeps the trigger durable while the evaluator is unavailable:
+    /// "if the evaluator is unavailable, the relevant trigger remains durable
+    /// and is surfaced on the next startup". I5.2 stages the complete opaque
+    /// input through the existing ORS owner and forbids `accepted_pending`
+    /// when staging fails: "if ORS cannot durably stage the complete opaque
+    /// operation, `accepted_pending` is forbidden".
+    ///
+    /// The complete opaque input must already be staged: where a retained
+    /// canonical source envelope exists only its delivery obligation is
+    /// stored, otherwise the caller stages the full opaque envelope through
+    /// ORS first. This entry proves the record's delivery obligation names a
+    /// durably staged envelope through the existing ORS owner
+    /// ([`prove_maintenance_trigger_staging`], guard-free, against the
+    /// owner's read-back rather than any caller list copy), then admits the
+    /// obligation into the owned [`MaintenanceTriggerDeliveryLedger`]. Exact
+    /// identity/hash replay returns the same staging receipt; changed content
+    /// under the same identity conflicts. Any capacity, key, integrity, or
+    /// durable-write failure returns the exact bounded
+    /// [`MaintenanceTriggerDeliveryError`] with nothing admitted, so the
+    /// producer keeps its retry identity (trigger identity, operation hash,
+    /// source cursor) and its cursor must not advance. The returned rows are
+    /// the ledger's durable snapshot for the store owner to persist; the
+    /// receipt proves staging only and is not a delivery acknowledgement.
+    /// `handle_maintenance_trigger_intake` stays the seam for guard-free
+    /// front-door callers (STITCH): this owner entry proves staging first so
+    /// no guard is ever held across the ORS read.
+    #[cfg(windows)]
+    pub fn admit_maintenance_trigger(
+        &self,
+        principal_ref: &str,
+        record: MaintenanceTriggerRecord,
+    ) -> Result<
+        (
+            MaintenanceTriggerIntakeReceipt,
+            Vec<MaintenanceTriggerDeliveryRow>,
+        ),
+        MaintenanceTriggerDeliveryError,
+    > {
+        let _flight = self.flight.enter().map_err(|message| {
+            if self.is_fenced() {
+                MaintenanceTriggerDeliveryError::Service(KernelServiceError::GenerationFenced)
+            } else {
+                MaintenanceTriggerDeliveryError::Service(KernelServiceError::Platform(message))
+            }
+        })?;
+        // Every mutating entry refuses `shadow_no_authority` first, before
+        // any ORS work. The exact service error is preserved (not flattened)
+        // so the caller sees the closed admission refusal.
+        {
+            let service = self.service.lock().map_err(|_| {
+                MaintenanceTriggerDeliveryError::Service(KernelServiceError::Platform(
+                    "Kernel service lock poisoned".to_owned(),
+                ))
+            })?;
+            service
+                .admit_shadow_effect()
+                .map_err(MaintenanceTriggerDeliveryError::Service)?;
+        }
+        // Bind the session from live authority; the guard is released before
+        // any ORS IO below.
+        let session = {
+            let service = self.service.lock().map_err(|_| {
+                MaintenanceTriggerDeliveryError::Service(KernelServiceError::Platform(
+                    "Kernel service lock poisoned".to_owned(),
+                ))
+            })?;
+            AuthenticatedMaintenanceTriggerSession::bind(&service, principal_ref)
+                .map_err(MaintenanceTriggerDeliveryError::Service)?
+        };
+        let commit_ors = self.commit_ors.clone().ok_or_else(|| {
+            MaintenanceTriggerDeliveryError::StagingProof(OrsError::IntegrityProblem {
+                record_type: "maintenance_trigger_delivery",
+                reason: "maintenance trigger intake requires the composition-bound ORS".to_owned(),
+            })
+        })?;
+        prove_maintenance_trigger_staging(
+            &*commit_ors,
+            &record.payload.envelope_reference,
+            &record.payload.payload_hash,
+        )
+        .map_err(MaintenanceTriggerDeliveryError::StagingProof)?;
+        // Re-prove liveness under a fresh guard, then admit under both
+        // guards, service-first and ledger-second. A missing envelope or a
+        // mismatched identity/digest fails above with no receipt: an
+        // in-memory pointer, ephemeral file, or inaccessible source reference
+        // is not a complete durable payload.
+        let service = self.service.lock().map_err(|_| {
+            MaintenanceTriggerDeliveryError::Service(KernelServiceError::Platform(
+                "Kernel service lock poisoned".to_owned(),
+            ))
+        })?;
+        session
+            .service_context(&service)
+            .map_err(MaintenanceTriggerDeliveryError::Service)?;
+        let mut ledger = self.maintenance_triggers.lock().map_err(|_| {
+            MaintenanceTriggerDeliveryError::Service(KernelServiceError::Platform(
+                "maintenance trigger ledger lock poisoned".to_owned(),
+            ))
+        })?;
+        let receipt = ledger.admit_intake(record)?;
+        Ok((receipt, ledger.durable_rows()))
     }
 
     /// Returns one bounded, restart-stable page of retained trigger lifecycle
