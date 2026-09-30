@@ -700,8 +700,11 @@ pub async fn record_task_controller_coordination_candidate(
         ),
         now,
     };
-    composition
-        .commit_coordination_candidate_lifecycle(issued, ingress)
+    // The four durable legs are awaited one after another inside this call, so
+    // the whole issuance record would otherwise be held in the caller's future
+    // across every await. Boxing the future keeps that state on the heap for the
+    // duration of the commit instead of on the task's stack frame.
+    Box::pin(composition.commit_coordination_candidate_lifecycle(issued, ingress))
         .await
         .map_err(|error| format!("coordination lifecycle commit: {error}"))
 }
