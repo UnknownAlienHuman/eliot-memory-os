@@ -203,9 +203,10 @@ impl GovernedProcessEffectBaseline {
 ///
 /// The Kernel-owned effect port constructs one entry per baseline target
 /// from two further independent opens plus the terminal evidence's own
-/// State Fence. A target that cannot be read back is omitted here; only
-/// agreeing real reads become evidence. A receipt without targets proves
-/// nothing and ingests nothing.
+/// State Fence. A target that cannot be read back is omitted here, unless
+/// two agreeing not-found observations prove deletion (I10.21 AUD5), which
+/// crosses as deletion evidence; only agreeing real reads otherwise become
+/// evidence. A receipt without targets proves nothing and ingests nothing.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GovernedProcessChangeReceipt {
     targets: Vec<EffectTargetReceipt>,
@@ -215,13 +216,16 @@ pub(crate) struct GovernedProcessChangeReceipt {
 /// One declared target's terminal state, joined to its baseline entry by
 /// absolute declared path. Only the agreeing terminal reads cross into
 /// evidence; ledger identity (resource, lane path, target digest) is read
-/// from the baseline entry the path joins to.
+/// from the baseline entry the path joins to. An after-state of all-`None`
+/// is proven deletion (two agreeing not-found reads against the baseline),
+/// never a read glitch: it admits an immutable `Absent` observation at
+/// ingest instead of an unobserved gap.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct EffectTargetReceipt {
     path: PathBuf,
-    after_bytes: Vec<u8>,
-    after_first_digest: String,
-    after_reread_digest: String,
+    after_bytes: Option<Vec<u8>>,
+    after_first_digest: Option<String>,
+    after_reread_digest: Option<String>,
 }
 
 impl GovernedProcessChangeReceipt {
@@ -230,16 +234,23 @@ impl GovernedProcessChangeReceipt {
     }
 }
 
-/// Stable categories for a missing or malformed independent source observation.
+/// Typed `ChangeMonitor` ingress failures the effect port reports instead
+/// of swallowing (I10.21 AUD4).
 ///
-/// The Kernel-owned port below reports I/O and binding outcomes through
-/// the baseline/receipt `observed` flags instead of failing: an unreadable
-/// image or a mismatched operation runs unobserved, never fenced. The type
-/// is retained so a future fallible adapter can introduce one variant per
-/// failure it can actually report; Kernel only forwards the value to the
-/// stable observation.
+/// Per-target evidence outcomes still report through the baseline/receipt
+/// `observed` flags instead of failing: an unreadable image or a
+/// mismatched operation runs unobserved, never fenced. A poisoned ledger
+/// is not an evidence outcome: no hint, record, or confirmation below can
+/// be admitted or read back, so the observation is refused with a typed
+/// error instead of recorded as unobserved. The gateway observes the typed
+/// outcome and continues the operation; the poisoned ledger itself keeps
+/// governed acceptance blocked, so reporting never fences an unrelated
+/// module.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum GovernedProcessEffectPortError {}
+pub(crate) enum GovernedProcessEffectPortError {
+    /// The `ChangeMonitor` ledger lock is poisoned.
+    LedgerPoisoned,
+}
 
 /// Kernel-owned readback and `ChangeMonitor` ingress for process tools.
 ///
@@ -312,27 +323,77 @@ pub(crate) struct GovernedProcessEffectSource {
 /// past evidence the ledger never admitted.
 /// Per-artifact last-observed
 /// digests are retained here under one mutex (atomic publish); the ledger
-/// itself stays the only acceptance gate.
+/// itself stays the only acceptance gate. After a restart the map starts
+/// empty and each capture falls back to the ledger-retained tip
+/// ([`change_monitor::resource_tip`], rebuilt from the durable sidecar at
+/// construction), so a restart never silently establishes a fresh baseline
+/// over an unreconciled mutation.
 pub(crate) struct KernelGovernedProcessEffectPort {
     last_observed: Mutex<BTreeMap<String, String>>,
 }
 
+/// What two opens of one tracked source prove: agreeing present bytes are
+/// a stable observation; two agreeing not-found observations prove absence
+/// (I10.21 AUD5: the deletion evidence the reconcile path admits as an
+/// immutable `Absent` observation). Any other failure — permissions,
+/// transient I/O, or disagreeing reads — proves nothing about stability or
+/// absence and is `None` from the reader below, never a deletion claim.
+enum TrackedSourceRead {
+    Present {
+        bytes: Vec<u8>,
+        first_digest: String,
+        reread_digest: String,
+    },
+    Absent,
+}
+
 impl KernelGovernedProcessEffectPort {
     pub(crate) fn new() -> Self {
-        Self {
+        let port = Self {
             last_observed: Mutex::new(BTreeMap::new()),
+        };
+        // I10.21 durability (AUD3): rebuild the ledger from its durable
+        // sidecar when this process started fresh, so ledger-retained tips
+        // keep detecting external transitions below. A missing sidecar is
+        // a clean boot; a corrupt or unreadable sidecar is reported here
+        // and stays fail-closed at the finish-acceptance gate, which
+        // rehydrates (and refuses) before consulting it.
+        if change_monitor::hydrate_ledger_sidecar_if_empty().is_err() {
+            observe_process(
+                "kernel.process.effect_baseline_unavailable",
+                "hydrate_failed",
+            );
         }
+        port
     }
 
     /// Opens the tracked path twice and hashes both reads. The digests
     /// must agree: a single read proves nothing about stability, and two
     /// reads that disagree prove the path is changing under observation.
-    fn read_tracked_source(path: &Path) -> Option<(Vec<u8>, String, String)> {
-        let first_bytes = std::fs::read(path).ok()?;
-        let second_bytes = std::fs::read(path).ok()?;
-        let first = super::sha256_hex(&first_bytes);
-        let second = super::sha256_hex(&second_bytes);
-        (first == second).then_some((first_bytes, first, second))
+    fn read_tracked_source(path: &Path) -> Option<TrackedSourceRead> {
+        let first = match std::fs::read(path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return None,
+        };
+        let second = match std::fs::read(path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return None,
+        };
+        match (first, second) {
+            (Some(first_bytes), Some(second_bytes)) => {
+                let first_digest = super::sha256_hex(&first_bytes);
+                let reread_digest = super::sha256_hex(&second_bytes);
+                (first_digest == reread_digest).then_some(TrackedSourceRead::Present {
+                    bytes: first_bytes,
+                    first_digest,
+                    reread_digest,
+                })
+            }
+            (None, None) => Some(TrackedSourceRead::Absent),
+            (Some(_), None) | (None, Some(_)) => None,
+        }
     }
 
     /// Lane-stable locator for one tracked resource: the content-bound
@@ -380,6 +441,130 @@ impl KernelGovernedProcessEffectPort {
             &notification,
             Some(before_digest),
         )
+    }
+
+    /// Checks one retained previous digest against fresh reads through the
+    /// filesystem/Git observation adapter (I10.21 A2): the retained previous
+    /// digest against two fresh agreeing reads is evidence no admission
+    /// explains by itself, so the transition is external and uncorrelated
+    /// until a recorded governed change reconciles it. Sets `observed` when
+    /// the adapter admits the transition and returns `false`; returns `true`
+    /// when the caller must skip the target (the transition stays
+    /// unrecorded and a blocking gap marker pins the retained digest so the
+    /// next capture re-detects it instead of advancing past evidence the
+    /// ledger never admitted). Ledger contention fences the tool instead.
+    fn check_retained_external_transition(
+        workspace_root: &Path,
+        hinted_source: &Path,
+        resource: &str,
+        event_ref: &str,
+        previous: &str,
+        operation: &str,
+        observed: &mut bool,
+    ) -> Result<bool, GovernedProcessEffectPortError> {
+        match Self::observe_external_filesystem_transition(
+            workspace_root,
+            hinted_source,
+            resource,
+            event_ref,
+            previous,
+        ) {
+            Ok(confirmation) => {
+                *observed = true;
+                observe_process(
+                    "kernel.process.effect_external_transition",
+                    match confirmation {
+                        change_monitor::HintConfirmation::VerifiedImmaterial => "immaterial",
+                        change_monitor::HintConfirmation::MaterialRecorded {
+                            reconciled, ..
+                        } => {
+                            if reconciled {
+                                "reconciled"
+                            } else {
+                                "material"
+                            }
+                        }
+                    },
+                );
+                Ok(false)
+            }
+            Err(error) => {
+                let outcome = if error == change_monitor::ChangeMonitorError::UnstableReadback {
+                    "unstable"
+                } else {
+                    "unobserved"
+                };
+                // I10.21 AUD4: the retained previous digest proves
+                // a real transition, but the ledger could not
+                // record it. The target leaves the baseline with a
+                // blocking gap marker pinned to the retained digest
+                // instead of advancing past evidence the ledger
+                // never admitted; the next capture re-detects it.
+                match change_monitor::note_unresolved_transition(
+                    resource,
+                    operation,
+                    Some(previous.to_owned()),
+                ) {
+                    Ok(_) => {
+                        observe_process("kernel.process.effect_external_transition", "unresolved");
+                    }
+                    Err(change_monitor::ChangeMonitorError::LedgerPoisoned) => {
+                        return Err(GovernedProcessEffectPortError::LedgerPoisoned);
+                    }
+                    Err(_) => observe_process("kernel.process.effect_external_transition", outcome),
+                }
+                Ok(true)
+            }
+        }
+    }
+
+    /// Admits one host-event hint for a declared target (I10.21 A1). A
+    /// conflicting identity under the same hint reuses an operation handle
+    /// for different content: evidence is ambiguous, so nothing is recorded
+    /// or confirmed for it. Ledger failures are typed, never swallowed
+    /// (I10.21 AUD4): a poisoned ledger refuses the observation instead of
+    /// recording it as unobserved, and any other ingest refusal pins a
+    /// blocking gap marker on the retained baseline instead of leaving the
+    /// resource unblocked. Returns the admitted hint identity plus whether
+    /// the caller must skip the target (`true`: the hint was refused and
+    /// the caller must continue ingest for the next target).
+    fn admit_host_event_hint(
+        operation: &str,
+        target_digest: &str,
+        resource: &str,
+        lane_path: &str,
+        owner_module: &str,
+        before_digest: &str,
+    ) -> Result<(String, bool), GovernedProcessEffectPortError> {
+        let hint_id = change_monitor::host_hint_id(operation, target_digest);
+        let hint = change_monitor::KernelChangeHint {
+            hint_id: hint_id.clone(),
+            resource: resource.to_owned(),
+            path: lane_path.to_owned(),
+            origin: change_monitor::HintOrigin::HostEvent,
+            origin_ref: Some(owner_module.to_owned()),
+        };
+        match change_monitor::ingest_hint(hint) {
+            Ok(_) => Ok((hint_id, false)),
+            Err(change_monitor::ChangeMonitorError::LedgerPoisoned) => {
+                Err(GovernedProcessEffectPortError::LedgerPoisoned)
+            }
+            Err(_) => {
+                let outcome = match change_monitor::note_unresolved_transition(
+                    resource,
+                    operation,
+                    Some(before_digest.to_owned()),
+                ) {
+                    Ok(_) => "unresolved",
+                    Err(change_monitor::ChangeMonitorError::LedgerPoisoned) => {
+                        return Err(GovernedProcessEffectPortError::LedgerPoisoned);
+                    }
+                    Err(_) => "unobserved",
+                };
+                observe_process("kernel.process.effect_observed", outcome);
+                Ok((hint_id, true))
+            }
+        }
     }
 }
 
@@ -438,14 +623,17 @@ fn declared_target_paths(argv: &[String], working_directory: &Path) -> Vec<PathB
     targets
 }
 
-// I10.21 A1: only a proven transition with real bytes on both
-// sides becomes a governed record. The ledger hashes the supplied
-// bytes itself and the diff handle is the ledger's own transition
-// binder, so the handle resolves to the recorded transition by
-// construction. The record is written before confirmation so the
-// confirmation can reconcile against this exact evidence. The
+// I10.21 A1: only a proven transition becomes a governed record. The
+// ledger hashes the supplied bytes itself and the diff handle is the
+// ledger's own transition binder, so the handle resolves to the recorded
+// transition by construction. The record is written before confirmation so
+// the confirmation can reconcile against this exact evidence. The
 // change identity scopes the record to this operation's exact
-// target, so one operation's targets never share one record.
+// target, so one operation's targets never share one record. A proven
+// deletion (agreeing terminal absence against a present baseline, I10.21
+// AUD5) records with no after side, so a tool that unlinked its declared
+// target reconciles the exact deletion instead of leaving an
+// unreconciled unknown no later observation can explain.
 fn record_proven_target_transition(
     operation: &str,
     base: &EffectTargetBaseline,
@@ -454,15 +642,18 @@ fn record_proven_target_transition(
     receipt: &GovernedProcessChangeReceipt,
 ) -> Option<String> {
     let mut recorded_transition: Option<String> = None;
-    if back.after_first_digest == back.after_reread_digest
-        && back.after_first_digest != base.before_digest
-    {
+    let present_transition = match (&back.after_first_digest, &back.after_reread_digest) {
+        (Some(first), Some(reread)) => first == reread && first != &base.before_digest,
+        _ => false,
+    };
+    let deletion = back.after_first_digest.is_none() && back.after_reread_digest.is_none();
+    if present_transition || deletion {
         let target_digest = base.target_digest.as_str();
         let change_id = format!("{operation}:{target_digest}");
         let (_, transition) = change_monitor::material_transition_ids(
             &change_id,
             Some(base.before_digest.as_str()),
-            Some(back.after_first_digest.as_str()),
+            back.after_first_digest.as_deref(),
         );
         let change = change_monitor::GovernedToolChange {
             change_id,
@@ -471,8 +662,8 @@ fn record_proven_target_transition(
             before_path: None,
             before_revision: Some(base.before_digest.clone()),
             before_bytes: Some(base.before_bytes.clone()),
-            after_revision: Some(back.after_first_digest.clone()),
-            after_bytes: Some(back.after_bytes.clone()),
+            after_revision: back.after_first_digest.clone(),
+            after_bytes: back.after_bytes.clone(),
             session: baseline.binding.session_id.as_str().to_owned(),
             action_lease: baseline.binding.action_lease_ref.as_str().to_owned(),
             operation: operation.to_owned(),
@@ -523,27 +714,42 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
             return Ok(unobserved());
         }
         let mut targets = Vec::new();
+        let mut mutated = false;
         for target_path in &source.declared_targets {
             let resource = target_path.to_string_lossy().into_owned();
             if resource.trim().is_empty() || resource.chars().any(char::is_control) {
                 continue;
             }
             let (target_digest, lane_path) = Self::lane_path_for(&resource);
-            let Some((before_bytes, first_digest, _reread_digest)) =
-                Self::read_tracked_source(target_path)
+            let Some(TrackedSourceRead::Present {
+                bytes: before_bytes,
+                first_digest,
+                ..
+            }) = Self::read_tracked_source(target_path)
             else {
                 // No evidence for this target: it stays out of the baseline
-                // instead of inventing bytes. (Deletion readback is a
-                // separate lane; an absent declared path is not a proven
-                // absence here.)
+                // instead of inventing bytes. An absent declared path is
+                // not a proven absence here: at capture a missing path may
+                // be a creation the tool is about to perform, so absence
+                // becomes ledger evidence only as a readback deletion
+                // against a retained baseline (see `read_after`, I10.21
+                // AUD5).
                 continue;
             };
             let previous = self
                 .last_observed
                 .lock()
                 .ok()
-                .and_then(|last| last.get(&resource).cloned());
-            let mut transition_unrecorded = false;
+                .and_then(|last| last.get(&resource).cloned())
+                .or_else(|| {
+                    // I10.21 durability (AUD3): after a restart this map
+                    // starts empty while the ledger-retained tip survived
+                    // in the durable sidecar, so the tip is the previous
+                    // digest instead of silently establishing a fresh
+                    // baseline over an unreconciled mutation.
+                    change_monitor::resource_tip(&resource).and_then(|tip| tip.digest)
+                });
+            let operation = binding.operation_id().as_str().to_owned();
             if let Some(previous) = previous
                 && previous != first_digest
             {
@@ -559,47 +765,19 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
                 // refusal keeps the retained digest so the next capture
                 // retries instead of advancing past evidence the ledger
                 // never admitted.
-                match Self::observe_external_filesystem_transition(
+                if Self::check_retained_external_transition(
                     &source.working_directory,
                     target_path,
                     &resource,
                     binding.owner.module_id(),
                     &previous,
-                ) {
-                    Ok(confirmation) => {
-                        observe_process(
-                            "kernel.process.effect_external_transition",
-                            match confirmation {
-                                change_monitor::HintConfirmation::VerifiedImmaterial => {
-                                    "immaterial"
-                                }
-                                change_monitor::HintConfirmation::MaterialRecorded {
-                                    reconciled,
-                                    ..
-                                } => {
-                                    if reconciled {
-                                        "reconciled"
-                                    } else {
-                                        "material"
-                                    }
-                                }
-                            },
-                        );
-                    }
-                    Err(error) => {
-                        transition_unrecorded = true;
-                        observe_process(
-                            "kernel.process.effect_external_transition",
-                            if error == change_monitor::ChangeMonitorError::UnstableReadback {
-                                "unstable"
-                            } else {
-                                "unobserved"
-                            },
-                        );
-                    }
+                    &operation,
+                    &mut mutated,
+                )? {
+                    continue;
                 }
             }
-            if !transition_unrecorded && let Ok(mut last) = self.last_observed.lock() {
+            if let Ok(mut last) = self.last_observed.lock() {
                 last.insert(resource.clone(), first_digest.clone());
             }
             targets.push(EffectTargetBaseline {
@@ -613,6 +791,15 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
         }
         if targets.is_empty() {
             observe_process("kernel.process.effect_baseline_unavailable", "unobserved");
+        }
+        // I10.21 durability (AUD3): capture-time ledger mutations
+        // (external-transition confirmations) are observations in their
+        // own right: persist them best-effort so a crash before reconcile
+        // still retains them. The observation stands regardless; only
+        // durability is best-effort, and it stays visible instead of
+        // silent.
+        if mutated && change_monitor::persist_ledger_sidecar().is_err() {
+            observe_process("kernel.process.effect_observed", "persist_failed");
         }
         Ok(GovernedProcessEffectBaseline {
             binding: binding.clone(),
@@ -637,25 +824,71 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
             observe_process("kernel.process.effect_readback_failed", "unobserved");
             return Ok(unobserved());
         }
+        let operation = baseline.binding.operation_id().as_str().to_owned();
         let mut targets = Vec::new();
         for base in &baseline.targets {
-            let Some((after_bytes, first_digest, reread_digest)) =
-                Self::read_tracked_source(&base.path)
-            else {
-                // No evidence for this declared target: it proves nothing
-                // for this operation and ingests nothing.
-                observe_process("kernel.process.effect_readback_failed", "unobserved");
-                continue;
-            };
-            if let Ok(mut last) = self.last_observed.lock() {
-                last.insert(base.resource.clone(), first_digest.clone());
+            match Self::read_tracked_source(&base.path) {
+                Some(TrackedSourceRead::Present {
+                    bytes: after_bytes,
+                    first_digest,
+                    reread_digest,
+                }) => targets.push(EffectTargetReceipt {
+                    path: base.path.clone(),
+                    after_bytes: Some(after_bytes),
+                    after_first_digest: Some(first_digest),
+                    after_reread_digest: Some(reread_digest),
+                }),
+                Some(TrackedSourceRead::Absent) => {
+                    // I10.21 AUD5: two agreeing not-found observations
+                    // against this operation's own retained baseline prove
+                    // the declared target was deleted during the run. The
+                    // target crosses into the receipt as deletion evidence
+                    // so ingest admits an immutable `Absent` observation:
+                    // a tool that unlinked its declared target reconciles
+                    // the exact deletion, while anything else stays
+                    // blocked as an unreconciled unknown-origin deletion.
+                    targets.push(EffectTargetReceipt {
+                        path: base.path.clone(),
+                        after_bytes: None,
+                        after_first_digest: None,
+                        after_reread_digest: None,
+                    });
+                    observe_process("kernel.process.effect_readback_deleted", "deleted");
+                }
+                None => {
+                    // No evidence for this declared target: it proves
+                    // nothing for this operation and ingests nothing. The
+                    // retained digest is kept for the next capture instead
+                    // of advancing past evidence the ledger never admitted
+                    // (I10.21 AUD4): a previously observed target that can
+                    // no longer be read gains a blocking gap marker, while
+                    // a never-observed path simply stays out of the
+                    // receipt.
+                    let previous = self
+                        .last_observed
+                        .lock()
+                        .ok()
+                        .and_then(|last| last.get(&base.resource).cloned())
+                        .or_else(|| {
+                            change_monitor::resource_tip(&base.resource).and_then(|tip| tip.digest)
+                        });
+                    let outcome = match previous {
+                        Some(digest) => match change_monitor::note_unresolved_transition(
+                            &base.resource,
+                            &operation,
+                            Some(digest),
+                        ) {
+                            Ok(_) => "unresolved",
+                            Err(change_monitor::ChangeMonitorError::LedgerPoisoned) => {
+                                return Err(GovernedProcessEffectPortError::LedgerPoisoned);
+                            }
+                            Err(_) => "unobserved",
+                        },
+                        None => "unobserved",
+                    };
+                    observe_process("kernel.process.effect_readback_failed", outcome);
+                }
             }
-            targets.push(EffectTargetReceipt {
-                path: base.path.clone(),
-                after_bytes,
-                after_first_digest: first_digest,
-                after_reread_digest: reread_digest,
-            });
         }
         Ok(GovernedProcessChangeReceipt {
             targets,
@@ -673,6 +906,7 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
             return Ok(());
         }
         let operation = baseline.binding.operation_id().as_str().to_owned();
+        let mut admitted_any = false;
         for base in &baseline.targets {
             let Some(back) = receipt
                 .targets
@@ -685,37 +919,40 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
                 continue;
             };
             let target_digest = base.target_digest.as_str();
-            let hint_id = change_monitor::host_hint_id(&operation, target_digest);
-            let hint = change_monitor::KernelChangeHint {
-                hint_id: hint_id.clone(),
-                resource: base.resource.clone(),
-                path: base.lane_path.clone(),
-                origin: change_monitor::HintOrigin::HostEvent,
-                origin_ref: Some(baseline.binding.owner.module_id().to_owned()),
-            };
-            // A conflicting identity under the same hint reuses an operation
-            // handle for different content: evidence is ambiguous, so nothing
-            // is recorded or confirmed for it.
-            if let Err(change_monitor::ChangeMonitorError::HintConflict) =
-                change_monitor::ingest_hint(hint)
-            {
-                observe_process("kernel.process.effect_observed", "unobserved");
+            let (hint_id, skip_target) = Self::admit_host_event_hint(
+                &operation,
+                target_digest,
+                &base.resource,
+                &base.lane_path,
+                baseline.binding.owner.module_id(),
+                &base.before_digest,
+            )?;
+            if skip_target {
                 continue;
             }
+            admitted_any = true;
             let recorded_transition =
                 record_proven_target_transition(&operation, base, back, &baseline, &receipt);
+            // I10.21 AUD5: a proven terminal absence confirms as an
+            // immutable `Absent` observation, never as invented bytes. A
+            // mixed present/absent pair cannot have come from agreeing
+            // readback and is refused below as `UnstableReadback`, which
+            // keeps the hint pending and the resource blocked.
+            let to_read = |digest: &Option<String>| match digest {
+                Some(sha256) => change_monitor::ContentRead::Present {
+                    sha256: sha256.clone(),
+                },
+                None => change_monitor::ContentRead::Absent,
+            };
             let verification = change_monitor::HintVerification {
                 before_digest: Some(base.before_digest.clone()),
-                first_read: change_monitor::ContentRead::Present {
-                    sha256: back.after_first_digest.clone(),
-                },
-                reread: change_monitor::ContentRead::Present {
-                    sha256: back.after_reread_digest.clone(),
-                },
+                first_read: to_read(&back.after_first_digest),
+                reread: to_read(&back.after_reread_digest),
                 git: None,
             };
             match change_monitor::confirm_hint(&hint_id, &verification) {
                 Ok(change_monitor::HintConfirmation::VerifiedImmaterial) => {
+                    admitted_any = true;
                     observe_process("kernel.process.effect_observed", "immaterial");
                 }
                 Ok(change_monitor::HintConfirmation::MaterialRecorded {
@@ -734,7 +971,28 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
                     {
                         outcome = "reconciled";
                     }
+                    // I10.21 AUD4: the retained map advances only past a
+                    // ledger-recorded transition, never past unadmitted
+                    // evidence. A ledger-recorded deletion retires the
+                    // retained digest instead (I10.21 AUD5): the next
+                    // capture falls back to the ledger tip (proved absent)
+                    // instead of comparing fresh reads against bytes the
+                    // ledger proved gone.
+                    if let Ok(mut last) = self.last_observed.lock() {
+                        match &back.after_first_digest {
+                            Some(digest) => {
+                                last.insert(base.resource.clone(), digest.clone());
+                            }
+                            None => {
+                                last.remove(base.resource.as_str());
+                            }
+                        }
+                    }
+                    admitted_any = true;
                     observe_process("kernel.process.effect_observed", outcome);
+                }
+                Err(change_monitor::ChangeMonitorError::LedgerPoisoned) => {
+                    return Err(GovernedProcessEffectPortError::LedgerPoisoned);
                 }
                 Err(change_monitor::ChangeMonitorError::UnstableReadback) => {
                     observe_process("kernel.process.effect_observed", "unstable");
@@ -743,6 +1001,15 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
                     observe_process("kernel.process.effect_observed", "unobserved");
                 }
             }
+        }
+        // I10.21 durability (AUD3): ingest-time ledger mutations (hint
+        // admissions, governed records, confirmations) are observations in
+        // their own right: persist them best-effort so a crash before the
+        // next mutation still retains them. The observation stands
+        // regardless; only durability is best-effort, and it stays visible
+        // instead of silent.
+        if admitted_any && change_monitor::persist_ledger_sidecar().is_err() {
+            observe_process("kernel.process.effect_observed", "persist_failed");
         }
         Ok(())
     }
@@ -1925,7 +2192,9 @@ impl ProcessExecutionGateway {
     /// Only the variant is emitted; no receipt, handle, or owner string
     /// crosses into diagnostics.
     fn effect_port_outcome(error: GovernedProcessEffectPortError) -> &'static str {
-        match error {}
+        match error {
+            GovernedProcessEffectPortError::LedgerPoisoned => "ledger_poisoned",
+        }
     }
 
     /// Captures the pre-effect tracked-source baseline for one admitted
