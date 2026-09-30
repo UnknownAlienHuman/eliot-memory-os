@@ -5232,7 +5232,7 @@ fn rollback_with_activation_owner(
 
 fn inspect_host_activation_registry_for_terminal(
     transaction: &InstallationTransaction,
-) -> Result<Option<RedbInstallationRegistry>, InstallationError> {
+) -> Result<Option<ApprovedGenerationRegistry>, InstallationError> {
     let host_state_root = Path::new(
         transaction
             .candidate_manifest
