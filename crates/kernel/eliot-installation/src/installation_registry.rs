@@ -567,11 +567,9 @@ impl RedbInstallationRegistry {
                         .to_owned(),
                 });
             }
-            root
-                .verify_stable_identity()
+            root.verify_stable_identity()
                 .map_err(|error| InstallationError::Platform(error.to_string()))?;
-            file
-                .verify_path_identity()
+            file.verify_path_identity()
                 .map_err(|error| InstallationError::Platform(error.to_string()))?;
             return Ok(());
         };
@@ -599,11 +597,9 @@ impl RedbInstallationRegistry {
             // retained root identity and canonical path.
             receipt.validate_against(root, receipt.canonical_path())?;
         }
-        root
-            .verify_stable_identity()
+        root.verify_stable_identity()
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
-        file
-            .verify_path_identity()
+        file.verify_path_identity()
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
         Ok(())
     }
@@ -623,8 +619,7 @@ impl RedbInstallationRegistry {
         )?;
         let actual_root = match &self.path_lease {
             RegistryPathLease::InstallationHost { _root: root, .. } => {
-                root
-                    .verify_stable_identity()
+                root.verify_stable_identity()
                     .map_err(|error| InstallationError::Platform(error.to_string()))?;
                 let canonical_root = root
                     .canonical_path()
@@ -635,8 +630,7 @@ impl RedbInstallationRegistry {
                 )?
             }
             RegistryPathLease::UserOwnedHost { _root: root, .. } => {
-                root
-                    .verify_stable_identity()
+                root.verify_stable_identity()
                     .map_err(|error| InstallationError::Platform(error.to_string()))?;
                 let canonical_root = root
                     .canonical_path()
