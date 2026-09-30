@@ -1118,14 +1118,12 @@ impl MechanismBinding {
             "causal_evidence.mechanism.source_revision",
             MAX_SCOPE_BYTES,
         )?;
-        check_digest(
-            &self.claim_digest,
-            "causal_evidence.mechanism.claim_digest",
-        )?;
+        check_digest(&self.claim_digest, "causal_evidence.mechanism.claim_digest")?;
         if self.claim_bytes.is_empty() || self.claim_bytes.len() > MAX_MECHANISM_CLAIM_BYTES {
             return Err(ConflictAnalysisError::Bounds {
                 phase: "causal_evidence.mechanism.claim_bytes".to_owned(),
-                detail: "retained mechanism claim bytes are empty or exceed their ceiling".to_owned(),
+                detail: "retained mechanism claim bytes are empty or exceed their ceiling"
+                    .to_owned(),
             });
         }
         if sha256_hex(&self.claim_bytes) != self.claim_digest {
