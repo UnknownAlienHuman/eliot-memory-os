@@ -411,12 +411,28 @@ impl KernelComposition {
                 return Err(TransportError::SessionFenced.into());
             }
         }
-        // I14.23 wake/attach race: a new activation arriving before the
-        // `DrainCommit` linearization point cancels the drain and proceeds;
-        // after linearization it cannot reuse the drained generation (the
-        // service independently fences `Activate` from `Draining`) and must
-        // re-establish a fresh generation through the reconcile path.
-        if matches!(&request.command, KernelControlCommand::Activate(_)) {
+        // I14.23 wake/attach race: an activation-family attach arriving before
+        // the `DrainCommit` linearization point cancels the drain and
+        // proceeds; after linearization it cannot reuse the drained generation
+        // (the service independently fences `Activate` from `Draining`) and
+        // must re-establish a fresh generation through the reconcile path.
+        //
+        // `ReconcileActivation` is in this family, and that is the load-bearing
+        // part. I1.5 names the reconcile path as where a post-linearization
+        // attach *receives* a fresh generation, and `KernelService::
+        // reconcile_activation` answers it by handing back the very
+        // `KernelActivationReceipt` `activate_permit` minted before the drain —
+        // the pre-drain lease. An attach that skipped this gate and went
+        // straight to the reconcile therefore left with drained authority
+        // intact, which is precisely "rescuing shutdown by reviving an old
+        // lease" that I14.23 forbids. It also read as the *safe* retry: a caller
+        // whose `Activate` answer was lost during the drain would retry with
+        // reconcile, so the one command most likely to be issued mid-drain was
+        // the one command that skipped the race classification entirely.
+        if matches!(
+            &request.command,
+            KernelControlCommand::Activate(_) | KernelControlCommand::ReconcileActivation(_)
+        ) {
             // The activation generation this request presents, taken from the
             // request's own authenticated candidate contour — the same
             // `SupervisionJournalEpoch` identity the `Broker` family compares
