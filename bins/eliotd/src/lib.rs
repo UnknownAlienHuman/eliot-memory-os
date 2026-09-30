@@ -115,6 +115,7 @@ mod kernel_authority_client;
 mod kernel_context_read_client;
 mod kernel_recovery_client;
 mod kernel_transition_client;
+pub use kernel_transition_client::OwnerSelectionKernelPort;
 pub mod maintenance_dispatch;
 pub mod maintenance_family_catalog;
 // Public because `daemon_runtime` lives in the `eliotd` binary crate and
@@ -216,8 +217,8 @@ pub use controlboard_adapters::{
 pub use daemon_config::{DaemonConfig, admit_daemon_module_manifest};
 pub(crate) use daemon_kernel_client::kernel_port_error;
 pub use daemon_kernel_client::{
-    ActivationSubmitError, DaemonKernelClient, LocalReadSubmitOutcome, ObserveDeferOutcome,
-    ObserveSubmitOutcome, OwnerSessionFacts, TaskControllerSubmitOutcome,
+    ActivationSubmitError, DaemonKernelClient, LocalReadSubmitOutcome, ObserveClaimedPair,
+    ObserveDeferOutcome, ObserveSubmitOutcome, OwnerSessionFacts, TaskControllerSubmitOutcome,
 };
 #[cfg(test)]
 pub(crate) use daemon_kernel_client::{KernelClientError, WireOutcome, operation_payload};
@@ -3137,6 +3138,19 @@ impl DaemonComposition {
                 self.governor.observation_reconciliation(),
             ),
         )
+    }
+
+    /// Reads exact current Session, Policy, and WorkScope owners for one
+    /// authenticated Observe request before the protected request content is
+    /// prepared for capture.
+    pub fn observation_capture_owner_binding(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        authenticated_principal_ref: &str,
+    ) -> Result<eliot_governor::ObservationCaptureOwnerBinding, eliot_governor::CompositionError>
+    {
+        self.governor
+            .observation_capture_owner_binding(identity, authenticated_principal_ref)
     }
 
     /// Borrows the Kernel-backed read-only context client over the retained
