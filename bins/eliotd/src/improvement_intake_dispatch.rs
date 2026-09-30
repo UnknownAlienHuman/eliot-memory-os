@@ -51,6 +51,16 @@
 //! Concilium have no arm and are annotated as such. None is filled from a
 //! substitute value.
 //!
+//! The decision now also carries its origin —
+//! [`eliot_maintenance::AutomationTriggerDecision::trigger`] is copied verbatim
+//! from the evaluated trigger — so the three suggestion sources are no longer
+//! blocked by a missing field. They remain unselected because the ONE
+//! observation this intake is handed is built from
+//! `MaintenanceTriggerOrigin::IdleTransition`, which maps to
+//! `MaintenanceTrigger::Policy` and can never read `WatchdogProblem`,
+//! `Dreamer` or `Concilium`. The per-source remaining step, which now differs
+//! sharply between them, is recorded on [`maintenance_evidence_source`].
+//!
 //! # The durable port is the existing Governor/Kernel named mutation
 //!
 //! The owner-actionable artifact (candidate revision + brief + owner decision)
@@ -1005,20 +1015,28 @@ fn enforce_advisory_class_gate(
 /// # Why no decision reaching this function is a `Watchdog` observation
 ///
 /// [`EvidenceSource::Watchdog`] is I12.24:54's "Dreamer/Watchdog/Concilium
-/// suggestion". [`eliot_maintenance::AutomationTriggerDecision`]
-/// (`crates/governor/eliot-maintenance/src/lib.rs:288-306`) carries
-/// `trigger_id`, `family`, `scope_ref`, `decision`, `reason`, `admits_job` and
-/// `durable_job_ref` — and no trigger-origin field, so no part of the decision
-/// establishes which kind of occurrence proposed the trigger. The origin that
-/// maps to `MaintenanceTrigger::WatchdogProblem` is
-/// `MaintenanceTriggerOrigin::AdmittedObservation`
-/// (`maintenance_trigger_evaluator.rs:125`), while the observation this dispatch
-/// records is built from `MaintenanceTriggerOrigin::IdleTransition`
-/// (`daemon_runtime.rs::idle_maintenance_observation` and
-/// `daemon_runtime.rs::improvement_intake_observation`), which maps to
-/// `MaintenanceTrigger::Policy` (`maintenance_trigger_evaluator.rs:123`). A
-/// policy-driven occurrence is not a Watchdog suggestion, and nothing in the
-/// decision could make it one.
+/// suggestion", and this function still cannot select it. The reason is NOT the
+/// one this file previously gave, and the previous reason is now false.
+///
+/// What used to be true, and is not any more: the decision carried no
+/// origin at all. [`eliot_maintenance::AutomationTriggerDecision`]
+/// (`crates/governor/eliot-maintenance/src/lib.rs:304-336`) now carries
+/// `trigger: MaintenanceTrigger` (`:323`), copied verbatim from
+/// `MaintenanceTriggerInput::trigger` at both construction sites
+/// (`lib.rs:762` and `lib.rs:1123`) and never selected, widened or defaulted
+/// there. The origin is therefore READABLE on the decision this function
+/// receives, and the arm is missing a producer rather than a field.
+///
+/// What is still true, and is what blocks the arm: the observation this
+/// dispatch records is built from `MaintenanceTriggerOrigin::IdleTransition`
+/// (`daemon_runtime::improvement_intake_observation`, `daemon_runtime.rs:5690`),
+/// and the origin→trigger map is exhaustive over the four-member origin enum
+/// (`maintenance_trigger_evaluator.rs:122-128`), so that origin maps to
+/// `MaintenanceTrigger::Policy` — never `WatchdogProblem`. A policy-driven
+/// occurrence is not a Watchdog suggestion, and the decision's own
+/// `trigger` field now says so out loud instead of being silent about it.
+/// That is the whole of the remaining gap, and it is a one-line change in
+/// another owner's file; see "The exact remaining step" below.
 ///
 /// The residual this function used to carry claimed
 /// [`EvidenceSource::Watchdog`] for every decision that was neither of the two
@@ -1032,14 +1050,20 @@ fn enforce_advisory_class_gate(
 /// support is the misattribution this issue exists to remove, so the residual
 /// is dropped rather than renamed.
 ///
-/// `ASSUMPTION:` I12.24:40-55 names no separate "maintenance" variant, and no
-/// field of the maintenance decision carries a Watchdog, Dreamer or Concilium
-/// attribution — those three sources therefore stay unreachable from this
-/// daemon rather than being mislabelled here. Reaching any of them needs the
-/// maintenance trigger ORIGIN to travel with the decision, which is an
-/// `eliot-maintenance` contract change this issue does not own; the honest
-/// outcome here is the `Attempt` label above plus that stated ceiling, not a
-/// refusal to classify a live observation.
+/// `ASSUMPTION:` I12.24:40-55 names no separate "maintenance" variant, and the
+/// decision's `trigger` field carries an I14.22 job origin
+/// (`MaintenanceTrigger`), not an I12.24 evidence source — so the three
+/// I12.24 sources stay unreachable from this daemon rather than being
+/// mislabelled here.
+///
+/// The contract half of that ceiling is now CLOSED and no longer part of the
+/// reason. `AutomationTriggerDecision::trigger` exists and travels verbatim
+/// (`lib.rs:323`, copied at `lib.rs:762` and `lib.rs:1123`), so "the origin does
+/// not travel with the decision" is no longer true of any of the three. What
+/// remains is per-source, and each remaining step is recorded at the source
+/// below: an observation whose origin is not `IdleTransition` reaching this
+/// intake. The honest outcome here is the `Attempt` label above plus that
+/// stated ceiling, not a refusal to classify a live observation.
 ///
 /// # The three sources with NO arm, and the producer each waits for
 ///
@@ -1047,33 +1071,75 @@ fn enforce_advisory_class_gate(
 /// [`EvidenceSource::Concilium`] are the W2 sources that are not merely an
 /// unreachable arm but an ABSENT one: the match below has no pattern that could
 /// produce them, while the closed vocabulary does carry all three honestly
-/// (`evidence_sources.rs:29-31`). They share the one reason stated in the
-/// `ASSUMPTION` above — the origin does not travel on the decision — and each
-/// additionally has no producer of its own:
+/// (`evidence_sources.rs:29-31`). They no longer share the reason the
+/// `ASSUMPTION` above used to give them, because that reason is discharged.
+/// What each still lacks is its own producer, and the remaining step differs
+/// per source:
 ///
-/// - `Watchdog` needs a Watchdog/Doctor RECIPE that proposes maintenance work
-///   and reaches a trigger site. The origin denoting one exists and is live
-///   ([`crate::MaintenanceTriggerOrigin::AdmittedObservation`], used at
-///   `daemon_runtime.rs:2636`), but that site's observation is the store-health
-///   poll, so its decision is a `SelfQualityDebt` decision about this daemon's
-///   own health that is routed to `note_blocked_automation_notification`
-///   (`daemon_runtime.rs:2669-2670`), never to the intake. The family census
-///   above settles it: no decision reaching this function can carry the
-///   Watchdog origin even though the origin is live elsewhere in the daemon.
-/// - `Dreamer` needs a Dreamer that SUGGESTS work. That route is
-///   owner-declared and unassigned on this base — an omitted Dreamer route
-///   resolves to `RouteState::Unassigned` with no paid route
-///   (`eliot_config::first_run::decide_first_run`) — and although
-///   `SelfQualityDebt` registers `Dreamer` among its origins, no Dreamer
-///   instance proposes anything to this daemon.
+/// - `Watchdog` is the CLOSEST of the three, and its remaining step is now a
+///   single origin at a single site rather than a missing contract field.
+///   Measured on this tree, not assumed:
+///
+///   1. The origin that denotes a Watchdog/Doctor occurrence,
+///      `MaintenanceTriggerOrigin::AdmittedObservation`, is live and has exactly
+///      ONE construction site in this daemon
+///      (`daemon_runtime.rs:2868`, the store-health poll). The origin→trigger
+///      map is exhaustive over the four-member origin enum
+///      (`maintenance_trigger_evaluator.rs:122-128`), and only
+///      `AdmittedObservation` maps to `MaintenanceTrigger::WatchdogProblem`, so
+///      that one site is the only producer of a `WatchdogProblem` decision.
+///   2. That decision does not reach this function. It is consumed at
+///      `daemon_runtime.rs:2902-2906` by
+///      `note_blocked_automation_notification` and
+///      `publish_maintenance_source_results`; it is never handed to
+///      `run_improvement_intake` (`:5260`), whose only call site is
+///      `maybe_start_improvement_intake` (`:5797`).
+///   3. The one observation that DOES reach this function is built at
+///      `daemon_runtime::improvement_intake_observation` (`:5684`), which names
+///      `MaintenanceTriggerOrigin::IdleTransition` unconditionally (`:5690`).
+///      The intake is therefore the sole consumer of that one origin, and the
+///      decision it assembles over carries `MaintenanceTrigger::Policy`.
+///
+///   **The exact remaining step**, now that the origin travels on the decision:
+///   a trigger site that hands this intake an observation built from
+///   `MaintenanceTriggerOrigin::AdmittedObservation`. The site already exists
+///   and already builds exactly such an observation
+///   (`daemon_runtime.rs:2868`); what is absent is a route carrying it from
+///   there into `improvement_intake_observation`. Once that route exists, this
+///   function can select [`EvidenceSource::Watchdog`] by comparing
+///   `decision.trigger` against [`MaintenanceTrigger::WatchdogProblem`] — a
+///   value it now holds, and the one value in the closed origin map that means
+///   "Watchdog/Doctor problem recipe"
+///   (`maintenance_trigger_evaluator.rs:118-119`). Until then the arm would be
+///   dead on a value the live path provably cannot carry, so it is not wired.
+/// - `Dreamer` needs a Dreamer that SUGGESTS work, and its gap is LARGER than
+///   the Watchdog one in a way the origin map settles. `MaintenanceTrigger` has
+///   a `Dreamer` member (`lib.rs:184-185`), but NO origin maps to it: the
+///   exhaustive map at `maintenance_trigger_evaluator.rs:122-128` names only
+///   `Policy`, `Onboarding` and `WatchdogProblem`. So unlike `Watchdog`, a
+///   `Dreamer` decision cannot be produced by re-routing an existing origin —
+///   it needs a NEW `MaintenanceTriggerOrigin` member, which is a vocabulary
+///   this issue does not own. Independently, no Dreamer instance proposes
+///   anything to this daemon: the route is owner-declared and unassigned on
+///   this base, an omitted Dreamer route resolving to `RouteState::Unassigned`
+///   with no paid route (`eliot_config::first_run::decide_first_run`).
 /// - `Concilium` needs a deliberation verdict with a route into this intake,
-///   and the funnel's request source is absent (see this module's header on
-///   `ImprovementRouteRequest` having no production request source), so a
-///   verdict has no path into `assemble_improvement_artifact`.
+///   and its gap is largest of the three: `MaintenanceTrigger` has NO
+///   `Concilium` member at all, so a Concilium verdict could not be carried on
+///   the decision even if the field were consulted. A vocabulary claim with no
+///   producer behind it is the mirror of the misattribution this function
+///   exists to remove, so none is added here. The funnel's request source is
+///   also absent (see this module's header on `ImprovementRouteRequest` having
+///   no production request source), so a verdict has no path into
+///   `assemble_improvement_artifact` at all.
 ///
 /// None is filled here because none has a producer this file could read without
 /// inventing the observation it claims. Filling any of them from a decision
-/// would reinstate exactly the misattribution the removed residual was.
+/// would reinstate exactly the misattribution the removed residual was — and
+/// with `trigger` now readable, that misattribution would be materially easier
+/// to commit by accident, which is the reason the `Watchdog` arm waits for a
+/// route rather than being wired speculatively against a field that exists but
+/// can only ever read `Policy` here.
 pub fn maintenance_evidence_source(
     decision: &eliot_maintenance::AutomationTriggerDecision,
 ) -> EvidenceSource {
@@ -1097,14 +1163,20 @@ pub fn maintenance_evidence_source(
         //    dispatch layer's.
         // 2. The one daemon site whose trigger origin IS the Watchdog/Doctor
         //    problem origin (`MaintenanceTriggerOrigin::AdmittedObservation`,
-        //    `maintenance_trigger_evaluator.rs:125`) is the store-health poll
-        //    (`daemon_runtime.rs:2635-2643`), and it observes
+        //    `maintenance_trigger_evaluator.rs:126`) is the store-health poll
+        //    (`daemon_runtime.rs:2868-2876`), and it observes
         //    `StoreHealth::manifest_digest` — the store API's own
         //    operation-manifest identity — naming `SELF_OBSERVED_FAMILY`. That
         //    is not a scanner receipt, and it is ineligible for this family
         //    twice over: the observed value is the wrong kind of fact, and the
         //    origin is not among this entry's registered origins (`Human`,
         //    `Policy`, `Installation`; `maintenance_family_catalog.rs:1444`).
+        //    The decision that site produces now carries
+        //    `MaintenanceTrigger::WatchdogProblem` on its own `trigger` field,
+        //    which makes the ineligibility CHECKABLE rather than assumed: the
+        //    origin reads back as a Watchdog/Doctor problem, and that is
+        //    precisely not a scanner receipt. Naming the family there would
+        //    claim a scan nobody ran.
         // 3. The exhaustive family census confirms the gap is total, not a
         //    missing match arm: the only `MaintenanceFamily` values any
         //    production trigger site names are `SELF_OBSERVED_FAMILY`
