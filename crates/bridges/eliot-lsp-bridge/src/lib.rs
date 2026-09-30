@@ -41,7 +41,7 @@ use eliot_artifact::{
     ArtifactError, ArtifactKind, ArtifactOwner, ArtifactReadReceipt, ArtifactReference,
     VerifiedArtifact,
 };
-use eliot_blob_api::BlobReadChunk;
+use eliot_blob_api::{BlobError, BlobReadChunk};
 use eliot_build_test_graph::{BuildFingerprint, CandidateIdentity};
 use eliot_contracts::{ArtifactId, ContractId, ContractVersion};
 use eliot_evidence::{
@@ -3145,17 +3145,9 @@ pub fn adopt_retained_observation(
 pub fn adopt_captured_observation_from_blob_readback(
     readback: &BlobReadChunk,
 ) -> Result<(RetainedLspObservationV1, NormalizedResult), BridgeError> {
-    readback.validate().map_err(|error| {
-        BridgeError::InconsistentBinding(format!(
-            "authenticated Blob readback failed validation: {error}"
-        ))
-    })?;
+    readback.validate()?;
     let record: RetainedLspObservationV1 =
-        serde_json::from_slice(readback.bytes()).map_err(|error| {
-            BridgeError::InconsistentBinding(format!(
-                "authenticated Blob payload is not a retained LSP observation: {error}"
-            ))
-        })?;
+        serde_json::from_slice(readback.bytes())?;
     validate_retained_observation(&record)?;
     let result = record.result.clone();
     Ok((record, result))
@@ -4547,6 +4539,12 @@ fn is_lower_hex_digest(value: &str) -> bool {
 /// observation receipt disposition while parsing stays total.
 #[derive(Debug, Error)]
 pub enum BridgeError {
+    /// S-04 rejected the authenticated retained-payload readback.
+    #[error("captured Blob readback failed validation: {0}")]
+    BlobReadback(#[from] BlobError),
+    /// Authenticated Blob bytes are not a retained LSP observation envelope.
+    #[error("captured LSP payload could not be decoded: {0}")]
+    CapturedObservationDecode(#[from] serde_json::Error),
     /// Analyzer configuration failed validation.
     #[error("invalid analyzer configuration: {0}")]
     InvalidConfig(String),
