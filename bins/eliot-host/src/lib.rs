@@ -1736,6 +1736,12 @@ mod launch_options_tests;
 
 #[derive(Debug, Error)]
 pub enum HostError {
+    #[error("Store-owner census Kernel contract: {0}")]
+    StoreCensusKernel(#[source] Box<eliot_kernel_service::KernelServiceError>),
+    #[error("Store-owner census authenticated transport: {0}")]
+    StoreCensusTransport(#[source] eliot_ipc::TransportError),
+    #[error("Store-owner census runtime: {0}")]
+    StoreCensusIo(#[source] std::io::Error),
     #[error("host state store: {0}")]
     State(#[from] eliot_platform::HostStateError),
     #[error("host state journal: {0}")]

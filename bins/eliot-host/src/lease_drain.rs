@@ -15,6 +15,7 @@
 //! lease references are checked for consistency, never used as the census.
 
 use super::*;
+use eliot_host_state::EliotActivationRecord;
 
 /// Complete identity of the Host activation generation whose retirement is
 /// being admitted.
@@ -26,7 +27,7 @@ pub struct GenerationRetirementFence {
 }
 
 /// Opaque owner-produced proof that the exact committed Host drain has no
-/// active `RuntimeLease` or `SupervisionLease` in canonical ORS.
+/// non-terminal lease or Store-dependent owner in canonical ORS.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GenerationRetirementBarrier {
     fence: GenerationRetirementFence,
@@ -69,6 +70,163 @@ impl GenerationRetirementBarrier {
 }
 
 impl HostComposition {
+    /// Reads the Kernel-authored Store-owner projection for one exact Host
+    /// activation without changing Kernel or Host lifecycle state.
+    ///
+    /// The returned type is the same authenticated projection cached by the
+    /// retirement barrier and consumed by the Kernel status/stop gate. The
+    /// Host journal's lease references remain a consistency check, never a
+    /// substitute for this ORS owner read.
+    pub(super) fn read_runtime_lease_census_for_activation(
+        &self,
+        activation: &EliotActivationRecord,
+    ) -> Result<eliot_kernel_service::RuntimeLeaseCensus, HostError> {
+        let launch = self.jobs.launch.as_ref().ok_or_else(|| {
+            HostError::ProcessContour(
+                "Store-owner census has no current approved Kernel launch".to_owned(),
+            )
+        })?;
+        let state_fence = StateFence::new(
+            activation.lineage.kernel_epoch.clone(),
+            launch.authority_generation,
+        );
+        let candidate = self.jobs.kernel_candidate.as_ref().ok_or_else(|| {
+            HostError::ProcessContour(
+                "Store-owner census has no approved Kernel candidate binding".to_owned(),
+            )
+        })?;
+        if candidate.activation_id != activation.activation_id
+            || candidate.installation_id != self.host.installation
+            || candidate.kernel_epoch != state_fence.authority_epoch
+        {
+            return Err(HostError::RecoveryRequired(
+                "Kernel candidate does not match the Host Store-owner census fence".to_owned(),
+            ));
+        }
+        let [supervision_lease_ref] = activation.supervision_lease_refs.as_slice() else {
+            return Err(HostError::RecoveryRequired(
+                "Store-owner census requires one exact current supervision lease reference"
+                    .to_owned(),
+            ));
+        };
+        let query = eliot_kernel_service::RuntimeLeaseCensusQuery {
+            state_fence: state_fence.clone(),
+            supervision_lease_id: supervision_lease_ref.as_str().to_owned(),
+        };
+        query
+            .validate()
+            .map_err(|error| HostError::StoreCensusKernel(Box::new(error)))?;
+        let request = kernel_control_request(
+            candidate,
+            launch.authority_generation,
+            KernelControlCommand::ReadRuntimeLeaseCensus(query),
+            1,
+        )?;
+        let response = self.exchange_store_census(candidate, &request, activation, &state_fence)?;
+        response
+            .validate()
+            .map_err(|error| HostError::StoreCensusKernel(Box::new(error)))?;
+        if response.message_id != request.message_id
+            || response.request_digest != request.payload_digest
+            || response.state != KernelServiceState::Ready
+            || response.error.is_some()
+            || response.receipt.is_some()
+            || response.runtime_health.is_some()
+            || response.activation_receipt.is_some()
+            || response.store_rebind_receipt.is_some()
+            || response.supervision_lease.is_some()
+            || response.introduction_rows.is_some()
+        {
+            return Err(HostError::RecoveryRequired(
+                "Kernel Store-owner census response binding was not exact".to_owned(),
+            ));
+        }
+        let census = response.runtime_lease_census.ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "Kernel omitted the canonical Store-owner census".to_owned(),
+            )
+        })?;
+        census
+            .validate()
+            .map_err(|error| HostError::StoreCensusKernel(Box::new(error)))?;
+        let supervision = &census.supervision_lease.record;
+        let store_stop = &census.store_stop_obligations;
+        if census.state_fence != state_fence
+            || census.supervision_lease_id != supervision_lease_ref.as_str()
+            || supervision.lease_id.as_str() != supervision_lease_ref.as_str()
+            || supervision.binding.activation_id.as_str() != activation.activation_id.as_str()
+            || supervision.binding.activation_generation != state_fence.resource_generation
+            || supervision.binding.kernel_epoch != state_fence.authority_epoch
+            || supervision.binding.state_fence != state_fence
+            || store_stop.installation_id != self.host.installation.as_str()
+            || store_stop.activation_id.as_deref() != Some(activation.activation_id.as_str())
+        {
+            return Err(HostError::RecoveryRequired(
+                "canonical Store-owner census is not bound to the Host activation".to_owned(),
+            ));
+        }
+        Ok(census)
+    }
+
+    /// Exchanges one exact census request with the authenticated original Kernel owner.
+    fn exchange_store_census(
+        &self,
+        candidate: &eliot_kernel_service::HostKernelCandidateBinding,
+        request: &KernelControlRequest,
+        activation: &EliotActivationRecord,
+        state_fence: &StateFence,
+    ) -> Result<eliot_kernel_service::KernelControlResponse, HostError> {
+        let kernel = self.jobs.kernel.as_ref().ok_or_else(|| {
+            HostError::ProcessContour(
+                "Store-owner census requires the live authenticated Kernel process".to_owned(),
+            )
+        })?;
+        let kernel_process = kernel.evidence().process().clone();
+        let expected_kernel_image = self.jobs.kernel_executable.as_ref().ok_or_else(|| {
+            HostError::ProcessContour("approved Kernel image is missing".to_owned())
+        })?;
+        let connection_id = format!(
+            "host-store-census:{}:{}",
+            activation.activation_id.as_str(),
+            state_fence.resource_generation.value()
+        );
+        let request_frame = eliot_kernel_service::control_request_frame(connection_id, request)
+            .map_err(HostError::StoreCensusTransport)?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(HostError::StoreCensusIo)?;
+        runtime.block_on(async {
+            let mut transport =
+                connect_authenticated_kernel_front_door(candidate, &kernel_process).await?;
+            validate_authenticated_kernel_peer(
+                transport.peer_identity(),
+                kernel_process.process_id,
+                kernel_process.start_time_100ns,
+                expected_kernel_image,
+            )?;
+            let limits = TransportLimits::default();
+            match transport
+                .send_frame(&request_frame, limits)
+                .await
+                .map_err(HostError::StoreCensusTransport)?
+            {
+                eliot_ipc::DeliveryOutcome::Delivered => {}
+                eliot_ipc::DeliveryOutcome::UnknownOutcome => {
+                    return Err(HostError::RecoveryRequired(
+                        "Kernel Store-owner census delivery outcome is unknown".to_owned(),
+                    ));
+                }
+            }
+            let frame = transport
+                .receive_frame(limits)
+                .await
+                .map_err(HostError::StoreCensusTransport)?;
+            eliot_kernel_service::decode_control_response_frame(&frame)
+                .map_err(HostError::StoreCensusTransport)
+        })
+    }
+
     /// Persists a protected recovery gap bound to the current activation and
     /// drain commit. The caller must keep the Kernel process alive until a
     /// later exact-fence owner census proves termination safe.
@@ -151,13 +309,13 @@ impl HostComposition {
     }
 
     /// Requires an exact durable Host drain and a current authenticated
-    /// Kernel/ORS readback proving that the fenced generation has no active
-    /// `RuntimeLease` or `SupervisionLease`.
+    /// Kernel/ORS readback proving that the fenced generation has no
+    /// non-terminal lease or Store-dependent owner.
     ///
     /// This method never infers absence from activation references. The Host
     /// commit must bind the requested activation, and the Kernel census reads
-    /// every canonical `RuntimeLease` row for the complete `StateFence`
-    /// together with the exact current supervision row in one ORS snapshot.
+    /// every Store-stop owner family from the same ORS snapshot as the exact
+    /// fence's runtime leases and current supervision row.
     #[allow(
         clippy::too_many_lines,
         reason = "the retirement barrier keeps the durable drain proof, the authenticated census transport, and the fail-closed gap record in one boundary"

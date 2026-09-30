@@ -243,7 +243,7 @@ impl KernelComposition {
         let view = KernelActivationView {
             service_state: kernel_service_state_code(state),
             generation: if generation_bound { "bound" } else { "unbound" },
-            governance: if census == KernelIdleLeaseCensus::SupervisionLeased {
+            governance: if census.supervision_is_active() {
                 "independently-supervised"
             } else {
                 "unsupervised"

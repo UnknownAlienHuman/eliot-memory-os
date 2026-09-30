@@ -150,6 +150,9 @@ fn host_error_variant(error: &HostError) -> &'static str {
         HostError::WatchdogCoverageUnavailable(_) => "watchdog_coverage_unavailable",
         HostError::OwnerLeaseHeld => "owner_lease_held",
         HostError::OwnerLeaseRecovery(_) => "owner_lease_recovery",
+        HostError::StoreCensusKernel(_) => "store_census_kernel",
+        HostError::StoreCensusTransport(_) => "store_census_transport",
+        HostError::StoreCensusIo(_) => "store_census_runtime",
     }
 }
 

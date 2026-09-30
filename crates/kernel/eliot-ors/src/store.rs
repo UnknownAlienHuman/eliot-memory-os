@@ -52,6 +52,9 @@ mod restore_journal;
 mod backup_snapshot;
 
 mod recovery_projection;
+mod stop_census;
+
+pub use stop_census::{StoreStopObligationCensus, StoreStopObligationCounts};
 
 use crate::cutover_ownership::{
     GenerationCutoverOwnership, GenerationCutoverOwnershipReceipt, StoredCutoverOwnership,
@@ -4647,6 +4650,8 @@ pub struct RuntimeLeaseCensusRows {
     pub supervision: SupervisionLeaseSnapshot,
     /// Exact-fence `RuntimeLease` rows ordered by lease id.
     pub runtime_leases: Vec<RuntimeLease>,
+    /// Complete Store-stop obligation projection from the same redb snapshot.
+    pub store_stop: StoreStopObligationCensus,
 }
 
 impl RedbRecoveryStore {
@@ -25475,8 +25480,26 @@ impl RedbRecoveryStore {
         fence: &eliot_contracts::StateFence,
         supervision_lease_id: &crate::OperationIdentity,
     ) -> Result<RuntimeLeaseCensusRows, OrsError> {
-        let supervision = self
-            .load_current_supervision_lease(supervision_lease_id)?
+        let read = self.database.begin_read().map_err(storage)?;
+        let supervision_table = read
+            .open_table(SUPERVISION_LEASE_CURRENT)
+            .map_err(storage)?;
+        let supervision = supervision_table
+            .get(supervision_lease_id.as_str())
+            .map_err(storage)?
+            .map(|value| {
+                let snapshot: SupervisionLeaseSnapshot =
+                    decode_named(value.value(), "supervision_lease_current")?;
+                snapshot.validate()?;
+                if snapshot.record.lease_id != *supervision_lease_id {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "supervision_lease_current",
+                        reason: "current key does not match lease identity".to_owned(),
+                    });
+                }
+                Ok(snapshot)
+            })
+            .transpose()?
             .ok_or(OrsError::IntegrityProblem {
                 record_type: "runtime_lease_census",
                 reason: "supervision head absent for census identity".to_owned(),
@@ -25484,10 +25507,31 @@ impl RedbRecoveryStore {
         if supervision.record.binding.state_fence != *fence {
             return Err(OrsError::FenceMismatch);
         }
-        let runtime_leases = self.load_runtime_leases_by_state_fence(fence)?;
+        let current = read.open_table(RUNTIME_LEASE_CURRENT).map_err(storage)?;
+        let mut runtime_leases = Vec::new();
+        for row in current.iter().map_err(storage)? {
+            let (key, value) = row.map_err(storage)?;
+            let lease: RuntimeLease = decode(value.value())?;
+            if key.value() != lease.lease_id {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "runtime_lease_current",
+                    reason: "current key does not match lease identity".to_owned(),
+                });
+            }
+            if lease.state_fence == *fence {
+                runtime_leases.push(lease);
+            }
+        }
+        runtime_leases.sort_by(|first, second| first.lease_id.cmp(&second.lease_id));
+        let store_stop = stop_census::census_in_read(
+            &read,
+            fence,
+            Some(supervision.record.binding.activation_id.as_str()),
+        )?;
         Ok(RuntimeLeaseCensusRows {
             supervision,
             runtime_leases,
+            store_stop,
         })
     }
 
@@ -31207,10 +31251,6 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         match cursor.phase {
             crate::WriteReservationRecoveryPhase::Reservations => {
                 let reservations = read.open_table(RESERVATIONS).map_err(storage)?;
-                let orders = read.open_table(RESERVATION_ORDERS).map_err(storage)?;
-                let operations = read.open_table(OPERATIONS).map_err(storage)?;
-                let idempotency = read.open_table(WRITE_IDEMPOTENCY).map_err(storage)?;
-                let envelopes = read.open_table(ENVELOPES).map_err(storage)?;
                 let rows = match cursor.after.as_ref() {
                     Some(after) => reservations
                         .range::<&str>((Bound::Excluded(after.as_str()), Bound::Unbounded))
@@ -31225,80 +31265,18 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
                     let (key, value) = entry.map_err(storage)?;
                     let key = key.value().to_owned();
                     let record: ReservationRecord = decode(value.value())?;
-                    let token = &record.token;
-                    if token.reservation_id.as_str() != key {
-                        return Err(OrsError::IntegrityProblem {
-                            record_type: "recovery_reservation_inventory",
-                            reason: "primary reservation key differs from its retained identity"
-                                .to_owned(),
-                        });
-                    }
-                    let order_key = format!("{:020}", token.reservation_order);
-                    if orders
-                        .get(order_key.as_str())
-                        .map_err(storage)?
-                        .is_none_or(|value| value.value() != token.reservation_id.as_str())
-                        || operations
-                            .get(token.operation_id.as_str())
-                            .map_err(storage)?
-                            .is_none_or(|value| value.value() != token.reservation_id.as_str())
-                    {
-                        return Err(OrsError::IntegrityProblem {
-                            record_type: "recovery_reservation_inventory",
-                            reason: "reservation is missing its order or operation index row"
-                                .to_owned(),
-                        });
-                    }
-                    if let Some(binding) = token.write_binding.as_ref() {
-                        binding.validate()?;
-                        if !write_binding_matches_token(binding, token)
-                            || idempotency
-                                .get(write_idempotency_index_key(binding).as_str())
-                                .map_err(storage)?
-                                .is_none_or(|value| value.value() != token.operation_id.as_str())
-                        {
-                            return Err(OrsError::IntegrityProblem {
-                                record_type: "recovery_reservation_inventory",
-                                reason:
-                                    "reservation binding differs from its durable idempotency index"
-                                        .to_owned(),
-                            });
-                        }
-                    }
-                    let envelope = envelopes
-                        .get(token.operation_id.as_str())
-                        .map_err(storage)?
-                        .map(|value| decode::<RecoveryPayloadEnvelope>(value.value()))
-                        .transpose()?;
-                    match envelope {
-                        Some(envelope)
-                            if envelope.operation_or_checkpoint_id == token.operation_id
-                                && envelope.authority_epoch == token.writer_epoch
-                                && envelope.state_fence == token.state_fence
-                                && envelope.write_binding == token.write_binding => {}
-                        Some(_) => {
-                            return Err(OrsError::IntegrityProblem {
-                                record_type: "recovery_reservation_inventory",
-                                reason: "retained envelope differs from its reservation identity"
-                                    .to_owned(),
-                            });
-                        }
-                        None if record.state.is_terminal() => {}
-                        None => {
-                            return Err(OrsError::IntegrityProblem {
-                                record_type: "recovery_reservation_inventory",
-                                reason: "nonterminal reservation is missing its retained envelope"
-                                    .to_owned(),
-                            });
-                        }
-                    }
+                    validate_write_reservation_primary_in_read(
+                        &read,
+                        &key,
+                        &record,
+                        &mut ignore_census_observation,
+                    )?;
                     last_key = Some(OpaqueLabel::new(key)?);
                     records.push(record);
                 }
             }
             crate::WriteReservationRecoveryPhase::ReservationOrders => {
                 let orders = read.open_table(RESERVATION_ORDERS).map_err(storage)?;
-                let reservations = read.open_table(RESERVATIONS).map_err(storage)?;
                 let rows = match cursor.after.as_ref() {
                     Some(after) => orders
                         .range::<&str>((Bound::Excluded(after.as_str()), Bound::Unbounded))
@@ -31311,43 +31289,13 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
                         break;
                     }
                     let (key, value) = entry.map_err(storage)?;
-                    let key = key.value().to_owned();
-                    let order = key
-                        .parse::<u64>()
-                        .map_err(|error| OrsError::IntegrityProblem {
-                            record_type: "reservation_order",
-                            reason: format!("recovery order key is malformed: {error}"),
-                        })?;
-                    if order == 0 || format!("{order:020}") != key {
-                        return Err(OrsError::IntegrityProblem {
-                            record_type: "reservation_order",
-                            reason: "recovery order key is not canonical".to_owned(),
-                        });
-                    }
-                    let reservation_id = OperationIdentity::new(value.value().to_owned())?;
-                    let reservation = reservations
-                        .get(reservation_id.as_str())
-                        .map_err(storage)?
-                        .map(|value| decode::<ReservationRecord>(value.value()))
-                        .transpose()?
-                        .ok_or_else(|| OrsError::IntegrityProblem {
-                            record_type: "reservation_order",
-                            reason: "order index names a missing primary reservation".to_owned(),
-                        })?;
-                    if reservation.token.reservation_id != reservation_id
-                        || reservation.token.reservation_order != order
-                    {
-                        return Err(OrsError::IntegrityProblem {
-                            record_type: "reservation_order",
-                            reason: "order index differs from the primary reservation".to_owned(),
-                        });
-                    }
+                    let key = key.value();
+                    validate_write_reservation_order_in_read(&read, key, value.value())?;
                     last_key = Some(OpaqueLabel::new(key)?);
                 }
             }
             crate::WriteReservationRecoveryPhase::Operations => {
                 let operations = read.open_table(OPERATIONS).map_err(storage)?;
-                let reservations = read.open_table(RESERVATIONS).map_err(storage)?;
                 let rows = match cursor.after.as_ref() {
                     Some(after) => operations
                         .range::<&str>((Bound::Excluded(after.as_str()), Bound::Unbounded))
@@ -31360,27 +31308,12 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
                         break;
                     }
                     let (key, value) = entry.map_err(storage)?;
+                    validate_write_reservation_operation_in_read(
+                        &read,
+                        key.value(),
+                        value.value(),
+                    )?;
                     let operation_id = OperationIdentity::new(key.value().to_owned())?;
-                    let reservation_id = OperationIdentity::new(value.value().to_owned())?;
-                    let reservation = reservations
-                        .get(reservation_id.as_str())
-                        .map_err(storage)?
-                        .map(|value| decode::<ReservationRecord>(value.value()))
-                        .transpose()?
-                        .ok_or_else(|| OrsError::IntegrityProblem {
-                            record_type: "reservation_operation_index",
-                            reason: "operation index names a missing primary reservation"
-                                .to_owned(),
-                        })?;
-                    if reservation.token.operation_id != operation_id
-                        || reservation.token.reservation_id != reservation_id
-                    {
-                        return Err(OrsError::IntegrityProblem {
-                            record_type: "reservation_operation_index",
-                            reason: "operation index differs from the primary reservation"
-                                .to_owned(),
-                        });
-                    }
                     last_key = Some(operation_id);
                 }
             }
@@ -31614,10 +31547,6 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         })
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one snapshot-bound index page validates each retained operation mapping"
-    )]
     fn scan_write_idempotency(
         &self,
         cursor: WriteIdempotencyRecoveryCursor,
@@ -31626,9 +31555,6 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         let read = self.database.begin_read().map_err(storage)?;
         Self::validate_recovery_inventory_snapshot_in_read(&read, &cursor.snapshot)?;
         let index = read.open_table(WRITE_IDEMPOTENCY).map_err(storage)?;
-        let operations = read.open_table(OPERATIONS).map_err(storage)?;
-        let reservations = read.open_table(RESERVATIONS).map_err(storage)?;
-        let envelopes = read.open_table(ENVELOPES).map_err(storage)?;
         let rows = match cursor.after.as_ref() {
             Some(after) => index
                 .range::<&str>((Bound::Excluded(after.as_str()), Bound::Unbounded))
@@ -31646,78 +31572,14 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             }
             let (key, value) = entry.map_err(storage)?;
             let index_key = key.value().to_owned();
-            crate::model::validate_digest(&index_key, "write_idempotency_index_key")?;
-            let operation_id = OperationIdentity::new(value.value().to_owned())?;
-            let reservation_id = operations
-                .get(operation_id.as_str())
-                .map_err(storage)?
-                .map(|value| OperationIdentity::new(value.value().to_owned()))
-                .transpose()?
-                .ok_or_else(|| OrsError::IntegrityProblem {
-                    record_type: "write_idempotency_index",
-                    reason: "idempotency row names an operation with no reservation index"
-                        .to_owned(),
-                })?;
-            let reservation = reservations
-                .get(reservation_id.as_str())
-                .map_err(storage)?
-                .map(|value| decode::<ReservationRecord>(value.value()))
-                .transpose()?
-                .ok_or_else(|| OrsError::IntegrityProblem {
-                    record_type: "write_idempotency_index",
-                    reason: "idempotency row names a missing primary reservation".to_owned(),
-                })?;
-            let binding = reservation.token.write_binding.as_ref().ok_or_else(|| {
-                OrsError::IntegrityProblem {
-                    record_type: "write_idempotency_index",
-                    reason:
-                        "idempotency row points to a legacy reservation without a write binding"
-                            .to_owned(),
-                }
-            })?;
-            if reservation.token.operation_id != operation_id
-                || reservation.token.reservation_id != reservation_id
-                || index_key != write_idempotency_index_key(binding)
-                || !write_binding_matches_token(binding, &reservation.token)
-            {
-                return Err(OrsError::IntegrityProblem {
-                    record_type: "write_idempotency_index",
-                    reason: "idempotency mapping differs from its original reservation binding"
-                        .to_owned(),
-                });
-            }
-            let envelope = envelopes
-                .get(operation_id.as_str())
-                .map_err(storage)?
-                .map(|value| decode::<RecoveryPayloadEnvelope>(value.value()))
-                .transpose()?;
-            match envelope {
-                Some(envelope)
-                    if envelope.operation_or_checkpoint_id == operation_id
-                        && envelope.write_binding.as_ref() == Some(binding) => {}
-                Some(_) => {
-                    return Err(OrsError::IntegrityProblem {
-                        record_type: "write_idempotency_index",
-                        reason: "retained payload does not match the idempotency binding"
-                            .to_owned(),
-                    });
-                }
-                None if reservation.state.is_terminal() => {}
-                None => {
-                    return Err(OrsError::IntegrityProblem {
-                        record_type: "write_idempotency_index",
-                        reason: "nonterminal idempotency row is missing its retained payload"
-                            .to_owned(),
-                    });
-                }
-            }
+            let entry = validate_write_idempotency_entry_in_read(
+                &read,
+                index_key.as_str(),
+                value.value(),
+                &mut ignore_census_observation,
+            )?;
             last_key = Some(OpaqueLabel::new(index_key.clone())?);
-            records.push(WriteIdempotencyRecoveryEntry {
-                idempotency_key_sha256: index_key,
-                operation_id,
-                reservation_id,
-                write_binding: binding.clone(),
-            });
+            records.push(entry);
         }
         let next_cursor = if continues {
             Some(
@@ -35187,6 +35049,357 @@ fn request_matches(
 
 fn write_idempotency_index_key(binding: &RecoveryWriteBinding) -> String {
     crate::model::sha256_hex(binding.idempotency_key.as_str().as_bytes())
+}
+
+/// Validates the complete reservation owner graph in the caller's read snapshot.
+///
+/// This deliberately has no recovery-page limit: the index rows are integrity
+/// evidence, while `RESERVATIONS` remains the obligation denominator. The
+/// paged recovery scanner and Store-stop census share the same per-row checks.
+pub(super) fn validate_write_reservation_inventory_in_read(
+    read: &redb::ReadTransaction,
+    observe: &mut impl FnMut(&str, &str, &str),
+) -> Result<(), OrsError> {
+    {
+        let reservations = read.open_table(RESERVATIONS).map_err(storage)?;
+        for row in reservations.iter().map_err(storage)? {
+            let (key, value) = row.map_err(storage)?;
+            let record: ReservationRecord = decode(value.value())?;
+            observe("store_stop_reservation_rows", key.value(), value.value());
+            validate_write_reservation_primary_in_read(read, key.value(), &record, observe)?;
+        }
+    }
+    {
+        let orders = read.open_table(RESERVATION_ORDERS).map_err(storage)?;
+        for row in orders.iter().map_err(storage)? {
+            let (key, value) = row.map_err(storage)?;
+            observe("store_stop_reservation_orders", key.value(), value.value());
+            validate_write_reservation_order_in_read(read, key.value(), value.value())?;
+        }
+    }
+    {
+        let operations = read.open_table(OPERATIONS).map_err(storage)?;
+        for row in operations.iter().map_err(storage)? {
+            let (key, value) = row.map_err(storage)?;
+            observe(
+                "store_stop_reservation_operations",
+                key.value(),
+                value.value(),
+            );
+            validate_write_reservation_operation_in_read(read, key.value(), value.value())?;
+        }
+    }
+    {
+        let idempotency = read.open_table(WRITE_IDEMPOTENCY).map_err(storage)?;
+        for row in idempotency.iter().map_err(storage)? {
+            let (key, value) = row.map_err(storage)?;
+            observe("store_stop_write_idempotency", key.value(), value.value());
+            validate_write_idempotency_entry_in_read(read, key.value(), value.value(), observe)?;
+        }
+    }
+    Ok(())
+}
+
+fn ignore_census_observation(_: &str, _: &str, _: &str) {}
+
+fn validate_write_reservation_primary_in_read(
+    read: &redb::ReadTransaction,
+    key: &str,
+    record: &ReservationRecord,
+    observe: &mut impl FnMut(&str, &str, &str),
+) -> Result<(), OrsError> {
+    let token = &record.token;
+    if token.reservation_id.as_str() != key {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "recovery_reservation_inventory",
+            reason: "primary reservation key differs from its retained identity".to_owned(),
+        });
+    }
+    let order_key = format!("{:020}", token.reservation_order);
+    let orders = read.open_table(RESERVATION_ORDERS).map_err(storage)?;
+    let order_matches = orders
+        .get(order_key.as_str())
+        .map_err(storage)?
+        .is_some_and(|value| value.value() == token.reservation_id.as_str());
+    drop(orders);
+    let operations = read.open_table(OPERATIONS).map_err(storage)?;
+    let operation_matches = operations
+        .get(token.operation_id.as_str())
+        .map_err(storage)?
+        .is_some_and(|value| value.value() == token.reservation_id.as_str());
+    drop(operations);
+    if !order_matches || !operation_matches {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "recovery_reservation_inventory",
+            reason: "reservation is missing its order or operation index row".to_owned(),
+        });
+    }
+    if let Some(binding) = token.write_binding.as_ref() {
+        binding.validate()?;
+        let idempotency = read.open_table(WRITE_IDEMPOTENCY).map_err(storage)?;
+        let matches = write_binding_matches_token(binding, token)
+            && idempotency
+                .get(write_idempotency_index_key(binding).as_str())
+                .map_err(storage)?
+                .is_some_and(|value| value.value() == token.operation_id.as_str());
+        if !matches {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "recovery_reservation_inventory",
+                reason: "reservation binding differs from its durable idempotency index".to_owned(),
+            });
+        }
+    }
+    let envelopes = read.open_table(ENVELOPES).map_err(storage)?;
+    let envelope = envelopes
+        .get(token.operation_id.as_str())
+        .map_err(storage)?
+        .map(|value| {
+            observe(
+                "store_stop_reservation_envelopes",
+                token.operation_id.as_str(),
+                value.value(),
+            );
+            decode::<RecoveryPayloadEnvelope>(value.value())
+        })
+        .transpose()?;
+    match envelope {
+        Some(envelope)
+            if envelope.operation_or_checkpoint_id == token.operation_id
+                && envelope.authority_epoch == token.writer_epoch
+                && envelope.state_fence == token.state_fence
+                && envelope.write_binding == token.write_binding => {}
+        Some(_) => {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "recovery_reservation_inventory",
+                reason: "retained envelope differs from its reservation identity".to_owned(),
+            });
+        }
+        None if record.state.is_terminal() => {}
+        None => {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "recovery_reservation_inventory",
+                reason: "nonterminal reservation is missing its retained envelope".to_owned(),
+            });
+        }
+    }
+
+    validate_write_reservation_scopes_in_read(read, record, observe)
+}
+
+fn validate_write_reservation_scopes_in_read(
+    read: &redb::ReadTransaction,
+    record: &ReservationRecord,
+    observe: &mut impl FnMut(&str, &str, &str),
+) -> Result<(), OrsError> {
+    let token = &record.token;
+    let heads = read.open_table(SCOPE_HEADS).map_err(storage)?;
+    for reserved in &token.scopes {
+        let head = heads
+            .get(reserved.scope.as_str())
+            .map_err(storage)?
+            .ok_or_else(|| OrsError::IntegrityProblem {
+                record_type: "scope_head",
+                reason: "reservation scope has no durable head".to_owned(),
+            })?;
+        observe(
+            "store_stop_scope_heads",
+            reserved.scope.as_str(),
+            head.value(),
+        );
+        let head: ScopeReservationHead = decode_named(head.value(), "scope_head")?;
+        if head.last_reserved_sequence < reserved.reserved_sequence {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "scope_head",
+                reason: "scope head does not cover its reservation sequence".to_owned(),
+            });
+        }
+        if let Some(receipt_id) = &record.terminal_receipt_id {
+            let terminal_key = format!(
+                "{}:{:020}",
+                reserved.scope.as_str(),
+                reserved.reserved_sequence
+            );
+            let terminals = read.open_table(SCOPE_TERMINALS).map_err(storage)?;
+            let terminal = terminals
+                .get(terminal_key.as_str())
+                .map_err(storage)?
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "scope_terminal",
+                    reason: "terminal reservation is missing its scope receipt".to_owned(),
+                })?;
+            observe(
+                "store_stop_scope_terminals",
+                terminal_key.as_str(),
+                terminal.value(),
+            );
+            let terminal: ScopeTerminalReceipt = decode_named(terminal.value(), "scope_terminal")?;
+            if terminal.scope != reserved.scope
+                || terminal.reserved_sequence != reserved.reserved_sequence
+                || terminal.receipt_id != *receipt_id
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "scope_terminal",
+                    reason: "scope receipt differs from its reservation terminal identity"
+                        .to_owned(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_write_reservation_order_in_read(
+    read: &redb::ReadTransaction,
+    key: &str,
+    reservation_id: &str,
+) -> Result<(), OrsError> {
+    let order = key
+        .parse::<u64>()
+        .map_err(|error| OrsError::IntegrityProblem {
+            record_type: "reservation_order",
+            reason: format!("recovery order key is malformed: {error}"),
+        })?;
+    if order == 0 || format!("{order:020}") != key {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "reservation_order",
+            reason: "recovery order key is not canonical".to_owned(),
+        });
+    }
+    let reservation_id = OperationIdentity::new(reservation_id.to_owned())?;
+    let reservations = read.open_table(RESERVATIONS).map_err(storage)?;
+    let reservation = reservations
+        .get(reservation_id.as_str())
+        .map_err(storage)?
+        .map(|value| decode::<ReservationRecord>(value.value()))
+        .transpose()?
+        .ok_or_else(|| OrsError::IntegrityProblem {
+            record_type: "reservation_order",
+            reason: "order index names a missing primary reservation".to_owned(),
+        })?;
+    if reservation.token.reservation_id != reservation_id
+        || reservation.token.reservation_order != order
+    {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "reservation_order",
+            reason: "order index differs from the primary reservation".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_write_reservation_operation_in_read(
+    read: &redb::ReadTransaction,
+    operation_id: &str,
+    reservation_id: &str,
+) -> Result<(), OrsError> {
+    let operation_id = OperationIdentity::new(operation_id.to_owned())?;
+    let reservation_id = OperationIdentity::new(reservation_id.to_owned())?;
+    let reservations = read.open_table(RESERVATIONS).map_err(storage)?;
+    let reservation = reservations
+        .get(reservation_id.as_str())
+        .map_err(storage)?
+        .map(|value| decode::<ReservationRecord>(value.value()))
+        .transpose()?
+        .ok_or_else(|| OrsError::IntegrityProblem {
+            record_type: "reservation_operation_index",
+            reason: "operation index names a missing primary reservation".to_owned(),
+        })?;
+    if reservation.token.operation_id != operation_id
+        || reservation.token.reservation_id != reservation_id
+    {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "reservation_operation_index",
+            reason: "operation index differs from the primary reservation".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_write_idempotency_entry_in_read(
+    read: &redb::ReadTransaction,
+    index_key: &str,
+    indexed_operation: &str,
+    observe: &mut impl FnMut(&str, &str, &str),
+) -> Result<WriteIdempotencyRecoveryEntry, OrsError> {
+    crate::model::validate_digest(index_key, "write_idempotency_index_key")?;
+    let operation_id = OperationIdentity::new(indexed_operation.to_owned())?;
+    let operations = read.open_table(OPERATIONS).map_err(storage)?;
+    let reservation_id = operations
+        .get(operation_id.as_str())
+        .map_err(storage)?
+        .map(|value| OperationIdentity::new(value.value().to_owned()))
+        .transpose()?
+        .ok_or_else(|| OrsError::IntegrityProblem {
+            record_type: "write_idempotency_index",
+            reason: "idempotency row names an operation with no reservation index".to_owned(),
+        })?;
+    let reservations = read.open_table(RESERVATIONS).map_err(storage)?;
+    let reservation = reservations
+        .get(reservation_id.as_str())
+        .map_err(storage)?
+        .map(|value| decode::<ReservationRecord>(value.value()))
+        .transpose()?
+        .ok_or_else(|| OrsError::IntegrityProblem {
+            record_type: "write_idempotency_index",
+            reason: "idempotency row names a missing primary reservation".to_owned(),
+        })?;
+    let binding =
+        reservation
+            .token
+            .write_binding
+            .as_ref()
+            .ok_or_else(|| OrsError::IntegrityProblem {
+                record_type: "write_idempotency_index",
+                reason: "idempotency row points to a legacy reservation without a write binding"
+                    .to_owned(),
+            })?;
+    if reservation.token.operation_id != operation_id
+        || reservation.token.reservation_id != reservation_id
+        || index_key != write_idempotency_index_key(binding)
+        || !write_binding_matches_token(binding, &reservation.token)
+    {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "write_idempotency_index",
+            reason: "idempotency mapping differs from its original reservation binding".to_owned(),
+        });
+    }
+    let envelopes = read.open_table(ENVELOPES).map_err(storage)?;
+    let envelope = envelopes
+        .get(operation_id.as_str())
+        .map_err(storage)?
+        .map(|value| {
+            observe(
+                "store_stop_idempotency_envelopes",
+                operation_id.as_str(),
+                value.value(),
+            );
+            decode::<RecoveryPayloadEnvelope>(value.value())
+        })
+        .transpose()?;
+    match envelope {
+        Some(envelope)
+            if envelope.operation_or_checkpoint_id == operation_id
+                && envelope.write_binding.as_ref() == Some(binding) => {}
+        Some(_) => {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "write_idempotency_index",
+                reason: "retained payload does not match the idempotency binding".to_owned(),
+            });
+        }
+        None if reservation.state.is_terminal() => {}
+        None => {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "write_idempotency_index",
+                reason: "nonterminal idempotency row is missing its retained payload".to_owned(),
+            });
+        }
+    }
+    Ok(WriteIdempotencyRecoveryEntry {
+        idempotency_key_sha256: index_key.to_owned(),
+        operation_id,
+        reservation_id,
+        write_binding: binding.clone(),
+    })
 }
 
 fn write_binding_matches_token(

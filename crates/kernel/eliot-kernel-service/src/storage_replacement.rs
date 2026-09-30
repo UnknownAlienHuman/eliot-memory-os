@@ -1367,8 +1367,19 @@ fn validate_digest(value: &str, field: &'static str) -> Result<(), KernelService
 ///
 /// The match is exhaustive by construction: a new ORS class is a compile error
 /// here rather than a silently stringified refusal.
+fn store_contract_refusal(source: &eliot_store_api::StoreError) -> KernelServiceError {
+    KernelServiceError::Core(eliot_kernel_core::KernelError::RecoveryState(
+        OrsError::StoreContract(Box::new(source.clone())),
+    ))
+}
+
+fn legacy_host_refusal() -> KernelServiceError {
+    invalid_field("host_request_legacy_correlation")
+}
+
 fn ors_refusal(error: &OrsError) -> KernelServiceError {
     match error {
+        OrsError::StoreContract(source) => store_contract_refusal(source),
         // The presented ORS state does not match the required authority,
         // fence, owner or durable head.
         OrsError::FenceMismatch => mismatch("authority_epoch_fence"),
@@ -1440,9 +1451,7 @@ fn ors_refusal(error: &OrsError) -> KernelServiceError {
         OrsError::SupervisionLeaseTicketAlreadyCommitted => invalid_field("lease_ticket_committed"),
         OrsError::InvalidSupervisionLeaseHistoryLimit => invalid_field("lease_history_limit"),
         OrsError::HostRequestIdentityConflict { .. } => invalid_field("host_request_identity"),
-        OrsError::HostRequestLegacyCorrelationUnresolved => {
-            invalid_field("host_request_legacy_correlation")
-        }
+        OrsError::HostRequestLegacyCorrelationUnresolved => legacy_host_refusal(),
         OrsError::HostRequestAttemptLimitExceeded => invalid_field("host_request_attempt_limit"),
         OrsError::HostRequestAttemptExpired => invalid_field("host_request_attempt_expired"),
         OrsError::CampaignLearningStateViewConflict { .. } => {

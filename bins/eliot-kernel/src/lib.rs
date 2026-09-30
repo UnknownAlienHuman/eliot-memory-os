@@ -224,7 +224,6 @@ fn observe_audit_fallback_submission(outcome: &crate::audit_fallback::AuditFallb
 }
 
 mod idle_lease_census;
-pub(crate) use idle_lease_census::KernelIdleLeaseCensus;
 // The availability value every I1.13 admission guard reads. The guard
 // functions themselves stay owned by `kernel_unavailability`; only the type is
 // named here, by the composition that observes it.
@@ -4806,39 +4805,10 @@ impl KernelComposition {
             format!("quiesce-requested:{}", quiescence.join(">")),
         )?;
 
-        // StoreStopLeaseZero: the store-stop request below is admitted only
-        // with no outstanding lease. I1.5 widens the existing I14.23
-        // canonical-data precondition to the full Kernel-owned lease census:
-        // a live supervision lease, a live authenticated front-door Session,
-        // or an outstanding host-request operation each keeps an obligation
-        // that shutdown may not abandon.
-        //
-        // The census samples several owners independently, so a zero from one
-        // is not evidence that the others stood still. Take the admission
-        // coherence sample the census is taken under, and revalidate exactly
-        // that sample after the census: independently sampled zeros are not
-        // treated as atomic (issue #2625, I1.5 DrainCommitRecord).
-        let admission = self
-            .drain_admission_coherence(coordinator)
-            .map_err(DrainHalt::new)?;
-        let census = self.idle_lease_census();
-        health_view::observe_shutdown_observation(
-            "kernel.shutdown.lease_census_observed",
-            census.observation_code(),
-        );
-        if !census.admits_drain() {
-            return Err(DrainHalt::with_pending(
-                "runtime-or-supervision-lease-outstanding",
-                vec![census.observation_code().to_owned()],
-            ));
-        }
-        // The store stop is the store owner's, not the coordinator's. The
-        // lease census above admits the drain only with no outstanding
-        // canonical-data or maintenance obligation, so the stop is requested
-        // here through the store gateway's own existing port and its
-        // completion is read back from that same owner. A stop the owner does
-        // not report as completed is an explicit residual, not a recorded
-        // phase: the store is never left half-stopped behind a clean terminal.
+        // Close the Store bridge before taking the final owner observation.
+        // `Drain` above has already closed service admission; this fences new
+        // gateway calls and waits out calls admitted before that transition.
+        // The attached Store claim stays owned throughout.
         #[cfg(windows)]
         let store_evidence = {
             let gateway = match self.canonical_store_gateway.lock() {
@@ -4866,21 +4836,40 @@ impl KernelComposition {
         };
         #[cfg(not(windows))]
         let store_evidence = "store-gateway-absent";
-        record(
-            ShutdownPhase::StoreStopLeaseZero,
-            format!(
-                "lease-census:{};{store_evidence}",
-                census.observation_code()
-            ),
-        )?;
 
-        // Revalidate the admission frontier the final census was taken under
-        // before the linearization point consumes it. Work that raced the
-        // snapshot is refused here rather than left unaccounted: an admission
-        // still in flight, a fresh drain generation, a re-fenced State Fence,
-        // a reopened service admission, or a front-door session/operation that
-        // appeared after the census all block the commit. A poisoned owner
-        // guard blocks it too, because a fenced read is not a stable frontier.
+        // StoreStopLeaseZero is authorized only from the complete ORS census
+        // taken after admission closure and Store gateway flight drain. The
+        // census has one coherent owner snapshot; the repeated owner read and
+        // local admission-frontier read below prove that neither source moved
+        // before the stop phase is consumed.
+        let admission = self
+            .drain_admission_coherence(coordinator)
+            .map_err(DrainHalt::new)?;
+        let census = self.idle_lease_census();
+        health_view::observe_shutdown_observation(
+            "kernel.shutdown.lease_census_observed",
+            census.observation_code(),
+        );
+        if !census.admits_drain() {
+            return Err(DrainHalt::with_pending(
+                "store-stop-obligation-census-not-zero",
+                vec![census.observation_code().to_owned()],
+            ));
+        }
+        let owner_census = census
+            .store_stop_obligations()
+            .cloned()
+            .ok_or_else(|| DrainHalt::new("store-stop-obligation-census-unavailable"))?;
+        if owner_census.state_fence != admission.state_fence
+            || owner_census.activation_id.as_deref() != Some(admission.activation_id.as_str())
+            || owner_census.activation_generation != admission.state_fence.resource_generation
+        {
+            return Err(DrainHalt::with_pending(
+                "store-owner-activation-or-fence-mismatch",
+                vec![census.observation_code().to_owned()],
+            ));
+        }
+
         let revalidated = self
             .drain_admission_coherence(coordinator)
             .map_err(|reason| {
@@ -4893,10 +4882,51 @@ impl KernelComposition {
             ));
         }
 
+        let final_census = self.idle_lease_census();
+        if !final_census.admits_drain()
+            || final_census.store_stop_obligations() != Some(&owner_census)
+        {
+            return Err(DrainHalt::with_pending(
+                "store-owner-revision-raced-final-census",
+                vec![final_census.observation_code().to_owned()],
+            ));
+        }
+        let final_admission = self
+            .drain_admission_coherence(coordinator)
+            .map_err(|reason| {
+                DrainHalt::with_pending(reason, vec![final_census.observation_code().to_owned()])
+            })?;
+        if final_admission != admission {
+            return Err(DrainHalt::with_pending(
+                "drain-admission-raced-final-census",
+                vec![final_census.observation_code().to_owned()],
+            ));
+        }
+
+        // Keep the exact owner revision in phase evidence. This is the same
+        // typed result used by Kernel status and Host's authenticated mirror.
+        record(
+            ShutdownPhase::StoreStopLeaseZero,
+            format!(
+                "lease-census:{};store-owner-revision:{};admission-revision:{};{store_evidence}",
+                final_census.observation_code(),
+                owner_census.observation_revision,
+                owner_census.admission_revision,
+            ),
+        )?;
+
         // DrainCommit linearization point. The committed State Fence is the
         // revalidated one, so the authority the commit fences is the same
         // authority the final census was proven under.
-        let authority_epochs_fenced = vec![revalidated.state_fence];
+        let authority_epochs_fenced = vec![format!(
+            "{}:{}",
+            final_admission
+                .state_fence
+                .authority_epoch
+                .lineage_id
+                .as_str(),
+            final_admission.state_fence.authority_epoch.sequence.get()
+        )];
         let decision = DrainCommitDecision {
             generation: generation.clone(),
             lease_and_pending_snapshot: Vec::new(),
@@ -4909,7 +4939,7 @@ impl KernelComposition {
             // values that genuinely mean the same generation instead of
             // comparing a wire identity against this process's local
             // `drain_generation` correlation id.
-            activation_generation_fenced: Some(revalidated.activation_generation),
+            activation_generation_fenced: Some(final_admission.activation_generation),
             branches_to_stop: quiescence,
             wake_disposition: DrainWakeDisposition::QueueNextGeneration,
             irreversible_stage: "authority-fenced".to_owned(),
@@ -4984,15 +5014,7 @@ impl KernelComposition {
     ) -> Result<DrainAdmissionCoherence, &'static str> {
         let drain_generation = coordinator.drain_generation();
         let state_fence = match self.front_door_policy.lock() {
-            Ok(policy) => {
-                let fence = &policy.module_generation.state_fence;
-                format!(
-                    "{}:{}@{}",
-                    fence.authority_epoch.lineage_id,
-                    fence.authority_epoch.sequence,
-                    fence.resource_generation.value()
-                )
-            }
+            Ok(policy) => policy.module_generation.state_fence.clone(),
             Err(_) => return Err("authority-fence-unavailable"),
         };
         // The activation generation of the live admitted candidate contour, in
@@ -5001,15 +5023,18 @@ impl KernelComposition {
         // has admitted no activation yet has no such contour, which is the
         // genesis case the I1.5 pairing leaves unfenced rather than a second
         // opinion about the live one.
-        let activation_generation = match self.service.lock() {
+        let (activation_id, activation_generation) = match self.service.lock() {
             Ok(service) => {
                 let candidate = service
                     .candidate_binding()
                     .ok_or("activation-contour-unavailable")?;
-                candidate
-                    .supervision_incarnation
-                    .activation_generation
-                    .clone()
+                (
+                    candidate.activation_id.clone(),
+                    candidate
+                        .supervision_incarnation
+                        .activation_generation
+                        .clone(),
+                )
             }
             Err(_) => return Err("activation-contour-unavailable"),
         };
@@ -5036,6 +5061,7 @@ impl KernelComposition {
         Ok(DrainAdmissionCoherence {
             drain_generation,
             state_fence,
+            activation_id: activation_id.as_str().to_owned(),
             activation_generation,
             service_state,
             bridge_sessions,
@@ -5122,8 +5148,11 @@ struct DrainAdmissionCoherence {
     /// The drain generation the census is taken under and the commit is
     /// consumed for.
     drain_generation: String,
-    /// The front-door `StateFence` binding (`lineage:sequence@resource`).
-    state_fence: String,
+    /// The exact front-door `StateFence` binding used by the ORS owner read.
+    state_fence: eliot_contracts::StateFence,
+    /// The admitted candidate activation identity, distinct from the fence's
+    /// resource generation and required to bind the ORS owner projection.
+    activation_id: String,
     /// The activation generation of the admitted candidate contour this sample
     /// observed, in the same `SupervisionJournalEpoch` domain a waking
     /// activation presents.

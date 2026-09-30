@@ -77,7 +77,7 @@ fn handle(value: &PlatformHandle, field: &'static str) -> Result<(), KernelServi
 /// Stable identity for the Host↔Kernel lifecycle control wire.
 pub const KERNEL_CONTROL_WIRE_ID: &str = "eliot.kernel.host-control";
 /// Current version of the Host↔Kernel lifecycle control wire.
-pub const KERNEL_CONTROL_WIRE_VERSION: u16 = 6;
+pub const KERNEL_CONTROL_WIRE_VERSION: u16 = 7;
 /// Canonical authenticated Kernel front-door pipe.
 pub const KERNEL_CONTROL_PIPE: &str = r"\\.\pipe\eliot\kernel\frontdoor";
 /// Stable identity for the Kernel-owned `eliotd` launch descriptor.
@@ -3380,10 +3380,13 @@ pub struct RuntimeLeaseCensus {
     pub runtime_leases: Vec<RuntimeLease>,
     /// Current supervision row bound to the same fence.
     pub supervision_lease: SupervisionLeaseSnapshot,
+    /// Complete Store-stop owner projection from the same ORS read snapshot.
+    pub store_stop_obligations: eliot_ors::StoreStopObligationCensus,
 }
 
 impl RuntimeLeaseCensus {
-    /// Validates fence agreement, lease ordering, and supervision binding.
+    /// Validates fence agreement, lease ordering, supervision binding, and the
+    /// complete same-snapshot Store-stop owner projection.
     pub fn validate(&self) -> Result<(), KernelServiceError> {
         let query = RuntimeLeaseCensusQuery {
             state_fence: self.state_fence.clone(),
@@ -3413,16 +3416,27 @@ impl RuntimeLeaseCensus {
             })?;
         if self.supervision_lease.record.lease_id.as_str() != self.supervision_lease_id
             || self.supervision_lease.record.binding.state_fence != self.state_fence
+            || self.store_stop_obligations.state_fence != self.state_fence
+            || self.store_stop_obligations.activation_id.as_deref()
+                != Some(self.supervision_lease.record.binding.activation_id.as_str())
+            || self.store_stop_obligations.activation_generation
+                != self.state_fence.resource_generation
         {
             return Err(KernelServiceError::HandshakeMismatch {
-                field: "runtime_lease_census.supervision_lease_binding",
+                field: "runtime_lease_census.owner_binding",
             });
         }
+        self.store_stop_obligations
+            .validate()
+            .map_err(|_| KernelServiceError::InvalidField {
+                field: "runtime_lease_census.store_stop_obligations",
+                reason: "must be a complete validated ORS owner projection",
+            })?;
         Ok(())
     }
 
-    /// Returns whether every `RuntimeLease` and the current
-    /// `SupervisionLease` are terminal in this exact-fence ORS snapshot.
+    /// Returns whether the exact-fence runtime and supervision leases are
+    /// terminal and the complete same-snapshot Store-stop owner census is zero.
     ///
     /// Ported from #1751 donor b2566e47 (M2 integration copy; the barrier
     /// retirement gate consumes it; no authorship change).
@@ -3446,6 +3460,7 @@ impl RuntimeLeaseCensus {
                 .all(|lease| terminal(lease.state))
             && terminal(self.supervision_lease.record.state)
             && self.supervision_lease.record.projection == SupervisionLeaseProjection::Terminal
+            && self.store_stop_obligations.is_known_zero()
     }
 }
 

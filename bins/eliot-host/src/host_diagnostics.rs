@@ -735,6 +735,9 @@ impl HostConsoleRequest {
 /// [`HostError`], so a new variant forces both projections to stay in sync.
 const fn project_host_error_reason(error: &HostError) -> &'static str {
     match error {
+        HostError::StoreCensusKernel(_) => "store_census_kernel",
+        HostError::StoreCensusTransport(_) => "store_census_transport",
+        HostError::StoreCensusIo(_) => "store_census_runtime",
         HostError::State(_) => "state",
         HostError::Journal(_) => "journal",
         HostError::Installation(_) => "installation",
