@@ -6306,6 +6306,88 @@ impl InquiryGovernance {
         Ok(record)
     }
 
+    /// The released wording this record is ABOUT TO PUBLISH, per audited material
+    /// claim.
+    ///
+    /// This is the delivered side of [`Self::release_gate`]'s post-audit
+    /// material-edit check, and it is deliberately **not** a restatement of
+    /// `claim_audits[*].released_statement`.
+    ///
+    /// # Why the audits are not the source
+    ///
+    /// The only production caller used to build the delivery map by iterating this
+    /// record's own audits and copying each `released_statement` into it
+    /// (`bins/eliot-mod-research/src/main.rs::report_admitted_inquiry`). `release_gate`
+    /// then iterated the same `&self.claim_audits`, so the two sides were the same
+    /// value by construction and every `released_wording` arm was unreachable: the
+    /// per-claim lookup could never miss, `text == &audit.released_statement` was
+    /// true for every entry and therefore always `continue`d before the material
+    /// edit arm and [`ClaimAuditRecord::is_nonsemantic_restyle_of`] were reached,
+    /// and the delivery key set was a subset of the audited set so the unaudited-claim
+    /// arm could not fire either. A check that compares a value with itself cannot
+    /// observe an edit, and A2 requires that a post-audit material edit *fail*.
+    ///
+    /// # What this composes from instead
+    ///
+    /// The publish side of this record, which is a different owner of the same
+    /// facts and never reads an audit:
+    ///
+    /// - the claim roster comes from [`Self::freeze`]'s admitted included members
+    ///   ([`EvidenceFreeze::included_members`]), the freeze the run committed,
+    ///   not from the verdict trail;
+    /// - each sentence is composed from this record's `inquiry_id`, the admitted
+    ///   `profile.question`, and the coverage receipt's admitted `requested_scope`
+    ///   ([`Self::profile`], [`Self::inquiry_id`], [`Self::coverage_receipt`]) —
+    ///   the inquiry a reader is being given, never an audit's restatement of it.
+    ///   Those three are the same facts the audited sentence names, read through
+    ///   the publish side: the profile question is what
+    ///   `SynthesisInputPack::resolve` froze the pack under and
+    ///   [`Self::validate_synthesis_input_binding`] re-proves against this record,
+    ///   and `requested_scope` is frozen from the same observation scope the audit
+    ///   read. Two owners of one value, so a material divergence is a real finding.
+    ///
+    /// The audited sentence is composed by [`released_material_statement`] from the
+    /// `InquiryObservation` this record was built from. Both sentences therefore
+    /// describe the same run, and any material divergence between them — a
+    /// reworded claim, a claim a publisher rewrote, a scope or question the release
+    /// changed after the audit, a handle delivered that was never audited — is a
+    /// real observation the gate refuses rather than an artefact of asking the
+    /// audit about itself.
+    ///
+    /// # Why the claim identity is the admitted handle
+    ///
+    /// The audit's `claim_id` and the freeze's included member are the same admitted
+    /// source handle: [`claim_audit_for_run`] derives one audited claim per
+    /// `MaterialClaimRoster::derive` member, and that derivation filters to handles
+    /// the manifest allows, the run-bound allowlist admits, and the portfolio holds
+    /// a provable record for — the same admitted set the freeze includes. So a
+    /// handle present in both rosters is one claim, and the key the gate looks up is
+    /// the claim's own identity rather than a positional index.
+    ///
+    /// The gate's completeness conjunct
+    /// ([`crate::evidence_portfolio::require_complete_claim_coverage`]) refuses a
+    /// roster mismatch by content before any wording is compared, so a handle that
+    /// is in exactly one of the two rosters never reaches the wording comparison
+    /// with the gate open.
+    #[must_use]
+    pub fn published_released_wording(&self) -> BTreeMap<String, String> {
+        self.freeze
+            .included_members()
+            .iter()
+            .map(|claim_id| {
+                (
+                    claim_id.clone(),
+                    released_material_statement_for_release(
+                        &self.profile.question,
+                        &self.inquiry_id,
+                        claim_id,
+                        &self.coverage_receipt.requested_scope,
+                    ),
+                )
+            })
+            .collect()
+    }
+
     /// The release gate a consumer must ask before it may release this run's
     /// material claims as fully supported.
     ///
@@ -6335,6 +6417,15 @@ impl InquiryGovernance {
     /// acceptance requirement is that every released material claim is in the
     /// coverage map. A claim named here that the audit trail never carried is a
     /// fabricated claim identity and is likewise refused.
+    ///
+    /// The comparison is only meaningful because the two sides are independent
+    /// observations. `delivered` must be what the release actually publishes —
+    /// [`Self::published_released_wording`] is the producer on the live path — and
+    /// not a reconstruction of `claim_audits[*].released_statement`. A map copied
+    /// off this record's own audits would make every `released_wording` arm
+    /// unreachable rather than satisfied: the lookup could never miss, the equality
+    /// test would always pass, and the delivery keys could never exceed the
+    /// audited set. Three rosters that are three copies of one list are one list.
     ///
     /// The one thing this gate accepts is a **nonsemantic restyle**: the same
     /// non-space words in a different whitespace or capitalisation-free
@@ -6371,6 +6462,14 @@ impl InquiryGovernance {
             // `delivered` is consulted per claim so a claim that is audited but
             // absent from the delivery map is caught as a material omission here,
             // at the gate a release consumer actually calls.
+            //
+            // The two sides must be independent observations for this arm to mean
+            // anything, so a caller that reconstructed `delivered` from
+            // `self.claim_audits` would silently turn the gate into a self
+            // comparison. [`Self::published_released_wording`] is the producer the
+            // live path uses and it reads only the freeze and the admitted inquiry
+            // facts; a caller who inverts that relationship has to do it in their
+            // own code, which is where the difference becomes reviewable.
             let Some(text) = delivered.get(&audit.claim_id) else {
                 return Err(InquiryError::ReleaseGateRefused {
                     gate: "released_wording",
@@ -8850,6 +8949,37 @@ fn released_material_statement(observation: &InquiryObservation, claim_id: &str)
         "the retained provider artifact `{}` for inquiry {} contains evidence the question `{}` \
          could be decided from within the admitted scope `{}`",
         claim_id, observation.inquiry_id, observation.question, observation.scope
+    )
+}
+
+/// The released wording of one material claim, composed from the values the
+/// release itself publishes.
+///
+/// The parameter order is deliberately the order the sentence reads in, so a
+/// reader comparing the two producers cannot mistake a transposition for the
+/// agreement it was checking: [`released_material_statement`] binds the handle,
+/// the inquiry, the question and the scope in that order too, and any other
+/// ordering here would compose a sentence about a different claim rather than
+/// simply a differently punctuated one.
+///
+/// One function for the same reason [`released_material_statement`] is one
+/// function. Two format strings describing "the retained artifact this run
+/// released" would let the audit side and the publish side drift apart
+/// invisibly, and the gate would then refuse every honest run for a difference
+/// nobody intended — or, worse, accept a real reword because the drift happened
+/// to coincide. Composed here, from the admitted profile question, this record's
+/// inquiry identity and the coverage receipt's admitted requested scope, so
+/// nothing in it is read from an audit.
+fn released_material_statement_for_release(
+    question: &str,
+    inquiry_id: &str,
+    claim_id: &str,
+    scope: &str,
+) -> String {
+    format!(
+        "the retained provider artifact `{}` for inquiry {} contains evidence the question `{}` \
+         could be decided from within the admitted scope `{}`",
+        claim_id, inquiry_id, question, scope
     )
 }
 
