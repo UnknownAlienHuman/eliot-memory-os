@@ -294,6 +294,8 @@ mod runtime_identity;
 mod scan_disclosure_route;
 mod shutdown_drain;
 mod startup_coordinator;
+mod user_broker_registration_authority;
+mod user_broker_registration_route;
 mod wasm_runtime_port_grant;
 use daemon_session_guard::caller_binding;
 #[cfg(all(windows, test))]
@@ -654,6 +656,11 @@ pub struct KernelComposition {
     user_broker_executable_path: Option<PathBuf>,
     /// Digest bound to `user_broker_executable_path`.
     user_broker_artifact_sha256: Option<String>,
+    /// Process-local typed authority for broker registrations admitted on the
+    /// exact authenticated User Broker connection. ORS payload bytes remain
+    /// opaque and can never be used to reconstruct this live state.
+    user_broker_registration_authority:
+        user_broker_registration_authority::UserBrokerRegistrationAuthority,
     /// Retained owner-side WASM join table (#2786 step 3): the single
     /// cross-call registry of published delivery-bound joins. The
     /// dispatch operation merges each published bundle here and admits

@@ -10,6 +10,10 @@
 //! on poisoned or stale state; it does not dispatch frames, grant semantic
 //! authority, or persist canonical transitions.
 
+use super::user_broker_registration_route::{
+    USER_BROKER_FENCE_OPERATION, USER_BROKER_HEARTBEAT_OPERATION, USER_BROKER_REGISTER_OPERATION,
+    USER_BROKER_VALIDATE_NATIVE_RESOURCE_SELECTION_CURRENT_OPERATION,
+};
 use super::*;
 
 fn observe_front_door_session(event: &'static str, outcome: &'static str) {
@@ -1337,6 +1341,108 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         }
         Ok(())
+    }
+
+    /// Binds the installer-pinned User Broker role to a scoped lifecycle
+    /// session. The listener selected this role from the live OS peer, and
+    /// this second gate joins the hello's exact module generation and artifact
+    /// to that selected role and to the current Kernel authority fence.
+    #[cfg(windows)]
+    pub fn bind_user_broker_session(
+        &self,
+        connection_id: impl Into<String>,
+        peer: PeerIdentity,
+        selection: &eliot_platform_windows::NamedPipePeerSelection,
+        client: &eliot_protocol::ClientHello,
+    ) -> Result<HandshakeResult, TransportError> {
+        let broker_capabilities = [
+            USER_BROKER_REGISTER_OPERATION,
+            USER_BROKER_HEARTBEAT_OPERATION,
+            USER_BROKER_FENCE_OPERATION,
+            USER_BROKER_VALIDATE_NATIVE_RESOURCE_SELECTION_CURRENT_OPERATION,
+        ];
+
+        observe_front_door_session("kernel.front_door_user_broker_bind", "attempt");
+        let connection_id = connection_id.into();
+        if selection.kind() != NamedPipePeerKind::UserBroker
+            || selection.module_id() != NamedPipePeerKind::UserBroker.module_id()
+            || client.module_bridge_identity != selection.module_id()
+            || client.module_generation.module_id.as_str() != selection.module_id()
+            || connection_id.trim().is_empty()
+            || connection_id.chars().any(char::is_control)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        peer.validate()
+            .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+        let Some(expected_artifact) = self.user_broker_artifact_sha256.as_deref() else {
+            return Err(TransportError::SessionFenced);
+        };
+        if client.artifact_hash.as_str() != expected_artifact
+            || client.module_generation.artifact_id.as_str() != expected_artifact
+            || client.module_contract.artifact_id.as_str() != expected_artifact
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let exactly_broker_capabilities = |capabilities: &[String]| {
+            capabilities.len() == broker_capabilities.len()
+                && broker_capabilities.iter().all(|expected| {
+                    capabilities
+                        .iter()
+                        .filter(|capability| capability.as_str() == *expected)
+                        .count()
+                        == 1
+                })
+        };
+        if !exactly_broker_capabilities(&client.capabilities)
+            || !exactly_broker_capabilities(&client.module_contract.required_capabilities)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+
+        let policy = self
+            .front_door_policy
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?
+            .clone();
+        client.validate()?;
+        if client.module_generation != policy.module_generation
+            || !client
+                .authority_epoch
+                .is_same_authority(&policy.module_generation.state_fence.authority_epoch)
+            || client.module_generation.state_fence != policy.module_generation.state_fence
+        {
+            return Err(TransportError::SessionFenced);
+        }
+
+        let mut session = Session::establish(connection_id, peer, client, policy.protocol_range)?;
+        session.capabilities = broker_capabilities.into_iter().map(str::to_owned).collect();
+        session
+            .privacy_classes
+            .retain(|class| policy.allowed_privacy_classes.contains(class));
+        session.effects.clear();
+        let server_hello = eliot_protocol::ServerHello {
+            selected_protocol: session.protocol_version,
+            session_principal_binding: policy.session_principal_binding.clone(),
+            allowed_capabilities: session.capabilities.clone(),
+            allowed_effects: Vec::new(),
+            config_snapshot: policy.config_snapshot.clone(),
+            heartbeat_ms: policy.heartbeat_ms,
+            control_channel: policy.control_channel.clone(),
+            rejection_reason: None,
+            authority_epoch: policy.module_generation.state_fence.authority_epoch.clone(),
+        };
+        server_hello
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        observe_front_door_session("kernel.front_door_user_broker_bind", "success");
+        Ok(HandshakeResult {
+            capabilities: session.capabilities.clone(),
+            privacy_classes: session.privacy_classes.clone(),
+            effects: Vec::new(),
+            session,
+            server_hello,
+        })
     }
 
     /// Binds an authenticated Watchdog supervision service to a
