@@ -164,7 +164,7 @@ pub enum ContractViolation {
     /// still lacks. Collapsing it to a reason string here would force every
     /// consumer to re-derive the block from the card, which is exactly the
     /// re-derivation the shared rule exists to remove.
-    #[error("quality refused {0}")]
+    #[error("quality refused: {0:?}")]
     QualityRefused(Box<eliot_context_contracts::QualityRefusal>),
     /// Candidate carries admitted/current/effect/delivery/use/outcome/promotion/Finish evidence.
     #[error("forbidden candidate carry: {0}")]
