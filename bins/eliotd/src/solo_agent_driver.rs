@@ -1176,10 +1176,7 @@ pub fn drive_solo_delegate(
 /// this operation. The call below verifies the remaining exact owner tuple,
 /// then returns a typed fail-closed residual before any capability or fabric
 /// effect is created. The native-worker owner must persist and verify the
-/// executable join itself before this path can proceed. Once that owner
-/// supplies the verified binding, its caller drives the completed sequence
-/// through [`drive_solo_delegate_admitted_async`], which consumes the
-/// owner-verified binding as a parameter instead of caller-claimed halves.
+/// executable join itself before this path can proceed.
 pub async fn drive_solo_delegate_async(
     kernel: &Arc<DaemonKernelClient>,
     intake: SoloDelegateIntake,
@@ -1217,9 +1214,9 @@ pub async fn drive_solo_delegate_async(
 /// A caller-claimed digest is never evidence: the binding the drive consumes
 /// must carry the same presented halves the intake claims, or the drive
 /// refuses with a typed identity conflict before any capability,
-/// reservation, or dispatch exists. On the queue-poll path the binding is
-/// derived from the intake itself, so this documents the invariant; on the
-/// admitted path the binding is owner-supplied and this check has teeth.
+/// reservation, or dispatch exists. The binding is currently derived from
+/// the queued intake itself, so this pins the invariant the poll path
+/// relies on; an owner-supplied binding takes the same parameter.
 fn check_verified_binds_intake(
     intake: &SoloDelegateIntake,
     material: &VerifiedProviderMaterial,
@@ -1307,32 +1304,6 @@ fn check_dispatch_record(
     Ok(())
 }
 
-/// Drives one solo delegate intake on an owner-verified binding (issue #2567).
-///
-/// Step (2) seam for the executable-binding owner: the caller supplies the
-/// already owner-verified [`VerifiedProviderMaterial`] (the existing verified
-/// result type on main) instead of caller-claimed halves, and this entry
-/// consumes it through the completed prepare/IO/adopt sequence below. The
-/// verified binding must field-for-field bind the intake
-/// ([`check_verified_binds_intake`]); a caller-claimed digest never counts
-/// as evidence. Refusal leaves no capability, reservation, or dispatch
-/// behind, so a queue caller keeps its head queued for a later fresh
-/// evaluation (see [`solo_poll_queue_async`]).
-///
-/// # Errors
-///
-/// Returns the intake-shape, binding-conflict, readiness, slot, staffing,
-/// seam-verifier, launch-gate, or dispatch refusal unchanged, each typed.
-pub async fn drive_solo_delegate_admitted_async(
-    composition: &DaemonComposition,
-    kernel: &Arc<DaemonKernelClient>,
-    intake: SoloDelegateIntake,
-    verified: VerifiedProviderMaterial,
-    now_unix_ms: u64,
-) -> Result<SoloDriveOutcome, DaemonError> {
-    drive_admitted_material_async(composition, kernel, intake, verified, now_unix_ms).await
-}
-
 /// Drives one admitted solo delegate intake through the verified async
 /// seam to a retained dispatch (issue #1108 W4/A2).
 ///
@@ -1358,10 +1329,6 @@ pub async fn drive_solo_delegate_admitted_async(
 /// executor-daemon bind (#874) for emission. The projection is persisted
 /// before `emit` exactly as in the sync drive, so a restart reads back the
 /// same digest-bound attempt.
-///
-/// The admitted entry [`drive_solo_delegate_admitted_async`] consumes an
-/// owner-verified binding through the same sequence; the poll path derives
-/// the binding from the queued intake itself.
 ///
 /// The caller holds the composition guard across the seam await (see
 /// [`solo_poll_queue_async`]); this function takes `&DaemonComposition`
