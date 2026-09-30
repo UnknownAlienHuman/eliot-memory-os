@@ -158,7 +158,7 @@ impl OrientationSemanticInputPublication {
         Ok(job)
     }
 
-    fn validate_for_request(
+    pub(crate) fn validate_for_request(
         &self,
         request: &DurableJobRequest,
         submission: &JobSubmission,

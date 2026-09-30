@@ -60,6 +60,14 @@ pub fn map_durable_error(error: DurableJobError) -> StoreError {
         DurableJobError::SemanticInputUnavailable => StoreError::Empty {
             field: "semantic_input",
         },
+        DurableJobError::RuntimeOwnerExecutionInputUnavailable => StoreError::Empty {
+            field: "runtime_owner_execution_input",
+        },
+        DurableJobError::RuntimeOwnerExecutionInputMismatch
+        | DurableJobError::OutputContractMismatch => StoreError::IdentityConflict,
+        DurableJobError::OutputContractUnavailable => StoreError::Empty {
+            field: "output_contract",
+        },
         DurableJobError::CapabilityDenied => StoreError::UnknownOperation,
         DurableJobError::LeaseInvalid | DurableJobError::TerminalImmutable => {
             StoreError::RevisionConflict
@@ -616,6 +624,36 @@ fn validate_bundle_identities(
     }
     if response.scope != record.record.submission.work_scope {
         return Err(StoreError::FenceMismatch);
+    }
+    match (
+        record.record.submission.runtime_owner_execution_input.as_ref(),
+        record
+            .record
+            .submission
+            .runtime_owner_execution_input_bytes
+            .as_ref(),
+        response.runtime_owner_execution_input.as_ref(),
+        response.runtime_owner_execution_input_bytes.as_ref(),
+    ) {
+        (None, None, None, None) => {}
+        (Some(expected_ref), Some(expected_bytes), Some(observed_ref), Some(observed_bytes))
+            if expected_ref == observed_ref && expected_bytes == observed_bytes => {}
+        (Some(_), Some(_), None, None) => {
+            return Err(StoreError::Empty {
+                field: "runtime_owner_execution_input",
+            });
+        }
+        _ => return Err(StoreError::IdentityConflict),
+    }
+    match response.output_contract.as_ref() {
+        Some(output_contract)
+            if output_contract == &record.record.submission.output_contract => {}
+        None => {
+            return Err(StoreError::Empty {
+                field: "output_contract",
+            });
+        }
+        Some(_) => return Err(StoreError::IdentityConflict),
     }
     let request_fence = &request.request_identity.operation.state_fence;
     if let JobOperation::RecordApplicability { update } = &request.operation {
