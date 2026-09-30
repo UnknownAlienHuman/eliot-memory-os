@@ -405,6 +405,11 @@ pub enum RowFamilyKind {
     /// live state: backup/export preserves the family under policy, import
     /// never restores scan state.
     ScanDisclosure,
+    /// Durable cold-start leases and immutable readiness receipts (issue
+    /// #1790). These rows are bound to one installation and exact workspace,
+    /// privacy, source generation and state fence. Backup restore must never
+    /// revive their prior lease or readiness decision.
+    ColdStartReadiness,
     /// Durable owner-backed `backup.verify` results (issue #2883): one row per
     /// distinct `(principal, authority lineage, operation id)` within one
     /// installation's ORS file — the exact tuple the durable key is scoped to, and
@@ -482,7 +487,8 @@ impl RowFamilyKind {
             | Self::NativeWorkerClaims
             | Self::CutoverOwnership
             | Self::VersionedArtifacts
-            | Self::ScanDisclosure => RowDisposition::NonrestorableHistorical,
+            | Self::ScanDisclosure
+            | Self::ColdStartReadiness => RowDisposition::NonrestorableHistorical,
             // Everything else, including the #269 process-stream recovery
             // family, is `Restorable`. That word only means eligible for the
             // family's own quarantined import: the sole durable import for a

@@ -94,11 +94,11 @@
 //! not refused. The census names the store's tables by referencing `store.rs`'s
 //! own constants, so a renamed table cannot drift from its entry, and it compares
 //! that list with the tables redb reports for the file being read, under the same
-//! transaction as the pages. Counted at the time of writing: 70 distinct declared
-//! tables, 42 backing a dispositioned row family and 28 carrying an explicit
+//! transaction as the pages. Counted at the time of writing: 73 distinct declared
+//! tables, 45 backing a dispositioned row family and 28 carrying an explicit
 //! source-bound nonrestorable/forensic exclusion with the reason written next to
-//! it; 42 dispositioned families, each bound to its own table, so none is excused
-//! from having one. A table with no disposition is refused with
+//! it; 43 dispositioned families, each bound to at least one table, so none is
+//! excused from having one. A table with no disposition is refused with
 //! [`OrsError::MigrationRequired`] on all three paths that run —
 //! [`export_page`], [`export_snapshot`] and [`import_page_quarantined`] — so it
 //! cannot be silently exported, imported or counted, and no table disappears
@@ -725,6 +725,8 @@ pub(super) fn row_family_denominator() -> Vec<RowFamilyDisposition> {
         RowFamilyDisposition::of(RowFamilyKind::RestoreJournalMeta),
         // Scan disclosure receipts are evidence, never live scan state (#2900).
         RowFamilyDisposition::of(RowFamilyKind::ScanDisclosure),
+        // Cold-start leases and terminal readiness never revive on restore (#1790).
+        RowFamilyDisposition::of(RowFamilyKind::ColdStartReadiness),
         // Owner-backed verification results are evidence, never authority: this
         // family is DECLARED in the EXISTING ORS operational retention/export
         // contract here (#2883 instruction 10), which is that contract's own
@@ -913,9 +915,9 @@ struct DispositionedTable {
 /// and there it comes from redb, not from this file.
 ///
 /// Counted against `store.rs`, `store/restore_journal.rs` and `status.rs` at the
-/// time of writing: 70 distinct declared tables, of which 42 back a dispositioned
+/// time of writing: 73 distinct declared tables, of which 45 back a dispositioned
 /// row family and 28 are explicit source-bound exclusions.
-/// `row_family_denominator` carries 42 families and every one of them is now bound
+/// `row_family_denominator` carries 43 families and every one of them is now bound
 /// to a table by this census.
 ///
 /// That count is a MEASUREMENT, not an enforced invariant, and the difference
@@ -932,7 +934,7 @@ struct DispositionedTable {
 /// in this issue. Until it exists, a table added to `store.rs` is on the author.
 ///
 /// Split in four so no half can grow past the point where a reader stops
-/// checking it: 42 table-backed families and 28 source-bound exclusions.
+/// checking it: 45 table-backed tables and 28 source-bound exclusions.
 fn dispositioned_tables() -> Vec<DispositionedTable> {
     let mut tables = family_backed_tables();
     tables.extend(source_bound_exclusions());
@@ -967,7 +969,7 @@ fn excluded(
     }
 }
 
-/// The 42 tables that back a dispositioned row family.
+/// The 45 tables that back a dispositioned row family.
 fn family_backed_tables() -> Vec<DispositionedTable> {
     let mut tables = canonical_family_tables();
     tables.extend(supervision_and_replay_family_tables());
@@ -1009,6 +1011,20 @@ fn canonical_family_tables() -> Vec<DispositionedTable> {
         family(
             super::SCAN_DISCLOSURE_RECORDS,
             RowFamilyKind::ScanDisclosure,
+        ),
+        // Lease revisions, revision heads, and exact-binding indexes belong to
+        // one readiness family; none can be restored as live readiness.
+        family(
+            super::COLD_START_READINESS_RECORDS,
+            RowFamilyKind::ColdStartReadiness,
+        ),
+        family(
+            super::COLD_START_READINESS_HEADS,
+            RowFamilyKind::ColdStartReadiness,
+        ),
+        family(
+            super::COLD_START_READINESS_BINDINGS,
+            RowFamilyKind::ColdStartReadiness,
         ),
         family(
             super::BACKUP_VERIFICATION_RESULTS,

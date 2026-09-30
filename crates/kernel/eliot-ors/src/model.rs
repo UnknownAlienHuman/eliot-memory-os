@@ -9705,3 +9705,488 @@ impl ScanDisclosureOrsRecord {
         Ok(())
     }
 }
+
+/// Stable ORS record-type name for durable cold-start readiness ownership.
+pub const COLD_START_READINESS_RECORD_TYPE: &str = "cold_start_readiness";
+
+/// Exact identity and governing-source fence for one cold-start readiness key.
+///
+/// ORS retains the typed identity inputs and recomputes both key digests on
+/// every read. The boundary reference is supplied by the authenticated owner
+/// route; a privacy class by itself is not treated as a boundary identity.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ColdStartReadinessOwnerKey {
+    pub installation_id: String,
+    pub lineage_candidate_ref: String,
+    pub workspace_instance_candidate_ref: String,
+    pub filesystem_identity_ref: String,
+    pub vcs_identity_ref: Option<String>,
+    pub privacy_boundary_ref: String,
+    pub privacy_class: PrivacyClass,
+    pub governing_source_set_ref: String,
+    pub governing_source_generation: u64,
+    pub governing_source_digests: Vec<String>,
+    pub dirty_summary_ref: Option<String>,
+    pub state_fence: StateFence,
+}
+
+impl ColdStartReadinessOwnerKey {
+    /// Validates identity and fence fields without resolving authority.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        validate_text(&self.installation_id, "cold_start_installation_id")?;
+        validate_text(
+            &self.lineage_candidate_ref,
+            "cold_start_lineage_candidate_ref",
+        )?;
+        validate_text(
+            &self.workspace_instance_candidate_ref,
+            "cold_start_workspace_instance_ref",
+        )?;
+        validate_text(
+            &self.filesystem_identity_ref,
+            "cold_start_filesystem_identity_ref",
+        )?;
+        if let Some(vcs_identity) = &self.vcs_identity_ref {
+            validate_text(vcs_identity, "cold_start_vcs_identity_ref")?;
+        }
+        validate_text(
+            &self.privacy_boundary_ref,
+            "cold_start_privacy_boundary_ref",
+        )?;
+        validate_text(
+            &self.governing_source_set_ref,
+            "cold_start_governing_source_set_ref",
+        )?;
+        if self.governing_source_generation == 0 {
+            return Err(OrsError::InvalidField {
+                field: "cold_start_governing_source_generation",
+                reason: "governing-source generation must be non-zero",
+            });
+        }
+        let mut previous: Option<&str> = None;
+        for digest in &self.governing_source_digests {
+            validate_digest(digest, "cold_start_governing_source_digest")?;
+            if previous.is_some_and(|observed| observed >= digest.as_str()) {
+                return Err(OrsError::InvalidField {
+                    field: "cold_start_governing_source_digests",
+                    reason: "source digest set must be sorted and unique",
+                });
+            }
+            previous = Some(digest);
+        }
+        if let Some(dirty_summary) = &self.dirty_summary_ref {
+            validate_text(dirty_summary, "cold_start_dirty_summary_ref")?;
+        }
+        self.state_fence
+            .validate()
+            .map_err(|error| OrsError::Contract(error.to_string()))
+    }
+
+    fn base_identity_digest(&self) -> Result<String, OrsError> {
+        let preimage = ColdStartReadinessBaseIdentityPreimage {
+            installation_id: &self.installation_id,
+            lineage_candidate_ref: &self.lineage_candidate_ref,
+            workspace_instance_candidate_ref: &self.workspace_instance_candidate_ref,
+            filesystem_identity_ref: &self.filesystem_identity_ref,
+            vcs_identity_ref: self.vcs_identity_ref.as_deref(),
+            privacy_boundary_ref: &self.privacy_boundary_ref,
+            privacy_class: self.privacy_class,
+        };
+        let bytes = canonical_json_bytes(&preimage)
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        Ok(sha256_hex(&bytes))
+    }
+
+    fn binding_digest(&self) -> Result<String, OrsError> {
+        let base_identity_digest = self.base_identity_digest()?;
+        let preimage = ColdStartReadinessBindingPreimage {
+            base_identity_digest: &base_identity_digest,
+            governing_source_set_ref: &self.governing_source_set_ref,
+            governing_source_generation: self.governing_source_generation,
+            governing_source_digests: &self.governing_source_digests,
+            dirty_summary_ref: self.dirty_summary_ref.as_deref(),
+            state_fence: &self.state_fence,
+        };
+        let bytes = canonical_json_bytes(&preimage)
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        Ok(sha256_hex(&bytes))
+    }
+}
+
+#[derive(Serialize)]
+struct ColdStartReadinessBaseIdentityPreimage<'a> {
+    installation_id: &'a str,
+    lineage_candidate_ref: &'a str,
+    workspace_instance_candidate_ref: &'a str,
+    filesystem_identity_ref: &'a str,
+    vcs_identity_ref: Option<&'a str>,
+    privacy_boundary_ref: &'a str,
+    privacy_class: PrivacyClass,
+}
+
+#[derive(Serialize)]
+struct ColdStartReadinessBindingPreimage<'a> {
+    base_identity_digest: &'a str,
+    governing_source_set_ref: &'a str,
+    governing_source_generation: u64,
+    governing_source_digests: &'a [String],
+    dirty_summary_ref: Option<&'a str>,
+    state_fence: &'a StateFence,
+}
+
+/// Candidate lease claim submitted to the canonical ORS readiness owner.
+///
+/// The lease bytes are canonical JSON and contain no task or authority
+/// binding. Repeated claims with the same computed binding digest share the
+/// first retained lease, even when a caller proposes a different lease ref.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ColdStartReadinessClaim {
+    pub contract_version: u16,
+    pub base_identity_digest: String,
+    pub binding_digest: String,
+    pub key: ColdStartReadinessOwnerKey,
+    pub lease_ref: String,
+    pub lease_deadline: u64,
+    pub lease_digest: String,
+    pub lease_bytes: String,
+}
+
+impl ColdStartReadinessClaim {
+    /// Constructs and validates a lease claim with owner-derived identity hashes.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the canonical lease claim binds its full identity, generation, fence, and exact serialized lease in one constructor"
+    )]
+    pub fn new(
+        key: ColdStartReadinessOwnerKey,
+        lease_ref: String,
+        lease_deadline: u64,
+        lease_bytes: String,
+    ) -> Result<Self, OrsError> {
+        key.validate()?;
+        let base_identity_digest = key.base_identity_digest()?;
+        let binding_digest = key.binding_digest()?;
+        let lease_digest = sha256_hex(lease_bytes.as_bytes());
+        let claim = Self {
+            contract_version: CONTRACT_VERSION,
+            base_identity_digest,
+            binding_digest,
+            key,
+            lease_ref,
+            lease_deadline,
+            lease_digest,
+            lease_bytes,
+        };
+        claim.validate()?;
+        Ok(claim)
+    }
+
+    /// Validates canonical payload bytes and recomputes every durable key.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        if self.contract_version != CONTRACT_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        self.key.validate()?;
+        validate_digest(
+            &self.base_identity_digest,
+            "cold_start_base_identity_digest",
+        )?;
+        validate_digest(&self.binding_digest, "cold_start_binding_digest")?;
+        if self.key.base_identity_digest()? != self.base_identity_digest
+            || self.key.binding_digest()? != self.binding_digest
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: COLD_START_READINESS_RECORD_TYPE,
+                reason: "cold-start key digest does not match its exact identity and fence"
+                    .to_owned(),
+            });
+        }
+        validate_text(&self.lease_ref, "cold_start_lease_ref")?;
+        if self.lease_deadline == 0 {
+            return Err(OrsError::InvalidField {
+                field: "cold_start_lease_deadline",
+                reason: "lease deadline must be non-zero",
+            });
+        }
+        validate_digest(&self.lease_digest, "cold_start_lease_digest")?;
+        if self.lease_bytes.is_empty() {
+            return Err(OrsError::InvalidField {
+                field: "cold_start_lease_bytes",
+                reason: "lease bytes must be non-empty",
+            });
+        }
+        if sha256_hex(self.lease_bytes.as_bytes()) != self.lease_digest {
+            return Err(OrsError::IntegrityProblem {
+                record_type: COLD_START_READINESS_RECORD_TYPE,
+                reason: "cold-start lease bytes do not match their digest".to_owned(),
+            });
+        }
+        let value: Value =
+            serde_json::from_str(&self.lease_bytes).map_err(|_| OrsError::InvalidField {
+                field: "cold_start_lease_bytes",
+                reason: "lease bytes must be JSON",
+            })?;
+        let canonical =
+            canonical_json_bytes(&value).map_err(|error| OrsError::Encoding(error.to_string()))?;
+        if canonical.as_slice() != self.lease_bytes.as_bytes() {
+            return Err(OrsError::InvalidField {
+                field: "cold_start_lease_bytes",
+                reason: "lease bytes must use canonical JSON encoding",
+            });
+        }
+        let expected_privacy = serde_json::to_value(self.key.privacy_class)
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        if value.get("lease_ref").and_then(Value::as_str) != Some(self.lease_ref.as_str())
+            || value.get("lineage_candidate_ref").and_then(Value::as_str)
+                != Some(self.key.lineage_candidate_ref.as_str())
+            || value
+                .get("workspace_instance_candidate_ref")
+                .and_then(Value::as_str)
+                != Some(self.key.workspace_instance_candidate_ref.as_str())
+            || value.get("privacy_class") != Some(&expected_privacy)
+            || value
+                .get("governing_source_generation")
+                .and_then(Value::as_u64)
+                != Some(self.key.governing_source_generation)
+            || value.get("deadline").and_then(Value::as_u64) != Some(self.lease_deadline)
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: COLD_START_READINESS_RECORD_TYPE,
+                reason: "serialized cold-start lease disagrees with its owner key".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn same_key(&self, other: &Self) -> bool {
+        self.base_identity_digest == other.base_identity_digest
+            && self.binding_digest == other.binding_digest
+            && self.key == other.key
+    }
+}
+
+/// Terminal disposition of one immutable readiness receipt revision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ColdStartReadinessTerminalDisposition {
+    Ready,
+    Ambiguous,
+    Failed,
+}
+
+/// Exact canonical terminal receipt retained with its lease revision.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ColdStartReadinessTerminalReceipt {
+    pub disposition: ColdStartReadinessTerminalDisposition,
+    pub receipt_ref: String,
+    pub receipt_revision: u64,
+    pub receipt_digest: String,
+    pub receipt_bytes: String,
+}
+
+/// One durable cold-start lease or immutable terminal readiness revision.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ColdStartReadinessOrsRecord {
+    pub contract_version: u16,
+    pub record_key: String,
+    pub record_revision: u64,
+    pub claim: ColdStartReadinessClaim,
+    pub terminal: Option<ColdStartReadinessTerminalReceipt>,
+}
+
+impl ColdStartReadinessOrsRecord {
+    pub(crate) fn leased(claim: ColdStartReadinessClaim, record_revision: u64) -> Self {
+        Self {
+            contract_version: CONTRACT_VERSION,
+            record_key: cold_start_readiness_record_key(
+                &claim.base_identity_digest,
+                record_revision,
+            ),
+            record_revision,
+            claim,
+            terminal: None,
+        }
+    }
+
+    /// Revalidates the exact row key and any terminal receipt bytes.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        if self.contract_version != CONTRACT_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        self.claim.validate()?;
+        self.validate_row_identity()?;
+        if let Some(terminal) = &self.terminal {
+            self.validate_terminal_receipt(terminal)?;
+        }
+        Ok(())
+    }
+
+    fn validate_row_identity(&self) -> Result<(), OrsError> {
+        if self.record_revision == 0
+            || self.record_key
+                != cold_start_readiness_record_key(
+                    &self.claim.base_identity_digest,
+                    self.record_revision,
+                )
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: COLD_START_READINESS_RECORD_TYPE,
+                reason: "cold-start row key does not match its durable revision".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_terminal_receipt(
+        &self,
+        terminal: &ColdStartReadinessTerminalReceipt,
+    ) -> Result<(), OrsError> {
+        let value = self.canonical_terminal_value(terminal)?;
+        self.validate_terminal_binding(terminal, &value)?;
+        Self::validate_terminal_disposition(terminal, &value)
+    }
+
+    fn canonical_terminal_value(
+        &self,
+        terminal: &ColdStartReadinessTerminalReceipt,
+    ) -> Result<Value, OrsError> {
+        validate_text(&terminal.receipt_ref, "cold_start_receipt_ref")?;
+        validate_digest(&terminal.receipt_digest, "cold_start_receipt_digest")?;
+        if terminal.receipt_revision != self.record_revision {
+            return Err(OrsError::IntegrityProblem {
+                record_type: COLD_START_READINESS_RECORD_TYPE,
+                reason: "terminal readiness revision does not match its lease revision".to_owned(),
+            });
+        }
+        if terminal.receipt_bytes.is_empty() {
+            return Err(OrsError::InvalidField {
+                field: "cold_start_receipt_bytes",
+                reason: "terminal receipt bytes must be non-empty",
+            });
+        }
+        if sha256_hex(terminal.receipt_bytes.as_bytes()) != terminal.receipt_digest {
+            return Err(OrsError::IntegrityProblem {
+                record_type: COLD_START_READINESS_RECORD_TYPE,
+                reason: "terminal receipt bytes do not match their digest".to_owned(),
+            });
+        }
+        let value: Value =
+            serde_json::from_str(&terminal.receipt_bytes).map_err(|_| OrsError::InvalidField {
+                field: "cold_start_receipt_bytes",
+                reason: "terminal receipt bytes must be JSON",
+            })?;
+        let canonical =
+            canonical_json_bytes(&value).map_err(|error| OrsError::Encoding(error.to_string()))?;
+        if canonical.as_slice() != terminal.receipt_bytes.as_bytes() {
+            return Err(OrsError::InvalidField {
+                field: "cold_start_receipt_bytes",
+                reason: "terminal receipt bytes must use canonical JSON encoding",
+            });
+        }
+        Ok(value)
+    }
+
+    fn validate_terminal_binding(
+        &self,
+        terminal: &ColdStartReadinessTerminalReceipt,
+        value: &Value,
+    ) -> Result<(), OrsError> {
+        let expected_fence = serde_json::to_value(&self.claim.key.state_fence)
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        let expected_lineage = Value::String(self.claim.key.lineage_candidate_ref.clone());
+        let expected_vcs = serde_json::to_value(&self.claim.key.vcs_identity_ref)
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        let scope = value.get("scope");
+        let instance = value.get("instance");
+        let identity_matches = value.get("receipt_ref").and_then(Value::as_str)
+            == Some(terminal.receipt_ref.as_str())
+            && value.get("lease_ref").and_then(Value::as_str)
+                == Some(self.claim.lease_ref.as_str())
+            && value.get("receipt_revision").and_then(Value::as_u64) == Some(self.record_revision)
+            && value
+                .get("governing_source_generation")
+                .and_then(Value::as_u64)
+                == Some(self.claim.key.governing_source_generation)
+            && value
+                .get("governing_source_set_ref")
+                .and_then(Value::as_str)
+                == Some(self.claim.key.governing_source_set_ref.as_str())
+            && value.get("state_fence") == Some(&expected_fence)
+            && scope.and_then(|scope| scope.get("lineage_ref")) == Some(&expected_lineage)
+            && scope
+                .and_then(|scope| scope.get("instance_ref"))
+                .and_then(Value::as_str)
+                == Some(self.claim.key.workspace_instance_candidate_ref.as_str())
+            && scope
+                .and_then(|scope| scope.get("root_identity"))
+                .and_then(Value::as_str)
+                == Some(self.claim.key.filesystem_identity_ref.as_str())
+            && instance
+                .and_then(|instance| instance.get("instance_ref"))
+                .and_then(Value::as_str)
+                == Some(self.claim.key.workspace_instance_candidate_ref.as_str())
+            && instance
+                .and_then(|instance| instance.get("root_identity"))
+                .and_then(Value::as_str)
+                == Some(self.claim.key.filesystem_identity_ref.as_str())
+            && instance.and_then(|instance| instance.get("vcs_identity_ref"))
+                == Some(&expected_vcs)
+            && value.get("expiry_tick").and_then(Value::as_u64) == Some(self.claim.lease_deadline);
+        if !identity_matches {
+            return Err(OrsError::IntegrityProblem {
+                record_type: COLD_START_READINESS_RECORD_TYPE,
+                reason: "terminal receipt disagrees with its lease, identity, or fence".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_terminal_disposition(
+        terminal: &ColdStartReadinessTerminalReceipt,
+        value: &Value,
+    ) -> Result<(), OrsError> {
+        let readiness = value.get("readiness").and_then(Value::as_str);
+        let task_disposition = value
+            .get("task_binding")
+            .and_then(|binding| binding.get("disposition"))
+            .and_then(Value::as_str);
+        let receipt_disposition = match readiness {
+            Some("READY_MATERIAL" | "READY_READ_ONLY") => {
+                ColdStartReadinessTerminalDisposition::Ready
+            }
+            Some("NEEDS_TASK") if task_disposition == Some("ambiguous") => {
+                ColdStartReadinessTerminalDisposition::Ambiguous
+            }
+            _ => ColdStartReadinessTerminalDisposition::Failed,
+        };
+        if terminal.disposition != receipt_disposition {
+            return Err(OrsError::IntegrityProblem {
+                record_type: COLD_START_READINESS_RECORD_TYPE,
+                reason: "terminal disposition disagrees with the readiness receipt".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Outcome of one atomic durable cold-start lease claim.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ColdStartReadinessStageOutcome {
+    /// This caller atomically created the active lease revision.
+    Stored {
+        record: Box<ColdStartReadinessOrsRecord>,
+    },
+    /// An earlier durable lease or terminal receipt owns the same exact key.
+    AlreadyBound {
+        record: Box<ColdStartReadinessOrsRecord>,
+    },
+}
+
+fn cold_start_readiness_record_key(base_identity_digest: &str, revision: u64) -> String {
+    format!("cold-start-readiness:{base_identity_digest}:{revision:020}")
+}
