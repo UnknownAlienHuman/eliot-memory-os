@@ -240,6 +240,7 @@ fn production_ports<'a>(
         keys: None,
         blob_scope: None,
         manifest_evidence: None,
+        destination_admission: None,
         rehearsal: false,
     }
 }
@@ -301,6 +302,7 @@ fn foreign_or_stale_destination_refused() {
         keys: None,
         blob_scope: None,
         manifest_evidence: Some(first_evidence),
+        destination_admission: None,
         rehearsal: false,
     };
     let mut journal = FixtureJournal::default();
@@ -323,6 +325,7 @@ fn foreign_or_stale_destination_refused() {
         keys: None,
         blob_scope: None,
         manifest_evidence: Some(second_evidence),
+        destination_admission: None,
         rehearsal: false,
     };
     let mut journal2 = FixtureJournal::default();
@@ -338,6 +341,7 @@ fn foreign_or_stale_destination_refused() {
         keys: None,
         blob_scope: None,
         manifest_evidence: Some(foreign_evidence),
+        destination_admission: None,
         rehearsal: false,
     };
     let mut journal3 = FixtureJournal::default();
@@ -398,6 +402,7 @@ fn missing_class_crypto_purge_capability_refuses_without_fallback() {
         keys: Some(&surplus),
         blob_scope: None,
         manifest_evidence: None,
+        destination_admission: None,
         rehearsal: false,
     };
     let coordinator = KernelBackupRestore::bind(root.clone());
@@ -634,6 +639,7 @@ fn kernel_effect_fence_required_before_any_phase() {
         keys: None,
         blob_scope: None,
         manifest_evidence: None,
+        destination_admission: None,
         rehearsal: false,
     };
     let coordinator = KernelBackupRestore::bind(root.clone());
@@ -912,6 +918,7 @@ fn rehearsal_cannot_activate_cutover_or_retire_source() {
         keys: None,
         blob_scope: None,
         manifest_evidence: None,
+        destination_admission: None,
         rehearsal: true,
     };
     let coordinator = KernelBackupRestore::bind(root.clone());

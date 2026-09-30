@@ -217,6 +217,8 @@ use super::backup_restore_ports::{
 };
 use super::backup_verify_provenance::{OwnerProvenanceEvidence, check_provenance_binding};
 use super::composition_bootstrap::DAEMON_FRONT_DOOR_CAPABILITY;
+use super::restore_destination_admission::AdmittedIsolatedDestination;
+use eliot_installation::PreparedDestinationAdmission;
 use super::{
     CaptureCallerAuth, CaptureReport, CaptureState, KernelCaptureError, KernelComposition,
     KernelFrameAction, status_frame,
@@ -389,12 +391,19 @@ const RESTORE_TEST_SHAPE_GATES_ADMITTED: [&str; 6] = [
 /// lists the same gate in both sets — that contradiction is the defect this
 /// split exists to make impossible.
 ///
-/// The first entry is structural: the Host-side destination manifest binding
-/// (#958) reaches no owner channel on this front door, so the rehearsal runs
-/// with `RestorePorts::manifest_evidence == None` — the shape that type's own
-/// doc names as "a bundle with no Host admission", under which isolated import
-/// still runs, prepare pins nothing, and cutover qualification refuses for want
-/// of a pinned owner admission. The second is the no-cutover boundary this
+/// The first entry is structural and now PRECISE rather than broad. The
+/// Host-side destination MANIFEST binding (`RestorePorts::manifest_evidence`,
+/// the digests of the active Host manifest) still reaches no owner channel on
+/// this front door, so the rehearsal carries `None` there. That is a DIFFERENT
+/// record from the destination itself: the owner-ISSUED ADMITTED ISOLATED
+/// DESTINATION is now admitted on this route through
+/// `AdmittedIsolatedDestination::bind_owner_admission` and reported as
+/// `destination-admission` in `gates_passed`, and the restore constructs its
+/// root from the owner's derived key rather than from the request's `target_id`.
+/// Before that, `manifest_evidence: None` was the only destination state, and
+/// `check_destination_admission` returned `Ok(())` for it, so "no admission" was
+/// indistinguishable from "admitted" and a caller-chosen name chose the landing
+/// place. The second entry is the no-cutover boundary this
 /// command may never cross (A13.7: "Cutover requires separate authority"): the
 /// route never calls `qualify_cutover`, so that gate is reported as not admitted
 /// on every answer, successful or not. The two gates in
@@ -403,6 +412,7 @@ const RESTORE_TEST_SHAPE_GATES_ADMITTED: [&str; 6] = [
 /// [`BACKUP_RESTORE_TEST_MISSING_OWNER`] names.
 const RESTORE_TEST_GATES_NOT_ADMITTED: [&str; 2] =
     ["destination-manifest-admission", "cutover-qualification"];
+
 
 /// The owner-held gates that are additionally not admitted for a blob-carrying
 /// archive, appended to [`RESTORE_TEST_GATES_NOT_ADMITTED`] for that archive.
@@ -3244,6 +3254,14 @@ struct AdmittedRestoreTest {
     /// The typed target context the restore owner compiles its plan against,
     /// carrying the admitted authority tuple.
     target: RestoreContext,
+    /// The decoded owner-ISSUED admitted isolated destination, carried from the
+    /// #954 destination-authorization field.
+    ///
+    /// This is the value the restore resolves its destination from, so the
+    /// request's own `target_id` cannot steer the import. It is decoded here and
+    /// admitted by the handler through the installation authority's own
+    /// validator; nothing in this module treats its shape as authority.
+    destination_authorization: Vec<u8>,
 }
 
 /// Admits one isolated restore-test frame's shape, returning the archive bytes
@@ -3300,9 +3318,14 @@ fn admit_restore_test_shape(payload: &Value) -> Result<AdmittedRestoreTest, Inva
         "backup.bundle_hex",
         BACKUP_WIRE_BYTES_MAX,
     )?;
-    // Admitted for its shape and length only. See this function's doc: it is
-    // never carried into an owner call.
-    hex_field(
+    // The destination authorization IS the carrier of the OWNER-ISSUED admitted
+    // isolated destination. It is decoded and admitted by the handler, not
+    // here, and it is not merely shape-checked: the handler runs the
+    // installation authority's OWN `PreparedDestinationAdmission::validate`,
+    // which re-derives the owner's `admission_digest` and the nested
+    // `IsolationEvidence::evidence_digest` and refuses a mismatch. No digest is
+    // computed in this module and no shape result is treated as authority.
+    let destination_authorization = hex_field(
         object,
         "destination_authorization_hex",
         "backup.destination_authorization_hex",
@@ -3343,7 +3366,11 @@ fn admit_restore_test_shape(payload: &Value) -> Result<AdmittedRestoreTest, Inva
                 .to_owned(),
         });
     }
-    Ok(AdmittedRestoreTest { bundle_raw, target })
+    Ok(AdmittedRestoreTest {
+        bundle_raw,
+        target,
+        destination_authorization,
+    })
 }
 
 /// Reads one required bounded hex member, binding the refusal to the field the
@@ -3402,29 +3429,34 @@ fn require_object<'a>(
 /// the source archive identity and the class are read out of the decoded
 /// bundle, never out of a second request field that could disagree with it.
 ///
-/// ## The destination is the one conjunct this route does not own
+/// ## The destination is now owner-ISSUED, and `target_id` no longer steers it
 ///
-/// The fourth argument, `destination_ref`, is the DECLARED
-/// `RestoreContext::target_id` of the request's own typed target, and this
-/// route does not dress that up as an owner fact. What keeps it from being a
-/// caller-chosen destination is the owner's own re-proof of it, not a claim
-/// here: `check_ors_journal_binding` (`backup_restore.rs`) refuses any binding
-/// whose `destination_ref` is not exactly the target this execution
-/// constructs, the ORS owner refuses to establish or to append to a stream
-/// whose durable row names another destination, and the shape gate above
-/// refuses a target that is not isolated from the presented destination store.
-/// So a frame that names a destination the engine will not construct under
-/// refuses, rather than restoring somewhere it chose.
+/// The restore no longer resolves its destination from the request. It
+/// resolves it from `AdmittedIsolatedDestination`, which this route builds from
+/// the #954 `destination_authorization_hex` carrier decoded as the installation
+/// authority's own `PreparedDestinationAdmission` and admitted through that
+/// authority's own `validate()`.
 ///
-/// What is genuinely absent is the owner-issued PREPARED, UNACTIVATED
-/// destination admission that would make this conjunct owner-held rather than
-/// owner-re-proved: `PinnedDestinationAdmission` (#958) is pinned by prepare
-/// only when `RestorePorts::manifest_evidence` carries Host admission, and this
-/// front door holds no channel that issues it — see
-/// [`RESTORE_TEST_GATES_NOT_ADMITTED`], which names
-/// `destination-manifest-admission` on every answer this route gives rather
-/// than papering over the difference. Opening that seam is #958/A13.7's
-/// governance decision, not a wiring choice made here.
+/// What changed, precisely: the label the restore constructs its root from was
+/// `RestoreContext::target_id` — the request's own bounded string — so a
+/// predictable caller-chosen name decided where every destination byte landed.
+/// It is now `IsolationEvidence::destination_installation_key`, which the #958
+/// owner DERIVED from owner-issued records and recorded. `target_id` survives
+/// only as the plan's target identity, and even that is re-proved against the
+/// ORS owner's durable row rather than trusted.
+///
+/// The `destination_ref` argument to `OrsRestoreBinding::from_composition` is
+/// still the declared plan target, because the ORS stream-binding row's schema
+/// is owned by `eliot-ors` and is not modified here. That is now a LABEL on the
+/// journal stream, not the destination: the destination is decided by the owner
+/// admission above, and the two cannot be confused because the label is
+/// compared against the plan target while the root is constructed from the
+/// owner's key.
+///
+/// An absent, undecodable or owner-refused admission is a typed
+/// `restore-destination-not-admitted` refusal BEFORE any journal row or
+/// destination byte exists. It is not a rehearsal into a name the request
+/// chose.
 ///
 /// ## What the ports carry, and what they deliberately do not
 ///
@@ -3443,10 +3475,11 @@ fn require_object<'a>(
 /// so the difference between "this archive is keyed" and "this front door holds
 /// no key owner" is decided by the owner's own gate and reported, never guessed.
 /// `manifest_evidence` is `None` for the reason
-/// [`RESTORE_TEST_GATES_NOT_ADMITTED`] states: the Host-side manifest binding
-/// reaches no owner channel here, and `None` is the shape that type's own doc
-/// names as a bundle with no Host admission — under which isolated import still
-/// runs and cutover qualification refuses.
+/// [`RESTORE_TEST_GATES_NOT_ADMITTED`] states: the Host-side destination
+/// MANIFEST binding reaches no owner channel here, and `None` is the shape that
+/// type's own doc names as a bundle with no Host admission. It is NOT the
+/// destination admission, which this route carries as
+/// `destination_admission` and which the restore requires.
 ///
 /// `rehearsal` is `true`, because this is a rehearsal: the engine then validates
 /// the admission instead of demanding production durable recovery, activates
@@ -3561,12 +3594,57 @@ fn handle_backup_restore_test(
         Err(error) => return refuse(&error, &gates_passed, &gates_not_admitted),
     };
     gates_passed.push("journal-admission");
+    // The OWNER-ISSUED admitted isolated destination, decoded from the #954
+    // destination-authorization carrier and admitted through the installation
+    // authority's OWN validator. This is the value the restore constructs its
+    // destination root from, so the request's own `target_id` can no longer
+    // decide where the import lands: it survives only as the plan's target
+    // identity, which the ORS owner re-proves against the durable row.
+    //
+    // An absent or invalid admission is a TYPED REFUSAL
+    // (`restore-destination-not-admitted`), not a rehearsal into a name the
+    // request chose. That is the difference between this and the previous
+    // behaviour, where `manifest_evidence: None` meant the destination was
+    // simply whatever `target_id` said.
+    let owner_admission: PreparedDestinationAdmission =
+        match serde_json::from_slice(&admitted.destination_authorization) {
+            Ok(admission) => admission,
+            Err(_) => {
+                return refuse(
+                    &KernelRestoreError::DestinationNotAdmitted,
+                    &gates_passed,
+                    &gates_not_admitted,
+                );
+            }
+        };
+    // The installation this destination was admitted FOR is compared against
+    // `OrsRestoreBinding::installation_ref`, the set-once composition-owned
+    // identity read from the authenticated Host startup binding. That is an
+    // owner-issued value no frame can supply, so an admission minted for another
+    // installation refuses here rather than naming a destination on this one.
+    let destination_admission =
+        match AdmittedIsolatedDestination::bind_owner_admission(
+            &owner_admission,
+            identity.installation_ref(),
+            &bundle,
+        ) {
+            Ok(binding) => binding,
+            Err(_) => {
+                return refuse(
+                    &KernelRestoreError::DestinationNotAdmitted,
+                    &gates_passed,
+                    &gates_not_admitted,
+                );
+            }
+        };
+    gates_passed.push("destination-admission");
     let ports = RestorePorts {
         journal_admission: &journal_admission,
         kernel_fence: fence,
         keys: None,
         blob_scope: None,
         manifest_evidence: None,
+        destination_admission: Some(&destination_admission),
         rehearsal: true,
     };
     match composition.backup_restore_with_ors_journal(&bundle, admitted.target, &ports, &identity) {

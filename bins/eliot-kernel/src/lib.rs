@@ -285,6 +285,12 @@ mod native_worker_reconcile_route;
 mod native_worker_replay_route;
 pub mod notify_operation_identity;
 mod provider_capability_route;
+mod restore_destination_admission;
+pub use restore_destination_admission::{
+    AdmittedIsolatedDestination, PinnedDestinationBinding,
+    ReadPinnedDestinationError, RESTORE_DESTINATION_BINDING_FILE, RestoreDestinationRefusal,
+    admitted_isolated_destination, require_admitted_destination,
+};
 pub mod reactive_restore_serve;
 mod request_dispatch;
 mod research_provider_route;

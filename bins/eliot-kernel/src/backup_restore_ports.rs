@@ -649,6 +649,22 @@ pub struct RestorePorts<'a> {
     /// admission, which is the rehearsal-without-admission case the
     /// [`DestinationManifestEvidence`] doc names.
     pub manifest_evidence: Option<DestinationManifestEvidence>,
+    /// The owner-ISSUED admitted isolated destination this restore may write
+    /// into (#958 installation-authority owner, issue #963 audit defect 1).
+    ///
+    /// This is a DIFFERENT record from `manifest_evidence`, and neither can
+    /// stand in for the other. `manifest_evidence` answers "which Host manifest
+    /// binding was pinned at prepare"; this answers "which destination did the
+    /// installation authority admit for THIS operation". The audit's finding was
+    /// that the destination was resolved from the request's own `target_id`
+    /// while this field was absent, so a predictable name chose where the import
+    /// landed. It is `Option` only because the injected-journal seam
+    /// ([`KernelBackupRestore::restore`](super::backup_restore::KernelBackupRestore::restore))
+    /// also constructs this bundle; the production path reaches it through
+    /// [`require_admitted_destination`](super::restore_destination_admission::require_admitted_destination),
+    /// which turns the absent case into a typed refusal rather than a pass.
+    pub destination_admission:
+        Option<&'a super::restore_destination_admission::AdmittedIsolatedDestination>,
     /// Rehearsal mode: isolated import runs, but cutover refuses and no
     /// activation, retirement, or effect unblocking exists on any path.
     pub rehearsal: bool,
@@ -729,6 +745,7 @@ impl RestorePorts<'_> {
             keys: self.keys,
             blob_scope: self.blob_scope,
             manifest_evidence: Some(evidence),
+            destination_admission: self.destination_admission,
             rehearsal: self.rehearsal,
         })
     }
@@ -902,6 +919,17 @@ pub struct PinnedDestinationAdmission {
     /// rehearsal that prepared a destination under Host admission is
     /// therefore structurally unable to become a cutover candidate.
     pub rehearsal: bool,
+    /// The OWNER-ISSUED admitted isolated destination this transaction prepared
+    /// (#958 installation-authority owner; issue #963 audit defect 1).
+    ///
+    /// This is the field that makes the pin about the DESTINATION rather than
+    /// only about the Host manifest binding. `evidence` above answers "which
+    /// manifest binding was pinned"; this answers "which destination did the
+    /// installation authority admit", and the restore side re-compares it
+    /// against the admission the owner still issues for the operation. Without
+    /// it the pin could be satisfied by any destination whose plan target
+    /// matched, which is the hole the audit found.
+    pub owner_destination: super::restore_destination_admission::PinnedDestinationBinding,
 }
 
 // ---------------------------------------------------------------------------

@@ -146,6 +146,10 @@ use super::backup_restore_ports::{
     backup_to_kernel, check_kernel_effect_fence, ors_to_backup, require_production_admitted,
     sync_file, sync_parent_directory,
 };
+use super::restore_destination_admission::{
+    AdmittedIsolatedDestination, RESTORE_DESTINATION_BINDING_FILE, ReadPinnedDestinationError,
+    admitted_isolated_destination, require_admitted_destination,
+};
 
 /// Maps one accepted restore step to its responsible owner.
 ///
@@ -1349,20 +1353,39 @@ impl KernelBackupRestore {
         let transaction = plan
             .transaction()
             .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
-        let destination = KernelIsolatedDestination::open(&self.work_root, &target.target_id)?;
+        // The destination is resolved from the OWNER-ISSUED admission, never
+        // from the request's own `target_id`. Before this, the label handed to
+        // `KernelIsolatedDestination::open` WAS `target.target_id`, so a
+        // predictable caller-chosen name decided where every destination byte
+        // landed and no owner record was consulted. The owner's
+        // `PreparedDestinationAdmission` now supplies the leaf name, so the
+        // request's `target_id` can no longer steer the import; it survives only
+        // as the plan's target identity, which the owner re-proves separately.
+        //
+        // An absent admission is a TYPED REFUSAL here
+        // (`DestinationNotAdmitted`), not the `Ok(())` this path used to reach
+        // when `manifest_evidence` was `None` — which is exactly the value the
+        // production front door carried.
+        let admitted = require_admitted_destination(ports)
+            .map_err(|_| KernelRestoreError::DestinationNotAdmitted)?;
+        let destination = admitted_isolated_destination(&self.work_root, admitted)?;
         Self::refuse_foreign_destination(
             &destination,
             &transaction.transaction_id,
             &plan.target.target_id,
             ports.rehearsal,
             ports.manifest_evidence.as_ref(),
+            Some(admitted),
         )?;
         // Third axis, and the one the two above cannot reach: the CONSTRUCTED
         // root must still RESOLVE to `<work_root>/.eliot/restore-isolated/<label>`.
-        // The label is the request's own `target_id`, so a directory already
-        // carrying that name can be a reparse point, and a lexical containment
-        // check passes straight through one. This is the same link-resolved
-        // rule the bounded cleanup of this owner's own staging already applies.
+        // The label is now the OWNER's derived destination key rather than the
+        // request's `target_id`, so this closes a strictly smaller hole than
+        // before — a directory already carrying the owner's key can still be a
+        // reparse point, and a lexical containment check passes straight
+        // through one. It is NOT weakened: the same link-resolved rule the
+        // bounded cleanup of this owner's own staging already applies still
+        // runs, and the label it re-checks is now the owner's.
         Self::refuse_destination_outside_isolated_area(&destination, &self.work_root)?;
         let receipts = match ports.keys {
             Some(manifest) => issue_restoration_receipts(
@@ -1516,10 +1539,48 @@ impl KernelBackupRestore {
         target_id: &str,
         rehearsal: bool,
         expected: Option<&DestinationManifestEvidence>,
+        expected_owner_destination: Option<&AdmittedIsolatedDestination>,
     ) -> Result<(), KernelRestoreError> {
+        // The owner-admitted destination pin is checked FIRST and on content.
+        // A destination with no owner pin, or with a pin this execution did not
+        // admit, refuses as `DestinationNotAdmitted` — the typed class that
+        // means "these bytes are not this operation's to write into". The
+        // Host-manifest pin below is a separate question and cannot satisfy
+        // this one.
+        match AdmittedIsolatedDestination::read_pinned(destination.root()) {
+            Ok(pinned) => {
+                let Some(expected) = expected_owner_destination else {
+                    return Err(KernelRestoreError::DestinationNotAdmitted);
+                };
+                if pinned != *expected {
+                    return Err(KernelRestoreError::DestinationNotAdmitted);
+                }
+            }
+            Err(ReadPinnedDestinationError::Io(error))
+                if error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                // An unpinned destination is not an admitted one. It used to
+                // pass here, which is how a request's own `target_id` chose the
+                // landing place with no owner record anywhere in the path.
+                return Err(KernelRestoreError::DestinationNotAdmitted);
+            }
+            Err(ReadPinnedDestinationError::Io(error)) => {
+                return Err(KernelRestoreError::DestinationInvalid(error.to_string()));
+            }
+            Err(ReadPinnedDestinationError::Corrupt) => {
+                return Err(KernelRestoreError::JournalCorrupt);
+            }
+            Err(ReadPinnedDestinationError::Refused(_)) => {
+                return Err(KernelRestoreError::DestinationNotAdmitted);
+            }
+        }
         let path = destination.root().join(DESTINATION_ADMISSION_FILE);
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
+            // The Host-manifest pin is optional (it exists only when this
+            // execution carried Host admission); its absence is not a
+            // destination refusal, because the owner-admitted destination above
+            // is the axis that decides the destination.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => {
                 return Err(KernelRestoreError::DestinationInvalid(error.to_string()));
@@ -2040,6 +2101,18 @@ struct KernelRestoreTarget<'a> {
     blob_scope: Option<&'a DestinationScope>,
     receipts: Vec<BlobRestorationReceipt>,
     manifest_evidence: Option<DestinationManifestEvidence>,
+    /// The OWNER-ISSUED admitted isolated destination this execution writes
+    /// into, pinned at prepare and re-verified before every later effect.
+    ///
+    /// It is an `Option` only because the struct literal is built once from
+    /// `RestorePorts`, whose field is itself an `Option` for the injected-
+    /// journal seam. The production path cannot reach a phase without one:
+    /// `restore_with_owner` refuses before constructing this target when the
+    /// admission is absent, and `apply_prepare` refuses rather than pinning
+    /// nothing. A present-but-drifted value refuses at
+    /// `check_destination_admission`.
+    destination_admission:
+        Option<&'a super::restore_destination_admission::AdmittedIsolatedDestination>,
     /// Whether this execution runs as rehearsal. Pinned into the destination
     /// admission at prepare and re-checked before every later effect, so a
     /// rehearsal-prepared root is never continued by a production run and can
@@ -2107,6 +2180,7 @@ impl<'a> KernelRestoreTarget<'a> {
             blob_scope: ports.blob_scope,
             receipts,
             manifest_evidence: ports.manifest_evidence.clone(),
+            destination_admission: ports.destination_admission,
             rehearsal: ports.rehearsal,
             ors: ors.map(std::sync::Arc::clone),
             applied_purge_revisions: Vec::new(),
@@ -2570,6 +2644,7 @@ impl<'a> KernelRestoreTarget<'a> {
             target_id,
             self.rehearsal,
             self.manifest_evidence.as_ref(),
+            self.destination_admission,
         )
         .is_err()
         {
@@ -2675,6 +2750,7 @@ impl<'a> KernelRestoreTarget<'a> {
         };
         first == "phase-receipts"
             || first == DESTINATION_ADMISSION_FILE
+            || first == RESTORE_DESTINATION_BINDING_FILE
             || first == RESTORE_EVIDENCE_FILE
     }
 
@@ -2782,14 +2858,17 @@ impl<'a> KernelRestoreTarget<'a> {
         match phase {
             RestorePhase::Pending => Err(BackupError::RestorePhaseMismatch),
             RestorePhase::PrepareIsolatedRoot => Ok(PhaseMaterial {
-                // The pinned destination admission is the one durable byte
-                // prepare publishes, and only when this execution carries Host
-                // admission to pin; a rehearsal without it publishes no member.
-                member: self
-                    .manifest_evidence
-                    .as_ref()
-                    .map(|_| self.contained_member_path(DESTINATION_ADMISSION_FILE))
-                    .transpose()?,
+                // The owner-admitted destination pin is the one durable byte
+                // prepare ALWAYS publishes, because the admission is required
+                // to reach this phase. The Host manifest pin remains
+                // conditional on carrying Host admission and is a SEPARATE
+                // member, so neither can stand in for the other.
+                //
+                // One phase publishes one member, so the owner destination is
+                // the member named here and the manifest pin is covered by the
+                // admission comparison in `check_destination_admission`, which
+                // reads it on every post-prepare effect.
+                member: Some(self.contained_member_path(RESTORE_DESTINATION_BINDING_FILE)?),
                 // `apply_prepare` digests `ObservedPrepare`, an observation
                 // assembled in memory and never persisted, so the admission's
                 // own bytes carry no digest this receipt attests.
@@ -2971,27 +3050,77 @@ impl<'a> KernelRestoreTarget<'a> {
         Ok(ObservedEffect::Applied(Box::new(applied)))
     }
 
-    /// Re-verifies the pinned destination admission before a post-prepare
-    /// effect. Unadmitted restores skip; admitted ones require the exact
-    /// pinned transaction, target, rehearsal posture, and manifest evidence —
-    /// any drift refuses the effect instead of continuing under changed
-    /// authority.
+    /// Re-verifies the pinned destination admissions before a post-prepare
+    /// effect.
+    ///
+    /// Two admissions are checked, and they are different questions:
+    ///
+    /// - the OWNER-ADMITTED DESTINATION (this method's reason for existing
+    ///   before this change): the durable pin must be present, must parse, and
+    ///   must equal the binding this execution carries. An ABSENT admission is
+    ///   a typed refusal, not a pass. This is the hole the external audit named:
+    ///   the previous body returned `Ok(())` when the evidence was `None`, and
+    ///   `None` was the production front door's value, so a restore with no
+    ///   owner-issued destination proceeded and the request's own `target_id`
+    ///   decided where it landed.
+    /// - the HOST MANIFEST pin, when this execution carries one: the exact
+    ///   pinned transaction, target, rehearsal posture and manifest evidence,
+    ///   any drift refusing the effect. This is unchanged and still runs; it is
+    ///   simply no longer the thing standing in for the destination.
+    ///
+    /// The destination comparison is on CONTENT, not existence: the pinned
+    /// `owner_admission` is the OWNER's own record and is re-validated through
+    /// the owner's `validate()` on read-back, so a pin naming a different
+    /// destination, another operation, or a tampered digest refuses rather than
+    /// being read as "a pin is present".
     fn check_destination_admission(
         &self,
         intent: &RestoreIntent,
         plan_target_id: &str,
     ) -> Result<(), BackupError> {
-        let Some(expected) = self.manifest_evidence.as_ref() else {
+        // Axis one: the owner-admitted destination. Absence refuses.
+        let Some(expected) = self.destination_admission else {
+            return Err(BackupError::FenceMismatch {
+                subject: "owner-admitted destination".to_owned(),
+            });
+        };
+        let pinned = AdmittedIsolatedDestination::read_pinned(&self.root)
+            .map_err(|error| match error {
+                // A pin that cannot be read is not a typed owner refusal and is
+                // never reported as one: an inaccessible record is a refusal to
+                // proceed, not evidence that the owner refused.
+                ReadPinnedDestinationError::Io(_)
+                | ReadPinnedDestinationError::Corrupt => BackupError::RestoreJournalCorrupt,
+                ReadPinnedDestinationError::Refused(_) => BackupError::FenceMismatch {
+                    subject: "owner-admitted destination".to_owned(),
+                },
+            })?;
+        if pinned != *expected {
+            return Err(BackupError::FenceMismatch {
+                subject: "owner-admitted destination".to_owned(),
+            });
+        }
+
+        // Axis two: the Host manifest pin, unchanged.
+        let Some(evidence) = self.manifest_evidence.as_ref() else {
             return Ok(());
         };
         let bytes = std::fs::read(self.root.join(DESTINATION_ADMISSION_FILE))
             .map_err(|_| BackupError::RestoreJournalCorrupt)?;
-        let pinned: PinnedDestinationAdmission =
+        let pinned_manifest: PinnedDestinationAdmission =
             serde_json::from_slice(&bytes).map_err(|_| BackupError::RestoreJournalCorrupt)?;
-        if pinned.transaction_id != intent.transaction_id
-            || pinned.target_id != plan_target_id
-            || pinned.rehearsal != self.rehearsal
-            || pinned.evidence != *expected
+        if pinned_manifest.transaction_id != intent.transaction_id
+            || pinned_manifest.target_id != plan_target_id
+            || pinned_manifest.rehearsal != self.rehearsal
+            || pinned_manifest.evidence != *evidence
+            // The pin also carries the owner destination, so a pin written
+            // under a different admitted destination refuses here too rather
+            // than only on the independent read-back above.
+            || pinned_manifest.owner_destination != expected.to_pinned().map_err(|_| {
+                BackupError::FenceMismatch {
+                    subject: "owner-admitted destination".to_owned(),
+                }
+            })?
         {
             return Err(BackupError::FenceMismatch {
                 subject: "destination admission".to_owned(),
@@ -3052,12 +3181,33 @@ impl<'a> KernelRestoreTarget<'a> {
     ) -> Result<RestoreAppliedEffect, BackupError> {
         self.prepare_isolated(&plan.target, &plan.restored_fence)?;
         self.gate(bundle)?;
+        // The owner-admitted destination binding is pinned UNCONDITIONALLY, and
+        // separately from the Host manifest evidence. The admission is now
+        // required to reach this phase at all, so a restore that reaches prepare
+        // always has one; writing it only when manifest evidence happened to be
+        // present is what left the destination unpinned on the production path.
+        // The absent case below is defence in depth — `restore_with_owner` already
+        // refused before constructing this target — and it refuses typed rather
+        // than pinning nothing and reporting success.
+        let owner_destination = self
+            .destination_admission
+            .ok_or(BackupError::FenceMismatch {
+                subject: "owner-admitted destination".to_owned(),
+            })?
+            .to_pinned()
+            .map_err(|_| BackupError::FenceMismatch {
+                subject: "owner-admitted destination".to_owned(),
+            })?;
+        let owner_destination_bytes = canonical_json_bytes(&owner_destination)
+            .map_err(|error| BackupError::Serialization(error.to_string()))?;
+        self.write_file(RESTORE_DESTINATION_BINDING_FILE, &owner_destination_bytes)?;
         if let Some(evidence) = self.manifest_evidence.clone() {
             let pinned = PinnedDestinationAdmission {
                 transaction_id: intent.transaction_id.clone(),
                 target_id: plan.target.target_id.clone(),
                 evidence,
                 rehearsal: self.rehearsal,
+                owner_destination,
             };
             let bytes = canonical_json_bytes(&pinned)
                 .map_err(|error| BackupError::Serialization(error.to_string()))?;
@@ -3761,6 +3911,7 @@ fn admitted_restore_ports<'a>(
         keys: ports.keys,
         blob_scope: ports.blob_scope,
         manifest_evidence: ports.manifest_evidence.clone(),
+        destination_admission: ports.destination_admission,
         rehearsal: ports.rehearsal,
     }
 }
