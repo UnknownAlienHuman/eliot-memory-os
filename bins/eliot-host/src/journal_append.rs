@@ -894,11 +894,7 @@ fn refuse_clean_marker_without_drain_termination_evidence(
         .runtime_lease_refs
         .iter()
         .chain(activation.supervision_lease_refs.iter())
-        .filter(|lease| {
-            !commit
-                .lease_and_pending_operation_snapshot
-                .contains(*lease)
-        })
+        .filter(|lease| !commit.lease_and_pending_operation_snapshot.contains(*lease))
         .cloned()
         .collect();
     if !unfenced.is_empty() {
