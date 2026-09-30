@@ -74,7 +74,8 @@ pub const OUTCOME_OBSERVATION_RESOLUTION: &str =
 /// claiming complete self-observation". The refusal reason is named and
 /// versioned rather than left blank, so a reader can tell a store refusal from
 /// a lost transport without inspecting the store.
-pub const OBSERVATION_GAP_REASON: &str = "eliot.governor.maintenance:observation-writeback-unavailable";
+pub const OBSERVATION_GAP_REASON: &str =
+    "eliot.governor.maintenance:observation-writeback-unavailable";
 
 /// The obligation profile a refused maintenance writeback gap belongs to.
 ///
@@ -324,7 +325,9 @@ fn recorded_coverage_gap(delivery: &MaintenanceDeliveryState) -> Option<String> 
 /// result-bearing state whose obligation was never recorded still owes one,
 /// and that is exactly the case this derivation exists to keep visible: a
 /// completed job with no obligation is not a job with nothing to observe.
-fn owed_result(job: &MaintenanceJob) -> Option<(String, MaintenanceExecutionOutcome, Option<String>)> {
+fn owed_result(
+    job: &MaintenanceJob,
+) -> Option<(String, MaintenanceExecutionOutcome, Option<String>)> {
     if let Some(latest) = job.result_obligations.last() {
         return Some((
             latest.publication_id.clone(),
@@ -574,10 +577,7 @@ pub fn record_observation_gap(
     status: RefusedReceiptStatus,
 ) -> Result<MaintenanceJob, MaintenanceError> {
     text(publication_id, "observation_gap.publication_id")?;
-    text(
-        refused_operation_id,
-        "observation_gap.refused_operation_id",
-    )?;
+    text(refused_operation_id, "observation_gap.refused_operation_id")?;
     let Some(index) = job
         .result_obligations
         .iter()
