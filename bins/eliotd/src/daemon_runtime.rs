@@ -5028,11 +5028,35 @@ async fn run_observe_poll(
             .then_some(deferral.resume),
     };
     if deferral.suboperation == eliotd::governor_observe_serve::ObserveSuboperation::Observation {
-        let body = prepare_observation_capture(kernel, composition, claimed).await?;
-        let outcome = match submit_observe_result_idempotent(kernel, &body).await? {
-            eliotd::ObserveSubmitOutcome::Accepted => ObservePollOutcome::Settled,
-            eliotd::ObserveSubmitOutcome::Expired => ObservePollOutcome::Expired,
-            eliotd::ObserveSubmitOutcome::StaleAttempt => ObservePollOutcome::StaleAttempt,
+        let body = match prepare_observation_capture(kernel, composition, claimed).await {
+            Ok(body) => body,
+            Err(error) => {
+                kernel
+                    .defer_observe_claim_async(&operation_id, &request_digest, attempt)
+                    .await
+                    .map_err(|defer_error| {
+                        format!(
+                            "Observe capture failed after pair publication ({error}); exact-attempt reconciliation handoff failed: {defer_error}"
+                        )
+                    })?;
+                return Ok(step(ObservePollOutcome::ReconciliationRequired));
+            }
+        };
+        let outcome = match submit_observe_result_idempotent(kernel, &body).await {
+            Ok(eliotd::ObserveSubmitOutcome::Accepted) => ObservePollOutcome::Settled,
+            Ok(eliotd::ObserveSubmitOutcome::Expired) => ObservePollOutcome::Expired,
+            Ok(eliotd::ObserveSubmitOutcome::StaleAttempt) => ObservePollOutcome::StaleAttempt,
+            Err(error) => {
+                kernel
+                    .defer_observe_claim_async(&operation_id, &request_digest, attempt)
+                    .await
+                    .map_err(|defer_error| {
+                        format!(
+                            "Observe result submission is ambiguous ({error}); exact-attempt reconciliation handoff failed: {defer_error}"
+                        )
+                    })?;
+                return Ok(step(ObservePollOutcome::ReconciliationRequired));
+            }
         };
         return Ok(step(outcome));
     }
