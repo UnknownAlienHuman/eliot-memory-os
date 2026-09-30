@@ -118,7 +118,8 @@ pub struct ProfileSelectionReceipt {
 ///
 /// `bootstrap_arguments` must be the already-admitted, nonce-free
 /// `HostLaunchOptions` argv tail; the adapter adds its private supervisor mode
-/// switch and refuses any attempt to route this task through SCM.
+/// switch and fixed `RunEx` placeholders, and refuses any attempt to route this
+/// task through SCM.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CurrentUserTaskRequest {
@@ -173,7 +174,8 @@ pub struct CurrentUserTaskReceipt {
     pub executable_sha256: String,
     /// Exact working directory read back from the task action.
     pub working_directory: PathBuf,
-    /// Exact argument vector, including the `UserMode` switch pair and bootstrap.
+    /// Exact bootstrap argv tail retained separately from the fixed action
+    /// switches and RunEx placeholders.
     pub arguments: Vec<String>,
     /// Digest of the exact Task Scheduler XML read back after registration.
     pub task_xml_sha256: String,
@@ -235,6 +237,18 @@ pub enum CurrentUserTaskObservation {
 
 /// Task Scheduler command-line mode used only by the `UserMode` task action.
 pub const USER_MODE_SUPERVISOR_SWITCH: &str = "--eliot-profile-supervisor";
+
+/// Transaction slot supplied only by an explicit Task Scheduler `RunEx` call.
+pub const USER_MODE_RUNEX_TRANSACTION_SWITCH: &str = "--eliot-runex-transaction";
+
+/// Effect slot supplied only by an explicit Task Scheduler `RunEx` call.
+pub const USER_MODE_RUNEX_EFFECT_SWITCH: &str = "--eliot-runex-effect";
+
+/// Static Task Scheduler replacement token for the transaction slot.
+pub const USER_MODE_RUNEX_TRANSACTION_ARGUMENT: &str = "$(Arg0)";
+
+/// Static Task Scheduler replacement token for the effect slot.
+pub const USER_MODE_RUNEX_EFFECT_ARGUMENT: &str = "$(Arg1)";
 
 /// Registration failure after task creation. If exact cleanup cannot be
 /// confirmed, the request, task identity, and available XML digests remain
@@ -1095,15 +1109,20 @@ fn root_binding_digest(selection: &ProfileSelectionReceipt) -> String {
 }
 
 fn task_arguments(arguments: &[String]) -> Result<String, WindowsAdapterError> {
-    if arguments
-        .iter()
-        .any(|argument| argument == USER_MODE_SUPERVISOR_SWITCH)
-    {
+    if arguments.iter().any(|argument| {
+        argument == USER_MODE_SUPERVISOR_SWITCH
+            || argument == USER_MODE_RUNEX_TRANSACTION_SWITCH
+            || argument == USER_MODE_RUNEX_EFFECT_SWITCH
+    }) {
         return Err(WindowsAdapterError::InvalidInput);
     }
-    let mut encoded = Vec::with_capacity(arguments.len() + 1);
+    let mut encoded = Vec::with_capacity(arguments.len() + 5);
     encoded.push(quote_windows_argument(USER_MODE_SUPERVISOR_SWITCH));
     encoded.push("user_mode".to_owned());
+    encoded.push(quote_windows_argument(USER_MODE_RUNEX_TRANSACTION_SWITCH));
+    encoded.push(format!("\"{USER_MODE_RUNEX_TRANSACTION_ARGUMENT}\""));
+    encoded.push(quote_windows_argument(USER_MODE_RUNEX_EFFECT_SWITCH));
+    encoded.push(format!("\"{USER_MODE_RUNEX_EFFECT_ARGUMENT}\""));
     for argument in arguments {
         if argument.chars().any(char::is_control) {
             return Err(WindowsAdapterError::InvalidInput);
