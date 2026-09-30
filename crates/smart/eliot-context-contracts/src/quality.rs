@@ -323,7 +323,11 @@ pub struct QualityApplicability {
 /// `Unknown` is a real result, not a failure to build the value — it is what
 /// keeps "nobody answered" distinguishable from "the weakest answer was chosen".
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "status", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+#[serde(
+    tag = "status",
+    rename_all = "SCREAMING_SNAKE_CASE",
+    deny_unknown_fields
+)]
 pub enum QualityApplicabilityResolution {
     /// The named owner supplied this input's governing answer.
     Resolved {
@@ -401,10 +405,7 @@ impl QualityApplicabilityResolutionSet {
                     crate::validate_text(answer, "quality.applicability.answer")?;
                 }
                 QualityApplicabilityResolution::Unknown { missing_owner } => {
-                    crate::validate_text(
-                        missing_owner,
-                        "quality.applicability.missing_owner",
-                    )?;
+                    crate::validate_text(missing_owner, "quality.applicability.missing_owner")?;
                 }
             }
         }
@@ -433,7 +434,10 @@ impl QualityApplicability {
         let mut resolved = Vec::new();
         let mut unknown = Vec::new();
         for (input, resolution) in [
-            (QualityApplicabilityInput::TaskAcceptance, &resolutions.task_acceptance),
+            (
+                QualityApplicabilityInput::TaskAcceptance,
+                &resolutions.task_acceptance,
+            ),
             (QualityApplicabilityInput::Route, &resolutions.route),
             (QualityApplicabilityInput::Impact, &resolutions.impact),
             (

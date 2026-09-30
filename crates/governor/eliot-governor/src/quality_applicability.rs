@@ -327,7 +327,7 @@ fn resolve_task_acceptance(
     let Some(record) = task_record else {
         return Ok(unknown(TASK_ACCEPTANCE_OWNER));
     };
-    if !owner_text(record.task_id.as_str()) || !owner_text(record.goal) {
+    if !owner_text(record.task_id.as_str()) || !owner_text(record.goal.as_str()) {
         return Err(QualityApplicabilityError::InvalidOwnerValue(
             "task_record",
         ));
