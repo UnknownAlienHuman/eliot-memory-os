@@ -267,9 +267,12 @@ pub fn check_campaign_view_for_delivery(
             "campaign_view.context_delivery",
         )));
     }
-    let reference = row.reference.as_ref().ok_or(AssemblyError::Contract(
-        ContextError::MissingField("campaign_view.context_delivery"),
-    ))?;
+    let reference =
+        row.reference
+            .as_ref()
+            .ok_or(AssemblyError::Contract(ContextError::MissingField(
+                "campaign_view.context_delivery",
+            )))?;
     if !fences_match_exact(&row.read_state_fence, packet_state_fence) {
         return Err(AssemblyError::Contract(ContextError::InvalidFence));
     }
@@ -279,7 +282,8 @@ pub fn check_campaign_view_for_delivery(
     if !fences_match_exact(&reference.recorded_state_fence, &delivery.state_fence) {
         return Err(AssemblyError::Contract(ContextError::InvalidFence));
     }
-    if reference.record_id != CampaignOwnerRecordId::Resource(delivery.source_id.as_str().to_owned())
+    if reference.record_id
+        != CampaignOwnerRecordId::Resource(delivery.source_id.as_str().to_owned())
         || reference.revision
             != CampaignOwnerRevision::ResourceSnapshot(delivery.snapshot_revision.clone())
     {
