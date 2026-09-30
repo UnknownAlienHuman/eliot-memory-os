@@ -5552,9 +5552,43 @@ fn causal_evidence_digest_parts(record: &CausalEvidenceRecord) -> Vec<String> {
         "causal_intervention:{}:{intervention}",
         record.source_handle
     ));
+    // The WHOLE retained rival/confounder denominator enters the preimage, not
+    // just its omissions. `expected` and `observed` are owner-retained values
+    // this crate already bounds, handle-checks and charges against the byte
+    // budget, so leaving them out of the preimage made them the one part of a
+    // causal record that changed a candidate identity could not see: two
+    // records differing only in how many rivals the owner expected, or in which
+    // rivals it actually observed, produced one byte-identical
+    // `candidate_digest`. The `Unknown` rival coverage those records both
+    // derive made the gap invisible in the published cell too, because
+    // `CausalClaimRecord` reports only the derived coverage, so the commitment
+    // cannot be delegated to it.
+    //
+    // One part per handle, per list, is the same shape the omitted list already
+    // used and the same shape the evidence-envelope loop below uses. It is a
+    // real content comparison of the retained values, not a count and not an
+    // existence check: a changed handle, a changed membership and a changed
+    // list length each change the part set, and because
+    // `owner_record_digest_parts` sorts every part before they are canonicalized
+    // the comparison is order-independent, so exact replay stays byte-stable.
+    // The owner-declared coverage is committed with them because it is retained
+    // on the same struct and is read by `RivalDenominator::validate`: two
+    // records whose lists agree but whose declared coverage differs are
+    // different owner records and must not share one candidate identity.
+    for handle in &record.rivals.expected {
+        parts.push(format!("rival_expected:{}:{handle}", record.source_handle));
+    }
+    for handle in &record.rivals.observed {
+        parts.push(format!("rival_observed:{}:{handle}", record.source_handle));
+    }
     for handle in &record.rivals.omitted {
         parts.push(format!("rival_omitted:{}:{handle}", record.source_handle));
     }
+    parts.push(format!(
+        "rival_denominator:{}:{}",
+        record.source_handle,
+        coverage_spelling(record.rivals.coverage)
+    ));
     for evidence in &record.evidence {
         // The envelope's own coverage and provenance are bound here because
         // admission and qualification now both read them: a preimage that
