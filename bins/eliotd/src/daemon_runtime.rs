@@ -2518,10 +2518,7 @@ async fn publish_maintenance_source_results(
                 // The instant the admitted observation record itself carries, so
                 // a later delayed comparison is bounded below by an admitted
                 // observation rather than by when the evaluator runs.
-                observation_instants.push((
-                    obligation.publication_id.clone(),
-                    observed_at_unix_ms,
-                ));
+                observation_instants.push((obligation.publication_id.clone(), observed_at_unix_ms));
                 // Only a job-side obligation can be settled durably. The
                 // decision's own non-execution result has no retained job
                 // revision to admit onto, and inventing one would be a second
@@ -2753,10 +2750,12 @@ async fn publish_maintenance_source_results(
 /// This function reaches no trigger, admits no job and appends no lifecycle
 /// transition. It is a pure read plus one durable append per admissible result,
 /// so a repeated unchanged result is refused by the owner rather than looping.
-#[allow(
-    clippy::too_many_lines,
-    reason = "the admission gate, the window derivation and the durable append stay in one order so an unadmitted result is never evaluated"
-)]
+///
+/// The three steps stay in this order in this function, because the order is
+/// what keeps an unadmitted result from ever being evaluated: the admission gate
+/// runs first and continues past a result the store never admitted, only then is
+/// the comparison window derived from admitted records alone, and only then is the
+/// durable append requested.
 async fn evaluate_admitted_maintenance_results(
     composition: &SharedComposition,
     jobs: &[eliot_maintenance::MaintenanceJob],
@@ -2820,28 +2819,11 @@ async fn evaluate_admitted_maintenance_results(
             continue;
         }
         // The comparison window runs from the instant the admitted source
-        // observation itself carries to this evaluation. Both bounds come from
-        // admitted records, not from an assumed window length.
-        let Some(start) = observation_instants
-            .iter()
-            .find(|(publication_id, _)| publication_id == &source.publication_id)
-            .map(|(_, instant)| *instant)
+        // observation itself carries to this evaluation.
+        let Some(window) = evaluation_window_for(&source.publication_id, observation_instants)
         else {
-            // An admitted result always has the instant its admitted record
-            // carries. Without one there is no admitted lower bound, so the
-            // comparison is not attempted rather than bounded by a guess.
             continue;
         };
-        let evaluated_at = observation_instants
-            .iter()
-            .map(|(_, instant)| *instant)
-            .max()
-            .unwrap_or(start);
-        let window =
-            match eliot_observation_contracts::CoverageInterval::new(start, evaluated_at) {
-                Ok(window) => window,
-                Err(_) => continue,
-            };
         // No comparison was observed in this pass, so none is presented. The
         // owner records the explicit unknown with the reason it is unknown.
         let evidence = eliot_maintenance::UtilityEvaluationEvidence::default();
@@ -2876,6 +2858,34 @@ async fn evaluate_admitted_maintenance_results(
             }
         }
     }
+}
+
+/// Derives the one comparison window an admitted maintenance result is evaluated
+/// over, or `None` when no admitted record bounds it.
+///
+/// Both bounds come from admitted records rather than from an assumed window
+/// length: the lower bound is the instant the source result's own admitted
+/// observation carries, and the upper bound is the latest instant any admitted
+/// record in this pass carries. Without the source's own admitted instant there
+/// is no admitted lower bound at all, so the comparison is not attempted rather
+/// than bounded by a guess.
+///
+/// A pure read over the caller's admitted instants. It reaches no lock, no
+/// composition, no store and no transaction: the append stays in the caller.
+fn evaluation_window_for(
+    source_publication_id: &str,
+    observation_instants: &[(String, u64)],
+) -> Option<eliot_observation_contracts::CoverageInterval> {
+    let start = observation_instants
+        .iter()
+        .find(|(publication_id, _)| publication_id.as_str() == source_publication_id)
+        .map(|(_, instant)| *instant)?;
+    let evaluated_at = observation_instants
+        .iter()
+        .map(|(_, instant)| *instant)
+        .max()
+        .unwrap_or(start);
+    eliot_observation_contracts::CoverageInterval::new(start, evaluated_at).ok()
 }
 
 /// Maps one terminal store receipt status onto the maintenance owner's refusal
