@@ -1479,7 +1479,10 @@ pub fn refuse_ready_string_without_evidence(
 /// gate-supplied governing-source closure. `Allow` returns `MATCHED`;
 /// anything else returns the exact disposition — stale, different-instance,
 /// ambiguous, provisional, or conflicted — and the retained binding, task
-/// state, and project memory stay untouched. An identity-clear observation
+/// state, and project memory stay untouched. The owner report is validated
+/// with the existing `TriggerReport::validate` before any disposition is
+/// preserved, so an `Allow` without an identity-clear `MATCHED` receipt (or
+/// any malformed receipt field) fails closed instead of admitting. An identity-clear observation
 /// without a `MATCHED` owner receipt (no source closure supplied, or a
 /// disagreeing receipt) returns `PROVISIONAL_REBIND` — or the receipt's own
 /// `CONFLICTED` — instead of admitting: scope uncertainty permits only the
@@ -1526,9 +1529,16 @@ pub fn scope_guard_disposition(
     })?;
     // The full owner guard, not the sources-independent identity legs alone:
     // `Allow` requires identity-clear `MATCHED`, so the provisional and
-    // conflicted dispositions below are reachable, never dead arms.
+    // conflicted dispositions below are reachable, never dead arms. The report
+    // itself is owner-validated first: a malformed `Allow` fails closed here
+    // instead of admitting below.
     let report =
         eliot_workscope::check_at_trigger(expected, &observed_binding, source_closure, trigger);
+    report.validate().map_err(|error| {
+        TaskBindingError::scope_incompatible(format!(
+            "task observation scope guard report failed owner validation: {error}"
+        ))
+    })?;
     if report.verdict == eliot_workscope::GuardVerdict::Allow {
         return Ok(ScopeBindingDisposition::Matched);
     }
