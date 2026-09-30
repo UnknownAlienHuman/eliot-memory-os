@@ -10779,6 +10779,23 @@ impl HostComposition {
         true
     }
 
+    /// I1.5 drain-cancel resume gate: a `Draining` activation whose drain was
+    /// cancelled before the durable linearization point still owns a
+    /// revalidation attempt. The `Cancelled` record plus the absent
+    /// `DrainCommitRecord` prove the point has not passed; every other
+    /// non-`Active` state fails closed at the caller.
+    #[cfg(windows)]
+    fn cancelled_drain_awaits_revalidation(
+        activation: &eliot_host_state::EliotActivationRecord,
+        drain: Option<&eliot_host_state::DrainRecord>,
+        drain_commit: Option<&eliot_host_state::DrainCommitRecord>,
+    ) -> bool {
+        use eliot_host_state::{ActivationState, DrainState};
+        activation.state == ActivationState::Draining
+            && drain_commit.is_none()
+            && drain.is_some_and(|drain| drain.state == DrainState::Cancelled)
+    }
+
     #[cfg(windows)]
     fn reconcile_branch_readiness_at(
         &mut self,
@@ -10863,12 +10880,11 @@ impl HostComposition {
         // `Cancelled` record plus the absent `DrainCommitRecord` prove the
         // linearization point has not passed, so this attempt is the
         // norm-mandated revalidation, not a second admission.
-        let cancelled_drain_awaits_revalidation = activation.state == ActivationState::Draining
-            && snapshot.drain_commit.is_none()
-            && snapshot
-                .drain
-                .as_ref()
-                .is_some_and(|drain| drain.state == DrainState::Cancelled);
+        let cancelled_drain_awaits_revalidation = Self::cancelled_drain_awaits_revalidation(
+            activation,
+            snapshot.drain.as_ref(),
+            snapshot.drain_commit.as_ref(),
+        );
         if activation.fence.activation_generation != self.activation_generation
             || !(activation.state == ActivationState::Active || cancelled_drain_awaits_revalidation)
         {
