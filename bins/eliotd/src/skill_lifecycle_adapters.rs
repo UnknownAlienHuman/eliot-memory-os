@@ -684,7 +684,11 @@ impl<T> ForwardingSkillLifecycle<T> {
         ack.validate()?;
         self.invalidate_unknown_tool_basis(skill_id, tools)?;
         let catalogue = self.lock_catalogue();
-        catalogue.activation_display(skill_id, &receipt, &ack, tools)
+        let display = catalogue.activation_display(skill_id, &receipt, &ack, tools)?;
+        // Serve-then-resolve: the chain recompute-and-compare leg exceeds
+        // display's own checks, so a substituted chain fails closed here.
+        catalogue.resolve_activation_chain(skill_id, &display, &receipt, &ack, tools)?;
+        Ok(display)
     }
 
     /// Binds the runtime receiver's ack to its exact receipt under the live
