@@ -580,11 +580,10 @@ impl KernelComposition {
         // A classifiable exit is the other case: the process owner did establish
         // what happened, so the admitted restart class for this child decides
         // whether that class of exit may buy a replacement. The rule is the
-        // shared `decide_automatic_restart`, evaluated against
-        // `KernelConfig::daemon_restart_policy`; this module only supplies the
-        // owner lifecycle and the exit/health evidence. No policy means no
-        // class, and an absent declaration is refused rather than widened into
-        // an unlimited budget.
+        // shared `decide_automatic_restart`, read from the admission retained on
+        // this composition; this module only supplies the owner lifecycle and
+        // the exit/health evidence. No policy means no class, and an absent
+        // declaration is refused rather than widened into an unlimited budget.
         if let Some(receipt) = previous_receipt.as_ref() {
             let closed = match self.close_previous_daemon_process(&launch, receipt).await {
                 Ok(closed) => closed,
@@ -596,10 +595,28 @@ impl KernelComposition {
                 let reason = format!("eliotd automatic restart refused: {reason}");
                 return Err(self.daemon_failure_error(reason));
             }
+            // The class is read only under a policy digest still bound to the
+            // admitted generation this replacement would take. That generation
+            // and its fence are taken from the Host-approved launch descriptor
+            // that produced the process being reconciled, which is an
+            // independent record of the admitted identity: a policy admitted
+            // for one generation cannot buy a replacement of another. An
+            // admitted digest whose binding no longer matches is refused here,
+            // not defaulted to a wider authority.
+            let admitted_generation = launch.generation;
+            let admitted_state_fence = eliot_contracts::StateFence::new(
+                launch.authority_epoch.clone(),
+                admitted_generation,
+            );
             let restart_policy = self.daemon_restart_policy.as_ref();
-            if let Some(refusal) =
-                daemon_class_withholds_replacement(restart_policy, service_state, &status, &closed)
-            {
+            if let Some(refusal) = daemon_class_withholds_replacement(
+                restart_policy,
+                admitted_generation,
+                &admitted_state_fence,
+                service_state,
+                &status,
+                &closed,
+            ) {
                 let reason = daemon_restart_refusal_reason(&refusal);
                 observe_daemon_runtime("kernel.daemon.restart_refused", reason);
                 let reason = format!("eliotd automatic restart refused: {reason}");
