@@ -8679,6 +8679,24 @@ where
                         ) && value.create_disposition
                             == Some(InstallationCreateDisposition::Created) =>
                     {
+                        // A partial root creation can still carry the exact
+                        // guard-revert composite from its guarded mutation.
+                        // Retain it verbatim before the durable uncertainty
+                        // below; it must never be dropped with the partial
+                        // value. An invalid composite is recorded as durable
+                        // uncertainty, never as a completed cleanup, and no
+                        // retry is authorized here.
+                        if let Some(outcome) = value.guard_revert.clone() {
+                            if outcome.validate().is_err() {
+                                return self.persist_unknown(
+                                    transaction,
+                                    index,
+                                    PlatformHandle::new("mismatch:guard-revert-invalid")
+                                        .map_err(|error| platform_error(&error))?,
+                                );
+                            }
+                            transaction.record_guard_revert(outcome)?;
+                        }
                         let expected = TransactionVersion::of(&transaction)?;
                         let Some(ownership) =
                             transaction.effect_progress[index].ownership_secret.as_mut()
@@ -8703,7 +8721,25 @@ where
                             }),
                         );
                     }
-                    PortOutcome::Partial { missing, .. } => {
+                    PortOutcome::Partial { value, missing } => {
+                        // A partial observation can still carry the exact
+                        // guard-revert composite from its guarded mutation.
+                        // Retain it verbatim before the durable uncertainty
+                        // below; it must never be dropped with the partial
+                        // value. An invalid composite is recorded as durable
+                        // uncertainty, never as a completed cleanup, and no
+                        // retry is authorized here.
+                        if let Some(outcome) = value.guard_revert.clone() {
+                            if outcome.validate().is_err() {
+                                return self.persist_unknown(
+                                    transaction,
+                                    index,
+                                    PlatformHandle::new("mismatch:guard-revert-invalid")
+                                        .map_err(|error| platform_error(&error))?,
+                                );
+                            }
+                            transaction.record_guard_revert(outcome)?;
+                        }
                         return self.persist_unknown(
                             transaction,
                             index,
