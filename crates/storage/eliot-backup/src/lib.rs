@@ -1403,6 +1403,14 @@ impl RestorePlan {
         })
     }
 
+    /// Derives this plan's own per-execution journal stream key.
+    ///
+    /// This is the crate's stream identity and it stays private: a caller that
+    /// needs the key ASKS the durable owner for it through
+    /// [`RestoreJournalAdmissionOwner::issue_journal_stream`], which publishes
+    /// exactly this value, rather than reconstructing it. Two restores of the
+    /// same archive therefore occupy different streams, and a key the owner did
+    /// not issue is never mistaken for one it did.
     fn journal_key(&self) -> Result<String, BackupError> {
         sha256(&(self.plan_id.as_str(), self.bundle_sha256.as_str()))
     }
@@ -1460,6 +1468,10 @@ impl RestorePlan {
         let journal_key = self.journal_key()?;
         let phases = restore_phases(bundle);
         let mut record = if let Some(record) = journal.load(&journal_key)? {
+            // Either a resume, or the genesis row the durable owner already
+            // established for this stream so it could admit the operation. Both
+            // are the same row this branch would have written, and it is read
+            // and validated below either way.
             record
         } else {
             let initial = RestoreJournalRecord {

@@ -69,10 +69,12 @@
 //! contains no in-memory or no-op journal type by construction. The admission
 //! is additionally bound to the journal that actually runs: the production
 //! entry [`KernelBackupRestore::restore_with_ors_journal`] compares the
-//! admission's `journal_identity_ref` with the durable ORS restore-journal
-//! namespace, and compares the ORS binding with the archive, target, and the
-//! admitted owner, so a production restore cannot file its durable rows under
-//! an admission describing some other store. Cutover is validated-only
+//! admission's `database_ref` with the one operational ORS database behind
+//! restore streams, re-proves the admission against the durable owner record
+//! for this plan's own stream, and compares the ORS binding with the archive,
+//! target, and the admitted owner, so a production restore cannot file its
+//! durable rows under an admission describing some other store or another
+//! execution's stream. Cutover is validated-only
 //! ([`KernelBackupRestore::qualify_cutover`]): no receipt is minted here —
 //! authorization and execution belong to #961 — and qualification requires
 //! owner-issued new-epoch and operational-readiness evidence, refusing a
@@ -108,7 +110,7 @@ use super::backup_restore_ports::{
     DESTINATION_ADMISSION_FILE, DestinationManifestEvidence, KernelIsolatedDestination,
     KernelRestoreError, OrsRestoreBinding, OrsRestoreJournal, OrsRestoreJournalOwner,
     PinnedDestinationAdmission, RESTORE_EVIDENCE_FILE, RESTORE_ISOLATED_AREA,
-    RESTORE_JOURNAL_IDENTITY, RESTORE_JOURNAL_PAYLOAD_AREA, RestorePorts, StagedCleanupRefusal,
+    RESTORE_JOURNAL_OWNER_LABEL, RESTORE_JOURNAL_PAYLOAD_AREA, RestorePorts, StagedCleanupRefusal,
     backup_to_kernel, check_kernel_effect_fence, ors_to_backup, require_production_admitted,
 };
 
@@ -738,26 +740,60 @@ impl KernelBackupRestore {
     /// the two composition facts the record's own doc names, and
     /// `fixture_proof_only` is never set.
     ///
-    /// The admission is issued against a journal that ALREADY holds `plan`'s
+    /// ## What the issued admission's two journal fields each mean
+    ///
+    /// They are different facts and both are bound here (#962):
+    ///
+    /// - `database_ref` is the CHANNEL. This owner returns
+    ///   [`RESTORE_JOURNAL_OWNER_LABEL`], the one operational ORS database
+    ///   behind restore streams, so the coordinator's channel check
+    ///   ([`check_ors_journal_binding`]) is a live comparison against a value
+    ///   the owner actually issues. An admission naming any other store
+    ///   refuses there.
+    /// - `journal_identity_ref` is THIS EXECUTION'S STREAM. It is the key this
+    ///   durable row was read under, which is the plan's own derived stream
+    ///   key, and `issue_for_operation` re-proves it against
+    ///   `plan.journal_key()` on the way out. Two restores of the same
+    ///   archive therefore get different streams and an admission borrowed
+    ///   from either of them refuses. It is deliberately not the namespace
+    ///   constant [`RESTORE_JOURNAL_IDENTITY`](super::backup_restore_ports::RESTORE_JOURNAL_IDENTITY),
+    ///   which names the channel from the row side; see that constant's doc for
+    ///   why the two cannot occupy one field.
+    ///
+    /// The admission is issued against a durable journal that holds `plan`'s
     /// transaction, because an admission admits an existing durable journal and
-    /// existence and shape prove nothing. A stream the engine has not started
-    /// yet therefore refuses with [`BackupError::RestoreJournalRequired`]
-    /// surfaced as a typed [`KernelRestoreError::TargetFailed`] with its cause
-    /// intact; nothing is minted to make a fresh stream look admitted. Starting
-    /// the stream needs the plan's stream identity, and
-    /// `RestorePlan::journal_key` is private to `eliot-backup`, so that half is
-    /// not reachable from this file. Until it is, a production restore is
-    /// admitted on resume and refused on a first run — the resume path is
-    /// genuinely provable, the first run is not, and this method says so rather
-    /// than admitting an operation the owner cannot name.
+    /// existence and shape prove nothing. Establishing that journal before
+    /// admitting it is the OWNER's job, and it is
+    /// [`eliot_backup::RestoreJournalAdmissionOwner::issue_journal_stream`]
+    /// that does it: the owner issues this operation's stream identity and
+    /// commits the genesis row for it, so a FIRST run is admitted and not only a
+    /// resume.
+    ///
+    /// This file does not derive that identity and cannot: the stream key is
+    /// `sha256(plan_id, bundle_sha256)`, computed inside `eliot-backup` where
+    /// the plan lives, and the Kernel asks the owner for the key rather than
+    /// reconstructing it. A key the owner did not issue is not the owner's key,
+    /// so the Kernel holds no copy of the derivation and no way to point an
+    /// admission at a stream of its own choosing.
+    ///
+    /// What the owner establishes is exactly the row the engine would have
+    /// written as its own first act: the same transaction, revision 0, phase
+    /// `Pending`, state `Ready`, no intent, no receipt and no effect, written
+    /// through the same ORS adapter, the same stream binding and the same writer
+    /// fence this execution uses. The engine reads that row on its way in and
+    /// continues from it. No target effect occurs here, and the durable row the
+    /// admission is then proved against is still the row the owner wrote and
+    /// still has to survive a fresh read.
     ///
     /// The returned value grants no cutover, no readiness and no activation
     /// (A13.7: cutover requires separate authority).
     ///
     /// # Errors
     ///
-    /// Refuses typed when the owner holds no durable record for this stream
-    /// ([`KernelRestoreError::TargetFailed`] carrying
+    /// Refuses typed when the owner's issued stream does not survive
+    /// establishment ([`KernelRestoreError::TargetFailed`] carrying the
+    /// journal error), when the owner holds no durable record for the stream it
+    /// issued ([`KernelRestoreError::TargetFailed`] carrying
     /// [`BackupError::RestoreJournalRequired`]), when the durable record
     /// disagrees with live composition
     /// ([`KernelRestoreError::JournalBindingConflict`]), or when the binding's
@@ -2981,9 +3017,10 @@ fn admitted_restore_ports<'a>(
     }
 }
 
-/// Rejects a journal binding that names a different source, class or
-/// destination than the archive and target actually being restored (issue
-/// #960).
+/// Rejects a journal binding that does not name this execution's durable
+/// restore-journal channel and stream, or that names a different source,
+/// class or destination than the archive and target actually being restored
+/// (issue #960, #962).
 ///
 /// The ORS binding is what every journal row is keyed to, so a binding that
 /// disagrees with the archive would file this transaction's durable rows under
@@ -2997,29 +3034,59 @@ fn admitted_restore_ports<'a>(
 /// [`require_production_admitted`](super::backup_restore_ports::require_production_admitted)
 /// alone only proves an admission VALUE is well-formed and not fixture-flagged;
 /// it says nothing about which journal the execution then ran on, because
-/// `restore` takes its `J` as a parameter. Binding the admission's
-/// `journal_identity_ref` to [`RESTORE_JOURNAL_IDENTITY`] — the exact
-/// namespace this adapter's ORS rows are filed under, and the identity
-/// composition is required to place in the admission it issues — is what
-/// makes the presented admission and the journal actually executing the same
-/// owner channel. An admission for any other journal identity, including one
-/// describing an in-process store, refuses before a single effect runs.
+/// `restore` takes its `J` as a parameter.
+///
+/// ## The two journal facts, and which field carries each
+///
+/// An admission names two distinct things, and the #962 reconciliation keeps
+/// both instead of trading one for the other:
+///
+/// 1. WHICH DURABLE CHANNEL — tested here, against
+///    [`RESTORE_JOURNAL_OWNER_LABEL`]. The admission's `database_ref` must be
+///    the one operational ORS database this adapter's rows are filed under.
+///    This is a Kernel-owned constant compared to a Kernel-issued field, and
+///    the ORS owner sets that field to the same constant, so the comparison is
+///    live: an owner-issued admission passes it. An admission describing any
+///    other store — an in-process map, a second database, a fixture — names a
+///    different `database_ref` and refuses here, before a single effect runs.
+///    The channel is then also re-proved from durable state by
+///    [`RestoreJournalAdmission::binds_owner_record`](eliot_backup::RestoreJournalAdmission::binds_owner_record),
+///    which [`admit_restore_journal`](super::KernelBackupRestore::admit_restore_journal)
+///    runs against the same store, binding and fence this execution uses.
+/// 2. WHICH EXECUTION'S STREAM — the admission's `journal_identity_ref` is the
+///    plan-derived per-execution stream key, `sha256(plan_id, bundle_sha256)`,
+///    and it is compared against `RestorePlan::journal_key()` inside that same
+///    owner-side binding check, which is where that derivation lives: the
+///    owner also ISSUES the key
+///    ([`eliot_backup::RestoreJournalAdmissionOwner::issue_journal_stream`])
+///    and re-proves it against the plan, so the comparison happens where the
+///    derivation is and not where a copy of it could be recomputed. An
+///    admission for another restore of the same archive, or for a different
+///    plan, therefore refuses there rather than here.
+///
+/// ## Why the namespace constant is not compared against `journal_identity_ref`
+///
+/// [`RESTORE_JOURNAL_IDENTITY`](super::backup_restore_ports::RESTORE_JOURNAL_IDENTITY)
+/// names the same channel from the ROW side: it is the visibility label every
+/// sealed restore-journal envelope carries. It is not the value of
+/// `journal_identity_ref`. That field carries the per-execution stream key, a
+/// 64-hex digest derived inside `eliot-backup`, which cannot name a
+/// Kernel-owned constant (the dependency runs Kernel -> backup, never the
+/// reverse). Comparing the two therefore refuses every owner-issued admission
+/// while testing nothing about either guarantee — fail-closed, and dead by
+/// construction. Both facts are now checked where they are actually
+/// derivable, and the per-execution check is an addition to this function's
+/// reach, not a replacement of it.
 fn check_ors_journal_binding(
     bundle: &BackupBundle,
     target: &RestoreContext,
     ports: &RestorePorts<'_>,
     identity: &OrsRestoreBinding,
 ) -> Result<(), KernelRestoreError> {
-    // Conflict resolution (wind-down, 2026-09-29): main added the
-    // `RESTORE_JOURNAL_IDENTITY` equality check and documents it as
-    // "load-bearing, not decorative" (backup_restore_ports.rs:51). This branch's
-    // `admit_restore_journal` derives `journal_identity_ref` from the plan's own
-    // stream key instead. The two guarantees are incompatible; main's is kept
-    // because it is the stricter and the merged one. The consequence is recorded
-    // in the issue REPORT.md: until the issuer is reconciled to name the constant
-    // journal identity, this check refuses every owner-issued admission. That is
-    // fail-closed, never a wrong import.
-    if ports.journal_admission.journal_identity_ref != RESTORE_JOURNAL_IDENTITY {
+    // The channel identity: the admission must name the one operational ORS
+    // database behind restore streams. `OrsRestoreJournalOwner` sets exactly
+    // this value, so an owner-issued admission passes; anything else refuses.
+    if ports.journal_admission.database_ref != RESTORE_JOURNAL_OWNER_LABEL {
         return Err(KernelRestoreError::OwnerEvidenceInvalid(
             "restore journal admission does not name the durable ORS restore journal".to_owned(),
         ));

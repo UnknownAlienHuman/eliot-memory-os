@@ -30,9 +30,12 @@
 //!   read through the accepted [`RestoreJournalPort`] seam and compared field by
 //!   field; re-deriving a fresh checksum over values held in memory would
 //!   replace the proof rather than check it.
-//! - It does not create a journal. [`RestoreJournalAdmissionOwner`] is a read
-//!   seam over state the owner already committed, and the row it must agree
-//!   with is written by the existing compare-and-swap, not here.
+//! - It does not run a restore, and it does not start one. The only row it ever
+//!   writes is the one genesis row the engine's own first act would have
+//!   written, through the same accepted [`RestoreJournalPort`] seam, for the
+//!   same transaction, carrying no intent, no receipt and no effect — see
+//!   [`RestoreJournalAdmissionOwner::issue_journal_stream`]. Every check below
+//!   it remains a read over committed state.
 //!
 //! Existence and shape prove nothing. [`RestoreJournalAdmission::binds_owner_record`]
 //! re-reads both the durable journal and the owner's record for the exact
@@ -40,6 +43,30 @@
 //! binding, the database, the installation, the generation, the journal
 //! identity and the receipt, so an admission that is well formed but borrowed
 //! from a different operation or installation fails closed.
+//!
+//! ## Why the owner also ISSUES the stream, rather than only reading one
+//!
+//! An admission admits an EXISTING durable journal, so the row it is admitted
+//! against has to exist before admission. The only producer of that row was the
+//! engine's own genesis compare-and-swap, which runs after admission — a circle
+//! in which a first run always refuses and, because no first run ever succeeds,
+//! no resume can exist either. The entry is unreachable for success, not merely
+//! first-run-blocked.
+//!
+//! [`RestoreJournalAdmissionOwner::issue_journal_stream`] is what breaks it, and
+//! it breaks it in the only direction that keeps admission honest: the OWNER
+//! establishes the stream and publishes the identity it filed it under. No
+//! caller, and no coordinator, ever derives that identity — the derivation
+//! lives with the plan, and it is handed out here rather than reconstructed at
+//! the call site, because a key the owner did not issue is not the owner's key.
+//!
+//! What is established is exactly what the engine would have written as its own
+//! first act, for the same transaction, through the same accepted
+//! [`RestoreJournalPort`] seam: one genesis row at revision 0 with no intent, no
+//! receipt and no effect. The engine then reads that row on its way in and
+//! continues from it, so this changes no byte the engine would have written and
+//! no decision it would have made. It is a capability that was missing, not a
+//! check that was removed.
 //!
 //! This crate supplies no owner of its own. The durable owner of a restore
 //! journal is the composition that holds that journal together with the
@@ -51,8 +78,8 @@
 use eliot_contracts::ResourceGeneration;
 
 use super::{
-    BackupError, OwnerTrustBinding, RestoreJournalAdmission, RestoreJournalPort, RestorePlan,
-    RestoreTransaction,
+    BackupError, OwnerTrustBinding, RestoreJournalAdmission, RestoreJournalPort,
+    RestoreJournalRecord, RestoreJournalState, RestorePhase, RestorePlan, RestoreTransaction,
 };
 
 /// One durable journal record, as the owning owner read it at issue time.
@@ -73,7 +100,20 @@ pub struct DurableJournalRecord {
     pub installation_ref: String,
     /// The committed authority generation of that installation.
     pub generation: ResourceGeneration,
-    /// The journal identity committed for this operation.
+    /// The journal identity committed for this operation: the key this record's
+    /// durable row was read under.
+    ///
+    /// This is the PER-EXECUTION STREAM KEY, derived from the plan as
+    /// `sha256(plan_id, bundle_sha256)`, and it is what keeps two restores of
+    /// the same archive in different journal streams. It is not the durable
+    /// channel's namespace identity: a channel is fixed across every
+    /// execution, while this value is different for every plan/bundle pair and
+    /// can never equal a fixed channel name. `database_ref` carries the
+    /// channel this record was read from; consumers that need to know which
+    /// store admitted a restore compare that field, and consumers that need to
+    /// know which execution an admission belongs to compare this one. Both
+    /// checks are exact equality, and
+    /// [`RestoreJournalAdmission::binds_owner_record`] performs the second.
     pub journal_identity_ref: String,
     /// The admission receipt committed for this operation.
     pub admission_receipt_ref: String,
@@ -101,6 +141,51 @@ pub trait RestoreJournalAdmissionOwner {
         &self,
         journal_key: &str,
     ) -> Result<DurableJournalRecord, BackupError>;
+
+    /// Issues the journal stream identity for `plan`'s operation, and returns
+    /// the identity the owner filed that stream under.
+    ///
+    /// This is the owner's own write side, and it is deliberately narrow:
+    ///
+    /// - The identity is derived from `plan` HERE, where that derivation lives,
+    ///   and published outward. A caller receives the key; it never computes
+    ///   one, and no caller-supplied key is accepted, so a coordinator cannot
+    ///   point the admission at a stream of its own choosing.
+    /// - A stream the owner has not established is established by one genesis
+    ///   compare-and-swap through the accepted [`RestoreJournalPort`] seam the
+    ///   restore engine itself writes through — the same binding, the same seal,
+    ///   the same fence. It is the exact row
+    ///   [`RestorePlan::execute_with_journal`] writes as its own first act: the
+    ///   plan's own transaction, revision 0, phase `Pending`, state `Ready`, and
+    ///   no intent, receipt or effect. A stream the owner already established is
+    ///   left untouched, which is the resume case.
+    /// - A stream that already exists for a DIFFERENT transaction is
+    ///   [`BackupError::RestoreJournalMismatch`], never adopted: the owner's
+    ///   stream is never taken over and its history is never rewritten.
+    /// - The returned identity is only produced after a fresh read proves the
+    ///   row is durable and holds this operation's own transaction, so what
+    ///   comes back is a verified durable fact, not a derivation.
+    ///
+    /// No target effect happens here. This writes one journal row that records
+    /// which stream an operation runs in; it applies nothing, imports nothing
+    /// and reaches no cutover, and the engine still refuses a plan whose own
+    /// validation fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackupError::RestoreJournalMismatch`] when the stream exists
+    /// for another transaction or the establishment cannot be committed, and
+    /// passes the port's own typed error through otherwise.
+    fn issue_journal_stream<J>(
+        &self,
+        journal: &mut J,
+        plan: &RestorePlan,
+    ) -> Result<String, BackupError>
+    where
+        J: RestoreJournalPort + ?Sized,
+    {
+        AdmittedJournalOperation::of(plan)?.establish_stream(journal)
+    }
 }
 
 /// The exact operation one journal admission is bound to.
@@ -139,26 +224,74 @@ impl AdmittedJournalOperation {
         }
         Ok(())
     }
+
+    /// Durably establishes this operation's own journal stream and returns the
+    /// stream identity it was filed under.
+    ///
+    /// An unstarted stream is established by the single genesis
+    /// compare-and-swap the engine performs as its own first act, written
+    /// through the accepted [`RestoreJournalPort`] seam and carrying no intent,
+    /// no receipt and no effect; the engine then reads that row on its way in
+    /// and continues from it. A stream already holding this transaction is the
+    /// resume case and is left exactly as it stands, so establishing a stream is
+    /// never able to rewrite history. A stream holding any other transaction is
+    /// refused, never adopted.
+    fn establish_stream<J>(&self, journal: &mut J) -> Result<String, BackupError>
+    where
+        J: RestoreJournalPort + ?Sized,
+    {
+        if journal.load(&self.journal_key)?.is_none() {
+            journal.compare_and_swap(
+                &self.journal_key,
+                0,
+                RestoreJournalRecord {
+                    journal_key: self.journal_key.clone(),
+                    transaction: self.transaction.clone(),
+                    revision: 0,
+                    completed_phases: 0,
+                    phase: RestorePhase::Pending,
+                    state: RestoreJournalState::Ready,
+                    intent: None,
+                    receipt: None,
+                    final_receipt: None,
+                },
+            )?;
+        }
+        // The identity is issued only once a fresh read proves the row is
+        // durable and is this operation's own, so what the owner hands back is
+        // a verified durable fact rather than a derivation.
+        self.is_journal_of(journal)?;
+        Ok(self.journal_key.clone())
+    }
 }
 
 impl RestoreJournalAdmission {
     /// Issues the owner-issued admission for the journal behind `plan`.
     ///
     /// Every field is copied from the owner's durable record for the journal
-    /// identity this plan derives; none is an argument, so no caller can select
-    /// the database, the installation, the generation, the journal identity or
-    /// the receipt. `fixture_proof_only` is `false` because the record came from
-    /// a durable owner rather than a fixture, and the result is immediately
-    /// re-proved against a fresh read of both the same owner and the same live
-    /// journal, so an owner whose record is not stable across the issue refuses
-    /// instead of issuing.
+    /// identity the OWNER issued for this operation; none is an argument, so no
+    /// caller can select the database, the installation, the generation, the
+    /// journal identity or the receipt. `fixture_proof_only` is `false` because
+    /// the record came from a durable owner rather than a fixture, and the
+    /// result is immediately re-proved against a fresh read of both the same
+    /// owner and the same live journal, so an owner whose record is not stable
+    /// across the issue refuses instead of issuing.
+    ///
+    /// The stream identity is the owner's to issue, not this issuer's to derive
+    /// and not the caller's to supply:
+    /// [`RestoreJournalAdmissionOwner::issue_journal_stream`] establishes the
+    /// stream and publishes the key it filed it under, that key must be this
+    /// plan's own derived stream, and the owner's record is then read under
+    /// that published key.
     ///
     /// # Errors
     ///
-    /// Returns [`BackupError::RestoreJournalRequired`] when the journal holds
-    /// no durable row for this operation,
-    /// [`BackupError::RestoreJournalMismatch`] when the re-read record does not
-    /// agree with the one issued, and the owner's own typed error otherwise.
+    /// Returns [`BackupError::RestoreJournalMismatch`] when the owner's issued
+    /// stream is not this plan's own, when the re-read record does not agree
+    /// with the one issued, or when the stream could not be established,
+    /// [`BackupError::RestoreJournalRequired`] when the journal holds no
+    /// durable row for this operation, and the owner's own typed error
+    /// otherwise.
     pub fn issue_for_operation<O, J>(
         owner: &O,
         journal: &mut J,
@@ -169,7 +302,11 @@ impl RestoreJournalAdmission {
         J: RestoreJournalPort + ?Sized,
     {
         let operation = AdmittedJournalOperation::of(plan)?;
-        let record = owner.durable_journal_record(&operation.journal_key)?;
+        let issued_stream_key = owner.issue_journal_stream(journal, plan)?;
+        if issued_stream_key != operation.journal_key {
+            return Err(BackupError::RestoreJournalMismatch);
+        }
+        let record = owner.durable_journal_record(&issued_stream_key)?;
         let admission = Self {
             persistent_owner: record.persistent_owner,
             database_ref: record.database_ref,

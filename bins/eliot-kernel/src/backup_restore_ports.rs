@@ -48,12 +48,36 @@
 //! file the issue scopes to "minimal adapters to the accepted
 //! RestoreTarget/RestoreJournalPort only".
 //!
-//! [`RESTORE_JOURNAL_IDENTITY`] is load-bearing, not decorative: the Kernel
-//! coordinator refuses any production restore whose owner-issued
-//! [`RestoreJournalAdmission`] names a different journal identity, so the
-//! admission and the ORS namespace the adapter actually writes are the same
-//! owner channel. An admission is never taken as proof of durability on its
-//! own. [`PinnedDestinationAdmission`] likewise pins the rehearsal posture at
+//! Two different facts about the restore journal, and they belong to two
+//! different fields.
+//!
+//! - WHICH DURABLE CHANNEL. [`RESTORE_JOURNAL_OWNER_LABEL`] names the one
+//!   operational ORS database behind restore streams, and the Kernel
+//!   coordinator refuses any production restore whose owner-issued
+//!   [`RestoreJournalAdmission`] carries any other `database_ref`, so the
+//!   admission and the ORS namespace the adapter actually writes are the same
+//!   owner channel. The channel is then re-proved from durable state, never
+//!   from the admission's own claim: the coordinator re-reads the owner's
+//!   durable record for the plan this execution runs and requires exact
+//!   agreement.
+//! - WHICH EXECUTION'S STREAM. `journal_identity_ref` is the plan's own
+//!   derived stream key — the digest that keeps two restores of the same
+//!   archive in different journal streams. The owner ISSUES that key
+//!   (`RestoreJournalAdmissionOwner::issue_journal_stream`) and re-proves it
+//!   against `RestorePlan::journal_key()` in the owner-side binding check, so
+//!   the comparison happens where the derivation lives.
+//!
+//! [`RESTORE_JOURNAL_IDENTITY`] is the third name and names the same channel
+//! from the row side: it is the visibility label this adapter stamps on every
+//! sealed restore-journal envelope, so the namespace is a durable property of
+//! the rows rather than a string an admission asserts about itself. An
+//! admission is never taken as proof of durability on its own, and the
+//! namespace constant is deliberately NOT compared against
+//! `journal_identity_ref`: that field carries the per-execution stream key and
+//! can never equal a literal, so such a comparison would refuse every
+//! owner-issued admission without testing anything.
+//!
+//! [`PinnedDestinationAdmission`] likewise pins the rehearsal posture at
 //! prepare, so a rehearsal cannot be re-presented as a production run and
 //! reach cutover qualification.
 //!
@@ -85,9 +109,39 @@ use eliot_ors::{
 use eliot_platform::PlatformHandle;
 use eliot_security_contracts::{InstructionTaint, PrivacyClass};
 
-/// Stable identity of the restore-journal stream namespace for admission
-/// bindings. Composition must place this identity in the admission it issues
-/// for the restore streams owned by the operational ORS database (#957).
+/// Stable identity of the restore-journal stream NAMESPACE: the visibility
+/// label this adapter stamps on every sealed restore-journal envelope, and
+/// therefore the name the durable rows themselves carry for the restore
+/// streams owned by the operational ORS database (#957).
+///
+/// ## What it is not, and why the admission does not carry it
+///
+/// This constant is NOT the value of
+/// [`RestoreJournalAdmission::journal_identity_ref`], and no code compares
+/// the two. That field carries a different, equally necessary fact: the
+/// plan-derived per-execution stream key
+/// (`sha256(plan_id, bundle_sha256)`), which is what keeps two restores of the
+/// same archive in different journal streams. The two facts are asked to
+/// occupy one field and cannot:
+///
+/// - The namespace is a property of the CHANNEL — a fixed property of every
+///   row this adapter writes, and of nothing else. It is a constant here
+///   precisely because no execution, archive or plan changes it.
+/// - The stream key is a property of ONE EXECUTION and is derived by
+///   `RestorePlan::journal_key()` in `eliot-backup`, which cannot name this
+///   constant: the dependency runs Kernel -> backup, never the reverse. A
+///   64-hex digest can never equal this literal.
+///
+/// So a coordinator that demanded equality here would refuse every
+/// owner-issued admission — fail-closed, and dead. The channel guarantee is
+/// kept where the channel is actually named and actually checkable: the
+/// Kernel coordinator compares the admission's `database_ref` against
+/// [`RESTORE_JOURNAL_OWNER_LABEL`] and then re-reads the durable owner record
+/// for this plan's stream, requiring exact agreement (see
+/// `KernelBackupRestore::restore_with_ors_journal`). The per-execution
+/// guarantee is kept by comparing `journal_identity_ref` against
+/// `plan.journal_key()` through the owner-side binding check. Neither
+/// guarantee was dropped to accommodate the other.
 pub const RESTORE_JOURNAL_IDENTITY: &str = "kernel-restore-journal-v1";
 /// Instruction taint carried on every restore-journal envelope (I5.5
 /// `instruction_taint`, I5.6 `privacy_origin_taint_metadata`).
@@ -1043,6 +1097,37 @@ fn require_live_installation(binding: &OrsRestoreBinding) -> Result<(), KernelRe
 /// [`OrsRestoreJournal::production`] takes, and it has no constructor a
 /// request, a config value or a test fixture can reach with a value of its own.
 ///
+/// ## It issues the stream, and the coordinator only asks
+///
+/// An admission admits an EXISTING durable journal, so the row it is admitted
+/// against has to exist before admission. The only producer of that row used to
+/// be the engine's own genesis compare-and-swap, which runs after admission: a
+/// circle in which a first run always refused and, since no first run ever
+/// succeeded, no resume could exist either. This owner therefore also answers
+/// [`RestoreJournalAdmissionOwner::issue_journal_stream`], which establishes the
+/// stream for an operation and publishes the identity it filed it under.
+///
+/// The coordinator asks this owner for that identity and does not derive it:
+///
+/// [`KernelBackupRestore::admit_restore_journal`](super::backup_restore::KernelBackupRestore::admit_restore_journal)
+///
+/// The key is
+/// `sha256(plan_id, bundle_sha256)`, computed inside `eliot-backup` where the
+/// plan lives, and it is deliberately not reconstructed here: the dependency
+/// runs Kernel -> backup, so a key this file could compute would be a key
+/// nobody issued. Asking is the only mechanism that keeps the stream the
+/// owner's own.
+///
+/// The row written is the row the engine would have written as its own first
+/// act — the same transaction, revision 0, phase `Pending`, state `Ready`, no
+/// intent, no receipt, no effect — committed through this same
+/// [`OrsRestoreJournal`] adapter, which binds the ORS stream to this
+/// composition's source, class, destination, writer and writer fence. A stream
+/// already holding another transaction is refused rather than taken over, and a
+/// stream already holding this one is left exactly as it stands, so establishing
+/// a stream can never rewrite history. No target effect is applied here and
+/// nothing reaches cutover.
+///
 /// ## What each admitted reference is, and where it is read
 ///
 /// Four of the six fields are read out of the ORS stream-binding row the ORS
@@ -1075,7 +1160,11 @@ fn require_live_installation(binding: &OrsRestoreBinding) -> Result<(), KernelRe
 ///   through returned the exact durable stream row the rest of this record
 ///   reports, and the label is this owner's own name for that store. Row
 ///   presence proves a row exists; it does not prove the label names that row's
-///   database, and no code here makes that claim.
+///   database, and no code here makes that claim. This is the field the Kernel
+///   coordinator's channel check reads, because it is the field that actually
+///   carries WHICH CHANNEL the admission is for; it is the one place the
+///   channel identity is comparable without a cross-crate constant, because
+///   both the constant and the value this owner returns live in this crate.
 /// - `installation_ref` — `OrsRestoreBinding::installation_ref`, read from the
 ///   live composition cell by `live_installation_id` and re-compared against it
 ///   by `require_live_installation` at this constructor. It is a
@@ -1083,7 +1172,13 @@ fn require_live_installation(binding: &OrsRestoreBinding) -> Result<(), KernelRe
 ///   column and is not modified here.
 /// - `generation` — the live effect fence's `resource_generation`, as above.
 /// - `journal_identity_ref` — the key the durable row was read under, which is
-///   the plan-derived stream identity the issuer checks the admission against.
+///   the plan-derived per-execution stream identity the issuer checks the
+///   admission against. It is deliberately NOT
+///   [`RESTORE_JOURNAL_IDENTITY`]: that constant is the channel namespace, a
+///   fixed property of every row, while this value changes per plan/bundle
+///   pair. Putting the constant in this field would make the whole
+///   owner-issued path unsatisfiable, and the channel fact is already carried
+///   by `database_ref` above.
 /// - `admission_receipt_ref` — the transaction identity the ORS owner committed
 ///   for this stream when it admitted the stream. It is read back from the
 ///   durable row on every issue and never recomputed.
@@ -1091,7 +1186,11 @@ fn require_live_installation(binding: &OrsRestoreBinding) -> Result<(), KernelRe
 /// ## What it refuses
 ///
 /// A missing durable stream binding is [`BackupError::RestoreJournalRequired`],
-/// never an empty record. A row that disagrees with live composition on the
+/// never an empty record. Because
+/// [`RestoreJournalAdmissionOwner::issue_journal_stream`] establishes the stream
+/// first, that refusal now means the establishment itself did not survive, not
+/// that the operation was never admitted. A row that disagrees with live
+/// composition on the
 /// source archive, the archive class, the destination, the writer identity or
 /// the sealed writer fence is [`BackupError::RestoreJournalMismatch`], so a
 /// well-formed admission for another operation, another destination or a
@@ -1212,8 +1311,11 @@ impl RestoreJournalAdmissionOwner for OrsRestoreJournalOwner {
 ///
 /// - [`JournalStreamVerdict::Unbound`] — no binding is persisted for this
 ///   stream. The ORS owner reports a missing binding as a refusal, so this is
-///   an observation the adapter made directly, and it is what lets the engine's
-///   genesis compare-and-swap bind the stream.
+///   an observation the adapter made directly, and it is what lets the genesis
+///   compare-and-swap bind the stream — whether that compare-and-swap is the
+///   engine's own first act or the one
+///   [`RestoreJournalAdmissionOwner::issue_journal_stream`] performs to establish
+///   the stream before admitting the operation.
 /// - [`JournalStreamVerdict::KnownEmpty`] — the stream IS bound and the owner
 ///   proved an exact new journal: zero members, no retained row, no retired
 ///   phase slot and no prune fence. Zero entries is known-empty only here. Every
@@ -1396,7 +1498,7 @@ impl OrsRestoreJournal {
     ///
     /// An **unbound** stream is an exact new stream: the ORS owner reports a
     /// missing binding as absent, not as corruption, so it reads as no journal
-    /// at all and the engine's genesis compare-and-swap can bind it. Reading it
+    /// at all and the genesis compare-and-swap can bind it. Reading it
     /// as an error would strand every fresh transaction before its first append.
     ///
     /// A **bound** stream is only ever reported through the owner's
@@ -1432,7 +1534,7 @@ impl OrsRestoreJournal {
             .map_err(ors_to_backup)?;
         // An unbound stream is an exact new stream: the ORS owner reports a
         // missing binding as absent, not as corruption, so it reads as no
-        // journal and the engine's genesis compare-and-swap can bind it.
+        // journal and the genesis compare-and-swap can bind it.
         let Some(existing) = persisted else {
             return Ok(JournalStreamVerdict::Unbound);
         };
