@@ -604,7 +604,7 @@ pub struct ProtectedReservePolicy {
     ///
     /// #1724 A2: read by [`ProtectedReservePolicy::validate`], which refuses a
     /// declared-but-absent reserve. A margin of zero under a block whose own
-    /// documentation is "protected_reasoning_review_and_margin_reserve" is a
+    /// documentation is `protected_reasoning_review_and_margin_reserve` is a
     /// policy that certifies the absence of the reserve I12.13 requires it to
     /// carry, so it refuses instead of digesting. No execution path in this
     /// workspace measures a margin figure — the Context-budget owner records it
