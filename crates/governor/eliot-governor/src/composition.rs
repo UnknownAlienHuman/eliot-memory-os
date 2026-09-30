@@ -81,6 +81,7 @@ use eliot_instrument_nextest::{
 use eliot_maintenance::{
     AutomationDecision, AutomationTriggerDecision, MaintenanceController, MaintenanceError,
     MaintenanceFamily, MaintenanceJob, MaintenanceJobState, MaintenanceStateStore,
+    maintenance_decision_ref,
 };
 use eliot_module_registry::ModuleCatalog;
 use eliot_module_registry::ModuleCatalogSnapshot;
@@ -4490,6 +4491,10 @@ pub struct PreparedMaintenanceAdmission {
     /// loads this key through its own Durable Job store handle outside any
     /// composition borrow.
     pub job_id: String,
+    /// Stable identity of the exact source decision this admission is prepared
+    /// from, so the adopted job attributes its later source results to the
+    /// decision that admitted the work.
+    pub decision_ref: String,
 }
 
 impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
@@ -4655,6 +4660,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             scope_ref: decision.scope_ref.clone(),
             trigger_id: decision.trigger_id.clone(),
             job_id,
+            // The owner's own decision reference, derived from the decision's
+            // stable identity rather than chosen here, so the adopted job and an
+            // owner-admitted job attribute their results identically.
+            decision_ref: maintenance_decision_ref(decision),
         })
     }
 
@@ -4740,6 +4749,12 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         let job = MaintenanceJob {
             job_id: prepared.job_id.clone(),
             trigger_id: prepared.trigger_id.clone(),
+            // The adoption names the same decision reference the owner's own
+            // `admit` would, derived from that decision's stable identity, so
+            // every later source result on this job is attributed to the
+            // decision that admitted the work rather than to a reference the
+            // adoption chose.
+            decision_ref: prepared.decision_ref.clone(),
             family: prepared.family,
             scope_ref: prepared.scope_ref.clone(),
             state_fence: prepared.state_fence.clone(),
@@ -4751,10 +4766,103 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             budget_ref,
             outcome_ref: None,
             user_session_required,
+            result_obligations: Vec::new(),
         };
         job.validate().map_err(|error| {
             CompositionError::Recovery(format!("adopted maintenance job is invalid: {error}"))
         })?;
+        Ok(job)
+    }
+
+    /// Records on the retained job revision that the canonical observation
+    /// route admitted one result this job owed an observation for.
+    ///
+    /// This is the narrow durable half of the result-to-observation path, and
+    /// the reason it lives beside [`Self::retained_durable_job`] rather than in
+    /// a new owner: the receipt is settled onto the same Kernel durable-job
+    /// ledger the transitions already write through, so the job state and the
+    /// observation it owes stay in one store with one atomic boundary. Nothing
+    /// here claims improvement, reconciles an outstanding obligation, or
+    /// writes an outcome.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompositionError::NotReady`] when the composition is not
+    /// ready, and [`CompositionError::Recovery`] when the maintenance owner
+    /// refuses the receipt — an unknown publication identity, a conflicting
+    /// second receipt under one identity, an already-unavailable delivery, a
+    /// job that is not retained, or a stale fence. The owner's own
+    /// [`MaintenanceError`] is preserved in the detail so a dangling
+    /// publication identity stays distinguishable from a transport failure.
+    pub fn admit_maintenance_observation_receipt(
+        &mut self,
+        job_id: &str,
+        publication_id: &str,
+        observation_receipt_ref: &str,
+    ) -> Result<MaintenanceJob, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        // The maintenance owner performs the read, the settlement and the
+        // single durable write through the same Kernel durable-job ledger its
+        // lifecycle transitions already use. This seam exists only because the
+        // owner set is otherwise immutable to `eliotd` callers.
+        let fence = self.snapshot.state_fence();
+        self.owners
+            .maintenance
+            .admit_observation_receipt(job_id, &fence, publication_id, observation_receipt_ref)
+            .map_err(|error| {
+                CompositionError::Recovery(format!(
+                    "maintenance observation receipt was not admitted: {error}"
+                ))
+            })
+    }
+
+    /// Returns the retained durable maintenance job for one exact job identity.
+    ///
+    /// The read goes through the same authenticated Kernel durable-job route the
+    /// maintenance owner writes through, so the returned revision and the
+    /// result-to-observation obligations its transitions appended are the ones the
+    /// owner actually persisted in that single atomic write. Nothing is
+    /// reconstructed here: an absent job is `Ok(None)`, which is unavailable
+    /// rather than resolved, and the read fails closed when the job is not
+    /// retained under this fence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompositionError::NotReady`] when the composition is not ready
+    /// and [`CompositionError::Kernel`] with the transport's own
+    /// [`KernelPortError`] when the durable-job read or the retained revision's
+    /// validation is refused.
+    pub fn retained_durable_job(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<MaintenanceJob>, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        // The retained snapshot's own fence, owned here because the projection
+        // builds a fresh `StateFence`. The read borrows it, and the binding
+        // check below compares against the same owned value, so neither use
+        // moves it.
+        let fence = self.snapshot.state_fence();
+        let job = self
+            .kernel
+            .load_durable_job(job_id, &fence)
+            .map_err(CompositionError::Kernel)?;
+        if let Some(job) = &job {
+            job.validate().map_err(|error| {
+                CompositionError::Recovery(format!(
+                    "retained durable maintenance job is invalid: {error}"
+                ))
+            })?;
+            if job.job_id != job_id || job.state_fence != fence {
+                return Err(CompositionError::Recovery(
+                    "retained durable maintenance job is not bound to this fence and identity"
+                        .to_owned(),
+                ));
+            }
+        }
         Ok(job)
     }
 

@@ -2493,6 +2493,7 @@ version = "0.1.0"
 dependencies = [
  "eliot-authority",
  "eliot-contracts",
+ "eliot-observation-contracts",
  "eliot-receipts",
  "eliot-runtime-contracts",
  "schemars",

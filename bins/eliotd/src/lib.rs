@@ -115,7 +115,12 @@ mod kernel_recovery_client;
 mod kernel_transition_client;
 pub mod maintenance_dispatch;
 pub mod maintenance_family_catalog;
-mod maintenance_trigger_evaluator;
+// Public because `daemon_runtime` lives in the `eliotd` binary crate and
+// reaches the maintenance publication owner through it, exactly as it reaches
+// `maintenance_dispatch` and `maintenance_family_catalog` beside it. The
+// previous private declaration made that reach a compile error the Governor
+// failure had masked.
+pub mod maintenance_trigger_evaluator;
 mod negative_memory_action_gate;
 pub mod notification_acknowledge_emit;
 pub mod notification_board_attach;
@@ -1620,6 +1625,56 @@ impl DaemonComposition {
             .owners()
             .maintenance
             .improvement_admission_policy(operation_ref, idempotency_key, SERVICE_NAME))
+    }
+
+    /// The live admitted State Fence this composition's owners stand on.
+    ///
+    /// Read from the retained Governor snapshot, never from a caller claim, so a
+    /// transported or cached fence cannot substitute for the one a maintenance
+    /// result is published under. Pure with respect to the Kernel: no exchange
+    /// happens here.
+    ///
+    /// # Errors
+    ///
+    /// [`DaemonError::Composition`] with [`CompositionError::NotReady`] when the
+    /// Governor is not ready; the fence itself is the retained snapshot's own
+    /// value and cannot fail.
+    pub fn governor_kernel_fence(&self) -> eliot_contracts::StateFence {
+        self.governor.kernel_snapshot().state_fence().clone()
+    }
+
+    /// The retained durable maintenance job for one exact job identity.
+    ///
+    /// This is the existing durable-job read route, not a local map: the job
+    /// revision and the result-to-observation obligations its transitions
+    /// appended come from the same atomic write the owner persisted, so a
+    /// publication reads the obligation the source transition actually recorded
+    /// rather than a value recomputed here.
+    ///
+    /// `Ok(None)` means no such job is retained; that is unavailable, not
+    /// resolved. The read happens under the composition lock, so a caller must
+    /// release it before any Kernel exchange.
+    ///
+    /// # Errors
+    ///
+    /// [`DaemonError::Composition`] with [`CompositionError::NotReady`] when the
+    /// Governor is not ready, [`CompositionError::Kernel`] carrying the
+    /// transport's own [`eliot_governor::KernelPortError`] when the durable-job
+    /// read is refused, and the composition's own `Recovery` variant when the
+    /// retained revision fails validation or is not bound to this fence and
+    /// identity. The Governor route refuses with a [`CompositionError`], so the
+    /// refusal keeps that type instead of being restated as a maintenance-owner
+    /// refusal the read never produced.
+    pub fn retained_maintenance_job(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<eliot_maintenance::MaintenanceJob>, DaemonError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        self.governor
+            .retained_durable_job(job_id)
+            .map_err(DaemonError::Composition)
     }
 
     /// Commits the durable learning-closure edge for one consequential attempt.
