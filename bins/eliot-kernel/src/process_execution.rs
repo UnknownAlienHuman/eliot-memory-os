@@ -318,11 +318,11 @@ impl KernelGovernedProcessEffectPort {
         hint_id: &str,
         hint: change_monitor::KernelChangeHint,
         verification: &change_monitor::HintVerification,
-    ) {
+    ) -> bool {
         if change_monitor::ingest_hint(hint).is_err() {
-            return;
+            return false;
         }
-        let _ = change_monitor::confirm_hint(hint_id, verification);
+        change_monitor::confirm_hint(hint_id, verification).is_ok()
     }
 }
 
@@ -376,6 +376,7 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
             .lock()
             .ok()
             .and_then(|last| last.get(&resource).cloned());
+        let mut transition_unrecorded = false;
         if let Some(previous) = previous
             && previous != first_digest
         {
@@ -404,10 +405,12 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
                 },
                 git: None,
             };
-            Self::confirm_external_transition(&hint_id, hint, &verification);
+            transition_unrecorded = !Self::confirm_external_transition(&hint_id, hint, &verification);
         }
-        if let Ok(mut last) = self.last_observed.lock() {
-            last.insert(resource.clone(), first_digest.clone());
+        if !transition_unrecorded {
+            if let Ok(mut last) = self.last_observed.lock() {
+                last.insert(resource.clone(), first_digest.clone());
+            }
         }
         Ok(GovernedProcessEffectBaseline {
             binding: binding.clone(),
