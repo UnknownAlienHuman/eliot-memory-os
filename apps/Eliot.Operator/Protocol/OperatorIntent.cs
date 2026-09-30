@@ -60,11 +60,28 @@ public static class OperatorIntentContract
         }
     }
 
+    /// The one character test for an operation identity. Case is part of the
+    /// identity, not a spelling of it: both minters emit lowercase only
+    /// (`Guid.NewGuid().ToString("N")` above, and the lowercase hex digest in
+    /// `UserAutomationOperatorRequest.DeriveIdempotencyKey`), and every
+    /// comparison of an operation id in this application is case-SENSITIVE
+    /// (`StringComparison.Ordinal`, an ordinal `HashSet<string>`, or `==` on
+    /// `string`). The owner keys its operation record on the exact string
+    /// bytes too, so an uppercase twin admitted here would be a SECOND
+    /// identity for one logical transition, not a tolerated spelling: the
+    /// guarded comparison and the guarded admission would disagree about what
+    /// "the same key" means, and the rejection that makes a reused key with a
+    /// different canonical request hash an identity conflict
+    /// (`docs/architecture/I05-05-write-envelope.md:34`) would rest on a
+    /// character rule the guard did not state. This tightens the existing test
+    /// rather than adding a mechanism: `Uri.IsHexDigit` already accepts
+    /// `A`-`F`, so the extra clause only drops values no producer emits, and
+    /// the one refusal sentence this method throws is unchanged.
     public static void RequireOperationId(string? value)
     {
         if (string.IsNullOrWhiteSpace(value)
             || value.Length != 32
-            || !value.All(character => Uri.IsHexDigit(character)))
+            || !value.All(character => Uri.IsHexDigit(character) && !char.IsAsciiLetterUpper(character)))
         {
             throw new InvalidOperationException("Operator intent requires one 32-character hex operation identity.");
         }
@@ -87,7 +104,7 @@ public enum OperatorMutationRoute
 /// the mutation was not admitted. `NotAttempted` is reserved for a request
 /// proven never to have left this process; it is not terminal and is never
 /// assigned to an older retained operation, because a failure before a new
-/// send says nothing about a previous execution. All eight states stay
+/// send says nothing about a previous execution. All nine states stay
 /// distinct.
 public enum OperatorOperationPhase
 {
