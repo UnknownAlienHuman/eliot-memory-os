@@ -168,6 +168,86 @@ impl<B: ResearchBridge> Researcher<B> {
             budget_units,
             deadline_ms,
             required_schema: "research-evidence-bundle/v1".into(),
+            // A first freeze is the honest state for a request admitted without a
+            // predecessor. `request` is the first-freeze façade: it has no prior
+            // freeze to reopen and takes no predecessor argument, so it declares
+            // neither half rather than inventing one. The reopen-aware producer
+            // is `request_reopening`, and a caller that has a predecessor and a
+            // reason must use it.
+            predecessor_freeze_digest: None,
+            reopen_reason: None,
+        })
+    }
+
+    /// Submits a query that reopens a prior evidence freeze.
+    ///
+    /// I21.8: "New material, materially changed source content or changed
+    /// protocol requires a recorded reopen/successor freeze with reason and
+    /// expected revision. It must not mutate a prior brief or audit." The two
+    /// facts that make a reopen a reopen — which freeze it supersedes and why —
+    /// have to be **declared by the requester**, and the only place they can be
+    /// declared is on the admitted request: the consumer
+    /// (`inquiry_governance::freeze_predecessor`) reads them from there and
+    /// invents neither, and `ResearchQueryRequest::validate` refuses the
+    /// half-present pair at the exchange boundary.
+    ///
+    /// This is therefore the production producer of the pair on the live path,
+    /// and it is a separate entry point rather than a parameter on
+    /// [`Self::request`] on purpose: an inherited `Option` there would let the
+    /// first-freeze path carry a half-declared relation by accident, and the
+    /// whole point of the pair is that it is either fully declared or absent.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`ResearchContractError::InvalidDigest`] for a predecessor that
+    /// is not a lowercase SHA-256 digest and
+    /// [`ResearchContractError::InvalidText`] for a blank or control-bearing
+    /// reason, both from the exchange's own validation of the request this
+    /// builds, plus every [`ExchangeError`] the underlying submit produces.
+    pub fn request_reopening(
+        &mut self,
+        exchange_id: impl Into<String>,
+        bridge_generation: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        requester_principal: impl Into<String>,
+        fence: StateFence,
+        question: impl Into<String>,
+        scope: impl Into<String>,
+        expected_decision: impl Into<String>,
+        source_classes: Vec<SourceClass>,
+        allowed_references: AllowedReferenceManifest,
+        budget_units: u64,
+        deadline_ms: i64,
+        predecessor_freeze_digest: impl Into<String>,
+        reopen_reason: impl Into<String>,
+    ) -> Result<ExchangeJob, ExchangeError> {
+        // Same protocol boilerplate as `request`, with the reopen pair supplied
+        // by the caller instead of hardcoded to a first freeze. The retention
+        // class is still inherited from the manifest for the same reason
+        // `request` inherits it: the run-bound manifest is the authority for the
+        // class a run declares.
+        let retention = allowed_references.retention_class.clone();
+        self.submit_query(ResearchQueryRequest {
+            exchange_id: exchange_id.into(),
+            protocol_revision: eliot_research_exchange_api::CONTRACT_VERSION,
+            bridge_generation: bridge_generation.into(),
+            idempotency_key: idempotency_key.into(),
+            requester_principal: requester_principal.into(),
+            state_fence: fence,
+            question: question.into(),
+            question_scope: scope.into(),
+            expected_decision: expected_decision.into(),
+            source_classes,
+            coverage_goal: "bounded exact sources with explicit unknowns".into(),
+            allowed_references,
+            disclosure: DisclosureClass::ProjectBound,
+            retention,
+            license_policy: "caller-policy".into(),
+            budget_units,
+            deadline_ms,
+            required_schema: "research-evidence-bundle/v1".into(),
+            predecessor_freeze_digest: Some(predecessor_freeze_digest.into()),
+            reopen_reason: Some(reopen_reason.into()),
         })
     }
 }
