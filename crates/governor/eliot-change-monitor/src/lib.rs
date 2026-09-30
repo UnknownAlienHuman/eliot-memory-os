@@ -1,11 +1,21 @@
 //! Rebuildable change observations and deterministic historical-anchor
 //! resolution.
 //!
-//! `ChangeMonitor` is an observation/projection component.  It does not watch a
-//! filesystem, open Git, execute tools, persist canonical history, or infer
-//! causal authority.  Adapters submit bounded observations; this crate
-//! validates, deduplicates, projects, and resolves them against explicit
-//! candidates.  Canonical semantic transitions remain owned by Governor.
+//! `ChangeMonitor` is an observation/projection component. It does not watch
+//! a filesystem, open Git, execute tools, persist canonical history, or infer
+//! causal authority; OS notification and read-only Git invocation stay with
+//! the trusted owner-side producer. What this crate does own is the
+//! production confirmation transfer: a host/filesystem hint confirms only
+//! through [`ChangeMonitor::confirm_kernel_readback`], which builds
+//! [`GitChangeEvidence`] and [`ChangeHintVerification`] from the producer's
+//! actually-read content bytes and read-only Git receipt bytes, hashing every
+//! payload itself and binding evidence by content compare. A confirmation
+//! without Git evidence, without two agreeing independent reads, or over a
+//! polled tool image instead of the hinted resource is refused with a typed
+//! error; the hint stays pending and governed acceptance stays blocked.
+//! Adapters submit bounded observations; this crate validates,
+//! deduplicates, projects, and resolves them against explicit candidates.
+//! Canonical semantic transitions remain owned by Governor.
 
 #![forbid(unsafe_code)]
 
@@ -962,6 +972,83 @@ pub struct ChangeHintConfirmation {
     pub acceptance_blocked: bool,
 }
 
+/// One direct content-read payload handed to the production confirmation
+/// adapter. The adapter hashes these exact bytes itself; callers never supply
+/// digests, so a forged digest cannot bind unrelated bytes to an observation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TransferredContentRead {
+    /// The path existed and these are the exact bytes observed.
+    Present { bytes: Vec<u8> },
+    /// The path was absent when read (a confirmed deletion readback).
+    Absent,
+}
+
+/// Read-only Git receipt payloads handed to the production confirmation
+/// adapter alongside the two independent content reads. The adapter hashes
+/// the exact status bytes itself and binds the reported paths to the same
+/// hinted resource the content reads cover; a confirmation without this
+/// evidence is refused, never inferred.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransferredGitReadback {
+    /// Stable repository identity/root handle.
+    pub repository_ref: String,
+    /// Repository HEAD observed before the first direct content read.
+    pub head_before: String,
+    /// Repository HEAD observed after the independent content re-read.
+    pub head_after: String,
+    /// Exact read-only Git status receipt captured before the first read.
+    pub status_before_ref: String,
+    /// Exact status bytes captured before the first read.
+    pub status_before_bytes: Vec<u8>,
+    /// Exact read-only Git status receipt captured after the re-read.
+    pub status_ref: String,
+    /// Exact status bytes captured after the re-read.
+    pub status_bytes: Vec<u8>,
+    /// Canonical repository-relative paths reported by Git as changed.
+    pub changed_paths: Vec<String>,
+    /// Exact Git rename pairs reported by the same status/diff readback.
+    pub renames: Vec<GitPathRename>,
+    /// Exact material diff/artifact handle, when Git reports a change.
+    pub diff_ref: Option<String>,
+}
+
+/// Trusted owner-side readback for one host/filesystem hint: the hinted
+/// resource identity, the previously admitted original state, two independent
+/// direct content reads of that same resource, and the read-only Git receipts
+/// covering the same path. This is the production transfer input the Kernel
+/// process-effect lane (or its Governor-side owner) builds from actual file
+/// reads and actual `git status`/diff output: never from a polled
+/// tool-executable image, and never with an empty Git substrate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelHintReadback {
+    /// Idempotent host-event identity.
+    pub hint_id: String,
+    /// State Fence at which the producer received the event.
+    pub state_fence: StateFence,
+    /// Stable identity of the hinted resource.
+    pub resource_ref: String,
+    /// Canonical repository-relative path read twice and reported by Git.
+    pub path: String,
+    /// Host event or filesystem notification route.
+    pub origin: ChangeOrigin,
+    /// Exact host event/notification receipt, when available.
+    pub origin_ref: Option<String>,
+    /// Previously admitted original state, when the producer has one.
+    pub before: Option<ResourceSnapshot>,
+    /// State observed by the first post-hint content read.
+    pub after: Option<ResourceSnapshot>,
+    /// Bytes of the first direct content read at `path`.
+    pub first_read: TransferredContentRead,
+    /// Receipt for the first direct file read.
+    pub first_read_ref: String,
+    /// Bytes of the independent content re-read at `path`.
+    pub reread: TransferredContentRead,
+    /// Receipt for the independent direct file re-read.
+    pub reread_ref: String,
+    /// Read-only Git evidence over the same hinted path.
+    pub git: TransferredGitReadback,
+}
+
 /// In-memory rebuildable projection over immutable observations.
 #[derive(Clone, Debug, Default)]
 pub struct ChangeMonitor {
@@ -1269,6 +1356,99 @@ impl ChangeMonitor {
         verification: &ChangeHintVerification,
     ) -> Result<ChangeHintConfirmation, ChangeMonitorError> {
         self.confirm_hint_inner(hint_id, verification, true)
+    }
+
+    /// Confirms a host/filesystem hint from actual Git/content/re-read
+    /// evidence supplied by the trusted owner-side producer.
+    ///
+    /// This is the production filesystem-event/Git-state transfer: the caller
+    /// hands over the hint, the previously admitted original, two independent
+    /// direct content reads of the hinted resource itself, and the read-only
+    /// Git receipts covering that same path. The adapter hashes every
+    /// supplied byte payload itself, requires the two reads to agree
+    /// byte-for-byte, binds the resulting digests to the after-state and to
+    /// the Git evidence by content compare, admits the hint first so a failed
+    /// confirmation stays pending, and only then runs the standard
+    /// [`Self::confirm_hint_with_readback`] validation. Any construction or
+    /// confirmation failure returns a typed error without confirming; the
+    /// pending hint keeps governed acceptance blocked (fail-closed) until a
+    /// later transfer supplies real evidence. Transport payloads must remain
+    /// [`ChangeHint`] values; they must never be deserialized into
+    /// [`KernelHintReadback`] or [`ChangeHintVerification`].
+    pub fn confirm_kernel_readback(
+        &mut self,
+        transfer: &KernelHintReadback,
+    ) -> Result<ChangeHintConfirmation, ChangeMonitorError> {
+        let hint = ChangeHint {
+            hint_id: transfer.hint_id.clone(),
+            state_fence: transfer.state_fence.clone(),
+            resource_ref: transfer.resource_ref.clone(),
+            path: transfer.path.clone(),
+            origin: transfer.origin,
+            origin_ref: transfer.origin_ref.clone(),
+        };
+        hint.validate()?;
+        // Validate the ORIGINAL through the existing validators; the adapter
+        // adds no parallel shape rules of its own.
+        if let Some(before) = &transfer.before {
+            before.validate()?;
+        }
+        if let Some(after) = &transfer.after {
+            after.validate()?;
+        }
+        // The two independent reads must agree byte-for-byte; a single poll
+        // of one image can never satisfy this comparison.
+        if transfer.first_read != transfer.reread {
+            return Err(ChangeMonitorError::InvalidHintVerification);
+        }
+        let read_state = match &transfer.reread {
+            TransferredContentRead::Present { bytes } => ContentReadState::Present {
+                sha256: sha256_hex(bytes),
+            },
+            TransferredContentRead::Absent => ContentReadState::Absent,
+        };
+        // The after-state must describe exactly the re-read bytes.
+        match (&transfer.after, &read_state) {
+            (Some(after), ContentReadState::Present { sha256 })
+                if after.content_digest.as_deref() == Some(sha256.as_str()) => {}
+            (None, ContentReadState::Absent) => {}
+            _ => return Err(ChangeMonitorError::InvalidHintVerification),
+        }
+        let git = GitChangeEvidence {
+            repository_ref: transfer.git.repository_ref.clone(),
+            head_before: transfer.git.head_before.clone(),
+            head_after: transfer.git.head_after.clone(),
+            status_before_ref: transfer.git.status_before_ref.clone(),
+            status_before_sha256: sha256_hex(&transfer.git.status_before_bytes),
+            status_ref: transfer.git.status_ref.clone(),
+            status_sha256: sha256_hex(&transfer.git.status_bytes),
+            before_resource_revision: transfer
+                .before
+                .as_ref()
+                .map(|before| before.revision.clone()),
+            after_resource_revision: transfer
+                .after
+                .as_ref()
+                .map(|after| after.revision.clone()),
+            diff_ref: transfer.git.diff_ref.clone(),
+            changed_paths: transfer.git.changed_paths.clone(),
+            renames: transfer.git.renames.clone(),
+        };
+        let verification = ChangeHintVerification {
+            before: transfer.before.clone(),
+            after: transfer.after.clone(),
+            first_read_path: transfer.path.clone(),
+            first_read: read_state.clone(),
+            first_read_ref: transfer.first_read_ref.clone(),
+            reread_path: transfer.path.clone(),
+            reread: read_state,
+            reread_ref: transfer.reread_ref.clone(),
+            git,
+        };
+        // Admit the hint before confirming so a failed confirmation leaves a
+        // pending hint behind: unconfirmed Material mutation stays blocking.
+        self.ingest_hint(hint)?;
+        self.confirm_hint_with_readback(&transfer.hint_id, &verification)
     }
 
     fn confirm_hint_inner(
