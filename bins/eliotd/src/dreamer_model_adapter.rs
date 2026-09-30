@@ -1595,6 +1595,9 @@ mod tests {
 
     use crate::capability_admission::CapabilityEvidenceStatus;
     use crate::capability_outcome::DegradationScope;
+    // #1816: `test_declared_route` names a declared execution identity, so the
+    // test module needs the same type the record itself holds.
+    use crate::route_execution_identity::ExecutionIdentity;
     use eliot_agent_api::{
         AgentLaunchRequest, AgentWorkUnitBrief, AttemptId, BudgetEnvelope, CONTRACT_VERSION,
         DecisionId, EffectCeiling, EffectKind, EventCursor, ExecutionOutcome, LaunchRequestId,
