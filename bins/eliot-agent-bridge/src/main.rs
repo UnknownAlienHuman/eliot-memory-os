@@ -296,11 +296,17 @@ enum Response {
         host_request_port: &'static str,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         kernel_binding_failure: Option<PortFailure>,
-        /// The activation owner's bounded cold-start question, retained from
-        /// the authenticated attach and shown only while the live Kernel
-        /// binding probe succeeds. This does not claim terminal readiness.
+        /// The activation owner's bounded scanner question, retained from the
+        /// authenticated attach and shown only while the live Kernel binding
+        /// is current and no durable terminal readiness receipt supersedes it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cold_start_question: Option<eliot_protocol::AgentActivationColdStartQuestion>,
+        /// Live durable readiness read for this authenticated activation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        readiness_status: Option<eliot_protocol::AgentBridgeReadinessStatus>,
+        /// Read failure is distinct from an unclaimed readiness record.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        readiness_status_failure: Option<PortFailure>,
         observation_forwarding_port: &'static str,
         recovery: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -324,6 +330,12 @@ enum Response {
         authority_epoch: EpochId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cold_start_question: Option<eliot_protocol::AgentActivationColdStartQuestion>,
+        /// Live durable readiness read for this authenticated activation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        readiness_status: Option<eliot_protocol::AgentBridgeReadinessStatus>,
+        /// Read failure is distinct from an unclaimed readiness record.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        readiness_status_failure: Option<PortFailure>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bootstrap: Option<UnderstandingBootstrap>,
     },
@@ -2165,16 +2177,41 @@ fn handle_reconnect(
             ),
         };
     }
+    let readiness_status = client.read_cold_start_readiness_status();
     match runner.reconnect(request) {
-        Ok(view) => Response::Reconnected {
-            previous_connection_id: expected_connection_id.as_str().to_owned(),
-            connection_id: view.binding().connection_id().as_str().to_owned(),
-            session_id: view.binding().session_id().as_str().to_owned(),
-            activation_generation: view.binding().activation_generation().get(),
-            authority_epoch: view.binding().state_fence().authority_epoch().clone(),
-            cold_start_question: view.cold_start_question().cloned(),
-            bootstrap: None,
-        },
+        Ok(view) => {
+            let retained_scanner_question = view.cold_start_question().cloned();
+            let (readiness_status, readiness_status_failure) = match readiness_status.and_then(
+                |status| {
+                    readiness_status_with_scanner_question(
+                        status,
+                        retained_scanner_question.as_ref(),
+                    )
+                },
+            ) {
+                Ok(status) => (Some(status), None),
+                Err(error) => (None, Some(error)),
+            };
+            let cold_start_question = if readiness_status
+                .as_ref()
+                .is_some_and(|status| status.readiness.is_some())
+            {
+                None
+            } else {
+                retained_scanner_question
+            };
+            Response::Reconnected {
+                previous_connection_id: expected_connection_id.as_str().to_owned(),
+                connection_id: view.binding().connection_id().as_str().to_owned(),
+                session_id: view.binding().session_id().as_str().to_owned(),
+                activation_generation: view.binding().activation_generation().get(),
+                authority_epoch: view.binding().state_fence().authority_epoch().clone(),
+                cold_start_question,
+                readiness_status,
+                readiness_status_failure,
+                bootstrap: None,
+            }
+        }
         Err(BridgeError::StaleAuthority) => Response::Error {
             code: "RECONNECT_STALE_AUTHORITY",
             detail: format!(
@@ -2342,6 +2379,7 @@ fn status_response(
     runner: &BridgeRunner,
     client: Option<&mut KernelHostRequestClient>,
 ) -> Response {
+    let mut client = client;
     match runner.attach_view() {
         None => Response::Status {
             profile: Profile::as_str(profile),
@@ -2356,6 +2394,8 @@ fn status_response(
             host_request_port: "no-session: attach and activate before host-request dispatch",
             kernel_binding_failure: None,
             cold_start_question: None,
+            readiness_status: None,
+            readiness_status_failure: None,
             observation_forwarding_port: "unavailable: attach and activate before forwarding coverage gaps",
             recovery: "attach and activate before host requests; attached Status and reconnect probe the live Kernel binding; a replacement connection requires a new admission".to_owned(),
             reactive: None,
@@ -2363,7 +2403,7 @@ fn status_response(
             resources: None,
         },
         Some(view) => {
-            let probe = match client {
+            let probe = match client.as_deref_mut() {
                 Some(client) => client.check_kernel_binding(),
                 None => Err(PortFailure::TransportBindingRejected {
                     reason: "Kernel status client is unavailable".to_owned(),
@@ -2392,10 +2432,45 @@ fn status_response(
                     "degraded: live Kernel binding could not be confirmed; forwarding availability is unknown",
                 ),
             };
-            let cold_start_question = if kernel_binding_failure.is_none() {
+            let retained_scanner_question = if kernel_binding_failure.is_none() {
                 view.cold_start_question().cloned()
             } else {
                 None
+            };
+            let (readiness_status, readiness_status_failure) =
+                if kernel_binding_failure.is_none() {
+                    match client.as_deref_mut() {
+                        Some(client) => match client
+                            .read_cold_start_readiness_status()
+                            .and_then(|status| {
+                                readiness_status_with_scanner_question(
+                                    status,
+                                    retained_scanner_question.as_ref(),
+                                )
+                            })
+                        {
+                            Ok(status) => (Some(status), None),
+                            Err(error) => (None, Some(error)),
+                        },
+                        None => (
+                            None,
+                            Some(PortFailure::TransportBindingRejected {
+                                reason: "Kernel readiness status client is unavailable".to_owned(),
+                            }),
+                        ),
+                    }
+                } else {
+                    // The binding probe's typed failure already explains why
+                    // no readiness request was made on this stale session.
+                    (None, None)
+                };
+            let cold_start_question = if readiness_status
+                .as_ref()
+                .is_some_and(|status| status.readiness.is_some())
+            {
+                None
+            } else {
+                retained_scanner_question
             };
             Response::Status {
                 profile: Profile::as_str(profile),
@@ -2410,6 +2485,8 @@ fn status_response(
                 host_request_port,
                 kernel_binding_failure,
                 cold_start_question,
+                readiness_status,
+                readiness_status_failure,
                 observation_forwarding_port,
                 recovery,
                 reactive: Some(reactive_status_view(runner)),
@@ -2418,6 +2495,27 @@ fn status_response(
             }
         }
     }
+}
+
+/// Joins the retained scanner question only while no durable terminal receipt
+/// supplies the current missing question. The scanner value is owner-derived
+/// at activation and never creates a readiness lifecycle.
+fn readiness_status_with_scanner_question(
+    mut status: eliot_protocol::AgentBridgeReadinessStatus,
+    question: Option<&eliot_protocol::AgentActivationColdStartQuestion>,
+) -> Result<eliot_protocol::AgentBridgeReadinessStatus, PortFailure> {
+    if status.readiness.is_none() && status.smallest_missing_question.is_none() {
+        status.smallest_missing_question =
+            question.map(|question| question.discriminative_question.clone());
+    }
+    status
+        .validate()
+        .map_err(|_| PortFailure::TransportBindingRejected {
+            reason:
+                "readiness status and retained scanner question did not form a valid projection"
+                    .to_owned(),
+        })?;
+    Ok(status)
 }
 
 /// Projects the bounded reactive delivery-record summary for Status.

@@ -11,8 +11,10 @@
 //! envelopes ride `Request`/`Execute` frames whose payload selects the closed kernel entry
 //! (`agent_host_request_submit`, `agent_host_request_cancel`,
 //! `agent_host_request_reconcile`, or `agent_host_request_rehydrate`). Live binding status uses
-//! the existing `Heartbeat`/`Health` frame. Host-request replies are decoded with the same
-//! connection/digest/fence joins as the activation path.
+//! the existing `Heartbeat`/`Health` frame; the durable readiness projection uses a separate
+//! fixed `agent_bridge_readiness_status` selector with no ticket or record selectors.
+//! Host-request replies are decoded with the same connection/digest/fence joins as the activation
+//! path.
 //!
 //! Ownership: this module is the sole owner of the invocation/cancellation/reconciliation/
 //! rehydration envelope builders, the envelope frame builder, the admitted-reply decoder
@@ -22,6 +24,7 @@
 //! kernel admission/dispatch, gateway validation/correlation, and any durable ledger.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use eliot_contracts::{
@@ -36,10 +39,12 @@ use eliot_mcp::{
     ToolRequest,
 };
 use eliot_protocol::{
+    AGENT_BRIDGE_READINESS_STATUS_OPERATION, AgentBridgeReadinessStatus,
     AgentHostRequestFailure, EncodingProfile, FINISH_INVOKE_PAYLOAD_SCHEMA_ID, Frame, FrameKind,
-    HARD_STRUCTURED_RESPONSE_BYTES, HOST_REQUEST_RESULT_BODY_WIRE_ID, HOST_REQUEST_WIRE_ID,
-    HostRequestAdmissionReceipt, HostRequestEnvelope, HostRequestIdentity, HostRequestKind,
-    HostRequestResultBody, HostRequestResultClass, MessageType, ProtocolPayload, ProtocolVersion,
+    HARD_STRUCTURED_RESPONSE_BYTES,
+    HOST_REQUEST_RESULT_BODY_WIRE_ID, HOST_REQUEST_WIRE_ID, HostRequestAdmissionReceipt,
+    HostRequestEnvelope, HostRequestIdentity, HostRequestKind, HostRequestResultBody,
+    HostRequestResultClass, MessageType, ProtocolPayload, ProtocolVersion,
     REACTIVE_RESTORE_CAPABILITY, REACTIVE_RESTORE_OPERATION, REACTIVE_RESTORE_PAYLOAD_SCHEMA_ID,
     ReactiveRestoreQuery, ReactiveRestoreReply, RequestIdentity, host_request_operation_id,
     restore_correlation,
@@ -135,6 +140,7 @@ const HOST_REQUEST_PAYLOAD_SCHEMA_ID: &str = "eliot.mcp.tool-request.v1";
 /// the submitted value, so Kernel-issued absolute-deadline ownership stays
 /// open contract work under issue #77 (`wave_1_kernel_contract`).
 const DEFAULT_DEADLINE_PREFERENCE_MS: u64 = 60_000;
+static READINESS_STATUS_REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 /// Gateway-side face of the single retained transport owner.
 ///
@@ -1591,6 +1597,100 @@ fn kernel_health_probe_frame(facts: &TransportFacts) -> Result<Frame, PortFailur
     };
     frame.validate().map_err(|_| request_failure())?;
     Ok(frame)
+}
+
+/// Builds one live, read-only Bridge readiness request. Its payload is only
+/// the stable operation selector; the activation ticket and fence stay in the
+/// retained Kernel session and are never request selectors.
+fn agent_bridge_readiness_status_frame(facts: &TransportFacts) -> Result<Frame, PortFailure> {
+    if facts.session.is_none() {
+        return Err(plan_gap_no_session());
+    }
+    let now = unix_ms()?;
+    let deadline_unix_ms = now.saturating_add(DEFAULT_DEADLINE_PREFERENCE_MS);
+    if deadline_unix_ms == 0 {
+        return Err(request_failure());
+    }
+    let sequence = READINESS_STATUS_REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let request_label = format!("agent-bridge-readiness-status:{now}:{sequence}");
+    let request_id = RequestId::new(&request_label).map_err(|_| request_failure())?;
+    let state_fence = facts.state_fence.clone();
+    let metadata = RequestMetadata {
+        request_id: request_id.clone(),
+        session_id: None,
+        task_id: None,
+        product_id: ProductId::new("eliot-agent-bridge").map_err(|_| request_failure())?,
+        source_id: SourceId::new("agent-bridge").map_err(|_| request_failure())?,
+        state_fence: state_fence.clone(),
+        clock: ClockReading {
+            valid_time_ms: None,
+            known_time_ms: None,
+            transaction_sequence: None,
+            monotonic_ns: None,
+        },
+    };
+    let identity = RequestIdentity {
+        request: RequestBinding {
+            metadata,
+            state_fence,
+        },
+        idempotency_key: request_label.clone(),
+        deadline_unix_ms,
+        cancellation_id: format!("{request_label}:cancel"),
+    };
+    identity.validate().map_err(|_| request_failure())?;
+    let frame = Frame {
+        protocol_version: ProtocolVersion::CURRENT,
+        encoding_profile: EncodingProfile::JsonV1,
+        connection_id: facts.connection_id.clone(),
+        request_id: Some(request_id),
+        kind: FrameKind::Request,
+        message_type: MessageType::Execute,
+        request_identity: Some(identity),
+        payload: ProtocolPayload::Json(serde_json::json!({
+            "operation": AGENT_BRIDGE_READINESS_STATUS_OPERATION,
+        })),
+        trace_context: BTreeMap::new(),
+    };
+    frame.validate().map_err(|_| request_failure())?;
+    Ok(frame)
+}
+
+/// Decodes only the correlated Kernel projection for the exact live status
+/// request. Malformed or mismatched data is an unknown status, never an
+/// unclaimed owner result.
+fn decode_agent_bridge_readiness_status_reply(
+    reply: &Frame,
+    request: &Frame,
+    facts: &TransportFacts,
+) -> Option<AgentBridgeReadinessStatus> {
+    request.validate().ok()?;
+    reply.validate().ok()?;
+    if request.protocol_version != ProtocolVersion::CURRENT
+        || request.encoding_profile != EncodingProfile::JsonV1
+        || request.connection_id != facts.connection_id
+        || request.kind != FrameKind::Request
+        || request.message_type != MessageType::Execute
+        || request.request_id.is_none()
+        || request.request_identity.is_none()
+        || !request.trace_context.is_empty()
+        || reply.protocol_version != request.protocol_version
+        || reply.encoding_profile != request.encoding_profile
+        || reply.connection_id != request.connection_id
+        || reply.kind != FrameKind::Response
+        || reply.message_type != MessageType::Result
+        || reply.request_id != request.request_id
+        || reply.request_identity.is_some()
+        || !reply.trace_context.is_empty()
+    {
+        return None;
+    }
+    let ProtocolPayload::Json(payload) = &reply.payload else {
+        return None;
+    };
+    let status: AgentBridgeReadinessStatus = serde_json::from_value(payload.clone()).ok()?;
+    status.validate().ok()?;
+    Some(status)
 }
 
 /// Accepts only the uncorrelated Heartbeat/Health reply shape emitted by the
@@ -3439,6 +3539,33 @@ impl KernelHostRequestClient {
             }
         })?;
         Ok(())
+    }
+
+    /// Reads the current activation's durable cold-start readiness projection
+    /// over the retained admitted Kernel transport. The Kernel derives the
+    /// activation ticket from its authenticated Bridge Session; this request
+    /// carries no ticket, record key, or digest selector.
+    pub fn read_cold_start_readiness_status(
+        &mut self,
+    ) -> Result<AgentBridgeReadinessStatus, PortFailure> {
+        let facts = self
+            .shared
+            .try_borrow()
+            .map_err(|_| request_failure())?
+            .snapshot();
+        let frame = agent_bridge_readiness_status_frame(&facts)?;
+        let reply = self.exchange(&frame).map_err(|_| {
+            PortFailure::TransportBindingRejected {
+                reason: "live Kernel readiness status read failed over the admitted transport"
+                    .to_owned(),
+            }
+        })?;
+        decode_agent_bridge_readiness_status_reply(&reply, &frame, &facts).ok_or_else(|| {
+            PortFailure::TransportBindingRejected {
+                reason: "Kernel readiness status reply did not match the live request or its typed owner projection"
+                    .to_owned(),
+            }
+        })
     }
 
     /// Asks the kernel preview entry to validate one invocation dry run

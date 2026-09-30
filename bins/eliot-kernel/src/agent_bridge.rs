@@ -40,10 +40,143 @@ use eliot_protocol::{
 /// activation binding, never from the request payload.
 pub(crate) struct ActiveAgentBridgeReadBinding {
     pub ticket_id: String,
-    pub session_id: String,
-    pub descriptor_sha256: String,
-    pub peer_admission_receipt_sha256: String,
     pub state_fence: eliot_contracts::StateFence,
+}
+
+#[cfg(windows)]
+fn readiness_lifecycle_from_receipt(
+    receipt: &serde_json::Value,
+) -> Result<eliot_protocol::AgentBridgeReadinessLifecycle, TransportError> {
+    use eliot_protocol::AgentBridgeReadinessLifecycle as Lifecycle;
+
+    match receipt
+        .get("readiness")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("UNSEEN") => Ok(Lifecycle::Unseen),
+        Some("SCANNING") => Ok(Lifecycle::Scanning),
+        Some("NEEDS_SCOPE") => Ok(Lifecycle::NeedsScope),
+        Some("NEEDS_TASK") => Ok(Lifecycle::NeedsTask),
+        Some("NEEDS_SOURCES") => Ok(Lifecycle::NeedsSources),
+        Some("READY_READ_ONLY") => Ok(Lifecycle::ReadyReadOnly),
+        Some("READY_MATERIAL") => Ok(Lifecycle::ReadyMaterial),
+        Some("DEGRADED") => Ok(Lifecycle::Degraded),
+        Some("CONFLICTED") => Ok(Lifecycle::Conflicted),
+        _ => Err(TransportError::SessionFenced),
+    }
+}
+
+#[cfg(windows)]
+fn smallest_missing_question_from_receipt(
+    receipt: &serde_json::Value,
+    readiness: eliot_protocol::AgentBridgeReadinessLifecycle,
+) -> Result<Option<String>, TransportError> {
+    use eliot_protocol::AgentBridgeReadinessLifecycle as Lifecycle;
+
+    let missing_inputs = receipt
+        .get("missing_inputs")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(TransportError::SessionFenced)?;
+    if let Some(first) = missing_inputs.first() {
+        return first
+            .as_str()
+            .map(|value| Some(value.to_owned()))
+            .ok_or(TransportError::SessionFenced);
+    }
+
+    let question = match readiness {
+        Lifecycle::NeedsScope => Some("scope_disambiguation"),
+        Lifecycle::NeedsTask => {
+            let disposition = receipt
+                .get("task_binding")
+                .and_then(|binding| binding.get("disposition"))
+                .and_then(serde_json::Value::as_str)
+                .ok_or(TransportError::SessionFenced)?;
+            Some(match disposition {
+                "ambiguous" => "task_disambiguation",
+                "stale" => "task_refresh",
+                "none" | "exploratory" | "current_task_contract" => "task_ref",
+                _ => return Err(TransportError::SessionFenced),
+            })
+        }
+        Lifecycle::NeedsSources => Some("governing_sources"),
+        Lifecycle::Unseen | Lifecycle::Scanning | Lifecycle::Degraded | Lifecycle::Conflicted => {
+            Some("readiness_retry")
+        }
+        Lifecycle::ReadyReadOnly | Lifecycle::ReadyMaterial => None,
+    };
+    Ok(question.map(str::to_owned))
+}
+
+#[cfg(windows)]
+fn readiness_status_for_activation(
+    record: Option<eliot_ors::ColdStartReadinessOrsRecord>,
+    now: u64,
+) -> Result<eliot_protocol::AgentBridgeReadinessStatus, TransportError> {
+    use eliot_protocol::{
+        AGENT_BRIDGE_READINESS_STATUS_WIRE_ID, AgentBridgeReadinessOwnerState as OwnerState,
+        AgentBridgeReadinessStatus,
+    };
+
+    let status = match record {
+        None => AgentBridgeReadinessStatus {
+            wire_id: AGENT_BRIDGE_READINESS_STATUS_WIRE_ID.to_owned(),
+            wire_version: AgentBridgeReadinessStatus::CONTRACT_VERSION,
+            owner_state: OwnerState::Unclaimed,
+            record_revision: None,
+            readiness: None,
+            smallest_missing_question: None,
+            lease_ref: None,
+            lease_deadline: None,
+            receipt_ref: None,
+            next_safe_action: None,
+        },
+        Some(record) => {
+            record.validate().map_err(|_| TransportError::SessionFenced)?;
+            let expired = now > record.claim.lease_deadline;
+            let (readiness, smallest_missing_question, receipt_ref, next_safe_action) =
+                if let Some(terminal) = &record.terminal {
+                    let receipt: serde_json::Value = serde_json::from_str(&terminal.receipt_bytes)
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    let readiness = readiness_lifecycle_from_receipt(&receipt)?;
+                    let smallest_missing_question =
+                        smallest_missing_question_from_receipt(&receipt, readiness)?;
+                    let next_safe_action = receipt
+                        .get("next_safe_action")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                        .ok_or(TransportError::SessionFenced)?;
+                    (
+                        Some(readiness),
+                        smallest_missing_question,
+                        Some(terminal.receipt_ref.clone()),
+                        Some(next_safe_action),
+                    )
+                } else {
+                    (None, None, None, None)
+                };
+            AgentBridgeReadinessStatus {
+                wire_id: AGENT_BRIDGE_READINESS_STATUS_WIRE_ID.to_owned(),
+                wire_version: AgentBridgeReadinessStatus::CONTRACT_VERSION,
+                owner_state: if expired {
+                    OwnerState::Expired
+                } else if readiness.is_some() {
+                    OwnerState::Terminal
+                } else {
+                    OwnerState::Claimed
+                },
+                record_revision: Some(record.record_revision),
+                readiness,
+                smallest_missing_question,
+                lease_ref: Some(record.claim.lease_ref),
+                lease_deadline: Some(record.claim.lease_deadline),
+                receipt_ref,
+                next_safe_action,
+            }
+        }
+    };
+    status.validate().map_err(|_| TransportError::SessionFenced)?;
+    Ok(status)
 }
 
 fn canonical_activation_denial(
@@ -1847,6 +1980,8 @@ impl KernelComposition {
             || receipt.state_fence != session.module_generation.state_fence
             || receipt.descriptor_sha256.trim().is_empty()
             || binding.activation_ticket_id.trim().is_empty()
+            || binding.activation_ticket_sha256.trim().is_empty()
+            || binding.peer_admission_receipt_sha256 != receipt.receipt_sha256
             || binding.session_id != binding.resolved_binding.session_id
             || binding.authority_epoch != receipt.state_fence.authority_epoch
             || binding.activation_generation != receipt.state_fence.resource_generation
@@ -1855,11 +1990,39 @@ impl KernelComposition {
         }
         Ok(ActiveAgentBridgeReadBinding {
             ticket_id: binding.activation_ticket_id.clone(),
-            session_id: binding.session_id.clone(),
-            descriptor_sha256: receipt.descriptor_sha256.clone(),
-            peer_admission_receipt_sha256: receipt.receipt_sha256.clone(),
             state_fence: receipt.state_fence.clone(),
         })
+    }
+
+    /// Returns durable readiness only for the activation retained by this
+    /// authenticated Bridge Session. The request body is a fixed selector and
+    /// cannot choose a ticket, workspace, record key, or digest.
+    #[cfg(windows)]
+    pub(crate) fn agent_bridge_readiness_status_operation(
+        &self,
+        session: &Session,
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let _transition = self.agent_bridge_transition_read()?;
+        let expected = serde_json::json!({
+            "operation": eliot_protocol::AGENT_BRIDGE_READINESS_STATUS_OPERATION,
+        });
+        if payload != &expected {
+            return Err(TransportError::SessionFenced);
+        }
+        let binding = self.current_agent_bridge_read_binding(session)?;
+        let record = self
+            .p07_ors
+            .load_cold_start_readiness_for_activation(&binding.ticket_id, &binding.state_fence)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| TransportError::SessionFenced)?
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        let status = readiness_status_for_activation(record, now)?;
+        serde_json::to_value(status).map_err(|_| TransportError::SessionFenced)
     }
 
     fn resolved_result_response_frame(

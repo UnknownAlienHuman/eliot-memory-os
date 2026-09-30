@@ -2719,6 +2719,22 @@ impl KernelComposition {
         self.require_current_daemon_session(session)?;
         let result = match operation {
             #[cfg(windows)]
+            eliot_protocol::AGENT_BRIDGE_READINESS_STATUS_OPERATION => {
+                let identity = request_identity.ok_or(TransportError::SessionFenced)?;
+                identity
+                    .validate()
+                    .map_err(|_| TransportError::SessionFenced)?;
+                if identity.request.metadata.request_id != request_id
+                    || identity.request.state_fence != session.module_generation.state_fence
+                {
+                    Err(TransportError::SessionFenced)
+                } else if super::unix_ms() >= identity.deadline_unix_ms {
+                    Err(TransportError::Timeout)
+                } else {
+                    self.agent_bridge_readiness_status_operation(session, payload)
+                }
+            }
+            #[cfg(windows)]
             scan_disclosure_route::OPERATION => {
                 self.scan_disclosure_owner_operation(session, payload)
             }
