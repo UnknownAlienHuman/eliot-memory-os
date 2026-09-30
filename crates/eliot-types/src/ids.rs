@@ -91,7 +91,9 @@ id_type!(EvalFailureClusterId);
 id_type!(BenchmarkIntegrityReceiptId);
 id_type!(HarnessExperimentRecordId);
 
-#[derive(Clone, Copy, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(transparent)]
 pub struct MemoryRevision(u64);
 

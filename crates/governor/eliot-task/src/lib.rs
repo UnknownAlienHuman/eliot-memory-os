@@ -41,7 +41,7 @@ fn text(value: &str, field: &'static str) -> Result<(), TaskError> {
 }
 
 fn validate_active_decision_state(decision: &ActiveDecisionState) -> Result<(), TaskError> {
-    text(decision.task_id.as_str(), "active_decision.task_id")?;
+    text(&decision.task_id.to_string(), "active_decision.task_id")?;
     text(&decision.packet_id, "active_decision.packet_id")?;
     text(
         &decision.next_allowed_action,
@@ -272,9 +272,7 @@ impl TaskCommand {
             Self::RecordProfessionalCompletionEvidence { evidence } => {
                 text(&evidence.artifact_manifest.manifest_ref, "manifest_ref")
             }
-            Self::SetActiveDecisionState { decision } => {
-                validate_active_decision_state(decision)
-            }
+            Self::SetActiveDecisionState { decision } => validate_active_decision_state(decision),
             Self::Open
             | Self::RequireUnderstanding
             | Self::BeginExecution
@@ -657,11 +655,13 @@ impl TaskLifecycleOwner {
         {
             state.require_evaluator_result()?;
         }
-        if matches!(command, TaskCommand::Block { .. } | TaskCommand::Fail { .. })
-            && self
-                .professional_execution
-                .get(task_id)
-                .is_some_and(|state| !state.latest_attempt_stopped_with_signal())
+        if matches!(
+            command,
+            TaskCommand::Block { .. } | TaskCommand::Fail { .. }
+        ) && self
+            .professional_execution
+            .get(task_id)
+            .is_some_and(|state| !state.latest_attempt_stopped_with_signal())
         {
             return Err(TaskError::MissingEvidence {
                 field: "premature_abandonment_signal",
@@ -787,7 +787,7 @@ fn validate_active_decision_revision(
             field: "active_decision_task_revision",
         });
     };
-    if decision.task_id.as_str() != task_id.as_str()
+    if decision.task_id.to_string() != task_id.as_str()
         || decision.revision_fence.value() != task_revision.value()
         || decision.revision_fence.value() != current_revision
     {
@@ -803,7 +803,7 @@ fn retained_active_decisions(
     for event in events {
         if let Some(TaskCommand::SetActiveDecisionState { decision }) = &event.command {
             validate_active_decision_state(decision)?;
-            if decision.task_id.as_str() != event.task_id.as_str() {
+            if decision.task_id.to_string() != event.task_id.as_str() {
                 return Err(TaskError::InvalidField("active_decision_task_id"));
             }
             let Some(task_revision) = event.state_fence.task_revision.as_ref() else {

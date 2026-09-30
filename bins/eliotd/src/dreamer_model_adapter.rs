@@ -75,10 +75,10 @@ use eliot_agent_coordinator::{
     ModelRole, PlanGap, StaffingPlanCandidate, StaffingPlanRequest,
 };
 use eliot_agent_opencode::{OpenCodeClient, OpenCodeRouteAdmission};
-use eliot_read::LocalReadPort;
 use eliot_contracts::{ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence};
 use eliot_governor::{CompositionError, CompositionReadiness, RouteScopeFingerprint};
 use eliot_protocol::ContinuityKind;
+use eliot_read::LocalReadPort;
 use serde::Deserialize;
 
 use super::capability_admission::{

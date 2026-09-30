@@ -55,6 +55,7 @@ pub use context_inputs::{
 pub use cue_composition::{
     CueCacheKey, CueCompositionError, CueReconstruction, CueReconstructionCache,
     MAX_CACHED_CUE_RECONSTRUCTIONS, evidence_projection_payload, reconstruct_cue_snapshot,
+    reconstruct_cue_snapshot_for_request,
 };
 pub use epistemic_composition::{GovernorEpistemicComposition, ObservedEpistemicProposal};
 pub use epistemic_orientation_read::{EpistemicOrientationRead, EpistemicOrientationReadError};

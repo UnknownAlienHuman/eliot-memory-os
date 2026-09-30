@@ -458,7 +458,7 @@ fn dispatch_orientation(
     };
     let observation_time_ms = match ready_owner_time(&joined) {
         Ok(time) => time,
-        Err(result) => return Ok(result),
+        Err(result) => return Ok(*result),
     };
     let candidate = match validate_owner_candidate(&joined, observation_time_ms)? {
         Ok(candidate) => candidate,
@@ -489,44 +489,101 @@ struct JoinedOrientation<'a> {
 }
 
 impl JoinedOrientation<'_> {
-    fn terminal(&self, disposition: eliot_dreamer_orientation::OrientationDisposition, reason: &'static str) -> DreamResult {
-        orientation_owner_terminal(&self.admitted_job, &self.original_receipt_digest, &self.bundle, &self.policy, &self.owner, disposition, reason)
+    fn terminal(
+        &self,
+        disposition: eliot_dreamer_orientation::OrientationDisposition,
+        reason: &'static str,
+    ) -> DreamResult {
+        orientation_owner_terminal(
+            &self.admitted_job,
+            &self.original_receipt_digest,
+            &self.bundle,
+            &self.policy,
+            &self.owner,
+            disposition,
+            reason,
+        )
     }
 
     fn blocked(&self, reason: &'static str) -> DreamResult {
-        orientation_owner_blocked(&self.admitted_job, &self.original_receipt_digest, &self.bundle, &self.policy, &self.owner, reason)
+        orientation_owner_blocked(
+            &self.admitted_job,
+            &self.original_receipt_digest,
+            &self.bundle,
+            &self.policy,
+            &self.owner,
+            reason,
+        )
     }
 }
 
 /// Validates owner time and the original admitted model boundaries before candidate use.
-fn ready_owner_time(joined: &JoinedOrientation<'_>) -> Result<u64, DreamResult> {
+fn ready_owner_time(joined: &JoinedOrientation<'_>) -> Result<u64, Box<DreamResult>> {
     use eliot_dreamer_orientation::OrientationDisposition;
     let owner = &joined.owner;
     if owner.cancelled {
-        return Err(joined.terminal(OrientationDisposition::Cancelled, "pulse cancelled"));
+        return Err(Box::new(
+            joined.terminal(OrientationDisposition::Cancelled, "pulse cancelled"),
+        ));
     }
-    let Some(now) = SystemTime::now().duration_since(UNIX_EPOCH).ok().and_then(|duration| u64::try_from(duration.as_millis()).ok()) else {
-        return Err(joined.terminal(OrientationDisposition::RevalidationRequired, "candidate validation clock unavailable"));
+    let Some(now) = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+    else {
+        return Err(Box::new(joined.terminal(
+            OrientationDisposition::RevalidationRequired,
+            "candidate validation clock unavailable",
+        )));
     };
     if owner.deadline_unix_ms <= now {
-        return Err(joined.terminal(OrientationDisposition::RevalidationRequired, "pulse deadline exceeded"));
+        return Err(Box::new(joined.terminal(
+            OrientationDisposition::RevalidationRequired,
+            "pulse deadline exceeded",
+        )));
     }
     if owner.model_request.job_id != joined.admitted_job.job.canonical_id()
         || owner.model_request.privacy.as_str() != joined.admitted_job.job.privacy_profile
-        || owner.model_request.validate_binds_bundle(&joined.bundle).is_err() {
-        return Err(joined.blocked("model request binding"));
+        || owner
+            .model_request
+            .validate_binds_bundle(&joined.bundle)
+            .is_err()
+    {
+        return Err(Box::new(joined.blocked("model request binding")));
     }
-    if owner.model_outcome.validate_binding(owner.model_request).is_err() {
-        return Err(joined.blocked(crate::production_orientation::MODEL_OUTCOME_MALFORMED));
+    if owner
+        .model_outcome
+        .validate_binding(owner.model_request)
+        .is_err()
+    {
+        return Err(Box::new(
+            joined.blocked(crate::production_orientation::MODEL_OUTCOME_MALFORMED),
+        ));
     }
     match owner.model_outcome.disposition {
-        ModelRouteDisposition::Completed | ModelRouteDisposition::Partial => {},
-        ModelRouteDisposition::Malformed => return Err(joined.blocked(crate::production_orientation::MODEL_OUTCOME_MALFORMED)),
-        ModelRouteDisposition::Cancelled => return Err(joined.terminal(OrientationDisposition::Cancelled, crate::production_orientation::MODEL_OUTCOME_CANCELLED)),
-        ModelRouteDisposition::Timeout => return Err(joined.terminal(OrientationDisposition::RevalidationRequired, crate::production_orientation::MODEL_OUTCOME_TIMEOUT)),
+        ModelRouteDisposition::Completed | ModelRouteDisposition::Partial => {}
+        ModelRouteDisposition::Malformed => {
+            return Err(Box::new(
+                joined.blocked(crate::production_orientation::MODEL_OUTCOME_MALFORMED),
+            ));
+        }
+        ModelRouteDisposition::Cancelled => {
+            return Err(Box::new(joined.terminal(
+                OrientationDisposition::Cancelled,
+                crate::production_orientation::MODEL_OUTCOME_CANCELLED,
+            )));
+        }
+        ModelRouteDisposition::Timeout => {
+            return Err(Box::new(joined.terminal(
+                OrientationDisposition::RevalidationRequired,
+                crate::production_orientation::MODEL_OUTCOME_TIMEOUT,
+            )));
+        }
     }
     if owner.model_outcome.draft.is_none() {
-        return Err(joined.blocked(crate::production_orientation::MODEL_OUTCOME_MALFORMED));
+        return Err(Box::new(
+            joined.blocked(crate::production_orientation::MODEL_OUTCOME_MALFORMED),
+        ));
     }
     Ok(now)
 }
@@ -550,21 +607,23 @@ fn validate_owner_candidate(
     usage.wall_ms = owner.model_outcome.receipt.wall_ms;
     let validation_policy = validation_policy_of(joined.admitted_job.job.policy_ref.as_str())?;
     let preservation = preservation_of()?;
-    Ok(match validate_grounded_dream_draft_at(
-        &joined.admitted_job.job,
-        &joined.bundle,
-        model,
-        &grounded,
-        &validation_policy,
-        &usage,
-        &preservation,
-        Some(observation_time_ms),
-        false,
-    ) {
-        Ok(CandidateValidationOutcome::Accepted(candidate)) => Ok(*candidate),
-        Ok(CandidateValidationOutcome::Rejected(_)) => Err("owner model candidate rejected"),
-        Err(_) => Err("owner model candidate validation refused"),
-    })
+    Ok(
+        match validate_grounded_dream_draft_at(
+            &joined.admitted_job.job,
+            &joined.bundle,
+            model,
+            &grounded,
+            &validation_policy,
+            &usage,
+            &preservation,
+            Some(observation_time_ms),
+            false,
+        ) {
+            Ok(CandidateValidationOutcome::Accepted(candidate)) => Ok(*candidate),
+            Ok(CandidateValidationOutcome::Rejected(_)) => Err("owner model candidate rejected"),
+            Err(_) => Err("owner model candidate validation refused"),
+        },
+    )
 }
 
 /// Keeps an unusable but present owner outcome in the typed pulse result.

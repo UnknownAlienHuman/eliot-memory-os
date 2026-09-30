@@ -6,9 +6,9 @@ use eliot_agent_coordinator::{
     ModelSelectionReceipt, compile_model_selection,
 };
 use eliot_agent_opencode::{
-    AdmittedOpenCodeAttempt, ModelSelection, ModelSelectionError, OpenCodeClient, OpenCodeRouteAdmission,
-    OpenCodeRouteRole, OpenCodeRouteSelectionError, ReadOnlyRunRequest, RunRequestError,
-    select_opencode_route,
+    AdmittedOpenCodeAttempt, ModelSelection, ModelSelectionError, OpenCodeClient,
+    OpenCodeRouteAdmission, OpenCodeRouteRole, OpenCodeRouteSelectionError, ReadOnlyRunRequest,
+    RunRequestError, select_opencode_route,
 };
 use eliot_contracts::{
     ContractVersion, RequestMetadata, StateFence, canonical_json_bytes, contract_identity,
@@ -23,12 +23,8 @@ use eliot_read::LocalReadPort;
 use eliot_store_api::ScopeId;
 use serde_json::Value;
 
-use super::agent_fabric::{
-    AdmittedOpenCodeAttemptProjectionError, AgentFabric,
-};
-use super::dreamer_materials::{
-    AdmittedSourceClaim, DreamerMaterialsError, resolve_source_claim,
-};
+use super::agent_fabric::{AdmittedOpenCodeAttemptProjectionError, AgentFabric};
+use super::dreamer_materials::{AdmittedSourceClaim, DreamerMaterialsError, resolve_source_claim};
 use super::dreamer_orientation_model::{
     DreamerOrientationModelAttempt, DreamerOrientationModelInput,
     admitted_model_route_context_bytes, run_admitted_model_route,

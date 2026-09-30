@@ -55,10 +55,9 @@ use eliot_dreamer_claim_grounding::GroundingRequest;
 use eliot_dreamer_classification::ClassificationPolicy;
 use eliot_dreamer_conflict_analysis::{ConflictAnalysisPolicy, ConflictSupplements};
 use eliot_dreamer_contracts::{
-    ClassificationInput, CurationAcceptanceCtx, DreamInputBundle, DreamJobAdmission,
-    GroundedDreamDraft, JobClass, ModelRouteDisposition, ModelRouteOutcome, ModelRouteRequest,
-    ValidatedCandidate, ValidatedCurationItem, ValidatedDreamDraft, ValidatedGroundingCandidate,
-    bundle_digest_of,
+    ClassificationInput, CurationAcceptanceCtx, DreamInputBundle, DreamJobAdmission, JobClass,
+    ModelRouteDisposition, ModelRouteOutcome, ModelRouteRequest, ValidatedCandidate,
+    ValidatedCurationItem, ValidatedGroundingCandidate, bundle_digest_of,
 };
 use eliot_dreamer_orientation::{
     AdmittedOrientationJob, CurrentEpistemicPositionHandle, OrientationDisposition,
@@ -142,28 +141,8 @@ pub(crate) struct ProductionOrientationInputs<'a> {
     pub projections: &'a CanonicalProjectionSet,
     /// Governor-resolved epistemic-position handles for the packet.
     pub cep_handles: &'a [CurrentEpistemicPositionHandle],
-    /// Classification stage inputs.
-    pub classification: ClassificationStage<'a>,
-    /// Cue-activation stage inputs.
-    pub cue_activation: CueActivationStage<'a>,
-    /// Epistemic resolution request over admitted records.
-    pub epistemic: &'a PositionRequest,
-    /// Original candidate retained by the Governor readback owner.
-    pub admitted_candidate: &'a EpistemicPositionCandidate,
-    /// Original source observation retained by that same owner.
-    pub source_observation: &'a ObservationRecord,
-    /// Understanding stage inputs with the route measurement.
-    pub understanding: UnderstandingStage<'a, MeasureFn>,
-    /// Claim-grounding request (cloned; the owner takes owned input).
-    pub grounding: &'a GroundingRequest,
-    /// Rival-structuring stage inputs.
-    pub rivals: RivalStage<'a>,
-    /// Conflict-analysis stage inputs.
-    pub conflict: ConflictStage<'a>,
-    /// Discriminative probe-plan parameters.
-    pub probes: ProbePlanParams<'a>,
-    /// Context-candidate stage inputs.
-    pub candidates: CandidateStage<'a>,
+    /// All mandatory native owner inputs, retained under this carrier's exact closure.
+    pub owner_stages: OrientationOwnerInputs<'a>,
     /// Declared shared operation identity.
     pub operation_id: String,
     /// Declared shared task identity.
@@ -230,10 +209,6 @@ pub struct OrientationSupply<'a> {
     pub rival_policy: &'a RivalPolicy,
     /// Validated curation item under conflict analysis.
     pub curation_item: &'a ValidatedCurationItem,
-    /// Validator-bound draft under conflict analysis.
-    pub validated_dream_draft: &'a ValidatedDreamDraft,
-    /// Claim-grounded draft under conflict analysis.
-    pub grounded: &'a GroundedDreamDraft,
     /// Admitted conflict set under analysis.
     pub conflict_set: &'a ConflictSet,
     /// Expected receipts and supplement bounds for conflict analysis.
@@ -365,8 +340,6 @@ pub(crate) fn borrow_governor_supply<'a>(
         },
         conflict: ConflictStage {
             item: supply.curation_item,
-            draft: supply.validated_dream_draft,
-            grounded: supply.grounded,
             conflict_set: supply.conflict_set,
             supplements: supply.supplements,
             policy: supply.conflict_policy,
@@ -440,17 +413,19 @@ pub(crate) fn resolve_production_inputs<'a>(
         model_outcome: owner.model_outcome,
         projections: owner.projections,
         cep_handles: owner.cep_handles,
-        classification: owner.classification,
-        cue_activation: owner.cue_activation,
-        epistemic: owner.epistemic,
-        admitted_candidate: owner.admitted_candidate,
-        source_observation: owner.source_observation,
-        understanding: owner.understanding,
-        grounding: owner.grounding,
-        rivals: owner.rivals,
-        conflict: owner.conflict,
-        probes: owner.probes,
-        candidates: owner.candidates,
+        owner_stages: OrientationOwnerInputs {
+            classification: owner.classification,
+            cue_activation: owner.cue_activation,
+            epistemic: owner.epistemic,
+            admitted_candidate: owner.admitted_candidate,
+            source_observation: owner.source_observation,
+            understanding: owner.understanding,
+            grounding: owner.grounding,
+            rivals: owner.rivals,
+            conflict: owner.conflict,
+            probes: owner.probes,
+            candidates: owner.candidates,
+        },
         operation_id: owner.operation_id,
         task_id: owner.task_id,
         scope_id: owner.scope_id,
@@ -502,21 +477,8 @@ pub(crate) fn compose_production_result(
         model_outcome: present_model_boundary(inputs.model_outcome),
         projections: present_projections_boundary(inputs.projections),
     };
-    let stage_inputs = OrientationOwnerInputs {
-        classification: inputs.classification,
-        cue_activation: inputs.cue_activation,
-        epistemic: inputs.epistemic,
-        admitted_candidate: inputs.admitted_candidate,
-        source_observation: inputs.source_observation,
-        understanding: inputs.understanding,
-        grounding: inputs.grounding,
-        rivals: inputs.rivals,
-        conflict: inputs.conflict,
-        probes: inputs.probes,
-        candidates: inputs.candidates,
-    };
     let stage_run = run_mandatory_stages(
-        &stage_inputs,
+        &inputs.owner_stages,
         model_draft,
         inputs.bundle,
         inputs.model_outcome,
@@ -578,30 +540,24 @@ pub(crate) fn compose_production_result(
             );
         }
     };
-    match packet_stage_record(&packet) {
-        Ok(record) => records.push(record),
-        Err(PulseError::Packet(error)) => {
-            let (disposition, reason) = packet_error_terminal(&error);
-            return refused_stages_blocked(
-                prefix,
-                records,
-                vec![reason.to_owned()],
-                reason,
-                disposition,
-            );
-        }
-        Err(error) => {
-            let (disposition, reason) = pulse_error_terminal(&error);
-            return refused_stages_blocked(
-                prefix,
-                records,
-                vec![reason.to_owned()],
-                reason,
-                disposition,
-            );
-        }
+    if let Err(error) = packet_stage_record(&packet).map(|record| records.push(record)) {
+        let (disposition, reason) = pulse_error_terminal(&error);
+        return refused_stages_blocked(
+            prefix,
+            records,
+            vec![reason.to_owned()],
+            reason,
+            disposition,
+        );
     }
-    finish_projection_result(prefix, inputs.model_outcome, inputs.projections, semantic_job, packet, records)
+    finish_projection_result(
+        prefix,
+        inputs.model_outcome,
+        inputs.projections,
+        semantic_job,
+        &packet,
+        records,
+    )
 }
 
 fn finish_projection_result(
@@ -609,10 +565,10 @@ fn finish_projection_result(
     model_outcome: &ModelRouteOutcome,
     projections: &CanonicalProjectionSet,
     semantic_job: &DreamJobInput,
-    packet: OrientationPacketCandidate,
+    packet: &OrientationPacketCandidate,
     records: Vec<OrientationStageRecord>,
 ) -> OrientationPulseResult {
-    let dream_packet = crate::dispatch_stage::map_orientation_packet(&packet, semantic_job);
+    let dream_packet = crate::dispatch_stage::map_orientation_packet(packet, semantic_job);
     let mut omissions = Vec::new();
     if !CONFLICT_OUTPUT_QUALIFIED {
         omissions.push(CONFLICT_UNQUALIFIED.to_owned());
@@ -848,9 +804,13 @@ fn packet_error_terminal(error: &OrientationError) -> (OrientationDisposition, &
             OrientationDisposition::Unsupported,
             "packet owner received unsupported job class",
         ),
-        OrientationError::Invalid(field) | OrientationError::Encoding(field) => (OrientationDisposition::Invalid, field),
+        OrientationError::Invalid(field) | OrientationError::Encoding(field) => {
+            (OrientationDisposition::Invalid, field)
+        }
         OrientationError::Unsupported(field) => (OrientationDisposition::Unsupported, field),
-        OrientationError::Binding(field) | OrientationError::Bounded(field) => (OrientationDisposition::Bound, field),
+        OrientationError::Binding(field) | OrientationError::Bounded(field) => {
+            (OrientationDisposition::Bound, field)
+        }
         OrientationError::Bound => (OrientationDisposition::Bound, "packet owner bound exceeded"),
         OrientationError::RevalidationRequired => (
             OrientationDisposition::RevalidationRequired,

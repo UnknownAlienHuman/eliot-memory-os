@@ -130,6 +130,10 @@ pub enum DreamerMaterialError {
     SemanticInputUnavailable,
     /// The retained Store owner response carries a malformed semantic input.
     SemanticInputStale,
+    /// Runtime-owner publication metadata was absent on one side of its original byte binding.
+    RuntimeOwnerInputUnavailable,
+    /// Original runtime-owner reference, bytes, or output contract failed its validator.
+    RuntimeOwnerInputStale,
     /// A mechanical gate failed (lock poison, serialization, live authority
     /// unavailable).
     Gate(String),
@@ -151,6 +155,12 @@ impl std::fmt::Display for DreamerMaterialError {
             }
             Self::SemanticInputStale => {
                 f.write_str("the durable Dreamer semantic input reference or bytes are stale")
+            }
+            Self::RuntimeOwnerInputUnavailable => {
+                f.write_str("the original runtime-owner publication is incomplete")
+            }
+            Self::RuntimeOwnerInputStale => {
+                f.write_str("the original runtime-owner publication or output contract is stale")
             }
             Self::Gate(detail) => write!(f, "dreamer launch gate failed: {detail}"),
             Self::Io(detail) => write!(f, "dreamer material file failed: {detail}"),
@@ -190,6 +200,15 @@ pub struct DreamerDispatchedEnvelope {
     /// Kernel carries these bytes without interpreting their meaning.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_input_bytes: Option<Vec<u8>>,
+    /// Original runtime-owner publication reference, opaque to the mechanical boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_owner_execution_input: Option<OpaqueContentRef>,
+    /// Exact bytes retained with that original publication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_owner_execution_input_bytes: Option<Vec<u8>>,
+    /// Original output contract retained by the durable owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_contract: Option<OpaqueContentRef>,
     /// Scope the ledger bound to this job (never caller bytes).
     pub scope_id: String,
     /// Fence the ledger bound to this job (never caller bytes).
@@ -230,6 +249,12 @@ pub struct ValidatedDreamerMaterial {
     /// Original inline bytes mechanically bound to `semantic_input`, when
     /// supplied by the durable owner.
     pub semantic_input_bytes: Option<Vec<u8>>,
+    /// Original runtime-owner publication reference, opaque to the mechanical boundary.
+    pub runtime_owner_execution_input: Option<OpaqueContentRef>,
+    /// Exact bytes retained with that original publication.
+    pub runtime_owner_execution_input_bytes: Option<Vec<u8>>,
+    /// Original output contract retained by the durable owner.
+    pub output_contract: Option<OpaqueContentRef>,
     /// Scope the ledger bound to this job.
     pub scope_id: String,
     /// Fence the ledger bound to this job.
@@ -314,6 +339,12 @@ pub struct DreamerLaunchRecord {
     /// They participate in single-flight equality and are never interpreted
     /// by Kernel.
     pub semantic_input_bytes: Option<Vec<u8>>,
+    /// Original runtime-owner publication reference, opaque to the mechanical boundary.
+    pub runtime_owner_execution_input: Option<OpaqueContentRef>,
+    /// Exact bytes retained with that original publication.
+    pub runtime_owner_execution_input_bytes: Option<Vec<u8>>,
+    /// Original output contract retained by the durable owner.
+    pub output_contract: Option<OpaqueContentRef>,
     /// Scope the ledger bound to this job.
     pub scope_id: String,
     /// Fence the ledger bound to this job.
@@ -684,6 +715,7 @@ pub(crate) fn validate_dreamer_material(
             .validate_semantic_input_bytes(bytes)
             .map_err(|_| DreamerMaterialError::SemanticInputStale)?;
     }
+    validate_runtime_owner_material(envelope)?;
     envelope
         .fence
         .validate()
@@ -727,6 +759,9 @@ pub(crate) fn validate_dreamer_material(
         revision: envelope.revision,
         semantic_input: envelope.semantic_input.clone(),
         semantic_input_bytes: envelope.semantic_input_bytes.clone(),
+        runtime_owner_execution_input: envelope.runtime_owner_execution_input.clone(),
+        runtime_owner_execution_input_bytes: envelope.runtime_owner_execution_input_bytes.clone(),
+        output_contract: envelope.output_contract.clone(),
         scope_id: envelope.scope_id.clone(),
         fence: envelope.fence.clone(),
         epoch: envelope.epoch.clone(),
@@ -734,6 +769,33 @@ pub(crate) fn validate_dreamer_material(
         nonce: envelope.nonce.clone(),
         grant: envelope.grant.clone(),
     })
+}
+
+/// Validates the original owner-issued reference and bytes without interpreting their semantics.
+fn validate_runtime_owner_material(
+    envelope: &DreamerDispatchedEnvelope,
+) -> Result<(), DreamerMaterialError> {
+    match (
+        &envelope.runtime_owner_execution_input,
+        &envelope.runtime_owner_execution_input_bytes,
+    ) {
+        (Some(reference), Some(bytes)) => {
+            reference
+                .validate("runtime_owner_execution_input.sha256")
+                .map_err(|_| DreamerMaterialError::RuntimeOwnerInputStale)?;
+            reference
+                .validate_semantic_input_bytes(bytes)
+                .map_err(|_| DreamerMaterialError::RuntimeOwnerInputStale)?;
+        }
+        (None, None) => {}
+        _ => return Err(DreamerMaterialError::RuntimeOwnerInputUnavailable),
+    }
+    if let Some(reference) = &envelope.output_contract {
+        reference
+            .validate("output_contract.sha256")
+            .map_err(|_| DreamerMaterialError::RuntimeOwnerInputStale)?;
+    }
+    Ok(())
 }
 
 /// Reserves one Dreamer launch lineage under its job identity.
@@ -759,6 +821,10 @@ pub(crate) fn reserve_dreamer_launch(
             && existing.revision == record.revision
             && existing.semantic_input == record.semantic_input
             && existing.semantic_input_bytes == record.semantic_input_bytes
+            && existing.runtime_owner_execution_input == record.runtime_owner_execution_input
+            && existing.runtime_owner_execution_input_bytes
+                == record.runtime_owner_execution_input_bytes
+            && existing.output_contract == record.output_contract
             && existing.scope_id == record.scope_id
             && existing.fence == record.fence
             && existing.executable_sha256 == record.executable_sha256
@@ -1050,6 +1116,9 @@ mod dreamer_dispatch_launch_tests {
             revision: 1,
             semantic_input: None,
             semantic_input_bytes: None,
+            runtime_owner_execution_input: None,
+            runtime_owner_execution_input_bytes: None,
+            output_contract: None,
             scope_id: "scope-t12-09".to_owned(),
             fence: test_fence(),
             epoch: epoch.clone(),
@@ -1146,6 +1215,9 @@ mod dreamer_dispatch_launch_tests {
             revision: 1,
             semantic_input: test_semantic_input(),
             semantic_input_bytes: None,
+            runtime_owner_execution_input: None,
+            runtime_owner_execution_input_bytes: None,
+            output_contract: None,
             scope_id: "scope-lineage".to_owned(),
             fence: fence.clone(),
             executable_sha256: "ef".repeat(32),

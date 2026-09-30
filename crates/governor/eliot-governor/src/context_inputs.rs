@@ -235,7 +235,8 @@ impl ContextReconstructionRequest {
         check_text_selector("negative_memory_selector", &self.negative_memory_selector)?;
         if self.negative_memory_selector != LearningRecordKind::ActivationReceipt.as_str() {
             return Err(ContextInputsError::RequestInvalid(
-                "negative_memory_selector must name the native activation_receipt source".to_owned(),
+                "negative_memory_selector must name the native activation_receipt source"
+                    .to_owned(),
             ));
         }
         check_text_selector("affordance_skill_id", &self.affordance_skill_id)?;
@@ -269,7 +270,8 @@ impl ContextReconstructionRequest {
             || self.affordance_max_records > u32::from(MAX_CAPABILITY_EVIDENCE_PAGE_RECORDS)
         {
             return Err(ContextInputsError::RequestInvalid(
-                "affordance_max_records must fit the native capability evidence page bound".to_owned(),
+                "affordance_max_records must fit the native capability evidence page bound"
+                    .to_owned(),
             ));
         }
         Ok(())
@@ -349,7 +351,10 @@ fn classify_capability_evidence_payload(
     fence: &eliot_contracts::StateFence,
     skill_id: &str,
     max_records: u16,
-) -> (ProjectionState, Option<Vec<RetainedCapabilityEvidenceRecord>>) {
+) -> (
+    ProjectionState,
+    Option<Vec<RetainedCapabilityEvidenceRecord>>,
+) {
     if let Err(state) = validate_capability_range_payload(payload, scope, fence) {
         return (state, None);
     }
@@ -364,7 +369,8 @@ fn classify_capability_evidence_payload(
     if truncated {
         (
             ProjectionState::Partial {
-                reason: "capability evidence range has an owner-issued continuation cursor".to_owned(),
+                reason: "capability evidence range has an owner-issued continuation cursor"
+                    .to_owned(),
             },
             Some(retained),
         )
@@ -474,14 +480,18 @@ fn decode_capability_rows(
             || !crate::is_evidence_ref(record_digest)
             || owner_revision == 0
         {
-            return Err(unavailable("record row identity is malformed or substituted"));
+            return Err(unavailable(
+                "record row identity is malformed or substituted",
+            ));
         }
         let record: crate::CapabilityEvidenceRecord = serde_json::from_str(record_json)
             .map_err(|_| unavailable("original record does not decode"))?;
         if record.skill_id != row_skill_id
             || !seen.insert((row_skill_id.to_owned(), scope_key.to_owned()))
         {
-            return Err(unavailable("typed record differs from its original row key"));
+            return Err(unavailable(
+                "typed record differs from its original row key",
+            ));
         }
         let revision = crate::OwnerEvidenceRevision::issued(owner_revision, record_digest)
             .map_err(|_| unavailable("owner revision or original digest is invalid"))?;
@@ -862,14 +872,13 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
             ))
         })?;
         let operation = NamedReadOperation::GetLearningRecordRange;
-        let parameters = NamedParameters::from_map(named_request.parameters.clone()).map_err(
-            |error| {
+        let parameters =
+            NamedParameters::from_map(named_request.parameters.clone()).map_err(|error| {
                 ContextInputsError::RequestRejected(bounded_reason(
                     "invalid negative-memory selectors",
                     error,
                 ))
-            },
-        )?;
+            })?;
         let response = match self
             .reads
             .bound_query(
@@ -936,14 +945,13 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
             ))
         })?;
         let operation = NamedReadOperation::GetCapabilityEvidenceRecordRange;
-        let parameters = NamedParameters::from_map(named_request.parameters.clone()).map_err(
-            |error| {
+        let parameters =
+            NamedParameters::from_map(named_request.parameters.clone()).map_err(|error| {
                 ContextInputsError::RequestRejected(bounded_reason(
                     "invalid capability evidence selectors",
                     error,
                 ))
-            },
-        )?;
+            })?;
         let response = match self
             .reads
             .bound_query(
@@ -1021,10 +1029,7 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
         {
             Ok(response) => response,
             Err(error) => {
-                return Ok((
-                    failed_role(operation, classify_read_error(error)?),
-                    None,
-                ));
+                return Ok((failed_role(operation, classify_read_error(error)?), None));
             }
         };
         let (state, readback) = decode_epistemic_payload(&response.view.payload);
@@ -1116,45 +1121,44 @@ fn retain_negative_memory_response(
     expected_fence: &eliot_contracts::StateFence,
 ) -> RoleAcquisition {
     let operation = named_response.operation;
-    let (state, records, policies) = match crate::resolve_negative_memory_rule_read(
-        &named_request,
-        &named_response,
-    ) {
-        Ok(resolved)
-            if resolved.scope_id() == expected_scope
-                && eliot_contracts::fences_match_exact(
-                    resolved.store_observed_fence(),
-                    expected_fence,
-                ) =>
-        {
-            let records = Some(resolved.records().to_vec());
-            let policies = Some(resolved.policies().to_vec());
-            let state = if !resolved.enumeration_complete() {
-                ProjectionState::Partial {
-                    reason: "native negative-memory page reports more retained records".to_owned(),
-                }
-            } else if resolved.records().is_empty() {
-                ProjectionState::KnownEmpty
-            } else {
-                ProjectionState::Complete
-            };
-            (state, records, policies)
-        }
-        Ok(_) => (
-            ProjectionState::Stale {
-                reason: "negative-memory source changed scope or StateFence".to_owned(),
-            },
-            None,
-            None,
-        ),
-        Err(error) => (
-            ProjectionState::Unknown {
-                reason: bounded_reason("negative-memory owner rejected its source page", error),
-            },
-            None,
-            None,
-        ),
-    };
+    let (state, records, policies) =
+        match crate::resolve_negative_memory_rule_read(&named_request, &named_response) {
+            Ok(resolved)
+                if resolved.scope_id() == expected_scope
+                    && eliot_contracts::fences_match_exact(
+                        resolved.store_observed_fence(),
+                        expected_fence,
+                    ) =>
+            {
+                let records = Some(resolved.records().to_vec());
+                let policies = Some(resolved.policies().to_vec());
+                let state = if !resolved.enumeration_complete() {
+                    ProjectionState::Partial {
+                        reason: "native negative-memory page reports more retained records"
+                            .to_owned(),
+                    }
+                } else if resolved.records().is_empty() {
+                    ProjectionState::KnownEmpty
+                } else {
+                    ProjectionState::Complete
+                };
+                (state, records, policies)
+            }
+            Ok(_) => (
+                ProjectionState::Stale {
+                    reason: "negative-memory source changed scope or StateFence".to_owned(),
+                },
+                None,
+                None,
+            ),
+            Err(error) => (
+                ProjectionState::Unknown {
+                    reason: bounded_reason("negative-memory owner rejected its source page", error),
+                },
+                None,
+                None,
+            ),
+        };
     RoleAcquisition {
         operation,
         state,

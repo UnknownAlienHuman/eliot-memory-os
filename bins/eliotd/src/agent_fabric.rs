@@ -69,9 +69,9 @@ use eliot_agent_coordinator::{
     ProviderIdentity, ProviderSelectionHealth, SchedulingProfile, StaffingPlanCandidate,
     StaffingPlanRequest, SwarmDefinitionAdmissionPrep, WorkClass,
 };
-use eliot_agent_opencode::{AdmittedAttemptError, AdmittedOpenCodeAttempt, ModelSelection};
 #[cfg(test)]
 use eliot_agent_coordinator::{OwnerCurrentness, PresentedClaimMaterial};
+use eliot_agent_opencode::{AdmittedAttemptError, AdmittedOpenCodeAttempt, ModelSelection};
 use eliot_contracts::{EpochId, StateFence, fences_match_exact};
 use eliot_kernel_service::ProviderCapabilityExpectation;
 use eliot_store_api::{StoreError, SwarmOwnerRevision, WriteReceipt, WriteReceiptStatus};
@@ -1980,9 +1980,10 @@ impl AgentFabric {
             return Err(AdmittedOpenCodeAttemptProjectionError::RouteMismatch);
         }
         let route_receipt = record.admitted_route.clone();
-        let binding = record.provider_binding.clone().ok_or_else(|| {
-            AdmittedOpenCodeAttemptProjectionError::MissingProviderBinding
-        })?;
+        let binding = record
+            .provider_binding
+            .clone()
+            .ok_or_else(|| AdmittedOpenCodeAttemptProjectionError::MissingProviderBinding)?;
         let runtime_generation = binding.runtime_generation.clone();
         let attempt = self.coordinator.binding_subject(attempt_id)?;
         Ok(AdmittedOpenCodeAttempt::new(

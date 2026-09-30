@@ -182,6 +182,15 @@ pub(crate) struct DreamerDispatchedEnvelope {
     /// `UserAutomation` content as a Dreamer orientation payload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) semantic_input_bytes: Option<Vec<u8>>,
+    /// Original runtime-owner publication reference, opaque to the mechanical boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) runtime_owner_execution_input: Option<OpaqueContentRef>,
+    /// Exact bytes retained with that original publication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) runtime_owner_execution_input_bytes: Option<Vec<u8>>,
+    /// Original output contract retained by the durable owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) output_contract: Option<OpaqueContentRef>,
     /// Scope the ledger bound to this job (never caller bytes).
     pub(crate) scope_id: String,
     /// Fence the ledger bound to this job (never caller bytes).
@@ -213,6 +222,12 @@ pub(crate) struct ValidatedDreamerMaterial {
     pub(crate) semantic_input: Option<OpaqueContentRef>,
     /// Exact original inline bytes, when supplied by the Store owner.
     pub(crate) semantic_input_bytes: Option<Vec<u8>>,
+    /// Original runtime-owner publication reference, opaque to the mechanical boundary.
+    pub(crate) runtime_owner_execution_input: Option<OpaqueContentRef>,
+    /// Exact bytes retained with that original publication.
+    pub(crate) runtime_owner_execution_input_bytes: Option<Vec<u8>>,
+    /// Original output contract retained by the durable owner.
+    pub(crate) output_contract: Option<OpaqueContentRef>,
     /// Scope the ledger bound to this job.
     pub(crate) scope_id: String,
     /// Fence the ledger bound to this job.
@@ -285,6 +300,12 @@ pub(crate) enum KernelPortError {
     /// its exact inline bytes.
     #[error("dreamer Kernel reply semantic input reference or bytes are stale: {0}")]
     SemanticInputStale(String),
+    /// Original execution metadata is absent on one side of the opaque byte binding.
+    #[error("dreamer runtime-owner execution publication is unavailable")]
+    RuntimeOwnerInputUnavailable,
+    /// Original execution publication or output contract changed across the claim handshake.
+    #[error("dreamer runtime-owner execution publication or output contract is stale: {0}")]
+    RuntimeOwnerInputStale(String),
     /// A claim/status reply changed the claimed job identity or fence.
     #[error("dreamer Kernel reply job, attempt, scope, or fence changed")]
     StaleClaimBinding,
@@ -453,6 +474,7 @@ fn validate_envelope(
             .validate_semantic_input_bytes(bytes)
             .map_err(|error| KernelPortError::SemanticInputStale(error.to_string()))?;
     }
+    validate_runtime_owner_material(envelope)?;
     envelope
         .fence
         .validate()
@@ -482,6 +504,9 @@ fn validate_envelope(
         revision: envelope.revision,
         semantic_input: envelope.semantic_input.clone(),
         semantic_input_bytes: envelope.semantic_input_bytes.clone(),
+        runtime_owner_execution_input: envelope.runtime_owner_execution_input.clone(),
+        runtime_owner_execution_input_bytes: envelope.runtime_owner_execution_input_bytes.clone(),
+        output_contract: envelope.output_contract.clone(),
         scope_id: envelope.scope_id.clone(),
         fence: envelope.fence.clone(),
         epoch: envelope.epoch.clone(),
@@ -489,6 +514,33 @@ fn validate_envelope(
         nonce: envelope.nonce.clone(),
         grant: envelope.grant.clone(),
     })
+}
+
+/// Validates the original owner-issued reference and bytes without interpreting their semantics.
+fn validate_runtime_owner_material(
+    envelope: &DreamerDispatchedEnvelope,
+) -> Result<(), KernelPortError> {
+    match (
+        &envelope.runtime_owner_execution_input,
+        &envelope.runtime_owner_execution_input_bytes,
+    ) {
+        (Some(reference), Some(bytes)) => {
+            reference
+                .validate("runtime_owner_execution_input.sha256")
+                .map_err(|error| KernelPortError::RuntimeOwnerInputStale(error.to_string()))?;
+            reference
+                .validate_semantic_input_bytes(bytes)
+                .map_err(|error| KernelPortError::RuntimeOwnerInputStale(error.to_string()))?;
+        }
+        (None, None) => {}
+        _ => return Err(KernelPortError::RuntimeOwnerInputUnavailable),
+    }
+    if let Some(reference) = &envelope.output_contract {
+        reference
+            .validate("output_contract.sha256")
+            .map_err(|error| KernelPortError::RuntimeOwnerInputStale(error.to_string()))?;
+    }
+    Ok(())
 }
 
 /// Requires non-blank, control-free, bounded identity text, mirroring the
@@ -1288,6 +1340,15 @@ fn validate_owner_response_binding(
             "Kernel owner reply changed the original semantic input bytes".to_owned(),
         ));
     }
+    if response.runtime_owner_execution_input != material.runtime_owner_execution_input
+        || response.runtime_owner_execution_input_bytes
+            != material.runtime_owner_execution_input_bytes
+        || response.output_contract != material.output_contract
+    {
+        return Err(KernelPortError::RuntimeOwnerInputStale(
+            "Kernel owner reply changed original execution metadata".to_owned(),
+        ));
+    }
     if response.job_id.as_str() != material.job_id
         || response.attempt_id.as_str() != material.attempt_id
         || response.scope.scope_id.as_str() != material.scope_id
@@ -1883,6 +1944,8 @@ mod tests {
             KernelPortError::StaleGeneration { .. } => "StaleGeneration",
             KernelPortError::SemanticInputUnavailable => "SemanticInputUnavailable",
             KernelPortError::SemanticInputStale(_) => "SemanticInputStale",
+            KernelPortError::RuntimeOwnerInputUnavailable => "RuntimeOwnerInputUnavailable",
+            KernelPortError::RuntimeOwnerInputStale(_) => "RuntimeOwnerInputStale",
             KernelPortError::StaleClaimBinding => "StaleClaimBinding",
             KernelPortError::BadNonce => "BadNonce",
             KernelPortError::BadGrant(_) => "BadGrant",

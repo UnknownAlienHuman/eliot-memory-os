@@ -635,7 +635,10 @@ fn run_admitted_pipeline(
             job,
             None,
             None,
-            dispatch_stage::DispatchOwnerInputs { curation: None, orientation: supply },
+            dispatch_stage::DispatchOwnerInputs {
+                curation: None,
+                orientation: supply,
+            },
             job.job_class,
             validated,
         );

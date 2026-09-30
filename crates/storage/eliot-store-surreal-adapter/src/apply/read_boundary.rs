@@ -294,14 +294,8 @@ pub(crate) async fn execute_named(
             let fence = read_fence(db, &adapter.config).await?;
             let state_fence = resolve_state_fence(fence.as_ref(), &query.state_fence)?;
             let revision_heads = read_all_revision_heads(db, &adapter.config).await?;
-            let payload = named_read_payload(
-                adapter,
-                db,
-                &query,
-                &state_fence,
-                &revision_heads,
-            )
-            .await?;
+            let payload =
+                named_read_payload(adapter, db, &query, &state_fence, &revision_heads).await?;
             (state_fence, revision_heads, payload)
         };
     let response = NamedReadResponse {
@@ -346,10 +340,9 @@ async fn read_task_state_snapshot(
     )
     .await?;
     if !response.take_errors().is_empty() {
-        return Err(StoreError::Serialization(
-            "task state snapshot query failed".to_owned(),
-        )
-        .into());
+        return Err(
+            StoreError::Serialization("task state snapshot query failed".to_owned()).into(),
+        );
     }
 
     // SurrealDB 3 retains the BEGIN result at index 0 (null).
@@ -1649,7 +1642,10 @@ fn validate_native_task_contract_record(record: &Value, task_id: &str) -> Result
         || project_sequence.is_none()
         || write_id.is_none_or(str::is_empty)
         || object.get("title").and_then(Value::as_str).is_none()
-        || object.get("acceptance_items").and_then(Value::as_array).is_none()
+        || object
+            .get("acceptance_items")
+            .and_then(Value::as_array)
+            .is_none()
     {
         return Err(StoreError::Serialization(
             "retained task contract identity or revision is malformed".to_owned(),

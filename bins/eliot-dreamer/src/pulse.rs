@@ -76,8 +76,8 @@ use eliot_dreamer_conflict_analysis::{
 use eliot_dreamer_contracts::grounding::GroundedDreamDraft as StructuredGroundedDreamDraft;
 use eliot_dreamer_contracts::{
     ClassificationInput, CurationAcceptanceCtx, DreamInputBundle, ModelRouteDisposition,
-    ModelRouteOutcome, ValidatedCurationItem,
-    ValidatedGroundingCandidate, bundle_digest_of, canonical_bytes, digest_hex,
+    ModelRouteOutcome, ValidatedCurationItem, ValidatedGroundingCandidate, bundle_digest_of,
+    canonical_bytes, digest_hex,
 };
 use eliot_dreamer_orientation::OrientationError;
 use eliot_dreamer_probe_plan::{ProbePlan, ProbePlanParams, plan_discriminative_probes};

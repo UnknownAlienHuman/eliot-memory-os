@@ -312,9 +312,7 @@ pub fn reconstruct_cue_snapshot_for_request(
     match &inputs.cue.state {
         ProjectionState::KnownEmpty if row_count == 0 => {}
         ProjectionState::Complete if row_count > 0 => {
-            return Err(CueCompositionError::MissingAdmittedBindings {
-                records: row_count,
-            });
+            return Err(CueCompositionError::MissingAdmittedBindings { records: row_count });
         }
         ProjectionState::Partial { reason } => {
             return Err(CueCompositionError::CueRoleNotComplete(reason.clone()));
@@ -348,7 +346,11 @@ fn validate_cue_request_binding(
     {
         return Err(mismatch("scope_head_closure"));
     }
-    let identity = inputs.cue.identity.as_ref().ok_or(mismatch("read_identity"))?;
+    let identity = inputs
+        .cue
+        .identity
+        .as_ref()
+        .ok_or(mismatch("read_identity"))?;
     if inputs.cue.operation != NamedReadOperation::GetUnderstandingProjectionInputs
         || identity.operation() != NamedReadOperation::GetUnderstandingProjectionInputs
         || identity.source().operation != NamedReadOperation::GetUnderstandingProjectionInputs
@@ -400,7 +402,8 @@ fn validate_cue_read_envelope(
     if payload.get("scope_id").and_then(Value::as_str) != Some(request.scope_id.as_str()) {
         return Err(mismatch("payload.scope_id"));
     }
-    if payload.get("selector").and_then(Value::as_str) != Some(request.projection_selector.as_str()) {
+    if payload.get("selector").and_then(Value::as_str) != Some(request.projection_selector.as_str())
+    {
         return Err(mismatch("payload.selector"));
     }
     let records = payload
@@ -427,7 +430,10 @@ fn validate_cue_read_envelope(
         return Err(mismatch("payload.provenance.extent"));
     };
     let actual_returned = u64::try_from(records.len()).unwrap_or(u64::MAX);
-    if returned != actual_returned || matched_total < returned || truncated != (matched_total > returned) {
+    if returned != actual_returned
+        || matched_total < returned
+        || truncated != (matched_total > returned)
+    {
         return Err(mismatch("payload.provenance.extent"));
     }
     let disposition_matches = match &inputs.cue.state {

@@ -5733,6 +5733,12 @@ pub fn prepare_dreamer_launch(
         revision,
         semantic_input: semantic_input.clone(),
         semantic_input_bytes: material.queued.semantic_input_bytes.clone(),
+        runtime_owner_execution_input: material.queued.runtime_owner_execution_input.clone(),
+        runtime_owner_execution_input_bytes: material
+            .queued
+            .runtime_owner_execution_input_bytes
+            .clone(),
+        output_contract: material.queued.output_contract.clone(),
         scope_id: scope_id.clone(),
         fence: fence.clone(),
         executable_sha256: material.child.executable_sha256.to_owned(),
@@ -5751,6 +5757,12 @@ pub fn prepare_dreamer_launch(
         revision,
         semantic_input: Some(semantic_input.clone()),
         semantic_input_bytes: material.queued.semantic_input_bytes.clone(),
+        runtime_owner_execution_input: material.queued.runtime_owner_execution_input.clone(),
+        runtime_owner_execution_input_bytes: material
+            .queued
+            .runtime_owner_execution_input_bytes
+            .clone(),
+        output_contract: material.queued.output_contract.clone(),
         scope_id,
         fence,
         epoch: authority_epoch.clone(),

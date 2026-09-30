@@ -2,34 +2,30 @@
 
 use eliot_context_assembly::ActiveUnderstandingViewResult;
 use eliot_context_candidates::ContextCandidateSetResult;
-use eliot_context_contracts::{
-    CanonicalProjectionSet, ContextError, SerializedContextMeasurement,
-};
+use eliot_context_contracts::{CanonicalProjectionSet, ContextError, SerializedContextMeasurement};
 use eliot_cue_activation::CueActivationEvaluation;
+use eliot_dreamer_claim_grounding::GroundingRequest;
 use eliot_dreamer_classification::ClassificationResult;
 use eliot_dreamer_conflict_analysis::ConflictAnalysisCandidate;
 use eliot_dreamer_contracts::grounding::GroundedDreamDraft as StructuredGroundedDreamDraft;
+use eliot_dreamer_contracts::rival::RivalModelSet as ProbeRivalModelSet;
 use eliot_dreamer_contracts::{
-    canonical_bytes, DreamInputBundle, ModelDraft, ModelRouteOutcome,
-    ValidatedGroundingCandidate,
+    DreamInputBundle, ModelDraft, ModelRouteOutcome, ValidatedGroundingCandidate, canonical_bytes,
 };
-use eliot_dreamer_claim_grounding::GroundingRequest;
 use eliot_dreamer_orientation::{
     InertProbe, OrientationInterpretation, OrientationResidue, OrientationSemanticView,
     OrientationStageOutput,
 };
 use eliot_dreamer_probe_plan::{ProbePlan, ProbePlanParams, ProbeProposal};
 use eliot_dreamer_rival_model::RivalModelSet;
-use eliot_dreamer_contracts::rival::RivalModelSet as ProbeRivalModelSet;
 use eliot_epistemic::{CurrentEpistemicPosition, ObservationRecord, PositionRequest};
 use eliot_epistemic_contracts::EpistemicPositionCandidate;
 use serde::Serialize;
 
 use crate::pulse::{
-    CandidateStage, ClassificationStage, ConflictStage, CueActivationStage, PulseError,
-    EpistemicStage, PulseStage, PulseStageId, RivalStage, StageOwnerOutput, UnderstandingStage,
-    check_model_boundary, check_projection_boundary,
-    canonical_input_commitment,
+    CandidateStage, ClassificationStage, ConflictStage, CueActivationStage, EpistemicStage,
+    PulseError, PulseStage, PulseStageId, RivalStage, StageOwnerOutput, UnderstandingStage,
+    canonical_input_commitment, check_model_boundary, check_projection_boundary,
     run_candidate_stage, run_classification_stage, run_conflict_stage, run_cue_stage,
     run_epistemic_stage, run_grounding_stage, run_probe_stage, run_rival_stage,
     run_understanding_stage,
@@ -279,11 +275,8 @@ fn retain_grounding_semantics(
     target: &mut StageOutputSet,
     output: &StructuredGroundedDreamDraft,
 ) -> bool {
-    let Some(ledger) = canonical_residue(
-        "claim_grounding_ledger",
-        &output.ledger,
-        &output.job_id,
-    ) else {
+    let Some(ledger) = canonical_residue("claim_grounding_ledger", &output.ledger, &output.job_id)
+    else {
         return false;
     };
     target.gaps.push(ledger);
@@ -332,14 +325,17 @@ fn retain_rival_frontier(
 
 fn retain_probe_semantics(target: &mut StageOutputSet, output: &ProbePlan) -> bool {
     let source = output.plan_id.as_str();
-    if !push_count_residue(&mut target.gaps, "probe_plan_count", output.probes.len(), source)
-        || !push_count_residue(
-            &mut target.gaps,
-            "probe_plan_omissions_count",
-            output.omissions.len(),
-            source,
-        )
-    {
+    if !push_count_residue(
+        &mut target.gaps,
+        "probe_plan_count",
+        output.probes.len(),
+        source,
+    ) || !push_count_residue(
+        &mut target.gaps,
+        "probe_plan_omissions_count",
+        output.omissions.len(),
+        source,
+    ) {
         return false;
     }
     for (index, probe) in output.probes.iter().enumerate() {
@@ -356,10 +352,9 @@ fn retain_one_probe(
     source: &str,
     index: usize,
 ) -> bool {
-    let (Some(text), Some(result_space)) = (
-        canonical_text(probe),
-        canonical_text(&probe.result_schema),
-    ) else {
+    let (Some(text), Some(result_space)) =
+        (canonical_text(probe), canonical_text(&probe.result_schema))
+    else {
         return false;
     };
     target.inert_probes.push(InertProbe {
@@ -377,11 +372,9 @@ fn retain_one_probe(
 
 fn retain_probe_omissions(target: &mut StageOutputSet, output: &ProbePlan) -> bool {
     for omission in &output.omissions {
-        let Some(entry) = canonical_residue(
-            "probe_plan_omission",
-            omission,
-            output.plan_id.as_str(),
-        ) else {
+        let Some(entry) =
+            canonical_residue("probe_plan_omission", omission, output.plan_id.as_str())
+        else {
             return false;
         };
         target.gaps.push(entry);
@@ -394,7 +387,8 @@ fn retain_candidate_semantics(
     output: &ContextCandidateSetResult,
 ) -> bool {
     for candidate in &output.set.candidates {
-        let Some(entry) = canonical_residue("context_candidate", candidate, candidate.atom_id.as_str())
+        let Some(entry) =
+            canonical_residue("context_candidate", candidate, candidate.atom_id.as_str())
         else {
             return false;
         };
@@ -636,8 +630,7 @@ fn run_grounding_rival_conflict(
         check_grounding_binding(inputs.grounding, bundle, model_outcome),
         || run_grounding_stage(Some(inputs.grounding)),
     )?;
-    if run.outputs.grounding.as_ref()
-        != Some(inputs.rivals.validated_draft.input.grounded.as_ref())
+    if run.outputs.grounding.as_ref() != Some(inputs.rivals.validated_draft.input.grounded.as_ref())
     {
         return Err((
             PulseStageId::Rivals,
@@ -658,9 +651,7 @@ fn run_grounding_rival_conflict(
     if grounding_route.is_none_or(|route| route != &candidate.input.grounded.input.route) {
         return Err((
             PulseStageId::Conflict,
-            PulseError::Boundary(
-                "structured grounding route lacks exact physical-route lineage",
-            ),
+            PulseError::Boundary("structured grounding route lacks exact physical-route lineage"),
         ));
     }
     run.execute(
@@ -687,13 +678,7 @@ fn run_probe_stage_from_predecessors(
     };
     run.outputs.probe_rival_projection = Some(probe_projection.clone());
     let candidate = inputs.rivals.validated_draft;
-    if !probe_inputs_match(
-        inputs,
-        bundle,
-        model_outcome,
-        candidate,
-        &probe_projection,
-    ) {
+    if !probe_inputs_match(inputs, bundle, model_outcome, candidate, &probe_projection) {
         return Err((
             PulseStageId::Probes,
             PulseError::Boundary("probe candidate and rival predecessor bindings"),
@@ -782,7 +767,9 @@ fn check_conflict_binding(
         || stage.supplements.frozen_bundle_digest != candidate.validated.receipt.bundle_digest
         || stage.supplements.frozen_manifest_digest != grounded.manifest_digest
     {
-        return Err(PulseError::Boundary("conflict structured grounding predecessor"));
+        return Err(PulseError::Boundary(
+            "conflict structured grounding predecessor",
+        ));
     }
     Ok(())
 }
@@ -853,7 +840,9 @@ fn check_understanding_binding(
         || binding != &stage.quality.binding
         || binding != &projections.binding
     {
-        return Err(PulseError::Boundary("understanding and projection identity"));
+        return Err(PulseError::Boundary(
+            "understanding and projection identity",
+        ));
     }
     Ok(())
 }
@@ -869,7 +858,9 @@ fn check_grounding_binding(
         .as_ref()
         .and_then(|execution| execution.grounding_route.as_ref())
     else {
-        return Err(PulseError::Boundary("model owner has no physical grounding route"));
+        return Err(PulseError::Boundary(
+            "model owner has no physical grounding route",
+        ));
     };
     if &request.bundle != bundle
         || &draft.bundle != bundle
@@ -949,7 +940,11 @@ fn residue(kind: &str, text: &str, source: &str) -> OrientationResidue {
     }
 }
 
-fn canonical_residue<T: Serialize>(kind: &str, value: &T, source: &str) -> Option<OrientationResidue> {
+fn canonical_residue<T: Serialize>(
+    kind: &str,
+    value: &T,
+    source: &str,
+) -> Option<OrientationResidue> {
     Some(residue(kind, &canonical_text(value)?, source))
 }
 
@@ -980,14 +975,14 @@ fn push_string_sequence(
         return false;
     }
     for (index, value) in values.iter().enumerate() {
-        let Some(entry) = canonical_residue(kind, value, &format!("{source}:{kind}:{index}")) else {
+        let Some(entry) = canonical_residue(kind, value, &format!("{source}:{kind}:{index}"))
+        else {
             return false;
         };
         target.push(entry);
     }
     true
 }
-
 
 #[derive(Serialize)]
 struct ConflictProbe<'a> {
@@ -1034,7 +1029,12 @@ fn retain_conflict_header(
     output: &ConflictAnalysisCandidate,
     source: &str,
 ) -> bool {
-    push_canonical!(&mut target.gaps, "conflict_outcome", &output.outcome.as_str(), source);
+    push_canonical!(
+        &mut target.gaps,
+        "conflict_outcome",
+        &output.outcome.as_str(),
+        source
+    );
     push_canonical!(&mut target.gaps, "conflict_scope", &output.scope, source);
     push_canonical!(
         &mut target.gaps,
@@ -1312,8 +1312,18 @@ fn retain_conflict_comparison_outcome(
                 &"differing",
                 source
             );
-            push_canonical!(&mut target.gaps, "conflict_compatibility_left", left, source);
-            push_canonical!(&mut target.gaps, "conflict_compatibility_right", right, source);
+            push_canonical!(
+                &mut target.gaps,
+                "conflict_compatibility_left",
+                left,
+                source
+            );
+            push_canonical!(
+                &mut target.gaps,
+                "conflict_compatibility_right",
+                right,
+                source
+            );
         }
         eliot_dreamer_conflict_analysis::DimensionOutcome::Unnormalizable { reason } => {
             push_canonical!(
@@ -1395,7 +1405,12 @@ fn retain_conflict_risks(
 ) -> bool {
     for (index, risk) in output.common_mode_risks.iter().enumerate() {
         let risk_source = format!("{source}:common_mode_risk:{index}");
-        push_canonical!(&mut target.gaps, "conflict_risk_kind", &risk.kind, &risk_source);
+        push_canonical!(
+            &mut target.gaps,
+            "conflict_risk_kind",
+            &risk.kind,
+            &risk_source
+        );
         push_canonical!(
             &mut target.gaps,
             "conflict_risk_description",
