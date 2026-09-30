@@ -358,6 +358,30 @@ impl ActiveUnderstandingView {
         Ok(())
     }
 
+    /// The source revisions this view's delivered atoms were read from.
+    ///
+    /// The independent expected set for
+    /// `QualityOutputBinding::evidence_revisions`: one revision per distinct
+    /// source snapshot actually present in the rendered projection, deduplicated
+    /// and in canonical order. It is derived from the delivered atoms rather
+    /// than from the card, so a card cannot satisfy it by restating its own
+    /// list, and it is a set because repeating one revision is one revision, not
+    /// two observations.
+    ///
+    /// The revision identity is the source snapshot identity
+    /// (`RenderedAtom::source_id`), not the free-text `source_revision` label:
+    /// two labels could agree while naming different snapshots, and the snapshot
+    /// identity is the value `validate_against` already proves back to
+    /// `AdmittedAtom::candidate.source.snapshot_id`.
+    fn observed_source_revisions(&self) -> Vec<ArtifactId> {
+        let distinct: BTreeSet<ArtifactId> = self
+            .rendered
+            .iter()
+            .map(|atom| atom.source_id.clone())
+            .collect();
+        distinct.into_iter().collect()
+    }
+
     /// Check this exact view's readiness for one requested dependent decision
     /// or effect, using the one shared rule.
     ///
@@ -429,6 +453,71 @@ impl ActiveUnderstandingView {
             || self.quality.output.rendered_digest != derived_output_digest
         {
             return Err(ContextError::QualityIncomplete);
+        }
+        // The serializer/route half of the output binding, compared against the
+        // execution this view was actually produced under. `execution` is the
+        // assembly owner's own record of the policy it applied, and
+        // `binds_measurement` above already compared it against the
+        // independently recorded measurement, so this is a third record
+        // disagreeing with the card rather than the card compared with itself.
+        // Two compilations of identical bytes under different serializer,
+        // options or route identities are different outputs, and a card that
+        // names the wrong one is refused.
+        if self.quality.output.serializer_id != self.execution.serializer_id
+            || self.quality.output.serializer_version != self.execution.serializer_version
+            || self.quality.output.serializer_options_digest
+                != self.execution.serializer_options_digest
+            || self.quality.output.route_id != self.execution.route_id
+        {
+            return Err(ContextError::QualityIncomplete);
+        }
+        // The source-revision half. Every revision the card claims it graded
+        // from must be a revision this packet actually carries. The expected
+        // set is derived from the rendered projection, not from the card, and
+        // `validate_against` already proves each rendered `source_id` equals
+        // its admitted record's `source.snapshot_id`, so a card citing a
+        // foreign or never-observed source revision is refused while a card
+        // citing a genuine one passes. The comparison runs in this direction —
+        // claimed ⊆ observed — because that is the guarantee: it makes a
+        // valid-looking handle without a current observation unable to bind.
+        // It deliberately does not demand the reverse, which would make a
+        // re-sealed packet that legitimately gained a source ungradeable by
+        // the seed card it was legitimately re-graded under.
+        let observed_revisions = self.observed_source_revisions();
+        if self
+            .quality
+            .output
+            .evidence_revisions
+            .iter()
+            .any(|claimed| !observed_revisions.contains(claimed))
+        {
+            return Err(ContextError::QualityIncomplete);
+        }
+        // A dimension that reports a pass may only cite an observation this
+        // packet actually recorded. `MeasurementRef::validate` above proved
+        // each cited handle is well formed, which is a shape check; this
+        // compares the CONTENT of every cited measurement against the
+        // measurement identities carried by the delivered atoms, which is what
+        // makes a valid-looking handle without a current observation unable to
+        // pass. The expected set is the rendered atoms' own records, so a
+        // dimension cannot satisfy this by citing its own list twice.
+        //
+        // Membership is by VALUE (`MeasurementRef` is a digest plus a serializer
+        // identity and implements neither `Ord` nor `Hash`, so it cannot be a
+        // set key). Both fields are compared, so a cited handle that matches on
+        // one and differs on the other is not a member.
+        let observed_measurements: Vec<&MeasurementRef> =
+            self.rendered.iter().map(|atom| &atom.measurement).collect();
+        for result in &self.quality.results {
+            if result.state.is_pass()
+                && result.measurements.iter().any(|cited| {
+                    !observed_measurements.iter().any(|observed| {
+                        observed.digest == cited.digest && observed.serializer == cited.serializer
+                    })
+                })
+            {
+                return Err(ContextError::QualityIncomplete);
+            }
         }
         if self.selection.binding != self.binding
             || self.quality.binding != self.binding

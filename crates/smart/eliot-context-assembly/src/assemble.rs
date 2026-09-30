@@ -263,12 +263,14 @@ where
     let boundaries = boundary::project_assembly_boundaries(admitted, recipe)?;
     let (rendered, output_digest, bytes) =
         render_and_match(admitted, recipe, &expected_fence_digest)?;
+    let execution = applied_execution_identity(policy);
     require_graded_output(
         &quality,
         admitted,
         &recipe.recipe_sha256,
         &expected_fence_digest,
         &output_digest,
+        &execution,
     )?;
     let final_bytes =
         u64::try_from(bytes.len()).map_err(|_| AssemblyError::Contract(ContextError::Overflow))?;
@@ -294,7 +296,7 @@ where
         selection,
         quality,
         measurement: measured,
-        execution: applied_execution_identity(policy),
+        execution,
         output_digest,
         recipe_digest: recipe.recipe_sha256.clone(),
         policy_sha256: recipe.decision.policy_sha256.clone(),
@@ -367,28 +369,66 @@ fn require_recipe_policy_binding(
 /// Require that the card graded the exact output this assembly just produced.
 ///
 /// The card is compared against the recipe revision, the fence, the admitted
-/// set's own canonical payload digest, the ordered rendered payload digest and
-/// the omission handles. Every one of those is the packet's own recorded value,
-/// recomputed by its existing owner, and the scorecard is an input to none of
-/// them, so grading the final representation and hashing that representation
-/// stay two ordered steps rather than a receipt containing its own output hash.
+/// set's own canonical payload digest, the ordered rendered payload digest, the
+/// omission handles, the serializer/route identity this assembly is actually
+/// applying, and the source revisions the delivered atoms carry. Every one of
+/// those is a record written by an owner other than the card — the recipe's own
+/// revision, `AdmittedContextSet::canonical_payload_digest`, the ordered
+/// rendered digest derived just above, this assembly's own
+/// [`applied_execution_identity`], and the admitted set's source snapshots — and
+/// the scorecard is an input to none of them. Grading the final representation
+/// and hashing that representation therefore stay two ordered steps rather than
+/// a receipt containing its own output hash.
 ///
-/// A card swapped in from another same-fence packet with a different recipe or
-/// membership records a different value here, so it is refused with the card
-/// retained: the caller receives the exact grades that were rejected instead of
-/// a fabricated success.
+/// The serializer/route comparison is the same identity
+/// `measurement::verify` already requires the injected measurement to match, so
+/// a card graded under a different serializer revision, options digest or route
+/// cannot be presented as the grade of these bytes. It is compared HERE, at the
+/// assembly that applies the policy, rather than only in
+/// `ActiveUnderstandingView::validate`, so a card is refused before the view is
+/// built instead of being caught at the view's own re-validation.
+///
+/// A card swapped in from another same-fence packet with a different recipe,
+/// membership, execution or source set records a different value here, so it is
+/// refused with the card retained: the caller receives the exact grades that
+/// were rejected instead of a fabricated success.
 fn require_graded_output(
     quality: &QualityScorecard,
     admitted: &AdmittedContextSet,
     recipe_digest: &str,
     fence_digest: &str,
     rendered_digest: &str,
+    execution: &ContextExecutionIdentity,
 ) -> Result<(), AssemblyError> {
+    // The source revisions this admitted set actually carries, in the same
+    // deduplicated canonical order `ActiveUnderstandingView::validate` derives
+    // them in. Derived here from the admitted set rather than read off the card,
+    // so it is an independent expected set and not a copy of the caller's list.
+    // The comparison runs claimed ⊆ observed because that is the guarantee: a
+    // card citing a source revision this compilation did not read from cannot
+    // be the grade of these bytes. The reverse is not demanded, so a re-sealed
+    // packet that legitimately gained a source is not refused for that.
+    let observed_revisions: Vec<eliot_contracts::ArtifactId> = admitted
+        .records
+        .iter()
+        .map(|record| record.candidate.source.snapshot_id.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
     if quality.output.recipe_digest != recipe_digest
         || quality.output.fence_digest != fence_digest
         || quality.output.admitted_digest != admitted.canonical_payload_digest()?
         || quality.output.rendered_digest != rendered_digest
         || quality.output.omission_handles != admitted.economy.displaced
+        || quality.output.serializer_id != execution.serializer_id
+        || quality.output.serializer_version != execution.serializer_version
+        || quality.output.serializer_options_digest != execution.serializer_options_digest
+        || quality.output.route_id != execution.route_id
+        || quality
+            .output
+            .evidence_revisions
+            .iter()
+            .any(|claimed| !observed_revisions.contains(claimed))
     {
         return Err(AssemblyError::QualityIncomplete(
             Box::new(quality.clone()),

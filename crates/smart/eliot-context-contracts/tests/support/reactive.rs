@@ -126,16 +126,22 @@ fn resolved_applicability() -> QualityApplicability {
 /// Intrinsically well-formed output binding for a card that is only checked for
 /// structural integrity. A card bound to a real packet's exact output is built
 /// by its owner; these fixtures only need the field to be well formed.
+///
+/// The serializer and route identities are the ones the assembled-view fixture
+/// executes under, because `ActiveUnderstandingView::validate` compares the
+/// card's serializer/route binding against the view's own execution identity:
+/// a card naming a different serializer or route is not the grade of those
+/// bytes and is refused.
 pub fn fixture_output_binding() -> QualityOutputBinding {
     QualityOutputBinding {
         recipe_digest: digest(),
         fence_digest: digest(),
         admitted_digest: digest(),
         rendered_digest: digest(),
-        serializer_id: "fixture-serde-v1".to_owned(),
+        serializer_id: "serde-json".to_owned(),
         serializer_version: "1".to_owned(),
         serializer_options_digest: digest(),
-        route_id: "fixture-route".to_owned(),
+        route_id: "route".to_owned(),
         evidence_revisions: Vec::new(),
         omission_handles: Vec::new(),
     }
@@ -179,6 +185,48 @@ fn quality(binding: &ContextBinding) -> QualityScorecard {
             })
             .collect(),
     }
+}
+
+/// The card bound to one exact packet output.
+///
+/// A card that is graded for its twelve dimensions and then handed to
+/// `ActiveUnderstandingView::assemble` has to NAME the output it graded, not a
+/// set of placeholders: `ActiveUnderstandingView::validate` compares the
+/// card's recipe, fence, rendered and admitted digests against the packet's own
+/// recomputed values. The serializer and route come from
+/// `fixture_output_binding` because they describe the execution identity the
+/// view is assembled under, and the source revisions are the admitted set's own
+/// source snapshots, so a card citing a revision this packet never read from
+/// is refused.
+#[allow(clippy::too_many_arguments, reason = "the card names its whole output")]
+fn quality_for(
+    admitted: &AdmittedContextSet,
+    recipe_digest: &str,
+    fence_digest: &str,
+    output_digest: &str,
+    rendered: &[eliot_context_contracts::RenderedAtom],
+) -> QualityScorecard {
+    let mut card = quality(&admitted.binding);
+    card.output.recipe_digest = recipe_digest.to_owned();
+    card.output.fence_digest = fence_digest.to_owned();
+    card.output.admitted_digest = admitted
+        .canonical_payload_digest()
+        .expect("admitted payload digest");
+    card.output.rendered_digest = output_digest.to_owned();
+    card.output.omission_handles = admitted.economy.displaced.clone();
+    // The source snapshots the delivered atoms were read from. The list is
+    // derived from the projection being delivered, so this is a real
+    // observation list rather than a self-referential one. The free-text
+    // `source_revision` label is deliberately not used: two labels can agree
+    // while naming different snapshots, and the snapshot identity is what the
+    // view cross-checks.
+    card.output.evidence_revisions = rendered
+        .iter()
+        .map(|atom| atom.source_id.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    card
 }
 
 fn admitted() -> AdmittedContextSet {
@@ -464,7 +512,13 @@ pub fn context_view() -> (
     };
     let view = ActiveUnderstandingView::assemble(
         &admitted,
-        quality(&binding),
+        quality_for(
+            &admitted,
+            &recipe_digest,
+            &fence_digest,
+            &output_digest,
+            &rendered,
+        ),
         measurement,
         ContextExecutionIdentity {
             ordering_revision: "a18.role-provider-atom.v1".to_owned(),
