@@ -776,6 +776,35 @@ pub struct AttentionEvaluationProducedRecord {
     pub gaps: Vec<HumanAttentionEvidenceGap>,
 }
 
+/// Carries exact assembly gaps into the candidate record uncertainty (issue
+/// #1784 items W3/W4).
+///
+/// A partial assembly never blocks persistence outright: every gap becomes an
+/// explicit uncertainty limitation on the produced revision, so the record
+/// reads inconclusive-marked and comparative conclusions stay bounded by the
+/// stated limits instead of tuning policy from incomplete evidence. Caller
+/// limitations are kept verbatim and never duplicated, and a complete
+/// assembly leaves the caller framing untouched. The carry is deterministic
+/// over gap order, so identical nominations still produce identical record
+/// bytes for idempotent replay.
+fn carry_attention_gaps_into_uncertainty(
+    mut framing: EvaluatorScopeUncertaintyInvalidation,
+    gaps: &[HumanAttentionEvidenceGap],
+) -> EvaluatorScopeUncertaintyInvalidation {
+    for gap in gaps {
+        let limitation = gap.limitation_statement();
+        if !framing
+            .uncertainty
+            .limitations
+            .iter()
+            .any(|existing| existing == &limitation)
+        {
+            framing.uncertainty.limitations.push(limitation);
+        }
+    }
+    framing
+}
+
 /// Produces one evaluation revision from caller-nominated evidence reads and
 /// admits it through the commit gate (issue #1784 item W3).
 ///
@@ -795,6 +824,13 @@ pub struct AttentionEvaluationProducedRecord {
 /// the typed [`AttentionEvaluationCommitError`]; unavailable evidence yields a
 /// partial record with exact gaps, never synthetic zeros, and no claim or
 /// score is minted here.
+///
+/// A partial assembly never blocks persistence outright: every gap is carried
+/// into the candidate record uncertainty limitations through
+/// [`carry_attention_gaps_into_uncertainty`], so the produced revision reads
+/// inconclusive-marked and comparative conclusions stay bounded by those
+/// stated limits. Caller limitations are kept verbatim and never duplicated;
+/// a complete assembly leaves the caller framing untouched.
 ///
 /// Invalidation is refused: it preserves the prior revision bytes apart from
 /// the statement, so it cannot be assembled from fresh nominations — persist
@@ -862,6 +898,7 @@ pub fn produce_and_commit_attention_evaluation(
     };
     let assembled = assemble_human_attention_evidence(&assembly_input)
         .map_err(|error| AttentionEvaluationCommitError::Record(error.to_string()))?;
+    let framing = carry_attention_gaps_into_uncertainty(framing, &assembled.gaps);
     let predecessor = prior.map(|prior_record| HumanAttentionEvaluationRevisionRef {
         evaluation_id: request.evaluation_id.clone(),
         revision: prior_record.revision,
