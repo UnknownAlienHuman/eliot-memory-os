@@ -31,7 +31,7 @@ use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_protocol::{HostRequestEnvelope, LocalReadAttempt, host_request_operation_id};
 
 /// Admitted capability this adapter serves.
-const OBSERVE_CAPABILITY: &str = "eliot.observe";
+pub(crate) const OBSERVE_CAPABILITY: &str = "eliot.observe";
 
 /// The closed five observe suboperations (`eliot.observe`, I7.6).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

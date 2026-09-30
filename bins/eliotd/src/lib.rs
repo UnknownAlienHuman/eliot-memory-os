@@ -2090,6 +2090,10 @@ impl DaemonComposition {
             .governor
             .read_unique_agent_activation(now)
             .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        let observation = self
+            .governor
+            .try_observation_capture_owner_binding_for_activation(&snapshot)
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
         let binding = AgentActivationResolvedBinding {
             principal_id: snapshot.principal_id,
             session_id: snapshot.session_id,
@@ -2108,11 +2112,7 @@ impl DaemonComposition {
         .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
         let readback = AgentActivationOwnerReadback::from_evidence(evidence, now.max(1))
             .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
-        let Some(observation) = self
-            .governor
-            .try_observation_capture_owner_binding_for_activation(&snapshot)
-            .map_err(|error| DaemonError::Lifecycle(error.to_string()))?
-        else {
+        let Some(observation) = observation else {
             return Ok(readback);
         };
         let observation = Self::activation_observation_policy_readback(&observation)?;
