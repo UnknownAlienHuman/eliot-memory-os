@@ -3609,7 +3609,7 @@ impl TaskSelectionAdmissionBinding {
 
 /// Non-forgeable owner snapshot token held across the external Kernel read.
 /// The fields are private so a caller cannot invent selection provenance.
-pub struct PendingTaskSelectionRequest {
+struct PendingTaskSelectionRequest {
     now: u64,
     activation: GovernorActivationSnapshot,
     selected: ActiveWorkLeaseProjection,
@@ -3619,19 +3619,19 @@ pub struct PendingTaskSelectionRequest {
 impl PendingTaskSelectionRequest {
     /// Exact task id to pass to the Kernel acceptance-set read.
     #[must_use]
-    pub const fn task_id(&self) -> &TaskId {
+    const fn task_id(&self) -> &TaskId {
         &self.activation.task_id
     }
 
     /// Exact `TaskContract` revision to pass to the Kernel acceptance-set read.
     #[must_use]
-    pub const fn task_revision(&self) -> u64 {
+    const fn task_revision(&self) -> u64 {
         self.activation.task_revision
     }
 
     /// Exact state fence to pass to the Kernel acceptance-set read.
     #[must_use]
-    pub const fn state_fence(&self) -> &StateFence {
+    const fn state_fence(&self) -> &StateFence {
         &self.activation.state_fence
     }
 }
@@ -10353,9 +10353,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         self.finish_task_selection_for_request(pending, now, acceptance)
     }
 
-    /// Captures the validated owner selection before the caller performs the
-    /// asynchronous canonical acceptance-set read.
-    pub fn prepare_task_selection_for_request(
+    /// Captures the validated owner selection before Governor awaits its
+    /// canonical acceptance-set read.
+    fn prepare_task_selection_for_request(
         &self,
         now: u64,
         authenticated_principal_ref: &str,
@@ -10407,8 +10407,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
 
     /// Completes a pending request using the exact canonical owner-read result.
     /// A second live owner read rejects any selection/scope/fence change that
-    /// occurred while the caller awaited the Kernel.
-    pub fn finish_task_selection_for_request(
+    /// occurred while Governor awaited the Kernel.
+    fn finish_task_selection_for_request(
         &self,
         pending: PendingTaskSelectionRequest,
         now: u64,
