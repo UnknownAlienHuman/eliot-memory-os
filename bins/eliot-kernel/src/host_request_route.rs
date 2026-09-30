@@ -262,12 +262,12 @@ const BRIDGE_EVENT_WITHHELD_SOURCE_CLASS_UNADMITTED: &str = "source_class_not_ad
 /// durable delivery classes are retained until acknowledged and reconciled,
 /// while best-effort telemetry is received as a transport observation only
 /// and never retained. The term is the event's retention requirement; the
-/// applicable WorkScope contract decides whether raw bytes may be kept under
+/// applicable `WorkScope` contract decides whether raw bytes may be kept under
 /// it. Same closed vocabulary `eliot-ors` validates.
 const BRIDGE_EVENT_RETENTION_RETAIN_UNTIL_ACKNOWLEDGED: &str = "retain_until_acknowledged";
 const BRIDGE_EVENT_RETENTION_OBSERVE_WITHOUT_RETENTION: &str = "observe_without_retention";
 
-/// Applicable WorkScope privacy/retention contract inputs for one bridge
+/// Applicable `WorkScope` privacy/retention contract inputs for one bridge
 /// event (issue #1934, I7.23). Every field is owner-resolved or wire-proven,
 /// never caller-claimed: `work_scope_id` is the Governor-resolved scope from
 /// the retained activation binding, `provider_id` is the envelope's producer
@@ -281,6 +281,19 @@ struct BridgeEventPrivacyContract<'a> {
     retention_term: &'a str,
     activation_ticket_id: &'a str,
     resolution_result_sha256: &'a str,
+}
+
+/// Staged inputs for one durable/control bridge event: the envelope
+/// context plus the pre-persistence admission decision. Every field is
+/// owner-resolved or wire-proven, never caller-claimed.
+struct StageBridgeEventDurable<'a> {
+    session: &'a Session,
+    event: &'a EventEnvelope,
+    evidence: &'a BridgeOwnerEvidence,
+    envelope_sha: &'a str,
+    privacy: &'a serde_json::Value,
+    expired: bool,
+    binding: &'a super::ActivatedApplicationBinding,
 }
 
 /// Bound on queued local-read pairs for the outbound-only eliotd poller.
@@ -6106,15 +6119,15 @@ impl KernelComposition {
                 // `with_live_bridge_application_binding`; without it there is
                 // no Governor-resolved scope to stage under.
                 let binding = retained.ok_or(TransportError::SessionFenced)?;
-                self.stage_bridge_event_durable(
+                self.stage_bridge_event_durable(StageBridgeEventDurable {
                     session,
                     event,
-                    &evidence,
-                    &envelope_sha,
-                    &privacy,
+                    evidence: &evidence,
+                    envelope_sha: &envelope_sha,
+                    privacy: &privacy,
                     expired,
                     binding,
-                )
+                })
             }
             DeliveryClass::BestEffortTelemetry => {
                 if degraded {
@@ -6329,14 +6342,17 @@ impl KernelComposition {
     /// safe-to-resubmit answer.
     fn stage_bridge_event_durable(
         &self,
-        session: &Session,
-        event: &EventEnvelope,
-        evidence: &BridgeOwnerEvidence,
-        envelope_sha: &str,
-        privacy: &serde_json::Value,
-        expired: bool,
-        binding: &super::ActivatedApplicationBinding,
+        args: StageBridgeEventDurable<'_>,
     ) -> Result<serde_json::Value, TransportError> {
+        let StageBridgeEventDurable {
+            session,
+            event,
+            evidence,
+            envelope_sha,
+            privacy,
+            expired,
+            binding,
+        } = args;
         let privacy_legs = Self::bridge_event_privacy_legs(privacy)?;
         let staged = serde_json::json!({
             "stream_id": event.stream_id,

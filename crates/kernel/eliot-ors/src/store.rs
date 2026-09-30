@@ -11523,6 +11523,48 @@ impl RedbRecoveryStore {
     /// owner-authorization fields remain absent and only the redaction
     /// receipt is persisted. The recorded revision is the owner-decision
     /// revision from this owner's own row — never a presenter-minted leg.
+    ///
+    /// Checks one presented verdict against the independently resolved owner
+    /// (issue #1934): the verdict must name a retained owner decision, bind
+    /// the enforced scope, carry the retain-until-acknowledged term this
+    /// entry stages under, and bind the exact owner decision refs.
+    fn check_grant_binds_owner<'a>(
+        grant: &BridgeEventPrivacyAuthorization,
+        owner: Option<&'a BridgeEventPrivacyOwner>,
+        enforced_scope: Option<&str>,
+    ) -> Result<&'a BridgeEventPrivacyOwner, OrsError> {
+        let owner = owner.ok_or(OrsError::InvalidField {
+            field: "privacy_authorization",
+            reason: "bridge event privacy verdict names no owner decision this owner retained",
+        })?;
+        if enforced_scope.is_some_and(|scope| grant.scope != scope) {
+            return Err(OrsError::InvalidField {
+                field: "privacy_authorization",
+                reason: "bridge event privacy owner verdict must bind the admitted scope",
+            });
+        }
+        // The retention term gates the durable write: this entry retains
+        // bytes, so it accepts only the retain-until-acknowledged term. A
+        // verdict resolved for observation without retention contradicts
+        // durable staging and is refused rather than retained.
+        if grant.retention_term != BRIDGE_EVENT_RETENTION_RETAIN_UNTIL_ACKNOWLEDGED {
+            return Err(OrsError::InvalidField {
+                field: "privacy_authorization.retention_term",
+                reason: "bridge event durable staging requires the retain-until-acknowledged term",
+            });
+        }
+        if grant.work_scope_id != owner.work_scope_id
+            || grant.activation_ticket_id != owner.activation_ticket_id
+            || grant.activation_result_sha256 != owner.activation_result_sha256
+        {
+            return Err(OrsError::InvalidField {
+                field: "privacy_authorization",
+                reason: "bridge event privacy verdict must bind the retained owner decision",
+            });
+        }
+        Ok(owner)
+    }
+
     fn bridge_event_privacy_staging(
         staged: &serde_json::Value,
         envelope_bytes: &[u8],
@@ -11539,36 +11581,7 @@ impl RedbRecoveryStore {
         let (scan_hit, scan_classes) = Self::privacy_deny_scan(envelope_bytes);
         let (denied, classes, reason, admitted_source, scope, owner_revision) = match grant {
             Some(grant) => {
-                let owner = owner.ok_or(OrsError::InvalidField {
-                    field: "privacy_authorization",
-                    reason: "bridge event privacy verdict names no owner decision this owner retained",
-                })?;
-                if enforced_scope.is_some_and(|scope| grant.scope != scope) {
-                    return Err(OrsError::InvalidField {
-                        field: "privacy_authorization",
-                        reason: "bridge event privacy owner verdict must bind the admitted scope",
-                    });
-                }
-                // The retention term gates the durable write: this entry
-                // retains bytes, so it accepts only the
-                // retain-until-acknowledged term. A verdict resolved for
-                // observation without retention contradicts durable staging
-                // and is refused rather than retained.
-                if grant.retention_term != BRIDGE_EVENT_RETENTION_RETAIN_UNTIL_ACKNOWLEDGED {
-                    return Err(OrsError::InvalidField {
-                        field: "privacy_authorization.retention_term",
-                        reason: "bridge event durable staging requires the retain-until-acknowledged term",
-                    });
-                }
-                if grant.work_scope_id != owner.work_scope_id
-                    || grant.activation_ticket_id != owner.activation_ticket_id
-                    || grant.activation_result_sha256 != owner.activation_result_sha256
-                {
-                    return Err(OrsError::InvalidField {
-                        field: "privacy_authorization",
-                        reason: "bridge event privacy verdict must bind the retained owner decision",
-                    });
-                }
+                let owner = Self::check_grant_binds_owner(&grant, owner, enforced_scope)?;
                 let denied = grant.verdict != BRIDGE_EVENT_PRIVACY_ADMISSION || scan_hit;
                 let (classes, reason) = if denied && !scan_classes.is_empty() {
                     // The conservative detector found denied content in the
