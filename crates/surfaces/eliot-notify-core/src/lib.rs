@@ -14,8 +14,8 @@ mod telegram_experiment;
 mod user_automation;
 
 pub use control_reserve::{
-    NOTIFICATION_INBOX_BOTTLENECK, NotifyPermit, NotifyPermitOperation, NotifyReserve,
-    NotifyReserveError,
+    NOTIFICATION_INBOX_BOTTLENECK, NotifyOwnerEvidenceContext, NotifyPermit, NotifyPermitOperation,
+    NotifyReserve, NotifyReserveError,
 };
 pub use notify_declaration::{
     FallbackVerificationDeclaration, NOTIFY_FALLBACK_VERIFIER_RELATIVE, NotifyDeclarationError,

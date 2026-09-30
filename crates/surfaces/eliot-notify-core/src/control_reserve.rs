@@ -26,6 +26,26 @@
 //! the live reserve it reports and refuses while that reserve still admits
 //! the request, so pressure evidence is never manufactured.
 //!
+//! W4 notification wave: every [`NotifyPermit`] is owner-issued non-clone
+//! evidence bound to capacity class, bottleneck/unit/granted amount, typed
+//! operation, operation identity, owner and the typed [`AuthorityEpoch`]
+//! observed at acquisition, mirroring the ORS evidence grade. Every denial
+//! names the exact bottleneck, shed work and observed epoch. A stale epoch, a
+//! changed operation or a changed owner fails before consumption because the
+//! evidence no longer matches the current owner state; there is no
+//! epoch-blind permit to replay.
+//!
+//! The claimed notification dimension publishes its live partition evidence
+//! through [`NotifyReserve::publish_owner_rows`] as one validated
+//! [`BottleneckCapacityProfile`] row naming exactly its own bottleneck, in
+//! frozen contract order. The row is re-validated by the existing
+//! [`BottleneckCapacityProfile::validate`] before it is returned, so a
+//! missing owner, generation, physical total, protected partition,
+//! enforcement, proof, evidence or invalidation reference fails here rather
+//! than joining the Kernel profile composition as a claimed guarantee. Rows
+//! for any other bottleneck are never produced here: one owner's numbers are
+//! never presented as proof for another dimension.
+//!
 //! This module has no production caller yet (STITCH): it publishes the owner
 //! evidence the notification profile composition will join. There is no
 //! emergency partition here; recording reserve loss stays with the front-door
@@ -36,18 +56,21 @@
 //! to the live-observed saturation at call time, not to a re-read of the
 //! profile revision. Full installed-saturation proof stays #11 Product scope.
 
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use eliot_contracts::{ArtifactId, OperationId};
+use eliot_contracts::{ArtifactId, AuthorityEpoch, OperationId};
 use eliot_runtime_contracts::{
     AffectedOperationClass, BackpressureDisposition, BottleneckAvailability,
-    BottleneckCoverageState, BottleneckObservationV1, CapacityBottleneck, CapacityClass,
+    BottleneckCapacityProfile, BottleneckCoverageState, BottleneckObservationV1,
+    CapacityBottleneck, CapacityClass, CapacityEnforcement, CapacityLimit, CapacityUnit,
     ControlOperationClass, EarliestRecoveryCondition, EvidenceCoverageState,
     HumanActionRequirement, I14_BACKPRESSURE_RESPONSE_VERSION, I14BackpressureCause,
     I14BackpressureResponseV1, I14CurrentnessState, I14EscalationCondition, I14ForbiddenAction,
     I14RecoveryAction, I14RecoveryDirectiveV1, I14RequiredAuthority, I14ResolutionState,
     I14WorkOutcome, NormalWorkClass, RecoveryCommitStatus, StatePreservationStatus,
+    frozen_bottleneck_owner_map,
 };
 use thiserror::Error;
 
@@ -75,7 +98,7 @@ pub enum NotifyReserveError {
     /// The normal partition cannot satisfy the request; the protected
     /// partition is untouched.
     #[error(
-        "notification normal capacity exhausted for {bottleneck:?}: work {work_class:?} operation {operation_id} owned by {owner}"
+        "notification normal capacity exhausted for {bottleneck:?}: work {work_class:?} operation {operation_id} owned by {owner} epoch {epoch:?}"
     )]
     NormalCapacityExhausted {
         /// Bottleneck whose normal partition is saturated.
@@ -86,10 +109,12 @@ pub enum NotifyReserveError {
         operation_id: String,
         /// Requesting owner.
         owner: String,
+        /// Authority epoch observed at denial.
+        epoch: AuthorityEpoch,
     },
     /// The protected partition cannot satisfy the request.
     #[error(
-        "notification protected reserve exhausted for {bottleneck:?}: control operation {operation:?} operation {operation_id} owned by {owner}"
+        "notification protected reserve exhausted for {bottleneck:?}: control operation {operation:?} operation {operation_id} owned by {owner} epoch {epoch:?}"
     )]
     ProtectedReserveExhausted {
         /// Bottleneck whose protected partition is saturated.
@@ -100,6 +125,8 @@ pub enum NotifyReserveError {
         operation_id: String,
         /// Requesting owner.
         owner: String,
+        /// Authority epoch observed at denial.
+        epoch: AuthorityEpoch,
     },
 }
 
@@ -128,6 +155,32 @@ impl NotifyPermitOperation {
     }
 }
 
+/// Composition-resolved references identifying one notification
+/// owner-evidence publication: the live partition capacities read from the
+/// reserve itself and their physical total, and the
+/// [`CapacityEnforcement::ConfigurationPartition`] mechanism those partitions
+/// are held under. The composition supplies the references that identify the
+/// observation: its own owner-generation reference for the notification/inbox
+/// owner, the independent proof-profile reference, and the current evidence
+/// and invalidation references. Both halves are required:
+/// [`NotifyReserve::publish_owner_rows`] fails closed through the existing
+/// [`BottleneckCapacityProfile::validate`] when any reference is missing or
+/// non-canonical, so the composition must resolve canonical (strictly
+/// ascending, duplicate-free) reference sets rather than have them defaulted
+/// or sorted here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NotifyOwnerEvidenceContext {
+    /// Owner generation/revision reference for the notification/inbox owner.
+    pub owner_generation_ref: String,
+    /// Independent proof-profile reference produced for the notification
+    /// dimension.
+    pub proof_profile_ref: String,
+    /// Current owner evidence references supporting the published row.
+    pub evidence_refs: Vec<String>,
+    /// Exact invalidation set of the published row.
+    pub invalidation_set: Vec<String>,
+}
+
 #[derive(Debug)]
 struct NotifyReserveInner {
     normal_capacity: u64,
@@ -150,12 +203,14 @@ pub struct NotifyReserve {
     inner: Arc<NotifyReserveInner>,
 }
 
-/// One held notification capacity permit, bound to class, operation and
-/// owner. Releasing is automatic on drop and returns exactly the consumed
-/// partition.
+/// One held notification capacity permit, bound to class, operation, owner
+/// and Authority Epoch. Releasing is automatic on drop and returns exactly
+/// the consumed partition.
 ///
-/// Permits are deliberately not [`Clone`]: duplicating a permit handle must
-/// never duplicate the underlying capacity.
+/// The permit is bound to the typed Authority Epoch the caller resolved at
+/// acquisition: evidence from a fenced epoch never authorizes consumption
+/// under the current one. Permits are deliberately not [`Clone`]: duplicating
+/// a permit handle must never duplicate the underlying capacity.
 #[derive(Debug)]
 pub struct NotifyPermit {
     inner: Arc<NotifyReserveInner>,
@@ -163,6 +218,7 @@ pub struct NotifyPermit {
     operation: NotifyPermitOperation,
     operation_id: String,
     owner: String,
+    epoch: AuthorityEpoch,
 }
 
 impl NotifyPermit {
@@ -176,6 +232,12 @@ impl NotifyPermit {
     #[must_use]
     pub const fn bottleneck(&self) -> CapacityBottleneck {
         NOTIFICATION_INBOX_BOTTLENECK
+    }
+
+    /// Returns the exact unit this permit was granted in.
+    #[must_use]
+    pub const fn unit(&self) -> CapacityUnit {
+        NOTIFICATION_INBOX_BOTTLENECK.unit()
     }
 
     /// Returns the amount held in the bottleneck's exact unit (items).
@@ -200,6 +262,12 @@ impl NotifyPermit {
     #[must_use]
     pub fn owner(&self) -> &str {
         &self.owner
+    }
+
+    /// Returns the Authority Epoch bound at acquisition.
+    #[must_use]
+    pub const fn epoch(&self) -> AuthorityEpoch {
+        self.epoch
     }
 }
 
@@ -327,20 +395,23 @@ impl NotifyReserve {
     ///
     /// Only [`NormalWorkClass`] operations typecheck here, so protected
     /// notification inbox capacity is unreachable through this path by
-    /// construction.
+    /// construction. The granted permit binds `epoch`; a caller presenting it
+    /// under a different epoch holds evidence that no longer matches the
+    /// current owner state.
     ///
     /// # Errors
     ///
     /// Returns [`NotifyReserveError::InvalidField`] for a blank
     /// owner/operation identity, or
     /// [`NotifyReserveError::NormalCapacityExhausted`] naming the inbox
-    /// bottleneck and shed work when the normal partition is saturated. The
-    /// protected partition is untouched in every case.
+    /// bottleneck, shed work and observed epoch when the normal partition is
+    /// saturated. The protected partition is untouched in every case.
     pub fn try_acquire_normal_inbox(
         &self,
         work: NormalWorkClass,
         owner: &str,
         operation_id: &str,
+        epoch: AuthorityEpoch,
     ) -> Result<NotifyPermit, NotifyReserveError> {
         validate_text(owner, "notify_permit.owner")?;
         validate_text(operation_id, "notify_permit.operation_id")?;
@@ -350,6 +421,7 @@ impl NotifyReserve {
                 work_class: work,
                 operation_id: operation_id.to_owned(),
                 owner: owner.to_owned(),
+                epoch,
             });
         }
         Ok(NotifyPermit {
@@ -358,6 +430,7 @@ impl NotifyReserve {
             operation: NotifyPermitOperation::Normal(work),
             operation_id: operation_id.to_owned(),
             owner: owner.to_owned(),
+            epoch,
         })
     }
 
@@ -366,20 +439,23 @@ impl NotifyReserve {
     /// Only [`ControlOperationClass`] operations typecheck here: ordinary work
     /// cannot name a protected operation and therefore cannot acquire this
     /// partition. This is the path an admitted cancellation/recovery record
-    /// keeps while normal inbox work reports `BUSY`.
+    /// keeps while normal inbox work reports `BUSY`. The granted permit binds
+    /// `epoch` so the recovery record proves it was admitted under the current
+    /// owner state.
     ///
     /// # Errors
     ///
     /// Returns [`NotifyReserveError::InvalidField`] for a blank
     /// owner/operation identity, or
     /// [`NotifyReserveError::ProtectedReserveExhausted`] naming the inbox
-    /// bottleneck, operation, owner and request when the protected partition
-    /// is saturated.
+    /// bottleneck, operation, owner, request and observed epoch when the
+    /// protected partition is saturated.
     pub fn try_acquire_protected_inbox(
         &self,
         operation: ControlOperationClass,
         owner: &str,
         operation_id: &str,
+        epoch: AuthorityEpoch,
     ) -> Result<NotifyPermit, NotifyReserveError> {
         validate_text(owner, "notify_permit.owner")?;
         validate_text(operation_id, "notify_permit.operation_id")?;
@@ -392,6 +468,7 @@ impl NotifyReserve {
                 operation,
                 operation_id: operation_id.to_owned(),
                 owner: owner.to_owned(),
+                epoch,
             });
         }
         Ok(NotifyPermit {
@@ -400,6 +477,7 @@ impl NotifyReserve {
             operation: NotifyPermitOperation::Protected(operation),
             operation_id: operation_id.to_owned(),
             owner: owner.to_owned(),
+            epoch,
         })
     }
 
@@ -457,6 +535,48 @@ impl NotifyReserve {
             RecoveryCommitStatus::None,
         )
     }
+
+    /// Publishes the live partition evidence for the notification dimension
+    /// as one claimed [`BottleneckCapacityProfile`] row, in frozen contract
+    /// order.
+    ///
+    /// The result carries exactly one row naming [`NOTIFICATION_INBOX_BOTTLENECK`]:
+    /// the frozen owner the contract binds to that dimension, the exact
+    /// bottleneck unit, the physical total and the disjoint normal and
+    /// protected partitions read from this reserve. There is no emergency
+    /// partition here, so none is claimed. The owner generation, proof
+    /// profile, evidence and invalidation references are composition-supplied
+    /// metadata echoed into the row from `ctx`; the Kernel composition wraps
+    /// this row in its own evidence record with the configuration snapshot
+    /// and Authority Epoch it resolved.
+    ///
+    /// The row is checked by the existing
+    /// [`BottleneckCapacityProfile::validate`] before it is returned, so a
+    /// missing owner, generation, physical total, protected partition,
+    /// enforcement, proof, evidence or invalidation reference fails here
+    /// rather than publishing a row the Kernel composition would have to lower
+    /// to `UNKNOWN`. Missing, duplicate and foreign rows are unrepresentable:
+    /// the fixed-size result carries exactly one row and the helper below
+    /// builds it only for this owner's own bottleneck, looked up in the
+    /// frozen owner map rather than restated here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NotifyReserveError::Contract`] when the frozen owner map
+    /// binds no owner to the notification dimension, when the configured
+    /// partition capacities cannot form a positive physical total, or when
+    /// the assembled row fails the existing contract validation.
+    pub fn publish_owner_rows(
+        &self,
+        ctx: &NotifyOwnerEvidenceContext,
+    ) -> Result<[BottleneckCapacityProfile; 1], NotifyReserveError> {
+        let row = notify_owner_capacity_row(
+            self.inner.normal_capacity,
+            self.inner.protected_capacity,
+            ctx,
+        )?;
+        Ok([row])
+    }
 }
 
 /// Exact parts of one notification rejection directive shared by every
@@ -513,4 +633,75 @@ impl NotifyRejectionParts {
             .map_err(|error| NotifyReserveError::Contract(error.to_string()))?;
         Ok(response)
     }
+}
+
+/// Builds the claimed owner row for the notification dimension from the
+/// reserve's configured partition capacities and the composition-resolved
+/// references.
+///
+/// The owner reference is read from the frozen owner map, never restated here;
+/// the unit is the bottleneck's own declared unit. The physical total is
+/// exactly the sum of the two disjoint partitions, so the existing partition
+/// accounting check always bounds them. A zero partition capacity or a missing
+/// frozen owner fails closed: the reserve constructor already refuses zero
+/// partitions, and a dimension without a frozen owner has no claim to publish.
+fn notify_owner_capacity_row(
+    normal_capacity: u64,
+    protected_capacity: u64,
+    ctx: &NotifyOwnerEvidenceContext,
+) -> Result<BottleneckCapacityProfile, NotifyReserveError> {
+    let owner = frozen_bottleneck_owner_map()
+        .into_iter()
+        .find(|bound| bound.bottleneck == NOTIFICATION_INBOX_BOTTLENECK)
+        .map(|bound| bound.owner)
+        .ok_or_else(|| {
+            NotifyReserveError::Contract(format!(
+                "frozen owner map binds no owner to {NOTIFICATION_INBOX_BOTTLENECK:?}; no notification row to publish"
+            ))
+        })?;
+    let unit = NOTIFICATION_INBOX_BOTTLENECK.unit();
+    let limit = |field: &'static str, amount: u64| {
+        NonZeroU64::new(amount)
+            .map(|quantity| CapacityLimit { unit, quantity })
+            .ok_or(NotifyReserveError::InvalidField {
+                field,
+                reason: "partition capacity must be greater than zero",
+            })
+    };
+    let normal_limit = limit("notify_reserve.normal_limit", normal_capacity)?;
+    let protected_limit = limit("notify_reserve.protected_limit", protected_capacity)?;
+    let physical_total =
+        normal_capacity
+            .checked_add(protected_capacity)
+            .ok_or(NotifyReserveError::InvalidField {
+                field: "notify_reserve.physical_total_limit",
+                reason: "disjoint partition capacities overflow the physical total",
+            })?;
+    let physical_total_limit =
+        NonZeroU64::new(physical_total).ok_or(NotifyReserveError::InvalidField {
+            field: "notify_reserve.physical_total_limit",
+            reason: "physical total must be greater than zero",
+        })?;
+    let row = BottleneckCapacityProfile {
+        bottleneck: NOTIFICATION_INBOX_BOTTLENECK,
+        coverage_state: BottleneckCoverageState::Claimed,
+        owner_ref: owner.to_owned(),
+        owner_generation_ref: ctx.owner_generation_ref.clone(),
+        unit,
+        physical_total_limit: Some(CapacityLimit {
+            unit,
+            quantity: physical_total_limit,
+        }),
+        normal_work_applicable: true,
+        normal_limit: Some(normal_limit),
+        protected_limit: Some(protected_limit),
+        emergency_limit: None,
+        enforcement: Some(CapacityEnforcement::ConfigurationPartition),
+        proof_profile_ref: ctx.proof_profile_ref.clone(),
+        evidence_refs: ctx.evidence_refs.clone(),
+        invalidation_set: ctx.invalidation_set.clone(),
+    };
+    row.validate()
+        .map_err(|error| NotifyReserveError::Contract(error.to_string()))?;
+    Ok(row)
 }
