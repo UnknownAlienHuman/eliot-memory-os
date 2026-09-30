@@ -404,50 +404,16 @@ pub fn decide_automatic_restart(
     failure: RestartFailureEvidence,
 ) -> Result<AutomaticRestartDecision, RuntimeContractError> {
     policy.validate()?;
-    Ok(decide_restart_class(
-        policy.restart_class,
-        owner_lifecycle,
-        identity,
-        failure,
-    ))
-}
-
-/// The restart class rule on its own, with no declared policy required.
-///
-/// This is the same rule [`decide_automatic_restart`] applies after it has
-/// validated a whole declaration. It reads only the class and the owner's
-/// observed evidence, so an owner that has declared a restart class binds the
-/// rule at its own restart decision without also having to declare, or to
-/// invent, the intensity values it does not own. Granting no budget and no
-/// effect authority, an owner still has to satisfy this rule before its own
-/// declared budget and effect paths may run.
-///
-/// The order of the three refusals is itself the rule:
-/// 1. an owner that is quiescing, retiring, draining, cancelling or otherwise
-///    not `Running` never gets an automatic replacement, so a deliberate
-///    shutdown, cancellation or retirement cannot provoke a restart loop;
-/// 2. a `Temporary` child never restarts automatically, whatever the evidence;
-/// 3. missing or ambiguous exit identity is a refusal, not a default. It is
-///    neither a proved normal exit nor a proved abnormal one, so it must not
-///    permit a replacement under any class, including `Permanent`, whose rule
-///    is "restart after any exit" and which must still refuse an exit it
-///    cannot prove it observed.
-pub fn decide_restart_class(
-    restart_class: RestartClass,
-    owner_lifecycle: RestartOwnerLifecycle,
-    identity: RestartIdentityEvidence,
-    failure: RestartFailureEvidence,
-) -> AutomaticRestartDecision {
     if owner_lifecycle != RestartOwnerLifecycle::Running {
-        return AutomaticRestartDecision::SuppressedByOwnerLifecycle;
+        return Ok(AutomaticRestartDecision::SuppressedByOwnerLifecycle);
     }
-    if restart_class == RestartClass::Temporary {
-        return AutomaticRestartDecision::TemporaryChild;
+    if policy.restart_class == RestartClass::Temporary {
+        return Ok(AutomaticRestartDecision::TemporaryChild);
     }
     if identity != RestartIdentityEvidence::Exact {
-        return AutomaticRestartDecision::BlockedByUncertainIdentity;
+        return Ok(AutomaticRestartDecision::BlockedByUncertainIdentity);
     }
-    let eligible = match restart_class {
+    let eligible = match policy.restart_class {
         RestartClass::Permanent => matches!(
             failure,
             RestartFailureEvidence::NormalExit | RestartFailureEvidence::AbnormalExit
@@ -458,11 +424,11 @@ pub fn decide_restart_class(
         ),
         RestartClass::Temporary => false,
     };
-    if eligible {
+    Ok(if eligible {
         AutomaticRestartDecision::Eligible
     } else {
         AutomaticRestartDecision::NoMatchingFailureCondition
-    }
+    })
 }
 
 /// Stable identity of exactly one restart operation.
