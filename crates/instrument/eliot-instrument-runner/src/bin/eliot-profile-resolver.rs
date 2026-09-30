@@ -747,9 +747,7 @@ fn seal_version_request(
     // concrete executable rather than to a name that could resolve elsewhere.
     let operation = format!(
         "verification-profile-version-{}",
-        &sha256_hex(
-            format!("{executable}\0{}", argv.join("\u{1}")).as_bytes()
-        )[..24]
+        &sha256_hex(format!("{}\0{}", executable.display(), argv.join("\u{1}")).as_bytes())[..24]
     );
     let intent = ProcessIntent::new(
         OperationId::new(operation.clone())?,
@@ -766,7 +764,8 @@ fn seal_version_request(
         executable
             .parent()
             .unwrap_or_else(|| Path::new("."))
-            .to_path_buf(),
+            .to_string_lossy()
+            .into_owned(),
         projection,
         ResourceLimits::new(
             VERSION_WALL_TIMEOUT_MS,
@@ -904,9 +903,8 @@ fn process_epoch() -> Result<EpochId, CliError> {
         // `write!` into the same String rather than appending a `format!` result:
         // one formatting call, no intermediate allocation, and no way for the
         // formatted hex to differ from what was pushed.
-        write!(lineage, "{byte:02x}").map_err(|_| {
-            CliError::Contract("epoch lineage is not formattable".to_owned())
-        })?;
+        write!(lineage, "{byte:02x}")
+            .map_err(|_| CliError::Contract("epoch lineage is not formattable".to_owned()))?;
     }
     let lineage = EpochLineageId::new(lineage)?;
     let sequence = NonZeroU64::new(1)
