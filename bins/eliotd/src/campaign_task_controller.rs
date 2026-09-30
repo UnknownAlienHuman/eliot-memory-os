@@ -545,14 +545,12 @@ async fn task_controller_selection_admission(
     claimed: &TaskControllerClaimedInvocation,
 ) -> Result<TaskControllerSelectionAdmission, String> {
     let identity = &claimed.envelope.identity;
-    let session_ref = identity
-        .session_id
-        .as_deref()
-        .ok_or_else(|| "TASK_SELECTION_REQUIRED: Task Controller request has no session".to_owned())?;
-    let scope_ref = identity
-        .work_scope_id
-        .as_deref()
-        .ok_or_else(|| "TASK_SCOPE_INCOMPATIBLE: Task Controller request has no WorkScope".to_owned())?;
+    let session_ref = identity.session_id.as_deref().ok_or_else(|| {
+        "TASK_SELECTION_REQUIRED: Task Controller request has no session".to_owned()
+    })?;
+    let scope_ref = identity.work_scope_id.as_deref().ok_or_else(|| {
+        "TASK_SCOPE_INCOMPATIBLE: Task Controller request has no WorkScope".to_owned()
+    })?;
     let task_ref = identity
         .task_id
         .as_deref()
@@ -560,15 +558,17 @@ async fn task_controller_selection_admission(
     let fence = &claimed.envelope.state_fence;
     let now = u64::try_from(
         SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| format!("TASK_SELECTION_REQUIRED: daemon clock is invalid: {error}"))?
-        .as_millis(),
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| format!("TASK_SELECTION_REQUIRED: daemon clock is invalid: {error}"))?
+            .as_millis(),
     )
     .map_err(|_| "TASK_SELECTION_REQUIRED: daemon clock exceeds owner range".to_owned())?;
     let pending = {
         let guard = composition.lock().await;
         if !eliot_contracts::fences_match_exact(&guard.governor_kernel_fence(), fence) {
-            return Err("TASK_SCOPE_INCOMPATIBLE: Task Controller request fence is stale".to_owned());
+            return Err(
+                "TASK_SCOPE_INCOMPATIBLE: Task Controller request fence is stale".to_owned(),
+            );
         }
         guard
             .prepare_task_selection_for_request(
@@ -593,9 +593,9 @@ async fn task_controller_selection_admission(
         })?;
     let now_after_kernel_read = u64::try_from(
         SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| format!("TASK_SELECTION_REQUIRED: daemon clock is invalid: {error}"))?
-        .as_millis(),
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| format!("TASK_SELECTION_REQUIRED: daemon clock is invalid: {error}"))?
+            .as_millis(),
     )
     .map_err(|_| "TASK_SELECTION_REQUIRED: daemon clock exceeds owner range".to_owned())?;
     let (owner, explicit_root, live_fence) = {
@@ -605,18 +605,20 @@ async fn task_controller_selection_admission(
             .map_err(task_selection_composition_error)?;
         let live_fence = guard.governor_kernel_fence();
         if !eliot_contracts::fences_match_exact(owner.state_fence(), &live_fence) {
-            return Err("TASK_SCOPE_INCOMPATIBLE: Task Controller selection fence moved".to_owned());
+            return Err(
+                "TASK_SCOPE_INCOMPATIBLE: Task Controller selection fence moved".to_owned(),
+            );
         }
         let explicit_root = guard
             .activation_workspace_locator_for_selection(&owner)
             .map_err(|error| error.to_string())?;
         (owner, explicit_root, live_fence)
     };
-    let observed_scope = crate::task_binding_admission::observe_explicit_workspace(
-        &explicit_root,
-        &live_fence,
-    )
-    .map_err(|error| format!("TASK_SCOPE_INCOMPATIBLE: Host workspace observation failed: {error}"))?;
+    let observed_scope =
+        crate::task_binding_admission::observe_explicit_workspace(&explicit_root, &live_fence)
+            .map_err(|error| {
+                format!("TASK_SCOPE_INCOMPATIBLE: Host workspace observation failed: {error}")
+            })?;
     Ok(TaskControllerSelectionAdmission {
         owner,
         observed_scope,
@@ -631,9 +633,7 @@ fn task_selection_composition_error(error: eliot_governor::CompositionError) -> 
             "TASK_SELECTION_REQUIRED"
         }
         eliot_governor::CompositionError::ActivationScopeSelectionRequired
-        | eliot_governor::CompositionError::ActivationStaleFence => {
-            "TASK_SCOPE_INCOMPATIBLE"
-        }
+        | eliot_governor::CompositionError::ActivationStaleFence => "TASK_SCOPE_INCOMPATIBLE",
         _ => "TASK_SELECTION_REQUIRED",
     };
     format!("{code}: {error}")
