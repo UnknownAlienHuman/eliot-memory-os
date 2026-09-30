@@ -6,6 +6,35 @@ rust-version.workspace = true
 license.workspace = true
 description = "Kernel-gated ELIOT Researcher provider process; fails closed when the Kernel front door is unreachable or a reply does not verify"
 
+[package.metadata.eliot]
+# Issue #24 research-provider capability declaration.
+#
+# What is declared here is only what the repo already states. The ownership
+# triple `functional_cell` / `lifecycle_owner` / `work_id` is deliberately NOT
+# written: no cell id, no lifecycle owner and no research-plane work-item id
+# exists for `eliot-mod-research` anywhere in the tree, and this package owns no
+# durable mutable state (its admission is immutable and per-operation, and the
+# Kernel/ORS research rows #15/#18 own are still absent). Naming a cell here
+# would therefore manufacture ownership rather than record it, and it would
+# also make this package a *declared* cell, which the capsule gate then reads
+# as requiring a full ModuleContractKit/CrateContextCapsule/ModuleTestCapsule
+# triad under `docs/code-navigation/capsules/<cell>/` — a path this work unit
+# does not own.
+#
+# The three markers below are carried verbatim from this work unit's own
+# assignment record, `workstreams/core-daemons/assignments/
+# 024-research-provider-runtime.toml` (lines 4-6), so the manifest states the
+# research provider's real support level instead of implying a generated
+# registry record that does not exist.
+implementation_support = "GOVERNED_PROVIDER_BRIDGE_SOURCE_CURRENT_UNVERIFIED"
+evidence_execution_status = "SOURCE_AUDIT_EXECUTED_EDGE_PROOF_NOT_EXECUTED"
+proof_ceiling = "RESEARCH_PROVIDER_EDGE_CANDIDATE"
+# Mirrors the `crates/modules/eliot-native-worker-core` precedent: the package's
+# own test target is the honest proof surface for this source. This is a
+# command, not an ownership claim.
+proof_entrypoint = "cargo test -p eliot-mod-research --all-targets --all-features"
+independent_proof_profile = "eliot-mod-research"
+
 [lib]
 path = "src/lib.rs"
 
