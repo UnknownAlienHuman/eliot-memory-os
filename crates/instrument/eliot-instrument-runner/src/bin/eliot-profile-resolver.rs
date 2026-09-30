@@ -107,8 +107,8 @@ use eliot_instrument_api::{InstrumentContractError, InstrumentInvocation};
 use eliot_instrument_runner::{
     ADMITTED_SCOPE_CLASS, AdmittedProfile, DeclaredEnvironmentDependency, ISOLATED_PROCESS_CLASS,
     InstrumentRegistry, InstrumentRequestPort, InstrumentRunner, InstrumentSpec, ParityVerdict,
-    PlannedStage, ProfileAggregate, ProfileCompiler, RunnerError, StageEnvironment, StageLauncher,
-    StageOrchestrator, SupplyChainReceipt, TargetLayout, VerificationProfileReceipt,
+    PlannedStage, ProfileAggregate, ProfileCompiler, RunnerError, StageEnvironment, StageEvidence,
+    StageLauncher, StageOrchestrator, SupplyChainReceipt, TargetLayout, VerificationProfileReceipt,
     VerificationRouteRequest, WorkScope, admitted_profile_for_alias, parity_summary,
     profile::{PROFILE_ALIASES, builtin_specs},
     resolve_verification_route, verify_profile_parity,
@@ -593,6 +593,16 @@ fn resolve_route(request: &Request) -> Result<VerificationProfileReceipt, CliErr
 /// never ran, so this entry fails closed instead of printing one. This is a
 /// reachability guard on the receipt, not a verdict — the aggregate's own
 /// normalized outcome still decides PASS.
+///
+/// The guard is NOT the diagnostic. Before it reduces the outcome to "launched
+/// no admitted stage", it reports what each stage's own run record already
+/// carries: every run whose evidence is `Missing` or `Omitted` is a refusal this
+/// run observed, and its exact reason text travels out with the refusal. A
+/// reader is therefore told WHICH stage refused and WHY, rather than only that
+/// the route launched nothing. The zero-launch verdict is unchanged and no
+/// refusal is dropped to reach it: a run that launched at least one stage still
+/// reports no per-stage reasons here, because this is a zero-launch guard and
+/// not a general stage report.
 fn require_launched_stage(
     admitted: &AdmittedProfile,
     aggregate: &ProfileAggregate,
@@ -603,12 +613,42 @@ fn require_launched_stage(
         .filter(|run| run.executable_digest.is_some())
         .count();
     if launched == 0 {
+        let refusals = stage_refusals(aggregate);
         return Err(CliError::Contract(format!(
-            "route '{}' revision {} launched no admitted stage; no tool identity was observed",
-            admitted.name, admitted.revision
+            "route '{}' revision {} launched no admitted stage; no tool identity was observed; {}",
+            admitted.name, admitted.revision, refusals
         )));
     }
     Ok(())
+}
+
+/// Renders each refused stage's existing run record as one reported reason.
+///
+/// This reads the aggregate the orchestrator already assembled; it computes
+/// nothing new and launches nothing. Every run is rendered, whether it launched
+/// a tool or not, so a stage that failed with a non-empty executable identity
+/// still contributes its execution axis and outcome to the report. A run with a
+/// concrete missing/omitted reason reports that exact reason; a launched run
+/// reports the outcome it actually reached, so the report never claims a stage
+/// refused when it in fact ran.
+fn stage_refusals(aggregate: &ProfileAggregate) -> String {
+    if aggregate.runs.is_empty() {
+        return "no admitted stage produced a run record at all".to_owned();
+    }
+    let mut reported = Vec::with_capacity(aggregate.runs.len());
+    for run in &aggregate.runs {
+        let stage_id = run.stage.stage_id.as_str();
+        let reason = match &run.evidence {
+            StageEvidence::Missing { reason } | StageEvidence::Omitted { reason } => {
+                format!("{reason} (evidence missing, execution {:?})", run.execution)
+            }
+            StageEvidence::Retained { .. } => {
+                format!("launched (execution {:?})", run.execution)
+            }
+        };
+        reported.push(format!("stage '{stage_id}' {reason}"));
+    }
+    format!("per-stage refusals: [{}]", reported.join("; "))
 }
 
 /// Pins every admitted external stage executable from the real bytes here.
@@ -1140,13 +1180,28 @@ fn fresh_key_bytes() -> [u8; 32] {
 /// The single dispatch-authority cell every stage of one run seals under.
 ///
 /// The cell issues one permit per admitted stage and stores the validation
-/// context those permits are consumed against. Every stage of a run shares the
-/// same authority epoch and generation, so the one stored context validates
-/// every permit the cell issued, while the per-stage one-shot nonce keeps each
-/// permit independently single-use.
+/// context of EACH of those stages, keyed by the exact operation identity the
+/// permit was issued against. Every stage of a run shares the same authority
+/// epoch and generation, but each stage is issued its OWN one-shot nonce, its
+/// own fence nonce, and its own revision heads — so one shared context slot
+/// would compare a sealed request against ANOTHER stage's material and refuse
+/// a launch that was correctly admitted. The map is what makes the
+/// correspondence one-to-one: the context consumed with a request is the
+/// context minted with that same request.
+///
+/// The permit authority is still ONE authority for the whole run, and
+/// consumption is still one-shot: [`DispatchPermitAuthority::validate_and_consume`]
+/// keeps its own issued/consumed nonce ledger, and it is the only thing that
+/// consumes a permit.
 struct DispatchCell {
     authority: Mutex<DispatchPermitAuthority>,
-    context: Mutex<Option<DispatchValidationContext>>,
+    /// One validation context per issued operation identity.
+    ///
+    /// Behind a mutex because the port that consumes it is shared, and because
+    /// a per-request entry is retained for the whole run so the context a
+    /// request is validated against is still resolvable after later requests
+    /// have been issued.
+    contexts: Mutex<BTreeMap<String, DispatchValidationContext>>,
 }
 
 impl DispatchCell {
@@ -1159,7 +1214,7 @@ impl DispatchCell {
         let key = KernelDispatchKey::from_secret_bytes(fresh_key_bytes())?;
         Ok(Self {
             authority: Mutex::new(DispatchPermitAuthority::activate(authority_id, key)),
-            context: Mutex::new(None),
+            contexts: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -1198,8 +1253,10 @@ impl DispatchCell {
             .issue(intent, issuance)?;
         // The stored context pins the exact material the permit was issued
         // with — the same fence, its own authority epoch, and the same revision
-        // heads — so consume-time validation compares the permit against this
-        // snapshot rather than against ambient state.
+        // heads — so consume-time validation compares the permit against THIS
+        // request's own snapshot rather than against ambient state. It is
+        // keyed by the operation identity it was minted for, so the executor
+        // can resolve it back from the request being validated.
         let context_epoch = fence.authority_epoch().clone();
         let context = DispatchValidationContext::new(
             observation_clock(issued_at_unix_ms),
@@ -1208,24 +1265,36 @@ impl DispatchCell {
             pinned_heads,
             VALIDATION_REVISION,
         )?;
-        *self
-            .context
+        self.contexts
             .lock()
-            .map_err(|_| CliError::Contract("validation context lock poisoned".to_owned()))? =
-            Some(context);
+            .map_err(|_| CliError::Contract("validation context lock poisoned".to_owned()))?
+            .insert(intent.operation_id().as_str().to_owned(), context);
         Ok(ProcessRequest::new(intent.clone(), permit)?)
     }
 
-    /// The stored validation context the executor consumes every permit against.
-    fn context(&self) -> Result<DispatchValidationContext, ProcessExecutionError> {
-        self.context
+    /// The validation context belonging to exactly the request being validated.
+    ///
+    /// The lookup key is the request's own operation identity, which is the same
+    /// key [`Self::issue`] stored its context under. A request this cell never
+    /// issued a permit for has no context and is refused here, before the
+    /// authority is consulted, so an unissued request can never be validated
+    /// against another request's material.
+    fn context(
+        &self,
+        request: &ProcessRequest,
+    ) -> Result<DispatchValidationContext, ProcessExecutionError> {
+        self.contexts
             .lock()
             .map_err(|_| {
                 ProcessExecutionError::Unavailable("validation context poisoned".to_owned())
             })?
-            .clone()
+            .get(request.operation_id().as_str())
+            .cloned()
             .ok_or_else(|| {
-                ProcessExecutionError::Unavailable("validation context absent".to_owned())
+                ProcessExecutionError::Unavailable(format!(
+                    "validation context absent for operation '{}'",
+                    request.operation_id().as_str()
+                ))
             })
     }
 }
@@ -1236,7 +1305,10 @@ impl DispatchValidationPort for DispatchCell {
         request: ProcessRequest,
         observed: SuspendedProcessIdentity,
     ) -> Result<ValidatedDispatch, ProcessExecutionError> {
-        let context = self.context()?;
+        // The context is resolved from the request itself, before the permit is
+        // consumed, so the one authority below compares the permit against the
+        // fence, epoch, and revision heads it was issued with and nothing else.
+        let context = self.context(&request)?;
         self.authority
             .lock()
             .map_err(|_| ProcessExecutionError::Unavailable("authority lock poisoned".to_owned()))?
@@ -1367,9 +1439,13 @@ impl StagePort {
     ///
     /// Sealing is a per-stage operation because the P-07 dispatch permit is
     /// one-shot: one permit can never launch two children. Each stage's request
-    /// is bound to its own one-shot nonce and its own sealed intent, and the
-    /// shared run context validates all of them because they carry the same
-    /// authority epoch and generation.
+    /// is bound to its own one-shot nonce, its own sealed intent, its own fence
+    /// nonce, and its own revision heads, and [`DispatchCell::issue`] stores the
+    /// matching validation context under that request's operation identity. The
+    /// stages of a run share one authority epoch and generation — so one
+    /// authority admits them all — but they do NOT share a fence or heads, so
+    /// they do not share a validation context either: each request is validated
+    /// against the context minted with it, and against no other request's.
     fn seal_all(
         cell: &DispatchCell,
         epoch: &EpochId,
