@@ -71,8 +71,10 @@ pub use improvement_admission::{
     ImprovementAdmissionDecision, ImprovementAdmissionError, ImprovementAdmissionPolicy,
     ImprovementBlockCause, ImprovementBlockRemedy, ImprovementBoundError, ImprovementCandidateView,
     ImprovementEvidenceView, ImprovementPulseOutcome, ImprovementRejectCause,
-    ImprovementSurfaceBound, ImprovementTargetSurface, admit_improvement_candidate,
+    ImprovementSurfaceBound, ImprovementTargetSurface, ImprovementBriefDisposition,
+    ImprovementDispositionError, OwnerDispositionSelection, admit_improvement_candidate,
     improvement_admission_policy, resolve_candidate_surface_bound,
+    select_non_mutating_disposition,
 };
 pub use improvement_pipeline::{
     ActivationEvidence, AdmittedResourceCeiling, AdmittedScopeRefinement, ExperimentPlan,
