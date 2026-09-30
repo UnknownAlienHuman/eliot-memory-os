@@ -936,6 +936,30 @@ pub enum CoordinatorError {
     StaleWorker,
     #[error("stale work lease")]
     StaleLease,
+    /// The swarm admission a call presented is no longer the one that admits
+    /// its wave: the old wave's recorded [`eliot_agent_contracts::OldWaveDisposition`]
+    /// is `CANCEL` or `SUPERSEDE`, or the definition revision it named has
+    /// already left `FROZEN` (issue #1702 A2/A3).
+    ///
+    /// This is NOT [`Self::StalePlanRevision`], which refuses a caller holding
+    /// an old Task Controller draft/frozen *definition* revision — here the
+    /// definition is current and the ADMISSION under it is revoked, so the
+    /// caller's records are individually correct and only their combination is
+    /// no longer admitted. It is NOT [`Self::StaleController`], which refuses a
+    /// presenter outside the current coordinator *lease* — an exactly-current
+    /// holder still gets this one, because the lease stays valid while the wave
+    /// it would advance has been explicitly dispositioned. It is NOT
+    /// [`Self::StaleFence`], which refuses a stale attempt state fence at this
+    /// crate's own attempt boundary. The distinction matters because the remedy
+    /// differs: a stale admission requires a NEW admission for the replacement
+    /// definition, which no amount of re-presentation, re-lease or re-fencing
+    /// can substitute for.
+    ///
+    /// Like the other stale variants this is a pure refusal against the
+    /// caller's own records: it changes no definition, admission, execution
+    /// revision, lease or wave.
+    #[error("stale swarm admission")]
+    StaleAdmission,
     #[error("stale result")]
     StaleResult,
     #[error("route receipt does not match the admitted route")]
@@ -1010,6 +1034,22 @@ pub enum CoordinatorError {
     /// enum for the same crate boundary would be a second authority.
     #[error(transparent)]
     RuntimeProfileRejected(#[from] crate::runtime_profile::RuntimeProfileRejection),
+    /// A coordinator execution update or retained-work record would change
+    /// frozen swarm semantics (issue #1702 A2/A6).
+    ///
+    /// `field` names the exact contract owner field the comparison refused. It
+    /// is carried through from
+    /// [`eliot_agent_contracts::ContractError::SemanticDrift`] rather than
+    /// re-derived here, because the frozen definition/admission/execution
+    /// vocabulary is owned by that contract, not by this crate. A caller
+    /// reading this variant therefore learns WHICH frozen field was changed and
+    /// nothing beyond that.
+    ///
+    /// This is a narrowing refusal: it changes no revision, no lease and no
+    /// wave, and it is produced by a pure comparison over the caller's own
+    /// records before any replacement, rebind or state advance is written.
+    #[error("execution update or retained record changes frozen swarm semantics for {0}")]
+    SemanticDrift(&'static str),
 }
 
 /// Classifies a persisted or presented result wire that predates the
