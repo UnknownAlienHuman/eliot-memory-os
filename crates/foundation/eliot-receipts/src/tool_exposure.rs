@@ -1345,6 +1345,53 @@ fn require_stage_unrecorded(
     Ok(())
 }
 
+/// Refuses to reopen a still-unresolved history stage.
+///
+/// Reopening an unresolved stage would mint an identical-key false revision,
+/// so the caller keeps the stage unresolved instead.
+fn require_stage_recorded(recorded: bool, field: &'static str) -> Result<(), ToolExposureError> {
+    if !recorded {
+        return Err(ToolExposureError::InvalidField {
+            field,
+            reason: "only a recorded stage can be reopened in a successor revision; an unresolved stage stays unresolved",
+        });
+    }
+    Ok(())
+}
+
+/// The single history stage a successor revision reopens.
+///
+/// Closed over the ten owner-populated stages of
+/// [`ToolExposureHistoryEntry`]: registration, advertisement, eligibility,
+/// selection, call, transport, delivery, retry/expansion, observable use, and
+/// terminal outcome. Checked against the entry fields, never against a caller
+/// list: every variant names exactly one entry field, and unknown coverage
+/// stays unknown through the reopening.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ExposureHistoryStage {
+    /// Definition/facet registration fact.
+    Registered,
+    /// Publish-seam advertisement fact.
+    AdvertisedToRoute,
+    /// Scope/policy/grant eligibility fact.
+    EligibleUnderScopePolicyAndGrant,
+    /// Planner/model selection fact.
+    SelectedByPlannerOrModel,
+    /// Execution call fact.
+    Called,
+    /// Transport-completion fact.
+    TransportCompleted,
+    /// Bridge/host delivery-completeness fact with its source reference.
+    ResultDelivery,
+    /// Retry/expansion fact.
+    ExpandedOrRetried,
+    /// Observable-use fact.
+    ObservablyUsedInDecisionActionOrVerifier,
+    /// Terminal task/product outcome reference.
+    TerminalOutcome,
+}
+
 impl ToolExposureHistoryEntry {
     /// Records the registration fact from the definition/facet owner.
     ///
@@ -1592,6 +1639,115 @@ impl ToolExposureHistoryEntry {
         self.terminal_task_or_product_outcome_ref = Some(outcome_ref);
         self.validate()?;
         Ok(self)
+    }
+
+    /// Stages a successor revision that reopens one recorded stage.
+    ///
+    /// The recorded entry is untouched: this clones it with every identity,
+    /// stage, source reference, and unknown carried over verbatim, then
+    /// clears exactly the named stage back to explicitly unresolved so its
+    /// owner can re-supply a changed verdict through the matching existing
+    /// `record_*` stager. No stage is inferred from another, and the staged
+    /// successor validates before return. Only a recorded stage can be
+    /// reopened: reopening an unresolved stage would mint an identical-key
+    /// false revision, so it fails as a typed error and the unresolved
+    /// stage stays unresolved. The successor's
+    /// [`Self::persistence_idempotency_key`] differs from the original, so
+    /// the owning persistence seam stores it alongside the original through
+    /// the existing observation/receipt/outbox path instead of rewriting,
+    /// while an identical redelivery still reconciles on the identical key.
+    /// The persistence seam is the STITCH caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the original entry is inconsistent, when the
+    /// named stage is still unresolved, or when the staged successor is
+    /// inconsistent.
+    pub fn successor_reopening(
+        &self,
+        stage: ExposureHistoryStage,
+    ) -> Result<Self, ToolExposureError> {
+        self.validate()?;
+        let mut successor = self.clone();
+        match stage {
+            ExposureHistoryStage::Registered => {
+                require_stage_recorded(
+                    successor.registered.observed.is_some(), "history.registered"
+                )?;
+                successor.registered = OwnerStageFact::unresolved();
+            }
+            ExposureHistoryStage::AdvertisedToRoute => {
+                require_stage_recorded(
+                    successor.advertised_to_route.observed.is_some(),
+                    "history.advertised_to_route"
+                )?;
+                successor.advertised_to_route = OwnerStageFact::unresolved();
+            }
+            ExposureHistoryStage::EligibleUnderScopePolicyAndGrant => {
+                require_stage_recorded(
+                    successor
+                        .eligible_under_scope_policy_and_grant
+                        .observed
+                        .is_some(),
+                    "history.eligible_under_scope_policy_and_grant",
+                )?;
+                successor.eligible_under_scope_policy_and_grant = OwnerStageFact::unresolved();
+            }
+            ExposureHistoryStage::SelectedByPlannerOrModel => {
+                require_stage_recorded(
+                    successor.selected_by_planner_or_model.observed.is_some(),
+                    "history.selected_by_planner_or_model",
+                )?;
+                successor.selected_by_planner_or_model = OwnerStageFact::unresolved();
+            }
+            ExposureHistoryStage::Called => {
+                require_stage_recorded(
+                    successor.called.observed.is_some(), "history.called"
+                )?;
+                successor.called = OwnerStageFact::unresolved();
+            }
+            ExposureHistoryStage::TransportCompleted => {
+                require_stage_recorded(
+                    successor.transport_completed.observed.is_some(),
+                    "history.transport_completed"
+                )?;
+                successor.transport_completed = OwnerStageFact::unresolved();
+            }
+            ExposureHistoryStage::ResultDelivery => {
+                require_stage_recorded(
+                    successor.result_delivery.is_some(), "history.result_delivery"
+                )?;
+                successor.result_delivery = None;
+                successor.delivery_source_ref = None;
+            }
+            ExposureHistoryStage::ExpandedOrRetried => {
+                require_stage_recorded(
+                    successor.expanded_or_retried.observed.is_some(),
+                    "history.expanded_or_retried"
+                )?;
+                successor.expanded_or_retried = OwnerStageFact::unresolved();
+            }
+            ExposureHistoryStage::ObservablyUsedInDecisionActionOrVerifier => {
+                require_stage_recorded(
+                    successor
+                        .observably_used_in_decision_action_or_verifier
+                        .observed
+                        .is_some(),
+                    "history.observably_used_in_decision_action_or_verifier",
+                )?;
+                successor.observably_used_in_decision_action_or_verifier =
+                    OwnerStageFact::unresolved();
+            }
+            ExposureHistoryStage::TerminalOutcome => {
+                require_stage_recorded(
+                    successor.terminal_task_or_product_outcome_ref.is_some(),
+                    "history.terminal_task_or_product_outcome_ref",
+                )?;
+                successor.terminal_task_or_product_outcome_ref = None;
+            }
+        }
+        successor.validate()?;
+        Ok(successor)
     }
 
     /// Derives the content-bound persistence key for this recorded revision.
