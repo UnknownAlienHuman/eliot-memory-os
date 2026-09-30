@@ -6557,8 +6557,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         if self.readiness != CompositionReadiness::Ready {
             return Err(CompositionError::NotReady);
         }
-        if state_fence != &self.snapshot.state_fence()
-            || state_fence != &self.recovery.state_fence
+        if state_fence != &self.snapshot.state_fence() || state_fence != &self.recovery.state_fence
         {
             return Err(CompositionError::Provider(
                 "Observe owner read is not at the exact retained StateFence".to_owned(),
@@ -6649,15 +6648,15 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 "authenticated Observe principal is invalid".to_owned(),
             ));
         }
-        let session = self
-            .owners
-            .session
-            .session(session_id)
-            .ok_or_else(|| CompositionError::Recovery("Session owner has no admitted Observe session".to_owned()))?;
+        let session = self.owners.session.session(session_id).ok_or_else(|| {
+            CompositionError::Recovery("Session owner has no admitted Observe session".to_owned())
+        })?;
         if session.session_id != *session_id
             || session.status != SessionState::Active
             || session.state_fence != *request_fence
-            || !session.authority_epoch.is_same_authority(&request_fence.authority_epoch)
+            || !session
+                .authority_epoch
+                .is_same_authority(&request_fence.authority_epoch)
             || session.task_scope.as_deref() != session_task_ref
         {
             return Err(CompositionError::Provider(
@@ -6701,9 +6700,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         let work_scope_read = self.recovery.owner_read(RecoveryOwner::WorkScope)?;
         if work_scope_read.state_fence != *request_fence
             || work_scope_read.revision != work_scope.owner_revision
-            || expected_scope_ref.is_some_and(|scope_ref| {
-                scope_ref != work_scope.binding.scope.scope_ref
-            })
+            || expected_scope_ref
+                .is_some_and(|scope_ref| scope_ref != work_scope.binding.scope.scope_ref)
             || !is_sha256(&work_scope_read.value_digest)
         {
             return Err(CompositionError::Recovery(
