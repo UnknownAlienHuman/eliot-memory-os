@@ -4531,6 +4531,20 @@ pub struct ColdStartSurfaceView {
     pub projection_generation: u64,
 }
 
+/// The validated claim retained for one cold-start trigger and its lease outcome.
+///
+/// `claim` is the exact full value read back from the readiness owner. Callers
+/// use it for terminal readback instead of reconstructing identity digests
+/// from the compile inputs. `join` preserves the existing single-flight
+/// disposition and terminal surface.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ColdStartTriggerCompilation {
+    /// Exact validated claim submitted to the readiness owner.
+    pub claim: ColdStartReadinessClaim,
+    /// Existing single-flight result for this trigger.
+    pub join: LeaseJoin,
+}
+
 /// Ephemeral capability held only by the composition invocation that won the
 /// durable ORS claim. Restart recovery uses ORS readback and never restores
 /// this process-local compile capability from serialized data.
@@ -6999,7 +7013,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// Live status: owning thin entry for attach/onboarding ingress; no live
     /// attach ingress builds the compilation inputs yet (BLOCKED-BY
     /// attach-transport: `bins/eliotd` `ScopeAttachIngress` carries no
-    /// discovery or onboarding lease). Caller: STITCH.
+    /// discovery or onboarding lease). The return carries the exact validated
+    /// claim retained by ORS alongside its lease disposition, so a caller can
+    /// read back the same terminal without reconstructing the full claim.
+    /// Caller: STITCH.
     #[allow(
         clippy::too_many_arguments,
         clippy::too_many_lines,
@@ -7037,7 +7054,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         scan_binding: &ScanDisclosureOwnerBinding,
         scan_receipt: Option<&ScanReceiptHandle>,
         now: u64,
-    ) -> Result<LeaseJoin, CompositionError> {
+    ) -> Result<ColdStartTriggerCompilation, CompositionError> {
         if self.readiness != CompositionReadiness::Ready {
             return Err(CompositionError::NotReady);
         }
@@ -7097,10 +7114,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             return Err(CompositionError::ActivationStaleFence);
         }
         if record.terminal.is_some() {
-            let joined = Self::readiness_join_from_record(&record, now, false)?;
+            let claim = record.claim.clone();
+            let join = Self::readiness_join_from_record(&record, now, false)?;
             self.cold_start_readiness_claims
                 .remove(&claim.binding_digest);
-            return Ok(joined);
+            return Ok(ColdStartTriggerCompilation { claim, join });
         }
         if now > record.claim.lease_deadline {
             self.cold_start_readiness_claims
@@ -7185,7 +7203,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         self.cold_start_readiness_claims
             .remove(&claim.binding_digest);
-        Self::readiness_join_from_record(&terminal_record, now, false)
+        let join = Self::readiness_join_from_record(&terminal_record, now, false)?;
+        Ok(ColdStartTriggerCompilation {
+            claim: terminal_record.claim.clone(),
+            join,
+        })
     }
 
     /// Projects the retained terminal cold-start surface for one exact lease
