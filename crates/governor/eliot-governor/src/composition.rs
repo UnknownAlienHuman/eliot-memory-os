@@ -3154,98 +3154,129 @@ pub(crate) fn acceptance_coverage_from_verifier_fact(
     );
     let mut acceptance = Vec::with_capacity(contract.item_ids.len());
     for item_id in &contract.item_ids {
-        // Explicit acceptance-to-test join owned by the canonical plan. A
-        // missing entry is an unmapped obligation; an empty test set declares
-        // a non-test obligation that executed verifier runs alone cannot
-        // satisfy. Neither form shrinks the denominator to the test list.
-        let mapped = verifier_plan
-            .acceptance_verifier_map
-            .get(item_id)
-            .cloned()
-            .unwrap_or_default();
-        let mut evidence_refs = BTreeSet::new();
-        let mut mapped_events = 0_usize;
-        let mut all_mapped_observed = true;
-        let mut all_pass = true;
-        for test_id in &mapped {
-            let test_events = fact
-                .verification_run
-                .evidence
-                .iter()
-                .filter(|event| {
-                    event
-                        .value
-                        .get("nextest_test_id")
-                        .and_then(serde_json::Value::as_str)
-                        == Some(test_id.as_str())
-                })
-                .collect::<Vec<_>>();
-            if test_events.is_empty() {
-                all_mapped_observed = false;
-            }
-            for event in test_events {
-                mapped_events += 1;
-                evidence_refs.insert(event.evidence_id.to_string());
-                evidence_refs.insert(event.raw_artifact_id.to_string());
-                if let Some(handles) = event
-                    .value
-                    .get("raw_artifact_handles")
-                    .and_then(serde_json::Value::as_array)
-                {
-                    evidence_refs.extend(
-                        handles
-                            .iter()
-                            .filter_map(serde_json::Value::as_str)
-                            .map(str::to_owned),
-                    );
-                }
-                if event
-                    .value
-                    .get("nextest_status")
-                    .and_then(serde_json::Value::as_str)
-                    != Some("PASS")
-                {
-                    all_pass = false;
-                }
-            }
-        }
-        if mapped_events == 0 {
-            // Keep the negative item disposition tied to the actual raw run
-            // artifacts inspected; never mint a placeholder item receipt.
-            evidence_refs.extend(
-                fact.verification_run
-                    .raw_evidence
-                    .iter()
-                    .map(ToString::to_string),
-            );
-        }
-        // An item is satisfied only for a current run where every bound test
-        // executed and every bound execution passed. Failed, stale,
-        // not-executed, simulated (non-productive, hence non-certifying and
-        // stale-marked upstream), unmapped, and non-test obligations stay
-        // uncovered here and fail closed in `derive_finish_decision`.
-        let satisfied = run_is_current && !mapped.is_empty() && all_mapped_observed && all_pass;
-        let verifier_run_refs = if mapped_events == 0 {
-            Vec::new()
-        } else {
-            vec![run_ref.clone()]
-        };
-        // Only an explicit empty mapping declares a non-test obligation that
-        // does not require a verifier run. A missing mapping stays a
-        // verifier gap so absent coverage fails closed downstream.
-        let requires_verifier = !matches!(
-            verifier_plan.acceptance_verifier_map.get(item_id),
-            Some(tests) if tests.is_empty()
-        );
-        acceptance.push(AcceptanceCoverage {
-            item_id: item_id.clone(),
-            satisfied,
-            evidence_refs: evidence_refs.into_iter().collect(),
-            verifier_run_refs,
-            requires_verifier,
-        });
+        acceptance.push(acceptance_coverage_for_item(
+            item_id,
+            verifier_plan,
+            fact,
+            &run_ref,
+            run_is_current,
+        ));
     }
     Ok(acceptance)
+}
+
+/// Projects one acceptance item's coverage from the executed verifier run.
+///
+/// This is the per-item half of [`acceptance_coverage_from_verifier_fact`], which
+/// keeps the plan/fact/denominator refusals and delegates the projection here, so
+/// neither half can grow into the other. It is a pure move of that loop body: it
+/// raises no refusal of its own, so the only thing a caller can observe is the
+/// `AcceptanceCoverage` it returns, and every check, comparison, order and effect
+/// in it is the one the loop already performed.
+///
+/// The denominator decision is unchanged. `requires_verifier` is false only for an
+/// explicitly empty mapping, so a *missing* mapping stays a verifier gap;
+/// `satisfied` is true only for a current run whose every mapped test was observed
+/// and every one of them passed; and a `mapped_events == 0` item keeps its
+/// disposition tied to the raw run artifacts actually inspected rather than a
+/// minted placeholder. A persisted `satisfied` flag is never an input here.
+fn acceptance_coverage_for_item(
+    item_id: &str,
+    verifier_plan: &CanonicalVerifierPlanBinding,
+    fact: &CanonicalVerifierExecutionFact,
+    run_ref: &str,
+    run_is_current: bool,
+) -> AcceptanceCoverage {
+    // Explicit acceptance-to-test join owned by the canonical plan. A
+    // missing entry is an unmapped obligation; an empty test set declares
+    // a non-test obligation that executed verifier runs alone cannot
+    // satisfy. Neither form shrinks the denominator to the test list.
+    let mapped = verifier_plan
+        .acceptance_verifier_map
+        .get(item_id)
+        .cloned()
+        .unwrap_or_default();
+    let mut evidence_refs = BTreeSet::new();
+    let mut mapped_events = 0_usize;
+    let mut all_mapped_observed = true;
+    let mut all_pass = true;
+    for test_id in &mapped {
+        let test_events = fact
+            .verification_run
+            .evidence
+            .iter()
+            .filter(|event| {
+                event
+                    .value
+                    .get("nextest_test_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(test_id.as_str())
+            })
+            .collect::<Vec<_>>();
+        if test_events.is_empty() {
+            all_mapped_observed = false;
+        }
+        for event in test_events {
+            mapped_events += 1;
+            evidence_refs.insert(event.evidence_id.to_string());
+            evidence_refs.insert(event.raw_artifact_id.to_string());
+            if let Some(handles) = event
+                .value
+                .get("raw_artifact_handles")
+                .and_then(serde_json::Value::as_array)
+            {
+                evidence_refs.extend(
+                    handles
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                );
+            }
+            if event
+                .value
+                .get("nextest_status")
+                .and_then(serde_json::Value::as_str)
+                != Some("PASS")
+            {
+                all_pass = false;
+            }
+        }
+    }
+    if mapped_events == 0 {
+        // Keep the negative item disposition tied to the actual raw run
+        // artifacts inspected; never mint a placeholder item receipt.
+        evidence_refs.extend(
+            fact.verification_run
+                .raw_evidence
+                .iter()
+                .map(ToString::to_string),
+        );
+    }
+    // An item is satisfied only for a current run where every bound test
+    // executed and every bound execution passed. Failed, stale,
+    // not-executed, simulated (non-productive, hence non-certifying and
+    // stale-marked upstream), unmapped, and non-test obligations stay
+    // uncovered here and fail closed in `derive_finish_decision`.
+    let satisfied = run_is_current && !mapped.is_empty() && all_mapped_observed && all_pass;
+    let verifier_run_refs = if mapped_events == 0 {
+        Vec::new()
+    } else {
+        vec![run_ref.to_owned()]
+    };
+    // Only an explicit empty mapping declares a non-test obligation that
+    // does not require a verifier run. A missing mapping stays a
+    // verifier gap so absent coverage fails closed downstream.
+    let requires_verifier = !matches!(
+        verifier_plan.acceptance_verifier_map.get(item_id),
+        Some(tests) if tests.is_empty()
+    );
+    AcceptanceCoverage {
+        item_id: item_id.to_owned(),
+        satisfied,
+        evidence_refs: evidence_refs.into_iter().collect(),
+        verifier_run_refs,
+        requires_verifier,
+    }
 }
 
 fn verifier_fact_error(reason: impl Into<String>) -> CompositionError {
