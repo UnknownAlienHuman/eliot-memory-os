@@ -5571,22 +5571,26 @@ fn causal_evidence_digest_parts(record: &CausalEvidenceRecord) -> Vec<String> {
     // them made for this function, so these parts cannot disagree with what
     // admission and `derived_coverage` read. The denominator's own DECLARED
     // coverage cell is committed separately from the derived one: admission reads
-    // it (a `CompleteForScope` claim is refused unless every expected member was
-    // observed, and cannot coexist with an omission), so two records declaring
-    // different coverage are two different retained records even when the
-    // coverage they DERIVE happens to coincide.
+    // it inside its two `CompleteForScope` arms (a `CompleteForScope` claim is
+    // refused unless every expected member was observed, and cannot coexist with
+    // an omission), so two records declaring different coverage are two different
+    // retained records even when the coverage they DERIVE happens to coincide.
     //
     // Committing these cells is an IDENTITY change and deliberately not an
     // ADMISSIBILITY change. An `expected` member that no retained envelope backs
     // stays admissible and stays a named gap: `expected` is the owner's declared
     // denominator, `observed` is the observation, and it is `observed` alone that
-    // `RivalDenominator::validate` joins to `evidence_ids`. Requiring an evidence
-    // join for `expected` as well would make `PartialForScope` and the
-    // `observed.is_empty()` `Unknown` arm unreachable, so no denominator could
-    // ever be anything but complete or refused — the coverage ceiling this
-    // package exists to preserve. Such a record still blocks every qualified
-    // causal state through the rival leg in `blocking_causal_leg`; what it can no
-    // longer do is share a candidate identity with a record that declared a
+    // `RivalDenominator::validate` joins to `evidence_ids`. Admissibility is not
+    // this change's scope; the type's own contract (`RivalDenominator`) binds
+    // `observed` to the evidence set and deliberately does not bind `expected`.
+    // Requiring `expected` to be a SUBSET of `observed` would make
+    // `PartialForScope` and the `observed.is_empty()` `Unknown` arm unreachable,
+    // so no denominator could ever be anything but complete or refused - the
+    // coverage ceiling this package exists to preserve. (An evidence JOIN for
+    // `expected` alone would not: `expected=["a"], observed=[]` still reaches the
+    // `Unknown` arm.) Such a record still blocks every qualified causal state
+    // through the rival leg in `blocking_causal_leg`; what it can no longer do is
+    // share a candidate identity with a record that declared a
     // different denominator.
     parts.push(format!(
         "rival_declared_coverage:{}:{}",
