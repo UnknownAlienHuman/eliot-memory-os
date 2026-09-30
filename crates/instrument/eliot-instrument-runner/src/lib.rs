@@ -35,9 +35,9 @@ pub mod verification_profile;
 pub use build_projection::{
     AffectedEdge, BuildCacheDecision, BuildCancellation, BuildClaimOrder, BuildCleanupPass,
     BuildProjectionError, CargoOrigin, CargoScopeRefusal, ClaimedBuild, CleanupCandidate,
-    CleanupDecision, DeclaredWorkItem, PreemptionClass, ProducerClaim, ProducerCompletion,
-    ProducerOutcome, ProjectedBuild, QuarantinedArtifact, TargetClass, TargetRootBuildCoordinator,
-    restrict_agent_argv,
+    CleanupDecision, DeclaredWorkItem, FlightResolution, HeldLease, LiveClaim, PreemptionClass,
+    ProducerClaim, ProducerCompletion, ProducerOutcome, ProjectedBuild, QuarantinedArtifact,
+    TargetClass, TargetRootBuildCoordinator, restrict_agent_argv,
 };
 pub use cache_lane::{CacheLane, CacheLaneAttestations, CacheLaneError, LaneOutcome};
 pub use capsule_binding::{

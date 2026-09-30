@@ -31,6 +31,20 @@
 //!   the producer's own raw evidence on success and on failure
 //!   ([`TargetRootBuildCoordinator`], [`ProducerOutcome`],
 //!   [`TargetRootBuildCoordinator::terminal_outcome`]);
+//! * **one flight identity, not one latest outcome per root** — every claim
+//!   carries the producer's own `OperationId`, the immutable result is
+//!   published under that exact (root, lineage, operation) flight *before* the
+//!   producer slot is released, and a new producer may occupy the root without
+//!   overwriting the previous flight's recorded result. A waiter therefore
+//!   resolves its own flight, or learns that the result is unavailable, and
+//!   never another flight's
+//!   ([`TargetRootBuildCoordinator`], [`FlightResolution`],
+//!   [`BuildProjectionError::FlightRetentionCapacity`]);
+//! * **cleanup resolved per candidate** — a candidate's own target root,
+//!   lineage, and owning lane decide which live claims and which runtime leases
+//!   are consulted, so an unrelated root's lease never blocks an independent
+//!   removal and an incomplete lease census is never removable
+//!   ([`BuildCleanupPass`], [`CleanupDecision`]);
 //! * **the refusal of an agent-originated `--workspace`/`--all`** (line 3),
 //!   with no override, because the projected route is the only admitted one
 //!   and the projected route is admitted only by presenting the real
@@ -84,6 +98,7 @@ use eliot_build_test_graph::{
     WorkEnvelopeError,
 };
 use eliot_instrument_api::ExecutionStatus;
+use eliot_process::OperationId;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -97,6 +112,25 @@ const PROJECTED_SUBCOMMAND: &str = "check";
 
 /// Cargo package-selection flag I18.26 line 10 names.
 const PACKAGE_SELECTION_FLAG: &str = "-p";
+
+/// Upper bound on closed producer flights one coordinator retains.
+///
+/// The retained set is what lets a waiter that has not yet read its result
+/// still receive it, so it cannot be emptied to make room. When the bound is
+/// reached, closing a further flight is refused with
+/// [`BuildProjectionError::FlightRetentionCapacity`] and the producer slot is
+/// *not* released: the caller gets backpressure and keeps a root that still has
+/// one live producer, never a silent eviction and never a second producer.
+const MAX_RETAINED_FLIGHT_OUTCOMES: usize = 64;
+
+/// Upper bound on waiters bound to one live producer flight.
+///
+/// Waiters are not queued or scheduled here; the bound only stops an unbounded
+/// fan-in from attaching to a flight whose result nobody can be holding. A
+/// claim past the bound is refused with backpressure, so a caller retries or
+/// reads the existing durable result — it never turns into a second producer,
+/// because the single-flight slot is still held.
+const MAX_WAITERS_PER_FLIGHT: usize = 64;
 
 /// Exact class of change a work item makes, and therefore which proof closure
 /// it must run.
@@ -476,15 +510,27 @@ impl BuildCacheDecision {
 /// One claimed producer slot for a target root.
 ///
 /// A waiter learns which producer to await; it never learns a verdict. The
-/// claim is the waiter's handle onto the flight: `target_root` and `lineage`
-/// together resolve the producer's own terminal outcome through
-/// [`TargetRootBuildCoordinator::terminal_outcome`], and they are the same
-/// identity the single-flight slot was keyed on, so `flight` can never name a
-/// producer that builds in a different root.
+/// claim is the waiter's handle onto **one exact flight**: `target_root`,
+/// `lineage`, and `operation` together resolve that flight's own terminal
+/// outcome through [`TargetRootBuildCoordinator::terminal_outcome`], and they
+/// are the same identity the single-flight slot was keyed on, so `flight` can
+/// never name a producer that builds in a different root.
+///
+/// The three together are load-bearing, not redundant. `target_root` and
+/// `lineage` are *build inputs*: two flights that agree on every input resolve
+/// to the same pair, and I10.8.4 line 29 is explicit that a shared execution
+/// key is not a shared execution. `operation` is the producer's own
+/// [`OperationId`] — the existing operation/attempt identity the process
+/// contract already owns — and it is the only element that separates flight A
+/// from a later flight C over the same root and fingerprint. It is read off the
+/// producer's claim at claim time and handed to every waiter unchanged; it is
+/// never derived from a waiter's own work-item identity, because a waiter's
+/// identity is not a producer's attempt.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProducerClaim {
     /// Normalized [`BuildFingerprint::digest`]: the lineage inside this claim's
-    /// target root, and the identity the recorded outcome is checked against.
+    /// target root, and one element of the identity the recorded outcome is
+    /// checked against.
     pub lineage: String,
     /// The work item that owns the producer slot.
     pub producer: String,
@@ -493,6 +539,12 @@ pub struct ProducerClaim {
     /// The governed target root the flight may build in, and the root the
     /// single-flight slot was taken from.
     pub target_root: PathBuf,
+    /// The producer's exact operation/attempt identity for this flight.
+    ///
+    /// For a waiter this is the *producer's* operation, recorded when the
+    /// producer claimed the slot. Two flights over one root and fingerprint
+    /// differ here and nowhere else.
+    pub operation: OperationId,
 }
 
 impl ProducerClaim {
@@ -526,6 +578,7 @@ impl Ord for ClaimedBuild {
             .cmp(&other.preemption)
             .then_with(|| self.claim.lineage.cmp(&other.claim.lineage))
             .then_with(|| self.claim.producer.cmp(&other.claim.producer))
+            .then_with(|| self.claim.operation.cmp(&other.claim.operation))
     }
 }
 
@@ -619,6 +672,11 @@ impl ProducerOutcome {
 pub struct ProducerCompletion {
     /// Normalized [`BuildFingerprint::digest`] of the closed flight.
     pub lineage: String,
+    /// The producer's exact operation/attempt identity the outcome was
+    /// published under. Together with the lineage and the target root this is
+    /// the flight a waiter resolves, and it is what makes a later flight over
+    /// the same root a *different* flight rather than a replacement.
+    pub operation: OperationId,
     /// Whether this call held the producer slot and released it.
     pub released: bool,
     /// The producer's terminal state. The same value is now recorded for the
@@ -693,19 +751,56 @@ impl BuildCancellation {
 }
 
 /// One artifact a disk-cleanup pass may consider removing.
+///
+/// The candidate carries its own governed target root beside its lineage, so a
+/// decision is made about *this* artifact's exact root/lineage and never about
+/// some other root's activity. I2.22 makes the two inseparable — the lineage
+/// digest is the root's last path segment — so keeping both here is one
+/// identity, not a second one.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CleanupCandidate {
     /// Normalized fingerprint digest whose lineage produced the artifact.
     pub lineage: String,
+    /// The governed target root that holds the artifact, resolved from the
+    /// lane that produced it.
+    pub target_root: PathBuf,
     /// The artifact to consider.
     pub artifact: PathBuf,
+}
+
+impl CleanupCandidate {
+    /// Whether this candidate names one coherent root/lineage/artifact
+    /// relation.
+    ///
+    /// I2.22's root ends in the lineage digest, so an artifact outside its own
+    /// declared root is a candidate whose identity does not resolve. Such a
+    /// candidate is never removable: the pass cannot tell which root's writer
+    /// might still be using it.
+    #[must_use]
+    pub fn resolves_under_own_root(&self) -> bool {
+        self.artifact.starts_with(&self.target_root)
+            && self
+                .target_root
+                .file_name()
+                .is_some_and(|last| last.to_string_lossy() == self.lineage)
+    }
 }
 
 /// The exact decision about one cleanup candidate.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CleanupDecision {
-    /// Nothing remains for this lineage, and no lease is held: the candidate
-    /// may be removed by the owning storage layer.
+    /// Nothing remains for this candidate's own root and lineage, and no lease
+    /// held by a lane that owns this root is outstanding: the candidate may be
+    /// removed by the owning storage layer.
+    ///
+    /// This is a *projection*, not a filesystem deletion permit. It names no
+    /// file to unlink and carries no authority to unlink one: the owning
+    /// storage layer still performs the deletion, and it still has to preserve
+    /// the artifact's owner, ACL, and reparse/symlink disposition through that
+    /// deletion, exactly as I2.22 requires of any derived-cache root. Losing
+    /// that identity while removing the bytes is how a reparse point or a
+    /// foreign owner's directory gets reused, so a decision here never widens
+    /// into a claim that the identity was preserved.
     Removable,
     /// The candidate is retained for the exact typed reason below.
     Retained {
@@ -714,53 +809,123 @@ pub enum CleanupDecision {
     },
 }
 
+/// One live producer claim, as the cleanup census sees it.
+///
+/// Cleanup must consult the claims that actually intersect the candidate, so it
+/// keeps the claim's whole identity — its root *and* its lineage — instead of
+/// a bare digest that would match any root.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct LiveClaim {
+    /// Governed target root the producer occupies.
+    pub target_root: PathBuf,
+    /// Fingerprint lineage the producer is building.
+    pub lineage: String,
+}
+
+/// One live runtime-environment lease, together with the root of the lane that
+/// holds it.
+///
+/// A lease blocks cleanup only for the roots that lane actually owns. Attaching
+/// the holding lane's own governed root is what makes "unrelated roots do not
+/// block independent cleanup" checkable: the lease and the candidate are
+/// compared by root relation, not by mere presence in the same pass.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct HeldLease {
+    /// Governed target root of the lane that holds this lease.
+    pub target_root: PathBuf,
+    /// The lease itself, as the admitted lane recorded it.
+    pub lease: RuntimeEnvironmentLease,
+}
+
+impl HeldLease {
+    /// Whether this lease's holding lane shares the candidate's governed root.
+    ///
+    /// A lease on a fixture namespace or a volume is a statement about the lane
+    /// that allocated it, so it intersects a candidate exactly when both live
+    /// under the same governed root. Two unrelated roots never intersect, and a
+    /// lease in a third worktree's root therefore cannot block this candidate.
+    #[must_use]
+    pub fn intersects(&self, candidate: &CleanupCandidate) -> bool {
+        self.target_root == candidate.target_root
+    }
+}
+
 /// The result of one lineage- and lease-aware disk-cleanup pass.
 ///
-/// I18.26 line 37. A candidate is removable only when two independent facts
-/// hold: its lineage has no live producer, and no
-/// [`RuntimeEnvironmentLease`] is still held. Any other outcome is retained
-/// with its exact typed reason. The pass removes nothing itself — deletion
-/// stays with the owning storage layer — and it never widens into removing a
-/// complete artifact of a live lineage.
+/// I18.26 line 37. A candidate is removable only when every one of these facts
+/// holds, each resolved *for that candidate*: its artifact lies under its own
+/// declared root, that root's last path segment is its own lineage, no live
+/// producer claim holds that exact root and lineage, and no lease held by a lane
+/// owning that same root is outstanding. Any other outcome is retained with its
+/// exact typed reason. The pass removes nothing itself — deletion stays with the
+/// owning storage layer — and it never widens into removing a complete artifact
+/// of a live lineage.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BuildCleanupPass {
-    /// Live lineage digests, derived from the producer claims.
-    pub live_lineages: BTreeSet<String>,
-    /// Runtime environment leases still held by their holders.
-    pub held_leases: Vec<RuntimeEnvironmentLease>,
+    /// Live producer claims, each with the root it occupies.
+    pub live_claims: BTreeSet<LiveClaim>,
+    /// Runtime environment leases still held, each with its holder's root.
+    pub held_leases: Vec<HeldLease>,
+    /// Whether the lease census above is complete.
+    ///
+    /// A census that could not be completed stays **unknown**, and unknown is
+    /// not removable. `false` is the fail-closed default, so a caller that
+    /// never enumerates the live holders cannot accidentally read an empty
+    /// lease set as "nothing is leased".
+    pub lease_census_complete: bool,
 }
 
 impl BuildCleanupPass {
     /// Builds the pass from the claims the caller already holds.
     ///
-    /// Lineage is the fingerprint digest, so this needs no second identity
-    /// mechanism: the caller reads the claims it already has and this reads
-    /// the producer ones.
+    /// Lineage is the fingerprint digest and the root is the claim's own, so
+    /// this needs no second identity mechanism: the caller reads the claims it
+    /// already has and this keeps the producer ones with their roots. The lease
+    /// census starts **incomplete**, because claims say nothing about leases.
     #[must_use]
     pub fn live_lineages(claims: &[ClaimedBuild]) -> Self {
         Self {
-            live_lineages: claims
+            live_claims: claims
                 .iter()
                 .filter(|claimed| claimed.claim.is_producer())
-                .map(|claimed| claimed.claim.lineage.clone())
+                .map(|claimed| LiveClaim {
+                    target_root: claimed.claim.target_root.clone(),
+                    lineage: claimed.claim.lineage.clone(),
+                })
                 .collect(),
             held_leases: Vec::new(),
+            lease_census_complete: false,
         }
     }
 
-    /// Records the runtime environment leases that are still held.
+    /// Records the runtime environment leases that are still held, attributed
+    /// to the root of the lane that holds each one.
     ///
     /// The leases are the ones the admitted lanes still hold, read through
     /// [`crate::GovernedWorkEnvelope::runtime_leases`]. The envelope never
     /// derives a lease from a worktree, because a worktree does not isolate
     /// runtime resources; a held lease is a live holder, not a directory
-    /// observation.
+    /// observation. Attributing each lease to its holder lane's own
+    /// [`crate::GovernedWorkEnvelope::derive_target_root`] is what lets
+    /// [`BuildCleanupPass::evaluate_one`] consult only intersecting leases.
     #[must_use]
     pub fn with_live_leases(mut self, lanes: &[&GovernedWorkEnvelope]) -> Self {
-        self.held_leases = lanes
-            .iter()
-            .flat_map(|lane| lane.runtime_leases().iter().cloned())
-            .collect();
+        let mut complete = true;
+        for lane in lanes {
+            let Ok(target_root) = lane.derive_target_root() else {
+                // A holder whose root cannot be derived cannot be matched
+                // against any candidate, so the census is not complete and every
+                // candidate stays unknown rather than removable.
+                complete = false;
+                continue;
+            };
+            self.held_leases
+                .extend(lane.runtime_leases().iter().map(|lease| HeldLease {
+                    target_root: target_root.clone(),
+                    lease: lease.clone(),
+                }));
+        }
+        self.lease_census_complete = complete;
         self
     }
 
@@ -774,20 +939,46 @@ impl BuildCleanupPass {
     }
 
     /// The single-candidate decision behind [`BuildCleanupPass::evaluate`].
+    ///
+    /// The order is fail-closed from the most specific fact to the least:
+    /// the candidate's own identity must resolve, then the claim that occupies
+    /// exactly that root and lineage, then the census, then only the leases
+    /// that intersect that root.
     fn evaluate_one(&self, candidate: &CleanupCandidate) -> CleanupDecision {
-        if self.live_lineages.contains(&candidate.lineage) {
+        if !candidate.resolves_under_own_root() {
+            return CleanupDecision::Retained {
+                reason: BuildProjectionError::CandidateIdentityUnresolved {
+                    lineage: candidate.lineage.clone(),
+                    target_root: candidate.target_root.to_string_lossy().into_owned(),
+                },
+            };
+        }
+        let claim_key = LiveClaim {
+            target_root: candidate.target_root.clone(),
+            lineage: candidate.lineage.clone(),
+        };
+        if self.live_claims.contains(&claim_key) {
             return CleanupDecision::Retained {
                 reason: BuildProjectionError::LineageLive {
                     lineage: candidate.lineage.clone(),
                 },
             };
         }
-        match self.held_leases.first() {
-            Some(lease) => CleanupDecision::Retained {
+        if !self.lease_census_complete {
+            return CleanupDecision::Retained {
+                reason: BuildProjectionError::LeaseCensusIncomplete,
+            };
+        }
+        match self
+            .held_leases
+            .iter()
+            .find(|held| held.intersects(candidate))
+        {
+            Some(held) => CleanupDecision::Retained {
                 reason: BuildProjectionError::LeaseStillHeld {
-                    kind: lease.kind,
-                    resource: lease.resource.clone(),
-                    holder: lease.holder.clone(),
+                    kind: held.lease.kind,
+                    resource: held.lease.resource.clone(),
+                    holder: held.lease.holder.clone(),
                 },
             },
             None => CleanupDecision::Removable,
@@ -795,22 +986,52 @@ impl BuildCleanupPass {
     }
 }
 
-/// One closed producer flight, retained so the flight's waiters can resolve it.
+/// The exact identity of one producer flight: root, fingerprint lineage, and
+/// the producer's own operation/attempt.
 ///
-/// The lineage is stored beside the outcome and re-checked on every read, so a
-/// resolution can never hand a claim evidence recorded for a different lineage
-/// that happens to share a target root.
-struct ClosedFlight {
+/// This is the key the retained result is stored under, and it is the whole
+/// point of the flight-identity repair. Storing the result under a bare target
+/// root (or a bare lineage) makes two *different executions* share one slot,
+/// which is how a waiter that had not yet read flight A's result can lose it
+/// and later be handed flight C's. I10.8.4 line 29 is explicit that a shared
+/// `BuildExecutionKey` is a reuse key, not an execution identity.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct FlightKey {
+    target_root: PathBuf,
     lineage: String,
+    operation: OperationId,
+}
+
+impl FlightKey {
+    /// The key a claim's own flight is recorded under.
+    fn of(claim: &ProducerClaim) -> Self {
+        Self {
+            target_root: claim.target_root.clone(),
+            lineage: claim.lineage.clone(),
+            operation: claim.operation.clone(),
+        }
+    }
+}
+
+/// One closed producer flight, retained so the flight's own waiters can resolve
+/// it.
+///
+/// The whole key is stored beside the outcome and re-checked on every read, so
+/// a resolution can never hand a claim evidence recorded for a different
+/// flight — not a different lineage, and not a different execution of the
+/// *same* lineage in the same root.
+struct ClosedFlight {
+    producer: String,
     outcome: ProducerOutcome,
 }
 
 /// The one InstrumentRunner-controlled build projection.
 ///
 /// The coordinator owns two things and nothing else: the single-producer claim
-/// per (target root, fingerprint), and the refusal of unrestricted agent Cargo
-/// invocations. It creates no scheduler, no job, no queue, no budget, and no
-/// pre-emption engine; I18.26 line 63 keeps those elsewhere.
+/// per (target root, fingerprint), bound to one exact flight identity, and the
+/// refusal of unrestricted agent Cargo invocations. It creates no scheduler, no
+/// job, no queue, no budget, and no pre-emption engine; I18.26 line 63 keeps
+/// those elsewhere.
 ///
 /// # Why the slot is keyed on the target root
 ///
@@ -838,6 +1059,19 @@ struct ClosedFlight {
 /// flight drops the entry, because the next claim for that root must be free to
 /// become the producer. That is what bounds this map to *live* roots.
 ///
+/// # Retained flights, not retained roots
+///
+/// Closing a flight records its outcome under the flight's exact
+/// (root, lineage, operation) key and never overwrites another flight's entry,
+/// so a new producer may occupy the root without erasing what the previous
+/// flight recorded. The retained set is bounded by
+/// `MAX_RETAINED_FLIGHT_OUTCOMES`; when the bound is reached the close is
+/// refused with the slot still held rather than evicting a result some waiter
+/// has not read. A settled flight is released explicitly through
+/// [`TargetRootBuildCoordinator::settle`], and restart recovery reads the
+/// existing Testd job/result persistence, so this map is not a second
+/// execution ledger.
+///
 /// # Single-owner coordination
 ///
 /// The state is behind a [`RefCell`], so a coordinator is single-owner and not
@@ -849,8 +1083,21 @@ struct ClosedFlight {
 pub struct TargetRootBuildCoordinator {
     /// One live producer slot per target root.
     live: RefCell<BTreeMap<PathBuf, SingleFlightBuildRegistry>>,
-    /// The terminal outcome of the most recently closed flight per target root.
-    closed: RefCell<BTreeMap<PathBuf, ClosedFlight>>,
+    /// The producer operation identity occupying each live target root, and how
+    /// many waiters are bound to it.
+    ///
+    /// A waiter learns the producer's operation from here, at claim time. It is
+    /// never derived from the waiter's own work-item identity: a waiter's
+    /// identity is not a producer's attempt, and a claim derived from it would
+    /// name a flight that never ran.
+    live_operation: RefCell<BTreeMap<PathBuf, (String, OperationId, usize)>>,
+    /// One terminal outcome per **closed flight**, keyed by the flight's exact
+    /// (root, lineage, operation) identity.
+    ///
+    /// Keying by flight rather than by root is what keeps flight A's immutable
+    /// result available to A's own waiters after a later producer C has
+    /// occupied the same root: C inserts its own key and never overwrites A's.
+    closed: RefCell<BTreeMap<FlightKey, ClosedFlight>>,
 }
 
 impl TargetRootBuildCoordinator {
@@ -859,6 +1106,7 @@ impl TargetRootBuildCoordinator {
     pub const fn new() -> Self {
         Self {
             live: RefCell::new(BTreeMap::new()),
+            live_operation: RefCell::new(BTreeMap::new()),
             closed: RefCell::new(BTreeMap::new()),
         }
     }
@@ -874,18 +1122,31 @@ impl TargetRootBuildCoordinator {
     /// resolve to different roots and are different lineages with independent
     /// producer slots (lines 21-22, and I2.22).
     ///
-    /// A claim granted [`BuildFlight::Producer`] also supersedes whatever this
-    /// root recorded before: the root has no live producer, so the previous
-    /// flight's artifacts are no longer what the root holds, and its recorded
-    /// outcome is dropped rather than served to a later reader.
+    /// A claim granted [`BuildFlight::Producer`] occupies the root and records
+    /// **this call's** `operation` as the flight's identity. It does not discard
+    /// anything the root recorded before: the previous flight's result stays
+    /// under its own exact key, because a waiter that has not read it yet is
+    /// still waiting for it.
+    ///
+    /// A claim that comes back [`BuildFlight::Waiter`] is bound to the *live*
+    /// producer's operation, read from the root's live record, so the returned
+    /// claim names the flight the waiter will actually receive. A flight
+    /// already holding `MAX_WAITERS_PER_FLIGHT` waiters refuses further
+    /// waiters with [`BuildProjectionError::WaiterCapacity`]; the producer slot
+    /// stays held, so exhausting the bound never becomes a second producer.
     ///
     /// # Errors
     ///
     /// Returns [`BuildProjectionError`] for an incomplete or malformed
-    /// declaration or an underivable lane, and
+    /// declaration or an underivable lane,
     /// [`BuildProjectionError::SingleFlight`] when the registry cannot be read
-    /// or rejects the producer identity.
-    pub fn claim(&self, item: &DeclaredWorkItem) -> Result<ProducerClaim, BuildProjectionError> {
+    /// or rejects the producer identity, and
+    /// [`BuildProjectionError::WaiterCapacity`] at the waiter bound.
+    pub fn claim(
+        &self,
+        item: &DeclaredWorkItem,
+        operation: &OperationId,
+    ) -> Result<ProducerClaim, BuildProjectionError> {
         item.validate()?;
         let target_root = item.target_root()?;
         let lineage = item.envelope.fingerprint.digest().map_err(|source| {
@@ -894,25 +1155,47 @@ impl TargetRootBuildCoordinator {
                 source,
             }
         })?;
-        let flight = {
+        let (flight, producer, flight_operation) = {
             let mut live = self.live.borrow_mut();
             let registry = live.entry(target_root.clone()).or_default();
             let flight = registry.claim(&item.envelope.fingerprint, item.work_item_id.clone())?;
-            if matches!(flight, BuildFlight::Producer) {
-                self.closed.borrow_mut().remove(&target_root);
-            }
-            flight
+            let mut operations = self.live_operation.borrow_mut();
+            let (producer, flight_operation) = match &flight {
+                BuildFlight::Producer => {
+                    operations.insert(
+                        target_root.clone(),
+                        (item.work_item_id.clone(), operation.clone(), 0),
+                    );
+                    (item.work_item_id.clone(), operation.clone())
+                }
+                BuildFlight::Waiter { producer } => {
+                    let entry = operations
+                        .get_mut(&target_root)
+                        .ok_or_else(|| BuildProjectionError::NotTheProducer {
+                            work_item_id: producer.clone(),
+                        })?;
+                    if entry.2 >= MAX_WAITERS_PER_FLIGHT {
+                        return Err(BuildProjectionError::WaiterCapacity {
+                            capacity: MAX_WAITERS_PER_FLIGHT,
+                        });
+                    }
+                    entry.2 += 1;
+                    (entry.0.clone(), entry.1.clone())
+                }
+            };
+            (flight, producer, flight_operation)
         };
         Ok(ProducerClaim {
             lineage,
-            producer: item.work_item_id.clone(),
+            producer,
             flight,
             target_root,
+            operation: flight_operation,
         })
     }
 
-    /// Closes one producer flight, releases its slot, and records its outcome so
-    /// the flight's waiters can resolve the producer's own evidence.
+    /// Closes one producer flight, publishes its outcome under that exact
+    /// flight, and only then releases its producer slot.
     ///
     /// This is I18.26 line 34: a failed producer wakes waiters with the same
     /// evidence. Both arms of [`ProducerOutcome`] deliver the identical
@@ -921,14 +1204,28 @@ impl TargetRootBuildCoordinator {
     /// here — line 35 rules out a silent retry storm, so the decision to re-run
     /// stays with the owning work item.
     ///
+    /// The publish happens **before** the release, deliberately. A root whose
+    /// slot is free but whose writer's result was never recorded looks
+    /// safely reusable while the evidence of the last attempt is unobserved, so
+    /// a failure to retain the result must leave an explicit recovery
+    /// obligation instead: [`BuildProjectionError::FlightRetentionCapacity`]
+    /// is returned with the slot still held, and the caller keeps a root that
+    /// still has one live producer and no second one.
+    ///
     /// # Errors
     ///
     /// Returns [`BuildProjectionError::NotTheProducer`] when `item` does not
-    /// hold a live flight of its target root, and the same declaration failures
-    /// as [`TargetRootBuildCoordinator::claim`] for a malformed lane.
+    /// hold a live flight of its target root, the same declaration failures as
+    /// [`TargetRootBuildCoordinator::claim`] for a malformed lane,
+    /// [`BuildProjectionError::EvidenceNotPreserved`] when the outcome carries
+    /// no retained raw evidence to publish, and
+    /// [`BuildProjectionError::FlightRetentionCapacity`] when the bounded
+    /// retained set is full — in which case the producer slot is **not**
+    /// released.
     pub fn completion_wakeup(
         &self,
         item: &DeclaredWorkItem,
+        operation: &OperationId,
         outcome: ProducerOutcome,
     ) -> Result<ProducerCompletion, BuildProjectionError> {
         item.validate()?;
@@ -939,6 +1236,47 @@ impl TargetRootBuildCoordinator {
                 source,
             }
         })?;
+        if !matches!(outcome.evidence(), RawEvidence::Retained { .. }) {
+            return Err(BuildProjectionError::EvidenceNotPreserved);
+        }
+        // Only the producer that actually holds this exact flight may close it.
+        // A waiter replaying the producer's work-item id cannot close a flight
+        // it does not hold, and a different producer's operation cannot close
+        // this one.
+        {
+            let live_operation = self.live_operation.borrow();
+            match live_operation.get(&target_root) {
+                Some((producer, held, _)) if producer == &item.work_item_id && held == operation => {}
+                _ => {
+                    return Err(BuildProjectionError::NotTheProducer {
+                        work_item_id: item.work_item_id.clone(),
+                    });
+                }
+            }
+        }
+        let key = FlightKey {
+            target_root: target_root.clone(),
+            lineage: lineage.clone(),
+            operation: operation.clone(),
+        };
+        // Publish before releasing: the result is durable in the retained set
+        // before the root becomes claimable again.
+        {
+            let mut closed = self.closed.borrow_mut();
+            if !closed.contains_key(&key) && closed.len() >= MAX_RETAINED_FLIGHT_OUTCOMES {
+                return Err(BuildProjectionError::FlightRetentionCapacity {
+                    retained: closed.len(),
+                    capacity: MAX_RETAINED_FLIGHT_OUTCOMES,
+                });
+            }
+            closed.insert(
+                key,
+                ClosedFlight {
+                    producer: item.work_item_id.clone(),
+                    outcome: outcome.clone(),
+                },
+            );
+        }
         let released = {
             let mut live = self.live.borrow_mut();
             let Some(registry) = live.get(&target_root) else {
@@ -959,44 +1297,122 @@ impl TargetRootBuildCoordinator {
                 work_item_id: item.work_item_id.clone(),
             });
         }
-        self.closed.borrow_mut().insert(
-            target_root,
-            ClosedFlight {
-                lineage: lineage.clone(),
-                outcome: outcome.clone(),
-            },
-        );
+        self.live_operation.borrow_mut().remove(&target_root);
         Ok(ProducerCompletion {
             lineage,
+            operation: operation.clone(),
             released,
             outcome,
         })
     }
 
-    /// The terminal outcome a claim's flight reached, or `None` while the
-    /// producer is still running.
+    /// The exact state of the flight a claim is bound to.
     ///
-    /// This is the waiter's side of I18.26 line 34. A waiter holds no handle
-    /// of its own, so it resolves through the claim it already owns: the claim
-    /// names the target root and the lineage, and the coordinator returns the
-    /// producer's own recorded [`ProducerOutcome`] only when both match. The
-    /// waiter therefore receives the *same* execution axis and the *same*
-    /// immutable [`RawEvidence`] the producer closed with, on the success and
-    /// the failure path alike, and the value is not a copy of anything the
-    /// waiter supplied.
+    /// The four states are the point of this repair. A single `None` conflated
+    /// "still running", "already expired", and "not my flight", and every
+    /// conflation let one waiter's answer depend on another flight's timing.
+    /// Each state below is decided by the claim's own
+    /// (root, lineage, operation) key and nothing else.
     ///
-    /// `None` means the flight has not closed, or that a newer producer has
-    /// already superseded this root's recorded outcome. It is never a signal to
-    /// re-run: line 35 forbids a silent retry storm, so the decision stays with
-    /// the owning work item.
+    /// This is the waiter's side of I18.26 line 34. A waiter holds no handle of
+    /// its own, so it resolves through the claim it already owns, and the
+    /// coordinator returns the producer's own recorded [`ProducerOutcome`] only
+    /// when the whole key matches. The waiter therefore receives the *same*
+    /// execution axis and the *same* immutable [`RawEvidence`] the producer
+    /// closed with, on the success and the failure path alike, and the value is
+    /// not a copy of anything the waiter supplied.
+    ///
+    /// No arm is ever a signal to re-run: I18.26 line 35 forbids a silent retry
+    /// storm, so the decision stays with the owning work item.
     #[must_use]
-    pub fn terminal_outcome(&self, claim: &ProducerClaim) -> Option<ProducerOutcome> {
-        self.closed
-            .borrow()
-            .get(&claim.target_root)
-            .filter(|closed| closed.lineage == claim.lineage)
-            .map(|closed| closed.outcome.clone())
+    pub fn terminal_outcome(&self, claim: &ProducerClaim) -> FlightResolution {
+        if let Some(closed) = self.closed.borrow().get(&FlightKey::of(claim)) {
+            return FlightResolution::Retained {
+                producer: closed.producer.clone(),
+                outcome: closed.outcome.clone(),
+            };
+        }
+        match self.live_operation.borrow().get(&claim.target_root) {
+            Some((_, held, _)) if held == &claim.operation => FlightResolution::Pending,
+            // The root is occupied by a *different* execution, so this claim's
+            // flight is neither running here nor retained: its result is
+            // explicitly unavailable, and the occupying flight's result must
+            // never be served in its place.
+            Some(_) => FlightResolution::Unavailable {
+                operation: claim.operation.clone(),
+            },
+            // No flight of this root is live and none is retained here. The
+            // claim names an execution this coordinator never observed, which
+            // is a different fact from "expired" and must not be reported as
+            // either.
+            None => FlightResolution::Foreign {
+                operation: claim.operation.clone(),
+            },
+        }
     }
+
+    /// Releases one settled flight's retained result, once its delivery and
+    /// retention obligations are discharged.
+    ///
+    /// Retention is bounded by `MAX_RETAINED_FLIGHT_OUTCOMES`, and a bound
+    /// nothing can lower is not a bound. A caller settles a flight through this
+    /// method after it has delivered the producer's evidence to its own
+    /// waiters and persisted the result through the existing Testd job/result
+    /// persistence; there is no second execution ledger here, and a restart
+    /// reads the same durable result this coordinator was writing from.
+    ///
+    /// Only an exact flight match is released. A claim naming a different
+    /// flight, or one whose result was never retained, is refused rather than
+    /// silently treated as settled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BuildProjectionError::FlightNotRetained`] when the claim's
+    /// exact flight has no retained result.
+    pub fn settle(&self, claim: &ProducerClaim) -> Result<(), BuildProjectionError> {
+        self.closed
+            .borrow_mut()
+            .remove(&FlightKey::of(claim))
+            .map(|_| ())
+            .ok_or_else(|| BuildProjectionError::FlightNotRetained {
+                lineage: claim.lineage.clone(),
+                operation: claim.operation.as_str().to_owned(),
+            })
+    }
+}
+
+/// What one claim's exact flight has reached.
+///
+/// The arms are deliberately not collapsed. I18.26 line 34 makes a waiter's
+/// receipt the producer's own evidence, and that is only meaningful if "not
+/// finished yet", "my result is gone", and "this is not my flight" stay three
+/// different answers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FlightResolution {
+    /// The claim's exact flight is still running; its result is not recorded
+    /// yet.
+    Pending,
+    /// The claim's exact flight closed and its immutable result is retained.
+    Retained {
+        /// Work item that owned the producer slot.
+        producer: String,
+        /// The producer's own terminal state, verbatim.
+        outcome: ProducerOutcome,
+    },
+    /// The claim's exact flight is not running and its result is no longer
+    /// retained: the root has since been occupied by a different execution.
+    /// The occupying flight's result is never returned here.
+    Unavailable {
+        /// The claim's own operation identity, which has no retained result.
+        operation: OperationId,
+    },
+    /// The claim names an operation this coordinator never observed live or
+    /// closed. It is a foreign identity, not an expired one, and it carries no
+    /// result of any kind.
+    Foreign {
+        /// The claim's own operation identity.
+        operation: OperationId,
+    },
 }
 
 /// The refusal of an agent-originated unrestricted Cargo selection.
@@ -1112,6 +1528,64 @@ pub enum BuildProjectionError {
         resource: String,
         /// Holder of the live lease.
         holder: String,
+    },
+    /// Disk cleanup could not enumerate the live runtime environment lease
+    /// holders.
+    ///
+    /// An incomplete census is *unknown*, and unknown is never removable: the
+    /// pass cannot claim no lease is held when it does not know the holders.
+    #[error(
+        "disk cleanup refused: the runtime environment lease census is incomplete, so no candidate is removable"
+    )]
+    LeaseCensusIncomplete,
+    /// A cleanup candidate's artifact, lineage, and target root do not form one
+    /// resolvable identity.
+    #[error(
+        "disk cleanup refused: artifact of lineage {lineage} does not resolve under its own target root {target_root}"
+    )]
+    CandidateIdentityUnresolved {
+        /// The candidate's declared lineage.
+        lineage: String,
+        /// The candidate's declared target root.
+        target_root: String,
+    },
+    /// A producer closed while the bounded retained-flight set was full.
+    ///
+    /// This is backpressure, not eviction: the producer slot is **not**
+    /// released, so the root still has exactly one live producer and no second
+    /// build starts. The caller settles an already-delivered flight through
+    /// [`TargetRootBuildCoordinator::settle`] and retries.
+    #[error(
+        "build flight refused: {retained} closed flights are retained (capacity {capacity}); the producer slot is still held and the result was not evicted"
+    )]
+    FlightRetentionCapacity {
+        /// Flights currently retained.
+        retained: usize,
+        /// The retention bound.
+        capacity: usize,
+    },
+    /// A waiter claim arrived for a flight that already has the maximum number
+    /// of bound waiters.
+    ///
+    /// This is backpressure, not a second producer: the single-flight slot is
+    /// still held by the live producer, so the caller retries or reads the
+    /// existing durable result.
+    #[error(
+        "build flight refused: {capacity} waiters are already bound to this flight; the producer slot is still held"
+    )]
+    WaiterCapacity {
+        /// The waiter bound.
+        capacity: usize,
+    },
+    /// A caller asked to settle a flight that has no retained result.
+    #[error(
+        "build flight {lineage} has no retained result for operation {operation}; nothing was released"
+    )]
+    FlightNotRetained {
+        /// The flight's lineage.
+        lineage: String,
+        /// The flight's producer operation identity.
+        operation: String,
     },
     /// The single-flight registry could not be read.
     #[error("single-flight build registry refused the claim: {0}")]
