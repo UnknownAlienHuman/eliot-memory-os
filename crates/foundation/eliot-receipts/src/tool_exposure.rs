@@ -1018,11 +1018,16 @@ impl ToolExposureReceiptV2 {
     /// delivery: marking a truncated or missing delivery as used never makes
     /// [`Self::is_delivered_full`] or [`Self::is_evidence_used`] hold. Only a
     /// delivered-full result that was observably used counts as evidence-used.
+    /// Use is of the delivered result, so marking use without a recorded
+    /// delivered representation fails instead of recording: a use observation
+    /// made before any delivery exists must never combine with a later
+    /// delivery into a counted evidence-used outcome.
     ///
     /// # Errors
     ///
-    /// Returns an error when the receipt is inconsistent, or when recorded
-    /// non-use would be rewritten as use; observations are monotonic.
+    /// Returns an error when the receipt is inconsistent, when recorded
+    /// non-use would be rewritten as use, or when no delivered representation
+    /// is recorded; observations are monotonic.
     pub fn record_observable_use(mut self) -> Result<Self, ToolExposureError> {
         self.validate()?;
         if matches!(
@@ -1032,6 +1037,12 @@ impl ToolExposureReceiptV2 {
             return Err(ToolExposureError::InvalidField {
                 field: "receipt.observably_used_in_decision_action_or_verifier",
                 reason: "recorded non-use is never rewritten as use",
+            });
+        }
+        if self.delivered_representation.is_none() {
+            return Err(ToolExposureError::InvalidField {
+                field: "receipt.observably_used_in_decision_action_or_verifier",
+                reason: "observable use is of the delivered result; no delivered representation is recorded",
             });
         }
         self.observably_used_in_decision_action_or_verifier = Some(true);
