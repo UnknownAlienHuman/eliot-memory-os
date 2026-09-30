@@ -20,7 +20,7 @@ use eliot_protocol::RequestIdentity;
 pub(super) struct BoundCurrentSourceProcessRequest {
     request: ProcessExecutionRequest,
     task_id: TaskId,
-    _identity: RequestIdentity,
+    identity: RequestIdentity,
 }
 
 impl BoundCurrentSourceProcessRequest {
@@ -34,12 +34,12 @@ impl BoundCurrentSourceProcessRequest {
         Ok(Self {
             request,
             task_id: task_id.clone(),
-            _identity: identity.clone(),
+            identity: identity.clone(),
         })
     }
 
     pub(super) fn into_parts(self) -> (ProcessExecutionRequest, RequestIdentity, TaskId) {
-        (self.request, self._identity, self.task_id)
+        (self.request, self.identity, self.task_id)
     }
 }
 
@@ -83,8 +83,8 @@ pub(super) fn validate_current_source_request(
         ));
     }
 
-    if let ProcessExecutionRequest::Start(admission) = request {
-        if admission.recipient_module_id() != session.module_generation.module_id.as_str()
+    if let ProcessExecutionRequest::Start(admission) = request
+        && (admission.recipient_module_id() != session.module_generation.module_id.as_str()
             || admission.deadline_unix_ms() != identity.deadline_unix_ms
             || !admission
                 .state_fence()
@@ -93,13 +93,12 @@ pub(super) fn validate_current_source_request(
             || admission.state_fence().generation().get()
                 != identity.request.state_fence.resource_generation.value()
             || admission.intent().operation_id().as_str()
-                != identity.request.metadata.request_id.as_str()
-        {
-            return Err(reject(
-                "SOURCE_PROCESS_ADMISSION_MISMATCH",
-                "source process start differs from the original recipient, deadline, operation, or exact state fence",
-            ));
-        }
+                != identity.request.metadata.request_id.as_str())
+    {
+        return Err(reject(
+            "SOURCE_PROCESS_ADMISSION_MISMATCH",
+            "source process start differs from the original recipient, deadline, operation, or exact state fence",
+        ));
     }
 
     Ok(())
