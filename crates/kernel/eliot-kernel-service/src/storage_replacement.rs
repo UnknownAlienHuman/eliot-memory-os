@@ -129,15 +129,24 @@
 //!   not name is refused every read and write, so a rebind to a candidate that
 //!   has no committed cutover cannot serve as a second canonical writer *once a
 //!   cutover exists*. What it does **not** do is stop such a gateway from being
-//!   constructed, and while no cutover has ever been committed for this route
-//!   the durable owner names no active generation at all, so the gate imposes
-//!   nothing and the composition's own ordering argument is still what keeps the
-//!   initial generation the one served. Telling those two apart is the
-//!   composition root's own decision, not this module's.
+//!   constructed. The gate binds as soon as one cutover is committed for this
+//!   route, and the row that names the active generation is written by the Kernel
+//!   Generation Registry ingress
+//!   (`bins/eliot-kernel/src/generation_control.rs::apply_authenticated_generation_cutover`)
+//!   for exactly a completed replacement this coordinator re-derives through
+//!   [`StorageReplacement::replay_recorded_stages`] and then re-derives its
+//!   receipt from through [`StorageReplacement::commit_canonical_store_route_cutover`].
+//!   Before that first commit the durable owner still names no active generation
+//!   at all, so the composition's own ordering argument is what keeps the initial
+//!   generation the one served. Telling those two apart is the composition root's
+//!   own decision, not this module's.
 //! - A cutover is still *committed* by the Kernel Generation Registry's owner,
-//!   which writes the ORS `CUTOVER_OWNERSHIP` row. This coordinator stages,
-//!   orders and proves the replacement and re-derives its receipt from that
-//!   row; it does not write it.
+//!   which writes the ORS `CUTOVER_OWNERSHIP` row — for this route, that owner is
+//!   the admitted cutover ingress
+//!   (`bins/eliot-kernel/src/generation_control.rs::apply_authenticated_generation_cutover`),
+//!   and it writes the row only for a completed replacement this coordinator
+//!   re-derives. This coordinator stages, orders and proves the replacement and
+//!   re-derives its receipt from that row; it does not write it.
 //! - The read-only rollback window (stage 10) is enforced on the Kernel side:
 //!   once the cutover is committed the incumbent generation is not the active
 //!   `canonical_store` generation, so the governed Store path admits nothing
@@ -958,6 +967,55 @@ impl StorageReplacement {
         }
         self.record_evidence(stage, evidence);
         Ok(stage)
+    }
+
+    /// Re-records the stages a completed replacement reached, in the order their
+    /// owners reached them, and leaves the machine at the next unreached stage.
+    ///
+    /// This is the coordinator's own reconstruction of a *presented* completion,
+    /// and it is reached only from the Kernel Generation Registry cutover ingress
+    /// (`bins/eliot-kernel/src/generation_control.rs`), which is the one place
+    /// that commits the ORS `CUTOVER_OWNERSHIP` row for this route. It is not a
+    /// summary of a claim: each presented stage is recorded through
+    /// [`Self::record_stage`] or [`Self::record_transfer_stage`], so the
+    /// coordinator's own rules decide what is admissible — a skipped, repeated or
+    /// out-of-order stage is refused by the exact-predecessor rule, a stage that
+    /// moves data cannot be presented without its [`StorageReplacementTransfer`]
+    /// and a non-transferring stage cannot smuggle one, and `I5.11` stage 8
+    /// itself is refused here because it is recorded only by
+    /// [`Self::commit_canonical_store_route_cutover`] against a committed ORS
+    /// row. A completion that does not carry every stage before stage 8
+    /// therefore cannot be positioned at the cutover at all, which the caller
+    /// checks before it writes anything.
+    ///
+    /// [`StorageReplacementStage`] and [`StorageReplacementTransfer`] are the
+    /// coordinator's own types, so the stage vocabulary and the transfer record
+    /// cannot drift from the ones this module records with.
+    pub fn replay_recorded_stages(
+        &mut self,
+        stages: &[(
+            StorageReplacementStage,
+            String,
+            Option<StorageReplacementTransfer>,
+        )],
+    ) -> Result<(), KernelServiceError> {
+        for (stage, evidence, transfer) in stages {
+            if stage.transfers_data() != transfer.is_some() {
+                return Err(KernelServiceError::InvalidField {
+                    field: "storage_replacement_stage_transfer",
+                    reason: "exactly the snapshot import and the canonical event tail carry an I5.10 transfer record",
+                });
+            }
+            match transfer {
+                Some(transfer) => {
+                    self.record_transfer_stage(*stage, transfer, evidence.as_str())?;
+                }
+                None => {
+                    self.record_stage(*stage, evidence.as_str())?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Commits the `canonical_store` `CapabilityRouteScope` cutover through the

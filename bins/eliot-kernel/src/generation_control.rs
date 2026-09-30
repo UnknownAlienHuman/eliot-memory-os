@@ -5,16 +5,34 @@
 //! fences the composition on any persist/publish failure and never retries
 //! with a stale route.
 //!
+//! The `I5.11` `canonical_store` route cutover is the one cutover whose ORS
+//! `CUTOVER_OWNERSHIP` row this file produces: `I5.11` stage 8 is "commit the
+//! `canonical_store` `CapabilityRouteScope` cutover through Kernel Generation
+//! Registry", and this ingress is that registry. It writes the row only for a
+//! completed `I5.11` replacement the `eliot_kernel_service::StorageReplacement`
+//! coordinator re-derives through its own stage machine, and it derives the
+//! replacement's receipt back from the committed row rather than asserting one —
+//! see [`KernelComposition::apply_authenticated_generation_cutover`].
+//!
 //! Architecture: A5.4 Time и State Fence; A13.2 Kernel и failure domains; A13.3 Module supervision и Doctor; ARCH-AUTH-01; ARCH-RES-03; ARCH-RES-04
 //! Implementation: I4.5 Generation vector and State Fence; I5.6 Admission and staging; I14.14 Module hot replacement; I14.15 Daemon hot replacement; I14.16 Kernel and Host update; I14.21 Unknown commit recovery
 //! Ordinary module: I2.23 Capability-family topology and crate extraction decisions — ordinary single-file extraction (<10k LOC) owning only `KernelComposition::generation_route_snapshot` and `KernelComposition::apply_generation_cutover` plus inseparable fencing with zero external users; no new crate.
-//! Forbidden authority: must not perform semantic planning, must not allow an alternate epoch owner, must not resurrect stale routes; publishes only the ORS-committed candidate via `OrsGenerationCoordinator` and fences on failure.
+//! Forbidden authority: must not perform semantic planning, must not allow an alternate epoch owner, must not resurrect stale routes; publishes only the ORS-committed candidate via `OrsGenerationCoordinator` and fences on failure; and it commits the `canonical_store` cutover-ownership row only for a replacement the `I5.11` coordinator itself re-derives.
 
 use super::KernelComposition;
 use super::kernel_audit::AuditEventDraft;
-use eliot_contracts::{EpochId, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex};
+use eliot_contracts::{
+    AuthorityEpoch, EpochId, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex,
+};
 use eliot_kernel_core::{CutoverDecision, GenerationRoute, GenerationRouter, RouteScope};
-use eliot_kernel_service::KernelServiceError;
+use eliot_kernel_service::{
+    IrreversibleStorageEffect, KernelServiceError, StorageReplacement,
+    StorageReplacementCutoverReceipt, StorageReplacementStage, StorageReplacementTransfer,
+};
+use eliot_ors::{
+    GenerationCutoverOwnership, InFlightDisposition, ModuleArtifactIdentity, RedbRecoveryStore,
+    StateMigrationDecision,
+};
 use eliot_runtime_contracts::GenerationCutoverState;
 use serde::{Deserialize, Serialize};
 
@@ -43,6 +61,17 @@ pub const GENERATION_CUTOVER_OPERATION: &str = "daemon_generation_cutover";
 /// migration decision, or a cutover state: every one of those is read from the
 /// owner's durable cutover-ownership record, so a request cannot assert an
 /// authority field the ORS linearization point never recorded.
+///
+/// `replacement` is the one addition, and it is the `I5.11` completion this
+/// ingress needs in order to *produce* that record when the cutover has never
+/// been committed. The `canonical_store` route cutover is the one `I5.11` cutover
+/// whose ORS row this ingress owns end to end, and it can own it only for a
+/// replacement the coordinator actually completed — so the request may present
+/// that completion, and every field of the row is then taken from the
+/// coordinator's own reconstructed state rather than from this payload. It is
+/// optional because a cutover that is already committed is reconciled against
+/// that committed row and needs nothing presented; see
+/// [`KernelComposition::apply_authenticated_generation_cutover`].
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct GenerationCutoverRequest {
@@ -52,6 +81,104 @@ pub struct GenerationCutoverRequest {
     pub cutover_id: String,
     /// Exact State Fence carried by the admitted daemon session.
     pub state_fence: StateFence,
+    /// The completed `I5.11` replacement whose `canonical_store` route cutover
+    /// this request commits, when no committed row exists for `cutover_id` yet.
+    /// `None` for a cutover that is already committed.
+    #[serde(default)]
+    pub replacement: Option<GenerationCutoverReplacement>,
+}
+
+/// One `I5.11` stage exactly as the owner that performed it recorded it.
+///
+/// It is the wire form of the coordinator's own per-stage record. The stage name
+/// is resolved through the coordinator's own
+/// [`StorageReplacementStage::from_name`] and the transfer is required for
+/// exactly the two stages that move `I5.10` data into the candidate. The Kernel
+/// interprets nothing here: `evidence` is the same bounded opaque text
+/// [`StorageReplacement::record_stage`] records.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GenerationCutoverReplacementStage {
+    /// Exact `I5.11` stage name ([`StorageReplacementStage::name`]).
+    pub stage: String,
+    /// Bounded opaque evidence the performing owner recorded.
+    pub evidence: String,
+    /// The `I5.10` transfer, for the two transferring stages only.
+    #[serde(default)]
+    pub transfer: Option<StorageReplacementTransfer>,
+}
+
+/// The `I14.14` step-7 cutover-ownership content committed for this cutover.
+///
+/// `I14.14` step 7 is "classify every in-flight request and persist a
+/// `GenerationCutoverRecord` in ORS" and step 8 is the one commit; this is that
+/// step-7 content and nothing else. Every field is the module owner's own
+/// `I14.14` content and is validated by `GenerationCutoverOwnership::validate`
+/// on the ORIGINAL recorded values inside the existing
+/// `RedbRecoveryStore::stage_cutover_ownership` — no digest, identity, epoch or
+/// decision is recomputed here to stand in for an owner proof.
+///
+/// What this claim deliberately does NOT carry is the two store generations, the
+/// route scope and the cutover state. Those are the coordinator's own, read back
+/// from the replacement it reconstructed, so a claim cannot assert a generation
+/// pair the coordinator never reached or a scope other than the pinned
+/// `canonical_store` one.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GenerationCutoverOwnershipClaim {
+    /// Immutable artifact identity of the candidate store bridge.
+    pub candidate_artifact: ModuleArtifactIdentity,
+    /// Immutable artifact identity of the incumbent store bridge, if any.
+    pub incumbent_artifact: Option<ModuleArtifactIdentity>,
+    /// Authority epoch before the switch. It must be the admitted session
+    /// fence's own epoch, which this ingress checks before it writes anything.
+    pub old_epoch: AuthorityEpoch,
+    /// Authority epoch issued by the switch.
+    pub new_epoch: AuthorityEpoch,
+    /// The exact `I14.14` in-flight disposition allowlist fixed at commit.
+    pub in_flight: Vec<InFlightDisposition>,
+    /// The `I14.14` state-migration decision. It must name forward repair
+    /// exactly when the coordinator's irreversible-effect ledger is non-empty,
+    /// which the coordinator re-checks against the committed row.
+    pub migration: StateMigrationDecision,
+    /// Health/readiness proof reference for the candidate store bridge.
+    pub health_proof_ref: String,
+    /// Rollback boundary: the retained incumbent artifact or its forward-repair
+    /// reference.
+    pub rollback_boundary: String,
+    /// Scopes left unresolved at commit.
+    pub unresolved_scopes: Vec<String>,
+}
+
+/// The coordinator's own completed `I5.11` replacement, in the exact form the
+/// Kernel Generation Registry receives it.
+///
+/// It is the two things this ingress cannot invent: the ordered stages 1-7 the
+/// coordinator reached with their own evidence, and the `I14.14` step-7 claim to
+/// commit. It is re-derived here through the coordinator's OWN stage machine
+/// ([`StorageReplacement::replay_recorded_stages`]), not through a summary of it,
+/// so a skipped, repeated or out-of-order stage, a stage that moves data without
+/// its `I5.10` transfer record, a presented stage 8, or a completion that stops
+/// before stage 8 is all refused by the coordinator rather than by a local rule.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GenerationCutoverReplacement {
+    /// Exact replacement identity this completion belongs to.
+    pub replacement_id: String,
+    /// The store generation that owned the route before the cutover.
+    pub incumbent_generation: Option<ResourceGeneration>,
+    /// The store generation that owns the route after the cutover.
+    pub candidate_generation: ResourceGeneration,
+    /// Irreversible migrations/effects the coordinator observed. The
+    /// coordinator's ledger only grows, and the committed row's `migration`
+    /// decision must agree with it exactly.
+    pub irreversible_effects: Vec<IrreversibleStorageEffect>,
+    /// The `I5.11` stages in the order their performing owners reached them.
+    pub stages: Vec<GenerationCutoverReplacementStage>,
+    /// The `I14.14` step-7 content committed at the cutover.
+    pub cutover: GenerationCutoverOwnershipClaim,
+    /// Bounded opaque evidence recorded for the `I5.11` stage-8 route cutover.
+    pub cutover_evidence: String,
 }
 
 impl GenerationCutoverRequest {
@@ -95,6 +222,20 @@ pub struct GenerationCutoverOutcome {
     pub terminal_code: Option<&'static str>,
     /// State Fence the cutover was admitted and attempted under.
     pub state_fence: StateFence,
+    /// The `I5.11` cutover receipt the coordinator re-derived from the committed
+    /// ORS row this request committed.
+    ///
+    /// It is present only when this request presented the completed replacement
+    /// AND the coordinator constructed the receipt from that durable row, so it
+    /// can never precede the durable linearization point. A request reconciled
+    /// against an already-committed cutover presents no completion and therefore
+    /// carries no receipt. It rides on a refused live swap too, because it
+    /// evidences the durable ORS cutover and says nothing about the in-memory
+    /// route swap, which `terminal_code` alone answers. The post-cutover `I5.11`
+    /// stages and the `I5.14` rollback answer are both reached by presenting this
+    /// value back to the coordinator, which re-derives it from ORS rather than
+    /// accepting it.
+    pub cutover_receipt: Option<StorageReplacementCutoverReceipt>,
 }
 
 /// Exact request payload for [`ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION`].
@@ -739,10 +880,12 @@ impl KernelComposition {
     /// [`KernelComposition::apply_generation_cutover`]. It is a selector and a
     /// binding, never a second authority:
     ///
-    /// - the request carries only a cutover identity and the admitted session
-    ///   `StateFence`; every generation, epoch, route scope, and cutover state
-    ///   below is READ from the owner's committed ORS record, so a request can
-    ///   never assert an authority field the linearization point never recorded;
+    /// - the request carries only a cutover identity, the admitted session
+    ///   `StateFence` and — when the cutover has never been committed — the
+    ///   completed `I5.11` replacement it commits; every generation, epoch, route
+    ///   scope, and cutover state below is READ from the owner's committed ORS
+    ///   record, so a request can never assert an authority field the
+    ///   linearization point never recorded;
     /// - the request fence must be the exact admitted session fence, and the
     ///   record's `old_epoch` must be the same authority tuple that fence
     ///   carries, so a stale, foreign, or replayed epoch stays typed instead of
@@ -750,6 +893,20 @@ impl KernelComposition {
     /// - only a `Committed` record reaches the gateway. A staged (`Armed`)
     ///   candidate or a `FailedRequiresForwardCutover` row is evidence, never
     ///   authority, and is refused before any ORS staging happens.
+    ///
+    /// ## The one cutover this ingress commits
+    ///
+    /// A cutover identity that already carries a row is reconciled against that
+    /// row and nothing is written: no second ORS commit, no second linearization
+    /// identity, and the same durable evidence the first request read.
+    ///
+    /// The `I5.11` `canonical_store` route cutover is the one cutover whose ORS
+    /// row this ingress owns end to end, so when no row exists at all it may
+    /// produce one — through [`commit_canonical_store_cutover_ownership`], and
+    /// only for a completed replacement the `I5.11` coordinator itself
+    /// re-derives. A request that presents no completion is refused exactly as
+    /// before, and the missing-row refusal is never relaxed: the row is made to
+    /// exist honestly, by its owner, for a cutover that was actually completed.
     ///
     /// The gateway owns the one terminal for the underlying cutover operation.
     /// This boundary reports that same terminal code back on the authenticated
@@ -768,21 +925,40 @@ impl KernelComposition {
                 field: "generation_cutover.request.session_fence",
             });
         }
-        let record = self
-            .generation_gateway
-            .ors
+        let ors = &self.generation_gateway.ors;
+        let existing = ors
             .load_cutover_ownership(request.cutover_id.as_str())
-            .map_err(|error| KernelServiceError::Platform(error.to_string()))?
-            .ok_or(KernelServiceError::InvalidField {
-                field: "generation_cutover.request.cutover_id",
-                reason: "no cutover ownership record is recorded for this cutover",
-            })?;
+            .map_err(|error| KernelServiceError::Platform(error.to_string()))?;
+        let (record, cutover_receipt) = if let Some(record) = existing {
+            (record, None)
+        } else {
+            // No row at all. This ingress owns the `canonical_store` route
+            // cutover's row, so it may produce it - but only from a completed
+            // replacement the coordinator re-derives through its own stage
+            // machine, and only once the claim's epoch is shown to be the
+            // admitted session's own. A request that presents no completion
+            // reaches the same typed refusal as before.
+            let replacement =
+                request
+                    .replacement
+                    .as_ref()
+                    .ok_or(KernelServiceError::InvalidField {
+                        field: "generation_cutover.request.cutover_id",
+                        reason: "no cutover ownership record is recorded for this cutover",
+                    })?;
+            let (record, receipt) =
+                commit_canonical_store_cutover_ownership(ors, request, replacement)?;
+            (record, Some(receipt))
+        };
         // I14.14: the ORS commit is the durable linearization point. A staged or
         // fenced row is evidence of an interrupted attempt, never authority, so
         // only a `Committed` record can reach the semantic gateway. The refusal
         // is a typed handshake mismatch on the record's state — the presented
         // record does not match the required committed state — and never
-        // fabricates a service-lifecycle transition.
+        // fabricates a service-lifecycle transition. A row this ingress has just
+        // committed satisfies that requirement by construction and is still read
+        // back here rather than assumed, so the gateway is only ever reached
+        // through a durable record.
         if record.state != GenerationCutoverState::Committed {
             return Err(KernelServiceError::HandshakeMismatch {
                 field: "generation_cutover.request.record_state",
@@ -830,6 +1006,7 @@ impl KernelComposition {
                 cutover_id,
                 terminal_code: None,
                 state_fence,
+                cutover_receipt,
             }),
             Err(error) => {
                 // The gateway already emitted the one terminal diagnostic for
@@ -837,15 +1014,172 @@ impl KernelComposition {
                 // authenticated reply so the refusal is observable on the real
                 // control-plane path; it is the SAME code and never a second
                 // failure claim, and no error payload crosses the reply.
+                //
+                // `cutover_receipt` still rides along when the coordinator built
+                // one: it is the durable ORS cutover's own evidence and says
+                // nothing about the live in-memory swap, which `terminal_code`
+                // alone answers.
                 Ok(GenerationCutoverOutcome {
                     version: 1,
                     cutover_id,
                     terminal_code: Some(generation_cutover_terminal_code(&error)),
                     state_fence,
+                    cutover_receipt,
                 })
             }
         }
     }
+}
+
+/// Commits the one ORS `CUTOVER_OWNERSHIP` row for the pinned `canonical_store`
+/// route cutover of a completed `I5.11` replacement, and returns that committed
+/// record together with the coordinator's own receipt for it.
+///
+/// This is the production caller of
+/// [`StorageReplacement::replay_recorded_stages`],
+/// [`StorageReplacement::commit_canonical_store_route_cutover`] and the two
+/// existing ORS ownership writers, and it is reachable only from the admitted,
+/// fence-checked ingress above — there is no other route to it, no fixture arm
+/// and no unconditional commit. The order is fixed and each step can refuse:
+///
+/// 1. the claim's `old_epoch` must be the admitted session fence's own authority
+///    sequence, so a stale, foreign or already-superseded epoch is refused
+///    before any row exists;
+/// 2. [`StorageReplacement::begin`] re-reads the durable committed rows for the
+///    pinned route scope and refuses a candidate generation that already owns it,
+///    so a restart cannot reopen a replacement from the top and cannot obtain a
+///    second identity for a switch that is already committed;
+/// 3. the presented stages are re-recorded through the coordinator's own stage
+///    machine, so a skipped, repeated or out-of-order stage, a data-moving stage
+///    without its `I5.10` transfer record, or a presented `I5.11` stage 8 is
+///    refused by the coordinator rather than by a rule here;
+/// 4. only a coordinator positioned exactly at `I5.11` stage 8 reaches the write,
+///    and the row it writes takes its route scope and its two store generations
+///    from that coordinator — never from this payload — while the remaining
+///    `I14.14` step-7 content is the claim's own and is validated by ORS on the
+///    original recorded values;
+/// 5. the coordinator then re-derives the receipt from the committed row itself,
+///    which reloads the row, refuses anything that is not `Committed`, and
+///    cross-checks the route scope, the two store generations and the state
+///    migration against the coordinator's own irreversible-effect ledger.
+///
+/// The cutover identity is the request's own label for the row, and it is bound
+/// by the ORS owner rather than trusted: `stage_cutover_ownership` refuses a
+/// different record already stored under it and is idempotent for the identical
+/// one, and `commit_cutover_ownership` mints the linearization identity from it
+/// while refusing any epoch that does not continue this route's committed
+/// lineage. With the restart guard above, a second identity for one route switch
+/// therefore cannot be obtained, and the row's own content never comes from the
+/// label.
+///
+/// Every refusal before the write is one of the coordinator's own typed
+/// refusals, so it reaches the caller as `InvalidField { field: … }` or
+/// `HandshakeMismatch { field: … }` on this crate's existing vocabulary. The ORS
+/// write refusal itself is projected exactly as this file already projects every
+/// ORS refusal at this boundary (the record load in the ingress above): as the
+/// owner's own text, with no second classifier invented beside it.
+fn commit_canonical_store_cutover_ownership(
+    ors: &RedbRecoveryStore,
+    request: &GenerationCutoverRequest,
+    replacement: &GenerationCutoverReplacement,
+) -> Result<(GenerationCutoverOwnership, StorageReplacementCutoverReceipt), KernelServiceError> {
+    let claimed_old_epoch = replacement.cutover.old_epoch.value();
+    if claimed_old_epoch != request.state_fence.authority_epoch.sequence.get() {
+        return Err(KernelServiceError::HandshakeMismatch {
+            field: "generation_cutover.request.old_epoch",
+        });
+    }
+    let mut coordinator = StorageReplacement::begin(
+        ors,
+        replacement.replacement_id.clone(),
+        replacement.incumbent_generation,
+        replacement.candidate_generation,
+    )?;
+    for effect in &replacement.irreversible_effects {
+        coordinator.record_irreversible_effect(*effect);
+    }
+    let stages = replacement
+        .stages
+        .iter()
+        .map(|stage| {
+            StorageReplacementStage::from_name(&stage.stage)
+                .map(|resolved| (resolved, stage.evidence.clone(), stage.transfer.clone()))
+                .ok_or(KernelServiceError::InvalidField {
+                    field: "generation_cutover.replacement.stage",
+                    reason: "the presented stage is not one of the I5.11 ordered replacement stages",
+                })
+        })
+        .collect::<Result<Vec<_>, KernelServiceError>>()?;
+    coordinator.replay_recorded_stages(&stages)?;
+    if coordinator.next_stage() != Some(StorageReplacementStage::CommitCanonicalStoreRouteCutover) {
+        return Err(KernelServiceError::InvalidField {
+            field: "generation_cutover.replacement.stages",
+            reason: "the canonical_store route cutover is committed only after every preceding I5.11 stage is recorded",
+        });
+    }
+    commit_canonical_store_cutover_ownership_row(
+        ors,
+        &coordinator,
+        request.cutover_id.as_str(),
+        &replacement.cutover,
+    )?;
+    let receipt = coordinator.commit_canonical_store_route_cutover(
+        ors,
+        request.cutover_id.as_str(),
+        replacement.cutover_evidence.as_str(),
+    )?;
+    let committed = coordinator
+        .cutover()
+        .cloned()
+        .ok_or(KernelServiceError::InvalidField {
+            field: "generation_cutover.request.cutover_id",
+            reason: "the coordinator derived a cutover receipt without holding its committed ORS record",
+        })?;
+    Ok((committed, receipt))
+}
+
+/// Stages and commits the one ORS `CUTOVER_OWNERSHIP` row for the pinned
+/// `canonical_store` route cutover, and returns the committed record.
+///
+/// The row is written in the `I14.14` two-step order the ORS owner already
+/// implements: [`RedbRecoveryStore::stage_cutover_ownership`] persists the
+/// `Armed` candidate — validating it on the original recorded values, and
+/// refusing a different record already stored under the same cutover identity —
+/// and [`RedbRecoveryStore::commit_cutover_ownership`] performs the single
+/// write transaction that is the durable linearization point, mints the
+/// linearization identity, and refuses a cutover whose epoch lineage does not
+/// continue this route's committed one. Neither writer invents anything here:
+/// the scope and the two store generations are the coordinator's own, and the
+/// rest is the claim's own `I14.14` step-7 content.
+fn commit_canonical_store_cutover_ownership_row(
+    ors: &RedbRecoveryStore,
+    replacement: &StorageReplacement,
+    cutover_id: &str,
+    claim: &GenerationCutoverOwnershipClaim,
+) -> Result<GenerationCutoverOwnership, KernelServiceError> {
+    let staged = GenerationCutoverOwnership {
+        cutover_id: cutover_id.to_owned(),
+        candidate_artifact: claim.candidate_artifact.clone(),
+        incumbent_artifact: claim.incumbent_artifact.clone(),
+        scope: replacement.route_scope().clone(),
+        old_generation: replacement.incumbent_generation(),
+        new_generation: replacement.candidate_generation(),
+        old_epoch: claim.old_epoch,
+        new_epoch: claim.new_epoch,
+        in_flight: claim.in_flight.clone(),
+        migration: claim.migration,
+        health_proof_ref: claim.health_proof_ref.clone(),
+        rollback_boundary: claim.rollback_boundary.clone(),
+        unresolved_scopes: claim.unresolved_scopes.clone(),
+        linearization_record_id: None,
+        state: GenerationCutoverState::Armed,
+    };
+    ors.stage_cutover_ownership(staged)
+        .map_err(|error| KernelServiceError::Platform(error.to_string()))?;
+    Ok(ors
+        .commit_cutover_ownership(cutover_id)
+        .map_err(|error| KernelServiceError::Platform(error.to_string()))?
+        .0)
 }
 
 #[cfg(test)]
