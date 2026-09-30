@@ -392,6 +392,10 @@ impl OwnerClosureProvider {
     /// The three overloads above are the same construction with less retained
     /// evidence, and they carry the same required identity — evidence may be
     /// sparse, identity may not be absent.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the retained restore carries the snapshot, history, fence, canonical second-phase links, quarantine evidence, retained semantic decisions and the admitted operation identity as one fail-closed construction"
+    )]
     pub fn restore_with_retained_quarantine_decisions(
         snapshot: AuthorityOwnerSnapshot,
         history: Option<RevocationHistoryEvidence>,
