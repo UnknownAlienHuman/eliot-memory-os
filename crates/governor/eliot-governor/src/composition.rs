@@ -2119,6 +2119,36 @@ impl CanonicalVerifierExecutionFact {
     }
 
     /// Whether the bound execution/evaluation is eligible to certify finish.
+    ///
+    /// `I7.9` (`docs/architecture/I07-09-strict-finish-input-and-outcomes.md:30`)
+    /// forbids a verifier with execution status `NOT_EXECUTED` or `SIMULATED`,
+    /// stale scope, a missing artifact binding, or an unknown outcome from
+    /// supporting `VERIFIED_COMPLETE`.  Every clause is answered here by
+    /// comparing the *recorded* axis of this fact, never by observing that a
+    /// record exists:
+    ///
+    /// - simulated — the run's own bound invocation profile is compared against
+    ///   the registered productive profile constant.  Equality with the
+    ///   canonical plan's declared profile, already required by
+    ///   [`Self::validate`] through `check_fact_invocation_matches_plan`, is an
+    ///   identity check between two freely-typed labels and says nothing about
+    ///   whether the run was executed productively.  The productive-profile
+    ///   refusal in `evaluate_testd_verification_current` runs on the
+    ///   publication path; this predicate is what the rehydration path and the
+    ///   persisted evidence read-back in
+    ///   [`CanonicalFinishEvidence::validate`] consult, so a simulated run
+    ///   rehydrated from the canonical owner can be recorded neither as
+    ///   certifying nor as an exact current run.
+    /// - unexecuted and unknown — `ExecutionStatus::Succeeded` is required on
+    ///   both the receipt binding and the run, so an admitted-but-not-started
+    ///   or in-flight execution and an unestablishable outcome both fail; only
+    ///   `VerificationOutcome::Pass` is accepted, so an unknown outcome stays
+    ///   unknown and is never read as success or as absence of objection.
+    /// - stale scope — `Exact*` freshness on the run and on every normalized
+    ///   evidence event, an unchanged source observation, and a recorded
+    ///   finish time.
+    /// - missing artifact binding — non-empty raw artifact bindings, non-empty
+    ///   raw and normalized run evidence, and no truncated artifact.
     #[must_use]
     pub fn certifies_completion(&self) -> bool {
         let fresh = matches!(
@@ -2127,7 +2157,8 @@ impl CanonicalVerifierExecutionFact {
                 | EvidenceFreshness::ExactCommit
                 | EvidenceFreshness::ExactQuiescedWorktree
         );
-        self.job_state == "succeeded"
+        self.invocation.profile == eliot_testd_core::TESTD_PRODUCTIVE_PROFILE
+            && self.job_state == "succeeded"
             && self.receipt.execution == ExecutionStatus::Succeeded
             && self.verification_run.execution == ExecutionStatus::Succeeded
             && self.verification_run.outcome == VerificationOutcome::Pass
