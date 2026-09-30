@@ -53,7 +53,11 @@ use eliot_governor::{
     ActualRouteReceipt, CapabilityRouteRegistry, ExecutionIdentity, ObservedRoute,
     RouteBehaviorFingerprint, RouteInstallationIdentity, RuntimeRoute,
 };
-use eliot_mcp::{HostInvocationOutcome, ResponseKind};
+use eliot_mcp::{
+    AdvertisedExposureHistory, ExposureHistoryRevisionSignal, ExposureRevisionLineage,
+    HostInvocationOutcome, PermittedTaskSurface, ResponseKind, ToolSurfaceDecision,
+    admit_exposure_history, advertise_exposure_history, replay_exposure_history_revision,
+};
 use eliot_protocol::{
     AGENT_BRIDGE_MODULE_ID, AckPhase, AgentBridgeClientDeclaration,
     AgentBridgePeerAdmissionReceipt, AgentBridgePeerChallenge, ContinuityKind, EncodingProfile,
@@ -61,6 +65,7 @@ use eliot_protocol::{
     RequestIdentity,
 };
 use eliot_receipts::RequestBinding;
+use eliot_receipts::tool_exposure::ExposureIdentities;
 use eliot_runtime::{Runtime, RuntimeConfig};
 
 mod bridge_contract;
@@ -5691,6 +5696,75 @@ impl BridgeRunner {
         // awaits a route-owner attestation; until then the evidence slot
         // carries the preview+handle.
         Some(view)
+    }
+    /// Persists one advertised exposure-history revision for the rendered tool
+    /// surface (I7.24 exposure history, R7 persistence caller).
+    ///
+    /// The compiled decision joined with the derived permitted subset and the
+    /// owner-supplied identities goes in; the lineage-bound entry comes out.
+    /// [`advertise_exposure_history`] populates only the publish-owned stages
+    /// (registered/advertised/eligible): selection, call, transport, retry,
+    /// use, delivery, and outcome stay explicitly unresolved for their owners.
+    /// [`admit_exposure_history`] then revalidates the entry against the
+    /// decision's independent considered set, so a method outside the set, a
+    /// stale owner version, or a disagreeing route fails closed before
+    /// anything persists.
+    ///
+    /// The lineage arrives bound from the owning caller: this seam mints no
+    /// receipt, prior-link, or idempotency identity, and a revision with no
+    /// bound receipt identity fails closed as a visible pending obligation
+    /// instead of persisting unkeyed. Against a recorded prior,
+    /// [`replay_exposure_history_revision`] dedupes on the lineage: an
+    /// idempotent replay returns `None` so the production door reconciles the
+    /// original event (executing nothing, recording no new use), a successor
+    /// revision returns alongside the retained prior, and a same-identity
+    /// conflict propagates its typed error so the recorded original is never
+    /// rewritten. The durable write dedupes on the carried lineage
+    /// idempotency key. This seam keeps no ledger of its own: replay state
+    /// comes from the durable path through `recorded_prior`.
+    ///
+    /// STITCH (durable observation/receipt write): the production door persists
+    /// a returned revision through the existing observation path
+    /// (`eliot.observe` capture via `ReceiptEnvelope`/`CausalBinding`). No
+    /// callable write API exists in this scope: the daemon observe-flight
+    /// submit (`bins/eliot-agent-bridge/src/kernel_host_request_client.rs`
+    /// `host_request_observe_submit_frame`) is private to its module, and the
+    /// bridge never mints receipt, session, or idempotency identities, so the
+    /// write stays with the owning observation seam.
+    pub fn persist_advertised_exposure_history(
+        decision: &ToolSurfaceDecision,
+        surface: &PermittedTaskSurface,
+        method: &str,
+        identities: ExposureIdentities,
+        lineage: ExposureRevisionLineage,
+        recorded_prior: Option<&AdvertisedExposureHistory>,
+    ) -> Result<Option<AdvertisedExposureHistory>, BridgeError> {
+        let entry = advertise_exposure_history(decision, surface, method, identities)
+            .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
+        admit_exposure_history(decision, &entry)
+            .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
+        if lineage.receipt_id.is_none() {
+            return Err(BridgeError::ProviderContract(
+                "exposure history revision carries no bound receipt identity; the owning seam binds lineage identities before persistence".to_owned(),
+            ));
+        }
+        let current = AdvertisedExposureHistory { entry, lineage };
+        let Some(prior) = recorded_prior else {
+            return Ok(Some(current));
+        };
+        match replay_exposure_history_revision(prior, &current)
+            .map_err(|error| BridgeError::ProviderContract(error.to_string()))?
+        {
+            // A replayed publication reconciles the recorded original:
+            // persist nothing new, execute nothing, record no new use.
+            Some(ExposureHistoryRevisionSignal::IdempotentReplay) => Ok(None),
+            // A successor revision and an unrelated bound revision both
+            // persist as their own revision alongside retained history; the
+            // lineage link (or its absence) tells the owner path which prior,
+            // if any, they follow. The durable write remains keyed by the
+            // lineage, never an overwrite.
+            Some(ExposureHistoryRevisionSignal::SuccessorRevision) | None => Ok(Some(current)),
+        }
     }
     /// Re-arms the once-per-session auto-boot when the live attach belongs to
     /// a different application session than the sealed snapshot's (I7.17).
