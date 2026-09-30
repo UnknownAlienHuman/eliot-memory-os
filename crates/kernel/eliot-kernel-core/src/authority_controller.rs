@@ -252,7 +252,7 @@ impl ProcessDispatchAuthorityController {
         binding: &AuthoritySnapshotBinding,
     ) -> KernelResult<OriginChallenge> {
         self.ensure_operational(binding)?;
-        self.ensure_origin_request_binding(request, binding)?;
+        Self::ensure_origin_request_binding(request, binding)?;
         let challenge = self
             .origin_authority
             .issue(request, issued_at_unix_ms, expires_at_unix_ms)
@@ -279,7 +279,7 @@ impl ProcessDispatchAuthorityController {
         binding: &AuthoritySnapshotBinding,
     ) -> KernelResult<OriginControlGrant> {
         self.ensure_operational(binding)?;
-        self.ensure_origin_request_binding(presentation.request(), binding)?;
+        Self::ensure_origin_request_binding(presentation.request(), binding)?;
         let active_epoch = binding_current_epoch(binding)?;
         let grant = self
             .origin_authority
@@ -410,7 +410,6 @@ impl ProcessDispatchAuthorityController {
     }
 
     fn ensure_origin_request_binding(
-        &self,
         request: &OriginChallengeRequest,
         binding: &AuthoritySnapshotBinding,
     ) -> KernelResult<()> {

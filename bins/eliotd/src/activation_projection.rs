@@ -301,6 +301,25 @@ pub fn map_governor_outcome_to_protocol_for_successor(
     )
 }
 
+/// Revalidates the frozen owner map against the built result: the mapped
+/// disposition admits owner authority exactly when the Governor resolved,
+/// and owner evidence is present exactly then.
+fn revalidate_owner_map_against_outcome(
+    was_resolved: bool,
+    result: &AgentActivationResolutionResult,
+) -> Result<(), DaemonError> {
+    let admits_owner = matches!(
+        result.disposition,
+        AgentActivationResolutionDisposition::Resolved { .. }
+    );
+    if admits_owner != was_resolved || result.owner_evidence.is_some() != was_resolved {
+        return Err(DaemonError::Lifecycle(
+            "activation result owner map drifted from the mapped Governor outcome".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn map_governor_outcome_to_protocol_inner(
     ticket: &AgentActivationResolutionTicket,
     outcome: GovernorActivationOutcome,
@@ -419,15 +438,7 @@ fn map_governor_outcome_to_protocol_inner(
     // resolved, and owner evidence is present exactly then. A drift between
     // the map and the built result fails closed instead of projecting owner
     // authority — or hiding it — for the wrong operation.
-    let admits_owner = matches!(
-        result.disposition,
-        AgentActivationResolutionDisposition::Resolved { .. }
-    );
-    if admits_owner != was_resolved || result.owner_evidence.is_some() != was_resolved {
-        return Err(DaemonError::Lifecycle(
-            "activation result owner map drifted from the mapped Governor outcome".to_owned(),
-        ));
-    }
+    revalidate_owner_map_against_outcome(was_resolved, &result)?;
     // #740: result span carries disposition + digest identities only.
     let _ = crate::diagnostics::AdmissionRecord::of(
         crate::diagnostics::disposition_of_resolution(&result.disposition),
