@@ -89,7 +89,12 @@ fn owner_refused(detail: impl Into<String>) -> CompositionError {
     CompositionError::Owner(detail.into())
 }
 
-fn problem_refused(error: eliot_problem::ProblemError) -> CompositionError {
+/// Projects a state-machine refusal onto the Governor's owner error.
+///
+/// Takes the error by reference: it is only ever formatted here, and
+/// `ProblemError` is `Clone` but not `Copy`, so taking it by value would clone a
+/// typed failure on every refused transition just to read its `Display`.
+fn problem_refused(error: &eliot_problem::ProblemError) -> CompositionError {
     CompositionError::Owner(format!(
         "problem state machine refused the transition: {error}"
     ))
@@ -212,6 +217,10 @@ pub enum ProblemOwnerClosure {
 pub struct PreparedProblemOwnerTransition {
     /// The named transition this is.
     pub transition: ProblemOwnerTransition,
+    /// The request identity this transition commits under, derived from the
+    /// caller's so the envelope, the receipt binding and the commit all agree on
+    /// one per-transition idempotency key.
+    pub identity: eliot_protocol::RequestIdentity,
     /// The candidate record: already validated, already the checked successor of
     /// the expected revision, and already carrying every binding.
     pub candidate: Problem,
@@ -221,6 +230,101 @@ pub struct PreparedProblemOwnerTransition {
     /// The envelope carrying every binding. Commit it through the existing
     /// canonical owner; never re-derive or widen it.
     pub envelope: CanonicalWriteEnvelope,
+}
+
+/// The bindings of one named owner transition, named once.
+///
+/// These are the inputs that describe *this transition* and nothing else: the
+/// admitted request it commits under, the base operation its own identity
+/// derives from, the committed record it replaces, the revision it expects to
+/// replace, the Signal it is bound to, the authorization that permits it, the
+/// clock its lease window is checked against, and the closed per-verb body.
+/// Passing them as one value rather than eight parameters keeps the four
+/// bindings the transition must compare together — the Signal, the
+/// operation/hash, the expected revision and the current authorization — in one
+/// place, so a new parameter cannot be added to one call path and forgotten on
+/// the other.
+pub struct ProblemOwnerTransitionRequest<'a> {
+    /// The admitted request identity this transition commits under.
+    pub identity: &'a eliot_protocol::RequestIdentity,
+    /// The base operation identity the transition's own identity derives from.
+    pub base_operation_id: &'a eliot_contracts::OperationId,
+    /// The committed record the caller read, or `None` for `Create` and only for
+    /// `Create`.
+    pub current: Option<&'a Problem>,
+    /// The record revision this transition expects to replace.
+    pub expected_revision: u64,
+    /// The Signal this transition is bound to.
+    pub source_signal: &'a Signal,
+    /// The current authorization. Only an [`AuthenticatedOwnerLease`] can appear
+    /// here, so no caller can present a principal string instead.
+    pub lease: &'a AuthenticatedOwnerLease,
+    /// Current time in Unix milliseconds, for the assignment lease's validity
+    /// window.
+    pub now_ms: u64,
+    /// The closed per-verb body, which selects the named transition.
+    pub body: &'a ProblemOwnerTransitionBody,
+}
+
+impl ProblemOwnerTransitionRequest<'_> {
+    /// The Problem this transition addresses, whether it opens one or advances a
+    /// committed one.
+    fn problem_id(&self) -> Result<String, CompositionError> {
+        match (self.current, self.body) {
+            (Some(record), _) => Ok(record.problem_id.as_str().to_owned()),
+            (None, ProblemOwnerTransitionBody::Create { problem_id, .. }) => {
+                Ok(problem_id.as_str().to_owned())
+            }
+            (None, _) => Err(owner_refused(
+                "a problem owner transition needs the committed record it advances, or a create body"
+                    .to_owned(),
+            )),
+        }
+    }
+
+    /// The operation identity this transition commits under.
+    ///
+    /// Derived from the base operation, the Problem, its source Signal, the verb
+    /// and the revision it replaces — never from retry time — so an identical
+    /// replay reconciles the existing receipt through the store's
+    /// `(operation_id, canonical_request_hash)` identity while the same operation
+    /// with changed bytes fails closed.
+    pub(crate) fn operation_id(&self) -> Result<eliot_contracts::OperationId, CompositionError> {
+        let problem_id = self.problem_id()?;
+        eliot_contracts::OperationId::new(format!(
+            "{base}/problem-{problem_id}-{signal}-{verb}-{revision}",
+            base = self.base_operation_id.as_str(),
+            signal = self.source_signal.signal_id.as_str(),
+            verb = self.body.transition().as_str().to_ascii_lowercase(),
+            revision = self.expected_revision,
+        ))
+        .map_err(|error| owner_refused(error.to_string()))
+    }
+
+    /// The admitted request identity this transition commits under.
+    ///
+    /// A per-transition idempotency key derived from the caller's, the Problem,
+    /// the verb and the expected revision, so each transition commits under its
+    /// own identity and an identical retry reconciles rather than writing a
+    /// second Problem or a second escalation. `prepare` produces this and
+    /// publishes it on [`PreparedProblemOwnerTransition`], so the envelope, the
+    /// receipt binding and the commit cannot each hold a different one.
+    pub(crate) fn transition_identity(
+        &self,
+    ) -> Result<eliot_protocol::RequestIdentity, CompositionError> {
+        Ok(eliot_protocol::RequestIdentity {
+            request: self.identity.request.clone(),
+            idempotency_key: format!(
+                "{}:problem-owner:{}:{}:{}",
+                self.identity.idempotency_key,
+                self.problem_id()?,
+                self.body.transition().as_str(),
+                self.expected_revision,
+            ),
+            deadline_unix_ms: self.identity.deadline_unix_ms,
+            cancellation_id: self.identity.cancellation_id.clone(),
+        })
+    }
 }
 
 /// Re-proves the current authorization and returns its digest.
@@ -235,7 +339,7 @@ fn authorization_digest(
     let commitment = lease
         .grant()
         .expected_commitment()
-        .map_err(problem_refused)?;
+        .map_err(|error| problem_refused(&error))?;
     if !lease.grant().authority_epoch.is_same_authority(epoch) {
         return Err(owner_refused(
             "presented ownership lease is not bound to the admitted authority epoch".to_owned(),
@@ -260,7 +364,7 @@ fn checked_source_signal<'a>(
     source: &'a Signal,
     fence: &StateFence,
 ) -> Result<&'a Signal, CompositionError> {
-    source.validate().map_err(problem_refused)?;
+    source.validate().map_err(|error| problem_refused(&error))?;
     if source.state_fence != *fence {
         return Err(owner_refused(
             "source Signal is not bound to the transition's state fence".to_owned(),
@@ -340,39 +444,22 @@ fn closure_value(closure: &ProblemOwnerClosure) -> Result<Value, CompositionErro
     Ok(value)
 }
 
-/// Builds the canonical envelope for one validated candidate record.
+/// Assembles the closed `ApplyProblemOwnerState` parameter map for one
+/// validated candidate.
 ///
-/// The four bindings all live here and all travel inside the canonical request
-/// hash, so a post-admission edit to any of them is a typed digest mismatch at
-/// every downstream recompute gate rather than a silently executed plan.
-///
-/// The one declared event id is what makes the history write and the outbox
-/// intent one atomic unit: the store derives the transition's outbox row from
-/// the emitted event id inside the same transaction that writes the command's
-/// durable record and the receipt, so a transition can never leave history
-/// without its outbox intent or publish an intent for a transition that did not
-/// commit.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the envelope binds every named-transition input explicitly"
-)]
-fn problem_owner_envelope(
-    identity: &eliot_protocol::RequestIdentity,
-    operation_id: &eliot_contracts::OperationId,
-    manifest_digest: &OperationManifestDigest,
+/// Split out of [`problem_owner_envelope`] because the parameter map is what
+/// the four bindings *are*, and it is the part that has a rule of its own: the
+/// retained closure record is conditional on the verb. Naming it says "these are
+/// the bindings, assembled and gated", separately from "this is the envelope
+/// they travel in".
+fn problem_owner_parameters(
     candidate: &Problem,
     expected_revision: u64,
     source_signal: &Signal,
     transition: ProblemOwnerTransition,
     authorization: &str,
     closure: Option<&ProblemOwnerClosure>,
-) -> Result<CanonicalWriteEnvelope, CompositionError> {
-    let fence = &identity.request.metadata.state_fence;
-    if candidate.state_fence != *fence {
-        return Err(owner_refused(
-            "candidate record is not bound to the admitted request fence".to_owned(),
-        ));
-    }
+) -> Result<(BTreeMap<String, Value>, String), CompositionError> {
     let record_json = serde_json::to_value(candidate)
         .map_err(|error| owner_refused(format!("cannot render the candidate record: {error}")))?;
     let record_bytes = canonical_json_bytes(&record_json)
@@ -382,27 +469,27 @@ fn problem_owner_envelope(
     for (name, value) in [
         (
             PROBLEM_PARAM_TRANSITION,
-            serde_json::Value::String(transition.as_str().to_owned()),
+            Value::String(transition.as_str().to_owned()),
         ),
         (
             PROBLEM_PARAM_PROBLEM_ID,
-            serde_json::Value::String(candidate.problem_id.as_str().to_owned()),
+            Value::String(candidate.problem_id.as_str().to_owned()),
         ),
         (
             PROBLEM_PARAM_EXPECTED_REVISION,
-            serde_json::Value::String(expected_revision.to_string()),
+            Value::String(expected_revision.to_string()),
         ),
         (
             PROBLEM_PARAM_SOURCE_SIGNAL_ID,
-            serde_json::Value::String(source_signal.signal_id.as_str().to_owned()),
+            Value::String(source_signal.signal_id.as_str().to_owned()),
         ),
         (
             PROBLEM_PARAM_AUTHORIZATION_DIGEST,
-            serde_json::Value::String(authorization.to_owned()),
+            Value::String(authorization.to_owned()),
         ),
         (
             PROBLEM_PARAM_RECORD_DIGEST,
-            serde_json::Value::String(record_digest.clone()),
+            Value::String(record_digest.clone()),
         ),
         (PROBLEM_PARAM_RECORD_JSON, record_json),
     ] {
@@ -425,6 +512,38 @@ fn problem_owner_envelope(
             "a waive or supersede transition must commit its retained closure record".to_owned(),
         ));
     }
+    Ok((parameters, record_digest))
+}
+
+/// Builds the canonical envelope for one validated candidate record.
+///
+/// The four bindings were assembled and gated by [`problem_owner_parameters`];
+/// they all travel inside the canonical request hash, so a post-admission edit
+/// to any of them is a typed digest mismatch at every downstream recompute gate
+/// rather than a silently executed plan.
+///
+/// The one declared event id is what makes the history write and the outbox
+/// intent one atomic unit: the store derives the transition's outbox row from
+/// the emitted event id inside the same transaction that writes the command's
+/// durable record and the receipt, so a transition can never leave history
+/// without its outbox intent or publish an intent for a transition that did not
+/// commit.
+fn problem_owner_envelope(
+    identity: &eliot_protocol::RequestIdentity,
+    operation_id: &eliot_contracts::OperationId,
+    manifest_digest: &OperationManifestDigest,
+    candidate: &Problem,
+    expected_revision: u64,
+    source_signal: &Signal,
+    bindings: (BTreeMap<String, Value>, String),
+) -> Result<CanonicalWriteEnvelope, CompositionError> {
+    let fence = &identity.request.metadata.state_fence;
+    if candidate.state_fence != *fence {
+        return Err(owner_refused(
+            "candidate record is not bound to the admitted request fence".to_owned(),
+        ));
+    }
+    let (parameters, record_digest) = bindings;
     let envelope = CanonicalWriteEnvelope {
         operation_id: operation_id.clone(),
         request: identity.request.metadata.clone(),
@@ -483,25 +602,38 @@ fn problem_owner_envelope(
 
 /// Prepares one named owner transition on a validated candidate copy.
 ///
-/// `current` is the committed record the caller read. `Create` is the only verb
-/// that has none and therefore the only one that takes `None`; for every other
-/// verb a missing record is refused rather than treated as an empty predecessor.
+/// The bindings arrive as one [`ProblemOwnerTransitionRequest`], so the four
+/// things this transition must compare are held together rather than spread
+/// across a parameter list a caller could populate inconsistently. `current` is
+/// the committed record the caller read: `Create` is the only verb that has none
+/// and therefore the only one that takes `None`; for every other verb a missing
+/// record is refused rather than treated as an empty predecessor.
 #[allow(
-    clippy::too_many_arguments,
     clippy::too_many_lines,
-    reason = "the admission binds every named transition input explicitly, and the nine verb arms stay side by side for review"
+    reason = "the nine verb arms stay side by side for review"
 )]
 pub fn prepare_problem_owner_transition(
-    identity: &eliot_protocol::RequestIdentity,
-    operation_id: &eliot_contracts::OperationId,
     manifest_digest: &OperationManifestDigest,
-    current: Option<&Problem>,
-    expected_revision: u64,
-    source_signal: &Signal,
-    lease: &AuthenticatedOwnerLease,
-    now_ms: u64,
-    body: &ProblemOwnerTransitionBody,
+    request: &ProblemOwnerTransitionRequest<'_>,
 ) -> Result<PreparedProblemOwnerTransition, CompositionError> {
+    let identity = request.identity;
+    let operation_id = &request.operation_id()?;
+    // The transition commits under its own request identity, derived from the
+    // caller's so each transition has its own idempotency key. It is produced
+    // here rather than by the caller because the envelope, the receipt binding
+    // and the commit all have to agree on it, and deriving it in one place is
+    // what keeps them from disagreeing.
+    let transition_identity = request.transition_identity()?;
+    let identity = &transition_identity;
+    // Every remaining field is individually `Copy` (a reference, a `u64`, or an
+    // `Option<&Problem>`), so the bindings are read out by value once and the
+    // rest of the admission reads plain locals rather than `request.` prefixes.
+    let current = request.current;
+    let expected_revision = request.expected_revision;
+    let source_signal = request.source_signal;
+    let lease = request.lease;
+    let now_ms = request.now_ms;
+    let body = request.body;
     let fence = &identity.request.metadata.state_fence;
     let transition = body.transition();
     // The expected record revision is compared here, before anything is prepared,
@@ -579,7 +711,7 @@ pub fn prepare_problem_owner_transition(
                 expected_resolution.clone(),
                 fence.clone(),
             )
-            .map_err(problem_refused)?,
+            .map_err(|error| problem_refused(&error))?,
             None,
         ),
         (Some(record), body) => {
@@ -603,10 +735,10 @@ pub fn prepare_problem_owner_transition(
                     repair,
                     next,
                 } => {
-                    candidate.title = title.clone();
-                    candidate.symptom = symptom.clone();
-                    candidate.hypotheses = hypotheses.clone();
-                    candidate.next_probe = next_probe.clone();
+                    candidate.title.clone_from(title);
+                    candidate.symptom.clone_from(symptom);
+                    candidate.hypotheses.clone_from(hypotheses);
+                    candidate.next_probe.clone_from(next_probe);
                     for artifact in containment {
                         if !candidate.containment.contains(artifact) {
                             candidate.containment.push(artifact.clone());
@@ -623,46 +755,46 @@ pub fn prepare_problem_owner_transition(
                     }
                     candidate
                         .transition(fence, *next)
-                        .map_err(problem_refused)?;
+                        .map_err(|error| problem_refused(&error))?;
                 }
                 ProblemOwnerTransitionBody::Assign => {
                     candidate
                         .assign_owner(fence, lease, now_ms)
-                        .map_err(problem_refused)?;
+                        .map_err(|error| problem_refused(&error))?;
                 }
                 ProblemOwnerTransitionBody::Unassign(loss) => {
                     candidate
                         .record_owner_loss(fence, loss)
-                        .map_err(problem_refused)?;
+                        .map_err(|error| problem_refused(&error))?;
                 }
                 ProblemOwnerTransitionBody::Escalate { evidence } => {
                     candidate
                         .escalate_obligation(fence, evidence)
-                        .map_err(problem_refused)?;
+                        .map_err(|error| problem_refused(&error))?;
                 }
                 ProblemOwnerTransitionBody::Resolve(evidence) => {
                     candidate
                         .resolve(fence, evidence)
-                        .map_err(problem_refused)?;
+                        .map_err(|error| problem_refused(&error))?;
                 }
                 ProblemOwnerTransitionBody::Waive(waiver) => {
                     let record = candidate
                         .accept_risk(fence, waiver)
-                        .map_err(problem_refused)?;
+                        .map_err(|error| problem_refused(&error))?;
                     closure = Some(ProblemOwnerClosure::Waived(record));
                 }
                 ProblemOwnerTransitionBody::Supersede(supersession) => {
                     let record = candidate
                         .supersede(fence, supersession)
-                        .map_err(problem_refused)?;
+                        .map_err(|error| problem_refused(&error))?;
                     closure = Some(ProblemOwnerClosure::SupersededBy(record));
                 }
                 ProblemOwnerTransitionBody::Reopen { evidence } => {
                     candidate
                         .reopen(fence, evidence.clone())
-                        .map_err(problem_refused)?;
+                        .map_err(|error| problem_refused(&error))?;
                 }
-            };
+            }
             (candidate, closure)
         }
         (None, _) => {
@@ -671,7 +803,9 @@ pub fn prepare_problem_owner_transition(
             ));
         }
     };
-    candidate.validate().map_err(problem_refused)?;
+    candidate
+        .validate()
+        .map_err(|error| problem_refused(&error))?;
     // The candidate must be the checked successor of the revision this
     // transition expected, so the persisted history and the readback can never
     // describe a state at a revision nothing replaced. `Create` establishes
@@ -701,10 +835,7 @@ pub fn prepare_problem_owner_transition(
         ));
     }
     check_retained_authorization(&candidate, lease)?;
-    let envelope = problem_owner_envelope(
-        identity,
-        operation_id,
-        manifest_digest,
+    let bindings = problem_owner_parameters(
         &candidate,
         expected_revision,
         source_signal,
@@ -712,8 +843,18 @@ pub fn prepare_problem_owner_transition(
         &authorization,
         closure.as_ref(),
     )?;
+    let envelope = problem_owner_envelope(
+        identity,
+        operation_id,
+        manifest_digest,
+        &candidate,
+        expected_revision,
+        source_signal,
+        bindings,
+    )?;
     Ok(PreparedProblemOwnerTransition {
         transition,
+        identity: transition_identity,
         candidate,
         closure,
         envelope,
@@ -736,25 +877,4 @@ pub struct ProblemOwnerTransitionOutcome {
     pub closure: Option<ProblemOwnerClosure>,
     /// The store's own commit receipt.
     pub receipt: eliot_store_api::WriteReceipt,
-}
-
-/// The operation identity a named transition commits under.
-///
-/// Derived from the base operation, the Problem it addresses, its source Signal
-/// and the revision it replaces — never from retry time — so an identical replay
-/// reconciles the existing receipt through the store's
-/// `(operation_id, canonical_request_hash)` identity while the same operation
-/// with changed bytes fails closed.
-pub fn problem_owner_operation_id(
-    base: &eliot_contracts::OperationId,
-    problem_id: &str,
-    source_signal_id: &str,
-    transition: ProblemOwnerTransition,
-    expected_revision: u64,
-) -> Result<eliot_contracts::OperationId, CompositionError> {
-    eliot_contracts::OperationId::new(format!(
-        "{base}/problem-{problem_id}-{source_signal_id}-{transition_word}-{expected_revision}",
-        transition_word = transition.as_str().to_ascii_lowercase(),
-    ))
-    .map_err(|error| owner_refused(error.to_string()))
 }

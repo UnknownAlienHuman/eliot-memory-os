@@ -1302,7 +1302,7 @@ impl Problem {
         evidence: &[ArtifactId],
     ) -> Result<OwnershipObligation, ProblemError> {
         same_fence(expected_fence, &self.state_fence)?;
-        nonempty(&evidence, "escalation.evidence")?;
+        nonempty(evidence, "escalation.evidence")?;
         let evidence_text = evidence.iter().map(ToString::to_string).collect::<Vec<_>>();
         unique_text(&evidence_text, "escalation.evidence")?;
         let Ownership::Unassigned(unassigned) = &self.ownership else {
@@ -1340,7 +1340,7 @@ impl Problem {
         }
         let revision = next_revision(self.revision)?;
         let mut candidate = self.clone();
-        candidate.observed_evidence = merge_evidence(&candidate.observed_evidence, &evidence);
+        candidate.observed_evidence = merge_evidence(&candidate.observed_evidence, evidence);
         candidate.revision = revision;
         candidate.validate()?;
         *self = candidate;

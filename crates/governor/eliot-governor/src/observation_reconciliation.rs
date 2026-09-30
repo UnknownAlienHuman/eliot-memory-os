@@ -176,8 +176,7 @@ use eliot_store_api::{
 };
 
 use crate::problem_owner_transitions::{
-    ProblemOwnerTransitionBody, ProblemOwnerTransitionOutcome, prepare_problem_owner_transition,
-    problem_owner_operation_id,
+    ProblemOwnerTransitionOutcome, ProblemOwnerTransitionRequest, prepare_problem_owner_transition,
 };
 use crate::{
     CanonicalAdmissionOwner, CompositionError, CompositionReadiness, KernelPortError,
@@ -2164,58 +2163,12 @@ impl<P: KernelTransitionPort + ?Sized> GovernorObservationReconciliation<'_, P> 
     /// the verb, or the canonical commit cannot be completed or reconciled.
     pub async fn commit_problem_owner_transition(
         &self,
-        identity: &eliot_protocol::RequestIdentity,
-        base_operation_id: &OperationId,
-        current: Option<&eliot_problem::Problem>,
-        expected_revision: u64,
-        source_signal: &eliot_problem::Signal,
-        lease: &eliot_problem::AuthenticatedOwnerLease,
-        now_ms: u64,
-        body: &ProblemOwnerTransitionBody,
+        request: &ProblemOwnerTransitionRequest<'_>,
     ) -> Result<ProblemOwnerTransitionOutcome, CompositionError> {
-        self.validate_capture_identity_fence(identity)?;
+        self.validate_capture_identity_fence(request.identity)?;
         let manifest_digest = production_manifest_digest()?;
-        let problem_id = match (current, body) {
-            (Some(record), _) => record.problem_id.as_str().to_owned(),
-            (None, ProblemOwnerTransitionBody::Create { problem_id, .. }) => {
-                problem_id.as_str().to_owned()
-            }
-            (None, _) => {
-                return Err(owner_refused(
-                    "a problem owner transition needs the committed record it advances, or a create body"
-                        .to_owned(),
-                ));
-            }
-        };
-        let operation_id = problem_owner_operation_id(
-            base_operation_id,
-            &problem_id,
-            source_signal.signal_id.as_str(),
-            body.transition(),
-            expected_revision,
-        )?;
-        let per_transition_identity = eliot_protocol::RequestIdentity {
-            request: identity.request.clone(),
-            idempotency_key: format!(
-                "{}:problem-owner:{}:{}:{expected_revision}",
-                identity.idempotency_key,
-                problem_id,
-                body.transition().as_str(),
-            ),
-            deadline_unix_ms: identity.deadline_unix_ms,
-            cancellation_id: identity.cancellation_id.clone(),
-        };
-        let prepared = prepare_problem_owner_transition(
-            &per_transition_identity,
-            &operation_id,
-            &manifest_digest,
-            current,
-            expected_revision,
-            source_signal,
-            lease,
-            now_ms,
-            body,
-        )?;
+        let operation_id = request.operation_id()?;
+        let prepared = prepare_problem_owner_transition(&manifest_digest, request)?;
         let expected_hash = prepared
             .envelope
             .canonical_request_hash()
@@ -2229,7 +2182,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorObservationReconciliation<'_, P> 
                 check_receipt(
                     &receipt,
                     &operation_id,
-                    &per_transition_identity,
+                    &prepared.identity,
                     &expected_hash,
                     TransitionClass::RecoverySchema,
                     &manifest_digest,
@@ -2238,7 +2191,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorObservationReconciliation<'_, P> 
             }
             None => {
                 self.commit_problem_leg(
-                    &per_transition_identity,
+                    &prepared.identity,
                     &operation_id,
                     prepared.envelope,
                     &expected_hash,

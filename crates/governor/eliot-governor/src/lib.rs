@@ -249,7 +249,7 @@ pub use owner_closure_provider::{
 };
 pub use problem_owner_transitions::{
     PreparedProblemOwnerTransition, ProblemOwnerClosure, ProblemOwnerTransitionBody,
-    ProblemOwnerTransitionOutcome, prepare_problem_owner_transition, problem_owner_operation_id,
+    ProblemOwnerTransitionOutcome, ProblemOwnerTransitionRequest, prepare_problem_owner_transition,
 };
 pub use reactive_admission::{
     AtomRiskBinding, ReactiveAdmissionError, ReactiveRiskAssessment, ReactiveRiskTier,
