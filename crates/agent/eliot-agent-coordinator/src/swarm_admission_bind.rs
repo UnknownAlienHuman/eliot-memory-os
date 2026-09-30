@@ -168,6 +168,14 @@ pub const ADMISSION_EXPIRY_WINDOW_FIELD: &str = "admission.expires_at_unix_ms";
 /// as a supplied value, not yet as a value some owner actually issued against a
 /// live admission.
 ///
+/// The gap is not confined to this one field. `expires_at_unix_ms` is the most
+/// visible absence, but the same receipts are wholly unissued: every
+/// construction site of the per-lane `eliot_agent_api::AdmittedRouteReceipt`
+/// that `admit` also requires is likewise inside a `#[cfg(test)]` module or a
+/// `tests/` directory. The full chain measurement, and the correction of an
+/// earlier delivery's misidentified blocker, are recorded on
+/// `AgentCoordinator::pull_next` in `core.rs`.
+///
 /// This is deliberately a documentation constant and not a field on
 /// [`SwarmAdmissionPlanCandidate`]. A plan is a durable, replayable record: a
 /// per-plan "no production issuer yet" flag would become false the moment a

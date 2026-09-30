@@ -1467,14 +1467,16 @@ impl AgentCoordinator {
     /// Known limitation, stated here so a reader of the code does not need the
     /// delivery report: the per-class partition is reachable only through the
     /// profile-bound path [`Self::pull_next`], and in production this
-    /// coordinator's `attempts` map is **empty** — `AgentFabric` never calls
-    /// [`Self::admit`], because no production issuer of the provider-verified
-    /// [`ProviderAdmissionReceipt`] that `admit` requires exists in this tree.
-    /// So this method returns `None` on every production path today, no caller
-    /// invokes it, and `profile_revision` in any published outcome would be
-    /// `None`. A reader must not conclude from this method that saturated
-    /// low-priority work is prevented from consuming another class's
-    /// partition: nothing on this path does that. The full measurement is on
+    /// coordinator's `attempts` map is **empty** — no production issuer of the
+    /// provider-verified [`ProviderAdmissionReceipt`] that [`Self::admit`]
+    /// requires exists in this tree, and the `eliotd` fabric admits through a
+    /// separate `FabricAdmission` vocabulary that never reaches this
+    /// coordinator. So this method returns `None` on every production path
+    /// today, no caller invokes it, and `profile_revision` in any published
+    /// outcome would be `None`. A reader must not conclude from this method that
+    /// saturated low-priority work is prevented from consuming another class's
+    /// partition: nothing on this path does that. The full measurement, and the
+    /// correction of an earlier delivery's misidentified blocker, are on
     /// [`Self::pull_next`].
     pub fn next_ready(&mut self) -> Option<AttemptRecord> {
         let selected = self.select_ready(None, false).selected_attempt_id?;
@@ -1551,28 +1553,75 @@ impl AgentCoordinator {
     /// `selected_attempt_id` starts that attempt through the existing
     /// [`Self::start_attempt`], which remains the only state transition.
     ///
-    /// Unreachable in production, and the reason is upstream of the profile.
-    /// Measured on `origin/main` @ `5d691922c`, the whole production gap is:
+    /// Unreachable in production. This note was re-measured on this increment
+    /// because an earlier delivery named the wrong owner for the missing join;
+    /// the correction is load-bearing, so it is recorded here rather than left
+    /// in a delivery report.
     ///
-    /// - No caller outside this crate constructs a [`ProviderAdmissionReceipt`].
-    ///   Its `expires_at_unix_ms` doc records that "No production issuer exists
-    ///   in this tree yet, so every construction site is a test fixture", and
-    ///   `git grep` finds no `bins/` construction site. The receipt is
-    ///   provider-verified on intake, so a pull cannot be fed a synthesized
-    ///   one without forging provider evidence.
-    /// - `AgentFabric` (`bins/eliotd/src/agent_fabric.rs`) calls exactly three
-    ///   coordinator methods — `plan` (twice), `snapshot`, and a lease
-    ///   `authorizes` on an unrelated `SwarmCoordinatorLease`. It never calls
-    ///   [`Self::admit`], so this coordinator's `attempts` map is empty in
-    ///   production and every pull over it would select nothing even if a
-    ///   profile were supplied.
+    /// The measured chain, link by link:
     ///
-    /// So the per-class partition is unexercised in production, and the
-    /// blocking join is `AgentFabric` -> [`Self::admit`], not a missing profile.
-    /// Building that join needs the #1678 admission saga's owner-issued
-    /// receipt; supplying only a `SchedulingProfile` would produce a selector
-    /// that is correct and permanently empty. See also the note on
-    /// [`Self::next_ready`].
+    /// - **Proposal is not the break.** `AgentCoordinator::plan` is reached in
+    ///   production: `AgentFabric::define_and_plan` calls it, and
+    ///   `bins/eliotd/src/solo_agent_driver.rs` drives `define_and_plan` from
+    ///   the daemon's live solo poll. A `StaffingPlanCandidate` is really
+    ///   produced.
+    /// - **Issuance is the break.** No production caller constructs a
+    ///   [`ProviderAdmissionReceipt`]. Its `expires_at_unix_ms` doc records
+    ///   that "No production issuer exists in this tree yet, so every
+    ///   construction site is a test fixture", and `git grep` finds the
+    ///   struct literal only in `src/tests.rs`,
+    ///   `src/core/admission_normalization_tests.rs` and `tests/coordinator.rs`.
+    /// - **The same gap holds one level down.** Every admitted lane also needs
+    ///   an `eliot_agent_api::AdmittedRouteReceipt` (S5), and every construction
+    ///   site of *that* type is likewise inside a `#[cfg(test)]` module or a
+    ///   `tests/` directory. So even a supplied envelope would fail
+    ///   `validate_lane_admission`, which recomputes the candidate digest and
+    ///   calls the owner validator.
+    /// - **Therefore `admit` is never called**, so `attempts` and
+    ///   `enqueue_sequence` — the two inputs `class_views` walks — stay empty,
+    ///   and every pull selects nothing even with a profile.
+    ///
+    /// **Correction to the previously recorded blocker.** The earlier note named
+    /// #1678 as the owner of the missing join. That is wrong, and building
+    /// against it would have produced a second unowned seam. #1678 owns the ORS
+    /// `AdmissionReservation` lifecycle: `git grep AdmissionReservation` finds
+    /// no occurrence in this crate, and this crate does not depend on
+    /// `eliot-ors` at all. Its `TASK.md` never mentions
+    /// `ProviderAdmissionReceipt`, `AgentCoordinator` or this crate, and it
+    /// assigns the fabric-side binding of its active evidence to **#1701**
+    /// ("#1701 owns wiring the resulting active evidence into Agent Fabric /
+    /// native-worker / adapter launch consumers"). #1678 landing would
+    /// therefore *not* by itself make this reachable.
+    ///
+    /// The real gap is that **`eliotd` runs a second, parallel admission
+    /// vocabulary that never reaches this coordinator.** `AgentFabric` admits
+    /// through `AdmissionAuthorityPort::{stage_reservation, commit_admission}`
+    /// into its own `FabricAdmission`, and in the default production
+    /// composition that port is `ProductionAdmissionAuthorityPort`
+    /// (`bins/eliotd/src/lib.rs`), whose every method returns
+    /// `blocked_port(...)` — it mints nothing. The one contour that does mint
+    /// (`SoloAdmissionAuthorityPort`) fabricates `admission_id` from a
+    /// `format!` of the definition digest, i.e. the principal names itself.
+    /// Neither path calls [`Self::admit`], and there is no `From`/`TryFrom`
+    /// between `FabricAdmission` and [`ProviderAdmissionReceipt`]: the two types
+    /// do not even share a shape (`FabricAdmission` carries no
+    /// `provider_identity`, no `g11_admission_receipt_ref`, no
+    /// `coordinator_lease`, no `admitted_lanes`, no expiry).
+    ///
+    /// So the blocking join is a **type-level join between two independently
+    /// owned admission vocabularies**, not a missing profile and not #1678's
+    /// reservation. Its owner is the #1701 fabric/Kernel binding plus the
+    /// external provider/Governor admission owner named in this crate's
+    /// `AGENTS.md` ("external provider/Governor admission must bind the exact
+    /// candidate bytes/digest"); this crate is explicitly forbidden from minting
+    /// the receipt itself.
+    ///
+    /// What an issuer would have to prove, and cannot prove from the request: an
+    /// admission here is only as strong as evidence the admitter did not choose
+    /// alone. A receipt synthesized from a caller-supplied provider id, or from
+    /// `FabricAdmission`'s self-derived digest, would convert a *visible* dead
+    /// path into an *invisible* wrong one — strictly worse than the state
+    /// recorded here. See also the note on [`Self::next_ready`].
     ///
     /// # Errors
     ///

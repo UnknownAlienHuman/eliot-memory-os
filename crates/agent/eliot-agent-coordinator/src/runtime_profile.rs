@@ -98,14 +98,17 @@
 //! does not invent a caller. The upstream reason is recorded on
 //! `AgentCoordinator::pull_next` in `core.rs` and is narrower than "no profile
 //! was supplied": in production this coordinator's `attempts` map is empty,
-//! because `AgentFabric` never calls `AgentCoordinator::admit` and no
-//! production issuer of the provider-verified `ProviderAdmissionReceipt` that
-//! `admit` requires exists in this tree. Wiring this loader alone would
-//! therefore compile a profile for a projection that is permanently empty; the
-//! blocking join is the #1678 admission saga's owner-issued receipt. The
-//! profile-free `AgentCoordinator::next_ready` is likewise exercised only from
-//! in-crate tests. The composition root that compiles this document is a
-//! separate owner.
+//! because no production issuer of the provider-verified
+//! `ProviderAdmissionReceipt` that `AgentCoordinator::admit` requires exists in
+//! this tree, and the `eliotd` fabric admits through a separate
+//! `FabricAdmission` vocabulary that never reaches this coordinator. Wiring this
+//! loader alone would therefore compile a profile for a projection that is
+//! permanently empty. The blocking join is a type-level join between those two
+//! independently owned admission vocabularies — **not** the #1678 reservation
+//! saga, which owns the ORS `AdmissionReservation` type, appears nowhere in this
+//! crate, and assigns its own fabric-side binding to #1701. The profile-free
+//! `AgentCoordinator::next_ready` is likewise exercised only from in-crate
+//! tests. The composition root that compiles this document is a separate owner.
 
 use std::io::Read;
 use std::path::Path;
