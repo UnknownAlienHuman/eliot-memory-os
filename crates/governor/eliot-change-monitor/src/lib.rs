@@ -1793,6 +1793,30 @@ impl ChangeMonitor {
         }
         blocked.into_iter().collect()
     }
+
+    /// Resolves one anchored-review anchor against explicit current
+    /// candidates over this projection (I10.18 anchored review, I10.21
+    /// A3/A4).
+    ///
+    /// Inputs are immutable: the original anchor and the candidate set the
+    /// review supplies, plus the owned snapshot of this monitor taken
+    /// above. Nothing here mutates the projection, re-derives history, or
+    /// auto-selects an ambiguous target: ties resolve `ambiguous` with
+    /// recorded evidence and no chosen target, and a target with a
+    /// matching immutable deletion observation resolves `deleted` while
+    /// staying historically addressable through its observation identity.
+    /// The returned observation carries the resolver algorithm/version,
+    /// the complete candidate and evidence inputs, and the confidence, so
+    /// the review route publishes exactly what was decided from what.
+    /// The anchored-review submit lane owns supplying candidates and
+    /// persisting this observation next to the review it justifies.
+    pub fn resolve_anchor(
+        &self,
+        original: &AnchorReference,
+        candidates: &[AnchorCandidate],
+    ) -> Result<AnchorResolutionObservation, ChangeMonitorError> {
+        EvolvingAnchorResolver.resolve_observed(original, candidates, &self.snapshot())
+    }
 }
 
 /// Candidate current location supplied by VCS/content/code-intelligence
