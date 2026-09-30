@@ -33,6 +33,17 @@
 //!    the binding is a comparison against owner-held state and not a value the
 //!    caller restated.
 //!
+//! The store boundary re-derives rather than trusts. `record_digest` and
+//! `authorization_digest` are the two bindings that are not a shape check, and
+//! [`eliot_store_api::decode_problem_owner_state_mutation`] compares both: the
+//! record digest is re-taken over the candidate's own canonical bytes, and the
+//! authorization digest is re-taken over the ownership-lease identity and
+//! `state_fence` the committed record itself retains, under the one shared
+//! [`PROBLEM_AUTHORIZATION_DOMAIN`](eliot_store_api::PROBLEM_AUTHORIZATION_DOMAIN)
+//! this module prepares it from. A transition therefore cannot commit a record
+//! whose bytes, or whose retained lease, disagree with the authorization and
+//! digest it travels beside.
+//!
 //! Pure and effect-separated: the state machine runs on a **candidate copy** of
 //! the record and is validated before it replaces anything, so a refused
 //! transition leaves the live record byte-identical. The effect is the single
@@ -75,12 +86,13 @@ use eliot_problem::{
 };
 use eliot_store_api::{
     EffectClass, EventId, EventProjectionRelationIntents, OperationManifestDigest,
-    OrderingHeadExpectation, OrderingScopeId, PROBLEM_CLOSURE_SUPERSEDED_BY,
-    PROBLEM_CLOSURE_WAIVED, PROBLEM_PARAM_AUTHORIZATION_DIGEST, PROBLEM_PARAM_CLOSURE_JSON,
-    PROBLEM_PARAM_EXPECTED_REVISION, PROBLEM_PARAM_PROBLEM_ID, PROBLEM_PARAM_RECORD_DIGEST,
-    PROBLEM_PARAM_RECORD_JSON, PROBLEM_PARAM_SOURCE_SIGNAL_ID, PROBLEM_PARAM_TRANSITION,
-    ProblemOwnerTransition, RevisionHeadExpectation, ScopeId, SecurityContext, StateFence,
-    TransitionClass, problem_owner_state_mutation_request, problem_revision_key,
+    OrderingHeadExpectation, OrderingScopeId, PROBLEM_AUTHORIZATION_DOMAIN,
+    PROBLEM_CLOSURE_SUPERSEDED_BY, PROBLEM_CLOSURE_WAIVED, PROBLEM_PARAM_AUTHORIZATION_DIGEST,
+    PROBLEM_PARAM_CLOSURE_JSON, PROBLEM_PARAM_EXPECTED_REVISION, PROBLEM_PARAM_PROBLEM_ID,
+    PROBLEM_PARAM_RECORD_DIGEST, PROBLEM_PARAM_RECORD_JSON, PROBLEM_PARAM_SOURCE_SIGNAL_ID,
+    PROBLEM_PARAM_TRANSITION, ProblemOwnerTransition, RevisionHeadExpectation, ScopeId,
+    SecurityContext, StateFence, TransitionClass, problem_owner_state_mutation_request,
+    problem_revision_key,
 };
 use serde_json::Value;
 
@@ -92,8 +104,6 @@ const PROBLEM_SCOPE_ID: &str = "governor";
 /// sequence; the constant mirrors the existing problem/recovery legs so all
 /// canonical writes share one conflict-serialization scope.
 const PROBLEM_ORDERING_SCOPE: &str = "scope:governor";
-/// Domain separator for the re-proved current-authorization digest.
-const AUTHORIZATION_DOMAIN: &str = "eliot.problem.owner-transition-authorization.v1";
 
 fn owner_refused(detail: impl Into<String>) -> CompositionError {
     CompositionError::Owner(detail.into())
@@ -341,7 +351,10 @@ impl ProblemOwnerTransitionRequest<'_> {
 ///
 /// The digest is over the lease owner's own commitment as this crate re-derives
 /// it, bound to the exact fence and ownership epoch the transition runs under.
-/// It is *derived here*, never taken from the caller.
+/// It is *derived here*, never taken from the caller, and it is derived over the
+/// same domain-separated tuple the store re-derives from the committed record's
+/// own retained lease and fence — so the store's recheck is a comparison against
+/// this value rather than a second scheme that can drift from it.
 fn authorization_digest(
     lease: &AuthenticatedOwnerLease,
     epoch: &EpochId,
@@ -356,7 +369,7 @@ fn authorization_digest(
         ));
     }
     let bytes = canonical_json_bytes(&(
-        AUTHORIZATION_DOMAIN,
+        PROBLEM_AUTHORIZATION_DOMAIN,
         &commitment,
         &lease.identity().lease_id,
         lease.ownership_epoch(),
