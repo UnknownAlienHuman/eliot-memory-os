@@ -710,7 +710,8 @@ pub(super) fn run() -> Result<(), String> {
         event = "eliotd.canonical_layer_schema_published",
         schema = eliotd::canonical_layer_json_schema_pretty(),
     );
-    let kernel = DaemonKernelClient::connect(&config).map_err(|error| error.to_string())?;
+    let kernel =
+        DaemonKernelClient::connect(&config).map_err(|error| pre_loop_failure(error.to_string()))?;
     let authority_activation = eliotd::kernel_authority_port(&kernel);
     let mut composition = DaemonComposition::start(
         config,
@@ -830,7 +831,9 @@ pub(super) fn run() -> Result<(), String> {
         .core_readiness_prerequisites_satisfied()
         .is_satisfied()
     {
-        let ready_supervision = kernel.report_ready().map_err(|error| error.to_string())?;
+        let ready_supervision = kernel
+            .report_ready()
+            .map_err(|error| pre_loop_failure(error.to_string()))?;
         let session_facts = kernel.owner_session_facts().ok_or_else(|| {
             "daemon has no validated Kernel session binding for supervision progress".to_owned()
         })?;
@@ -1530,6 +1533,21 @@ fn attach_skill_tool_source() -> Result<String, String> {
     eliot_governor::canonical_skill_tool_source()
         .map(|(_, admitted)| admitted)
         .map_err(|error| format!("skill tool source unavailable: {error}"))
+}
+
+// #740 A14: owning error record for a pre-loop String failure (the Kernel
+// handshake and readiness-report legs). The typed client boundary already
+// emitted its kernel-owner record; this names the daemon-runtime observation
+// before the `?` propagates to the stdout status frame. Terminal output is
+// unchanged: the record goes to the diagnostics sink only.
+fn pre_loop_failure(reason: String) -> String {
+    let _ = eliotd::diagnostics::ErrorRecord::of(
+        eliotd::diagnostics::OwningComponent::DaemonRuntime,
+        "pre-loop-failure",
+        &reason,
+    )
+    .emit();
+    reason
 }
 
 fn report_terminal_failure(kernel: &DaemonKernelClient, reason: String) -> String {

@@ -1399,41 +1399,56 @@ impl DaemonKernelClient {
         // is retained so `request_shutdown` can publish; the receiving half is
         // cloned per exchange so a cancel-aware send observes the same signal.
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let client = Self {
-            launch: config.launch.clone(),
-            connection_id: format!(
-                "eliotd:{}:{}:{}:{}",
-                config.launch.instance_id,
-                config.launch.kernel.generation.value(),
-                config.launch.kernel.authority_epoch.lineage_id.as_str(),
-                config.launch.kernel.authority_epoch.sequence.get()
-            ),
-            snapshot: expected_snapshot(&config.launch)?,
-            kernel_binding: config.kernel_binding.clone(),
-            validated_session_binding: Mutex::new(None),
-            shutdown_tx,
-            shutdown_rx,
-        };
-        #[cfg(windows)]
-        {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
-            let snapshot = runtime
-                .block_on(client.snapshot_request_with_pre_admission_retry())
-                .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
-            let mut client = client;
-            client.snapshot = snapshot;
-            Ok(Arc::new(client))
+        let outcome: Result<Arc<Self>, super::DaemonError> = (|| {
+            let client = Self {
+                launch: config.launch.clone(),
+                connection_id: format!(
+                    "eliotd:{}:{}:{}:{}",
+                    config.launch.instance_id,
+                    config.launch.kernel.generation.value(),
+                    config.launch.kernel.authority_epoch.lineage_id.as_str(),
+                    config.launch.kernel.authority_epoch.sequence.get()
+                ),
+                snapshot: expected_snapshot(&config.launch)?,
+                kernel_binding: config.kernel_binding.clone(),
+                validated_session_binding: Mutex::new(None),
+                shutdown_tx,
+                shutdown_rx,
+            };
+            #[cfg(windows)]
+            {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+                let snapshot = runtime
+                    .block_on(client.snapshot_request_with_pre_admission_retry())
+                    .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+                let mut client = client;
+                client.snapshot = snapshot;
+                // #740: handshake record, distinct from the readiness record
+                // the runtime emits. The snapshot reply above passed wire
+                // correlation plus snapshot/admission validation, so
+                // `validated` is observed, never fabricated. The non-windows
+                // leg below is an error leg, so it has no success record.
+                let _ =
+                    crate::diagnostics::emit_kernel_handshake(&client.connection_id, true);
+                Ok(Arc::new(client))
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = client;
+                Err(super::DaemonError::Kernel(
+                    KernelClientError::Unsupported.to_string(),
+                ))
+            }
+        })();
+        // #740: owning error record at the handshake boundary. One record per
+        // failed connect; the success leg above emits the handshake record.
+        if let Err(error) = &outcome {
+            let _ = crate::diagnostics::ErrorRecord::of_daemon_error(error).emit();
         }
-        #[cfg(not(windows))]
-        {
-            let _ = client;
-            Err(super::DaemonError::Kernel(
-                KernelClientError::Unsupported.to_string(),
-            ))
-        }
+        outcome
     }
 
     /// #791 (W4/W17): publishes the daemon's shutdown request so any pending
@@ -1774,27 +1789,36 @@ impl DaemonKernelClient {
     pub fn report_ready(&self) -> Result<super::DaemonReadySupervision, super::DaemonError> {
         // #740: readiness span, distinct from the handshake span above.
         let _span = tracing::info_span!("eliotd.daemon_readiness").entered();
-        #[cfg(windows)]
-        {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
-            let value = runtime
-                .block_on(self.report_ready_with_pre_admission_retry())
-                .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
-            // Issue #88, wave 3: the Kernel answers `daemon_ready` with the
-            // once-per-generation supervision bundle (authority lineage plus
-            // the exact current lease head). The per-tick producer cites this
-            // bundle verbatim; a missing bundle fails readiness closed.
-            super::parse_daemon_ready_supervision(&value).map_err(super::DaemonError::Kernel)
+        let outcome: Result<super::DaemonReadySupervision, super::DaemonError> = (|| {
+            #[cfg(windows)]
+            {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+                let value = runtime
+                    .block_on(self.report_ready_with_pre_admission_retry())
+                    .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+                // Issue #88, wave 3: the Kernel answers `daemon_ready` with the
+                // once-per-generation supervision bundle (authority lineage plus
+                // the exact current lease head). The per-tick producer cites this
+                // bundle verbatim; a missing bundle fails readiness closed.
+                super::parse_daemon_ready_supervision(&value).map_err(super::DaemonError::Kernel)
+            }
+            #[cfg(not(windows))]
+            {
+                Err(super::DaemonError::Kernel(
+                    KernelClientError::Unsupported.to_string(),
+                ))
+            }
+        })();
+        // #740: owning error record at the readiness-report boundary. One
+        // record per failed report; the success leg needs no record here
+        // because the runtime emits the daemon_readiness record.
+        if let Err(error) = &outcome {
+            let _ = crate::diagnostics::ErrorRecord::of_daemon_error(error).emit();
         }
-        #[cfg(not(windows))]
-        {
-            Err(super::DaemonError::Kernel(
-                KernelClientError::Unsupported.to_string(),
-            ))
-        }
+        outcome
     }
 
     /// Submits one per-tick supervision-progress renewal request on the
