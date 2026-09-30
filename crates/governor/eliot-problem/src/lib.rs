@@ -1702,45 +1702,7 @@ impl Incident {
                     reason: "a promoted incident must retain its expected closure set",
                 });
             }
-            // I13.9 separates semantic contamination from structural corruption.
-            // A review request that observed a wrong interpretation is not a
-            // corruption finding, so an `UnknownMaterialOrCriticalExternalEffect`
-            // or `CriticalTelemetryOrControlPathLost` request can never be the
-            // retained request a structural-corruption promotion decides on:
-            // wrong interpretations do not automatically justify restore or a
-            // global shutdown.
-            if promotion.reason == IncidentReason::StructuralCorruption
-                && self
-                    .review_requests
-                    .iter()
-                    .all(|request| request.reason != IncidentReason::StructuralCorruption)
-            {
-                return Err(ProblemError::InvalidField {
-                    field: "promotion.reason",
-                    reason: "structural corruption requires a retained review request that found it",
-                });
-            }
-            // The admitting authority is re-checked against the retained review
-            // request here too, so a record rebuilt from state alone cannot
-            // present a rule identity or a confidence the requesting Signal
-            // never carried. A `DeterministicPolicy` promotion whose retained
-            // request is `Suspected`/`Unknown` is exactly the model-only
-            // assessment I13.10 refuses, so validation and promotion agree.
-            let request = self
-                .review_requests
-                .iter()
-                .find(|request| request.signal_id == promotion.request_signal)
-                .ok_or(ProblemError::InvalidField {
-                    field: "promotion.request_signal",
-                    reason: "must name a retained review request",
-                })?;
-            if request.reason != promotion.reason {
-                return Err(ProblemError::InvalidField {
-                    field: "promotion.reason",
-                    reason: "must be the reason the retained review request observed",
-                });
-            }
-            promotion.authority.validate_against(request)?;
+            self.validate_promotion_backing(promotion)?;
         }
         let expected = self
             .expected_resolution
@@ -1804,6 +1766,59 @@ impl Incident {
             }),
             (Ownership::Assigned(_), None) => Ok(()),
         }
+    }
+
+    /// Re-proves a committed promotion against the retained review request it
+    /// decided on, so a record rebuilt from stored state cannot open an Incident
+    /// on its own word.
+    ///
+    /// [`Incident::promote`] already refuses a promotion whose authority does not
+    /// bind the requesting Signal. That refusal is worthless on its own: a record
+    /// reconstructed from bytes never passes through `promote`, so the same
+    /// admission has to hold here or a `DeterministicPolicy` promotion over a
+    /// `Suspected`/`Unknown` Signal — the model-only assessment I13.10 refuses —
+    /// would validate as a committed Incident. Promotion and validation therefore
+    /// agree by construction rather than by convention.
+    fn validate_promotion_backing(
+        &self,
+        promotion: &IncidentPromotion,
+    ) -> Result<(), ProblemError> {
+        // I13.9 separates semantic contamination from structural corruption. A
+        // review request that observed a wrong interpretation is not a corruption
+        // finding, so an `UnknownMaterialOrCriticalExternalEffect` or
+        // `CriticalTelemetryOrControlPathLost` request can never be the retained
+        // request a structural-corruption promotion decides on: wrong
+        // interpretations do not automatically justify restore or a global
+        // shutdown.
+        if promotion.reason == IncidentReason::StructuralCorruption
+            && self
+                .review_requests
+                .iter()
+                .all(|request| request.reason != IncidentReason::StructuralCorruption)
+        {
+            return Err(ProblemError::InvalidField {
+                field: "promotion.reason",
+                reason: "structural corruption requires a retained review request that found it",
+            });
+        }
+        // The admitting authority is re-checked against the retained review
+        // request, so a record rebuilt from state alone cannot present a rule
+        // identity or a confidence the requesting Signal never carried.
+        let request = self
+            .review_requests
+            .iter()
+            .find(|request| request.signal_id == promotion.request_signal)
+            .ok_or(ProblemError::InvalidField {
+                field: "promotion.request_signal",
+                reason: "must name a retained review request",
+            })?;
+        if request.reason != promotion.reason {
+            return Err(ProblemError::InvalidField {
+                field: "promotion.reason",
+                reason: "must be the reason the retained review request observed",
+            });
+        }
+        promotion.authority.validate_against(request)
     }
 
     /// Records that review was requested, without deciding anything.
