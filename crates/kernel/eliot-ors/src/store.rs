@@ -102,15 +102,14 @@ use crate::{
     SupervisionLeaseStageResolutionDisposition, SupervisionLeaseTicketReconciliation,
     UnknownCommitOutcome, UnknownCommitRecord, UserBrokerFence, UserBrokerHeartbeat,
     UserBrokerRegistration, UserBrokerRegistrationReceipt, UserBrokerRegistrationSnapshot,
-    UserBrokerResourceSelection, UserBrokerResourceSelectionSnapshot,
-    VersionedArtifactEntry, VersionedArtifactRegistry,
-    WorkerReplayAck, WorkerReplayAckRecord,
-    WorkerReplayBegin, WorkerReplayCursors, WorkerReplayDraft, WorkerReplayEvent,
-    WorkerReplayRequestDecision, WorkerReplayRequestRecord, WorkerReplayStreamRecord,
-    WriteIdempotencyRecoveryCursor, WriteIdempotencyRecoveryEntry, WriteIdempotencyRecoveryPage,
-    WriteReservationRecoveryCursor, WriteReservationRecoveryPage, WriterReservationToken,
-    is_replay_terminal_phase, parse_replay_stream_id, require_replay_claim_binding,
-    signed_supervision_lease_from_verified, signed_terminal_supervision_lease_from_verified,
+    UserBrokerResourceSelection, UserBrokerResourceSelectionSnapshot, VersionedArtifactEntry,
+    VersionedArtifactRegistry, WorkerReplayAck, WorkerReplayAckRecord, WorkerReplayBegin,
+    WorkerReplayCursors, WorkerReplayDraft, WorkerReplayEvent, WorkerReplayRequestDecision,
+    WorkerReplayRequestRecord, WorkerReplayStreamRecord, WriteIdempotencyRecoveryCursor,
+    WriteIdempotencyRecoveryEntry, WriteIdempotencyRecoveryPage, WriteReservationRecoveryCursor,
+    WriteReservationRecoveryPage, WriterReservationToken, is_replay_terminal_phase,
+    parse_replay_stream_id, require_replay_claim_binding, signed_supervision_lease_from_verified,
+    signed_terminal_supervision_lease_from_verified,
 };
 
 /// The versioned-artifact family rides the same ORS persistence codec as every
@@ -27875,12 +27874,11 @@ impl RedbRecoveryStore {
             authority_epoch.current.epoch,
         )?;
         state_fence.validate_against_epoch(&selection.selection.authority_epoch)?;
-        let created_at_ms = i64::try_from(selection.selection.issued_at).map_err(|_| {
-            OrsError::InvalidField {
+        let created_at_ms =
+            i64::try_from(selection.selection.issued_at).map_err(|_| OrsError::InvalidField {
                 field: "user_broker_resource_selection_issued_at",
                 reason: "selection timestamp exceeds the ORS creation-time range",
-            }
-        })?;
+            })?;
         let locator = PlatformHandle::new(format!(
             "ors:user-broker-resource-selection:{}",
             subject_id.as_str()
@@ -28038,10 +28036,7 @@ impl RedbRecoveryStore {
         &self,
         subject_id: &OperationIdentity,
     ) -> Result<Option<UserBrokerResourceSelectionSnapshot>, OrsError> {
-        let key = Self::operational_key(
-            OperationalKind::UserBrokerResourceSelection,
-            subject_id,
-        );
+        let key = Self::operational_key(OperationalKind::UserBrokerResourceSelection, subject_id);
         let read = self.database.begin_read().map_err(storage)?;
         let current = read.open_table(OPERATIONAL_CURRENT).map_err(storage)?;
         current
@@ -28081,10 +28076,7 @@ impl RedbRecoveryStore {
                 .get(key.as_str())
                 .map_err(storage)?
                 .map(|value| {
-                    decode_named::<DurableOperationalRecord>(
-                        value.value(),
-                        "operational_current",
-                    )
+                    decode_named::<DurableOperationalRecord>(value.value(), "operational_current")
                 })
                 .transpose()?
         };
