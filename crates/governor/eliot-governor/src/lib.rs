@@ -106,6 +106,7 @@ pub use negative_memory_read::{
     NegativeMemoryReadRefusal, ResolvedNegativeMemoryRuleSet, plan_negative_memory_rule_read,
     resolve_negative_memory_rule_read,
 };
+mod captured_lsp_evidence;
 mod controlboard_projection;
 mod learning_admission;
 mod learning_closure;
@@ -130,7 +131,6 @@ mod owner_projection_refresh;
 mod problem_owner_transitions;
 mod quality_applicability;
 mod reactive_admission;
-mod captured_lsp_evidence;
 mod route_registry;
 mod scan_disclosure_owner;
 mod scope_identity_admission;
@@ -172,6 +172,7 @@ pub use capability_evidence_commit::{
     capability_evidence_idempotency_key, capability_evidence_mutation_request_for_record,
     commit_capability_evidence_record,
 };
+pub use captured_lsp_evidence::CapturedLspEvidenceError;
 pub use composition::*;
 pub use controlboard_projection::{
     ControlBoardAttentionEvaluationRow, ControlBoardGovernorSnapshot, ControlBoardOwnerBinding,
@@ -182,6 +183,7 @@ pub use controlboard_projection::{
 /// the daemon composition root can name the exact envelope type without a
 /// second canonical dependency path.
 pub use eliot_canonical::{CanonicalWriteEnvelope, FinishAttemptDraft, RequestedFinishOutcome};
+pub use eliot_code_cortex::CapturedLspObservation;
 pub use eliot_finish::FinishDecisionReceipt;
 /// Admission-receipt type re-exported so the daemon composition root can name
 /// the exact delivery-gate receipt type without a second dependency path (same
@@ -279,8 +281,6 @@ pub use reactive_admission::{
     AtomRiskBinding, ReactiveAdmissionError, ReactiveRiskAssessment, ReactiveRiskTier,
     assess_reactive_risk, bind_atom_risk,
 };
-pub use captured_lsp_evidence::CapturedLspEvidenceError;
-pub use eliot_code_cortex::CapturedLspObservation;
 pub use route_registry::{
     ActualRouteReceipt, CapabilityRouteRegistry, EFFECTIVE_ROUTE_KEY_DOMAIN, ExecutionIdentity,
     ObservedRoute, RouteAdmission, RouteAdmissionDecision, RouteBehaviorFingerprint,
@@ -311,11 +311,11 @@ pub use selection_chain::{
     selection_chain_security_context, selection_claim_ceiling,
 };
 pub use skill_lifecycle::{GovernorSkillLifecycle, canonical_skill_tool_source};
+pub(crate) use source_artifact_admission::issue_source_artifact_admission;
 pub use source_artifact_admission::{
     SourceArtifactAdmission, SourceArtifactAdmissionError, SourceArtifactAdmissionRequest,
     SourceArtifactReadRequest,
 };
-pub(crate) use source_artifact_admission::issue_source_artifact_admission;
 pub use source_artifact_blob_profile::{
     SOURCE_ARTIFACT_BLOB_ACCESS_DOMAIN_SETTING,
     SOURCE_ARTIFACT_BLOB_CONFIDENTIALITY_DOMAIN_SETTING,

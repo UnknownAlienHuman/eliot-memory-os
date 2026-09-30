@@ -254,12 +254,8 @@ impl SourceArtifactBlobProfile {
         let residency_domains = SourceArtifactResidencyDomains {
             scope: domain(SOURCE_ARTIFACT_BLOB_SCOPE_DOMAIN_SETTING)?,
             access: domain(SOURCE_ARTIFACT_BLOB_ACCESS_DOMAIN_SETTING)?,
-            confidentiality: domain(
-                SOURCE_ARTIFACT_BLOB_CONFIDENTIALITY_DOMAIN_SETTING,
-            )?,
-            encryption_key: domain(
-                SOURCE_ARTIFACT_BLOB_ENCRYPTION_KEY_DOMAIN_SETTING,
-            )?,
+            confidentiality: domain(SOURCE_ARTIFACT_BLOB_CONFIDENTIALITY_DOMAIN_SETTING)?,
+            encryption_key: domain(SOURCE_ARTIFACT_BLOB_ENCRYPTION_KEY_DOMAIN_SETTING)?,
             retention: domain(SOURCE_ARTIFACT_BLOB_RETENTION_DOMAIN_SETTING)?,
             erasure: domain(SOURCE_ARTIFACT_BLOB_ERASURE_DOMAIN_SETTING)?,
         };

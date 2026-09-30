@@ -357,23 +357,16 @@ pub async fn serve_context_reconstruction(
             ));
         }
     };
-    let captured = captured_lsp_payloads(
-        seven.evidence.payload.as_ref(),
-        task_id,
-        &retained_fence,
-    )?;
+    let captured =
+        captured_lsp_payloads(seven.evidence.payload.as_ref(), task_id, &retained_fence)?;
     let instrument_evidence = if captured.is_empty() {
         Vec::new()
     } else {
-        let task_frame_readback = seven
-            .task_frame
-            .identity
-            .clone()
-            .ok_or_else(|| {
-                ReconstructionPrerequisite::CapturedEvidenceRefused(
-                    "current task-frame read has no retained ReadIdentity".to_owned(),
-                )
-            })?;
+        let task_frame_readback = seven.task_frame.identity.clone().ok_or_else(|| {
+            ReconstructionPrerequisite::CapturedEvidenceRefused(
+                "current task-frame read has no retained ReadIdentity".to_owned(),
+            )
+        })?;
         let first_causal = captured[0].read_causal_binding.clone();
         if captured
             .iter()
@@ -386,22 +379,21 @@ pub async fn serve_context_reconstruction(
         let holder = eliot_authority::PrincipalRef::new(owner_session.kernel_principal.clone())
             .map_err(crate::CapturedLspAdoptionError::from)?;
         let mut composition = composition.lock().await;
-        composition
-            .consume_captured_lsp_payloads(
-                crate::CapturedLspReadContext {
-                    envelope: envelope.clone(),
-                    attempt: attempt.clone(),
-                    request_metadata: ctx,
-                    holder,
-                    task_frame_readback,
-                    causal_binding: first_causal,
-                    now: eliot_authority::LogicalTime::new(crate::unix_ms()),
-                },
-                captured
-                    .into_iter()
-                    .map(|payload| (payload.reference, payload.task_binding))
-                    .collect(),
-            )?
+        composition.consume_captured_lsp_payloads(
+            crate::CapturedLspReadContext {
+                envelope: envelope.clone(),
+                attempt: attempt.clone(),
+                request_metadata: ctx,
+                holder,
+                task_frame_readback,
+                causal_binding: first_causal,
+                now: eliot_authority::LogicalTime::new(crate::unix_ms()),
+            },
+            captured
+                .into_iter()
+                .map(|payload| (payload.reference, payload.task_binding))
+                .collect(),
+        )?
     };
     context_reconstruction_result_body(
         envelope,
@@ -1098,8 +1090,7 @@ fn captured_lsp_payloads(
             .state_fence
             .validate()
             .map_err(ReconstructionPrerequisite::CapturedBindingFence)?;
-        if task_binding.task_id.as_str() != expected_task_id
-        {
+        if task_binding.task_id.as_str() != expected_task_id {
             return Err(ReconstructionPrerequisite::CapturedEvidenceRefused(
                 "LSP capture row does not bind the admitted task".to_owned(),
             ));

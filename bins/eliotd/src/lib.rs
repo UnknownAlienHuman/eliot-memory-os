@@ -2034,11 +2034,9 @@ impl DaemonComposition {
                 .policy_owner()
                 .ok_or(CapturedLspAdoptionError::MissingPolicyOwner)?
                 .source_artifact_blob_profile(&admission)?;
-            let readback = self.source_artifact_owner.read_captured_observation_payload(
-                &admission,
-                &profile,
-                &reference,
-            )?;
+            let readback = self
+                .source_artifact_owner
+                .read_captured_observation_payload(&admission, &profile, &reference)?;
             observations.push(eliot_governor::CapturedLspObservation::new(
                 reference,
                 readback,
@@ -2048,12 +2046,13 @@ impl DaemonComposition {
         let Some(current_task_binding) = current_task_binding else {
             return Ok(Vec::new());
         };
-        self.governor.consume_captured_lsp_observations(
-            current_task_binding,
-            context.causal_binding,
-            observations,
-        )
-        .map_err(CapturedLspAdoptionError::from)
+        self.governor
+            .consume_captured_lsp_observations(
+                current_task_binding,
+                context.causal_binding,
+                observations,
+            )
+            .map_err(CapturedLspAdoptionError::from)
     }
 
     /// Computes the digest of the provider-owned recovery snapshot admitted at
