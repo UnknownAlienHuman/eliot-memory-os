@@ -31,6 +31,21 @@
 //! binding) lives once in `eliot-improvement`/`eliot-context-admission`
 //! and executes below; this module only sequences the boundary flow with
 //! host-held owner inputs.
+//!
+//! # Incomplete compilation is retained, not collapsed (#1726 W6)
+//!
+//! When the assembled packet cannot be produced because the grade is
+//! incomplete, the host returns [`HostAdmitError::QualityIncomplete`] carrying
+//! the whole [`IncompleteCompilation`]: the recipe actually attempted, the
+//! exact handles the admitted set really reached, and the complete
+//! twelve-dimension card with every failed, unknown, degraded and
+//! not-applicable result, together with the typed operation-scoped refusal
+//! the assembly owner produced. This is the only host refusal that is a
+//! record rather than a message. Every other failure keeps its own string
+//! variant, and none of them is an incomplete grade, so a structural contract
+//! rejection is never confused with a compilation that ran and found its
+//! packet lacking. No `ActiveUnderstandingView` is produced on this path: a
+//! failed compilation returns no packet, only the evidence about why.
 
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -41,7 +56,8 @@ use eliot_context_assembly::{
     assemble_active_view_with_learning,
 };
 use eliot_context_contracts::{
-    AdmissionInput, AdmissionResult, ContextError, ContextOutcome, ContextRecipe, QualityScorecard,
+    AdmissionInput, AdmissionResult, AdmittedContextSet, ContextError, ContextOutcome,
+    ContextRecipe, IncompleteCompilation, QualityDimensionResult, QualityScorecard,
     SerializedContextMeasurement,
 };
 use eliot_governor::{Governor, LearningAdmissionClaim, issue_learning_admission};
@@ -85,6 +101,20 @@ pub enum HostAdmitError {
     Assembly(String),
     /// A guest/native response failed the honored-output gate.
     HonorRefused(String),
+    /// The compilation was attempted and could not produce a complete grade.
+    ///
+    /// #1726 W6. This is the one host refusal that is not a message. The
+    /// assembly owner already produces the complete card together with the
+    /// typed operation-scoped refusal; this variant carries that record
+    /// unchanged across the host boundary instead of collapsing it into a
+    /// string, so the daemon-facing response still names the attempted recipe,
+    /// the exact handles the compilation had, and every failed and unknown
+    /// dimension result. A host reader branches on the variant, not on text.
+    ///
+    /// `Display` renders the class, the operation and the blocking dimensions
+    /// for a log line; the authoritative detail is the retained record, and it
+    /// is never dropped to make the message shorter.
+    QualityIncomplete(Box<IncompleteCompilation>),
 }
 
 impl fmt::Display for HostAdmitError {
@@ -99,7 +129,123 @@ impl fmt::Display for HostAdmitError {
             Self::Admission(reason) => write!(formatter, "ADMISSION_REFUSED:{reason}"),
             Self::Assembly(reason) => write!(formatter, "ASSEMBLY_REFUSED:{reason}"),
             Self::HonorRefused(reason) => write!(formatter, "HONOR_REFUSED:{reason}"),
+            Self::QualityIncomplete(retained) => {
+                // This is the daemon-facing response, so it is where the
+                // retained attempt is actually read rather than merely carried.
+                // Three facts cross here and none of them is an aggregate:
+                //
+                // * A2 — the diagnostic-display suitability. It is `Ok` for a
+                //   read-only display even though the dependent action was
+                //   refused, and it names the applicability inputs that are
+                //   still unresolved, so the packet is shown WITH its
+                //   limitation rather than as an error blob.
+                // * A6 — the mandatory/optional split for the operation that
+                //   was actually requested. An optional dimension's unknown
+                //   does not appear in the mandatory list, so it cannot
+                //   conceal a mandatory failure, and a mandatory failure is
+                //   named even when unrelated dimensions are also uncertain.
+                // * W6 — the complete non-passing result set, which is wider
+                //   than the blocking list: a failed dimension that did not
+                //   block the requested operation is still reported.
+                //
+                // Rendered for a log line and a human reader. The authoritative
+                // detail remains the retained record; nothing here filters a
+                // result to make the line shorter.
+                // `diagnostic_display` re-validates, so it is fallible in principle. A
+                // record only reaches this variant through
+                // `IncompleteCompilation::retain`, which validates it before
+                // returning, so a failure here would mean the retained record
+                // stopped satisfying its own contract. `Display` cannot report
+                // that as an error without inventing a second failure inside a
+                // formatter, so the refusal is rendered explicitly instead —
+                // which is also the honest reading: a record that cannot
+                // re-validate is not a diagnostic packet.
+                let Ok((suitability, incomplete)) = retained.diagnostic_display() else {
+                    return write!(
+                        formatter,
+                        "QUALITY_INCOMPLETE:retained_record_failed_revalidation:operation={:?}:attempted_recipe={}",
+                        retained.refusal.operation, retained.attempted_recipe_digest,
+                    );
+                };
+                // The split is against the operation the compilation was
+                // REFUSED for — read from the retained refusal — and never
+                // against the display operation above. `DiagnosticDisplay`
+                // requires nothing by construction, so splitting on it would
+                // report an empty mandatory set and hide exactly the failures
+                // this is here to name.
+                let refused = retained.refusal.operation;
+                // The split comes from the contract owner's own per-operation
+                // required set, so "optional" is a closed function of the
+                // operation and not something a producer flags. The two lists
+                // partition the complete non-passing set: an optional unknown is
+                // never in the mandatory list, so it cannot conceal a
+                // mandatory failure, and a mandatory failure is still named
+                // when unrelated dimensions are also uncertain.
+                let (mandatory, optional) =
+                    retained.incomplete_results_by_requirement(refused, &[]);
+                let dimensions = |results: &[QualityDimensionResult]| {
+                    results
+                        .iter()
+                        .map(|result| {
+                            let dimension = result.dimension;
+                            let state = &result.state;
+                            format!("{dimension:?}={state:?}")
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",")
+                };
+                write!(
+                    formatter,
+                    "QUALITY_INCOMPLETE:attempted_recipe={}:operation={refused:?}:mandatory=[{}]:optional=[{}]:unresolved_applicability={:?}:handles={}:omissions={}",
+                    retained.attempted_recipe_digest,
+                    dimensions(&mandatory),
+                    dimensions(&optional),
+                    suitability.unresolved_applicability,
+                    retained.available_handles.len(),
+                    retained.omitted_handles.len(),
+                )?;
+                if !incomplete.is_empty() {
+                    write!(formatter, ":incomplete_results={}", dimensions(&incomplete))?;
+                }
+                Ok(())
+            }
         }
+    }
+}
+
+/// Retain one refused compilation attempt across the host boundary.
+///
+/// #1726 W6. The assembly owner's `AssemblyError::QualityIncomplete` already
+/// retains the complete card and the typed operation-scoped refusal; this is
+/// where the ADMISSION owner is still available to supply the exact handles the
+/// attempt had, which the assembly error does not carry. Everything else is
+/// passed through unchanged: the recipe is the one the caller attempted, and
+/// the card is the one the assembly owner graded. No dimension is filtered, no
+/// result is summarised, and the retained record is validated by
+/// [`IncompleteCompilation::retain`] before it is returned, so a record that
+/// does not describe a real attempt never reaches a host reader.
+///
+/// Every other assembly failure keeps its own `Assembly` variant: a structural
+/// contract rejection is not an incomplete grade, and nothing about it is
+/// stringified into this path.
+fn retained_incomplete(
+    error: AssemblyError,
+    recipe: &ContextRecipe,
+    admitted: &AdmittedContextSet,
+) -> HostAdmitError {
+    match error {
+        AssemblyError::QualityIncomplete(quality, refusal) => {
+            // A retention that itself fails is a contract failure of this
+            // module, not a silent success: it is reported as an assembly
+            // refusal with the contract cause, because a half-retained
+            // diagnostic is exactly the collapse this variant exists to stop.
+            IncompleteCompilation::retain(&admitted.binding, recipe, admitted, *quality, *refusal)
+                .map_or_else(
+                    |cause| HostAdmitError::Assembly(cause.to_string()),
+                    |retained| HostAdmitError::QualityIncomplete(Box::new(retained)),
+                )
+        }
+        other => HostAdmitError::Assembly(other.to_string()),
     }
 }
 
@@ -232,9 +378,12 @@ where
     let admission = admit_context_with_learning(&input, presented)
         .map_err(|error| HostAdmitError::Admission(error.to_string()))?;
     let view = match &admission.outcome {
+        // The admitted set is still in scope on this arm, so the exact handles
+        // the attempt reached are available to the retention rather than being
+        // reconstructed from the card.
         ContextOutcome::Complete(set) => Some(
             assemble_active_view_with_learning(set, recipe, quality, policy, measure, presented)
-                .map_err(|error: AssemblyError| HostAdmitError::Assembly(error.to_string()))?,
+                .map_err(|error| retained_incomplete(error, recipe, set))?,
         ),
         ContextOutcome::Incomplete(_) => None,
     };

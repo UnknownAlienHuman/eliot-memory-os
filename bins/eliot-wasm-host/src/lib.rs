@@ -76,7 +76,9 @@ pub use dispatch_material::{
     bind_dispatch_material, consume_staged, read_dispatch_material, read_dispatch_material_from,
     read_staged_bytes,
 };
-pub use governed_admission::{HostAdmitError, admit_governed_host, check_governed_host_output};
+pub use governed_admission::{
+    HostAdmitError, HostGovernedCompilation, admit_governed_host, check_governed_host_output,
+};
 pub use guest_exec::{
     ChildMetering, EXIT_COMPLETED, EXIT_DENIED, EXIT_ENGINE_FAILED, EXIT_NOT_COMPLETED,
     GuestExecRejection, GuestExecRequest, metering_line, parse_metering_line, run_guest_exec,

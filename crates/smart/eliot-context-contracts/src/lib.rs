@@ -132,7 +132,9 @@ pub use recipe::{
     RecipeRevocationRecord, RecipeRolePosition, RecipeStage, RecipeSupersession,
     ResolvedContextRecipe,
 };
-pub use view::{ActiveUnderstandingView, RenderedAtom, SelectionIntegrityProof};
+pub use view::{
+    ActiveUnderstandingView, IncompleteCompilation, RenderedAtom, SelectionIntegrityProof,
+};
 
 /// Compatibility spelling for a provider-produced whole atom.
 pub type ContextAtom = ContextCandidate;

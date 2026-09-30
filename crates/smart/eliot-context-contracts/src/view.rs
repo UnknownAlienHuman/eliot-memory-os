@@ -9,9 +9,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AdmittedAtom, AdmittedContextSet, AtomAvailability, AuthorityClass, ContextBinding,
-    ContextError, ContextExecutionIdentity, LossPolicy, MeasurementRef, PrivacyClass, ProofBinding,
-    QualityDimension, QualityOperation, QualityRefusal, QualityRefusalKind, QualityScorecard,
-    QualitySuitability, SerializedContextMeasurement,
+    ContextError, ContextExecutionIdentity, ContextRecipe, LossPolicy, MeasurementRef,
+    PrivacyClass, ProofBinding, QualityDimension, QualityDimensionResult, QualityOperation,
+    QualityRefusal, QualityRefusalKind, QualityScorecard, QualitySuitability,
+    SerializedContextMeasurement,
 };
 
 /// Rendered projection of one admitted atom, retaining all load-bearing fields.
@@ -557,5 +558,406 @@ impl ActiveUnderstandingView {
         crate::validate_digest(&self.recipe_digest, "view.recipe_digest")?;
         crate::validate_digest(&self.policy_sha256, "view.policy_sha256")?;
         crate::validate_digest(&self.fence_digest, "view.fence_digest")
+    }
+}
+
+/// The retained result of a compilation that did not complete.
+///
+/// #1726 W6. An incomplete compilation is not an absent one: the recipe that
+/// was actually attempted, the exact handles that were available, and the
+/// COMPLETE set of failed and unknown dimension results all survive the
+/// refusal, because the next thing a reader needs is precisely which dimension
+/// lacks which evidence — not an empty error and not a successful
+/// [`ActiveUnderstandingView`] standing in for a compilation that did not happen.
+///
+/// This is a retention record, not a packet. It carries no rendered bytes and
+/// no measurement, so it cannot be consumed as a packet: there is no
+/// `ActiveUnderstandingView` inside it that some downstream reader might treat
+/// as assembled and acted on. Converting it to a packet is the job of a
+/// reevaluation, which produces a new record and leaves this one intact.
+///
+/// The two existing vocabularies are reused rather than a third failure type
+/// introduced: the grade is a [`QualityScorecard`] carrying the existing
+/// [`QualityDimensionState`] per dimension, and the reason is the existing
+/// [`QualityRefusal`]. There is no new pass/fail vocabulary here, only a place
+/// to keep both of them after a refusal.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct IncompleteCompilation {
+    /// Exact task/attempt/scope/decision/fence the attempt was made under.
+    pub binding: ContextBinding,
+    /// The recipe this compilation actually attempted, retained whole.
+    ///
+    /// The recipe revision and its approved policy digest are what a
+    /// reevaluation must be re-decided against, so the attempted recipe
+    /// survives the refusal instead of being reduced to a message. It is the
+    /// recipe this attempt was made with, not a successful one: nothing here
+    /// claims the recipe produced a packet.
+    pub attempted_recipe: ContextRecipe,
+    /// Canonical digest of [`Self::attempted_recipe`].
+    ///
+    /// This is the recipe's own `recipe_sha256`, which
+    /// [`ContextRecipe::canonical_policy_digest`] re-derives from the policy
+    /// shape with the digest field itself zeroed. It is recorded beside the
+    /// recipe so a reader can compare this attempt against a later
+    /// reevaluation without re-deriving it, and it is re-derived in
+    /// [`Self::validate`] rather than trusted, so a deserialized record whose
+    /// digest does not describe the recipe beside it is refused.
+    pub attempted_recipe_digest: String,
+    /// Exact handles the admitted set did make available.
+    ///
+    /// These are the identities the compilation could reach — the exact
+    /// references a reader can still go and open. They are the "retain exact
+    /// handle only" disposition, and they are recorded as the admitted set's
+    /// own member identities rather than as the caller's list, so the retained
+    /// handles are what this attempt actually had.
+    pub available_handles: Vec<ArtifactId>,
+    /// Omission handles the attempt recorded for the material it did not carry.
+    ///
+    /// Read from the admitted set's own displaced list by the constructor, so
+    /// it is the attempt's accounting and not a restatement.
+    pub omitted_handles: Vec<ArtifactId>,
+    /// The COMPLETE twelve-dimension card, refused rather than truncated.
+    ///
+    /// Every failed, unknown, degraded, not-applicable and invalidated result
+    /// stays here with the evidence it lacks. Nothing is dropped so the record
+    /// fits a smaller payload, and a reader that sees only the blocking results
+    /// is not shown the dimensions that passed.
+    pub quality: QualityScorecard,
+    /// The typed operation-scoped refusal that stopped the compilation.
+    pub refusal: QualityRefusal,
+}
+
+impl IncompleteCompilation {
+    /// Retain one refused compilation attempt.
+    ///
+    /// The expected sets here are derived from what the attempt actually holds,
+    /// never from the caller's lists: the recipe digest is recomputed by the
+    /// recipe's own `canonical_policy_digest`, the available handles are the
+    /// admitted set's own member identities, and the omitted handles are the
+    /// admitted set's own displaced list. A caller that supplies a card, a
+    /// refusal and a set of "the handles I had" gets the handles this attempt
+    /// really had instead.
+    ///
+    /// `quality` and `refusal` are checked against each other and against the
+    /// retained binding before this constructor returns: a card that does not
+    /// describe this binding and recipe, or a refusal that names no blocked
+    /// dimension and no unresolved applicability input, cannot become a
+    /// retained record that reads as a real refusal of a real attempt.
+    pub fn retain(
+        binding: &ContextBinding,
+        attempted_recipe: &ContextRecipe,
+        admitted: &AdmittedContextSet,
+        quality: QualityScorecard,
+        refusal: QualityRefusal,
+    ) -> Result<Self, ContextError> {
+        binding.validate()?;
+        attempted_recipe.validate()?;
+        admitted.validate()?;
+        if attempted_recipe.binding != *binding || admitted.binding != *binding {
+            return Err(ContextError::IdentityConflict);
+        }
+        // The card must grade THIS attempt: same binding, and the same
+        // compilation identity the retained recipe carries. A card graded
+        // against a different recipe or fence is not a diagnosis of this one.
+        if quality.binding != *binding
+            || quality.output.recipe_digest != attempted_recipe.recipe_sha256
+        {
+            return Err(ContextError::IdentityConflict);
+        }
+        quality.validate()?;
+        // The refusal must be a refusal of the same attempt, naming the same
+        // binding through the card it was read from. An `InvalidScorecard`
+        // refusal is a structural rejection rather than a diagnosis of a real
+        // grade, so it is not retained as one: this record exists to keep a
+        // genuine incomplete grade readable.
+        if refusal.kind == QualityRefusalKind::InvalidScorecard {
+            return Err(ContextError::QualityIncomplete);
+        }
+        if refusal.blocking.is_empty() && refusal.unresolved_applicability.is_empty() {
+            return Err(ContextError::QualityIncomplete);
+        }
+        // The retained handles are the admitted set's own member identities,
+        // deduplicated and in canonical order. Derived here rather than accepted
+        // from the caller, so the record cannot claim a handle this attempt
+        // never had or silently omit one it did.
+        let available_handles: Vec<ArtifactId> = admitted
+            .records
+            .iter()
+            .map(|record| record.candidate.atom_id.clone())
+            .collect::<BTreeSet<ArtifactId>>()
+            .into_iter()
+            .collect();
+        let omitted_handles = admitted.economy.displaced.clone();
+        let record = Self {
+            binding: binding.clone(),
+            attempted_recipe_digest: attempted_recipe.recipe_sha256.clone(),
+            attempted_recipe: attempted_recipe.clone(),
+            available_handles,
+            omitted_handles,
+            quality,
+            refusal,
+        };
+        record.validate()?;
+        Ok(record)
+    }
+
+    /// Every dimension result that did not reach an observed pass.
+    ///
+    /// This is the complete failed/unknown set for the retained attempt, in
+    /// canonical dimension order, derived from the card's own results against
+    /// the contract owner's [`QualityDimensionResult::is_current_pass`] rather
+    /// than against the refusal's `blocking` list. The refusal names what
+    /// blocked ONE operation; this names every dimension that is not a current
+    /// pass, which is the wider set a diagnostic reader needs. A dimension that
+    /// failed but does not block the requested operation is still here, and an
+    /// invalidated result is here too: its grade is historical, not current.
+    #[must_use]
+    pub fn incomplete_results(&self) -> Vec<QualityDimensionResult> {
+        self.quality
+            .results
+            .iter()
+            .filter(|result| !result.is_current_pass())
+            .cloned()
+            .collect()
+    }
+
+    /// Whether this retained record is still bound to the compilation it
+    /// describes.
+    ///
+    /// Invalidation is not a new scheme here: it is the existing binding.
+    /// A route, governing-instruction, source, task or verifier change alters
+    /// the recipe revision, the state fence or the evidence revisions this
+    /// attempt was made under, so a reevaluation under changed inputs produces
+    /// a DIFFERENT record and this one must not be read as describing it. The
+    /// historical evidence stays on the card and is still visible; only its
+    /// currency is decided here.
+    ///
+    /// The comparison is against the three values the compilation was actually
+    /// made under — the binding, the attempted recipe digest and the fence
+    /// digest the card recorded — read off the caller that holds the new ones.
+    /// It is the same set of fields the existing scorecard-binding and view
+    /// validation already compare, so a change to any of them produces a new
+    /// record rather than a stale one read as current.
+    #[must_use]
+    pub fn still_current_for(
+        &self,
+        binding: &ContextBinding,
+        recipe_digest: &str,
+        fence_digest: &str,
+    ) -> bool {
+        self.binding == *binding
+            && self.attempted_recipe_digest == recipe_digest
+            && self.quality.output.fence_digest == fence_digest
+    }
+
+    /// Split this attempt's non-passing results by what the requested operation
+    /// actually requires of them.
+    ///
+    /// #1726 A6. "Optional" and "mandatory" are not a flag a producer sets on a
+    /// dimension: they are a closed function of the requested operation, read
+    /// from the contract owner's own
+    /// [`QualityOperation::required_dimensions`], exactly as
+    /// [`QualityScorecard::suitability`] reads it. A caller therefore cannot
+    /// declare an inconvenient dimension optional and cannot declare a
+    /// required one optional to make a refusal disappear.
+    ///
+    /// The two halves of A6 are separated here, on independent grounds:
+    ///
+    /// * `mandatory` is every non-passing result the operation independently
+    ///   requires. These are the results that must not be traded away, and a
+    ///   *failed* one among them is a real failure — no optional uncertainty
+    ///   elsewhere in the card can absorb it, because the two are read from
+    ///   disjoint parts of the requirement and one is never subtracted from the
+    ///   other. The refusal is what stops the dependent action, and the
+    ///   operation's required set is not reducible by an unrelated result.
+    /// * `optional` is every non-passing result the operation does not
+    ///   require. These are the informational uncertainties. They stay visible
+    ///   and they stay reported, and they do not appear in `mandatory` — so
+    ///   their presence never has to be argued about to let independent safe
+    ///   work that the operation does not depend on proceed.
+    ///
+    /// The two lists partition [`Self::incomplete_results`]: nothing is dropped
+    /// and nothing appears twice, so a reader can count the failures and the
+    /// uncertainties separately without re-deriving the split.
+    #[must_use]
+    pub fn incomplete_results_by_requirement(
+        &self,
+        operation: QualityOperation,
+        additional_required: &[QualityDimension],
+    ) -> (Vec<QualityDimensionResult>, Vec<QualityDimensionResult>) {
+        // The mandatory set is read from the contract owner and unioned with
+        // the recipe-selected blockers. Union is the only combining operation,
+        // so a recipe can add a required dimension and never remove one.
+        let required: BTreeSet<QualityDimension> = operation
+            .required_dimensions()
+            .iter()
+            .chain(additional_required)
+            .copied()
+            .collect();
+        let mut mandatory = Vec::new();
+        let mut optional = Vec::new();
+        for result in self.incomplete_results() {
+            if required.contains(&result.dimension) {
+                mandatory.push(result);
+            } else {
+                optional.push(result);
+            }
+        }
+        (mandatory, optional)
+    }
+
+    /// The mandatory results this attempt is missing for one operation.
+    ///
+    /// A6's first half, stated as the property it has: an optional dimension's
+    /// uncertainty is not in this list, so it cannot conceal a mandatory
+    /// failure that is, and a mandatory failure is not hidden merely because
+    /// some unrelated dimension is also uncertain. The list is empty exactly
+    /// when every dimension the operation independently requires reached an
+    /// observed current pass.
+    ///
+    /// This is the first element of
+    /// [`Self::incomplete_results_by_requirement`], named for the caller that
+    /// only needs the half. A caller that also has to report the
+    /// informational uncertainties calls that method instead, so the two
+    /// readings are the same function and cannot drift apart.
+    #[must_use]
+    pub fn mandatory_failures(
+        &self,
+        operation: QualityOperation,
+        additional_required: &[QualityDimension],
+    ) -> Vec<QualityDimensionResult> {
+        self.incomplete_results_by_requirement(operation, additional_required)
+            .0
+    }
+
+    /// Validate the retained record against its own contents.
+    ///
+    /// Structural integrity of the retention, not suitability: a retained
+    /// incomplete compilation is a real record of a real refusal, and the fact
+    /// that it is incomplete is what it is for. The card is validated by
+    /// `QualityScorecard::validate`, the recipe by its own `validate`, and the
+    /// binding by its own; the cross-record checks are the recipe digest
+    /// re-derived from the recipe held, the handles compared against the
+    /// independent declaration each claims, and the refusal checked to name the
+    /// attempt rather than an unrelated operation.
+    ///
+    /// This says nothing about whether the attempt is still CURRENT against a
+    /// later compilation. That is [`Self::still_current_for`], and it needs the
+    /// new values a reevaluation was made under, which this record does not
+    /// have: a self-consistent record that has since been superseded still
+    /// validates, because the historical evidence it carries is meant to stay
+    /// readable.
+    pub fn validate(&self) -> Result<(), ContextError> {
+        self.binding.validate()?;
+        // `ContextRecipe::validate` already re-derives `recipe_sha256` from the
+        // policy shape, so the recipe held here cannot be an altered one. The
+        // retained digest is checked against that same re-derivation rather
+        // than trusted, because a deserialized record can carry a digest that
+        // does not describe the recipe beside it.
+        self.attempted_recipe.validate()?;
+        if self.attempted_recipe_digest != self.attempted_recipe.canonical_policy_digest()? {
+            return Err(ContextError::IdentityConflict);
+        }
+        if self.attempted_recipe.binding != self.binding {
+            return Err(ContextError::IdentityConflict);
+        }
+        self.quality.validate()?;
+        if self.quality.binding != self.binding
+            || self.quality.output.recipe_digest != self.attempted_recipe_digest
+        {
+            return Err(ContextError::IdentityConflict);
+        }
+        // Self-currency: the record must still be bound to the compilation it
+        // names. `still_current_for` compares the same three values a later
+        // reevaluation would, so a route/instruction/source/task/verifier
+        // change makes a record historical and it is never re-sealed as current.
+        if !self.still_current_for(
+            &self.binding,
+            &self.attempted_recipe_digest,
+            &self.quality.output.fence_digest,
+        ) {
+            return Err(ContextError::InvalidFence);
+        }
+        if self.attempted_recipe.binding != self.binding {
+            return Err(ContextError::IdentityConflict);
+        }
+        self.quality.validate()?;
+        if self.quality.binding != self.binding
+            || self.quality.output.recipe_digest != self.attempted_recipe_digest
+        {
+            return Err(ContextError::IdentityConflict);
+        }
+        // A refusal that blocks nothing is not a diagnosis; retaining one would
+        // let a caller present a structurally-rejected card as a graded
+        // incomplete attempt.
+        if self.refusal.kind == QualityRefusalKind::InvalidScorecard
+            || (self.refusal.blocking.is_empty()
+                && self.refusal.unresolved_applicability.is_empty())
+        {
+            return Err(ContextError::QualityIncomplete);
+        }
+        // Both handle lists are sets, checked here rather than only at
+        // construction because this struct is deserializable: a repeated handle
+        // states no additional fact, so a padded list cannot pose as wider
+        // coverage.
+        let mut available: BTreeSet<&ArtifactId> = BTreeSet::new();
+        for handle in &self.available_handles {
+            if !available.insert(handle) {
+                return Err(ContextError::Duplicate("incomplete.available_handles"));
+            }
+        }
+        let mut omitted: BTreeSet<&ArtifactId> = BTreeSet::new();
+        for handle in &self.omitted_handles {
+            if !omitted.insert(handle) {
+                return Err(ContextError::Duplicate("incomplete.omitted_handles"));
+            }
+        }
+        // Every omission handle the card claims must be one this attempt
+        // actually recorded as displaced. The comparison runs claimed ⊆
+        // recorded, the same direction the existing scorecard-binding checks
+        // use, because that is the guarantee: a card cannot account for an
+        // omission this attempt did not make. The reverse is deliberately not
+        // demanded — the assembly owner raises this refusal for a reason that
+        // can precede its own admitted-set comparison, and a retained attempt
+        // is still a truthful record of what was tried when its card and its
+        // admitted set are compared at different stages of one compilation.
+        if self
+            .quality
+            .output
+            .omission_handles
+            .iter()
+            .any(|claimed| !omitted.contains(claimed))
+        {
+            return Err(ContextError::SelectionIntegrityMismatch);
+        }
+        Ok(())
+    }
+
+    /// Show this retained attempt for a read-only diagnostic display.
+    ///
+    /// A2. Diagnostic display is the one operation that requires nothing, so
+    /// the same packet that cannot enable a dependent action is still shown —
+    /// with its limitation *stated*, not flattened. This returns both halves a
+    /// honest display needs: the granted [`QualitySuitability`], which carries
+    /// the applicability inputs that remain unresolved, and the COMPLETE set of
+    /// results that are not current observed passes, so the displayed
+    /// limitation is every dimension this attempt did not clear, not only the
+    /// ones that happened to block the operation the compiler asked about.
+    ///
+    /// Returning `Ok` grants no authority and no action readiness; it is the
+    /// read-only path, and the accompanying results say exactly how far the
+    /// attempt got. The same record is refused for
+    /// [`QualityOperation::DependentAction`], which is what "shown
+    /// diagnostically" is meant to distinguish from.
+    pub fn diagnostic_display(
+        &self,
+    ) -> Result<(QualitySuitability, Vec<QualityDimensionResult>), ContextError> {
+        self.validate()?;
+        let suitability = self
+            .quality
+            .suitability(QualityOperation::DiagnosticDisplay, &[])
+            .map_err(|_| ContextError::QualityIncomplete)?;
+        Ok((suitability, self.incomplete_results()))
     }
 }
