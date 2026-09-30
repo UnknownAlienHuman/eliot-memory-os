@@ -2,13 +2,38 @@
 
 use std::collections::BTreeSet;
 
-use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
+use eliot_contracts::{
+    ContractIdentity, ContractVersion, StateFence, canonical_json_bytes, contract_identity,
+    sha256_hex,
+};
 use eliot_dreamer_contracts::{DreamInputBundle, DreamJobAdmission};
 use eliot_epistemic_contracts::{CurrentEpistemicPosition, PositionId, PositionRevision};
 use eliot_evidence::EvidenceEnvelope;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+/// Contract identity namespace for canonical publications of
+/// [`AdmittedOrientationJob`].
+pub const ADMITTED_ORIENTATION_JOB_CONTRACT_NAME: &str =
+    "eliot.smart.dreamer.orientation.admitted-job";
+
+/// Contract version for canonical publications of [`AdmittedOrientationJob`].
+pub const ADMITTED_ORIENTATION_JOB_CONTRACT_VERSION: ContractVersion =
+    ContractVersion::new(1, 0, 0);
+
+/// Computes the schema identity used to validate the original published
+/// Orientation admission object. The helper neither publishes nor modifies
+/// that source; callers compare this value with its unchanged content ref.
+pub fn admitted_orientation_job_contract_identity(
+) -> Result<ContractIdentity, eliot_contracts::ContractError> {
+    let schema = schemars::schema_for!(AdmittedOrientationJob);
+    contract_identity(
+        ADMITTED_ORIENTATION_JOB_CONTRACT_NAME,
+        ADMITTED_ORIENTATION_JOB_CONTRACT_VERSION,
+        &schema,
+    )
+}
 
 /// The exact frame a caller wants projected. Its body digest excludes the
 /// enclosing manifest; validation binds that body to one admitted material.
