@@ -322,10 +322,66 @@ fn exact_query_subject(tool: &Value) -> Result<String, ReconstructionPrerequisit
 /// for the admitted task under the admitted fence.
 ///
 /// The checks are the same ones the production campaign-packet route applies to
-/// this record: exact owner id, exact task record id, exact task revision from
-/// the admitted fence, exact documented schema, and an exact
-/// recipe task/scope/fence binding. A record that is not the current
-/// authenticated row for that task is refused.
+/// this record: exact owner id, exact task record id, the owner-resolved current
+/// task revision, exact documented schema, and an exact recipe task/scope/fence
+/// binding. A record that is not the current authenticated row for that task is
+/// refused.
+///
+/// # What this function actually proves
+///
+/// The lookup carries `expected_revision: None`, so the store resolves the
+/// *current* row for the exact `(role, owner, record_id)` this function asked
+/// for and returns it as `CampaignSourceReadStatus::Current` with its own
+/// `current_head`. What is proved here is:
+///
+/// - the read is `Current` and its `read_state_fence` is the exact admitted
+///   fence, so it answers this operation and no other;
+/// - the `CampaignOwnerReadReceipt` validates its ORIGINAL recorded value with
+///   the existing `CampaignOwnerReadReceipt::validate()` and binds the returned
+///   row through the existing `binds_record()`. No digest is recomputed here;
+/// - the returned row is the `(role, owner, record_id)` key this function
+///   requested. `CampaignSourceRecord::validate` pins the row's *owner* to the
+///   Task Controller and its `(record_id, revision)` to the task/revision
+///   family, but pins no specific `TaskId`, so an owner that answers a
+///   different task under the same owner id is refused here rather than
+///   compiled;
+/// - the owner-resolved current revision is a `CampaignOwnerRevision::Task`
+///   value, and an absent current head is refused;
+/// - the recipe's binding fence declares that same owner-resolved task
+///   revision, binds the admitted `TaskId` exactly, binds the admitted scope
+///   exactly, and is compatible with this operation's admitted fence.
+///
+/// # Why the recipe's fence is compared by compatibility, not by equality
+///
+/// I4.5 is explicit that `StateFence` "contains only load-bearing dependencies"
+/// and that revisions are "exact dependency-key/revision pairs, not one global
+/// scope counter". `StateFence::I45_KEY_OMISSIONS` names the owner of the
+/// revision dimension as `eliot-store-api RevisionHeadExpectation via
+/// eliot-canonical CanonicalWriteEnvelope`, resolved and compared at the
+/// operation's own owner rather than pinned onto the transport fence.
+/// `KernelGenerationSnapshot::state_fence()` is
+/// `StateFence::new(authority_epoch, resource_generation)`, which leaves
+/// `task_revision` at `None` by construction, and `serve_context_reconstruction`
+/// proves `envelope.state_fence == kernel.kernel_fence()` before calling here.
+///
+/// A `LearningStateViewRecipe` cannot be published without a task revision in
+/// its binding fence: `validate_admitted_task_binding` refuses a recipe whose
+/// binding fence lacks one, the Task Controller producer takes its
+/// `CampaignOwnerRevision::Task` from that field, and
+/// `CampaignSourceDocument::validate_owner_binding` re-asserts it. So the
+/// recipe's `task_revision` is `Some(_)` and the admitted transport fence's is
+/// `None` on every producer, and `recipe.binding.state_fence == *fence` could
+/// never be true: the route was unreachable.
+///
+/// The transport fence therefore cannot be the reference for the task-revision
+/// dimension, and this function does not pretend it can. That dimension is
+/// matched by value against `required_revision`, the owner-resolved current
+/// revision this read returned, which is the value's actual owner. The
+/// dimensions the transport fence does carry — authority epoch and resource
+/// generation — are held by the existing `StateFence::is_compatible_with`, the
+/// one-sided compatibility comparison the Kernel and the Task Controller
+/// lifecycle already use at their own admission edges. A recipe published under
+/// a different authority epoch or resource generation is refused.
 async fn read_authenticated_task_recipe(
     kernel: &DaemonKernelClient,
     fence: &StateFence,
@@ -338,9 +394,6 @@ async fn read_authenticated_task_recipe(
             .map_err(|error| error.to_string())?,
     );
     let record_id = CampaignOwnerRecordId::Task(task.clone());
-    let required_revision = fence
-        .task_revision
-        .ok_or_else(|| "admitted fence carries no task revision".to_owned())?;
     let lookup = CampaignSourceRevisionLookup {
         role: CampaignSourceRole::TaskPlan,
         owner_id: owner_id.clone(),
@@ -365,6 +418,26 @@ async fn read_authenticated_task_recipe(
     if read.status != CampaignSourceReadStatus::Current || read.read_state_fence != *fence {
         return Err("task recipe owner read is not current under the admitted fence".to_owned());
     }
+    // The owner-resolved current revision, and the required task revision for
+    // this reconstruction. `read.current_head` is the store's own answer to
+    // "which revision of this `(role, owner, record_id)` is current";
+    // `CampaignSourceRevisionRead::validate` already requires it to agree with
+    // the returned row, and a non-`Task` revision cannot appear on a `TaskPlan`
+    // row because `CampaignSourceRecord::validate` already refuses one. The
+    // match is kept as the exhaustive, typed resolution of the revision family
+    // rather than a comparison that can never fire.
+    let head = read
+        .current_head
+        .ok_or_else(|| "task recipe owner read returned no current head".to_owned())?;
+    let required_revision = match &head.revision {
+        CampaignOwnerRevision::Task(revision) => *revision,
+        _ => {
+            return Err(
+                "task recipe owner read resolved a non-task revision for the task record"
+                    .to_owned(),
+            );
+        }
+    };
     let source = read
         .source
         .ok_or_else(|| "task recipe owner read returned no source row".to_owned())?;
@@ -377,11 +450,16 @@ async fn read_authenticated_task_recipe(
     {
         return Err("task recipe owner read receipt does not bind the returned row".to_owned());
     }
+    // The returned row must be the exact `(role, owner, record_id)` key this
+    // function asked the Task Controller owner for. `campaign_record_matches_head`
+    // and `CampaignOwnerReadReceipt::binds_record` already force the row, the
+    // current head and the receipt to agree on that key, and
+    // `CampaignSourceRecord::validate` already pins the owner and the
+    // `(record_id, revision)` family, so re-asserting their agreement here
+    // would be a clause that cannot fire.
     if source.role != CampaignSourceRole::TaskPlan
         || source.owner_id != owner_id
         || source.record_id != record_id
-        || source.revision != CampaignOwnerRevision::Task(required_revision)
-        || source.recorded_state_fence.task_revision != Some(required_revision)
     {
         return Err("task recipe row is not the current row for the admitted task".to_owned());
     }
@@ -393,9 +471,23 @@ async fn read_authenticated_task_recipe(
     recipe
         .validate()
         .map_err(|error| format!("task recipe is invalid: {error}"))?;
+    // The recipe must be proven to belong to THIS admitted operation.
+    //
+    // Task identity and scope are compared exactly, against the same admitted
+    // values the owner read was scoped to. The task-revision dimension is
+    // compared by value against `required_revision`, the owner-resolved current
+    // revision, because that is the owner's own answer and the transport fence
+    // structurally cannot carry one (see the module note). The remaining fence
+    // dimensions the transport fence does carry are compared with the existing
+    // one-sided compatibility helper, which rejects a recipe published under a
+    // different authority epoch or resource generation. An equality test here
+    // would demand `Some(task_revision) == None` and refuse every recipe any
+    // Task Controller can produce.
+    let recipe_fence = &recipe.binding.state_fence;
     if recipe.binding.task_id != task
         || recipe.binding.scope.as_str() != scope.as_str()
-        || recipe.binding.state_fence != *fence
+        || recipe_fence.task_revision != Some(required_revision)
+        || !fence.is_compatible_with(recipe_fence)
     {
         return Err("task recipe does not bind the admitted task, scope and fence".to_owned());
     }
