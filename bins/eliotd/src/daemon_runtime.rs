@@ -5044,8 +5044,13 @@ async fn run_observe_poll(
         };
         let outcome = match submit_observe_result_idempotent(kernel, &body).await {
             Ok(eliotd::ObserveSubmitOutcome::Accepted) => ObservePollOutcome::Settled,
-            Ok(eliotd::ObserveSubmitOutcome::Expired) => ObservePollOutcome::Expired,
-            Ok(eliotd::ObserveSubmitOutcome::StaleAttempt) => ObservePollOutcome::StaleAttempt,
+            // The canonical capture is already committed at this point. An
+            // expired/stale attempt response cannot turn that effect into a
+            // no-effect outcome; leave the original operation for repair.
+            Ok(
+                eliotd::ObserveSubmitOutcome::Expired
+                | eliotd::ObserveSubmitOutcome::StaleAttempt,
+            ) => ObservePollOutcome::ReconciliationRequired,
             Err(error) => {
                 kernel
                     .defer_observe_claim_async(&operation_id, &request_digest, attempt)
