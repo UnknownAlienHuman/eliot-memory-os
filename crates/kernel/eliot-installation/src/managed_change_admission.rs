@@ -43,7 +43,7 @@ use super::managed_change_plan::survey_content_digest;
 use super::{
     AcceptedCatalogueContext, AcceptedInstallationSurvey, InstallationError,
     ManagedChangeAdmissionError, ManagedEnvironmentChangePlan, PlatformHandle, SurveyCandidate,
-    SurveyObservationSource, SurveyProbeAdmission, SurveyStageOutcome, handle, resolve_bounded_probe,
+    SurveyObservationSource, SurveyProbeAdmission, handle, resolve_bounded_probe,
     revalidate_managed_change_plan, survey_accepted_installation,
 };
 
@@ -111,6 +111,13 @@ pub enum MissingQualification {
     /// not a qualified one. It is reported as itself rather than as an absence,
     /// so a coverage hole can never be read as a clean negative.
     LiveSurveyUnreadableInput,
+    /// The live survey never inspected an input the accepted revision declared.
+    ///
+    /// The known-location stage is asked about every declared location, and one
+    /// the observation source never reported is a coverage hole rather than an
+    /// absence. A capability claim that ignored it would be a claim about an
+    /// input nobody looked at.
+    LiveSurveyInputNotCovered,
     /// The live survey could not attribute an input to exactly one identity.
     AmbiguousIdentityInTheLiveSurvey,
 }
@@ -141,10 +148,13 @@ pub enum MissingQualification {
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ManagedCapabilityStatus {
-    /// The live survey resolved this exact identity and nothing more.
+    /// The live survey covered this family completely and no current target
+    /// identity is being advertised.
     ///
     /// `I3.3`: a discovered executable is not started automatically as a
-    /// trusted Module. Finding it is the whole of this state.
+    /// trusted Module. Finding it is the whole of this state. It is reached only
+    /// for a change that acts on no current installation, so it reports the
+    /// family's coverage rather than any candidate's qualification.
     Discovered,
     /// The accepted revision declares a bounded probe for this exact identity,
     /// and nothing has run it.
@@ -290,16 +300,25 @@ fn derive_advertisement(
     let family = live_family(live, &frozen_plan.family_id)?;
     let Some(target_identity) = frozen_plan.target_identity.clone() else {
         // An `Install` plan names no current installation. A prospective change
-        // says nothing about a candidate that does not exist yet, so the honest
-        // state is `discovered` for the family and no identity is advertised.
+        // says nothing about a candidate that does not exist yet, so no identity
+        // is advertised. The family is still reported through its own coverage,
+        // because a family this survey could not read is a named gap rather than
+        // a clean family, and reporting `discovered` over a coverage hole would
+        // be reporting an absence the survey never established.
+        let gaps = unreadable_coverage_gaps(family);
+        let state = if gaps.is_empty() {
+            ManagedCapabilityState {
+                status: ManagedCapabilityStatus::Discovered,
+                missing: Vec::new(),
+            }
+        } else {
+            unsupported(&gaps)
+        };
         return Ok(ManagedCapabilityAdvertisement {
             family_id: frozen_plan.family_id.clone(),
             category: family.category,
             target_identity: None,
-            state: ManagedCapabilityState {
-                status: ManagedCapabilityStatus::Discovered,
-                missing: Vec::new(),
-            },
+            state,
             requalified_against,
         });
     };
@@ -356,15 +375,19 @@ fn classify_candidate(
     };
 
     // An owner this contour could not read is a named gap, never a clean
-    // absence and never a success. The probe stage's own coverage is inspected
-    // before any capability claim, because a probe stage that was refused or
-    // could not be attributed proves nothing about the binary.
-    let mut missing = unreadable_coverage_gaps(family);
-    if let Some(gap) = candidate_coverage_gap(candidate) {
-        missing.push(gap);
-    }
-    if !missing.is_empty() {
-        return Ok(unsupported(&missing));
+    // absence and never a success. The family's own stage coverage is inspected
+    // before any capability claim, because a refused, unreadable, unattributable
+    // or uninspected input proves nothing about the binary.
+    //
+    // The candidate's own probe coverage is deliberately not re-derived here.
+    // `InstallationSurvey::validate` already refuses a survey whose candidate
+    // admission, probe outcome and answer set disagree, so by the time a live
+    // survey reaches here the two facts below are already the whole of the
+    // per-identity probe story. Repeating that rule would be a second copy of an
+    // invariant one owner already holds.
+    let gaps = unreadable_coverage_gaps(family);
+    if !gaps.is_empty() {
+        return Ok(unsupported(&gaps));
     }
 
     // The bounded probe contract is resolved from the live accepted catalogue
@@ -411,29 +434,31 @@ fn classify_candidate(
 /// `I3.3` requires denied, unreadable and ambiguous inputs to stay visible, and
 /// an input that could not be read leaves its content unknown. An unknown
 /// content is not a qualified one, so these gaps are reported before any
-/// candidate is classified rather than being folded into a single boolean.
+/// candidate is classified rather than being folded into a single boolean, and
+/// an ambiguous input is named as ambiguous rather than as unreadable: the two
+/// are different reasons the evidence is missing.
+///
+/// A `Withheld` stage is deliberately not a gap. The survey coordinator runs no
+/// process, so the mandatory probe stage ends in `Withheld` for every identity
+/// by design; treating that as a coverage hole would mask the difference
+/// between "nothing declared a probe" and "a probe was declared but not run",
+/// which is the distinction `I3.3.1` requires to stay visible.
 fn unreadable_coverage_gaps(family: &super::SurveyFamilyReport) -> Vec<MissingQualification> {
     let mut gaps = Vec::new();
     for stage in &family.stages {
-        if !stage.unreadable.is_empty() || !stage.ambiguous.is_empty() {
+        if !stage.denied.is_empty() || !stage.unreadable.is_empty() {
             gaps.push(MissingQualification::LiveSurveyUnreadableInput);
         }
-        if !stage.denied.is_empty() {
-            gaps.push(MissingQualification::LiveSurveyUnreadableInput);
+        if !stage.ambiguous.is_empty() {
+            gaps.push(MissingQualification::AmbiguousIdentityInTheLiveSurvey);
+        }
+        // Only the known-location stage is asked about a declared input set, so
+        // this is the one place an uninspected declared input can appear.
+        if !stage.not_covered.is_empty() {
+            gaps.push(MissingQualification::LiveSurveyInputNotCovered);
         }
     }
     gaps
-}
-
-/// Names the per-identity probe-stage gap, if the live survey recorded one.
-fn candidate_coverage_gap(candidate: &SurveyCandidate) -> Option<MissingQualification> {
-    match candidate.probe_outcome {
-        SurveyStageOutcome::Unreadable | SurveyStageOutcome::Ambiguous => {
-            Some(MissingQualification::AmbiguousIdentityInTheLiveSurvey)
-        }
-        SurveyStageOutcome::Denied => Some(MissingQualification::LiveSurveyUnreadableInput),
-        _ => None,
-    }
 }
 
 /// Builds the `unsupported` state naming every missing qualification.
