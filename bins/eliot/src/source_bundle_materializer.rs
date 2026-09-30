@@ -1350,7 +1350,7 @@ fn runtime_launch_descriptor(
         eliotd_artifact_digest: make_digest(executables.eliotd.sha256.clone(), "eliotd digest")?,
         eliotd_config_path: paths.governor_config.clone(),
         eliotd_config_digest: make_digest(template.governor_sha256.clone(), "governor digest")?,
-        protected_snapshot_digest: template.protected_snapshot_digest.as_str().to_owned(),
+        protected_snapshot_digest: template.protected_snapshot_digest.clone(),
         eliotd_descriptor_path: paths.eliotd_descriptor.clone(),
         eliotd_descriptor_digest: make_digest(descriptor_sha256.to_owned(), "descriptor digest")?,
         eliotd_launch_nonce: template.launch_nonce.clone(),
