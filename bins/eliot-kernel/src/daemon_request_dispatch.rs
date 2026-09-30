@@ -6873,8 +6873,7 @@ impl KernelComposition {
                     &request,
                     &readback,
                     client,
-                    "rejected",
-                    reason,
+                    DecidedDisposition { outcome: "rejected", reason },
                 )
                 .await;
             }
@@ -6953,11 +6952,13 @@ impl KernelComposition {
                     request,
                     readback,
                     client,
-                    "deferred",
-                    format!(
-                        "the deterministic preflight deferred occurrence {occurrence_id} with \
-                         reason {reason:?}, before any model or provider call"
-                    ),
+                    DecidedDisposition {
+                        outcome: "deferred",
+                        reason: format!(
+                            "the deterministic preflight deferred occurrence {occurrence_id} with \
+                             reason {reason:?}, before any model or provider call"
+                        ),
+                    },
                 )
                 .await;
             }
@@ -6971,12 +6972,14 @@ impl KernelComposition {
                     request,
                     readback,
                     client,
-                    "blocked_config",
-                    format!(
-                        "occurrence {occurrence_id} entered blocked_config under failure \
-                         fingerprint {} before any model call",
-                        failure.failure_fingerprint
-                    ),
+                    DecidedDisposition {
+                        outcome: "blocked_config",
+                        reason: format!(
+                            "occurrence {occurrence_id} entered blocked_config under failure \
+                             fingerprint {} before any model call",
+                            failure.failure_fingerprint
+                        ),
+                    },
                 )
                 .await;
             }
@@ -7122,8 +7125,7 @@ impl KernelComposition {
         client: &UserAutomationHostExecutionClient<
             AuthenticatedUserAutomationHostExecutionTransport,
         >,
-        outcome: &str,
-        reason: String,
+        disposition: DecidedDisposition<'_>,
     ) -> Result<serde_json::Value, TransportError> {
         let horizon = Self::user_automation_due_wake_horizon(
             session,
@@ -7138,8 +7140,8 @@ impl KernelComposition {
             "status": if recovery.is_none() { "known" } else { "unknown" },
             "value": {
                 "accepted": false,
-                "outcome": outcome,
-                "reason": reason,
+                "outcome": disposition.outcome,
+                "reason": disposition.reason,
                 "occurrence_id": occurrence_id,
                 "resolution": resolution,
                 "wake_readback": readback,
@@ -11262,6 +11264,30 @@ enum UserAutomationDueWakeRead {
     /// The wake is refused or the owner could not be read; this is the answer
     /// to return instead of admitting the occurrence.
     Answer(serde_json::Value),
+}
+
+/// The decided disposition one terminal due-wake occurrence reports.
+///
+/// The disposition name and the owner-issued reason that accompanies it are one
+/// value rather than two arguments because neither is meaningful apart from the
+/// other: the reason is the owner's own explanation of that name and of no
+/// other, so a signature accepting them separately would permit a caller to
+/// pair a name with the reason belonging to a different disposition. Binding
+/// them into one value also keeps the closed pair inside this module's private
+/// vocabulary instead of leaving it spelled as two trailing parameters that
+/// widen the arity of every step reporting a decided disposition.
+///
+/// The decided arm deliberately does not carry the whole
+/// `UserAutomationRuntimeError` it replaced: a disposition reached here is
+/// always owner-acknowledged, so the variants expressing an unanswered or
+/// ambiguous owner cannot be represented, and admitting them again would let an
+/// unacknowledged answer reach a projection that reports decided outcomes.
+#[cfg(windows)]
+struct DecidedDisposition<'a> {
+    /// The closed disposition name reported under `outcome`.
+    outcome: &'a str,
+    /// The owner-issued reason reported under `reason`.
+    reason: String,
 }
 
 /// Classifies the runtime handoff one closed operator operation owns.
