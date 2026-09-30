@@ -12,7 +12,8 @@
 //! normalized HostEventEnvelope;
 //! adapter and transformation versions;
 //! sequence/cursor and parent-child lineage;
-//! requested and actual route references;
+//! requested and actual route references plus the versioned validated
+//! route-evidence relation binding them to their owners;
 //! normalization warnings;
 //! EventEnvelope disposition.
 //! ```
@@ -42,6 +43,9 @@
 
 use std::collections::BTreeMap;
 
+use eliot_agent_api::route_receipts::{
+    COMMITTED_ROUTE_EVIDENCE_SCHEMA_VERSION, CommittedRouteEvidenceRelation,
+};
 use eliot_agent_api::{
     AdmittedRouteReceipt, CommittedHostEventIntake, ContractError, EventCursor, EventId,
     HOST_EVENT_CONTRACT_VERSION, HOST_EVENT_DIGEST_ALGORITHM, HostEventDeliveryDisposition,
@@ -349,6 +353,14 @@ pub struct DurableHostEventRecord {
     pub requested_route_digest: Option<LowercaseSha256>,
     /// Observed actual route reference digest, when one was observed.
     pub actual_route_digest: Option<LowercaseSha256>,
+    /// Versioned validated route-evidence relation (issue #2645 W5). `Some`
+    /// exactly for execution-unit lineage: resolved from the governing #369
+    /// admission and the applicable #369 physical observation (or its explicit
+    /// absence) by the staging gate before any mutation, carrying the
+    /// role-qualified requested/actual digests plus the exact
+    /// owner-resolvable admission and observation references. `None` exactly
+    /// for session-only lineage, which carries no route authority.
+    pub route_evidence: Option<CommittedRouteEvidenceRelation>,
     /// Causal predecessor event identities carried at ingest.
     pub predecessors: Vec<EventId>,
     /// Normalization warnings. Bounded; never raw provider content.
@@ -1033,14 +1045,24 @@ impl DurableHostEventJournal {
     /// plus the stable identity derived from the normalized input. The
     /// coordinator intake re-verifies every fact before observing.
     ///
-    /// Route-relation note (issue #2645): commit implies the record's
-    /// requested/actual route columns already passed owner-qualified staging
-    /// validation (admission fingerprint for requested, validated physical
-    /// observation for actual, explicit absence otherwise). The envelope's
-    /// `admitted_route_digest` travels in this view as the exact
-    /// owner-resolvable admission reference; the fingerprint-level columns
-    /// remain readable on the committed record itself. No unused column is
-    /// declared proof of coordinator validation here.
+    /// Route-relation contract (issues #2645 W5/W6): commit implies the
+    /// record's requested/actual route columns already passed owner-qualified
+    /// staging validation (admission fingerprint for requested, validated
+    /// physical observation for actual, explicit absence otherwise), and this
+    /// projection readback-validates the retained versioned
+    /// [`CommittedRouteEvidenceRelation`] before converting: the relation's
+    /// owner references must bind the envelope-carried admission reference
+    /// and the relation's role-qualified columns must equal the retained
+    /// record columns, or conversion fails closed. A pre-fix execution-unit
+    /// row (relation absent or legacy-versioned) converts with the explicit
+    /// unverified legacy disposition instead: its retained columns travel as
+    /// forensic evidence, never as verified binding, and dependent use stays
+    /// restricted. A consumer that uses route claims receives the validated
+    /// relation in this view (same relation is also available through
+    /// [`Self::committed_route_evidence`]) and requires its `Verified`
+    /// disposition; the envelope's `admitted_route_digest` travels in this
+    /// view as the exact owner-resolvable admission reference. No unused
+    /// column is declared proof of coordinator validation here.
     pub fn to_coordinator_intake(
         &self,
         key: &EventKey,
@@ -1052,8 +1074,89 @@ impl DurableHostEventJournal {
         if !record.disposition.committed {
             return Err(IngestError::NotCommitted);
         }
-        CommittedHostEventIntake::from_envelope(&record.envelope, record.disposition.acked)
-            .map_err(IngestError::Contract)
+        Self::check_retained_route_evidence(record)?;
+        CommittedHostEventIntake::from_envelope(
+            &record.envelope,
+            record.disposition.acked,
+            record.route_evidence.clone(),
+        )
+        .map_err(IngestError::Contract)
+    }
+
+    /// Returns the retained versioned route-evidence relation for one
+    /// committed record (issues #2645 W5/W6): `Some` exactly for
+    /// execution-unit lineage carrying a current-version relation — the
+    /// role-qualified requested/actual digests plus the exact
+    /// owner-resolvable admission and observation references; `None` exactly
+    /// for session-only lineage, which carries no route authority, and for
+    /// pre-fix execution-unit rows, whose absent or legacy-versioned relation
+    /// reads as the explicit unverified legacy disposition on the converted
+    /// intake view instead. A route-claim consumer requires that view's
+    /// `Verified` disposition: `None` here never authorizes route use.
+    ///
+    /// The retained relation is readback-validated before it is handed out
+    /// (see [`Self::check_retained_route_evidence`]): a current-version
+    /// relation that drifted from the envelope-carried admission reference
+    /// or the retained record columns fails closed here instead of reaching
+    /// a route-claim consumer.
+    /// A staged-but-uncommitted record reports [`IngestError::NotCommitted`].
+    pub fn committed_route_evidence(
+        &self,
+        key: &EventKey,
+    ) -> Result<Option<CommittedRouteEvidenceRelation>, IngestError> {
+        let record = self
+            .records
+            .get(&(key.stream_id.clone(), key.sequence))
+            .ok_or(IngestError::UnknownRecord)?;
+        if !record.disposition.committed {
+            return Err(IngestError::NotCommitted);
+        }
+        Self::check_retained_route_evidence(record)?;
+        Ok(record.route_evidence.clone())
+    }
+
+    /// Readback-validates the retained route-evidence relation of one record
+    /// (issues #2645 W5/W6) without the owner receipts at hand: session-only
+    /// lineage must retain no relation and no route columns (it carries no
+    /// route authority); execution-unit lineage with a current-version
+    /// relation must bind the envelope-carried admission reference with
+    /// role-qualified columns equal to the retained record columns (see
+    /// [`CommittedRouteEvidenceRelation::verify_retained`]); execution-unit
+    /// lineage with an absent or legacy-versioned relation is a pre-fix row
+    /// and is preserved as-is — its retained columns stay forensic evidence
+    /// under the explicit unverified legacy disposition surfaced through the
+    /// intake view, never upgraded by column agreement, never deleted, with
+    /// no receipt mutated. Any other drift (smuggled session relation,
+    /// re-pointed admission, column mismatch on a versioned row) fails
+    /// closed with a typed error before the intake converts or the relation
+    /// reaches a consumer.
+    fn check_retained_route_evidence(record: &DurableHostEventRecord) -> Result<(), IngestError> {
+        match &record.envelope.lineage {
+            ProviderObservationLineage::SessionObservation(_) => {
+                if record.route_evidence.is_some() {
+                    return Err(IngestError::Contract(ContractError::BindingMismatch));
+                }
+                if record.requested_route_digest.is_some() || record.actual_route_digest.is_some() {
+                    return Err(IngestError::EnvelopeMismatch("route_digest"));
+                }
+                Ok(())
+            }
+            ProviderObservationLineage::ExecutionUnitObservation(_) => {
+                let Some(evidence) = record.route_evidence.as_ref() else {
+                    return Ok(());
+                };
+                if evidence.schema_version != COMMITTED_ROUTE_EVIDENCE_SCHEMA_VERSION {
+                    return Ok(());
+                }
+                evidence
+                    .verify_retained(
+                        record.envelope.admitted_route_digest.as_ref(),
+                        record.requested_route_digest.as_ref(),
+                        record.actual_route_digest.as_ref(),
+                    )
+                    .map_err(IngestError::Contract)
+            }
+        }
     }
 
     /// Returns every recorded best-effort drop gap for a stream, in record
@@ -1174,6 +1277,74 @@ impl DurableHostEventJournal {
         )
     }
 
+    /// Measured per-stream expected cursor ranges for one coverage manifest:
+    /// every committed stream binds `1..=last_durable` (commits are
+    /// contiguous from one, and cursor facts are never evicted). No committed
+    /// stream is an invalid plan.
+    fn measured_cursor_ranges(&self) -> Result<Vec<StreamCursorRange>, IngestError> {
+        let mut ranges = Vec::new();
+        for (stream_id, progress) in &self.progress {
+            if progress.last_durable_sequence == 0 {
+                continue;
+            }
+            ranges.push(StreamCursorRange {
+                stream: stream_id.clone(),
+                first_expected_cursor: 1,
+                last_expected_cursor: progress.last_durable_sequence,
+            });
+        }
+        if ranges.is_empty() {
+            return Err(IngestError::InvalidInput("coverage_manifest.streams"));
+        }
+        Ok(ranges)
+    }
+
+    /// Measured received/applied counts over the committed records:
+    /// rejections stay typed [`IngestError`] returns, never records, so one
+    /// stored record yields exactly one counted event.
+    fn measured_event_counts(&self) -> (u64, u64) {
+        let mut received = 0u64;
+        let mut applied = 0u64;
+        for record in self.records.values() {
+            received += 1;
+            if record.disposition.applied_count > 0 {
+                applied += 1;
+            }
+        }
+        (received, applied)
+    }
+
+    /// Measured blind intervals from the retained best-effort drop gaps: one
+    /// localized blind interval per dropped sequence, plus the raw gap count
+    /// for the sequence-fault facts.
+    fn measured_blind_intervals(&self) -> (Vec<CoverageBlindInterval>, u64) {
+        let mut blind_cursors: Vec<(String, u64, &'static str)> = self
+            .dropped_gaps
+            .iter()
+            .map(|gap| {
+                let reason = match gap.reason {
+                    BestEffortDropReason::ConflictingDuplicate => {
+                        "best-effort-drop:CONFLICTING_DUPLICATE"
+                    }
+                    BestEffortDropReason::StaleSequence => "best-effort-drop:STALE_SEQUENCE",
+                };
+                (gap.stream_id.clone(), gap.sequence, reason)
+            })
+            .collect();
+        blind_cursors.sort();
+        blind_cursors.dedup_by(|first, second| first.0 == second.0 && first.1 == second.1);
+        let intervals = blind_cursors
+            .into_iter()
+            .map(|(stream, sequence, reason)| CoverageBlindInterval {
+                stream,
+                first_missing_cursor: sequence,
+                last_missing_cursor: sequence,
+                reason: reason.to_owned(),
+            })
+            .collect();
+        (intervals, self.dropped_gaps.len() as u64)
+    }
+
     /// Constructs and retains the coverage denominator for one
     /// product/session/attempt/route fingerprint (issue #1936 W1, I7.23).
     ///
@@ -1217,52 +1388,9 @@ impl DurableHostEventJournal {
         {
             return Err(IngestError::NotCommitted);
         }
-        let mut ranges = Vec::new();
-        for (stream_id, progress) in &self.progress {
-            if progress.last_durable_sequence == 0 {
-                continue;
-            }
-            ranges.push(StreamCursorRange {
-                stream: stream_id.clone(),
-                first_expected_cursor: 1,
-                last_expected_cursor: progress.last_durable_sequence,
-            });
-        }
-        if ranges.is_empty() {
-            return Err(IngestError::InvalidInput("coverage_manifest.streams"));
-        }
-        let mut received = 0u64;
-        let mut applied = 0u64;
-        for record in self.records.values() {
-            received += 1;
-            if record.disposition.applied_count > 0 {
-                applied += 1;
-            }
-        }
-        let mut blind_cursors: Vec<(String, u64, &'static str)> = self
-            .dropped_gaps
-            .iter()
-            .map(|gap| {
-                let reason = match gap.reason {
-                    BestEffortDropReason::ConflictingDuplicate => {
-                        "best-effort-drop:CONFLICTING_DUPLICATE"
-                    }
-                    BestEffortDropReason::StaleSequence => "best-effort-drop:STALE_SEQUENCE",
-                };
-                (gap.stream_id.clone(), gap.sequence, reason)
-            })
-            .collect();
-        blind_cursors.sort();
-        blind_cursors.dedup_by(|first, second| first.0 == second.0 && first.1 == second.1);
-        let blind_intervals_and_missing_source_reasons = blind_cursors
-            .into_iter()
-            .map(|(stream, sequence, reason)| CoverageBlindInterval {
-                stream,
-                first_missing_cursor: sequence,
-                last_missing_cursor: sequence,
-                reason: reason.to_owned(),
-            })
-            .collect();
+        let ranges = self.measured_cursor_ranges()?;
+        let (received, applied) = self.measured_event_counts();
+        let (blind_intervals, gaps) = self.measured_blind_intervals();
         let manifest = ObservationCoverageManifest {
             fingerprint: plan.fingerprint.clone(),
             allowed_manifest_digest: plan.allowed_manifest_digest.to_owned(),
@@ -1279,12 +1407,12 @@ impl DurableHostEventJournal {
                 unknown: received - applied,
             },
             sequence_faults: SequenceFaults {
-                gaps: self.dropped_gaps.len() as u64,
+                gaps,
                 duplicates: 0,
                 reorders: 0,
                 payload_mutations: 0,
             },
-            blind_intervals_and_missing_source_reasons,
+            blind_intervals_and_missing_source_reasons: blind_intervals,
             missing_source_reasons: plan.missing_source_reasons.to_vec(),
             coverage_by_material_action_and_effect_route: plan
                 .coverage_by_material_action_and_effect_route
@@ -1740,36 +1868,156 @@ impl DurableHostEventJournal {
             requested_route_digest.as_ref(),
             actual_route_digest.as_ref(),
         )?;
+        // Versioned route-evidence relation (issue #2645 W5): resolved from
+        // the same validated owners by the same gate, before any mutation,
+        // so the persisted record carries the exact owner-resolvable
+        // references alongside the columns.
+        let route_evidence =
+            Self::retained_route_evidence(&envelope, binding, admission, physical_observation)?;
         Self::check_envelope_linkage(&envelope, sequence, &stored)?;
+        let envelope_digest = Self::sealed_envelope_digest(&envelope)?;
+        let hash_hex = transport_hash.as_str().to_owned();
+        let key = EventKey {
+            stream_id: stream_id.to_owned(),
+            sequence,
+        };
+        if let Some(outcome) = self.replay_if_identical(
+            stream_id,
+            sequence,
+            &transport_hash,
+            &hash_hex,
+            &envelope_digest,
+            &envelope,
+            requested_route_digest.as_ref(),
+            actual_route_digest.as_ref(),
+            route_evidence.as_ref(),
+            key,
+        )? {
+            return Ok(outcome);
+        }
+        self.insert_staged_record(
+            stream_id,
+            sequence,
+            transport_hash,
+            stored,
+            envelope,
+            envelope_digest,
+            requested_route_digest,
+            actual_route_digest,
+            route_evidence,
+            predecessors,
+            warnings,
+            transformation_version,
+            EventKey {
+                stream_id: stream_id.to_owned(),
+                sequence,
+            },
+        )
+    }
+
+    /// Computes the canonical digest of a staged envelope and binds it to
+    /// the declared normalization output digest: a sealed envelope whose
+    /// recomputed digest drifts from its receipt fails closed here, before
+    /// any cursor moves.
+    fn sealed_envelope_digest(
+        envelope: &NormalizedHostEventEnvelope,
+    ) -> Result<LowercaseSha256, IngestError> {
         let envelope_digest = envelope
             .compute_digest()
             .map_err(|_| IngestError::DigestEncoding)?;
         if envelope_digest != envelope.normalization.output_digest {
             return Err(IngestError::EnvelopeMismatch("output_digest"));
         }
-        let hash_hex = transport_hash.as_str().to_owned();
-        let key = EventKey {
-            stream_id: stream_id.to_owned(),
-            sequence,
+        Ok(envelope_digest)
+    }
+
+    /// Idempotent-replay branch of the shared staging core: an identical
+    /// redelivery under one cursor returns the existing key without storing;
+    /// changed bytes or changed route metadata under one cursor quarantines
+    /// [`IngestError::ConflictingDuplicate`] (with best-effort gap evidence
+    /// only for best-effort deliveries). Returns `None` when no record
+    /// exists under the cursor and fresh insertion must proceed.
+    #[allow(clippy::too_many_arguments)]
+    fn replay_if_identical(
+        &mut self,
+        stream_id: &str,
+        sequence: u64,
+        transport_hash: &LowercaseSha256,
+        hash_hex: &str,
+        envelope_digest: &LowercaseSha256,
+        envelope: &NormalizedHostEventEnvelope,
+        requested_route_digest: Option<&LowercaseSha256>,
+        actual_route_digest: Option<&LowercaseSha256>,
+        route_evidence: Option<&CommittedRouteEvidenceRelation>,
+        key: EventKey,
+    ) -> Result<Option<StageOutcome>, IngestError> {
+        let Some(existing) = self.records.get(&(stream_id.to_owned(), sequence)) else {
+            return Ok(None);
         };
-        if let Some(existing) = self.records.get(&(stream_id.to_owned(), sequence)) {
-            if existing.transport_hash.as_str() == hash_hex
-                && existing.envelope_digest == envelope_digest
-                && existing.requested_route_digest.as_ref() == requested_route_digest.as_ref()
-                && existing.actual_route_digest.as_ref() == actual_route_digest.as_ref()
-            {
-                return Ok(StageOutcome { key, fresh: false });
-            }
-            self.record_best_effort_drop(
-                stream_id,
-                sequence,
-                &transport_hash,
-                &envelope_digest,
-                envelope.delivery,
-                BestEffortDropReason::ConflictingDuplicate,
-            );
-            return Err(IngestError::ConflictingDuplicate);
+        if Self::staged_replay_identical(
+            existing,
+            hash_hex,
+            envelope_digest,
+            requested_route_digest,
+            actual_route_digest,
+            route_evidence,
+        ) {
+            return Ok(Some(StageOutcome { key, fresh: false }));
         }
+        self.record_best_effort_drop(
+            stream_id,
+            sequence,
+            transport_hash,
+            envelope_digest,
+            envelope.delivery,
+            BestEffortDropReason::ConflictingDuplicate,
+        );
+        Err(IngestError::ConflictingDuplicate)
+    }
+
+    /// Exact-replay identity for one stored record (issue #2645 W4): an
+    /// identical redelivery under one cursor is idempotent, while changed
+    /// route metadata under the same event identity is not — the retained
+    /// versioned route-evidence relation compares alongside the existing
+    /// transport/envelope/column commitment, so drift conflicts instead of
+    /// restaging silently.
+    fn staged_replay_identical(
+        existing: &DurableHostEventRecord,
+        hash_hex: &str,
+        envelope_digest: &LowercaseSha256,
+        requested_route_digest: Option<&LowercaseSha256>,
+        actual_route_digest: Option<&LowercaseSha256>,
+        route_evidence: Option<&CommittedRouteEvidenceRelation>,
+    ) -> bool {
+        existing.transport_hash.as_str() == hash_hex
+            && existing.envelope_digest == *envelope_digest
+            && existing.requested_route_digest.as_ref() == requested_route_digest
+            && existing.actual_route_digest.as_ref() == actual_route_digest
+            && existing.route_evidence.as_ref() == route_evidence
+    }
+
+    /// Fresh-record insertion for the shared staging core: stale-sequence,
+    /// adapter-identity, and capacity gates, then the staged insert. Never
+    /// advances a cursor. Idempotent replays never reach here (they return
+    /// above without storing), so capacity failures here always mean
+    /// genuinely new bytes.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_staged_record(
+        &mut self,
+        stream_id: &str,
+        sequence: u64,
+        transport_hash: LowercaseSha256,
+        stored: StoredPayload,
+        envelope: NormalizedHostEventEnvelope,
+        envelope_digest: LowercaseSha256,
+        requested_route_digest: Option<LowercaseSha256>,
+        actual_route_digest: Option<LowercaseSha256>,
+        route_evidence: Option<CommittedRouteEvidenceRelation>,
+        predecessors: Vec<EventId>,
+        warnings: Vec<String>,
+        transformation_version: &str,
+        key: EventKey,
+    ) -> Result<StageOutcome, IngestError> {
         let durable = self
             .progress
             .get(stream_id)
@@ -1814,6 +2062,7 @@ impl DurableHostEventJournal {
                 transformation_version: transformation_version.to_owned(),
                 requested_route_digest,
                 actual_route_digest,
+                route_evidence,
                 predecessors,
                 warnings,
                 disposition: RecordDisposition {
@@ -1887,6 +2136,36 @@ impl DurableHostEventJournal {
             return Err(IngestError::EnvelopeMismatch("route_digest"));
         }
         Ok(())
+    }
+
+    /// Resolves the retained versioned route-evidence relation from the
+    /// validated staging owners (issue #2645 W5). Session-only lineage
+    /// carries no route authority and retains `None`; execution-unit lineage
+    /// retains the relation resolved from the governing admission and the
+    /// applicable physical observation (or its explicit absence) via
+    /// [`CommittedRouteEvidenceRelation::resolve`], which re-runs the owner
+    /// validation instead of trusting caller columns. Runs inside the shared
+    /// staging core after [`Self::check_staging_context`] and before any
+    /// mutation, so both the allowed and the redacted paths persist the same
+    /// relation; exact replay compares it along with the existing
+    /// source/envelope commitment, so changed route metadata under one event
+    /// identity conflicts instead of restaging silently.
+    fn retained_route_evidence(
+        envelope: &NormalizedHostEventEnvelope,
+        binding: Option<&ProviderExecutionBinding>,
+        admission: Option<&AdmittedRouteReceipt>,
+        physical_observation: Option<&PhysicalRouteObservationReceipt>,
+    ) -> Result<Option<CommittedRouteEvidenceRelation>, IngestError> {
+        match &envelope.lineage {
+            ProviderObservationLineage::SessionObservation(_) => Ok(None),
+            ProviderObservationLineage::ExecutionUnitObservation(_) => {
+                let binding = binding.ok_or(IngestError::InvalidInput("binding/lineage"))?;
+                let admission = admission.ok_or(IngestError::InvalidInput("admission/lineage"))?;
+                CommittedRouteEvidenceRelation::resolve(binding, admission, physical_observation)
+                    .map_err(IngestError::Contract)
+                    .map(Some)
+            }
+        }
     }
 
     /// Checks that the carried execution-unit route-reference digests each
