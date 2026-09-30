@@ -231,7 +231,7 @@ impl SourceTreeSnapshot {
     }
 
     /// Returns the complete Git archive bytes to bind through the existing
-    /// ArtifactIdentity content address and S-04 read receipt.
+    /// `ArtifactIdentity` content address and S-04 read receipt.
     #[must_use]
     pub fn archive_bytes(&self) -> &[u8] {
         &self.archive_bytes
@@ -253,11 +253,9 @@ impl SourceTreeSnapshot {
     }
 }
 
-fn capture_once(
+fn prepare_snapshot_capture(
     root: &RepoRoot,
-    runner: &dyn ProcessRunner,
-    max_archive_bytes: u64,
-) -> Result<SourceTreeSnapshot, GitSnapshotError> {
+) -> Result<(PathBuf, OwnedGitIndex, GitProcessProfile), GitSnapshotError> {
     let requested = root.path();
     let workspace_root = fs::canonicalize(requested)
         .map_err(|_| GitSnapshotError::WorkspaceUnavailable(requested.to_path_buf()))?;
@@ -271,6 +269,16 @@ fn capture_once(
             detail,
         }
     })?;
+    Ok((workspace_root, index, profile))
+}
+
+fn capture_once(
+    root: &RepoRoot,
+    runner: &dyn ProcessRunner,
+    max_archive_bytes: u64,
+) -> Result<SourceTreeSnapshot, GitSnapshotError> {
+    let requested = root.path();
+    let (workspace_root, index, profile) = prepare_snapshot_capture(root)?;
 
     let resolved = run_git(
         runner,
@@ -381,18 +389,7 @@ async fn capture_once_async(
     max_archive_bytes: u64,
 ) -> Result<SourceTreeSnapshot, GitSnapshotError> {
     let requested = root.path();
-    let workspace_root = fs::canonicalize(requested)
-        .map_err(|_| GitSnapshotError::WorkspaceUnavailable(requested.to_path_buf()))?;
-    if !workspace_root.is_dir() {
-        return Err(GitSnapshotError::WorkspaceUnavailable(workspace_root));
-    }
-    let index = OwnedGitIndex::create()?;
-    let profile = GitProcessProfile::isolated_index(index.index_path()).map_err(|detail| {
-        GitSnapshotError::IndexDirectory {
-            path: index.directory.clone(),
-            detail,
-        }
-    })?;
+    let (workspace_root, index, profile) = prepare_snapshot_capture(root)?;
 
     let resolved = run_git_async(
         runner,
@@ -517,7 +514,7 @@ impl OwnedGitIndex {
                 temp_root.join(format!("eliot-git-index-{}-{sequence}", std::process::id()));
             match fs::create_dir(&directory) {
                 Ok(()) => return Ok(Self { directory }),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(error) => {
                     return Err(GitSnapshotError::IndexDirectory {
                         path: directory,
@@ -570,12 +567,14 @@ fn read_all_blobs(
         .split(|byte| *byte == 0)
         .filter(|row| !row.is_empty())
     {
-        let (metadata, path) = row.split_once(|byte| *byte == b'\t').ok_or_else(|| {
-            GitSnapshotError::InvalidGitOutput {
+        let (metadata, path) = row
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .map(|delimiter| (&row[..delimiter], &row[delimiter + 1..]))
+            .ok_or_else(|| GitSnapshotError::InvalidGitOutput {
                 operation: "tree enumeration",
                 detail: "tree row omitted its path separator".to_owned(),
-            }
-        })?;
+            })?;
         let fields: Vec<&[u8]> = metadata
             .split(|byte| *byte == b' ')
             .filter(|field| !field.is_empty())
@@ -658,12 +657,14 @@ async fn read_all_blobs_async(
         .split(|byte| *byte == 0)
         .filter(|row| !row.is_empty())
     {
-        let (metadata, path) = row.split_once(|byte| *byte == b'\t').ok_or_else(|| {
-            GitSnapshotError::InvalidGitOutput {
+        let (metadata, path) = row
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .map(|delimiter| (&row[..delimiter], &row[delimiter + 1..]))
+            .ok_or_else(|| GitSnapshotError::InvalidGitOutput {
                 operation: "tree enumeration",
                 detail: "tree row omitted its path separator".to_owned(),
-            }
-        })?;
+            })?;
         let fields: Vec<&[u8]> = metadata
             .split(|byte| *byte == b' ')
             .filter(|field| !field.is_empty())
@@ -735,7 +736,7 @@ fn verify_archive(
     archive: &[u8],
     expected: &BTreeMap<Vec<u8>, SourceBlob>,
 ) -> Result<(), GitSnapshotError> {
-    if archive.len() % 512 != 0 {
+    if !archive.len().is_multiple_of(512) {
         return Err(GitSnapshotError::InvalidGitOutput {
             operation: "tree archive",
             detail: "tar length is not block aligned".to_owned(),
@@ -757,37 +758,10 @@ fn verify_archive(
             ended = true;
             break;
         }
-        let size =
-            tar_octal(&header[124..136]).ok_or_else(|| GitSnapshotError::InvalidGitOutput {
-                operation: "tree archive",
-                detail: "tar entry has an invalid size".to_owned(),
-            })?;
-        let size = usize::try_from(size).map_err(|_| GitSnapshotError::InvalidGitOutput {
-            operation: "tree archive",
-            detail: "tar entry size does not fit this process".to_owned(),
-        })?;
-        let data_start = offset + 512;
-        let data_end =
-            data_start
-                .checked_add(size)
-                .ok_or_else(|| GitSnapshotError::InvalidGitOutput {
-                    operation: "tree archive",
-                    detail: "tar entry size overflow".to_owned(),
-                })?;
-        if data_end > archive.len() {
-            return Err(GitSnapshotError::InvalidGitOutput {
-                operation: "tree archive",
-                detail: "tar entry exceeds archive length".to_owned(),
-            });
-        }
+        let (body, next_offset) = tar_entry_body(archive, offset)?;
         let kind = header[156];
         if kind == b'x' {
-            let payload = pax_path(&archive[data_start..data_end]).ok_or_else(|| {
-                GitSnapshotError::InvalidGitOutput {
-                    operation: "tree archive",
-                    detail: "tar extended header is malformed".to_owned(),
-                }
-            })?;
+            let payload = pax_path(body)?;
             extended_path = payload;
         } else if kind == b'g' {
             return Err(GitSnapshotError::InvalidGitOutput {
@@ -807,7 +781,7 @@ fn verify_archive(
             let bytes = if kind == b'2' {
                 tar_field_bytes(&header[157..257])
             } else {
-                archive[data_start..data_end].to_vec()
+                body.to_vec()
             };
             if actual.insert(path, (mode.to_owned(), bytes)).is_some() {
                 return Err(GitSnapshotError::InvalidGitOutput {
@@ -831,21 +805,7 @@ fn verify_archive(
                 detail: format!("unsupported tar entry type {}", kind as char),
             });
         }
-        let padded = size
-            .checked_add(511)
-            .ok_or_else(|| GitSnapshotError::InvalidGitOutput {
-                operation: "tree archive",
-                detail: "tar padding overflow".to_owned(),
-            })?
-            / 512
-            * 512;
-        offset =
-            data_start
-                .checked_add(padded)
-                .ok_or_else(|| GitSnapshotError::InvalidGitOutput {
-                    operation: "tree archive",
-                    detail: "tar offset overflow".to_owned(),
-                })?;
+        offset = next_offset;
     }
     if !ended || extended_path.is_some() || actual.len() != expected.len() {
         return Err(GitSnapshotError::InvalidGitOutput {
@@ -866,28 +826,77 @@ fn verify_archive(
     Ok(())
 }
 
-fn pax_path(payload: &[u8]) -> Option<Option<Vec<u8>>> {
+fn tar_entry_body(archive: &[u8], offset: usize) -> Result<(&[u8], usize), GitSnapshotError> {
+    let header = &archive[offset..offset + 512];
+    let size = tar_octal(&header[124..136]).ok_or_else(|| GitSnapshotError::InvalidGitOutput {
+        operation: "tree archive",
+        detail: "tar entry has an invalid size".to_owned(),
+    })?;
+    let size = usize::try_from(size).map_err(|_| GitSnapshotError::InvalidGitOutput {
+        operation: "tree archive",
+        detail: "tar entry size does not fit this process".to_owned(),
+    })?;
+    let data_start = offset + 512;
+    let data_end =
+        data_start
+            .checked_add(size)
+            .ok_or_else(|| GitSnapshotError::InvalidGitOutput {
+                operation: "tree archive",
+                detail: "tar entry size overflow".to_owned(),
+            })?;
+    if data_end > archive.len() {
+        return Err(GitSnapshotError::InvalidGitOutput {
+            operation: "tree archive",
+            detail: "tar entry exceeds archive length".to_owned(),
+        });
+    }
+    let padded = size
+        .checked_add(511)
+        .ok_or_else(|| GitSnapshotError::InvalidGitOutput {
+            operation: "tree archive",
+            detail: "tar padding overflow".to_owned(),
+        })?
+        / 512
+        * 512;
+    let next_offset =
+        data_start
+            .checked_add(padded)
+            .ok_or_else(|| GitSnapshotError::InvalidGitOutput {
+                operation: "tree archive",
+                detail: "tar offset overflow".to_owned(),
+            })?;
+    Ok((&archive[data_start..data_end], next_offset))
+}
+
+fn pax_path(payload: &[u8]) -> Result<Option<Vec<u8>>, GitSnapshotError> {
+    let malformed = || GitSnapshotError::InvalidGitOutput {
+        operation: "tree archive",
+        detail: "tar extended header is malformed".to_owned(),
+    };
     let mut rest = payload;
     let mut path = None;
     while !rest.is_empty() {
-        let separator = rest.iter().position(|byte| *byte == b' ')?;
+        let separator = rest
+            .iter()
+            .position(|byte| *byte == b' ')
+            .ok_or_else(malformed)?;
         let length = std::str::from_utf8(&rest[..separator])
-            .ok()?
+            .map_err(|_| malformed())?
             .parse::<usize>()
-            .ok()?;
+            .map_err(|_| malformed())?;
         if length <= separator + 1 || length > rest.len() {
-            return None;
+            return Err(malformed());
         }
         let record = &rest[separator + 1..length];
         if record.last() != Some(&b'\n') {
-            return None;
+            return Err(malformed());
         }
         if let Some(value) = record.strip_prefix(b"path=") {
             path = Some(value.strip_suffix(b"\n").unwrap_or(value).to_vec());
         }
         rest = &rest[length..];
     }
-    Some(path)
+    Ok(path)
 }
 
 fn tar_path(header: &[u8]) -> Vec<u8> {
