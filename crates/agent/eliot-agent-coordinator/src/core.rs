@@ -2929,16 +2929,25 @@ impl AgentCoordinator {
     }
 
     /// Observes one committed durable journal record through the neutral
-    /// intake view (issues #371 W7/A27: the journal→intake conversion edge).
+    /// intake view (issues #371 W7/A27: the journal→intake conversion edge;
+    /// issue #2645 W5: the view carries the validated route-evidence
+    /// relation).
     ///
     /// Every preserved fact on the view is re-verified against the carried
     /// envelope (receipt equality, recomputed output digest,
     /// identity/sequence/cursor/predecessor/delivery/payload-kind/
-    /// generation/fence agreement, stable-identity recomputation) before
-    /// delegating to [`Self::observe_provider_event`]: a view that drifted
-    /// from its envelope rejects here without mutation. Acknowledgement
-    /// state is observed, never advanced: cursor acknowledgement follows
-    /// durable linkage/disposition, not this in-memory return.
+    /// generation/fence agreement, stable-identity recomputation, and the
+    /// carried route-evidence relation agreement) before delegating to
+    /// [`Self::observe_provider_event`]: a view that drifted from its
+    /// envelope rejects here without mutation. The relation check keeps the
+    /// validated route claims with the intake: an execution-unit intake
+    /// stripped of its relation, a session intake carrying one, or a relation
+    /// whose admission reference no longer equals the envelope-carried
+    /// admission reference fails closed with a typed contract error, so a
+    /// route-claim consumer downstream of this observation receives the
+    /// validated relation or nothing. Acknowledgement state is observed,
+    /// never advanced: cursor acknowledgement follows durable
+    /// linkage/disposition, not this in-memory return.
     pub fn observe_committed_intake(
         &mut self,
         context: ExecutionContext,

@@ -1052,9 +1052,9 @@ impl DurableHostEventJournal {
     /// owner references must bind the envelope-carried admission reference
     /// and the relation's role-qualified columns must equal the retained
     /// record columns, or conversion fails closed. A consumer that uses route
-    /// claims receives the validated relation through
-    /// [`Self::committed_route_evidence`]; the envelope's
-    /// `admitted_route_digest` travels in this view as the exact
+    /// claims receives the validated relation in this view (same relation is
+    /// also available through [`Self::committed_route_evidence`]); the
+    /// envelope's `admitted_route_digest` travels in this view as the exact
     /// owner-resolvable admission reference. No unused column is declared
     /// proof of coordinator validation here.
     pub fn to_coordinator_intake(
@@ -1069,8 +1069,12 @@ impl DurableHostEventJournal {
             return Err(IngestError::NotCommitted);
         }
         Self::check_retained_route_evidence(record)?;
-        CommittedHostEventIntake::from_envelope(&record.envelope, record.disposition.acked)
-            .map_err(IngestError::Contract)
+        CommittedHostEventIntake::from_envelope(
+            &record.envelope,
+            record.disposition.acked,
+            record.route_evidence.clone(),
+        )
+        .map_err(IngestError::Contract)
     }
 
     /// Returns the retained versioned route-evidence relation for one

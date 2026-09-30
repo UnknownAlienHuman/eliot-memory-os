@@ -41,6 +41,7 @@ use crate::{
     CancelReason, CancellationState, ContractError, EventCursor, EventId, ExecutionUnit,
     ProviderExecutionBinding, ProviderObservationLineage, UsageReceipt,
 };
+use crate::route_receipts::CommittedRouteEvidenceRelation;
 use eliot_agent_contracts::AgentAttemptId;
 use eliot_contracts::{
     ClockReading, LowercaseSha256, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex,
@@ -1327,16 +1328,36 @@ pub struct CommittedHostEventIntake {
     pub envelope: NormalizedHostEventEnvelope,
     /// Sealed normalization receipt; must equal `envelope.normalization`.
     pub receipt: HostEventNormalizationReceipt,
+    /// Versioned validated route-evidence relation (issue #2645 W5): `Some`
+    /// exactly for execution-unit lineage, carrying the role-qualified
+    /// requested/actual digests plus the exact owner-resolvable admission
+    /// and physical-observation references; `None` exactly for session-only
+    /// lineage, which carries no route authority. A consumer that uses route
+    /// claims reads this relation, never the envelope's admission reference
+    /// alone. Identity separation holds: the raw transport hash stays on the
+    /// journal record and never enters this view, the canonical normalized
+    /// digest is `receipt.output_digest` (recomputed, never copied), and the
+    /// route evidence identities are this relation's digests, resolved
+    /// through their receipt owners at staging.
+    pub route_evidence: Option<CommittedRouteEvidenceRelation>,
 }
 
 impl CommittedHostEventIntake {
     /// Builds the intake view for one envelope known committed by the durable
-    /// journal. Rejects a receipt that is not the envelope's sealed receipt
-    /// and an output digest that does not recompute; extracts every preserved
-    /// fact from the envelope instead of re-deriving it.
+    /// journal, carrying the journal's retained versioned route-evidence
+    /// relation (issue #2645 W5). Rejects a receipt that is not the
+    /// envelope's sealed receipt and an output digest that does not
+    /// recompute; extracts every preserved fact from the envelope instead of
+    /// re-deriving it. The carried relation is the journal-readback-validated
+    /// [`CommittedRouteEvidenceRelation`] for this record (`Some` exactly for
+    /// execution-unit lineage, `None` exactly for session-only lineage); the
+    /// finished view is re-verified (see [`Self::verify`]) before it is
+    /// handed out, so a relation that drifted from the envelope-carried
+    /// admission reference fails closed here.
     pub fn from_envelope(
         envelope: &NormalizedHostEventEnvelope,
         acked: bool,
+        route_evidence: Option<CommittedRouteEvidenceRelation>,
     ) -> Result<Self, ContractError> {
         let receipt = envelope.normalization.clone();
         let computed = envelope
@@ -1360,7 +1381,7 @@ impl CommittedHostEventIntake {
             &envelope.payload,
             &envelope.raw_source.digest,
         )?;
-        Ok(Self {
+        let intake = Self {
             event_id: envelope.event_id.clone(),
             cursor: envelope.cursor.clone(),
             sequence: envelope.sequence,
@@ -1373,13 +1394,17 @@ impl CommittedHostEventIntake {
             stable_event_identity,
             envelope: envelope.clone(),
             receipt,
-        })
+            route_evidence,
+        };
+        intake.verify()?;
+        Ok(intake)
     }
 
     /// Re-verifies the preserved facts against the carried envelope: receipt
     /// equality, recomputed output digest, identity/sequence/cursor agreement,
     /// predecessor/delivery/payload-kind agreement, generation/fence presence
-    /// agreement with the lineage, and stable-identity recomputation. The
+    /// agreement with the lineage, stable-identity recomputation, and the
+    /// carried route-evidence relation agreement (issue #2645 W5). The
     /// coordinator intake calls this before observing; a view that drifted
     /// from its envelope fails closed here.
     pub fn verify(&self) -> Result<(), ContractError> {
@@ -1423,6 +1448,29 @@ impl CommittedHostEventIntake {
         if stable != self.stable_event_identity {
             return Err(ContractError::DigestMismatch);
         }
-        Ok(())
+        self.verify_route_evidence()
+    }
+
+    /// Readback-validates the carried route-evidence relation against the
+    /// carried envelope (issue #2645 W5): session-only lineage carries no
+    /// relation and no route authority; execution-unit lineage carries
+    /// exactly one relation whose schema shape holds and whose admission
+    /// reference equals the envelope-carried admission reference. A stripped,
+    /// smuggled, or re-pointed relation fails with a typed error instead of
+    /// reaching a route-claim consumer; the relation's role-qualified columns
+    /// were already bound to the retained record columns journal-side before
+    /// conversion, and are not re-derived here.
+    fn verify_route_evidence(&self) -> Result<(), ContractError> {
+        match (&self.envelope.lineage, &self.route_evidence) {
+            (ProviderObservationLineage::SessionObservation(_), None) => Ok(()),
+            (ProviderObservationLineage::ExecutionUnitObservation(_), Some(relation)) => {
+                relation.validate()?;
+                if self.envelope.admitted_route_digest.as_ref() != Some(&relation.admission_digest) {
+                    return Err(ContractError::BindingMismatch);
+                }
+                Ok(())
+            }
+            _ => Err(ContractError::BindingMismatch),
+        }
     }
 }
