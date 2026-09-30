@@ -9,9 +9,7 @@ use eliot_process::{
     CancellationStatus, OperationId, ProcessLifecycle, ProcessStartReceipt, ResourceLimits,
     SecretRef,
 };
-use eliot_protocol::{
-    AckPhase, EncodingProfile, Frame, NATIVE_WORKER_PROTOCOL_VERSION,
-};
+use eliot_protocol::{AckPhase, EncodingProfile, Frame, NATIVE_WORKER_PROTOCOL_VERSION};
 use eliot_receipts::ReceiptDisposition;
 use eliot_runtime_contracts::ServiceProcessState;
 use schemars::JsonSchema;
