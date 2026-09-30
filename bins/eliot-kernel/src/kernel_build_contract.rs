@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 use super::{AuthorityHandoffRecord, KernelDispatchKey, is_lower_sha256};
 use crate::kernel_diagnostics::{EntrypointStage, observe_entrypoint_with_detail};
+use eliot_contracts::ResourceGeneration;
 use eliot_kernel_service::ProcessAuthorityHandoffDescriptor;
 use eliot_platform::PortError;
 #[cfg(windows)]
@@ -185,6 +186,23 @@ pub enum KernelBuildError {
     StoreBootstrapRequired,
     /// This composition already owns its one canonical-store client/gateway.
     StoreAlreadyConnected,
+    /// The durable `canonical_store` route owner does not name the generation
+    /// this composition was about to build a canonical-Store writer for
+    /// (issue #1872, item W5).
+    ///
+    /// The refusal class travels as its own type rather than as prose, so
+    /// "the durable owner names another generation" stays distinguishable at
+    /// this boundary from "no owner is recorded for this scope" and from "the
+    /// owner could not be read" — three different facts, kept apart exactly as
+    /// `crates/kernel/eliot-kernel-service/src/storage_replacement.rs` keeps
+    /// them apart, so no reader can collapse "the window is open" into "the
+    /// window is not yet proven".
+    StoreRouteOwnerRefused {
+        /// Generation the approved bootstrap/handoff descriptor presented.
+        presented: ResourceGeneration,
+        /// The class of refusal, unchanged from its owner.
+        refusal: eliot_kernel_service::CanonicalStoreWriterRefusal,
+    },
     /// The platform could not bind the authenticated local front door.
     Principal(String),
 }
@@ -261,6 +279,13 @@ impl fmt::Display for KernelBuildError {
             }
             Self::StoreAlreadyConnected => {
                 write!(f, "canonical-store client/gateway is already connected")
+            }
+            Self::StoreRouteOwnerRefused { presented, refusal } => {
+                write!(
+                    f,
+                    "canonical-store writer for generation {} refused: {refusal}",
+                    presented.value()
+                )
             }
             Self::Principal(error) => write!(f, "principal composition failed: {error}"),
         }

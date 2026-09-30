@@ -65,6 +65,7 @@ fn daemon_recovery_terminal_code(error: &KernelBuildError) -> &'static str {
         KernelBuildError::Service(_) => "RECOVERY_SERVICE",
         KernelBuildError::StoreBootstrapRequired => "RECOVERY_STORE_BOOTSTRAP_REQUIRED",
         KernelBuildError::StoreAlreadyConnected => "RECOVERY_STORE_ALREADY_CONNECTED",
+        KernelBuildError::StoreRouteOwnerRefused { .. } => "RECOVERY_STORE_ROUTE_OWNER_REFUSED",
         KernelBuildError::Principal(_) => "RECOVERY_PRINCIPAL",
     }
 }

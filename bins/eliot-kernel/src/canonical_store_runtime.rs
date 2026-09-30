@@ -64,6 +64,7 @@ fn store_build_error_code(error: &KernelBuildError) -> &'static str {
         KernelBuildError::Service(_) => "SERVICE",
         KernelBuildError::StoreBootstrapRequired => "STORE_BOOTSTRAP_REQUIRED",
         KernelBuildError::StoreAlreadyConnected => "STORE_ALREADY_CONNECTED",
+        KernelBuildError::StoreRouteOwnerRefused { .. } => "STORE_ROUTE_OWNER_REFUSED",
         KernelBuildError::Principal(_) => "PRINCIPAL",
     }
 }
@@ -317,6 +318,56 @@ impl KernelComposition {
             EntrypointStage::StoreBootstrap,
             "kernel.store.requirement_validated",
         );
+        // #1872 item W5: a composition may not build a canonical-Store writer
+        // for a generation the durable `canonical_store` route owner does not
+        // name, and it has to learn that before anything is reached. Every
+        // *generation* check below this point compares the approved descriptor
+        // against itself — the `store_bridge` route the `route_matched` check
+        // below resolves was registered from that same descriptor in
+        // `composition_bootstrap.rs`, so
+        // `route.active_generation() != requirement.store_generation` is
+        // tautological on this path and can never refuse a candidate bridge.
+        // The question is therefore put to the durable owner, and it is put
+        // here, above the first peer, process and pipe step below, so a refused
+        // generation is not connected to at all: A12.3, "a second writer is a
+        // security and integrity problem regardless of how plausible the
+        // content appears", and A0.3's fail-closed class, "a second ungoverned
+        // canonical owner or write path". Refusing later, at the first Store
+        // operation, is what the per-operation
+        // `KernelStoreGateway::require_active_store_generation` gate already
+        // does and is not sufficient: a gateway built, connected and RETAINED
+        // there is a live Store connection whatever it is later allowed to do.
+        //
+        // The decision is `eliot_kernel_service::admit_canonical_store_writer`,
+        // which reads the same durable owner through the same
+        // `canonical_store_route_owner` that composition establishes and that
+        // the per-operation gate admits every Store operation against. Because
+        // the route table is rebuilt from the Host descriptor on every restart
+        // while the owner row is durable, the refusal is re-derived on every
+        // restart and only a committed cutover for this scope may move the
+        // owner off it.
+        eliot_kernel_service::admit_canonical_store_writer(
+            &self.generation_gateway.ors,
+            requirement.store_generation,
+        )
+        .map_err(|refusal| {
+            use eliot_kernel_service::CanonicalStoreWriterRefusal as Refusal;
+            observe_entrypoint_with_detail(
+                EntrypointStage::StoreBootstrap,
+                match refusal {
+                    Refusal::NotRouteOwner { .. } | Refusal::NoDurableOwner => {
+                        "kernel.store.connect_rejected:route_owner_refused"
+                    }
+                    Refusal::OwnerUnreadable => {
+                        "kernel.store.connect_rejected:route_owner_unreadable"
+                    }
+                },
+            );
+            KernelBuildError::StoreRouteOwnerRefused {
+                presented: requirement.store_generation,
+                refusal,
+            }
+        })?;
         let process = &handoff.process_binding.process;
         let observed = observe_named_pipe_peer_process_in_job(
             handoff.process_binding.job.as_str(),
