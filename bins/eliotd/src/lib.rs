@@ -1897,7 +1897,7 @@ impl DaemonComposition {
     /// the storeless smallest-question leg may run and completion fails closed.
     /// Caller: `daemon_runtime::resolve_valid_ticket`, which retains this
     /// Host observation for the accepted-result trigger after Kernel ACK.
-    pub(crate) fn attach_cold_start_question(
+    pub fn attach_cold_start_question(
         result: AgentActivationResolutionResult,
         observed: &mut crate::task_binding_admission::ColdStartDiscoveryInput,
         owner: Option<(
