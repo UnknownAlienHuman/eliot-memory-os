@@ -289,6 +289,10 @@ impl<T> ForwardingSkillLifecycle<T> {
         context: &eliot_skill::CatalogueInstallContext,
         tools: &dyn KnownTools,
     ) -> Result<String, SkillError> {
+        // Lifecycle host/profile observation point (issue #1882 W2/A2): the
+        // Governor-owned context pins the live versions this install admits;
+        // observing them here binds the leg before the shared handle moves.
+        lifecycle_live_host_versions(context)?;
         let mut catalogue = self.lock_catalogue();
         eliot_skill::install_package(&mut catalogue, candidate, package, inputs, context, tools)
     }
@@ -335,6 +339,10 @@ impl<T> ForwardingSkillLifecycle<T> {
                 reason: "the stated admitted version disagrees with the install context",
             });
         }
+        // Lifecycle host/profile observation point (issue #1882 W2/A2): the
+        // Governor-owned context pins the live versions this install admits;
+        // observing them here binds the leg before the shared handle moves.
+        lifecycle_live_host_versions(context)?;
         let mut catalogue = self.lock_catalogue();
         eliot_skill::install_package_versioned(
             &mut catalogue,
@@ -724,12 +732,21 @@ impl<T> ForwardingSkillLifecycle<T> {
         aliases: &ToolAliasTable,
         admitted_definition_version: &str,
     ) -> Result<ActivatedSkillDisplay, SkillError> {
-        let live = display_source.definition_version();
-        if live.trim().is_empty() || live != admitted_definition_version {
+        // Surface definition-leg observation (issue #1882 W2/A2): the live
+        // version comes from the tool-owner source through the surface
+        // producer, never a re-stated claim; drift refuses with the display
+        // path's existing typed field after the persistent mark below.
+        if super::skill_surface_adapters::surface_live_definition_version(
+            display_source,
+            admitted_definition_version,
+        )
+        .is_err()
+        {
             // Persistent invalidation: a version drift marks the entry stale
             // so later issuance and display fail closed too. Only a present
             // entry can be marked; absence and validation failures keep the
             // drift refusal below as the fail-closed outcome.
+            let live = display_source.definition_version();
             if !live.trim().is_empty() {
                 let mut catalogue = self.lock_catalogue();
                 let _marked = catalogue.mark_definition_drift_stale(
@@ -743,6 +760,7 @@ impl<T> ForwardingSkillLifecycle<T> {
                 reason: "the live tool source no longer binds the admitted definition version",
             });
         }
+        let live = display_source.definition_version();
         // Standing version check against the entry-recorded admission: the
         // act may state the live version while the entry was admitted under
         // an older one (installed before the registry moved, never
@@ -843,6 +861,31 @@ pub(crate) fn record_promotion_observation(
         return catalogue.note_dependency_change(skill_id, observed, reason);
     }
     Ok(false)
+}
+
+/// Observes the live host/profile versions pinned by the Governor-owned
+/// install context (issue #1882 W2/A2, `I7.13`).
+///
+/// Lifecycle attach driver: validates the presented [`CatalogueInstallContext`]
+/// with its existing `validate` and returns the host/profile version borrows
+/// — the host/profile legs of the owning crate's [`LiveSkillWorld`](eliot_skill::LiveSkillWorld)
+/// (`live_host_version`, `live_profile_version`) in exact world shape. The
+/// versions are Governor-admitted content observed for this operation, never
+/// synthesized and never a timer/startup fabrication. Typed failures stay
+/// typed.
+///
+/// `pub(crate)` for the documented stitch consumer: the bridge commit path
+/// (`skill_dispatch.rs`, owned by the unmerged sibling branch — do not wire
+/// it here) assembles the full world from this leg plus the bridge
+/// dependency-set and surface tool/definition legs.
+pub(crate) fn lifecycle_live_host_versions(
+    context: &CatalogueInstallContext,
+) -> Result<(&str, &str), SkillError> {
+    context.validate()?;
+    Ok((
+        context.host_version.as_str(),
+        context.profile_version.as_str(),
+    ))
 }
 
 impl<T: SkillLifecycleApi> SkillLifecycleApi for ForwardingSkillLifecycle<T> {

@@ -26,8 +26,8 @@ use std::pin::Pin;
 use eliot_agent_bridge_core::{ProposeSkillRequest, SkillLifecyclePort};
 use eliot_contracts::RequestMetadata;
 use eliot_skill::{
-    ActivatedSkillDisplay, HotsetDeliveryAck, HotsetDeliveryReceipt, SkillCandidate, SkillError,
-    SkillLifecycleApi, SkillLifecycleView,
+    ActivatedSkillDisplay, DependencyVersion, HotsetDeliveryAck, HotsetDeliveryReceipt,
+    SkillCandidate, SkillError, SkillLifecycleApi, SkillLifecycleView,
 };
 
 use super::skill_lifecycle_adapters::ForwardingSkillLifecycle;
@@ -53,6 +53,31 @@ impl<U> BridgeSkillForwarder<U> {
     }
 }
 
+/// Observes the live dependency set declared at the bridge attach handshake
+/// (issue #1882 W2/A2, `I7.13`).
+///
+/// Production attach driver: clones the dependency versions the caller
+/// presented on the live [`ProposeSkillRequest`] and re-validates every entry
+/// with the existing [`DependencyVersion::validate`](eliot_skill::DependencyVersion::validate).
+/// The returned set is caller-observed live content for this operation — the
+/// dependency-set leg of the owning crate's [`LiveSkillWorld`](eliot_skill::LiveSkillWorld)
+/// (`current_dependencies`) — never synthesized and never a timer/startup
+/// fabrication. Typed failures stay typed.
+///
+/// `pub(crate)` for the documented stitch consumer: the bridge commit path
+/// (`skill_dispatch.rs`, owned by the unmerged sibling branch — do not wire
+/// it here) assembles the full world from this leg plus the lifecycle
+/// host/profile and surface tool/definition legs.
+pub(crate) fn bridge_live_dependencies(
+    request: &ProposeSkillRequest,
+) -> Result<Vec<DependencyVersion>, SkillError> {
+    let observed = request.dependency_versions().to_vec();
+    for dependency in &observed {
+        dependency.validate()?;
+    }
+    Ok(observed)
+}
+
 impl<U: SkillLifecycleApi> SkillLifecyclePort for BridgeSkillForwarder<U> {
     fn skill_read<'a>(
         &'a mut self,
@@ -68,6 +93,7 @@ impl<U: SkillLifecycleApi> SkillLifecyclePort for BridgeSkillForwarder<U> {
         request: ProposeSkillRequest,
     ) -> Pin<Box<dyn Future<Output = Result<SkillCandidate, SkillError>> + 'a>> {
         Box::pin(async move {
+            let dependencies = bridge_live_dependencies(&request)?;
             self.adapter
                 .propose(
                     ctx,
@@ -75,7 +101,7 @@ impl<U: SkillLifecycleApi> SkillLifecyclePort for BridgeSkillForwarder<U> {
                     request.candidate_package_digest().to_owned(),
                     request.action(),
                     request.evidence_refs().to_vec(),
-                    request.dependency_versions().to_vec(),
+                    dependencies,
                     request.scope().clone(),
                 )
                 .await

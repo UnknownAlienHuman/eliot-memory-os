@@ -42,8 +42,8 @@ use std::pin::Pin;
 use eliot_contracts::RequestMetadata;
 use eliot_controlboard::{ProposeSkillRequest, SkillLifecyclePort};
 use eliot_skill::{
-    ActivatedSkillDisplay, HotsetDeliveryAck, HotsetDeliveryReceipt, KnownTools, SkillCandidate,
-    SkillError, SkillLifecycleApi, SkillLifecycleView,
+    ActivatedSkillDisplay, CanonicalToolSource, HotsetDeliveryAck, HotsetDeliveryReceipt,
+    KnownTools, SkillCandidate, SkillError, SkillLifecycleApi, SkillLifecycleView,
 };
 
 /// Forwards one [`SkillLifecyclePort`] to the single Governor skill owner.
@@ -108,6 +108,40 @@ impl<T: SkillLifecycleApi> SkillLifecyclePort for GovernorSkillForwarder<T> {
                 .await
         })
     }
+}
+
+/// Observes the live admitted Tool Definition version bound by the tool-owner
+/// source (issue #1882 W2/A2, `I7.13`).
+///
+/// Surface display driver: reads the definition version the live
+/// [`CanonicalToolSource`] binds at this call and requires it to equal the
+/// Governor-admitted version the install ran under. The returned borrow is
+/// caller-observed live content for this operation — the definition
+/// (contract) leg of the owning crate's [`LiveSkillWorld`](eliot_skill::LiveSkillWorld)
+/// (`live_definition_version`) — never synthesized and never a
+/// timer/startup fabrication. A blank live version or any drift refuses with
+/// the display path's existing typed field; the caller marks the entry stale.
+/// Typed failures stay typed.
+///
+/// `pub(crate)` for the documented stitch consumer: the bridge commit path
+/// (`skill_dispatch.rs`, owned by the unmerged sibling branch — do not wire
+/// it here) assembles the full world from this leg plus the bridge
+/// dependency-set and lifecycle host/profile legs. (The tool-owner
+/// [`KnownTools`] view itself already travels caller-observed on every
+/// display call, so it needs no producer: this leg covers the version half
+/// of the surface terms.)
+pub(crate) fn surface_live_definition_version<'a>(
+    display_source: &'a dyn CanonicalToolSource,
+    admitted_definition_version: &str,
+) -> Result<&'a str, SkillError> {
+    let live = display_source.definition_version();
+    if live.trim().is_empty() || live != admitted_definition_version {
+        return Err(SkillError::InvalidField {
+            field: "tools.definition_version",
+            reason: "the live tool source no longer binds the admitted definition version",
+        });
+    }
+    Ok(live)
 }
 
 #[cfg(test)]
