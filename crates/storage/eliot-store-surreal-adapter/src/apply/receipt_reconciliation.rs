@@ -168,6 +168,10 @@ pub(super) async fn read_receipt_by_operation(
     if let Some(receipt) = &receipt {
         receipt.validate()?;
         receipt.require_reconciliation_envelope()?;
+        let causal = read_causal_replay(db, config, operation_id, receipt).await?;
+        if receipt.require_reconciliation_envelope()?.core.causal != *causal.binding() {
+            return Err(AdapterError::Store(StoreError::InvalidReceipt));
+        }
     }
     Ok(receipt)
 }
