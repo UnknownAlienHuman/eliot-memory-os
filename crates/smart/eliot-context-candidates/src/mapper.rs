@@ -601,8 +601,13 @@ fn collect_epistemic(
     // contribution to frame, so it keeps the recipe's registered slot.
     let registered = match input.position.currentness {
         Currentness::Current => {
+            // The refusal keeps the owner's field name. `from_position` fails
+            // on the POSITION it is handed, and `derive_epistemic` refuses the
+            // same defect as `epistemic.position` (`derive.rs`), so mapping it
+            // to a second field name here would make the same bad input report
+            // two different identities depending on which stage saw it first.
             let contribution = EpistemicContextContribution::from_position(&input.position)
-                .map_err(|_| ContextError::InvalidField("epistemic.contribution"))?;
+                .map_err(|_| ContextError::InvalidField("epistemic.position"))?;
             registered_slot_for(contribution.provider.as_str())?
         }
         // Only a CURRENT position is re-derived through the provider
