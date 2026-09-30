@@ -9611,7 +9611,7 @@ impl KernelComposition {
     /// (`bins/eliot-user-broker/src/main.rs::serve_operator_pipe_connection`),
     /// which compares this echoed evidence with the OS-observed peer before it
     /// accepts any redemption.
-    fn operator_session_token_operation(
+    pub(crate) fn operator_session_token_operation(
         &self,
         session: &Session,
         payload: serde_json::Value,
