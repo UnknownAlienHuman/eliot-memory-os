@@ -3018,7 +3018,7 @@ pub fn admit_named_mutation_capture(
 }
 
 /// Admits one task-bound prepared transition with the original owner-issued
-/// selection, an independently retained WorkScope binding, the observed Host
+/// selection, an independently retained `WorkScope` binding, the observed Host
 /// scope, and the current fence (issue #1929, W2/W3/W4).
 ///
 /// The caller performs [`admit_named_mutation_capture`] first and invokes this
@@ -3029,7 +3029,7 @@ pub fn admit_named_mutation_capture(
 /// issuer; none of its task, principal, session, revision, digest, scope, or
 /// fence terms are derived from the evidence being checked. Compatibility is
 /// admitted only after those independent terms match exactly and the Host
-/// observation passes the WorkScope identity guard.
+/// observation passes the `WorkScope` identity guard.
 pub fn admit_prepared_transition_with_owner_selection(
     context: &RequestMetadata,
     transition: &PreparedTransition,
@@ -3095,6 +3095,41 @@ pub fn admit_prepared_transition_with_owner_selection(
         ))
     })?;
 
+    admit_prepared_selection_payload(transition, owner)?;
+
+    if request_scope_ref != transition.scope_id.as_str()
+        || owner.work_scope().binding.scope.scope_ref != request_scope_ref
+        || evidence.work_scope_ref != request_scope_ref
+    {
+        return Err(TaskBindingError::scope_incompatible(
+            "prepared transition, owner selection, and current WorkScope differ",
+        ));
+    }
+    if !eliot_contracts::fences_match_exact(owner.state_fence(), live_fence)
+        || !eliot_contracts::fences_match_exact(&expected_scope.state_fence, live_fence)
+        || !eliot_contracts::fences_match_exact(&context.state_fence, live_fence)
+        || !eliot_contracts::fences_match_exact(&transition.state_fence, live_fence)
+    {
+        return Err(TaskBindingError::scope_incompatible(
+            "owner selection, request, prepared transition, WorkScope snapshot, and live fence do not match",
+        ));
+    }
+
+    admit_task_bound_with_observed_scope(
+        Some(evidence),
+        &admitted_task_ref,
+        &expected_scope.binding,
+        observed_scope,
+        live_fence,
+        CompatibilityDisposition::Compatible,
+    )
+}
+
+fn admit_prepared_selection_payload(
+    transition: &PreparedTransition,
+    owner: &TaskSelectionAdmissionBinding,
+) -> Result<(), TaskBindingError> {
+    let evidence = owner.evidence();
     let task_bound_capture = transition.task_id.is_some();
     let mut found_bound_operation = false;
     for named in &transition.named_operations {
@@ -3158,32 +3193,7 @@ pub fn admit_prepared_transition_with_owner_selection(
         ));
     }
 
-    if request_scope_ref != transition.scope_id.as_str()
-        || owner.work_scope().binding.scope.scope_ref != request_scope_ref
-        || evidence.work_scope_ref != request_scope_ref
-    {
-        return Err(TaskBindingError::scope_incompatible(
-            "prepared transition, owner selection, and current WorkScope differ",
-        ));
-    }
-    if !eliot_contracts::fences_match_exact(owner.state_fence(), live_fence)
-        || !eliot_contracts::fences_match_exact(&expected_scope.state_fence, live_fence)
-        || !eliot_contracts::fences_match_exact(&context.state_fence, live_fence)
-        || !eliot_contracts::fences_match_exact(&transition.state_fence, live_fence)
-    {
-        return Err(TaskBindingError::scope_incompatible(
-            "owner selection, request, prepared transition, WorkScope snapshot, and live fence do not match",
-        ));
-    }
-
-    admit_task_bound_with_observed_scope(
-        Some(evidence),
-        &admitted_task_ref,
-        &expected_scope.binding,
-        observed_scope,
-        live_fence,
-        CompatibilityDisposition::Compatible,
-    )
+    Ok(())
 }
 
 /// Observes one explicit workspace root and admits one task-relative
