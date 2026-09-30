@@ -19,7 +19,7 @@
 
 use eliot_contracts::{RequestMetadata, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_read::{LocalReadPort, QueryResult, ReadError};
-use eliot_store_api::ScopeId;
+use eliot_store_api::{NamedReadOperation, ScopeId};
 use serde::Serialize;
 use thiserror::Error;
 
@@ -85,6 +85,9 @@ pub enum DreamerMaterialsError {
     /// The fence does not equal the admitted fence.
     #[error("orientation material fence does not match the admitted fence")]
     FenceMismatch,
+    /// The named-read response does not identify the exact requested subject and scope.
+    #[error("orientation source readback does not match its requested selector")]
+    SelectorMismatch,
     /// Byte accounting overflowed.
     #[error("orientation material byte accounting overflowed")]
     Overflow,
@@ -386,6 +389,14 @@ pub async fn resolve_source_claim_with_readback(
         .await?;
     if result.state_fence != ctx.state_fence {
         return Err(DreamerMaterialsError::FenceMismatch);
+    }
+    if result.operation != NamedReadOperation::GetEvidencePack
+        || result.payload.get("subject").and_then(serde_json::Value::as_str)
+            != Some(claim.source_handle.as_str())
+        || result.payload.get("scope_id").and_then(serde_json::Value::as_str)
+            != Some(scope.as_str())
+    {
+        return Err(DreamerMaterialsError::SelectorMismatch);
     }
     let bytes = canonical_json_bytes(&result.payload)
         .map_err(|_| DreamerMaterialsError::ManifestEncoding)?;
@@ -704,7 +715,11 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let fence = test_fence()?;
         let payload =
-            serde_json::json!({"records": [{"capture_index": 0}], "subject": "evidence-a"});
+            serde_json::json!({
+                "records": [{"capture_index": 0}],
+                "subject": "evidence-a",
+                "scope_id": "scope-one"
+            });
         let bytes = canonical_json_bytes(&payload)?;
         let claim = test_claim("evidence-a", &bytes);
         let scope = ScopeId::new("scope-one")?;
