@@ -1431,8 +1431,7 @@ impl DaemonKernelClient {
                 // correlation plus snapshot/admission validation, so
                 // `validated` is observed, never fabricated. The non-windows
                 // leg below is an error leg, so it has no success record.
-                let _ =
-                    crate::diagnostics::emit_kernel_handshake(&client.connection_id, true);
+                let _ = crate::diagnostics::emit_kernel_handshake(&client.connection_id, true);
                 Ok(Arc::new(client))
             }
             #[cfg(not(windows))]

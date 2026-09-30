@@ -710,8 +710,8 @@ pub(super) fn run() -> Result<(), String> {
         event = "eliotd.canonical_layer_schema_published",
         schema = eliotd::canonical_layer_json_schema_pretty(),
     );
-    let kernel =
-        DaemonKernelClient::connect(&config).map_err(|error| pre_loop_failure(error.to_string()))?;
+    let kernel = DaemonKernelClient::connect(&config)
+        .map_err(|error| pre_loop_failure(error.to_string()))?;
     let authority_activation = eliotd::kernel_authority_port(&kernel);
     let mut composition = DaemonComposition::start(
         config,
