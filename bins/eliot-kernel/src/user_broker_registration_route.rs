@@ -35,7 +35,8 @@ use super::{
 pub(crate) const USER_BROKER_MODULE_ID: &str = "eliot-user-broker";
 pub(crate) const USER_BROKER_REGISTER_OPERATION: &str = "eliot.user-broker.register";
 pub(crate) const USER_BROKER_HEARTBEAT_OPERATION: &str = "eliot.user-broker.heartbeat";
-pub(crate) const USER_BROKER_AUTHORIZE_LAUNCH_OPERATION: &str = "eliot.user-broker.authorize-launch";
+pub(crate) const USER_BROKER_AUTHORIZE_LAUNCH_OPERATION: &str =
+    "eliot.user-broker.authorize-launch";
 pub(crate) const USER_BROKER_FENCE_OPERATION: &str = "eliot.user-broker.fence";
 pub(crate) const USER_BROKER_VALIDATE_NATIVE_RESOURCE_SELECTION_CURRENT_OPERATION: &str =
     "eliot.user-broker.validate-native-resource-selection-current";
