@@ -1248,10 +1248,7 @@ fn classify_evidence_payload(payload: &Value, scope: &ScopeId, subject: &str) ->
     // captured-Blob consumer. Version 1 remains structurally readable, while
     // the source-read route separately requires that causal field before it
     // can issue a current read admission.
-    if !matches!(
-        payload.get("version").and_then(Value::as_u64),
-        Some(1 | 2)
-    ) {
+    if !matches!(payload.get("version").and_then(Value::as_u64), Some(1 | 2)) {
         return unavailable("unsupported evidence pack version");
     }
     if payload.get("subject").and_then(Value::as_str) != Some(subject) {

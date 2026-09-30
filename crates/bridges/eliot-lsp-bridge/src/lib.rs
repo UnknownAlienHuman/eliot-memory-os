@@ -3146,8 +3146,7 @@ pub fn adopt_captured_observation_from_blob_readback(
     readback: &BlobReadChunk,
 ) -> Result<(RetainedLspObservationV1, NormalizedResult), BridgeError> {
     readback.validate()?;
-    let record: RetainedLspObservationV1 =
-        serde_json::from_slice(readback.bytes())?;
+    let record: RetainedLspObservationV1 = serde_json::from_slice(readback.bytes())?;
     validate_retained_observation(&record)?;
     let result = record.result.clone();
     Ok((record, result))
