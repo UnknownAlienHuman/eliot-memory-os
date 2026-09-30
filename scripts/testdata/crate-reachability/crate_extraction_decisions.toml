@@ -212,11 +212,11 @@ source_ref = "Own module.toml consumers=[TaskGraphCompiler, Governor, Agent Coor
 [[decision]]
 package = "eliot-epistemic-context-provider"
 disposition = "Connect"
-rationale = "Own module.toml consumers=[eliot-context-candidates] (root member, R5); issue #1720 controller wiring map (2026-09-16 comment: per-crate declared-consumer table). Edge unwired as of registry revision: no Cargo edge and no production source-construction site exists today (measured: reverse edges 0, production source_consumers 0). This row is the wiring promise, not the wire."
+rationale = "Own module.toml consumers=[eliot-context-candidates] (root member, R5); issue #1720 controller wiring map (2026-09-16 comment: per-crate declared-consumer table). Edge WIRED as of this registry revision: the declared consumer crates/smart/eliot-context-candidates declares the Cargo dependency, and its declared canonical path crates/smart/eliot-context-candidates/src/mapper.rs::collect_epistemic invokes the capability through crates/smart/eliot-context-candidates/src/provider_registry.rs::registered_slot_for (impl) and EpistemicContextContribution::from_position (caller) on the admitted Current Epistemic Position. That consumer is itself reachable from bins/eliotd and bins/eliot-dreamer, so the wire terminates in a binary. This row records the measured wire, not the promise."
 declared_consumer = "eliot-context-candidates"
 declared_bundle = "eliotd"
 review_owner = "Workspace topology and C4 composition owners (issue #1720)"
-source_ref = "Own module.toml consumers=[eliot-context-candidates] (root member, R5); issue #1720 controller wiring map (2026-09-16 comment: per-crate declared-consumer table)"
+source_ref = "Own module.toml consumers=[eliot-context-candidates] (root member, R5); issue #1720 controller wiring map (2026-09-16 comment: per-crate declared-consumer table); wire measured in crates/smart/eliot-context-candidates/Cargo.toml and crates/smart/eliot-context-candidates/src/mapper.rs::collect_epistemic"
 
 [[decision]]
 package = "eliot-dreamer-research-synthesis"
