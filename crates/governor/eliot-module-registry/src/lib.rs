@@ -91,6 +91,8 @@ pub enum ModuleError {
     RevisionConflict,
     #[error("module catalog entry not found")]
     NotFound,
+    #[error("module generation admission receipt has not been read back from its owner")]
+    AdmissionReceiptUnverified,
     #[error("module catalog operation identity conflict")]
     IdentityConflict,
     #[error("module catalog serialization failed: {0}")]
@@ -269,6 +271,199 @@ impl CapabilityIntent {
     }
 }
 
+/// Governor-owned route scope for one admitted module capability.
+///
+/// The coordinates are source policy. The stable hash binds those coordinates
+/// for the Kernel projection; it is never used to reconstruct them.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModuleCapabilityRouteScope {
+    pub module_id: ModuleId,
+    pub capability_id: CapabilityId,
+    pub work_scope: String,
+    pub effect_domain: String,
+    pub route_scope_hash: String,
+}
+
+impl ModuleCapabilityRouteScope {
+    /// Declares an exact route scope and binds its stable hash.
+    pub fn declare(
+        module_id: ModuleId,
+        capability_id: CapabilityId,
+        work_scope: impl Into<String>,
+        effect_domain: impl Into<String>,
+    ) -> Result<Self, ModuleError> {
+        let mut value = Self {
+            module_id,
+            capability_id,
+            work_scope: work_scope.into(),
+            effect_domain: effect_domain.into(),
+            route_scope_hash: String::new(),
+        };
+        value.route_scope_hash = value.computed_hash()?;
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn computed_hash(&self) -> Result<String, ModuleError> {
+        text(self.module_id.as_str(), "route_scope.module_id")?;
+        text(self.capability_id.as_str(), "route_scope.capability_id")?;
+        text(&self.work_scope, "route_scope.work_scope")?;
+        text(&self.effect_domain, "route_scope.effect_domain")?;
+        let identity = format!(
+            "{}\0{}\0{}\0{}",
+            self.module_id, self.capability_id, self.work_scope, self.effect_domain
+        );
+        Ok(sha256_hex(identity.as_bytes()))
+    }
+
+    pub fn validate(&self) -> Result<(), ModuleError> {
+        digest(&self.route_scope_hash, "route_scope.route_scope_hash")?;
+        if self.computed_hash()? != self.route_scope_hash {
+            return Err(ModuleError::IdentityConflict);
+        }
+        Ok(())
+    }
+}
+
+/// Windows Job Object policy values owned by the admitted Module Manifest.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModuleResourceLimits {
+    pub job_object_policy: String,
+    pub max_processes: u32,
+    pub max_working_set_bytes: u64,
+    pub cpu_rate_control_percent: u16,
+}
+
+impl ModuleResourceLimits {
+    fn validate(&self) -> Result<(), ModuleError> {
+        text(&self.job_object_policy, "resource_limits.job_object_policy")?;
+        if self.max_processes == 0 {
+            return Err(ModuleError::InvalidField {
+                field: "resource_limits.max_processes",
+                reason: "must be greater than zero",
+            });
+        }
+        if self.max_working_set_bytes == 0 {
+            return Err(ModuleError::InvalidField {
+                field: "resource_limits.max_working_set_bytes",
+                reason: "must be greater than zero",
+            });
+        }
+        if !(1..=100).contains(&self.cpu_rate_control_percent) {
+            return Err(ModuleError::InvalidField {
+                field: "resource_limits.cpu_rate_control_percent",
+                reason: "must be between 1 and 100",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Bounded module restart budget and its quarantine disposition.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModuleRestartBudget {
+    pub max_restarts: u32,
+    pub quarantine_rule: String,
+}
+
+impl ModuleRestartBudget {
+    fn validate(&self) -> Result<(), ModuleError> {
+        if self.max_restarts == 0 {
+            return Err(ModuleError::InvalidField {
+                field: "restart_budget.max_restarts",
+                reason: "must be greater than zero",
+            });
+        }
+        text(&self.quarantine_rule, "restart_budget.quarantine_rule")
+    }
+}
+
+/// State-class behavior declared for a generation cutover.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModuleStateClassBehavior {
+    RetainCompatible,
+    CheckpointTransfer,
+    RebuildFromSnapshot,
+    ForwardRepairRequired,
+}
+
+/// Explicit source-owned execution values copied into a Kernel projection.
+///
+/// This policy is stored with the desired Module Manifest. Preparation reads
+/// the exact admitted row and supplies no defaults. It grants no activation
+/// authority; Kernel still owns generation admission and route cutover.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GenerationExecutionPolicy {
+    pub policy_revision: u64,
+    pub allowed_route_scopes: Vec<ModuleCapabilityRouteScope>,
+    pub resource_limits: ModuleResourceLimits,
+    pub restart_budget: ModuleRestartBudget,
+    pub state_class_behavior: ModuleStateClassBehavior,
+}
+
+impl GenerationExecutionPolicy {
+    pub fn validate(&self) -> Result<(), ModuleError> {
+        if self.policy_revision == 0 {
+            return Err(ModuleError::InvalidField {
+                field: "execution_policy.policy_revision",
+                reason: "must be greater than zero",
+            });
+        }
+        self.resource_limits.validate()?;
+        self.restart_budget.validate()?;
+        unique(
+            self.allowed_route_scopes
+                .iter()
+                .map(|scope| scope.route_scope_hash.clone()),
+            "execution_policy.allowed_route_scopes",
+        )?;
+        for scope in &self.allowed_route_scopes {
+            scope.validate()?;
+        }
+        Ok(())
+    }
+
+    fn validate_for_module(
+        &self,
+        module_id: &ModuleId,
+        manifest: &ModuleManifest,
+    ) -> Result<(), ModuleError> {
+        self.validate()?;
+        for scope in &self.allowed_route_scopes {
+            if &scope.module_id != module_id {
+                return Err(ModuleError::IdentityConflict);
+            }
+            let intent = manifest
+                .capability_intents
+                .iter()
+                .find(|intent| intent.capability_id == scope.capability_id)
+                .ok_or(ModuleError::IdentityConflict)?;
+            if !intent
+                .allowed_scopes
+                .iter()
+                .any(|allowed| allowed == &scope.work_scope)
+                || !manifest.effect_ceiling.admits(intent.effect_ceiling)
+            {
+                return Err(ModuleError::IdentityConflict);
+            }
+        }
+        if manifest.effect_ceiling == EffectCeiling::EffectExactLease
+            && self.allowed_route_scopes.is_empty()
+        {
+            return Err(ModuleError::InvalidField {
+                field: "execution_policy.allowed_route_scopes",
+                reason: "effect-capable generations require an admitted route scope",
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Desired execution description. It carries references and hashes, never
 /// secret values, process handles, or a mutable route.
 ///
@@ -294,6 +489,10 @@ pub struct ModuleManifest {
     pub restart_authorization: RestartAuthorization,
     pub restart_policy: Option<RestartPolicyV1>,
     pub approved_scope_refs: Vec<String>,
+    /// Source-owned values required to prepare a Kernel execution projection.
+    /// Absence remains explicit and never selects runtime defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_policy: Option<GenerationExecutionPolicy>,
     pub manifest_digest: String,
 }
 
@@ -328,11 +527,25 @@ impl ModuleManifest {
             restart_authorization,
             restart_policy,
             approved_scope_refs,
+            execution_policy: None,
             manifest_digest: String::new(),
         };
         value.manifest_digest = value.identity_digest()?;
         value.validate()?;
         Ok(value)
+    }
+
+    /// Adds explicit source-owned execution values and rebinds the manifest
+    /// digest to the complete declaration.
+    pub fn with_execution_policy(
+        mut self,
+        execution_policy: GenerationExecutionPolicy,
+    ) -> Result<Self, ModuleError> {
+        execution_policy.validate()?;
+        self.execution_policy = Some(execution_policy);
+        self.manifest_digest = self.identity_digest()?;
+        self.validate()?;
+        Ok(self)
     }
 
     fn identity_digest(&self) -> Result<String, ModuleError> {
@@ -349,6 +562,8 @@ impl ModuleManifest {
             restart_authorization: RestartAuthorization,
             restart_policy: &'a Option<RestartPolicyV1>,
             approved_scope_refs: &'a [String],
+            #[serde(skip_serializing_if = "Option::is_none")]
+            execution_policy: &'a Option<GenerationExecutionPolicy>,
         }
 
         digest_value(&Identity {
@@ -363,6 +578,7 @@ impl ModuleManifest {
             restart_authorization: self.restart_authorization,
             restart_policy: &self.restart_policy,
             approved_scope_refs: &self.approved_scope_refs,
+            execution_policy: &self.execution_policy,
         })
     }
 
@@ -377,6 +593,12 @@ impl ModuleManifest {
                 .iter()
                 .map(|dependency| dependency.module_id.clone()),
             "dependencies.module_id",
+        )?;
+        unique(
+            self.dependencies
+                .iter()
+                .map(|dependency| dependency.startup_order),
+            "dependencies.startup_order",
         )?;
         for dependency in &self.dependencies {
             dependency.validate()?;
@@ -405,9 +627,20 @@ impl ModuleManifest {
         for scope in &self.approved_scope_refs {
             text(scope, "approved_scope_ref")?;
         }
+        if let Some(policy) = &self.execution_policy {
+            policy.validate()?;
+        }
         digest(&self.manifest_digest, "manifest_digest")?;
         if self.identity_digest()? != self.manifest_digest {
             return Err(ModuleError::IdentityConflict);
+        }
+        Ok(())
+    }
+
+    fn validate_for_module(&self, module_id: &ModuleId) -> Result<(), ModuleError> {
+        self.validate()?;
+        if let Some(policy) = &self.execution_policy {
+            policy.validate_for_module(module_id, self)?;
         }
         Ok(())
     }
@@ -621,6 +854,7 @@ impl GenerationAdmission {
             || self.catalog_revision != self.execution.accepted_catalog_revision
             || self.candidate.module_id != self.execution.module_id
             || self.candidate.candidate_id != self.execution.generation_id
+            || self.admission_receipt != self.execution.accepted_catalog_receipt
         {
             return Err(ModuleError::IdentityConflict);
         }
@@ -650,7 +884,7 @@ pub struct ModuleCatalogEntry {
 
 impl ModuleCatalogEntry {
     pub fn validate(&self) -> Result<(), ModuleError> {
-        self.manifest.validate()?;
+        self.manifest.validate_for_module(&self.module_id)?;
         self.restart_policy_disposition
             .validate()
             .map_err(|error| ModuleError::Contract(error.to_string()))?;
@@ -736,7 +970,9 @@ impl ModuleCatalogChange {
             text(approval, "approval_ref")?;
         }
         match &self.mutation {
-            CatalogMutation::Upsert { manifest, .. } => manifest.validate()?,
+            CatalogMutation::Upsert { manifest, .. } => {
+                manifest.validate_for_module(&self.module_id)?;
+            }
             CatalogMutation::SetState { removal_reason, .. } => {
                 if let Some(reason) = removal_reason {
                     text(reason, "removal_reason")?;
@@ -1159,13 +1395,10 @@ impl ModuleCatalog {
     /// catalog's current revision and state fence.
     ///
     /// The order inside an arm is the order of the checks the catalog relies
-    /// on, and each arm is refused before it replaces anything: the entry must
-    /// exist, the admitted policy must exist, the candidate must match the
-    /// manifest on every bound field, and only then is the new entry validated
-    /// and returned. Only a generation acceptance replaces a running module,
-    /// so only that arm selects affected dependents, and it records the
-    /// trigger and the selection together; `Upsert` and `SetState` change
-    /// desired state and invalidate nothing that is already running.
+    /// on, and each arm is refused before it replaces anything. Caller-supplied
+    /// generation admissions remain refused until the owner receipt can be read
+    /// back; desired-state `Upsert` and `SetState` change no accepted generation
+    /// and invalidate nothing that is already running.
     fn apply_mutation(
         &self,
         module_id: &ModuleId,
@@ -1208,72 +1441,11 @@ impl ModuleCatalog {
                 current.validate()?;
                 Ok(AppliedCatalogMutation::without_invalidation(current))
             }
-            CatalogMutation::AcceptGeneration { admission } => {
-                let mut current = entry.ok_or(ModuleError::NotFound)?;
-                // The accepted generation is bound to the admitted policy
-                // digest. A withheld disposition permits no automatic restart
-                // and names no policy at all, so no generation is admitted
-                // under it: accepting one would put a running child under an
-                // unadmitted restart policy, which is precisely the wider
-                // authority the disposition refuses.
-                let expected_policy_digest = admitted_policy_digest(&current)?;
-                if admission.candidate.module_id != *module_id
-                    || admission.state_fence != self.state_fence
-                    || admission.catalog_revision != self.revision
-                    || admission.candidate.artifact_digest != current.manifest.artifact_digest
-                    || admission.candidate.config_digest != current.manifest.config_digest
-                    || admission.candidate.protocol_digest != current.manifest.protocol_digest
-                    || admission.execution.artifact_digest != current.manifest.artifact_digest
-                    || admission.execution.config_digest != current.manifest.config_digest
-                    || admission.execution.protocol_digest != current.manifest.protocol_digest
-                    || admission.execution.command_ref != current.manifest.command_ref
-                    || admission.execution.health_contract_ref
-                        != current.manifest.health_contract_ref
-                    || admission.execution.effect_ceiling != current.manifest.effect_ceiling
-                    || admission.execution.restart_authorization
-                        != current.manifest.restart_authorization
-                    || admission.execution.restart_policy_digest != expected_policy_digest
-                {
-                    return Err(ModuleError::IdentityConflict);
-                }
-                current.accepted_generation = Some(admission.clone());
-                current.catalog_revision = self.revision + 1;
-                current.state_fence = self.state_fence.clone();
-                current.validate()?;
-                // A new generation is a new protocol identity for this module,
-                // so every dependent that declared `RequiredProtocolDigestMismatch`
-                // on it is genuinely invalidated and must be recovered with it.
-                // The set is derived from the declared edges here; no caller
-                // supplies it, so it cannot be a copy of the caller's intent.
-                let trigger = RestartInvalidationTrigger::RequiredProtocolDigestMismatch;
-                let invalidated_dependents =
-                    self.select_invalidation_dependents(module_id, trigger)?;
-                Ok(AppliedCatalogMutation {
-                    entry: current,
-                    invalidated_dependents,
-                    invalidation_trigger: Some(trigger),
-                })
+            CatalogMutation::AcceptGeneration { .. } => {
+                Err(ModuleError::AdmissionReceiptUnverified)
             }
         }
     }
-}
-
-/// The policy digest an entry's accepted generation must be bound to.
-///
-/// This is the single definition of that digest, shared by admission and by
-/// every later read, so a generation cannot be admitted under one policy
-/// revision and supervised under another. A withheld disposition has no policy
-/// to name, so it is refused here: the caller cannot mint a digest for a
-/// declaration the catalog never admitted.
-fn admitted_policy_digest(entry: &ModuleCatalogEntry) -> Result<String, ModuleError> {
-    if !entry.restart_policy_disposition.permits_automatic_restart() {
-        return Err(ModuleError::IdentityConflict);
-    }
-    entry
-        .restart_policy_disposition
-        .policy_digest()
-        .map(str::to_owned)
-        .ok_or(ModuleError::IdentityConflict)
 }
 
 /// A manifest that declares itself as its own dependency is refused, because
