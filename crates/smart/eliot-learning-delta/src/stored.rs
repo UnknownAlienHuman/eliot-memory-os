@@ -56,11 +56,10 @@ pub fn repeated_verifier_failure_ref(verifier: &str) -> Result<ArtifactId, Learn
             field: "repeated_verifier_failure.verifier",
         });
     }
-    ArtifactId::new(format!(
-        "{REPEATED_VERIFIER_FAILURE_REF_PREFIX}{verifier}"
-    ))
-    .map_err(|_| LearningDeltaError::InvalidInput {
-        field: "repeated_verifier_failure.verifier",
+    ArtifactId::new(format!("{REPEATED_VERIFIER_FAILURE_REF_PREFIX}{verifier}")).map_err(|_| {
+        LearningDeltaError::InvalidInput {
+            field: "repeated_verifier_failure.verifier",
+        }
     })
 }
 
