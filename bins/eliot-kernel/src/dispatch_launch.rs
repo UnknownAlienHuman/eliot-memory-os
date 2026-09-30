@@ -3389,7 +3389,9 @@ fn begin_native_worker_process_start(
         || executable_file_identity.1 == 0
         || deadline_unix_ms <= super::unix_ms()
         || launches.native_worker_pending_starts.contains_key(claim_id)
-        || launches.native_worker_process_receipts.contains_key(claim_id)
+        || launches
+            .native_worker_process_receipts
+            .contains_key(claim_id)
     {
         return Err(DispatchLaunchError::Inconsistent(
             "native worker pending process terms do not match the reserved claim".to_owned(),
@@ -3416,16 +3418,12 @@ fn discard_native_worker_process_start_pending(
     contour: &'static ComposedDispatchContour,
     claim_id: &str,
 ) {
-    let removed = contour
-        .launches
-        .lock()
-        .ok()
-        .is_some_and(|mut launches| {
-            launches
-                .native_worker_pending_starts
-                .remove(claim_id)
-                .is_some()
-        });
+    let removed = contour.launches.lock().ok().is_some_and(|mut launches| {
+        launches
+            .native_worker_pending_starts
+            .remove(claim_id)
+            .is_some()
+    });
     if removed {
         NATIVE_WORKER_PROCESS_START_CHANGED.notify_all();
     }
@@ -3510,17 +3508,15 @@ fn retain_native_worker_process_start(
         ));
     }
     retain_launch_record(&mut launches, record);
-    launches
-        .native_worker_process_receipts
-        .insert(
-            identity.clone(),
-            NativeWorkerProcessStartReceipt {
-                receipt: process_receipt,
-                activation_epoch,
-                activation_generation,
-                executable_file_identity,
-            },
-        );
+    launches.native_worker_process_receipts.insert(
+        identity.clone(),
+        NativeWorkerProcessStartReceipt {
+            receipt: process_receipt,
+            activation_epoch,
+            activation_generation,
+            executable_file_identity,
+        },
+    );
     let pending = launches.native_worker_pending_starts.remove(&identity);
     drop(launches);
     if pending.is_some() {
@@ -3654,24 +3650,28 @@ pub(crate) fn wait_for_native_worker_process_start(
         .ok_or(DispatchLaunchError::Uncomposed("native-worker front door"))?;
     let mut launches = launches_table(contour)?;
     loop {
-        let mut matching = launches
-            .native_worker_process_receipts
-            .iter()
-            .filter_map(|(claim_id, receipt)| {
-                let retained = launches.by_identity.get(claim_id)?;
-                if retained.kind != DispatchedWorkerKind::NativeWorker
-                    || retained.phase != LaunchPhase::Launched
-                    || retained.nonce != launch_nonce
-                {
-                    return None;
-                }
-                let physical = receipt.receipt.identity().physical();
-                (peer.process_id() == physical.process_id()
-                    && peer.start_time_100ns() == physical.start_time_100ns()
-                    && peer.executable_file_identity() == Some(receipt.executable_file_identity)
-                    && peer.image_path().eq_ignore_ascii_case(physical.image_path()))
-                .then_some(claim_id.as_str())
-        });
+        let mut matching =
+            launches
+                .native_worker_process_receipts
+                .iter()
+                .filter_map(|(claim_id, receipt)| {
+                    let retained = launches.by_identity.get(claim_id)?;
+                    if retained.kind != DispatchedWorkerKind::NativeWorker
+                        || retained.phase != LaunchPhase::Launched
+                        || retained.nonce != launch_nonce
+                    {
+                        return None;
+                    }
+                    let physical = receipt.receipt.identity().physical();
+                    (peer.process_id() == physical.process_id()
+                        && peer.start_time_100ns() == physical.start_time_100ns()
+                        && peer.executable_file_identity()
+                            == Some(receipt.executable_file_identity)
+                        && peer
+                            .image_path()
+                            .eq_ignore_ascii_case(physical.image_path()))
+                    .then_some(claim_id.as_str())
+                });
         if matching.next().is_some() {
             if matching.next().is_some() {
                 return Err(DispatchLaunchError::Inconsistent(
@@ -3680,21 +3680,22 @@ pub(crate) fn wait_for_native_worker_process_start(
             }
             return Ok(());
         }
-        let mut pending_matches = launches
-            .native_worker_pending_starts
-            .iter()
-            .filter(|(claim_id, pending)| {
-                launches.by_identity.get(*claim_id).is_some_and(|record| {
-                    record.kind == DispatchedWorkerKind::NativeWorker
-                        && record.phase == LaunchPhase::Reserved
-                        && record.operation_id == pending.operation_id
-                        && record.nonce == pending.launch_nonce
-                        && pending.launch_nonce == launch_nonce
-                }) && peer.executable_file_identity() == Some(pending.executable_file_identity)
-                    && peer
-                        .image_path()
-                        .eq_ignore_ascii_case(pending.executable_path.to_string_lossy().as_ref())
-            });
+        let mut pending_matches =
+            launches
+                .native_worker_pending_starts
+                .iter()
+                .filter(|(claim_id, pending)| {
+                    launches.by_identity.get(*claim_id).is_some_and(|record| {
+                        record.kind == DispatchedWorkerKind::NativeWorker
+                            && record.phase == LaunchPhase::Reserved
+                            && record.operation_id == pending.operation_id
+                            && record.nonce == pending.launch_nonce
+                            && pending.launch_nonce == launch_nonce
+                    }) && peer.executable_file_identity() == Some(pending.executable_file_identity)
+                        && peer.image_path().eq_ignore_ascii_case(
+                            pending.executable_path.to_string_lossy().as_ref(),
+                        )
+                });
         let Some((_, pending)) = pending_matches.next() else {
             return Err(DispatchLaunchError::Inconsistent(
                 "authenticated native worker peer has no retained or pending launch".to_owned(),
@@ -3742,24 +3743,27 @@ pub(crate) fn native_worker_process_start_binding_for_peer(
         .get()
         .ok_or(DispatchLaunchError::Uncomposed("native-worker front door"))?;
     let launches = launches_table(contour)?;
-    let mut matching = launches
-        .native_worker_process_receipts
-        .iter()
-        .filter_map(|(claim_id, receipt)| {
-            let retained = launches.by_identity.get(claim_id)?;
-            if retained.kind != DispatchedWorkerKind::NativeWorker
-                || retained.phase != LaunchPhase::Launched
-                || expected_claim_id.is_some_and(|expected| expected != claim_id.as_str())
-            {
-                return None;
-            }
-            let physical = receipt.receipt.identity().physical();
-            (peer.process_id() == physical.process_id()
-                && peer.start_time_100ns() == physical.start_time_100ns()
-                && peer.executable_file_identity() == Some(receipt.executable_file_identity)
-                && peer.image_path().eq_ignore_ascii_case(physical.image_path()))
-            .then_some(claim_id.as_str())
-        });
+    let mut matching =
+        launches
+            .native_worker_process_receipts
+            .iter()
+            .filter_map(|(claim_id, receipt)| {
+                let retained = launches.by_identity.get(claim_id)?;
+                if retained.kind != DispatchedWorkerKind::NativeWorker
+                    || retained.phase != LaunchPhase::Launched
+                    || expected_claim_id.is_some_and(|expected| expected != claim_id.as_str())
+                {
+                    return None;
+                }
+                let physical = receipt.receipt.identity().physical();
+                (peer.process_id() == physical.process_id()
+                    && peer.start_time_100ns() == physical.start_time_100ns()
+                    && peer.executable_file_identity() == Some(receipt.executable_file_identity)
+                    && peer
+                        .image_path()
+                        .eq_ignore_ascii_case(physical.image_path()))
+                .then_some(claim_id.as_str())
+            });
     let Some(claim_id) = matching.next().map(str::to_owned) else {
         return Err(DispatchLaunchError::Inconsistent(
             "authenticated native worker peer has no retained launched process".to_owned(),
@@ -3873,7 +3877,10 @@ fn mark_reconciled(
         record.phase = LaunchPhase::Reconciled;
     }
     launches.native_worker_process_receipts.remove(identity);
-    let pending = launches.native_worker_pending_starts.remove(identity).is_some();
+    let pending = launches
+        .native_worker_pending_starts
+        .remove(identity)
+        .is_some();
     drop(launches);
     if pending {
         NATIVE_WORKER_PROCESS_START_CHANGED.notify_all();
