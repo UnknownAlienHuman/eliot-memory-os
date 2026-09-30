@@ -9,12 +9,14 @@
 //! derive such an effect is refused by [`ProhibitedEffectAttempt::deny`], which
 //! is the only exit from an effect attempt and admits no class.
 
+use crate::risk::RiskRoute;
 use crate::signals::{
     AcknowledgementFact, CoverageRef, EvidenceRef, ExpectedRevision, ObservedTime, ProfileRevision,
     RecordedValue, ReopenCondition, RuleRevision, Signal, SignalAttribution, SignalDelivery,
     SignalDisposition, SignalId, SignalProcessing, SignalReferences, SignalRevision,
     SignalSeverity, SignalTarget, SourceEventRef,
 };
+use std::collections::BTreeSet;
 
 const HEALTH_RULE_REVISION: u64 = 1;
 
@@ -198,6 +200,45 @@ impl ProhibitedEffectAttempt {
         }
     }
 
+    /// Builds the attempt from the Diagnostic Brief the caller actually holds.
+    ///
+    /// The cited identity is the brief's own derived identity, reused through
+    /// the existing [`SignalId`] rather than a new identifier: the attempt must
+    /// name the output it cites, and no second identity scheme is introduced.
+    /// The only exit remains [`ProhibitedEffectAttempt::deny`].
+    #[must_use]
+    pub fn for_health_brief(
+        class: ProhibitedEffectClass,
+        brief: &HealthDiagnosticBrief,
+        subject: String,
+    ) -> Self {
+        Self {
+            output: HealthOutputFamily::DiagnosticBrief,
+            class,
+            signal_id: SignalId(brief.brief_id.clone()),
+            subject,
+        }
+    }
+
+    /// Builds the attempt from the bounded analysis request the caller holds.
+    ///
+    /// The cited identity is the owning brief's identity, so the attempt stays
+    /// anchored to the validated brief input rather than to a restated label.
+    /// The only exit remains [`ProhibitedEffectAttempt::deny`].
+    #[must_use]
+    pub fn for_health_analysis(
+        class: ProhibitedEffectClass,
+        request: &HealthAnalysisRequest,
+        subject: String,
+    ) -> Self {
+        Self {
+            output: HealthOutputFamily::AnalysisRequest,
+            class,
+            signal_id: SignalId(request.brief_id.clone()),
+            subject,
+        }
+    }
+
     /// Refuses the attempt.
     ///
     /// This is the only exit from an effect attempt against a health output:
@@ -371,9 +412,98 @@ pub struct ContextQualityDrift {
     pub counterevidence: Vec<EvidenceRef>,
 }
 
+/// Owner-projected Safety Floor presence for one context observation pair.
+///
+/// STITCH copies this from the applicable owner policy evaluation: whether the
+/// context packet applied to this pair carried the owner-required Safety Floor.
+/// The core reads no policy store; an unknown projection stays
+/// [`HealthNoSignalReason::OwnerEvidenceUnknown`], never a substituted value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SafetyFloorPresence {
+    /// The owner projection establishes the Safety Floor was present.
+    Present,
+    /// The owner projection establishes the Safety Floor was missing.
+    Missing,
+    /// The owner projection cannot establish Safety Floor presence.
+    Unknown,
+}
+
+/// Owner-projected scope and freshness of the feedback applied to one pair.
+///
+/// STITCH copies this from the owning feedback record: whether the feedback the
+/// context packet carries applies to the observed scope and is fresh. A
+/// wrong-scope or stale projection is I08-18 pressure; an unknown projection
+/// stays [`HealthNoSignalReason::OwnerEvidenceUnknown`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FeedbackPlacement {
+    /// Feedback applies to the observed scope and is fresh.
+    InScopeFresh,
+    /// Feedback applies to a different scope than the one observed.
+    WrongScope,
+    /// Feedback applies to the observed scope but is stale.
+    Stale,
+    /// Scope or freshness cannot be established by the owner projection.
+    Unknown,
+}
+
+/// Owner-projected canonical context that completes one context-quality pair.
+///
+/// The packet/replay bounds in [`ContextQualityObservation`] carry the
+/// quantitative pressure; this context carries the two remaining I08-18
+/// canonical branches - missing Safety Floor and wrong-scope/stale feedback -
+/// as projected by their owners. Both sides are validated originals: unknown
+/// stays unknown.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContextQualityCanonicalContext {
+    /// Safety Floor presence projected by the applicable owner policy.
+    pub safety_floor: SafetyFloorPresence,
+    /// Feedback scope and freshness projected by the owning feedback record.
+    pub feedback: FeedbackPlacement,
+}
+
 /// Evaluates context drift using only the applicable owner-supplied bounds.
 pub fn evaluate_context_quality(
     observation: ContextQualityObservation,
+) -> Result<HealthDetection<ContextQualityDrift>, crate::signals::SignalValidationError> {
+    context_quality_with_pressure(observation, false)
+}
+
+/// Evaluates context drift with the I08-18 canonical Safety Floor and
+/// feedback branches included.
+///
+/// A missing Safety Floor or wrong-scope/stale feedback is pressure alongside
+/// an over-bound packet or replay count: it still requires stalled useful
+/// expansion, rising omission regret, and no acknowledged use before a signal
+/// opens, so the one-off large packet with acknowledged use stays silent. The
+/// shared core below is the single rule body; this entry only validates the
+/// canonical originals and names the extra pressure.
+pub fn evaluate_context_quality_with_canonical_context(
+    observation: ContextQualityObservation,
+    canonical: ContextQualityCanonicalContext,
+) -> Result<HealthDetection<ContextQualityDrift>, crate::signals::SignalValidationError> {
+    if canonical.safety_floor == SafetyFloorPresence::Unknown
+        || canonical.feedback == FeedbackPlacement::Unknown
+    {
+        return Ok(HealthDetection::NoSignal(
+            HealthNoSignalReason::OwnerEvidenceUnknown,
+        ));
+    }
+    let canonical_pressure = canonical.safety_floor == SafetyFloorPresence::Missing
+        || matches!(
+            canonical.feedback,
+            FeedbackPlacement::WrongScope | FeedbackPlacement::Stale
+        );
+    context_quality_with_pressure(observation, canonical_pressure)
+}
+
+/// Single shared body of the context-quality rule.
+///
+/// Both public entries evaluate here, so the pairwise guards, the
+/// acknowledged-use suppression, and the expansion/regret thresholds cannot
+/// drift between the bounds-only and the canonical-context projections.
+fn context_quality_with_pressure(
+    observation: ContextQualityObservation,
+    canonical_pressure: bool,
 ) -> Result<HealthDetection<ContextQualityDrift>, crate::signals::SignalValidationError> {
     if let Some(reason) = pair_no_signal_reason(&observation.pair) {
         return Ok(HealthDetection::NoSignal(reason));
@@ -399,7 +529,8 @@ pub fn evaluate_context_quality(
         ));
     }
     let packet_or_replay_pressure = observation.packet_bytes.current > packet_bound.value
-        || observation.replay_count.current > replay_bound.value;
+        || observation.replay_count.current > replay_bound.value
+        || canonical_pressure;
     if !packet_or_replay_pressure
         || !observation.useful_expansion.did_not_increase()
         || !observation.omission_regret.increased()
@@ -587,6 +718,56 @@ pub fn evaluate_observation_coverage(
     }))
 }
 
+/// Owner-projected #1755 interval manifest values for one coverage comparison.
+///
+/// STITCH copies these from the actual owner-issued interval manifest on the
+/// same interval the [`ObservationCoverageInput`] names. The core reads no
+/// manifest store; this projection is how the supplied interval, evidence, and
+/// explanation are validated against the owner's own record before a gap signal
+/// may stand.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoverageManifestProjection {
+    /// Exact interval identity in the owner-issued manifest.
+    pub interval_id: String,
+    /// Handle for the owner-issued interval manifest.
+    pub evidence: EvidenceRef,
+    /// Whether the owner manifest explains the coverage gap.
+    pub explanation: CoverageGapExplanation,
+}
+
+/// How supplied coverage values contradict the owner-issued manifest.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CoverageManifestMismatch {
+    /// The supplied interval identity differs from the manifest interval.
+    IntervalMismatch,
+    /// The supplied manifest evidence differs from the manifest handle.
+    EvidenceMismatch,
+    /// The supplied explanation differs from the manifest verdict.
+    ExplanationMismatch,
+}
+
+/// Validates supplied coverage values against the owner-issued manifest.
+///
+/// A gap signal that names a different interval, cites different evidence, or
+/// claims a different explanation than the #1755 manifest on that interval is
+/// a contradictory coverage claim and must not stand. Each mismatch class is
+/// typed so STITCH can project the exact correction.
+pub fn validate_observation_coverage_against_manifest(
+    input: &ObservationCoverageInput,
+    manifest: &CoverageManifestProjection,
+) -> Result<(), CoverageManifestMismatch> {
+    if input.manifest_interval_id != manifest.interval_id {
+        return Err(CoverageManifestMismatch::IntervalMismatch);
+    }
+    if input.manifest_evidence != manifest.evidence {
+        return Err(CoverageManifestMismatch::EvidenceMismatch);
+    }
+    if input.explanation != manifest.explanation {
+        return Err(CoverageManifestMismatch::ExplanationMismatch);
+    }
+    Ok(())
+}
+
 /// Continuous debt counts projected from #1689 due-policy evaluation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaintenanceDebtInput {
@@ -739,4 +920,253 @@ fn encode_identity(fields: &[String]) -> String {
         encoded.push_str(field);
     }
     encoded
+}
+
+/// Revision of the health Diagnostic Brief input contract.
+const HEALTH_BRIEF_REVISION: u64 = 1;
+
+/// Maximum member signals compiled into one Diagnostic Brief input.
+///
+/// A brief carries its member signals whole, so bounding the member count
+/// bounds the evidence the brief can carry into a Dreamer/Watchdog-Agent
+/// analysis request.
+pub const MAX_BRIEF_SIGNALS: usize = 8;
+
+/// Ineffective-analysis count at which a brief's route requires Human review.
+///
+/// One ineffective analysis steps the requested #1761 route down; a repeated
+/// ineffective analysis rolls back to Human review per I09-17: a repeatedly
+/// ineffective action may roll back the candidate route/profile or require
+/// Human review.
+pub const HUMAN_REVIEW_AFTER_INEFFECTIVE_ANALYSES: u32 = 2;
+
+/// Persistence classification of the drift one brief compiles.
+///
+/// I08-18 compiles a brief only from persistent or cross-cutting drift: a
+/// single-interval delta is a signal, not a brief. The classification travels
+/// on the brief so the analysis route can see which claim it is asked about.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BriefPersistence {
+    /// Drift persisted across the compared observation pairs.
+    Persistent,
+    /// Drift cuts across more than one rule family or scope.
+    CrossCutting,
+    /// Drift both persisted and cuts across families or scopes.
+    PersistentAndCrossCutting,
+}
+
+impl BriefPersistence {
+    /// Returns the stable wire name of this persistence classification.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Persistent => "persistent",
+            Self::CrossCutting => "cross_cutting",
+            Self::PersistentAndCrossCutting => "persistent_and_cross_cutting",
+        }
+    }
+}
+
+/// Diagnostic Brief input compiled from persistent or cross-cutting drift.
+///
+/// This is the I08-18 brief input, not the doctor's repair-domain brief: it
+/// carries member health signals whole, the explicit analysis question, and
+/// the stop condition the bounded analysis must honor. It carries no effect
+/// authority - see [`ProhibitedEffectAttempt::for_health_brief`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HealthDiagnosticBrief {
+    /// Deterministic identity derived from the member signal identities.
+    pub brief_id: String,
+    /// Explicit question the bounded analysis is asked.
+    pub question: String,
+    /// Explicit condition at which the bounded analysis must stop.
+    pub stop_condition: String,
+    /// Persistence classification the brief was compiled under.
+    pub persistence: BriefPersistence,
+    /// Independent member signals this brief compiles.
+    pub signals: Vec<Signal>,
+}
+
+/// Structural failure while compiling a Diagnostic Brief input.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BriefBuildError {
+    /// No member signal was supplied.
+    EmptySignals,
+    /// More member signals were supplied than one brief may carry.
+    TooManySignals {
+        /// Supplied member count.
+        actual: usize,
+        /// Maximum member count.
+        maximum: usize,
+    },
+    /// The same signal identity was supplied twice; brief members must be an
+    /// independent set so one observation is never counted twice.
+    DuplicateSignalId {
+        /// Repeated signal identity.
+        signal_id: String,
+    },
+    /// A member signal carries an unknown evidence, coverage, or source-event
+    /// record, so its original cannot be validated.
+    UnvalidatedOriginal {
+        /// Signal identity that cannot be validated.
+        signal_id: String,
+    },
+    /// The analysis question is empty or carries control characters.
+    EmptyQuestion,
+    /// The stop condition is empty or carries control characters.
+    EmptyStopCondition,
+}
+
+/// Compiles member health signals into one Diagnostic Brief input.
+///
+/// Every member original is validated: evidence, coverage, and source events
+/// must be known records, and member identities must form an independent set.
+/// The brief identity derives deterministically from the sorted member
+/// identities, so the same member set always compiles to the same brief.
+pub fn compile_health_brief(
+    question: String,
+    stop_condition: String,
+    persistence: BriefPersistence,
+    signals: Vec<Signal>,
+) -> Result<HealthDiagnosticBrief, BriefBuildError> {
+    if !non_empty_text(&question) {
+        return Err(BriefBuildError::EmptyQuestion);
+    }
+    if !non_empty_text(&stop_condition) {
+        return Err(BriefBuildError::EmptyStopCondition);
+    }
+    if signals.is_empty() {
+        return Err(BriefBuildError::EmptySignals);
+    }
+    if signals.len() > MAX_BRIEF_SIGNALS {
+        return Err(BriefBuildError::TooManySignals {
+            actual: signals.len(),
+            maximum: MAX_BRIEF_SIGNALS,
+        });
+    }
+    let mut member_ids = BTreeSet::new();
+    for signal in &signals {
+        let revision = signal.revision();
+        if !original_validated(revision) {
+            return Err(BriefBuildError::UnvalidatedOriginal {
+                signal_id: revision.signal_id.0.clone(),
+            });
+        }
+        if !member_ids.insert(revision.signal_id.0.clone()) {
+            return Err(BriefBuildError::DuplicateSignalId {
+                signal_id: revision.signal_id.0.clone(),
+            });
+        }
+    }
+    let mut identity_fields = vec![
+        "health_diagnostic_brief".to_owned(),
+        HEALTH_BRIEF_REVISION.to_string(),
+        persistence.as_str().to_owned(),
+    ];
+    identity_fields.extend(member_ids.into_iter());
+    Ok(HealthDiagnosticBrief {
+        brief_id: encode_identity(&identity_fields),
+        question,
+        stop_condition,
+        persistence,
+        signals,
+    })
+}
+
+/// One bounded Dreamer/Watchdog-Agent analysis request for a compiled brief.
+///
+/// Exactly one request leaves per call: a persistent drift compiles a brief
+/// and one bounded analysis request, never a campaign. The route reuses the
+/// existing #1761 [`RiskRoute`] contract - no parallel escalation path is
+/// introduced here. The request carries the brief's question and stop
+/// condition unchanged and no effect authority - see
+/// [`ProhibitedEffectAttempt::for_health_analysis`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HealthAnalysisRequest {
+    /// Identity of the owning compiled brief.
+    pub brief_id: String,
+    /// #1761 route selected for this request after rollback degradation.
+    pub route: RiskRoute,
+    /// Explicit question carried over from the owning brief.
+    pub question: String,
+    /// Explicit stop condition carried over from the owning brief.
+    pub stop_condition: String,
+    /// Ineffective-analysis count observed for this brief before this request.
+    pub prior_ineffective_analyses: u32,
+}
+
+/// Requests one bounded analysis for a compiled brief through #1761 routes.
+///
+/// The route degrades with the ineffective-analysis history per I09-17's
+/// rollback rule: one ineffective analysis steps the route down, a repeated
+/// ineffective history requires Human review. The question and stop condition
+/// are carried over from the validated brief unchanged.
+#[must_use]
+pub fn request_health_analysis(
+    brief: &HealthDiagnosticBrief,
+    route: RiskRoute,
+    prior_ineffective_analyses: u32,
+) -> HealthAnalysisRequest {
+    HealthAnalysisRequest {
+        brief_id: brief.brief_id.clone(),
+        route: degraded_route_for_ineffective_history(route, prior_ineffective_analyses),
+        question: brief.question.clone(),
+        stop_condition: brief.stop_condition.clone(),
+        prior_ineffective_analyses,
+    }
+}
+
+/// Degrades a requested route with the ineffective-analysis history.
+///
+/// A first ineffective analysis steps the requested route down one authority
+/// level; a repeatedly ineffective history rolls back to Human review. A route
+/// that already is Human review stays there.
+fn degraded_route_for_ineffective_history(
+    route: RiskRoute,
+    prior_ineffective_analyses: u32,
+) -> RiskRoute {
+    if prior_ineffective_analyses >= HUMAN_REVIEW_AFTER_INEFFECTIVE_ANALYSES {
+        return RiskRoute::HumanEscalation;
+    }
+    if prior_ineffective_analyses == 0 {
+        return route;
+    }
+    match route {
+        RiskRoute::Observe => RiskRoute::Observe,
+        RiskRoute::RequestResync => RiskRoute::Observe,
+        RiskRoute::CheapDiagnosis => RiskRoute::Observe,
+        RiskRoute::StrongDiagnosis => RiskRoute::CheapDiagnosis,
+        RiskRoute::Concilium => RiskRoute::StrongDiagnosis,
+        RiskRoute::PreauthorizedContainment => RiskRoute::Concilium,
+        RiskRoute::HumanEscalation => RiskRoute::HumanEscalation,
+    }
+}
+
+/// Whether a member signal original is validated for brief membership.
+///
+/// The evidence, coverage, and source-event records must all be known and
+/// non-empty: a brief compiled over an unknown original could not say what
+/// the analysis is asked about.
+fn original_validated(revision: &SignalRevision) -> bool {
+    let evidence_known = match &revision.evidence {
+        SignalReferences::Known(references) => !references.is_empty(),
+        SignalReferences::Unknown { .. } => false,
+    };
+    let coverage_known = match &revision.coverage {
+        SignalReferences::Known(references) => !references.is_empty(),
+        SignalReferences::Unknown { .. } => false,
+    };
+    let source_events_known = match &revision.source_events {
+        SignalReferences::Known(references) => !references.is_empty(),
+        SignalReferences::Unknown { .. } => false,
+    };
+    evidence_known && coverage_known && source_events_known
+}
+
+/// Whether a question or stop condition carries publishable text.
+///
+/// Both fields travel into a bounded analysis request, so neither may be
+/// empty, blank, or carry control characters.
+fn non_empty_text(value: &str) -> bool {
+    !value.trim().is_empty() && !value.chars().any(char::is_control)
 }
