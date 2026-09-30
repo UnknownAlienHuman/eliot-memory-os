@@ -33,6 +33,17 @@
 //!    the binding is a comparison against owner-held state and not a value the
 //!    caller restated.
 //!
+//! The store boundary re-derives rather than trusts. `record_digest` and
+//! `authorization_digest` are the two bindings that are not a shape check, and
+//! [`eliot_store_api::decode_problem_owner_state_mutation`] now compares both:
+//! the record digest is re-taken over the candidate's own canonical bytes, and
+//! the authorization digest is re-taken over the ownership-lease identity and
+//! `state_fence` the committed record itself retains, under the one shared
+//! [`PROBLEM_AUTHORIZATION_DOMAIN`](eliot_store_api::PROBLEM_AUTHORIZATION_DOMAIN)
+//! this module prepares it from. A transition therefore cannot commit a record
+//! whose bytes, or whose retained lease, disagree with the authorization and
+//! digest it travels beside.
+//!
 //! Pure and effect-separated: the state machine runs on a **candidate copy** of
 //! the record and is validated before it replaces anything, so a refused
 //! transition leaves the live record byte-identical. The effect is the single
@@ -42,8 +53,15 @@
 //! write and the required outbox intent cannot diverge. A closure record — the
 //! admitted waiver or the accepted replacement obligation — is committed in that
 //! same transition as its state change, so neither is durable only in a caller's
-//! return value. A readback through the committed-only `GetAttentionAndProblems`
-//! projection therefore reflects exactly the transitions that committed.
+//! return value.
+//!
+//! The readback is [`decode_committed_problem_owner_transition`]: the store
+//! projects a committed `ApplyProblemOwnerState` record verbatim through
+//! `GetAttentionAndProblems`, and that function is the one place those committed
+//! bytes become the typed verb, the record held to its own `validate()`, and the
+//! retained closure held to its own. It is also the only producer of the
+//! `current` record that every verb except `create` advances, so it is what
+//! makes those eight verbs reachable at all.
 //!
 //! Honesty about reachability: no production
 //! [`OwnerLeaseIssuer`](eliot_problem::OwnerLeaseIssuer) exists in this tree, so
@@ -65,12 +83,13 @@ use eliot_problem::{
 };
 use eliot_store_api::{
     EffectClass, EventId, EventProjectionRelationIntents, OperationManifestDigest,
-    OrderingHeadExpectation, OrderingScopeId, PROBLEM_CLOSURE_SUPERSEDED_BY,
-    PROBLEM_CLOSURE_WAIVED, PROBLEM_PARAM_AUTHORIZATION_DIGEST, PROBLEM_PARAM_CLOSURE_JSON,
-    PROBLEM_PARAM_EXPECTED_REVISION, PROBLEM_PARAM_PROBLEM_ID, PROBLEM_PARAM_RECORD_DIGEST,
-    PROBLEM_PARAM_RECORD_JSON, PROBLEM_PARAM_SOURCE_SIGNAL_ID, PROBLEM_PARAM_TRANSITION,
-    ProblemOwnerTransition, RevisionHeadExpectation, ScopeId, SecurityContext, StateFence,
-    TransitionClass, problem_owner_state_mutation_request, problem_revision_key,
+    OrderingHeadExpectation, OrderingScopeId, PROBLEM_AUTHORIZATION_DOMAIN,
+    PROBLEM_CLOSURE_SUPERSEDED_BY, PROBLEM_CLOSURE_WAIVED, PROBLEM_PARAM_AUTHORIZATION_DIGEST,
+    PROBLEM_PARAM_CLOSURE_JSON, PROBLEM_PARAM_EXPECTED_REVISION, PROBLEM_PARAM_PROBLEM_ID,
+    PROBLEM_PARAM_RECORD_DIGEST, PROBLEM_PARAM_RECORD_JSON, PROBLEM_PARAM_SOURCE_SIGNAL_ID,
+    PROBLEM_PARAM_TRANSITION, ProblemOwnerTransition, RevisionHeadExpectation, ScopeId,
+    SecurityContext, StateFence, TransitionClass, problem_owner_state_mutation_request,
+    problem_revision_key,
 };
 use serde_json::Value;
 
@@ -82,8 +101,6 @@ const PROBLEM_SCOPE_ID: &str = "governor";
 /// sequence; the constant mirrors the existing problem/recovery legs so all
 /// canonical writes share one conflict-serialization scope.
 const PROBLEM_ORDERING_SCOPE: &str = "scope:governor";
-/// Domain separator for the re-proved current-authorization digest.
-const AUTHORIZATION_DOMAIN: &str = "eliot.problem.owner-transition-authorization.v1";
 
 fn owner_refused(detail: impl Into<String>) -> CompositionError {
     CompositionError::Owner(detail.into())
@@ -331,7 +348,10 @@ impl ProblemOwnerTransitionRequest<'_> {
 ///
 /// The digest is over the lease owner's own commitment as this crate re-derives
 /// it, bound to the exact fence and ownership epoch the transition runs under.
-/// It is *derived here*, never taken from the caller.
+/// It is *derived here*, never taken from the caller, and it is derived over the
+/// same domain-separated tuple the store re-derives from the committed record's
+/// own retained lease and fence — so the store's recheck is a comparison against
+/// this value rather than a second scheme that can drift from it.
 fn authorization_digest(
     lease: &AuthenticatedOwnerLease,
     epoch: &EpochId,
@@ -346,7 +366,7 @@ fn authorization_digest(
         ));
     }
     let bytes = canonical_json_bytes(&(
-        AUTHORIZATION_DOMAIN,
+        PROBLEM_AUTHORIZATION_DOMAIN,
         &commitment,
         &lease.identity().lease_id,
         lease.ownership_epoch(),
@@ -858,6 +878,110 @@ pub fn prepare_problem_owner_transition(
         closure,
         envelope,
     })
+}
+
+/// One committed named owner transition, decoded back from the store's own
+/// committed record.
+///
+/// This is the readback half of the same boundary: the store projects a
+/// committed `ApplyProblemOwnerState` record verbatim through
+/// `GetAttentionAndProblems`, and this is the one function that turns those
+/// committed bytes back into the typed verb, the validated `Problem` and the
+/// retained closure. It is also the only producer of the `current` record a
+/// non-`Create` transition advances, so without it every verb except `create`
+/// had no admissible way to name the revision it replaces.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommittedProblemOwnerTransition {
+    /// The named transition this committed record carries.
+    pub transition: ProblemOwnerTransition,
+    /// The committed candidate record, validated by its own `validate()`.
+    pub problem: Problem,
+    /// The retained closure a `Waive` or `Supersede` transition committed,
+    /// validated by its own `validate()`.
+    pub closure: Option<ProblemOwnerClosure>,
+    /// The record revision this transition replaced.
+    pub expected_revision: u64,
+    /// The Signal this transition is bound to.
+    pub source_signal_id: String,
+}
+
+/// Decodes one committed `ApplyProblemOwnerState` record back into its named
+/// transition, validated record and retained closure.
+///
+/// The store's own decoder performs the binding comparisons — the candidate's
+/// identity, its checked-successor revision, its retained source Signal, its own
+/// record bytes against the recorded `record_digest`, and its own retained
+/// ownership lease and fence against the recorded `authorization_digest` — so
+/// this reuses that one gate rather than restating it. The record is then
+/// deserialized and held to the existing `Problem::validate`, which validates
+/// the ORIGINAL recorded value; nothing here recomputes a digest in place of
+/// validating what was committed.
+pub fn decode_committed_problem_owner_transition(
+    parameters: &BTreeMap<String, Value>,
+) -> Result<CommittedProblemOwnerTransition, CompositionError> {
+    let decoded =
+        eliot_store_api::decode_problem_owner_state_mutation(parameters).map_err(|error| {
+            owner_refused(format!(
+                "committed owner transition is not decodable: {error}"
+            ))
+        })?;
+    let problem: Problem =
+        serde_json::from_value(decoded.record_json.clone()).map_err(|error| {
+            owner_refused(format!(
+                "committed candidate record does not decode: {error}"
+            ))
+        })?;
+    problem
+        .validate()
+        .map_err(|error| problem_refused(&error))?;
+    let closure = match decoded.closure_json {
+        None => None,
+        Some(value) => Some(decode_closure_value(&value)?),
+    };
+    Ok(CommittedProblemOwnerTransition {
+        transition: decoded.transition,
+        problem,
+        closure,
+        expected_revision: decoded.expected_revision,
+        source_signal_id: decoded.source_signal_id,
+    })
+}
+
+/// Decodes one retained closure record by the `kind` the store gate admitted.
+///
+/// `kind` is the wire discriminator this crate's own parameter assembly adds on
+/// top of the state machine's record, so it is removed before the record is
+/// decoded: the closure types are `deny_unknown_fields`, and the admitted
+/// decision is the record itself, not the wrapper that names its kind.
+fn decode_closure_value(value: &Value) -> Result<ProblemOwnerClosure, CompositionError> {
+    let kind = value.get("kind").and_then(Value::as_str).ok_or_else(|| {
+        owner_refused("retained closure record does not name its kind".to_owned())
+    })?;
+    let mut admitted = value.clone();
+    if let Some(object) = admitted.as_object_mut() {
+        object.remove("kind");
+    }
+    match kind {
+        PROBLEM_CLOSURE_WAIVED => {
+            let record: WaiverRecord = serde_json::from_value(admitted).map_err(|error| {
+                owner_refused(format!("retained waiver record does not decode: {error}"))
+            })?;
+            record.validate().map_err(|error| problem_refused(&error))?;
+            Ok(ProblemOwnerClosure::Waived(record))
+        }
+        PROBLEM_CLOSURE_SUPERSEDED_BY => {
+            let record: SupersessionRecord = serde_json::from_value(admitted).map_err(|error| {
+                owner_refused(format!(
+                    "retained supersession record does not decode: {error}"
+                ))
+            })?;
+            record.validate().map_err(|error| problem_refused(&error))?;
+            Ok(ProblemOwnerClosure::SupersededBy(record))
+        }
+        _ => Err(owner_refused(
+            "retained closure record names a kind this transition set does not admit".to_owned(),
+        )),
+    }
 }
 
 /// What one committed named owner transition produced.

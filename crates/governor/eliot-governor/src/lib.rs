@@ -249,8 +249,9 @@ pub use owner_closure_provider::{
     PreservedAdmission,
 };
 pub use problem_owner_transitions::{
-    PreparedProblemOwnerTransition, ProblemOwnerClosure, ProblemOwnerTransitionBody,
-    ProblemOwnerTransitionOutcome, ProblemOwnerTransitionRequest, prepare_problem_owner_transition,
+    CommittedProblemOwnerTransition, PreparedProblemOwnerTransition, ProblemOwnerClosure,
+    ProblemOwnerTransitionBody, ProblemOwnerTransitionOutcome, ProblemOwnerTransitionRequest,
+    decode_committed_problem_owner_transition, prepare_problem_owner_transition,
 };
 pub use quality_applicability::{
     ACTIVE_DIRECTIVE_OWNER, GOVERNANCE_PROFILE_OWNER, GovernedDecision, IMPACT_OWNER,

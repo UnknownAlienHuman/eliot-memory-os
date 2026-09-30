@@ -176,7 +176,8 @@ use eliot_store_api::{
 };
 
 use crate::problem_owner_transitions::{
-    ProblemOwnerTransitionOutcome, ProblemOwnerTransitionRequest, prepare_problem_owner_transition,
+    ProblemOwnerTransitionOutcome, ProblemOwnerTransitionRequest,
+    decode_committed_problem_owner_transition, prepare_problem_owner_transition,
 };
 use crate::{
     CanonicalAdmissionOwner, CompositionError, CompositionReadiness, KernelPortError,
@@ -2135,12 +2136,20 @@ impl<P: KernelTransitionPort + ?Sized> GovernorObservationReconciliation<'_, P> 
     /// The four bindings are compared, not carried: the source Signal is checked
     /// against the admitted fence and against the candidate's retained
     /// `signal_refs`; the verb and the candidate `record_digest` are inside the
-    /// canonical request hash; the expected record revision is compared with the
+    /// canonical request hash and the store re-takes that digest over the
+    /// candidate's own bytes; the expected record revision is compared with the
     /// record here and travels as the `problem:{problem_id}` revision-head
     /// expectation the store arbitrates; and the presented
     /// [`AuthenticatedOwnerLease`](eliot_problem::AuthenticatedOwnerLease) is
-    /// re-proved against the lease owner's own commitment and required to be
-    /// exactly the lease identity the candidate retains.
+    /// re-proved against the lease owner's own commitment, required to be
+    /// exactly the lease identity the candidate retains, and its digest re-taken
+    /// by the store over the identity and fence that record retains.
+    ///
+    /// Before the commit, the exact parameter map this transition will write is
+    /// decoded back through the store's own decoder and the record's own
+    /// `validate()`, and must reproduce the record and closure reported below.
+    /// That is the readback, run on the bytes about to be committed, so the
+    /// outcome cannot report a record the store would decode differently.
     ///
     /// A lost commit response reconciles the original receipt through the
     /// neutral port instead of committing a second transition, so a retry of the
@@ -2169,6 +2178,24 @@ impl<P: KernelTransitionPort + ?Sized> GovernorObservationReconciliation<'_, P> 
         let manifest_digest = production_manifest_digest()?;
         let operation_id = request.operation_id()?;
         let prepared = prepare_problem_owner_transition(&manifest_digest, request)?;
+        // The readback: the exact parameter map this transition is about to
+        // commit is decoded back through the store's own decoder and the
+        // record's own `validate()`, and must yield exactly the record and the
+        // closure this call reports. So the outcome names what the committed
+        // bytes decode to rather than the in-memory candidate this call
+        // happened to build, and the very same decode is what a
+        // `GetAttentionAndProblems` reader performs after a restart.
+        let committed_parameters = sole_owner_state_parameters(&prepared.envelope)?;
+        let committed = decode_committed_problem_owner_transition(&committed_parameters)?;
+        if committed.problem != prepared.candidate
+            || committed.closure != prepared.closure
+            || committed.transition != prepared.transition
+        {
+            return Err(owner_refused(
+                "the committed owner transition does not decode back to the prepared record"
+                    .to_owned(),
+            ));
+        }
         let expected_hash = prepared
             .envelope
             .canonical_request_hash()
@@ -3034,4 +3061,28 @@ mod tests {
         );
         assert_eq!(kernel.apply_count(), 2, "conflicting retry must not commit");
     }
+}
+
+/// The one `ApplyProblemOwnerState` parameter map a prepared owner transition
+/// commits.
+///
+/// Read back off the envelope that is about to be committed rather than
+/// re-assembled, so the readback decodes the exact bytes the store receives.
+/// A named owner transition is by construction a single named command; any
+/// other count is a typed refusal, never a silently chosen one.
+pub(crate) fn sole_owner_state_parameters(
+    envelope: &CanonicalWriteEnvelope,
+) -> Result<BTreeMap<String, serde_json::Value>, CompositionError> {
+    let [command] = envelope.semantic_commands.as_slice() else {
+        return Err(owner_refused(
+            "a named problem owner transition must commit exactly one named store operation"
+                .to_owned(),
+        ));
+    };
+    if command.operation != NamedMutationOperation::ApplyProblemOwnerState {
+        return Err(owner_refused(
+            "a named problem owner transition must commit ApplyProblemOwnerState".to_owned(),
+        ));
+    }
+    Ok(command.parameters.clone())
 }

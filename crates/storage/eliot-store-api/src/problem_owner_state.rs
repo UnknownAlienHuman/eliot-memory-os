@@ -16,6 +16,26 @@
 //! the recorded record must satisfy the identity, predecessor revision and
 //! source-Signal bindings that verb implies.
 //!
+//! Every binding is **compared**, never carried:
+//!
+//! - the candidate `record_digest` is re-derived from the candidate record's own
+//!   canonical bytes and compared, so a digest cannot describe one record while
+//!   a different record travels beside it;
+//! - the `authorization_digest` is re-derived from the ownership-lease identity
+//!   the candidate record itself retains, plus that record's own `state_fence`,
+//!   and compared, so the authorization a transition claims is provably the
+//!   authorization the record was written under rather than a value the caller
+//!   restated;
+//! - the expected record revision is compared against the record's own revision
+//!   (the checked successor) here, and separately against the live revision head
+//!   by the store that arbitrates it, so a stale revision fails at use time;
+//! - the source Signal is compared against the record's own retained
+//!   `signal_refs`.
+//!
+//! [`PROBLEM_AUTHORIZATION_DOMAIN`] is the one stated domain separator for that
+//! re-derivation, and the Governor prepares the digest through the same constant,
+//! so there is one derivation rather than two that can drift.
+//!
 //! Wire identity: [`PROBLEM_OWNER_STATE_SCHEMA_V1`]
 //! (`eliot.problem.owner-state.v1`). Mutation operation:
 //! [`PROBLEM_OWNER_STATE_MUTATION_NAME`] (`ApplyProblemOwnerState`). Read
@@ -67,6 +87,17 @@ pub const PROBLEM_PARAM_CLOSURE_JSON: &str = "closure_json";
 pub const PROBLEM_CLOSURE_WAIVED: &str = "WAIVED";
 /// `closure_json.kind` for a supersession.
 pub const PROBLEM_CLOSURE_SUPERSEDED_BY: &str = "SUPERSEDED_BY";
+
+/// Domain separator for the current-authorization digest of a named owner
+/// transition.
+///
+/// The digest is over the exact ownership-lease identity the committed record
+/// retains — lease id, the lease owner's own commitment and the ownership epoch
+/// — together with that record's own `state_fence`. It lives here, beside the
+/// wire names it travels under, so the Governor that prepares it and the store
+/// that rechecks it derive it from one stated constant instead of two literals
+/// that can drift.
+pub const PROBLEM_AUTHORIZATION_DOMAIN: &str = "eliot.problem.owner-transition-authorization.v1";
 
 /// Wire value of the `create` transition.
 pub const PROBLEM_TRANSITION_CREATE: &str = "CREATE";
@@ -211,12 +242,106 @@ impl DecodedProblemOwnerState {
         }
     }
 
+    /// The ownership-lease identity this transition's authorization is over,
+    /// read from the candidate record's own `ownership`.
+    ///
+    /// Read from the record rather than from a presented value, so the digest
+    /// compared against it is the authorization the record was actually written
+    /// under. An assigned record carries the live lease; an unassigned record
+    /// carries the exact lost lease the loss observed, which is the identity an
+    /// owner-loss or escalation transition is authorized by. A record that
+    /// retains neither is refused: there is nothing to bind the authorization
+    /// to.
+    fn retained_lease_identity(&self) -> Result<(String, String, u64), StoreError> {
+        let ownership = self
+            .record_json
+            .get("ownership")
+            .and_then(Value::as_object)
+            .ok_or(StoreError::InvalidField {
+                field: "record_json.ownership",
+                reason: "candidate record must retain its ownership",
+            })?;
+        // `Ownership` is an externally tagged enum with SCREAMING_SNAKE_CASE
+        // variants, so exactly one of these two members is present.
+        let lease = if let Some(assigned) = ownership.get("ASSIGNED") {
+            assigned.get("lease")
+        } else if let Some(unassigned) = ownership.get("UNASSIGNED") {
+            unassigned.get("lost_lease")
+        } else {
+            return Err(StoreError::InvalidField {
+                field: "record_json.ownership",
+                reason: "candidate record must retain an assigned lease or an observed lost lease",
+            });
+        };
+        let lease = lease
+            .and_then(Value::as_object)
+            .ok_or(StoreError::InvalidField {
+                field: "record_json.ownership.lease",
+                reason: "candidate record must retain the exact ownership-lease identity",
+            })?;
+        let text = |name: &str| {
+            lease
+                .get(name)
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+                .ok_or(StoreError::InvalidField {
+                    field: "record_json.ownership.lease",
+                    reason: "retained ownership lease must name its identity members",
+                })
+        };
+        let ownership_epoch = lease
+            .get("ownership_epoch")
+            .and_then(Value::as_u64)
+            .filter(|epoch| *epoch > 0)
+            .ok_or(StoreError::InvalidField {
+                field: "record_json.ownership.lease.ownership_epoch",
+                reason: "retained ownership lease must carry a non-zero ownership epoch",
+            })?;
+        Ok((text("lease_id")?, text("commitment")?, ownership_epoch))
+    }
+
+    /// The authorization digest the candidate record's own retained ownership
+    /// implies, re-derived here over the ORIGINAL recorded values.
+    ///
+    /// This is never recomputed from a presented value: the lease id, the lease
+    /// owner's own commitment and the ownership epoch are read out of the
+    /// committed record, together with that record's own `state_fence`, and the
+    /// digest is taken over exactly those. A transition therefore cannot claim
+    /// an authorization that belongs to a different lease, epoch or fence than
+    /// the one its record retains.
+    fn rederived_authorization_digest(&self) -> Result<String, StoreError> {
+        let (lease_id, commitment, ownership_epoch) = self.retained_lease_identity()?;
+        let state_fence =
+            self.record_json
+                .get("state_fence")
+                .cloned()
+                .ok_or(StoreError::InvalidField {
+                    field: "record_json.state_fence",
+                    reason: "candidate record must retain the state fence it was admitted under",
+                })?;
+        let bytes = crate::canonical_json_bytes(&(
+            PROBLEM_AUTHORIZATION_DOMAIN,
+            &commitment,
+            &lease_id,
+            ownership_epoch,
+            &state_fence,
+        ))
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+        Ok(crate::sha256_hex(&bytes))
+    }
+
     /// Whether the candidate record satisfies every binding this transition
     /// carries.
     ///
     /// The record is the lossless statement of what the transition produced, so
     /// the bridge compares the record against the presented bindings rather than
-    /// recording both and trusting that they agree.
+    /// recording both and trusting that they agree. Each of the four bindings is
+    /// a comparison: the record's own bytes against the presented
+    /// `record_digest`, the record's own retained lease and fence against the
+    /// presented `authorization_digest`, the record's own revision against the
+    /// checked successor of the presented expected revision, and the record's
+    /// own `signal_refs` against the presented source Signal.
     pub fn record_satisfies_bindings(&self) -> Result<(), StoreError> {
         let Some(required) = self.required_record_revision() else {
             return Err(StoreError::InvalidField {
@@ -253,6 +378,26 @@ impl DecodedProblemOwnerState {
             return Err(StoreError::InvalidField {
                 field: "record_json.signal_refs",
                 reason: "candidate record is not bound to the presented source Signal",
+            });
+        }
+        // The record digest is re-derived from the record's own canonical bytes
+        // and compared, so it describes THIS record rather than travelling
+        // beside it.
+        let record_bytes = crate::canonical_json_bytes(record)
+            .map_err(|error| StoreError::Serialization(error.to_string()))?;
+        if crate::sha256_hex(&record_bytes) != self.record_digest {
+            return Err(StoreError::InvalidField {
+                field: PROBLEM_PARAM_RECORD_DIGEST,
+                reason: "record digest does not describe the presented candidate record",
+            });
+        }
+        // The authorization digest is re-derived from the record's own retained
+        // lease identity and fence and compared, so the authorization is bound
+        // to the record this transition commits.
+        if self.rederived_authorization_digest()? != self.authorization_digest {
+            return Err(StoreError::InvalidField {
+                field: PROBLEM_PARAM_AUTHORIZATION_DIGEST,
+                reason: "authorization digest does not describe the lease the record retains",
             });
         }
         Ok(())
