@@ -232,6 +232,14 @@ pub use store_gateway::KernelStoreGateway;
 pub use store_gateway::NamedReadGatewayError;
 #[cfg(windows)]
 pub use store_gateway::StoreApplyRefusal;
+// Issue #2806: the due-wake horizon advance retains a durable obligation before
+// it issues anything, and a projection step inside that route can fail AFTER the
+// record was durably settled. The refusal type is public so the one caller that
+// can read such a record back learns WHICH of the two facts it is — a durable
+// record exists and here is its original owner operation identity, or nothing was
+// retained at all — instead of rendering one reason string for both.
+#[cfg(windows)]
+pub use store_gateway::UserAutomationHorizonPublicationRefusal;
 // Issue #1681 W3: the named-read refusal leaves the Kernel with a typed
 // `StoreError` and nothing else. These two are the missing half the transport
 // edge needs to turn that cause into the complete versioned #1679 directive
