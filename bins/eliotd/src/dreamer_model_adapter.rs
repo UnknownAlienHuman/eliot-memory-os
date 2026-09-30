@@ -74,6 +74,7 @@ use eliot_agent_coordinator::{
     AgentCoordinator, CoordinatorConfig, HumanModelPreferencePolicy, ModelCatalogueSnapshot,
     ModelRole, PlanGap, StaffingPlanCandidate, StaffingPlanRequest,
 };
+use eliot_agent_opencode::{OpenCodeClient, OpenCodeRouteAdmission};
 use eliot_contracts::{ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence};
 use eliot_governor::{CompositionError, CompositionReadiness, RouteScopeFingerprint};
 use eliot_protocol::ContinuityKind;
@@ -120,6 +121,49 @@ pub trait DreamerModelExecution {
         admission: &AdmittedRouteReceipt,
         binding: &ProviderExecutionBinding,
     ) -> impl Future<Output = Result<AgentResult, CompositionError>>;
+}
+
+/// Concrete adapter from the configured OpenCode runtime owner to the
+/// production CC-002 Orientation worker. It borrows the live OpenCode client
+/// and its retained route-admission record; it neither constructs attempt
+/// authority nor substitutes an unadmitted `run_read_only` call.
+pub struct ConfiguredDreamerOrientationModelOwner<'a> {
+    client: &'a OpenCodeClient,
+    route_admission: &'a OpenCodeRouteAdmission,
+}
+
+impl<'a> ConfiguredDreamerOrientationModelOwner<'a> {
+    /// Borrows the current configured provider runtime and its exact route
+    /// admission evidence.
+    #[must_use]
+    pub const fn new(
+        client: &'a OpenCodeClient,
+        route_admission: &'a OpenCodeRouteAdmission,
+    ) -> Self {
+        Self {
+            client,
+            route_admission,
+        }
+    }
+
+    /// Executes one admitted Orientation model call through the real
+    /// OpenCode route owner. The worker returns the exact owner outcome or
+    /// typed refusal with any already-observed raw bytes, usage, and route
+    /// receipts still attached.
+    pub async fn execute_admitted_orientation(
+        &self,
+        input: super::dreamer_orientation_model_worker::DreamerOrientationModelWorkerInput<'_>,
+    ) -> Result<
+        super::dreamer_orientation_model::DreamerOrientationModelAttempt,
+        super::dreamer_orientation_model_worker::DreamerOrientationModelWorkerError,
+    > {
+        super::dreamer_orientation_model_worker::execute_admitted_orientation_model(
+            self.client,
+            self.route_admission,
+            input,
+        )
+        .await
+    }
 }
 
 /// One governed model invocation: staffing request plus the current catalogue, explicit
