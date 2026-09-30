@@ -82,8 +82,10 @@ use eliot_dreamer_contracts::{
 use eliot_dreamer_orientation::OrientationError;
 use eliot_dreamer_probe_plan::{ProbePlan, ProbePlanParams, plan_discriminative_probes};
 use eliot_dreamer_rival_model::{RivalModelSet, RivalPolicy, structure_rival_models};
-use eliot_epistemic::{CurrentEpistemicPosition, PositionRequest, resolve};
-use eliot_epistemic_contracts::{ConflictSet, CurrentEpistemicPosition as AdmittedPosition};
+use eliot_epistemic::{CurrentEpistemicPosition, ObservationRecord, PositionRequest, resolve};
+use eliot_epistemic_contracts::{
+    ConflictSet, CurrentEpistemicPosition as AdmittedPosition, EpistemicPositionCandidate,
+};
 
 use crate::OrientationStageDisposition;
 
@@ -105,6 +107,18 @@ pub(crate) struct CueActivationStage<'a> {
     pub request: &'a ActivationRequest,
     /// Caller-supplied versioned numerical profile.
     pub profile: &'a ActivationProfile,
+}
+
+/// Original admitted source records joined to one native CEP resolver request.
+pub(crate) struct EpistemicStage<'a> {
+    /// Original candidate returned by storage readback.
+    pub candidate: &'a EpistemicPositionCandidate,
+    /// Original Current view returned beside that candidate.
+    pub admitted_position: &'a AdmittedPosition,
+    /// Original source observation re-acquired by Governor.
+    pub observation: &'a ObservationRecord,
+    /// Native resolver request built from that source observation.
+    pub request: &'a PositionRequest,
 }
 
 /// Caller-supplied understanding stage inputs (owner-built, never inferred).
@@ -471,6 +485,9 @@ pub(crate) enum PulseError {
     /// Epistemic resolver refused.
     #[error("pulse epistemic position refused")]
     Epistemic,
+    /// Original admitted candidate, source observation, and local resolver result did not join.
+    #[error("pulse admitted epistemic owner binding refused")]
+    EpistemicBinding,
     /// Understanding assembler refused.
     #[error("pulse understanding view refused")]
     Understanding,
@@ -517,6 +534,9 @@ impl PulseError {
             Self::Classification => OrientationError::Invalid("pulse classification owner refused"),
             Self::CueActivation => OrientationError::Invalid("pulse cue activation owner refused"),
             Self::Epistemic => OrientationError::Invalid("pulse epistemic position owner refused"),
+            Self::EpistemicBinding => {
+                OrientationError::Binding("admitted epistemic owner and resolver result")
+            }
             Self::Understanding => {
                 OrientationError::Invalid("pulse understanding view owner refused")
             }
@@ -653,22 +673,35 @@ pub(crate) fn run_cue_stage(stage: Option<&CueActivationStage>) -> Result<PulseS
 }
 
 pub(crate) fn run_epistemic_stage(
-    position_request: Option<&PositionRequest>,
+    stage: Option<&EpistemicStage<'_>>,
 ) -> Result<PulseStage, PulseError> {
-    position_request.map_or_else(
+    stage.map_or_else(
         || Ok(PulseStage::pending(PulseStageId::EpistemicPosition)),
         |inputs| {
-            let output = resolve(inputs).map_err(|_| PulseError::Epistemic)?;
-            if output.question != inputs.question
-                || output.scope != inputs.scope
-                || output.state_fence != inputs.state_fence
+            let output = resolve(inputs.request).map_err(|_| PulseError::Epistemic)?;
+            if output.question != inputs.request.question
+                || output.scope != inputs.request.scope
+                || output.state_fence != inputs.request.state_fence
             {
                 return Err(PulseError::Epistemic);
             }
+            eliot_epistemic::bind_admitted_position(
+                inputs.candidate,
+                inputs.admitted_position,
+                inputs.observation,
+                inputs.request,
+                &output,
+            )
+            .map_err(|_| PulseError::EpistemicBinding)?;
             // CEP defines no native input digest; retain a canonical ledger
-            // commitment over the exact request record.
-            let input_commitment =
-                canonical_input_commitment(inputs).ok_or(PulseError::Epistemic)?;
+            // commitment over the exact source, admitted, and resolver inputs.
+            let input_commitment = canonical_input_commitment(&(
+                inputs.candidate,
+                inputs.admitted_position,
+                inputs.observation,
+                inputs.request,
+            ))
+            .ok_or(PulseError::Epistemic)?;
             let (commitment, canonical) =
                 canonical_owner_output(&output).ok_or(PulseError::Epistemic)?;
             Ok(PulseStage::executed(

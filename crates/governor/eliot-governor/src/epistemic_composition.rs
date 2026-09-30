@@ -401,11 +401,52 @@ impl<P: KernelTransitionPort + ?Sized, R: CanonicalReadClient + ?Sized>
         self.read_committed(proposal, &receipt).await
     }
 
+    /// Re-reads one exact committed observed candidate together with the
+    /// original source observation for a downstream Orientation owner call.
+    ///
+    /// This method is read-only. It uses the same committed-receipt readback,
+    /// capture receipt, and evidence-pack acquisition path as admission, then
+    /// validates the source-derived candidate again before returning the
+    /// non-deserializable owner read value.
+    pub async fn read_committed_for_orientation(
+        &self,
+        proposal: &ObservedEpistemicProposal,
+        receipt: &WriteReceipt,
+    ) -> Result<crate::EpistemicOrientationRead, CompositionError> {
+        let readback = self.read_committed(proposal, receipt).await?;
+        let observation = self.acquired_observation(proposal).await?;
+        let candidate = Self::validate_source_candidate(proposal, &observation)?;
+        if readback.candidate != candidate {
+            return Err(refused(
+                "orientation readback candidate differs from the source-derived candidate",
+            ));
+        }
+        crate::EpistemicOrientationRead::from_validated_source(readback, observation)
+            .map_err(refused)
+    }
+
     fn validate_semantics(
         proposal: &ObservedEpistemicProposal,
         before: Option<&EpistemicPositionReadback>,
         observation: &ObservationRecord,
     ) -> Result<(), CompositionError> {
+        let candidate = Self::validate_source_candidate(proposal, observation)?;
+        proposal
+            .transition
+            .validate_closed(
+                &proposal.request,
+                &candidate,
+                before.map_or(&[], |value| value.candidate.support.as_slice()),
+                &candidate.support,
+            )
+            .map_err(refused)?;
+        Ok(())
+    }
+
+    fn validate_source_candidate(
+        proposal: &ObservedEpistemicProposal,
+        observation: &ObservationRecord,
+    ) -> Result<EpistemicPositionCandidate, CompositionError> {
         let candidate = eliot_epistemic::propose_observed_candidate(
             &proposal.request,
             observation,
@@ -436,16 +477,7 @@ impl<P: KernelTransitionPort + ?Sized, R: CanonicalReadClient + ?Sized>
         {
             return Err(refused("coverage does not name the acquired evidence"));
         }
-        proposal
-            .transition
-            .validate_closed(
-                &proposal.request,
-                &candidate,
-                before.map_or(&[], |value| value.candidate.support.as_slice()),
-                &candidate.support,
-            )
-            .map_err(refused)?;
-        Ok(())
+        Ok(candidate)
     }
 
     async fn check_heads(
