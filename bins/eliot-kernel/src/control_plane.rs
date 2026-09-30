@@ -1705,7 +1705,8 @@ impl KernelComposition {
         let terminal = row
             .transition_to(LeaseState::Expired)
             .map_err(|_| TransportError::SessionFenced)?;
-        ors.record_runtime_lease_current(&terminal).map_err(|_| TransportError::SessionFenced)?;
+        ors.record_runtime_lease_current(&terminal)
+            .map_err(|_| TransportError::SessionFenced)?;
         Ok(())
     }
 
