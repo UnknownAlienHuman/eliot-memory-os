@@ -7,24 +7,21 @@
 //! content revision over the complete source rows. No row is released or
 //! expired by this read.
 
-use super::{
-    ACTIVATION_LIFECYCLES, BRIDGE_EVENT_GAPS, BRIDGE_EVENT_HANDOFFS, BRIDGE_EVENT_PROJECTIONS,
-    AUTHORITY_HANDOFFS, BRIDGE_EVENT_CURSORS, BRIDGE_EVENT_OWNER_MAINTENANCE_CURSORS,
-    BRIDGE_EVENT_RECORDS, CAMPAIGN_SOURCE_PENDING, CUTOVER_OWNERSHIP,
-    COLD_START_READINESS_BINDINGS, COLD_START_READINESS_HEADS, COLD_START_READINESS_RECORDS,
-    DOCTOR_ATTEMPTS, DOCTOR_EFFECTS,
-    DurableInboxRecord, DurableOperationalRecord, EFFECT_OPERATION_LEASES,
-    EFFECT_REPLAY_RECONCILIATIONS, HOST_REQUESTS, HOST_REQUEST_LOGICAL_KEYS, META,
-    NATIVE_WORKER_CLAIMS, OPERATIONAL_CURRENT, PROCESS_START_REPLAY, PROCESS_STREAM_RECOVERY, RECOVERY_INBOX,
-    RECOVERY_PROBLEMS, REPLAY_ACKS, REPLAY_EVENTS, RESERVATIONS, RUNTIME_LEASE_CURRENT,
-    SCAN_DISCLOSURE_RECORDS, STORE_FAILURE_RETENTION, STORE_REBIND_REPLAY,
-    SUPERVISION_LEASE_CURRENT, SUPERVISION_LEASE_STAGED, UNKNOWN_COMMIT_RECOVERY,
-    RedbRecoveryStore,
-    decode, decode_named,
-    read_store_object_identity, storage,
-};
 use super::restore_journal::{
     RESTORE_JOURNAL_INTENTS, RESTORE_JOURNAL_META, RESTORE_JOURNAL_RESULTS,
+};
+use super::{
+    ACTIVATION_LIFECYCLES, AUTHORITY_HANDOFFS, BRIDGE_EVENT_CURSORS, BRIDGE_EVENT_GAPS,
+    BRIDGE_EVENT_HANDOFFS, BRIDGE_EVENT_OWNER_MAINTENANCE_CURSORS, BRIDGE_EVENT_PROJECTIONS,
+    BRIDGE_EVENT_RECORDS, CAMPAIGN_SOURCE_PENDING, COLD_START_READINESS_BINDINGS,
+    COLD_START_READINESS_HEADS, COLD_START_READINESS_RECORDS, CUTOVER_OWNERSHIP, DOCTOR_ATTEMPTS,
+    DOCTOR_EFFECTS, DurableInboxRecord, DurableOperationalRecord, EFFECT_OPERATION_LEASES,
+    EFFECT_REPLAY_RECONCILIATIONS, HOST_REQUEST_LOGICAL_KEYS, HOST_REQUESTS, META,
+    NATIVE_WORKER_CLAIMS, OPERATIONAL_CURRENT, PROCESS_START_REPLAY, PROCESS_STREAM_RECOVERY,
+    RECOVERY_INBOX, RECOVERY_PROBLEMS, REPLAY_ACKS, REPLAY_EVENTS, RESERVATIONS,
+    RUNTIME_LEASE_CURRENT, RedbRecoveryStore, SCAN_DISCLOSURE_RECORDS, STORE_FAILURE_RETENTION,
+    STORE_REBIND_REPLAY, SUPERVISION_LEASE_CURRENT, SUPERVISION_LEASE_STAGED,
+    UNKNOWN_COMMIT_RECOVERY, decode, decode_named, read_store_object_identity, storage,
 };
 use crate::{
     AdmissionReservationState, HostRequestRecord, KernelReconciliationItem, OperationalPhase,
@@ -298,7 +295,9 @@ pub(super) fn census_in_read(
     }
 
     {
-        let leases = read.open_table(SUPERVISION_LEASE_CURRENT).map_err(storage)?;
+        let leases = read
+            .open_table(SUPERVISION_LEASE_CURRENT)
+            .map_err(storage)?;
         for row in leases.iter().map_err(storage)? {
             let (key, value) = row.map_err(storage)?;
             let snapshot: SupervisionLeaseSnapshot =
@@ -378,10 +377,8 @@ pub(super) fn census_in_read(
             let (key, value) = row.map_err(storage)?;
             let record: DurableOperationalRecord =
                 decode_named(value.value(), "operational_current")?;
-            let expected_key = RedbRecoveryStore::operational_key(
-                record.kind,
-                &record.input.subject_id,
-            );
+            let expected_key =
+                RedbRecoveryStore::operational_key(record.kind, &record.input.subject_id);
             if key.value() != expected_key {
                 return Err(integrity(
                     "store_stop_operational_current",
@@ -404,7 +401,10 @@ pub(super) fn census_in_read(
                         increment(builder.counts.admission_reservations)?;
                 }
             } else if is_store_dependent_operational_kind(record.kind)
-                && !matches!(record.phase, OperationalPhase::Terminal | OperationalPhase::Released)
+                && !matches!(
+                    record.phase,
+                    OperationalPhase::Terminal | OperationalPhase::Released
+                )
             {
                 builder.counts.operational_work = increment(builder.counts.operational_work)?;
             }
@@ -736,9 +736,7 @@ pub(super) fn census_in_read(
     }
 
     {
-        let projections = read
-            .open_table(PROCESS_STREAM_RECOVERY)
-            .map_err(storage)?;
+        let projections = read.open_table(PROCESS_STREAM_RECOVERY).map_err(storage)?;
         for row in projections.iter().map_err(storage)? {
             let (key, value) = row.map_err(storage)?;
             let projection: crate::ProcessStreamRecoveryProjection = decode(value.value())?;
@@ -824,8 +822,7 @@ pub(super) fn census_in_read(
             }
             builder.observe("authority_handoffs", key.value(), value.value())?;
             if record.state != crate::AuthorityHandoffState::Consumed {
-                builder.counts.authority_handoffs =
-                    increment(builder.counts.authority_handoffs)?;
+                builder.counts.authority_handoffs = increment(builder.counts.authority_handoffs)?;
             }
         }
     }
@@ -845,8 +842,7 @@ pub(super) fn census_in_read(
             }
             builder.observe("cutover_ownership", key.value(), value.value())?;
             if stored.record.state != eliot_runtime_contracts::GenerationCutoverState::Committed {
-                builder.counts.cutover_ownership =
-                    increment(builder.counts.cutover_ownership)?;
+                builder.counts.cutover_ownership = increment(builder.counts.cutover_ownership)?;
             }
         }
     }
@@ -981,15 +977,12 @@ pub(super) fn census_in_read(
                 ));
             }
             builder.observe("bridge_event_records", key.value(), value.value())?;
-            builder.counts.bridge_event_records =
-                increment(builder.counts.bridge_event_records)?;
+            builder.counts.bridge_event_records = increment(builder.counts.bridge_event_records)?;
         }
     }
 
     {
-        let projections = read
-            .open_table(BRIDGE_EVENT_PROJECTIONS)
-            .map_err(storage)?;
+        let projections = read.open_table(BRIDGE_EVENT_PROJECTIONS).map_err(storage)?;
         for row in projections.iter().map_err(storage)? {
             let (key, value) = row.map_err(storage)?;
             let projection: super::BridgeEventProjectionRow = decode(value.value())?;
@@ -1034,8 +1027,7 @@ pub(super) fn census_in_read(
             // Even RECONCILED is not receiver-owned terminal evidence for this
             // contract; retirement remains unavailable until that evidence is
             // represented and the owner removes the row.
-            builder.counts.bridge_event_handoffs =
-                increment(builder.counts.bridge_event_handoffs)?;
+            builder.counts.bridge_event_handoffs = increment(builder.counts.bridge_event_handoffs)?;
         }
     }
 
@@ -1061,18 +1053,14 @@ pub(super) fn census_in_read(
     builder.counts.restore_journal_intents =
         super::RedbRecoveryStore::unresolved_intents_for_store_stop_in(&read)?;
     {
-        let intents = read
-            .open_table(RESTORE_JOURNAL_INTENTS)
-            .map_err(storage)?;
+        let intents = read.open_table(RESTORE_JOURNAL_INTENTS).map_err(storage)?;
         for row in intents.iter().map_err(storage)? {
             let (key, value) = row.map_err(storage)?;
             builder.observe("restore_journal_intents", key.value(), value.value())?;
         }
     }
     {
-        let results = read
-            .open_table(RESTORE_JOURNAL_RESULTS)
-            .map_err(storage)?;
+        let results = read.open_table(RESTORE_JOURNAL_RESULTS).map_err(storage)?;
         for row in results.iter().map_err(storage)? {
             let (key, value) = row.map_err(storage)?;
             builder.observe("restore_journal_results", key.value(), value.value())?;
@@ -1104,8 +1092,7 @@ fn observe_cold_start_readiness(
     builder: &mut CensusBuilder,
 ) -> Result<(), crate::OrsError> {
     let mut newest_by_base = std::collections::BTreeMap::<String, (String, u64)>::new();
-    let mut newest_by_binding =
-        std::collections::BTreeMap::<String, (String, String, u64)>::new();
+    let mut newest_by_binding = std::collections::BTreeMap::<String, (String, String, u64)>::new();
     {
         let records = read
             .open_table(COLD_START_READINESS_RECORDS)
@@ -1257,9 +1244,8 @@ fn observe_bridge_event_maintenance(
             .flatten()
             {
                 scan.validate()?;
-                builder.counts.bridge_event_maintenance_continuations = increment(
-                    builder.counts.bridge_event_maintenance_continuations,
-                )?;
+                builder.counts.bridge_event_maintenance_continuations =
+                    increment(builder.counts.bridge_event_maintenance_continuations)?;
             }
         }
     }
@@ -1278,11 +1264,14 @@ fn observe_bridge_event_maintenance(
                     "owner maintenance key does not match its typed presenter scope",
                 ));
             }
-            builder.observe("bridge_event_owner_maintenance_cursors", key.value(), value.value())?;
+            builder.observe(
+                "bridge_event_owner_maintenance_cursors",
+                key.value(),
+                value.value(),
+            )?;
             if cursor.after_sequence != 0 {
-                builder.counts.bridge_event_maintenance_continuations = increment(
-                    builder.counts.bridge_event_maintenance_continuations,
-                )?;
+                builder.counts.bridge_event_maintenance_continuations =
+                    increment(builder.counts.bridge_event_maintenance_continuations)?;
             }
         }
     }
@@ -1314,12 +1303,12 @@ fn runtime_lease_is_terminal(state: eliot_runtime_contracts::LeaseState) -> bool
 }
 
 fn increment(value: u64) -> Result<u64, crate::OrsError> {
-    value.checked_add(1).ok_or_else(|| {
-        crate::OrsError::IntegrityProblem {
+    value
+        .checked_add(1)
+        .ok_or_else(|| crate::OrsError::IntegrityProblem {
             record_type: "store_stop_census",
             reason: "obligation count overflowed its wire range".to_owned(),
-        }
-    })
+        })
 }
 
 fn integrity(record_type: &'static str, reason: &'static str) -> crate::OrsError {
@@ -1342,18 +1331,10 @@ impl CensusBuilder {
         }
     }
 
-    fn observe(
-        &mut self,
-        family: &str,
-        key: &str,
-        value: &str,
-    ) -> Result<(), crate::OrsError> {
+    fn observe(&mut self, family: &str, key: &str, value: &str) -> Result<(), crate::OrsError> {
         let key_digest = crate::model::sha256_hex(key.as_bytes());
         let value_digest = crate::model::sha256_hex(value.as_bytes());
-        let next = format!(
-            "{}\n{family}\n{key_digest}\n{value_digest}",
-            self.revision
-        );
+        let next = format!("{}\n{family}\n{key_digest}\n{value_digest}", self.revision);
         self.revision = crate::model::sha256_hex(next.as_bytes());
         Ok(())
     }

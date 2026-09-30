@@ -204,9 +204,7 @@ impl KernelIdleLeaseCensus {
     }
 
     /// Complete ORS owner projection captured with this census, if its read succeeded.
-    pub(crate) fn store_stop_obligations(
-        &self,
-    ) -> Option<&eliot_ors::StoreStopObligationCensus> {
+    pub(crate) fn store_stop_obligations(&self) -> Option<&eliot_ors::StoreStopObligationCensus> {
         self.store_stop_obligations.as_ref()
     }
 }
@@ -320,9 +318,7 @@ impl KernelComposition {
         Option<eliot_ors::StoreStopObligationCensus>,
     ) {
         (
-            KernelIdleLeaseDisposition::Unavailable(
-                CensusUnavailability::RuntimeCensusUnreadable,
-            ),
+            KernelIdleLeaseDisposition::Unavailable(CensusUnavailability::RuntimeCensusUnreadable),
             None,
         )
     }
@@ -432,11 +428,9 @@ impl KernelComposition {
             // cannot be proven is treated exactly the same way: neither is
             // evidence that the installation is idle, so both legs answer
             // Unavailable and the drain gate stays closed.
-            Ok(None) | Err(_) => {
-                KernelIdleLeaseDisposition::Unavailable(
-                    CensusUnavailability::SupervisionHeadUnreadable,
-                )
-            }
+            Ok(None) | Err(_) => KernelIdleLeaseDisposition::Unavailable(
+                CensusUnavailability::SupervisionHeadUnreadable,
+            ),
         }
     }
 

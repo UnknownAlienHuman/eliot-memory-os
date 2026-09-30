@@ -1776,16 +1776,19 @@ impl RedbRecoveryStore {
         let results = read.open_table(RESTORE_JOURNAL_RESULTS).map_err(storage)?;
         let meta = read.open_table(RESTORE_JOURNAL_META).map_err(storage)?;
         let state = validate_journal_tables(&intents, &results, &meta)?;
-        state.streams.iter().try_fold(0_u64, |total, (stream, stream_state)| {
-            total
-                .checked_add(unresolved_frontier(stream, stream_state)?.unresolved_members)
-                .ok_or_else(|| {
-                    integrity(
-                        "restore_journal_census",
-                        "unresolved intent count overflowed its wire range",
-                    )
-                })
-        })
+        state
+            .streams
+            .iter()
+            .try_fold(0_u64, |total, (stream, stream_state)| {
+                total
+                    .checked_add(unresolved_frontier(stream, stream_state)?.unresolved_members)
+                    .ok_or_else(|| {
+                        integrity(
+                            "restore_journal_census",
+                            "unresolved intent count overflowed its wire range",
+                        )
+                    })
+            })
     }
 
     /// Rebuilds an owner receipt from current owner state.
