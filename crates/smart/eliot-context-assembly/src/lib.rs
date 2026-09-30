@@ -30,16 +30,13 @@ mod boundary;
 mod bounds;
 mod campaign_view;
 mod cite;
-mod error;
 #[cfg(not(target_arch = "wasm32"))]
 mod learning_gate;
 mod measurement;
 mod readback;
 mod render;
 
-pub use assemble::{
-    ASSEMBLY_ORDERING_REVISION, ActiveUnderstandingViewResult, AssemblyPolicy, assemble_active_view,
-};
+pub use assemble::{ASSEMBLY_ORDERING_REVISION, assemble_active_view};
 pub use boundary::{
     BOUNDARY_ASSEMBLY_TRANSFORMER_ID, BOUNDARY_ASSEMBLY_TRANSFORMER_REVISION,
     assembly_boundary_limits, boundary_binding_digest, project_assembly_boundaries,
@@ -47,15 +44,14 @@ pub use boundary::{
 };
 pub use campaign_view::check_campaign_view_for_assembly;
 pub use cite::project_citation;
-pub use error::AssemblyError;
 #[cfg(not(target_arch = "wasm32"))]
 pub use learning_gate::assemble_active_view_with_learning;
 pub use measurement::assemble_active_view_with_measurement;
 pub use readback::{ReopenedSource, gate_citation};
 
 pub use eliot_context_contracts::{
-    ActiveUnderstandingView, AdmittedContextSet, BoundaryMetadataSet, ContextError, ContextOutcome,
-    IndexPreview, PreviewAuthority, ProjectedCitation, QualityScorecard, ReadbackRefusal,
-    ReadbackRefusalKind, ReadbackRequest, RenderedAtom, SelectionIntegrityProof,
-    SerializedContextMeasurement,
+    ActiveUnderstandingView, ActiveUnderstandingViewResult, AdmittedContextSet, AssemblyError,
+    AssemblyPolicy, BoundaryMetadataSet, ContextError, ContextOutcome, IndexPreview,
+    PreviewAuthority, ProjectedCitation, QualityScorecard, ReadbackRefusal, ReadbackRefusalKind,
+    ReadbackRequest, RenderedAtom, SelectionIntegrityProof, SerializedContextMeasurement,
 };
