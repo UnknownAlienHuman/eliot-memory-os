@@ -14,16 +14,21 @@
 //!   `bins/eliot-mod-research/Cargo.toml::[package.metadata.eliot].functional_cell`
 //!   and `bins/eliot-mod-research/capability-cell.contract.toml`. It is emitted
 //!   by `scripts/gen_capability_cell_registry.py` and must not be hand-edited.
-//! - The cell identity and the source package the resolution is keyed by are
-//!   *also* generated, from the same one input chain. The expected pair is
-//!   therefore an independent expected set read beside the record, never a
-//!   copy of the registry's own roster: a registry cannot satisfy the lookup by
-//!   listing itself.
-//! - Resolution is [`CapabilityCellRegistry::resolve_cell_proof`], the #13
-//!   owner primitive. This module restates no record-side check and adds no
-//!   parallel cell schema, so the Kernel-side
-//!   `bins/eliot-kernel/src/composition_bootstrap.rs` consumer and this one
-//!   cannot drift apart.
+//! - The cell identity, source package and the three proof-surface expectations
+//!   the resolution compares against are also generated, from the package
+//!   manifest and the contract file. They are a second reading of the same
+//!   declaration inputs, NOT a second authority: `resolve_cell_proof` proves
+//!   that the compiled record and the compiled declaration agree, and does not
+//!   make them independent of one another. What it does establish is that the
+//!   record's proof surface is compared **by value** (entrypoint, support claim,
+//!   contract digest), so a registry cannot satisfy this binding by containing a
+//!   cell that merely has *some* entrypoint or digest.
+//! - Resolution is [`CapabilityCellRegistry::resolve_cell_proof`], the #13 owner
+//!   primitive. This module restates no record-side check and adds no parallel
+//!   cell schema. The Kernel-side native-worker consumer in
+//!   `bins/eliot-kernel/src/composition_bootstrap.rs` does **not** yet call this
+//!   primitive - it still resolves its own generated record locally - so the two
+//!   consumers can drift apart until it is migrated.
 //! - Nothing here mints authority, widens a record, or falls back: an absent,
 //!   duplicate, stale, or unbound record is a typed refusal that the caller
 //!   turns into `KERNEL_ADMISSION_REQUIRED`.
@@ -38,14 +43,17 @@
 // BEGIN GENERATED research-provider capability-cell registry (scripts/gen_capability_cell_registry.py; do not hand-edit)
 const RESEARCH_PROVIDER_CAPABILITY_CELL_ID: &str = "mod-research-provider";
 const RESEARCH_PROVIDER_CAPABILITY_SOURCE_PACKAGE: &str = "eliot-mod-research";
-const RESEARCH_PROVIDER_CAPABILITY_CELL_REGISTRY_JSON: &str = r#"{"cells":[{"affected_edges":[],"allowed_effect_classes":[],"cell":"mod-research-provider","cell_revision":{"major":1,"minor":0,"patch":0},"contract_digest":"fd0a6fbf1af1d4463ea2ced41576c8b1abf5ef2cd74a79a3716067486558d731","contract_digest_source":"bins/eliot-mod-research/capability-cell.contract.toml#contract-surface","execution_contour":"HOST_INLINE","freshness":{"current_support":"CURRENT_UNVERIFIED","invalidation":[]},"generation_owner":"issue-24","lifecycle_owner":"issue-24","maintenance_owner":"issue-24","manifest":{"context_capsule":{"owner":"issue-24","present":true},"contract_kit":{"owner":"issue-24","present":true},"test_capsule":{"owner":"issue-24","present":true}},"product_pulse":{"NOT_APPLICABLE":{"reason":"This provider bridge process is candidate-only research acquisition: a completed provider run proves process custody and evidence lineage, not research correctness, coverage, or product behavior. Product evidence is measured at the Kernel research route and the installed operational spine (#11)."}},"proof_ceiling":"STATIC_FIELD_AND_MIGRATION_CONTRACT_ONLY","proof_entrypoint":"cargo test -p eliot-mod-research --all-targets --all-features","removal_boundary":"Stop admitting research-provider dispatches, drain and cancel the exact eliot-mod-research process generation through Kernel, then remove the provider bridge; the Kernel research route answers CAPABILITY_UNAVAILABLE once the admitted material is no longer delivered.","replacement_class":"keep","runtime_bundle":null,"semantic_owner":"issue-24","source_crate":"eliot-mod-research","state_owners":[{"owner":"issue-24","state":"Per-operation admitted research-provider lifecycle: sealed admission, submitted envelope, raw provider evidence, provider job reference, terminal outcome, and cancellation receipt (in-process, per operation; no durable research Job/Attempt or coverage-denominator state)"}],"stateless":false}],"generator_version":"1.0.0","pair_key":"sha256:ab2011bd67557d89b2f094061d350a297389f7f57d0478be5e1ff8d2da8ed1c1","registry_version":1,"source_identity":{"cargo_lock_digest":"fc31e3176125cb717e6d665772d3181e11f7e11d64b3c47215402346b94863aa","generator_version":"1.0.0","toolchain":"rustc 1.97.1 (8bab26f4f 2026-07-14); binary: rustc; commit-hash: 8bab26f4f68e0e26f0bb7960be334d5b520ea452; commit-date: 2026-07-14; host: x86_64-pc-windows-msvc; release: 1.97.1; LLVM version: 22.1.6","tree_digest":"79098f85d8b75a546d936e8ddbe202bcbe1c82ca4badcbb1c7f33b57351e131d"}}"#;
+const RESEARCH_PROVIDER_CAPABILITY_CONTRACT_DIGEST: &str = "fd0a6fbf1af1d4463ea2ced41576c8b1abf5ef2cd74a79a3716067486558d731";
+const RESEARCH_PROVIDER_CAPABILITY_PROOF_ENTRYPOINT: &str = "cargo test -p eliot-mod-research --all-targets --all-features";
+const RESEARCH_PROVIDER_CAPABILITY_CURRENT_SUPPORT: &str = "CURRENT_UNVERIFIED";
+const RESEARCH_PROVIDER_CAPABILITY_CELL_REGISTRY_JSON: &str = r#"{"cells":[{"affected_edges":[],"allowed_effect_classes":[],"cell":"mod-research-provider","cell_revision":{"major":1,"minor":0,"patch":0},"contract_digest":"fd0a6fbf1af1d4463ea2ced41576c8b1abf5ef2cd74a79a3716067486558d731","contract_digest_source":"bins/eliot-mod-research/capability-cell.contract.toml#contract-surface","execution_contour":"HOST_INLINE","freshness":{"current_support":"CURRENT_UNVERIFIED","invalidation":[]},"generation_owner":"issue-24","lifecycle_owner":"issue-24","maintenance_owner":"issue-24","manifest":{"context_capsule":{"owner":"issue-24","present":true},"contract_kit":{"owner":"issue-24","present":true},"test_capsule":{"owner":"issue-24","present":true}},"product_pulse":{"NOT_APPLICABLE":{"reason":"This provider bridge process is candidate-only research acquisition: a completed provider run proves process custody and evidence lineage, not research correctness, coverage, or product behavior. Product evidence is measured at the Kernel research route and the installed operational spine (#11)."}},"proof_ceiling":"STATIC_FIELD_AND_MIGRATION_CONTRACT_ONLY","proof_entrypoint":"cargo test -p eliot-mod-research --all-targets --all-features","removal_boundary":"Stop admitting research-provider dispatches, drain and cancel the exact eliot-mod-research process generation through Kernel, then remove the provider bridge; the Kernel research route answers CAPABILITY_UNAVAILABLE once the admitted material is no longer delivered.","replacement_class":"keep","runtime_bundle":null,"semantic_owner":"issue-24","source_crate":"eliot-mod-research","state_owners":[{"owner":"issue-24","state":"Per-operation admitted research-provider lifecycle: sealed admission, submitted envelope, raw provider evidence, provider job reference, terminal outcome, and cancellation receipt (in-process, per operation; no durable research Job/Attempt or coverage-denominator state)"}],"stateless":false}],"generator_version":"1.0.0","pair_key":"sha256:ab2011bd67557d89b2f094061d350a297389f7f57d0478be5e1ff8d2da8ed1c1","registry_version":1,"source_identity":{"cargo_lock_digest":"fc31e3176125cb717e6d665772d3181e11f7e11d64b3c47215402346b94863aa","generator_version":"1.0.0","toolchain":"rustc 1.97.1 (8bab26f4f 2026-07-14); binary: rustc; commit-hash: 8bab26f4f68e0e26f0bb7960be334d5b520ea452; commit-date: 2026-07-14; host: x86_64-pc-windows-msvc; release: 1.97.1; LLVM version: 22.1.6","tree_digest":"cd64e55df7f6d50e641c8567355175dbb723183e6d6a073d321f8b311868826c"}}"#;
 // END GENERATED research-provider capability-cell registry
 
 use std::sync::OnceLock;
 
 use eliot_contracts::{
-    CapabilityCellId, CapabilityCellProof, CapabilityCellProofError, CapabilityCellRegistry,
-    SourceCrateRef,
+    CapabilityCellExpectation, CapabilityCellId, CapabilityCellProof, CapabilityCellProofError,
+    CapabilityCellRegistry, ContractDigest, ProofEntrypointRef, SourceCrateRef, SupportStatus,
 };
 
 use crate::admission::{AdmissionRefusal, ProviderAdmission};
@@ -104,9 +112,7 @@ pub fn resolve_admitted_cell(
         Err(_) => return Err(AdmissionRefusal::UndeclaredCapabilityCell),
     };
     // The expected cell and package identity are generated from the same input
-    // chain as the record and are read as typed #13 references, so the lookup is
-    // keyed by an independently generated expected set rather than by anything
-    // taken out of the registry it is about to resolve.
+    // chain as the record and are read as typed #13 references.
     let expected_cell = CapabilityCellId::new(RESEARCH_PROVIDER_CAPABILITY_CELL_ID)
         .map_err(|_| AdmissionRefusal::UndeclaredCapabilityCell)?;
     let expected_source_crate = SourceCrateRef::new(RESEARCH_PROVIDER_CAPABILITY_SOURCE_PACKAGE)
@@ -118,11 +124,43 @@ pub fn resolve_admitted_cell(
     if admission.module_id().as_str() != expected_cell.as_str() {
         return Err(AdmissionRefusal::CapabilityCellMismatch);
     }
+    // What this package independently DECLARES about its own cell, read from the
+    // declaration sources rather than from the record: the contract digest of
+    // `capability-cell.contract.toml`, the proof entrypoint from the package
+    // manifest, and the support claim from the contract. `resolve_cell_proof`
+    // compares these to the record by value, so a record that merely *contains*
+    // a plausible-looking entrypoint or digest no longer passes.
+    //
+    // Honest scope: these three are generated into this file by the same
+    // generator pass that writes the record, so they are a second reading of
+    // the same declaration inputs rather than a second, independent authority.
+    // What the comparison genuinely establishes is that the compiled record and
+    // the compiled declaration agree; it does not by itself make them
+    // independent of each other.
+    let expected_contract_digest =
+        ContractDigest::new(RESEARCH_PROVIDER_CAPABILITY_CONTRACT_DIGEST)
+            .map_err(|_| AdmissionRefusal::UndeclaredCapabilityCell)?;
+    let expected_proof_entrypoint =
+        ProofEntrypointRef::new(RESEARCH_PROVIDER_CAPABILITY_PROOF_ENTRYPOINT)
+            .map_err(|_| AdmissionRefusal::UndeclaredCapabilityCell)?;
+    let expected_support =
+        parse_support(RESEARCH_PROVIDER_CAPABILITY_CURRENT_SUPPORT)
+            .ok_or(AdmissionRefusal::UndeclaredCapabilityCell)?;
+    let expectation = CapabilityCellExpectation::new(
+        expected_cell,
+        expected_source_crate,
+        expected_proof_entrypoint,
+        expected_contract_digest,
+        expected_support,
+    );
     let proof = registry
-        .resolve_cell_proof(&expected_cell, &expected_source_crate)
+        .resolve_cell_proof(&expectation)
         .map_err(|error| match error {
             CapabilityCellProofError::MissingProofEntrypoint
-            | CapabilityCellProofError::StaleProofSurface => {
+            | CapabilityCellProofError::StaleProofSurface
+            | CapabilityCellProofError::ProofEntrypointMismatch { .. }
+            | CapabilityCellProofError::SupportMismatch { .. }
+            | CapabilityCellProofError::ContractDigestMismatch { .. } => {
                 AdmissionRefusal::CapabilityCellUnsupported
             }
             CapabilityCellProofError::UndeclaredCell { .. }
@@ -138,5 +176,37 @@ pub fn resolve_admitted_cell(
     if proof.cell().as_str() != admission.module_id().as_str() {
         return Err(AdmissionRefusal::CapabilityCellMismatch);
     }
+    // The process-cell half of the binding: the admitted Module generation is
+    // checked against the contour the record actually declares, not assumed.
+    //
+    // This cell declares `HOST_INLINE` with no delegated `runtime_bundle`, so
+    // there is no runtime-bundle identity for the Module generation to equal.
+    // What the documents let us assert is the negative: the record must not
+    // claim a delegated bundle this process does not own. A record that names
+    // one would be describing execution in a bundle this process is not, and
+    // accepting it would let a `module_generation_id` read as a delegation claim
+    // the record never made.
+    //
+    // Reported limitation, not silently narrowed: the admitted Module generation
+    // itself is still matched against nothing. #13 declares no Module-generation
+    // field on `CapabilityCellRecord` - `runtime_bundle` is the only process-cell
+    // identity it has - so there is no owner-typed value on the record side to
+    // compare `ProviderAdmission::module_generation_id` against. Binding it needs
+    // either a #13 `ModuleGenerationId` on the record or a decision that the
+    // Module generation belongs to a different owner surface; neither exists in
+    // this tree today.
+    if proof.runtime_bundle().is_some() {
+        return Err(AdmissionRefusal::CapabilityCellUnsupported);
+    }
     Ok(proof)
+}
+
+/// Parses the generated support claim into #13's own closed vocabulary.
+///
+/// The generated constant is the SCREAMING_SNAKE spelling the record's wire
+/// form uses, so it is parsed through the same spelling rather than being
+/// pattern-matched against a second local list. An unknown spelling returns
+/// `None` and is refused; it is never mapped onto a default.
+fn parse_support(value: &str) -> Option<SupportStatus> {
+    serde_json::from_value(serde_json::Value::String(value.to_owned())).ok()
 }

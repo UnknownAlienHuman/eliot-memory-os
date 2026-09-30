@@ -440,7 +440,8 @@ impl std::fmt::Display for ProviderExecutionReceipt {
             "operation={} exchange={} cancellation={} dispatch={} admission_receipt={} \
              executable={} module_generation={} \
              capability_cell={} capability_cell_contract={} capability_cell_registry={} \
-             capability_cell_proof={:?} capability_cell_source_crate={} \
+             capability_cell_support={:?} capability_cell_source_crate={} \
+             capability_cell_proof_entrypoint={} \
              process_generation={} disclosure={} \
              budget_units={} deadline_ms={} inquiry={} denominator={} \
              submit_envelope={} submit_binding={} outcome={:?} \
@@ -465,6 +466,7 @@ impl std::fmt::Display for ProviderExecutionReceipt {
             self.capability_cell_proof.registry_digest(),
             self.capability_cell_proof.current_support(),
             self.capability_cell_proof.source_crate().as_str(),
+            self.capability_cell_proof.proof_entrypoint().as_str(),
             self.process_generation,
             self.disclosure,
             self.budget_units,

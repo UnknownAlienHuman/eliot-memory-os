@@ -178,6 +178,12 @@ class CellSource(NamedTuple):
     required_bundle_dependencies: tuple[str, ...]
     # Extra package/contract/build inputs bound by this cell's tree digest.
     tree_inputs: tuple[str, ...]
+    # Constants this cell's sink needs beyond the three identity constants: the
+    # (name, kind) pairs of the independently declared expectation values a
+    # consumer compares the record's proof surface against by value. Emitted
+    # per cell and only for the cell that consumes them, because a constant no
+    # consumer reads would be dead code in that sink.
+    expectation_constants: tuple[tuple[str, str], ...]
 
 
 CELL_SOURCES = (
@@ -199,6 +205,9 @@ CELL_SOURCES = (
             "crates/modules/eliot-native-worker-core/src/generated/native_worker_facets_v1.rs.in",
             "crates/modules/eliot-native-worker-core/src/generated/native_worker_facets_v1.rs",
         ),
+        # The Kernel-side consumer still resolves this cell through its own
+        # local record check, so it needs no expectation constants.
+        expectation_constants=(),
     ),
     CellSource(
         key="research-provider",
@@ -216,6 +225,16 @@ CELL_SOURCES = (
         # there is no separate host dependency to require.
         required_bundle_dependencies=(),
         tree_inputs=(),
+        # This cell's consumer compares the record's proof surface by value, so
+        # the sink carries the expectations it compares against. Each is read
+        # here from the package manifest or the contract file - the declaration
+        # sources - and NOT from the generated record, so the comparison is a
+        # check between two independent declarations rather than a restatement.
+        expectation_constants=(
+            ("RESEARCH_PROVIDER_CAPABILITY_CONTRACT_DIGEST", "contract_digest"),
+            ("RESEARCH_PROVIDER_CAPABILITY_PROOF_ENTRYPOINT", "proof_entrypoint"),
+            ("RESEARCH_PROVIDER_CAPABILITY_CURRENT_SUPPORT", "current_support"),
+        ),
     ),
 )
 
@@ -685,6 +704,25 @@ def load_cell_registry(
     if not isinstance(state, str) or not state.strip() or not isinstance(state_owner, str):
         raise RegistryError("STATE_OWNERSHIP_MISSING", cell_source.contract)
 
+    # The expectations a consumer compares this record's proof surface against,
+    # read from the DECLARATION sources rather than from the record built below:
+    # the contract digest is the digest of the contract file itself, the proof
+    # entrypoint is the package manifest's declared entrypoint, and the support
+    # claim is the contract's declared claim. A consumer that holds these and
+    # compares them to the record is checking two independent declarations; a
+    # consumer that read them back out of the record would only be restating it.
+    expectations: dict[str, str] = {
+        "contract_digest": contract_digest,
+        "proof_entrypoint": str(proof_entrypoint),
+        "current_support": str(contract.get("current_support")),
+    }
+    missing = [kind for _name, kind in cell_source.expectation_constants if kind not in expectations]
+    if missing:
+        raise RegistryError(
+            "EXPECTATION_CONSTANT_UNKNOWN",
+            f"{cell_source.key} names unknown expectation kinds: {missing}",
+        )
+
     record: dict[str, object] = {
         "cell": cell,
         "cell_revision": {"major": revision[0], "minor": revision[1], "patch": revision[2]},
@@ -731,6 +769,7 @@ def load_cell_registry(
         record,
         str(cell),
         str(source_package),
+        expectations,
     )
 
 
@@ -749,18 +788,22 @@ def replace_registry_block(
 
 def emit_cell_registry(root: Path, cell_source: CellSource) -> tuple[str, str]:
     source = read_text(root, cell_source.registry)
-    registry_json, _record, cell, package = load_cell_registry(root, cell_source)
-    newline = "\r\n" if "\r\n" in source else "\n"
-    generated = newline.join(
-        (
-            cell_source.begin_marker,
-            f'const {cell_source.cell_id_marker}: &str = {json.dumps(cell)};',
-            f'const {cell_source.package_marker}: &str = {json.dumps(package)};',
-            f'const {cell_source.registry_marker}: &str = {rust_raw_string(registry_json)};',
-            cell_source.end_marker,
-        )
+    registry_json, _record, cell, package, expectations = load_cell_registry(
+        root, cell_source
     )
-    return source, replace_registry_block(cell_source, source, generated)
+    newline = "\r\n" if "\r\n" in source else "\n"
+    lines = [
+        cell_source.begin_marker,
+        f'const {cell_source.cell_id_marker}: &str = {json.dumps(cell)};',
+        f'const {cell_source.package_marker}: &str = {json.dumps(package)};',
+    ]
+    lines.extend(
+        f'const {name}: &str = {json.dumps(expectations[kind])};'
+        for name, kind in cell_source.expectation_constants
+    )
+    lines.append(f'const {cell_source.registry_marker}: &str = {rust_raw_string(registry_json)};')
+    lines.append(cell_source.end_marker)
+    return source, replace_registry_block(cell_source, source, newline.join(lines))
 
 
 def emit(root: Path) -> tuple[str, str]:

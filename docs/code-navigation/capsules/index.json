@@ -6045,20 +6045,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/foundation.authority.epoch-identity/contract_kit.json",
-          "artifact_digest": "694b23869b1bc97247190c037ab266c153d8281413d30a072235b5ede00fd0e7",
-          "contract_revision": "694b23869b1bc972"
+          "artifact_digest": "898566a72b1cd52d147b39bbbd875f8ba99e40b6ad20a6d1a31d849477cf6d8b",
+          "contract_revision": "898566a72b1cd52d"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/foundation.authority.epoch-identity/context_capsule.json",
-          "artifact_digest": "4933cf88f727f01eb2705b5340a2d844b118aabd479a78c8969a66fba2a59f0e",
-          "contract_revision": "4933cf88f727f01e"
+          "artifact_digest": "7691e4b9de157ef56919940157cd942a7e664603b8acaabe736bc07a7e8a929a",
+          "contract_revision": "7691e4b9de157ef5"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/foundation.authority.epoch-identity/test_capsule.json",
-          "artifact_digest": "a63bcf6cf76b1d45c59df4089ae3ff30a8792a7586657c49ba1df522644d2956",
-          "contract_revision": "a63bcf6cf76b1d45"
+          "artifact_digest": "b591c989b8ab03ff3e440d96b08d28edcfa5e5cf3ec3d6457fde2f22485d5045",
+          "contract_revision": "b591c989b8ab03ff"
         }
       }
     },
@@ -6240,20 +6240,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/foundation.contracts.primitives/contract_kit.json",
-          "artifact_digest": "597203f37518f5b080d6693ba02b3c709fc823a763b293627e5c1f144d584585",
-          "contract_revision": "597203f37518f5b0"
+          "artifact_digest": "0858b1fd31b2c524efdded911eab920e772b2a03893285b27c9b832f6f129a0a",
+          "contract_revision": "0858b1fd31b2c524"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/foundation.contracts.primitives/context_capsule.json",
-          "artifact_digest": "42a98d41d2945a2b00a31b91cdea7d05e313c1511a69cae525ef45cc1cf18443",
-          "contract_revision": "42a98d41d2945a2b"
+          "artifact_digest": "d3b371bd3d922a064e9fba216cf13f12f186b8d862b85983f83f5553c668fc32",
+          "contract_revision": "d3b371bd3d922a06"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/foundation.contracts.primitives/test_capsule.json",
-          "artifact_digest": "021c24381fd3293e40b5a2cfe19e86b567225323c024c4512e0b8b7e58a0f192",
-          "contract_revision": "021c24381fd3293e"
+          "artifact_digest": "c6d0aa9a6173e3fa5bacffccb38e4b287cee4511505f9290a2e92e0fb4d79076",
+          "contract_revision": "c6d0aa9a6173e3fa"
         }
       }
     },
@@ -7176,20 +7176,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/mod-research-provider/contract_kit.json",
-          "artifact_digest": "36cde2c7b57974156f67381517be952f352293527e5794feddd9728f70b051ff",
-          "contract_revision": "36cde2c7b5797415"
+          "artifact_digest": "33b01cb89b4123ac60b6eb227bbf51bf05dc121eea0cc4af194a21a0b40a7630",
+          "contract_revision": "33b01cb89b4123ac"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/mod-research-provider/context_capsule.json",
-          "artifact_digest": "c63f54eee62eb2b7d6cd1ebe3d140d131d53071634d2e53302bb9e6b4bf239a4",
-          "contract_revision": "c63f54eee62eb2b7"
+          "artifact_digest": "5943f2477c864c6d88bc0216862eba222060949722094bb75b27d7638d60fe8e",
+          "contract_revision": "5943f2477c864c6d"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/mod-research-provider/test_capsule.json",
-          "artifact_digest": "6e6af580bcd1f1d3e03c3d528c087c93317e4c3d6b54763677f49b160db0baff",
-          "contract_revision": "6e6af580bcd1f1d3"
+          "artifact_digest": "65c20bb7fff6a33e12e5f0ab772fb89978e119cf584e748b3fb181b19c7d39a9",
+          "contract_revision": "65c20bb7fff6a33e"
         }
       }
     },
@@ -11362,20 +11362,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/foundation.authority.epoch-identity/contract_kit.json",
-          "artifact_digest": "694b23869b1bc97247190c037ab266c153d8281413d30a072235b5ede00fd0e7",
-          "contract_revision": "694b23869b1bc972"
+          "artifact_digest": "898566a72b1cd52d147b39bbbd875f8ba99e40b6ad20a6d1a31d849477cf6d8b",
+          "contract_revision": "898566a72b1cd52d"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/foundation.authority.epoch-identity/context_capsule.json",
-          "artifact_digest": "4933cf88f727f01eb2705b5340a2d844b118aabd479a78c8969a66fba2a59f0e",
-          "contract_revision": "4933cf88f727f01e"
+          "artifact_digest": "7691e4b9de157ef56919940157cd942a7e664603b8acaabe736bc07a7e8a929a",
+          "contract_revision": "7691e4b9de157ef5"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/foundation.authority.epoch-identity/test_capsule.json",
-          "artifact_digest": "a63bcf6cf76b1d45c59df4089ae3ff30a8792a7586657c49ba1df522644d2956",
-          "contract_revision": "a63bcf6cf76b1d45"
+          "artifact_digest": "b591c989b8ab03ff3e440d96b08d28edcfa5e5cf3ec3d6457fde2f22485d5045",
+          "contract_revision": "b591c989b8ab03ff"
         }
       },
       "implementation_support": {
@@ -11682,20 +11682,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/foundation.contracts.primitives/contract_kit.json",
-          "artifact_digest": "597203f37518f5b080d6693ba02b3c709fc823a763b293627e5c1f144d584585",
-          "contract_revision": "597203f37518f5b0"
+          "artifact_digest": "0858b1fd31b2c524efdded911eab920e772b2a03893285b27c9b832f6f129a0a",
+          "contract_revision": "0858b1fd31b2c524"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/foundation.contracts.primitives/context_capsule.json",
-          "artifact_digest": "42a98d41d2945a2b00a31b91cdea7d05e313c1511a69cae525ef45cc1cf18443",
-          "contract_revision": "42a98d41d2945a2b"
+          "artifact_digest": "d3b371bd3d922a064e9fba216cf13f12f186b8d862b85983f83f5553c668fc32",
+          "contract_revision": "d3b371bd3d922a06"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/foundation.contracts.primitives/test_capsule.json",
-          "artifact_digest": "021c24381fd3293e40b5a2cfe19e86b567225323c024c4512e0b8b7e58a0f192",
-          "contract_revision": "021c24381fd3293e"
+          "artifact_digest": "c6d0aa9a6173e3fa5bacffccb38e4b287cee4511505f9290a2e92e0fb4d79076",
+          "contract_revision": "c6d0aa9a6173e3fa"
         }
       },
       "implementation_support": {
@@ -13307,20 +13307,20 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/mod-research-provider/contract_kit.json",
-          "artifact_digest": "36cde2c7b57974156f67381517be952f352293527e5794feddd9728f70b051ff",
-          "contract_revision": "36cde2c7b5797415"
+          "artifact_digest": "33b01cb89b4123ac60b6eb227bbf51bf05dc121eea0cc4af194a21a0b40a7630",
+          "contract_revision": "33b01cb89b4123ac"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/mod-research-provider/context_capsule.json",
-          "artifact_digest": "c63f54eee62eb2b7d6cd1ebe3d140d131d53071634d2e53302bb9e6b4bf239a4",
-          "contract_revision": "c63f54eee62eb2b7"
+          "artifact_digest": "5943f2477c864c6d88bc0216862eba222060949722094bb75b27d7638d60fe8e",
+          "contract_revision": "5943f2477c864c6d"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/mod-research-provider/test_capsule.json",
-          "artifact_digest": "6e6af580bcd1f1d3e03c3d528c087c93317e4c3d6b54763677f49b160db0baff",
-          "contract_revision": "6e6af580bcd1f1d3"
+          "artifact_digest": "65c20bb7fff6a33e12e5f0ab772fb89978e119cf584e748b3fb181b19c7d39a9",
+          "contract_revision": "65c20bb7fff6a33e"
         }
       },
       "implementation_support": {
@@ -18311,5 +18311,5 @@
       }
     }
   ],
-  "registry_digest": "d7ab3e99f642a62c1b7ba4938e4571e5c5e394e1c396f970fd51d2b87ad78e2b"
+  "registry_digest": "caf6d5de9888a180157eea5bcc5a1c39144442300625140e9d48d0eb78c9299e"
 }

@@ -16,7 +16,7 @@ description = "Kernel-gated ELIOT Researcher provider process; fails closed when
 # (`execution.rs`). Declaring it here is what turns that identity from free text
 # into a catalogued capability cell: `scripts/gen_capability_cell_registry.py`
 # projects it into a generated `CapabilityCellRecord`, and
-# `eliot_mod_research::capability_cell::bind_declared_cell` refuses any
+# `eliot_mod_research::capability_cell::resolve_admitted_cell` refuses any
 # admission whose sealed cell id the generated registry does not declare with a
 # current validated proof surface. Without this declaration the record cannot
 # exist and the proof surface is unbound.
