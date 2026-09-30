@@ -27,7 +27,10 @@
 //! - every stage really starts as a real child through the sole
 //!   [`WindowsProcessExecutor`] under a Kernel-issued dispatch permit, so the
 //!   per-stage evidence the receipt carries came from a process this entry
-//!   executed rather than from a value it was handed. That launch is gated by
+//!   executed rather than from a value it was handed. The `--version` read that
+//!   pins each tool's identity is launched the same way, under its own one-shot
+//!   permit, so this entry has no launch of any kind outside that single
+//!   executor. That stage launch is gated by
 //!   `StageOrchestrator::launch_plan_live`, which refuses to launch a plan
 //!   compiled against a replaced registry generation and admits each stage
 //!   through `AdmittedStage::admit_live` against the live [`InstrumentRegistry`]
@@ -70,6 +73,7 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -92,10 +96,10 @@ use eliot_instrument_runner::{
 use eliot_process::{
     ActionLeaseRef, CancellationReceipt, DispatchAuthorityId, DispatchPermitAuthority,
     DispatchValidationContext, EnvironmentInheritance, EnvironmentProjection, EvidenceSinkError,
-    FencingToken, Generation, ImageId, JobId, KernelDispatchKey, OperationId, PermitIssuance,
-    ProcessEvidence, ProcessEvidenceSink, ProcessExecutionError, ProcessExecutionView,
-    ProcessExecutor, ProcessIntent, ProcessRequest, ProcessStartReceipt, ProcessTreeId,
-    ResourceLimits, SessionId, SuspendedProcessIdentity, ValidatedDispatch,
+    ExitDisposition, FencingToken, Generation, ImageId, JobId, KernelDispatchKey, OperationId,
+    PermitIssuance, ProcessEvidence, ProcessEvidenceSink, ProcessExecutionError,
+    ProcessExecutionView, ProcessExecutor, ProcessIntent, ProcessRequest, ProcessStartReceipt,
+    ProcessTreeId, ResourceLimits, SessionId, SuspendedProcessIdentity, ValidatedDispatch,
 };
 use eliot_process_executor::{
     DispatchValidationPort, ExecutableObservation, WindowsProcessExecutor,
@@ -155,6 +159,27 @@ const STAGE_MAX_DESCENDANTS: u32 = 256;
 /// tool's version line, so an ordinary version is recorded in full and only a
 /// runaway read is refused.
 const MAX_TOOL_VERSION_BYTES: usize = 4096;
+
+/// Wall bound for the permit-bound `--version` observation child, in milliseconds.
+///
+/// A version read is a short bounded probe, not a stage: this is deliberately
+/// far below [`STAGE_WALL_TIMEOUT_MS`] so a tool that hangs instead of answering
+/// its version is refused here rather than holding a stage-sized launch open.
+const VERSION_WALL_TIMEOUT_MS: u64 = 60_000;
+
+/// Per-stream capture ceiling for the permit-bound `--version` observation child.
+///
+/// Set above [`MAX_TOOL_VERSION_BYTES`] so an ordinary version is captured whole
+/// and still bounds what a runaway tool can write. Because the retained prefix
+/// preview omits any suffix past this ceiling, `observed_tool_version` refuses a
+/// read that hit it instead of reporting a truncated line as the version.
+const VERSION_STDOUT_BYTES: u64 = 64 * 1024;
+
+/// Ceiling on descendant processes for the permit-bound `--version` child.
+///
+/// A version read answers with a single line from the tool itself, so a wider
+/// descendant tree than [`STAGE_MAX_DESCENDANTS`] is not a normal observation.
+const VERSION_MAX_DESCENDANTS: u32 = 8;
 
 /// The exact invocation this binary reads.
 struct Request {
@@ -421,10 +446,7 @@ fn resolve_route(request: &Request) -> Result<VerificationProfileReceipt, CliErr
     // stale compiled one.
     let plan = StageOrchestrator::plan(&admitted);
     let runs = block_on(StageOrchestrator::launch_plan_live(
-        &runner,
-        &registry,
-        &plan,
-        &launcher,
+        &runner, &registry, &plan, &launcher,
     ));
     let aggregate = ProfileAggregate::assemble(&plan, runs);
     require_launched_stage(&admitted, &aggregate)?;
@@ -612,32 +634,76 @@ fn file_digest(path: &Path) -> Result<String, CliError> {
 /// pinned or recorded", and a version nobody read is neither. The text is
 /// whatever the tool itself printed on its own `--version` invocation, bounded
 /// to the first non-empty line and to [`MAX_TOOL_VERSION_BYTES`]; a tool that
-/// exits nonzero, prints nothing, or overruns that bound is refused rather than
-/// receipted under a synthesized value, because a wrong version is a pinned
-/// identity that does not describe the bytes it is bound to.
+/// does not exit normally, prints nothing, or overruns that bound is refused
+/// rather than receipted under a synthesized value, because a wrong version is a
+/// pinned identity that does not describe the bytes it is bound to.
 ///
-/// This runs the tool as a plain child of this process for the sole purpose of
-/// reading its version. It is deliberately NOT the governed stage launch: the
-/// stage's own permit-bound launch is [`seal_stage_request`], and this read
-/// happens before it, so no stage is executed and no verdict is derived here.
-fn observed_tool_version(executable: &Path) -> Result<String, CliError> {
-    let output = std::process::Command::new(executable)
-        .arg("--version")
-        .output()
-        .map_err(|error| {
-            CliError::Contract(format!(
-                "tool {} reported no version ({error})",
-                executable.display()
-            ))
-        })?;
-    if !output.status.success() {
+/// The `--version` child is a real launch and crosses the same physical
+/// process boundary every other launch in this entry does: it is sealed with
+/// its own one-shot P-07 dispatch permit by [`seal_version_request`] and started
+/// through the sole [`WindowsProcessExecutor`], so I10.8.2's single-executor
+/// rule holds for the version read exactly as it does for an admitted stage.
+/// Reading the tool's version is observation, not a verdict: this runs before
+/// any stage and derives nothing about the route's outcome, so it stays separate
+/// from the admitted stage launch in [`seal_stage_request`]. What the governed
+/// path adds is that the text it returns is the stdout this process's own
+/// executor really captured under a Kernel-validated permit, not bytes an
+/// ungoverned child wrote.
+fn observed_tool_version(executable: &Path, epoch: &EpochId) -> Result<String, CliError> {
+    // The read gets its own `DispatchCell` because a P-07 dispatch permit is
+    // one-shot: the `--version` child is a distinct launch from the stage that
+    // follows it, so it can never consume the stage's permit or its stored
+    // validation context. It is still the same authority composition, the same
+    // epoch, and the same generation, so this run has exactly one epoch.
+    let cell = Arc::new(DispatchCell::activate()?);
+    let executor = StageExecutor::with(Arc::clone(&cell));
+    let request = seal_version_request(&cell, epoch, executable)?;
+    let receipt = block_on(executor.start(
+        request,
+        Arc::new(RetainedEvidenceSink::default()) as Arc<dyn ProcessEvidenceSink>,
+    ))?;
+    let view = block_on(executor.inspect(receipt.operation_id().clone()))?;
+    if !view.lifecycle().is_terminal() {
         return Err(CliError::Contract(format!(
-            "tool {} exited {} while reporting its version",
-            executable.display(),
-            output.status
+            "tool {} version read did not reach a terminal state",
+            executable.display()
         )));
     }
-    let reported = String::from_utf8_lossy(&output.stdout);
+    // `ExitDisposition::Completed` is the executor's own observed terminal
+    // classification, so this is the governed equivalent of the old
+    // `output.status.success()` test: a signalled, resource-limited, cancelled,
+    // or unclassifiable tree is refused here exactly as a nonzero exit was.
+    let exit = view.exit().ok_or_else(|| {
+        CliError::Contract(format!(
+            "tool {} reported no exit observation while reading its version",
+            executable.display()
+        ))
+    })?;
+    if exit.disposition() != ExitDisposition::Completed {
+        return Err(CliError::Contract(format!(
+            "tool {} ended {exit:?} while reporting its version",
+            executable.display()
+        )));
+    }
+    let evidence = block_on(executor.reconcile(receipt.operation_id().clone()))?;
+    // The version text is the stdout this executor really captured for that
+    // exact permit-bound operation, read back out of the reconciled evidence's
+    // bounded prefix preview. The preview is the transport-level prefix, so a
+    // version line longer than the retained bound is still refused below rather
+    // than silently truncated into a shorter "version".
+    let stdout = evidence.stdout().ok_or_else(|| {
+        CliError::Contract(format!(
+            "tool {} retained no version output",
+            executable.display()
+        ))
+    })?;
+    if !stdout.preview().omitted_ranges().is_empty() {
+        return Err(CliError::Contract(format!(
+            "tool {} wrote more than the {VERSION_STDOUT_BYTES} byte version bound; its version line was truncated",
+            executable.display()
+        )));
+    }
+    let reported = String::from_utf8_lossy(stdout.preview().bytes());
     let version = reported
         .lines()
         .map(str::trim)
@@ -656,6 +722,80 @@ fn observed_tool_version(executable: &Path) -> Result<String, CliError> {
         )));
     }
     Ok(version.to_owned())
+}
+
+/// Seals the one-shot permit-bound request for the `--version` observation read.
+///
+/// This is deliberately the same P-07 composition [`seal_stage_request`] uses —
+/// the same [`ProcessIntent`] fields, the same isolated [`isolated_projection`],
+/// the same fenced epoch and registry generation, and the same
+/// [`DispatchCell::issue`] one-shot issuance — so the read is a governed launch
+/// of the same kind the stage is, and the I10.8.2 single-executor rule covers it
+/// without exception. It differs only in what is being launched: the tool's own
+/// `--version` argv against the pinned executable, observed in the directory
+/// [`resolve_tool`] resolved it in, so a stage's working directory cannot change
+/// which bytes answer.
+fn seal_version_request(
+    cell: &DispatchCell,
+    epoch: &EpochId,
+    executable: &Path,
+) -> Result<ProcessRequest, CliError> {
+    let projection = isolated_projection()?;
+    let argv = vec!["--version".to_owned()];
+    // The operation identity is derived from the same real tool bytes the stage
+    // launch pins, so the read and the stage it precedes are bound to one
+    // concrete executable rather than to a name that could resolve elsewhere.
+    let operation = format!(
+        "verification-profile-version-{}",
+        &sha256_hex(
+            format!("{executable}\0{}", argv.join("\u{1}")).as_bytes()
+        )[..24]
+    );
+    let intent = ProcessIntent::new(
+        OperationId::new(operation.clone())?,
+        ProcessTreeId::new(format!("{operation}-tree"))?,
+        JobId::new(format!("{operation}-job"))?,
+        ImageId::new(format!("{operation}-image"))?,
+        SessionId::new(format!("{EPOCH_LINEAGE}-{operation}"))?,
+        Generation::new(VERIFICATION_REGISTRY_GENERATION)?,
+        executable.to_string_lossy().into_owned(),
+        file_digest(executable)?,
+        argv.clone(),
+        // The tool's own resolved parent, not the admitted source root: this
+        // observes the tool where `resolve_tool` pinned it.
+        executable
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf(),
+        projection,
+        ResourceLimits::new(
+            VERSION_WALL_TIMEOUT_MS,
+            None,
+            None,
+            VERSION_STDOUT_BYTES,
+            VERSION_STDOUT_BYTES,
+            VERSION_MAX_DESCENDANTS,
+        )?,
+    )?;
+    let fence = FencingToken::new(
+        epoch.clone(),
+        Generation::new(VERIFICATION_REGISTRY_GENERATION)?,
+        format!("{operation}-fence"),
+    )?;
+    let heads = BTreeMap::from([(
+        "verification-profile-version".to_owned(),
+        sha256_hex(format!("{operation}\0{}", argv.join("\u{1}")).as_bytes()),
+    )]);
+    let issued_at = now_unix_ms().max(1);
+    cell.issue(
+        &intent,
+        fence,
+        heads,
+        issued_at,
+        issued_at.saturating_add(VERSION_WALL_TIMEOUT_MS),
+        ActionLeaseRef::new(format!("{operation}-lease"))?,
+        format!("{operation}-nonce"),
+    )
 }
 
 /// Reads the exact invocation text this binary accepts.
@@ -761,7 +901,12 @@ fn process_epoch() -> Result<EpochId, CliError> {
         if matches!(index, 4 | 6 | 8 | 10) {
             lineage.push('-');
         }
-        lineage.push_str(&format!("{byte:02x}"));
+        // `write!` into the same String rather than appending a `format!` result:
+        // one formatting call, no intermediate allocation, and no way for the
+        // formatted hex to differ from what was pushed.
+        write!(lineage, "{byte:02x}").map_err(|_| {
+            CliError::Contract("epoch lineage is not formattable".to_owned())
+        })?;
     }
     let lineage = EpochLineageId::new(lineage)?;
     let sequence = NonZeroU64::new(1)
@@ -951,6 +1096,10 @@ impl DispatchValidationPort for DispatchCell {
 /// Each stage really starts a child through the sole [`WindowsProcessExecutor`]
 /// under this run's own dispatch cell, so the identity the receipt records for
 /// that stage is the identity of bytes this process actually executed.
+///
+/// The permit-bound `--version` read uses this same owner over its own cell, so
+/// every child this entry starts — the version probes and the stages alike —
+/// crosses the one executor composition below.
 struct StageExecutor {
     cell: Arc<DispatchCell>,
 }
@@ -1097,12 +1246,13 @@ fn stage_argv(stage: &PlannedStage) -> Vec<String> {
 /// sealing and launch fails the executor's own observation check.
 ///
 /// The tool version is observed by really running the tool's own version flag
-/// and keeping the first line it printed. A complete identity requires a
-/// non-empty version (`is_complete` refuses an observation without one), and
-/// this is the same machine observation the `eliot-verifier-selfchange` driver
-/// makes before it launches a child: no version is invented from the file name,
-/// and a tool that cannot report one is refused here rather than receipted with
-/// a placeholder.
+/// through [`observed_tool_version`] and keeping the first line that launch
+/// printed. A complete identity requires a non-empty version (`is_complete`
+/// refuses an observation without one), and no version is invented from the file
+/// name: a tool that cannot report one is refused here rather than receipted with
+/// a placeholder. That read is itself a governed launch under its own one-shot
+/// permit, so both children this function causes to exist — the `--version` probe
+/// and the stage itself — cross the single [`WindowsProcessExecutor`] boundary.
 fn seal_stage_request(
     cell: &DispatchCell,
     epoch: &EpochId,
@@ -1117,7 +1267,7 @@ fn seal_stage_request(
         &executable,
         argv.to_vec(),
         environment_projection_digest(&projection),
-        Some(observed_tool_version(&executable)?),
+        Some(observed_tool_version(&executable, epoch)?),
     )
     .map_err(|error| CliError::Contract(format!("executable observation refused: {error}")))?;
     if !observed.is_complete() {
