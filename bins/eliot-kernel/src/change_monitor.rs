@@ -12,8 +12,8 @@
 //! checksum/re-read confirmation, governed-tool records, and the acceptance
 //! block the host-request route queries. Two producers feed it: the Kernel
 //! process-effect lane (`crate::process_execution::KernelGovernedProcessEffectPort`,
-//! attached in the owning crate) for host-event hints over the lease-owned
-//! governed image, and the filesystem/Git observation adapter in this module
+//! attached in the owning crate) for host-event hints over the
+//! admission-declared mutation set (one hint per declared target), and the
 //! ([`observe_filesystem_notification`]) for received OS filesystem
 //! notifications. The adapter opens the hinted tracked source twice per
 //! observation and reads the real Git substrate (`.git/HEAD` plus the
@@ -299,7 +299,7 @@ struct UnknownReconciliation {
 struct KernelChangeLedger {
     hints: BTreeMap<String, HintEntry>,
     governed: BTreeMap<String, GovernedChangeRecord>,
-    governed_by_operation: BTreeMap<String, String>,
+    governed_by_operation: BTreeMap<String, Vec<String>>,
     unknown: BTreeMap<String, UnknownOriginRecord>,
     reconciliations: Vec<UnknownReconciliation>,
 }
@@ -389,15 +389,18 @@ fn validate_verification(verification: &HintVerification) -> Result<(), ChangeMo
     Ok(())
 }
 
-/// Builds the idempotent hint identity for one governed tool operation.
+/// Builds the idempotent hint identity for one governed tool operation
+/// target.
 ///
-/// The same operation handle always maps to the same hint, so an exact
-/// re-ingest of the same hint replays instead of conflicting. A retry that
-/// observes new evidence re-evaluates under the same identity
+/// The same operation handle plus the same target digest always maps to the
+/// same hint, so an exact re-ingest of the same hint replays instead of
+/// conflicting. Distinct targets never share an identity, so a second
+/// target's transition is never swallowed by the first confirmation. A
+/// retry that observes new evidence re-evaluates under the same identity
 /// ([`confirm_hint`] follows the latest evidence, never a stale
 /// confirmation).
-pub(crate) fn host_hint_id(operation_id: &str) -> String {
-    format!("cmh:{operation_id}")
+pub(crate) fn host_hint_id(operation_id: &str, target_digest: &str) -> String {
+    format!("cmh:{operation_id}:{target_digest}")
 }
 
 /// Builds the hint identity for one filesystem-observed artifact
@@ -566,7 +569,7 @@ pub(crate) fn confirm_hint(
 }
 
 /// One operating-system filesystem notification received by the Kernel
-/// (I10.21 W2, AUD2 defect 2). Unlike the inferred executable-image
+/// (I10.21 W2, AUD2 defect 2). Unlike the inferred declared-target
 /// transition the process-effect lane polls at pre-effect capture, this is
 /// a delivered OS event: the watcher observed `path` change and handed over
 /// `event_ref`. It is still only a hint until
@@ -831,8 +834,18 @@ pub(crate) fn record_governed_tool_change(
         fence_invalidated: change.fence_invalidated,
     };
     let mut ledger = ledger()?;
-    if let Some(bound) = ledger.governed_by_operation.get(&change.operation).cloned()
-        && bound != change.change_id
+    // I10.21 A1: one operation may record one governed change per declared
+    // target it mutated. A further change identity under the same operation
+    // is admitted only when it carries the owning operation's own
+    // session/lease: the same handle under a different lease/session is
+    // operation reuse, never an additional target.
+    if let Some(bound) = ledger.governed_by_operation.get(&change.operation)
+        && !bound.contains(&change.change_id)
+        && !bound.iter().any(|bound_id| {
+            ledger.governed.get(bound_id).is_some_and(|record| {
+                record.session == change.session && record.action_lease == change.action_lease
+            })
+        })
     {
         return Err(ChangeMonitorError::OperationReuse);
     }
@@ -844,7 +857,9 @@ pub(crate) fn record_governed_tool_change(
     }
     ledger
         .governed_by_operation
-        .insert(change.operation.clone(), change.change_id.clone());
+        .entry(change.operation.clone())
+        .or_default()
+        .push(change.change_id.clone());
     ledger.governed.insert(change.change_id.clone(), record);
     let matched: Vec<(String, String)> = ledger
         .unknown
