@@ -2841,7 +2841,7 @@ impl Drop for OwnedSecurityDescriptor {
 pub struct WindowsPlatform {
     root: PathBuf,
     #[cfg(windows)]
-    _root_pin: std::fs::File,
+    root_pin: std::fs::File,
 }
 
 impl WindowsPlatform {
@@ -2859,7 +2859,7 @@ impl WindowsPlatform {
         Ok(Self {
             root,
             #[cfg(windows)]
-            _root_pin: root_pin,
+            root_pin,
         })
     }
 
