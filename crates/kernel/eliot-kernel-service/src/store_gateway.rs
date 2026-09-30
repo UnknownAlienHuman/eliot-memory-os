@@ -32,7 +32,7 @@ use eliot_kernel_core::user_automation::{
     UserAutomationPreflightProjection, UserAutomationRevision,
 };
 use eliot_ors::{
-    CONTRACT_VERSION as ORS_CONTRACT_VERSION, HOST_REQUEST_SEND_CLAIM_LEASE_MS, HostRequestAttempt,
+    AcceptedPending, CONTRACT_VERSION as ORS_CONTRACT_VERSION, HOST_REQUEST_SEND_CLAIM_LEASE_MS, HostRequestAttempt,
     HostRequestAttemptPhase, HostRequestDeliveryReceipt, HostRequestKind, HostRequestNoSendProof,
     HostRequestOwnerReadbackEvidence, HostRequestRecord, HostRequestResponseSource,
     HostRequestState, HostRequestTransportBoundary, HostRequestTransportObservation, OpaqueLabel,
@@ -80,12 +80,12 @@ use crate::commit_recovery::{
 use crate::store_client::DreamerCommitEvidence;
 use crate::store_write_reservation::{
     CompositionReservation, ReservationSeed, ReservedSubmission, ResolvedSendOutcome,
-    SealedReservation, StagedWriteRecovery,
-    accept_reservation_for_transition_with_original_submission, begin_execute_after_send,
-    cancel_before_send, claim_execute_before_send, ensure_eligible, finalize_reservation,
-    mark_unknown_outcome, reconcile_receipt, reservation_record_by_order, reserve_for_transition,
-    reserve_for_transition_with_original_submission, retain_unsupported_prepared_plan,
-    writer_epoch_for_fence_from_epoch,
+    SealedReservation, StagedWriteRecovery, accept_reservation_for_transition_with_original_submission,
+    claim_execute_before_send, begin_execute_after_send, cancel_before_send, ensure_eligible,
+    finalize_reservation, mark_unknown_outcome, reconcile_receipt,
+    reservation_record_by_operation,
+    reserve_for_transition, reserve_for_transition_with_original_submission,
+    retain_unsupported_prepared_plan, writer_epoch_for_fence_from_epoch,
 };
 use crate::user_automation_execution::{
     UserAutomationDueWakeResolution, UserAutomationDurableJobMaterial,
@@ -849,6 +849,104 @@ impl AcceptedReservedWrite {
     pub fn submission(&self) -> &WriteSubmission {
         &self.submission
     }
+
+    /// The exact token loaded from the ORS operation owner after acceptance.
+    pub fn token(&self) -> &WriterReservationToken {
+        &self.token
+    }
+}
+
+/// Typed disposition from the staged reserved-write owner.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StagedReservedWriteError {
+    /// The exact staged token is still durable, but an earlier scope owner
+    /// blocks execution. Retry or restore this same operation; never restage.
+    RetryablePredecessorPending { operation_id: String },
+    /// A pre-send gate refused execution. If staging already succeeded, the
+    /// accepted token remains durable and can be polled or restored.
+    Refused { detail: String },
+    /// Acceptance, claim, send, or receipt evidence is ambiguous. Query only
+    /// the exact Store receipt; never retransmit from this result.
+    OutcomeUnknown { operation_id: String, detail: String },
+}
+
+impl std::fmt::Display for StagedReservedWriteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RetryablePredecessorPending { operation_id } => write!(
+                formatter,
+                "reserved write {operation_id} remains staged: predecessor pending"
+            ),
+            Self::Refused { detail } => formatter.write_str(detail),
+            Self::OutcomeUnknown {
+                operation_id,
+                detail,
+            } => write!(formatter, "reserved write {operation_id} outcome unknown: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for StagedReservedWriteError {}
+
+impl From<String> for StagedReservedWriteError {
+    fn from(detail: String) -> Self {
+        Self::Refused { detail }
+    }
+}
+
+fn bind_accepted_staged_write(
+    sealed: SealedReservation,
+    accepted_pending: AcceptedPending,
+    context: &RequestMetadata,
+    transition: &PreparedTransition,
+    expected_revision_heads: Vec<RevisionHeadExpectation>,
+    expected_ordering_heads: Vec<OrderingHeadExpectation>,
+    original_submission: &OriginalWriteSubmission,
+) -> Result<AcceptedReservedWrite, StagedReservedWriteError> {
+    let operation_id = transition.identity.operation_id.as_str().to_owned();
+    let staged_request = ReservedSubmission::from_sealed_with_original_submission(
+        &sealed,
+        context,
+        transition,
+        expected_revision_heads,
+        expected_ordering_heads,
+        original_submission,
+    )
+    .map_err(|error| StagedReservedWriteError::OutcomeUnknown {
+        operation_id: operation_id.clone(),
+        detail: error.to_string(),
+    })?;
+    let request = staged_request.request().clone();
+    let accepted_binding = sealed.token.write_binding.clone().ok_or_else(|| {
+        StagedReservedWriteError::OutcomeUnknown {
+            operation_id: operation_id.clone(),
+            detail: "accepted ORS reservation token omitted its original write binding".to_owned(),
+        }
+    })?;
+    if accepted_pending.operation_id.as_str() != request.admission.operation_id.as_str()
+        || accepted_pending.reservation_id.as_str() != request.admission.reservation_id
+        || accepted_pending.reservation_order != request.admission.reservation_order
+        || accepted_pending.prepared_transition_sha256
+            != request.admission.prepared_transition_digest
+        || accepted_pending.write_binding != accepted_binding
+    {
+        return Err(StagedReservedWriteError::OutcomeUnknown {
+            operation_id,
+            detail: "accepted ORS stage differs from the exact Store admission projection"
+                .to_owned(),
+        });
+    }
+    let submission = WriteSubmission::staged(&request.admission)
+        .map_err(|error| StagedReservedWriteError::OutcomeUnknown {
+            operation_id: transition.identity.operation_id.as_str().to_owned(),
+            detail: error.to_string(),
+        })?;
+    Ok(AcceptedReservedWrite {
+        submission,
+        request,
+        token: sealed.token,
+        created_at_ms: sealed.created_at_ms,
+    })
 }
 
 impl std::fmt::Debug for KernelStoreGateway {
@@ -1457,18 +1555,18 @@ impl KernelStoreGateway {
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
         seed: ReservationSeed,
     ) -> Result<WriteReceipt, String> {
-        self.apply_reserved_inner(
+        Box::pin(self.apply_reserved_inner(
             context,
             transition,
             expected_revision_heads,
             expected_ordering_heads,
             seed,
             None,
-        )
+        ))
         .await
     }
 
-    /// Applies a CaptureObservation through ORS while retaining and forwarding
+    /// Applies a `CaptureObservation` through ORS while retaining and forwarding
     /// the exact source submission received by the public Observe boundary.
     pub async fn apply_reserved_with_original_submission(
         &self,
@@ -1479,17 +1577,19 @@ impl KernelStoreGateway {
         seed: ReservationSeed,
         original_submission: &OriginalWriteSubmission,
     ) -> Result<WriteReceipt, String> {
-        let accepted = self
-            .stage_reserved_with_original_submission(
+        let accepted = Box::pin(self.stage_reserved_with_original_submission(
                 context,
                 transition,
                 expected_revision_heads,
                 expected_ordering_heads,
                 seed,
                 original_submission,
-            )
-            .await?;
-        self.execute_staged_reserved(accepted).await
+            ))
+            .await
+            .map_err(|error| error.to_string())?;
+        Box::pin(self.execute_staged_reserved(accepted))
+            .await
+            .map_err(|error| error.to_string())
     }
 
     /// Durably stages the complete protected original Store operation and
@@ -1505,7 +1605,7 @@ impl KernelStoreGateway {
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
         seed: ReservationSeed,
         original_submission: &OriginalWriteSubmission,
-    ) -> Result<AcceptedReservedWrite, String> {
+    ) -> Result<AcceptedReservedWrite, StagedReservedWriteError> {
         let _flight = self.flight.enter()?;
         if self.is_fenced() {
             return Err("canonical-store gateway is fenced for rebind".to_owned());
@@ -1541,9 +1641,7 @@ impl KernelStoreGateway {
             .iter()
             .map(|head| head.scope.clone())
             .collect::<Vec<_>>();
-        let ordering_readbacks = self
-            .store
-            .ordering_head_readbacks(ordering_scopes)
+        let ordering_readbacks = Box::pin(self.store.ordering_head_readbacks(ordering_scopes))
             .await
             .map_err(|error| error.to_string())?;
         self.require_active_store_generation()
@@ -1554,7 +1652,7 @@ impl KernelStoreGateway {
         let owner = self.bind_reservation_owner(&commit_ors, context, &transition)?;
         let transition_digest = eliot_store_api::prepared_transition_digest(&transition)
             .map_err(|error| error.to_string())?;
-        let (sealed, accepted_pending) = evidence
+        let maybe_accepted = evidence
             .with_ordering_readbacks(
                 transition.identity.operation_id.as_str(),
                 &transition_digest,
@@ -1572,40 +1670,22 @@ impl KernelStoreGateway {
                     )
                 },
             )
-            .map_err(|error| error.to_string())?
             .map_err(|error| error.to_string())?;
-        let staged_request = ReservedSubmission::from_sealed_with_original_submission(
-            &sealed,
+        let (sealed, accepted_pending) = maybe_accepted.map_err(|error| {
+            StagedReservedWriteError::OutcomeUnknown {
+                operation_id: transition.identity.operation_id.as_str().to_owned(),
+                detail: error.to_string(),
+            }
+        })?;
+        bind_accepted_staged_write(
+            sealed,
+            accepted_pending,
             context,
             &transition,
             expected_revision_heads,
             expected_ordering_heads,
             original_submission,
         )
-        .map_err(|error| error.to_string())?;
-        let request = staged_request.request().clone();
-        if accepted_pending.operation_id.as_str() != request.admission.operation_id.as_str()
-            || accepted_pending.reservation_id.as_str() != request.admission.reservation_id
-            || accepted_pending.reservation_order != request.admission.reservation_order
-            || accepted_pending.prepared_transition_sha256
-                != request.admission.prepared_transition_digest
-            || accepted_pending.write_binding
-                != sealed.token.write_binding.clone().ok_or_else(|| {
-                    "accepted ORS reservation token omitted its original write binding".to_owned()
-                })?
-        {
-            return Err(
-                "accepted ORS stage differs from the exact Store admission projection".to_owned(),
-            );
-        }
-        let submission =
-            WriteSubmission::staged(&request.admission).map_err(|error| error.to_string())?;
-        Ok(AcceptedReservedWrite {
-            submission,
-            request,
-            token: sealed.token,
-            created_at_ms: sealed.created_at_ms,
-        })
     }
 
     /// Executes one already accepted reservation. Eligibility and the normal
@@ -1615,10 +1695,56 @@ impl KernelStoreGateway {
     pub async fn execute_staged_reserved(
         &self,
         accepted: AcceptedReservedWrite,
-    ) -> Result<WriteReceipt, String> {
+    ) -> Result<WriteReceipt, StagedReservedWriteError> {
         let _flight = self.flight.enter()?;
-        self.execute_staged_request(accepted.request, accepted.token, accepted.created_at_ms)
+        Box::pin(self.execute_staged_request(accepted.request, accepted.token, accepted.created_at_ms))
             .await
+    }
+
+    /// Waits on the composition ORS readiness signal for this exact staged
+    /// reservation. This method does not hold a gateway flight lease while it
+    /// waits: rebind may proceed, and the live generation and token are checked
+    /// again after the owner reports readiness.
+    pub async fn wait_for_staged_predecessor(
+        &self,
+        context: &RequestMetadata,
+        transition: &PreparedTransition,
+        token: &WriterReservationToken,
+    ) -> Result<(), StagedReservedWriteError> {
+        if transition.state_fence != context.state_fence
+            || token.operation_id.as_str() != transition.identity.operation_id.as_str()
+            || token.state_fence != transition.state_fence
+        {
+            return Err("predecessor wait inputs do not match the original staged operation".into());
+        }
+        if self.is_fenced() {
+            return Err("canonical-store gateway is fenced for rebind".into());
+        }
+        self.require_active_store_generation()
+            .map_err(|error| error.to_string())?;
+        let commit_ors = self.commit_ors.clone().ok_or_else(|| {
+            "staged predecessor wait requires the composition-bound ORS".to_owned()
+        })?;
+        let owner = self.bind_reservation_owner(&commit_ors, context, transition)?;
+        let writer_epoch = writer_epoch_for_fence_from_epoch(&transition.state_fence.authority_epoch)
+            .map_err(|error| error.to_string())?;
+        if token.writer_epoch != writer_epoch {
+            return Err("staged reservation token belongs to a different writer epoch".into());
+        }
+        let record = owner
+            .ors
+            .wait_until_eligible(token, &writer_epoch)
+            .await
+            .map_err(|error| error.to_string())?;
+        if self.is_fenced() {
+            return Err("canonical-store gateway was fenced while waiting for its predecessor".into());
+        }
+        self.require_active_store_generation()
+            .map_err(|error| error.to_string())?;
+        if record.token != *token || record.state != ReservationState::Eligible {
+            return Err("ORS readiness notification did not return the exact eligible token".into());
+        }
+        Ok(())
     }
 
     /// Restores and continues one reservation from its complete original
@@ -1632,7 +1758,7 @@ impl KernelStoreGateway {
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
         original_submission: &OriginalWriteSubmission,
         actual_token: WriterReservationToken,
-    ) -> Result<WriteReceipt, String> {
+    ) -> Result<WriteReceipt, StagedReservedWriteError> {
         let _flight = self.flight.enter()?;
         original_submission
             .validate()
@@ -1664,16 +1790,23 @@ impl KernelStoreGateway {
         )
         .map_err(|error| error.to_string())?
         .into_request();
-        self.execute_staged_request(request, sealed.token, sealed.created_at_ms)
+        Box::pin(self.execute_staged_request(request, sealed.token, sealed.created_at_ms))
             .await
     }
 
-    async fn execute_staged_request(
+    fn validate_staged_request(
         &self,
-        request: ReservedWriteRequest,
-        token: WriterReservationToken,
+        request: &ReservedWriteRequest,
+        token: &WriterReservationToken,
         created_at_ms: i64,
-    ) -> Result<WriteReceipt, String> {
+    ) -> Result<
+        (
+            CompositionReservation,
+            Arc<CanonicalStoreEvidence>,
+            ReservationRecord,
+        ),
+        StagedReservedWriteError,
+    > {
         request.validate().map_err(|error| error.to_string())?;
         self.refuse_shadow_mutation()?;
         apply_reserved_admission(&request.context, &request.transition)?;
@@ -1682,23 +1815,22 @@ impl KernelStoreGateway {
         }
         self.require_active_store_generation()
             .map_err(|error| error.to_string())?;
-        let commit_ors = self
-            .commit_ors
-            .clone()
-            .ok_or_else(|| "reserved writes require the composition-bound ORS".to_owned())?;
-        let evidence = self.canonical_store_evidence.as_ref().ok_or_else(|| {
+        let commit_ors = self.commit_ors.clone().ok_or_else(|| {
+            "reserved writes require the composition-bound ORS".to_owned()
+        })?;
+        let evidence = self.canonical_store_evidence.clone().ok_or_else(|| {
             "reserved writes require the shared canonical Store evidence provider".to_owned()
         })?;
-        let owner =
-            self.bind_reservation_owner(&commit_ors, &request.context, &request.transition)?;
-        let operation_id = token.operation_id.as_str().to_owned();
-        let binding = token.write_binding.as_ref().ok_or_else(|| {
-            "staged CaptureObservation token has no original write binding".to_owned()
-        })?;
-        let source = request.original_write_submission.as_ref().ok_or_else(|| {
-            "staged CaptureObservation request omitted its original source".to_owned()
-        })?;
-        if request.admission.operation_id.as_str() != operation_id
+        let owner = self.bind_reservation_owner(&commit_ors, &request.context, &request.transition)?;
+        let binding = token
+            .write_binding
+            .as_ref()
+            .ok_or_else(|| "staged CaptureObservation token has no original write binding".to_owned())?;
+        let source = request
+            .original_write_submission
+            .as_ref()
+            .ok_or_else(|| "staged CaptureObservation request omitted its original source".to_owned())?;
+        if request.admission.operation_id.as_str() != token.operation_id.as_str()
             || request.admission.reservation_id != token.reservation_id.as_str()
             || request.admission.reservation_order != token.reservation_order
             || request.admission.prepared_transition_digest != token.prepared_transition_sha256
@@ -1740,10 +1872,9 @@ impl KernelStoreGateway {
                 "durable write binding scopes differ from the exact transition scopes".to_owned(),
             );
         }
-        let record =
-            reservation_record_by_order(&owner, token.reservation_order, &token.operation_id)
-                .map_err(|error| error.to_string())?;
-        if record.token != token {
+        let record = reservation_record_by_operation(&owner, &token.operation_id)
+            .map_err(|error| error.to_string())?;
+        if record.token != *token {
             return Err("current ORS reservation token differs from the staged request".to_owned());
         }
         let envelope = owner
@@ -1775,20 +1906,38 @@ impl KernelStoreGateway {
                 );
             }
         }
+        Ok((owner, evidence, record))
+    }
+
+    async fn execute_staged_request(
+        &self,
+        request: ReservedWriteRequest,
+        token: WriterReservationToken,
+        created_at_ms: i64,
+    ) -> Result<WriteReceipt, StagedReservedWriteError> {
+        let operation_id = token.operation_id.as_str().to_owned();
+        let (owner, evidence, record) =
+            self.validate_staged_request(&request, &token, created_at_ms)?;
         match record.state {
-            ReservationState::Executing | ReservationState::Reconciling => {
+            ReservationState::Executing
+            | ReservationState::Reconciling
+            | ReservationState::Finalized
+            | ReservationState::Released => {
                 return self
-                    .reconcile_staged_receipt(&owner, evidence, &token)
+                    .reconcile_staged_receipt(&owner, &evidence, &token)
                     .await;
             }
             ReservationState::Reserved | ReservationState::Eligible => {}
-            ReservationState::Finalized | ReservationState::Released => {
-                return self
-                    .reconcile_staged_receipt(&owner, evidence, &token)
-                    .await;
-            }
         }
-        ensure_eligible(&owner, &token).map_err(|error| error.to_string())?;
+        match ensure_eligible(&owner, &token) {
+            Ok(_) => {}
+            Err(crate::ReservationWriteError::Ors(OrsError::PredecessorPending)) => {
+                return Err(StagedReservedWriteError::RetryablePredecessorPending {
+                    operation_id,
+                });
+            }
+            Err(error) => return Err(error.to_string().into()),
+        }
         let lease = self.acquire_send_lease(&request.transition)?;
         if self.is_fenced() {
             return Err("canonical-store gateway is fenced for rebind".to_owned());
@@ -1798,30 +1947,49 @@ impl KernelStoreGateway {
         // This durable transition is the send-start boundary. Any failure
         // after it remains receipt-only, including a crash before the socket
         // call or an ambiguous transport result.
-        claim_execute_before_send(&owner, &token).map_err(|error| error.to_string())?;
-        let outcome = self.store.apply_reserved_write(request).await;
+        claim_execute_before_send(&owner, &token).map_err(|error| {
+            StagedReservedWriteError::OutcomeUnknown {
+                operation_id: operation_id.clone(),
+                detail: format!("send-start claim did not return a determinate result: {error}"),
+            }
+        })?;
+        let outcome = Box::pin(self.store.apply_reserved_write(request)).await;
         match outcome {
             Ok(receipt) => {
-                let reconciliation =
-                    reconcile_receipt(&token, &receipt).map_err(|error| error.to_string())?;
+                let reconciliation = reconcile_receipt(&token, &receipt).map_err(|error| {
+                    StagedReservedWriteError::OutcomeUnknown {
+                        operation_id: operation_id.clone(),
+                        detail: format!("Store receipt did not resolve the exact reservation: {error}"),
+                    }
+                })?;
                 evidence
                     .with_store_receipt(&token, &reconciliation, &receipt, || {
                         finalize_reservation(&owner, &reconciliation)
                     })
-                    .map_err(|error| error.to_string())?
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| StagedReservedWriteError::OutcomeUnknown {
+                        operation_id: operation_id.clone(),
+                        detail: error.to_string(),
+                    })?
+                    .map_err(|error| StagedReservedWriteError::OutcomeUnknown {
+                        operation_id: operation_id.clone(),
+                        detail: error.to_string(),
+                    })?;
                 drop(lease);
                 Ok(receipt)
             }
             Err(error) => {
                 let unknown = mark_unknown_outcome(&owner, &token).map_err(|mark_error| {
-                    format!("{error}; reservation remains executing ({mark_error})")
+                    StagedReservedWriteError::OutcomeUnknown {
+                        operation_id: operation_id.clone(),
+                        detail: format!("{error}; reservation remains executing ({mark_error})"),
+                    }
                 });
                 drop(lease);
                 unknown?;
-                Err(format!(
-                    "reserved write outcome unknown for operation {operation_id}: exact Store receipt reconciliation required ({error})"
-                ))
+                Err(StagedReservedWriteError::OutcomeUnknown {
+                    operation_id,
+                    detail: format!("exact Store receipt reconciliation required ({error})"),
+                })
             }
         }
     }
@@ -1831,32 +1999,51 @@ impl KernelStoreGateway {
         owner: &CompositionReservation,
         evidence: &CanonicalStoreEvidence,
         token: &WriterReservationToken,
-    ) -> Result<WriteReceipt, String> {
-        let operation_id =
-            OperationId::new(token.operation_id.as_str()).map_err(|error| error.to_string())?;
+    ) -> Result<WriteReceipt, StagedReservedWriteError> {
+        let operation_id = OperationId::new(token.operation_id.as_str())
+            .map_err(|error| StagedReservedWriteError::OutcomeUnknown {
+                operation_id: token.operation_id.as_str().to_owned(),
+                detail: error.to_string(),
+            })?;
         self.require_active_store_generation()
             .map_err(|error| error.to_string())?;
         let receipt = self
             .store
             .receipt(operation_id)
             .await
-            .map_err(|error| error.to_string())?
+            .map_err(|error| StagedReservedWriteError::OutcomeUnknown {
+                operation_id: token.operation_id.as_str().to_owned(),
+                detail: error.to_string(),
+            })?
             .ok_or_else(|| {
-                format!(
-                    "reserved write outcome unknown for operation {}: no exact Store receipt is available; resend refused",
-                    token.operation_id.as_str()
-                )
+                StagedReservedWriteError::OutcomeUnknown {
+                    operation_id: token.operation_id.as_str().to_owned(),
+                    detail: "no exact Store receipt is available; resend refused".to_owned(),
+                }
             })?;
         self.require_active_store_generation()
-            .map_err(|error| error.to_string())?;
-        let reconciliation =
-            reconcile_receipt(token, &receipt).map_err(|error| error.to_string())?;
+            .map_err(|error| StagedReservedWriteError::OutcomeUnknown {
+                operation_id: token.operation_id.as_str().to_owned(),
+                detail: error.to_string(),
+            })?;
+        let reconciliation = reconcile_receipt(token, &receipt).map_err(|error| {
+            StagedReservedWriteError::OutcomeUnknown {
+                operation_id: token.operation_id.as_str().to_owned(),
+                detail: error.to_string(),
+            }
+        })?;
         evidence
             .with_store_receipt(token, &reconciliation, &receipt, || {
                 finalize_reservation(owner, &reconciliation)
             })
-            .map_err(|error| error.to_string())?
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| StagedReservedWriteError::OutcomeUnknown {
+                operation_id: token.operation_id.as_str().to_owned(),
+                detail: error.to_string(),
+            })?
+            .map_err(|error| StagedReservedWriteError::OutcomeUnknown {
+                operation_id: token.operation_id.as_str().to_owned(),
+                detail: error.to_string(),
+            })?;
         Ok(receipt)
     }
 
@@ -1873,60 +2060,18 @@ impl KernelStoreGateway {
         if self.is_fenced() {
             return Err("canonical-store gateway is fenced for rebind".to_owned());
         }
-        // I14.16 step 4: the shadow refusal precedes the ORS `stage_and_reserve`
-        // write below. The normal admission lease is only acquired later, at
-        // the bounded send window, so without this gate a
-        // `shadow_no_authority` candidate would stage and reserve ORS rows
-        // before the lease gate refused the Store send.
-        self.refuse_shadow_mutation()?;
-        apply_reserved_admission(context, &transition)?;
-        {
-            let view = CanonicalRequestView::from_apply(
+        let (owner, evidence, ordering_readbacks, transition_digest) = Box::pin(
+            self.prepare_reserved_reservation(
                 context,
                 &transition,
                 &expected_revision_heads,
                 &expected_ordering_heads,
-            );
-            verify_canonical_request_hash(&view, &transition.identity.canonical_request_hash)
-                .map_err(|error| error.to_string())?;
-        }
-        let commit_ors = self.commit_ors.clone().ok_or_else(|| {
-            "reserved writes require the composition-bound ORS; refusing without unreserved Apply fallback"
-                .to_owned()
-        })?;
-        let evidence = self.canonical_store_evidence.as_ref().ok_or_else(|| {
-            "reserved writes require the shared canonical Store evidence provider".to_owned()
-        })?;
-        // Store owns the canonical head bytes and digest. Read them through
-        // the retained authenticated client before staging, then recheck the
-        // active generation after the RPC. No provider scope or ORS transaction
-        // is held across this await.
-        self.require_active_store_generation()
-            .map_err(|error| error.to_string())?;
-        let ordering_scopes = expected_ordering_heads
-            .iter()
-            .map(|head| head.scope.clone())
-            .collect::<Vec<_>>();
-        let ordering_readbacks = self
-            .store
-            .ordering_head_readbacks(ordering_scopes)
-            .await
-            .map_err(|error| error.to_string())?;
-        self.require_active_store_generation()
-            .map_err(|error| error.to_string())?;
-        if self.is_fenced() {
-            return Err("canonical-store gateway is fenced for rebind".to_owned());
-        }
-        // Rejoin the request fence to the current Kernel authority and route
-        // after the async owner readback. The gateway flight prevents a rebind
-        // from completing during this operation, and this check refuses a
-        // changed or fenced composition before ORS sees the observation.
-        let owner = self.bind_reservation_owner(&commit_ors, context, &transition)?;
+            ),
+        )
+        .await?;
         // Reservation and eligibility run without any admission lease: queued
         // normal work holds no provider permit, Kernel lock, or
         // protected-control resource while awaiting a predecessor (I14.3).
-        let transition_digest = eliot_store_api::prepared_transition_digest(&transition)
-            .map_err(|error| error.to_string())?;
         let reserve = || match original_submission {
             Some(source) => reserve_for_transition_with_original_submission(
                 &owner,
@@ -2038,6 +2183,60 @@ impl KernelStoreGateway {
                 Err(refusal)
             }
         }
+    }
+
+    async fn prepare_reserved_reservation(
+        &self,
+        context: &RequestMetadata,
+        transition: &PreparedTransition,
+        expected_revision_heads: &[RevisionHeadExpectation],
+        expected_ordering_heads: &[OrderingHeadExpectation],
+    ) -> Result<
+        (
+            CompositionReservation,
+            Arc<CanonicalStoreEvidence>,
+            Vec<OrderingHeadReadback>,
+            String,
+        ),
+        String,
+    > {
+        // Refuse shadow mutation before the ORS write. The normal admission
+        // lease is acquired later, only for the bounded send window.
+        self.refuse_shadow_mutation()?;
+        apply_reserved_admission(context, transition)?;
+        let view = CanonicalRequestView::from_apply(
+            context,
+            transition,
+            expected_revision_heads,
+            expected_ordering_heads,
+        );
+        verify_canonical_request_hash(&view, &transition.identity.canonical_request_hash)
+            .map_err(|error| error.to_string())?;
+        let commit_ors = self.commit_ors.clone().ok_or_else(|| {
+            "reserved writes require the composition-bound ORS; refusing without unreserved Apply fallback"
+                .to_owned()
+        })?;
+        let evidence = self.canonical_store_evidence.clone().ok_or_else(|| {
+            "reserved writes require the shared canonical Store evidence provider".to_owned()
+        })?;
+        self.require_active_store_generation()
+            .map_err(|error| error.to_string())?;
+        let ordering_scopes = expected_ordering_heads
+            .iter()
+            .map(|head| head.scope.clone())
+            .collect::<Vec<_>>();
+        let ordering_readbacks = Box::pin(self.store.ordering_head_readbacks(ordering_scopes))
+            .await
+            .map_err(|error| error.to_string())?;
+        self.require_active_store_generation()
+            .map_err(|error| error.to_string())?;
+        if self.is_fenced() {
+            return Err("canonical-store gateway is fenced for rebind".to_owned());
+        }
+        let owner = self.bind_reservation_owner(&commit_ors, context, transition)?;
+        let transition_digest = eliot_store_api::prepared_transition_digest(transition)
+            .map_err(|error| error.to_string())?;
+        Ok((owner, evidence, ordering_readbacks, transition_digest))
     }
 
     /// Binds the reservation owner from the live composition fence tuple.
