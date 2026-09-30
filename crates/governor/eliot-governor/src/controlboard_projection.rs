@@ -46,6 +46,7 @@ use std::collections::BTreeMap;
 use eliot_contracts::{ArtifactId, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_coordination::{
     AnchorResolution, CoordinationOwner, PeerReviewLifecycle, PeerReviewStanding,
+    ReviewRecommendation,
 };
 use eliot_evaluation_contracts::HumanAttentionEvaluation;
 use eliot_observation::ObservationJournal;
@@ -127,10 +128,21 @@ pub struct ControlBoardReviewBatch {
 }
 
 /// One retained anchored-review obligation as the owner holds it.
+///
+/// Every field reproduces an owner-retained fact verbatim: the stable
+/// review/request identity, the immutable reviewed revision and digest, the
+/// author session, the submitted anchor, this item's own lifecycle, standing
+/// and recommendation, the retained rejection reason, the carried evidence,
+/// and the record fence the obligation was admitted under. No visibility,
+/// privacy, role, or recipient fact is carried because the owner retains
+/// none; none is invented here.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ControlBoardReviewBatchObligation {
     /// Stable review identity.
     pub review_id: String,
+    /// Stable request identity this review answers, so the item stays
+    /// joinable to its review request.
+    pub request_id: String,
     /// Exact reviewed artifact revision; never rewritten by a later head.
     pub artifact_revision: u64,
     /// Exact reviewed artifact digest at that revision.
@@ -145,10 +157,15 @@ pub struct ControlBoardReviewBatchObligation {
     pub lifecycle: PeerReviewLifecycle,
     /// This obligation's own standing.
     pub standing: PeerReviewStanding,
+    /// This obligation's own recommendation; one item's recommendation never
+    /// disposes another item.
+    pub recommendation: ReviewRecommendation,
     /// Reason retained when this obligation was rejected.
     pub rejection_reason: Option<String>,
     /// Evidence references the obligation itself carries.
     pub evidence_refs: Vec<String>,
+    /// Record fence the retained obligation was admitted under.
+    pub state_fence: StateFence,
 }
 
 /// Refresh-consistent `ControlBoard` snapshot assembled over Governor owners.
@@ -312,6 +329,7 @@ fn project_review_batches(coordination: &CoordinationOwner) -> Vec<ControlBoardR
                 .into_iter()
                 .map(|obligation| ControlBoardReviewBatchObligation {
                     review_id: obligation.review_id,
+                    request_id: obligation.request_id,
                     artifact_revision: obligation.artifact_revision,
                     artifact_digest: obligation.artifact_digest,
                     reviewer_session_id: obligation.reviewer_session_id,
@@ -319,8 +337,10 @@ fn project_review_batches(coordination: &CoordinationOwner) -> Vec<ControlBoardR
                     anchor_resolution: obligation.anchor_resolution,
                     lifecycle: obligation.lifecycle,
                     standing: obligation.standing,
+                    recommendation: obligation.recommendation,
                     rejection_reason: obligation.rejection_reason,
                     evidence_refs: obligation.evidence_refs,
+                    state_fence: obligation.state_fence,
                 })
                 .collect(),
         })
