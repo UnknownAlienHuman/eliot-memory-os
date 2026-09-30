@@ -156,8 +156,7 @@ use eliot_store_api::{
     OrderingHeadExpectation, OrderingScopeId, OriginalWriteSubmission, PreparedTransition,
     ReceiptEnvelope, ReservedScopeBinding, ReservedWriteRequest, RevisionHeadExpectation,
     WriteAdmissionParams, WriteAdmissionProjection, WriteReceipt, WriteReceiptStatus,
-    WriterEpochBinding, prepared_transition_digest, sha256_hex,
-    verify_canonical_request_hash,
+    WriterEpochBinding, prepared_transition_digest, sha256_hex, verify_canonical_request_hash,
 };
 
 use crate::canonical_store_evidence::CanonicalStoreEvidence;
@@ -817,10 +816,7 @@ fn reserve_for_transition_inner(
     seed: &ReservationSeed,
     context: &RequestMetadata,
     transition: &PreparedTransition,
-    head_expectations: (
-        &[RevisionHeadExpectation],
-        &[OrderingHeadExpectation],
-    ),
+    head_expectations: (&[RevisionHeadExpectation], &[OrderingHeadExpectation]),
     original_submission: Option<&OriginalWriteSubmission>,
     accept_after_stage: bool,
 ) -> Result<(SealedReservation, Option<AcceptedPending>), ReservationWriteError> {
@@ -847,10 +843,12 @@ fn reserve_for_transition_inner(
             });
         }
         (_, Some(source)) => {
-            source.validate().map_err(|error| ReservationWriteError::Admission {
-                operation_id: operation_id.clone(),
-                detail: format!("original Observe submission is invalid: {error}"),
-            })?;
+            source
+                .validate()
+                .map_err(|error| ReservationWriteError::Admission {
+                    operation_id: operation_id.clone(),
+                    detail: format!("original Observe submission is invalid: {error}"),
+                })?;
         }
         (false, None) => {}
     }
@@ -898,12 +896,14 @@ fn reserve_for_transition_inner(
             || accepted.operation_id != token.operation_id
             || accepted.reservation_order != token.reservation_order
             || accepted.prepared_transition_sha256 != token.prepared_transition_sha256
-            || accepted.write_binding != token.write_binding.clone().ok_or_else(|| {
-                ReservationWriteError::Binding {
-                    operation_id: operation_id.clone(),
-                    detail: "accepted ORS record has no original write binding".to_owned(),
-                }
-            })?
+            || accepted.write_binding
+                != token
+                    .write_binding
+                    .clone()
+                    .ok_or_else(|| ReservationWriteError::Binding {
+                        operation_id: operation_id.clone(),
+                        detail: "accepted ORS record has no original write binding".to_owned(),
+                    })?
         {
             return Err(ReservationWriteError::Binding {
                 operation_id,
@@ -1007,12 +1007,10 @@ pub(crate) fn reservation_record_by_operation(
     owner
         .ors
         .load_write_reservation_by_operation(operation_id)?
-        .ok_or_else(|| {
-        ReservationWriteError::Binding {
+        .ok_or_else(|| ReservationWriteError::Binding {
             operation_id: operation_id.as_str().to_owned(),
             detail: "durable ORS operation index omitted its reservation record".to_owned(),
-        }
-    })
+        })
 }
 
 fn bind_original_write_submission(
