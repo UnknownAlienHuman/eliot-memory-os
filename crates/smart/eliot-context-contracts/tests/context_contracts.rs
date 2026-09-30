@@ -147,16 +147,22 @@ fn resolved_applicability() -> QualityApplicability {
 /// Intrinsically well-formed output binding for a card that is only checked for
 /// structural integrity. A card bound to a real packet's exact output is built
 /// by its owner; these fixtures only need the field to be well formed.
+///
+/// The serializer and route identities are the ones the assembled-view fixture
+/// executes under, because `ActiveUnderstandingView::validate` compares the
+/// card's serializer/route binding against the view's own execution identity:
+/// a card naming a different serializer or route is not the grade of those
+/// bytes and is refused.
 fn fixture_output_binding() -> QualityOutputBinding {
     QualityOutputBinding {
         recipe_digest: digest(),
         fence_digest: digest(),
         admitted_digest: digest(),
         rendered_digest: digest(),
-        serializer_id: "fixture-serde-v1".to_owned(),
+        serializer_id: "serde-json".to_owned(),
         serializer_version: "1".to_owned(),
         serializer_options_digest: digest(),
-        route_id: "fixture-route".to_owned(),
+        route_id: "route".to_owned(),
         evidence_revisions: Vec::new(),
         omission_handles: Vec::new(),
     }

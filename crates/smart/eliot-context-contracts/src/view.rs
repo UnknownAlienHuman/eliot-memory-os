@@ -374,8 +374,11 @@ impl ActiveUnderstandingView {
     /// identity is the value `validate_against` already proves back to
     /// `AdmittedAtom::candidate.source.snapshot_id`.
     fn observed_source_revisions(&self) -> Vec<ArtifactId> {
-        let distinct: BTreeSet<ArtifactId> =
-            self.rendered.iter().map(|atom| atom.source_id.clone()).collect();
+        let distinct: BTreeSet<ArtifactId> = self
+            .rendered
+            .iter()
+            .map(|atom| atom.source_id.clone())
+            .collect();
         distinct.into_iter().collect()
     }
 
@@ -481,7 +484,8 @@ impl ActiveUnderstandingView {
         // re-sealed packet that legitimately gained a source ungradeable by
         // the seed card it was legitimately re-graded under.
         let observed_revisions = self.observed_source_revisions();
-        if quality
+        if self
+            .quality
             .output
             .evidence_revisions
             .iter()
@@ -497,14 +501,20 @@ impl ActiveUnderstandingView {
         // makes a valid-looking handle without a current observation unable to
         // pass. The expected set is the rendered atoms' own records, so a
         // dimension cannot satisfy this by citing its own list twice.
-        let observed_measurements: BTreeSet<&MeasurementRef> =
+        //
+        // Membership is by VALUE (`MeasurementRef` is a digest plus a serializer
+        // identity and implements neither `Ord` nor `Hash`, so it cannot be a
+        // set key). Both fields are compared, so a cited handle that matches on
+        // one and differs on the other is not a member.
+        let observed_measurements: Vec<&MeasurementRef> =
             self.rendered.iter().map(|atom| &atom.measurement).collect();
         for result in &self.quality.results {
             if result.state.is_pass()
-                && result
-                    .measurements
-                    .iter()
-                    .any(|cited| !observed_measurements.contains(cited))
+                && result.measurements.iter().any(|cited| {
+                    !observed_measurements.iter().any(|observed| {
+                        observed.digest == cited.digest && observed.serializer == cited.serializer
+                    })
+                })
             {
                 return Err(ContextError::QualityIncomplete);
             }
