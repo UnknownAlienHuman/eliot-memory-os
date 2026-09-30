@@ -12,6 +12,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_receipts::ProofCeiling;
+use eliot_receipts::tool_exposure::{ExposureIdentities, OwnerStageFact};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -1065,4 +1066,78 @@ fn non_blank_list(values: &[String], field: &'static str) -> Result<(), Semantic
         }
     }
     Ok(())
+}
+
+// Definition-owner exposure-history staging (I7.24 R7).
+//
+// This section stages the registry-owned registration fact and the
+// owner-joined turn/run/attempt/surface identities for one exposure-history
+// entry. It stages only: revisions persist replay-safe through the existing
+// observation/receipt/outbox path on the owning persistence seam, which lives
+// outside this module. Nothing here mints identities, opens a second store,
+// or builds a second profile registry — the [`SemanticRegistry`] remains the
+// single operational semantics owner.
+
+/// Owner evidence reference for one resolved semantic profile.
+///
+/// Binds the canonical method name to its live profile revision
+/// (`canonical-name@profile-version`), the same shape the publish seam
+/// records as registration evidence. A generated descriptor, README, or
+/// handshake claim never substitutes for this owner binding.
+#[must_use]
+pub fn registration_source_ref(profile: &ToolSemanticProfile) -> String {
+    format!(
+        "{}@{}",
+        profile.method.canonical_name, profile.profile_version
+    )
+}
+
+/// Stages the definition-owner registration fact for one method identity.
+///
+/// A resolved profile stages supplied `true` bound to
+/// [`registration_source_ref`]. An unregistered identity stages explicitly
+/// unresolved unknown — never a silent `false` and never inferred from any
+/// neighbouring stage. The definition owner records its own negative verdict
+/// with its revision reference through the shared history contract; unknown
+/// methods still fail closed at admission.
+///
+/// # Errors
+///
+/// Returns an error when the registry lookup fails for a reason other than a
+/// missing profile, or when the resolved owner reference cannot be staged.
+pub fn registration_stage_fact(
+    registry: &SemanticRegistry,
+    canonical_name: &str,
+    definition_version: &str,
+) -> Result<OwnerStageFact, SemanticProfileError> {
+    match registry.resolve(canonical_name, definition_version) {
+        Ok(profile) => OwnerStageFact::supplied(true, registration_source_ref(profile))
+            .map_err(|_| SemanticProfileError::InvalidText {
+                field: "history.registered",
+            }),
+        Err(SemanticProfileError::MissingProfile { .. }) => Ok(OwnerStageFact::unresolved()),
+        Err(other) => Err(other),
+    }
+}
+
+/// Packs the owner-joined turn/run/attempt/surface identities for one
+/// exposure-history entry.
+///
+/// Each identity arrives from its owner; a seam that never mints an identity
+/// passes `None` and the dimension stays explicitly unresolved rather than
+/// invented. The surface binding is still required: entry validation fails
+/// closed on a history fact about no surface.
+#[must_use]
+pub fn stage_exposure_identities(
+    turn_ref: Option<String>,
+    run_ref: Option<String>,
+    attempt_ref: Option<String>,
+    surface_ref: Option<String>,
+) -> ExposureIdentities {
+    ExposureIdentities {
+        turn_ref,
+        run_ref,
+        attempt_ref,
+        surface_ref,
+    }
 }
