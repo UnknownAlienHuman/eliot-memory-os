@@ -37,7 +37,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(windows)]
-use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
+use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::thread::{self, JoinHandle};
@@ -1176,10 +1176,12 @@ impl LiveStdinWriter {
         let Some(sender) = self.sender.as_ref() else {
             return Err(ProcessExecutionError::UnknownOutcome);
         };
-        sender.try_send(frame.to_vec()).map_err(|error| match error {
-            TrySendError::Full(_) => unavailable("live stdin writer queue is full"),
-            TrySendError::Disconnected(_) => ProcessExecutionError::UnknownOutcome,
-        })
+        sender
+            .try_send(frame.to_vec())
+            .map_err(|error| match error {
+                TrySendError::Full(_) => unavailable("live stdin writer queue is full"),
+                TrySendError::Disconnected(_) => ProcessExecutionError::UnknownOutcome,
+            })
     }
 
     /// Closes the producer side and joins after the child has been contained.
@@ -2167,7 +2169,13 @@ impl WindowsProcessExecutor {
 
         #[cfg(not(windows))]
         {
-            let _ = (request, sink, outer_binding, stdin_payload, retain_stdin_writer);
+            let _ = (
+                request,
+                sink,
+                outer_binding,
+                stdin_payload,
+                retain_stdin_writer,
+            );
             return Err(unavailable(
                 "Windows ProcessExecutor is unavailable on this target",
             ));
@@ -2470,10 +2478,7 @@ impl WindowsProcessExecutor {
             }));
             let post_resume_setup_error = capture_spawn_error
                 .map(|error| (error, CAPTURE_EVIDENCE_GAP))
-                .or_else(|| {
-                    stdin_writer_setup_error
-                        .map(|error| (error, LIVE_STDIN_EVIDENCE_GAP))
-                });
+                .or_else(|| stdin_writer_setup_error.map(|error| (error, LIVE_STDIN_EVIDENCE_GAP)));
             if let Some((error, evidence_gap)) = post_resume_setup_error {
                 // Fail closed AFTER resume (issue #84 §2): the child is already
                 // running, so retain the Job/process owner, stop new effect
