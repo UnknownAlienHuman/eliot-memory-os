@@ -255,9 +255,17 @@ pub(crate) const SCHEMA_MIGRATION_V1_TO_V2_DDL: &str = RECOVERY_TABLES_DDL;
 /// `erasure_transaction_bindings` (`operation_id`, `subject`, `payload_ref`,
 /// `encryption_key_ref`, `deadline_unix_ms`, `scope_id`, `surfaces`,
 /// `state_fence`, `operation_count`), and `erasure_outcome`
-/// carries the sealed per-surface outcomes (`operation_id`, `outcomes`).
-/// `operation_id` is unique in each table; one intent row plus its single
-/// outcome seal per operation — never a second ledger.
+/// carries the sealed per-surface outcomes (`operation_id`, `scope_id`,
+/// `outcomes`). `operation_id` is unique in each table; one intent row plus its
+/// single outcome seal per operation — never a second ledger.
+///
+/// `erasure_outcome.scope_id` is the *sealed* row's own copy of the single
+/// admitted scope, copied verbatim from the frozen intent that opened the
+/// transaction by `erasure_transaction_bindings` and never derived. A privacy
+/// purge ledger is read per scope, so a seal carrying only `operation_id` could
+/// not attribute its own outcomes to the scope whose data they purged. The
+/// scope the seal's identity rests on is still the intent row's, which
+/// `TX_ERASURE_INTENT` compares in the same transaction.
 pub(crate) const ERASURE_TABLES_DDL: &str = r"
 DEFINE TABLE erasure_intent SCHEMALESS;
 DEFINE FIELD operation_id ON erasure_intent TYPE string;
@@ -273,6 +281,7 @@ DEFINE INDEX ei_operation ON erasure_intent FIELDS operation_id UNIQUE;
 
 DEFINE TABLE erasure_outcome SCHEMALESS;
 DEFINE FIELD operation_id ON erasure_outcome TYPE string;
+DEFINE FIELD scope_id ON erasure_outcome TYPE string;
 DEFINE FIELD outcomes ON erasure_outcome TYPE array;
 DEFINE INDEX eo_operation ON erasure_outcome FIELDS operation_id UNIQUE;
 ";
@@ -554,6 +563,7 @@ DEFINE INDEX ei_operation ON erasure_intent FIELDS operation_id UNIQUE;
 
 DEFINE TABLE erasure_outcome SCHEMALESS;
 DEFINE FIELD operation_id ON erasure_outcome TYPE string;
+DEFINE FIELD scope_id ON erasure_outcome TYPE string;
 DEFINE FIELD outcomes ON erasure_outcome TYPE array;
 DEFINE INDEX eo_operation ON erasure_outcome FIELDS operation_id UNIQUE;
 ";
