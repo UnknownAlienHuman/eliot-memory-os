@@ -2306,12 +2306,18 @@ impl AgentFabric {
     ///
     /// Returns the coordinator owner rejection, the staffing-policy rejection
     /// when the recipe exceeds the selected policy's lane or writer bound or
-    /// the task class cannot be staffed under current evidence, or
+    /// the task class cannot be staffed under current evidence,
+    /// [`FabricError::Contract`] when the plan needs the swarm path while
+    /// the swarm owner reports no accepted binding, or
     /// [`FabricError::DefinitionConflict`].
     pub fn define_and_plan(
         &mut self,
         request: StaffingPlanRequest,
     ) -> Result<(SwarmDefinition, StaffingPlanCandidate), FabricError> {
+        // Issue #2567 AUD3: a plan needing peer/swarm behavior refuses while
+        // the swarm owner is unbound, before any receipt, record, or
+        // planning. Solo shapes never reach the refusal.
+        self.refuse_unbound_swarm_scope(&request)?;
         // The receipt is computed from the frozen request and the live
         // coordinator config before anything is recorded, so a plan the policy
         // cannot staff never enters this composition's state.
@@ -2356,6 +2362,42 @@ impl AgentFabric {
         self.staffing_receipts.insert(key.clone(), receipt);
         self.record("plan_compiled", &key);
         Ok((definition, candidate))
+    }
+
+    /// Refuses a plan that requires peer/swarm behavior while the owning
+    /// swarm port reports no accepted binding (issue #2567, audit 5857087693
+    /// repair 3).
+    ///
+    /// More than one lane or a fanout above one needs the swarm path; until
+    /// the B-SWARM owner binds an accepted interface such a request is
+    /// refused here, before any receipt, record, or coordinator planning, so
+    /// the absence never fabricates success. Solo shapes (one lane, fanout
+    /// one) pass through untouched, and a bound or uncertain port defers to
+    /// the owner call as usual, so independent solo work is never blocked.
+    /// The peer channel stays unused: planning consults no peer behavior,
+    /// only the swarm port's own binding report.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FabricError::Contract`] naming the exact unbound port, its
+    /// reported state, and the requiring shape.
+    fn refuse_unbound_swarm_scope(&self, request: &StaffingPlanRequest) -> Result<(), FabricError> {
+        if request.lanes.len() == 1 && request.launch.max_fanout == 1 {
+            return Ok(());
+        }
+        let state = self.ports.swarm_control.interface_binding();
+        if state.admits_dependent_use() {
+            return Ok(());
+        }
+        Err(FabricError::Contract(format!(
+            "fabric refuses {}-lane fanout-{} plan while {} owner {} reports {}; \
+             wider work needs the swarm path",
+            request.lanes.len(),
+            request.launch.max_fanout,
+            FabricPortId::SwarmControl.as_str(),
+            FabricPortId::SwarmControl.owner_ref(),
+            state,
+        )))
     }
 
     /// Resolves one model route through the injected B-MOD registry.
