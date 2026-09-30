@@ -88,8 +88,8 @@ pub use negative_memory_context::{
     NegativeMemoryBackingMember, NegativeMemoryComparedDimension, NegativeMemoryDimensionKind,
     NegativeMemoryEvidenceLoss, NegativeMemoryExposureError, NegativeMemoryPermittedNextAction,
     NegativeMemoryRuleExposure, NegativeMemoryRuleInvalidation, NegativeMemoryRuleProjection,
-    NegativeMemoryRuleValidity, admitted_rule, apply_negative_memory_coverage,
-    project_negative_memory_rules,
+    NegativeMemoryRuleValidity, QualityCompilationEvidence, QualityEvidenceError, admitted_rule,
+    apply_negative_memory_coverage, project_negative_memory_rules, quality_axis_results,
 };
 pub use negative_memory_gate::{
     NegativeMemoryGateDecision, NegativeMemoryGateInput, NegativeMemoryGateRefusal,
