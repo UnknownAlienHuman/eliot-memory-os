@@ -10232,16 +10232,26 @@ impl HostComposition {
         let (approved_kernel_path, approved_store_path, approved_config_path) =
             manifest.host_child_paths();
         let config_path = PathBuf::from(approved_config_path.as_str());
-        if !(requires_runtime && requires_store) {
-            // A generation that does not require the full control contour must
-            // not run one. The Host readiness fence refuses `ControlReady`
-            // without a proven Store branch, so admitting a partial contour here
-            // would produce a generation that can never become ready; refusing
-            // the start keeps the unmet requirement visible instead.
+        if !requires_runtime {
+            // Every trigger class in the frozen `ActivationTriggerClass`
+            // vocabulary requires the runtime branch: without it no branch of
+            // this contour can start, so the start is refused fail-closed
+            // instead of launching processes no admitted request required.
             return self.cleanup_launched_contour(HostError::RecoveryRequired(format!(
-                "activation generation requires runtime={requires_runtime} store={requires_store}; the approved contour needs both"
+                "activation generation requires runtime={requires_runtime} store={requires_store}; refusing to start a contour without the runtime branch"
             )));
         }
+        // I1.5 narrow contours (`ScheduledWake`, `WatchdogRegisteredActivity`):
+        // a generation that requires the runtime branch without the canonical
+        // Store is admitted here instead of refused. Its runtime branch starts
+        // below and its supervision branch started above when required; the
+        // single launch owner starts the approved kernel/store pair together
+        // (`HostJobBranches::start_approved` has no kernel-only launch) and the
+        // Store proof fence still gates readiness in
+        // `persist_process_observations`, so the admitted narrow generation
+        // reaches `Active` through fully proven branches. Not launching an
+        // unrequired Store branch belongs to the launch owner, not to this
+        // gate, which no longer refuses a correctly narrow durable set.
         let (prior_kernel, kernel_generation, kernel_authority_epoch) = match self
             .next_kernel_activation_context(
                 phase_b.launch.authority_state_fence.authority_epoch.clone(),
