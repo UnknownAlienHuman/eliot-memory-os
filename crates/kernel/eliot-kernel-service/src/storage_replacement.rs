@@ -407,11 +407,7 @@ fn refuse_unproven_generation_rollback(
     committed: &[GenerationCutoverOwnership],
     candidate_generation: ResourceGeneration,
 ) -> Result<(), KernelServiceError> {
-    let Some(newest) = committed
-        .iter()
-        .map(|record| record.new_generation)
-        .max()
-    else {
+    let Some(newest) = committed.iter().map(|record| record.new_generation).max() else {
         // This route has never switched, so it has left no generation to return
         // to and there is no committed record that could prove anything.
         return Ok(());
@@ -1389,11 +1385,9 @@ impl StorageReplacement {
             // occurred, and the route cannot return to a generation it has left
             // while that record stands.
             if self.irreversible_effects.is_empty()
-                && scope_committed
-                    .iter()
-                    .any(|committed| {
-                        committed.migration == StateMigrationDecision::ForwardRepairRequired
-                    })
+                && scope_committed.iter().any(|committed| {
+                    committed.migration == StateMigrationDecision::ForwardRepairRequired
+                })
             {
                 return Err(KernelServiceError::GenerationFenced);
             }
