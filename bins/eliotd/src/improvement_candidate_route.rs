@@ -64,9 +64,10 @@ use eliot_maintenance::{
     ActivationEvidence, ExperimentPlan, IMPROVEMENT_PIPELINE_OWNER, ImprovementAdmissionDecision,
     ImprovementAdmissionPolicy, ImprovementCanaryHandoff, ImprovementCandidateView,
     ImprovementEvidenceView, ImprovementOperation, ImprovementPipelineInputs, ImprovementProposal,
-    ImprovementTerminalDisposition, RollbackContract, check_checked_record_identity,
-    check_handoff_wire_revision, improvement_retry_permitted, reconcile_unknown_activation,
-    retained_improvement_completion, run_improvement_candidate_pipeline,
+    ImprovementTerminalDisposition, ImprovementUnknownEffectIdentity, RollbackContract,
+    check_checked_record_identity, check_handoff_wire_revision, improvement_retry_permitted,
+    reconcile_unknown_activation, retained_improvement_completion,
+    run_improvement_candidate_pipeline,
 };
 use serde::Serialize;
 
@@ -397,48 +398,12 @@ pub fn improvement_candidate_retry_permitted(disposition: &ImprovementTerminalDi
 /// entry point therefore returns `None` for every disposition the pipeline
 /// produces today. Reading it as a running reconciliation would overstate the
 /// daemon. The owner that could attach one is named in the report rather than
-/// simulated: see [`UnknownEffectObligation::owner_id`].
+/// simulated: see [`ImprovementUnknownEffectIdentity::owner_id`].
 #[must_use]
 pub fn retained_improvement_candidate_completion(
     disposition: &ImprovementTerminalDisposition,
 ) -> Option<&eliot_receipts::ReceiptEnvelope> {
     retained_improvement_completion(disposition)
-}
-
-/// The exact identity of one unresolved external effect, as its owner must see
-/// it.
-///
-/// Every field is copied from the Governor pipeline's own
-/// [`eliot_maintenance::ImprovementUnknownEffect`], which its single
-/// construction site builds from checked records only: the candidate and
-/// experiment from the committed record, the operation and idempotency namespace
-/// from that record's proposal commitment, and the forward-repair reference and
-/// invalidation targets from the gap-free rollback contract. Nothing here is
-/// derived, defaulted, or supplied by this daemon, so a durable copy of this
-/// value can name no debt the Governor owner did not check.
-///
-/// The operation and idempotency pair is what the Governor owner re-checks when
-/// a receipt is offered to the obligation, so it is carried verbatim rather than
-/// restated: a receipt that names another operation is refused at that seam, and
-/// this projection must not appear to relax it by spelling a different identity.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct UnknownEffectObligation {
-    /// Owner that holds the unresolved reconciliation debt.
-    pub owner_id: String,
-    /// Candidate whose external activation or effect outcome is unresolved.
-    pub candidate_id: String,
-    /// Exact bounded experiment the unresolved effect belongs to.
-    pub experiment_id: String,
-    /// Committed logical operation an owner receipt must name.
-    pub operation_ref: String,
-    /// Committed idempotency namespace the same receipt must name.
-    pub idempotency_key: String,
-    /// Forward-repair reference the checked rollback contract names for an
-    /// incomplete rollback effect.
-    pub forward_repair_ref: String,
-    /// Invalidation targets the checked rollback contract covers, in the
-    /// contract's own committed order.
-    pub invalidation_set: Vec<String>,
 }
 
 /// What one terminal disposition says about the external effect it names.
@@ -452,16 +417,29 @@ pub struct UnknownEffectObligation {
 /// projection reports those two answers verbatim and never turns one into the
 /// other.
 ///
+/// The obligation is the Governor owner's OWN durable record,
+/// [`eliot_maintenance::ImprovementUnknownEffectIdentity`], read through
+/// `ImprovementUnknownEffect::retained_identity`. It is deliberately not a
+/// daemon-local projection: a second, looser shape carrying the operation and
+/// idempotency namespace as bare strings would be a second record for the same
+/// debt, one no owner re-checks, and a reader could not tell which of the two it
+/// was reading. Reading the owner's own record instead means the durable copy
+/// carries the whole `ProposalCommitment` the pipeline computed — domain, encoding
+/// revision, algorithm, operation reference, idempotency namespace, digest and
+/// canonical size together — so the debt can be re-bound to the exact proposal
+/// bytes it was raised over and the owner can content-check it on read-back.
+///
 /// # The absent owner, named rather than simulated
 ///
 /// The effect owner's outcome is private to the Governor module and reachable
 /// only through `ImprovementUnknownEffect::with_settled_owner_outcome`, whose
-/// four re-checks this route cannot and does not bypass. No producer for such a
+/// re-checks this route cannot and does not bypass. No producer for such a
 /// receipt exists in this workspace, so every `ImprovementEffectState` this
 /// daemon builds today is the denying one: no obligation settled, no retry
 /// permitted, no completion retained. That is the honest live report. Supplying a
-/// receipt to discharge the debt is [`UnknownEffectObligation::owner_id`]'s
-/// work, over [`ImprovementTerminalDisposition::UnknownRequiresReconciliation`].
+/// receipt to discharge the debt is
+/// [`eliot_maintenance::ImprovementUnknownEffectIdentity::owner_id`]'s work,
+/// over [`ImprovementTerminalDisposition::UnknownRequiresReconciliation`].
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ImprovementEffectState {
     /// The Governor gate's own answer for this disposition.
@@ -469,8 +447,9 @@ pub struct ImprovementEffectState {
     /// Whether the effect owner has retained a result for a COMPLETED effect.
     pub completion_retained: bool,
     /// The unresolved obligation to route to its named owner, present only when
-    /// the disposition carries one.
-    pub obligation: Option<UnknownEffectObligation>,
+    /// the disposition carries one. This is the Governor owner's own durable
+    /// record, never a daemon-local restatement of it.
+    pub obligation: Option<ImprovementUnknownEffectIdentity>,
 }
 
 /// Reads one terminal disposition's external-effect state from its owner.
@@ -498,18 +477,17 @@ pub fn read_improvement_effect_state(
 /// named here for the same reason the Governor entry points name it: a bare
 /// `contract_ref` is a contract reference, not a named unresolved effect, and
 /// reading it as one would invent debt the checked records do not carry.
-fn obligation_of(disposition: &ImprovementTerminalDisposition) -> Option<UnknownEffectObligation> {
+///
+/// The arm hands back the Governor owner's own durable record, read through
+/// `retained_identity`, so the value committed for this debt and the value a
+/// later pass reconciles are the same record rather than two shapes that can
+/// drift apart.
+fn obligation_of(
+    disposition: &ImprovementTerminalDisposition,
+) -> Option<ImprovementUnknownEffectIdentity> {
     match disposition {
         ImprovementTerminalDisposition::UnknownRequiresReconciliation { obligation } => {
-            Some(UnknownEffectObligation {
-                owner_id: obligation.owner_id.clone(),
-                candidate_id: obligation.candidate_id.clone(),
-                experiment_id: obligation.experiment_id.clone(),
-                operation_ref: obligation.commitment.operation_ref.clone(),
-                idempotency_key: obligation.commitment.idempotency_key.clone(),
-                forward_repair_ref: obligation.forward_repair_ref.clone(),
-                invalidation_set: obligation.invalidation_set.clone(),
-            })
+            Some(obligation.retained_identity())
         }
         ImprovementTerminalDisposition::RolledBack { .. }
         | ImprovementTerminalDisposition::Rejected { .. }

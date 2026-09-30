@@ -1086,7 +1086,8 @@ pub struct ImprovementUnknownEffect {
     /// the retry gate without ever reaching the owner's validating constructor.
     /// The only writer is [`Self::with_settled_owner_outcome`], which re-checks
     /// the binding; the only direct writer is this module's single construction
-    /// site [`unknown_effect_of`], which stores `None`.
+    /// site [`unknown_effect_of`], which stores `None`, and it is reachable only
+    /// through [`reconcile_retained_unknown_effect`].
     ///
     /// The value is not part of this obligation's wire form. The owner's receipt
     /// type carries no serializable projection here, and inventing one would be
@@ -1353,6 +1354,117 @@ impl ImprovementUnknownEffect {
         self.owner_outcome
             .as_deref()
             .filter(|receipt| self.binds_operation(&receipt.authorized_effect.proposal.operation))
+    }
+
+    /// The durable identity of this obligation, as its owner must commit it.
+    ///
+    /// The one projection of this obligation a caller may persist, and the one
+    /// [`reconcile_retained_unknown_effect`] consumes. Every field is copied
+    /// from this obligation — including the whole [`ProposalCommitment`] — so a
+    /// consumer commits the Governor owner's own record rather than restating
+    /// the candidate, experiment and operation identity as loose strings it could
+    /// disagree with. That is what makes a retained debt re-bindable to the exact
+    /// proposal bytes it was raised over: the digest, domain, encoding revision,
+    /// algorithm, operation reference, idempotency namespace and canonical size
+    /// travel together and are compared together.
+    ///
+    /// It carries no outcome, no receipt and no authority. The owner's validated
+    /// outcome stays behind the private `owner_outcome` field, so a decoded
+    /// identity is the unresolved direction on its own and the owner re-attaches
+    /// what it holds.
+    #[must_use]
+    pub fn retained_identity(&self) -> ImprovementUnknownEffectIdentity {
+        ImprovementUnknownEffectIdentity {
+            candidate_id: self.candidate_id.clone(),
+            experiment_id: self.experiment_id.clone(),
+            commitment: self.commitment.clone(),
+            owner_id: self.owner_id.clone(),
+            forward_repair_ref: self.forward_repair_ref.clone(),
+            invalidation_set: self.invalidation_set.clone(),
+        }
+    }
+}
+
+/// The durable identity of one unresolved external effect.
+///
+/// This is the record a named external debt is committed under and read back as,
+/// so a reconciliation can be re-bound to the SAME candidate, experiment and
+/// committed proposal bytes after a process restart instead of to a fresh
+/// in-process value. I14.21 requires the unknown outcome to be preserved against
+/// the operation's original identity and reconciled against the owner's own
+/// record of that identity, and this is that identity as the owner writes it.
+///
+/// The commitment is the owner's own [`ProposalCommitment`] rather than a pair of
+/// loose operation and idempotency strings, so a retained debt cannot disagree
+/// with the commitment the pipeline computed for it, and
+/// [`ImprovementUnknownEffectIdentity::validate`] re-checks the content identity
+/// of that commitment against this build's constants before anything reads it.
+///
+/// It carries NO outcome, NO receipt, NO permit and NO authority. The effect
+/// owner's validated outcome is attached to the rebuilt obligation through
+/// [`ImprovementUnknownEffect::with_settled_owner_outcome`], so a decoded
+/// identity alone never discharges a debt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ImprovementUnknownEffectIdentity {
+    /// Candidate whose external activation or effect outcome is unresolved.
+    pub candidate_id: String,
+    /// Exact bounded experiment the unresolved effect belongs to.
+    pub experiment_id: String,
+    /// The Governor owner's own committed content identity for that candidate.
+    pub commitment: ProposalCommitment,
+    /// Owner that holds the unresolved reconciliation debt.
+    pub owner_id: String,
+    /// Forward-repair reference the checked rollback contract named.
+    pub forward_repair_ref: String,
+    /// Invalidation targets the checked rollback contract covers, in the
+    /// contract's own committed order.
+    pub invalidation_set: Vec<String>,
+}
+
+impl ImprovementUnknownEffectIdentity {
+    /// Refuses a retained identity whose commitment does not carry this build's
+    /// checked content identity.
+    ///
+    /// The three components compared are the SAME constants
+    /// [`commitment_of`] stamps and the same ones
+    /// [`check_checked_record_identity`] enforces, read here against the
+    /// ORIGINAL recorded values rather than against anything recomputed from
+    /// local state. A retained record written under another domain, encoding
+    /// revision or algorithm is a typed refusal rather than a tolerated debt, and
+    /// nothing is padded, rounded or reinterpreted toward the current identity.
+    ///
+    /// The candidate, experiment and owner identities are not checked here: they
+    /// are compared against the current checked record by
+    /// [`reconcile_retained_unknown_effect`], which is the only place that
+    /// holds both sides.
+    pub fn validate(&self) -> Result<(), UncheckedRecordIdentity> {
+        for (component, found, expected) in [
+            (
+                "commitment.domain",
+                self.commitment.domain.as_str(),
+                IMPROVEMENT_PROPOSAL_COMMITMENT_DOMAIN,
+            ),
+            (
+                "commitment.encoding_version",
+                self.commitment.encoding_version.as_str(),
+                IMPROVEMENT_PROPOSAL_ENCODING_VERSION,
+            ),
+            (
+                "commitment.algorithm",
+                self.commitment.algorithm.as_str(),
+                IMPROVEMENT_PROPOSAL_DIGEST_ALGORITHM,
+            ),
+        ] {
+            if found != expected {
+                return Err(UncheckedRecordIdentity {
+                    component,
+                    found: found.to_owned(),
+                    expected,
+                });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1775,6 +1887,17 @@ pub enum PipelineError {
     /// Governor admission refused or failed with the inner reason.
     #[error("improvement admission failed: {0}")]
     AdmissionFailed(String),
+    /// The effect owner offered a reconciliation outcome this obligation refused.
+    ///
+    /// The refusal is carried whole, so a still-unsettled effect, an outcome
+    /// never settled against a canonical receipt, a receipt bound to another
+    /// operation and an outcome recorded under a divergent state fence stay four
+    /// distinct facts across this layer boundary instead of collapsing into one
+    /// reason string. A refusal never discharges the obligation: the debt stays
+    /// owed and the retry gate stays closed, which is the same denying direction
+    /// an absent owner outcome produces.
+    #[error("improvement owner outcome was refused: {0}")]
+    UnboundOwnerOutcome(#[from] UnboundOwnerOutcome),
 }
 
 /// Returns the versioned content commitment for one complete proposal.
@@ -2341,9 +2464,11 @@ pub fn reconcile_unknown_activation(
     check_checked_record_identity(current)?;
     Ok(match prior {
         ImprovementAdmissionDecision::RequiresReconciliation { owner_id, .. } => {
-            ImprovementTerminalDisposition::UnknownRequiresReconciliation {
-                obligation: Box::new(unknown_effect_of(current, rollback, owner_id)),
-            }
+            reconcile_retained_unknown_effect(
+                &unknown_effect_identity_of(current, rollback, owner_id),
+                current,
+                None,
+            )?
         }
         // An unknown activation outcome is an unknown effect owed by the owner
         // that must stay named for the run, so it is the same typed obligation
@@ -2354,9 +2479,11 @@ pub fn reconcile_unknown_activation(
         // outcome.
         ImprovementAdmissionDecision::AdmitForExperiment {
             rollback_owner_id, ..
-        } => ImprovementTerminalDisposition::UnknownRequiresReconciliation {
-            obligation: Box::new(unknown_effect_of(current, rollback, rollback_owner_id)),
-        },
+        } => reconcile_retained_unknown_effect(
+            &unknown_effect_identity_of(current, rollback, rollback_owner_id),
+            current,
+            None,
+        )?,
         ImprovementAdmissionDecision::Reject {
             cause,
             reason,
@@ -2382,37 +2509,136 @@ pub fn reconcile_unknown_activation(
     })
 }
 
-/// Builds the unresolved external-effect obligation from checked records only.
+/// Reconciles one retained unresolved external effect against the owner's outcome.
 ///
-/// The single construction site of [`ImprovementUnknownEffect`]. Every identity
-/// is copied from a record this run checked — the candidate and experiment from
-/// the committed record, the repair bindings from the gap-free rollback
-/// contract — and the owner is the decision's own owner. Nothing here is read
-/// from a reason string or supplied by a caller, so the obligation cannot name a
-/// candidate, an experiment, or a repair path the checked records do not
-/// contain.
+/// This is the single place a named external debt is discharged, and the one
+/// public way a caller turns a persisted
+/// [`ImprovementUnknownEffectIdentity`] back into a live typed obligation. The
+/// guarantee is established here in the order its questions differ:
 ///
-/// The owner's outcome starts absent because the checked records hold none:
-/// this run admits a candidate, it does not observe an effect, so supplying a
-/// reconciled outcome here would be a fabricated observation. Absent is the
-/// denying value, and the effect owner attaches its own validated receipt
-/// through [`ImprovementUnknownEffect::with_settled_owner_outcome`] to discharge
-/// the obligation. This is why the private field is still written literally
-/// here: this is the module's only construction site, it is inside the module so
-/// privacy does not bar it, and the only value it may ever write is the absent
-/// one — there is no code path from a checked record to a settled receipt.
-fn unknown_effect_of(
+/// 1. **The retained record must be readable by this build.** `retained.validate`
+///    re-checks the ORIGINAL recorded domain, encoding revision and algorithm of
+///    the retained commitment, and `current` is checked by
+///    [`check_checked_record_identity`]. A record written under another identity
+///    is a typed refusal on either side, and nothing is recomputed, padded or
+///    reinterpreted toward the current identity.
+/// 2. **The retained record must BE this operation's debt.** The comparison is
+///    over content, never over presence or shape: the retained commitment must
+///    equal the current checked commitment as a whole record - domain, encoding
+///    revision, algorithm, operation reference, idempotency namespace, digest
+///    and canonical size together - and the retained candidate and experiment
+///    identities must equal the ones the current record commits. A foreign or
+///    stale debt, or a spliced one naming another candidate, experiment or
+///    operation, is refused and discharges nothing.
+/// 3. **The owner's outcome is consumed through the owner's own checked seam.**
+///    `owner_outcome` is the effect owner's own [`EffectReceipt`] and is attached
+///    through [`ImprovementUnknownEffect::with_settled_owner_outcome`], which
+///    re-checks that the outcome is terminal, that a canonical receipt is
+///    present, that the authorized effect and that receipt both name this
+///    obligation's exact operation id and idempotency key, and that the two were
+///    recorded under the same state fence. An unknown, unsettled, foreign or
+///    divergent outcome is a typed [`UnboundOwnerOutcome`] and the debt stays
+///    owed. `None` is the absent-outcome case and the same denying direction: the
+///    owner has not settled the effect.
+/// 4. **The returned disposition carries the answer, not a verdict about it.**
+///    [`improvement_retry_permitted`] then answers from the stored outcome alone,
+///    and [`retained_improvement_completion`] returns the retained result of a
+///    COMPLETED effect rather than authorizing a second execution of it. This
+///    function decides neither.
+///
+/// [`reconcile_unknown_activation`] routes both of its unknown arms through here
+/// with an absent owner outcome, so a decision-mapped debt and a
+/// read-back-and-reconciled debt reach the same obligation through the same
+/// checks: there is no second reconciliation path and no second identity.
+pub fn reconcile_retained_unknown_effect(
+    retained: &ImprovementUnknownEffectIdentity,
+    current: &ImprovementCurrentProposal,
+    owner_outcome: Option<&EffectReceipt>,
+) -> Result<ImprovementTerminalDisposition, PipelineError> {
+    retained.validate()?;
+    check_checked_record_identity(current)?;
+    // CONTENT, not existence or shape. The whole committed record travels and is
+    // compared together, so a debt raised over other proposal bytes, another
+    // operation namespace or another idempotency namespace stays a different debt
+    // even when every other field it carries happens to look familiar.
+    if retained.commitment != current.commitment {
+        return Err(PipelineError::UnboundRelation {
+            relation: "retained-unknown-effect: commitment-is-not-the-current-checked-record",
+        });
+    }
+    for (relation, retained_id, current_id) in [
+        (
+            "retained-unknown-effect: candidate-identity-mismatch",
+            retained.candidate_id.as_str(),
+            current.candidate_id.as_str(),
+        ),
+        (
+            "retained-unknown-effect: experiment-identity-mismatch",
+            retained.experiment_id.as_str(),
+            current.experiment_plan.experiment_id.as_str(),
+        ),
+    ] {
+        if retained_id != current_id {
+            return Err(PipelineError::UnboundRelation { relation });
+        }
+    }
+    let mut obligation = unknown_effect_of(retained);
+    if let Some(receipt) = owner_outcome {
+        obligation.with_settled_owner_outcome(receipt.clone())?;
+    }
+    Ok(
+        ImprovementTerminalDisposition::UnknownRequiresReconciliation {
+            obligation: Box::new(obligation),
+        },
+    )
+}
+
+/// Builds the unresolved external-effect identity from checked records only.
+///
+/// The single construction site of [`ImprovementUnknownEffectIdentity`]. Every
+/// identity is copied from a record this run checked - the candidate, experiment
+/// and commitment from the committed record, the repair bindings from the
+/// gap-free rollback contract - and the owner is the decision's own owner.
+/// Nothing here is read from a reason string or supplied by a caller, so the
+/// identity cannot name a candidate, an experiment or a repair path the checked
+/// records do not contain.
+///
+/// The owner's outcome is absent because the checked records hold none: this run
+/// admits a candidate, it does not observe an effect, so supplying a reconciled
+/// outcome here would be a fabricated observation. Absent is the denying value,
+/// and the effect owner attaches its own validated receipt through
+/// [`ImprovementUnknownEffect::with_settled_owner_outcome`] to discharge it.
+fn unknown_effect_identity_of(
     current: &ImprovementCurrentProposal,
     rollback: &RollbackContract,
     owner_id: &str,
-) -> ImprovementUnknownEffect {
-    ImprovementUnknownEffect {
+) -> ImprovementUnknownEffectIdentity {
+    ImprovementUnknownEffectIdentity {
         candidate_id: current.candidate_id.clone(),
         experiment_id: current.experiment_plan.experiment_id.clone(),
         commitment: current.commitment.clone(),
         owner_id: owner_id.to_string(),
         forward_repair_ref: rollback.forward_repair_ref.clone(),
         invalidation_set: rollback.invalidation_set.clone(),
+    }
+}
+
+/// Rebuilds the unresolved obligation from a checked identity.
+///
+/// The identity read here is either the one [`unknown_effect_identity_of`] built
+/// from records this run checked, or one a caller retained and presented to
+/// [`reconcile_retained_unknown_effect`], which proved its content against the
+/// current checked record first. Either way the owner's outcome starts absent:
+/// the only value any construction site may write is the absent one, and the
+/// single writer of a settled value is the re-checked seam.
+fn unknown_effect_of(retained: &ImprovementUnknownEffectIdentity) -> ImprovementUnknownEffect {
+    ImprovementUnknownEffect {
+        candidate_id: retained.candidate_id.clone(),
+        experiment_id: retained.experiment_id.clone(),
+        commitment: retained.commitment.clone(),
+        owner_id: retained.owner_id.clone(),
+        forward_repair_ref: retained.forward_repair_ref.clone(),
+        invalidation_set: retained.invalidation_set.clone(),
         owner_outcome: None,
     }
 }
@@ -3256,15 +3482,15 @@ fn map_decision(
         // checked. The run observed no effect, so the obligation carries no
         // owner outcome yet and `improvement_retry_permitted` denies until the
         // effect owner supplies its own validated receipt through the checked
-        // attaching seam.
+        // attaching seam. It goes through the same reconciliation entry point a
+        // retained debt does, so a decision-mapped obligation and a
+        // read-back-and-reconciled one are the same value built the same way.
         ImprovementAdmissionDecision::RequiresReconciliation { owner_id, .. } => {
-            ImprovementTerminalDisposition::UnknownRequiresReconciliation {
-                obligation: Box::new(unknown_effect_of(
-                    &joined.current,
-                    joined.rollback,
-                    owner_id,
-                )),
-            }
+            reconcile_retained_unknown_effect(
+                &unknown_effect_identity_of(&joined.current, joined.rollback, owner_id),
+                &joined.current,
+                None,
+            )?
         }
         ImprovementAdmissionDecision::NoProgress { reason, owner_id } => {
             ImprovementTerminalDisposition::NoProgress {
