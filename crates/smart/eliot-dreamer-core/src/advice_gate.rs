@@ -181,8 +181,8 @@ pub enum AdviceRejected {
 /// observe the same private ledger with no reader, not an owner of it.
 ///
 /// Every text value this gate admits or commits is trimmed by the single
-/// private owner [`trim_to_owned`], and every discriminator and hypothesis
-/// statement is folded by the single private owner [`fold_whitespace`]. The two
+/// private owner `trim_to_owned`, and every discriminator and hypothesis
+/// statement is folded by the single private owner `fold_whitespace`. The two
 /// are deliberately different rules: a committed record keeps its internal
 /// spacing, a hypothesis key folds it.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -418,11 +418,11 @@ fn fold_whitespace(value: &str) -> String {
 /// is the duplication work item 4 removes. All of them now read this one
 /// private owner.
 ///
-/// `trim_to_owned` deliberately stays separate from
-/// [`fold_whitespace`]: a committed record keeps its internal spacing and only
-/// loses its edges, while the hypothesis key folds internal whitespace and
-/// lowercases. Merging them would silently rewrite committed values, so the
-/// two rules stay distinct owners with distinct jobs.
+/// `trim_to_owned` deliberately stays separate from `fold_whitespace`: a
+/// committed record keeps its internal spacing and only loses its edges, while
+/// the hypothesis key folds internal whitespace and lowercases. Merging them
+/// would silently rewrite committed values, so the two rules stay distinct
+/// owners with distinct jobs.
 fn trim_to_owned(value: &str) -> String {
     value.trim().to_owned()
 }
