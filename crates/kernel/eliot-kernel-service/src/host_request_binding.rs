@@ -927,7 +927,13 @@ impl HostBinderLegDisposition {
     }
 }
 
-impl KernelHostRequestBinder<'_, NoProviderPort> {
+/// Fail-closed owner for the admitted bind/dispatch leg (issue #77 W2). It
+/// carries no state, so a promoted const borrow outlives any single frame
+/// where a local borrow cannot satisfy the binder lifetime unified with the
+/// caller's store borrow.
+const NO_PROVIDER_OWNER: NoProviderPort = NoProviderPort;
+
+impl<'a> KernelHostRequestBinder<'a, NoProviderPort> {
     /// Runs the Kernel-owned bind/dispatch leg for one admitted invoke-read
     /// envelope (issue #77 W2).
     ///
@@ -978,7 +984,7 @@ impl KernelHostRequestBinder<'_, NoProviderPort> {
     /// their linkage owner stays the route's invoke-read payload gate.
     pub fn run_admitted_read_leg(
         service: &KernelService,
-        store: &dyn OperationalRecoveryStore,
+        store: &'a dyn OperationalRecoveryStore,
         admission: &AgentBridgeAdmissionDescriptor,
         connection_id: &str,
         envelope: &HostRequestEnvelope,
@@ -995,13 +1001,11 @@ impl KernelHostRequestBinder<'_, NoProviderPort> {
             Ok(tool) => tool,
             Err(_) => return HostBinderLegDisposition::Rejected,
         };
-        let projection = match envelope.identity.correlation_projection.clone() {
-            Some(projection) => projection,
-            None => return HostBinderLegDisposition::Rejected,
+        let Some(projection) = envelope.identity.correlation_projection.clone() else {
+            return HostBinderLegDisposition::Rejected;
         };
-        let correlation_id = match HostCorrelationId::new(projection.occurrence_text()) {
-            Ok(correlation_id) => correlation_id,
-            Err(_) => return HostBinderLegDisposition::Rejected,
+        let Ok(correlation_id) = HostCorrelationId::new(projection.occurrence_text()) else {
+            return HostBinderLegDisposition::Rejected;
         };
         let request = HostInvocationRequest {
             protocol_version: McpProtocolVersion::default(),
@@ -1018,16 +1022,15 @@ impl KernelHostRequestBinder<'_, NoProviderPort> {
             scoped_credential_ref: connection_id.to_owned(),
             transport_generation: admission.generation.value(),
         };
-        let session = match AuthenticatedHostSession::bind(service, admission, transport) {
-            Ok(session) => session,
-            Err(_) => return HostBinderLegDisposition::Rejected,
+        let Ok(session) = AuthenticatedHostSession::bind(service, admission, transport) else {
+            return HostBinderLegDisposition::Rejected;
         };
-        let owner = NoProviderPort;
-        let mut binder = Self::new(session, &owner, store);
+        let mut binder = Self::new(session, &NO_PROVIDER_OWNER, store);
         match binder.invoke_admitted(service, envelope, peer_receipt, None, &request) {
             Ok(HostInvocationPortOutcome::Responded { .. }) => HostBinderLegDisposition::Dispatched,
-            Ok(HostInvocationPortOutcome::Accepted { .. }) => HostBinderLegDisposition::OwnerGap,
-            Err(PortFailure::PlanGap { .. }) => HostBinderLegDisposition::OwnerGap,
+            Ok(HostInvocationPortOutcome::Accepted { .. }) | Err(PortFailure::PlanGap { .. }) => {
+                HostBinderLegDisposition::OwnerGap
+            }
             Err(_) => HostBinderLegDisposition::Rejected,
         }
     }
