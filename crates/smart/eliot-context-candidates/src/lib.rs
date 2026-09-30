@@ -39,14 +39,23 @@
 //! slots: [`CanonicalProjectionInput`] plus
 //! [`construct_context_candidates_with_canonical`]. The opaque path stays
 //! for owners that have not adopted the typed set.
+//!
+//! Issue #1862 adds the campaign learning-state join this cell owns:
+//! [`check_campaign_learning_state_view`] refuses an immutable
+//! `CampaignLearningStateView` whose State Fence, task/scope/request identity
+//! or load-bearing Context recipe owner revision does not join this
+//! compilation. The #40-frozen `eliot_context::ContextCompiler` decides
+//! nothing on this route.
 
 #![forbid(unsafe_code)]
 
+pub mod campaign_view;
 pub mod derive;
 pub mod inputs;
 pub mod mapper;
 pub mod vocabulary;
 
+pub use campaign_view::check_campaign_learning_state_view;
 pub use derive::{
     CanonicalDerivedMembers, CanonicalMember, assurance_member_id, attention_member_id,
     conflict_member_id, derive_canonical_projections, derived_member_id, direct_member_id,
