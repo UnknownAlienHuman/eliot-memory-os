@@ -4643,18 +4643,21 @@ impl KernelComposition {
         }
 
         // ModulesQuiescedReverse: dependents stop before the stores and
-        // bridges they depend on. The contour is the live composition state:
-        // the store bridge (dependency) ordered before the daemon
-        // (dependent), then reversed for quiescence. This phase records the
-        // quiesce *request* against the live contour; each owner's completed
-        // stop is recorded separately at the phase that owner stops in, from
-        // that owner's own post-stop state.
-        let mut dependency_order = Vec::new();
+        // bridges they depend on. The contour is the live composition state
+        // collected as an unordered *set* — the order branches are observed
+        // in carries no meaning and is not consulted. The quiesce order comes
+        // from `KERNEL_QUIESCENCE_EDGES`, the declared edges, inside
+        // `reverse_quiescence_order`; a branch that no declared edge names is
+        // refused there rather than placed by assumption. This phase records
+        // the quiesce *request* against that derived order; each owner's
+        // completed stop is recorded separately at the phase that owner stops
+        // in, from that owner's own post-stop state.
+        let mut live_branches: Vec<String> = Vec::new();
         #[cfg(windows)]
         match self.canonical_store_gateway.lock() {
             Ok(gateway) => {
                 if gateway.is_some() {
-                    dependency_order.push("store-bridge".to_owned());
+                    live_branches.push(shutdown_drain::STORE_BRIDGE_BRANCH.to_owned());
                 }
             }
             Err(_) => return Err(DrainHalt::new("store-contour-unavailable")),
@@ -4662,13 +4665,13 @@ impl KernelComposition {
         match self.daemon_active_launch.lock() {
             Ok(launch) => {
                 if launch.is_some() {
-                    dependency_order.push("daemon".to_owned());
+                    live_branches.push(shutdown_drain::DAEMON_BRANCH.to_owned());
                 }
             }
             Err(_) => return Err(DrainHalt::new("daemon-contour-unavailable")),
         }
-        let quiescence = reverse_quiescence_order(&dependency_order)
-            .map_err(|_| DrainHalt::new("module-contour-ambiguous"))?;
+        let quiescence =
+            reverse_quiescence_order(&live_branches).map_err(|_| DrainHalt::new("module-contour-unprovable"))?;
         record(
             ShutdownPhase::ModulesQuiescedReverse,
             format!("quiesce-requested:{}", quiescence.join(">")),

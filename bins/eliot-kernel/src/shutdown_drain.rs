@@ -1562,19 +1562,122 @@ impl ShutdownDrainCoordinator {
     }
 }
 
-/// Returns modules in quiescence order: the exact reverse of dependency
-/// (startup) order, so dependents stop before the stores and bridges they
-/// depend on.
+/// The canonical store branch of the composition contour.
+pub(crate) const STORE_BRIDGE_BRANCH: &str = "store-bridge";
+/// The supervised daemon branch of the composition contour.
+pub(crate) const DAEMON_BRANCH: &str = "daemon";
+
+/// One declared quiescence edge: `dependent` requires `dependency` to still be
+/// running, so `dependent` must stop first.
+///
+/// This is a *declaration*, not an observation. The composition root states
+/// which branch rides on which, and [`reverse_quiescence_order`] orders the
+/// quiesce sequence from these edges alone. Deriving the order any other way —
+/// from the order the branches were started, from the order this module
+/// happens to check them in, or from a map iteration — re-states the startup
+/// order as a shutdown order and is exactly the defect the declared edges
+/// exist to remove (the same rule `ModuleCatalog::select_invalidation_dependents`
+/// applies to restart selection: "selection walks the edges each dependent
+/// *declared* ..., never the startup order, never iteration order").
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct QuiescenceEdge {
+    pub(crate) dependent: &'static str,
+    pub(crate) dependency: &'static str,
+}
+
+/// The composition root's declared dependency edges.
+///
+/// `eliotd` reaches canonical data only through the store bridge, so the
+/// daemon is the dependent and the bridge is its dependency. That is a
+/// structural fact about the contour, stated once here; the quiesce order is
+/// computed from it rather than restated at each call site.
+///
+/// Scope note: the Governor's `eliot-module-registry` graph
+/// (`ModuleDependency::invalidation_edges`, #1682) is the authority for
+/// *optional* module dependencies, but `eliot-kernel` has no dependency edge
+/// to that crate and the Kernel runtime root may not grow one, so these two
+/// hard composition branches declare their own relation here. A branch with no
+/// declared edge is refused rather than placed by assumption — see
+/// [`reverse_quiescence_order`].
+pub(crate) const KERNEL_QUIESCENCE_EDGES: [QuiescenceEdge; 1] = [QuiescenceEdge {
+    dependent: DAEMON_BRANCH,
+    dependency: STORE_BRIDGE_BRANCH,
+}];
+
+/// Returns the branches in quiescence order: every declared dependent before
+/// the dependencies it requires, so a dependent stops before the store and
+/// bridge it reads through.
+///
+/// `live_branches` is the contour the composition root actually observed, and
+/// it is treated as a *set*: its input order carries no meaning and is not
+/// consulted. The order is a topological order of the declared edges among the
+/// live branches, with a lexical tie-break only so the result is deterministic
+/// when no edge separates two branches — never a tie-break by startup order.
+///
+/// Completeness is proved against an expected set derived independently from
+/// the declarations, not against the list being emitted: every live branch
+/// must be named by a declared edge, and the emitted order must contain each
+/// live branch exactly once.
 ///
 /// # Errors
 ///
-/// Returns a reason when the contour is ambiguous (duplicate entries).
-pub(crate) fn reverse_quiescence_order(dependency_order: &[String]) -> Result<Vec<String>, String> {
-    let unique: BTreeSet<&String> = dependency_order.iter().collect();
-    if unique.len() != dependency_order.len() {
-        return Err("module contour contains duplicates".to_owned());
+/// Returns a reason when the contour repeats a branch, when a live branch is
+/// named by no declared edge (its position is unprovable, so it is refused
+/// rather than ordered by assumption), or when the declared edges are cyclic
+/// among the live branches and no quiescence order exists.
+pub(crate) fn reverse_quiescence_order(
+    live_branches: &[String],
+) -> Result<Vec<String>, String> {
+    let live: BTreeSet<&str> = live_branches.iter().map(String::as_str).collect();
+    if live.len() != live_branches.len() {
+        return Err("quiescent contour contains duplicates".to_owned());
     }
-    Ok(dependency_order.iter().rev().cloned().collect())
+    // The expected set comes from the declarations alone, independently of the
+    // order this function will emit.
+    let declared: BTreeSet<&str> = KERNEL_QUIESCENCE_EDGES
+        .iter()
+        .flat_map(|edge| [edge.dependent, edge.dependency])
+        .collect();
+    if live.iter().any(|branch| !declared.contains(branch)) {
+        return Err("quiescent contour has an undeclared branch".to_owned());
+    }
+    // Kahn's algorithm over the reverse edges: a branch is emittable only once
+    // every branch that requires it has already been emitted.
+    let mut outstanding: BTreeMap<&str, BTreeSet<&str>> = live
+        .iter()
+        .map(|branch| (branch, BTreeSet::new()))
+        .collect();
+    for edge in &KERNEL_QUIESCENCE_EDGES {
+        if live.contains(edge.dependent)
+            && live.contains(edge.dependency)
+            && let Some(requires) = outstanding.get_mut(edge.dependent)
+        {
+            requires.insert(edge.dependency);
+        }
+    }
+    let mut ordered: Vec<String> = Vec::with_capacity(live.len());
+    while !outstanding.is_empty() {
+        // The lexical minimum among the branches nothing else is waiting on.
+        // Deterministic, and it asserts no dependency the declarations did not
+        // make.
+        let Some(next) = outstanding
+            .iter()
+            .filter(|(_, requires)| requires.is_empty())
+            .map(|(branch, _)| *branch)
+            .min()
+        else {
+            return Err("declared quiescence edges are cyclic".to_owned());
+        };
+        outstanding.remove(next);
+        ordered.push(next.to_owned());
+        for requires in outstanding.values_mut() {
+            requires.remove(next);
+        }
+    }
+    if ordered.len() != live.len() {
+        return Err("quiescent contour was not fully ordered".to_owned());
+    }
+    Ok(ordered)
 }
 
 #[cfg(test)]
@@ -1687,13 +1790,30 @@ mod shutdown_drain_tests {
             )
             .expect("publication follows linearization");
 
-        // Reverse-dependency quiescence order used by the composition root.
+        // Reverse-dependency quiescence order used by the composition root,
+        // derived from `KERNEL_QUIESCENCE_EDGES` rather than from the order
+        // the branches are observed in: the same contour in either input
+        // order quiesces daemon-before-store-bridge.
         assert_eq!(
             reverse_quiescence_order(&["store-bridge".to_owned(), "daemon".to_owned()])
-                .expect("distinct contour reverses"),
+                .expect("declared edges order both live branches"),
             vec!["daemon".to_owned(), "store-bridge".to_owned()]
         );
+        assert_eq!(
+            reverse_quiescence_order(&["daemon".to_owned(), "store-bridge".to_owned()])
+                .expect("input order carries no meaning"),
+            vec!["daemon".to_owned(), "store-bridge".to_owned()]
+        );
+        // A single live branch has no edge constraint left to satisfy.
+        assert_eq!(
+            reverse_quiescence_order(&["daemon".to_owned()])
+                .expect("one live branch is fully ordered"),
+            vec!["daemon".to_owned()]
+        );
         assert!(reverse_quiescence_order(&["daemon".to_owned(), "daemon".to_owned()]).is_err());
+        // A branch no declared edge names is refused rather than ordered by
+        // assumption.
+        assert!(reverse_quiescence_order(&["unrelated-module".to_owned()]).is_err());
 
         // Canonical-data lease-zero precondition used by the composition root.
         assert!(ShutdownDrainCoordinator::check_lease_zero(false).is_ok());
