@@ -10,7 +10,7 @@ use crate::{
     WriterHandle,
 };
 use eliot_context_contracts::{MeasurementStatus, StuEstimate};
-use eliot_context_measurement::stu_for_bytes;
+use eliot_context_measurement::{MAX_MEASUREMENT_BYTES, stu_for_bytes, validate_envelope};
 use eliot_types::memory::{
     CurrentGitScopeView, GovernedGitScope, MemoryApplicabilityDecision,
     MemoryApplicabilityDisposition, MemoryApplicabilityPacketView, MemoryProvenanceView,
@@ -40,7 +40,7 @@ pub const DEFAULT_PACKET_HARD_CEILING_TOKENS: usize = 4_096;
 
 #[path = "context_contracts.rs"]
 mod context_contracts;
-use context_contracts::PacketMeasurementAssignmentStatus;
+use context_contracts::{PacketMeasurementAssignmentStatus, packet_serializer_binding};
 pub use context_contracts::{
     PacketBudgetDecision, PacketBudgetPolicy, PacketCandidateOutcome, PacketCompileAudit,
     PacketCompileAuditContext, PacketCompileAuditReport, PacketCompileMode, PacketCompilePlan,
@@ -2848,21 +2848,30 @@ fn canonical_stu_for_byte_len(byte_len: usize) -> Result<usize, EngineError> {
     })
 }
 
-fn canonical_measurement_for_byte_len(byte_len: usize) -> Result<(u64, StuEstimate), EngineError> {
-    let byte_len_u64 = u64::try_from(byte_len).map_err(|_| EngineError::ServiceNotReady {
+fn canonical_measurement_for_payload(
+    serialized: &[u8],
+) -> Result<(u64, StuEstimate, String), EngineError> {
+    let byte_len = u64::try_from(serialized.len()).map_err(|_| EngineError::ServiceNotReady {
         service: "context-measurement".to_owned(),
         reason: "serialized byte length is not representable as u64".to_owned(),
     })?;
-    let stu = stu_for_bytes(byte_len_u64).map_err(|error| EngineError::ServiceNotReady {
+    let digest = eliot_contracts::sha256_hex(serialized);
+    let envelope = validate_envelope(serialized, byte_len, &digest, MAX_MEASUREMENT_BYTES)
+        .map_err(|error| EngineError::ServiceNotReady {
+            service: "context-measurement".to_owned(),
+            reason: error.to_string(),
+        })?;
+    let stu = stu_for_bytes(envelope.byte_len).map_err(|error| EngineError::ServiceNotReady {
         service: "context-measurement".to_owned(),
         reason: error.to_string(),
     })?;
     Ok((
-        byte_len_u64,
+        envelope.byte_len,
         StuEstimate {
             value: stu,
             empirical: false,
         },
+        envelope.digest,
     ))
 }
 
@@ -3010,10 +3019,23 @@ fn finalize_precompiled_packet_with_policy_and_audit_context(
         )?;
         PacketQualityService::finalize(&mut rendered_packet, frame)?;
         let final_serialized_packet = serde_json::to_vec(&rendered_packet)?;
-        let (rendered_utf8_bytes, stu_estimate) =
-            canonical_measurement_for_byte_len(final_serialized_packet.len())?;
+        let (rendered_utf8_bytes, stu_estimate, content_digest) =
+            canonical_measurement_for_payload(&final_serialized_packet)?;
+        budget.estimated_tokens = usize::try_from(stu_estimate.value).map_err(|_| {
+            EngineError::ServiceNotReady {
+                service: "context-measurement".to_owned(),
+                reason: "STU estimate is not representable as usize".to_owned(),
+            }
+        })?;
         budget.rendered_utf8_bytes = rendered_utf8_bytes;
         budget.stu_estimate = stu_estimate;
+        let (serializer_id, serializer_version, serializer_options_digest, serializer_profile_digest) =
+            packet_serializer_binding();
+        budget.serializer_id = serializer_id;
+        budget.serializer_version = serializer_version;
+        budget.serializer_options_digest = serializer_options_digest;
+        budget.serializer_profile_digest = serializer_profile_digest;
+        budget.content_digest = content_digest;
         budget.measurement_status = MeasurementStatus::ConservativeStu;
         budget.actual_tokens = None;
         budget.measured_fit = None;
@@ -3027,6 +3049,9 @@ fn finalize_precompiled_packet_with_policy_and_audit_context(
         );
         let next_metadata_tokens = packet_return_metadata_tokens(&budget, &compile_audit)?;
         if next_metadata_tokens == budget_metadata_tokens {
+            budget
+                .validate_packet_envelope(&final_serialized_packet)
+                .map_err(EngineError::WriteRejected)?;
             let project_understanding =
                 rendered_packet
                     .project_understanding
@@ -3126,19 +3151,28 @@ fn render_packet_with_budget_policy(
         }
         .into());
     };
-    // This legacy scalar reports only the exact packet-envelope STU. Response
-    // supplements stay separately budgeted; the full response envelope is
-    // unavailable here because callers provide only their planning scalar.
-    let estimated_tokens = packet.token_budget_report.estimated_tokens;
-    let packet_bytes = serde_json::to_vec(&packet)?.len();
-    let (rendered_utf8_bytes, stu_estimate) = canonical_measurement_for_byte_len(packet_bytes)?;
+    packet.token_budget_report.max_tokens = effective_tokens;
+    let packet_bytes = serde_json::to_vec(&packet)?;
+    let (rendered_utf8_bytes, stu_estimate, content_digest) =
+        canonical_measurement_for_payload(&packet_bytes)?;
+    let estimated_tokens = usize::try_from(stu_estimate.value).map_err(|_| {
+        EngineError::ServiceNotReady {
+            service: "context-measurement".to_owned(),
+            reason: "STU estimate is not representable as usize".to_owned(),
+        }
+    })?;
+    let (
+        serializer_id,
+        serializer_version,
+        serializer_options_digest,
+        serializer_profile_digest,
+    ) = packet_serializer_binding();
     let mut section_tokens = packet_section_accounting(&packet)?;
     section_tokens.insert("returned_supplements".to_owned(), policy.supplement_tokens);
     section_tokens.insert(
         "packet_budget_decision_and_compile_audit".to_owned(),
         budget_metadata_tokens,
     );
-    packet.token_budget_report.max_tokens = effective_tokens;
     Ok((
         packet,
         PacketBudgetDecision {
@@ -3151,6 +3185,11 @@ fn render_packet_with_budget_policy(
             effective_tokens,
             estimated_tokens,
             rendered_utf8_bytes,
+            serializer_id,
+            serializer_version,
+            serializer_options_digest,
+            serializer_profile_digest,
+            content_digest,
             stu_estimate,
             actual_tokens: None,
             measured_fit: None,

@@ -1,6 +1,7 @@
 use crate::EngineError;
 use eliot_context_contracts::{MeasurementStatus, StuEstimate};
-use eliot_context_measurement::stu_for_bytes;
+use eliot_context_measurement::{MAX_MEASUREMENT_BYTES, stu_for_bytes, validate_envelope};
+use eliot_contracts::sha256_hex;
 use eliot_skills::{
     SKILL_PACK_HASH_ALGORITHM, canonical_skill_content_hash, canonical_skill_pack_hash,
 };
@@ -41,6 +42,13 @@ pub struct SkillPackEntryReport {
     pub actual_tokens: Option<u64>,
     pub measured_fit: Option<bool>,
     pub measurement_status: MeasurementStatus,
+    /// Profile for interpreting body and description bytes as exact UTF-8.
+    pub raw_text_profile_id: String,
+    pub raw_text_profile_version: String,
+    pub raw_text_profile_options_digest: String,
+    pub raw_text_profile_digest: String,
+    pub body_content_sha256: String,
+    pub description_content_sha256: String,
     pub canonical_hash: String,
     pub opencode_parity: bool,
     pub claude_parity: bool,
@@ -56,12 +64,86 @@ pub struct SkillPackLintReport {
     /// Exact serialized UTF-8 bytes of the final ordered description listing.
     pub listing_utf8_bytes: u64,
     pub listing_stu_estimate: StuEstimate,
+    /// Serializer identity and content binding for the final description list.
+    pub listing_serializer_id: String,
+    pub listing_serializer_version: String,
+    pub listing_serializer_options_digest: String,
+    pub listing_serializer_profile_digest: String,
+    pub listing_content_sha256: String,
     pub actual_tokens: Option<u64>,
     pub measured_fit: Option<bool>,
     pub measurement_status: MeasurementStatus,
     pub entries: Vec<SkillPackEntryReport>,
     pub errors: Vec<String>,
     pub pack_hash: String,
+}
+
+impl SkillPackEntryReport {
+    /// Reject changed body/description content or a changed raw UTF-8 profile.
+    pub fn validate_contents(&self, body: &str, description: &str) -> Result<(), EngineError> {
+        let (profile_id, profile_version, profile_options, profile_digest) = raw_text_profile();
+        if self.raw_text_profile_id != profile_id
+            || self.raw_text_profile_version != profile_version
+            || self.raw_text_profile_options_digest != profile_options
+            || self.raw_text_profile_digest != profile_digest
+        {
+            return Err(measurement_error("skill raw-text measurement profile changed"));
+        }
+        if self.actual_tokens.is_some()
+            || self.measured_fit.is_some()
+            || self.measurement_status != MeasurementStatus::ConservativeStu
+        {
+            return Err(measurement_error(
+                "skill raw-text measurement contains unsupported evidence",
+            ));
+        }
+        validate_exact_text(
+            body.as_bytes(),
+            self.body_utf8_bytes,
+            &self.body_content_sha256,
+            &self.stu_estimate,
+        )?;
+        validate_exact_text(
+            description.as_bytes(),
+            self.description_utf8_bytes,
+            &self.description_content_sha256,
+            &self.description_stu_estimate,
+        )?;
+        Ok(())
+    }
+}
+
+impl SkillPackLintReport {
+    /// Revalidate the exact serialized description-listing bytes against the
+    /// original serializer profile and content digest. A changed listing is
+    /// stale measurement evidence and cannot be repaired by this method.
+    pub fn validate_listing_envelope(&self, serialized: &[u8]) -> Result<(), EngineError> {
+        let (serializer_id, serializer_version, options_digest, profile_digest) =
+            listing_serializer_profile();
+        if self.listing_serializer_id != serializer_id
+            || self.listing_serializer_version != serializer_version
+            || self.listing_serializer_options_digest != options_digest
+            || self.listing_serializer_profile_digest != profile_digest
+        {
+            return Err(measurement_error(
+                "skill listing serializer profile changed",
+            ));
+        }
+        if self.actual_tokens.is_some()
+            || self.measured_fit.is_some()
+            || self.measurement_status != MeasurementStatus::ConservativeStu
+        {
+            return Err(measurement_error(
+                "skill listing measurement contains unsupported evidence",
+            ));
+        }
+        validate_exact_text(
+            serialized,
+            self.listing_utf8_bytes,
+            &self.listing_content_sha256,
+            &self.listing_stu_estimate,
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -101,9 +183,13 @@ impl SkillPackService {
             descriptions += description_characters;
             listing_descriptions.push(description.to_owned());
             let nonblank_lines = body.lines().filter(|line| !line.trim().is_empty()).count();
-            let (body_utf8_bytes, stu_estimate) = stu_measurement(body.as_bytes().len())?;
-            let (description_utf8_bytes, description_stu_estimate) =
-                stu_measurement(description.as_bytes().len())?;
+            let (body_utf8_bytes, stu_estimate, body_content_sha256) =
+                exact_text_measurement(body.as_bytes())?;
+            let (
+                description_utf8_bytes,
+                description_stu_estimate,
+                description_content_sha256,
+            ) = exact_text_measurement(description.as_bytes())?;
             if nonblank_lines > 100 {
                 errors.push(format!("{name}: body exceeds 100 nonblank lines"));
             }
@@ -149,7 +235,13 @@ impl SkillPackService {
             if !opencode_parity || !claude_parity || !codex_parity || !antigravity_parity {
                 errors.push(format!("{name}: generated host package drift"));
             }
-            entries.push(SkillPackEntryReport {
+            let (
+                raw_text_profile_id,
+                raw_text_profile_version,
+                raw_text_profile_options_digest,
+                raw_text_profile_digest,
+            ) = raw_text_profile();
+            let entry = SkillPackEntryReport {
                 name: name.to_owned(),
                 body_utf8_bytes,
                 description_utf8_bytes,
@@ -160,6 +252,12 @@ impl SkillPackService {
                 actual_tokens: None,
                 measured_fit: None,
                 measurement_status: MeasurementStatus::ConservativeStu,
+                raw_text_profile_id,
+                raw_text_profile_version,
+                raw_text_profile_options_digest,
+                raw_text_profile_digest,
+                body_content_sha256,
+                description_content_sha256,
                 canonical_hash,
                 opencode_parity,
                 claude_parity,
@@ -167,11 +265,19 @@ impl SkillPackService {
                     ("codex".to_owned(), codex_parity),
                     ("antigravity".to_owned(), antigravity_parity),
                 ]),
-            });
+            };
+            entry.validate_contents(&body, description)?;
+            entries.push(entry);
         }
         let serialized_listing = serde_json::to_vec(&listing_descriptions)?;
-        let (listing_utf8_bytes, listing_stu_estimate) =
-            stu_measurement(serialized_listing.len())?;
+        let (listing_utf8_bytes, listing_stu_estimate, listing_content_sha256) =
+            exact_text_measurement(&serialized_listing)?;
+        let (
+            listing_serializer_id,
+            listing_serializer_version,
+            listing_serializer_options_digest,
+            listing_serializer_profile_digest,
+        ) = listing_serializer_profile();
         let skill_count = entries.len();
         let pack_hash_entries = entries
             .iter()
@@ -228,38 +334,123 @@ impl SkillPackService {
                 }
             }
         }
-        Ok(SkillPackLintReport {
+        let report = SkillPackLintReport {
             valid: errors.is_empty() && skill_count == 4,
             skill_count,
             listing_characters: descriptions,
             listing_utf8_bytes,
             listing_stu_estimate,
+            listing_serializer_id,
+            listing_serializer_version,
+            listing_serializer_options_digest,
+            listing_serializer_profile_digest,
+            listing_content_sha256,
             actual_tokens: None,
             measured_fit: None,
             measurement_status: MeasurementStatus::ConservativeStu,
             entries,
             errors,
             pack_hash,
-        })
+        };
+        report.validate_listing_envelope(&serialized_listing)?;
+        Ok(report)
     }
 }
 
-fn stu_measurement(byte_len: usize) -> Result<(u64, StuEstimate), EngineError> {
-    let byte_len = u64::try_from(byte_len).map_err(|_| EngineError::ServiceNotReady {
+fn exact_text_measurement(bytes: &[u8]) -> Result<(u64, StuEstimate, String), EngineError> {
+    let declared_len = u64::try_from(bytes.len()).map_err(|_| EngineError::ServiceNotReady {
         service: "context-measurement".to_owned(),
-        reason: "serialized byte length is not representable as u64".to_owned(),
+        reason: "UTF-8 byte length is not representable as u64".to_owned(),
     })?;
-    let value = stu_for_bytes(byte_len).map_err(|error| EngineError::ServiceNotReady {
+    let content_digest = sha256_hex(bytes);
+    let envelope = validate_envelope(
+        bytes,
+        declared_len,
+        &content_digest,
+        MAX_MEASUREMENT_BYTES,
+    )
+    .map_err(|error| EngineError::ServiceNotReady {
+        service: "context-measurement".to_owned(),
+        reason: error.to_string(),
+    })?;
+    let value = stu_for_bytes(envelope.byte_len).map_err(|error| EngineError::ServiceNotReady {
         service: "context-measurement".to_owned(),
         reason: error.to_string(),
     })?;
     Ok((
-        byte_len,
+        envelope.byte_len,
         StuEstimate {
             value,
             empirical: false,
         },
+        envelope.digest,
     ))
+}
+
+fn validate_exact_text(
+    bytes: &[u8],
+    recorded_byte_len: u64,
+    recorded_digest: &str,
+    recorded_stu: &StuEstimate,
+) -> Result<(), EngineError> {
+    if recorded_stu.empirical {
+        return Err(measurement_error("unvalidated STU cannot be empirical"));
+    }
+    let envelope = validate_envelope(
+        bytes,
+        recorded_byte_len,
+        recorded_digest,
+        MAX_MEASUREMENT_BYTES,
+    )
+    .map_err(|error| EngineError::ServiceNotReady {
+        service: "context-measurement".to_owned(),
+        reason: error.to_string(),
+    })?;
+    let expected_stu = stu_for_bytes(envelope.byte_len).map_err(|error| {
+        EngineError::ServiceNotReady {
+            service: "context-measurement".to_owned(),
+            reason: error.to_string(),
+        }
+    })?;
+    if recorded_stu.value != expected_stu {
+        return Err(measurement_error(
+            "unvalidated STU does not match the bound UTF-8 bytes",
+        ));
+    }
+    Ok(())
+}
+
+fn raw_text_profile() -> (String, String, String, String) {
+    const PROFILE_ID: &str = "eliot-raw-utf8";
+    const PROFILE_VERSION: &str = "v1";
+    const OPTIONS: &[u8] = b"exact String::as_bytes UTF-8; no normalization";
+    profile_binding(PROFILE_ID, PROFILE_VERSION, OPTIONS)
+}
+
+fn listing_serializer_profile() -> (String, String, String, String) {
+    const SERIALIZER_ID: &str = "serde_json";
+    const SERIALIZER_VERSION: &str = "eliot-skill-description-list/v1";
+    const OPTIONS: &[u8] =
+        b"serde_json::to_vec(Vec<String>); compact JSON; default serializer options; UTF-8";
+    profile_binding(SERIALIZER_ID, SERIALIZER_VERSION, OPTIONS)
+}
+
+fn profile_binding(id: &str, version: &str, options: &[u8]) -> (String, String, String, String) {
+    let options_digest = sha256_hex(options);
+    let profile_digest = sha256_hex(format!("{id}\0{version}\0{options_digest}").as_bytes());
+    (
+        id.to_owned(),
+        version.to_owned(),
+        options_digest,
+        profile_digest,
+    )
+}
+
+fn measurement_error(reason: &str) -> EngineError {
+    EngineError::ServiceNotReady {
+        service: "context-measurement".to_owned(),
+        reason: reason.to_owned(),
+    }
 }
 
 const DERIVED_PACKAGE_NOTICE: &str = "\

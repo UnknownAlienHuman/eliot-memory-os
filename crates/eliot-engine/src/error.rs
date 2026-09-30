@@ -85,7 +85,7 @@ pub enum EngineError {
     StaleRead { required: u64, actual: u64 },
 
     #[error(
-        "context packet floor exceeds budget: estimated {estimated_tokens} tokens > max {max_tokens}"
+        "context packet floor exceeds budget: unvalidated STU planning estimate {estimated_tokens} > max {max_tokens} STU; actual token count and measured fit are unknown"
     )]
     PacketFloorExceedsBudget {
         max_tokens: usize,

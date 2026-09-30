@@ -46,8 +46,6 @@
 //! authority imports are introduced.
 
 use eliot_types::{ContextPacketL3, MaterialPacketFrame, PacketQualityReport, PacketQualityResult};
-use eliot_context_measurement::stu_for_bytes;
-
 use crate::EngineError;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -59,6 +57,8 @@ impl PacketQualityService {
         packet: &mut ContextPacketL3,
         frame: Option<&MaterialPacketFrame>,
     ) -> Result<(), EngineError> {
+        let target = packet;
+        let mut packet = (*target).clone();
         let frame = frame.cloned().unwrap_or_default();
         packet.packet_quality = None;
         packet.packet_id.clear();
@@ -129,14 +129,24 @@ impl PacketQualityService {
         } else {
             PacketQualityResult::Sufficient
         };
+        let seed_serialized = serde_json::to_vec(&packet)?;
+        let (seed_bytes, seed_stu, _) = super::canonical_measurement_for_payload(&seed_serialized)?;
+        let seed_bytes = usize::try_from(seed_bytes).map_err(|_| EngineError::ServiceNotReady {
+            service: "context-measurement".to_owned(),
+            reason: "serialized byte length is not representable as usize".to_owned(),
+        })?;
+        let seed_stu = usize::try_from(seed_stu.value).map_err(|_| EngineError::ServiceNotReady {
+            service: "context-measurement".to_owned(),
+            reason: "STU estimate is not representable as usize".to_owned(),
+        })?;
         let report = PacketQualityReport {
             packet_id: packet.packet_id.clone(),
             task_id: packet.task_id.clone(),
             revision_fence: packet.at_revision,
-            structured_bytes: 0,
+            structured_bytes: seed_bytes,
             // Compatibility projection only: this legacy field contains the
             // canonical #704 unvalidated STU estimate, not observed tokens.
-            estimated_tokens: 0,
+            estimated_tokens: seed_stu,
             task_frame_present,
             current_truth_coverage,
             causal_bridge_hops: packet.causal_bridge.len(),
@@ -158,13 +168,27 @@ impl PacketQualityService {
         packet.packet_quality = Some(report);
 
         // The report is part of the serialized packet it describes. Iterate
-        // the byte/STU fields to a stable final-envelope length; no component
-        // rounding or tokenizer claim is involved.
+        // the byte/STU fields until the exact final byte vector is unchanged;
+        // matching lengths alone do not prove measurement identity. The
+        // enclosing PacketBudgetDecision binds the final packet digest after
+        // this self-referential report stabilizes.
         let mut stable = false;
         for _ in 0..16 {
             let serialized = serde_json::to_vec(packet)?;
-            let structured_bytes = serialized.len();
-            let estimated_tokens = legacy_stu_projection(structured_bytes)?;
+            let (structured_bytes, stu_estimate, _) =
+                super::canonical_measurement_for_payload(&serialized)?;
+            let structured_bytes = usize::try_from(structured_bytes).map_err(|_| {
+                EngineError::ServiceNotReady {
+                    service: "context-measurement".to_owned(),
+                    reason: "serialized byte length is not representable as usize".to_owned(),
+                }
+            })?;
+            let estimated_tokens = usize::try_from(stu_estimate.value).map_err(|_| {
+                EngineError::ServiceNotReady {
+                    service: "context-measurement".to_owned(),
+                    reason: "STU estimate is not representable as usize".to_owned(),
+                }
+            })?;
             let signal_density = if structured_bytes == 0 {
                 0.0
             } else {
@@ -175,7 +199,7 @@ impl PacketQualityService {
                 report.estimated_tokens = estimated_tokens;
                 report.signal_density = signal_density;
             }
-            if serde_json::to_vec(packet)?.len() == structured_bytes {
+            if serde_json::to_vec(packet)? == serialized {
                 stable = true;
                 break;
             }
@@ -185,23 +209,9 @@ impl PacketQualityService {
                 "packet measurement did not converge on final serialized bytes".to_owned(),
             ));
         }
+        *target = packet;
         Ok(())
     }
-}
-
-fn legacy_stu_projection(byte_len: usize) -> Result<usize, EngineError> {
-    let byte_len = u64::try_from(byte_len).map_err(|_| EngineError::ServiceNotReady {
-        service: "context-measurement".to_owned(),
-        reason: "serialized byte length is not representable as u64".to_owned(),
-    })?;
-    let stu = stu_for_bytes(byte_len).map_err(|error| EngineError::ServiceNotReady {
-        service: "context-measurement".to_owned(),
-        reason: error.to_string(),
-    })?;
-    usize::try_from(stu).map_err(|_| EngineError::ServiceNotReady {
-        service: "context-measurement".to_owned(),
-        reason: "STU estimate is not representable as usize".to_owned(),
-    })
 }
 
 fn causal_bridge_missing_hops(hops: usize) -> Vec<String> {
