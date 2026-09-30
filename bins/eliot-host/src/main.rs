@@ -8,7 +8,9 @@ use std::io::{self, BufRead, Write};
 use std::sync::OnceLock;
 
 #[cfg(windows)]
-use eliot_host::activation_lifecycle::{ActivationTriggerClass, DrainWakeOutcome, IdleLeaseCensus};
+use eliot_host::activation_lifecycle::{
+    ActivationTriggerClass, DrainWakeOutcome, IdleLeaseCensus, ObservableUseOutcome,
+};
 use eliot_host::host_diagnostics::{
     HostConsoleRequest, HostRequestProjection, observe_host_request,
 };
@@ -875,6 +877,31 @@ fn observe_malformed_sighted(options: &HostLaunchOptions) {
     );
 }
 
+/// Surfaces post-commit next-generation wake demands the admitted trigger expired.
+///
+/// I1.5 background wake: when scheduling is unavailable, the next observable
+/// use surfaces one deduplicated manual action instead of silently abandoning
+/// maintenance. The durable `Expired` record retains the obligation; this is
+/// its operator-visible surfacing on the same pass. The count is per-pass and
+/// already deduplicated (see [`ObservableUseOutcome`]): an expired intent
+/// never returns to `Pending`, so no later trigger re-reports it, and zero
+/// expiries stay silent. Only counts and frozen spellings travel here, never
+/// lease identity, digest or error text (F-LOG-HOST-1).
+#[cfg(windows)]
+fn surface_expired_wake_demands(
+    admission: ObservableUseOutcome,
+    origin: &'static str,
+) -> DrainWakeOutcome {
+    if admission.expired_wake_intents > 0 {
+        let _ = writeln!(
+            io::stderr().lock(),
+            "eliot-host: {origin} expired {expired} post-commit next-generation wake demand(s) with no demand-start claim; the obligation is surfaced here as the deduplicated manual entrypoint rather than silently abandoned maintenance",
+            expired = admission.expired_wake_intents,
+        );
+    }
+    admission.outcome
+}
+
 /// Admits one served Host console request as an observable-use trigger.
 ///
 /// I1.5 (AUD5): the stdin/stdout operator protocol is Host's local CLI
@@ -906,7 +933,10 @@ fn admit_console_trigger(
     let sequence = CONSOLE_TRIGGER_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let evidence = PlatformHandle::new(format!("{request}:{sequence}"))
         .map_err(|error| HostError::Platform(error.to_string()))?;
-    match host.note_observable_use(trigger, &evidence) {
+    match host
+        .note_observable_use(trigger, &evidence)
+        .map(|admission| surface_expired_wake_demands(admission, "console use"))
+    {
         Ok(DrainWakeOutcome::CancelDrain) => {
             match host.resume_cancelled_drain_on_observable_use() {
                 Ok(true) => {
@@ -2460,7 +2490,10 @@ impl HostIdleDrainSupervisor {
     ) -> Result<DrainWakeOutcome, HostError> {
         self.idle_since = None;
         self.precommit_opened_at = None;
-        match host.note_observable_use(trigger, evidence) {
+        match host
+            .note_observable_use(trigger, evidence)
+            .map(|admission| surface_expired_wake_demands(admission, "observable use"))
+        {
             Ok(DrainWakeOutcome::CancelDrain) => {
                 // A cancellation ends the drain attempt and changes the
                 // obligation set, so the cached census is no longer authority

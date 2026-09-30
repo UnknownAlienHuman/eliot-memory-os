@@ -233,10 +233,15 @@ pub enum ActivationTriggerClass {
     /// `eliot` CLI request from an authenticated user session.
     CliRequest,
     /// Native UI request over the role-filtered ControlBoard/Operator contract.
-    /// No UI ingress reaches Host in-tree, so this class has no producer here:
-    /// STITCH caller is the ControlBoard/Operator contract owner
-    /// (`crates/agent`, `crates/governor`), which must propagate the
-    /// authenticated UI identity onto a Host-visible envelope.
+    /// No UI ingress reaches Host in-tree (verified: no UI listener under
+    /// `bins/eliot-host`, and `HostRuntimeControlRequest` carries no
+    /// caller/principal field that could attribute a carrier to a UI session),
+    /// so this class has no producer here: STITCH caller is the
+    /// ControlBoard/Operator contract owner (`crates/agent`,
+    /// `crates/governor`), which must propagate the authenticated UI identity
+    /// onto a Host-visible envelope. A `Human`-origin automation carrier must
+    /// never be minted as this class: it is CLI-or-UI ambiguous, so that
+    /// attribution would fabricate the trigger.
     UiRequest,
     /// Agent bridge / MCP attach or tool call.
     AgentBridgeAttach,
@@ -248,12 +253,18 @@ pub enum ActivationTriggerClass {
     ProtectedExternalEffect,
     /// Watchdog observation of a registered agent/bridge event requiring
     /// reconciliation.
-    /// No Watchdog observation ingress reaches Host in-tree (Watchdog demand-starts
-    /// Host only via a persisted signed `WakeIntent` plus SCM start, which this
-    /// process consumes as `ScheduledWake`), so this class has no producer here:
-    /// STITCH caller is the Watchdog carrier owner, which must attest the
-    /// watchdog origin on a Host-visible envelope, or the Governor-owned spool
-    /// journal path.
+    /// No Watchdog observation ingress reaches Host in-tree (verified: no
+    /// `WakeIntent` symbol exists anywhere under `bins/eliot-watchdog`, so the
+    /// Watchdog owns no signed-intent persistence or Host demand-start
+    /// producer; and Watchdog spool intents flow Watchdog-to-Kernel-to-Governor
+    /// over `WATCHDOG_SPOOL_BATCH_ROUTE`, never to Host), so this class has no
+    /// producer here: a Watchdog SCM demand-start arrives as a bare start with
+    /// no journal intent, which this process consumes as nothing rather than
+    /// fabricating this class from Watchdog liveness. STITCH caller is the
+    /// Watchdog carrier owner, which must attest the watchdog origin on a
+    /// Host-visible envelope (`HostRuntimeControlRequest` and the
+    /// `UserAutomation` execution carrier both carry no watchdog-origin
+    /// discriminator today), or the Governor-owned spool journal path.
     WatchdogRegisteredActivity,
     /// Task Scheduler wake created by an admitted `WakeIntent`.
     ScheduledWake,
@@ -338,6 +349,28 @@ impl DrainWakeOutcome {
             Self::ReplayAlreadyConsumed => "replay-already-consumed",
         }
     }
+}
+
+/// Admitted observable-use trigger: the durable verdict plus the wake-expiry
+/// report of the same pass.
+///
+/// I1.5 background wake: "When scheduling is unavailable, the next observable
+/// use surfaces one deduplicated manual action instead of silently abandoning
+/// maintenance." [`HostComposition::revalidate_pending_wakes`] moves a
+/// past-horizon post-commit next-generation intent to `Expired` on the
+/// admitting trigger itself, and that transition happens exactly once per
+/// intent (the `Pending` filter never revisits it), so reporting the per-pass
+/// count here is already deduplicated. The composition never prints: the
+/// `main.rs` caller (`HostIdleDrainSupervisor::note_observable_use`,
+/// `admit_console_trigger`) surfaces the count operator-visibly on the same
+/// pass, beside the durable `Expired` record that retains the obligation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ObservableUseOutcome {
+    /// Durable verdict the dispatch loop decides on.
+    pub outcome: DrainWakeOutcome,
+    /// Post-commit next-generation wake demands this trigger expired with no
+    /// demand-start claim. Zero on every arm that does not revalidate.
+    pub expired_wake_intents: usize,
 }
 
 /// Durable facts one re-armed pre-commit drain attempt binds both of its
@@ -556,6 +589,11 @@ impl HostComposition {
     /// Post-linearization drain: the trigger queues a durable next-generation
     /// `WakeIntent` and returns [`DrainWakeOutcome::QueueNextGeneration`].
     ///
+    /// Returns the durable verdict together with the per-pass wake-expiry
+    /// report (see [`ObservableUseOutcome`]): only the `Proceed` arm
+    /// revalidates, so only it can report expiries; every other arm reports
+    /// zero.
+    ///
     /// # Errors
     ///
     /// Returns an error when admission is fenced, the generation admits no
@@ -565,7 +603,7 @@ impl HostComposition {
         &mut self,
         trigger: ActivationTriggerClass,
         evidence: &PlatformHandle,
-    ) -> Result<DrainWakeOutcome, HostError> {
+    ) -> Result<ObservableUseOutcome, HostError> {
         // F-LOG-HOST-1: one terminal for the whole classification.
         let mut host_terminal = HostTerminalGuard::armed(BOUNDARY_OBSERVABLE_USE_TERMINAL);
         self.ensure_admission_open()?;
@@ -575,6 +613,7 @@ impl HostComposition {
         })?;
         let trigger_class = PlatformHandle::new(trigger.as_str())
             .map_err(|error| HostError::Platform(error.to_string()))?;
+        let mut expired_wake_intents = 0_usize;
         let outcome = if state.drain_commit.is_some() {
             let queued =
                 self.queue_next_generation_wake(&activation, trigger, trigger_class, evidence)?;
@@ -641,7 +680,8 @@ impl HostComposition {
             // observable request is exactly that revalidation point, so the
             // generation revalidates its queued WakeIntents here instead of
             // executing anything it once scheduled.
-            self.revalidate_pending_wakes(&activation, trigger, evidence)?;
+            let (_, expired) = self.revalidate_pending_wakes(&activation, trigger, evidence)?;
+            expired_wake_intents = expired;
             DrainWakeOutcome::Proceed
         } else {
             return Err(HostError::OwnerLeaseRecovery(format!(
@@ -659,7 +699,10 @@ impl HostComposition {
         };
         host_lifecycle_observe_scm(detail);
         host_terminal.disarm();
-        Ok(outcome)
+        Ok(ObservableUseOutcome {
+            outcome,
+            expired_wake_intents,
+        })
     }
 
     /// Returns the current activation generation to `ACTIVE` after a drain
@@ -1346,6 +1389,12 @@ impl HostComposition {
     /// unserviceable demand is still `CANCELLED` rather than executed because
     /// it was once queued.
     ///
+    /// Returns `(claimed, expired)`: claimed intents this pass, and
+    /// owner-family intents moved to `Expired` this pass. The caller surfaces
+    /// the expired count on the admitting trigger (see
+    /// [`ObservableUseOutcome`]); the `Pending` filter never revisits an
+    /// expired intent, so that surfacing is deduplicated by construction.
+    ///
     /// # Errors
     ///
     /// Returns an error when the durable state cannot be read, the wall clock
@@ -1355,7 +1404,7 @@ impl HostComposition {
         activation: &EliotActivationRecord,
         trigger: ActivationTriggerClass,
         evidence: &PlatformHandle,
-    ) -> Result<usize, HostError> {
+    ) -> Result<(usize, usize), HostError> {
         let state = self.snapshot()?;
         let pending = state
             .wakes
@@ -1364,7 +1413,7 @@ impl HostComposition {
             .cloned()
             .collect::<Vec<_>>();
         if pending.is_empty() {
-            return Ok(0);
+            return Ok((0, 0));
         }
         let requested = trigger
             .requested_capabilities()
@@ -1378,6 +1427,7 @@ impl HostComposition {
         // closed rather than claiming under an unproven schedule.
         let now_ms = unix_millis()?;
         let mut claimed = 0_usize;
+        let mut expired = 0_usize;
         for wake in pending {
             match next_generation_wake_schedule_state(&wake, now_ms) {
                 NextGenerationWakeSchedule::NoOwnerPolicy | NextGenerationWakeSchedule::Due => {}
@@ -1399,6 +1449,7 @@ impl HostComposition {
                     next.reason_evidence_refs.push(evidence.clone());
                     next.intent.state = WakeIntentState::Expired;
                     self.append_record(HostStateRecord::Wake(next))?;
+                    expired += 1;
                     continue;
                 }
             }
@@ -1464,7 +1515,7 @@ impl HostComposition {
             self.append_record(HostStateRecord::Wake(next))?;
         }
         host_lifecycle_observe_scm(BOUNDARY_WAKE_REVALIDATION_OBSERVED);
-        Ok(claimed)
+        Ok((claimed, expired))
     }
 
     /// Marks every `CLAIMED` `WakeIntent` of the current generation as started
