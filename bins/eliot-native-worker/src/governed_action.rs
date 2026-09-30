@@ -124,7 +124,7 @@ impl FinishState {
 /// Closed shape (`deny_unknown_fields`): every field is untrusted presenter
 /// bytes until [`validate_envelope`] accepts them. `state_fence` and
 /// `authority_epoch` carry the admitted fence/epoch as canonical JSON objects;
-/// only their shape is checked here (object, non-null) — currentness stays
+/// only their shape is checked here (non-empty object) — currentness stays
 /// with the Kernel admission contour. A `verifier` starting with `unknown:`
 /// explicitly preserves the unknown per A10.1 step 8 instead of binding a
 /// verifier.
@@ -440,7 +440,9 @@ fn check_required_text(envelope: &ActionEnvelope, operation: &str) -> Result<(),
 }
 
 /// Checks the authority binding: the State Fence and Authority Epoch must
-/// each be an admitted object. Currentness stays with the Kernel contour.
+/// each be a non-empty admitted object. An empty object can never be an
+/// admitted fence or epoch, so it is refused here instead of travelling to
+/// the Kernel contour. Currentness stays with the Kernel contour.
 #[allow(
     clippy::result_large_err,
     reason = "typed refusal surface is matched by value on purpose"
@@ -449,20 +451,33 @@ fn check_authority_binding(
     envelope: &ActionEnvelope,
     operation: &str,
 ) -> Result<(), ActionRejection> {
-    if !envelope.state_fence.is_object() {
+    if !is_bound_object(&envelope.state_fence) {
         return Err(reject_for(
             operation,
-            "envelope State Fence is not bound: an admitted fence object is required".to_owned(),
+            "envelope State Fence is not bound: a non-empty admitted fence object is required"
+                .to_owned(),
         ));
     }
-    if !envelope.authority_epoch.is_object() {
+    if !is_bound_object(&envelope.authority_epoch) {
         return Err(reject_for(
             operation,
-            "envelope Authority Epoch is not bound: an admitted epoch object is required"
+            "envelope Authority Epoch is not bound: a non-empty admitted epoch object is required"
                 .to_owned(),
         ));
     }
     Ok(())
+}
+
+/// Returns true when a presented binding is a non-empty JSON object.
+///
+/// Shape only: a non-empty object is still untrusted presenter bytes until
+/// the Kernel admission contour matches it against admitted material. An
+/// empty object is refused outright because no admitted fence or epoch
+/// ever projects to one.
+fn is_bound_object(value: &serde_json::Value) -> bool {
+    value
+        .as_object()
+        .is_some_and(|object| !object.is_empty())
 }
 
 /// Checks the affected-resource bounds and derives the Governor impact,

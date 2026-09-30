@@ -413,6 +413,8 @@ impl ProcessDispatchAuthorityController {
 
     /// Issues the P-03 recovery capability only after P-07 selected and bound
     /// the durable record.  No caller-supplied capability can enter P-03.
+    /// A controller fenced after a persistence failure issues nothing until
+    /// restored: retention failure cannot produce executable acceptance.
     pub fn issue_recovery_capability(
         &self,
         binding: &AuthoritySnapshotBinding,
@@ -420,7 +422,7 @@ impl ProcessDispatchAuthorityController {
         capability_id: impl Into<String>,
         current: &DispatchValidationContext,
     ) -> KernelResult<RecoveryCapability> {
-        self.ensure_binding(binding)?;
+        self.ensure_operational(binding)?;
         Ok(self
             .authority
             .issue_recovery_capability(process_binding, capability_id, current)?)

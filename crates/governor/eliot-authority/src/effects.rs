@@ -498,6 +498,14 @@ impl EffectAuthorizer {
         })
     }
 
+    /// Authorizes one effect against the lease (I6.6 authorization step).
+    ///
+    /// The idempotent replay path returns the exact stored decision without
+    /// consuming lease budget: that return is historical readback, never a
+    /// renewal of permission to execute now. Executable admission is sealed
+    /// separately by [`Self::admit_effect_execution`], which joins the
+    /// stored record to the current revocation standing, lease, executor
+    /// and fence immediately before the effect.
     pub fn authorize(
         &mut self,
         lease: &mut ActionLease,
@@ -550,7 +558,11 @@ impl EffectAuthorizer {
             // The stored executor and lease are distinct material from the
             // proposal fields: replaying the same logical request under a
             // different executor or a different lease is a substituted
-            // identity, not the same decision.
+            // identity, not the same decision. The operation/request
+            // identity is already covered above: `same_logical_effect`
+            // compares the complete operation binding, so a changed
+            // operation identity under a reused idempotency key conflicts
+            // here instead of silently returning the old decision.
             if existing.executor_boundary != executor_boundary
                 || existing.lease_id != lease.lease_id
             {
@@ -804,14 +816,24 @@ fn dependent_revoked_roots(
     matched
 }
 
+/// True when a replayed proposal is the same logical request as the stored
+/// one, compared by complete binding.
+///
+/// The whole [`OperationBinding`] is compared — operation identity,
+/// request identity, idempotency key, operation kind, effect class and
+/// state fence — together with the action identity, the exact payload
+/// digest, the operation name and the resource reference. A replay under
+/// the same idempotency key with a different operation/request identity
+/// or any other changed binding field is an incompatible binding, not
+/// the same logical request: the caller must not silently reuse the old
+/// record. Executor and lease identity stay distinct material and are
+/// checked separately at the admission site.
 fn same_logical_effect(left: &ProposedEffect, right: &ProposedEffect) -> bool {
     left.action_id == right.action_id
         && left.canonical_payload_sha256 == right.canonical_payload_sha256
         && left.operation_name == right.operation_name
         && left.resource_ref == right.resource_ref
-        && left.operation.operation_kind == right.operation.operation_kind
-        && left.operation.effect == right.operation.effect
-        && left.operation.state_fence == right.operation.state_fence
+        && left.operation == right.operation
 }
 
 /// Effect outcome. Unknown outcome is explicitly non-terminal until reconciled.
