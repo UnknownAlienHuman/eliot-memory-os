@@ -632,6 +632,16 @@ pub struct KernelComposition {
     ipc: IpcImplementation,
     generation_gateway: OrsGenerationCoordinator,
     service: Arc<Mutex<KernelService>>,
+    /// I14.16 shadow-candidate posture retained from assembly (issue #1953).
+    /// `true` only when the composition was constructed with
+    /// `KernelStartupMode::ShadowCandidate`: the constructors already refused
+    /// every authority-bearing input and assembly skipped every
+    /// composition-owned durable write, and this flag extends that same
+    /// denial to the post-construction ORS-mutating owner entries. The same
+    /// `KernelService` lifecycle owner carries both modes; this is a retained
+    /// construction fact, never a second service. Immutable diagnostics stay
+    /// available in both modes.
+    shadow_candidate: bool,
     generations: Mutex<GenerationRouter>,
     generation_poison: Mutex<Option<String>>,
     front_door_policy: Mutex<ServerHandshakePolicy>,

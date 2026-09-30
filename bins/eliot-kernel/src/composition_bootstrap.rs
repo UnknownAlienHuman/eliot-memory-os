@@ -586,6 +586,27 @@ impl KernelComposition {
             .map_err(&terminal)
     }
 
+    /// Refuses an owner-authority mutation while this composition is an
+    /// I14.16 shadow candidate (issue #1953, map item 2).
+    ///
+    /// Classified by actual effects: `initialize_p07_owner_revision` advances
+    /// the durable grant-graph revision, and bind/refresh/recover install or
+    /// rotate the retained canonical owner from durable Governor state — all
+    /// ORS writes a zero-authority candidate must never perform. The
+    /// immutable readbacks (`p07_owner_revision`, `p07_owner_readback`) stay
+    /// available: no state change, no new authority. The service/gateway half
+    /// of the map lives on `KernelService::admit_shadow_effect` and
+    /// `KernelStoreGateway::refuse_shadow_mutation`; this covers the
+    /// composition-owned owner entries those cannot see.
+    fn refuse_shadow_owner_mutation(&self) -> Result<(), KernelBuildError> {
+        if self.shadow_candidate {
+            return Err(KernelBuildError::Service(
+                "shadow candidate admits no owner authority mutation".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Initializes one owner-lineage graph revision before the first
     /// revocation-history read. The operation is idempotent for the same
     /// revision and refuses a lower presentation; it does not bind an owner
@@ -596,6 +617,7 @@ impl KernelComposition {
         expected_revision: u64,
         state_fence: &StateFence,
     ) -> Result<u64, KernelBuildError> {
+        self.refuse_shadow_owner_mutation()?;
         if expected_revision == 0 || authority_root_ref.trim().is_empty() {
             return Err(KernelBuildError::Core(
                 "owner revision initialization requires a root and nonzero revision".to_owned(),
@@ -625,6 +647,7 @@ impl KernelComposition {
         restore: GovernorClosureRestore,
         expected_revision: u64,
     ) -> Result<u64, KernelBuildError> {
+        self.refuse_shadow_owner_mutation()?;
         let _transition = self.p07_owner_transition.write().map_err(|_| {
             KernelBuildError::Service("P-07 owner transition lock poisoned".to_owned())
         })?;
@@ -690,6 +713,7 @@ impl KernelComposition {
         restore: GovernorClosureRestore,
         expected_revision: u64,
     ) -> Result<u64, KernelBuildError> {
+        self.refuse_shadow_owner_mutation()?;
         let _transition = self.p07_owner_transition.write().map_err(|_| {
             KernelBuildError::Service("P-07 owner transition lock poisoned".to_owned())
         })?;
@@ -760,6 +784,7 @@ impl KernelComposition {
         restore: GovernorClosureRestore,
         expected_revision: u64,
     ) -> Result<u64, KernelBuildError> {
+        self.refuse_shadow_owner_mutation()?;
         let _transition = self.p07_owner_transition.write().map_err(|_| {
             KernelBuildError::Service("P-07 owner transition lock poisoned".to_owned())
         })?;
@@ -1880,6 +1905,7 @@ impl KernelComposition {
             ipc,
             generation_gateway,
             service: Arc::new(Mutex::new(service)),
+            shadow_candidate,
             generations: Mutex::new(generations),
             generation_poison: Mutex::new(None),
             front_door_policy: Mutex::new(policy),
