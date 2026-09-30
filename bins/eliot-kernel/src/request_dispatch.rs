@@ -1,13 +1,16 @@
 //! Kernel front-door backup method route (issue #963).
 //!
-//! Closed backup entry: exactly three operations (`backup.create`,
-//! `backup.verify`, `backup.restore-test`) selected by the operation string,
-//! each validated to its exact payload shape before any owner is named.
-//! `backup.verify` reaches the real capture owner and answers from it; the
-//! other two remain rehearsal-only and perform no capture, no coordination
-//! commit, no store import, and no activation/retirement/cutover. Missing
-//! owners refuse as typed replies (`refused`/`blocked` with
-//! `code = plan_gap`), never as fake success and never silently.
+//! Closed backup entry: exactly four operations (`backup.create`,
+//! `backup.verify`, `backup.restore-test`, `backup.restore-store`) selected by
+//! the operation string, each validated to its exact payload shape before any
+//! owner is named. `backup.verify` reaches the real capture owner and answers
+//! from it; `backup.create` and `backup.restore-test` remain rehearsal-only and
+//! perform no capture, no coordination commit, no store import, and no
+//! activation/retirement/cutover. `backup.restore-store` is the ONE selector
+//! that performs a destination effect, and it does so only through the
+//! composition's retained `KernelStoreGateway`. Missing owners refuse as typed
+//! replies (`refused`/`blocked` with `code = plan_gap`), never as fake success
+//! and never silently.
 //!
 //! Why each refusal is honest rather than a validation gap:
 //! - `backup.create` admits bounded capture descriptors, then admits the caller
@@ -130,6 +133,24 @@
 //!   and no `CoordinationCommit` type anywhere, and the composition's
 //!   isolated-restore entry has no production caller. Owner-backed gates are
 //!   marked `-deferred` in `gates_passed` and never claimed as proven.
+//! - `backup.restore-store` is the transport join the audit asked for and the
+//!   only selector that reaches a destination effect (issue #952, audit
+//!   `5869992012`). It is deliberately NOT the rehearsal selector: a rehearsal
+//!   cannot perform restore effects, and the console rehearsal payload has no
+//!   member denominator, no expected heads and no owner-issued isolation
+//!   evidence, so no `CanonicalRestoreBatch` could be formed from it without
+//!   fabricating exactly the authority the rehearsal exists to report as
+//!   absent. This selector instead carries the admitted #950 carrier itself
+//!   (`{context, restore_batch, bundle_hex}`): the fenced Store `RequestMeta`,
+//!   the destination-bound `CanonicalRestoreBatch`, and the retained archive
+//!   the batch's members resolve against. Every destination fact arrives in the
+//!   request and is proved by the destination's own validators — the batch
+//!   `validate` checks `IsolatedDestination` (external admission evidence,
+//!   separation from the source/active installation, isolation class) BEFORE
+//!   anything else, and the archive is re-proved whole before one retained
+//!   member is published — so this route mints no identity, no evidence and no
+//!   authority. It restores into the admitted isolated destination and stops:
+//!   no activation, no effect unblocking, no source retirement, no cutover.
 //!
 //! The dispatch-matrix arm is [`crate::frame_dispatch`]'s closed `backup`
 //! operation gate; this file holds only the route. The arm fences the frame
@@ -144,8 +165,9 @@
 
 use std::num::NonZeroU64;
 
+use eliot_backup::BackupBundle;
 use eliot_contracts::{
-    EpochId, EpochLineageId, ResourceGeneration, canonical_json_bytes, sha256_hex,
+    EpochId, EpochLineageId, RequestId, ResourceGeneration, canonical_json_bytes, sha256_hex,
 };
 use eliot_ipc::{PeerIdentity, Session, TransportError};
 use eliot_ors::{
@@ -157,6 +179,7 @@ use eliot_ors::{
 };
 use eliot_protocol::backup::BackupClassWire;
 use eliot_protocol::{Frame, FrameKind, MessageType, ProtocolPayload};
+use eliot_store_api::{CanonicalRestoreBatch, RequestMeta};
 use serde_json::{Map, Value};
 
 use super::backup_capture::{
@@ -189,6 +212,31 @@ pub(crate) const BACKUP_VERIFY_OPERATION: &str = "backup.verify";
 /// Closed isolated restore-test operation selector (mirrored by the operator
 /// CLI surface; rehearsal only, never cutover).
 pub(crate) const BACKUP_RESTORE_TEST_OPERATION: &str = "backup.restore-test";
+/// Closed isolated Store restore-batch operation selector (issue #952).
+///
+/// This is the ONE backup selector that performs a destination effect, and it
+/// is distinct from [`BACKUP_RESTORE_TEST_OPERATION`] for the reason the
+/// rehearsal exists: a rehearsal must never restore. The selector only routes
+/// the frame to the awaited route handler
+/// ([`KernelComposition::execute_backup_store_restore`]); every fact it can
+/// carry is the admitted #950 carrier in the request, and the destination
+/// transaction, its admission evidence and its refusals belong to the Store
+/// owner this route reaches through the retained `KernelStoreGateway`.
+pub(crate) const BACKUP_RESTORE_STORE_OPERATION: &str = "backup.restore-store";
+/// Exact command fields the closed store-restore selector admits.
+///
+/// The wire is closed: the fenced Store context, the destination-bound restore
+/// batch, and the retained archive. Nothing else is admitted, and none of these
+/// three may be defaulted or synthesized here.
+const BACKUP_RESTORE_STORE_FIELDS: [&str; 3] = ["context", "bundle_hex", "restore_batch"];
+/// Wire code carried by a typed restore refusal from the source owner or the
+/// destination transaction.
+///
+/// This is a refusal, not an absent owner: no `missing_owner` is named,
+/// because nothing is missing on this path. The typed cause travels whole in
+/// `reason` — the `KernelRestoreError` of the retained-member publication or
+/// the `StoreApplyRefusal` of the gateway — and is never replaced by prose.
+const BACKUP_RESTORE_STORE_REFUSAL_CODE: &str = "restore_refused";
 
 /// Maximum inline bundle bytes admitted on one backup frame payload.
 ///
@@ -386,7 +434,7 @@ fn require_exact_keys(object: &Map<String, Value>, keys: &[&str]) -> Result<(), 
 /// exact payload shape, session joins, and fence below. Unknown operations
 /// never reach the handlers.
 ///
-/// The three selectors stay literals because the protocol's own operation
+/// The four selectors stay literals because the protocol's own operation
 /// vocabulary is a different, non-interchangeable one:
 /// `eliot_protocol::backup::BackupOperationKind` names backup *control*
 /// operations (`REQUEST_CAPTURE`, `VERIFY_ARCHIVE`,
@@ -400,7 +448,10 @@ fn require_exact_keys(object: &Map<String, Value>, keys: &[&str]) -> Result<(), 
 pub(crate) fn is_backup_operation(operation: &str) -> bool {
     matches!(
         operation,
-        BACKUP_CREATE_OPERATION | BACKUP_VERIFY_OPERATION | BACKUP_RESTORE_TEST_OPERATION
+        BACKUP_CREATE_OPERATION
+            | BACKUP_VERIFY_OPERATION
+            | BACKUP_RESTORE_TEST_OPERATION
+            | BACKUP_RESTORE_STORE_OPERATION
     )
 }
 
@@ -3276,6 +3327,105 @@ fn handle_backup_restore_test(payload: &Value, idempotency_key: &str) -> Value {
     )
 }
 
+/// One admitted isolated Store restore request (issue #952).
+///
+/// All three halves arrive in the request and none is derived, defaulted or
+/// re-encoded here. `context` is the fenced Store `RequestMeta` the batch is
+/// sent under; `batch` is the #950 `CanonicalRestoreBatch` whose
+/// `IsolatedDestination` carries the owner-issued external admission evidence
+/// the destination validates before anything else; `bundle` is the retained
+/// archive the batch's member list resolves against, and it is re-proved whole
+/// by `KernelBackupRestore::publish_retained_archive_members` before one
+/// retained member is published.
+struct AdmittedBackupRestore {
+    /// Fenced Store context the batch is sent under.
+    context: RequestMeta,
+    /// The admitted, destination-bound canonical restore batch.
+    batch: CanonicalRestoreBatch,
+    /// The admitted archive this batch's members resolve against.
+    bundle: BackupBundle,
+}
+
+/// Decodes and admits the closed typed store-restore request.
+///
+/// The wire is closed: exactly `BACKUP_RESTORE_STORE_FIELDS` are admitted, and
+/// each half is re-validated through its OWNING contract —
+/// `RequestMeta::validate`, `BackupBundle::validate` (whole-archive
+/// integrity, section checksums and class denominator) and
+/// `CanonicalRestoreBatch::validate` (destination admission first). A shape
+/// failure is reported as an [`InvalidShape`] so the sync route answers it with
+/// the same `invalid` reply the sibling handlers use; it never becomes a
+/// fence, and it never becomes an assembled batch.
+fn admit_backup_store_restore(payload: &Value) -> Result<AdmittedBackupRestore, InvalidShape> {
+    let invalid = |field: &'static str, reason: String| InvalidShape { field, reason };
+    let object = payload.as_object().ok_or_else(|| {
+        invalid(
+            "backup.restore-store",
+            "payload must be a JSON object".to_owned(),
+        )
+    })?;
+    require_exact_keys(object, &BACKUP_RESTORE_STORE_FIELDS)
+        .map_err(|reason| invalid("backup.restore-store", reason))?;
+    // Every field below is read by index, which is unreachable for a missing
+    // key ONLY because the closed-key check above proved all three are present;
+    // the assertion records that invariant without adding a second error path.
+    debug_assert!(object.contains_key("context"));
+    debug_assert!(object.contains_key("restore_batch"));
+    let context: RequestMeta = serde_json::from_value(object["context"].clone())
+        .map_err(|error| invalid("backup.context", error.to_string()))?;
+    context
+        .validate()
+        .map_err(|error| invalid("backup.context", error.to_string()))?;
+    let bundle_hex =
+        get_str(object, "bundle_hex").map_err(|reason| invalid("backup.bundle_hex", reason))?;
+    let bundle_raw = hex_bytes(bundle_hex, "backup.bundle_hex", BACKUP_WIRE_BYTES_MAX)
+        .map_err(|reason| invalid("backup.bundle_hex", reason))?;
+    if bundle_raw.is_empty() {
+        return Err(invalid(
+            "backup.bundle_hex",
+            "bundle bytes must be non-empty".to_owned(),
+        ));
+    }
+    let bundle = serde_json::from_slice::<BackupBundle>(&bundle_raw)
+        .map_err(|error| invalid("backup.bundle_hex", error.to_string()))?;
+    bundle
+        .validate()
+        .map_err(|error| invalid("backup.bundle_hex", error.to_string()))?;
+    let batch: CanonicalRestoreBatch = serde_json::from_value(object["restore_batch"].clone())
+        .map_err(|error| invalid("backup.restore_batch", error.to_string()))?;
+    batch
+        .validate()
+        .map_err(|error| invalid("backup.restore_batch", error.to_string()))?;
+    Ok(AdmittedBackupRestore {
+        context,
+        batch,
+        bundle,
+    })
+}
+
+/// Projects one typed restore refusal as the closed `refused` domain reply.
+///
+/// The typed cause is rendered exactly once, here, and travels whole in
+/// `reason`: it is either the `KernelRestoreError` of the retained-member
+/// publication or the `StoreApplyRefusal` of the destination transaction. No
+/// owner is named missing because none is — this path refused, it did not lack
+/// an owner — and the request's own idempotency key is echoed unchanged, so the
+/// refusal reconciles under the same identity the operation would have.
+fn backup_restore_refusal_reply(idempotency_key: &str, reason: &str) -> Value {
+    backup_reply(
+        BACKUP_RESTORE_STORE_OPERATION,
+        "refused",
+        idempotency_key,
+        vec![
+            (
+                "code",
+                Value::String(BACKUP_RESTORE_STORE_REFUSAL_CODE.to_owned()),
+            ),
+            ("reason", Value::String(reason.to_owned())),
+        ],
+    )
+}
+
 impl KernelComposition {
     /// Dispatches one backup frame from an admitted session.
     ///
@@ -3295,6 +3445,15 @@ impl KernelComposition {
     /// exact absent capture-owner behaviour, and `backup.restore-test` still
     /// refuses naming its missing owners, so binding the receiver changes no
     /// other behaviour.
+    ///
+    /// `backup.restore-store` is the one selector that does not answer here:
+    /// it admits the same front-door caller gate and then the typed #950
+    /// carrier, proves that the batch carries this request's OWN correlated
+    /// identity, and returns [`KernelFrameAction::Backup`] so the destination
+    /// transaction runs in the awaited
+    /// [`KernelComposition::execute_backup_store_restore`] instead of being
+    /// assembled on a route that cannot await it. Every other selector keeps
+    /// its exact existing gate, reply and fence behaviour.
     ///
     /// Service-readiness and peer-authentication gates stay with the
     /// `frame_dispatch` backup arm, which owns the exact pre-dispatch binding
@@ -3363,6 +3522,54 @@ impl KernelComposition {
                 self.handle_backup_verify(session, &params, idempotency_key)?
             }
             BACKUP_RESTORE_TEST_OPERATION => handle_backup_restore_test(&params, idempotency_key),
+            BACKUP_RESTORE_STORE_OPERATION => {
+                // The same front-door admission `backup.create` and
+                // `backup.verify` apply is applied here too, and it fences an
+                // unadmitted session exactly as it does there: a request that
+                // can restore canonical records into a Store destination is the
+                // most consequential one this entry admits, so it does not get
+                // a weaker gate than a rehearsal. Its result is deliberately not
+                // bound — no owner consumes it on this route.
+                let _caller = admit_backup_caller(session)?;
+                // The typed #950 carrier is admitted here, before the async
+                // hop, so no batch is ever assembled on a route that cannot
+                // await the destination transaction. A shape failure is the
+                // same `invalid` domain reply the sibling handlers answer,
+                // through the same correlated response path; an identity
+                // failure fences exactly like the fence and connection joins
+                // above, because a batch that names another operation's
+                // identity is not this request at all.
+                let admitted = match admit_backup_store_restore(&params) {
+                    Ok(admitted) => admitted,
+                    Err(fault) => {
+                        let reply = invalid_reply(
+                            BACKUP_RESTORE_STORE_OPERATION,
+                            idempotency_key,
+                            fault.field,
+                            &fault.reason,
+                        );
+                        let mut frame =
+                            status_frame(session, FrameKind::Response, MessageType::Result, reply)?;
+                        frame.request_id = Some(request_id);
+                        frame
+                            .validate()
+                            .map_err(|_| TransportError::SessionFenced)?;
+                        return Ok(KernelFrameAction::Reply(frame));
+                    }
+                };
+                // The batch's own operation identity IS this request's
+                // correlated identity. A fresh or substituted key would make
+                // the durable restore idempotency record unreachable from the
+                // request it answers, so the join fences instead of rebinding.
+                if admitted.batch.operation.idempotency_key != identity.idempotency_key {
+                    return Err(TransportError::SessionFenced);
+                }
+                return Ok(KernelFrameAction::Backup {
+                    request_id,
+                    operation,
+                    payload: params,
+                });
+            }
             _ => return Err(TransportError::SessionFenced),
         };
         let mut frame = status_frame(session, FrameKind::Response, MessageType::Result, reply)?;
@@ -3372,4 +3579,144 @@ impl KernelComposition {
             .map_err(|_| TransportError::SessionFenced)?;
         Ok(KernelFrameAction::Reply(frame))
     }
+
+    /// Executes one admitted isolated Store restore batch (issue #952,
+    /// external audit `5869992012`).
+    ///
+    /// This is the awaited half of [`KernelFrameAction::Backup`], and it runs
+    /// only on the front door that produced it. It re-derives everything
+    /// [`KernelComposition::dispatch_backup_frame`] proved (closed operation
+    /// name, the front-door caller gate, peer authentication, the typed
+    /// carrier's own context/archive/batch validators, and the fence join
+    /// between the presented context and the presenting session), then performs
+    /// the source resolution and the ONE destination hop:
+    ///
+    /// 1. `KernelBackupRestore::publish_retained_archive_members` resolves the
+    ///    batch's member list against the admitted archive's OWN retained
+    ///    payloads. It runs where the bytes are, it re-proves the whole archive
+    ///    first, and it refuses typed when a member has no archive backing — a
+    ///    member digest is never treated as a payload source.
+    /// 2. The batch is re-admitted by its own `validate` after that
+    ///    publication, so the retained reference closure the destination checks
+    ///    is proved here too.
+    /// 3. Exactly one `KernelStoreGateway::backup_restore_batch` call goes out
+    ///    over the Store client the composition's retained gateway already
+    ///    owns. No second client, transport, endpoint or credential exists on
+    ///    this path: the destination process, its credentials and its
+    ///    `store_backup_client` binding are the gateway's own, so its flight
+    ///    slot, generation-route gate and drain/fence accounting are the ones
+    ///    every other mutating route runs.
+    ///
+    /// The typed outcomes stay typed and become the correlated domain reply
+    /// through this module's existing `status_frame` response path: the
+    /// `StoreApplyRefusal` of the destination transaction and the
+    /// `KernelRestoreError` of source resolution are rendered as `refused`
+    /// replies carrying their own text, and the frame's correlation identity
+    /// and the request's own idempotency key are echoed unchanged. Only
+    /// mechanical failures fence: a wrong operation, an unauthenticated peer, a
+    /// re-decoded carrier that no longer validates, a missing or poisoned
+    /// retained gateway, and an unprojectable reply.
+    ///
+    /// No activation, effect unblocking, source retirement or cutover is
+    /// reachable from here: the batch restores into the already-admitted
+    /// isolated destination and the function returns that destination's own
+    /// receipt.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one linear resolve-admit-send-project sequence; splitting it would hide the exact order the destination transaction depends on"
+    )]
+    pub async fn execute_backup_store_restore(
+        &self,
+        session: &Session,
+        request_id: RequestId,
+        operation: &str,
+        payload: serde_json::Value,
+    ) -> Result<Frame, TransportError> {
+        if operation != BACKUP_RESTORE_STORE_OPERATION {
+            return Err(TransportError::SessionFenced);
+        }
+        // The front-door caller gate is re-proved here, exactly as the peer and
+        // fence joins are: an awaited route must not be weaker than the sync
+        // route that admitted its frame.
+        let _caller = admit_backup_caller(session)?;
+        session
+            .peer
+            .validate()
+            .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+        let admitted =
+            admit_backup_store_restore(&payload).map_err(|_| TransportError::SessionFenced)?;
+        if !session
+            .module_generation
+            .state_fence
+            .is_compatible_with(&admitted.context.state_fence)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let mut batch = admitted.batch;
+        // The idempotency key is the request's own correlated identity, read
+        // from the admitted batch — never a fresh one minted for the hop.
+        let idempotency_key = batch.operation.idempotency_key.clone();
+        if let Err(error) = self
+            .backup_restore()
+            .publish_retained_archive_members(&admitted.bundle, &mut batch)
+        {
+            let reply = backup_restore_refusal_reply(&idempotency_key, &error.to_string());
+            return correlated_backup_reply(session, request_id, reply);
+        }
+        batch
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        #[cfg(windows)]
+        {
+            let gateway = self
+                .canonical_store_gateway
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?
+                .clone()
+                .ok_or(TransportError::SessionFenced)?;
+            let reply = match gateway.backup_restore_batch(&admitted.context, batch).await {
+                Ok(receipt) => backup_reply(
+                    BACKUP_RESTORE_STORE_OPERATION,
+                    "ok",
+                    &idempotency_key,
+                    vec![(
+                        "restore",
+                        serde_json::to_value(receipt).map_err(|_| TransportError::SessionFenced)?,
+                    )],
+                ),
+                Err(refusal) => {
+                    backup_restore_refusal_reply(&idempotency_key, &refusal.to_string())
+                }
+            };
+            correlated_backup_reply(session, request_id, reply)
+        }
+        #[cfg(not(windows))]
+        {
+            // No Windows contour retains a canonical Store gateway off
+            // Windows, so the destination hop is unprovable here and the
+            // request fails closed instead of being answered by a fabricated
+            // receipt.
+            let _ = (admitted.context, batch, idempotency_key);
+            Err(TransportError::SessionFenced)
+        }
+    }
+}
+
+/// Stamps one correlated backup domain reply through the existing response
+/// path.
+///
+/// The correlation identity is the frame's OWN `request_id`; it is set last, and
+/// the frame is re-validated afterwards, so a reply that cannot answer the
+/// admitted request fences instead of delivering a foreign answer.
+fn correlated_backup_reply(
+    session: &Session,
+    request_id: RequestId,
+    reply: Value,
+) -> Result<Frame, TransportError> {
+    let mut frame = status_frame(session, FrameKind::Response, MessageType::Result, reply)?;
+    frame.request_id = Some(request_id);
+    frame
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
+    Ok(frame)
 }

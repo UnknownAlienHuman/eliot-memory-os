@@ -891,11 +891,17 @@ impl KernelComposition {
     /// ## Chain status: still no production caller
     ///
     /// This entry has no caller in this repository, and that is recorded here
-    /// rather than papered over. The Kernel's only front-door backup dispatch
+    /// rather than papered over. The Kernel's front-door backup dispatch
     /// (`KernelComposition::dispatch_backup_frame`) routes `backup.create`,
-    /// `backup.verify` and `backup.restore-test`; `backup.verify` is read-only,
-    /// and `backup.restore-test` is a rehearsal that answers `plan_gap` naming
-    /// the missing owner evidence, so neither performs a restore. The other two
+    /// `backup.verify`, `backup.restore-test` and `backup.restore-store`;
+    /// `backup.verify` is read-only, `backup.restore-test` is a rehearsal that
+    /// answers `plan_gap` naming the missing owner evidence, and
+    /// `backup.restore-store` reaches
+    /// [`KernelComposition::execute_backup_store_restore`] — a DIFFERENT entry,
+    /// which sends one admitted canonical batch into its already-admitted
+    /// isolated destination through the retained `KernelStoreGateway` and
+    /// restores into no journal this composition owns. None of the four
+    /// performs the journaled restore THIS entry runs. The other two
     /// workspace consumers of this package are a native worker and an
     /// instrument harness, not a restore owner. Calling this from any of them
     /// would be a caller invented for the sake of one, and calling it from the
@@ -1514,6 +1520,37 @@ pub enum KernelFrameAction {
         /// Closed operation name from the research-provider wire.
         operation: String,
         /// Bounded operation payload carrying the typed dispatch envelope.
+        payload: serde_json::Value,
+    },
+    /// Execute one authenticated isolated Store restore batch (issue #952,
+    /// external audit `5869992012`).
+    ///
+    /// The operation is `backup.restore-store`, the front-door method selector
+    /// for the one backup request that performs a destination effect. Its
+    /// payload is the admitted #950 restore carrier and nothing else: the
+    /// fenced Store `RequestMeta` under `context`, the destination-bound
+    /// `CanonicalRestoreBatch` under `restore_batch`, and the retained archive
+    /// under `bundle_hex` whose canonical members the batch's member list is
+    /// resolved against. Shape admission is owned by
+    /// [`KernelComposition::dispatch_backup_frame`] (the exact-key wire shape,
+    /// the batch's own `validate`, which checks the destination's external
+    /// admission evidence before anything else, and the join proving the batch
+    /// carries the request's OWN correlated identity).
+    ///
+    /// Ledger-bound execution itself is owned by
+    /// [`KernelComposition::execute_backup_store_restore`], which publishes the
+    /// retained archive members through the retained `KernelBackupRestore` and
+    /// performs exactly one `KernelStoreGateway::backup_restore_batch` call over
+    /// the Store client that gateway already owns. No second client, transport,
+    /// endpoint, credential or carrier is representable on this path, and no
+    /// destination is activated, unblocked or cut over by it: the batch restores
+    /// into the already-admitted isolated destination and nothing else.
+    Backup {
+        /// Correlation identity to echo in the response.
+        request_id: RequestId,
+        /// Closed operation name; must equal `BACKUP_RESTORE_STORE_OPERATION`.
+        operation: String,
+        /// Bounded operation payload carrying context, batch and archive.
         payload: serde_json::Value,
     },
     /// Return a typed rejection, then fence the connection.
