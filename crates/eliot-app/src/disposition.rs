@@ -319,7 +319,7 @@ pub const CLOSED_REFERENCE_ROLES: &[ClosedReferenceRole] = &[
     ClosedReferenceRole { path: "docs/integrations/claude/CLAUDE_INTEGRATION_SECURITY.md", role: "reference_only:security_guidance", basis: "security guidance describes the old launcher as a migration boundary" },
     ClosedReferenceRole { path: "docs/migration/1860-dispositions.md", role: "reference_only:migration_inventory", basis: "generated migration disposition records a package retirement row" },
     ClosedReferenceRole { path: "docs/migration/1860-impact-graph.md", role: "reference_only:migration_inventory", basis: "generated impact graph records the package node and edge set" },
-    ClosedReferenceRole { path: "docs/operations/AGENT_DELIVERY_GUIDE.md", role: "reference_only:operator_history", basis: "operator guide cites the old client path as migration context" },
+    ClosedReferenceRole { path: "docs/operations/AGENT_DELIVERY_GUIDE.md", role: "live_consumer:build", basis: "the Windows release copies docs/operations verbatim and this operator guide tells recipients the Governor host route is current" },
     ClosedReferenceRole { path: "workstreams/T13.md", role: "reference_only:workstream_record", basis: "retirement workstream records the facade migration sequence" },
     ClosedReferenceRole { path: "workstreams/T7.md", role: "reference_only:workstream_record", basis: "retirement workstream records the facade migration sequence" },
     ClosedReferenceRole { path: "workstreams/configuration/assignments/1219-legacy-config-retirement.toml", role: "reference_only:workstream_record", basis: "configuration assignment records a retired config filename that shares the token" },
