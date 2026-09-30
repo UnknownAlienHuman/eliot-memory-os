@@ -1,13 +1,23 @@
-//! One frozen operation/identity model for the admission-reservation stage
-//! half of the #1678 saga (#1678 REQ1, REQ2, REQ3; W1, W2; A1, A2).
+//! One frozen operation/identity model for the admission-reservation saga
+//! (#1678 REQ1, REQ2, REQ3, REQ6; W1, W2, W4, W5; A1, A2, A4, A7).
 //!
-//! This module is the Kernel-side coordinator contract that produces a durable,
-//! immutable `StagedInactive` reservation BEFORE any semantic admission
-//! effect. It creates no process, provider or environment effect: the only
-//! thing it can do is stage one reservation row through the typed
-//! [`OperationalRecoveryStore`] owner, and then read that same row back.
+//! This module is the Kernel-side coordinator contract for the durable
+//! reservation lifecycle. It holds the two halves of the saga that are
+//! purely about the ORS reservation row itself:
 //!
-//! # What this half is allowed to do
+//! - the **stage** half ([`stage_admission_reservation_inactive`]) produces a
+//!   durable, immutable `StagedInactive` reservation BEFORE any semantic
+//!   admission effect;
+//! - the **activate** half ([`activate_admission_reservation_from_owner_evidence`])
+//!   moves that same reservation to `Active` only from owner evidence.
+//!
+//! Neither half creates a process, provider or environment effect. Staging
+//! reserves/account charges only; activation is still not a process start. Both
+//! halves go through the one typed [`OperationalRecoveryStore`] owner, read the
+//! same reservation identity back, and reuse the existing identity/validator
+//! types rather than minting parallel ones.
+//!
+//! # What the stage half is allowed to do
 //!
 //! The stage half is exactly:
 //!
@@ -19,8 +29,25 @@
 //!    Epoch claims through the existing typed ORS owner;
 //! 3. durably read that same reservation identity back.
 //!
-//! It does not admit, activate, release, expire, reconcile, launch, provision
-//! or allocate anything. Those are W3-W8 / REQ4-REQ10 and are owned elsewhere.
+//! It does not admit, release, expire or reconcile anything. Those are the
+//! canonical-admission and disposition owners.
+//!
+//! # What the activate half is allowed to do
+//!
+//! The activate half is exactly one transition:
+//!
+//! 1. re-read the exact reservation identity and prove it is the
+//!    `StagedInactive` (or `Reconciling`) row the caller believes it is, under
+//!    the caller's current Authority Epoch lineage and State Fence;
+//! 2. check the owner-issued canonical admission receipt and the ORS activation
+//!    receipt are both well-formed and distinct;
+//! 3. CAS the row to `Active` through the typed owner, and read that same
+//!    identity back.
+//!
+//! It admits nothing, launches nothing, provisions nothing, allocates no
+//! environment and fabricates no canonical receipt. The canonical admission
+//! receipt arrives as evidence from the canonical owner; this module only
+//! refuses to activate without it.
 //!
 //! # Why the identity is derived, not minted
 //!
@@ -30,7 +57,10 @@
 //! that the owner already holds durably. The derivation is deterministic and
 //! content-addressed: the same work item, proposed attempt, admission revision,
 //! claim set, fence and epoch always produce the same identity, on any
-//! process, after any crash.
+//! process, after any crash. The activation operation identity
+//! ([`activation_operation_identity`]) follows the same rule for the same
+//! reason: an activation replay after a lost response must reuse the one ORS
+//! operation identity rather than mint a second activation (A7).
 //!
 //! # Why the completeness check is independent
 //!
@@ -44,13 +74,15 @@
 //! missing role is a typed refusal rather than a shorter loop.
 
 use eliot_contracts::EpochId;
+use eliot_receipts::ReceiptIdentity;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AdmissionReservationClaimRef, AdmissionReservationClaims, AdmissionReservationRecord,
-    AdmissionReservationSnapshot, AdmissionReservationStage, AdmissionReservationState,
-    EpochIdentity, EpochLineage, OpaqueLabel, OperationIdentity, OperationalRecoveryStore,
-    OrsError, StateFenceSnapshot, model::sha256_hex,
+    AdmissionReservationActivatedOutcome, AdmissionReservationActivationEvidence,
+    AdmissionReservationActivationRequest, AdmissionReservationClaimRef,
+    AdmissionReservationClaims, AdmissionReservationRecord, AdmissionReservationSnapshot,
+    AdmissionReservationStage, AdmissionReservationState, EpochIdentity, EpochLineage, OpaqueLabel,
+    OperationIdentity, OperationalRecoveryStore, OrsError, StateFenceSnapshot, model::sha256_hex,
 };
 
 /// Wire revision of this stage identity contract.
@@ -516,4 +548,208 @@ pub fn epoch_lineage_for(
     };
     lineage.validate()?;
     Ok(lineage)
+}
+
+/// Domain separator binding a derived activation identity to this exact
+/// contract revision. Without it a derived activation digest could collide
+/// with any other ORS identity derived from the same immutable inputs.
+const ACTIVATION_OPERATION_DOMAIN: &str = "eliot.ors.admission-reservation.activation.v1";
+
+/// Derives the ORS operation identity for the activation of one reservation
+/// from the exact owner evidence that authorizes it.
+///
+/// The identity is bound to the reservation it activates AND to the exact pair
+/// of owner receipts, so a replay after a lost response reuses the one ORS
+/// operation identity and returns the original active snapshot, while the same
+/// reservation activated under different owner evidence is a same-identity
+/// different-content conflict rather than a second activation.
+///
+/// # Errors
+///
+/// Returns [`OrsError::InvalidField`] when `reservation_id` is blank, and
+/// [`OrsError::Encoding`] when the canonical preimage cannot be encoded.
+pub fn activation_operation_identity(
+    reservation_id: &OperationIdentity,
+    canonical_admission_receipt: &ReceiptIdentity,
+    activation_receipt: &ReceiptIdentity,
+) -> Result<OperationIdentity, OrsError> {
+    if reservation_id.as_str().trim().is_empty() {
+        return Err(OrsError::InvalidField {
+            field: "admission_reservation.reservation_id",
+            reason: "reservation identity must be non-blank",
+        });
+    }
+    let preimage = serde_json::to_vec(&(
+        ACTIVATION_OPERATION_DOMAIN,
+        ADMISSION_RESERVATION_STAGE_VERSION,
+        reservation_id,
+        canonical_admission_receipt,
+        activation_receipt,
+    ))
+    .map_err(|error| OrsError::Encoding(error.to_string()))?;
+    OperationIdentity::new(format!(
+        "admission-reservation-activation:{}",
+        sha256_hex(&preimage)
+    ))
+}
+
+/// Activates the exact reservation from owner evidence and returns the durable
+/// activation receipt (REQ6, A4, A7).
+///
+/// This is the activate half of the #1678 saga and the only public entry point
+/// that produces an active reservation. It:
+///
+/// 1. re-reads the exact reservation identity from the typed owner and refuses
+///    anything that is not the `StagedInactive` (or `Reconciling`) row the
+///    caller named, under the caller's current Authority Epoch lineage and
+///    State Fence — a foreign epoch, a stale fence, a different work item,
+///    attempt or claim set fails **before** any mutation;
+/// 2. validates the two owner receipts with the existing
+///    [`AdmissionReservationActivationEvidence`] validator, so a malformed or
+///    non-distinct receipt pair never reaches the write;
+/// 3. CAS-transitions the row to `Active` through the same typed owner, using
+///    the current ORS receipt it just read as the expected receipt;
+/// 4. reads the SAME identity back out of the owner and returns that durable
+///    snapshot, from which the caller takes the committed activation and
+///    canonical admission receipts.
+///
+/// The function admits nothing, launches nothing, provisions nothing and
+/// allocates no environment. It is the mechanical prerequisite #1701 consumes,
+/// not a process start.
+///
+/// # Errors
+///
+/// Returns [`OrsError::ReservationNotFound`] when no reservation exists under
+/// the named identity, [`OrsError::DuplicateConflict`] when the durable row is
+/// not the row the caller described (different work item, attempt, claims,
+/// epoch or fence) or when the expected ORS receipt no longer matches the
+/// current one, [`OrsError::FenceMismatch`] when the caller's Authority Epoch
+/// or State Fence does not match the durable row, [`OrsError::InvalidExpiry`]
+/// when the declared expiry boundary has already elapsed, and
+/// [`OrsError::InvalidField`] when the request is incomplete or malformed.
+///
+/// An **exact replay** — the same operation identity, the same expected
+/// receipt, the same owner evidence — returns the original active snapshot
+/// unchanged: the second activation is refused as a same-identity
+/// different-content conflict only when the content actually differs.
+pub fn activate_admission_reservation_from_owner_evidence<S: OperationalRecoveryStore + ?Sized>(
+    store: &S,
+    request: &AdmissionReservationActivationRequest,
+) -> Result<AdmissionReservationActivatedOutcome, OrsError> {
+    if request.now_ms <= 0 {
+        return Err(OrsError::InvalidField {
+            field: "admission_reservation_activation.now_ms",
+            reason: "activation time must be greater than zero",
+        });
+    }
+    if request.reservation_id.as_str().trim().is_empty()
+        || request.work_item_id.as_str().trim().is_empty()
+        || request.proposed_attempt_id.as_str().trim().is_empty()
+        || request.operation_id.as_str().trim().is_empty()
+    {
+        return Err(OrsError::InvalidField {
+            field: "admission_reservation_activation.identity",
+            reason: "reservation, work item, proposed attempt and operation identities must be non-blank",
+        });
+    }
+    // The immutable binding is validated BEFORE the write with the existing
+    // validators, by value, against the ORIGINAL recorded fence and epoch.
+    request.claims.validate()?;
+    request.authority_epoch.validate()?;
+    request
+        .state_fence
+        .validate_against_lineage(&request.authority_epoch)?;
+    AdmissionReservationActivationEvidence {
+        canonical_admission_receipt: request.canonical_admission_receipt.clone(),
+        activation_receipt: request.activation_receipt.clone(),
+    }
+    .validate()?;
+
+    // Re-read the exact row the caller believes it is activating. This is the
+    // pre-mutation identity check: nothing is written until the durable row,
+    // its immutable binding and the caller's current authority all agree.
+    let current = store
+        .load_kernel_admission_reservation(&request.reservation_id)?
+        .ok_or(OrsError::ReservationNotFound)?;
+    let staged = current.record();
+    staged.validate()?;
+    verify_staged_claim_completeness(staged)?;
+    if staged.state != AdmissionReservationState::StagedInactive
+        && staged.state != AdmissionReservationState::Reconciling
+    {
+        return Err(OrsError::InvalidTransition);
+    }
+    if staged.work_item_id != request.work_item_id
+        || staged.proposed_attempt_id != request.proposed_attempt_id
+        || staged.claims != request.claims
+    {
+        return Err(OrsError::DuplicateConflict);
+    }
+    if staged.authority_epoch != request.authority_epoch
+        || staged.state_fence != request.state_fence
+    {
+        return Err(OrsError::FenceMismatch);
+    }
+    if request.now_ms >= staged.expires_at_ms {
+        return Err(OrsError::InvalidExpiry);
+    }
+    // The CAS precondition is the receipt this call actually observed, not a
+    // value the caller may have invented: the store compares the request's
+    // `expected_current_receipt` against the row it holds at write time and
+    // refuses a mismatch.
+    if current.receipt() != &request.expected_current_receipt {
+        return Err(OrsError::DuplicateConflict);
+    }
+
+    let activated =
+        store.activate_kernel_admission_reservation(AdmissionReservationActivationRequest {
+            reservation_id: request.reservation_id.clone(),
+            work_item_id: request.work_item_id.clone(),
+            proposed_attempt_id: request.proposed_attempt_id.clone(),
+            operation_id: request.operation_id.clone(),
+            claims: request.claims.clone(),
+            canonical_admission_receipt: request.canonical_admission_receipt.clone(),
+            activation_receipt: request.activation_receipt.clone(),
+            expected_current_receipt: request.expected_current_receipt.clone(),
+            authority_epoch: request.authority_epoch.clone(),
+            state_fence: request.state_fence.clone(),
+            now_ms: request.now_ms,
+        })?;
+    // The store's own echoed row is cross-checked against the facts this call
+    // verified BEFORE the write, so "the reservation is active" means the
+    // persisted row carries the evidence that was checked, not merely that a
+    // write returned successfully.
+    let persisted = activated.record();
+    persisted.validate()?;
+    if persisted.state != AdmissionReservationState::Active
+        || persisted.reservation_id != request.reservation_id
+        || persisted.canonical_admission_receipt.as_ref()
+            != Some(&request.canonical_admission_receipt)
+        || persisted.activation_receipt.as_ref() != Some(&request.activation_receipt)
+    {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "admission_reservation",
+            reason: "the activated row does not carry the owner evidence this call validated"
+                .to_owned(),
+        });
+    }
+
+    // Durably read the SAME identity back. This is the A7 restart path: a
+    // replay after a lost response lands on the identical active row and its
+    // original activation receipt, and this read launches nothing.
+    let readback = store
+        .load_kernel_admission_reservation(&request.reservation_id)?
+        .ok_or(OrsError::ReservationNotFound)?;
+    if readback.record().state != AdmissionReservationState::Active
+        || readback.record().activation_receipt.as_ref() != Some(&request.activation_receipt)
+    {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "admission_reservation",
+            reason: "readback returned a different active reservation identity".to_owned(),
+        });
+    }
+    Ok(AdmissionReservationActivatedOutcome::from_store(
+        request.reservation_id.clone(),
+        readback,
+    ))
 }
