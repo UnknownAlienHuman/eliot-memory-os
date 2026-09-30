@@ -258,8 +258,8 @@ use plan::{
 };
 pub use profile_governed_roots::{ProfileGovernedRoots, ProfileRootAnchors, select_profile_roots};
 pub use profile_launch_composition::{ProfileLaunchComposition, compose_profile_launch};
-pub use profile_supervision::launch_adapter_name;
 pub use profile_roots::{INSTALLATION_ROOT_BINDING_VERSION, InstallationRoots};
+pub use profile_supervision::launch_adapter_name;
 pub use profile_supervision::{
     NoServiceProfileAuthorityProof, ProfileGovernanceReport, ProfileRootRoles, ProfileSupervision,
     prove_no_service_profile_authority_dependency,
@@ -1619,13 +1619,13 @@ impl RuntimeLaunchDescriptor {
     pub fn current_user_host_bootstrap_arguments(
         &self,
     ) -> Result<Vec<PlatformHandle>, InstallationError> {
-        let authority_generation =
-            PlatformHandle::new(self.authority_generation.value().to_string()).map_err(|error| {
-                InstallationError::InvalidField {
-                    field: "runtime_launch.authority_generation".to_owned(),
-                    reason: error.to_string(),
-                }
-            })?;
+        let authority_generation = PlatformHandle::new(
+            self.authority_generation.value().to_string(),
+        )
+        .map_err(|error| InstallationError::InvalidField {
+            field: "runtime_launch.authority_generation".to_owned(),
+            reason: error.to_string(),
+        })?;
         [
             "--config-descriptor",
             self.authority_descriptor_path.as_str(),

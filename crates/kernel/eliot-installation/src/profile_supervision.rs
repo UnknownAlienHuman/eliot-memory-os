@@ -145,9 +145,7 @@ pub struct NoServiceProfileAuthorityProof {
 /// disposable supervision. It exists so a status or plan response can report
 /// the adapter a profile actually uses rather than only naming supervision in
 /// prose.
-pub const fn launch_adapter_name(
-    profile: InstallationProfile,
-) -> &'static str {
+pub const fn launch_adapter_name(profile: InstallationProfile) -> &'static str {
     match profile {
         InstallationProfile::SystemService => "scm_service_registration",
         InstallationProfile::UserMode => "current_user_launcher_task_scheduler",
@@ -417,8 +415,7 @@ pub fn prove_no_service_profile_authority_dependency(
     // that cannot name the current interactive account it will be supervised
     // as has not proved it avoids service-account authority. The values come
     // from the live process token, never from a caller-supplied string.
-    let (current_user_owner_sid, current_user_session_id) =
-        retained_current_user_identity()?;
+    let (current_user_owner_sid, current_user_session_id) = retained_current_user_identity()?;
     Ok(NoServiceProfileAuthorityProof {
         profile: governed.profile,
         selects_scm_supervision: false,

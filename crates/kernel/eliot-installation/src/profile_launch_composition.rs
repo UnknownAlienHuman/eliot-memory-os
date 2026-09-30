@@ -190,10 +190,8 @@ fn user_mode_root_request(
             )
         })?
         .to_owned();
-    let immutable = super::WindowsPathIdentity::parse_root(
-        &governed.immutable_binaries,
-        "immutable_binaries",
-    )?;
+    let immutable =
+        super::WindowsPathIdentity::parse_root(&governed.immutable_binaries, "immutable_binaries")?;
     // I3.1 pins both the Windows profiles' immutable root to
     // `<anchor>\Programs\Eliot\<component>\<version>` for `user_mode`, so the
     // component and version leaves of the retained immutable root are the
@@ -208,15 +206,11 @@ fn user_mode_root_request(
                 "user_mode immutable root does not carry its component leaf".to_owned(),
             )
         })?;
-    let version = immutable
-        .components
-        .last()
-        .cloned()
-        .ok_or_else(|| {
-            InstallationError::ProfileViolation(
-                "user_mode immutable root does not carry its version leaf".to_owned(),
-            )
-        })?;
+    let version = immutable.components.last().cloned().ok_or_else(|| {
+        InstallationError::ProfileViolation(
+            "user_mode immutable root does not carry its version leaf".to_owned(),
+        )
+    })?;
     Ok(ProfileRootRequest {
         profile: ProfileSelection::UserMode,
         installation_id: runtime_state_roots.profile_anchor_root.as_str().to_owned(),
