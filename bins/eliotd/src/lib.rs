@@ -3591,7 +3591,17 @@ impl DaemonComposition {
     /// Returns the session-resolution rejection (not ready, no live session,
     /// stale expectation epoch), the Kernel verifier rejection, the
     /// capability construction rejection, the coordinator owner restore
-    /// rejection, or a stale-config conflict unchanged, each typed.
+    /// rejection from the durable document, or a stale-config conflict
+    /// unchanged, each typed.
+    ///
+    /// `coordinator_document` is the coordinator snapshot JSON selected out of
+    /// the persisted projection FILE bytes by
+    /// `solo_agent_driver::load_verified_projection` after that file's
+    /// envelope was verified; the coordinator is restored from it rather than
+    /// from the in-memory `snapshot` (issue #370 W24/W25/W26/A2/A28). This adds
+    /// no second capability build and no second recovery path: the one
+    /// `build_production_provider_capability` result drives both, and the
+    /// typed snapshot stays the fabric state carrier.
     pub async fn agent_fabric_restore_verified_async(
         &self,
         kernel: &Arc<DaemonKernelClient>,
@@ -3599,6 +3609,7 @@ impl DaemonComposition {
         ports: FabricPorts,
         material: VerifiedProviderMaterial,
         claimed: &crate::solo_agent_driver::SoloClaimedHalves,
+        coordinator_document: &str,
     ) -> Result<AgentFabric, DaemonError> {
         let _span = tracing::info_span!("eliotd.fabric_restore_verified_async").entered();
         let material = self.resolve_verified_material(kernel, material)?;
@@ -3618,11 +3629,12 @@ impl DaemonComposition {
             Self::build_production_provider_capability(material, &owner, live_fence, claimed)?;
         let config = daemon_coordinator_config()?;
         let store = crate::semantic_revision_store::SemanticRevisionStore::new(self.state_root());
-        Ok(AgentFabric::restore_with_admitted_provider(
+        Ok(AgentFabric::restore_durable_snapshot_with_admitted_provider(
             snapshot,
             config,
             ports,
             Some(&store),
+            coordinator_document,
             capability,
         )?)
     }
