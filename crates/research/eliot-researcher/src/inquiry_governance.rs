@@ -8774,7 +8774,7 @@ fn retained_excerpts(
         return Vec::new();
     };
     crate::admitted_excerpt::AdmittedExcerpt::offer(
-        crate::admitted_excerpt::AdmittedExcerpt::Params {
+        crate::admitted_excerpt::AdmittedExcerptParams {
             source_handle: claim_id.to_owned(),
             excerpt: quote,
             // The offset is measured from the retained bytes here, so asserting

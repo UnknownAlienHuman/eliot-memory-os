@@ -58,8 +58,9 @@ pub use evidence_portfolio::{
 // `OccurrenceFailure` values, and because a release consumer asking "was this
 // crop detected" reads `OccurrenceCheck` rather than prose.
 pub use admitted_excerpt::{
-    AdmittedExcerpt, ContextAxis, ContextFinding, ExcerptPosition, OccurrenceCheck,
-    OccurrenceFailure, RetainedSourceRevision, SnippetRegion, verify_excerpt_occurrence,
+    AdmittedExcerpt, AdmittedExcerptParams, ContextAxis, ContextFinding, ExcerptPosition,
+    OccurrenceCheck, OccurrenceFailure, RetainedSourceRevision, RetainedSourceRevisionParams,
+    SnippetRegion, verify_excerpt_occurrence,
 };
 // The `R6` typed inquiry-governance surface. Every field type a consumer reads
 // off an exported record is nameable here, so the domain can be consumed without

@@ -144,18 +144,27 @@ pub struct AdmittedExcerpt {
     pub digest: String,
 }
 
-impl AdmittedExcerpt {
-    /// Named constructor arguments for [`AdmittedExcerpt::offer`].
-    #[derive(Clone, Debug)]
-    pub struct Params {
-        /// Handle of the admitted source revision.
-        pub source_handle: String,
-        /// The exact quoted bytes.
-        pub excerpt: String,
-        /// Where in the admitted revision the caller believes it sits.
-        pub position: ExcerptPosition,
-    }
+/// Named constructor arguments for [`AdmittedExcerpt::offer`].
+///
+/// Declared at module scope rather than inside the `impl` block, for two
+/// reasons. `rustfmt` refuses to format a struct declared inside an `impl` or
+/// `trait` ("struct is not supported in `trait`s or `impl`s"), and a bare
+/// `Params` does not resolve to an associated type from inside the very block
+/// that declares it. Both constructors in this module take a named-argument
+/// struct for the same reason — a frozen commitment should be spelled out field
+/// by field at the call site rather than positionally — and both are named for
+/// the value they construct, so the two shapes stay distinct types.
+#[derive(Clone, Debug)]
+pub struct AdmittedExcerptParams {
+    /// Handle of the admitted source revision.
+    pub source_handle: String,
+    /// The exact quoted bytes.
+    pub excerpt: String,
+    /// Where in the admitted revision the caller believes it sits.
+    pub position: ExcerptPosition,
+}
 
+impl AdmittedExcerpt {
     /// Offers one exact excerpt, freezing its identity.
     ///
     /// # Errors
@@ -168,7 +177,7 @@ impl AdmittedExcerpt {
     /// only shape requirement is that it is non-empty. The excerpt's own
     /// digest is computed over these exact bytes, so a caller cannot offer one
     /// set of bytes and be checked against another.
-    pub fn offer(params: Params) -> Result<Self, PortfolioError> {
+    pub fn offer(params: AdmittedExcerptParams) -> Result<Self, PortfolioError> {
         text(&params.source_handle, "excerpt.source_handle")?;
         if params.excerpt.trim().is_empty() {
             return Err(PortfolioError::Blank { field: "excerpt.excerpt" });
@@ -270,22 +279,29 @@ pub struct RetainedSourceRevision {
     pub digest: String,
 }
 
-impl RetainedSourceRevision {
-    /// Named constructor arguments for [`RetainedSourceRevision::retain`].
-    #[derive(Clone, Debug)]
-    pub struct Params {
-        /// Handle of the admitted source.
-        pub source_handle: String,
-        /// The immutable artifact reference the bytes were committed under.
-        pub artifact_ref: String,
-        /// The source record's `content_digest`.
-        pub content_digest: String,
-        /// The exact retained bytes.
-        pub bytes: Vec<u8>,
-        /// Regions the retaining owner declared to be search-result excerpts.
-        pub snippet_regions: Vec<SnippetRegion>,
-    }
+/// Named constructor arguments for [`RetainedSourceRevision::retain`].
+///
+/// At module scope for the same reason as [`AdmittedExcerptParams`]: `rustfmt`
+/// will not format a struct declared inside an `impl` block, and a bare
+/// `Params` does not resolve there. This shape is **distinct** from
+/// [`AdmittedExcerptParams`] — it carries the retained bytes and their declared
+/// `content_digest`, which the excerpt shape has no reason to hold — so the two
+/// are separate types rather than one merged shape.
+#[derive(Clone, Debug)]
+pub struct RetainedSourceRevisionParams {
+    /// Handle of the admitted source.
+    pub source_handle: String,
+    /// The immutable artifact reference the bytes were committed under.
+    pub artifact_ref: String,
+    /// The source record's `content_digest`.
+    pub content_digest: String,
+    /// The exact retained bytes.
+    pub bytes: Vec<u8>,
+    /// Regions the retaining owner declared to be search-result excerpts.
+    pub snippet_regions: Vec<SnippetRegion>,
+}
 
+impl RetainedSourceRevision {
     /// Retains one admitted source revision's exact bytes.
     ///
     /// # Errors
@@ -298,7 +314,7 @@ impl RetainedSourceRevision {
     /// revision identity at construction, so nothing downstream has to take the
     /// pairing on trust. The region refusal is what stops the snippet arm being
     /// neutralised by declaring a region that covers the whole document.
-    pub fn retain(params: Params) -> Result<Self, PortfolioError> {
+    pub fn retain(params: RetainedSourceRevisionParams) -> Result<Self, PortfolioError> {
         text(&params.source_handle, "retained.source_handle")?;
         text(&params.artifact_ref, "retained.artifact_ref")?;
         digest(&params.content_digest, "retained.content_digest")?;
