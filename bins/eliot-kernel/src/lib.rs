@@ -79,6 +79,11 @@ mod kernel_config;
 pub mod kernel_diagnostics;
 mod process_execution;
 mod process_execution_client;
+mod lsp_current_executor;
+pub use lsp_current_executor::{
+    GitAdmissionFuture, GitAdmissionPort, KernelGitProcessRunner, KernelLspCurrentExecutor,
+    KernelLspProcessOwnerPort, MAX_GIT_PROCESS_STREAM_BYTES,
+};
 mod supervision_lease_authority;
 mod testd_terminal_completion_route;
 mod tool_exposure;
