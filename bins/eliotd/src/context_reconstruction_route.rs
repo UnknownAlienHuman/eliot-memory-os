@@ -418,11 +418,14 @@ async fn read_authenticated_task_recipe(
     if read.status != CampaignSourceReadStatus::Current || read.read_state_fence != *fence {
         return Err("task recipe owner read is not current under the admitted fence".to_owned());
     }
-    // The owner-resolved current revision. `read.current_head` is the store's
-    // own answer to "which revision of this `(role, owner, record_id)` is
-    // current"; `CampaignSourceRevisionRead::validate` already requires it to
-    // agree with the returned row on every field, and it is re-checked here
-    // against the exact task revision the row itself declares.
+    // The owner-resolved current revision, and the required task revision for
+    // this reconstruction. `read.current_head` is the store's own answer to
+    // "which revision of this `(role, owner, record_id)` is current";
+    // `CampaignSourceRevisionRead::validate` already requires it to agree with
+    // the returned row, and a non-`Task` revision cannot appear on a `TaskPlan`
+    // row because `CampaignSourceRecord::validate` already refuses one. The
+    // match is kept as the exhaustive, typed resolution of the revision family
+    // rather than a comparison that can never fire.
     let head = read
         .current_head
         .ok_or_else(|| "task recipe owner read returned no current head".to_owned())?;
