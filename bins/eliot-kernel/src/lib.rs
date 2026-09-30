@@ -80,11 +80,6 @@ pub mod kernel_diagnostics;
 mod process_execution;
 mod process_execution_client;
 mod process_stream_readback;
-mod lsp_current_executor;
-pub use lsp_current_executor::{
-    GitAdmissionFuture, GitAdmissionPort, KernelGitProcessRunner, KernelLspCurrentExecutor,
-    KernelLspProcessOwnerPort,
-};
 mod supervision_lease_authority;
 mod testd_terminal_completion_route;
 mod tool_exposure;
