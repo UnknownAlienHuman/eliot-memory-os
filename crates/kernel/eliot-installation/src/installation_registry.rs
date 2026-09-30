@@ -90,7 +90,7 @@ pub(super) const INSTALLATION_REGISTRY_FILE_NAME: &str = "installation-registry.
 /// ```
 pub struct RedbInstallationRegistry {
     pub(super) database: Database,
-    _path_lease: RegistryPathLease,
+    path_lease: RegistryPathLease,
 }
 
 enum RegistryPathLease {
@@ -185,7 +185,7 @@ impl RedbInstallationRegistry {
     pub(super) fn from_database_for_test(database: Database) -> Self {
         Self {
             database,
-            _path_lease: RegistryPathLease::Test,
+            path_lease: RegistryPathLease::Test,
         }
     }
 
@@ -212,7 +212,7 @@ impl RedbInstallationRegistry {
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
         Ok(Self {
             database,
-            _path_lease: RegistryPathLease::Test,
+            path_lease: RegistryPathLease::Test,
         })
     }
 
@@ -235,7 +235,7 @@ impl RedbInstallationRegistry {
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
         Ok(Self {
             database,
-            _path_lease: RegistryPathLease::Legacy { _lease: path_lease },
+            path_lease: RegistryPathLease::Legacy { _lease: path_lease },
         })
     }
 
@@ -272,7 +272,7 @@ impl RedbInstallationRegistry {
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
         let registry = Self {
             database,
-            _path_lease: RegistryPathLease::InstallationHost {
+            path_lease: RegistryPathLease::InstallationHost {
                 _root: host_root,
                 _file: file,
             },
@@ -330,7 +330,7 @@ impl RedbInstallationRegistry {
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
         let registry = Self {
             database,
-            _path_lease: RegistryPathLease::InstallationHost {
+            path_lease: RegistryPathLease::InstallationHost {
                 _root: host_root,
                 _file: file,
             },
@@ -340,7 +340,7 @@ impl RedbInstallationRegistry {
         Ok(Some(registry))
     }
 
-    /// Opens an existing SystemService registry for the installer replay
+    /// Opens an existing `SystemService` registry for the installer replay
     /// window before its first activation projection. This never creates a
     /// file or database. A captured transaction receipt must bind the retained
     /// Host root; only an exact uninitialized registry may lack its persisted
@@ -384,7 +384,7 @@ impl RedbInstallationRegistry {
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
         let registry = Self {
             database,
-            _path_lease: RegistryPathLease::InstallationHost {
+            path_lease: RegistryPathLease::InstallationHost {
                 _root: host_root,
                 _file: file,
             },
@@ -409,7 +409,7 @@ impl RedbInstallationRegistry {
 
     /// Opens or creates the registry below a retained current-user Host root.
     ///
-    /// UserMode and PortableDev registries retain both the current-user root
+    /// `UserMode` and `PortableDev` registries retain both the current-user root
     /// and fixed child-file leases for the complete redb handle lifetime.
     #[allow(
         clippy::needless_pass_by_value,
@@ -437,7 +437,7 @@ impl RedbInstallationRegistry {
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
         Ok(Self {
             database,
-            _path_lease: RegistryPathLease::UserOwnedHost {
+            path_lease: RegistryPathLease::UserOwnedHost {
                 _root: host_root,
                 _file: file,
             },
@@ -483,7 +483,7 @@ impl RedbInstallationRegistry {
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
         Ok(Some(Self {
             database,
-            _path_lease: RegistryPathLease::UserOwnedHost {
+            path_lease: RegistryPathLease::UserOwnedHost {
                 _root: host_root,
                 _file: file,
             },
@@ -550,7 +550,11 @@ impl RedbInstallationRegistry {
         registry: &ApprovedGenerationRegistry,
         required: bool,
     ) -> Result<(), InstallationError> {
-        let RegistryPathLease::InstallationHost { _root, _file } = &self._path_lease else {
+        let RegistryPathLease::InstallationHost {
+            _root: root,
+            _file: file,
+        } = &self.path_lease
+        else {
             return Err(InstallationError::Platform(
                 "SystemService Host-root binding requires the retained protected Host registry root"
                     .to_owned(),
@@ -563,10 +567,10 @@ impl RedbInstallationRegistry {
                         .to_owned(),
                 });
             }
-            _root
+            root
                 .verify_stable_identity()
                 .map_err(|error| InstallationError::Platform(error.to_string()))?;
-            _file
+            file
                 .verify_path_identity()
                 .map_err(|error| InstallationError::Platform(error.to_string()))?;
             return Ok(());
@@ -577,7 +581,7 @@ impl RedbInstallationRegistry {
             let launch = &generation.manifest.runtime_launch;
             if launch.profile == crate::InstallationProfile::SystemService {
                 receipt
-                    .validate_against(_root, launch.runtime_state_roots.host_state_root.as_str())?;
+                    .validate_against(root, launch.runtime_state_roots.host_state_root.as_str())?;
                 validated_descriptor = true;
             }
         }
@@ -585,7 +589,7 @@ impl RedbInstallationRegistry {
             let launch = &pending.manifest.runtime_launch;
             if launch.profile == crate::InstallationProfile::SystemService {
                 receipt
-                    .validate_against(_root, launch.runtime_state_roots.host_state_root.as_str())?;
+                    .validate_against(root, launch.runtime_state_roots.host_state_root.as_str())?;
                 validated_descriptor = true;
             }
         }
@@ -593,12 +597,12 @@ impl RedbInstallationRegistry {
             // The registry may be bound before its first generation projection.
             // In that interval, the receipt itself still has to match the live
             // retained root identity and canonical path.
-            receipt.validate_against(_root, receipt.canonical_path())?;
+            receipt.validate_against(root, receipt.canonical_path())?;
         }
-        _root
+        root
             .verify_stable_identity()
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
-        _file
+        file
             .verify_path_identity()
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
         Ok(())
@@ -617,12 +621,12 @@ impl RedbInstallationRegistry {
             host_state_root.as_str(),
             "installation_registry.owner.host_state_root",
         )?;
-        let actual_root = match &self._path_lease {
-            RegistryPathLease::InstallationHost { _root, .. } => {
-                _root
+        let actual_root = match &self.path_lease {
+            RegistryPathLease::InstallationHost { _root: root, .. } => {
+                root
                     .verify_stable_identity()
                     .map_err(|error| InstallationError::Platform(error.to_string()))?;
-                let canonical_root = _root
+                let canonical_root = root
                     .canonical_path()
                     .map_err(|error| InstallationError::Platform(error.to_string()))?;
                 WindowsPathIdentity::parse_root(
@@ -630,11 +634,11 @@ impl RedbInstallationRegistry {
                     "installation_registry.owner.retained_host_state_root",
                 )?
             }
-            RegistryPathLease::UserOwnedHost { _root, .. } => {
-                _root
+            RegistryPathLease::UserOwnedHost { _root: root, .. } => {
+                root
                     .verify_stable_identity()
                     .map_err(|error| InstallationError::Platform(error.to_string()))?;
-                let canonical_root = _root
+                let canonical_root = root
                     .canonical_path()
                     .map_err(|error| InstallationError::Platform(error.to_string()))?;
                 let canonical_root_text =
@@ -652,7 +656,14 @@ impl RedbInstallationRegistry {
                     "installation_registry.owner.retained_host_state_root",
                 )?
             }
-            _ => {
+            RegistryPathLease::Legacy { .. } => {
+                return Err(InstallationError::Platform(
+                    "owner-bound abort requires the retained protected Host registry root"
+                        .to_owned(),
+                ));
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            RegistryPathLease::Test => {
                 return Err(InstallationError::Platform(
                     "owner-bound abort requires the retained protected Host registry root"
                         .to_owned(),
