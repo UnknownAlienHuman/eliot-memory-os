@@ -74,10 +74,10 @@ use eliot_protocol::{
     AgentActivationResolutionResult, AgentBridgePeerAdmissionReceipt, AgentBridgeProcessBinding,
     AgentHostRequestFailure, AgentResponseDisposition, DeliveryClass, EventEnvelope,
     HOST_REQUEST_INVOKE_READ_WIRE_ID, HOST_REQUEST_PAYLOAD_SCHEMA_ID,
-    HOST_REQUEST_RESULT_BODY_WIRE_ID,
-    HostRequestAdmissionReceipt, HostRequestEnvelope, HostRequestInvokeReadPayload,
-    HostRequestKind, HostRequestResultBody, LocalReadAttempt, WatchdogIntentKind,
-    WatchdogSpoolIntentBatchPayload, WatchdogSpoolIntentSubmission, host_request_operation_id,
+    HOST_REQUEST_RESULT_BODY_WIRE_ID, HostRequestAdmissionReceipt, HostRequestEnvelope,
+    HostRequestInvokeReadPayload, HostRequestKind, HostRequestResultBody, LocalReadAttempt,
+    WatchdogIntentKind, WatchdogSpoolIntentBatchPayload, WatchdogSpoolIntentSubmission,
+    host_request_operation_id,
 };
 use eliot_runtime_contracts::RecoveryDirective;
 use eliot_store_api::{
