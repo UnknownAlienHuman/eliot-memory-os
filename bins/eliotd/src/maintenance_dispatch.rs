@@ -1318,9 +1318,9 @@ pub fn redeliver_maintenance_trigger_after_timeout(
                 ProtocolError::ReplayConflict,
             ));
         }
-        return Ok(
-            MaintenanceTriggerRedeliveryOutcome::ReconcileByReceipt(receipt.clone()),
-        );
+        return Ok(MaintenanceTriggerRedeliveryOutcome::ReconcileByReceipt(
+            receipt.clone(),
+        ));
     }
     // No committed decision: re-issue one fresh finite claim under the same
     // identity and revision. The claim join re-checks the fence, the finite
