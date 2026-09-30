@@ -1320,9 +1320,13 @@ fn staffing_rejection(error: &crate::staffing_policy::StaffingPolicyError) -> Fa
 /// authority always resolves. Every stored staffing plan receipt must still
 /// bind its own body. Legacy snapshots carry no semantic records and no
 /// staffing receipts and pass trivially. A contradictory image fails closed so
-/// torn persistence never restores authority; live coherence (leases, active
-/// dispositions) is rehydrated independently by the owners after restore,
-/// never from saved labels alone.
+/// torn persistence never restores authority.
+///
+/// This function verifies the STORED SEMANTIC MAPS only. It does not rehydrate
+/// live coherence: nothing re-derives leases or active dispositions from this
+/// snapshot after restore, so a saved `Verified` or `Active` label is evidence
+/// about the stored record and never about a live lease. A caller that needs
+/// live authority must re-resolve it from its own owner.
 fn verify_snapshot_semantics(snapshot: &FabricSnapshot) -> Result<(), FabricError> {
     // Issue #1963: a restored staffing plan receipt is only usable while it
     // still binds its own body, so a tampered or torn persisted receipt refuses
@@ -2840,10 +2844,12 @@ impl AgentFabric {
     /// objective, acceptance, ceilings, stop conditions, wave or root fails
     /// with [`FabricError::SemanticDrift`]. Updates against a cancelled or
     /// superseded old wave fail with [`FabricError::Superseded`]: replacement
-    /// work needs the new definition and its distinct admission. A draining
-    /// old wave still admits mechanical progress under its recorded
-    /// disposition, but never semantic change. A stale or foreign coordinator
-    /// fails with [`FabricError::StaleOwnerLease`].
+    /// work needs the new definition and its distinct admission. `Drain` is
+    /// NOT a narrowed permission: it is the arm that declines to refuse, so a
+    /// draining old wave is checked by exactly the same guard as any other
+    /// frozen-and-admitted wave, and is refused for semantic change on the same
+    /// terms. A stale or foreign coordinator fails with
+    /// [`FabricError::StaleOwnerLease`].
     ///
     /// # Errors
     ///
