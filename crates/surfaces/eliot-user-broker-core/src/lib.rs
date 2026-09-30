@@ -1378,12 +1378,21 @@ impl IssuedOperationIdentity {
             (None, None) => {}
             _ => return Err(BrokerError::InvalidField("operation_identity.registration")),
         }
+        // Every Kernel operation selector the composed transport issuer admits
+        // (`bins/eliot-user-broker/src/operation_identity.rs::BrokerOperation`)
+        // validates here through the existing kernel-request validator below:
+        // the read-only native-resource currentness check and the Operator
+        // session-token exchange are Kernel transactions with their own exact
+        // operation identity, not broker-owned control effects. Selectors
+        // outside this closed vocabulary still fail typed at the catch-all arm.
         let kernel_request = matches!(
             self.operation.as_str(),
             "eliot.user-broker.register"
                 | "eliot.user-broker.heartbeat"
                 | "eliot.user-broker.authorize-launch"
                 | "eliot.user-broker.fence"
+                | "eliot.user-broker.validate-native-resource-selection-current"
+                | "eliot.user-broker.operator-session-token"
         );
         let broker_control = matches!(
             self.operation.as_str(),
