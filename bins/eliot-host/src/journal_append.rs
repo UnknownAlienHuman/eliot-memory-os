@@ -765,15 +765,16 @@ pub(super) fn drain_commit_record_for_stop(
 /// Names at most eight residual identities in a refusal; a longer set reports
 /// its exact remaining length instead of growing the error without bound.
 fn bounded_residual_list(handles: &[PlatformHandle]) -> String {
+    use std::fmt::Write as _;
     const MAX_LISTED: usize = 8;
     let mut text = handles
         .iter()
         .take(MAX_LISTED)
-        .map(|handle| handle.as_str())
+        .map(eliot_platform::PlatformHandle::as_str)
         .collect::<Vec<_>>()
         .join(", ");
     if handles.len() > MAX_LISTED {
-        text.push_str(&format!(", and {} more", handles.len() - MAX_LISTED));
+        let _ = write!(text, ", and {} more", handles.len() - MAX_LISTED);
     }
     text
 }
