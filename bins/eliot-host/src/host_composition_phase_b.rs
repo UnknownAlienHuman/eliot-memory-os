@@ -241,12 +241,10 @@ impl HostComposition {
         launch: &RuntimeLaunchDescriptor,
     ) -> Result<Option<UserOwnedRootLease>, HostError> {
         let (root_path, expected_role) = match launch.profile {
-            InstallationProfile::UserMode => {
-                (
-                    launch.profile_governed_roots.immutable_binaries.as_str(),
-                    "immutable_binaries",
-                )
-            }
+            InstallationProfile::UserMode => (
+                launch.profile_governed_roots.immutable_binaries.as_str(),
+                "immutable_binaries",
+            ),
             InstallationProfile::PortableDev => (
                 launch
                     .portable_root
@@ -310,8 +308,7 @@ impl HostComposition {
                 )
             {
                 return Err(HostError::RecoveryRequired(
-                    "Phase-B launch root differs from Host's retained profile selection"
-                        .to_owned(),
+                    "Phase-B launch root differs from Host's retained profile selection".to_owned(),
                 ));
             }
             retained.verify_stable_identity().map_err(|_| {
