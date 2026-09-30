@@ -73,6 +73,12 @@ fn observe_supervision_lease(context: &tracing::Span, event: &'static str, outco
 fn supervision_lease_operation_context(ticket: &SupervisionLeaseCommitTicket) -> tracing::Span {
     use crate::kernel_diagnostics::operation_context;
 
+    // A ticket is an ORS-owned value. Its fields are not observation
+    // evidence until the original ORS validator accepts the whole ticket.
+    if ticket.validate().is_err() {
+        return operation_context(None, None, None, None);
+    }
+
     let binding = &ticket.binding;
     let epoch_digest =
         StateFence::canonical_epoch_digest(&binding.state_fence.authority_epoch).ok();
@@ -105,12 +111,97 @@ fn record_supervision_ticket_context(
 ) {
     use crate::kernel_diagnostics::bound_field;
 
+    // Keep invalid ticket references unavailable even when the caller shares
+    // a broader operation span with this authority boundary.
+    if ticket.validate().is_err() {
+        return;
+    }
+
     let lease = bound_field(ticket.lease_id.as_str());
     context.record("lease", lease.text());
     if let Some(receipt_sha256) = ticket.previous_receipt_sha256.as_deref() {
         let receipt = bound_field(receipt_sha256);
         context.record("receipt", receipt.text());
     }
+}
+
+#[cfg(windows)]
+fn record_supervision_ticket_operation_context(
+    context: &tracing::Span,
+    ticket: &SupervisionLeaseCommitTicket,
+) {
+    use crate::kernel_diagnostics::bound_field;
+
+    if ticket.validate().is_err() {
+        return;
+    }
+
+    let operation = bound_field(ticket.operation_id.as_str());
+    context.record("operation", operation.text());
+    context.record(
+        "operation_redaction",
+        operation.redaction_status().unwrap_or("none"),
+    );
+    let generation_value =
+        ticket
+            .binding
+            .generation_binding
+            .process_generation
+            .value()
+            .to_string();
+    let generation = bound_field(&generation_value);
+    context.record("generation", generation.text());
+    context.record(
+        "generation_redaction",
+        generation.redaction_status().unwrap_or("none"),
+    );
+    let epoch = StateFence::canonical_epoch_digest(&ticket.binding.state_fence.authority_epoch).ok();
+    if let Some(epoch) = epoch.as_ref() {
+        let authority_epoch = bound_field(epoch.as_str());
+        context.record("authority_epoch", authority_epoch.text());
+        context.record(
+            "authority_epoch_redaction",
+            authority_epoch.redaction_status().unwrap_or("none"),
+        );
+        let state_fence_value = format!(
+            "epoch={};resource_generation={}",
+            epoch.as_str(),
+            ticket.binding.state_fence.resource_generation.value()
+        );
+        let state_fence = bound_field(&state_fence_value);
+        context.record("state_fence", state_fence.text());
+        context.record(
+            "state_fence_redaction",
+            state_fence.redaction_status().unwrap_or("none"),
+        );
+    }
+}
+
+#[cfg(windows)]
+fn supervision_expiry_operation_context(
+    supervision_lease_id: &str,
+    expected_fence: &StateFence,
+) -> tracing::Span {
+    use crate::kernel_diagnostics::{bound_field, operation_context};
+
+    let epoch_digest = StateFence::canonical_epoch_digest(&expected_fence.authority_epoch).ok();
+    let generation = expected_fence.resource_generation.value().to_string();
+    let state_fence = epoch_digest.as_ref().map(|epoch| {
+        format!(
+            "epoch={};resource_generation={}",
+            epoch.as_str(),
+            expected_fence.resource_generation.value()
+        )
+    });
+    let context = operation_context(
+        None,
+        Some(&generation),
+        state_fence.as_deref(),
+        epoch_digest.as_ref().map(|epoch| epoch.as_str()),
+    );
+    let lease = bound_field(supervision_lease_id);
+    context.record("lease", lease.text());
+    context
 }
 
 /// Maps one supervision-lease authority failure to its stable code.
@@ -748,13 +839,15 @@ impl KernelSupervisionLeaseAuthority {
         ticket: &SupervisionLeaseCommitTicket,
     ) -> Result<SupervisionLeaseSnapshot, SupervisionLeaseAuthorityError> {
         let context = supervision_lease_operation_context(ticket);
-        self.commit_terminal_in_context(ticket, &context)
+        let mut terminal_owned = false;
+        self.commit_terminal_in_context(ticket, &context, &mut terminal_owned)
     }
 
     pub(crate) fn commit_terminal_in_context(
         &self,
         ticket: &SupervisionLeaseCommitTicket,
         context: &tracing::Span,
+        terminal_owned: &mut bool,
     ) -> Result<SupervisionLeaseSnapshot, SupervisionLeaseAuthorityError> {
         // F-LOG-KERNEL-3 (#901): lease revoke/expire/supersede/close
         // boundary. A terminal disposition stays terminal; exactly one
@@ -763,6 +856,7 @@ impl KernelSupervisionLeaseAuthority {
         observe_supervision_lease(context, "kernel.supervision.terminal_requested", "attempt");
         match self.commit_terminal_inner(ticket) {
             Ok(snapshot) => {
+                *terminal_owned = false;
                 observe_supervision_lease(
                     context,
                     "kernel.supervision.terminal_committed",
@@ -780,6 +874,7 @@ impl KernelSupervisionLeaseAuthority {
                     supervision_authority_terminal_code(&error),
                     context,
                 );
+                *terminal_owned = true;
                 Err(error)
             }
         }
@@ -879,7 +974,7 @@ impl KernelSupervisionLeaseAuthority {
     /// Production callers in `bins/eliot-kernel/src/lib.rs`:
     /// `KernelComposition::renew_current_supervision_with_progress`, on the
     /// renewal-refusal tick for both the progress-submit and probe paths, and
-    /// `KernelComposition::renew_daemon_supervision_for_probe`, on the probe
+    /// `KernelComposition::renew_daemon_supervision_for_probe_in_context`, on the probe
     /// pre-check where that tick is never reached for a past-due head.
     pub fn expire_past_due_lease(
         &self,
@@ -912,6 +1007,48 @@ impl KernelSupervisionLeaseAuthority {
         now_ms: u64,
         supplied_context: Option<&tracing::Span>,
     ) -> Result<Option<SupervisionLeaseSnapshot>, SupervisionLeaseAuthorityError> {
+        let owned_context;
+        let context = match supplied_context {
+            Some(context) => context,
+            None => {
+                owned_context = supervision_expiry_operation_context(
+                    supervision_lease_id,
+                    expected_fence,
+                );
+                &owned_context
+            }
+        };
+        let record_ticket_operation = supplied_context.is_none();
+        let mut child_terminal_owned = false;
+        let result = self.expire_past_due_lease_inner_with_context(
+            supervision_lease_id,
+            expected_fence,
+            now_ms,
+            context,
+            record_ticket_operation,
+            &mut child_terminal_owned,
+        );
+        if let Err(error) = &result {
+            observe_supervision_lease(context, "kernel.supervision.expire_failed", "rejected");
+            if !child_terminal_owned {
+                crate::kernel_diagnostics::observe_terminal_error_in_context(
+                    supervision_authority_terminal_code(error),
+                    context,
+                );
+            }
+        }
+        result
+    }
+
+    fn expire_past_due_lease_inner_with_context(
+        &self,
+        supervision_lease_id: &str,
+        expected_fence: &StateFence,
+        now_ms: u64,
+        context: &tracing::Span,
+        record_ticket_operation: bool,
+        child_terminal_owned: &mut bool,
+    ) -> Result<Option<SupervisionLeaseSnapshot>, SupervisionLeaseAuthorityError> {
         let Some(current) = self.current_snapshot(supervision_lease_id)? else {
             return Ok(None);
         };
@@ -921,6 +1058,7 @@ impl KernelSupervisionLeaseAuthority {
         {
             return Ok(None);
         }
+        observe_supervision_lease(context, "kernel.supervision.expire_requested", "attempt");
         if current.record.binding.state_fence != *expected_fence {
             return Err(SupervisionLeaseAuthorityError::Ors(
                 OrsError::SupervisionLeaseBindingMismatch,
@@ -963,33 +1101,18 @@ impl KernelSupervisionLeaseAuthority {
         // expiry is observed; routine not-due ticks stay unlogged. Exactly one
         // terminal is emitted per failed commit and no lease material is
         // logged.
-        let owned_context;
-        let context = if let Some(context) = supplied_context {
-            record_supervision_ticket_context(context, &stage.ticket);
-            context
-        } else {
-            owned_context = supervision_lease_operation_context(&stage.ticket);
-            &owned_context
-        };
-        observe_supervision_lease(context, "kernel.supervision.expire_requested", "attempt");
-        match self.commit_terminal_in_context(&stage.ticket, context) {
+        record_supervision_ticket_context(context, &stage.ticket);
+        if record_ticket_operation {
+            record_supervision_ticket_operation_context(context, &stage.ticket);
+        }
+        match self.commit_terminal_in_context(&stage.ticket, context, child_terminal_owned) {
             Ok(snapshot) => {
                 if snapshot.record.state != LeaseState::Expired
                     || snapshot.record.projection != eliot_ors::SupervisionLeaseProjection::Terminal
                 {
-                    let error = SupervisionLeaseAuthorityError::Ors(
+                    return Err(SupervisionLeaseAuthorityError::Ors(
                         OrsError::SupervisionLeaseBindingMismatch,
-                    );
-                    observe_supervision_lease(
-                        context,
-                        "kernel.supervision.expire_failed",
-                        "rejected",
-                    );
-                    crate::kernel_diagnostics::observe_terminal_error_in_context(
-                        supervision_authority_terminal_code(&error),
-                        context,
-                    );
-                    return Err(error);
+                    ));
                 }
                 observe_supervision_lease(
                     context,
@@ -1001,7 +1124,6 @@ impl KernelSupervisionLeaseAuthority {
             Err(error) => {
                 // `commit_terminal_in_context` owns the one terminal. Expiry
                 // only observes this propagated failure at its own level.
-                observe_supervision_lease(context, "kernel.supervision.expire_failed", "rejected");
                 Err(error)
             }
         }
