@@ -155,6 +155,7 @@ fn envelope(candidate: ContextCandidate) -> GuestRequest {
             schema_version: CONTEXT_CONTRACT_VERSION,
             binding: context.clone(),
             recipe,
+            approved_policy: None,
             candidates: ContextCandidateSet {
                 binding: context.clone(),
                 candidates: vec![candidate],

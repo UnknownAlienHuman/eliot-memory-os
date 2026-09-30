@@ -87,10 +87,10 @@ use eliot_context_candidates::{
 use eliot_context_contracts::{
     AdmissionDisposition, AdmissionInput, AdmissionMeasurement, AdmissionRuleIdentity,
     AdmittedContextSet, CONTEXT_CONTRACT_VERSION, ContextBinding, ContextError, ContextOutcome,
-    ContextRecipe, DecisionContextIncomplete, DownstreamHeadroomRequest, DownstreamHeadroomResult,
-    HeadroomAllocationLedger, MeasurementCompositionProfile, PriorityPolicyIdentity, ProviderId,
-    QualityRefusal, QualityScorecard, SafetyFloorIdentity, SerializedContextMeasurement,
-    SuppliedOmissionBinding,
+    ContextRecipe, ContextRecipePolicy, DecisionContextIncomplete, DownstreamHeadroomRequest,
+    DownstreamHeadroomResult, HeadroomAllocationLedger, MeasurementCompositionProfile,
+    PriorityPolicyIdentity, ProviderId, QualityRefusal, QualityScorecard, SafetyFloorIdentity,
+    SerializedContextMeasurement, SuppliedOmissionBinding,
 };
 use eliot_contracts::{
     ArtifactId, ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence,
@@ -1727,11 +1727,22 @@ impl KernelContextReadClient {
     /// validated evidence. Admission runs under that reservation, and the
     /// assembled output is rechecked against it before the packet is
     /// action-ready.
+    /// #1725 approved-policy join: `approved_policy` is the approved
+    /// `ContextRecipe` policy revision the Context owner resolved for `recipe`
+    /// through its own owner resolution path, carried here only so its whole-unit
+    /// `section_budgets` reach admission. It is never resolved, selected or
+    /// defaulted in this composition: `None` means the caller presented no
+    /// approved revision, and the `AdmissionInput` then carries no budget
+    /// record at all rather than a synthesized one. When it is present,
+    /// `AdmissionInput::validate` joins it to THIS `recipe` through
+    /// `ContextRecipePolicy::binds_recipe`, so the budgets and this instance
+    /// provably describe the same approved revision.
     #[allow(clippy::too_many_arguments)]
     pub fn compile_context_packet(
         seven: &SevenRoleInputs,
         request: &CandidateRequest,
         recipe: &ContextRecipe,
+        approved_policy: Option<&ContextRecipePolicy>,
         policy: &CandidatePolicy,
         campaign_view: &CampaignLearningStateView,
         context_recipe_body_digest: &str,
@@ -1828,7 +1839,8 @@ impl KernelContextReadClient {
             recipe,
             &request.binding,
         )?;
-        let input = packet_admission_input(request, recipe, &candidates, &admission);
+        let input =
+            packet_admission_input(request, recipe, approved_policy, &candidates, &admission);
         input
             .validate()
             .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
@@ -1922,12 +1934,16 @@ fn recheck_packet_headroom(
 ///
 /// Every field is a recorded value carried by the request, the recipe, the
 /// candidate set or the owner's own bundle, so this closure invents no piece:
-/// `candidates` is the candidate stage's own result and the floor, priority,
-/// rule, measurement profile, omissions and measurements are exactly what
-/// [`PacketAdmissionBundle::build`] admitted.
+/// `candidates` is the candidate stage's own result, `approved_policy` is the
+/// owner-resolved revision the caller presented for exactly this recipe
+/// (`AdmissionInput::validate` joins the two through `binds_recipe`), and the
+/// floor, priority, rule, measurement profile, omissions and measurements are
+/// exactly what [`PacketAdmissionBundle::build`] admitted. An absent approved
+/// policy is carried as absent.
 fn packet_admission_input(
     request: &CandidateRequest,
     recipe: &ContextRecipe,
+    approved_policy: Option<&ContextRecipePolicy>,
     candidates: &ContextCandidateSetResult,
     admission: &PacketAdmissionBundle,
 ) -> AdmissionInput {
@@ -1935,6 +1951,7 @@ fn packet_admission_input(
         schema_version: CONTEXT_CONTRACT_VERSION,
         binding: request.binding.clone(),
         recipe: recipe.clone(),
+        approved_policy: approved_policy.cloned(),
         candidates: candidates.set.clone(),
         learning_tickets: Vec::new(),
         floor: admission.floor.clone(),

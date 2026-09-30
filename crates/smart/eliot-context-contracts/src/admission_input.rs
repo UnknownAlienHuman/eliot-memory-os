@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     AdmissionDisposition, AdmissionRecord, CONTEXT_CONTRACT_VERSION, CapacityLimits,
     ContextBinding, ContextCandidate, ContextCandidateSet, ContextEconomyReceipt, ContextError,
-    ContextOutcome, ContextRecipe, DecisionContextIncomplete, DecisionRevision,
+    ContextOutcome, ContextRecipe, ContextRecipePolicy, DecisionContextIncomplete, DecisionRevision,
     DecisionSafetyFloor, ExpansionHandle, LearningAdmissionTicket, LossPolicy,
     NonRecoverableReason, OmissionRecord, RepresentationKind, StuEstimate, TokenizerObservation,
     canonical_digest, validate_digest, validate_text,
@@ -484,6 +484,24 @@ pub struct AdmissionInput {
     pub schema_version: ContractVersion,
     pub binding: ContextBinding,
     pub recipe: ContextRecipe,
+    /// The exact approved policy revision this recipe instance was issued
+    /// under, carrying that revision's whole-unit `section_budgets`.
+    ///
+    /// #1725: an `AdmissionInput` otherwise reaches admission with no approved
+    /// budget record at all — `recipe` is an instance and carries no budgets,
+    /// and `DecisionRevision::policy_sha256` is a digest, which cannot supply
+    /// `required_exact_references` or `minimum_required_whole_units`. Absent is
+    /// ABSENT: nothing here derives, infers or defaults a budget, because a
+    /// budget whose values no owner approved is not enforcement.
+    ///
+    /// When it IS present, [`ContextRecipePolicy::binds_recipe`] joins it to
+    /// `recipe` with that policy's own existing comparison of the recorded
+    /// digests, so the budgets and the recipe instance provably describe the
+    /// same approved revision rather than two records that happen to travel
+    /// together. A revision that approves no budget for a role leaves that role
+    /// unbudgeted, and it is left that way rather than filled in.
+    #[serde(default)]
+    pub approved_policy: Option<ContextRecipePolicy>,
     pub candidates: ContextCandidateSet,
     /// Owner-minted learning admission tickets authorizing marked atoms in
     /// this input. Empty when no learning influence is presented. Carried
@@ -535,6 +553,16 @@ impl AdmissionInput {
         }
         self.binding.validate()?;
         self.recipe.validate()?;
+        // When an approved policy revision is carried, it is joined to THIS
+        // recipe instance through the policy's own `binds_recipe` comparison,
+        // which re-validates the policy (including its recorded digest) and
+        // refuses unless the policy's `policy_sha256` is exactly the digest the
+        // instance recorded in `DecisionRevision::policy_sha256`. No budget is
+        // read, derived or compared to anything other than this input's own
+        // recipe, and an absent policy is left absent.
+        if let Some(approved_policy) = &self.approved_policy {
+            approved_policy.binds_recipe(&self.recipe)?;
+        }
         self.candidates.validate_for_admission()?;
         for candidate in &self.candidates.candidates {
             candidate.validate_public_privacy()?;
