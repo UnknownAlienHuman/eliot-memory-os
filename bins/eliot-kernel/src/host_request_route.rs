@@ -6894,14 +6894,27 @@ impl KernelComposition {
         let mut batch_items: Vec<serde_json::Value> = Vec::with_capacity(scope.consumed.len());
         let mut batch_receipt_items: Vec<serde_json::Value> =
             Vec::with_capacity(scope.consumed.len());
-        let mut batch_namespaces: Vec<(String, String, u64, u64, u64)> =
-            Vec::with_capacity(scope.consumed.len());
+        let mut batch_namespaces: Vec<(
+            String,
+            String,
+            u64,
+            u64,
+            u64,
+            Option<(String, String, u64)>,
+        )> = Vec::with_capacity(scope.consumed.len());
         if !pure_read {
-            for (stream_id, sequence) in &scope.consumed {
+            for entry in &scope.consumed {
+                // The resolve evidence is the live presenter plus this
+                // entry's retained continuity, when the admitted creator
+                // presents its bind receipt after a reconnect.
+                let entry_presenter = match &entry.continuity {
+                    Some(continuity) => bridge_presenter_with_continuity(&presenter, continuity),
+                    None => presenter.clone(),
+                };
                 let item = self
                     .generation_gateway
                     .ors
-                    .resolve_bridge_ack_item(&presenter, stream_id)
+                    .resolve_bridge_ack_item(&entry_presenter, &entry.stream_id)
                     .map_err(|_| TransportError::SessionFenced)?;
                 let namespace = item
                     .get("namespace")
@@ -6917,36 +6930,42 @@ impl KernelComposition {
                     .ok_or(TransportError::SessionFenced)?;
                 batch_namespaces.push((
                     namespace.to_owned(),
-                    stream_id.clone(),
-                    *sequence,
+                    entry.stream_id.clone(),
+                    entry.sequence,
                     revision,
                     incarnation,
+                    entry.continuity.clone(),
                 ));
                 // Each batch item carries the presenter's live session
                 // occurrence alongside the resolved expectation, so ORS
                 // re-proves the acknowledgement right inside the commit
                 // transaction (issue #2729, AUD3/AUD6): a grant change
                 // between this resolution and the commit fails closed.
-                batch_items.push(serde_json::json!({
+                // The evidence legs are merged from the exact presenter
+                // object the resolve above proved, so resolve and commit
+                // never disagree about what was presented.
+                let mut batch_item = serde_json::json!({
                     "namespace": namespace,
                     "expected_revision": revision,
                     "expected_incarnation": incarnation,
-                    "sequence": sequence,
-                    "owner_authority_lineage": evidence.authority_lineage,
-                    "owner_principal": evidence.principal,
-                    "owner_installation_id": evidence.installation_id,
-                    "owner_connection": evidence.connection,
-                    "owner_launch_nonce": evidence.launch_nonce,
-                    "owner_session_epoch": evidence.session_epoch,
-                }));
+                    "sequence": entry.sequence,
+                });
+                if let Some(object) = batch_item.as_object_mut() {
+                    if let Some(evidence_object) = entry_presenter.as_object() {
+                        for (key, value) in evidence_object {
+                            object.insert(key.clone(), value.clone());
+                        }
+                    }
+                }
+                batch_items.push(batch_item);
                 // The ORS request deliberately stays at its existing closed
                 // shape. This parallel leg carries the exact stream identity
                 // that the Bridge must join to its verified producer tuple;
                 // ORS currently returns namespace/cursor outcomes only.
                 batch_receipt_items.push(serde_json::json!({
-                    "stream_id": stream_id,
+                    "stream_id": entry.stream_id,
                     "namespace": namespace,
-                    "sequence": sequence,
+                    "sequence": entry.sequence,
                     "expected_revision": revision,
                     "expected_incarnation": incarnation,
                     "owner_authority_lineage": evidence.authority_lineage,
@@ -7106,7 +7125,7 @@ impl KernelComposition {
         let mut handoff_receipts: Vec<serde_json::Value> =
             Vec::with_capacity(batch_namespaces.len());
         let mut handoff_failure = false;
-        for (namespace, stream_id, sequence, revision, incarnation) in &batch_namespaces {
+        for (namespace, stream_id, sequence, revision, incarnation, ..) in &batch_namespaces {
             let Ok(marked) = self
                 .generation_gateway
                 .ors
@@ -7194,11 +7213,33 @@ impl KernelComposition {
         &self,
         presenter: &serde_json::Value,
         reconciliation: &serde_json::Value,
-        batch_namespaces: &[(String, String, u64, u64, u64)],
+        batch_namespaces: &[(
+            String,
+            String,
+            u64,
+            u64,
+            u64,
+            Option<(String, String, u64)>,
+        )],
     ) -> Result<Vec<serde_json::Value>, TransportError> {
-        let mut stream_ids: std::collections::BTreeSet<String> = batch_namespaces
+        // Continuity presented for this request's consumed entries, keyed
+        // by stream: the post-ack maintenance re-resolve must prove the
+        // same right the ack proved, or a reconnect ack would leave its
+        // own maintenance unreachable.
+        let batch_continuity: std::collections::BTreeMap<&str, &(String, String, u64)> =
+            batch_namespaces
+                .iter()
+                .filter_map(|(_, stream_id, _, _, _, continuity)| {
+                    continuity.as_ref().map(|triple| (stream_id.as_str(), triple))
+                })
+                .collect();
+        let batch_streams: std::collections::BTreeSet<&str> = batch_namespaces
             .iter()
-            .map(|(_, stream_id, _, _, _)| stream_id.clone())
+            .map(|(_, stream_id, _, _, _, _)| stream_id.as_str())
+            .collect();
+        let mut stream_ids: std::collections::BTreeSet<String> = batch_streams
+            .iter()
+            .map(|stream_id| (*stream_id).to_owned())
             .collect();
         let streams = reconciliation
             .get("streams")
@@ -7213,11 +7254,30 @@ impl KernelComposition {
         }
         let mut namespaces = Vec::with_capacity(stream_ids.len());
         for stream_id in stream_ids {
-            let item = self
+            // Re-prove with the entry's continuity when this request
+            // presented it. Inventory streams carry no continuity: an
+            // unproven scope there skips this best-effort leg (the
+            // owner-index page below still covers it) instead of failing
+            // the whole maintenance, while a consumed stream that no
+            // longer resolves fails closed.
+            let entry_presenter;
+            let resolve_presenter = match batch_continuity.get(stream_id.as_str()).copied() {
+                Some(continuity) => {
+                    entry_presenter = bridge_presenter_with_continuity(presenter, continuity);
+                    &entry_presenter
+                }
+                None => presenter,
+            };
+            let is_batch_stream = batch_streams.contains(stream_id.as_str());
+            let item = match self
                 .generation_gateway
                 .ors
-                .resolve_bridge_ack_item(presenter, &stream_id)
-                .map_err(|_| TransportError::SessionFenced)?;
+                .resolve_bridge_ack_item(resolve_presenter, &stream_id)
+            {
+                Ok(item) => item,
+                Err(OrsError::RecoveryOwnerMismatch) if !is_batch_stream => continue,
+                Err(_) => return Err(TransportError::SessionFenced),
+            };
             let namespace = item
                 .get("namespace")
                 .and_then(serde_json::Value::as_str)
@@ -7917,21 +7977,47 @@ fn bridge_owner_evidence(
 
 /// Rejects contradictory consumed-frontier entries before any mutation
 /// (issue #2729, item 3): the same stream twice with different sequences
-/// fails the whole reconcile scope, so no batch cursor moves. The store
-/// batch re-validates the same rule for its own callers.
-fn reject_contradictory_consumed(consumed: &[(String, u64)]) -> Result<(), TransportError> {
-    for (index, (stream, sequence)) in consumed.iter().enumerate() {
-        if consumed[..index]
-            .iter()
-            .any(|(prior_stream, prior_sequence)| {
-                prior_stream == stream && prior_sequence != sequence
-            })
-        {
+/// — or with different continuity evidence — fails the whole reconcile
+/// scope, so no batch cursor moves. The store batch re-validates the
+/// same rule for its own callers.
+fn reject_contradictory_consumed(consumed: &[BridgeConsumedEntry]) -> Result<(), TransportError> {
+    for (index, entry) in consumed.iter().enumerate() {
+        if consumed[..index].iter().any(|prior| {
+            prior.stream_id == entry.stream_id
+                && (prior.sequence != entry.sequence || prior.continuity != entry.continuity)
+        }) {
             return Err(TransportError::SessionFenced);
         }
     }
     Ok(())
 }
+
+/// Attaches owner-issued continuity evidence to a Kernel-derived
+/// presenter (issue #2729, AUD2). The base presenter stays the live
+/// session occurrence; the continuity triple is the retained creating
+/// occurrence the admitted creator presents after a reconnect.
+fn bridge_presenter_with_continuity(
+    base: &serde_json::Value,
+    continuity: &(String, String, u64),
+) -> serde_json::Value {
+    let mut presenter = base.clone();
+    if let Some(object) = presenter.as_object_mut() {
+        object.insert(
+            "owner_continuity_connection".to_owned(),
+            serde_json::Value::String(continuity.0.clone()),
+        );
+        object.insert(
+            "owner_continuity_launch_nonce".to_owned(),
+            serde_json::Value::String(continuity.1.clone()),
+        );
+        object.insert(
+            "owner_continuity_session_epoch".to_owned(),
+            serde_json::Value::from(continuity.2),
+        );
+    }
+    presenter
+}
+
 /// Bound on consumed-frontier entries carried by one reconcile scope.
 const MAX_BRIDGE_RECONCILE_CONSUMED: usize = 1024;
 
@@ -8076,11 +8162,24 @@ pub(crate) fn bridge_gap_from_payload(
     }))
 }
 
+/// One consumed frontier: the stream and sequence plus the optional
+/// owner-issued continuity evidence (issue #2729, AUD2) the admitted
+/// creator retained from its bind receipt. A reconnecting session whose
+/// live occurrence differs from the creating occurrence presents the
+/// retained creating occurrence here; ORS verifies it against the
+/// retained row for read/ack only. Entries without continuity prove the
+/// live session.
+pub(crate) struct BridgeConsumedEntry {
+    pub(crate) stream_id: String,
+    pub(crate) sequence: u64,
+    pub(crate) continuity: Option<(String, String, u64)>,
+}
+
 /// Scope carried by one event reconcile request. Consumed frontiers advance
 /// monotonically at or below the durable cursor; an optional owner-issued
 /// recovery selector asks for one bounded continuation page and is read-only.
 pub(crate) struct BridgeReconcileScope {
-    pub(crate) consumed: Vec<(String, u64)>,
+    pub(crate) consumed: Vec<BridgeConsumedEntry>,
     pub(crate) recovery_scope: Option<BridgeRecoverySelector>,
 }
 
@@ -8125,7 +8224,56 @@ pub(crate) fn bridge_reconcile_scope_from_payload(
             .and_then(serde_json::Value::as_u64)
             .filter(|sequence| *sequence != 0)
             .ok_or(TransportError::SessionFenced)?;
-        consumed.push((stream_id.to_owned(), sequence));
+        // Owner-issued continuity evidence rides the existing consumed
+        // entry shape additively (issue #2729, AUD2): the retained
+        // creating occurrence the admitted creator presents after a
+        // reconnect. All three legs must travel together or none does;
+        // a half-supplied claim fails the scope closed. Route-side
+        // checks are wire hygiene only — ORS re-verifies the triple
+        // against the retained row before it authorizes anything.
+        let continuity_connection = entry.get("owner_continuity_connection");
+        let continuity_nonce = entry.get("owner_continuity_launch_nonce");
+        let continuity_epoch = entry.get("owner_continuity_session_epoch");
+        let continuity = if continuity_connection.is_none()
+            && continuity_nonce.is_none()
+            && continuity_epoch.is_none()
+        {
+            None
+        } else {
+            let connection = entry
+                .get("owner_continuity_connection")
+                .and_then(serde_json::Value::as_str)
+                .filter(|text| {
+                    !text.trim().is_empty()
+                        && text.len() <= MAX_BRIDGE_RECONCILE_TEXT_BYTES
+                        && !text.chars().any(char::is_control)
+                })
+                .ok_or(TransportError::SessionFenced)?;
+            let launch_nonce = entry
+                .get("owner_continuity_launch_nonce")
+                .and_then(serde_json::Value::as_str)
+                .filter(|text| {
+                    !text.trim().is_empty()
+                        && text.len() <= MAX_BRIDGE_RECONCILE_TEXT_BYTES
+                        && !text.chars().any(char::is_control)
+                })
+                .ok_or(TransportError::SessionFenced)?;
+            let session_epoch = entry
+                .get("owner_continuity_session_epoch")
+                .and_then(serde_json::Value::as_u64)
+                .filter(|epoch| *epoch != 0)
+                .ok_or(TransportError::SessionFenced)?;
+            Some((
+                connection.to_owned(),
+                launch_nonce.to_owned(),
+                session_epoch,
+            ))
+        };
+        consumed.push(BridgeConsumedEntry {
+            stream_id: stream_id.to_owned(),
+            sequence,
+            continuity,
+        });
     }
     let recovery_scope = match payload.get("recovery_scope") {
         Some(value) => {
