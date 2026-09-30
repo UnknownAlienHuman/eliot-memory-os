@@ -13,8 +13,8 @@ use eliot_runtime::{
 use eliot_watchdog_core::{
     BriefBuildError, BriefPersistence, CoverageGapExplanation, CoverageManifestMismatch,
     CoverageManifestProjection, EvidenceRef, HealthAnalysisRequest, ObservationCoverageInput,
-    RiskRoute, Signal, compile_health_brief, request_health_analysis,
-    validate_observation_coverage_against_manifest,
+    ProhibitedEffectAttempt, ProhibitedEffectClass, RiskRoute, Signal, compile_health_brief,
+    request_health_analysis, validate_observation_coverage_against_manifest,
 };
 
 use crate::AdmittedIsolatedDestination;
@@ -241,6 +241,14 @@ pub fn validate_supplied_coverage_against_manifest(
 /// unvalidated original, or unusable question/stop text — passes through
 /// unchanged.
 ///
+/// Step 4 (#2381): before the request leaves, every [`ProhibitedEffectClass`]
+/// is refused against both the compiled brief (via
+/// [`ProhibitedEffectAttempt::for_health_brief`]) and the request (via
+/// [`ProhibitedEffectAttempt::for_health_analysis`]) through
+/// [`ProhibitedEffectAttempt::deny`], and each refusal is traced with the
+/// untouched subject named. There is no branch that admits such an effect, so
+/// an attempt citing either output fails closed here.
+///
 /// # Errors
 ///
 /// Returns the exact [`BriefBuildError`] when the member set is empty,
@@ -271,11 +279,49 @@ pub fn request_persistent_drift_analysis(
         persistence,
         signals,
     )?;
-    Ok(request_health_analysis(
-        &brief,
-        route,
-        prior_ineffective_analyses,
-    ))
+    let request = request_health_analysis(&brief, route, prior_ineffective_analyses);
+    // I8.18 (#2381 step 4): the brief and the request compiled above carry no
+    // memory-delete, policy-alter, or work-terminate authority. Each class is
+    // refused here through the core deny contract before the request leaves,
+    // so an attempt citing either output fails closed with the untouched
+    // subject named. The refusals are bounded operator evidence on the trace;
+    // nothing is written, dispatched, or authorized here.
+    let subject = brief
+        .signals
+        .first()
+        .map(|signal| signal.revision().target.subject_id.clone())
+        .unwrap_or_default();
+    for class in [
+        ProhibitedEffectClass::MemoryDelete,
+        ProhibitedEffectClass::PolicyAlter,
+        ProhibitedEffectClass::WorkTerminate,
+    ] {
+        let brief_denial =
+            ProhibitedEffectAttempt::for_health_brief(class, &brief, subject.clone()).deny();
+        tracing::debug!(
+            event = "watchdog.health_output_effect_refused",
+            observation = "refused",
+            brief_id = brief.brief_id.as_str(),
+            output = "diagnostic_brief",
+            class = class.as_str(),
+            reason = brief_denial.reason,
+            subject = subject.as_str(),
+            "I8.18 health output carries no authority for the attempted effect"
+        );
+        let analysis_denial =
+            ProhibitedEffectAttempt::for_health_analysis(class, &request, subject.clone()).deny();
+        tracing::debug!(
+            event = "watchdog.health_output_effect_refused",
+            observation = "refused",
+            brief_id = request.brief_id.as_str(),
+            output = "analysis_request",
+            class = class.as_str(),
+            reason = analysis_denial.reason,
+            subject = subject.as_str(),
+            "I8.18 health output carries no authority for the attempted effect"
+        );
+    }
+    Ok(request)
 }
 
 /// The actual manifest's own interval identity: the declared owner-clock
