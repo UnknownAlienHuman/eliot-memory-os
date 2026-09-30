@@ -100,14 +100,14 @@ struct UserAutomationOutputEnvelope<'a> {
 fn content_address<T: Serialize>(
     document: T,
     source_revision: &str,
-) -> Result<OpaqueContentRef, UserAutomationExecutionError> {
+) -> Result<(OpaqueContentRef, Vec<u8>), UserAutomationExecutionError> {
     let bytes = canonical_json_bytes(&document).map_err(|error| {
         UserAutomationExecutionError::Metadata(format!(
             "the Durable Job submission document could not be canonically encoded: {error}"
         ))
     })?;
     let sha256 = sha256_hex(&bytes);
-    Ok(OpaqueContentRef {
+    let reference = OpaqueContentRef {
         contract: durable_job_contract_identity().map_err(|error| {
             UserAutomationExecutionError::Metadata(format!(
                 "the existing Durable Job contract identity could not be read: {error}"
@@ -122,7 +122,8 @@ fn content_address<T: Serialize>(
             ))
         })?),
         sha256,
-    })
+    };
+    Ok((reference, bytes))
 }
 
 /// Derives the admitted submission deadline from the authenticated clock.
@@ -164,7 +165,7 @@ fn admitted_semantic_input<'a>(
     admission: &'a UserAutomationRuntimeAdmission,
     occurrence_id: &'a str,
     work_scope: &'a WorkScopeBinding,
-) -> Result<OpaqueContentRef, UserAutomationExecutionError> {
+) -> Result<(OpaqueContentRef, Vec<u8>), UserAutomationExecutionError> {
     let revision = &admission.revision;
     content_address(
         UserAutomationSemanticInput {
@@ -200,7 +201,7 @@ fn admitted_output_envelope(
     admission: &UserAutomationRuntimeAdmission,
 ) -> Result<OpaqueContentRef, UserAutomationExecutionError> {
     let revision = &admission.revision;
-    content_address(
+    let (reference, _bytes) = content_address(
         UserAutomationOutputEnvelope {
             domain: USER_AUTOMATION_OUTPUT_ENVELOPE_DOMAIN,
             within_limits: USER_AUTOMATION_OUTPUT_VERBATIM,
@@ -212,7 +213,8 @@ fn admitted_output_envelope(
             preflight_contract_revision: &revision.preflight_contract_revision,
         },
         &admission.preflight.config_snapshot_id,
-    )
+    )?;
+    Ok(reference)
 }
 
 /// Reads the job admission reference from the committed source receipt.
@@ -468,7 +470,8 @@ impl UserAutomationDurableJobMaterial {
             resource_generation: core.work_scope.resource_generation,
             state_fence: core.work_scope.state_fence.clone(),
         };
-        let semantic_input = admitted_semantic_input(admission, &occurrence_id, &work_scope)?;
+        let (semantic_input, semantic_input_bytes) =
+            admitted_semantic_input(admission, &occurrence_id, &work_scope)?;
         let output_envelope = admitted_output_envelope(admission)?;
         let job_id = typed_id(TaskId::new, &format!("user-automation:{occurrence_id}"))?;
         let attempt_id = typed_id(ArtifactId::new, &semantic_input.sha256)?;
@@ -477,6 +480,7 @@ impl UserAutomationDurableJobMaterial {
             attempt_id,
             work_scope: work_scope.clone(),
             semantic_input,
+            semantic_input_bytes: Some(semantic_input_bytes),
             output_contract: output_envelope,
             admission: admitted_job_ref(admission, &work_scope, budget_units, deadline_unix_ms)?,
             cancellation_id: format!("user-automation:{occurrence_id}:cancellation"),

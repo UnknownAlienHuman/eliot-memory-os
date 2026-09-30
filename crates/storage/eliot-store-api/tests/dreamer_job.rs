@@ -66,6 +66,7 @@ fn submission() -> eliot_protocol::JobSubmission {
         attempt_id: ArtifactId::new("attempt").expect("attempt"),
         work_scope: scope.clone(),
         semantic_input: content_ref("input"),
+        semantic_input_bytes: None,
         output_contract: content_ref("output"),
         admission: AdmissionRef {
             authority: AuthorityBinding {
@@ -176,6 +177,10 @@ fn base_response(request: &DurableJobRequest, bound_scope: WorkScopeBinding) -> 
         scope: bound_scope,
         semantic_input: match &request.operation {
             JobOperation::Submit { submission } => Some(submission.semantic_input.clone()),
+            _ => None,
+        },
+        semantic_input_bytes: match &request.operation {
+            JobOperation::Submit { submission } => submission.semantic_input_bytes.clone(),
             _ => None,
         },
         revision: 1,

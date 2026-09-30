@@ -22,7 +22,7 @@ use thiserror::Error;
 /// Stable identity of the `DurableJob` control family.
 pub const DURABLE_JOB_CONTRACT_NAME: &str = "eliot.foundation.protocol.durable-job";
 /// Current semantic revision of the `DurableJob` control family.
-pub const DURABLE_JOB_CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 1, 0);
+pub const DURABLE_JOB_CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 2, 0);
 /// Versioned namespace used when hashing a mutation request.
 pub const DURABLE_JOB_CANONICAL_ENCODING: &str = "eliot.durable-job.canonical.v1";
 /// Maximum bounded text field size in bytes.
@@ -252,6 +252,19 @@ impl OpaqueContentRef {
         }
         lowercase_digest(&self.sha256, field)
     }
+
+    /// Verifies optional original semantic-input bytes against this exact
+    /// owner-issued reference without interpreting their content.
+    pub fn validate_semantic_input_bytes(
+        &self,
+        bytes: &[u8],
+    ) -> Result<(), DurableJobError> {
+        let byte_length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if self.byte_length != byte_length || self.sha256 != sha256_hex(bytes) {
+            return Err(DurableJobError::SemanticInputMismatch);
+        }
+        Ok(())
+    }
 }
 
 /// Fresh transport correlation, separate from the stable mutation identity.
@@ -314,16 +327,34 @@ impl DurableRequestIdentity {
 
 fn canonical_operation_payload(operation: &JobOperation) -> serde_json::Value {
     match operation {
-        JobOperation::Submit { submission } => serde_json::json!({
-            "operation": "SUBMIT_JOB",
-            "job_id": submission.job_id,
-            "attempt_id": submission.attempt_id,
-            "work_scope": submission.work_scope,
-            "semantic_input": submission.semantic_input,
-            "output_contract": submission.output_contract,
-            "admission": submission.admission,
-            "cancellation_id": submission.cancellation_id,
-        }),
+        JobOperation::Submit { submission } => {
+            let mut payload = serde_json::Map::from_iter([
+                ("operation".to_owned(), serde_json::json!("SUBMIT_JOB")),
+                ("job_id".to_owned(), serde_json::json!(submission.job_id)),
+                ("attempt_id".to_owned(), serde_json::json!(submission.attempt_id)),
+                ("work_scope".to_owned(), serde_json::json!(submission.work_scope)),
+                (
+                    "semantic_input".to_owned(),
+                    serde_json::json!(submission.semantic_input),
+                ),
+                (
+                    "output_contract".to_owned(),
+                    serde_json::json!(submission.output_contract),
+                ),
+                ("admission".to_owned(), serde_json::json!(submission.admission)),
+                (
+                    "cancellation_id".to_owned(),
+                    serde_json::json!(submission.cancellation_id),
+                ),
+            ]);
+            if let Some(bytes) = &submission.semantic_input_bytes {
+                payload.insert(
+                    "semantic_input_bytes".to_owned(),
+                    serde_json::json!(bytes),
+                );
+            }
+            serde_json::Value::Object(payload)
+        }
         JobOperation::LeaseNext { selector } => {
             serde_json::json!({ "operation": "LEASE_NEXT", "selector": selector })
         }
@@ -470,6 +501,10 @@ pub struct JobSubmission {
     pub attempt_id: ArtifactId,
     pub work_scope: WorkScopeBinding,
     pub semantic_input: OpaqueContentRef,
+    /// Original inline bytes for sources that can retain them alongside the
+    /// opaque identity. Absence is preserved for legacy/non-inline sources.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_input_bytes: Option<Vec<u8>>,
     pub output_contract: OpaqueContentRef,
     pub admission: AdmissionRef,
     pub cancellation_id: String,
@@ -478,6 +513,9 @@ pub struct JobSubmission {
 impl JobSubmission {
     pub fn validate(&self) -> Result<(), DurableJobError> {
         self.semantic_input.validate("semantic_input.sha256")?;
+        if let Some(bytes) = &self.semantic_input_bytes {
+            self.semantic_input.validate_semantic_input_bytes(bytes)?;
+        }
         self.output_contract.validate("output_contract.sha256")?;
         self.admission.validate()?;
         self.work_scope
@@ -1579,6 +1617,10 @@ pub struct DurableJobResponse {
     /// `DurableJobRecord`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_input: Option<OpaqueContentRef>,
+    /// Original inline bytes retained by the durable owner when the source
+    /// supplied them. Absence remains explicit for legacy/non-inline jobs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_input_bytes: Option<Vec<u8>>,
     /// Exact record revision observed for this response.
     pub revision: u64,
     /// Semantic lifecycle state, separate from the mutation disposition.
@@ -1633,6 +1675,13 @@ impl DurableJobResponse {
         self.request_identity.validate()?;
         if let Some(semantic_input) = &self.semantic_input {
             semantic_input.validate("semantic_input.sha256")?;
+        }
+        if let Some(bytes) = &self.semantic_input_bytes {
+            let semantic_input = self
+                .semantic_input
+                .as_ref()
+                .ok_or(DurableJobError::SemanticInputUnavailable)?;
+            semantic_input.validate_semantic_input_bytes(bytes)?;
         }
         if self.revision == 0 {
             return Err(DurableJobError::InvalidField {
@@ -1795,6 +1844,9 @@ impl DurableJobResponse {
                 if semantic_input != &submission.semantic_input {
                     return Err(DurableJobError::SemanticInputMismatch);
                 }
+                if self.semantic_input_bytes != submission.semantic_input_bytes {
+                    return Err(DurableJobError::SemanticInputMismatch);
+                }
                 // Any positive revision is admitted: an idempotent resubmit
                 // may return the already-advanced record.
                 Ok(())
@@ -1955,7 +2007,9 @@ pub enum DurableJobError {
     OperationMismatch,
     #[error("original semantic input reference is unavailable")]
     SemanticInputUnavailable,
-    #[error("response semantic input reference differs from the submitted owner record")]
+    #[error(
+        "semantic input reference or supplied bytes differ from the original owner record"
+    )]
     SemanticInputMismatch,
     #[error("role does not have the requested capability")]
     CapabilityDenied,

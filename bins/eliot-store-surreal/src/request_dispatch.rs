@@ -1047,6 +1047,13 @@ mod dreamer_dispatch_tests {
                 }
                 _ => serde_json::Value::Null,
             },
+            "semantic_input_bytes": match &request.operation {
+                JobOperation::Submit { submission } => {
+                    serde_json::to_value(&submission.semantic_input_bytes)
+                        .expect("semantic input bytes")
+                }
+                _ => serde_json::Value::Null,
+            },
             "revision": 1,
             "state": "QUEUED",
             "disposition": "COMMITTED",
