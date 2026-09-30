@@ -126,7 +126,8 @@ pub fn bind_orientation_projections<'a>(
             },
             None,
             ProjectionState::Stale {
-                reason: "owner lineage differs from the admitted task, scope, or StateFence".to_owned(),
+                reason: "owner lineage differs from the admitted task, scope, or StateFence"
+                    .to_owned(),
             },
         );
     }
@@ -140,12 +141,14 @@ pub fn bind_orientation_projections<'a>(
     // is part of the read closure.
     if is_complete(&members.safety) {
         members.safety = ProjectionState::Unknown {
-            reason: "negative-memory owner record identities are absent from the retained read".to_owned(),
+            reason: "negative-memory owner record identities are absent from the retained read"
+                .to_owned(),
         };
     }
     if is_complete(&members.affordance) {
         members.affordance = ProjectionState::Unknown {
-            reason: "scope and instance identities do not establish allowed capabilities".to_owned(),
+            reason: "scope and instance identities do not establish allowed capabilities"
+                .to_owned(),
         };
     }
     let parts = ProjectionParts {
@@ -252,7 +255,8 @@ fn role_disposition(
             if !role_identity_matches(role, operation, input) =>
         {
             ProjectionState::Stale {
-                reason: "retained read identity differs from the admitted source closure".to_owned(),
+                reason: "retained read identity differs from the admitted source closure"
+                    .to_owned(),
             }
         }
         state => state.clone(),
@@ -280,13 +284,16 @@ fn role_identity_matches(
         && identity.state_fence() == &binding.state_fence
         && role.revision_heads.as_slice() == roles.heads_before.revision_heads.as_slice()
         && identity.observed_revision_heads() == roles.heads_before.revision_heads.as_slice()
-        && identity.declared_dependency_revisions().iter().all(|(key, revision)| {
-            roles
-                .heads_before
-                .revision_heads
-                .iter()
-                .any(|head| &head.key == key && head.revision == *revision)
-        })
+        && identity
+            .declared_dependency_revisions()
+            .iter()
+            .all(|(key, revision)| {
+                roles
+                    .heads_before
+                    .revision_heads
+                    .iter()
+                    .any(|head| &head.key == key && head.revision == *revision)
+            })
         && identity.invalidation().state_fence() == identity.state_fence()
         && identity.invalidation().scope_id() == identity.scope_id()
         && identity.invalidation().revision_heads() == identity.observed_revision_heads()
@@ -332,12 +339,22 @@ fn task_projection(
     let task_id = record.get("task_id").and_then(Value::as_str);
     let goal = record.get("title").and_then(Value::as_str);
     let items = record.get("acceptance_items").and_then(Value::as_array);
-    let has_native_revision = record.get("memory_revision").and_then(Value::as_u64).is_some()
-        && record.get("project_sequence").and_then(Value::as_u64).is_some()
-        && record.get("write_id").and_then(Value::as_str).is_some_and(|id| !id.is_empty());
+    let has_native_revision = record
+        .get("memory_revision")
+        .and_then(Value::as_u64)
+        .is_some()
+        && record
+            .get("project_sequence")
+            .and_then(Value::as_u64)
+            .is_some()
+        && record
+            .get("write_id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty());
     let Some(((task_id, goal), items)) = task_id.zip(goal).zip(items) else {
         *disposition = ProjectionState::Unknown {
-            reason: "retained task contract lacks typed identity, goal, or acceptance items".to_owned(),
+            reason: "retained task contract lacks typed identity, goal, or acceptance items"
+                .to_owned(),
         };
         return None;
     };
@@ -442,11 +459,7 @@ fn continuity_projection(
         };
         return None;
     }
-    let payload = input
-        .role_inputs
-        .task_frame
-        .payload
-        .as_ref();
+    let payload = input.role_inputs.task_frame.payload.as_ref();
     let Some(active) = payload.and_then(|payload| payload.get("active_decision_state")) else {
         *disposition = ProjectionState::Missing;
         return None;
@@ -494,7 +507,9 @@ fn omission_disposition(
         return ProjectionState::Missing;
     };
     if omissions.len() > MAX_SET_OMISSIONS
-        || omissions.iter().any(|record| record.validate(binding).is_err())
+        || omissions
+            .iter()
+            .any(|record| record.validate(binding).is_err())
     {
         return ProjectionState::Unknown {
             reason: "original omission records exceed bounds or differ from the binding".to_owned(),
@@ -515,7 +530,10 @@ fn mark_complete_members_stale(members: &mut OrientationProjectionMemberStates) 
         &mut members.affordance,
         &mut members.omissions,
     ] {
-        if matches!(state, ProjectionState::Complete | ProjectionState::KnownEmpty) {
+        if matches!(
+            state,
+            ProjectionState::Complete | ProjectionState::KnownEmpty
+        ) {
             *state = ProjectionState::Stale {
                 reason: "member source differs from the admitted ContextBinding".to_owned(),
             };
@@ -532,11 +550,19 @@ fn members_complete(members: &OrientationProjectionMemberStates) -> bool {
         &members.omissions,
     ]
     .into_iter()
-    .all(|state| matches!(state, ProjectionState::Complete | ProjectionState::KnownEmpty))
+    .all(|state| {
+        matches!(
+            state,
+            ProjectionState::Complete | ProjectionState::KnownEmpty
+        )
+    })
 }
 
 fn is_complete(state: &ProjectionState) -> bool {
-    matches!(state, ProjectionState::Complete | ProjectionState::KnownEmpty)
+    matches!(
+        state,
+        ProjectionState::Complete | ProjectionState::KnownEmpty
+    )
 }
 
 fn overall_disposition(members: &OrientationProjectionMemberStates) -> ProjectionState {

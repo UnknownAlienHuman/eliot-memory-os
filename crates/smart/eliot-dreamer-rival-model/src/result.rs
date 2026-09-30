@@ -21,8 +21,8 @@ use eliot_dreamer_contracts::rival::{
     CurrentPositionBinding, DeclarationAvailability, DiscriminatorPeerAddress as ProbePeerAddress,
     RequirementFacet as ProbeRequirementFacet, RequirementReason as ProbeRequirementReason,
     RetainedDiscriminator, RivalCoverageDeclaration, RivalCoverageStatus, RivalCoverageSummary,
-    RivalDeclarationSet, RivalDeclarationSetRef, RivalModelDeclaration,
-    RivalModelRef, RivalModelSet as ProbeRivalModelSet, RivalModelSetParams as ProbeRivalModelSetParams,
+    RivalDeclarationSet, RivalDeclarationSetRef, RivalModelDeclaration, RivalModelRef,
+    RivalModelSet as ProbeRivalModelSet, RivalModelSetParams as ProbeRivalModelSetParams,
     RivalModelSlot, UnresolvedDiscriminatorRequirement,
 };
 use eliot_dreamer_contracts::{DreamInputBundle, ValidatedGroundingCandidate};

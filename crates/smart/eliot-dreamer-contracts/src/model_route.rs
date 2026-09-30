@@ -341,9 +341,17 @@ impl ModelRouteExecutionIdentity {
         check_text(&self.route, "execution.route", MAX_ROUTE_CHARS)?;
         check_text(&self.provider_id, "execution.provider_id", MAX_ROUTE_CHARS)?;
         check_text(&self.model_id, "execution.model_id", MAX_ROUTE_CHARS)?;
-        check_text(&self.harness_id, "execution.harness_id", MAX_PROVIDER_USAGE_TEXT_CHARS)?;
+        check_text(
+            &self.harness_id,
+            "execution.harness_id",
+            MAX_PROVIDER_USAGE_TEXT_CHARS,
+        )?;
         if let Some(route) = &self.grounding_route {
-            check_text(&route.route_revision, "execution.route_revision", MAX_ROUTE_CHARS)?;
+            check_text(
+                &route.route_revision,
+                "execution.route_revision",
+                MAX_ROUTE_CHARS,
+            )?;
             if route.provider != self.provider_id
                 || route.model != self.model_id
                 || crate::grounding::route_fingerprint(route)? != route.fingerprint
@@ -399,7 +407,11 @@ impl ModelRouteProviderUsage {
     /// locally measured cost or usage receipt.
     pub fn validate(&self) -> Result<(), ContractViolation> {
         if let Some(cost) = &self.provider_cost_usd {
-            check_text(cost, "provider_usage.provider_cost_usd", MAX_PROVIDER_USAGE_TEXT_CHARS)?;
+            check_text(
+                cost,
+                "provider_usage.provider_cost_usd",
+                MAX_PROVIDER_USAGE_TEXT_CHARS,
+            )?;
             if cost.parse::<f64>().is_err() {
                 return Err(ContractViolation::Malformed {
                     field: "provider_usage.provider_cost_usd",
@@ -408,11 +420,7 @@ impl ModelRouteProviderUsage {
             }
         }
         if let Some(reason) = &self.unavailable_reason {
-            check_text(
-                reason,
-                "provider_usage.unavailable_reason",
-                MAX_NOTE_CHARS,
-            )?;
+            check_text(reason, "provider_usage.unavailable_reason", MAX_NOTE_CHARS)?;
         }
         if self.state == ModelRouteUsageState::Available && self.unavailable_reason.is_some() {
             return Err(ContractViolation::BindingMismatch {

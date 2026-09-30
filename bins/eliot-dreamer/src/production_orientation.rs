@@ -312,10 +312,7 @@ pub(crate) fn compose_production_result(
         return carrier_failure_result(&inputs, &error);
     }
     if inputs.schema_version != PRODUCTION_ORIENTATION_INPUTS_SCHEMA_VERSION {
-        return carrier_failure_result(
-            &inputs,
-            &PulseError::Boundary("production inputs version"),
-        );
+        return carrier_failure_result(&inputs, &PulseError::Boundary("production inputs version"));
     }
     let admitted = admitted_prefix(&inputs);
     if let Err(field) = validate_identity_closure(&inputs, semantic_job) {
@@ -456,13 +453,12 @@ pub(crate) fn compose_production_result(
     if packet.disposition == OrientationDisposition::Partial && omissions.is_empty() {
         omissions.push("joined owner packet partial".to_owned());
     }
-    let disposition = if packet.disposition == OrientationDisposition::Partial
-        || !CONFLICT_OUTPUT_QUALIFIED
-    {
-        OrientationDisposition::Partial
-    } else {
-        OrientationDisposition::Complete
-    };
+    let disposition =
+        if packet.disposition == OrientationDisposition::Partial || !CONFLICT_OUTPUT_QUALIFIED {
+            OrientationDisposition::Partial
+        } else {
+            OrientationDisposition::Complete
+        };
     OrientationPulseResult {
         schema_version: ORIENTATION_PULSE_RESULT_SCHEMA_VERSION,
         disposition,
@@ -584,12 +580,10 @@ fn validate_identity_closure(
     if &inputs.validated_candidate.job != admitted
         || &inputs.validated_candidate.bundle != bundle
         || inputs.model_outcome.draft.as_ref() != Some(&inputs.validated_candidate.model)
-        || inputs.validated_candidate.usage.input_bytes
-            != inputs.model_outcome.receipt.input_bytes
+        || inputs.validated_candidate.usage.input_bytes != inputs.model_outcome.receipt.input_bytes
         || inputs.validated_candidate.usage.output_bytes
             != inputs.model_outcome.receipt.output_bytes
-        || inputs.validated_candidate.usage.model_calls
-            != inputs.model_outcome.receipt.model_calls
+        || inputs.validated_candidate.usage.model_calls != inputs.model_outcome.receipt.model_calls
         || inputs.validated_candidate.usage.wall_ms != inputs.model_outcome.receipt.wall_ms
     {
         return Err("owner model candidate binding");
@@ -676,10 +670,9 @@ fn packet_error_terminal(error: &OrientationError) -> (OrientationDisposition, &
             OrientationDisposition::RevalidationRequired,
             "packet owner requires revalidation",
         ),
-        OrientationError::Cancelled => (
-            OrientationDisposition::Cancelled,
-            "packet owner cancelled",
-        ),
+        OrientationError::Cancelled => {
+            (OrientationDisposition::Cancelled, "packet owner cancelled")
+        }
         OrientationError::Encoding(field) => (OrientationDisposition::Invalid, field),
         OrientationError::Internal => (
             OrientationDisposition::Blocked,
@@ -923,11 +916,7 @@ fn missing_prerequisites_blocked(
     let stages = PulseStageId::ORDER
         .iter()
         .map(|id| {
-            let stage_reason = if stale {
-                reason
-            } else {
-                id.missing_reason()
-            };
+            let stage_reason = if stale { reason } else { id.missing_reason() };
             let mut record = blocked_stage_record(*id, stage_reason);
             if stale {
                 record.disposition = OrientationStageDisposition::Stale;

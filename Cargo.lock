@@ -1530,6 +1530,7 @@ dependencies = [
  "eliot-dreamer-contracts",
  "eliot-epistemic-contracts",
  "eliot-evidence",
+ "serde",
 ]
 
 [[package]]

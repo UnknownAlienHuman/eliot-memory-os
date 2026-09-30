@@ -2,15 +2,15 @@ use crate::{
     AdmittedAttemptCandidate, AdmittedAttemptError, AdmittedObservation, AdmittedObservationKind,
     AdmittedOpenCodeAttempt, AdmittedSlotConsumption, AuthorityCeiling, BasicAuth,
     EnvironmentAllowlist, ExecutableFingerprint, HealthResponse, HttpMethod, HttpRequest,
-    MalformedProviderOutput,
-    LoopbackEndpoint, LoopbackHttpClient, LoopbackHttpError, ModelSelection, NoAuthorityRunResult,
-    OPENCODE_ADMITTED_ATTEMPT_EDGE_CANDIDATE, OPENCODE_ROUTE_RECONCILIATION_REF, OpenCodeEvent,
+    LoopbackEndpoint, LoopbackHttpClient, LoopbackHttpError, MalformedProviderOutput,
+    ModelSelection, NoAuthorityRunResult, OPENCODE_ADMITTED_ATTEMPT_EDGE_CANDIDATE,
+    OPENCODE_PROVIDER_RAW_OUTPUT_UTF8_KEY, OPENCODE_ROUTE_RECONCILIATION_REF, OpenCodeEvent,
     OpenCodeObservationConversionError, OpenCodeWireRouteReceipt, PhysicalObservationBody,
     ProviderCatalog, QuotaAvailability, ReadOnlyRunRequest, RunRequestError, RunStatus,
     SealedRouteDisposition, Session, SessionDiff, SessionStatus, SessionStatusMap, SseConnection,
     SseDecodeError, SseDecoder, SseEvent, SseLimits, UnknownFields, UsageAvailability,
-    UsageTelemetry, OPENCODE_PROVIDER_RAW_OUTPUT_UTF8_KEY, bound_session_identity,
-    committed_message_id, wire_receipt_evidence, wire_route_locator,
+    UsageTelemetry, bound_session_identity, committed_message_id, wire_receipt_evidence,
+    wire_route_locator,
 };
 use eliot_agent_api::{
     AgentResult, EffectCeiling, EventCursor, ExecutionOutcome, ResultDisposition,
@@ -996,9 +996,7 @@ impl OpenCodeClient {
                         "a previously committed assistant outcome could not be fully reconciled",
                     ))
                 })?
-                .map_err(|error| {
-                    AdmittedAttemptError::Run(map_admitted_post_claim_error(error))
-                })?;
+                .map_err(|error| AdmittedAttemptError::Run(map_admitted_post_claim_error(error)))?;
                 let (projection, statuses) = reconciled;
                 (
                     self.success_result(request, &prepared, projection, Vec::new()),
@@ -1024,9 +1022,7 @@ impl OpenCodeClient {
                         "the admitted slot already had unresolved provider work",
                     ))
                 })?
-                .map_err(|error| {
-                    AdmittedAttemptError::Run(map_admitted_post_claim_error(error))
-                })?;
+                .map_err(|error| AdmittedAttemptError::Run(map_admitted_post_claim_error(error)))?;
                 let (projection, statuses) = reconciled;
                 (
                     self.success_result(request, &prepared, projection, Vec::new()),
@@ -2661,8 +2657,12 @@ fn inspect_messages(
         cost_usd: info.get("cost").and_then(Value::as_f64),
         extra: UnknownFields::new(),
     });
-    let (output, raw_output) =
-        parse_text_json_output(parts, expected_output_schema, &observed_model, usage.as_ref())?;
+    let (output, raw_output) = parse_text_json_output(
+        parts,
+        expected_output_schema,
+        &observed_model,
+        usage.as_ref(),
+    )?;
     Ok(MessageProjection {
         observed_model,
         output,
@@ -2689,18 +2689,22 @@ fn parse_text_json_output(
             observed_model: observed_model.clone(),
             raw_output: raw_output.clone(),
             usage: usage.cloned(),
-            reason: reason.chars().take(MAX_MALFORMED_OUTPUT_REASON_CHARS).collect(),
+            reason: reason
+                .chars()
+                .take(MAX_MALFORMED_OUTPUT_REASON_CHARS)
+                .collect(),
         }))
     };
     if raw_output.trim().is_empty() {
-        return Err(malformed("assistant message contains no text JSON output".to_owned()));
+        return Err(malformed(
+            "assistant message contains no text JSON output".to_owned(),
+        ));
     }
-    let output = serde_json::from_str::<Value>(&raw_output)
-        .map_err(|error| {
-            malformed(format!(
-                "assistant text is not one strict JSON value: {error}"
-            ))
-        })?;
+    let output = serde_json::from_str::<Value>(&raw_output).map_err(|error| {
+        malformed(format!(
+            "assistant text is not one strict JSON value: {error}"
+        ))
+    })?;
     attest_top_level_output_schema(&output, expected_output_schema)
         .map_err(|error| malformed(error.to_string()))?;
     Ok((output, raw_output))
