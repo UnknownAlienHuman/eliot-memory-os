@@ -894,10 +894,70 @@ impl KernelComposition {
     ///
     /// These are the actual bound clients, not freshly constructed ones: the
     /// composition owns them, so a caller cannot reach a differently-bound,
-    /// fake or no-op owner. Which owner serves a given operation is resolved by
-    /// [`BackupOwnerClients::route`] from the *authenticated* requester, never
-    /// from the payload, because `RestoreStatus` and `ReconcileRestore` are
-    /// served by both owners.
+    /// fake or no-op owner.
+    ///
+    /// ## Chain status: bound, not yet reached
+    ///
+    /// The pair is BUILT in production assembly and this accessor has no
+    /// production caller. `BackupOwnerClients::route`,
+    /// `HostBackupOwnerClient::admit_effect`/`admit_prepare`/`admit_cutover` and
+    /// `WatchdogBackupOwnerClient::admit_effect` are reached only by
+    /// `bins/eliot-kernel/tests/backup_owner_wire.rs`. That is the honest status
+    /// of this cell, and it is stated here rather than implied, because
+    /// `backup_capture` and `backup_restore_with_ors_journal` below each
+    /// disclose their own reachability in the same terms.
+    ///
+    /// The module is also not a channel: `backup_owner_clients.rs` performs
+    /// client construction and pre-effect admission checks only — no I/O, no
+    /// transport, no journal, no cutover execution. `admit_effect` returns an
+    /// in-process permit record, and `authority_matches`/`response_identity_ok`
+    /// are pure predicates over strings a caller supplies. So a reader added
+    /// here would re-derive a table verdict, not reach a Host or Watchdog
+    /// process; dispatching a real owner effect through this pair needs a
+    /// transport that does not exist on this tree.
+    ///
+    /// Two named capabilities are what a reader would still need, and neither
+    /// is manufactured here:
+    ///
+    /// 1. **An authenticated owner identity to route from.**
+    ///    [`BackupOwnerClients::route`] requires the owner to be authenticated
+    ///    requester metadata and never inferred from the operation, because
+    ///    `RestoreStatus` and `ReconcileRestore` are served by both owners. The
+    ///    front door holds no such value: `PeerIdentity::Authenticated` carries
+    ///    process, user, session and proof identity and no owner role, and
+    ///    `admit_backup_caller` (`request_dispatch.rs`) admits exactly one
+    ///    capability, this Kernel's own `daemon` front door, and fences every
+    ///    specialised owner session. A reader here would have to invent the
+    ///    `OwnerRole` it routes on.
+    /// 2. **A `BackupOperationKind` on the frame.** The four front-door backup
+    ///    selectors are method selectors, and this route's own source
+    ///    (`is_backup_operation`) states that the protocol's operation
+    ///    vocabulary is a different, non-interchangeable one — deriving one
+    ///    from the other would assert an identity the protocol does not state.
+    ///
+    /// With those absent, the role projection also decides which operations
+    /// either client could admit, measured against the canonical tables rather
+    /// than asserted. `OwnerRole::Host` carries `InstallationAuthority`, so
+    /// `HostBackupOwnerClient::admit_effect` admits `PrepareIsolatedRestore`
+    /// and `RestoreStatus` only: `AdmitCutover` stops at
+    /// `CutoverAdmissionRequired` and `ReconcileRestore` is refused
+    /// `CapabilityDenied`, so the Host refuses two of its own four registered
+    /// operations. `OwnerRole::Watchdog` carries `SpoolOwner`, so
+    /// `WatchdogBackupOwnerClient::admit_effect` admits `RestoreStatus` and
+    /// `ReconcileRestore` only, and refuses `ReadSnapshotPage` and
+    /// `VerifyArchive` as `CapabilityDenied` — also two of its own four.
+    /// `RestoreStep` is unreachable on that channel in the other direction:
+    /// `SpoolOwner` carries it, but the Watchdog accepted table does not, so
+    /// `is_supported` refuses it first. `admit_prepare`/`admit_cutover` are
+    /// reachable only with an owner-issued `OwnerAdmission` digest, and no
+    /// production issuer of one exists on this tree.
+    ///
+    /// Whether the Watchdog channel should carry `ReadSnapshotPage` at all is
+    /// #2984 AUD5, an open root ruling over the canonical role projection in
+    /// `eliot_protocol::backup`. It is not decided here: this accessor records
+    /// what the tables admit today and leaves the precedence question to that
+    /// ruling, and it does not pre-empt it by routing an operation to a role
+    /// that cannot carry it.
     #[must_use]
     pub const fn backup_owner_clients(&self) -> &BackupOwnerClients {
         &self.backup_owner_clients
