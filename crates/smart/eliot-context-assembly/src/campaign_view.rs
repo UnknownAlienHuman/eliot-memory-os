@@ -30,7 +30,9 @@
 //! cell binds the view to the admitted set, which is the only binding that
 //! describes what is about to be rendered. No cell inherits another's verdict.
 
-use eliot_context_contracts::{AdmittedContextSet, ContextError};
+use eliot_context_contracts::{
+    AdmittedContextSet, ContextError, canonical_json_serializer_identity,
+};
 use eliot_contracts::fences_match_exact;
 use eliot_learning_contracts::{
     CampaignLearningStateView, CampaignSourceResolutionStatus, CampaignSourceRole, Completeness,
@@ -61,12 +63,41 @@ use crate::AssemblyError;
 ///   `MissingField("campaign_view.context_reference")`;
 /// - a Context recipe row whose recorded content digest is not the digest the
 ///   Context owner re-derived is
-///   `InvalidDigest("campaign_view.context_recipe")`.
+///   `InvalidDigest("campaign_view.context_recipe")`;
+/// - an admitted set whose recorded measurement serializer is not the
+///   owner-published canonical Context codec identity is
+///   `IdentityConflict` (see the envelope-codec join below).
 ///
 /// The `Partial` completeness state is not refused here: the learning-state
 /// owner already admits it only when every omitted field is recorded as
 /// non-load-bearing for the bound recipe, and this join adds nothing to that
 /// decision.
+///
+/// ## Envelope-codec identity (#1862, I2.16)
+///
+/// I2.16 requires a measurement to name the serializer identity, version and
+/// options of the codec that produced the bytes it digested, and refuses to
+/// certify a measurement taken under a changed serializer. Nothing named a
+/// publisher for those values on this lane, so the three consumer chains the
+/// Context lane has — the candidate member binding, the admission measurement
+/// closure and the assembly measurement verification — could only ever compare
+/// one caller's labels against another caller's labels.
+///
+/// This join is where the owner value reaches a real campaign-lane record. The
+/// admitted set carries its own serializer identity in
+/// `ContextEconomyReceipt::measurement` (`MeasurementRef`), which
+/// `ContextEconomyReceipt::validate` already checks, and it is compared here
+/// against [`canonical_json_serializer_identity`], the measurement owner's
+/// publication of the codec this lane serializes with. The admitted set is the
+/// last owner record that exists before rendering, so a set admitted under a
+/// foreign envelope codec is refused here rather than rendered and graded.
+///
+/// `MeasurementRef` carries only the serializer identity, not the version and
+/// options pair; those two live on `SerializedContextMeasurement` and on
+/// `QualityOutputBinding`, neither of which this join receives. The version and
+/// options pair therefore stays where it already is compared — the whole triple
+/// against `AssemblyPolicy` in `crate::measurement::verify` — and is not
+/// claimed here.
 pub fn check_campaign_view_for_assembly(
     admitted: &AdmittedContextSet,
     view: &CampaignLearningStateView,
@@ -129,6 +160,14 @@ pub fn check_campaign_view_for_assembly(
         return Err(AssemblyError::Contract(ContextError::InvalidDigest(
             "campaign_view.context_recipe",
         )));
+    }
+    // The admitted set's recorded envelope-codec identity against the owner
+    // publication. The recorded value is validated in shape by the receipt's own
+    // `validate`; the owner comparison is made here, and a foreign identity is
+    // an identity conflict rather than a silently rendered packet.
+    let owner_serializer = canonical_json_serializer_identity();
+    if admitted.economy.measurement.serializer != owner_serializer.serializer_id {
+        return Err(AssemblyError::Contract(ContextError::IdentityConflict));
     }
     Ok(())
 }
