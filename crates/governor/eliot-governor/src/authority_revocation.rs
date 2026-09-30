@@ -1119,18 +1119,149 @@ mod authority_revocation_tests {
         );
     }
 
+    /// One recorded closure as the durable history owner would have written
+    /// it.
+    ///
+    /// `RecordedRevocation` carries the full producer-declared coordinate set
+    /// (owner namespace, bounds, disposition, omissions, influence state,
+    /// affected count/digest and canonical request digest), and recovery
+    /// RECOMPUTES and compares the content-addressed ones. A fixture that
+    /// omits or stubs them would refuse at decode for a reason unrelated to
+    /// the case under test, so this declares every coordinate over the same
+    /// membership it reports.
+    fn recorded_revocation(root_ref: &str) -> RecordedRevocation {
+        let dependent_refs = vec!["grant:child".to_owned(), "grant:origin".to_owned()];
+        let affected = eliot_authority::AuthorityRevocationClosureEvidence::members_of(
+            root_ref,
+            &dependent_refs,
+        );
+        let affected_member_digest =
+            eliot_authority::AuthorityRevocationClosureEvidence::affected_members_digest(&affected)
+                .expect("recorded affected membership is addressable");
+        let bounds = eliot_influence::RevocationBounds::default_bounds();
+        let invalidation_reason = eliot_store_api::RevocationReason::SourceRevoked;
+        let disposition = eliot_store_api::RecordedRevocationDisposition::Complete;
+        let omissions: Vec<String> = Vec::new();
+        let affected_member_count = affected.len() as u64;
+        let recorded_bounds = recorded_bounds(&bounds);
+        let canonical_request_digest =
+            eliot_store_api::canonical_json_bytes(&recorded_revocation_preimage(
+                root_ref,
+                &dependent_refs,
+                invalidation_reason,
+                &recorded_bounds,
+                disposition,
+                &omissions,
+                affected_member_count,
+                &affected_member_digest,
+            ))
+            .map(|bytes| eliot_store_api::sha256_hex(&bytes))
+            .expect("recorded revocation is addressable");
+        RecordedRevocation {
+            closure_id: "revocation-686-01".to_owned(),
+            root_ref: root_ref.to_owned(),
+            dependent_refs,
+            invalidation_reason,
+            revision: 9,
+            owner_namespace: root_ref.to_owned(),
+            bounds: recorded_bounds,
+            disposition,
+            omissions,
+            current_influence: eliot_security_contracts::InfluenceState::Revoked,
+            affected_member_count,
+            affected_member_digest,
+            canonical_request_digest,
+        }
+    }
+
+    /// The recorded wire form of the engine's one standing bounds set.
+    fn recorded_bounds(
+        bounds: &eliot_influence::RevocationBounds,
+    ) -> eliot_store_api::RecordedRevocationBounds {
+        eliot_store_api::RecordedRevocationBounds {
+            max_nodes: bounds.max_nodes,
+            max_edges: bounds.max_edges,
+            max_depth: bounds.max_depth,
+            max_result: bounds.max_result,
+            max_work: bounds.max_work,
+            max_frontier: bounds.max_frontier,
+            max_time: bounds.max_time,
+        }
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the recorded closure preimage is exactly the producer-declared coordinate set the durable owner hashes"
+    )]
+    fn recorded_revocation_preimage<'a>(
+        root_ref: &'a str,
+        dependent_refs: &'a [String],
+        invalidation_reason: eliot_store_api::RevocationReason,
+        recorded_bounds: &'a eliot_store_api::RecordedRevocationBounds,
+        disposition: eliot_store_api::RecordedRevocationDisposition,
+        omissions: &'a [String],
+        affected_member_count: u64,
+        affected_member_digest: &'a str,
+    ) -> impl serde::Serialize + 'a {
+        #[derive(serde::Serialize)]
+        struct Preimage<'a> {
+            evidence_version: u16,
+            closure_id: &'a str,
+            owner_namespace: &'a str,
+            root_ref: &'a str,
+            dependent_refs: &'a [String],
+            invalidation_reason: eliot_store_api::RevocationReason,
+            current_influence: eliot_security_contracts::InfluenceState,
+            state_fence: eliot_contracts::StateFence,
+            revision: u64,
+            bounds: eliot_store_api::RecordedRevocationBounds,
+            disposition: &'a str,
+            omissions: &'a [String],
+            affected_member_count: u64,
+            affected_member_digest: &'a str,
+        }
+        Preimage {
+            evidence_version: REVOCATION_HISTORY_EVIDENCE_VERSION as u16,
+            closure_id: "revocation-686-01",
+            owner_namespace: root_ref,
+            root_ref,
+            dependent_refs,
+            invalidation_reason,
+            current_influence: eliot_security_contracts::InfluenceState::Revoked,
+            state_fence: fence(),
+            revision: 9,
+            bounds: eliot_store_api::RecordedRevocationBounds {
+                max_nodes: recorded_bounds.max_nodes,
+                max_edges: recorded_bounds.max_edges,
+                max_depth: recorded_bounds.max_depth,
+                max_result: recorded_bounds.max_result,
+                max_work: recorded_bounds.max_work,
+                max_frontier: recorded_bounds.max_frontier,
+                max_time: recorded_bounds.max_time,
+            },
+            disposition: match disposition {
+                eliot_store_api::RecordedRevocationDisposition::Complete => {
+                    eliot_security_contracts::REVOCATION_DISPOSITION_COMPLETE
+                }
+                eliot_store_api::RecordedRevocationDisposition::Partial => {
+                    eliot_security_contracts::REVOCATION_DISPOSITION_PARTIAL
+                }
+                eliot_store_api::RecordedRevocationDisposition::Unknown => {
+                    eliot_security_contracts::REVOCATION_DISPOSITION_UNKNOWN
+                }
+            },
+            omissions,
+            affected_member_count,
+            affected_member_digest,
+        }
+    }
+
     fn history_response(fence: &StateFence) -> NamedReadResponse {
         let payload = RevocationHistoryPayload {
             version: REVOCATION_HISTORY_PAYLOAD_VERSION,
             origin_ref: "root:alpha".to_owned(),
             source_revision: 9,
-            closures: vec![RecordedRevocation {
-                closure_id: "revocation-686-01".to_owned(),
-                root_ref: "root:alpha".to_owned(),
-                dependent_refs: vec!["grant:child".to_owned(), "grant:origin".to_owned()],
-                invalidation_reason: eliot_store_api::RevocationReason::SourceRevoked,
-                revision: 9,
-            }],
+            closures: vec![recorded_revocation("root:alpha")],
         };
         NamedReadResponse {
             operation: NamedReadOperation::GetAuthorityRevocationHistory,
