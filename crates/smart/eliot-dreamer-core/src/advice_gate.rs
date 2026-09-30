@@ -15,6 +15,31 @@
 //! mutation-shaped entry point ([`AdviceGate::direct_apply`]) always fails
 //! with [`AdviceRejected::DirectMutationForbidden`] so the prohibition is
 //! executable and testable.
+//!
+//! # D-DRM-NEG-1 — an OPEN, deliberate divergence from the admitted owner
+//!
+//! [`NegativeMemoryEntry`] is a second negative-memory state shape. The
+//! ADMITTED owner of the durable negative-memory rule is cell
+//! `smart.dreamer.failure` (`crates/smart/eliot-dreamer-failure`, whose
+//! `NegativeMemoryFingerprint` is the only current durable record), and it is
+//! strictly stronger on every dimension this type names: a typed exact
+//! trigger predicate, an owner-issued affected scope with a non-empty resource
+//! set, a recomputed record digest, a mandatory reopen condition with a named
+//! verifier, a mandatory discriminating check, and an
+//! owner-admitted `NegativeMemoryActionPolicy`.
+//!
+//! This shape keys negative memory on a free-text hypothesis key —
+//! `<class>:<whitespace-folded lowercased statement>` — with no failed action,
+//! no trigger predicate, no affected scope and no policy. It is KEPT, not
+//! closed, and the divergence is recorded here rather than hidden, because
+//! closing it is not a deletion: the admitted owner admits an exact typed
+//! predicate or refuses, and has no path that accepts a model-authored prose
+//! key, so deleting this type would drop a capability rather than migrate one.
+//! The exact precondition is recorded in
+//! `crates/smart/eliot-dreamer-core/disposition.module.toml`
+//! (`[[work_item_4_negative_memory_owner_reevaluation]]`). It must not be read
+//! as the canonical failure memory of I12.19, and it acquires no
+//! admission, blocking power, authority or Finish role of its own.
 
 use std::collections::{BTreeMap, BTreeSet};
 
