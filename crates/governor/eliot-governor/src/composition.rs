@@ -7160,6 +7160,12 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// owner decision.
     ///
     /// Ported-from: work/1787-workscope-identity@443e39841049b0f80a25bebca813f470f8ad311c.
+    ///
+    /// Eight arguments are the documented admission evidence (descriptor,
+    /// revision, presented + observed bindings, source set, privacy profile
+    /// and boundary); grouping them would hide the per-leg MATCHED checks
+    /// below, so the arity is allowed here as on the cold-start drive legs.
+    #[allow(clippy::too_many_arguments)]
     pub fn admit_initial_scope_binding(
         &self,
         descriptor: &WorkScopeDescriptor,
