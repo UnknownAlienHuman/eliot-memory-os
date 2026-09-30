@@ -13,10 +13,9 @@ use eliot_installation::{
     InstallationRecoveryStage, LOCAL_SERVICE_SID, PHASE_B_PENDING_MARKER, PackageArtifactDigest,
     PlatformHandle, ProfileSelectionInput, ProfileSelectionResolution,
     RedbInstallationTransactionStore, ResourceGeneration, RuntimeLaunchDescriptor,
-    SOURCE_BUNDLE_PUBLICATION_JOURNAL_WIRE_VERSION,
-    SourceBundlePublicationJournal, SourceBundlePublicationJournalState,
-    SourceBundlePublicationRole, StateFence, SupervisionAuthorityBinding,
-    agent_bridge_source_plan_from_observed_kernel,
+    SOURCE_BUNDLE_PUBLICATION_JOURNAL_WIRE_VERSION, SourceBundlePublicationJournal,
+    SourceBundlePublicationJournalState, SourceBundlePublicationRole, StateFence,
+    SupervisionAuthorityBinding, agent_bridge_source_plan_from_observed_kernel,
     provider_bootstrap_credential_target_for_store_target, source_bundle_publication_operation_id,
 };
 use eliot_kernel_service::EliotdLaunchDescriptor;
@@ -856,7 +855,11 @@ fn build_typed_bundle_with_selection(
     let store_bridge_arguments = match profile {
         InstallationProfile::PortableDev => make_args([
             "--portable-dev-root".to_owned(),
-            input.profile_selection.profile_anchor_root.as_str().to_owned(),
+            input
+                .profile_selection
+                .profile_anchor_root
+                .as_str()
+                .to_owned(),
             "--config".to_owned(),
             config_path.as_str().to_owned(),
         ])?,
@@ -1943,8 +1946,8 @@ pub fn materialize_canary_source_bundle(
 ) -> Result<CanarySourceBundleMaterializeOutcome, InstallationError> {
     let selection = GenerationPackagePlanner::resolve_profile_selection(&input.profile_selection)?;
     validate_materializer_selection(input, &selection).map_err(to_installation_error)?;
-    if let Some(existing) = reconcile_existing_publication(input, &selection)
-        .map_err(to_installation_error)?
+    if let Some(existing) =
+        reconcile_existing_publication(input, &selection).map_err(to_installation_error)?
     {
         return Ok(existing);
     }
@@ -1984,8 +1987,8 @@ pub fn materialize_canary_source_bundle(
 mod tests {
     use super::*;
     use eliot_installation::{
-        GenerationPackagePlanInput, InstallationTransactionStore, RedbInstallationTransactionStore,
-        ProfileRootAnchors, validate_installation_transaction_json,
+        GenerationPackagePlanInput, InstallationTransactionStore, ProfileRootAnchors,
+        RedbInstallationTransactionStore, validate_installation_transaction_json,
     };
     use tempfile::TempDir;
 

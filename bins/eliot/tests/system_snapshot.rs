@@ -10,12 +10,12 @@ use std::{
 use eliot_contracts::{EpochId, EpochLineageId};
 use eliot_installation::{
     CandidateManifest, GenerationPackagePlanInput, GenerationPackagePlanner,
-    INSTALLATION_TRANSACTION_WIRE_VERSION, InstallationEpoch, InstallationProfile,
-    InstallationRoots, InstallationTransaction, InstallerAclPrincipal, InstallerEffectPlan,
-    ManagedEnvironmentAction, ManagedEnvironmentChangeRequest, PHASE_B_PENDING_MARKER,
-    PackageArtifactDigest, PlannedChange, ResourceGeneration, RuntimeLaunchDescriptor,
-    RuntimeStateRoots, StateFence, INSTALLATION_ROOT_BINDING_VERSION,
-    SupervisionAuthorityBinding, UserOwnedRootLease, parse_installation_transaction_id,
+    INSTALLATION_ROOT_BINDING_VERSION, INSTALLATION_TRANSACTION_WIRE_VERSION, InstallationEpoch,
+    InstallationProfile, InstallationRoots, InstallationTransaction, InstallerAclPrincipal,
+    InstallerEffectPlan, ManagedEnvironmentAction, ManagedEnvironmentChangeRequest,
+    PHASE_B_PENDING_MARKER, PackageArtifactDigest, PlannedChange, ResourceGeneration,
+    RuntimeLaunchDescriptor, RuntimeStateRoots, StateFence, SupervisionAuthorityBinding,
+    UserOwnedRootLease, parse_installation_transaction_id,
 };
 #[cfg(windows)]
 use eliot_platform_windows::{
