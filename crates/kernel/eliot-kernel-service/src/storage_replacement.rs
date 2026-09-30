@@ -1413,8 +1413,9 @@ impl StorageReplacement {
     /// direction open. The `<=` (rather than `<`) comparison also covers a switch
     /// that does not move the generation at all: such a frame names a
     /// destination that is itself the destination of the recorded irreversible
-    /// migration, so this gate refuses it too rather than passing the question
-    /// on. That refusal is owned here, not by the coordinator: the coordinator's
+    /// migration, so a FRESH cutover identity naming that destination is refused
+    /// here rather than passed on. That refusal is owned here, not by the
+    /// coordinator: the coordinator's
     /// own rule in [`StorageReplacement::begin`] refuses a candidate that already
     /// owns the route through a committed cutover, and that rule runs later,
     /// after this one, on the other admission path.
@@ -1430,10 +1431,13 @@ impl StorageReplacement {
     /// committed no cutover — and it is the same reading
     /// [`canonical_store_route_owner`] and the Kernel recovery boundary already
     /// make. It is deliberately NOT described as failing closed here, because it
-    /// does not: it admits. Every other durable refusal — a projection bound, an
-    /// integrity problem, any other typed ORS class — still reaches the caller as
-    /// its existing `KernelServiceError` variant through `ors_refusal`, so those
-    /// do close this gate.
+    /// does not: it admits. Every other durable refusal - a projection bound,
+    /// a storage or decode failure, any other typed ORS class - still reaches
+    /// the caller as its existing `KernelServiceError` variant through
+    /// `ors_refusal`, so those do close this gate. An integrity or
+    /// invalid-transition class is no longer reachable HERE, because this scan
+    /// does not rebuild a route snapshot; that invariant is enforced at the
+    /// writer and read by `active_canonical_store_generation`.
     pub fn refuse_unproven_generation_rollback(
         ors: &RedbRecoveryStore,
         cutover_id: &str,

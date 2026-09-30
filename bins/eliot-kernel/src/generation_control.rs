@@ -16,7 +16,8 @@
 //!
 //! That ingress is also where the `I5.11`/`I14.14` rollback rule is enforced on
 //! the switch itself rather than only on the operation that reports a rollback:
-//! the incumbent committed row's durable state-migration decision is read through
+//! every committed cutover row's durable state-migration decision for the pinned
+//! canonical-store scope is read through
 //! [`StorageReplacement::refuse_unproven_generation_rollback`] before the row for
 //! the requested cutover identity is written and before the semantic gateway is
 //! asked to move the live route, so a fresh cutover frame cannot obtain the
