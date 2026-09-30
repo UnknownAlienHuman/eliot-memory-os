@@ -4363,9 +4363,7 @@ impl AgentFabric {
             capability,
             move |config, capability| {
                 Ok(AgentCoordinator::restore_snapshot_json(
-                    &document,
-                    config,
-                    capability,
+                    &document, config, capability,
                 )?)
             },
         )

@@ -926,10 +926,7 @@ fn read_projection_bytes(
 /// `file.sha256`, and the payload must address this exact operation. This runs
 /// to completion BEFORE any caller selects the coordinator document out of
 /// these bytes, so a document is never read out of an unverified envelope.
-fn verify_projection(
-    bytes: &[u8],
-    operation_id: &str,
-) -> Result<SoloProjectionFile, DaemonError> {
+fn verify_projection(bytes: &[u8], operation_id: &str) -> Result<SoloProjectionFile, DaemonError> {
     let file: SoloProjectionFile = serde_json::from_slice(bytes).map_err(|error| {
         DaemonError::Composition(CompositionError::Recovery(format!(
             "solo projection decode: {error}"

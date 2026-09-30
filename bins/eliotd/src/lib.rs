@@ -3629,14 +3629,16 @@ impl DaemonComposition {
             Self::build_production_provider_capability(material, &owner, live_fence, claimed)?;
         let config = daemon_coordinator_config()?;
         let store = crate::semantic_revision_store::SemanticRevisionStore::new(self.state_root());
-        Ok(AgentFabric::restore_durable_snapshot_with_admitted_provider(
-            snapshot,
-            config,
-            ports,
-            Some(&store),
-            coordinator_document,
-            capability,
-        )?)
+        Ok(
+            AgentFabric::restore_durable_snapshot_with_admitted_provider(
+                snapshot,
+                config,
+                ports,
+                Some(&store),
+                coordinator_document,
+                capability,
+            )?,
+        )
     }
 
     /// Enqueues one validated solo delegate intake for the runtime poll hook
