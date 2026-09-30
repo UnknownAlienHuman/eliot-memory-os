@@ -8,10 +8,10 @@
 //! a clock, locale, environment variable, or timezone database.
 
 use eliot_kernel_core::user_automation::{
-    NormalizedSchedule, ScheduleKind, UserAutomationError,
+    NormalizedSchedule, PINNED_ZONE_DATABASE_REVISION, ScheduleKind, UserAutomationError,
 };
-use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 const GREGORIAN_UTC_CALENDAR: &str = "gregorian-utc";
 const ONE_SHOT_PREFIX: &str = "utc:";
@@ -25,6 +25,35 @@ const EXPRESSION_ARITHMETIC: &str = "schedule.expression.interval_arithmetic";
 const INCOMPLETE_PROJECTION: &str = "schedule.next_occurrences.incomplete";
 const UNRELATED_PROJECTION: &str = "schedule.next_occurrences.unrelated_to_compiled_expression";
 
+/// Opaque evidence that the service compiler independently matched a schedule
+/// projection to its declared UTC expression.
+///
+/// The fields and constructor remain private so callers can consume the
+/// verified identities but cannot manufacture a successful compiler result.
+/// The content digests bind the exact source and ordered occurrence set;
+/// `pinned_zone_database_revision` names the pinned release those core digests
+/// include.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct VerifiedScheduleCompilation {
+    source_digest: String,
+    compiled_occurrences_digest: String,
+    pinned_zone_database_revision: &'static str,
+}
+
+impl VerifiedScheduleCompilation {
+    pub(crate) fn source_digest(&self) -> &str {
+        &self.source_digest
+    }
+
+    pub(crate) fn compiled_occurrences_digest(&self) -> &str {
+        &self.compiled_occurrences_digest
+    }
+
+    pub(crate) fn pinned_zone_database_revision(&self) -> &'static str {
+        self.pinned_zone_database_revision
+    }
+}
+
 /// Independently compiles a strict Gregorian UTC expression and verifies the
 /// complete ordered occurrence projection against the core's validated
 /// occurrence contract.
@@ -34,7 +63,7 @@ const UNRELATED_PROJECTION: &str = "schedule.next_occurrences.unrelated_to_compi
 /// parsing or expected-instant generation.
 pub(crate) fn verify_compiled_schedule(
     schedule: &NormalizedSchedule,
-) -> Result<(), UserAutomationError> {
+) -> Result<VerifiedScheduleCompilation, UserAutomationError> {
     let normalized = schedule.validated_occurrences_without_receipt()?;
     if schedule.calendar != GREGORIAN_UTC_CALENDAR {
         return Err(UserAutomationError::Invalid(UNSUPPORTED_CALENDAR));
@@ -70,13 +99,7 @@ pub(crate) fn verify_compiled_schedule(
             };
             let anchor = parse_expression_anchor(anchor)?;
             let interval_seconds = parse_positive_interval(interval)?;
-            first_interval_instants(
-                anchor,
-                interval_seconds,
-                start,
-                end,
-                normalized.len(),
-            )?
+            first_interval_instants(anchor, interval_seconds, start, end, normalized.len())?
         }
     };
 
@@ -88,7 +111,15 @@ pub(crate) fn verify_compiled_schedule(
     {
         return Err(UserAutomationError::Invalid(UNRELATED_PROJECTION));
     }
-    Ok(())
+
+    let source_digest = schedule.source_digest()?;
+    let compiled_occurrences_digest = schedule.compiled_occurrences_digest()?;
+    let pinned_zone_database_revision = PINNED_ZONE_DATABASE_REVISION;
+    Ok(VerifiedScheduleCompilation {
+        source_digest,
+        compiled_occurrences_digest,
+        pinned_zone_database_revision,
+    })
 }
 
 /// Parses a canonical second-precision UTC timestamp from an expression.
@@ -100,10 +131,7 @@ fn parse_expression_anchor(value: &str) -> Result<i64, UserAutomationError> {
 }
 
 /// Parses an already core-validated schedule bound as an instant.
-fn parse_schedule_instant(
-    value: &str,
-    field: &'static str,
-) -> Result<i64, UserAutomationError> {
+fn parse_schedule_instant(value: &str, field: &'static str) -> Result<i64, UserAutomationError> {
     if !has_canonical_timestamp_shape(value, false) {
         return Err(UserAutomationError::Invalid(field));
     }
@@ -151,7 +179,7 @@ fn has_canonical_timestamp_shape(value: &str, utc_only: bool) -> bool {
 fn parse_time_timestamp(value: &str) -> Option<i64> {
     OffsetDateTime::parse(value, &Rfc3339)
         .ok()
-        .map(|instant| instant.unix_timestamp())
+        .map(OffsetDateTime::unix_timestamp)
 }
 
 fn all_ascii_digits(bytes: &[u8]) -> bool {
@@ -224,8 +252,8 @@ fn first_interval_instants(
         return Err(UserAutomationError::Invalid(INCOMPLETE_PROJECTION));
     }
 
-    let mut current = i64::try_from(first)
-        .map_err(|_| UserAutomationError::Invalid(EXPRESSION_ARITHMETIC))?;
+    let mut current =
+        i64::try_from(first).map_err(|_| UserAutomationError::Invalid(EXPRESSION_ARITHMETIC))?;
     let mut expected = Vec::with_capacity(count);
     for index in 0..count {
         if end.is_some_and(|end| current > end) {

@@ -75,7 +75,7 @@ impl UserAutomationServiceRequest {
             .validate()
             .map_err(|error| UserAutomationServiceError::Metadata(error.to_string()))?;
         self.identity.validate()?;
-        self.intent.validate()?;
+        self.intent.validate_for_normalization_submission()?;
         validate_text(&self.authenticated_principal, "authenticated_principal")?;
         if self.intent.state_fence != self.context.state_fence {
             return Err(UserAutomationServiceError::FenceMismatch);
@@ -117,7 +117,7 @@ impl UserAutomationStoreRequest {
             .validate()
             .map_err(|error| UserAutomationServiceError::Metadata(error.to_string()))?;
         self.identity.validate()?;
-        self.intent.validate()?;
+        self.intent.validate_for_normalization_submission()?;
         validate_text(&self.authenticated_principal, "authenticated_principal")?;
         if self.intent.principal_ref != self.authenticated_principal {
             return Err(UserAutomationServiceError::PrincipalMismatch);
@@ -435,9 +435,9 @@ fn validate_mutation_result(
                 cancelled_wake_ids,
             },
         ) => {
-            expected.validate()?;
+            expected.validate_for_normalization_submission()?;
             revision.validate()?;
-            if expected.as_ref() != revision
+            if !same_revision_except_store_normalization_receipt(expected, revision)
                 || revision.supersedes.is_some()
                 || !cancelled_wake_ids.is_empty()
             {
@@ -457,9 +457,11 @@ fn validate_mutation_result(
                 cancelled_wake_ids,
             },
         ) => {
-            expected.validate_supersedes(previous_revision)?;
+            expected.validate_supersedes_for_normalization_submission(previous_revision)?;
             revision.validate_supersedes(previous_revision)?;
-            if expected.as_ref() != revision || !cancelled_wake_ids.is_empty() {
+            if !same_revision_except_store_normalization_receipt(expected, revision)
+                || !cancelled_wake_ids.is_empty()
+            {
                 return Err(UserAutomationServiceError::ResponseMismatch(
                     "edit revision result",
                 ));
@@ -559,6 +561,18 @@ fn validate_mutation_result(
             "mutation result kind",
         )),
     }
+}
+
+fn same_revision_except_store_normalization_receipt(
+    expected: &UserAutomationRevision,
+    issued: &UserAutomationRevision,
+) -> bool {
+    let mut expected_with_store_receipt = expected.clone();
+    expected_with_store_receipt
+        .schedule
+        .normalization_receipt
+        .clone_from(&issued.schedule.normalization_receipt);
+    expected_with_store_receipt == *issued
 }
 
 fn validate_state_transition(

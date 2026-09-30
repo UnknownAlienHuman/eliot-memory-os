@@ -42,12 +42,10 @@ use std::collections::BTreeMap;
 use eliot_contracts::{ArtifactId, ContractId, ProductId, TransactionSequence};
 use eliot_kernel_core::user_automation::{
     AutomationReconciliationCause, AutomationReconciliationReference,
-    UserAutomationExecutionProjection, UserAutomationInvocation, UserAutomationOperation,
-    UserAutomationRevision, USER_AUTOMATION_NORMALIZATION_AUTHORITY_ID,
-    USER_AUTOMATION_NORMALIZATION_AUTHORITY_OWNER,
-    USER_AUTOMATION_NORMALIZATION_OPERATION_KIND,
-    USER_AUTOMATION_NORMALIZATION_VERIFIER_ID,
-    USER_AUTOMATION_NORMALIZATION_VERIFIER_REVISION,
+    USER_AUTOMATION_NORMALIZATION_AUTHORITY_ID, USER_AUTOMATION_NORMALIZATION_AUTHORITY_OWNER,
+    USER_AUTOMATION_NORMALIZATION_OPERATION_KIND, USER_AUTOMATION_NORMALIZATION_VERIFIER_ID,
+    USER_AUTOMATION_NORMALIZATION_VERIFIER_REVISION, UserAutomationExecutionProjection,
+    UserAutomationInvocation, UserAutomationOperation, UserAutomationRevision,
 };
 use eliot_receipts::{
     ArtifactBinding, AuthorityBinding, CausalBinding, EffectClass, OperationBinding, ProofCeiling,
@@ -2018,7 +2016,8 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
                         &revision.revision,
                     )
                     .await?;
-                if stored != *revision.as_ref() {
+                let (expected, _) = revision_with_owner_normalization_receipt(request, revision)?;
+                if stored != expected {
                     return Err(StoreError::InvalidField {
                         field: "automation.revision",
                         reason: "stored revision diverged from the admitted revision",
@@ -2271,13 +2270,23 @@ fn owner_normalization_bindings(
 /// and the same shared validator `ApplyNotificationState` uses for
 /// `source_receipt_json`. One envelope, one issuing subsystem, one writer, one
 /// lifecycle root — the Store persists the ORIGINAL bytes and re-derives
-/// nothing, and `check_normalization_receipt_binding` is untouched.
+/// nothing; the core receipt checker validates the retained envelope on read.
 fn revision_with_owner_normalization_receipt(
     request: &UserAutomationStoreRequest,
     revision: &UserAutomationRevision,
 ) -> Result<(UserAutomationRevision, ReceiptEnvelope), StoreError> {
-    super::user_automation_compiler::verify_compiled_schedule(&revision.schedule)
-        .map_err(schedule_compilation_store_error)?;
+    let verified = super::user_automation_compiler::verify_compiled_schedule(&revision.schedule)
+        .map_err(|error| schedule_compilation_store_error(&error))?;
+    let source_digest = revision
+        .schedule
+        .source_digest()
+        .map_err(|error| schedule_compilation_store_error(&error))?;
+    if verified.source_digest() != source_digest {
+        return Err(StoreError::InvalidField {
+            field: "automation.schedule.source_digest",
+            reason: "verified compiler result no longer matches the submitted schedule",
+        });
+    }
 
     let state_fence = request.context.state_fence.clone();
     let (task, session) = owner_normalization_bindings(request, &state_fence)?;
@@ -2286,13 +2295,7 @@ fn revision_with_owner_normalization_receipt(
         revision.automation_id, revision.revision
     ))
     .map_err(StoreError::Foundation)?;
-    let occurrences_digest = revision
-        .schedule
-        .compiled_occurrences_digest()
-        .map_err(|_| StoreError::InvalidField {
-            field: "automation.schedule.next_occurrences",
-            reason: "compiled occurrence set could not be digested",
-        })?;
+    let occurrences_digest = verified.compiled_occurrences_digest().to_owned();
     let core = ReceiptCore {
         contract: eliot_receipts::contract_identity().map_err(StoreError::Receipt)?,
         kind: ReceiptKind::Verification,
@@ -2339,9 +2342,7 @@ fn revision_with_owner_normalization_receipt(
             artifact_id: artifact_id.clone(),
             sha256: occurrences_digest,
             role: ReceiptKind::Artifact,
-            source_revision: Some(
-                eliot_kernel_core::user_automation::PINNED_ZONE_DATABASE_REVISION.to_owned(),
-            ),
+            source_revision: Some(verified.pinned_zone_database_revision().to_owned()),
         }],
         verifier: Some(VerifierBinding {
             verifier_id: ContractId::new(USER_AUTOMATION_NORMALIZATION_VERIFIER_ID)
@@ -2380,6 +2381,9 @@ fn revision_with_owner_normalization_receipt(
     }
     let mut owned = revision.clone();
     owned.schedule.normalization_receipt = receipt;
+    owned
+        .validate()
+        .map_err(|error| schedule_compilation_store_error(&error))?;
     Ok((owned, retained))
 }
 
@@ -2387,7 +2391,7 @@ fn revision_with_owner_normalization_receipt(
 /// Store boundary, whose public error type carries static field and reason
 /// labels only.
 fn schedule_compilation_store_error(
-    error: eliot_kernel_core::user_automation::UserAutomationError,
+    error: &eliot_kernel_core::user_automation::UserAutomationError,
 ) -> StoreError {
     use eliot_kernel_core::user_automation::UserAutomationError;
 
@@ -2416,8 +2420,7 @@ fn schedule_compilation_store_error(
                     "automation.schedule.next_occurrences",
                     "occurrence projection is invalid or disagrees with the expression",
                 )
-            } else if field.starts_with("schedule.start_at")
-                || field.starts_with("schedule.end_at")
+            } else if field.starts_with("schedule.start_at") || field.starts_with("schedule.end_at")
             {
                 (
                     "automation.schedule.interval",
@@ -2457,12 +2460,11 @@ fn schedule_compilation_store_error(
             field: "automation.schedule.timezone",
             reason: "occurrence zone evidence disagrees with the pinned table",
         },
-        UserAutomationError::LegacyScheduleEncoding(_) | UserAutomationError::OccurrenceMismatch => {
-            StoreError::InvalidField {
-                field: "automation.schedule.next_occurrences",
-                reason: "occurrence projection requires re-normalization or does not match",
-            }
-        }
+        UserAutomationError::LegacyScheduleEncoding(_)
+        | UserAutomationError::OccurrenceMismatch => StoreError::InvalidField {
+            field: "automation.schedule.next_occurrences",
+            reason: "occurrence projection requires re-normalization or does not match",
+        },
         UserAutomationError::Receipt(_) | UserAutomationError::ReceiptBinding => {
             StoreError::InvalidField {
                 field: "automation.schedule.normalization_receipt",

@@ -40,8 +40,7 @@ pub const USER_AUTOMATION_SCOPE: &str = "user-automation";
 /// Revision required by the deterministic preflight contract.
 pub const USER_AUTOMATION_PREFLIGHT_CONTRACT_REVISION: &str = "eliot.user-automation.preflight.v1";
 /// Canonical operation kind for schedule normalization receipts.
-pub const USER_AUTOMATION_NORMALIZATION_OPERATION_KIND: &str =
-    "user-automation.schedule.normalize";
+pub const USER_AUTOMATION_NORMALIZATION_OPERATION_KIND: &str = "user-automation.schedule.normalize";
 /// Stable service authority that owns schedule normalization.
 pub const USER_AUTOMATION_NORMALIZATION_AUTHORITY_ID: &str =
     "eliot-user-automation:schedule-normalizer";
@@ -281,21 +280,22 @@ pub struct NormalizedSchedule {
     /// Bounded, chronologically ordered owner-normalized occurrences in the
     /// [`NORMALIZED_OCCURRENCE_ENCODING`] encoding.
     pub next_occurrences: Vec<String>,
-    /// Required receipt projection linking `next_occurrences` to a compiled
-    /// result for this schedule's declared trigger contract.
-    ///
-    /// This field is REQUIRED and it has no default, so every revision stored
-    /// before contract 1.2.0 fails to decode rather than being silently
-    /// certified under the stronger contract. A missing projection therefore
-    /// requires re-normalization into a new immutable revision. This required
-    /// field is a storage-shape guarantee only; preflight validates the retained
-    /// envelope and the Store owns authenticated compiler issuance.
+    /// Store-issued receipt projection linking `next_occurrences` to a compiled
+    /// result for this schedule's declared trigger contract. Create/Edit wire
+    /// drafts may omit it: serde materializes the all-empty draft sentinel below
+    /// and omits that sentinel again when serializing. Strict revision validation
+    /// rejects the sentinel, so the Store must replace it after compilation and
+    /// before persistence; preflight also validates the retained envelope.
     ///
     /// It is boxed because `NormalizedSchedule` is reachable by value from
     /// `UserAutomationOperation`, and inlining it would grow that enum past the
     /// existing `large_enum_variant` threshold. The box is a layout detail only:
-    /// serde encodes a boxed value exactly as the unboxed one, so the wire format
-    /// and the required-field decode behavior are unchanged.
+    /// serde encodes a boxed value exactly as the unboxed one, so issued receipt
+    /// wire values are unchanged.
+    #[serde(
+        default,
+        skip_serializing_if = "ScheduleNormalizationReceipt::is_unissued_draft_projection"
+    )]
     pub normalization_receipt: Box<ScheduleNormalizationReceipt>,
 }
 
@@ -305,7 +305,7 @@ pub struct NormalizedSchedule {
 /// the ordered set and checks it against the retained envelope. That content
 /// binding is not a signature or proof that compilation occurred: the Store
 /// producer must issue the envelope only after an authenticated compiler result.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScheduleNormalizationReceipt {
     /// Content identity of the [`ReceiptEnvelope`] retained for this result.
@@ -344,6 +344,16 @@ pub struct ScheduleNormalizationReceipt {
     /// release and table digest, and the occurrences IN ORDER. Reordering or
     /// substituting a member changes it.
     pub occurrences_digest: String,
+}
+
+impl ScheduleNormalizationReceipt {
+    fn is_unissued_draft_projection(&self) -> bool {
+        self.receipt_id.is_empty()
+            && self.normalizer_authority.is_empty()
+            && self.source_digest.is_empty()
+            && self.zone_database_revision.is_empty()
+            && self.occurrences_digest.is_empty()
+    }
 }
 
 impl NormalizedSchedule {
@@ -485,11 +495,11 @@ impl NormalizedSchedule {
 
     /// Validates the semantic bindings carried by one schedule receipt envelope.
     ///
-    /// ReceiptEnvelope's content identity only proves that the serialized core
+    /// `ReceiptEnvelope`'s content identity only proves that the serialized core
     /// is unchanged. The Store must bind these fields from its authenticated
     /// compiler result; this check rejects stale, unrelated or incomplete
     /// envelopes without treating text or a digest as issuer authentication.
-    /// The artifact and WorkScope must name the exact immutable revision. The
+    /// The artifact and `WorkScope` must name the exact immutable revision. The
     /// normalization fence remains historical and is checked only for internal
     /// consistency, never against a later wake.
     fn validate_normalization_receipt_envelope(
@@ -601,6 +611,9 @@ impl NormalizedSchedule {
     /// revision/scope, zone release and occurrence artifact together.
     fn require_normalization_receipt(&self) -> Result<(), UserAutomationError> {
         let receipt = &self.normalization_receipt;
+        if receipt.is_unissued_draft_projection() {
+            return Err(UserAutomationError::ReceiptBinding);
+        }
         if receipt.source_digest != self.source_digest()? {
             return Err(UserAutomationError::Invalid(
                 "schedule.normalization_receipt.source_digest",
@@ -737,6 +750,20 @@ impl NormalizedSchedule {
     pub fn validate_normalized_occurrences(&self) -> Result<(), UserAutomationError> {
         self.normalized_occurrences()?;
         Ok(())
+    }
+
+    /// Validates occurrences for a Create/Edit draft before Store compilation.
+    ///
+    /// A missing receipt sentinel skips only the receipt-to-occurrence digest
+    /// check; a supplied projection and every schedule occurrence are still
+    /// validated. Persisted revisions must use `validate_normalized_occurrences`.
+    fn validate_for_normalization_submission(&self) -> Result<(), UserAutomationError> {
+        if self.normalization_receipt.is_unissued_draft_projection() {
+            self.validated_occurrences_without_receipt()?;
+            Ok(())
+        } else {
+            self.validate_normalized_occurrences()
+        }
     }
 
     /// Returns whether one calendar occurrence belongs to this revision's
@@ -1913,6 +1940,22 @@ pub struct UserAutomationRevision {
 impl UserAutomationRevision {
     /// Validates the immutable revision and all nested owner projections.
     pub fn validate(&self) -> Result<(), UserAutomationError> {
+        self.validate_with_schedule_receipt(true)
+    }
+
+    /// Validates an unpersisted Create/Edit revision before Store compilation.
+    ///
+    /// This applies the same revision, scope, task and capability checks as
+    /// `validate`, while allowing only the schedule receipt sentinel to defer
+    /// its binding until the Store issues the compiled receipt.
+    pub fn validate_for_normalization_submission(&self) -> Result<(), UserAutomationError> {
+        self.validate_with_schedule_receipt(false)
+    }
+
+    fn validate_with_schedule_receipt(
+        &self,
+        require_schedule_receipt: bool,
+    ) -> Result<(), UserAutomationError> {
         text(&self.automation_id, "automation_id")?;
         text(&self.revision, "revision")?;
         if self.supersedes.as_deref() == Some(self.revision.as_str()) {
@@ -1921,7 +1964,11 @@ impl UserAutomationRevision {
         text(&self.owner_principal, "owner_principal")?;
         self.work_scope.validate()?;
         text(&self.natural_language_intent, "natural_language_intent")?;
-        self.schedule.validate_normalized_occurrences()?;
+        if require_schedule_receipt {
+            self.schedule.validate_normalized_occurrences()?;
+        } else {
+            self.schedule.validate_for_normalization_submission()?;
+        }
         self.task.validate()?;
         list_text(
             &self.portable_skill_package_revision_refs,
@@ -2001,6 +2048,22 @@ impl UserAutomationRevision {
         old: &UserAutomationRevision,
     ) -> Result<(), UserAutomationError> {
         self.validate()?;
+        old.validate()?;
+        if self.automation_id != old.automation_id
+            || self.revision == old.revision
+            || self.supersedes.as_deref() != Some(old.revision.as_str())
+        {
+            return Err(UserAutomationError::InvalidSupersession);
+        }
+        Ok(())
+    }
+
+    /// Validates Edit input whose replacement schedule awaits Store issuance.
+    pub fn validate_supersedes_for_normalization_submission(
+        &self,
+        old: &UserAutomationRevision,
+    ) -> Result<(), UserAutomationError> {
+        self.validate_for_normalization_submission()?;
         old.validate()?;
         if self.automation_id != old.automation_id
             || self.revision == old.revision
@@ -3064,11 +3127,10 @@ impl UserAutomationPreflightProjection {
             .iter()
             .find(|candidate| candidate.identity.receipt_id.as_str() == declared.receipt_id)
             .ok_or(UserAutomationError::ReceiptBinding)?;
-        assembly.revision.schedule.validate_normalization_receipt_envelope(
-            declared,
-            envelope,
-            assembly.revision,
-        )
+        assembly
+            .revision
+            .schedule
+            .validate_normalization_receipt_envelope(declared, envelope, assembly.revision)
     }
 
     /// Requires the evidence completeness the reported configuration state
@@ -3622,6 +3684,19 @@ impl UserAutomationOperation {
             }
         }
     }
+
+    /// Validates operator input before the Store compiles a Create/Edit schedule.
+    /// All other operation variants retain their ordinary strict validation.
+    pub fn validate_for_normalization_submission(&self) -> Result<(), UserAutomationError> {
+        match self {
+            Self::Create { revision } => revision.validate_for_normalization_submission(),
+            Self::Edit {
+                previous_revision,
+                revision,
+            } => revision.validate_supersedes_for_normalization_submission(previous_revision),
+            _ => self.validate(),
+        }
+    }
 }
 
 /// Authenticated Human operator intent; the owner service persists it through
@@ -3648,6 +3723,17 @@ impl UserAutomationOperatorIntent {
             .validate()
             .map_err(|_| UserAutomationError::Invalid("intent.state_fence"))?;
         self.operation.validate()
+    }
+
+    /// Validates an operator submission while deferring only an unissued
+    /// Create/Edit schedule receipt to the Store compiler.
+    pub fn validate_for_normalization_submission(&self) -> Result<(), UserAutomationError> {
+        text(&self.intent_id, "intent_id")?;
+        text(&self.principal_ref, "principal_ref")?;
+        self.state_fence
+            .validate()
+            .map_err(|_| UserAutomationError::Invalid("intent.state_fence"))?;
+        self.operation.validate_for_normalization_submission()
     }
 }
 
