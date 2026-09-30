@@ -12,8 +12,9 @@
 
 use eliot_context_contracts::{
     AdmissionInput, AdmissionMeasurement, AdmissionRuleIdentity, ContextBinding,
-    ContextCandidateSet, ContextError, ContextRecipe, MeasurementCompositionProfile,
-    PriorityPolicyIdentity, SafetyFloorIdentity, SuppliedOmissionBinding,
+    ContextCandidateSet, ContextError, ContextRecipe, ContextRecipePolicy,
+    MeasurementCompositionProfile, PriorityPolicyIdentity, SafetyFloorIdentity,
+    SuppliedOmissionBinding,
 };
 use eliot_contracts::ContractVersion;
 
@@ -28,6 +29,13 @@ pub struct ClosureParts {
     pub binding: ContextBinding,
     /// Immutable context recipe with capacity and role policies.
     pub recipe: ContextRecipe,
+    /// The approved policy revision this recipe instance was issued under.
+    ///
+    /// Carried verbatim or not at all: the assembler never resolves a catalogue,
+    /// never selects a revision and never defaults a section budget. An
+    /// `AdmissionInput` built without it carries no approved budget record,
+    /// which is the truthful state rather than a synthesized one.
+    pub approved_policy: Option<ContextRecipePolicy>,
     /// Candidate set with its provider denominator.
     pub candidates: ContextCandidateSet,
     /// Safety-floor identity with the mandatory floor.
@@ -56,6 +64,7 @@ pub fn assemble_closure(parts: ClosureParts) -> Result<AdmissionInput, ContextEr
         schema_version: parts.schema_version,
         binding: parts.binding,
         recipe: parts.recipe,
+        approved_policy: parts.approved_policy,
         candidates: parts.candidates,
         learning_tickets: Vec::new(),
         floor: parts.floor,

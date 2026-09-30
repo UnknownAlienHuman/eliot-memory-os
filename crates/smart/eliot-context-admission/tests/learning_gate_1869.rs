@@ -286,6 +286,7 @@ fn input_with_learning(task: &str, permit_digest: &str, expires: Option<u64>) ->
         schema_version: CONTEXT_CONTRACT_VERSION,
         binding: context.clone(),
         recipe: recipe.clone(),
+        approved_policy: None,
         candidates: ContextCandidateSet {
             binding: context.clone(),
             candidates: vec![required.clone(), learning.clone()],

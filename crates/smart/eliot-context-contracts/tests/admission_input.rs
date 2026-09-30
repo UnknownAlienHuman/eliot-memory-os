@@ -152,6 +152,7 @@ fn input() -> AdmissionInput {
         schema_version: CONTEXT_CONTRACT_VERSION,
         binding: context.clone(),
         recipe: recipe.clone(),
+        approved_policy: None,
         candidates: ContextCandidateSet {
             binding: context.clone(),
             candidates: vec![candidate],
