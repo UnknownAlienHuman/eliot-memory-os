@@ -3731,16 +3731,30 @@ impl KernelComposition {
             self.clear_pending_result_binding(&body.operation_id);
         }
         // I7.24 (#1945): advance the evaluated exposure receipt through its
-        // measured stages for this persisted completion. Observational only:
-        // every missing input or failed transition skips recording inside
-        // the call, so the submit disposition and the durability contract
+        // measured stages for this persisted completion, and retain the
+        // completed receipt on the durable operation row it evidences —
+        // never dropped. Observational only: every missing input, failed
+        // transition, or failed attach inside the two calls leaves the
+        // submit disposition and the durability contract unchanged, so they
         // never gain a receipt-shaped failure mode.
-        advance_tool_exposure_receipt_for_persisted_result(
+        if let Some(receipt) = advance_tool_exposure_receipt_for_persisted_result(
             queue,
             queued_envelope.as_ref(),
             queued_tool.as_ref(),
             &persisted,
-        );
+        ) {
+            match self
+                .generation_gateway
+                .ors
+                .record_host_request_tool_exposure_receipt(
+                    &operation_id,
+                    &persisted.request_digest,
+                    &receipt,
+                ) {
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
         // The single completion consumes the attempt use budget: retire the
         // pair in the same queue ledger that authorized it so no later claim
         // or submit can reuse this generation.
@@ -3780,30 +3794,34 @@ impl KernelComposition {
 /// route tokenizer owner exists.
 ///
 /// Observational only and infallible by construction: every missing input
-/// or failed transition returns early, so the submit disposition and the
-/// durability contract never gain a receipt-shaped failure mode.
+/// or failed transition returns `None`, so the submit disposition and the
+/// durability contract never gain a receipt-shaped failure mode. A returned
+/// receipt is passed by the caller into the durable operation row it
+/// evidences — never dropped.
+/// Returns the completed receipt for retention, or `None` when there is
+/// nothing to retain.
 fn advance_tool_exposure_receipt_for_persisted_result(
     queue: DaemonReadQueue,
     envelope: Option<&HostRequestEnvelope>,
     tool: Option<&serde_json::Value>,
     persisted: &HostRequestRecord,
-) {
+) -> Option<eliot_receipts::ToolExposureReceiptV2> {
     let (Some(envelope), Some(tool)) = (envelope, tool) else {
-        return;
+        return None;
     };
     let Ok(admission) = check_local_read_admission(envelope, tool) else {
-        return;
+        return None;
     };
     let Some(request) = super::tool_exposure::build_tool_call_request(envelope, tool, &admission)
     else {
-        return;
+        return None;
     };
     let operation = persisted.operation_id.as_str();
     let (Some(digest), Some(response)) = (
         persisted.result_digest.as_deref(),
         persisted.result_response.as_ref(),
     ) else {
-        return;
+        return None;
     };
     let Ok(delivered) = super::tool_exposure::observe_persisted_delivery(
         &request,
@@ -3812,7 +3830,7 @@ fn advance_tool_exposure_receipt_for_persisted_result(
         response,
         operation.to_owned(),
     ) else {
-        return;
+        return None;
     };
     // Observable use is lane-measured: only the campaign-packet lane feeds
     // result content into an owner decision (the campaign-view verification
@@ -3834,9 +3852,11 @@ fn advance_tool_exposure_receipt_for_persisted_result(
         }
     };
     // Terminal outcome names the durable completion coordinates from the
-    // ORS owner's persisted record, never caller prose.
+    // ORS owner's persisted record, never caller prose. The completed
+    // receipt is returned for retention on the durable operation row —
+    // never dropped.
     let terminal_ref = format!("host-request-result-received:{operation}:{digest}");
-    let _terminal = used.record_terminal_outcome(terminal_ref);
+    used.record_terminal_outcome(terminal_ref).ok()
 }
 
 /// Closed capability admitted to the observe queue (issue #2565: one
