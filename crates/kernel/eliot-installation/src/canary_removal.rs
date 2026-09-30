@@ -851,7 +851,7 @@ impl CanaryRemovalOperation {
         {
             return Err(InstallationError::IdentityConflict);
         }
-        if self.stage != self.derived_stage()? {
+        if self.stage != self.derived_stage() {
             return Err(InstallationError::IdentityConflict);
         }
         Ok(())
@@ -901,7 +901,7 @@ impl CanaryRemovalOperation {
     /// `Remove` row's exact postcondition was observed from its own owner and
     /// that no `Remove` row is still open - never that a retained resource was
     /// removed.
-    fn derived_stage(&self) -> Result<CanaryRemovalStage, InstallationError> {
+    fn derived_stage(&self) -> CanaryRemovalStage {
         let mut open = 0_usize;
         let mut unknown = 0_usize;
         let mut started = 0_usize;
@@ -961,7 +961,7 @@ impl CanaryRemovalOperation {
         } else {
             CanaryRemovalStage::Admitted
         };
-        Ok(expected)
+        expected
     }
 
     fn project(&self) -> CanaryRemovalStatus {
@@ -2593,7 +2593,7 @@ fn resolve_terminal_registry_absence(
         evidence,
     };
     operation.blocking_effect_id = None;
-    operation.stage = operation.derived_stage()?;
+    operation.stage = operation.derived_stage();
     operation.revision = next_revision(expected.revision)?;
     operation.validate()?;
     store.compare_and_save_canary_removal_operation(&expected, operation)
@@ -2947,7 +2947,7 @@ fn commit_intent(
         intent_digest,
     };
     operation.plan.effects[position].bound = attempt;
-    operation.stage = operation.derived_stage()?;
+    operation.stage = operation.derived_stage();
     operation.revision = next_revision(expected.revision)?;
     operation.validate()?;
     store.compare_and_save_canary_removal_operation(&expected, operation)
@@ -2977,7 +2977,7 @@ fn resolve_row(
         .iter()
         .find(|progress| effect_state_is_unknown(&progress.state))
         .map(|progress| progress.effect_id.clone());
-    operation.stage = operation.derived_stage()?;
+    operation.stage = operation.derived_stage();
     operation.revision = next_revision(expected.revision)?;
     operation.validate()?;
     store.compare_and_save_canary_removal_operation(&expected, operation)
