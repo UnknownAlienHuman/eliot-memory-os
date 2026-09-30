@@ -2256,6 +2256,9 @@ pub fn admit_bootstrap_context(
 /// A moved task, scope, fence, bootstrap/profile revision, or re-projected
 /// bootstrap conflicts for rebind; it is never rewritten
 /// under the old operation identity.
+/// Only bootstrap provenance participates in this join. A live task selection
+/// retains its opaque Governor owner binding and uses the dedicated live
+/// selection revalidation gate.
 ///
 /// Cold/unbound and non-task-relative admissions carry no sealed identity and
 /// pass through untouched. This entry mints nothing and selects nothing.
@@ -2269,6 +2272,26 @@ pub fn require_material_bootstrap_for_task_bound(
     binding: &DispatchedBinding,
     bootstrap: &BootstrapAdmission,
 ) -> Result<(), TaskBindingError> {
+    let (
+        admitted_receipt_revision,
+        admitted_governance_profile_ref,
+        admitted_projection_generation,
+    ) = match &binding.provenance {
+        DispatchedBindingProvenance::Bootstrap {
+            receipt_revision,
+            governance_profile_ref,
+            projection_generation,
+        } => (
+            *receipt_revision,
+            governance_profile_ref.as_str(),
+            *projection_generation,
+        ),
+        DispatchedBindingProvenance::LiveTaskSelection(_) => {
+            return Err(TaskBindingError::selection_required(
+                "live TaskSelection dispatch requires exact Governor owner revalidation",
+            ));
+        }
+    };
     let material = match bootstrap {
         BootstrapAdmission::Material(material) => material,
         BootstrapAdmission::Diagnostic { reason, .. } => {
@@ -2297,8 +2320,8 @@ pub fn require_material_bootstrap_for_task_bound(
             "task-bound dispatch bootstrap was assembled at another fence; rebind at the live fence, no silent rebind",
         ));
     }
-    if material.receipt_revision != binding.receipt_revision
-        || material.governance_profile_ref != binding.governance_profile_ref
+    if material.receipt_revision != admitted_receipt_revision
+        || material.governance_profile_ref != admitted_governance_profile_ref
     {
         return Err(TaskBindingError::scope_incompatible(
             "task-bound dispatch bootstrap/profile revision moved before effect; rebind at the live revision, no silent rebind",
@@ -2307,7 +2330,7 @@ pub fn require_material_bootstrap_for_task_bound(
     // A re-projected bootstrap under the same receipt revision still conflicts
     // for rebind: the admitted projection is never silently adopted under the
     // old operation identity.
-    if material.projection_generation != binding.projection_generation {
+    if material.projection_generation != admitted_projection_generation {
         return Err(TaskBindingError::scope_incompatible(
             "task-bound dispatch bootstrap was re-projected before effect; rebind at the live projection, no silent adoption",
         ));
