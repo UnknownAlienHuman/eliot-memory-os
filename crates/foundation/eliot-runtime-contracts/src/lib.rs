@@ -126,7 +126,7 @@ pub use restart_policy::{
     RestartIntensityPolicy, RestartInvalidationTrigger, RestartOperationIdentity,
     RestartOwnerLifecycle, RestartPolicyAdmissionBinding, RestartPolicyDisposition,
     RestartPolicyError, RestartPolicyV1, RestartReservation, decide_automatic_restart,
-    dispose_restart_policy,
+    decide_restart_class, dispose_restart_policy,
 };
 pub use runtime_live::{
     RUNTIME_LIVE_STORE_BIND, RUNTIME_LIVE_STORE_ENDPOINT, RUNTIME_LIVE_STORE_NAMESPACE,

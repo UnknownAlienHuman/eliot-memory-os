@@ -17,15 +17,17 @@ use eliot_platform_windows::{
     current_process_named_pipe_expectation, observe_named_pipe_peer_process,
 };
 use eliot_process::{
-    CancellationStatus, Generation, ProcessExecutionError, ProcessLifecycle, ProcessOwnerBinding,
-    ProcessStartReceipt,
+    CancellationStatus, Generation, ProcessExecutionError, ProcessExecutionView,
+    ProcessLifecycle, ProcessOwnerBinding, ProcessStartReceipt,
 };
+use eliot_runtime_contracts::AutomaticRestartDecision;
 
 use super::diagnostic_brief::DiagnosticTrigger;
 use super::kernel_audit::{AuditEventDraft, AuditEventKind};
 use super::{
-    ACTIVE_DAEMON_CALLER, DaemonRuntimeStatus, ELIOTD_MAX_RECOVERY_ATTEMPTS, KernelBuildError,
-    KernelComposition, daemon_status_proves_ready, eliotd_launch_attempt_identity,
+    ACTIVE_DAEMON_CALLER, DaemonRuntimeStatus, ELIOTD_MAX_RECOVERY_ATTEMPTS,
+    ELIOTD_RESTART_CLASS, KernelBuildError, KernelComposition, daemon_automatic_restart_decision,
+    daemon_restart_decision_reason, daemon_status_proves_ready, eliotd_launch_attempt_identity,
     eliotd_operation_id, fresh_eliotd_launch_descriptor, probe_ready_state_admitted, sha256_hex,
     stable_owner_principal_digest,
 };
@@ -215,7 +217,7 @@ impl KernelComposition {
         &self,
         launch: &EliotdLaunchDescriptor,
         receipt: &ProcessStartReceipt,
-    ) -> Result<(), KernelBuildError> {
+    ) -> Result<ProcessExecutionView, KernelBuildError> {
         let gateway = self.process_gateway.as_ref().ok_or_else(|| {
             KernelBuildError::Service(
                 "process authority is required for eliotd recovery".to_owned(),
@@ -289,10 +291,12 @@ impl KernelComposition {
         }
         match view.lifecycle() {
             ProcessLifecycle::Exited | ProcessLifecycle::Failed | ProcessLifecycle::Reconciled => {
-                self.reconcile_closed_daemon_process(gateway, &owner, launch, receipt)
+                let closed = self
+                    .reconcile_closed_daemon_process(gateway, &owner, launch, receipt)
                     .await?;
                 self.close_restarted_daemon_descendant(gateway, &owner, receipt)
-                    .await
+                    .await?;
+                Ok(closed)
             }
             ProcessLifecycle::Running => {
                 let cancellation = gateway
@@ -304,15 +308,15 @@ impl KernelComposition {
                         "eliotd previous process cancellation binding changed".to_owned(),
                     ));
                 }
-                let closed = gateway
+                let cancelled = gateway
                     .inspect(&owner, receipt.operation_id().clone())
                     .await
                     .map_err(|error| KernelBuildError::Service(error.to_string()))?;
-                if closed.binding() != receipt.binding()
-                    || closed.identity() != Some(receipt.identity())
-                    || closed.lifecycle() != ProcessLifecycle::Exited
-                    || closed.cancellation() != CancellationStatus::Completed
-                    || !closed.descendants().is_some_and(|descendants| {
+                if cancelled.binding() != receipt.binding()
+                    || cancelled.identity() != Some(receipt.identity())
+                    || cancelled.lifecycle() != ProcessLifecycle::Exited
+                    || cancelled.cancellation() != CancellationStatus::Completed
+                    || !cancelled.descendants().is_some_and(|descendants| {
                         descendants.complete() && descendants.tree_terminated()
                     })
                 {
@@ -320,10 +324,12 @@ impl KernelComposition {
                         "eliotd previous process tree closure was not proven".to_owned(),
                     ));
                 }
-                self.reconcile_closed_daemon_process(gateway, &owner, launch, receipt)
+                let closed = self
+                    .reconcile_closed_daemon_process(gateway, &owner, launch, receipt)
                     .await?;
                 self.close_restarted_daemon_descendant(gateway, &owner, receipt)
-                    .await
+                    .await?;
+                Ok(closed)
             }
             ProcessLifecycle::Quarantined => {
                 // Issue #1839 (I16.4 quarantine): the previous lineage is
@@ -386,7 +392,7 @@ impl KernelComposition {
         owner: &ProcessOwnerBinding,
         launch: &EliotdLaunchDescriptor,
         receipt: &ProcessStartReceipt,
-    ) -> Result<(), KernelBuildError> {
+    ) -> Result<ProcessExecutionView, KernelBuildError> {
         let evidence = match gateway
             .reconcile(owner, receipt.operation_id().clone())
             .await
@@ -455,7 +461,10 @@ impl KernelComposition {
                     "eliotd supervised generation is not the active daemon route: {error}"
                 ))
             })?;
-        Ok(())
+        // The reconciled terminal view is returned so the caller's declared
+        // restart class is evaluated against the exact exit evidence the
+        // process owner recorded for this generation, not against a guess.
+        Ok(evidence.view().clone())
     }
 
     /// Performs one Kernel-owned bounded recovery of a failed daemon
@@ -563,9 +572,32 @@ impl KernelComposition {
             ));
             return Err(self.daemon_failure_error(reason));
         }
+        // The declared restart class (I14.10) is decided on the exact
+        // reconciled evidence of the generation being replaced: after its
+        // process is proven terminal and before any replacement is launched.
+        // An exit the process owner could not classify is not read as a
+        // normal exit here and cannot buy a replacement.
         if let Some(receipt) = previous_receipt.as_ref() {
-            if let Err(error) = self.close_previous_daemon_process(&launch, receipt).await {
-                return Err(self.daemon_failure_error(error.to_string()));
+            let closed = match self.close_previous_daemon_process(&launch, receipt).await {
+                Ok(closed) => closed,
+                Err(error) => return Err(self.daemon_failure_error(error.to_string())),
+            };
+            let decision = daemon_automatic_restart_decision(
+                ELIOTD_RESTART_CLASS,
+                service_state,
+                &status,
+                &closed,
+            );
+            observe_daemon_runtime(
+                "kernel.daemon.restart_class_decided",
+                daemon_restart_decision_reason(decision),
+            );
+            if decision != AutomaticRestartDecision::Eligible {
+                let reason = format!(
+                    "eliotd declared restart class refused a replacement: {}",
+                    daemon_restart_decision_reason(decision)
+                );
+                return Err(self.daemon_failure_error(reason));
             }
         } else if !matches!(
             status,
