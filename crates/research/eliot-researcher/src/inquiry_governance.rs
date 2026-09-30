@@ -4138,11 +4138,7 @@ impl EvidenceFreeze {
         // under one identity. Counted as well as itemised, so a receipt list that
         // gained or lost an entry cannot be spelled the same way as one that
         // reordered them.
-        push_count(
-            &mut preimage,
-            "member_receipts",
-            self.member_receipts.len(),
-        );
+        push_count(&mut preimage, "member_receipts", self.member_receipts.len());
         for receipt in &self.member_receipts {
             receipt.push_into(&mut preimage);
         }
@@ -4257,7 +4253,10 @@ impl EvidenceFreeze {
             .iter()
             .zip(self.member_receipts.iter())
         {
-            require_text(receipt.source_handle.as_str(), "freeze.receipt.source_handle")?;
+            require_text(
+                receipt.source_handle.as_str(),
+                "freeze.receipt.source_handle",
+            )?;
             require_digest(&receipt.admission_digest, "freeze.receipt.admission_digest")?;
             require_digest(&receipt.content_digest, "freeze.receipt.content_digest")?;
             require_digest(

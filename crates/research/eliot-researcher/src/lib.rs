@@ -72,12 +72,12 @@ pub use inquiry_governance::{
     FreezeMemberReceipt, GovernorInquiryAdmissionRequest, HypothesisPolicy,
     IndependenceBlindingPolicy, IndependenceDimension, IndependenceDimensionMeasurement,
     IndependenceProfile, InquiryError, InquiryGovernance, InquiryHorizon, InquiryLane,
-    InquiryObservation, InquiryOutputContract,
-    InquiryProtocol, InquiryProtocolProfile, InquiryRisk, InquirySelectionFeatures,
-    InquiryStopRule, InquiryTerminalRecord, InquiryUncertainty, LaneDisciplineOutcome,
-    MissingSourceClass, PreservedNextProbe, PreservedUnknown, ReopenCondition, ResearchDebt,
-    ResearchDebtKind, ResearchDebtRestriction, SourcePortfolio, SpecialistDiscoverability,
-    StopRuleKind, StreamEvidence, UnadmittedReference, UnadmittedReferenceKind, VerifierStrength,
+    InquiryObservation, InquiryOutputContract, InquiryProtocol, InquiryProtocolProfile,
+    InquiryRisk, InquirySelectionFeatures, InquiryStopRule, InquiryTerminalRecord,
+    InquiryUncertainty, LaneDisciplineOutcome, MissingSourceClass, PreservedNextProbe,
+    PreservedUnknown, ReopenCondition, ResearchDebt, ResearchDebtKind, ResearchDebtRestriction,
+    SourcePortfolio, SpecialistDiscoverability, StopRuleKind, StreamEvidence, UnadmittedReference,
+    UnadmittedReferenceKind, VerifierStrength,
 };
 pub use inquiry_lanes::{
     AttemptOutcome, AttemptRecord, AttemptRecordParams, BlindedDelivery, BlindedDeliveryParams,
