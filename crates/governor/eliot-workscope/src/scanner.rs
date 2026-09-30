@@ -1714,6 +1714,20 @@ pub fn run_bootstrap_discovery(
         discovery.governing_source_refs.clone(),
         discovery.now,
     )?;
+    complete_with_replay(store, binding, outcome)
+}
+
+/// Replays a completed scan's persisted receipt through the same owner before
+/// return (issue #1788 W5): the persisted handle is read back under the same
+/// binding and its receipt identity is compared against this operation's
+/// receipt, so a missing, inaccessible, corrupt, replaced, stale,
+/// invalidated or unknown-commit record surfaces its typed cause instead of
+/// a completed outcome.
+fn complete_with_replay(
+    store: &mut (dyn ScanDisclosureStore + '_),
+    binding: &ScanDisclosureOwnerBinding,
+    outcome: BootstrapScanOutcome,
+) -> Result<BootstrapScanOutcome, WorkScopeError> {
     match outcome {
         BootstrapScanOutcome::Completed {
             profile,
