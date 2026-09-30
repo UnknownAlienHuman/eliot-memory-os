@@ -1181,16 +1181,35 @@ impl DispatchValidationPort for DispatchCell {
 /// crosses the one executor composition below.
 struct StageExecutor {
     cell: Arc<DispatchCell>,
+    /// The ONE physical executor every lifecycle call of this owner crosses.
+    ///
+    /// `WindowsProcessExecutor` owns the operation registry as an instance
+    /// field, so the registry that records a `start` must be the same instance
+    /// a later `inspect`, `cancel` or `reconcile` reads. Constructing one per
+    /// call discards the registration with the temporary, and the follow-up
+    /// call is then refused as `NotFound` against an empty registry — which is
+    /// a true statement about the wrong executor, not about the operation.
+    ///
+    /// The `cell` is retained so the `Arc<dyn DispatchValidationPort>` this
+    /// executor holds and the cell this owner seals its one-shot permits under
+    /// remain the same value; the constructor deliberately clones the `Arc`
+    /// rather than constructing the port from a second cell.
+    executor: WindowsProcessExecutor,
 }
 
 impl StageExecutor {
     fn with(cell: Arc<DispatchCell>) -> Self {
-        Self { cell }
+        Self {
+            executor: WindowsProcessExecutor::new(
+                Arc::clone(&cell) as Arc<dyn DispatchValidationPort>,
+            ),
+            cell,
+        }
     }
 
     /// The P-07 authority composition every lifecycle call crosses.
-    fn executor(&self) -> WindowsProcessExecutor {
-        WindowsProcessExecutor::new(Arc::clone(&self.cell) as Arc<dyn DispatchValidationPort>)
+    fn executor(&self) -> &WindowsProcessExecutor {
+        &self.executor
     }
 }
 

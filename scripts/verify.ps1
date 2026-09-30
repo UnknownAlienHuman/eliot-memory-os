@@ -710,15 +710,16 @@ try {
 }
 Write-Host "VERIFY_PROFILE_ALIAS: $verificationRouteAlias exit=$resolverExit"
 # A refused local/CI parity comparison is a refusal, not a report. The resolver
-# already exits nonzero for both a non-PASS aggregate and a non-PASS parity
-# verdict (see src/bin/eliot-profile-resolver.rs run()/
-# require_receipt_parity), so the comparison and this run's own outcome are one
-# decision over one receipt value. This guard is what makes a non-PASS
-# comparison stop the run instead of being recorded beside gates that then
-# execute anyway: the resolver's `PARITY_NON_PASS reason=...` line above is the
-# reason, and this exit is the refusal.
-if ($resolverExit -ne 0) {
-    [Console]::Error.WriteLine("VERIFY_PROFILE_ADMISSION_REFUSED: the shared resolver refused profile '$verificationRouteAlias' (exit $resolverExit); the PARITY_NON_PASS line above, if any, is the exact local/CI divergence it compared, and no gate ran under a refused profile revision.")
+# exits nonzero for a non-PASS parity verdict (see
+# src/bin/eliot-profile-resolver.rs run()/require_receipt_parity), and that
+# exit is a refusal of THIS RUN's outcome — the same decision the run's own
+# non-PASS aggregate already takes. The receipt is still the admission
+# evidence, so a route that issued one and reported a non-PASS outcome keeps
+# that receipt and is reported below rather than refused here: this script
+# records the resolver's outcome, and the gates read the outcome out of the
+# receipt instead of out of an exit code.
+if ($resolverExit -ne 0 -and -not (Test-Path -LiteralPath $profileReceiptPath -PathType Leaf)) {
+    [Console]::Error.WriteLine("VERIFY_PROFILE_ADMISSION_REFUSED: the shared resolver refused profile '$verificationRouteAlias' (exit $resolverExit) and issued no VerificationProfileReceipt, so no gate ran under an unadmitted profile revision.")
     exit 1
 }
 if (-not (Test-Path -LiteralPath $profileReceiptPath -PathType Leaf)) {
@@ -750,9 +751,10 @@ if ($profileReceipt.profile -ne $expectedRoute) {
 # non-PASS outcome with a zero exit is therefore impossible by construction, so
 # there is no "disagreement" branch to warn on here: adding one would be a check
 # that can never fire. A genuinely non-PASS outcome arrives as a nonzero
-# resolver exit, is refused above before any gate ran, and is surfaced verbatim
-# in the VERIFY_PROFILE_ALIAS and VERIFY_PROFILE_REVISION lines below; a route
-# that could not be admitted at all issues no receipt and is refused above.
+# resolver exit, is surfaced verbatim in the VERIFY_PROFILE_ALIAS and
+# VERIFY_PROFILE_REVISION lines below, and fails the run through the profile's
+# own nonpass policy; a route that could not be admitted at all issues no
+# receipt and is refused above.
 Write-Host "VERIFY_PROFILE_REVISION: $($profileReceipt.profile)@$($profileReceipt.profile_revision) schema=$($profileReceipt.schema.schema)@$($profileReceipt.schema.version) outcome=$($profileReceipt.outcome)"
 foreach ($identity in @($profileReceipt.tool_identities)) {
     Write-Host "VERIFY_PROFILE_TOOL: $($identity.stage_id) instrument=$($identity.instrument) executable=$($identity.executable) sha256=$($identity.executable_digest)"
@@ -765,12 +767,26 @@ foreach ($dependency in @($profileReceipt.environment_dependencies)) {
 # rather than left to a reader who has to notice whether a counterpart receipt
 # was supplied at all. The verdict itself is the resolver's `PARITY_PASS` /
 # `PARITY_NON_PASS` line above and nothing here recomputes it.
+#
+# A supplied comparison that did NOT pass is a refusal, and it is refused HERE,
+# before any gate executes. This is the one place the parity verdict becomes a
+# run decision: the resolver already refused it with its own nonzero exit, but a
+# nonzero exit is also how this run's own non-PASS aggregate and a
+# route-that-could-not-admit are reported, so the exit alone cannot say WHICH of
+# those happened. The receipt is the discriminator — it exists only when the
+# route was admitted, so "a receipt exists AND a comparison was requested AND
+# the resolver refused" is exactly "the comparison refused", and a
+# non-comparison or an admitted non-PASS run is never caught by it.
 $profileParitySummary = if ([string]::IsNullOrWhiteSpace($CompareProfileReceipt)) {
     'not compared; no -CompareProfileReceipt was supplied, so this run reports its own profile revision without a counterpart verdict'
 } else {
-    "compared against $CompareProfileReceipt through the shared verify_profile_parity owner (resolver exit $resolverExit); a non-PASS verdict refused this run before any gate executed"
+    "compared against $CompareProfileReceipt through the shared verify_profile_parity owner (resolver exit $resolverExit)"
 }
 Write-Host "VERIFY_PROFILE_PARITY: $profileParitySummary"
+if (-not [string]::IsNullOrWhiteSpace($CompareProfileReceipt) -and $resolverExit -ne 0) {
+    [Console]::Error.WriteLine("VERIFY_PROFILE_PARITY_REFUSED: the local/CI parity comparison against '$CompareProfileReceipt' reported non-PASS (resolver exit $resolverExit); the VERIFY_PROFILE_PARITY line above names the comparison and the resolver's own line names the divergence, and no gate ran under a refused parity verdict.")
+    exit 1
+}
 
 # Exact already-produced run evidence reused for the summary denominator.
 $script:verifyMetadataJson = ''
