@@ -3270,48 +3270,54 @@ fn resolve_valid_ticket(
             )
         })?;
         let owner_binding = composition
-            .host_origin_observation_owner_binding(peer_receipt)
+            .try_host_origin_observation_owner_binding(peer_receipt)
             .map_err(|error| {
                 format!(
                     "daemon Host-origin observation owner ticket {}: {error}",
                     ticket.ticket_id
                 )
             })?;
-        let owner_projection_value = owner_binding
-            .canonical_value()
-            .map_err(|error| format!("Host-origin observation projection: {error}"))?;
-        let owner_projection_sha256 = owner_binding
-            .canonical_digest()
-            .map_err(|error| format!("Host-origin observation projection digest: {error}"))?;
-        let kernel_owner = kernel_owner
-            .as_ref()
-            .map_err(|error| {
-                format!(
-                    "daemon activation Kernel owner readback ticket {}: {error}",
-                    ticket.ticket_id
+        if let Some(owner_binding) = owner_binding {
+            let owner_projection_value = owner_binding
+                .canonical_value()
+                .map_err(|error| format!("Host-origin observation projection: {error}"))?;
+            let owner_projection_sha256 = owner_binding
+                .canonical_digest()
+                .map_err(|error| format!("Host-origin observation projection digest: {error}"))?;
+            let kernel_owner = kernel_owner
+                .as_ref()
+                .map_err(|error| {
+                    format!(
+                        "daemon activation Kernel owner readback ticket {}: {error}",
+                        ticket.ticket_id
+                    )
+                })?
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "cold Host-origin observation policy has no exact P-07 owner readback for ticket {}",
+                        ticket.ticket_id
+                    )
+                })?;
+            result
+                .with_observation_host_policy_readback(
+                    AgentActivationObservationHostPolicyReadback {
+                        owner_projection_value,
+                        owner_projection_sha256,
+                        observed_at_unix_ms: now,
+                        kernel_owner,
+                    },
                 )
-            })?
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| {
-                format!(
-                    "cold Host-origin observation policy has no exact P-07 owner readback for ticket {}",
-                    ticket.ticket_id
-                )
-            })?;
-        result
-            .with_observation_host_policy_readback(AgentActivationObservationHostPolicyReadback {
-                owner_projection_value,
-                owner_projection_sha256,
-                observed_at_unix_ms: now,
-                kernel_owner,
-            })
-            .map_err(|error| {
-                format!(
-                    "daemon Host-origin observation projection ticket {}: {error}",
-                    ticket.ticket_id
-                )
-            })?
+                .map_err(|error| {
+                    format!(
+                        "daemon Host-origin observation projection ticket {}: {error}",
+                        ticket.ticket_id
+                    )
+                })?
+        } else {
+            result
+        }
     } else {
         result
     };
