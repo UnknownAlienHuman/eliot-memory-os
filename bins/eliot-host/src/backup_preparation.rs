@@ -4317,6 +4317,29 @@ impl OwnerEvidence {
         &self.approved.manifest.runtime_launch.runtime_state_roots
     }
 
+    /// The installation identities this authority already knows about (#958, A2).
+    ///
+    /// Read out of the inspected registry projection rather than supplied by a
+    /// caller, so "an active, approved or already-prepared installation is never
+    /// a restore destination" is decided against the authority's OWN records: its
+    /// approved generations and every destination it has already admitted as
+    /// prepared.
+    pub fn known_installations(&self) -> Vec<PlatformHandle> {
+        let mut known: Vec<PlatformHandle> = self
+            .registry
+            .generations()
+            .iter()
+            .map(|generation| generation.manifest.generation.clone())
+            .collect();
+        known.extend(
+            self.registry
+                .prepared_isolated_destinations()
+                .iter()
+                .map(|admission| admission.destination_installation.clone()),
+        );
+        known
+    }
+
     /// Binds the active generation to owner-verified build facts.
     ///
     /// The record is already validated by [`OwnerEvidence::inspect`];
