@@ -298,8 +298,9 @@ pub use selection_chain::{
 pub use skill_lifecycle::{GovernorSkillLifecycle, canonical_skill_tool_source};
 pub use source_artifact_admission::{
     SourceArtifactAdmission, SourceArtifactAdmissionError, SourceArtifactAdmissionRequest,
-    issue_source_artifact_admission,
+    SourceArtifactReadRequest,
 };
+pub(crate) use source_artifact_admission::issue_source_artifact_admission;
 pub use source_artifact_blob_profile::{
     SOURCE_ARTIFACT_BLOB_ACCESS_DOMAIN_SETTING,
     SOURCE_ARTIFACT_BLOB_CONFIDENTIALITY_DOMAIN_SETTING,
