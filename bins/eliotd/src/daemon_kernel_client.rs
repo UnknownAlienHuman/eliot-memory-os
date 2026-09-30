@@ -575,9 +575,7 @@ pub fn parse_task_controller_claimed_pair(
             Some(value.clone())
         }
         Some(_) => {
-            return Err(
-                "Kernel Task Controller native worker claim ID is invalid".to_owned(),
-            );
+            return Err("Kernel Task Controller native worker claim ID is invalid".to_owned());
         }
     };
 
