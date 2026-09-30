@@ -4,11 +4,11 @@ pub(super) use readiness_append::{
     append_authenticated_kernel_readiness, append_authenticated_kernel_readiness_with_heartbeat,
 };
 
-use super::{HostError, fresh_identity, fresh_lineage_id, operation, record_fence, sha256_json};
 use super::activation_lifecycle::{
     CAPABILITY_CANONICAL_STORE, CAPABILITY_INDEPENDENT_SUPERVISION, CAPABILITY_RUNTIME_SUPERVISION,
     requires_capability,
 };
+use super::{HostError, fresh_identity, fresh_lineage_id, operation, record_fence, sha256_json};
 use eliot_host_state::{
     ActivationState, AppendReceipt, CleanMarker, DrainCommitRecord, DrainRecord, DrainState,
     EliotActivationRecord, EpochTransition, FailureRecoveryDirective, HostInstallationEpoch,
