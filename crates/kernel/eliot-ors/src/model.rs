@@ -38,6 +38,19 @@ use crate::{CONTRACT_VERSION, MAX_INLINE_RECOVERY_BYTES, MAX_RECOVERY_PAGE};
 /// wire value and is classified conservatively during restart recovery.
 pub const HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION: u16 = 1;
 
+/// Current version of the encrypted executable-input carrier on a host request.
+pub const HOST_REQUEST_EXECUTABLE_INPUT_CONTRACT_VERSION: u16 = 1;
+
+/// Shared schema identity for the canonical ToolRequest byte stream.
+pub const HOST_REQUEST_TOOL_REQUEST_SCHEMA_ID: &str = "eliot.mcp.tool-request.v1";
+
+/// Hard ceiling for one complete retained executable ToolRequest.
+pub const MAX_HOST_REQUEST_EXECUTABLE_INPUT_BYTES: u64 = 64 * 1024;
+
+/// Maximum canonical owner-binding bytes retained beside one executable host
+/// request. Payload bytes are separately protected and use their own cap.
+pub const MAX_HOST_REQUEST_APPLICATION_BINDING_BYTES: usize = 256 * 1024;
+
 /// This issue allows one original send attempt plus one proven-not-sent retry.
 pub const MAX_HOST_REQUEST_SEND_ATTEMPTS: usize = 2;
 
@@ -1906,7 +1919,7 @@ impl EpochIdentity {
 }
 
 /// Opaque payload representation. ORS owns neither keys nor locator contents.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE", tag = "kind")]
 pub enum RecoveryPayload {
     Encrypted {
@@ -1944,7 +1957,7 @@ pub const ROOT_TRANSITION_REQUEST_VERSION: u16 = 1;
 /// re-derives or downgrades it. `PrivacyClass` and `InstructionTaint` are
 /// closed enums, so an unknown variant cannot be constructed or deserialized;
 /// the field is required on the wire by `deny_unknown_fields`.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecoveryAccessClass {
     /// Admitted privacy class of the pending payload (I5.5 `privacy_class`).
@@ -1978,7 +1991,7 @@ impl RecoveryAccessClass {
 /// the reservation without making ORS an interpreter of either value. The
 /// operation identity is repeated deliberately: it is checked against the
 /// envelope key and survives as part of the token and poll identity.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecoveryWriteBinding {
     /// Version of the admitted `VersionedWriteSubmission` protocol.
@@ -2131,7 +2144,7 @@ impl RecoveryWriteBinding {
 /// retention class, type or field beyond `created_at_and_expires_at`; a separate
 /// retention member would be an invented field, so none is added and
 /// `expires_at_ms` remains the single cleanup horizon.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecoveryPayloadEnvelope {
     pub contract_version: u16,
@@ -6789,6 +6802,11 @@ pub struct HostRequestAttempt {
     pub owner_launch_nonce: OpaqueLabel,
     pub owner_session_epoch: u64,
     pub phase: HostRequestAttemptPhase,
+    /// Commitment to the exact retained executable ToolRequest and its
+    /// protected recovery envelope. Absent only on legacy attempts.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_commitment_sha256: Option<String>,
     /// Authenticated Host channel committed at claim acquisition. Legacy
     /// protocol-zero attempts have no channel binding.
     #[serde(default)]
@@ -7198,6 +7216,7 @@ impl HostRequestAttempt {
             && self.owner_connection_ref == other.owner_connection_ref
             && self.owner_launch_nonce == other.owner_launch_nonce
             && self.owner_session_epoch == other.owner_session_epoch
+            && self.input_commitment_sha256 == other.input_commitment_sha256
             && self.channel_binding_sha256 == other.channel_binding_sha256
     }
 
@@ -7229,6 +7248,9 @@ impl HostRequestAttempt {
                 channel_binding_sha256,
                 "host_request_attempt_channel_binding_sha256",
             )?;
+        }
+        if let Some(input_commitment_sha256) = &self.input_commitment_sha256 {
+            validate_digest(input_commitment_sha256, "host_request_attempt_input_commitment")?;
         }
         if self.fence_digest != fence_digest {
             return Err(OrsError::FenceMismatch);
@@ -7734,6 +7756,704 @@ fn validate_unique_texts(values: &[String], field: &'static str) -> Result<(), O
     Ok(())
 }
 
+/// Exact authenticated application decision resolved for an executable host
+/// request. ORS validates internal digests and joins the opaque values to the
+/// host-request row; it does not interpret activation, task, scope, or policy
+/// semantics.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostRequestApplicationBinding {
+    /// Application-binding wire version.
+    pub wire_version: u16,
+    /// Exact original HostRequestIdentity serialized by the Kernel owner.
+    pub request_identity: Value,
+    /// Canonical digest of `request_identity`.
+    pub request_identity_sha256: String,
+    /// Authenticated principal resolved from retained application binding.
+    pub principal_ref: OpaqueLabel,
+    /// Resolved durable Session.
+    pub session_ref: OpaqueLabel,
+    /// Resolved task, if one is selected.
+    pub task_ref: Option<OpaqueLabel>,
+    /// Resolved WorkScope, if one is selected.
+    pub scope_ref: Option<OpaqueLabel>,
+    /// Exact TaskContract revision, absent for task-free application scope.
+    pub task_revision: Option<u64>,
+    /// Exact activation State Fence retained by the application owner.
+    pub state_fence: StateFence,
+    /// Full resolved activation binding as an opaque typed-owner projection.
+    pub resolved_application_binding: Option<Value>,
+    /// Canonical digest of `resolved_application_binding`.
+    pub resolved_application_binding_sha256: Option<String>,
+    /// Full authenticated activation owner evidence as an opaque projection.
+    pub activation_owner_evidence: Option<Value>,
+    /// Canonical digest of `activation_owner_evidence`.
+    pub activation_owner_evidence_sha256: Option<String>,
+    /// Exact Governor-owned observation-policy binding, including its
+    /// persisted Setting and PolicyOwner revision/fence evidence.
+    pub observation_policy_binding: Value,
+    /// Canonical digest of the exact Governor policy-owner projection.
+    pub observation_policy_binding_sha256: String,
+    /// Exact retained activation result digest.
+    pub activation_result_sha256: Option<String>,
+    /// P07 owner revision captured by the admission owner.
+    pub p07_revision: Option<u64>,
+    /// Exact P07 bundle digest captured by the admission owner.
+    pub p07_bundle_sha256: Option<String>,
+    /// Clock reading captured at admission and passed unchanged to the daemon.
+    pub clock_reading: eliot_contracts::ClockReading,
+    /// Kernel-observed admission time in Unix milliseconds.
+    pub admitted_at_unix_ms: u64,
+}
+
+impl HostRequestApplicationBinding {
+    /// Returns the canonical commitment to this exact retained binding.
+    pub fn commitment_sha256(&self) -> Result<String, OrsError> {
+        let bytes = canonical_json_bytes(self)
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        Ok(sha256_hex(&bytes))
+    }
+
+    /// Validates this binding against its retained host-request identity.
+    pub fn validate_for(&self, record: &HostRequestRecord) -> Result<(), OrsError> {
+        if self.wire_version != HOST_REQUEST_EXECUTABLE_INPUT_CONTRACT_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.wire_version));
+        }
+        let binding_bytes = canonical_json_bytes(self)
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        if binding_bytes.len() > MAX_HOST_REQUEST_APPLICATION_BINDING_BYTES {
+            return Err(OrsError::PayloadTooLarge);
+        }
+        self.validate_owner_projections()?;
+        self.validate_resolved_binding_fields()?;
+        self.validate_clock_and_revisions()?;
+        self.validate_fence_binding(record)?;
+        self.validate_observation_policy_binding(record)?;
+        self.validate_request_identity(record)
+    }
+
+    fn validate_owner_projections(&self) -> Result<(), OrsError> {
+        Self::validate_projection(
+            Some(&self.request_identity),
+            Some(&self.request_identity_sha256),
+            "host_request_owner_identity",
+        )?;
+        Self::validate_projection(
+            self.resolved_application_binding.as_ref(),
+            self.resolved_application_binding_sha256.as_ref(),
+            "host_request_resolved_application_binding",
+        )?;
+        Self::validate_projection(
+            self.activation_owner_evidence.as_ref(),
+            self.activation_owner_evidence_sha256.as_ref(),
+            "host_request_activation_owner_evidence",
+        )?;
+        Self::validate_projection(
+            Some(&self.observation_policy_binding),
+            Some(&self.observation_policy_binding_sha256),
+            "host_request_observation_policy_binding",
+        )?;
+        if let Some(digest) = &self.activation_result_sha256 {
+            validate_digest(digest, "host_request_activation_result_sha256")?;
+        }
+        if let Some(digest) = &self.p07_bundle_sha256 {
+            validate_digest(digest, "host_request_p07_bundle_sha256")?;
+        }
+        validate_text(self.principal_ref.as_str(), "host_request_principal_ref")?;
+        validate_text(self.session_ref.as_str(), "host_request_resolved_session_ref")?;
+        self.validate_activation_projection()?;
+        Ok(())
+    }
+
+    fn validate_projection(
+        value: Option<&Value>,
+        digest: Option<&String>,
+        field: &'static str,
+    ) -> Result<(), OrsError> {
+        match (value, digest) {
+            (Some(value), Some(digest)) if value.is_object() => {
+                let bytes = canonical_json_bytes(value)
+                    .map_err(|error| OrsError::Encoding(error.to_string()))?;
+                validate_digest(digest, field)?;
+                if sha256_hex(&bytes) != *digest {
+                    return Err(OrsError::PayloadIntegrityMismatch);
+                }
+                Ok(())
+            }
+            (None, None) => Ok(()),
+            _ => Err(OrsError::InvalidField {
+                field,
+                reason: "retained owner projection and digest must be complete together",
+            }),
+        }
+    }
+
+    fn validate_activation_projection(&self) -> Result<(), OrsError> {
+        match (
+            self.resolved_application_binding.as_ref(),
+            self.resolved_application_binding_sha256.as_ref(),
+            self.activation_owner_evidence.as_ref(),
+            self.activation_owner_evidence_sha256.as_ref(),
+            self.activation_result_sha256.as_ref(),
+            self.p07_revision,
+            self.p07_bundle_sha256.as_ref(),
+        ) {
+            (Some(binding), Some(binding_sha), Some(owner), Some(_), Some(result), Some(revision), Some(p07)) => {
+                let expected_fence = serde_json::to_value(&self.state_fence)
+                    .map_err(|error| OrsError::Encoding(error.to_string()))?;
+                if owner.get("binding") != Some(binding)
+                    || owner.get("binding_sha256").and_then(Value::as_str)
+                        != Some(binding_sha.as_str())
+                    || owner.get("state_fence") != Some(&expected_fence)
+                    || owner
+                        .get("owner_revision")
+                        .and_then(Value::as_u64)
+                        .is_none_or(|owner_revision| owner_revision == 0)
+                    || revision == 0
+                    || result.is_empty()
+                    || p07.is_empty()
+                {
+                    return Err(OrsError::FenceMismatch);
+                }
+                validate_digest(result, "host_request_activation_result_sha256")?;
+                validate_digest(p07, "host_request_p07_bundle_sha256")?;
+                validate_digest(
+                    owner
+                        .get("evidence_sha256")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                    "host_request_activation_owner_evidence_digest",
+                )
+            }
+            (None, None, None, None, None, None, None) if self.task_ref.is_none() => Ok(()),
+            _ => Err(OrsError::InvalidField {
+                field: "host_request_activation_binding",
+                reason: "task activation evidence must be complete together, and absent only for task-free requests",
+            }),
+        }
+    }
+
+    fn validate_clock_and_revisions(&self) -> Result<(), OrsError> {
+        let admitted_at_ms = i64::try_from(self.admitted_at_unix_ms).ok();
+        if self.admitted_at_unix_ms == 0
+            || self.clock_reading.valid_time_ms.is_some()
+            || self.clock_reading.known_time_ms != admitted_at_ms
+            || self.clock_reading.transaction_sequence.is_some()
+            || self.clock_reading.monotonic_ns.is_some()
+        {
+            return Err(OrsError::InvalidField {
+                field: "host_request_application_admission_clock",
+                reason: "the measured admission timestamp must be retained as the known-time-only clock reading",
+            });
+        }
+        self.clock_reading
+            .validate()
+            .map_err(|_| OrsError::InvalidField {
+                field: "host_request_application_clock",
+                reason: "admission clock reading is invalid",
+            })?;
+        Ok(())
+    }
+
+    fn validate_resolved_binding_fields(&self) -> Result<(), OrsError> {
+        let Some(binding) = self.resolved_application_binding.as_ref() else {
+            return if self.task_ref.is_none() {
+                Ok(())
+            } else {
+                Err(OrsError::InvalidField {
+                    field: "host_request_application_binding",
+                    reason: "task-bound requests require the original activation binding",
+                })
+            };
+        };
+        for (field, value, expected) in [
+            (
+                "host_request_application_principal",
+                binding.get("principal_id").and_then(Value::as_str),
+                Some(self.principal_ref.as_str()),
+            ),
+            (
+                "host_request_application_session",
+                binding.get("session_id").and_then(Value::as_str),
+                Some(self.session_ref.as_str()),
+            ),
+            (
+                "host_request_application_task",
+                binding.get("task_id").and_then(Value::as_str),
+                self.task_ref.as_ref().map(OpaqueLabel::as_str),
+            ),
+            (
+                "host_request_application_scope",
+                binding.get("work_scope_id").and_then(Value::as_str),
+                self.scope_ref.as_ref().map(OpaqueLabel::as_str),
+            ),
+        ] {
+            if value != expected {
+                return Err(OrsError::FenceMismatch);
+            }
+        }
+        let task_revision = binding
+            .get("task_revision")
+            .and_then(Value::as_str)
+            .and_then(|revision| revision.parse::<u64>().ok());
+        if task_revision != self.task_revision {
+            return Err(OrsError::FenceMismatch);
+        }
+        Ok(())
+    }
+
+    fn validate_fence_binding(&self, record: &HostRequestRecord) -> Result<(), OrsError> {
+        self.state_fence
+            .validate()
+            .map_err(|_| OrsError::FenceMismatch)?;
+        let fence_bytes = serde_json::to_vec(&self.state_fence)
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        if sha256_hex(&fence_bytes) != record.fence_digest
+            || self.state_fence.authority_epoch != record.authority_epoch
+            || self.state_fence.resource_generation.value() != record.generation
+            || self.session_ref.as_str()
+                != record
+                    .session_ref
+                    .as_ref()
+                    .map(OpaqueLabel::as_str)
+                    .unwrap_or_default()
+            || self.task_ref.as_ref().map(OpaqueLabel::as_str)
+                != record.task_ref.as_ref().map(OpaqueLabel::as_str)
+            || self.scope_ref.as_ref().map(OpaqueLabel::as_str)
+                != record.scope_ref.as_ref().map(OpaqueLabel::as_str)
+        {
+            return Err(OrsError::FenceMismatch);
+        }
+        match (self.task_ref.as_ref(), self.task_revision, self.state_fence.task_revision) {
+            (Some(_), Some(revision), Some(fence_revision))
+                if revision != 0 && revision == fence_revision.value() => {}
+            (None, None, None) => {}
+            _ => {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_application_task_binding",
+                    reason:
+                        "task, task revision, and fenced revision must be present and equal together",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_observation_policy_binding(
+        &self,
+        record: &HostRequestRecord,
+    ) -> Result<(), OrsError> {
+        let policy = &self.observation_policy_binding;
+        for (field, value, expected) in [
+            (
+                "host_request_observation_policy_principal",
+                policy
+                    .get("authenticated_principal_ref")
+                    .and_then(Value::as_str),
+                Some(self.principal_ref.as_str()),
+            ),
+            (
+                "host_request_observation_policy_session",
+                policy
+                    .get("authenticated_session_ref")
+                    .and_then(Value::as_str),
+                Some(self.session_ref.as_str()),
+            ),
+            (
+                "host_request_observation_policy_scope",
+                policy
+                    .get("authenticated_scope_ref")
+                    .and_then(Value::as_str),
+                self.scope_ref.as_ref().map(OpaqueLabel::as_str),
+            ),
+            (
+                "host_request_observation_policy_task",
+                policy
+                    .get("authenticated_task_ref")
+                    .and_then(Value::as_str),
+                self.task_ref.as_ref().map(OpaqueLabel::as_str),
+            ),
+        ] {
+            if value != expected {
+                return Err(OrsError::FenceMismatch);
+            }
+        }
+        let policy_fence = policy.get("state_fence").cloned().unwrap_or(Value::Null);
+        let expected_fence =
+            serde_json::to_value(&self.state_fence).map_err(|error| OrsError::Encoding(error.to_string()))?;
+        if policy_fence != expected_fence {
+            return Err(OrsError::FenceMismatch);
+        }
+        for field in [
+            "policy_named_read_digest",
+            "config_policy_snapshot_sha256",
+            "work_scope_canonical_read_digest",
+            "work_scope_binding_sha256",
+        ] {
+            let digest = policy
+                .get(field)
+                .and_then(Value::as_str)
+                .ok_or(OrsError::InvalidField {
+                    field: "host_request_observation_policy_digest",
+                    reason: "retained policy and scope evidence is missing a source digest",
+                })?;
+            validate_digest(digest, "host_request_observation_policy_digest")?;
+        }
+        for field in ["policy_read_fence", "work_scope_read_fence"] {
+            let fence: StateFence = serde_json::from_value(
+                policy.get(field).cloned().unwrap_or(Value::Null),
+            )
+            .map_err(|_| OrsError::FenceMismatch)?;
+            if fence != self.state_fence {
+                return Err(OrsError::FenceMismatch);
+            }
+        }
+        for field in ["config_policy_snapshot", "work_scope_binding"] {
+            if !policy.get(field).is_some_and(Value::is_object) {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_observation_policy_snapshot",
+                    reason: "retained policy and scope source snapshots must be complete objects",
+                });
+            }
+        }
+        if policy.get("policy").is_none() {
+            return Err(OrsError::InvalidField {
+                field: "host_request_observation_policy_value",
+                reason: "retained observation policy value is required",
+            });
+        }
+        for field in [
+            "ingress_setting_key",
+            "ingress_setting_value_ref",
+            "ingress_setting_owner_ref",
+        ] {
+            validate_text(
+                policy.get(field).and_then(Value::as_str).unwrap_or_default(),
+                "host_request_observation_policy_setting_ref",
+            )?;
+        }
+        for field in [
+            "policy_owner_revision",
+            "policy_read_revision",
+            "work_scope_owner_revision",
+            "work_scope_read_revision",
+        ] {
+            if policy.get(field).and_then(Value::as_u64).is_none_or(|revision| revision == 0) {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_observation_policy_revision",
+                    reason: "retained policy and scope owner revisions must be non-zero",
+                });
+            }
+        }
+        if record.scope_ref.as_ref().map(OpaqueLabel::as_str)
+            != self.scope_ref.as_ref().map(OpaqueLabel::as_str)
+        {
+            return Err(OrsError::FenceMismatch);
+        }
+        Ok(())
+    }
+
+    fn validate_request_identity(&self, record: &HostRequestRecord) -> Result<(), OrsError> {
+        if self.request_identity.get("request_id").and_then(Value::as_str)
+            != Some(record.request_id.as_str())
+            || self.request_identity.get("idempotency_key").and_then(Value::as_str)
+                != Some(record.idempotency_key.as_str())
+            || self.request_identity.get("cancellation_id").and_then(Value::as_str)
+                != Some(record.cancellation_id.as_str())
+        {
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: record.operation_id.as_str().to_owned(),
+                request_digest: record.request_digest.clone(),
+            });
+        }
+        for (field, value, expected) in [
+            (
+                "host_request_owner_session",
+                self.request_identity.get("session_id").and_then(Value::as_str),
+                record.session_ref.as_ref().map(OpaqueLabel::as_str),
+            ),
+            (
+                "host_request_owner_task",
+                self.request_identity.get("task_id").and_then(Value::as_str),
+                record.task_ref.as_ref().map(OpaqueLabel::as_str),
+            ),
+            (
+                "host_request_owner_scope",
+                self.request_identity
+                    .get("work_scope_id")
+                    .and_then(Value::as_str),
+                record.scope_ref.as_ref().map(OpaqueLabel::as_str),
+            ),
+        ] {
+            if value != expected {
+                return Err(OrsError::InvalidField {
+                    field,
+                    reason: "original request selectors diverge from the retained row",
+                });
+            }
+        }
+        let request_correlation = self
+            .request_identity
+            .get("correlation_projection")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let retained_correlation = serde_json::to_value(&record.correlation_projection)
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        let parent_operation_id = record
+            .parent_operation_id
+            .as_ref()
+            .map(OpaqueLabel::as_str);
+        if self.request_identity.get("parent_operation_id").and_then(Value::as_str)
+            != parent_operation_id
+            || self.request_identity.get("deadline_unix_ms").and_then(Value::as_u64)
+                != Some(record.deadline_unix_ms)
+            || self.request_identity.get("capability").and_then(Value::as_str)
+                != Some(record.capability_ref.as_str())
+            || self.request_identity.get("payload_sha256").and_then(Value::as_str)
+                != Some(record.payload_digest.as_str())
+            || self.request_identity.get("payload_schema_id").and_then(Value::as_str)
+                != record.payload_schema_id.as_ref().map(OpaqueLabel::as_str)
+            || request_correlation != retained_correlation
+        {
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: record.operation_id.as_str().to_owned(),
+                request_digest: record.request_digest.clone(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Encoding required for an executable ToolRequest byte stream.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum HostRequestExecutableInputEncoding {
+    /// Shared canonical JSON representation of the typed ToolRequest.
+    CanonicalJsonV1,
+}
+
+/// Exact executable ToolRequest input retained under the existing protected
+/// recovery payload contract. The plaintext is never stored in this type.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostRequestExecutableInput {
+    /// Executable-input wire version.
+    pub contract_version: u16,
+    /// Exact shared ToolRequest schema identity.
+    pub schema_id: OpaqueLabel,
+    /// Encoding used for the original typed ToolRequest.
+    pub encoding: HostRequestExecutableInputEncoding,
+    /// Digest of the original canonical ToolRequest bytes.
+    pub payload_sha256: String,
+    /// Byte length of the original canonical ToolRequest bytes.
+    pub payload_length: u64,
+    /// SID observed by Kernel for the admitted bridge peer.
+    pub authenticated_principal_ref: OpaqueLabel,
+    /// Windows interactive session observed on the admitted peer token.
+    pub authenticated_host_session_id: u32,
+    /// Exact current daemon descriptor commitment.
+    pub descriptor_sha256: String,
+    /// Exact peer-admission receipt commitment from the Host owner.
+    pub peer_admission_receipt_sha256: String,
+    /// Exact activation selection and Governor policy owner projections.
+    pub application_binding: HostRequestApplicationBinding,
+    /// Stable commitment over the original request, owner binding and
+    /// protected envelope metadata.
+    pub commitment_sha256: String,
+    /// Existing protected-recovery envelope holding the original DPAPI
+    /// ciphertext and its owner-supplied access/fence metadata.
+    pub protected_envelope: RecoveryPayloadEnvelope,
+}
+
+#[derive(Serialize)]
+struct HostRequestExecutableInputCommitment<'a> {
+    domain: &'static str,
+    contract_version: u16,
+    operation_id: &'a OperationIdentity,
+    kind: &'a HostRequestKind,
+    request_id: &'a OpaqueLabel,
+    correlation_projection: &'a Option<eliot_contracts::HostCorrelationProjection>,
+    idempotency_key: &'a OpaqueLabel,
+    cancellation_id: &'a OpaqueLabel,
+    parent_operation_id: &'a Option<OpaqueLabel>,
+    request_digest: &'a str,
+    payload_digest: &'a str,
+    connection_ref: &'a OpaqueLabel,
+    session_ref: &'a Option<OpaqueLabel>,
+    task_ref: &'a Option<OpaqueLabel>,
+    scope_ref: &'a Option<OpaqueLabel>,
+    capability_ref: &'a OpaqueLabel,
+    fence_digest: &'a str,
+    authority_epoch: &'a EpochId,
+    generation: u64,
+    deadline_unix_ms: u64,
+    schema_id: &'a OpaqueLabel,
+    encoding: HostRequestExecutableInputEncoding,
+    payload_length: u64,
+    payload_sha256: &'a str,
+    authenticated_principal_ref: &'a OpaqueLabel,
+    authenticated_host_session_id: u32,
+    descriptor_sha256: &'a str,
+    peer_admission_receipt_sha256: &'a str,
+    application_binding_sha256: String,
+    privacy_and_visibility_class: &'a RecoveryAccessClass,
+    protected_payload_contract_version: u16,
+    protected_payload_sha256: &'a str,
+    protected_payload_length: u64,
+    protected_payload_authority_epoch: &'a EpochLineage,
+    protected_payload_state_fence_sha256: &'a str,
+    protected_payload_key: &'a SecretReference,
+    protected_payload_created_at_ms: i64,
+    protected_payload_known_at_ms: i64,
+    protected_payload_expires_at_ms: Option<i64>,
+}
+
+impl HostRequestExecutableInput {
+    /// Computes the stable commitment over this input and its exact request
+    /// owner row; the stored ciphertext is represented by its original digest.
+    pub fn computed_commitment_sha256(
+        &self,
+        record: &HostRequestRecord,
+    ) -> Result<String, OrsError> {
+        let RecoveryPayload::Encrypted { key, .. } = &self.protected_envelope.payload else {
+            return Err(OrsError::InvalidField {
+                field: "host_request_executable_input_payload",
+                reason: "executable input requires an encrypted recovery payload",
+            });
+        };
+        let material = HostRequestExecutableInputCommitment {
+            domain: "eliot.host-request.executable-input.v1",
+            contract_version: self.contract_version,
+            operation_id: &record.operation_id,
+            kind: &record.kind,
+            request_id: &record.request_id,
+            correlation_projection: &record.correlation_projection,
+            idempotency_key: &record.idempotency_key,
+            cancellation_id: &record.cancellation_id,
+            parent_operation_id: &record.parent_operation_id,
+            request_digest: &record.request_digest,
+            payload_digest: &record.payload_digest,
+            connection_ref: &record.connection_ref,
+            session_ref: &record.session_ref,
+            task_ref: &record.task_ref,
+            scope_ref: &record.scope_ref,
+            capability_ref: &record.capability_ref,
+            fence_digest: &record.fence_digest,
+            authority_epoch: &record.authority_epoch,
+            generation: record.generation,
+            deadline_unix_ms: record.deadline_unix_ms,
+            schema_id: &self.schema_id,
+            encoding: self.encoding,
+            payload_length: self.payload_length,
+            payload_sha256: &self.payload_sha256,
+            authenticated_principal_ref: &self.authenticated_principal_ref,
+            authenticated_host_session_id: self.authenticated_host_session_id,
+            descriptor_sha256: &self.descriptor_sha256,
+            peer_admission_receipt_sha256: &self.peer_admission_receipt_sha256,
+            application_binding_sha256: self.application_binding.commitment_sha256()?,
+            privacy_and_visibility_class: &self.protected_envelope.privacy_and_visibility_class,
+            protected_payload_contract_version: self.protected_envelope.contract_version,
+            protected_payload_sha256: &self.protected_envelope.payload_sha256,
+            protected_payload_length: self.protected_envelope.payload_length,
+            protected_payload_authority_epoch: &self.protected_envelope.authority_epoch,
+            protected_payload_state_fence_sha256: &self.protected_envelope.state_fence.sha256,
+            protected_payload_key: key,
+            protected_payload_created_at_ms: self.protected_envelope.created_at_ms,
+            protected_payload_known_at_ms: self.protected_envelope.known_at_ms,
+            protected_payload_expires_at_ms: self.protected_envelope.expires_at_ms,
+        };
+        let bytes = canonical_json_bytes(&material)
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        Ok(sha256_hex(&bytes))
+    }
+
+    /// Validates exact input, protection, owner and row bindings.
+    pub fn validate_for(&self, record: &HostRequestRecord) -> Result<(), OrsError> {
+        if self.contract_version != HOST_REQUEST_EXECUTABLE_INPUT_CONTRACT_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        self.application_binding.validate_for(record)?;
+        self.validate_payload_and_peer(record)?;
+        self.validate_protected_envelope(record)?;
+        if self.computed_commitment_sha256(record)? != self.commitment_sha256 {
+            return Err(OrsError::PayloadIntegrityMismatch);
+        }
+        Ok(())
+    }
+
+    fn validate_payload_and_peer(&self, record: &HostRequestRecord) -> Result<(), OrsError> {
+        validate_digest(&self.payload_sha256, "host_request_executable_payload_sha256")?;
+        if self.schema_id.as_str() != HOST_REQUEST_TOOL_REQUEST_SCHEMA_ID
+            || self.encoding != HostRequestExecutableInputEncoding::CanonicalJsonV1
+            || self.payload_length == 0
+            || self.payload_length > MAX_HOST_REQUEST_EXECUTABLE_INPUT_BYTES
+            || self.payload_sha256 != record.payload_digest
+            || self.schema_id.as_str()
+                != record
+                    .payload_schema_id
+                    .as_ref()
+                    .map(OpaqueLabel::as_str)
+                    .unwrap_or_default()
+        {
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: record.operation_id.as_str().to_owned(),
+                request_digest: record.request_digest.clone(),
+            });
+        }
+        validate_text(
+            self.authenticated_principal_ref.as_str(),
+            "host_request_executable_input_principal",
+        )?;
+        validate_digest(
+            &self.descriptor_sha256,
+            "host_request_executable_input_descriptor_sha256",
+        )?;
+        validate_digest(
+            &self.peer_admission_receipt_sha256,
+            "host_request_executable_input_peer_receipt_sha256",
+        )?;
+        validate_digest(
+            &self.commitment_sha256,
+            "host_request_executable_input_commitment_sha256",
+        )?;
+        Ok(())
+    }
+
+    fn validate_protected_envelope(&self, record: &HostRequestRecord) -> Result<(), OrsError> {
+        self.protected_envelope.validate()?;
+        let policy_access: RecoveryAccessClass = serde_json::from_value(
+            self.application_binding
+                .observation_policy_binding
+                .get("access")
+                .cloned()
+                .unwrap_or(Value::Null),
+        )
+        .map_err(|_| OrsError::InvalidField {
+            field: "host_request_observation_policy_access",
+            reason: "policy owner must carry its exact typed recovery access class",
+        })?;
+        if self.protected_envelope.operation_or_checkpoint_id != record.operation_id
+            || self.protected_envelope.privacy_and_visibility_class != policy_access
+            || !matches!(
+                &self.protected_envelope.payload,
+                RecoveryPayload::Encrypted { .. }
+            )
+            || self.protected_envelope.state_fence
+                != StateFenceSnapshot::capture(
+                    &self.application_binding.state_fence,
+                    self.application_binding.state_fence.authority_epoch.sequence.get(),
+                )?
+            || self.protected_envelope.authority_epoch.current.lineage_id.as_str()
+                != self.application_binding.state_fence.authority_epoch.lineage_id.as_str()
+            || self.protected_envelope.authority_epoch.current.epoch
+                != self.application_binding.state_fence.authority_epoch.sequence.get()
+        {
+            return Err(OrsError::FenceMismatch);
+        }
+        Ok(())
+    }
+}
+
 /// Durable P-04 host-request operation record.
 ///
 /// Every identity is opaque to ORS: Session, task, scope, capability, fence,
@@ -7792,6 +8512,11 @@ pub struct HostRequestRecord {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payload_body: Option<Value>,
+    /// Protected original ToolRequest bytes and their schema/digest binding.
+    /// Optional only for historical or non-executable rows.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub executable_input: Option<HostRequestExecutableInput>,
     pub connection_ref: OpaqueLabel,
     pub session_ref: Option<OpaqueLabel>,
     pub task_ref: Option<OpaqueLabel>,
@@ -7912,6 +8637,7 @@ impl HostRequestRecord {
                 self.payload_schema_id.as_ref(),
                 other.payload_schema_id.as_ref(),
             )
+            && self.executable_input == other.executable_input
             && self.connection_ref == other.connection_ref
             && self.session_ref == other.session_ref
             && self.task_ref == other.task_ref
@@ -7939,6 +8665,7 @@ impl HostRequestRecord {
     /// Validates identity shape and state/result coherence.
     pub fn validate(&self) -> Result<(), OrsError> {
         self.validate_identity_and_cancellation_binding()?;
+        self.validate_execution_binding()?;
         validate_text(self.connection_ref.as_str(), "host_request_connection_ref")?;
         for (value, field) in [
             (self.session_ref.as_ref(), "host_request_session_ref"),
@@ -8057,6 +8784,42 @@ impl HostRequestRecord {
         Ok(())
     }
 
+    fn validate_execution_binding(&self) -> Result<(), OrsError> {
+        if let Some(executable_input) = &self.executable_input {
+            if self.kind != HostRequestKind::Invocation
+                || self.capability_ref.as_str() != "eliot.observe"
+                || self.payload_body.is_some()
+            {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_executable_input",
+                    reason:
+                        "protected execution requires an Observe invocation with no plaintext payload body",
+                });
+            }
+            executable_input.validate_for(self)?;
+        }
+        Ok(())
+    }
+
+    fn validate_attempt_execution_binding(
+        &self,
+        attempt: &HostRequestAttempt,
+    ) -> Result<(), OrsError> {
+        match self.executable_input.as_ref() {
+            None if attempt.input_commitment_sha256.is_none() => Ok(()),
+            Some(input)
+                if attempt.input_commitment_sha256.as_deref()
+                    == Some(&input.commitment_sha256) =>
+            {
+                Ok(())
+            }
+            _ => Err(OrsError::InvalidField {
+                field: "host_request_attempt_execution_binding",
+                reason: "attempt commitment must exactly bind the retained executable input",
+            }),
+        }
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "the retained request and cancellation identities share one validation boundary"
@@ -8113,6 +8876,7 @@ impl HostRequestRecord {
         }
         for (index, attempt) in self.attempt_history.iter().enumerate() {
             attempt.validate(&self.fence_digest)?;
+            self.validate_attempt_execution_binding(attempt)?;
             if self.send_claim_protocol_version == HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
                 && attempt.claim_expires_at_unix_ms.is_none()
             {
@@ -8185,6 +8949,7 @@ impl HostRequestRecord {
         }
         if let Some(attempt) = &self.attempt {
             attempt.validate(&self.fence_digest)?;
+            self.validate_attempt_execution_binding(attempt)?;
             if self.send_claim_protocol_version == HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
                 && attempt.claim_expires_at_unix_ms.is_none()
             {
