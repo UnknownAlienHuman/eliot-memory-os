@@ -60,6 +60,7 @@ use std::collections::BTreeMap;
 use eliot_context_contracts::{
     ContextBinding, QUALITY_DIMENSIONS, QUALITY_RESULT_SCHEMA_VERSION, QualityDimension,
     QualityDimensionResult, QualityDimensionState, QualityScorecard,
+    SerializedContextMeasurement,
 };
 use eliot_contracts::ArtifactId;
 use eliot_dreamer_failure::{
@@ -936,6 +937,73 @@ pub fn apply_negative_memory_coverage(
             "scorecard.results",
         )),
     }
+}
+
+/// Invalidate the recorded grades whose owner dependency this re-read of the
+/// rule set no longer agrees with.
+///
+/// This is the production constructor of
+/// [`eliot_context_contracts::QualityInvalidation`]. Before this, the
+/// `invalidation` field on a recorded grade had no producer anywhere in the
+/// tree, so `QualityDimensionResult::is_current_pass` was vacuously true and a
+/// rule-set change could never invalidate a recorded grade.
+///
+/// The decision is delegated to
+/// [`SerializedContextMeasurement::reevaluate_against`], the route-identity
+/// owner, which compares the five
+/// [`eliot_context_contracts::QualityInvalidationReason`]s against that type's
+/// own independent denominator. This function supplies the one value only this
+/// owner holds — the verifier revision the gate resolved — and does not
+/// reimplement the rule, narrow the reason set, or recompute a digest to
+/// compare against itself.
+///
+/// `observed` is the re-observation of the packet: a measurement carrying the
+/// route the packet is now served on, the recipe revision it was compiled
+/// under, the source snapshots it read, and this owner' declared verifier
+/// revision. The verifier revision is appended here to whatever the caller
+/// already declared for the other dimensions, so a caller that declares more
+/// verifier identities keeps them; the entry for
+/// [`QualityDimension::VerifierActionReadiness`] is this owner's own resolved
+/// rule-set revision and replaces any other entry for that one dimension,
+/// because a dimension is keyed and two owners cannot both state it.
+///
+/// # Errors
+///
+/// Returns [`NegativeMemoryExposureError::BindingInconsistent`] when the
+/// projection does not validate, when the resolved rule-set revision cannot be
+/// read as an identity, or when the re-observation or the card fails the
+/// contract owner's own validation. The card is left untouched on error.
+pub fn invalidate_stale_grade(
+    projection: &NegativeMemoryRuleProjection,
+    observed: &SerializedContextMeasurement,
+    scorecard: &mut QualityScorecard,
+) -> Result<Option<Vec<QualityDimensionResult>>, NegativeMemoryExposureError> {
+    projection.validate()?;
+    let rule_set_revision = projection.evidence.rule_set_revision.trim();
+    if rule_set_revision.is_empty() {
+        return Err(NegativeMemoryExposureError::BindingInconsistent(
+            "projection.evidence.rule_set_revision",
+        ));
+    }
+    let verifier_revision = ArtifactId::new(std::format!(
+        "negative-memory-rule-set:{rule_set_revision}"
+    ))
+    .map_err(|_| {
+        NegativeMemoryExposureError::BindingInconsistent("projection.evidence.rule_set_revision")
+    })?;
+    let mut declared = observed
+        .verifier_rule_revisions
+        .iter()
+        .filter(|(dimension, _)| *dimension != QualityDimension::VerifierActionReadiness)
+        .cloned()
+        .collect::<Vec<_>>();
+    declared.push((QualityDimension::VerifierActionReadiness, verifier_revision));
+    let observed = SerializedContextMeasurement {
+        verifier_rule_revisions: declared,
+        ..observed.clone()
+    };
+    SerializedContextMeasurement::reevaluate_against(&observed, scorecard)
+        .map_err(|_| NegativeMemoryExposureError::BindingInconsistent("scorecard.invalidation"))
 }
 
 /// Names one named loss by its own exact identity, bound to the read it was
