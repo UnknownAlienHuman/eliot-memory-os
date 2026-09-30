@@ -654,7 +654,8 @@ macro_rules! run_and_retain {
         || inputs.candidates.request.binding.scope_id.as_str() != bundle.scope_id
         || inputs.candidates.request.binding.state_fence != bundle.state_fence
         || inputs.candidates.epistemic_position.is_some_and(|view| {
-            view.position.admission.scope != bundle.scope_id
+            &view.position != inputs.rivals.current_position
+                || view.position.admission.scope != bundle.scope_id
                 || view.position.admission.fence != bundle.state_fence
         })
     {

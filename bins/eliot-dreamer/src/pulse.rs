@@ -887,11 +887,6 @@ pub(crate) fn run_conflict_stage(
             {
                 return Err(PulseError::Boundary("conflict A05 receipt predecessor"));
             }
-            // A05 owns the exact original structured-candidate preimage and
-            // recorded input digest. The conflict owner result separately
-            // records its own candidate digest over conflict inputs; this
-            // runner never relabels or reissues either commitment.
-            let input_commitment = candidate.validated.receipt.input_digest.clone();
             let output = analyze_grounded_conflict(
                 inputs.item,
                 candidate,
@@ -900,6 +895,18 @@ pub(crate) fn run_conflict_stage(
                 inputs.policy,
             )
             .map_err(|_| PulseError::Conflict)?;
+            // The stage ledger binds every exact native analyzer input. The
+            // original A05 receipt input digest remains independently checked
+            // by `candidate.validate_binding()` above; it does not bind the
+            // conflict set, supplements, or policy and is never reused here.
+            let input_commitment = canonical_input_commitment(&(
+                inputs.item,
+                candidate,
+                inputs.conflict_set,
+                inputs.supplements,
+                inputs.policy,
+            ))
+            .ok_or(PulseError::Conflict)?;
             let commitment = output.candidate_digest.clone();
             Ok(PulseStage::executed(
                 PulseStageId::Conflict,
@@ -971,9 +978,9 @@ pub(crate) fn run_candidate_stage(
                 || inputs.recipe.binding != projection_set.binding
                 || inputs.attention_and_conflicts.is_none()
                 || conflict_set.is_none_or(|expected| {
-                    !inputs
-                        .attention_and_conflicts
-                        .is_some_and(|attention| attention.conflicts.iter().any(|value| value == expected))
+                    !inputs.attention_and_conflicts.is_some_and(|attention| {
+                        attention.conflicts.as_slice() == std::slice::from_ref(expected)
+                    })
                 })
             {
                 return Err(PulseError::Boundary("candidate projection or conflict predecessor"));
