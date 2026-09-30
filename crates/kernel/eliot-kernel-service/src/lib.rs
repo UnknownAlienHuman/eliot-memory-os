@@ -229,7 +229,7 @@ pub use store_client::{
     StoreClientFault, StoreClientFaultHarness,
 };
 #[cfg(windows)]
-pub use store_gateway::KernelStoreGateway;
+pub use store_gateway::{BorrowedCanonicalStoreClient, KernelStoreGateway};
 #[cfg(windows)]
 pub use store_gateway::NamedReadGatewayError;
 #[cfg(windows)]
