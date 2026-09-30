@@ -1,4 +1,6 @@
 use crate::EngineError;
+use eliot_context_contracts::{MeasurementStatus, StuEstimate};
+use eliot_context_measurement::stu_for_bytes;
 use eliot_skills::{
     SKILL_PACK_HASH_ALGORITHM, canonical_skill_content_hash, canonical_skill_pack_hash,
 };
@@ -27,9 +29,18 @@ pub use eliot_skills::{DERIVED_SKILL_PACKAGES, ELIOT_SKILL_NAMES};
 #[derive(Clone, Debug, Serialize)]
 pub struct SkillPackEntryReport {
     pub name: String,
+    /// Exact UTF-8 bytes of the raw owned skill body read from disk.
+    pub body_utf8_bytes: u64,
+    /// Exact UTF-8 bytes of the raw frontmatter description.
+    pub description_utf8_bytes: u64,
     pub description_characters: usize,
     pub nonblank_lines: usize,
-    pub estimated_tokens: usize,
+    /// #704 unvalidated STU; no route-bound tokenizer or fit claim is present.
+    pub stu_estimate: StuEstimate,
+    pub description_stu_estimate: StuEstimate,
+    pub actual_tokens: Option<u64>,
+    pub measured_fit: Option<bool>,
+    pub measurement_status: MeasurementStatus,
     pub canonical_hash: String,
     pub opencode_parity: bool,
     pub claude_parity: bool,
@@ -38,9 +49,16 @@ pub struct SkillPackEntryReport {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct SkillPackLintReport {
+    /// Validates nonmeasurement lint conditions; token-policy fit is unknown.
     pub valid: bool,
     pub skill_count: usize,
     pub listing_characters: usize,
+    /// Exact serialized UTF-8 bytes of the final ordered description listing.
+    pub listing_utf8_bytes: u64,
+    pub listing_stu_estimate: StuEstimate,
+    pub actual_tokens: Option<u64>,
+    pub measured_fit: Option<bool>,
+    pub measurement_status: MeasurementStatus,
     pub entries: Vec<SkillPackEntryReport>,
     pub errors: Vec<String>,
     pub pack_hash: String,
@@ -60,6 +78,7 @@ impl SkillPackService {
         let mut errors = Vec::new();
         let mut entries = Vec::new();
         let mut descriptions = 0;
+        let mut listing_descriptions = Vec::new();
         let mut paragraph_owners = BTreeMap::<String, String>::new();
 
         for name in ELIOT_SKILL_NAMES {
@@ -78,19 +97,15 @@ impl SkillPackService {
             if description.is_empty() {
                 errors.push(format!("{name}: description is empty"));
             }
-            descriptions += description.chars().count();
+            let description_characters = description.chars().count();
+            descriptions += description_characters;
+            listing_descriptions.push(description.to_owned());
             let nonblank_lines = body.lines().filter(|line| !line.trim().is_empty()).count();
-            let estimated_tokens = body.chars().count().div_ceil(4);
+            let (body_utf8_bytes, stu_estimate) = stu_measurement(body.as_bytes().len())?;
+            let (description_utf8_bytes, description_stu_estimate) =
+                stu_measurement(description.as_bytes().len())?;
             if nonblank_lines > 100 {
                 errors.push(format!("{name}: body exceeds 100 nonblank lines"));
-            }
-            if estimated_tokens > 500 {
-                errors.push(format!("{name}: body exceeds estimated 500 token budget"));
-            }
-            if description.chars().count().div_ceil(4) > 25 {
-                errors.push(format!(
-                    "{name}: description exceeds estimated 25 token budget"
-                ));
             }
             let lower = body.to_ascii_lowercase();
             for forbidden in [
@@ -136,9 +151,15 @@ impl SkillPackService {
             }
             entries.push(SkillPackEntryReport {
                 name: name.to_owned(),
-                description_characters: description.chars().count(),
+                body_utf8_bytes,
+                description_utf8_bytes,
+                description_characters,
                 nonblank_lines,
-                estimated_tokens,
+                stu_estimate,
+                description_stu_estimate,
+                actual_tokens: None,
+                measured_fit: None,
+                measurement_status: MeasurementStatus::ConservativeStu,
                 canonical_hash,
                 opencode_parity,
                 claude_parity,
@@ -148,9 +169,9 @@ impl SkillPackService {
                 ]),
             });
         }
-        if descriptions.div_ceil(4) > 100 {
-            errors.push("combined descriptions exceed estimated 100 token budget".to_owned());
-        }
+        let serialized_listing = serde_json::to_vec(&listing_descriptions)?;
+        let (listing_utf8_bytes, listing_stu_estimate) =
+            stu_measurement(serialized_listing.len())?;
         let skill_count = entries.len();
         let pack_hash_entries = entries
             .iter()
@@ -211,11 +232,34 @@ impl SkillPackService {
             valid: errors.is_empty() && skill_count == 4,
             skill_count,
             listing_characters: descriptions,
+            listing_utf8_bytes,
+            listing_stu_estimate,
+            actual_tokens: None,
+            measured_fit: None,
+            measurement_status: MeasurementStatus::ConservativeStu,
             entries,
             errors,
             pack_hash,
         })
     }
+}
+
+fn stu_measurement(byte_len: usize) -> Result<(u64, StuEstimate), EngineError> {
+    let byte_len = u64::try_from(byte_len).map_err(|_| EngineError::ServiceNotReady {
+        service: "context-measurement".to_owned(),
+        reason: "serialized byte length is not representable as u64".to_owned(),
+    })?;
+    let value = stu_for_bytes(byte_len).map_err(|error| EngineError::ServiceNotReady {
+        service: "context-measurement".to_owned(),
+        reason: error.to_string(),
+    })?;
+    Ok((
+        byte_len,
+        StuEstimate {
+            value,
+            empirical: false,
+        },
+    ))
 }
 
 const DERIVED_PACKAGE_NOTICE: &str = "\

@@ -73,6 +73,9 @@ pub struct PacketQualityReport {
     pub task_id: String,
     pub revision_fence: MemoryRevision,
     pub structured_bytes: usize,
+    /// Closed compatibility adapter: this scalar is the canonical, unvalidated
+    /// #704 STU projection for the exact serialized packet, never an observed
+    /// tokenizer count or proof that a route budget fits.
     pub estimated_tokens: usize,
     pub task_frame_present: bool,
     pub current_truth_coverage: f32,

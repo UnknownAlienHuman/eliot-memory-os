@@ -10,6 +10,8 @@ blake3.workspace = true
 eliot-bootstrap.workspace = true
 eliot-build-test-graph = { path = "../instrument/eliot-build-test-graph", version = "0.1.0" }
 eliot-contracts.workspace = true
+eliot-context-contracts = { path = "../smart/eliot-context-contracts", version = "0.1.0" }
+eliot-context-measurement = { path = "../smart/eliot-context-measurement", version = "0.1.0" }
 eliot-instrument-api.workspace = true
 eliot-instrument-nextest = { path = "../instrument/eliot-instrument-nextest", version = "0.1.0" }
 eliot-instrument-runner = { path = "../instrument/eliot-instrument-runner", version = "0.1.0" }

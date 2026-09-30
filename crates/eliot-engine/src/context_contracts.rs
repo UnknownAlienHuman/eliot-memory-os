@@ -60,6 +60,7 @@
 use std::collections::BTreeMap;
 
 use serde_json::Value;
+use eliot_context_contracts::{MeasurementStatus, StuEstimate};
 
 use eliot_types::memory::GovernedGitScope;
 use eliot_types::{
@@ -112,7 +113,21 @@ pub struct PacketBudgetDecision {
     pub packet_mandatory_floor_tokens: usize,
     pub mandatory_floor_tokens: usize,
     pub effective_tokens: usize,
+    /// Compatibility projection of the canonical unvalidated STU planning estimate.
+    /// This is not an observed token count and never proves route fit.
     pub estimated_tokens: usize,
+    /// Exact final packet UTF-8 byte length. The Context compiler has no real
+    /// `ContextBinding` or route/model input, so this cannot become a full #584 receipt.
+    pub rendered_utf8_bytes: u64,
+    /// Canonical #704 STU estimate; empirical is false without a tokenizer observation.
+    pub stu_estimate: StuEstimate,
+    /// Actual route-tokenizer count, absent because no bound route observation is available.
+    pub actual_tokens: Option<u64>,
+    /// Measured fit is unknown until a route-bound tokenizer observation exists.
+    pub measured_fit: Option<bool>,
+    /// `ConservativeStu` records exact-byte plus unvalidated-STU evidence only;
+    /// serializer/profile/route binding and tokenizer observation are unavailable.
+    pub measurement_status: MeasurementStatus,
     pub render_mode: PacketRenderMode,
     pub section_tokens: BTreeMap<String, usize>,
     pub reason: String,

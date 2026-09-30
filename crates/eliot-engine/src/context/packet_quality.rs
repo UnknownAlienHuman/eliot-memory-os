@@ -46,6 +46,7 @@
 //! authority imports are introduced.
 
 use eliot_types::{ContextPacketL3, MaterialPacketFrame, PacketQualityReport, PacketQualityResult};
+use eliot_context_measurement::stu_for_bytes;
 
 use crate::EngineError;
 
@@ -63,7 +64,6 @@ impl PacketQualityService {
         packet.packet_id.clear();
         let content = serde_json::to_vec(packet)?;
         packet.packet_id = format!("eliot/packet/{}", blake3::hash(&content).to_hex());
-        let structured_bytes = serde_json::to_vec(packet)?.len();
         let truth_total = packet.current_truth.len()
             + packet.relevant_supported_claims.len()
             + packet.weak_claims_warning.len()
@@ -93,11 +93,6 @@ impl PacketQualityService {
                 .exact_load_bearing_atoms
                 .len()
             + usize::from(!packet.decision_locality_suffix.verifier.is_empty());
-        let signal_density = if structured_bytes == 0 {
-            0.0
-        } else {
-            (signal_items as f32 * 128.0 / structured_bytes as f32).min(1.0)
-        };
         let task_frame_present =
             !packet.goal.trim().is_empty() && !packet.acceptance_items.is_empty();
         let verifier_present = !packet.decision_locality_suffix.verifier.trim().is_empty();
@@ -138,8 +133,10 @@ impl PacketQualityService {
             packet_id: packet.packet_id.clone(),
             task_id: packet.task_id.clone(),
             revision_fence: packet.at_revision,
-            structured_bytes,
-            estimated_tokens: structured_bytes.div_ceil(4),
+            structured_bytes: 0,
+            // Compatibility projection only: this legacy field contains the
+            // canonical #704 unvalidated STU estimate, not observed tokens.
+            estimated_tokens: 0,
             task_frame_present,
             current_truth_coverage,
             causal_bridge_hops: packet.causal_bridge.len(),
@@ -155,12 +152,56 @@ impl PacketQualityService {
             wrong_scope_items_suppressed,
             tool_schema_bytes_visible: frame.tool_schema_bytes_visible,
             instruction_hotset_size: frame.instruction_hotset_size,
-            signal_density,
+            signal_density: 0.0,
             result,
         };
         packet.packet_quality = Some(report);
+
+        // The report is part of the serialized packet it describes. Iterate
+        // the byte/STU fields to a stable final-envelope length; no component
+        // rounding or tokenizer claim is involved.
+        let mut stable = false;
+        for _ in 0..16 {
+            let serialized = serde_json::to_vec(packet)?;
+            let structured_bytes = serialized.len();
+            let estimated_tokens = legacy_stu_projection(structured_bytes)?;
+            let signal_density = if structured_bytes == 0 {
+                0.0
+            } else {
+                (signal_items as f32 * 128.0 / structured_bytes as f32).min(1.0)
+            };
+            if let Some(report) = &mut packet.packet_quality {
+                report.structured_bytes = structured_bytes;
+                report.estimated_tokens = estimated_tokens;
+                report.signal_density = signal_density;
+            }
+            if serde_json::to_vec(packet)?.len() == structured_bytes {
+                stable = true;
+                break;
+            }
+        }
+        if !stable {
+            return Err(EngineError::WriteRejected(
+                "packet measurement did not converge on final serialized bytes".to_owned(),
+            ));
+        }
         Ok(())
     }
+}
+
+fn legacy_stu_projection(byte_len: usize) -> Result<usize, EngineError> {
+    let byte_len = u64::try_from(byte_len).map_err(|_| EngineError::ServiceNotReady {
+        service: "context-measurement".to_owned(),
+        reason: "serialized byte length is not representable as u64".to_owned(),
+    })?;
+    let stu = stu_for_bytes(byte_len).map_err(|error| EngineError::ServiceNotReady {
+        service: "context-measurement".to_owned(),
+        reason: error.to_string(),
+    })?;
+    usize::try_from(stu).map_err(|_| EngineError::ServiceNotReady {
+        service: "context-measurement".to_owned(),
+        reason: "STU estimate is not representable as usize".to_owned(),
+    })
 }
 
 fn causal_bridge_missing_hops(hops: usize) -> Vec<String> {

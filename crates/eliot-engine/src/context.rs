@@ -9,6 +9,8 @@ use crate::{
     SkillDistractorFilterService, StopCoordinationGate, WorkState, WriteAdmissionService,
     WriterHandle,
 };
+use eliot_context_contracts::{MeasurementStatus, StuEstimate};
+use eliot_context_measurement::stu_for_bytes;
 use eliot_types::memory::{
     CurrentGitScopeView, GovernedGitScope, MemoryApplicabilityDecision,
     MemoryApplicabilityDisposition, MemoryApplicabilityPacketView, MemoryProvenanceView,
@@ -144,7 +146,7 @@ pub struct PacketCompilePlanInvalid {
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize, thiserror::Error)]
 #[error(
-    "PACKET_HARD_CEILING_EXCEEDED: mandatory floor {mandatory_floor_tokens} exceeds hard ceiling {hard_ceiling_tokens} (preferred {preferred_tokens})"
+    "PACKET_HARD_CEILING_EXCEEDED: unvalidated STU planning estimate for mandatory floor {mandatory_floor_tokens} exceeds hard ceiling {hard_ceiling_tokens} (preferred {preferred_tokens}); actual tokens and measured fit are unknown"
 )]
 pub struct PacketHardCeilingExceeded {
     pub preferred_tokens: usize,
@@ -470,6 +472,7 @@ impl ContextCompiler {
             current_git_scope,
             frame,
         );
+        refresh_legacy_packet_stu(&mut packet)?;
         Ok(PacketCandidateOutcome { packet, read_audit })
     }
 
@@ -496,6 +499,8 @@ impl ContextCompiler {
             current_git_scope,
             frame,
         );
+        packet.token_budget_report.estimated_tokens = estimate_tokens(&packet)
+            .expect("the static candidate serializes as valid JSON before returning");
         PacketCandidateOutcome {
             packet,
             read_audit: PacketSourceReadAudit::default(),
@@ -1792,7 +1797,7 @@ fn empty_packet(
     memory_confidence: eliot_types::MemoryConfidence,
     retrieval_truncated: bool,
 ) -> ContextPacketL3 {
-    ContextPacketL3 {
+    let mut packet = ContextPacketL3 {
         packet_id: String::new(),
         project_id: request.project_id,
         task_id: request.task_id.clone(),
@@ -1839,7 +1844,20 @@ fn empty_packet(
             limit: request.max_tokens,
             returned: 0,
         },
-    }
+    };
+    // This private seed packet is measured before return. Candidate callers
+    // refresh the compatibility projection after adding source-owned content.
+    packet.token_budget_report.estimated_tokens = estimate_tokens(&packet)
+        .expect("the private seed packet serializes as valid JSON");
+    packet
+}
+
+fn refresh_legacy_packet_stu(packet: &mut ContextPacketL3) -> Result<(), EngineError> {
+    // `estimated_tokens` is a closed compatibility projection of #704 STU;
+    // it is refreshed after all candidate content is present and says nothing
+    // about actual tokenizer count or measured route fit.
+    packet.token_budget_report.estimated_tokens = estimate_tokens(packet)?;
+    Ok(())
 }
 
 fn populate_source_owned_packet_fields(
@@ -2811,7 +2829,41 @@ fn stable_revision_capture_time(revision: MemoryRevision) -> OffsetDateTime {
 pub fn serialized_supplement_tokens<T: serde::Serialize>(
     supplement: &T,
 ) -> Result<usize, EngineError> {
-    Ok(serde_json::to_vec(supplement)?.len().div_ceil(4))
+    let serialized = serde_json::to_vec(supplement)?;
+    canonical_stu_for_byte_len(serialized.len())
+}
+
+fn canonical_stu_for_byte_len(byte_len: usize) -> Result<usize, EngineError> {
+    let byte_len = u64::try_from(byte_len).map_err(|_| EngineError::ServiceNotReady {
+        service: "context-measurement".to_owned(),
+        reason: "serialized byte length is not representable as u64".to_owned(),
+    })?;
+    let stu = stu_for_bytes(byte_len).map_err(|error| EngineError::ServiceNotReady {
+        service: "context-measurement".to_owned(),
+        reason: error.to_string(),
+    })?;
+    usize::try_from(stu).map_err(|_| EngineError::ServiceNotReady {
+        service: "context-measurement".to_owned(),
+        reason: "STU estimate is not representable as usize".to_owned(),
+    })
+}
+
+fn canonical_measurement_for_byte_len(byte_len: usize) -> Result<(u64, StuEstimate), EngineError> {
+    let byte_len_u64 = u64::try_from(byte_len).map_err(|_| EngineError::ServiceNotReady {
+        service: "context-measurement".to_owned(),
+        reason: "serialized byte length is not representable as u64".to_owned(),
+    })?;
+    let stu = stu_for_bytes(byte_len_u64).map_err(|error| EngineError::ServiceNotReady {
+        service: "context-measurement".to_owned(),
+        reason: error.to_string(),
+    })?;
+    Ok((
+        byte_len_u64,
+        StuEstimate {
+            value: stu,
+            empirical: false,
+        },
+    ))
 }
 
 #[derive(serde::Serialize)]
@@ -2957,6 +3009,14 @@ fn finalize_precompiled_packet_with_policy_and_audit_context(
             budget_metadata_tokens,
         )?;
         PacketQualityService::finalize(&mut rendered_packet, frame)?;
+        let final_serialized_packet = serde_json::to_vec(&rendered_packet)?;
+        let (rendered_utf8_bytes, stu_estimate) =
+            canonical_measurement_for_byte_len(final_serialized_packet.len())?;
+        budget.rendered_utf8_bytes = rendered_utf8_bytes;
+        budget.stu_estimate = stu_estimate;
+        budget.measurement_status = MeasurementStatus::ConservativeStu;
+        budget.actual_tokens = None;
+        budget.measured_fit = None;
         budget.section_tokens = packet_section_accounting(&rendered_packet)?;
         budget
             .section_tokens
@@ -3032,12 +3092,14 @@ fn render_packet_with_budget_policy(
         PacketRenderMode::WithinPreferred
     };
     let reason = match render_mode {
-        PacketRenderMode::WithinPreferred => "within_preferred_budget",
+        PacketRenderMode::WithinPreferred => {
+            "within_preferred_unvalidated_stu_planning_estimate; actual_token_count_unknown; measured_fit_unknown"
+        }
         PacketRenderMode::PreferredBudgetExceededByMandatoryFloor => {
-            "preferred_budget_exceeded_by_mandatory_floor"
+            "unvalidated_stu_planning_estimate_exceeds_preferred_budget_by_mandatory_floor; actual_token_count_unknown; measured_fit_unknown"
         }
         PacketRenderMode::PreferredBudgetClampedToHardCeiling => {
-            "preferred_budget_clamped_to_hard_ceiling"
+            "unvalidated_stu_planning_budget_clamped_to_hard_ceiling; actual_token_count_unknown; measured_fit_unknown"
         }
     }
     .to_owned();
@@ -3064,10 +3126,12 @@ fn render_packet_with_budget_policy(
         }
         .into());
     };
-    let estimated_tokens = packet
-        .token_budget_report
-        .estimated_tokens
-        .saturating_add(total_supplement_tokens);
+    // This legacy scalar reports only the exact packet-envelope STU. Response
+    // supplements stay separately budgeted; the full response envelope is
+    // unavailable here because callers provide only their planning scalar.
+    let estimated_tokens = packet.token_budget_report.estimated_tokens;
+    let packet_bytes = serde_json::to_vec(&packet)?.len();
+    let (rendered_utf8_bytes, stu_estimate) = canonical_measurement_for_byte_len(packet_bytes)?;
     let mut section_tokens = packet_section_accounting(&packet)?;
     section_tokens.insert("returned_supplements".to_owned(), policy.supplement_tokens);
     section_tokens.insert(
@@ -3086,6 +3150,11 @@ fn render_packet_with_budget_policy(
             mandatory_floor_tokens,
             effective_tokens,
             estimated_tokens,
+            rendered_utf8_bytes,
+            stu_estimate,
+            actual_tokens: None,
+            measured_fit: None,
+            measurement_status: MeasurementStatus::ConservativeStu,
             render_mode,
             section_tokens,
             reason,
@@ -3182,9 +3251,10 @@ fn enforce_budget(
 ) -> Result<(), EngineError> {
     let required_handles = required_handles.iter().collect::<BTreeSet<_>>();
     let mut sections_truncated = Vec::new();
+    let initial_estimate = estimate_tokens(packet)?;
     packet.token_budget_report = TokenBudgetReport {
         max_tokens,
-        estimated_tokens: 0,
+        estimated_tokens: initial_estimate,
         truncated: false,
         sections_truncated: Vec::new(),
     };
@@ -3224,10 +3294,13 @@ fn finalize_budget_report(
     truncated: bool,
     sections_truncated: &[String],
 ) -> Result<usize, EngineError> {
-    let mut estimated = 0;
+    let mut estimated = estimate_tokens(packet)?;
     loop {
         packet.token_budget_report = TokenBudgetReport {
             max_tokens,
+            // Legacy packet field: exact #704 STU for the currently planned
+            // serialization. PacketBudgetDecision separately records the
+            // post-quality final envelope and keeps measured fit unknown.
             estimated_tokens: estimated,
             truncated,
             sections_truncated: sections_truncated.to_owned(),
@@ -3236,7 +3309,6 @@ fn finalize_budget_report(
         if next == estimated {
             return Ok(next);
         }
-        debug_assert!(next > estimated);
         estimated = next;
     }
 }
@@ -3370,47 +3442,8 @@ fn push_section(sections: &mut Vec<String>, name: &str) {
 }
 
 fn estimate_tokens(packet: &ContextPacketL3) -> Result<usize, EngineError> {
-    let mut bytes = 0usize;
-    bytes += estimate_serialized_value(&packet.project_id)?;
-    bytes += estimate_serialized_value(&packet.at_revision)?;
-    bytes += packet.task_id.len();
-    bytes += packet.goal.len();
-    bytes += estimate_serialized_value(&packet.project_understanding)?;
-    bytes += estimate_serialized_slice(&packet.acceptance_items)?;
-    bytes += estimate_serialized_slice(&packet.current_truth)?;
-    bytes += estimate_serialized_slice(&packet.relevant_verified_claims)?;
-    bytes += estimate_serialized_slice(&packet.relevant_supported_claims)?;
-    bytes += estimate_serialized_slice(&packet.weak_claims_warning)?;
-    bytes += estimate_serialized_slice(&packet.negative_memory)?;
-    bytes += estimate_serialized_slice(&packet.recent_failures)?;
-    bytes += estimate_serialized_slice(&packet.known_decisions)?;
-    bytes += estimate_serialized_slice(&packet.open_questions)?;
-    bytes += estimate_serialized_slice(&packet.exact_handles)?;
-    bytes += estimate_serialized_slice(&packet.source_receipts)?;
-    bytes += estimate_serialized_value(&packet.current_truth_snapshot)?;
-    bytes += estimate_serialized_value(&packet.epistemic_state)?;
-    bytes += estimate_serialized_slice(&packet.active_plan)?;
-    bytes += estimate_serialized_slice(&packet.completed_work)?;
-    bytes += estimate_serialized_slice(&packet.killed_paths)?;
-    bytes += estimate_serialized_slice(&packet.causal_bridge)?;
-    bytes += estimate_serialized_slice(&packet.memory_decisions)?;
-    bytes += estimate_serialized_value(&packet.decision_locality_suffix)?;
-    bytes += estimate_serialized_value(&packet.memory_applicability)?;
-    bytes += estimate_serialized_slice(&packet.historical_memory)?;
-    bytes += estimate_serialized_value(&packet.procedural_skills)?;
-    if let Some(codecortex) = &packet.codecortex {
-        bytes += estimate_serialized_slice(&codecortex.report_refs)?;
-        bytes += estimate_serialized_value(&codecortex.git_head)?;
-        bytes += estimate_serialized_slice(&codecortex.file_evidence)?;
-        bytes += estimate_serialized_slice(&codecortex.symbol_evidence)?;
-        bytes += estimate_serialized_slice(&codecortex.diagnostic_evidence)?;
-        bytes += estimate_serialized_slice(&codecortex.verifier_map)?;
-        bytes += estimate_serialized_value(&codecortex.blast_radius)?;
-        bytes += estimate_serialized_slice(&codecortex.unknowns)?;
-    }
-    bytes += estimate_serialized_value(&packet.token_budget_report)?;
-    bytes += estimate_serialized_value(&packet.truncation)?;
-    Ok(bytes.div_ceil(4))
+    let serialized = serde_json::to_vec(packet)?;
+    canonical_stu_for_byte_len(serialized.len())
 }
 
 pub fn refinalize_compiled_packet(
@@ -3429,114 +3462,101 @@ pub fn packet_section_accounting(
     let mut sections = BTreeMap::new();
     sections.insert(
         "task_and_acceptance_frame".to_owned(),
-        (estimate_serialized_value(&packet.project_id)?
-            + estimate_serialized_value(&packet.task_id)?
-            + estimate_serialized_value(&packet.goal)?
-            + estimate_serialized_value(&packet.task_execution_class)?
-            + estimate_serialized_value(&packet.memory_confidence)?
-            + estimate_serialized_slice(&packet.acceptance_items)?
-            + estimate_serialized_value(&packet.at_revision)?)
-        .div_ceil(4),
+        serialized_stu(&(
+            &packet.project_id,
+            &packet.task_id,
+            &packet.goal,
+            &packet.task_execution_class,
+            &packet.memory_confidence,
+            &packet.acceptance_items,
+            &packet.at_revision,
+        ))?,
     );
     sections.insert(
         "project_understanding".to_owned(),
-        estimate_serialized_value(&packet.project_understanding)?.div_ceil(4),
+        serialized_stu(&packet.project_understanding)?,
     );
     sections.insert(
         "current_truth".to_owned(),
-        estimate_serialized_slice(&packet.current_truth)?.div_ceil(4),
+        serialized_stu(&packet.current_truth)?,
     );
     sections.insert(
         "verified_and_supported_claims".to_owned(),
-        (estimate_serialized_slice(&packet.relevant_verified_claims)?
-            + estimate_serialized_slice(&packet.relevant_supported_claims)?)
-        .div_ceil(4),
+        serialized_stu(&(
+            &packet.relevant_verified_claims,
+            &packet.relevant_supported_claims,
+        ))?,
     );
     sections.insert(
         "warnings_failures_and_questions".to_owned(),
-        (estimate_serialized_slice(&packet.weak_claims_warning)?
-            + estimate_serialized_slice(&packet.negative_memory)?
-            + estimate_serialized_slice(&packet.recent_failures)?
-            + estimate_serialized_slice(&packet.known_decisions)?
-            + estimate_serialized_slice(&packet.open_questions)?)
-        .div_ceil(4),
+        serialized_stu(&(
+            &packet.weak_claims_warning,
+            &packet.negative_memory,
+            &packet.recent_failures,
+            &packet.known_decisions,
+            &packet.open_questions,
+        ))?,
     );
     sections.insert(
         "exact_handles_and_source_receipts".to_owned(),
-        (estimate_serialized_slice(&packet.exact_handles)?
-            + estimate_serialized_slice(&packet.source_receipts)?)
-        .div_ceil(4),
+        serialized_stu(&(&packet.exact_handles, &packet.source_receipts))?,
     );
     sections.insert(
         "truth_snapshot_and_epistemic_state".to_owned(),
-        (estimate_serialized_value(&packet.current_truth_snapshot)?
-            + estimate_serialized_value(&packet.epistemic_state)?)
-        .div_ceil(4),
+        serialized_stu(&(&packet.current_truth_snapshot, &packet.epistemic_state))?,
     );
     sections.insert(
         "decision_locality_suffix".to_owned(),
-        estimate_serialized_value(&packet.decision_locality_suffix)?.div_ceil(4),
+        serialized_stu(&packet.decision_locality_suffix)?,
     );
     sections.insert(
         "codecortex".to_owned(),
-        estimate_serialized_value(&packet.codecortex)?.div_ceil(4),
+        serialized_stu(&packet.codecortex)?,
     );
     sections.insert(
         "continuity".to_owned(),
-        (estimate_serialized_slice(&packet.active_plan)?
-            + estimate_serialized_slice(&packet.completed_work)?
-            + estimate_serialized_slice(&packet.killed_paths)?
-            + estimate_serialized_slice(&packet.causal_bridge)?)
-        .div_ceil(4),
+        serialized_stu(&(
+            &packet.active_plan,
+            &packet.completed_work,
+            &packet.killed_paths,
+            &packet.causal_bridge,
+        ))?,
     );
     sections.insert(
         "memory_decisions_experience_and_need".to_owned(),
-        (estimate_serialized_slice(&packet.memory_decisions)?
-            + estimate_serialized_slice(&packet.experience_priors)?
-            + estimate_serialized_value(&packet.memory_need_decision)?)
-        .div_ceil(4),
+        serialized_stu(&(
+            &packet.memory_decisions,
+            &packet.experience_priors,
+            &packet.memory_need_decision,
+        ))?,
     );
     sections.insert(
         "applicability_and_history".to_owned(),
-        (estimate_serialized_value(&packet.memory_applicability)?
-            + estimate_serialized_slice(&packet.historical_memory)?)
-        .div_ceil(4),
+        serialized_stu(&(&packet.memory_applicability, &packet.historical_memory))?,
     );
     sections.insert(
         "lifecycle_and_procedural_skills".to_owned(),
-        (estimate_serialized_value(&packet.memory_lifecycle)?
-            + estimate_serialized_value(&packet.procedural_skills)?)
-        .div_ceil(4),
+        serialized_stu(&(&packet.memory_lifecycle, &packet.procedural_skills))?,
     );
     sections.insert(
         "budget_and_truncation".to_owned(),
-        (estimate_serialized_value(&packet.token_budget_report)?
-            + estimate_serialized_value(&packet.truncation)?)
-        .div_ceil(4),
+        serialized_stu(&(&packet.token_budget_report, &packet.truncation))?,
     );
     sections.insert(
         "identity_and_quality".to_owned(),
-        (estimate_serialized_value(&packet.packet_id)?
-            + estimate_serialized_value(&packet.packet_quality)?)
-        .div_ceil(4),
+        serialized_stu(&(&packet.packet_id, &packet.packet_quality))?,
     );
     sections.insert("whole_packet_estimate".to_owned(), estimate_tokens(packet)?);
     sections.insert(
         "whole_packet_serialized".to_owned(),
-        serde_json::to_vec(packet)?.len().div_ceil(4),
+        serde_json::to_vec(packet)?.len(),
     );
     Ok(sections)
 }
 
-fn estimate_serialized_slice<T: serde::Serialize>(values: &[T]) -> Result<usize, EngineError> {
-    values
-        .iter()
-        .map(estimate_serialized_value)
-        .try_fold(0usize, |total, next| Ok(total + next?))
-}
-
-fn estimate_serialized_value<T: serde::Serialize>(value: &T) -> Result<usize, EngineError> {
-    Ok(serde_json::to_vec(value)?.len())
+fn serialized_stu<T: serde::Serialize>(value: &T) -> Result<usize, EngineError> {
+    let serialized = serde_json::to_vec(value)?;
+    canonical_stu_for_byte_len(serialized.len())
 }
 
 struct HandleIndex {
@@ -4775,7 +4795,7 @@ mod current_git_scope_tests {
         );
         assert_eq!(
             outcome.budget.reason,
-            "preferred_budget_exceeded_by_mandatory_floor"
+            "unvalidated_stu_planning_estimate_exceeds_preferred_budget_by_mandatory_floor; actual_token_count_unknown; measured_fit_unknown"
         );
         assert_eq!(
             outcome.packet.token_budget_report.max_tokens,
