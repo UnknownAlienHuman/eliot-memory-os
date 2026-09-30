@@ -69,7 +69,7 @@ pub(crate) const AUTHORIZE_LAUNCH_OPERATION: &str = "eliot.user-broker.authorize
 /// Canonical Kernel operation selectors issued through this broker.
 pub(crate) const FENCE_OPERATION: &str = "eliot.user-broker.fence";
 /// Canonical Kernel selector for the fresh, short-lived Operator session token
-/// I11.8 requires on every WinUI binding. It is the same selector the Kernel
+/// I11.8 requires on every `WinUI` binding. It is the same selector the Kernel
 /// serves at `bins/eliot-kernel/src/daemon_request_dispatch.rs`
 /// (`bind_operator_session_token`); the broker never mints the token itself.
 pub(crate) const OPERATOR_SESSION_TOKEN_OPERATION: &str =

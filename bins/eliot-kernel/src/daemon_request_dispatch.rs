@@ -3483,7 +3483,6 @@ impl KernelComposition {
             }
             "bind_operator_session_token" => {
                 self.operator_session_token_operation(session, payload.clone())
-                    .await
             }
             _ => return Err(TransportError::SessionFenced),
         };
@@ -8819,7 +8818,7 @@ impl KernelComposition {
     /// Binds one fresh, short-lived Operator session token on the admitted path
     /// (`#1777` I11.8): the production caller of
     /// `eliot_kernel_service::bind_operator_session_token`, the minter of the
-    /// Kernel challenge/session token the WinUI client then presents at
+    /// Kernel challenge/session token the `WinUI` client then presents at
     /// redemption.
     ///
     /// The binding evidence arrives as closed payload evidence from the
@@ -8837,7 +8836,7 @@ impl KernelComposition {
     /// (`bins/eliot-user-broker/src/main.rs::serve_operator_pipe_connection`),
     /// which compares this echoed evidence with the OS-observed peer before it
     /// accepts any redemption.
-    async fn operator_session_token_operation(
+    fn operator_session_token_operation(
         &self,
         session: &Session,
         payload: serde_json::Value,
