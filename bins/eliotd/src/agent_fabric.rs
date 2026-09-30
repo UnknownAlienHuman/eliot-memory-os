@@ -57,6 +57,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use eliot_agent_api::{AttemptId, RouteFingerprint};
+use eliot_agent_bridge_core::ToolResultReceipt;
 use eliot_agent_contracts::{
     ExecutionUpdateProposal, OldWaveDisposition, RevisionId, SupersessionLink, SwarmAdmissionId,
     SwarmCoordinatorLease, SwarmExecutionId, SwarmExecutionRevision, SwarmPlanAdmission,
@@ -1364,6 +1365,28 @@ fn verify_snapshot_admissions(snapshot: &FabricSnapshot) -> Result<(), FabricErr
     Ok(())
 }
 
+/// Rejects torn tool-result evidence in a durable snapshot (issue #1108 A12).
+///
+/// Every stored receipt must name a registered attempt, carry a well-formed
+/// digest, and still satisfy the owner's complete-evidence gate; otherwise
+/// persistence damage would restore result evidence no owner stands behind.
+/// Stored receipts never confer Finish: the restored attempt lifecycle keeps
+/// its own meaning and [`AgentFabric::require_finish`] still refuses it.
+fn verify_snapshot_tool_receipts(snapshot: &FabricSnapshot) -> Result<(), FabricError> {
+    for (key, receipt) in &snapshot.tool_result_receipts {
+        if !snapshot.attempt_states.contains_key(key) {
+            return Err(FabricError::BrokenOwnershipLink(
+                "stored tool-result receipt without registered attempt".to_owned(),
+            ));
+        }
+        receipt.check_complete_evidence().map_err(|error| {
+            FabricError::Contract(format!("stored tool-result receipt: {error}"))
+        })?;
+        validate_text(receipt.result_digest(), "result_digest")?;
+    }
+    Ok(())
+}
+
 /// Reconstructs the definition-to-admission cache from committed owner
 /// records, rejecting torn or contradictory joins instead of allowing map
 /// insertion to choose one admission silently.
@@ -1614,6 +1637,13 @@ pub struct FabricSnapshot {
     /// unless an explicit policy-authorized degradation was recorded first.
     #[serde(default)]
     pub attempt_routes: BTreeMap<String, RouteFingerprint>,
+    /// Owner-projected tool-result receipts by attempt identity (issue #1108
+    /// A12). Each receipt is projected by the route owner over the exact
+    /// delivered bytes (never estimated here) and recorded only after the
+    /// owner's complete-evidence gate passes. Absent on older snapshots, which
+    /// restore without tool-result evidence exactly as before.
+    #[serde(default)]
+    pub tool_result_receipts: BTreeMap<String, ToolResultReceipt>,
 }
 
 /// Attempt lifecycle tracked by this composition. Terminal states never
@@ -1675,6 +1705,8 @@ pub struct AgentFabric {
     staffing_receipts: BTreeMap<String, StaffingPlanReceipt>,
     /// Route each already-dispatched attempt runs on.
     attempt_routes: BTreeMap<String, RouteFingerprint>,
+    /// Owner-projected tool-result receipts by attempt identity.
+    tool_result_receipts: BTreeMap<String, ToolResultReceipt>,
     /// Explicit policy-authorized degradations recorded before an attempt
     /// continues on a different route. In-memory only: a restart drops them,
     /// so a restored fabric re-refuses the switch instead of resuming it.
@@ -1719,6 +1751,7 @@ impl AgentFabric {
             semantic_supersessions: BTreeMap::new(),
             staffing_receipts: BTreeMap::new(),
             attempt_routes: BTreeMap::new(),
+            tool_result_receipts: BTreeMap::new(),
             attempt_degradations: BTreeMap::new(),
             initialized: true,
         };
@@ -1770,6 +1803,7 @@ impl AgentFabric {
             semantic_supersessions: BTreeMap::new(),
             staffing_receipts: BTreeMap::new(),
             attempt_routes: BTreeMap::new(),
+            tool_result_receipts: BTreeMap::new(),
             attempt_degradations: BTreeMap::new(),
             initialized: true,
         };
@@ -3114,6 +3148,97 @@ impl AgentFabric {
         }
     }
 
+    /// Records one owner-projected tool-result receipt against its dispatched
+    /// attempt (issue #1108 A12).
+    ///
+    /// The receipt is projected by the route owner over the exact delivered
+    /// bytes (`eliot-agent-bridge` `project_tool_result_receipt`: exact result
+    /// digest, admissible source handle, route-measured tokens, observed
+    /// delivery); the fabric estimates nothing and mints nothing. The owner's
+    /// complete-evidence gate ([`ToolResultReceipt::check_complete_evidence`])
+    /// runs first, so a `PARTIAL`, `TRUNCATED`, or `MISSING` delivery never
+    /// reaches fabric state. The receipt is then bound to the exact
+    /// dispatched attempt in its own map and the attempt advances to
+    /// `ResultSubmitted` exactly as through [`Self::submit_attempt_result`]:
+    /// a candidate artifact, never task Finish. Same identity and payload
+    /// replay exactly; a changed receipt under one attempt conflicts.
+    ///
+    /// No `DaemonComposition` method threads a projected receipt into this
+    /// fabric yet, so on the current base no production operation reaches
+    /// this seam; the seam exists so that operation carries owner-projected
+    /// evidence instead of a caller-authored digest string.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FabricError::Contract`] when the receipt is not complete
+    /// evidence or its digest is malformed,
+    /// [`FabricError::DefinitionConflict`] when the attempt already holds a
+    /// different receipt, [`FabricError::ResultNotFinish`] when the attempt
+    /// is not dispatched, or [`FabricError::Quarantined`] for unknown
+    /// attempts.
+    pub fn submit_tool_result_receipt(
+        &mut self,
+        attempt_id: &AttemptId,
+        receipt: &ToolResultReceipt,
+    ) -> Result<(), FabricError> {
+        // #740: tool-result span over the existing result path. A tool result
+        // is attempt evidence only; it never completes work as task Finish.
+        let _span = tracing::info_span!(
+            "eliotd.fabric_tool_result",
+            attempt = %crate::diagnostics::sanitize_identity(attempt_id.as_str())
+        )
+        .entered();
+        let outcome = self.submit_tool_result_receipt_checked(attempt_id, receipt);
+        if let Err(error) = &outcome {
+            let _ = crate::diagnostics::RejectionRecord::of_fabric_error(error).emit();
+        }
+        outcome
+    }
+
+    fn submit_tool_result_receipt_checked(
+        &mut self,
+        attempt_id: &AttemptId,
+        receipt: &ToolResultReceipt,
+    ) -> Result<(), FabricError> {
+        receipt.check_complete_evidence().map_err(|error| {
+            FabricError::Contract(format!("tool-result receipt: {error}"))
+        })?;
+        validate_text(receipt.result_digest(), "result_digest")?;
+        let key = attempt_id.as_str().to_owned();
+        if let Some(stored) = self.tool_result_receipts.get(&key) {
+            if *stored == *receipt {
+                self.record("tool_result_replayed", &key);
+                return Ok(());
+            }
+            return Err(FabricError::DefinitionConflict(format!(
+                "attempt {key} reused with a different tool-result receipt"
+            )));
+        }
+        match self.attempt_states.get(&key) {
+            Some(AttemptLifecycle::Dispatched) => {
+                self.tool_result_receipts
+                    .insert(key.clone(), receipt.clone());
+                self.attempt_states
+                    .insert(key.clone(), AttemptLifecycle::ResultSubmitted);
+                self.record("tool_result_recorded", &key);
+                Ok(())
+            }
+            Some(_) => Err(FabricError::ResultNotFinish(format!(
+                "attempt {key} tool result is a candidate artifact, not task Finish"
+            ))),
+            None => Err(FabricError::Quarantined(format!(
+                "orphan tool result for unknown attempt {key}"
+            ))),
+        }
+    }
+
+    /// Returns the recorded tool-result receipt for one attempt, if any.
+    /// Read-only observation: it never consults a port and never admits use.
+    #[must_use]
+    pub fn tool_result_of(&self, attempt_id: &AttemptId) -> Option<&ToolResultReceipt> {
+        self.tool_result_receipts.get(attempt_id.as_str())
+    }
+
     /// Observes one worker result line. Orphan, foreign, or stale observations
     /// are quarantined and publish no proof or effect.
     ///
@@ -3289,6 +3414,7 @@ impl AgentFabric {
             semantic_supersessions: self.semantic_supersessions.clone(),
             staffing_receipts: self.staffing_receipts.clone(),
             attempt_routes: self.attempt_routes.clone(),
+            tool_result_receipts: self.tool_result_receipts.clone(),
         })
     }
 
@@ -3340,6 +3466,7 @@ impl AgentFabric {
         // authority. Legacy snapshots carry no semantic records and pass
         // trivially.
         verify_snapshot_semantics(&snapshot)?;
+        verify_snapshot_tool_receipts(&snapshot)?;
         let admission_by_definition = rebuild_admission_by_definition(&snapshot)?;
         let coordinator = AgentCoordinator::restore(
             snapshot.coordinator_snapshot.clone(),
@@ -3384,6 +3511,7 @@ impl AgentFabric {
             semantic_supersessions: snapshot.semantic_supersessions,
             staffing_receipts: snapshot.staffing_receipts,
             attempt_routes: snapshot.attempt_routes,
+            tool_result_receipts: snapshot.tool_result_receipts,
             attempt_degradations: BTreeMap::new(),
             initialized: true,
         };
@@ -3420,6 +3548,7 @@ impl AgentFabric {
         // authority. Legacy snapshots carry no semantic records and pass
         // trivially.
         verify_snapshot_semantics(&snapshot)?;
+        verify_snapshot_tool_receipts(&snapshot)?;
         let admission_by_definition = rebuild_admission_by_definition(&snapshot)?;
         let coordinator = AgentCoordinator::restore_with_admitted_provider(
             snapshot.coordinator_snapshot.clone(),
@@ -3462,6 +3591,7 @@ impl AgentFabric {
             semantic_supersessions: snapshot.semantic_supersessions,
             staffing_receipts: snapshot.staffing_receipts,
             attempt_routes: snapshot.attempt_routes,
+            tool_result_receipts: snapshot.tool_result_receipts,
             attempt_degradations: BTreeMap::new(),
             initialized: true,
         };
