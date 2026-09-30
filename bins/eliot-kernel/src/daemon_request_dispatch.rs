@@ -8972,15 +8972,14 @@ impl KernelComposition {
             Err(error) => return Ok(Self::store_error_response_text("write_receipt", &error)),
         };
         let apply_result = if let Some(seed) = reserved_seed {
-            gateway
-                .apply_reserved(
-                    &operation.context,
-                    operation.transition,
-                    operation.expected_revision_heads,
-                    operation.expected_ordering_heads,
-                    seed,
-                )
-                .await
+            Box::pin(gateway.apply_reserved(
+                &operation.context,
+                operation.transition,
+                operation.expected_revision_heads,
+                operation.expected_ordering_heads,
+                seed,
+            ))
+            .await
                 .map_err(|error| Self::store_error_response_text("write_receipt", &error))
         } else {
             match gateway
@@ -9057,6 +9056,42 @@ impl KernelComposition {
         else {
             return Ok(None);
         };
+        let Some(input) = Self::retained_observe_reservation_input(&record, operation)? else {
+            return Ok(None);
+        };
+        let current_time_ms = unix_ms();
+        if current_time_ms >= record.deadline_unix_ms {
+            return Err("protected Observe request deadline has expired".to_owned());
+        }
+        let created_at_ms = i64::try_from(current_time_ms)
+            .map_err(|_| "Kernel clock is outside the reservation time range".to_owned())?;
+        let expires_at_ms = i64::try_from(record.deadline_unix_ms)
+            .map_err(|_| "host request deadline is outside the reservation time range".to_owned())?;
+
+        let observed_heads = self.read_observe_reservation_heads(gateway, operation).await?;
+        let access = input
+            .protected_envelope
+            .privacy_and_visibility_class
+            .clone();
+        access.validate().map_err(|error| error.to_string())?;
+        let seed = gateway_seed(
+            self.platform.as_ref(),
+            transition,
+            "kernel-composition",
+            created_at_ms,
+            created_at_ms,
+            expires_at_ms,
+            access,
+            &observed_heads,
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(Some(seed))
+    }
+
+    fn retained_observe_reservation_input<'a>(
+        record: &'a HostRequestRecord,
+        operation: &StoreApplyOperation,
+    ) -> Result<Option<&'a eliot_ors::HostRequestExecutableInput>, String> {
         let Some(input) = record.executable_input.as_ref() else {
             if record.kind == eliot_ors::HostRequestKind::Invocation
                 && record.capability_ref.as_str() == "eliot.observe"
@@ -9065,10 +9100,9 @@ impl KernelComposition {
             }
             return Ok(None);
         };
-
         record.validate().map_err(|error| error.to_string())?;
         input
-            .validate_for(&record)
+            .validate_for(record)
             .map_err(|error| error.to_string())?;
         let attempt = record
             .attempt
@@ -9084,6 +9118,7 @@ impl KernelComposition {
                 "protected Observe row is not the exact durably claimed submission".to_owned(),
             );
         }
+        let transition = &operation.transition;
         let app = &input.application_binding;
         let scope_ref = record
             .scope_ref
@@ -9104,17 +9139,14 @@ impl KernelComposition {
                 "prepared observation does not match the retained host request binding".to_owned(),
             );
         }
+        Ok(Some(input))
+    }
 
-        let current_time_ms = unix_ms();
-        if current_time_ms >= record.deadline_unix_ms {
-            return Err("protected Observe request deadline has expired".to_owned());
-        }
-        let created_at_ms = i64::try_from(current_time_ms)
-            .map_err(|_| "Kernel clock is outside the reservation time range".to_owned())?;
-        let expires_at_ms = i64::try_from(record.deadline_unix_ms).map_err(|_| {
-            "host request deadline is outside the reservation time range".to_owned()
-        })?;
-
+    async fn read_observe_reservation_heads(
+        &self,
+        gateway: &Arc<KernelStoreGateway>,
+        operation: &StoreApplyOperation,
+    ) -> Result<Vec<ObservedHead>, String> {
         let store = BorrowedCanonicalStoreClient::new(gateway);
         let actual_revision_heads = store
             .revision_heads(
@@ -9147,7 +9179,7 @@ impl KernelComposition {
             }
             if expected_revisions
                 .get(head.key.as_str())
-                .map_or(true, |(revision, fence)| {
+                .is_none_or(|(revision, fence)| {
                     *revision != head.revision || **fence != head.state_fence
                 })
             {
@@ -9161,7 +9193,7 @@ impl KernelComposition {
         }
 
         let actual_ordering_heads = store
-            .ordering_head_readbacks(transition.ordering_scopes.clone())
+            .ordering_head_readbacks(operation.transition.ordering_scopes.clone())
             .await
             .map_err(|error| format!("could not observe canonical ordering heads: {error}"))?;
         if actual_ordering_heads.len() != operation.expected_ordering_heads.len() {
@@ -9191,7 +9223,7 @@ impl KernelComposition {
                 || head.state_fence != operation.context.state_fence
                 || expected_ordering
                     .get(head.scope.as_str())
-                    .map_or(true, |(sequence, fence)| {
+                    .is_none_or(|(sequence, fence)| {
                         *sequence != head.sequence || **fence != head.state_fence
                     })
             {
@@ -9210,24 +9242,9 @@ impl KernelComposition {
             );
         }
 
-        let access = input
-            .protected_envelope
-            .privacy_and_visibility_class
-            .clone();
-        access.validate().map_err(|error| error.to_string())?;
-        let seed = gateway_seed(
-            self.platform.as_ref(),
-            transition,
-            "kernel-composition",
-            created_at_ms,
-            created_at_ms,
-            expires_at_ms,
-            access,
-            &observed_heads,
-        )
-        .map_err(|error| error.to_string())?;
-        Ok(Some(seed))
+        Ok(observed_heads)
     }
+
 
     /// Resolves an already-committed `Apply` receipt for this exact operation
     /// identity.

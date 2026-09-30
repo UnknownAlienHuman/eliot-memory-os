@@ -2023,7 +2023,7 @@ impl KernelComposition {
         if state.activation_completed || state.session.is_some() {
             return Err(TransportError::IdentityConflict);
         }
-        state.observation_host_policy_readback = result.observation_host_policy_readback.clone();
+        state.observation_host_policy_readback.clone_from(&result.observation_host_policy_readback);
         state.observation_host_activation_result = Some(result.clone());
         state.observation_host_activation_ticket = Some(pending.ticket.clone());
         state.activation_completed = true;
