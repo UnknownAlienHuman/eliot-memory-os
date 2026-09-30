@@ -1038,6 +1038,7 @@ name = "eliot-cli"
 version = "0.1.0"
 dependencies = [
  "eliot-bootstrap",
+ "eliot-backup",
  "eliot-contracts",
  "eliot-ipc",
  "eliot-kernel-core",
