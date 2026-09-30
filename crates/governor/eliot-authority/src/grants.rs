@@ -893,8 +893,8 @@ impl EffectiveCapabilitySnapshot {
     /// Issues one exact-use lease from an original validated capability path.
     ///
     /// The caller supplies only the use identity and obligation. The binding,
-    /// holder, WorkScope, Session, and expiry are copied from the same
-    /// effective path and the snapshot that GrantGraph admitted; caller-made
+    /// holder, `WorkScope`, `Session`, and expiry are copied from the same
+    /// effective path and the snapshot that `GrantGraph` admitted; caller-made
     /// bindings or path cross-products are not accepted.
     pub fn issue_action_lease(
         &self,
