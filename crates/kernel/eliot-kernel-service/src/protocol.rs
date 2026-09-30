@@ -709,7 +709,7 @@ impl EliotdLaunchDescriptor {
                     field: "eliotd.restart_policy",
                     reason: error.to_string(),
                 })?;
-            if policy.subject_id != ELIOTD_RESTART_POLICY_SUBJECT_ID {
+            if policy.subject_id.as_str() != ELIOTD_RESTART_POLICY_SUBJECT_ID {
                 return Err(KernelServiceError::InvalidField {
                     field: "eliotd.restart_policy.subject_id",
                     reason: "admitted restart policy names a different supervised child",

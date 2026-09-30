@@ -1347,7 +1347,7 @@ impl KernelComposition {
             policy
                 .validate()
                 .map_err(|error| KernelBuildError::Service(error.to_string()))?;
-            if policy.subject_id != module_id.as_str() {
+            if policy.subject_id.as_str() != module_id.as_str() {
                 return Err(KernelBuildError::Service(
                     "admitted eliotd restart policy names a different supervised child".to_owned(),
                 ));
