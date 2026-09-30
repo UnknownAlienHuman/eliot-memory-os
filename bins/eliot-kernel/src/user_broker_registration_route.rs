@@ -19,13 +19,13 @@ use eliot_platform::PlatformHandle;
 use eliot_protocol::{Frame, ProtocolPayload, RequestIdentity};
 use eliot_security_contracts::NativeResourceSelection;
 use eliot_user_broker_core::{
-    RegistrationFenceReceipt, RegistrationFenceRequest, RegistrationGrant, RegistrationReceipt,
-    RegistrationRequest, RegistrationStatus,
+    LaunchRequest, RegistrationFenceReceipt, RegistrationFenceRequest, RegistrationGrant,
+    RegistrationReceipt, RegistrationRequest, RegistrationStatus,
 };
 
 use super::user_broker_registration_authority::{
-    LiveUserBrokerRegistration, UserBrokerFenceReplay, UserBrokerHeartbeatReplay,
-    UserBrokerSessionBinding,
+    LiveUserBrokerRegistration, SpentUserBrokerOperationIdentity, UserBrokerFenceReplay,
+    UserBrokerHeartbeatReplay, UserBrokerSessionBinding,
 };
 use super::{
     FrameKind, KernelComposition, KernelFrameAction, KernelServiceState, MessageType, Session,
@@ -35,18 +35,27 @@ use super::{
 pub(crate) const USER_BROKER_MODULE_ID: &str = "eliot-user-broker";
 pub(crate) const USER_BROKER_REGISTER_OPERATION: &str = "eliot.user-broker.register";
 pub(crate) const USER_BROKER_HEARTBEAT_OPERATION: &str = "eliot.user-broker.heartbeat";
+pub(crate) const USER_BROKER_AUTHORIZE_LAUNCH_OPERATION: &str =
+    "eliot.user-broker.authorize-launch";
 pub(crate) const USER_BROKER_FENCE_OPERATION: &str = "eliot.user-broker.fence";
 pub(crate) const USER_BROKER_VALIDATE_NATIVE_RESOURCE_SELECTION_CURRENT_OPERATION: &str =
     "eliot.user-broker.validate-native-resource-selection-current";
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct UserBrokerHeartbeatPayload {
     registration: RegistrationReceipt,
     observed_at: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct UserBrokerAuthorizeLaunchPayload {
+    registration: RegistrationReceipt,
+    request: LaunchRequest,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct UserBrokerResourceSelectionCurrentPayload {
     registration: RegistrationReceipt,
@@ -261,6 +270,75 @@ fn validate_user_broker_operation_identity(
         return Err(TransportError::SessionFenced);
     }
     Ok(policy.heartbeat_ms)
+}
+
+/// Computes the canonical digest binding one presented operation to its exact
+/// payload and request identity (issue #74 W7).
+///
+/// The digest is this route's I5.5 canonical request hash: the same
+/// idempotency key presented with the same digest is an exact-retry
+/// candidate, and the same key with a different digest is an identity
+/// conflict. The full presented identity (request id, fence-bound metadata,
+/// key, deadline, cancellation id) enters the digest, so refreshing any
+/// identity field is new canonical bytes, never a silent retry.
+fn canonical_user_broker_operation_digest<T: Serialize>(
+    operation: &str,
+    request: &T,
+    identity: &RequestIdentity,
+) -> Result<String, TransportError> {
+    let payload_bytes = serde_json::to_vec(request).map_err(|_| TransportError::SessionFenced)?;
+    let identity_bytes = serde_json::to_vec(identity).map_err(|_| TransportError::SessionFenced)?;
+    broker_digest(&(operation, payload_bytes, identity_bytes))
+}
+
+/// Builds the spent-identity evidence retained when one operation is
+/// admitted under its presented identity.
+fn spent_user_broker_operation_identity(
+    operation: &str,
+    canonical_digest: String,
+    identity: &RequestIdentity,
+) -> SpentUserBrokerOperationIdentity {
+    SpentUserBrokerOperationIdentity {
+        operation: operation.to_owned(),
+        request_id: identity.request.metadata.request_id.as_str().to_owned(),
+        idempotency_key: identity.idempotency_key.clone(),
+        cancellation_id: identity.cancellation_id.clone(),
+        canonical_digest,
+    }
+}
+
+/// Rejects cross-operation identity reuse and idempotency-key conflicts
+/// (issue #74 W7; I5.5 identity-conflict rule).
+///
+/// Every admitted operation identity is spent exactly once for its
+/// registration chain: a presented identity whose idempotency key matches
+/// retained evidence must name the same operation and canonical digest, in
+/// which case it is an exact-retry candidate the per-operation handler then
+/// confirms byte-for-byte before serving anything. Any other use of a spent
+/// idempotency key, request id, or cancellation id — across operations or
+/// under different canonical bytes — is a typed
+/// [`TransportError::IdentityConflict`], which the frame layer projects as
+/// `frame_identity_conflict` without dispatching or mutating ORS. Fully
+/// fresh identities pass through to the existing admission gates unchanged.
+fn reject_user_broker_identity_reuse(
+    spent: &[SpentUserBrokerOperationIdentity],
+    operation: &str,
+    canonical_digest: &str,
+    identity: &RequestIdentity,
+) -> Result<(), TransportError> {
+    let request_id = identity.request.metadata.request_id.as_str();
+    for prior in spent {
+        if prior.idempotency_key == identity.idempotency_key {
+            if prior.operation.as_str() == operation && prior.canonical_digest == canonical_digest {
+                continue;
+            }
+            return Err(TransportError::IdentityConflict);
+        }
+        if prior.request_id == request_id || prior.cancellation_id == identity.cancellation_id {
+            return Err(TransportError::IdentityConflict);
+        }
+    }
+    Ok(())
 }
 
 fn ors_epoch_lineage(
@@ -556,6 +634,12 @@ impl KernelComposition {
                 .map_err(|_| TransportError::SessionFenced)?;
             return self.dispatch_user_broker_heartbeat(session, frame, &request, identity, now);
         }
+        if operation == USER_BROKER_AUTHORIZE_LAUNCH_OPERATION {
+            let request: UserBrokerAuthorizeLaunchPayload = serde_json::from_value(payload.clone())
+                .map_err(|_| TransportError::SessionFenced)?;
+            return self
+                .dispatch_user_broker_authorize_launch(session, frame, &request, identity, now);
+        }
         if operation == USER_BROKER_FENCE_OPERATION {
             let request: RegistrationFenceRequest = serde_json::from_value(payload.clone())
                 .map_err(|_| TransportError::SessionFenced)?;
@@ -586,6 +670,37 @@ impl KernelComposition {
             serde_json::from_value(payload.clone()).map_err(|_| TransportError::SessionFenced)?;
         let (installation_id, state_fence, authority_epoch, heartbeat_ms) =
             peer_claims_registration(self, session, &request, identity, frame, now)?;
+        let canonical_digest = canonical_user_broker_operation_digest(
+            USER_BROKER_REGISTER_OPERATION,
+            &request,
+            identity,
+        )?;
+        let spent = {
+            let live_guard = self
+                .user_broker_registration_authority
+                .live
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            let fenced_guard = self
+                .user_broker_registration_authority
+                .fenced_replays
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            let mut spent = Vec::new();
+            if let Some(current) = live_guard.get(&session.connection_id) {
+                spent.extend(current.spent.iter().cloned());
+            }
+            if let Some(replay) = fenced_guard.get(&session.connection_id) {
+                spent.extend(replay.spent.iter().cloned());
+            }
+            spent
+        };
+        reject_user_broker_identity_reuse(
+            &spent,
+            USER_BROKER_REGISTER_OPERATION,
+            &canonical_digest,
+            identity,
+        )?;
         let subject_id = OperationIdentity::new(format!(
             "user-broker-subject:{}",
             broker_digest(&(
@@ -706,6 +821,11 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         }
         let store_receipt = snapshot.receipt().clone();
+        let spent = vec![spent_user_broker_operation_identity(
+            USER_BROKER_REGISTER_OPERATION,
+            canonical_digest,
+            identity,
+        )];
         live.insert(
             session.connection_id.clone(),
             LiveUserBrokerRegistration {
@@ -722,6 +842,7 @@ impl KernelComposition {
                 store_record: input,
                 last_observed_at: registration_observed_at,
                 heartbeat_replay: None,
+                spent,
             },
         );
         serde_json::to_value(grant).map_err(|_| TransportError::SessionFenced)
@@ -757,6 +878,17 @@ impl KernelComposition {
             identity,
             &current.registration,
             now,
+        )?;
+        let canonical_digest = canonical_user_broker_operation_digest(
+            USER_BROKER_HEARTBEAT_OPERATION,
+            request,
+            identity,
+        )?;
+        reject_user_broker_identity_reuse(
+            &current.spent,
+            USER_BROKER_HEARTBEAT_OPERATION,
+            &canonical_digest,
+            identity,
         )?;
         if request.observed_at > now
             || request.observed_at < current.registration.observed_at
@@ -872,7 +1004,90 @@ impl KernelComposition {
             identity: identity.clone(),
             grant: grant.clone(),
         });
+        current.spent.push(spent_user_broker_operation_identity(
+            USER_BROKER_HEARTBEAT_OPERATION,
+            canonical_digest,
+            identity,
+        ));
         serde_json::to_value(grant).map_err(|_| TransportError::SessionFenced)
+    }
+
+    /// Admits one authorize-launch identity through the spent-identity chain
+    /// (issue #74 W7; I5.5 identity-conflict rule).
+    ///
+    /// The presented payload is parsed, bound to its canonical digest, and
+    /// judged by [`reject_user_broker_identity_reuse`] against the live
+    /// registration's spent chain before any ORS read or mutation: cross-
+    /// operation reuse and the same idempotency key under different canonical
+    /// bytes are a typed [`TransportError::IdentityConflict`], while an exact
+    /// retry (same operation and digest) passes through and is served
+    /// identically without growing spent evidence. This route performs no ORS
+    /// write, dispatch, or effect, and issues no launch grant — there is no
+    /// typed `LaunchGrant` owner on this route — so an admitted identity is
+    /// retained as spent evidence and the grant decision fails closed with
+    /// [`TransportError::SessionFenced`].
+    fn dispatch_user_broker_authorize_launch(
+        &self,
+        session: &Session,
+        frame: &Frame,
+        request: &UserBrokerAuthorizeLaunchPayload,
+        identity: &RequestIdentity,
+        now: u64,
+    ) -> Result<Value, TransportError> {
+        let mut live = self
+            .user_broker_registration_authority
+            .live
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let current = live
+            .get_mut(&session.connection_id)
+            .ok_or(TransportError::SessionFenced)?;
+        if !current.session.matches(session) {
+            return Err(TransportError::SessionFenced);
+        }
+        validate_user_broker_operation_identity(
+            self,
+            session,
+            frame,
+            identity,
+            &current.registration,
+            now,
+        )?;
+        let canonical_digest = canonical_user_broker_operation_digest(
+            USER_BROKER_AUTHORIZE_LAUNCH_OPERATION,
+            request,
+            identity,
+        )?;
+        reject_user_broker_identity_reuse(
+            &current.spent,
+            USER_BROKER_AUTHORIZE_LAUNCH_OPERATION,
+            &canonical_digest,
+            identity,
+        )?;
+        if request.registration != current.receipt
+            || current.receipt.status != RegistrationStatus::Active
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        if now >= current.receipt.expires_at {
+            drop(live);
+            self.fence_user_broker_session(session);
+            return Err(TransportError::SessionFenced);
+        }
+        if load_live_user_broker_registration(self, current).is_err() {
+            drop(live);
+            self.fence_user_broker_session(session);
+            return Err(TransportError::SessionFenced);
+        }
+        let admitted = spent_user_broker_operation_identity(
+            USER_BROKER_AUTHORIZE_LAUNCH_OPERATION,
+            canonical_digest,
+            identity,
+        );
+        if !current.spent.contains(&admitted) {
+            current.spent.push(admitted);
+        }
+        Err(TransportError::SessionFenced)
     }
 
     #[allow(
@@ -905,6 +1120,17 @@ impl KernelComposition {
             identity,
             &current.registration,
             now,
+        )?;
+        let canonical_digest = canonical_user_broker_operation_digest(
+            USER_BROKER_VALIDATE_NATIVE_RESOURCE_SELECTION_CURRENT_OPERATION,
+            request,
+            identity,
+        )?;
+        reject_user_broker_identity_reuse(
+            &current.spent,
+            USER_BROKER_VALIDATE_NATIVE_RESOURCE_SELECTION_CURRENT_OPERATION,
+            &canonical_digest,
+            identity,
         )?;
         if request.registration != current.receipt
             || current.receipt.status != RegistrationStatus::Active
@@ -982,6 +1208,14 @@ impl KernelComposition {
         {
             return Err(TransportError::SessionFenced);
         }
+        let admitted = spent_user_broker_operation_identity(
+            USER_BROKER_VALIDATE_NATIVE_RESOURCE_SELECTION_CURRENT_OPERATION,
+            canonical_digest,
+            identity,
+        );
+        if !current.spent.contains(&admitted) {
+            current.spent.push(admitted);
+        }
         Ok(())
     }
 
@@ -1009,6 +1243,17 @@ impl KernelComposition {
                 || replay.request != request
                 || replay.identity != *identity
             {
+                let canonical_digest = canonical_user_broker_operation_digest(
+                    USER_BROKER_FENCE_OPERATION,
+                    &request,
+                    identity,
+                )?;
+                reject_user_broker_identity_reuse(
+                    &replay.spent,
+                    USER_BROKER_FENCE_OPERATION,
+                    &canonical_digest,
+                    identity,
+                )?;
                 return Err(TransportError::SessionFenced);
             }
             validate_user_broker_operation_identity(
@@ -1051,6 +1296,17 @@ impl KernelComposition {
             identity,
             &current.registration,
             now,
+        )?;
+        let canonical_digest = canonical_user_broker_operation_digest(
+            USER_BROKER_FENCE_OPERATION,
+            &request,
+            identity,
+        )?;
+        reject_user_broker_identity_reuse(
+            &current.spent,
+            USER_BROKER_FENCE_OPERATION,
+            &canonical_digest,
+            identity,
         )?;
         let Some(status_name) = user_broker_fence_status_name(request.status) else {
             return Err(TransportError::SessionFenced);
@@ -1104,6 +1360,12 @@ impl KernelComposition {
         };
 
         let receipt = registration_fence_receipt(&request);
+        let mut spent = current.spent.clone();
+        spent.push(spent_user_broker_operation_identity(
+            USER_BROKER_FENCE_OPERATION,
+            canonical_digest,
+            identity,
+        ));
         let replay = UserBrokerFenceReplay {
             session: current.session.clone(),
             registration: current.registration.clone(),
@@ -1114,6 +1376,7 @@ impl KernelComposition {
             store_receipt: snapshot.receipt().clone(),
             store_operation_order: snapshot.operation_order(),
             store_record: input,
+            spent,
         };
         live.remove(&session.connection_id);
         drop(live);
