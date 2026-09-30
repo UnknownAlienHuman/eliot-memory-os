@@ -51,12 +51,13 @@ use eliot_research_exchange_api::{
 
 use crate::evidence_portfolio::{
     AbsencePreconditions, AbsenceVerdict, AuditBindingError, AuditReferenceBinding, AuditedClaim,
-    AuthorizedManifest, AuthorizedManifestParams, ClaimCoverageMap, ClaimVerdict, CoverageAccount,
-    EvidencePortfolio, LineageTable, ManifestSource, MaterialClaimRoster, NoMatchEvaluation,
-    ObservedOutsideScope, PortfolioError, PrecisionAssertion, PrecisionKind, RiskState,
-    SourceDisposition, SourceRecord, SourceRecordParams, UnsupportedPrecisionItem, assess_absence,
-    bool_text, check_precision, digest, fence_preimage, freeze, grade_name, grade_rank, push_count,
-    push_field, reject_vague, text,
+    AuthorizedManifest, AuthorizedManifestParams, ClaimConditionSources, ClaimCoverageMap,
+    ClaimVerdict, CoverageAccount, EvidencePortfolio, LineageTable, ManifestSource,
+    MaterialClaimRoster, NoMatchEvaluation, ObservedOutsideScope, PortfolioError,
+    PrecisionAssertion, PrecisionKind, RiskState, SourceDisposition, SourceRecord,
+    SourceRecordParams, UnsupportedPrecisionItem, assess_absence, bool_text, check_precision,
+    digest, fence_preimage, freeze, grade_name, grade_rank, push_count, push_field, reject_vague,
+    text,
 };
 use crate::inquiry_lanes::{
     CommittedLaneRegistration, DeviationAllowance, DeviationScope, ExclusionAndQualityControl,
@@ -8592,7 +8593,27 @@ fn claim_audit_for_run(
         // A claim with no verifiable frozen identity can never be released as
         // supported, so the identity is frozen here from the statement the run
         // actually releases rather than being trusted as a caller-supplied value.
-        let identity = claim.freeze_identity().map_err(InquiryError::from)?;
+        // Its two data-dependent conditions are read from the owners that
+        // established them — the admitted record behind this claim's single
+        // citation for the time/version scope, and the Kernel-admitted
+        // denominator plus the coverage account for the definition it is
+        // measured in. `claim_id` IS a portfolio record key by construction:
+        // `MaterialClaimRoster::derive` above built this list out of
+        // `portfolio.records.keys()`, so a handle that is not there is a roster
+        // that disagrees with the portfolio and is refused rather than given an
+        // identity about some other record.
+        let Some(record) = portfolio.records.get(claim_id) else {
+            return Err(InquiryError::UnknownHandle {
+                field: "claim_audit.claim_record",
+            });
+        };
+        let identity = claim
+            .freeze_identity(ClaimConditionSources {
+                record,
+                admitted_denominator_digest: &profile.admitted_denominator_digest,
+                account,
+            })
+            .map_err(InquiryError::from)?;
         let claim = AuditedClaim {
             frozen_identities: vec![identity],
             excerpts: retained_excerpts(observation, claim_id),
