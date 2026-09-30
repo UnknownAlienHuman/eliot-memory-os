@@ -467,11 +467,8 @@ impl KernelGovernedProcessEffectPort {
         before_digest: String,
         terminal_fence: FencingToken,
     ) -> (Option<String>, change_monitor::HintVerification) {
-        let (_, transition) = change_monitor::material_transition_ids(
-            operation,
-            Some(before_digest.as_str()),
-            None,
-        );
+        let (_, transition) =
+            change_monitor::material_transition_ids(operation, Some(before_digest.as_str()), None);
         let change = change_monitor::GovernedToolChange {
             change_id: operation.to_owned(),
             resource: baseline.resource.clone(),
