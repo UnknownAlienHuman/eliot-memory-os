@@ -68,30 +68,34 @@
 //!   at the funnel's second step and this record is one.
 //! - **ConformanceDiagnosis** — the routed #971 finding, projected by
 //!   [`conformance_diagnosis_evidence`].
+//! - **Watchdog** and **Dreamer** — the two of I12.24:54's "Dreamer/Watchdog/
+//!   Concilium suggestion" that the closed [`MaintenanceTrigger`] vocabulary can
+//!   carry, selected by [`maintenance_trigger_evidence_source`] from
+//!   [`eliot_maintenance::AutomationTriggerDecision::trigger`]. That field is the
+//!   evaluator's VERBATIM copy of the caller-observed origin, so the label is a
+//!   derivation from the observation, the same standard the family match is held
+//!   to — and neither is filled from a substitute value.
 //!
-//! The other seven are **EvaluatorVerdict**, **SecurityIncident**,
-//! **ImplementationDeviation**, **Complaint**, **Watchdog**, **Dreamer** and
-//! **Concilium**, and none is filled from a substitute value. A family census
-//! shows the only families any production trigger site can name are
+//! That is five of the ten connected. The other five are **EvaluatorVerdict**,
+//! **SecurityIncident**, **ImplementationDeviation**, **Complaint** and
+//! **Concilium**, and none of them is filled from a substitute value either. A
+//! family census shows the only families any production trigger site can name are
 //! [`crate::SELF_OBSERVED_FAMILY`] and `MaintenanceFamily::DonorConformance`, so
 //! security incidents need a pinned-scanner receipt producer that does not exist
 //! (annotated at the arm); evaluator verdicts, accepted implementation
 //! deviations and complaints have no producer anywhere in this workspace to read
-//! (`sourced_evidence_from_repeated_verifier_failure`,
-//! `eliot_problem::ImplementationDeviation` and `CoverageComplaint` each have no
-//! call site); and Watchdog, Dreamer and Concilium have no arm and are annotated
-//! as such. The three no-producer cases are set out in full below, under "The
-//! three remaining sources with no producer AT ALL".
+//! (`eliot_problem::ImplementationDeviation` and `CoverageComplaint` each have no
+//! call site); and `Concilium` has no `MaintenanceTrigger` member to be carried
+//! on at all. The three no-producer cases are set out in full below, under "The
+//! three sources with no producer AT ALL".
 //!
-//! The decision also carries its origin —
-//! [`eliot_maintenance::AutomationTriggerDecision::trigger`] is copied verbatim
-//! from the evaluated trigger — so the three suggestion sources are not blocked
-//! by a missing field. They remain unselected because the ONE observation this
-//! intake is handed is built from
-//! `MaintenanceTriggerOrigin::IdleTransition`, which maps to
-//! `MaintenanceTrigger::Policy` and can never read `WatchdogProblem`,
-//! `Dreamer` or `Concilium`. The per-source remaining step, which differs
-//! sharply between them, is recorded on [`maintenance_evidence_source`].
+//! The per-source remaining step for Watchdog and Dreamer differs sharply —
+//! Watchdog needs an existing origin ROUTED to this intake, Dreamer needs a new
+//! `MaintenanceTriggerOrigin` member that is not this file's to add — and is
+//! recorded on [`maintenance_evidence_source`]. The live intake observation is
+//! still built from `MaintenanceTriggerOrigin::IdleTransition`, which maps to
+//! `MaintenanceTrigger::Policy`, so the two new arms do not fire on the path
+//! that exists today; they fire on the origin the decision actually carries.
 //!
 //! # The durable port is the existing Governor/Kernel named mutation
 //!
@@ -247,6 +251,19 @@
 //! requirement — a real production caller consuming real evidence and
 //! emitting a durably committed owner-actionable artifact — is met without
 //! weakening that gate, which stays closed.
+//!
+//! The refusal is now ENFORCED rather than merely unreached, which is what A3
+//! asks for. The gate used to hold on this path only because nothing called the
+//! promoting seam: `ImprovementCandidate::promote_lifecycle` had no production
+//! caller anywhere, so a replay-only candidate could not promote by omission and
+//! not by decision — a guarantee that a later change could remove by adding one
+//! call. [`refuse_replay_only_promotion`] now runs in
+//! [`commit_improvement_artifact`] and CHECKS the candidate's own recorded
+//! lifecycle against the crate's own promoting predicate, refusing through the
+//! crate's own gate. So a candidate whose recorded lifecycle reached `Supported`
+//! or `Narrowed` cannot become durable through this seam even if a future change
+//! routed one in without a budget record — the guarantee is a decision this
+//! module makes on every pass, not a property of a seam nobody calls.
 
 //! # The bounded backlog is a GOVERNED admission, not a daemon literal
 //!
@@ -322,18 +339,26 @@
 //!    (I12.24:82: "advisory … default; changes nothing until owner acts"), and
 //!    the artifact is truthful about WHO chose it. What is not true of it is that
 //!    an owner chose it.
-//! 2. **`OwnerDecisionKind::Reject` remains unreachable from a real,
-//!    non-constant source**, and so do `WorkItem` and `Experiment`. That is not
-//!    repaired here, because every available substitute is a fabrication: the
-//!    maintenance owner's own `AutomationDecision` (`eliot-maintenance/src/lib.rs:184`)
-//!    decides whether to run a maintenance JOB and never saw this brief; the
+//! 2. **The SELECTION is now content-derived, and the four dispositions are
+//!    still not an owner's.** [`daemon_disposition_kind`] derives the kind from
+//!    the Governor maintenance owner's own recorded
+//!    [`AutomationDecision`](eliot_maintenance::AutomationDecision) over the same
+//!    family and scope this artifact is assembled from, so
+//!    [`OwnerDecisionKind::Reject`] — which was previously unreachable from any
+//!    non-constant source, because the kind was spelled `Investigate` at the
+//!    call site — is now reached on a real recorded verdict, and the blocked
+//!    intake this module exists to serve is that verdict. What remains
+//!    unrepaired is the PRINCIPAL, not the selection: the maintenance owner
+//!    decided whether to run a maintenance JOB and never saw this brief, the
 //!    observed closure's `actor_id` is the principal that EXECUTED the
-//!    consequential attempt and selected nothing; and the `G-19` admission
+//!    consequential attempt and selected nothing, and the `G-19` admission
 //!    authority issues learning-admission PERMITS, which is a different act from
-//!    selecting a disposition over a brief. Mapping any of them onto this
-//!    vocabulary would record an owner's decision that owner never made — the
-//!    misattribution [`maintenance_evidence_source`] exists to remove, reached
-//!    from the other direction.
+//!    selecting a disposition over a brief. So the daemon is still the recorded
+//!    selector, its verdict is still only EVIDENCE, and the note names both.
+//!    `WorkItem` and `Experiment` remain unproduced anywhere in `bins/`, because
+//!    reaching them would require a work item or an experiment this intake does
+//!    not hold — and both are mutating kinds, which I12.24:82 forbids without
+//!    an owner action that has no route here.
 //!
 //! # The exact missing route, named
 //!
@@ -462,12 +487,12 @@ use eliot_improvement::{
     ChangeDescriptor, EvidenceSource, ImprovementBrief, ImprovementCandidate, ImprovementError,
     ImprovementLifecycle, ImprovementSurface, OwnerDecision, OwnerDecisionKind, ReplayPlan,
     SafeBoundary, SourcedEvidence, brief_at_safe_boundary, candidate_from_evidence,
-    check_class_gate, classify, sourced_evidence,
+    check_class_gate, classify, require_matched_budget_for_promotion, sourced_evidence,
 };
 use eliot_maintenance::{
     IMPROVEMENT_ADMISSION_AUTHORITY, IMPROVEMENT_CANDIDATE_BOUNDS_REVISION,
     ImprovementAdmissionPolicy, ImprovementBoundError, ImprovementSurfaceBound,
-    ImprovementTargetSurface, resolve_candidate_surface_bound,
+    ImprovementTargetSurface, MaintenanceTrigger, resolve_candidate_surface_bound,
 };
 use eliot_protocol::RequestIdentity;
 use eliot_receipts::RequestBinding;
@@ -710,25 +735,22 @@ pub fn assemble_improvement_artifact(
     // path does, so the durable record carries the owner-decision lifecycle.
     candidate.transition_lifecycle(ImprovementLifecycle::Triaged)?;
 
-    // The application-class boundary is enforced HERE, in the production
-    // assembly, not only inside `prepare_intake` (issue #1867 W5). Before this
-    // the gate had no production caller at all: `classify` and
-    // `check_class_gate` were reachable only from `intake_from_evidence`, which
-    // this daemon deliberately does not call because its budget gate would
-    // demand fabricated canary refs. The class is therefore decided here from
-    // the candidate's OWN recorded surface, and a candidate whose recorded
-    // surface the owner forbids to the advisory class is refused rather than
-    // assembled.
+    // The application-class boundary is enforced in the production path, not
+    // only inside `prepare_intake` (issue #1867 W5). Before this the gate had no
+    // production caller at all: `classify` and `check_class_gate` were reachable
+    // only from `intake_from_evidence`, which this daemon deliberately does not
+    // call because its budget gate would demand fabricated canary refs. The
+    // class is therefore decided from the candidate's OWN recorded surface, and
+    // a candidate whose recorded surface the owner forbids to the advisory
+    // class is refused rather than admitted.
     //
-    // Stated plainly so this call is not read as broader than it is: the
-    // candidate assembled above records [`IMPROVEMENT_SURFACE`] (`Memory`),
-    // which is not a protected surface, so on the live maintenance path the
-    // class taken is `Advisory` and the gate passes. What the gate buys here is
-    // that the class is a FUNCTION of the candidate's recorded surface rather
-    // than of literals — a candidate carrying `Verifier` or `Scheduler` is
-    // refused. See `enforce_advisory_class_gate` for the exact ceiling,
-    // including the two classes this path cannot represent at all.
-    enforce_advisory_class_gate(&candidate)?;
+    // The call is made at the ADMISSION seam
+    // ([`admit_improvement_artifact`]) rather than here, because that is where
+    // the live registry is in hand and I12.24:86's "one experiment per control
+    // surface" is a count over it. This function runs before the authenticated
+    // read that restores that registry, so a count taken here would be a claim
+    // rather than a measurement. See `enforce_improvement_class_gate` for the
+    // full argument and for the two classes this path cannot represent at all.
 
     // The safe boundary is READ, not spelled. It used to be two formatted
     // strings (a constant owner and a constant `boundary:{scope_ref}`), which
@@ -832,7 +854,7 @@ pub fn assemble_improvement_artifact(
         &boundary,
     )?;
 
-    let decision_record = record_daemon_disposition(&brief, decision.family)?;
+    let decision_record = record_daemon_disposition(&brief, decision)?;
 
     // Deduplication and bounded admission are NOT done here. They need the
     // live Governor owner (a real permit whose authority the bound is checked
@@ -844,6 +866,62 @@ pub fn assemble_improvement_artifact(
         brief,
         decision: decision_record,
     })
+}
+
+/// The non-mutating disposition the daemon selects over the brief it just
+/// assembled, DERIVED from the Governor maintenance owner's own recorded verdict
+/// on the same family and scope (issue #1867 A2, I12.24:65).
+///
+/// A2 reads "An owner can select a non-mutating decision such as reject or
+/// investigate." This function is what makes the SELECTION real rather than a
+/// constant, and it keeps it inside the two kinds
+/// [`OwnerDecision::is_non_mutating`] admits, so recording it authorizes nothing
+/// — I12.24:82's "advisory … default; changes nothing until owner acts"
+/// observed rather than asserted.
+///
+/// # Why this derivation and not a hardcoded `Investigate`
+///
+/// The disposition used to be spelled `OwnerDecisionKind::Investigate` at the
+/// call site, which made `Reject` unreachable from any content: a later reader
+/// could not tell a considered triage from a default. The input here is the
+/// Governor owner's OWN closed [`AutomationDecision`] on the decision this intake
+/// was handed — the same verdict, over the same `family` and `scope_ref`, that
+/// this artifact is assembled from — so the kind is a function of recorded
+/// evidence rather than of this file's choice:
+///
+/// - [`AutomationDecision::Block`] is "Policy, route, budget or session
+///   requirements deny execution" (`eliot-maintenance/src/lib.rs:194`). The
+///   daemon's own triage of a brief proposing to "evaluate and resolve the
+///   blocked maintenance family" is therefore [`OwnerDecisionKind::Reject`]:
+///   the owner denied the work, so the daemon stops pursuing the proposal. This
+///   is the live case, which is exactly why the constant made the gap
+///   invisible — the arm that mattered was the one never written.
+/// - every other value maps to [`OwnerDecisionKind::Investigate`], including
+///   [`AutomationDecision::Escalate`], which hands the occurrence to a Human or
+///   recovery owner: that owner was GIVEN the problem and has not yet ruled, so
+///   "investigate" is the truthful record and "reject" would claim a resolution
+///   nobody reached.
+///
+/// # What this is NOT
+///
+/// The principal recorded against the decision is still the DAEMON
+/// ([`SERVICE_NAME`], see below), never the maintenance owner. The maintenance
+/// owner's `AutomationDecision` is the EVIDENCE this triage is derived from; it
+/// is not a selection over this brief, because that owner never saw the brief.
+/// Naming it as the selector is the false attribution this module exists to
+/// remove, and the note text says which principal chose and on whose recorded
+/// verdict. The route by which an OWNER's own selection reaches this process is
+/// still absent, and the full measurement of every candidate ingress surface is
+/// in the module documentation above under "The recorded disposition is the
+/// DAEMON's own, and no owner ingress exists".
+fn daemon_disposition_kind(
+    decision: &eliot_maintenance::AutomationTriggerDecision,
+) -> OwnerDecisionKind {
+    use eliot_maintenance::AutomationDecision;
+    match decision.decision {
+        AutomationDecision::Block => OwnerDecisionKind::Reject,
+        _ => OwnerDecisionKind::Investigate,
+    }
 }
 
 /// Records the DAEMON'S OWN non-authoritative disposition over the brief it just
@@ -895,26 +973,35 @@ pub fn assemble_improvement_artifact(
 /// named place to arrive through.
 ///
 /// The four dispositions remain unreachable from an owner's selection, and
-/// `OwnerDecisionKind::Reject` in particular is not produced anywhere in
-/// `bins/`. The measurement of every candidate ingress surface, and the exact
-/// route that is missing and where it would attach, are recorded in the module
-/// documentation above under "The recorded disposition is the DAEMON's own, and
-/// no owner ingress exists". Nothing here substitutes a fabricated caller for it.
+/// `OwnerDecisionKind::WorkItem` and `OwnerDecisionKind::Experiment` in
+/// particular are not produced anywhere in `bins/`, and the two non-mutating
+/// kinds are reached only from the DAEMON's own triage of its own observation.
+/// The measurement of every candidate ingress surface, and the exact route by
+/// which an owner's own selection is missing and where it would attach, are
+/// recorded in the module documentation above under "The recorded disposition is
+/// the DAEMON's own, and no owner ingress exists". Nothing here substitutes a
+/// fabricated caller for it.
 ///
-/// `family` is the maintenance family this pass evaluated, and it appears only
-/// in the note text; the disposition it selects does not depend on it.
+/// `decision` is the Governor owner's own verdict this artifact is assembled
+/// from; the disposition is DERIVED from it by [`daemon_disposition_kind`] and
+/// the note names both the principal that chose and whose recorded verdict it
+/// chose on.
 fn record_daemon_disposition(
     brief: &eliot_improvement::ImprovementBrief,
-    family: eliot_maintenance::MaintenanceFamily,
+    decision: &eliot_maintenance::AutomationTriggerDecision,
 ) -> Result<OwnerDecision, ImprovementDispatchError> {
+    let kind = daemon_disposition_kind(decision);
     crate::improvement_intake::record_brief_decision(
         brief,
         SERVICE_NAME,
-        OwnerDecisionKind::Investigate,
+        kind,
         &format!(
-            "the daemon triaged blocked maintenance family {family} at its own initiative; this \
-             disposition selects nothing and no owner has ruled on this brief, because no \
-             owner-issued ingress reaches this process"
+            "the daemon triaged maintenance family {family} at its own initiative, on the \
+             maintenance owner's recorded verdict {verdict:?}; this disposition selects \
+             nothing and no owner has ruled on this brief, because no owner-issued ingress \
+             reaches this process",
+            family = decision.family,
+            verdict = decision.decision,
         ),
     )
     .map_err(|error| ImprovementDispatchError::Contract(error.to_string()))
@@ -1359,21 +1446,59 @@ fn observed_unknowns(
 /// `work_item_ref` is `None` because the candidate records no work item.
 /// Those absences are the fail-closed direction: a candidate whose recorded
 /// surface classifies as `Protected` is refused with
-/// [`ImprovementError::ApplicationClassViolation`] rather than assembled, and
-/// `live_experiments_on_surface` is `0` — this path starts no experiment — but
-/// it is not read, because the tuning class is not representable above.
+/// [`ImprovementError::ApplicationClassViolation`] rather than assembled.
 ///
-/// The refusal is therefore content-bound: it turns on the surface the
-/// candidate actually records. It is not a claim that every class upgrade is
-/// caught, and no such claim is made here.
-fn enforce_advisory_class_gate(
+/// `live_experiments_on_surface` is the REAL count of live candidates on this
+/// candidate's own surface, read from the governed backlog through
+/// [`BoundedBacklog::active_for`]. It used to be a literal `0` here, which
+/// satisfied I12.24:86's "one experiment per control surface" by asserting the
+/// bound instead of measuring it — the same shape-check-as-proof defect this
+/// whole function exists to remove, and it was the last unmeasured argument left
+/// on this call. The count is now the registry's own live entries for the
+/// recorded surface, so if a future change makes the tuning class representable
+/// the bound is compared against the owner registry rather than against a
+/// number this file chose. The registry in hand is the one restored from the
+/// committed records
+/// (`improvement_dedup_read::restored_registry`), i.e. the durable set, not an
+/// in-memory placeholder.
+///
+/// The refusal is therefore content-bound twice over: it turns on the surface the
+/// candidate actually records, and — for the one class that reads the count — on
+/// the live experiments that surface actually has. It is not a claim that every
+/// class upgrade is caught, and no such claim is made here.
+///
+/// # Why the count is read at the admission seam, not at assembly
+///
+/// The registry is the SECOND guarded phase's input
+/// ([`admit_improvement_artifact`], reached from
+/// `daemon_runtime::admit_over_restored_registry` only after the guard is
+/// released for the authenticated read), and
+/// [`assemble_improvement_artifact`] runs before that read with no registry in
+/// hand. Enforcing the gate in both places would mean measuring the count twice
+/// against two different registries, and the assembly-time copy would still be
+/// unmeasured. So the gate runs ONCE, at the admission seam, where the candidate
+/// and the live registry are both real and the count is a fact rather than a
+/// claim. The candidate assembled earlier is the same value this gate reads, so
+/// nothing is decided on a surface the candidate does not record.
+fn enforce_improvement_class_gate(
     candidate: &ImprovementCandidate,
+    backlog: &BoundedBacklog,
 ) -> Result<(), ImprovementDispatchError> {
     let change = ChangeDescriptor::from_recorded_surface(candidate.target_surface);
     let class = classify(&change);
-    check_class_gate(class, &change, 0, &candidate.rollback, None, false, None)?;
+    let live_experiments_on_surface = backlog.active_for(candidate.target_surface).len();
+    check_class_gate(
+        class,
+        &change,
+        live_experiments_on_surface,
+        &candidate.rollback,
+        None,
+        false,
+        None,
+    )?;
     Ok(())
 }
+
 
 /// The I12.24 evidence source this daemon's own maintenance decision belongs
 /// to (issue #1867 W2).
@@ -1488,82 +1613,63 @@ fn enforce_advisory_class_gate(
 /// intake. The honest outcome here is the `Attempt` label above plus that
 /// stated ceiling, not a refusal to classify a live observation.
 ///
-/// # The three suggestion sources with NO arm, and the producer each waits for
+/// # The two suggestion sources now CONNECTED, and how
 ///
-/// [`EvidenceSource::Watchdog`], [`EvidenceSource::Dreamer`] and
-/// [`EvidenceSource::Concilium`] are W2 sources that are not merely an
-/// unreachable arm but an ABSENT one: the match below has no pattern that could
-/// produce them, while the closed vocabulary does carry all three honestly
-/// (`evidence_sources.rs:29-31`). They no longer share the reason the
-/// `ASSUMPTION` above used to give them, because that reason is discharged.
-/// What each still lacks is its own producer, and the remaining step differs
-/// per source:
+/// [`EvidenceSource::Watchdog`] and [`EvidenceSource::Dreamer`] are the two of
+/// I12.24:54's "Dreamer/Watchdog/Concilium suggestion" that the closed
+/// [`MaintenanceTrigger`] vocabulary can actually carry, and they are now
+/// selected by [`maintenance_trigger_evidence_source`] from
+/// [`AutomationTriggerDecision::trigger`]. That field is the evaluator's
+/// verbatim copy of the caller-observed origin, so the label is a derivation
+/// from the observation rather than an assertion about it — the same standard
+/// the family match above is held to. The remaining step for each is a
+/// PRODUCER, not a vocabulary, and each is one route away:
 ///
-/// - `Watchdog` is the CLOSEST of the three, and its remaining step is now a
-///   single origin at a single site rather than a missing contract field.
-///   Measured on this tree, not assumed:
-///
-///   1. The origin that denotes a Watchdog/Doctor occurrence,
-///      `MaintenanceTriggerOrigin::AdmittedObservation`, is live and has exactly
-///      ONE construction site in this daemon
-///      (`daemon_runtime.rs:2868`, the store-health poll). The origin→trigger
-///      map is exhaustive over the four-member origin enum
-///      (`maintenance_trigger_evaluator.rs:122-128`), and only
-///      `AdmittedObservation` maps to `MaintenanceTrigger::WatchdogProblem`, so
-///      that one site is the only producer of a `WatchdogProblem` decision.
-///   2. That decision does not reach this function. It is consumed at
-///      `daemon_runtime.rs:2902-2906` by
-///      `note_blocked_automation_notification` and
-///      `publish_maintenance_source_results`; it is never handed to
-///      `run_improvement_intake` (`:5260`), whose only call site is
-///      `maybe_start_improvement_intake` (`:5797`).
-///   3. The one observation that DOES reach this function is built at
-///      `daemon_runtime::improvement_intake_observation` (`:5684`), which names
-///      `MaintenanceTriggerOrigin::IdleTransition` unconditionally (`:5690`).
-///      The intake is therefore the sole consumer of that one origin, and the
-///      decision it assembles over carries `MaintenanceTrigger::Policy`.
-///
-///   **The exact remaining step**, now that the origin travels on the decision:
-///   a trigger site that hands this intake an observation built from
-///   `MaintenanceTriggerOrigin::AdmittedObservation`. The site already exists
-///   and already builds exactly such an observation
-///   (`daemon_runtime.rs:2868`); what is absent is a route carrying it from
-///   there into `improvement_intake_observation`. Once that route exists, this
-///   function can select [`EvidenceSource::Watchdog`] by comparing
-///   `decision.trigger` against [`MaintenanceTrigger::WatchdogProblem`] — a
-///   value it now holds, and the one value in the closed origin map that means
-///   "Watchdog/Doctor problem recipe"
-///   (`maintenance_trigger_evaluator.rs:118-119`). Until then the arm would be
-///   dead on a value the live path provably cannot carry, so it is not wired.
-/// - `Dreamer` needs a Dreamer that SUGGESTS work, and its gap is LARGER than
-///   the Watchdog one in a way the origin map settles. `MaintenanceTrigger` has
-///   a `Dreamer` member (`lib.rs:184-185`), but NO origin maps to it: the
-///   exhaustive map at `maintenance_trigger_evaluator.rs:122-128` names only
-///   `Policy`, `Onboarding` and `WatchdogProblem`. So unlike `Watchdog`, a
-///   `Dreamer` decision cannot be produced by re-routing an existing origin —
-///   it needs a NEW `MaintenanceTriggerOrigin` member, which is a vocabulary
-///   this issue does not own. Independently, no Dreamer instance proposes
-///   anything to this daemon: the route is owner-declared and unassigned on
-///   this base, an omitted Dreamer route resolving to `RouteState::Unassigned`
-///   with no paid route (`eliot_config::first_run::decide_first_run`).
-/// - `Concilium` needs a deliberation verdict with a route into this intake,
-///   and its gap is largest of the three: `MaintenanceTrigger` has NO
+/// - `Watchdog` is the closest. The origin that denotes a Watchdog/Doctor
+///   occurrence, `MaintenanceTriggerOrigin::AdmittedObservation`, is live and has
+///   exactly ONE construction site in this daemon (`daemon_runtime.rs:2868`, the
+///   store-health poll). The origin→trigger map is exhaustive over the
+///   four-member origin enum (`maintenance_trigger_evaluator.rs:122-128`), and
+///   only `AdmittedObservation` maps to
+///   `MaintenanceTrigger::WatchdogProblem`, so that one site is the only
+///   producer of a `WatchdogProblem` decision — and that decision does not reach
+///   this function. It is consumed at `daemon_runtime.rs:2902-2906` by
+///   `note_blocked_automation_notification` and
+///   `publish_maintenance_source_results`, while the one observation that DOES
+///   reach here is built at `daemon_runtime::improvement_intake_observation`
+///   (`:5684`) from `MaintenanceTriggerOrigin::IdleTransition`, which maps to
+///   `MaintenanceTrigger::Policy`. The exact remaining step is therefore a route
+///   carrying that existing site into the intake; the classifier needs no
+///   further change, because it already reads the field the route would deliver.
+/// - `Dreamer` needs a NEW `MaintenanceTriggerOrigin` member. `MaintenanceTrigger`
+///   HAS a `Dreamer` member (`lib.rs:184-185`) and this classifier now reads it,
+///   but NO origin maps to it: the exhaustive map at
+///   `maintenance_trigger_evaluator.rs:122-128` names only `Policy`,
+///   `Onboarding` and `WatchdogProblem`. So unlike `Watchdog`, a `Dreamer`
+///   decision cannot be produced by re-routing an existing origin, and that new
+///   vocabulary member is not this file's to add. Independently, no Dreamer
+///   instance proposes anything to this daemon: the route is owner-declared and
+///   unassigned on this base, an omitted Dreamer route resolving to
+///   `RouteState::Unassigned` with no paid route
+///   (`eliot_config::first_run::decide_first_run`).
+/// - `Concilium` remains the one suggestion source with NO arm, and the reason
+///   is structural rather than a missing route: `MaintenanceTrigger` has NO
 ///   `Concilium` member at all, so a Concilium verdict could not be carried on
 ///   the decision even if the field were consulted. A vocabulary claim with no
 ///   producer behind it is the mirror of the misattribution this function
-///   exists to remove, so none is added here. The funnel's request source is
-///   also absent (see this module's header on `ImprovementRouteRequest` having
-///   no production request source), so a verdict has no path into
+///   exists to remove, so none is added. The funnel's request source is also
+///   absent (see this module's header on `ImprovementRouteRequest` having no
+///   production request source), so a verdict has no path into
 ///   `assemble_improvement_artifact` at all.
 ///
-/// # The three remaining sources with no producer AT ALL
+/// # The three sources with no producer AT ALL
 ///
 /// [`EvidenceSource::EvaluatorVerdict`],
 /// [`EvidenceSource::ImplementationDeviation`] and
-/// [`EvidenceSource::Complaint`] are three of the seven variants this function
-/// does not connect, and they are separated from the suggestion three above
-/// because their gap is different in kind: not "a route is missing" but "no
-/// admitted owner produces the observation". Measured, not assumed:
+/// [`EvidenceSource::Complaint`] are the three variants this function still does
+/// not connect, and they are separated from the suggestion sources above because
+/// their gap is different in kind: not "a route is missing" but "no admitted
+/// owner produces the observation". Measured, not assumed:
 ///
 /// - `EvaluatorVerdict` has a constructor and no caller.
 ///   [`eliot_improvement::sourced_evidence_from_repeated_verifier_failure`]
@@ -1713,6 +1819,41 @@ pub fn maintenance_evidence_source(
         // the producer is missing.
         MaintenanceFamily::SecurityDependencyScan => EvidenceSource::SecurityIncident,
         MaintenanceFamily::DonorConformance => EvidenceSource::ConformanceDiagnosis,
+        // A registered family whose own obligation is NOT a suggestion, so a
+        // Watchdog-origin decision over it stays a Watchdog observation. See
+        // the `trigger` match below, which is where the origin is read.
+        _ => maintenance_trigger_evidence_source(decision.trigger),
+    }
+}
+
+/// The I12.24 evidence source a maintenance ORIGIN names, for a family whose own
+/// obligation is not a source in its own right (issue #1867 W2, I12.24:54).
+///
+/// [`AutomationTriggerDecision::trigger`] is the Governor evaluator's verbatim
+/// copy of the caller-observed origin — copied at both construction sites and
+/// never selected, widened or defaulted there
+/// (`crates/governor/eliot-maintenance/src/lib.rs:762`, `:1123`) — so a decision
+/// cannot claim an origin the evaluated trigger did not carry. That makes this a
+/// derivation from the observation, not a label: `WatchdogProblem` is
+/// documented "Watchdog or Doctor recovery/problem recipe"
+/// (`maintenance_trigger_evaluator.rs:118-119`) and `Dreamer` is "Accepted
+/// Dreamer maintenance plan candidate" (`lib.rs:184-185`), which are exactly
+/// the two occurrences I12.24:54 names.
+///
+/// The other four origin members are deliberately not arms:
+/// `MaintenanceTrigger::Human` is a Human request (already covered by the
+/// issue's "relevant complaints" route, which has no producer here),
+/// `Onboarding` and `Installation` are first-run/update occurrences that name
+/// no suggestion source, and `Policy` is the idle/scheduled policy origin the
+/// one live intake observation carries — which is the residual
+/// [`EvidenceSource::Attempt`] above. I12.24:54 closes the trigger set with
+/// "Dreamer/Watchdog/Concilium suggestion", and `Concilium` is absent because
+/// the closed [`MaintenanceTrigger`] vocabulary has no such member, so a
+/// Concilium verdict could not be carried here even if it were consulted.
+fn maintenance_trigger_evidence_source(trigger: MaintenanceTrigger) -> EvidenceSource {
+    match trigger {
+        MaintenanceTrigger::WatchdogProblem => EvidenceSource::Watchdog,
+        MaintenanceTrigger::Dreamer => EvidenceSource::Dreamer,
         _ => EvidenceSource::Attempt,
     }
 }
@@ -2059,7 +2200,11 @@ pub struct GovernedImprovementAdmission {
 ///    constant), and then enforces the bound, merging by evidence lineage or
 ///    relieving a full bound through the explicit summarized archive
 ///    transition (W3).
-/// 5. [`merged_survivor_entry`] reads the surviving entry back out of the
+/// 5. [`enforce_improvement_class_gate`] runs the I12.24 application-class
+///    boundary here, where the live registry is in hand, so its
+///    one-experiment-per-control-surface bound is a count over the owner's own
+///    durable entries rather than a literal (W5).
+/// 6. [`merged_survivor_entry`] reads the surviving entry back out of the
 ///    backlog on the merge branch. This is the only seam that still holds the
 ///    backlog, so the post-merge state is carried out on
 ///    [`GovernedImprovementAdmission::merged_survivor`] rather than recomputed
@@ -2076,6 +2221,7 @@ pub fn admit_improvement_artifact(
     state_fence: &StateFence,
 ) -> Result<GovernedImprovementAdmission, ImprovementDispatchError> {
     let bound = maintenance_bound(policy)?;
+    enforce_improvement_class_gate(&artifact.candidate, backlog)?;
     let claim = improvement_admission_claim(policy, state_fence);
     let permit = issue_learning_admission(governor, &claim)?;
     let verified = verify_learning_admission(governor, &permit, state_fence)?;
@@ -2469,12 +2615,63 @@ fn improvement_commit_identity(
 /// without its incoming candidate's brief, but never a durable incoming
 /// candidate row without the receipt that makes the registry read it as
 /// absorbed.
+/// Refuses to make durable any candidate this replay-only intake produced, and
+/// says why through the crate's OWN gate (issue #1867 A3, I12.24:76).
+///
+/// A3 reads "A replay-only local improvement cannot transition to promotion
+/// without a bound budget/economics record and live matched-budget evidence."
+/// Two things make that true on this path, and this function is the second:
+///
+/// 1. The candidate is REPLAY-ONLY by construction. Its evidence is one
+///    maintenance decision plus one committed closure record, its
+///    [`ReplayPlan`] names fixed replay/holdout/transfer refs and one evaluator,
+///    and this daemon runs no experiment — so it holds no
+///    [`eliot_improvement::BudgetProof`], no `BudgetEquivalenceLedger`, no
+///    complexity-economics delta and no matched-budget live shadow or canary
+///    reference. There is nothing here that could satisfy the gate even in
+///    principle.
+/// 2. The lifecycle this intake writes is therefore never a promoting
+///    disposition, and this function PROVES that against the candidate's own
+///    recorded field rather than assuming it from the call site.
+///
+/// The proof is the crate's own predicate
+/// ([`ImprovementLifecycle::is_promoting_disposition`]) read over
+/// [`ImprovementCandidate::lifecycle`], and the refusal is the crate's own gate
+/// ([`require_matched_budget_for_promotion`]) asked with the `None` this path
+/// honestly holds. Neither is recomputed here and neither is spelled: a
+/// candidate whose recorded lifecycle somehow reached `Supported` or `Narrowed`
+/// is refused with the crate's own typed
+/// [`ImprovementError::MissingBudgetProof`] rather than committed, so a
+/// promotion can never become durable through this seam even if a future change
+/// routed one in without a budget record.
+///
+/// Why `None` is the honest argument and not a convenient one:
+/// [`require_matched_budget_for_promotion`] accepts `Option<&BudgetProof>`
+/// precisely so "no proof is bound" is expressible, and `None` maps to
+/// [`ImprovementError::MissingBudgetProof`] through the crate's own arm. Passing
+/// a synthesized proof to get a different error would be fabricating the record
+/// whose absence is the whole point, and the function is only ever called on the
+/// branch where the gate is actually consulted — a non-promoting lifecycle
+/// returns without asking, so no pass is refused for a gate it never entered.
+fn refuse_replay_only_promotion(
+    candidate: &ImprovementCandidate,
+) -> Result<(), ImprovementDispatchError> {
+    if !candidate.lifecycle.is_promoting_disposition() {
+        return Ok(());
+    }
+    require_matched_budget_for_promotion(None)?;
+    Ok(())
+}
+
 pub async fn commit_improvement_artifact(
     composition: &mut DaemonComposition,
     artifact: &ImprovementArtifact,
     admitted: &GovernedImprovementAdmission,
     state_fence: &StateFence,
 ) -> Result<(eliot_store_api::WriteReceipt, bool), ImprovementDispatchError> {
+    // A3: what this path writes must not be promotable, and that is CHECKED
+    // against the candidate's own recorded lifecycle before the bytes exist.
+    refuse_replay_only_promotion(&artifact.candidate)?;
     let record = serde_json::json!({
         "candidate": artifact.candidate,
         "brief": artifact.brief,
