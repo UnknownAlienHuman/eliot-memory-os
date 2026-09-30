@@ -44,7 +44,20 @@ public sealed record UserAutomationCreateOperation(
     [property: JsonPropertyName("revision")] UserAutomationRevision Revision)
     : UserAutomationOperation
 {
-    public override void Validate() => Revision.Validate();
+    public override void Validate()
+    {
+        // An absent `revision` member decodes to null before this check runs, so
+        // it is refused by name here rather than dereferenced below. The
+        // retained-byte readers, the pending journal and the reconciliation
+        // loop all report a refusal as InvalidOperationException, so a
+        // dereference here would escape every one of them as a null fault
+        // instead of the closed-shape refusal they are written to handle.
+        if (Revision is null)
+        {
+            throw new InvalidOperationException("create requires one typed revision payload.");
+        }
+        Revision.Validate();
+    }
 
     public override bool IsEffect() => true;
 }
@@ -103,6 +116,12 @@ public sealed record UserAutomationEditOperation(
 {
     public override void Validate()
     {
+        // Refused by name for the same reason as `create`: a missing member
+        // decodes to null, and both required revisions are load-bearing here.
+        if (PreviousRevision is null || Revision is null)
+        {
+            throw new InvalidOperationException("edit requires both typed revision payloads.");
+        }
         PreviousRevision.Validate();
         Revision.Validate();
         if (!string.Equals(PreviousRevision.AutomationId, Revision.AutomationId, StringComparison.Ordinal)
