@@ -1908,15 +1908,18 @@ impl<'a> KernelRestoreTarget<'a> {
     /// this owner returns.
     ///
     /// The engine's typed failure is the cause and is never replaced. When the
-    /// cleanup removed everything, had nothing removable to remove, or
-    /// preserved only published phase material a phase receipt still attests,
-    /// the refusal stays plain
-    /// [`KernelRestoreError::TargetFailed`] — in every one of those three cases
-    /// the bounded cleanup did what it exists to do, so there is no second
-    /// fact to report and nothing about the primary cause is lost. When the
-    /// cleanup preserved what it could not attribute, that exact typed reason
-    /// travels with the SAME primary failure, so nothing is lost and nothing
-    /// is stringified.
+    /// cleanup removed everything, or had nothing removable to remove, the
+    /// refusal stays plain [`KernelRestoreError::TargetFailed`] — in both of
+    /// those cases the bounded cleanup did exactly what it exists to do, so
+    /// there is no second fact to report and nothing about the primary cause is
+    /// lost. When the cleanup preserved something — either what it could not
+    /// attribute, or published phase material a still-present phase receipt
+    /// attests — that exact typed reason travels with the SAME primary failure,
+    /// so nothing is lost and nothing is stringified. The two preservation
+    /// causes are distinct typed reasons and never collapse into one, because
+    /// "we could not prove this was ours to remove" and "these bytes are
+    /// applied history the journal still accounts for" are different facts a
+    /// caller needs separately (#960 W13/A18).
     fn refuse_with_staged_cleanup(
         &self,
         destination: &KernelIsolatedDestination,
@@ -1925,10 +1928,14 @@ impl<'a> KernelRestoreTarget<'a> {
         primary: BackupError,
     ) -> KernelRestoreError {
         match self.cleanup_staged_output(destination, transaction_id, target_id) {
-            StagedCleanup::NothingStaged
-            | StagedCleanup::Removed
-            | StagedCleanup::AttestedPhaseMaterialPreserved => {
+            StagedCleanup::NothingStaged | StagedCleanup::Removed => {
                 KernelRestoreError::TargetFailed(primary)
+            }
+            StagedCleanup::AttestedPhaseMaterialPreserved => {
+                KernelRestoreError::StagedCleanupIncomplete {
+                    primary,
+                    cleanup: StagedCleanupRefusal::AttestedPhaseMaterialPreserved,
+                }
             }
             StagedCleanup::Refused(cleanup) => {
                 KernelRestoreError::StagedCleanupIncomplete { primary, cleanup }
