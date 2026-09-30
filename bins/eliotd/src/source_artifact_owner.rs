@@ -180,8 +180,8 @@ impl SourceArtifactOwner {
     }
 
     /// Reads the exact retained LSP observation payload named by its original
-    /// Store pointer. This path returns Blob's verified chunk directly and
-    /// does not mint an ArtifactIdentity for a non-Artifact observation
+    /// `Store` pointer. This path returns the verified `Blob` chunk directly
+    /// and does not mint an `ArtifactIdentity` for a non-`Artifact` observation
     /// envelope.
     pub fn read_captured_observation_payload(
         &self,
