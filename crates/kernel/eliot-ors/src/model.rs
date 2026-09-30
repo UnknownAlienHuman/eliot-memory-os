@@ -8685,6 +8685,10 @@ pub struct NativeWorkerClaimRecord {
     /// identity is rejected as
     /// [`OrsError::NativeWorkerClaimIdentityConflict`] and never overwrites
     /// the durable binding.
+    ///
+    /// Absent (empty) in rows staged before this column and in joinless
+    /// claims; decodes as empty and never verifies.
+    #[serde(default)]
     pub executable_binding_digest: String,
     /// Supported execution-unit schema version.
     pub execution_unit_schema_version: u16,
@@ -8779,15 +8783,19 @@ impl NativeWorkerClaimRecord {
             (&self.binding_digest, "native_worker_claim_binding_digest"),
             (&self.request_digest, "native_worker_claim_request_digest"),
             (
-                &self.executable_binding_digest,
-                "native_worker_claim_executable_binding_digest",
-            ),
-            (
                 &self.resource_envelope_digest,
                 "native_worker_claim_resource_envelope_digest",
             ),
         ] {
             validate_digest(value, field)?;
+        }
+        // Absent (pre-column or joinless) bindings decode as empty and never
+        // verify; a retained binding must be an exact digest.
+        if !self.executable_binding_digest.is_empty() {
+            validate_digest(
+                &self.executable_binding_digest,
+                "native_worker_claim_executable_binding_digest",
+            )?;
         }
         match (&self.capability_cell, &self.capability_cell_registry_digest) {
             (Some(cell), Some(registry_digest)) => {
@@ -8863,9 +8871,7 @@ impl NativeWorkerClaimRecord {
         operation_id: &str,
         presented_digest: &str,
     ) -> Result<&str, OrsError> {
-        if self.attempt_id.as_str() != attempt_id
-            || self.operation_id.as_str() != operation_id
-        {
+        if self.attempt_id.as_str() != attempt_id || self.operation_id.as_str() != operation_id {
             return Err(OrsError::NativeWorkerClaimIdentityConflict {
                 claim_id: self.claim_id.as_str().to_owned(),
             });
