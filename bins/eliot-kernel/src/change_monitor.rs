@@ -138,8 +138,13 @@ pub(crate) struct KernelChangeHint {
 /// the value and binds it by content compare in [`confirm_hint`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ContentRead {
-    Present { sha256: String },
-    #[allow(dead_code, reason = "AUD5 deletion stitch: constructed by the process-effect lane (sibling W1-1824e scope), not yet on this base")]
+    Present {
+        sha256: String,
+    },
+    #[allow(
+        dead_code,
+        reason = "AUD5 deletion stitch: constructed by the process-effect lane (sibling W1-1824e scope), not yet on this base"
+    )]
     Absent,
 }
 
@@ -493,11 +498,8 @@ pub(crate) fn confirm_hint(
     }
     let after_digest = verification.reread.digest().map(str::to_owned);
     let before_digest = verification.before_digest.clone();
-    let (change_id, transition_digest) = material_transition_ids(
-        hint_id,
-        before_digest.as_deref(),
-        after_digest.as_deref(),
-    );
+    let (change_id, transition_digest) =
+        material_transition_ids(hint_id, before_digest.as_deref(), after_digest.as_deref());
     let mut ledger = ledger()?;
     let resource = ledger
         .hints
@@ -732,7 +734,10 @@ pub(crate) fn reconcile_unknown_change(
 /// stays addressable after reconciliation (history is never rewritten),
 /// so an old review anchor over a deleted target resolves to historically
 /// addressable `deleted` instead of vanishing.
-#[allow(dead_code, reason = "AUD5 deletion stitch: consumed by the anchored-review/resolver lane once the process-effect lane constructs `ContentRead::Absent` (sibling W1-1824e scope)")]
+#[allow(
+    dead_code,
+    reason = "AUD5 deletion stitch: consumed by the anchored-review/resolver lane once the process-effect lane constructs `ContentRead::Absent` (sibling W1-1824e scope)"
+)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DeletionObservation {
     pub change_id: String,
@@ -756,7 +761,10 @@ pub(crate) struct DeletionObservation {
 /// this base yet (the process-effect `Absent` construction is sibling
 /// W1-1824e scope); the name and shape are fixed here so the lane can
 /// bind to them.
-#[allow(dead_code, reason = "AUD5 deletion stitch: no in-tree caller on this base yet; reserved for the anchored-review/resolver lane")]
+#[allow(
+    dead_code,
+    reason = "AUD5 deletion stitch: no in-tree caller on this base yet; reserved for the anchored-review/resolver lane"
+)]
 pub(crate) fn deletion_observations_for(resource: &str) -> Vec<DeletionObservation> {
     let Ok(ledger) = ledger() else {
         return Vec::new();
