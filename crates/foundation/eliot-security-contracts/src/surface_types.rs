@@ -333,6 +333,7 @@ impl SourceUseAuthority {
     /// intersection is the only use that both admit. Instruction taint takes
     /// the stronger of the two, so intersecting can never clear taint, and the
     /// fence of the receiver is kept.
+    #[must_use]
     pub fn narrowed_with(&self, other: &SourceUseAuthority) -> SourceUseAuthority {
         SourceUseAuthority {
             assessed_source: self.assessed_source.clone(),

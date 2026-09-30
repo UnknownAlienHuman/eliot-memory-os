@@ -238,16 +238,21 @@ pub enum DroppedEvidenceKind {
     OriginAndMinority,
 }
 
-/// External material that attempts to issue system or tool instructions.
+/// Retained foreign material an indicator class cites.
+///
+/// The instruction-attempt class and the standing-instruction/secret-persistence
+/// class cite retained material the same way — an immutable artifact the
+/// passage was read from, plus retained handles for the passage inside it — and
+/// differ only in what they conclude from it. They therefore share this one
+/// shape and are distinguished by their [`IndicatorEvidence`] variant and its
+/// class-specific field, rather than by two near-identical payload structs.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct ExternalInstructionEvidence {
+pub struct RetainedExternalEvidence {
     /// Retained immutable artifact the passage was read from.
     pub retained_source_ref: String,
     /// Retained handles for the passage itself, in the restricted store.
     pub evidence_handles: Vec<String>,
-    /// The producer's classification of the passage's role.
-    pub content_role: ExternalContentRole,
 }
 
 /// An installed tool definition that departs from the approved schema.
@@ -261,18 +266,6 @@ pub struct ToolDefinitionChangeEvidence {
     /// Approved schema revision the deltas were computed against. Absent means
     /// the comparison baseline is unknown, so the class bounds nothing.
     pub approved_schema_revision: Option<String>,
-}
-
-/// A source asking to persist a standing instruction or a secret.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct PersistenceRequestEvidence {
-    /// Retained immutable artifact the request was read from.
-    pub retained_source_ref: String,
-    /// Retained handles for the request itself, in the restricted store.
-    pub evidence_handles: Vec<String>,
-    /// Exactly what the source asked to have persisted.
-    pub requested: PersistenceRequest,
 }
 
 /// A derived summary claiming a use its source owner does not grant.
@@ -354,9 +347,21 @@ pub struct UndeclaredEffectEvidence {
     deny_unknown_fields
 )]
 pub enum IndicatorEvidence {
-    ExternalInstructionAttempt(ExternalInstructionEvidence),
+    /// External material that attempts to issue system or tool instructions.
+    ExternalInstructionAttempt {
+        /// The retained foreign material the passage was read from.
+        retained: RetainedExternalEvidence,
+        /// The producer's classification of the passage's role.
+        content_role: ExternalContentRole,
+    },
     UnexpectedToolDefinitionChange(ToolDefinitionChangeEvidence),
-    StandingInstructionOrSecretPersistence(PersistenceRequestEvidence),
+    /// A source asking to persist a standing instruction or a secret.
+    StandingInstructionOrSecretPersistence {
+        /// The retained foreign material the request was read from.
+        retained: RetainedExternalEvidence,
+        /// Exactly what the source asked to have persisted.
+        requested: PersistenceRequest,
+    },
     SummaryAuthorityEscalation(SummaryAuthorityEvidence),
     RepeatedPoisonedLineage(RepeatedLineageEvidence),
     OverbroadRemoteDreamExtraction(BroadExtractionEvidence),
@@ -365,14 +370,35 @@ pub enum IndicatorEvidence {
 }
 
 impl IndicatorEvidence {
+    /// The retained foreign material this evidence cites, when it cites any.
+    ///
+    /// Both retained-material classes carry the same
+    /// [`RetainedExternalEvidence`] payload, so this reaches them through one
+    /// accessor. That shared type is what lets the two patterns bind the same
+    /// name: binding one name across two differently-typed payload variants is
+    /// a type error, and giving the two classes one payload shape is both the
+    /// true statement and the legal way to dispatch on them together.
+    fn retained(&self) -> Option<&RetainedExternalEvidence> {
+        match self {
+            Self::ExternalInstructionAttempt { retained, .. }
+            | Self::StandingInstructionOrSecretPersistence { retained, .. } => Some(retained),
+            Self::UnexpectedToolDefinitionChange(_)
+            | Self::SummaryAuthorityEscalation(_)
+            | Self::RepeatedPoisonedLineage(_)
+            | Self::OverbroadRemoteDreamExtraction(_)
+            | Self::DroppedOriginOrMinorityEvidence(_)
+            | Self::UndeclaredProcedureEffect(_) => None,
+        }
+    }
+
     /// The one indicator class this evidence shape belongs to.
     pub const fn class(&self) -> IndicatorClass {
         match self {
-            Self::ExternalInstructionAttempt(_) => IndicatorClass::ExternalInstructionAttempt,
+            Self::ExternalInstructionAttempt { .. } => IndicatorClass::ExternalInstructionAttempt,
             Self::UnexpectedToolDefinitionChange(_) => {
                 IndicatorClass::UnexpectedToolDefinitionChange
             }
-            Self::StandingInstructionOrSecretPersistence(_) => {
+            Self::StandingInstructionOrSecretPersistence { .. } => {
                 IndicatorClass::StandingInstructionOrSecretPersistence
             }
             Self::SummaryAuthorityEscalation(_) => IndicatorClass::SummaryAuthorityEscalation,
@@ -395,21 +421,29 @@ impl IndicatorEvidence {
     /// instruction-shaped passage that the producer classified as a quoted
     /// example or as narration establishes no attempt by this source at all, so
     /// it reports unknown coverage rather than complete.
+    ///
+    /// The two classes with no optional baseline name the field their
+    /// comparison rests on instead of asserting a bare `true`, so each arm
+    /// states what it actually depends on.
     pub const fn has_comparison_inputs(&self) -> bool {
         match self {
-            Self::ExternalInstructionAttempt(evidence) => {
+            Self::ExternalInstructionAttempt { content_role, .. } => {
                 matches!(
-                    evidence.content_role,
+                    content_role,
                     ExternalContentRole::DirectInstruction
                 )
             }
-            Self::StandingInstructionOrSecretPersistence(_) => true,
+            Self::StandingInstructionOrSecretPersistence { retained, .. } => {
+                !retained.retained_source_ref.is_empty()
+            }
             Self::UnexpectedToolDefinitionChange(evidence) => {
                 evidence.approved_schema_revision.is_some()
             }
             Self::SummaryAuthorityEscalation(evidence) => evidence.owner_permitted_uses.is_some(),
             Self::RepeatedPoisonedLineage(evidence) => evidence.transformation_ref.is_some(),
-            Self::OverbroadRemoteDreamExtraction(_) => true,
+            Self::OverbroadRemoteDreamExtraction(evidence) => {
+                !evidence.admitted_handle_refs.is_empty()
+            }
             Self::DroppedOriginOrMinorityEvidence(evidence) => {
                 evidence.verified_transformation_ref.is_some()
             }
@@ -425,144 +459,33 @@ impl IndicatorEvidence {
     /// collection is empty, or the evidence does not actually establish its own
     /// class.
     pub fn validate(&self) -> Result<(), SecurityContractError> {
+        if let Some(retained) = self.retained() {
+            validate_retained(retained)?;
+        }
         match self {
-            // These two payloads are distinct types, so they get separate arms
-            // and share only the retained-evidence check they both need.
-            Self::ExternalInstructionAttempt(evidence) => {
-                validate_retained(&evidence.retained_source_ref, &evidence.evidence_handles)
-            }
-            Self::StandingInstructionOrSecretPersistence(evidence) => {
-                validate_retained(&evidence.retained_source_ref, &evidence.evidence_handles)
-            }
+            // The retained-material classes share one payload shape, so this is
+            // a single arm with nothing to bind.
+            Self::ExternalInstructionAttempt { .. }
+            | Self::StandingInstructionOrSecretPersistence { .. } => Ok(()),
             Self::UnexpectedToolDefinitionChange(evidence) => {
-                assessment_text(
-                    &evidence.observed_tool_ref,
-                    "tool_definition.observed_tool_ref",
-                )?;
-                if evidence.deltas.is_empty() {
-                    return Err(SecurityContractError::EmptyCollection {
-                        field: "tool_definition.deltas",
-                    });
-                }
-                let mut seen = std::collections::BTreeSet::new();
-                for delta in &evidence.deltas {
-                    if !seen.insert(*delta) {
-                        return Err(SecurityContractError::DuplicateReference {
-                            field: "tool_definition.deltas",
-                        });
-                    }
-                }
-                if let Some(revision) = &evidence.approved_schema_revision {
-                    assessment_text(revision, "tool_definition.approved_schema_revision")?;
-                }
-                Ok(())
+                validate_tool_definition_change(evidence)
             }
-            Self::SummaryAuthorityEscalation(evidence) => {
-                assessment_text(&evidence.summary_ref, "summary.summary_ref")?;
-                if let Some(permitted) = &evidence.owner_permitted_uses {
-                    if permitted.is_empty() {
-                        return Err(SecurityContractError::EmptyCollection {
-                            field: "summary.owner_permitted_uses",
-                        });
-                    }
-                    if permitted.contains(&evidence.claimed_use) {
-                        return Err(SecurityContractError::IndicatorEvidenceUnproven {
-                            field: "summary.claimed_use",
-                        });
-                    }
-                }
-                Ok(())
-            }
-            Self::RepeatedPoisonedLineage(evidence) => {
-                assessment_text(&evidence.lineage_ref, "lineage.lineage_ref")?;
-                if evidence.repeated_output_refs.len() < 2 {
-                    return Err(SecurityContractError::IndicatorEvidenceUnproven {
-                        field: "lineage.repeated_output_refs",
-                    });
-                }
-                assessment_refs(
-                    &evidence.repeated_output_refs,
-                    "lineage.repeated_output_refs",
-                )?;
-                if let Some(reference) = &evidence.transformation_ref {
-                    assessment_text(reference, "lineage.transformation_ref")?;
-                }
-                Ok(())
-            }
-            Self::OverbroadRemoteDreamExtraction(evidence) => {
-                assessment_text(&evidence.request_ref, "extraction.request_ref")?;
-                assessment_refs(
-                    &evidence.admitted_handle_refs,
-                    "extraction.admitted_handle_refs",
-                )?;
-                if evidence.exceeded_handle_refs.is_empty() {
-                    return Err(SecurityContractError::IndicatorEvidenceUnproven {
-                        field: "extraction.exceeded_handle_refs",
-                    });
-                }
-                assessment_refs(
-                    &evidence.exceeded_handle_refs,
-                    "extraction.exceeded_handle_refs",
-                )
-            }
-            Self::DroppedOriginOrMinorityEvidence(evidence) => {
-                assessment_text(&evidence.transformation_ref, "dropped.transformation_ref")?;
-                // The declared kind must match what was actually dropped, so a
-                // record cannot claim one kind while carrying the other's
-                // handles.
-                let declares_origin =
-                    !matches!(evidence.dropped, DroppedEvidenceKind::MinorityPosition);
-                let declares_minority =
-                    !matches!(evidence.dropped, DroppedEvidenceKind::OriginProvenance);
-                if declares_origin {
-                    if evidence.dropped_origin_refs.is_empty() {
-                        return Err(SecurityContractError::EmptyCollection {
-                            field: "dropped.dropped_origin_refs",
-                        });
-                    }
-                    assessment_refs(&evidence.dropped_origin_refs, "dropped.dropped_origin_refs")?;
-                }
-                if declares_minority {
-                    if evidence.dropped_minority_refs.is_empty() {
-                        return Err(SecurityContractError::EmptyCollection {
-                            field: "dropped.dropped_minority_refs",
-                        });
-                    }
-                    assessment_refs(
-                        &evidence.dropped_minority_refs,
-                        "dropped.dropped_minority_refs",
-                    )?;
-                }
-                if let Some(reference) = &evidence.verified_transformation_ref {
-                    assessment_text(reference, "dropped.verified_transformation_ref")?;
-                }
-                Ok(())
-            }
-            Self::UndeclaredProcedureEffect(evidence) => {
-                assessment_text(&evidence.procedure_ref, "procedure.procedure_ref")?;
-                if let Some(declared) = &evidence.declared_effects {
-                    if declared.is_empty() {
-                        return Err(SecurityContractError::EmptyCollection {
-                            field: "procedure.declared_effects",
-                        });
-                    }
-                    if declared.contains(&evidence.observed_effect) {
-                        return Err(SecurityContractError::IndicatorEvidenceUnproven {
-                            field: "procedure.observed_effect",
-                        });
-                    }
-                }
-                Ok(())
-            }
+            Self::SummaryAuthorityEscalation(evidence) => validate_summary_authority(evidence),
+            Self::RepeatedPoisonedLineage(evidence) => validate_repeated_lineage(evidence),
+            Self::OverbroadRemoteDreamExtraction(evidence) => validate_broad_extraction(evidence),
+            Self::DroppedOriginOrMinorityEvidence(evidence) => validate_dropped_evidence(evidence),
+            Self::UndeclaredProcedureEffect(evidence) => validate_undeclared_effect(evidence),
         }
     }
 
     /// The retained references this record cites, sorted and de-duplicated.
     fn cited_refs(&self) -> Vec<String> {
         let mut refs = match self {
-            Self::ExternalInstructionAttempt(evidence) => evidence.evidence_handles.clone(),
-            Self::StandingInstructionOrSecretPersistence(evidence) => {
-                evidence.evidence_handles.clone()
+            // One shared payload shape, so the retained-material classes cite
+            // through a single arm.
+            Self::ExternalInstructionAttempt { retained, .. }
+            | Self::StandingInstructionOrSecretPersistence { retained, .. } => {
+                retained.evidence_handles.clone()
             }
             Self::UnexpectedToolDefinitionChange(evidence) => {
                 vec![evidence.observed_tool_ref.clone()]
@@ -870,12 +793,181 @@ impl IndicatorSourceMap {
     }
 }
 
-fn validate_retained(
-    source_ref: &str,
-    evidence_handles: &[String],
+/// Retained foreign material must name its artifact and cite retained handles.
+///
+/// # Errors
+///
+/// Returns an error when the artifact reference is blank or when the handle
+/// collection is empty or contains duplicates.
+fn validate_retained(retained: &RetainedExternalEvidence) -> Result<(), SecurityContractError> {
+    assessment_text(&retained.retained_source_ref, "retained_source_ref")?;
+    assessment_refs(&retained.evidence_handles, "evidence_handles")
+}
+
+/// A tool definition must name the tool, and its deltas must be real and unique.
+///
+/// # Errors
+///
+/// Returns an error when the tool reference is blank, the delta list is empty or
+/// duplicated, or the approved schema revision is present but blank.
+fn validate_tool_definition_change(
+    evidence: &ToolDefinitionChangeEvidence,
 ) -> Result<(), SecurityContractError> {
-    assessment_text(source_ref, "retained_source_ref")?;
-    assessment_refs(evidence_handles, "evidence_handles")
+    assessment_text(
+        &evidence.observed_tool_ref,
+        "tool_definition.observed_tool_ref",
+    )?;
+    if evidence.deltas.is_empty() {
+        return Err(SecurityContractError::EmptyCollection {
+            field: "tool_definition.deltas",
+        });
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for delta in &evidence.deltas {
+        if !seen.insert(*delta) {
+            return Err(SecurityContractError::DuplicateReference {
+                field: "tool_definition.deltas",
+            });
+        }
+    }
+    if let Some(revision) = &evidence.approved_schema_revision {
+        assessment_text(revision, "tool_definition.approved_schema_revision")?;
+    }
+    Ok(())
+}
+
+/// A summary may only claim a use its source owner does not already grant.
+///
+/// # Errors
+///
+/// Returns an error when the summary reference is blank, when the owner's
+/// permitted-use list is present but empty, or when the claimed use is one the
+/// owner already grants, which is not an escalation at all.
+fn validate_summary_authority(evidence: &SummaryAuthorityEvidence) -> Result<(), SecurityContractError> {
+    assessment_text(&evidence.summary_ref, "summary.summary_ref")?;
+    if let Some(permitted) = &evidence.owner_permitted_uses {
+        if permitted.is_empty() {
+            return Err(SecurityContractError::EmptyCollection {
+                field: "summary.owner_permitted_uses",
+            });
+        }
+        if permitted.contains(&evidence.claimed_use) {
+            return Err(SecurityContractError::IndicatorEvidenceUnproven {
+                field: "summary.claimed_use",
+            });
+        }
+    }
+    Ok(())
+}
+
+/// A repeated lineage needs at least two distinct outputs and a lineage name.
+///
+/// # Errors
+///
+/// Returns an error when the lineage reference is blank, when fewer than two
+/// outputs repeat it, when the output references are duplicated, or when the
+/// transformation record is present but blank.
+fn validate_repeated_lineage(evidence: &RepeatedLineageEvidence) -> Result<(), SecurityContractError> {
+    assessment_text(&evidence.lineage_ref, "lineage.lineage_ref")?;
+    if evidence.repeated_output_refs.len() < 2 {
+        return Err(SecurityContractError::IndicatorEvidenceUnproven {
+            field: "lineage.repeated_output_refs",
+        });
+    }
+    assessment_refs(
+        &evidence.repeated_output_refs,
+        "lineage.repeated_output_refs",
+    )?;
+    if let Some(reference) = &evidence.transformation_ref {
+        assessment_text(reference, "lineage.transformation_ref")?;
+    }
+    Ok(())
+}
+
+/// A broad extraction must have exceeded something it was admitted for.
+///
+/// # Errors
+///
+/// Returns an error when the request reference is blank, when the admitted
+/// handles are empty or duplicated, when no handle was exceeded, or when the
+/// exceeded handles are duplicated.
+fn validate_broad_extraction(evidence: &BroadExtractionEvidence) -> Result<(), SecurityContractError> {
+    assessment_text(&evidence.request_ref, "extraction.request_ref")?;
+    assessment_refs(
+        &evidence.admitted_handle_refs,
+        "extraction.admitted_handle_refs",
+    )?;
+    if evidence.exceeded_handle_refs.is_empty() {
+        return Err(SecurityContractError::IndicatorEvidenceUnproven {
+            field: "extraction.exceeded_handle_refs",
+        });
+    }
+    assessment_refs(
+        &evidence.exceeded_handle_refs,
+        "extraction.exceeded_handle_refs",
+    )
+}
+
+/// The dropped handles must match the kind of evidence the record declares.
+///
+/// # Errors
+///
+/// Returns an error when the transformation reference is blank, when a declared
+/// kind has no handles, when the handle lists are duplicated, or when the
+/// verified transformation record is present but blank.
+fn validate_dropped_evidence(evidence: &DroppedEvidenceRecord) -> Result<(), SecurityContractError> {
+    assessment_text(&evidence.transformation_ref, "dropped.transformation_ref")?;
+    // The declared kind must match what was actually dropped, so a record cannot
+    // claim one kind while carrying the other's handles.
+    let declares_origin = !matches!(evidence.dropped, DroppedEvidenceKind::MinorityPosition);
+    let declares_minority = !matches!(evidence.dropped, DroppedEvidenceKind::OriginProvenance);
+    if declares_origin {
+        if evidence.dropped_origin_refs.is_empty() {
+            return Err(SecurityContractError::EmptyCollection {
+                field: "dropped.dropped_origin_refs",
+            });
+        }
+        assessment_refs(&evidence.dropped_origin_refs, "dropped.dropped_origin_refs")?;
+    }
+    if declares_minority {
+        if evidence.dropped_minority_refs.is_empty() {
+            return Err(SecurityContractError::EmptyCollection {
+                field: "dropped.dropped_minority_refs",
+            });
+        }
+        assessment_refs(
+            &evidence.dropped_minority_refs,
+            "dropped.dropped_minority_refs",
+        )?;
+    }
+    if let Some(reference) = &evidence.verified_transformation_ref {
+        assessment_text(reference, "dropped.verified_transformation_ref")?;
+    }
+    Ok(())
+}
+
+/// An undeclared effect must be absent from the candidate's own declaration.
+///
+/// # Errors
+///
+/// Returns an error when the procedure reference is blank, when the declared
+/// effect list is present but empty, or when the observed effect is one the
+/// candidate already declared, which is not an undeclared effect.
+fn validate_undeclared_effect(evidence: &UndeclaredEffectEvidence) -> Result<(), SecurityContractError> {
+    assessment_text(&evidence.procedure_ref, "procedure.procedure_ref")?;
+    if let Some(declared) = &evidence.declared_effects {
+        if declared.is_empty() {
+            return Err(SecurityContractError::EmptyCollection {
+                field: "procedure.declared_effects",
+            });
+        }
+        if declared.contains(&evidence.observed_effect) {
+            return Err(SecurityContractError::IndicatorEvidenceUnproven {
+                field: "procedure.observed_effect",
+            });
+        }
+    }
+    Ok(())
 }
 
 fn intersect<T: Copy + PartialEq>(left: &[T], right: &[T]) -> Vec<T> {

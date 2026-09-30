@@ -15,11 +15,11 @@ mod validation;
 
 pub use injection_indicators::{
     BroadExtractionEvidence, DroppedEvidenceKind, DroppedEvidenceRecord, ExternalContentRole,
-    ExternalInstructionEvidence, ExtractionScope, INDICATOR_CLASS_COUNT, IndicatorClass,
-    IndicatorCoverage, IndicatorEvidence, IndicatorObservation, IndicatorResolution,
-    IndicatorResponse, IndicatorSourceMap, PersistenceRequest, PersistenceRequestEvidence,
-    ProposedSourceRestriction, RepeatedLineageEvidence, SummaryAuthorityEvidence,
-    ToolDefinitionChangeEvidence, ToolDefinitionDelta, UndeclaredEffectEvidence,
+    ExtractionScope, INDICATOR_CLASS_COUNT, IndicatorClass, IndicatorCoverage, IndicatorEvidence,
+    IndicatorObservation, IndicatorResolution, IndicatorResponse, IndicatorSourceMap,
+    PersistenceRequest, ProposedSourceRestriction, RepeatedLineageEvidence, RetainedExternalEvidence,
+    SummaryAuthorityEvidence, ToolDefinitionChangeEvidence, ToolDefinitionDelta,
+    UndeclaredEffectEvidence,
 };
 pub use native_resource_lease::{
     NATIVE_RESOURCE_LEASE_VERSION, NativeResourceLease, NativeResourceLeaseBinding,
