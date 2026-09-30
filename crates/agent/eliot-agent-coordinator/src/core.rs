@@ -1126,10 +1126,10 @@ impl AgentCoordinator {
             lane.budget.validate().map_err(provider_contract)?;
             lane.budget
                 .is_within(&work.budget)
-                .map_err(|_| CoordinatorError::BudgetExceeded)?;
+                .map_err(budget_refusal)?;
             lane.budget
                 .is_within(&request.recipe.budget)
-                .map_err(|_| CoordinatorError::BudgetExceeded)?;
+                .map_err(budget_refusal)?;
             // A role may not admit effect kinds or external-effect counts
             // excluded by its manifest. Scope containment remains unresolved
             // until owner-validated manifest evidence is available.
@@ -2264,7 +2264,7 @@ impl AgentCoordinator {
         receipt
             .budget
             .is_within(&old.budget)
-            .map_err(|_| CoordinatorError::BudgetExceeded)?;
+            .map_err(budget_refusal)?;
         if self.active_attempt_count().saturating_add(1) > self.config.max_admitted_attempts {
             return Err(CoordinatorError::Backpressure {
                 active: self.active_attempt_count(),
@@ -3528,12 +3528,19 @@ fn validate_recipe(request: &StaffingPlanRequest) -> Result<(), CoordinatorError
         .recipe
         .budget
         .is_within(&request.launch.cumulative_descendant_budget)
-        .map_err(|_| CoordinatorError::BudgetExceeded)?;
+        .map_err(budget_refusal)?;
+    // The recipe's own descendant ceiling against the two budgets that admit it.
+    // This is a separate comparison from the envelope check above: that one
+    // compares `recipe.budget` with the launch's cumulative budget, this one
+    // compares `recipe.max_descendants` with each of them. Same named dimension,
+    // same refusal, and no attempt is written on the path either way.
     if request.recipe.max_descendants > request.recipe.budget.max_descendants
         || request.recipe.max_descendants
             > request.launch.cumulative_descendant_budget.max_descendants
     {
-        return Err(CoordinatorError::BudgetExceeded);
+        return Err(CoordinatorError::BudgetExceeded {
+            field: "max_descendants",
+        });
     }
 
     validate_recipe_references(&request.recipe)?;
@@ -4000,6 +4007,25 @@ fn validate_attempt_binding(
 
 fn provider_contract(error: impl std::fmt::Display) -> CoordinatorError {
     CoordinatorError::ProviderContract(error.to_string())
+}
+
+/// Names the exact budget dimension a refusal closed (issue #1683 W6/A8).
+///
+/// `BudgetEnvelope::is_within` reports which dimension it compared, and
+/// `eliot_agent_api` owns that vocabulary, so this carries the dimension through
+/// instead of re-deriving or discarding it: a caller learns that
+/// `output_bytes` is what is too wide, not merely that something was.
+///
+/// `is_within` also validates both envelopes, so it can refuse a *malformed*
+/// envelope rather than a wide one. That is a different condition and keeps the
+/// existing [`CoordinatorError::ProviderContract`] refusal that every other
+/// `validate()` failure on these paths already uses; relabelling it as a budget
+/// refusal is exactly the indistinguishability this refuses to introduce.
+fn budget_refusal(error: ContractError) -> CoordinatorError {
+    match error {
+        ContractError::ChildBudgetExceeded { field } => CoordinatorError::BudgetExceeded { field },
+        other => provider_contract(other),
+    }
 }
 
 fn binding_contract(error: ContractError) -> CoordinatorError {
