@@ -14,7 +14,7 @@ use super::{
     COLD_START_READINESS_BINDINGS, COLD_START_READINESS_HEADS, COLD_START_READINESS_RECORDS,
     DOCTOR_ATTEMPTS, DOCTOR_EFFECTS,
     DurableInboxRecord, DurableOperationalRecord, EFFECT_OPERATION_LEASES,
-    EFFECT_REPLAY_RECONCILIATIONS, HOST_REQUESTS, META,
+    EFFECT_REPLAY_RECONCILIATIONS, HOST_REQUESTS, HOST_REQUEST_LOGICAL_KEYS, META,
     NATIVE_WORKER_CLAIMS, OPERATIONAL_CURRENT, PROCESS_START_REPLAY, PROCESS_STREAM_RECOVERY, RECOVERY_INBOX,
     RECOVERY_PROBLEMS, REPLAY_ACKS, REPLAY_EVENTS, RESERVATIONS, RUNTIME_LEASE_CURRENT,
     SCAN_DISCLOSURE_RECORDS, STORE_FAILURE_RETENTION, STORE_REBIND_REPLAY,
@@ -214,9 +214,7 @@ pub struct StoreStopObligationCensus {
 impl StoreStopObligationCensus {
     /// Validates the exact generation binding, source revisions, and count range.
     pub fn validate(&self) -> Result<(), crate::OrsError> {
-        self.state_fence
-            .validate()
-            .map_err(|error| crate::OrsError::Contract(error.to_string()))?;
+        self.state_fence.validate()?;
         crate::model::validate_text(&self.installation_id, "store_stop_installation_id")?;
         if self.store_object_generation == 0
             || self.activation_generation != self.state_fence.resource_generation
@@ -259,9 +257,7 @@ impl RedbRecoveryStore {
         state_fence: &StateFence,
         activation_id: Option<&str>,
     ) -> Result<StoreStopObligationCensus, crate::OrsError> {
-        state_fence
-            .validate()
-            .map_err(|error| crate::OrsError::Contract(error.to_string()))?;
+        state_fence.validate()?;
         if let Some(activation_id) = activation_id {
             crate::model::validate_text(activation_id, "store_stop_activation_id")?;
         }
@@ -638,6 +634,97 @@ pub(super) fn census_in_read(
             builder.observe("host_requests", key.value(), value.value())?;
             if !record.state.is_terminal() {
                 builder.counts.host_requests = increment(builder.counts.host_requests)?;
+            }
+        }
+    }
+
+    // The logical index is a second durable representation of HostRequest
+    // ownership. A missing operation row behind a live link would otherwise
+    // disappear from the request denominator and could make a corrupt Store
+    // appear empty. Validate all index entries in this same read snapshot.
+    {
+        let requests = read.open_table(HOST_REQUESTS).map_err(storage)?;
+        let links = read
+            .open_table(HOST_REQUEST_LOGICAL_KEYS)
+            .map_err(storage)?;
+        for row in links.iter().map_err(storage)? {
+            let (key, value) = row.map_err(storage)?;
+            let parsed: serde_json::Value = serde_json::from_str(value.value()).map_err(|_| {
+                integrity(
+                    "host_request_logical_index",
+                    "index value is not valid JSON",
+                )
+            })?;
+            builder.observe("host_request_logical_index", key.value(), value.value())?;
+            if parsed.as_object().is_some_and(|object| {
+                object.contains_key("kind")
+                    && object.contains_key("session")
+                    && object.contains_key("occurrence")
+            }) {
+                let presence: super::HostRequestLegacyPresence = decode(value.value())?;
+                if RedbRecoveryStore::host_request_legacy_presence_key(
+                    presence.kind,
+                    &presence.session,
+                    &presence.occurrence,
+                ) != key.value()
+                {
+                    return Err(integrity(
+                        "host_request_legacy_presence",
+                        "presence index key diverges from its stored facts",
+                    ));
+                }
+                continue;
+            }
+            if parsed.as_object().is_some_and(|object| {
+                object.contains_key("tombstone")
+                    && object.contains_key("operation_id")
+                    && object.contains_key("request_digest")
+            }) {
+                let marker: super::HostRequestLogicalTombstone = decode(value.value())?;
+                let row_key = format!(
+                    "{}::{}",
+                    marker.operation_id.as_str(),
+                    marker.request_digest
+                );
+                if let Some(stored) = requests.get(row_key.as_str()).map_err(storage)? {
+                    let record: HostRequestRecord = decode(stored.value())?;
+                    if record.operation_id != marker.operation_id
+                        || record.request_digest != marker.request_digest
+                        || record.state != crate::HostRequestState::Terminal
+                        || RedbRecoveryStore::host_request_logical_key_for_record(&record)?
+                            .as_deref()
+                            != Some(key.value())
+                    {
+                        return Err(integrity(
+                            "host_request_logical_tombstone",
+                            "logical tombstone diverges from its retained host-request row",
+                        ));
+                    }
+                }
+                continue;
+            }
+
+            let link: super::HostRequestLogicalLink = decode(value.value())?;
+            let row_key = format!("{}::{}", link.operation_id.as_str(), link.request_digest);
+            let stored = requests
+                .get(row_key.as_str())
+                .map_err(storage)?
+                .ok_or_else(|| {
+                    integrity(
+                        "host_request_logical_link",
+                        "logical link points at a missing host-request row",
+                    )
+                })?;
+            let record: HostRequestRecord = decode(stored.value())?;
+            if record.operation_id != link.operation_id
+                || record.request_digest != link.request_digest
+                || RedbRecoveryStore::host_request_logical_key_for_record(&record)?.as_deref()
+                    != Some(key.value())
+            {
+                return Err(integrity(
+                    "host_request_logical_link",
+                    "logical link diverges from its host-request row",
+                ));
             }
         }
     }
