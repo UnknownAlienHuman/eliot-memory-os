@@ -139,6 +139,37 @@ impl ActionContract {
         Ok(contract)
     }
 
+    /// SHA-256 over the canonical bytes of this exact action: the digest the
+    /// Approver's subject is.
+    ///
+    /// I07-21 and I11.3 both bind an approval to "the exact action hash", and
+    /// [`ApprovalReference`](crate::ApprovalReference) requires that hash to
+    /// equal the digest of the action actually presented, so one approval can
+    /// never be reused for a different action. A10.3 fixes the content that
+    /// the digest covers: the action frame this crate already owns, carrying
+    /// intent and affected scope, preconditions, expected effect or
+    /// observable, invariants and known failures, rollback or compensation,
+    /// verifier, and stop or revision condition.
+    ///
+    /// It is deliberately the ONE digest of these bytes, and therefore the
+    /// same value as the `canonical_payload_sha256` a compiled proposal
+    /// carries. A second, separately domain-separated digest over the same
+    /// frame would be a second canonicalization of the action rather than a
+    /// stronger binding of it, and it would let an approval compare equal to a
+    /// proposal that was never the action that was approved. A caller that
+    /// must check an approval against a presented action compares both against
+    /// this value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthorityError::InvalidField`] when the frame cannot be
+    /// serialized to canonical JSON.
+    pub fn approved_action_hash(&self) -> Result<String, AuthorityError> {
+        let bytes = canonical_json_bytes(self)
+            .map_err(|_| AuthorityError::InvalidField("canonical_action"))?;
+        Ok(sha256_hex(&bytes))
+    }
+
     /// Compiles this action frame into a [`ProposedEffect`] bound to one
     /// exact operation.
     ///
@@ -174,11 +205,11 @@ impl ActionContract {
         if effect_rank(operation.effect) > effect_rank_for_impact(self.impact_class) {
             return Err(AuthorityError::EffectCeilingExceeded);
         }
-        let canonical_payload_sha256 = {
-            let bytes = canonical_json_bytes(self)
-                .map_err(|_| AuthorityError::InvalidField("canonical_payload"))?;
-            sha256_hex(&bytes)
-        };
+        // The proposal's payload commitment IS the approved-action digest:
+        // both are the one SHA-256 over this frame's canonical bytes, so an
+        // approval minted by the Approver and the proposal compiled from the
+        // action it approved cannot disagree about which action this is.
+        let canonical_payload_sha256 = self.approved_action_hash()?;
         ProposedEffect::new(
             self.action_id.clone(),
             operation,
