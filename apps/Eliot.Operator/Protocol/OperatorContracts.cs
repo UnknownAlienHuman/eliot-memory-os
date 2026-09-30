@@ -136,6 +136,16 @@ public static class OperatorJson
 }
 
 /// One broker-owned, one-shot UI binding. It contains no bearer credential.
+///
+/// `pipe_name` names EXACTLY ONE transport: the User Broker's own one-shot
+/// handoff pipe, on which the broker accepts `operator_challenge` and then
+/// `redeem_operator_handoff` and nothing else. The broker is not the owner of
+/// the role-filtered ControlBoard/Operator IPC, so this field never names that
+/// pipe and never may be reused as its address; the owner pins it to the
+/// broker's own pipe (`OperatorEndpoint::validate` in
+/// `crates/surfaces/eliot-user-broker-core`). The ControlBoard/Operator pipe
+/// is read from the runtime owner that publishes it
+/// (`ControlBoardPipeLocator`).
 public sealed record OperatorEndpoint(
     [property: JsonPropertyName("pipe_name")] string PipeName,
     [property: JsonPropertyName("broker_epoch")] ulong BrokerEpoch,

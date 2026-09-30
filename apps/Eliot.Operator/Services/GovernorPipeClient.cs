@@ -529,7 +529,39 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
                 operationScope, tool, OperatorFaultReason.EstablishmentWindowExpired, OperatorExchangeStages.Establishment);
         }
 
-        var pipeName = handoff.Endpoint.PipeName.Replace(@"\\.\pipe\", string.Empty, StringComparison.OrdinalIgnoreCase);
+        // ONE PROTOCOL PER PIPE (I11.8). This leg writes `eliot_ipc_handshake`,
+        // the role-filtered ControlBoard/Operator contract, which the runtime
+        // instance serves on its own pipe and publishes in its own runtime
+        // publication. It is a different transport from the broker handoff
+        // pipe, which this same method redeems on below and on which the
+        // broker's only server answers anything but `operator_challenge` then
+        // `redeem_operator_handoff` with `BROKER_PROTOCOL_SEQUENCE_REJECTED`.
+        //
+        // `handoff.Endpoint.PipeName` is therefore NEVER reused here. It names
+        // the broker's transport, and the broker owner pins it to that broker's
+        // own pipe (`OperatorEndpoint::validate` in
+        // `crates/surfaces/eliot-user-broker-core`). The name is read from the
+        // serving owner instead, and a published name equal to the handoff's
+        // is refused, so this handshake cannot reach the broker's one-shot
+        // pipe. No default, no cached name and no second attempt.
+        string pipeName;
+        try
+        {
+            pipeName = ControlBoardPipeLocator.ReadPipeName(handoff.Endpoint.PipeName);
+        }
+        catch (OperatorProtocolException error)
+        {
+            // No connection was built and no byte left this process, so this is
+            // a refusal BEFORE the request was attempted, not an unknown owner
+            // outcome. The handoff is deliberately NOT invalidated: it is the
+            // serving owner's published address that was unreadable, and the
+            // handoff's own owner-issued lifetime still bounds establishment.
+            throw new OperatorNotAttemptedException(
+                operationScope,
+                tool,
+                OperatorFaultReason.ForException(error),
+                OperatorExchangeStages.Connect);
+        }
         // Single use: the nonce is spent now, not after a successful connect.
         handoff.Consume(DateTimeOffset.UtcNow);
 

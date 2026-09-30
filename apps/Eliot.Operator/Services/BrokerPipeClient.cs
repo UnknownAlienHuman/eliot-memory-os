@@ -364,7 +364,13 @@ internal static class BrokerPipeClient
         }
     }
 
-    private static string RequiredString(JsonElement parent, string propertyName, string shapeName)
+    /// The one closed-shape string reader for every control surface in this
+    /// process: a missing, non-string or null member is a refusal carrying
+    /// only the shape and field name, never the value. Shared with
+    /// `ControlBoardPipeLocator` so the ControlBoard/Operator publication is
+    /// read by the same validator as the broker's own control shapes rather
+    /// than by a second decoder.
+    internal static string RequiredString(JsonElement parent, string propertyName, string shapeName)
     {
         if (parent.ValueKind == JsonValueKind.Object
             && parent.TryGetProperty(propertyName, out var value)

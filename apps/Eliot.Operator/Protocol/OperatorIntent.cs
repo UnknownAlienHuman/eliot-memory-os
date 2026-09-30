@@ -164,14 +164,20 @@ public static class LegacyOperatorAdapter
     ///    `crates/eliot-app/src/mcp_stdio/operator.rs:821` -`:840`, in a crate
     ///    that calls itself "not a current production composition root"
     ///    (`crates/eliot-app/Cargo.toml:7`) and depends on no `eliot-contracts`.
-    /// 4. The UI pipe carries one protocol for this client. It carries two
-    ///    today: the broker redeem leg (`BrokerPipeClient.cs:75` -`:134`) and
-    ///    the Governor handshake leg, which writes `eliot_ipc_handshake`
-    ///    (`GovernorPipeClient.cs:579` -`:594`) on the pipe the broker's only
-    ///    server for that name binds (`bins/eliot-user-broker/src/main.rs:872`)
-    ///    and where anything other than `operator_challenge` then
-    ///    `redeem_operator_handoff` is answered
-    ///    `BROKER_PROTOCOL_SEQUENCE_REJECTED` (`:941` -`:954`, `:979` -`:990`).
+    /// 4. The UI carries one protocol per pipe. THIS PRECONDITION NOW HOLDS.
+    ///    The broker's one-shot handoff pipe carries only the broker's own
+    ///    challenge/redeem exchange (`BrokerPipeClient.cs`), and the
+    ///    `eliot_ipc_handshake` leg is dialed on the ControlBoard/Operator pipe
+    ///    the runtime owner publishes in its own runtime publication
+    ///    (`ControlBoardPipeLocator.ReadPipeName`, production caller
+    ///    `GovernorPipeClient.EnsureConnectedAsync`). That handshake is no
+    ///    longer written to the broker's pipe, whose only server answers
+    ///    anything but `operator_challenge` then `redeem_operator_handoff`
+    ///    with `BROKER_PROTOCOL_SEQUENCE_REJECTED`; and
+    ///    `OperatorEndpoint.pipe_name` is pinned by its owner to the broker's
+    ///    own pipe (`OperatorEndpoint::validate` in
+    ///    `crates/surfaces/eliot-user-broker-core`), so a handoff can no longer
+    ///    name any other transport.
     /// 5. `Consumer` has no remaining call site of the four tools.
     ///
     /// An unmet precondition leaves the adapter exactly as it is. It must never
