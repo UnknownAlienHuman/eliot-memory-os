@@ -1,0 +1,80 @@
+{
+  "issue": 1821,
+  "lane": "W1",
+  "branch": "work/1821-live-peer-delivery-w1",
+  "base": "6e2ee5fc820d3a104cc830677b61958a7cc33199",
+  "base_is_origin_main": true,
+  "scope": "bins/eliot-kernel",
+  "lane_verdict": "BLOCKED",
+  "items": [
+    {
+      "id": "W1",
+      "text": "Build live-peer delivery as a typed mailbox payload on top of the mailbox work, not as a new chat channel.",
+      "status": "MET",
+      "impl": "crates/agent/eliot-agent-contracts/src/lib.rs::LivePeerMessagePayload (line 678), admitted through crates/governor/eliot-coordination/src/peer_communication.rs::CoordinationOwner::enqueue_live_peer_delta (line 1716) into the existing peer mailbox (peer_messages/peer_streams); generic enqueue_peer_message refuses LivePeerDelta without a typed payload (lines 1641-1645)",
+      "caller": "CoordinationOwner public API; exercised by crates/governor/eliot-coordination/tests/peer_communication.rs (production stitch deferred by owner decision)",
+      "note": "Mechanism verified on main by reading. No second channel: single peer_messages ledger."
+    },
+    {
+      "id": "W2",
+      "text": "Implement payload validation and Context Compiler admission checks exactly around recipient relevance, frozen-plan revision, State Fence, disclosure/privacy, evidence-handle availability, deduplication, urgency, payload budget, and first-pass independence.",
+      "status": "MET",
+      "impl": "crates/agent/eliot-agent-contracts/src/lib.rs::LivePeerMessagePayload::validate (line 696) + ::validate_against_map (line 738); crates/governor/eliot-coordination/src/peer_communication.rs::validate_live_peer_payload (line 1108: map relevance/revision, sender attempt/work-item binding lines 1118-1125, authority/effect assertion rejection lines 1126-1134, PeerBoardKind-closed evidence/artifact handle binding lines 1141-1172, recipient-work-item binding lines 1173-1176, canonical-bytes budget plus digest binding lines 1180-1187) + ::enqueue_live_peer_delta plan-revision rejection journal (lines 1730-1743) + ::replay_live_peer_delta dedup (line 1660); first-pass independence is structural (admission never injects into the current step; observation only through boundary-gated deliver_live_peer_delta)",
+      "caller": "CoordinationOwner public API; exercised by crates/governor/eliot-coordination/tests/peer_communication.rs (production stitch deferred by owner decision)",
+      "note": "All nine checks verified on main by reading. Typed failures via existing ContractError/CoordinationError; originals validated with existing validate()."
+    },
+    {
+      "id": "W3",
+      "text": "Support the four delivery profiles with explicit unavailable/degraded behavior.",
+      "status": "MET",
+      "impl": "crates/governor/eliot-coordination/src/peer_communication.rs::CoordinationOwner::deliver_live_peer_delta (line 1956) + ::PeerSafeBoundaryPort (line 613) + ::build_peer_message admission states (line 1191): DeliveryPolicy::Unavailable (crates/agent/eliot-agent-contracts/src/lib.rs line 644) never calls the delivery port and retains a visible degraded Unavailable record (lines 2002-2007); EventIntegrated/ToolOnly/OfflineWorker proceed only on an attested open boundary, otherwise a visible degraded Unavailable record plus attempt history (lines 2008-2018); observed messages re-deliver as counted late duplicates via push_live_peer_duplicate (line 2061)",
+      "caller": "Host supplies PeerSafeBoundaryPort + PeerDeliveryPort (production stitch deferred by owner decision)",
+      "note": "Degraded behavior verified on main by reading. Sender waits only for durable admission: enqueue requires PeerDurability::Durable attestation (lines 1753-1756, LivePeerDurabilityRequired)."
+    },
+    {
+      "id": "W4",
+      "text": "Permit specified urgent kinds to create a revalidation or pause obligation only; they must not create truth, authority, completion, plan revision, or write-scope expansion.",
+      "status": "MET",
+      "impl": "crates/governor/eliot-coordination/src/peer_communication.rs::CoordinationOwner::create_live_peer_obligation (line 2096) -> live_peer_obligations single-map write only (crates/governor/eliot-coordination/src/lib.rs line 612); qualifies exactly assumption_invalidated | plan_contradiction | before_next_dependent_effect; LivePeerObligationKind::{Revalidate, PauseDependentEffect} carries no truth/authority/completion/revision/write-scope (struct line 966)",
+      "caller": "deliver_live_peer_delta on Delivered outcome only (peer_communication.rs lines 2046-2048)",
+      "note": "Verified on main by reading. Obligation shape cannot express truth/authority/completion/revision/write-scope."
+    },
+    {
+      "id": "W5",
+      "text": "Store delivery, recipient acknowledgement, public use, and outcome-helpfulness separately.",
+      "status": "MET",
+      "impl": "delivery = PeerMessageState + attempt_history; ack = acknowledge_peer_message (acknowledged_revision/by fields); crates/governor/eliot-coordination/src/peer_communication.rs::CoordinationOwner::record_live_peer_use (line 2265) -> live_peer_uses journal (lib.rs line 616); ::record_live_peer_helpfulness (line 2342) -> live_peer_helpfulness journal (lib.rs line 618); getters live_peer_obligation (2424) / live_peer_rejection (2430) / live_peer_use_observations (2436) / live_peer_helpfulness (2444)",
+      "caller": "CoordinationOwner public API; exercised by crates/governor/eliot-coordination/tests/peer_communication.rs (production stitch deferred by owner decision)",
+      "note": "Four separate types, four separate stores, four separate reducers; verified on main by reading. Use/helpfulness require recipient session plus seen state (Delivered/Acknowledged/Consumed); never inferred from delivery/ack."
+    },
+    {
+      "id": "A1",
+      "text": "A duplicate live delta with the same deduplication key is not re-injected. An assumption_invalidated message with matching plan/State Fence and evidence handle is durably admitted and reaches an EventIntegrated recipient only at its next safe model/tool boundary, without interrupting the current step. A plan-revision mismatch or unavailable delivery capability retains a visible rejected/degraded admission/delivery record and does not report recipient acknowledgement or awareness.",
+      "status": "MET",
+      "impl": "dedup: replay_live_peer_delta (line 1660) returns the original admission receipt; durable admission: enqueue_live_peer_delta requires PeerDurability::Durable (lines 1753-1756); boundary-only: deliver_live_peer_delta (line 1956) with PeerSafeBoundaryPort gate, generic path refuses live deltas (lines 1641-1645); mismatch: live_peer_rejections journal with LIVE_PEER_REJECTION_PLAN_MISMATCH (line 951) written in enqueue (lines 1732-1743); unavailable: degraded Unavailable delivery records (lines 2002-2018, 1213-1233); rejections disjoint from ack fields; ack/use/helpfulness require seen state (lines 2293-2309, 2371-2387)",
+      "caller": "CoordinationOwner public API; exercised by crates/governor/eliot-coordination/tests/peer_communication.rs (production stitch deferred by owner decision)",
+      "note": "Mechanism acceptance verified on main by reading. Production delivery to a live recipient awaits the deferred stitch (see blocked_by)."
+    }
+  ],
+  "not_done": [
+    "bins/eliot-kernel production route for live-peer deltas (mechanical admission + boundary-gated release + observation recording through the mailbox owner, with a real production caller)"
+  ],
+  "blocked_by": [
+    "Issue #1820 mailbox work is unmerged (branch fix/1820-mailbox-delivery-MC1820, commit f371ca895, not an ancestor of main): bins/eliot-kernel/src/mailbox.rs, AdmitMailboxItem/RecordMailboxDelivery/AcknowledgeMailboxItem/ExpireMailboxItem named operations, decode_mailbox_* decoders and peer_mailbox contract types do not exist on main, so a live-peer gate in bins/eliot-kernel has no mailbox owner or named operation to build through on main",
+    "No live-peer named store operation or decoder exists on main (eliot-store-api is outside this lane's scope)",
+    "No production sender or CoordinationOwner host exists on main (eliotd sender plus owner hosting are outside this lane's scope; the stitch was explicitly deferred by owner decision)",
+    "Any module added under these conditions would be an unwired stub, a duplicate ledger, or an unproven durability claim, all forbidden by the lane brief"
+  ],
+  "docs": {
+    "bundle": "control-20260923-impl/v2/issues/1821/docs-read-bundle-W1-232254.md",
+    "bundle_sha256": "039aa0c1550d5ffaf0c9faaef234a7dba1b8d621d2f3271290984e9f57fe1d0d",
+    "route_receipt": "sha256:3d06a6c4775da72d65dd7f67711093e63764b095f41d130a78fe61a3d94eb4ff",
+    "read_receipt": "sha256:809756823d39a138e66e3291723468bfa9998dd415bae0d43acce0c9aea12646",
+    "normative_pair": "sha256:ab2011bd67557d89b2f094061d350a297389f7f57d0478be5e1ff8d2da8ed1c1",
+    "canonical_section": "docs/architecture/I10-18-mailbox-blackboard-live-peer-delivery-and-anchored-review.md",
+    "attestation": "I opened the verified bundle and read every required item before mutation, and read the canonical I10.18 section (149 lines) in full. No documentation routing was performed by this lane; the provided bundle was used."
+  },
+  "assumptions": [],
+  "code_changed_by_this_lane": "none: every Work/Acceptance mechanism was verified present on fresh origin/main by reading exact source lines; no new symbols were needed, and no new symbol could be added within bins/eliot-kernel without creating an unwired stub, a duplicate ledger, or an unproven durability claim",
+  "gate": "DO NOT run cargo per lane brief (write code, commit, return; manager builds). No tests added or touched. No cargo invocations performed."
+}
