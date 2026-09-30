@@ -15,15 +15,15 @@ use eliot_graph_api::{
     GraphQueryResult, GraphRevision,
 };
 use eliot_instrument_api::{EvidenceAxes, EvidenceCoverage, EvidenceFreshness, NormalizedEvidence};
-use eliot_receipts::{CausalBinding, TaskBinding};
-use eliot_store_api::CapturedBlobPayloadRefV1;
 use eliot_lsp_bridge::{
-    adopt_captured_observation_from_blob_readback, adopt_retained_observation,
     BridgeError as LspBridgeError, Coverage as LspCoverage, DiagnosticObservation,
     DiagnosticSeverity, FailureDisposition, Freshness as LspFreshness, LspAdoptionProjection,
     LspRawOutputKind, NormalizedResult, RenameCandidate, RetainedLspObservationV1,
-    SemanticOperation, SymbolInfo,
+    SemanticOperation, SymbolInfo, adopt_captured_observation_from_blob_readback,
+    adopt_retained_observation,
 };
+use eliot_receipts::{CausalBinding, TaskBinding};
+use eliot_store_api::CapturedBlobPayloadRefV1;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -118,7 +118,12 @@ fn validate_captured_lsp_task_join(
         || reference.plaintext_length != ready_capability.plaintext_length()
         || reference.plaintext_sha256 != ready_capability.plaintext_sha256()
         || staged_payload_receipt.core.task.as_ref() != Some(&captured.historical_task_binding)
-        || staged_payload_receipt.core.request.metadata.task_id.as_ref()
+        || staged_payload_receipt
+            .core
+            .request
+            .metadata
+            .task_id
+            .as_ref()
             != Some(&captured.historical_task_binding.task_id)
         || staged_payload_receipt.core.request.state_fence
             != captured.historical_task_binding.state_fence
@@ -610,10 +615,7 @@ impl CodeCortexService {
         current_read_causal_binding: &CausalBinding,
         observations: Vec<CapturedLspObservation>,
     ) -> Result<Self, CodeCortexError> {
-        validate_current_read_binding(
-            &current_read_task_binding,
-            current_read_causal_binding,
-        )?;
+        validate_current_read_binding(&current_read_task_binding, current_read_causal_binding)?;
         let mut index = SemanticIndex::new();
         for observation in observations {
             validate_captured_lsp_payload_reference(&observation.reference)?;
@@ -637,7 +639,7 @@ impl CodeCortexService {
         }
         Ok(Self {
             index,
-                current_task_binding: Some(current_read_task_binding),
+            current_task_binding: Some(current_read_task_binding),
         })
     }
 
@@ -654,9 +656,11 @@ impl CodeCortexService {
         request: &CompositionRequest,
     ) -> Result<CodeCortexReport, CodeCortexError> {
         request.validate()?;
-        if self.current_task_binding.as_ref().is_some_and(|binding| {
-            request.task_id != binding.task_id.to_string()
-        }) {
+        if self
+            .current_task_binding
+            .as_ref()
+            .is_some_and(|binding| request.task_id != binding.task_id.to_string())
+        {
             return Err(CodeCortexError::TaskBindingMismatch);
         }
         let mut report = compose_snapshot(request, &self.index.snapshot())?;
@@ -895,9 +899,14 @@ fn project_lsp_result(
             request,
             observation,
             report,
-            items
-                .iter()
-                .map(|item| (item.symbol.as_str(), item.path.as_str(), item.line, item.column)),
+            items.iter().map(|item| {
+                (
+                    item.symbol.as_str(),
+                    item.path.as_str(),
+                    item.line,
+                    item.column,
+                )
+            }),
             "definition_observation",
             "lsp_definition_observed",
             freshness,
@@ -906,9 +915,14 @@ fn project_lsp_result(
             request,
             observation,
             report,
-            items
-                .iter()
-                .map(|item| (item.symbol.as_str(), item.path.as_str(), item.line, item.column)),
+            items.iter().map(|item| {
+                (
+                    item.symbol.as_str(),
+                    item.path.as_str(),
+                    item.line,
+                    item.column,
+                )
+            }),
             "reference_observation",
             "lsp_reference_observed",
             freshness,
@@ -921,13 +935,9 @@ fn project_lsp_result(
             &receipt.coverage,
             node_freshness,
         ),
-        NormalizedResult::Diagnostics { observations, .. } => project_lsp_diagnostics(
-            request,
-            observation,
-            report,
-            observations,
-            node_freshness,
-        ),
+        NormalizedResult::Diagnostics { observations, .. } => {
+            project_lsp_diagnostics(request, observation, report, observations, node_freshness)
+        }
         NormalizedResult::Rename { candidate, .. } => project_lsp_rename(
             request,
             observation,
