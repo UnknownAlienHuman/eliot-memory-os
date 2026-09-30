@@ -840,6 +840,15 @@ impl KernelComposition {
         {
             return Err(TransportError::SessionFenced);
         }
+        // #1824 (I10.21 A2/A3 durability): rebuild the Kernel ledger from
+        // its durable sidecar when this process started fresh, so an
+        // unreconciled unknown-origin Material change recorded before a
+        // restart still blocks governed finish-candidate acceptance. A
+        // corrupt or unreadable sidecar fails closed: acceptance blocks
+        // instead of trusting a half-read projection.
+        if super::change_monitor::hydrate_ledger_sidecar_if_empty().is_err() {
+            return Err(TransportError::SessionFenced);
+        }
         // #1824 (I10.21 A2): an unreconciled unknown-origin Material change
         // (or a still-unverified host/filesystem hint) blocks governed
         // finish-candidate acceptance until reconciled. The block is scoped
