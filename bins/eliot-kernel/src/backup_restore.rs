@@ -62,13 +62,19 @@
 //! receipt over material that IS published among them — so the engine takes
 //! its explicit rollback-required disposition). A receipt file that cannot be
 //! read is never an absence: `Path::exists()` collapses missing, inaccessible
-//! and broken paths into one silent `false`, and every absence test here is a
-//! fallible read that distinguishes them. All effects here are synchronous
-//! and local with a persisted identity receipt per phase, so no ambiguous
-//! external commit exists in this target and no `Unknown` outcome is
-//! manufactured: async owner-channel unknowns belong to the #962 wire layer,
-//! which must upgrade reconciliation there, never downgrade readback to a
-//! blind re-apply here.
+//! and broken paths into one silent `false`, so the two absence tests on the
+//! RECONCILIATION path — the receipt read in `load_applied` and the member
+//! probe in `phase_material_published` — are fallible reads that distinguish
+//! them, and an inaccessible one refuses rather than reading as absent. The
+//! staged-output CLEANUP path is a separate concern and is not covered by that
+//! claim: `is_attested_phase_material` and `count_dir` still answer presence
+//! with `Path::exists()`. All effects here are synchronous and local with a
+//! persisted identity receipt per phase, so no ambiguous external commit
+//! exists in this target; the `Unknown` outcomes above are therefore all
+//! LOCAL to a phase whose own material is undecidable, never a manufactured
+//! effect ambiguity. Async owner-channel unknowns belong to the #962 wire
+//! layer, which must upgrade reconciliation there, never downgrade readback to
+//! a blind re-apply here.
 //!
 //! Every staged byte is made durable BEFORE the phase receipt that names it is
 //! written, in the order the same module's ORS journal already applies to its
