@@ -2468,6 +2468,7 @@ fn origin_test_request(fence: eliot_contracts::StateFence) -> OriginChallengeReq
         fence,
         OriginControlOperation::Kill,
         "origin-recovery-nonce",
+        OperationId::new("origin-recovery-operation").expect("operation"),
     )
     .expect("origin request")
 }

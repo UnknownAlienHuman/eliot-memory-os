@@ -45,7 +45,7 @@ use eliot_kernel_service::{
 };
 use eliot_process::{
     OperationId, OriginChallengeRequest, OriginControlGrant, OriginControlOperation,
-    OriginControlPresentation, ProcessExecutionView, ProcessLifecycle,
+    OriginControlPresentation, ProcessExecutionError, ProcessExecutionView, ProcessLifecycle,
 };
 use eliot_protocol::{
     AgentActivationClaimRequest, HostRequestEnvelope, HostRequestResultBody,
@@ -601,6 +601,7 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "daemon_ready" => "daemon_ready",
         "origin_challenge_issue" => "origin_challenge_issue",
         "origin_control_decide" => "origin_control_decide",
+        "origin_grant_reconcile" => "origin_grant_reconcile",
         ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION => ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION,
         GENERATION_CUTOVER_OPERATION => GENERATION_CUTOVER_OPERATION,
         STORAGE_REPLACEMENT_OPERATION => STORAGE_REPLACEMENT_OPERATION,
@@ -1951,6 +1952,19 @@ struct OriginControlDecideOperation {
     presentation: serde_json::Value,
 }
 
+/// Crash/lost-response reconciliation for one grant-funded kill effect.
+///
+/// Both fields are front-door envelope values, never proof content: the
+/// gateway authorizes the caller against the retained operation record,
+/// then cross-checks the envelope operation against the operation the
+/// journaled one-shot was decided for before any effect or live read.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OriginGrantReconcileOperation {
+    operation_id: OperationId,
+    request_nonce: String,
+}
+
 #[cfg(windows)]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -3107,6 +3121,9 @@ impl KernelComposition {
             "origin_control_decide" => {
                 self.origin_control_decide_operation(session, payload.clone())
                     .await
+            }
+            "origin_grant_reconcile" => {
+                self.origin_grant_reconcile_operation(session, payload.clone())
             }
             ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION => {
                 self.generation_registry_active_query_operation(session, payload.clone())
@@ -7417,6 +7434,64 @@ impl KernelComposition {
         }))
     }
 
+    /// Reconciles one grant-funded kill effect after crash or lost response
+    /// (issue #1775 A-crash).
+    ///
+    /// The reachable front-door caller for the durable authority journal's
+    /// reconciliation query path: the envelope carries only the operation
+    /// and the consumed one-shot nonce, and the gateway authorizes the
+    /// caller against the retained operation record, cross-checks the
+    /// envelope operation and the live installation against the journaled
+    /// original, and then either replays the preserved original kill
+    /// receipt or answers reconciliation-required — never re-executing and
+    /// never minting a fresh nonce. A proven (`Effected`) effect projects
+    /// the preserved receipt; an unproven (`Unknown`) effect projects a
+    /// structured `reconciliation_required` recovery obligation, not prose;
+    /// every authorization or binding failure fences the session before any
+    /// effect or live read.
+    fn origin_grant_reconcile_operation(
+        &self,
+        session: &Session,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let operation: OriginGrantReconcileOperation =
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
+        let (owner, _) =
+            super::caller_binding(session).map_err(|_| TransportError::PeerIdentityUnavailable)?;
+        let gateway = self
+            .process_gateway
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        match gateway.reconcile_origin_grant_effect(
+            &owner,
+            &operation.operation_id,
+            &operation.request_nonce,
+        ) {
+            Ok(receipt) => Ok(serde_json::json!({
+                "status": "known",
+                "value": {
+                    "kind": "origin_grant_reconcile",
+                    "effect": "effected",
+                    "receipt": receipt,
+                },
+                "recovery": null,
+            })),
+            Err(ProcessExecutionError::UnknownOutcome) => Ok(serde_json::json!({
+                "status": "known",
+                "value": {
+                    "kind": "origin_grant_reconcile",
+                    "effect": "unknown",
+                },
+                "recovery": {
+                    "kind": "reconciliation_required",
+                    "operation_id": operation.operation_id.as_str(),
+                },
+            })),
+            Err(_) => Err(TransportError::SessionFenced),
+        }
+    }
+
     fn generation_registry_active_query_operation(
         &self,
         session: &Session,
@@ -10770,6 +10845,23 @@ fn validate_origin_inspection(
     }
     let identity = view.identity().ok_or(TransportError::SessionFenced)?;
     if identity.generation() != request.generation() || identity.physical() != request.physical() {
+        return Err(TransportError::SessionFenced);
+    }
+    // The packaged operation must equal the envelope operation the live
+    // view was just read under: a request packaged for one operation can
+    // never be issued or decided under another.
+    if request.operation_id() != operation_id {
+        return Err(TransportError::SessionFenced);
+    }
+    // The packaged installation is caller text until it is proven against
+    // the Kernel-retained composition identity: a foreign installation
+    // fails here, before any challenge is minted or decided. An uncomposed
+    // Kernel has no installation identity at all and refuses.
+    let live = super::dispatch_contour().map_or(
+        "",
+        super::dispatch_launch::ComposedDispatchContour::installation_id,
+    );
+    if live.trim().is_empty() || request.installation_id() != live {
         return Err(TransportError::SessionFenced);
     }
     Ok(())
