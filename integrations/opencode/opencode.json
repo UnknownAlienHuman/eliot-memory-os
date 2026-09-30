@@ -13,6 +13,9 @@
         "--instance",
         "default"
       ],
+      "environment": {
+        "ELIOT_CLAUDE_FRONT_DOOR": "agent-bridge"
+      },
       "enabled": true,
       "timeout": 30000
     }

@@ -3417,13 +3417,13 @@ function Test-ReleaseBundle([string]$Path, [string]$GovernorRetirementApproval) 
         }
         $server = $serverProperties[0].Value
         if ([string]$server.type -ne 'stdio' -or
-            [string]$server.command -ne 'bin/eliot-governor.exe' -or
+            [string]$server.command -ne 'bin/eliot-agent-bridge.exe' -or
             [string]$server.cwd -ne '.' -or
             $server.enabled -ne $true -or
             $server.required -ne $false) {
             throw 'release Codex MCP server transport is not the enabled fail-open local plugin binary'
         }
-        $expectedArgs = @('mcp', 'stdio', '--profile', 'codex_controller', '--instance', 'default')
+        $expectedArgs = @('mcp', '--profile', 'codex_controller', '--transport', 'stdio', '--client-declaration', '${PLUGIN_ROOT}/bin/agent-bridge/client-declaration-v2.json')
         $actualArgs = @($server.args)
         if ($actualArgs.Count -ne $expectedArgs.Count) {
             throw 'release Codex MCP server has the wrong argument count'
