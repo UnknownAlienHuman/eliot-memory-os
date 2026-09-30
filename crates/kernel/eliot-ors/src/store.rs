@@ -30418,6 +30418,17 @@ impl RedbRecoveryStore {
                 }
                 record.canonical_admission_receipt =
                     Some(request.canonical_admission_receipt.clone());
+                // #1678 W3/A3: retain the committed canonical `ADMITTED`
+                // decision and its launch-outbox intent on the row, so a restart
+                // reads the committed decision back instead of re-asking the
+                // canonical owner. The values are the canonical owner's own,
+                // copied verbatim. `record.validate()` below refuses a retained
+                // commit whose `admission_receipt` differs from the slot set
+                // just above, so the retained evidence and the receipt reference
+                // cannot drift apart.
+                if let Some(committed) = &request.canonical_admission {
+                    record.canonical_admission = Some(committed.clone());
+                }
                 record.activation_receipt = Some(request.activation_receipt.clone());
             }
         }
@@ -31267,6 +31278,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             authority_epoch: stage.authority_epoch,
             state_fence: stage.state_fence,
             canonical_admission_receipt: None,
+            canonical_admission: None,
             activation_receipt: None,
             expires_at_ms: stage.expires_at_ms,
             state: AdmissionReservationState::StagedInactive,
