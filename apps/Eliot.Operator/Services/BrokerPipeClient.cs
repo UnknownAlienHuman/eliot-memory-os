@@ -7,11 +7,10 @@ using Eliot.Operator.Protocol;
 namespace Eliot.Operator.Services;
 
 /// Redeems the inherited one-shot handoff with the User Broker before the
-/// Governor connection is opened. The client has one fixed pipe, one
+/// Governor connection is opened. The client has one owner-issued pipe, one
 /// challenge/redeem exchange and no cached authority or retry path.
 internal static class BrokerPipeClient
 {
-    private const string PipeName = @"eliot\user-broker\operator";
     private const string Preface = "ELIOT-BROKER-1\n";
 
     private static readonly string[] ChallengeProperties =
@@ -75,7 +74,7 @@ internal static class BrokerPipeClient
 
         using var pipe = new NamedPipeClientStream(
             ".",
-            PipeName,
+            OwnerIssuedPipeName(endpoint),
             PipeDirection.InOut,
             PipeOptions.Asynchronous);
         await pipe.ConnectAsync(cancellationToken).ConfigureAwait(false);
@@ -185,6 +184,28 @@ internal static class BrokerPipeClient
         {
             throw new OperatorRestartRequiredException(OperatorFaultReason.HandshakeRefused);
         }
+    }
+
+    /// The endpoint is the only owner-issued statement of WHICH broker
+    /// instance this handoff may authenticate against, so that name is used
+    /// verbatim with the same normalisation the Governor client applies to its
+    /// own endpoint. A name literal in this client would contradict the owner
+    /// (the broker serves exactly the name it minted into this handoff) and
+    /// would let a stale or forged endpoint be redeemed against an arbitrary
+    /// pipe. An unusable owner-issued name is therefore the same typed refusal
+    /// as any other invalid endpoint: no default, no cached name, no second
+    /// attempt, and the name itself never reaches a message or diagnostic.
+    private static string OwnerIssuedPipeName(OperatorEndpoint endpoint)
+    {
+        var pipeName = endpoint.PipeName is { } issued
+            ? issued.Replace(@"\\.\pipe\", string.Empty, StringComparison.OrdinalIgnoreCase)
+            : string.Empty;
+        if (string.IsNullOrWhiteSpace(pipeName))
+        {
+            throw new OperatorRestartRequiredException(OperatorFaultReason.EndpointInvalid);
+        }
+
+        return pipeName;
     }
 
     private static bool ProcessGenerationMatches(string processGeneration, int processId)
