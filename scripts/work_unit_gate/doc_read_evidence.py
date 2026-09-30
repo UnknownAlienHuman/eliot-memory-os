@@ -53,6 +53,7 @@ verifier with different semantics is introduced.
 from __future__ import annotations
 
 import argparse
+import atexit
 import hashlib
 import json
 import re
@@ -62,9 +63,10 @@ import sys
 import tarfile
 import tempfile
 import tomllib
+from collections import OrderedDict
 from dataclasses import dataclass
 from enum import Enum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Sequence
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -94,7 +96,18 @@ SHARED_COMMAND = (
 BLOCK_START = "<!-- eliot-doc-read-evidence:v2:start -->"
 BLOCK_END = "<!-- eliot-doc-read-evidence:v2:end -->"
 
-# Prose that must never stand in for evidence (issue #2965 item 6).
+# Placeholder prose must never stand in for evidence (issue #2965 item 6).
+# Whether a value counts as a placeholder depends on the FIELD'S MEANING, not
+# on substring coincidence (audit 5919739325 defect 1): descriptive text
+# (topic, attestation statement, optional-expansion reason) may legitimately
+# discuss placeholders, Rust generics ("Vec<T>") or defects, while a machine
+# identity, repository path or digest can never legitimately contain them.
+# Identities, hashes, changed paths and the final-candidate comparison stay
+# strict by type and recomputation (exact digests, closed schemas,
+# final-tree/path/route comparison); only the prose reading of a value is
+# scoped to whole-value evasion. There is one validator (_text), not two, and
+# no blanket text exemption: a descriptive field that IS the placeholder still
+# fails with the same typed code.
 _PLACEHOLDER_TOKENS = (
     "see receipt",
     "as listed above",
@@ -108,6 +121,12 @@ _PLACEHOLDER_TOKENS = (
     "tbd",
 )
 _SENTINEL_TOKENS = ("<path>", "<sha>", "<digest>", "<issue title>", "<topic>")
+# Whole-value evasions: the value IS the placeholder instead of the evidence.
+# The plural "see receipts" is the punctuated whole-value form that the
+# singular substring token alone would miss under whole-value comparison.
+_WHOLE_VALUE_EVASIONS = _PLACEHOLDER_TOKENS + ("see receipts",)
+_TRAILING_EVASION_PUNCTUATION = ".!?:;,"
+_WHOLE_SLOT_RE = re.compile(r"\A<[^<>]*>\Z")
 _SHA256_HEX = re.compile(r"\A[0-9a-f]{64}\Z")
 _SHA256_PREFIXED = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
 _FULL_COMMIT = re.compile(r"\A[0-9a-f]{40}\Z")
@@ -202,25 +221,60 @@ def _fail(code: EvidenceFailure, detail: str = "") -> None:
 # Bounded typed field helpers.
 # ---------------------------------------------------------------------------
 
-def _is_placeholder(text: str) -> bool:
-    folded = text.casefold()
-    if any(token in folded for token in _PLACEHOLDER_TOKENS):
+def _folded_whole_value(text: str) -> str:
+    """Normalize a field value for whole-value evasion comparison."""
+    return " ".join(text.casefold().split()).strip(_TRAILING_EVASION_PUNCTUATION)
+
+
+def _is_whole_value_evasion(text: str) -> bool:
+    """True when the value, taken as a whole, offers no content of its own."""
+    core = _folded_whole_value(text)
+    if not core or core in ("...", "…"):
         return True
-    if any(token in folded for token in _SENTINEL_TOKENS):
+    if core in _WHOLE_VALUE_EVASIONS or core in _SENTINEL_TOKENS:
+        return True
+    if _WHOLE_SLOT_RE.fullmatch(core):
+        return True
+    return False
+
+
+def _is_placeholder(text: str) -> bool:
+    """Strict predicate for machine-meaning fields (paths, identities, commits).
+
+    A whole-value evasion ("see receipts", "TBD", "<path>") stands in for
+    evidence. Angle slots and ellipses can never legitimately appear in a
+    machine identity or repository path, so any occurrence refuses. Bare token
+    *substrings* no longer refuse on their own: a genuine path may mention a
+    placeholder, and set membership plus digest recomputation decides it.
+    """
+    if _is_whole_value_evasion(text):
         return True
     if ("<" in text and ">" in text) or "…" in text or "..." in text:
         return True
     return False
 
 
-def _text(value: Any, field: str, code: EvidenceFailure, *, allow_empty: bool = False) -> str:
+def _is_placeholder_prose(text: str) -> bool:
+    """Predicate for descriptive fields (topic, attestation statement, reason).
+
+    Only a whole-value evasion refuses: the recorded causal property,
+    attestation or reason IS the placeholder instead of the real text. Longer
+    prose that merely discusses placeholders, generics ("Vec<T>") or defects
+    passes; blank values are still rejected by _text before this runs.
+    """
+    return _is_whole_value_evasion(text)
+
+
+def _text(value: Any, field: str, code: EvidenceFailure, *, allow_empty: bool = False,
+          descriptive: bool = False) -> str:
     if type(value) is not str:
         _fail(code, f"{field} must be a string")
     if not value.strip() and not allow_empty:
         _fail(code, f"{field} is blank")
     if len(value) > MAX_TEXT:
         _fail(code, f"{field} exceeds {MAX_TEXT} bytes")
-    if _is_placeholder(value):
+    evasive = _is_placeholder_prose(value) if descriptive else _is_placeholder(value)
+    if evasive:
         _fail(code, f"{field} is placeholder prose, not evidence")
     return value
 
@@ -297,7 +351,7 @@ def _changed_paths(root: Path, base_tree: str, candidate_tree: str) -> list[str]
     return sorted({_router.normalize_repo_path(line) for line in output.splitlines() if line.strip()})
 
 
-def _materialize_candidate(root: Path, candidate_tree: str) -> Path:
+def _materialize_full_tree(root: Path, candidate_tree: str) -> Path:
     """Export the exact candidate tree so file reads come from final-candidate bytes."""
     directory = tempfile.mkdtemp(prefix="eliot-doc-read-candidate-")
     target = Path(directory)
@@ -324,6 +378,281 @@ def _materialize_candidate(root: Path, candidate_tree: str) -> Path:
             shutil.rmtree(target, ignore_errors=True)
             _fail(EvidenceFailure.BASE_OR_CANDIDATE_MISMATCH, f"cannot extract candidate ({type(exc).__name__})")
     return target
+
+
+# ---------------------------------------------------------------------------
+# Bounded candidate projection with a same-tree cache (audit 5919739325
+# defect 3, secondary).
+#
+# Filesystem closure the SOLE algorithms touch on a candidate root, enumerated
+# from docs_router_core/route_payload and docs_read/build_read_bundle (no
+# other reader input exists on that root):
+# * the route config, handle index and normative pair, read through
+#   _router.DEFAULT_CONFIG/_router.DEFAULT_INDEX/_router.DEFAULT_RECEIPT and
+#   _contract_inputs;
+# * the assignment contract (.github/work-unit-cohort.toml);
+# * AGENTS.md EXISTENCE at the repository root and at every ancestor directory
+#   of each changed path (ancestor_agent_files checks is_file only; file
+#   contents are never read);
+# * required/optional FILE bytes and sizes named by the baseline config lists,
+#   the matched routes' config lists and the ancestor AGENTS.md set
+#   (file_record during route_payload);
+# * required item bytes named by route["required"] (verified_item during
+#   build_read_bundle). Optional fragments and changed-path bytes are never
+#   read; route matching itself is pure string comparison.
+#
+# The projection serves exactly that closure with real bytes taken from the
+# immutable candidate TREE object: never the mutable worktree, never a
+# caller-authored allowlist. AGENTS.md files are enumerated from `git ls-tree`,
+# declared files come from the REAL load_config parse narrowed by the REAL
+# matched_routes call, and required bytes come from the REAL route_payload
+# output. A tree-absent path stays absent, so genuine "does not exist" errors
+# fire identically. Anything unprovable — an unlistable tree, an unreadable
+# blob, an un-normalizable path, a budget overflow, or a route/read error
+# inside the phased runs — raises _ProjectionGap, and the caller falls back to
+# the full tree export, which is byte-for-byte today's behavior. A projection
+# is never shipped on an unproven fast path.
+# ---------------------------------------------------------------------------
+
+# Optimization bounds, not policy: exceeding them selects the full export.
+_MAX_PROJECTED_FILES = 1024
+_MAX_PROJECTED_BYTES = 16 * 1024 * 1024
+# Same-tree materialization cache bound (immutable key: tree + topic + paths).
+_MAX_CACHED_CANDIDATES = 4
+
+
+class _ProjectionGap(Exception):
+    """Internal: the bounded projection cannot prove equivalence; full export."""
+
+
+_CANDIDATE_CACHE: OrderedDict[str, Path] = OrderedDict()
+_PROJECTED_ROOTS: set[str] = set()
+
+
+def _evict_all_candidates() -> None:
+    while _CANDIDATE_CACHE:
+        _, path = _CANDIDATE_CACHE.popitem(last=False)
+        _PROJECTED_ROOTS.discard(str(path))
+        shutil.rmtree(path, ignore_errors=True)
+
+
+atexit.register(_evict_all_candidates)
+
+
+def _cache_key(candidate_tree: str, paths: Sequence[str], topic: str) -> str:
+    digest = hashlib.sha256()
+    digest.update(candidate_tree.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(topic.encode("utf-8"))
+    digest.update(b"\0")
+    for entry in paths:
+        digest.update(entry.encode("utf-8"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _remember_candidate(key: str, path: Path, projected: bool) -> Path:
+    while len(_CANDIDATE_CACHE) >= _MAX_CACHED_CANDIDATES:
+        _, old = _CANDIDATE_CACHE.popitem(last=False)
+        _PROJECTED_ROOTS.discard(str(old))
+        shutil.rmtree(old, ignore_errors=True)
+    _CANDIDATE_CACHE[key] = path
+    if projected:
+        _PROJECTED_ROOTS.add(str(path))
+    return path
+
+
+def _release_candidate(path: Path) -> None:
+    """Release a materialized candidate root.
+
+    Cached entries persist under their immutable key (FIFO eviction and exit
+    cleanup own them); anything else is removed, preserving today's hygiene
+    for non-cached materializations.
+    """
+    if any(path == cached for cached in _CANDIDATE_CACHE.values()):
+        return
+    _PROJECTED_ROOTS.discard(str(path))
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def _used_projection(path: Path) -> bool:
+    return str(path) in _PROJECTED_ROOTS
+
+
+def _candidate_tree_names(root: Path, candidate_tree: str) -> set[str]:
+    """Every blob path in the candidate tree, from the immutable object store."""
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(root), "ls-tree", "-r", "--name-only", "-z", candidate_tree],
+            capture_output=True, text=False, check=False, timeout=GIT_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise _ProjectionGap(f"cannot list candidate tree ({type(exc).__name__})") from exc
+    if completed.returncode != 0:
+        raise _ProjectionGap("cannot list candidate tree")
+    return {entry for entry in completed.stdout.decode("utf-8", "replace").split("\0") if entry}
+
+
+def _extract_tree_paths(
+    root: Path, candidate_tree: str, wanted: Sequence[str], target: Path, budget_spent: int = 0
+) -> int:
+    """Extract exactly the wanted tree blobs into target; return the new spent total."""
+    if not wanted:
+        return budget_spent
+    scratch: str | None = None
+    try:
+        scratch = tempfile.mkdtemp(prefix="eliot-doc-read-archive-")
+        archive = Path(scratch) / "projection.tar"
+        with archive.open("wb") as handle:
+            subprocess.run(
+                ["git", "-C", str(root), "archive", "--format=tar", candidate_tree, "--", *wanted],
+                stdout=handle, stderr=subprocess.PIPE, check=True, timeout=GIT_TIMEOUT_S,
+            )
+        with tarfile.open(archive, "r:") as tar:
+            members = tar.getmembers()
+            spent = budget_spent
+            for member in members:
+                if member.isfile():
+                    spent += member.size
+                    if spent > _MAX_PROJECTED_BYTES:
+                        raise _ProjectionGap("projection exceeds the byte bound")
+            for member in members:
+                name = member.name.replace("\\", "/")
+                if name.startswith("/") or ".." in Path(name).parts:
+                    raise _ProjectionGap("candidate archive escapes root")
+            tar.extractall(target)
+    except (subprocess.CalledProcessError, OSError, subprocess.SubprocessError, tarfile.TarError) as exc:
+        raise _ProjectionGap(f"cannot extract projection ({type(exc).__name__})") from exc
+    finally:
+        if scratch is not None:
+            shutil.rmtree(scratch, ignore_errors=True)
+    return spent
+
+
+def _projection_fixed_inputs() -> list[str]:
+    """The algorithms' own declared fixed inputs (their constants, not a list)."""
+    return [
+        _router.DEFAULT_CONFIG,
+        _router.DEFAULT_INDEX,
+        _router.DEFAULT_RECEIPT,
+        COHORT_LOCK_PATH,
+    ]
+
+
+def _project_candidate(root: Path, candidate_tree: str, paths: Sequence[str], topic: str) -> Path:
+    """Materialize the bounded projection; raise _ProjectionGap when unprovable."""
+    names = _candidate_tree_names(root, candidate_tree)
+    directory = tempfile.mkdtemp(prefix="eliot-doc-read-candidate-")
+    target = Path(directory)
+    try:
+        fixed = [entry for entry in _projection_fixed_inputs() if entry in names]
+        agents = sorted(name for name in names if PurePosixPath(name).name == "AGENTS.md")
+        phase1 = sorted(set(fixed) | set(agents))
+        if len(phase1) > _MAX_PROJECTED_FILES:
+            raise _ProjectionGap("projection exceeds the file bound")
+        spent = _extract_tree_paths(root, candidate_tree, phase1, target)
+        try:
+            config = _router.load_config(target)
+        except _router.RouteError as exc:
+            raise _ProjectionGap(f"projection cannot parse route config: {exc}") from exc
+        try:
+            matched = _router.matched_routes(config, list(paths), topic)
+        except _router.RouteError as exc:
+            raise _ProjectionGap(f"projection cannot reproduce route matching: {exc}") from exc
+        declared: set[str] = set(config.baseline_files) | set(config.baseline_optional_files)
+        for route in matched:
+            declared |= set(route.required_files) | set(route.optional_files)
+        try:
+            wanted_files = sorted(
+                _router.normalize_repo_path(entry) for entry in declared if entry.strip()
+            )
+        except _router.RouteError as exc:
+            raise _ProjectionGap(f"projection cannot normalize declared files: {exc}") from exc
+        phase1b = sorted({entry for entry in wanted_files if entry in names})
+        if len(phase1) + len(phase1b) > _MAX_PROJECTED_FILES:
+            raise _ProjectionGap("projection exceeds the file bound")
+        spent = _extract_tree_paths(root, candidate_tree, phase1b, target, spent)
+        try:
+            route = _router.route_payload(target, config, list(paths), topic)
+        except _router.RouteError as exc:
+            raise _ProjectionGap(f"projection cannot reproduce routing: {exc}") from exc
+        required: list[str] = []
+        for item in route.get("required", []):
+            if not isinstance(item, dict):
+                raise _ProjectionGap("projection met a non-object required item")
+            try:
+                required.append(_router.normalize_repo_path(str(item.get("path", ""))))
+            except _router.RouteError as exc:
+                raise _ProjectionGap(f"projection cannot normalize required path: {exc}") from exc
+        phase2 = sorted({entry for entry in required if entry in names})
+        if len(phase1) + len(phase1b) + len(phase2) > _MAX_PROJECTED_FILES:
+            raise _ProjectionGap("projection exceeds the file bound")
+        _extract_tree_paths(root, candidate_tree, phase2, target, spent)
+        return target
+    except BaseException:
+        shutil.rmtree(target, ignore_errors=True)
+        raise
+
+
+def _materialize_candidate(
+    root: Path, candidate_tree: str,
+    paths: Sequence[str] | None = None, topic: str | None = None,
+) -> Path:
+    """Export final-candidate bytes for the SOLE router/reader algorithms.
+
+    Prefers the bounded Git-tree-backed projection (real bytes from the
+    immutable candidate tree object, never the mutable worktree), cached under
+    the immutable (tree, topic, paths) key so repeating the same check repeats
+    no export. Falls back to the full tree export whenever equivalence is
+    unprovable. Callers release the result with _release_candidate, never with
+    rmtree.
+    """
+    materialized = list(paths) if paths is not None else []
+    key: str | None = None
+    if materialized and topic is not None:
+        key = _cache_key(candidate_tree, materialized, topic)
+        cached = _CANDIDATE_CACHE.get(key)
+        if cached is not None and cached.is_dir():
+            return cached
+        try:
+            projected = _project_candidate(root, candidate_tree, materialized, topic)
+        except _ProjectionGap:
+            projected = None
+        if projected is not None:
+            return _remember_candidate(key, projected, True)
+    full = _materialize_full_tree(root, candidate_tree)
+    if key is not None:
+        return _remember_candidate(key, full, False)
+    return full
+
+
+def _recompute_final(
+    root: Path, candidate_tree: str, changed: Sequence[str], topic: str
+) -> tuple[Path, Recomputed]:
+    """Materialize (projection preferred, full export on gap) and recompute.
+
+    When the projection serves an error the full tree would not serve — or a
+    different one — the full export is re-run and THAT outcome is reported,
+    which is byte-for-byte today's behavior. A projection success is
+    equivalent by construction (see the closure note above): every filesystem
+    query the sole algorithms issue is answered with identical bytes or
+    identical absence, through the same router/reader algorithms, with the
+    final-candidate identity checks kept.
+    """
+    candidate_root = _materialize_candidate(root, candidate_tree, changed, topic)
+    try:
+        return candidate_root, _recompute(candidate_root, list(changed), topic)
+    except EvidenceError:
+        if not _used_projection(candidate_root):
+            raise
+        _release_candidate(candidate_root)
+        full_root = _materialize_full_tree(root, candidate_tree)
+        _remember_candidate(_cache_key(candidate_tree, list(changed), topic), full_root, False)
+        try:
+            return full_root, _recompute(full_root, list(changed), topic)
+        except BaseException:
+            _release_candidate(full_root)
+            raise
 
 
 # ---------------------------------------------------------------------------
@@ -563,7 +892,7 @@ def _candidate_repository(candidate_root: Path) -> str:
 
 
 def _compare_router_input(envelope: dict[str, Any], recomputed: Recomputed) -> None:
-    topic = _text(envelope["topic"], "topic", EvidenceFailure.ROUTER_INPUT_MISMATCH)
+    topic = _text(envelope["topic"], "topic", EvidenceFailure.ROUTER_INPUT_MISMATCH, descriptive=True)
     if topic != recomputed.route["topic"]:
         _fail(
             EvidenceFailure.ROUTER_INPUT_MISMATCH,
@@ -674,7 +1003,8 @@ def _compare_optional(recorded: Any, recomputed: Recomputed) -> None:
         if type(entry) is not dict or set(entry) != {"path", "sha256", "reason"}:
             _fail(EvidenceFailure.REQUIRED_ITEM_MISMATCH, "optional expansion must be {path, sha256, reason}")
         path = _text(entry["path"], "optional.path", EvidenceFailure.REQUIRED_ITEM_MISMATCH)
-        _text(entry["reason"], f"optional[{path}].reason", EvidenceFailure.REQUIRED_ITEM_MISMATCH)
+        _text(entry["reason"], f"optional[{path}].reason", EvidenceFailure.REQUIRED_ITEM_MISMATCH,
+              descriptive=True)
         digest = _sha256(entry["sha256"], f"optional[{path}].sha256", EvidenceFailure.REQUIRED_ITEM_MISMATCH, prefixed=False)
         if path in claimed:
             _fail(EvidenceFailure.REQUIRED_ITEM_MISMATCH, f"duplicate optional expansion: {path}")
@@ -713,7 +1043,8 @@ def _compare_contract_inputs(recorded: Any, candidate_root: Path) -> None:
 def _compare_attestation(recorded: Any) -> None:
     attestation = _closed(recorded, ("read_by", "statement"), "attestation")
     _text(attestation["read_by"], "attestation.read_by", EvidenceFailure.ATTESTATION_MISSING)
-    _text(attestation["statement"], "attestation.statement", EvidenceFailure.ATTESTATION_MISSING)
+    _text(attestation["statement"], "attestation.statement", EvidenceFailure.ATTESTATION_MISSING,
+          descriptive=True)
 
 
 # ---------------------------------------------------------------------------
@@ -834,6 +1165,255 @@ def _assignment_contract(candidate_root: Path) -> dict[int, bool]:
 
 
 # ---------------------------------------------------------------------------
+# Same-reader provenance refresh (audit 5919739325 defect 2).
+#
+# route_payload hashes optional items and the full topic into the route ID, and
+# build_read_bundle embeds that route ID into the bundle and read receipt. An
+# unopened optional-file-only change — or equivalent topic wording — therefore
+# changes route/read/bundle provenance even though every required item is
+# byte-identical. The OLD envelope still fails (it is regenerated, never
+# accepted); but TASK item 5 requires renewed reading/attestation only when
+# REQUIRED content changes, so the same reader on the same attempt refreshes
+# provenance without re-reading unchanged required text:
+# * reading_delta (pure, no I/O) reports the required/read-optional delta
+#   between a prior envelope and the current recomputation;
+# * refresh_provenance regenerates the exact current outer evidence
+#   deterministically, retaining current provenance and the earlier reading's
+#   attribution.
+# Refusals stay typed: changed required/selected content, changed routing
+# obligations (routes, pair key, contract inputs) or a DIFFERENT reader fail
+# STALE_SOURCE_TREE — renewed reading is required and the diagnostic presents
+# the changed material. Receipt IDs are never redefined silently (the prior
+# and current route IDs are both named in the refreshed attestation);
+# required_delta=0 is reported as a fact and is never product acceptance (the
+# refreshed envelope must still pass verify()). A new reader never inherits
+# another model's comprehension claim.
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ReadingDelta:
+    """Required/read-optional delta: prior envelope versus current recompute."""
+
+    required_added: tuple[str, ...]
+    required_removed: tuple[str, ...]
+    required_changed: tuple[str, ...]
+    required_unchanged: tuple[str, ...]
+    claimed_optional_stale: tuple[str, ...]
+    claimed_optional_current: tuple[str, ...]
+    topic_changed: bool
+    routes_changed: bool
+    pair_key_changed: bool
+
+    @property
+    def required_changed_any(self) -> bool:
+        return bool(self.required_added or self.required_removed or self.required_changed)
+
+    @property
+    def selected_content_changed(self) -> bool:
+        return self.required_changed_any or bool(self.claimed_optional_stale)
+
+
+def reading_delta(prior_envelope: dict[str, Any], topic: str, recomputed: Recomputed) -> ReadingDelta:
+    """Pure required/read-optional delta (no I/O, no acceptance claim).
+
+    Compares the prior envelope's recorded required items (path, SHA-256,
+    bytes, handles — the same tuple _compare_required enforces) against
+    _required_projection(recomputed), and its claimed optional expansions
+    against the recomputed routed optional set.
+    """
+    if type(prior_envelope) is not dict:
+        _fail(EvidenceFailure.MALFORMED_EVIDENCE_BLOCK, "prior envelope must be an object")
+    prior_required = prior_envelope.get("required_items")
+    if type(prior_required) is not list:
+        _fail(EvidenceFailure.MALFORMED_EVIDENCE_BLOCK, "prior required_items must be a list")
+    prior_paths: dict[str, tuple[str, int, tuple[str, ...]]] = {}
+    for item in prior_required:
+        if type(item) is not dict or type(item.get("path")) is not str:
+            _fail(EvidenceFailure.MALFORMED_EVIDENCE_BLOCK, "prior required item must carry a path")
+        handles = item.get("handles", [])
+        if type(handles) is not list or not all(type(entry) is str for entry in handles):
+            _fail(EvidenceFailure.MALFORMED_EVIDENCE_BLOCK, "prior required handles must be strings")
+        raw_bytes = item.get("bytes")
+        prior_paths[item["path"]] = (
+            str(item.get("sha256", "")),
+            raw_bytes if type(raw_bytes) is int else -1,
+            tuple(sorted(handles)),
+        )
+    current = _required_projection(recomputed)
+    added = sorted(set(current) - set(prior_paths))
+    removed = sorted(set(prior_paths) - set(current))
+    changed = sorted(
+        path for path in set(current) & set(prior_paths)
+        if (
+            current[path]["sha256"],
+            current[path]["bytes"],
+            tuple(current[path]["handles"]),
+        ) != prior_paths[path]
+    )
+    unchanged = sorted(
+        path for path in set(current) & set(prior_paths)
+        if (
+            current[path]["sha256"],
+            current[path]["bytes"],
+            tuple(current[path]["handles"]),
+        ) == prior_paths[path]
+    )
+    optional_now = {
+        str(item["path"]): str(item.get("sha256", ""))
+        for item in recomputed.route.get("optional", [])
+        if isinstance(item, dict) and type(item.get("path")) is str
+    }
+    claimed = prior_envelope.get("optional_expansions")
+    stale: list[str] = []
+    current_claims: list[str] = []
+    if claimed != "none":
+        if type(claimed) is not list:
+            _fail(EvidenceFailure.MALFORMED_EVIDENCE_BLOCK, "prior optional_expansions must be 'none' or a list")
+        for entry in claimed:
+            if type(entry) is not dict or type(entry.get("path")) is not str:
+                _fail(EvidenceFailure.MALFORMED_EVIDENCE_BLOCK, "prior optional expansion must carry a path")
+            path = entry["path"]
+            if optional_now.get(path) != str(entry.get("sha256", "")):
+                stale.append(path)
+            else:
+                current_claims.append(path)
+    prior_topic = prior_envelope.get("topic")
+    if type(prior_topic) is not str:
+        _fail(EvidenceFailure.MALFORMED_EVIDENCE_BLOCK, "prior topic must be a string")
+    prior_routes = prior_envelope.get("matched_routes")
+    if type(prior_routes) is not list or not all(type(entry) is str for entry in prior_routes):
+        _fail(EvidenceFailure.MALFORMED_EVIDENCE_BLOCK, "prior matched_routes must be a list of route ids")
+    prior_pair = prior_envelope.get("pair_key")
+    if type(prior_pair) is not str:
+        _fail(EvidenceFailure.MALFORMED_EVIDENCE_BLOCK, "prior pair_key must be a string")
+    return ReadingDelta(
+        required_added=tuple(added),
+        required_removed=tuple(removed),
+        required_changed=tuple(changed),
+        required_unchanged=tuple(unchanged),
+        claimed_optional_stale=tuple(sorted(stale)),
+        claimed_optional_current=tuple(sorted(current_claims)),
+        topic_changed=prior_topic != topic,
+        routes_changed=list(prior_routes) != list(recomputed.route["matched_routes"]),
+        pair_key_changed=prior_pair != recomputed.route["pair_key"],
+    )
+
+
+def refresh_provenance(
+    root: Path, base: str, candidate: str, prior_body: str, *, topic: str, read_by: str
+) -> str:
+    """Regenerate the exact current outer evidence for the SAME reader/attempt.
+
+    Recomputes the changed-path denominator, routing and read bundle for the
+    final candidate with the SOLE algorithms, then either refuses or returns
+    the canonical fenced envelope body:
+    * STALE_SOURCE_TREE when required items, claimed optional material,
+      matched routes, the pair key or the contract inputs changed, or when
+      `read_by` is not the prior attestation's reader — renewed reading is
+      required and the diagnostic presents the changed material;
+    * otherwise the regenerated envelope: current machine fields (base and
+      candidate trees, changed paths, topic, route/read/pair/bundle provenance,
+      contract inputs), the prior optional claims verbatim (every one proven
+      current), the prior checklist verbatim (never rebound here — verify()
+      judges it), and the earlier reading's attribution carried forward with
+      both the prior and the current route IDs named.
+    The returned body is not acceptance: required_delta=0 is a fact about the
+    delta, and the envelope must still pass verify().
+    """
+    root = root.resolve()
+    base_tree = _resolve_tree(root, base, "base")
+    candidate_tree = _resolve_tree(root, candidate, "candidate")
+    prior = _shape(_extract_envelope(prior_body))
+    _reject_committed_local_evidence(root, candidate_tree)
+    changed = _changed_paths(root, base_tree, candidate_tree)
+    if not changed:
+        _fail(EvidenceFailure.UNCOVERED_CHANGED_PATH, "base and candidate differ in no tracked path")
+    current_topic = _text(topic, "topic", EvidenceFailure.ROUTER_INPUT_MISMATCH, descriptive=True)
+    current_reader = _text(read_by, "read_by", EvidenceFailure.ATTESTATION_MISSING)
+    candidate_root, recomputed = _recompute_final(root, candidate_tree, changed, current_topic)
+    try:
+        _compare_contract_inputs(prior["contract_inputs"], candidate_root)
+        _compare_attestation(prior["attestation"])
+        if str(prior["attestation"]["read_by"]) != current_reader:
+            _fail(
+                EvidenceFailure.STALE_SOURCE_TREE,
+                f"earlier reading is attributed to {prior['attestation']['read_by']!r}, "
+                f"not {current_reader!r}; a new reader cannot inherit it",
+            )
+        delta = reading_delta(prior, current_topic, recomputed)
+        if delta.selected_content_changed or delta.routes_changed or delta.pair_key_changed:
+            changed_material = sorted(
+                set(delta.required_added)
+                | set(delta.required_removed)
+                | set(delta.required_changed)
+                | set(delta.claimed_optional_stale)
+            )
+            preview = ", ".join(changed_material[:MAX_DIAGNOSTIC_PATHS])
+            more = (
+                "" if len(changed_material) <= MAX_DIAGNOSTIC_PATHS
+                else f" (+{len(changed_material) - MAX_DIAGNOSTIC_PATHS} more)"
+            )
+            obligations = []
+            if delta.routes_changed:
+                obligations.append("matched routes")
+            if delta.pair_key_changed:
+                obligations.append("normative pair key")
+            scope = f"changed routing obligation(s): {', '.join(obligations)}; " if obligations else ""
+            _fail(
+                EvidenceFailure.STALE_SOURCE_TREE,
+                f"renewed reading required for the final candidate: {scope}"
+                f"changed selected material: {preview}{more}",
+            )
+        kind = _git(root, "cat-file", "-t", candidate)
+        commit_value = _git(root, "rev-parse", candidate) if kind == "commit" else None
+        prior_route_id = str(prior.get("route_receipt_id", ""))
+        envelope = {
+            "schema_version": OUTER_SCHEMA,
+            "repository": prior["repository"],
+            "base_sha": _tree_digest(base_tree),
+            "candidate": {"commit": commit_value, "tree": _tree_digest(candidate_tree)},
+            "changed_paths": list(changed),
+            "topic": current_topic,
+            "route_receipt_id": recomputed.route["receipt_id"],
+            "read_receipt_id": recomputed.read_receipt["read_receipt_id"],
+            "pair_key": recomputed.route["pair_key"],
+            "matched_routes": list(recomputed.route["matched_routes"]),
+            "required_items": [
+                {
+                    "path": item["path"],
+                    "sha256": item["sha256"],
+                    "bytes": item["bytes"],
+                    "handles": sorted(item.get("handles", [])),
+                }
+                for item in recomputed.read_receipt["required"]
+            ],
+            "bundle": {
+                "sha256": recomputed.read_receipt["bundle_sha256"],
+                "bytes": recomputed.read_receipt["bundle_bytes"],
+            },
+            "optional_expansions": prior["optional_expansions"],
+            "contract_inputs": _contract_inputs(candidate_root),
+            "attestation": {
+                "read_by": current_reader,
+                "statement": (
+                    "Earlier reading retained without re-read: every required item is "
+                    "byte-identical (path, SHA-256, bytes, handles) to the prior envelope "
+                    "and no claimed optional material changed. Outer provenance regenerated "
+                    "deterministically for the current candidate: prior route "
+                    f"{prior_route_id} -> current route {recomputed.route['receipt_id']}. "
+                    "Required-item delta is zero; this envelope is not acceptance and must "
+                    "still pass the documentation-read gate."
+                ),
+            },
+            "checklist": prior["checklist"],
+        }
+    finally:
+        _release_candidate(candidate_root)
+    payload = json.dumps(envelope, indent=2, sort_keys=True)
+    return f"{BLOCK_START}\n```json\n{payload}\n```\n{BLOCK_END}\n"
+
+
+# ---------------------------------------------------------------------------
 # Merge-boundary integration visibility (issue #2965 item 12/13).
 # ---------------------------------------------------------------------------
 
@@ -909,16 +1489,15 @@ def verify(
     if not changed:
         _fail(EvidenceFailure.UNCOVERED_CHANGED_PATH, "base and candidate differ in no tracked path")
 
-    candidate_root = _materialize_candidate(root, candidate_tree)
+    topic = _text(envelope["topic"], "topic", EvidenceFailure.ROUTER_INPUT_MISMATCH, descriptive=True)
+    candidate_root, recomputed = _recompute_final(root, candidate_tree, changed, topic)
     try:
-        topic = _text(envelope["topic"], "topic", EvidenceFailure.ROUTER_INPUT_MISMATCH)
-        recomputed = _recompute(candidate_root, changed, topic)
         checklist_state, assignment_contract = _compare(
             envelope, recomputed, base_tree, candidate_tree, changed, candidate_root,
             work_issue,
         )
     finally:
-        shutil.rmtree(candidate_root, ignore_errors=True)
+        _release_candidate(candidate_root)
 
     if checklist_state is ChecklistState.REQUIRED_MISSING:
         _fail(
@@ -1153,9 +1732,8 @@ def _valid_envelope(root: Path, base: str, candidate: str, topic: str) -> str:
     base_tree = _resolve_tree(root, base, "base")
     candidate_tree = _resolve_tree(root, candidate, "candidate")
     changed = _changed_paths(root, base_tree, candidate_tree)
-    candidate_root = _materialize_candidate(root, candidate_tree)
+    candidate_root, recomputed = _recompute_final(root, candidate_tree, changed, topic)
     try:
-        recomputed = _recompute(candidate_root, changed, topic)
         required = [
             {
                 "path": item["path"],
@@ -1202,7 +1780,7 @@ def _valid_envelope(root: Path, base: str, candidate: str, topic: str) -> str:
             },
         }
     finally:
-        shutil.rmtree(candidate_root, ignore_errors=True)
+        _release_candidate(candidate_root)
     payload = json.dumps(envelope, indent=2, sort_keys=True)
     return f"{BLOCK_START}\n```json\n{payload}\n```\n{BLOCK_END}\n"
 
