@@ -31,16 +31,49 @@
 //! resource generation); its operation and idempotency namespaces are the `G-19`
 //! policy record's own; its risk and effect ceilings are the pipeline's own
 //! admitted constants; and its rollback owner is the one the same policy record
-//! names. See each field's `ASSUMPTION` note for what a value is and is not.
+//! names, read back out of the operation owner map's `Rollback` row rather than
+//! re-spelled. See each field's `ASSUMPTION` note for what a value is and is not.
+//!
+//! # One map, one read: the daemon names owners it does not own
+//!
+//! This daemon raises exactly one proposal and drives the pipeline, so it never
+//! executes, measures, evaluates, admits, activates, promotes or rolls back
+//! anything itself. It nevertheless has to STATE who owns each of those, in the
+//! four records that name an owner: the `ExperimentPlan`'s executor and
+//! evaluator, the `ActivationEvidence` and `ImprovementEvidenceView` verifiers,
+//! and the `RollbackContract` and `ImprovementEvidenceView` rollback owners. All
+//! six fields are read from [`improvement_operation_owners`] — the production
+//! projection of [`eliot_maintenance::ImprovementOperation::owner`] — at the one
+//! point in [`dispatch_improvement_candidate_route`] where this daemon decides
+//! what it is routing. That is what makes the map load-bearing rather than
+//! decorative: `check_experiment_owner_routing`, `check_evaluator_independence`
+//! and `check_rollback_join` in the Governor crate all re-derive the same
+//! question from these fields, so a map entry that diverged from the pipeline's
+//! expectation becomes a typed [`PipelineError::UnboundRelation`] on the live
+//! route instead of a routing nobody notices.
+//!
+//! The map's single input is the rollback owner, and it is the same `G-19`
+//! admission policy record's own
+//! [`eliot_maintenance::ImprovementAdmissionPolicy::rollback_owner_id`] the
+//! request already carries — read on the live path from
+//! `DaemonComposition::maintenance_improvement_admission_policy`, which hands the
+//! `G-19` owner this daemon's own service identity rather than a caller's
+//! string. No literal is introduced at this seam, and an operation the map does
+//! not resolve is refused rather than defaulted.
 //!
 //! # The owner routing a plan declares is not a claim that anything ran
 //!
-//! [`ExperimentPlan::testd_owner_id`] and [`ExperimentPlan::evaluator_id`] name
-//! the Testd owner and the independent Instrument verifier family because the
-//! Governor pipeline REQUIRES that routing (W5) — a plan routed to any other
-//! executor or evaluator is refused as unbound. Declaring the routing is a
-//! statement about who would run and who would grade the bounded experiment; it
-//! is not a statement that either happened.
+//! [`ExperimentPlan::testd_owner_id`] and [`ExperimentPlan::evaluator_id`] are
+//! read from the one operation owner map
+//! ([`improvement_operation_owners`]) at the start of
+//! [`dispatch_improvement_candidate_route`], so the executor and the evaluator
+//! are two rows of the same `ImprovementOperation::owner` projection rather than
+//! two constants this module spells beside each other. The Governor pipeline
+//! REQUIRES that routing (W5) — a plan routed to any other executor or evaluator
+//! is refused as unbound — so if the map ever resolved elsewhere the route
+//! REFUSES rather than recording a routing nothing checks. Declaring the routing
+//! is a statement about who would run and who would grade the bounded experiment;
+//! it is not a statement that either happened.
 //!
 //! The claim that something ran lives in
 //! [`ActivationEvidence::execution`], and this module sets it to its honest
@@ -245,9 +278,9 @@ use eliot_maintenance::{
     ActivationEvidence, ExperimentPlan, IMPROVEMENT_CANDIDATE_BOUNDS_REVISION,
     IMPROVEMENT_EFFECT_CEILING, IMPROVEMENT_PROOF_CEILING, IMPROVEMENT_REQUESTED_EFFECT,
     IMPROVEMENT_RISK_CEILING_BOUNDED, ImprovementAdmissionPolicy, ImprovementCandidateView,
-    ImprovementEvidenceExecution, ImprovementEvidenceView, ImprovementProposal,
-    ImprovementPulseOutcome, ImprovementReplayAssessment, ImprovementTerminalDisposition,
-    MechanismDeclaration, PipelineError, RollbackContract, TESTD_OWNER, VERIFIER_OWNER_FAMILY,
+    ImprovementEvidenceExecution, ImprovementEvidenceView, ImprovementOperation,
+    ImprovementProposal, ImprovementPulseOutcome, ImprovementReplayAssessment,
+    ImprovementTerminalDisposition, MechanismDeclaration, PipelineError, RollbackContract,
 };
 use eliot_protocol::RequestIdentity;
 use eliot_receipts::RequestBinding;
@@ -259,8 +292,8 @@ use eliot_store_api::{
 use super::DaemonComposition;
 use super::improvement_candidate_route::{
     ImprovementEffectState, ImprovementRouteRequest, UnknownEffectObligation,
-    assess_improvement_repeat, check_improvement_handoff_identity, read_improvement_effect_state,
-    route_improvement_candidate,
+    assess_improvement_repeat, check_improvement_handoff_identity, improvement_operation_owners,
+    read_improvement_effect_state, route_improvement_candidate,
 };
 use super::improvement_intake_dispatch::{ImprovementArtifact, ImprovementDispatchError};
 
@@ -353,6 +386,75 @@ pub struct ImprovementRouteOutcome {
     pub effect: ImprovementEffectState,
 }
 
+/// The three owner identities this dispatch reads out of the operation map.
+///
+/// Read once, before any record is built, from
+/// [`improvement_operation_owners`] — the single projection of
+/// [`eliot_maintenance::ImprovementOperation::owner`]. Every owner field below is
+/// assigned from one of these three values, never from a constant re-spelled at
+/// the field, so the routing this daemon commits and the routing the Governor
+/// pipeline independently re-checks are one decision expressed once.
+///
+/// A14.6 separates the production path, the measurement path and the
+/// optimization-feedback path; A5.5 adds that "a model evaluator is admissible
+/// for a subjective property, but its model name does not make it independent".
+/// That is why the executor and the evaluator are two separate reads of the map
+/// rather than one identity used twice: the daemon that proposes is not the
+/// owner that executes the bounded experiment, and the owner that executes it is
+/// not the owner that independently evaluates the result (A0.3, "hidden control
+/// capture").
+struct RouteOwners {
+    /// Owner of the bounded experiment's execution — `ExecuteExperiment`.
+    executor: String,
+    /// Owner of the independent evaluation — `Evaluate`.
+    evaluator: String,
+    /// Owner bound by the rollback contract — `Rollback`.
+    rollback: String,
+}
+
+impl RouteOwners {
+    /// Reads this dispatch's owner identities from the single operation map.
+    ///
+    /// `rollback_owner_id` is the map's one input and it is the SAME
+    /// `G-19` admission policy record's own
+    /// [`eliot_maintenance::ImprovementAdmissionPolicy::rollback_owner_id`] that
+    /// the request already carries — read on the live path at
+    /// `daemon_runtime::improvement_intake_artifact` from
+    /// `DaemonComposition::maintenance_improvement_admission_policy`, which
+    /// forwards this daemon's own service identity to the `G-19` owner rather
+    /// than accepting a caller's string. It is a real owner identity, not a
+    /// literal, and not a value invented at this call site: it is the very value
+    /// `check_rollback_join` in the Governor crate compares the rollback
+    /// contract and the admission evidence against.
+    fn read(rollback_owner_id: &str) -> Result<Self, PipelineError> {
+        let map = improvement_operation_owners(rollback_owner_id);
+        Ok(Self {
+            executor: route_operation_owner(&map, ImprovementOperation::ExecuteExperiment)?,
+            evaluator: route_operation_owner(&map, ImprovementOperation::Evaluate)?,
+            rollback: route_operation_owner(&map, ImprovementOperation::Rollback)?,
+        })
+    }
+}
+
+/// Reads one operation's owner out of the operation map.
+///
+/// A map that does not carry the requested operation is an unbound relation, not
+/// a missing field to be filled with a default: there is no literal here to fall
+/// back to, and an owner this daemon cannot resolve must not be guessed, so the
+/// dispatch returns the typed [`PipelineError::UnboundRelation`] the Governor
+/// pipeline uses for every other diverging owner relation and builds nothing.
+fn route_operation_owner(
+    map: &[(&'static str, String)],
+    operation: ImprovementOperation,
+) -> Result<String, PipelineError> {
+    map.iter()
+        .find(|(name, _)| *name == operation.as_str())
+        .map(|(_, owner)| owner.clone())
+        .ok_or(PipelineError::UnboundRelation {
+            relation: "operation-owner-map: no-owner-for-this-operation",
+        })
+}
+
 /// Routes one real maintenance observation through the Governor-owned
 /// improvement pipeline.
 ///
@@ -390,22 +492,33 @@ pub fn dispatch_improvement_candidate_route(
     dispatch: ImprovementRouteDispatch<'_>,
 ) -> Result<ImprovementRouteOutcome, PipelineError> {
     let candidate = &dispatch.artifact.candidate;
+    // # The one point where this daemon consults the operation owner map
+    //
+    // This daemon raises exactly one proposal and drives the pipeline, so every
+    // owner it has to STATE is read here, once, from the same projection
+    // `ImprovementOperation::owner` defines — rather than each record builder
+    // naming an owner for itself. I12.24:66-68 puts the experiment, its
+    // measurement and the affected-checks/live-shadow evaluation in the hands of
+    // the execution and verification owners rather than in the proposer's hands,
+    // and the operation map is how the code says so.
+    //
+    // The rollback owner is the same `G-19` policy record's own value the
+    // request already carries, read on the live path from
+    // `DaemonComposition::maintenance_improvement_admission_policy` — never a
+    // literal at this call site.
+    let owners = RouteOwners::read(dispatch.policy.rollback_owner_id.as_str())?;
     // Bound once, so the plan the request borrows, the plan the returned handoff
     // is checked against, and the plan the outcome carries are the same value
     // rather than two constructions that could drift.
-    let experiment = route_experiment(candidate, dispatch.policy);
+    let experiment = route_experiment(candidate, dispatch.policy, &owners);
     let proposal = route_proposal(candidate, dispatch.policy, dispatch.state_fence);
     let disposition = route_improvement_candidate(ImprovementRouteRequest {
         proposal: &proposal,
         experiment: &experiment,
-        evidence: &route_activation_evidence(candidate),
-        rollback: &route_rollback_contract(candidate, dispatch.policy),
+        evidence: &route_activation_evidence(candidate, &owners),
+        rollback: &route_rollback_contract(candidate, &owners),
         candidate: &route_candidate_view(candidate, dispatch.policy),
-        admission_evidence: &route_admission_evidence(
-            candidate,
-            dispatch.policy,
-            dispatch.retained,
-        ),
+        admission_evidence: &route_admission_evidence(candidate, &owners, dispatch.retained),
         policy: dispatch.policy,
     })?;
     // The handoff is consumed under this build's identity BEFORE anything reads
@@ -876,6 +989,7 @@ fn route_data_identity(candidate: &ImprovementCandidate) -> String {
 fn route_experiment(
     candidate: &ImprovementCandidate,
     policy: &ImprovementAdmissionPolicy,
+    owners: &RouteOwners,
 ) -> ExperimentPlan {
     let candidate_id = candidate.candidate_id.as_str();
     // The experiment identity of this candidate. Derived from the candidate's
@@ -884,10 +998,16 @@ fn route_experiment(
     let experiment_id = format!("maintenance-improvement-experiment:{candidate_id}");
     ExperimentPlan {
         experiment_id,
-        // Owner routing the pipeline requires (W5), declared and not claimed to
-        // have happened; see the module documentation.
-        testd_owner_id: TESTD_OWNER.to_owned(),
-        evaluator_id: VERIFIER_OWNER_FAMILY.to_owned(),
+        // Owner routing read from the operation map rather than spelled here, and
+        // declared rather than claimed to have happened; see the module
+        // documentation. I12.24:66-67 keeps the isolated experiment and its fixed
+        // replay outside the proposer's own hands.
+        testd_owner_id: owners.executor.clone(),
+        // A14.6: the measurement/evaluation path is distinct from the production
+        // path, and A5.5: a model evaluator's name does not make it independent.
+        // The evaluator is the map's own `Evaluate` owner, a different read from
+        // the executor above.
+        evaluator_id: owners.evaluator.clone(),
         scope_ref: candidate.validity_scope.clone(),
         // Identical to the proposal's admitted budget and deadline, so no scope
         // refinement is claimed: `scope_refinement` stays absent rather than
@@ -901,14 +1021,20 @@ fn route_experiment(
 }
 
 /// The independent activation evidence bound to this candidate and experiment.
-fn route_activation_evidence(candidate: &ImprovementCandidate) -> ActivationEvidence {
+fn route_activation_evidence(
+    candidate: &ImprovementCandidate,
+    owners: &RouteOwners,
+) -> ActivationEvidence {
     let candidate_id = candidate.candidate_id.as_str();
     ActivationEvidence {
         evidence_id: format!("maintenance-activation-evidence:{candidate_id}"),
-        // The verifier family the plan declared, as a routing identity. It is
-        // NOT a claim that this family evaluated anything: `execution` below is
-        // the machine state that says so, and the pipeline reads it first.
-        verifier_id: VERIFIER_OWNER_FAMILY.to_owned(),
+        // The verifier family the plan declared, read from the same map row the
+        // plan's `evaluator_id` was read from, as a routing identity. It is NOT a
+        // claim that this family evaluated anything: `execution` below is the
+        // machine state that says so, and the pipeline reads it first. A14.6 is
+        // the reason the two fields cannot be the same value: the executor of a
+        // change is not the independent evaluator of it.
+        verifier_id: owners.evaluator.clone(),
         // Honest: no independent evaluation of this candidate exists, and none
         // passed. Both are false because this daemon starts no experiment, not
         // because a weaker success is being downgraded.
@@ -943,7 +1069,7 @@ fn route_content_revision_ref(candidate: &ImprovementCandidate) -> String {
 /// The repair path named before any experiment is admitted.
 fn route_rollback_contract(
     candidate: &ImprovementCandidate,
-    policy: &ImprovementAdmissionPolicy,
+    owners: &RouteOwners,
 ) -> RollbackContract {
     RollbackContract {
         // The candidate's OWN recorded repair references, bound verbatim.
@@ -957,8 +1083,13 @@ fn route_rollback_contract(
         // default.
         reopen_ref: String::new(),
         expiry_ref: String::new(),
-        // The rollback owner is the one the same `G-19` policy record declares.
-        rollback_owner_id: policy.rollback_owner_id.clone(),
+        // The rollback owner, read from the map's own `Rollback` row. The map
+        // resolves `Rollback` to the owner it was given, and the owner it was
+        // given is the same `G-19` policy record's `rollback_owner_id` the
+        // request carries — so this value is the real rollback-contract owner
+        // that `check_rollback_join` compares this contract and the admission
+        // evidence against, not a copy that could drift from it.
+        rollback_owner_id: owners.rollback.clone(),
         forward_repair_ref: String::new(),
         invalidation_set: vec![candidate.validity_scope.clone()],
     }
@@ -995,17 +1126,22 @@ fn route_candidate_view(
 }
 
 /// The admission-review evidence the Governor owner would read.
+///
+/// The `policy` argument this builder used to take is gone: every owner it
+/// declared is now read from the map, and the one remaining field it took from
+/// the policy record (`rollback_owner_id`) is the map's `Rollback` row, so the
+/// parameter had no honest reader left.
 fn route_admission_evidence(
     candidate: &ImprovementCandidate,
-    policy: &ImprovementAdmissionPolicy,
+    owners: &RouteOwners,
     retained: Option<&RetainedImprovementProposal>,
 ) -> ImprovementEvidenceView {
     let candidate_id = candidate.candidate_id.as_str();
     ImprovementEvidenceView {
-        // The admission-review evaluator identity the plan declared. No
-        // admission review ran; the `independent` / `verifier_passed` pair below
-        // is what says so.
-        verifier_id: VERIFIER_OWNER_FAMILY.to_owned(),
+        // The admission-review evaluator identity the plan declared, read from
+        // the same map row rather than spelled here. No admission review ran; the
+        // `independent` / `verifier_passed` pair below is what says so.
+        verifier_id: owners.evaluator.clone(),
         bound_candidate_id: candidate.candidate_id.clone(),
         bound_experiment_id: format!("maintenance-improvement-experiment:{candidate_id}"),
         content_revision_ref: route_content_revision_ref(candidate),
@@ -1031,7 +1167,10 @@ fn route_admission_evidence(
         rollback_ref: Some(candidate.rollback.clone()),
         disable_ref: Some(route_deadline_ref(candidate)),
         reopen_ref: None,
-        rollback_owner_id: policy.rollback_owner_id.clone(),
+        // The same map row the rollback contract above was read from, so the
+        // evidence and the contract name one owner. `check_rollback_join` refuses
+        // the pair if they ever disagree.
+        rollback_owner_id: owners.rollback.clone(),
         expiry_ref: None,
         // The caller's own checked prior record, or the pipeline's own
         // no-retained-record case. This is a record, never a verdict: the gate
