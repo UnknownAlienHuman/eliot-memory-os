@@ -31,6 +31,10 @@ pub const RUNTIME_OWNER_EXECUTION_INPUT_CONTRACT_NAME: &str =
 /// Current semantic revision of the optional runtime owner input.
 pub const RUNTIME_OWNER_EXECUTION_INPUT_CONTRACT_VERSION: ContractVersion =
     ContractVersion::new(1, 0, 0);
+/// Revision that adds separate original DreamJobAdmission, DreamInputBundle,
+/// and provider-staffing owner publications to the runtime input.
+pub const RUNTIME_OWNER_EXECUTION_INPUT_V2_CONTRACT_VERSION: ContractVersion =
+    ContractVersion::new(2, 0, 0);
 /// Maximum bounded text field size in bytes.
 pub const DURABLE_JOB_MAX_TEXT_BYTES: usize = 16 * 1024;
 /// Maximum number of references in one bounded control value.
@@ -279,6 +283,57 @@ impl OpaqueContentRef {
     }
 }
 
+/// Frozen v1 runtime-owner schema used to validate older sealed publications.
+/// The explicit schemars name keeps its original root identity stable even
+/// though the runtime DTO has since gained optional v2 publications.
+#[derive(JsonSchema)]
+#[schemars(rename = "DurableJobRuntimeOwnerExecutionInput")]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct RuntimeOwnerExecutionInputV1Schema {
+    /// Original task identity from the admitted request metadata.
+    task_id: TaskId,
+    /// Original K0 job identity.
+    job_id: TaskId,
+    /// Original K0 attempt identity.
+    attempt_id: ArtifactId,
+    /// Original admitted scope, including its generation and fence.
+    work_scope: WorkScopeBinding,
+    /// Explicit duplicate fence for child-side direct comparison.
+    state_fence: StateFence,
+    /// Exact `ContextInput` value carried by the original authenticated
+    /// `TaskController` invocation.
+    context_input: serde_json::Value,
+    /// Exact rich `ContextRecipe` carried by the original invocation.
+    context_campaign_recipe: serde_json::Value,
+    /// Exact `ApprovedRecipeCatalogue` carried by the original invocation.
+    context_campaign_recipe_catalogue: serde_json::Value,
+    /// Exact authenticated result of the original `ContextReconstruction`
+    /// query, including its owner readback, source attempt, request selectors
+    /// and existing result digest.
+    context_reconstruction_result: crate::HostRequestResultBody,
+    /// Exact versioned Context compiler supplier input from the authenticated
+    /// Orientation publisher. It remains separate from `ContextInput`, the
+    /// recipe catalogue and `ContextReconstruction` readback.
+    context_compilation_input: serde_json::Value,
+    /// Original Governor `CampaignSourceRevisionRead` for the Orientation
+    /// classification profile. The daemon preserves it opaquely; Governor
+    /// performs native decoding and validates the record, receipt and fence.
+    orientation_classification_source_readback: serde_json::Value,
+    /// Original semantic-source named-read claim.
+    semantic_source: crate::task_controller::TaskControllerOrientationSourceClaim,
+    /// Original output-contract reference.
+    output_contract: OpaqueContentRef,
+    /// Original recipe's `OutputSchema` tuple.
+    output_schema_recipe: crate::task_controller::TaskControllerOrientationOutputSchemaRecipe,
+    /// Original named-read claim for the output schema artifact.
+    schema_source: crate::task_controller::TaskControllerOrientationSourceClaim,
+    /// Original bounded evidence-material claims.
+    materials: Vec<crate::task_controller::TaskControllerOrientationSourceClaim>,
+    /// Original source and byte limits admitted for this job.
+    budget: crate::task_controller::TaskControllerOrientationMaterialBudget,
+}
+
 /// Typed owner material retained for the exact submitted attempt and consumed
 /// by the claimed runtime. Its canonical bytes are carried beside an opaque
 /// content reference in `JobSubmission` and echoed by every durable response.
@@ -326,12 +381,32 @@ pub struct DurableJobRuntimeOwnerExecutionInput {
     pub materials: Vec<crate::task_controller::TaskControllerOrientationSourceClaim>,
     /// Original source and byte limits admitted for this job.
     pub budget: crate::task_controller::TaskControllerOrientationMaterialBudget,
+    /// Original content-addressed DreamJobAdmission publication. Absent only
+    /// on the legacy v1 runtime payload; a v2 publication requires the pair.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_admission_ref: Option<OpaqueContentRef>,
+    /// Exact canonical DreamJobAdmission bytes named by `job_admission_ref`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_admission_bytes: Option<Vec<u8>>,
+    /// Original content-addressed DreamInputBundle publication. Absent only
+    /// on the legacy v1 runtime payload; a v2 publication requires the pair.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_bundle_ref: Option<OpaqueContentRef>,
+    /// Exact canonical DreamInputBundle bytes named by `input_bundle_ref`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_bundle_bytes: Option<Vec<u8>>,
+    /// Separate original publication from the provider-runtime configuration
+    /// owner. This source is not inferred from the selected model route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_staffing_source: Option<ProviderStaffingRuntimeSourcePublication>,
 }
 
 impl DurableJobRuntimeOwnerExecutionInput {
-    /// Returns the declared content-addressed schema identity for this payload.
+    /// Returns the v1 identity used by existing sealed Task Controller
+    /// publications. New v2 publishers must call
+    /// [`Self::contract_identity_v2`].
     pub fn contract_identity() -> Result<ContractIdentity, DurableJobError> {
-        let shape = schemars::schema_for!(Self);
+        let shape = schemars::schema_for!(RuntimeOwnerExecutionInputV1Schema);
         contract_identity(
             RUNTIME_OWNER_EXECUTION_INPUT_CONTRACT_NAME,
             RUNTIME_OWNER_EXECUTION_INPUT_CONTRACT_VERSION,
@@ -340,11 +415,83 @@ impl DurableJobRuntimeOwnerExecutionInput {
         .map_err(DurableJobError::Foundation)
     }
 
+    /// Returns the declared content-addressed schema identity for the new
+    /// Orientation runtime-owner publication shape.
+    pub fn contract_identity_v2() -> Result<ContractIdentity, DurableJobError> {
+        let shape = schemars::schema_for!(Self);
+        contract_identity(
+            RUNTIME_OWNER_EXECUTION_INPUT_CONTRACT_NAME,
+            RUNTIME_OWNER_EXECUTION_INPUT_V2_CONTRACT_VERSION,
+            &shape,
+        )
+        .map_err(DurableJobError::Foundation)
+    }
+
+    /// Returns whether this payload retains all three additional v2 owner
+    /// publications. The references and bytes remain independently validated.
+    #[must_use]
+    pub fn has_v2_owner_publications(&self) -> bool {
+        self.job_admission_ref.is_some()
+            && self.job_admission_bytes.is_some()
+            && self.input_bundle_ref.is_some()
+            && self.input_bundle_bytes.is_some()
+            && self.provider_staffing_source.is_some()
+    }
+
+    fn has_any_v2_owner_publication(&self) -> bool {
+        self.job_admission_ref.is_some()
+            || self.job_admission_bytes.is_some()
+            || self.input_bundle_ref.is_some()
+            || self.input_bundle_bytes.is_some()
+            || self.provider_staffing_source.is_some()
+    }
+
     /// Checks the publication's internal source and original-scope bindings.
     pub fn validate(&self) -> Result<(), DurableJobError> {
         self.validate_original_scope_and_sources()?;
         self.validate_context_reconstruction_owner_result()?;
-        self.validate_source_claims()
+        self.validate_source_claims()?;
+        self.validate_v2_owner_publication_pairs()
+    }
+
+    fn validate_v2_owner_publication_pairs(&self) -> Result<(), DurableJobError> {
+        validate_optional_canonical_publication_pair(
+            self.job_admission_ref.as_ref(),
+            self.job_admission_bytes.as_deref(),
+            "job_admission",
+        )?;
+        validate_optional_canonical_publication_pair(
+            self.input_bundle_ref.as_ref(),
+            self.input_bundle_bytes.as_deref(),
+            "input_bundle",
+        )?;
+        if let Some(source) = &self.provider_staffing_source {
+            source.validate()?;
+        }
+        if let (Some(admission), Some(bundle)) =
+            (&self.job_admission_ref, &self.input_bundle_ref)
+            && (admission == bundle
+                || admission.sha256 == bundle.sha256
+                || admission.contract == bundle.contract)
+        {
+            return Err(DurableJobError::RuntimeOwnerExecutionInputMismatch);
+        }
+        Ok(())
+    }
+
+    fn validate_for_contract(
+        &self,
+        reference: &OpaqueContentRef,
+    ) -> Result<(), DurableJobError> {
+        self.validate()?;
+        let v1 = Self::contract_identity()?;
+        let v2 = Self::contract_identity_v2()?;
+        if (reference.contract == v1 && self.has_any_v2_owner_publication())
+            || (reference.contract == v2 && !self.has_v2_owner_publications())
+        {
+            return Err(DurableJobError::RuntimeOwnerExecutionInputMismatch);
+        }
+        Ok(())
     }
 
     fn validate_original_scope_and_sources(&self) -> Result<(), DurableJobError> {
@@ -499,6 +646,32 @@ impl DurableJobRuntimeOwnerExecutionInput {
             return Err(DurableJobError::RuntimeOwnerExecutionInputMismatch);
         }
         Ok(())
+    }
+}
+
+fn validate_optional_canonical_publication_pair(
+    reference: Option<&OpaqueContentRef>,
+    bytes: Option<&[u8]>,
+    field: &'static str,
+) -> Result<(), DurableJobError> {
+    match (reference, bytes) {
+        (None, None) => Ok(()),
+        (Some(reference), Some(bytes)) => {
+            reference.validate(field)?;
+            reference.validate_original_bytes(bytes)?;
+            let value: serde_json::Value = serde_json::from_slice(bytes)
+                .map_err(|error| DurableJobError::Serialization(error.to_string()))?;
+            if !value.is_object()
+                || canonical_json_bytes(&value)
+                    .map_err(|error| DurableJobError::Serialization(error.to_string()))?
+                    .as_slice()
+                    != bytes
+            {
+                return Err(DurableJobError::RuntimeOwnerExecutionInputMismatch);
+            }
+            Ok(())
+        }
+        _ => Err(DurableJobError::RuntimeOwnerExecutionInputMismatch),
     }
 }
 
@@ -862,7 +1035,9 @@ impl JobSubmission {
         };
         reference.validate("runtime_owner_execution_input.sha256")?;
         reference.validate_original_bytes(bytes)?;
-        if reference.contract != DurableJobRuntimeOwnerExecutionInput::contract_identity()? {
+        let v1_identity = DurableJobRuntimeOwnerExecutionInput::contract_identity()?;
+        let v2_identity = DurableJobRuntimeOwnerExecutionInput::contract_identity_v2()?;
+        if reference.contract != v1_identity && reference.contract != v2_identity {
             return Err(DurableJobError::RuntimeOwnerExecutionInputMismatch);
         }
         let input: DurableJobRuntimeOwnerExecutionInput = serde_json::from_slice(bytes)
@@ -873,7 +1048,7 @@ impl JobSubmission {
         {
             return Err(DurableJobError::RuntimeOwnerExecutionInputMismatch);
         }
-        input.validate()?;
+        input.validate_for_contract(reference)?;
         if input.job_id != self.job_id
             || input.attempt_id != self.attempt_id
             || input.work_scope != self.work_scope
@@ -2076,8 +2251,9 @@ impl DurableJobResponse {
             (Some(reference), Some(bytes)) => {
                 reference.validate("runtime_owner_execution_input.sha256")?;
                 reference.validate_original_bytes(bytes)?;
-                if reference.contract != DurableJobRuntimeOwnerExecutionInput::contract_identity()?
-                {
+                let v1_identity = DurableJobRuntimeOwnerExecutionInput::contract_identity()?;
+                let v2_identity = DurableJobRuntimeOwnerExecutionInput::contract_identity_v2()?;
+                if reference.contract != v1_identity && reference.contract != v2_identity {
                     return Err(DurableJobError::RuntimeOwnerExecutionInputMismatch);
                 }
                 let input: DurableJobRuntimeOwnerExecutionInput = serde_json::from_slice(bytes)
@@ -2088,7 +2264,7 @@ impl DurableJobResponse {
                 {
                     return Err(DurableJobError::RuntimeOwnerExecutionInputMismatch);
                 }
-                input.validate()?;
+                input.validate_for_contract(reference)?;
                 if input.job_id != self.job_id
                     || input.attempt_id != self.attempt_id
                     || input.work_scope != self.scope
