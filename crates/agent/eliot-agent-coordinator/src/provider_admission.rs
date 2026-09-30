@@ -431,10 +431,21 @@ impl ProviderVerifier for KernelProviderVerifier {
         self.capability.minimum_event_sequence
     }
 
+    /// Sole reader of the input-only issue #265 observation: route selection
+    /// and health projection read this; [`verify`](ProviderVerifier::verify)
+    /// below never does, and it never mints admission.
     fn selection_health(&self) -> Option<&ProviderSelectionHealth> {
         self.capability.health()
     }
 
+    /// Verifies one presented proof of any receipt kind through the T9-04
+    /// pure owner verifier over the admitted presented/owner halves.
+    ///
+    /// Health-input boundary (issue #265, W6): this call never reads the
+    /// capability `health` half. Catalogue, quota, and liveness observations
+    /// reach route selection only through `selection_health` above, so
+    /// changing or dropping them cannot change a verify outcome; human
+    /// detail, provider names, and liveness never decide validity.
     fn verify(
         &self,
         kind: ProviderProofKind,
