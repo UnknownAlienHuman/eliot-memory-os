@@ -1984,7 +1984,7 @@ impl DaemonComposition {
         };
         self.governor.consume_captured_lsp_observations(
             current_task_binding,
-            context.causal_binding,
+            &context.causal_binding,
             observations,
         )
         .map_err(CapturedLspAdoptionError::from)
