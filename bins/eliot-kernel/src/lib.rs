@@ -310,6 +310,7 @@ use eliot_kernel_core::{
 };
 
 mod activation_lifecycle;
+mod admission_reservation_saga;
 mod daemon_live_receipt;
 #[cfg(windows)]
 mod daemon_process_launch;
@@ -1652,7 +1653,13 @@ pub enum KernelFrameAction {
     Fence(Frame),
 }
 
-fn unix_ms() -> u64 {
+/// Milliseconds since the Unix epoch, saturating at the `u64` boundary.
+///
+/// Shared crate-wide so the #1678 admission-reservation saga, the dispatch
+/// launch gates and the daemon request routes all read the SAME clock; a second
+/// clock read in one of them would make a recorded timestamp disagree with the
+/// one the owner admitted it under.
+pub(crate) fn unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
