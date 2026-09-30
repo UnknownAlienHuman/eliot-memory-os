@@ -23,40 +23,36 @@ use eliot_kernel_core::{
     NotificationStore, ResolutionAuthorization,
 };
 use eliot_store_api::epistemic_revision::{EpistemicCommit, position_key};
+#[cfg(test)]
+use eliot_store_api::validate_store_receipt_envelope;
 use eliot_store_api::{
     AUTOMATION_QUERY_CURRENT, AUTOMATION_QUERY_FAILURE, AUTOMATION_QUERY_HISTORY,
     AUTOMATION_QUERY_INVOCATIONS, AUTOMATION_QUERY_LIST, AUTOMATION_STATE_RETIRED,
     CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, CausalBinding,
-    CausalWriteReceipt,
-    CommitId,
-    DecodedAutomationMutation, DecodedNotificationMutation, DecodedReactiveMutation,
-    ERASURE_PARAM_DEADLINE_UNIX_MS, ERASURE_PARAM_ENCRYPTION_KEY_REF, ERASURE_PARAM_OPERATION_ID,
-    ERASURE_PARAM_PAYLOAD_REF, ERASURE_PARAM_SUBJECT, ERASURE_PARAM_SURFACES,
-    EVIDENCE_PACK_MAX_RECORDS, EventId, EventProjectionRelationIntents, MAX_RECOVERY_RECORD_BYTES,
-    NamedMutationOperation, NamedReadOperation, NamedReadRequest, NamedReadResponse,
-    OWNER_SNAPSHOT_SCHEMA, OperationId, OperationManifestDigest, OrderingHead,
+    CausalWriteReceipt, CommitId, DecodedAutomationMutation, DecodedNotificationMutation,
+    DecodedReactiveMutation, ERASURE_PARAM_DEADLINE_UNIX_MS, ERASURE_PARAM_ENCRYPTION_KEY_REF,
+    ERASURE_PARAM_OPERATION_ID, ERASURE_PARAM_PAYLOAD_REF, ERASURE_PARAM_SUBJECT,
+    ERASURE_PARAM_SURFACES, EVIDENCE_PACK_MAX_RECORDS, EventId, EventProjectionRelationIntents,
+    MAX_RECOVERY_RECORD_BYTES, NamedMutationOperation, NamedReadOperation, NamedReadRequest,
+    NamedReadResponse, OWNER_SNAPSHOT_SCHEMA, OperationId, OperationManifestDigest, OrderingHead,
     OrderingHeadExpectation, OrderingScopeId, OutboxId, OutboxIntent, OutboxState,
     PreparedTransition, ProjectionMode, ProjectionPublicationId, ProjectionPublicationRecord,
     ProjectionStatus, RecoveryRecord, RecoveryRecordKey, RequestMeta, Resubmission, RevisionDelta,
     RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, SplitView,
     StateFence, StoreError, StoreGenesisRequest, StoreHealth, StoreHealthStatus,
-    StoreRecoveryRequest, StoreRecoverySnapshot, TransitionClass, WriteReceipt, WriteReceiptStatus,
-    TransactionSequence, audit_heads_digest, bind_issue18_receipt,
-    bind_policy_config_schema_versions, committed_receipt_sequence,
-    canonical_json_bytes, canonical_request_hash, decode_automation_mutation,
-    decode_erasure_surfaces, decode_notification_mutation, decode_reactive_mutation,
-    decode_resource_content, generated_operation_manifests, genesis_manifest, genesis_transition,
-    is_genesis_fence, issue_genesis_receipt_envelope,
+    StoreRecoveryRequest, StoreRecoverySnapshot, TransactionSequence, TransitionClass,
+    WriteReceipt, WriteReceiptStatus, audit_heads_digest, bind_issue18_receipt,
+    bind_policy_config_schema_versions, canonical_json_bytes, canonical_request_hash,
+    committed_receipt_sequence, decode_automation_mutation, decode_erasure_surfaces,
+    decode_notification_mutation, decode_reactive_mutation, decode_resource_content,
+    generated_operation_manifests, genesis_manifest, genesis_transition, is_genesis_fence,
+    issue_genesis_receipt_envelope, issue_store_receipt_envelope_with_causal,
     named_mutation_operation_name, sha256_hex, validate_automation_read_params,
     validate_genesis_receipt_envelope, validate_reactive_ledger_read_params,
-    validate_resource_snapshot_read_params,
-    issue_store_receipt_envelope_with_causal, validate_store_receipt_envelope_with_causal,
-    verify_canonical_request_hash,
-    verify_ordering_scope_binding,
+    validate_resource_snapshot_read_params, validate_store_receipt_envelope_with_causal,
+    verify_canonical_request_hash, verify_ordering_scope_binding,
 };
 use schemars::JsonSchema;
-#[cfg(test)]
-use eliot_store_api::validate_store_receipt_envelope;
 use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -343,7 +339,7 @@ impl MemoryStore {
             // rows and compare-and-set heads across a restart, so it fails
             // closed here rather than returning a committed receipt for
             // history it would lose. The refusal is a BACKEND limit, not an
-            // activation gap — a caller that needs the commit talks to the
+            // activation gap â€” a caller that needs the commit talks to the
             // durable adapter, which implements the same compare-and-set.
             return Err(StoreError::Unavailable);
         }
@@ -1494,7 +1490,7 @@ fn retain_automation_revision(
 /// This is the same edge `apply_notification_leg` applies to
 /// `source_receipt_json`: the envelope is decoded with the shared
 /// `ReceiptEnvelope` type and checked with its own `validate()`, and what is
-/// persisted is what the owning leg submitted — never a re-derivation, a
+/// persisted is what the owning leg submitted â€” never a re-derivation, a
 /// re-issue, or a digest. Absent stays absent, so a revision leg that carried
 /// no envelope retains none and its compiled occurrence set stays unadmitted
 /// by name downstream.
@@ -2584,8 +2580,8 @@ fn learning_range_payload(
 /// carries scope-free gap/control records regardless of scope, so
 /// store-level scope filtering here would silently drop records the
 /// consumer must see (F2 resolution: scope-free catalogue rows per the
-/// `GetMailbox` precedent — facade caller scope required, catalogue
-/// rows scope-free — with scope gating at the decision layer per
+/// `GetMailbox` precedent â€” facade caller scope required, catalogue
+/// rows scope-free â€” with scope gating at the decision layer per
 /// I12-26). Fence agreement is enforced by the caller: this helper runs
 /// only after `execute_named_sync` proves the query fence equals the
 /// state fence. Erasure disposition is checked here as well as on
@@ -2596,7 +2592,7 @@ fn learning_range_payload(
 /// [`MAX_AUDIT_RANGE_RECORDS`](eliot_store_api::MAX_AUDIT_RANGE_RECORDS)
 /// fail closed with [`StoreError::PayloadTooLarge`] instead of
 /// truncating: a truncated audit range cannot prove journal
-/// completeness. This projects candidates only — full envelope
+/// completeness. This projects candidates only â€” full envelope
 /// validation and live-journal presence binding stay downstream, so a
 /// carried candidate can never become a false journal record here.
 ///
@@ -2647,8 +2643,8 @@ fn audit_range_payload(
         // durable `CaptureObservation` rows, so an evidence-backed erased
         // `(scope_id, subject)` pair must not reappear here after the
         // evidence pack suppressed it. The check is the exact admitted pair
-        // under the row's own retained scope — the same key the erasure
-        // recorded — never a substring, a default scope, or a guess. A
+        // under the row's own retained scope â€” the same key the erasure
+        // recorded â€” never a substring, a default scope, or a guess. A
         // non-envelope subject is skipped below exactly as before.
         if state
             .erased_subjects
@@ -2831,8 +2827,8 @@ struct AutomationPageSlice<T> {
 ///
 /// The rule inspects at most the bound plus one eligible row and returns at
 /// most the bound. `truncated` is set exactly when an eligible row exists
-/// beyond the returned slice, so the exact one-over case — a bound-sized page
-/// with one further eligible row — is `TRUNCATED` with exactly one
+/// beyond the returned slice, so the exact one-over case â€” a bound-sized page
+/// with one further eligible row â€” is `TRUNCATED` with exactly one
 /// continuation, and only a page with no further eligible row is `COMPLETE`.
 /// `last_row_id` is the identity of the last row actually returned, so a
 /// continuation is never minted from the probe row or from a row that
@@ -3813,7 +3809,7 @@ fn existing_receipt(
     Ok(None)
 }
 
-/// Reconstructs the expected receipt-chain binding from the MemoryStore's
+/// Reconstructs the expected receipt-chain binding from the `MemoryStore`'s
 /// canonical receipt rows. The envelope being validated is excluded from the
 /// predecessor scan; its own causal projection is never used as evidence.
 fn memory_causal_binding(
@@ -4141,19 +4137,16 @@ fn commit_transaction(
         .extend(transition.event_projection_relation_intents.relation_kinds);
     state
         .named_operations
-        .extend(
-            transition
-                .named_operations
-                .into_iter()
-                .map(|operation| ScopedNamedOperation {
-                    scope_id: transition.scope_id.clone(),
-                    task_binding: receipt
-                        .envelope
-                        .as_ref()
-                        .and_then(|envelope| envelope.core.task.clone()),
-                    operation,
-                }),
-        );
+        .extend(transition.named_operations.into_iter().map(|operation| {
+            ScopedNamedOperation {
+                scope_id: transition.scope_id.clone(),
+                task_binding: receipt
+                    .envelope
+                    .as_ref()
+                    .and_then(|envelope| envelope.core.task.clone()),
+                operation,
+            }
+        }));
     state.receipts_by_idempotency.insert(
         receipt.idempotency_key.clone(),
         (
@@ -4189,7 +4182,7 @@ impl MemoryStore {
     /// removal. Recording the same `operation_id` with byte-identical intent
     /// content is idempotent and returns the current outcomes; the same id
     /// with different content is an [`StoreError::IdentityConflict`], never
-    /// a silent overwrite. There is exactly one intent registry per store —
+    /// a silent overwrite. There is exactly one intent registry per store â€”
     /// no second ledger.
     pub fn record_erasure_intent(
         &self,
@@ -4205,16 +4198,16 @@ impl MemoryStore {
     /// Fail-closed with zero destructive effects when no recorded intent
     /// exists for `operation_id` ([`StoreError::ReceiptNotFound`]).
     /// Same-operation replay returns the original per-surface outcomes without
-    /// duplicate destructive work. Otherwise dispatches per-surface removal —
+    /// duplicate destructive work. Otherwise dispatches per-surface removal â€”
     /// exact subject match on `CaptureObservation` rows admitted under the
-    /// exact recorded scope — with outcome semantics:
+    /// exact recorded scope â€” with outcome semantics:
     ///
     /// * `CanonicalPayload`/`Projection`/`Index` are store-owned: matching
     ///   capture rows are removed (observations vanish from the reference log)
     ///   and the surface reports `Purged`. When the intent pair had a
     ///   recorded intent plus dispatched removal, the pair enters
     ///   `erased_subjects` suppression so `GetEvidencePack` no longer returns
-    ///   its observations even if rows remain — suppression is evidence-backed,
+    ///   its observations even if rows remain â€” suppression is evidence-backed,
     ///   never a guess.
     /// * every other surface is out of store scope and reports `Incomplete`
     ///   (never a claimed foreign removal).
@@ -4563,7 +4556,7 @@ impl MemoryStore {
     ///
     /// Reads only actually captured observations: the `CaptureObservation`
     /// records stored by the commit path, in capture order, filtered by exact
-    /// scope and `subject` match — never substring or a default scope.
+    /// scope and `subject` match â€” never substring or a default scope.
     /// The commit path retains each operation's admitted scope. The current
     /// fence gates the read, not the visibility of historical observations;
     /// the explicit `max_records` bound caps the returned records with a
@@ -4573,7 +4566,7 @@ impl MemoryStore {
     /// not an error.
     ///
     /// 688-B: an evidence-backed erased `(scope_id, subject)` pair suppresses
-    /// its records — the pack returns exact empty with `matched_total = 0` —
+    /// its records â€” the pack returns exact empty with `matched_total = 0` â€”
     /// even if rows remain in the log. Suppression requires a recorded intent
     /// with dispatched removal; nothing else hides rows.
     fn evidence_pack_payload(
@@ -4645,7 +4638,6 @@ impl MemoryStore {
                             .and_then(Value::as_str)
                             == Some(subject)
                 })
-                .map(|(index, record)| (index, record))
                 .collect()
         };
         let matched_total = matched.len();
@@ -4709,7 +4701,7 @@ impl MemoryStore {
     ///
     /// Reads only actually admitted task transitions: the `UpdateTaskState`
     /// records stored by the commit path, in commit order, filtered by exact
-    /// scope and exact `task_id` match — never substring or a default scope.
+    /// scope and exact `task_id` match â€” never substring or a default scope.
     /// Returns the bounded history plus the current parameters (the last
     /// matching record) or null when no task transition exists. Zero matches
     /// are an exact empty result, not an error.
@@ -5314,7 +5306,7 @@ impl CanonicalStoreClient for MemoryStore {
 }
 
 impl MemoryStore {
-    /// Projects the canonical receipt history while holding the MemoryStore
+    /// Projects the canonical receipt history while holding the `MemoryStore`
     /// owner lock, excluding the receipt under validation from its own
     /// predecessor scan.
     fn causal_write_receipt(
@@ -6931,7 +6923,7 @@ mod tests {
         // here while a tamper outside plan coverage reports the canonical
         // digest. Both cover the tampered bytes with the same typed kind,
         // and the issue acceptance requires exactly that kind ("fails ...
-        // with a typed digest mismatch"), never a specific digest value —
+        // with a typed digest mismatch"), never a specific digest value â€”
         // so either value satisfies the contract.
         let mut tampered = exact.clone();
         tampered.named_operations[0]
@@ -6975,8 +6967,8 @@ mod tests {
             .parameters
             .insert("subject".to_owned(), json!("forked"));
         // Rebind the plan digests for the new bytes: the fork must be fully
-        // self-consistent (plan + canonical) so the idempotency collision —
-        // not a stale plan claim — decides the outcome.
+        // self-consistent (plan + canonical) so the idempotency collision â€”
+        // not a stale plan claim â€” decides the outcome.
         eliot_store_api::bind_issue18_digests(&mut forked)?;
         let forked_view = CanonicalRequestView::from_apply(&ctx, &forked, &[], &[]);
         forked.identity.canonical_request_hash = canonical_request_hash(&forked_view)?;
@@ -7038,8 +7030,8 @@ mod tests {
     #[test]
     fn governor_envelope_store_view_and_receipt_share_one_golden_digest() -> Result<(), StoreError>
     {
-        // Issue #63 A2: Governor envelope (eliot-canonical) → shared view
-        // and hash (eliot-store-api) → memory commit receipt. All three
+        // Issue #63 A2: Governor envelope (eliot-canonical) â†’ shared view
+        // and hash (eliot-store-api) â†’ memory commit receipt. All three
         // bind the pinned digest; the exact replay is byte-identical.
         use eliot_canonical::CanonicalWriteEnvelope;
         use eliot_store_api::{
@@ -7594,7 +7586,7 @@ mod tests {
         // 688-B memory erasure execution: one capture, then record-intent
         // before dispatch; the pack no longer returns the erased pair even
         // though rows remain suppressed (not deleted from the log shape in
-        // this contour — suppression is evidence-backed, never a guess);
+        // this contour â€” suppression is evidence-backed, never a guess);
         // same-operation replay returns the original outcomes with no
         // duplicate destructive work; dispatch without intent fails closed
         // with zero effects.
