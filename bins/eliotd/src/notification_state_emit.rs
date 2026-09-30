@@ -245,18 +245,31 @@ pub enum NotificationStateEmit {
     },
 }
 
-/// Policy and actual-route evidence observed for the decision being recorded.
+/// Policy, actual-route and trigger-site evidence observed for the decision
+/// being recorded.
 ///
 /// The policy is bound to the decision's family and scope before it can affect
 /// the fingerprint or canonical record. Optional publisher fields remain
 /// absent until their owners publish them; this type does not synthesize policy
-/// revisions or route identities.
+/// revisions or route identities. The trigger event the Governor evaluated
+/// travels on the decision itself; the concrete evidence identities the
+/// trigger site actually saw travel here, beside the owner evidence rather
+/// than inside it, so the record can bind each one separately.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaintenanceNotificationEvidence {
     /// Human-owned policy evidence selected for this family and scope.
     pub policy: MaintenancePolicyEvidence,
     /// Actual admitted route evidence, when an owner has published it.
     pub route: MaintenanceRouteEvidence,
+    /// Evidence identities actually observed at the trigger site.
+    ///
+    /// These state what this evaluation saw, never the catalog's requirement
+    /// list: `MaintenanceRecommendation::evidence` states the evidence kinds a
+    /// future result must carry, while this states the receipts already
+    /// observed. Empty states explicitly that none was bound on this leg; the
+    /// notification renders that as `unobserved` rather than projecting the
+    /// requirement names.
+    pub observed_refs: Vec<String>,
 }
 
 impl MaintenanceNotificationEvidence {
@@ -344,6 +357,7 @@ fn automation_failure_key_with_family_decision(
     let family = closed_wire_name(decision.family)?;
     let reason = closed_wire_name(decision.reason)?;
     let outcome = closed_wire_name(decision.decision)?;
+    let trigger_event = closed_wire_name(decision.trigger)?;
     let mode = closed_wire_name(evidence.policy.mode)?;
     let requested_route = (
         family_decision.route.target(),
@@ -352,7 +366,11 @@ fn automation_failure_key_with_family_decision(
     // The canonical Human-board obligation is one per family/scope/reason and
     // policy episode. Keep volatile trigger/job/route observations in the
     // record below; including them here would create a new notification for
-    // each poll, replacement trigger, or route observation.
+    // each poll, replacement trigger, or route observation. The trigger event
+    // and the concrete observed evidence travel in the summary body instead:
+    // bound separately beside the policy revision, the actual route result
+    // and the board/job receipt, never projected from the catalog's
+    // requirement list and never keyed.
     let identity = (
         family.as_str(),
         decision.scope_ref.as_str(),
@@ -371,14 +389,15 @@ fn automation_failure_key_with_family_decision(
         notification_id: format!("notification-automation-{fingerprint}"),
         subject: dispatch.subject(&decision.family),
         summary: format!(
-            "maintenance automation {family} at {} evaluated {outcome} for reason {reason}; \
+            "maintenance automation {family} at {} raised by trigger event {trigger_event} evaluated {outcome} for reason {reason}; \
              Governor admits job: {}; catalog route admits start: {}; trigger identity {}; \
-             job identity {}; policy episode {}; requested route {} (missing {}); actual route {}; \
+             observed evidence {}; job identity {}; policy episode {}; requested route {} (missing {}); actual route {}; \
              next allowed action: {}; {}",
             decision.scope_ref,
             decision.admits_job,
             family_decision.admits_start,
             decision.trigger_id,
+            observed_evidence_summary(evidence),
             decision
                 .durable_job_ref
                 .as_deref()
@@ -573,6 +592,14 @@ pub async fn notification_already_recorded(
 /// the notification is suppressed only after the decision carries the
 /// Durable Job reference that proves the existing admission owner accepted it.
 ///
+/// The record binds each leg separately: the trigger event the Governor
+/// evaluated, the concrete evidence identities the trigger site observed, the
+/// selected policy revision, the actual admitted route result, and the
+/// board/job receipt each render in the summary body beside the others. The
+/// catalog's requirement names stay a requirement in the action field and are
+/// never projected as observed receipts, and none of the volatile bindings
+/// enters the dedup key, so a replay re-derives the same record.
+///
 /// # Errors
 ///
 /// Returns [`NotificationEmitError`] when the store contract refuses the
@@ -721,6 +748,18 @@ fn actual_route_summary(evidence: &MaintenanceNotificationEvidence) -> String {
             .unwrap_or("unpublished"),
         evidence.route.unattended_suitable,
     )
+}
+
+/// Renders the concrete evidence identities the trigger site observed.
+///
+/// These are receipts already seen, never the catalog's requirement list: an
+/// empty binding states explicitly that nothing was observed on this leg
+/// rather than projecting the requirement names into the record.
+fn observed_evidence_summary(evidence: &MaintenanceNotificationEvidence) -> String {
+    if evidence.observed_refs.is_empty() {
+        return "unobserved".to_owned();
+    }
+    evidence.observed_refs.join("+")
 }
 
 /// The exact four-field flat apply contract the admitted Kernel route decodes.
