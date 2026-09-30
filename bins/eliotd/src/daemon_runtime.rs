@@ -2109,7 +2109,11 @@ fn settle_activation_completion(
             Ok(())
         }
         ActivationCompletion::Resolve(resolve_outcome) => {
+            // Pre-dispatch resolve failure: no dispatch decision exists and no
+            // identity was retained, so it carries typed hard detail and never
+            // the activation-unknown disposition (#740 A10).
             settle_activation_resolve_completion(kernel, flight, resolve_outcome)
+                .map_err(RunLoopFailure::hard)
         }
         ActivationCompletion::Dispatch(dispatch_outcome) => match dispatch_outcome {
             Ok(()) => {
