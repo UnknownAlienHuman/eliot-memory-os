@@ -2686,6 +2686,47 @@ impl NoMatchEvaluation {
         self.proof_ceiling_grade
     }
 
+    /// Whether this record was admitted under exactly this State Fence.
+    ///
+    /// The fence is inside this record's own identity preimage, so this is a
+    /// comparison against a commitment the record carries rather than a restated
+    /// claim about it. It exists because the closure decision needs to know that
+    /// the evidence it rests on belongs to *this* operation's authority epoch:
+    /// a `NoMatchEvaluation` admitted under another epoch describes another run,
+    /// and a closure that read it anyway would publish a negative this fence does
+    /// not cover.
+    #[must_use]
+    pub fn is_admitted_under(&self, fence: &StateFence) -> bool {
+        &self.fence == fence
+    }
+
+    /// Digest of the authorized manifest this record names.
+    ///
+    /// `AbsencePreconditions::derive` already requires the presented manifest to
+    /// be this one, so this reader is for the *closure* side, where the manifest
+    /// has to be compared against the record without re-running the derivation.
+    #[must_use]
+    pub fn named_manifest_digest(&self) -> &str {
+        &self.manifest_digest
+    }
+
+    /// Whether this record is the one a scoped negative was derived from.
+    ///
+    /// This is deliberately **not** a re-run of
+    /// [`assess_absence`](crate::evidence_portfolio::assess_absence) and not a
+    /// second implementation of it: the verdict is a property of the receipt's
+    /// accounting, and the closure side already holds that receipt and its
+    /// retained verdict. What this answers is the narrower question the
+    /// closure side cannot get from the record alone — whether the record is
+    /// *currently-applicable* absence evidence about a frozen scope, rather than
+    /// a historical evaluation or one whose five dimensions were never all
+    /// established. Both facts are on the record itself and both are inside its
+    /// own digest, so neither can be restated by a caller.
+    #[must_use]
+    pub fn proves_absence(&self) -> bool {
+        self.applicability == NoMatchApplicability::Current && self.missing_dimensions().is_empty()
+    }
+
     /// Validates the record's shape, independently of its frozen digest.
     ///
     /// This is the only place the canonical result order is enforced, and it is
