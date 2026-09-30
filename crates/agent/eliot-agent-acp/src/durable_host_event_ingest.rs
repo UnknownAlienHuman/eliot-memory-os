@@ -43,6 +43,7 @@
 
 use std::collections::BTreeMap;
 
+use eliot_agent_api::route_receipts::CommittedRouteEvidenceRelation;
 use eliot_agent_api::{
     AdmittedRouteReceipt, CommittedHostEventIntake, ContractError, EventCursor, EventId,
     HOST_EVENT_CONTRACT_VERSION, HOST_EVENT_DIGEST_ALGORITHM, HostEventDeliveryDisposition,
@@ -51,7 +52,6 @@ use eliot_agent_api::{
     ProviderObservationLineage, QualifiedSourceDigest,
     host_event::HOST_EVENT_RAW_BYTES_DIGEST_ALGORITHM, route_fingerprint_digest_for,
 };
-use eliot_agent_api::route_receipts::CommittedRouteEvidenceRelation;
 use eliot_contracts::sha256_hex;
 use eliot_evaluation_contracts::{
     CoverageBlindInterval, CoverageCompleteness, DenominatorOrigin, EvaluationContractError,
@@ -1823,12 +1823,8 @@ impl DurableHostEventJournal {
         // the same validated owners by the same gate, before any mutation,
         // so the persisted record carries the exact owner-resolvable
         // references alongside the columns.
-        let route_evidence = Self::retained_route_evidence(
-            &envelope,
-            binding,
-            admission,
-            physical_observation,
-        )?;
+        let route_evidence =
+            Self::retained_route_evidence(&envelope, binding, admission, physical_observation)?;
         Self::check_envelope_linkage(&envelope, sequence, &stored)?;
         let envelope_digest = envelope
             .compute_digest()
