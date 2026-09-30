@@ -514,7 +514,7 @@ fn validate_identity_closure(
     if semantic_job.job_class != JobClass::Orientation {
         return Err("production job class");
     }
-    if semantic_job.job_id != inputs.bundle.job_id {
+    if inputs.admitted_job.job.canonical_id() != inputs.bundle.job_id {
         return Err("production job binding");
     }
     if semantic_job.scope_id != inputs.scope_id {
@@ -854,7 +854,7 @@ impl BlockedIdentity {
 
     fn of_job(admitted: &eliot_dreamer_contracts::DreamJobAdmission) -> Self {
         Self {
-            job_id: admitted.job_id.clone(),
+            job_id: admitted.canonical_id(),
             task_id: admitted.task_id.clone(),
             scope_id: admitted.scope_id.clone(),
             operation_id: admitted.operation_id.clone(),

@@ -54,12 +54,10 @@
 //! exact projection; candidate mapping consumes the executed cue result and
 //! exact analyzed conflict set alongside its other admitted source records.
 
-use eliot_context_assembly::{
-    ActiveUnderstandingViewResult, AssemblyPolicy, assemble_active_view,
-};
+use eliot_context_assembly::{ActiveUnderstandingViewResult, AssemblyPolicy, assemble_active_view};
 use eliot_context_candidates::{
-    AttentionInput, CandidatePolicy, CandidateRequest, CanonicalProjectionInput, CueInput,
-    ContextCandidateSetResult, EpistemicInput, EvidenceInput, MemberMeasurement,
+    AttentionInput, CandidatePolicy, CandidateRequest, CanonicalProjectionInput,
+    ContextCandidateSetResult, CueInput, EpistemicInput, EvidenceInput, MemberMeasurement,
     construct_context_candidates_with_canonical,
 };
 use eliot_context_contracts::{
@@ -75,12 +73,12 @@ use eliot_dreamer_conflict_analysis::{
     ConflictAnalysisCandidate, ConflictAnalysisPolicy, ConflictSupplements,
     analyze_grounded_conflict,
 };
+use eliot_dreamer_contracts::grounding::GroundedDreamDraft as StructuredGroundedDreamDraft;
 use eliot_dreamer_contracts::{
     ClassificationInput, CurationAcceptanceCtx, DreamInputBundle, GroundedDreamDraft,
     ModelRouteDisposition, ModelRouteOutcome, ValidatedCurationItem, ValidatedDreamDraft,
     ValidatedGroundingCandidate, bundle_digest_of, canonical_bytes, digest_hex,
 };
-use eliot_dreamer_contracts::grounding::GroundedDreamDraft as StructuredGroundedDreamDraft;
 use eliot_dreamer_orientation::OrientationError;
 use eliot_dreamer_probe_plan::{ProbePlan, ProbePlanParams, plan_discriminative_probes};
 use eliot_dreamer_rival_model::{RivalModelSet, RivalPolicy, structure_rival_models};
@@ -983,7 +981,9 @@ pub(crate) fn run_candidate_stage(
                     })
                 })
             {
-                return Err(PulseError::Boundary("candidate projection or conflict predecessor"));
+                return Err(PulseError::Boundary(
+                    "candidate projection or conflict predecessor",
+                ));
             }
             let supplied_cue = inputs.cue_activation_result;
             let cue_input = match (supplied_cue, cue_activation) {

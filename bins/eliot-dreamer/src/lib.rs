@@ -26,6 +26,7 @@ mod error;
 mod grounding_stage;
 pub(crate) mod kernel_port;
 mod model_stage;
+mod orientation_owner_inputs;
 mod production_orientation;
 mod pulse;
 mod result_stage;
@@ -555,6 +556,18 @@ fn run_admitted_pipeline(
         ))?;
         return dispatch_stage::dispatch_curation(binding, protection, carrier);
     }
+    if job.job_class == JobClass::Orientation {
+        return dispatch_stage::dispatch_admitted_with_orientation_supply(
+            admission,
+            job,
+            None,
+            None,
+            None,
+            job.job_class,
+            None,
+            production_orientation::ProductionOrientationSupply::Missing,
+        );
+    }
     let model_inputs = model_stage::resolve_model_inputs(admission, job)?;
     let draft = model_stage::run_admitted_model(model_inputs)?;
     let grounding_request = grounding_stage::resolve_grounding_inputs(admission, job, draft)?;
@@ -569,7 +582,7 @@ fn run_admitted_pipeline(
     // threads into dispatch, which proves its binding before any native
     // handler runs and never re-runs the owner validation.
     let validated = validation_stage::validate_admitted_draft(&validation_input)?;
-    dispatch_stage::dispatch_admitted(
+    dispatch_stage::dispatch_admitted_with_orientation_supply(
         admission,
         job,
         screen_binding,
@@ -577,6 +590,7 @@ fn run_admitted_pipeline(
         None,
         job.job_class,
         Some(&validated),
+        production_orientation::ProductionOrientationSupply::Missing,
     )
 }
 

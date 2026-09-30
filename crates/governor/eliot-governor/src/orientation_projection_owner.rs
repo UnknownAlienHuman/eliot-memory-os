@@ -229,7 +229,7 @@ fn admitted_lineage_matches(input: &OrientationProjectionOwnerInput<'_>) -> bool
     binding.validate().is_ok()
         && scope.validate().is_ok()
         && governor.validate().is_ok()
-        && roles.scope_id == binding.scope_id
+        && roles.scope_id.as_str() == binding.scope_id.as_str()
         && fences_match_exact(&roles.state_fence, &binding.state_fence)
         && roles.heads_before == roles.heads_after
         && roles.heads_before.scope_id == roles.scope_id

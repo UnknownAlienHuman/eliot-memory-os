@@ -11,22 +11,22 @@
 use std::time::{Duration, Instant};
 
 use eliot_agent_api::{
-    route_fingerprint_digest_for, AgentResult, CancellationState, EffectCeiling, RouteFingerprint,
+    AgentResult, CancellationState, EffectCeiling, RouteFingerprint, route_fingerprint_digest_for,
 };
 use eliot_agent_opencode::{
     AdmittedAttemptError, AdmittedAttemptOutcome, AdmittedOpenCodeAttempt,
     AdmittedOutcomeProjectionError, AvailabilityState, ModelSelection,
-    OPENCODE_PROVIDER_RAW_OUTPUT_UTF8_KEY, OpenCodeClient, OpenCodeRunError,
-    ReadOnlyRunRequest, RunStatus, SealedRouteDisposition, UsageAvailability, UsageTelemetry,
+    OPENCODE_PROVIDER_RAW_OUTPUT_UTF8_KEY, OpenCodeClient, OpenCodeRunError, ReadOnlyRunRequest,
+    RunStatus, SealedRouteDisposition, UsageAvailability, UsageTelemetry,
 };
 use eliot_contracts::{ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex};
+use eliot_dreamer_contracts::grounding::{RouteIdentity, route_fingerprint};
 use eliot_dreamer_contracts::{
-    CostUsageReceipt, DreamInputBundle, DreamJobAdmission, DreamJobInput, MODEL_ROUTE_SCHEMA_VERSION,
-    ModelDraft, ModelRouteDisposition, ModelRouteExecutionIdentity, ModelRouteOutcome,
-    ModelRoutePrivacy, ModelRouteProviderUsage, ModelRouteRequest, ModelRouteUsageState,
-    bundle_digest_of,
+    CostUsageReceipt, DreamInputBundle, DreamJobAdmission, DreamJobInput,
+    MODEL_ROUTE_SCHEMA_VERSION, ModelDraft, ModelRouteDisposition, ModelRouteExecutionIdentity,
+    ModelRouteOutcome, ModelRoutePrivacy, ModelRouteProviderUsage, ModelRouteRequest,
+    ModelRouteUsageState, bundle_digest_of,
 };
-use eliot_dreamer_contracts::grounding::{route_fingerprint, RouteIdentity};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -217,8 +217,8 @@ pub async fn run_admitted_model_route(
             Duration::from_millis(request.timeout_ms),
         )
         .await;
-    let elapsed_ms = duration_millis(started.elapsed())
-        .map_err(|_| ModelRouteRequestError::UsageOutOfRange)?;
+    let elapsed_ms =
+        duration_millis(started.elapsed()).map_err(|_| ModelRouteRequestError::UsageOutOfRange)?;
     let owner = match owner_result {
         Ok(original) => {
             let agent_result = original.to_agent_result(
@@ -250,13 +250,11 @@ pub async fn run_admitted_model_route(
                     error,
                 ))),
             };
-            DreamerOrientationModelOwnerResult::Outcome(Box::new(
-                DreamerOrientationModelOutcome {
-                    original,
-                    agent_result,
-                    model_route,
-                },
-            ))
+            DreamerOrientationModelOwnerResult::Outcome(Box::new(DreamerOrientationModelOutcome {
+                original,
+                agent_result,
+                model_route,
+            }))
         }
         Err(error) => {
             let malformed = project_malformed_refusal(
@@ -266,9 +264,8 @@ pub async fn run_admitted_model_route(
                 input_bytes,
                 elapsed_ms,
             );
-            let model_route = malformed.or_else(|| {
-                project_timeout_refusal(&request, &error, elapsed_ms)
-            });
+            let model_route =
+                malformed.or_else(|| project_timeout_refusal(&request, &error, elapsed_ms));
             DreamerOrientationModelOwnerResult::Refused {
                 error: Box::new(error),
                 model_route,
@@ -322,11 +319,8 @@ fn build_model_route_request(
     client: &OpenCodeClient,
     input: &DreamerOrientationModelInput<'_>,
 ) -> Result<ModelRouteRequest, ModelRouteRequestError> {
-    let expected_prompt = admitted_model_route_context_bytes(
-        input.job,
-        input.admission,
-        input.bundle,
-    )?;
+    let expected_prompt =
+        admitted_model_route_context_bytes(input.job, input.admission, input.bundle)?;
     if input.admitted.attempt().cancellation != input.cancellation
         || input.admitted.admission().selected_route.as_ref()
             != Some(input.selected_route_fingerprint)
@@ -430,12 +424,13 @@ fn project_admitted_outcome(
             disposition: Box::new(original.route.clone()),
         });
     }
-    let physical = original
-        .route
-        .receipt()
-        .ok_or_else(|| ModelRouteProjectionError::RouteNotObserved {
-            disposition: Box::new(original.route.clone()),
-        })?;
+    let physical =
+        original
+            .route
+            .receipt()
+            .ok_or_else(|| ModelRouteProjectionError::RouteNotObserved {
+                disposition: Box::new(original.route.clone()),
+            })?;
     if physical.requested_route != *selected_route {
         return Err(ModelRouteProjectionError::RouteNotObserved {
             disposition: Box::new(original.route.clone()),
@@ -471,7 +466,8 @@ fn project_admitted_outcome(
     };
     let usage = provider_usage_from_availability(&original.run.usage);
     let receipt = measured_receipt(request, input_bytes, raw_bytes.len(), 1, elapsed_ms)?;
-    let (disposition, raw, draft, note) = match serde_json::from_value::<ModelDraft>(output.clone()) {
+    let (disposition, raw, draft, note) = match serde_json::from_value::<ModelDraft>(output.clone())
+    {
         Ok(candidate) if candidate.validate().is_ok() => match original.run.status {
             RunStatus::Succeeded => (
                 ModelRouteDisposition::Completed,
@@ -695,8 +691,8 @@ fn measured_receipt(
     model_calls: u64,
     wall_ms: u64,
 ) -> Result<CostUsageReceipt, ModelRouteProjectionError> {
-    let output_bytes = u64::try_from(output_bytes)
-        .map_err(|_| ModelRouteProjectionError::UsageOutOfRange)?;
+    let output_bytes =
+        u64::try_from(output_bytes).map_err(|_| ModelRouteProjectionError::UsageOutOfRange)?;
     let receipt = CostUsageReceipt {
         schema_version: MODEL_ROUTE_SCHEMA_VERSION,
         job_id: request.job_id.clone(),

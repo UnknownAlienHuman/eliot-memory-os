@@ -20,7 +20,7 @@ use eliot_dreamer_contracts::grounding::{ArtifactId, StateFence, TaskId};
 use eliot_dreamer_contracts::rival::{
     CurrentPositionBinding, DeclarationAvailability, DiscriminatorPeerAddress as ProbePeerAddress,
     RequirementFacet as ProbeRequirementFacet, RequirementReason as ProbeRequirementReason,
-    RetainedDiscriminator, RivalCoverageDeclaration, RivalCoverageStatus, RivalCoverageSummary,
+    RetainedDiscriminator, RivalCoverageDeclaration, RivalCoverageReceipt, RivalCoverageStatus, RivalCoverageSummary,
     RivalDeclarationSet, RivalDeclarationSetRef, RivalModelDeclaration, RivalModelRef,
     RivalModelSet as ProbeRivalModelSet, RivalModelSetParams as ProbeRivalModelSetParams,
     RivalModelSlot, UnresolvedDiscriminatorRequirement,

@@ -2,16 +2,14 @@
 
 use eliot_context_assembly::ActiveUnderstandingViewResult;
 use eliot_context_candidates::ContextCandidateSetResult;
-use eliot_context_contracts::{
-    CanonicalProjectionSet, ContextError, SerializedContextMeasurement,
-};
+use eliot_context_contracts::{CanonicalProjectionSet, ContextError, SerializedContextMeasurement};
 use eliot_cue_activation::CueActivationEvaluation;
 use eliot_dreamer_classification::ClassificationResult;
 use eliot_dreamer_conflict_analysis::ConflictAnalysisCandidate;
 use eliot_dreamer_contracts::grounding::GroundedDreamDraft as StructuredGroundedDreamDraft;
+use eliot_dreamer_contracts::rival::RivalModelSet as ProbeRivalModelSet;
 use eliot_dreamer_contracts::{
-    canonical_bytes, DreamInputBundle, ModelDraft, ModelRouteOutcome,
-    ValidatedGroundingCandidate,
+    DreamInputBundle, ModelDraft, ModelRouteOutcome, ValidatedGroundingCandidate, canonical_bytes,
 };
 use eliot_dreamer_orientation::{
     InertProbe, OrientationInterpretation, OrientationResidue, OrientationSemanticView,
@@ -19,17 +17,15 @@ use eliot_dreamer_orientation::{
 };
 use eliot_dreamer_probe_plan::{ProbePlan, ProbePlanParams};
 use eliot_dreamer_rival_model::RivalModelSet;
-use eliot_dreamer_contracts::rival::RivalModelSet as ProbeRivalModelSet;
 use eliot_epistemic::PositionRequest;
 use eliot_epistemic_contracts::CurrentEpistemicPosition;
 use serde::Serialize;
 
 use crate::pulse::{
-    CandidateStage, ClassificationStage, ConflictStage, CueActivationStage, PulseError,
-    PulseStage, PulseStageId, RivalStage, StageOwnerOutput, UnderstandingStage,
-    check_model_boundary, check_projection_boundary,
-    run_candidate_stage, run_classification_stage, run_conflict_stage, run_cue_stage,
-    run_epistemic_stage, run_grounding_stage, run_probe_stage, run_rival_stage,
+    CandidateStage, ClassificationStage, ConflictStage, CueActivationStage, PulseError, PulseStage,
+    PulseStageId, RivalStage, StageOwnerOutput, UnderstandingStage, check_model_boundary,
+    check_projection_boundary, run_candidate_stage, run_classification_stage, run_conflict_stage,
+    run_cue_stage, run_epistemic_stage, run_grounding_stage, run_probe_stage, run_rival_stage,
     run_understanding_stage,
 };
 
@@ -135,17 +131,25 @@ impl StageOutputSet {
             StageOwnerOutput::Classification(output) => self.classification = Some(output),
             StageOwnerOutput::CueActivation(output) => self.cue_activation = Some(output),
             StageOwnerOutput::EpistemicPosition(output) => {
-                self.gaps.extend(output.unknowns.iter().map(|text| {
-                    residue("epistemic_unknown", text, "epistemic_position")
-                }));
-                self.gaps.extend(output.required_inquiry.iter().map(|text| {
-                    residue("required_inquiry", text, "epistemic_position")
-                }));
+                self.gaps.extend(
+                    output
+                        .unknowns
+                        .iter()
+                        .map(|text| residue("epistemic_unknown", text, "epistemic_position")),
+                );
+                self.gaps.extend(
+                    output
+                        .required_inquiry
+                        .iter()
+                        .map(|text| residue("required_inquiry", text, "epistemic_position")),
+                );
                 self.epistemic_position = Some(output);
             }
             StageOwnerOutput::Understanding(output) => self.understanding = Some(output),
             StageOwnerOutput::Grounding(output) => {
-                let Some(ledger) = canonical_residue("claim_grounding_ledger", &output.ledger, &output.job_id) else {
+                let Some(ledger) =
+                    canonical_residue("claim_grounding_ledger", &output.ledger, &output.job_id)
+                else {
                     return false;
                 };
                 self.gaps.push(ledger);
@@ -154,21 +158,15 @@ impl StageOutputSet {
             StageOwnerOutput::Rivals(output) => {
                 let source = output.source_set.set_id.as_str().to_owned();
                 for assessment in &output.assessments {
-                    let Some(entry) = canonical_residue(
-                        "rival_assessment",
-                        assessment,
-                        &source,
-                    ) else {
+                    let Some(entry) = canonical_residue("rival_assessment", assessment, &source)
+                    else {
                         return false;
                     };
                     self.rival_items.push(entry);
                 }
                 for unknown in &output.unknown_slots {
-                    let Some(entry) = canonical_residue(
-                        "rival_unknown_facet",
-                        unknown,
-                        &source,
-                    ) else {
+                    let Some(entry) = canonical_residue("rival_unknown_facet", unknown, &source)
+                    else {
                         return false;
                     };
                     self.gaps.push(entry);
@@ -180,19 +178,18 @@ impl StageOutputSet {
                         &source,
                     ));
                 }
-                self.gaps.extend(output.omission_frontier.model_ids.iter().map(|model| {
-                    residue(
-                        "rival_omission_frontier",
-                        model.model_id.as_str(),
-                        &source,
-                    )
-                }));
+                self.gaps
+                    .extend(output.omission_frontier.model_ids.iter().map(|model| {
+                        residue("rival_omission_frontier", model.model_id.as_str(), &source)
+                    }));
                 self.rivals = Some(output);
             }
             StageOwnerOutput::Conflict(output) => {
                 let source = output.conflict_id.as_str();
-                self.gaps.push(residue("conflict_outcome", output.outcome.as_str(), source));
-                self.gaps.push(residue("conflict_scope", &output.scope, source));
+                self.gaps
+                    .push(residue("conflict_outcome", output.outcome.as_str(), source));
+                self.gaps
+                    .push(residue("conflict_scope", &output.scope, source));
                 for position in &output.positions {
                     self.rival_items.push(residue(
                         "conflict_position",
@@ -221,7 +218,11 @@ impl StageOutputSet {
                         &position.source_handle,
                     ));
                     self.gaps.extend(position.assumptions.iter().map(|text| {
-                        residue("conflict_position_assumption", text, &position.source_handle)
+                        residue(
+                            "conflict_position_assumption",
+                            text,
+                            &position.source_handle,
+                        )
                     }));
                     self.gaps.extend(position.counters.iter().map(|text| {
                         residue("conflict_position_counter", text, &position.source_handle)
@@ -277,7 +278,11 @@ impl StageOutputSet {
                 for group in &output.lineage_groups {
                     self.gaps.push(residue(
                         "conflict_lineage_group",
-                        &format!("known={} members={}", group.known, group.member_sources.join(",")),
+                        &format!(
+                            "known={} members={}",
+                            group.known,
+                            group.member_sources.join(",")
+                        ),
                         &group.lineage_root,
                     ));
                 }
@@ -334,7 +339,10 @@ impl StageOutputSet {
                         "conflict_preservation",
                         &format!(
                             "{} passed={} known={} {}",
-                            verdict.dimension.as_str(), verdict.passed, verdict.known, verdict.note
+                            verdict.dimension.as_str(),
+                            verdict.passed,
+                            verdict.known,
+                            verdict.note
                         ),
                         source,
                     ));
@@ -344,11 +352,8 @@ impl StageOutputSet {
                     &output.candidate_digest,
                     source,
                 ));
-                self.gaps.push(residue(
-                    "conflict_analysis_note",
-                    &output.note,
-                    source,
-                ));
+                self.gaps
+                    .push(residue("conflict_analysis_note", &output.note, source));
                 self.gaps.push(residue(
                     "conflict_independent_root_count",
                     &output.independent_root_count.to_string(),
@@ -390,32 +395,43 @@ impl StageOutputSet {
                         self.gaps.push(entry);
                     }
                 }
-                self.gaps.extend(output.unknowns.iter().map(|text| {
-                    residue("conflict_unknown", text, source)
-                }));
-                self.gaps.extend(output.assumptions.iter().map(|text| {
-                    residue("conflict_assumption", text, source)
-                }));
-                self.gaps.extend(output.counterevidence.iter().map(|text| {
-                    residue("conflict_counterevidence", text, source)
-                }));
-                self.gaps.extend(output.invalidation_conditions.iter().map(|text| {
-                    residue("conflict_invalidation", text, source)
-                }));
+                self.gaps.extend(
+                    output
+                        .unknowns
+                        .iter()
+                        .map(|text| residue("conflict_unknown", text, source)),
+                );
+                self.gaps.extend(
+                    output
+                        .assumptions
+                        .iter()
+                        .map(|text| residue("conflict_assumption", text, source)),
+                );
+                self.gaps.extend(
+                    output
+                        .counterevidence
+                        .iter()
+                        .map(|text| residue("conflict_counterevidence", text, source)),
+                );
+                self.gaps.extend(
+                    output
+                        .invalidation_conditions
+                        .iter()
+                        .map(|text| residue("conflict_invalidation", text, source)),
+                );
                 self.conflict = Some(output);
             }
             StageOwnerOutput::Probes(output) => {
-                self.inert_probes.extend(output.probes.iter().map(|probe| InertProbe {
-                    text: probe.expected_discrimination.clone(),
-                    status: "candidate_only".to_owned(),
-                    result_space: None,
-                }));
+                self.inert_probes
+                    .extend(output.probes.iter().map(|probe| InertProbe {
+                        text: probe.expected_discrimination.clone(),
+                        status: "candidate_only".to_owned(),
+                        result_space: None,
+                    }));
                 for omission in &output.omissions {
-                    let Some(entry) = canonical_residue(
-                        "probe_plan_omission",
-                        omission,
-                        output.plan_id.as_str(),
-                    ) else {
+                    let Some(entry) =
+                        canonical_residue("probe_plan_omission", omission, output.plan_id.as_str())
+                    else {
                         return false;
                     };
                     self.gaps.push(entry);
@@ -501,9 +517,10 @@ pub(crate) fn run_mandatory_stages(
             }
         })
     {
-        stages.extend(MANDATORY_STAGES.map(|id| {
-            PulseStage::blocked(id, "mandatory route or projection binding refused")
-        }));
+        stages
+            .extend(MANDATORY_STAGES.map(|id| {
+                PulseStage::blocked(id, "mandatory route or projection binding refused")
+            }));
         return MandatoryStageRun {
             stages,
             outputs,
@@ -511,7 +528,7 @@ pub(crate) fn run_mandatory_stages(
         };
     }
 
-macro_rules! run_and_retain {
+    macro_rules! run_and_retain {
         ($binding_check:expr, $owner_call:expr, $id:expr) => {{
             if let Err(error) = $binding_check {
                 return failed_run(stages, outputs, $id, error);
@@ -565,9 +582,7 @@ macro_rules! run_and_retain {
         run_grounding_stage(Some(inputs.grounding)),
         PulseStageId::Grounding
     );
-    if outputs.grounding.as_ref()
-        != inputs.rivals.validated_draft.input.grounded.as_deref()
-    {
+    if outputs.grounding.as_ref() != inputs.rivals.validated_draft.input.grounded.as_deref() {
         return failed_run(
             stages,
             outputs,
@@ -586,7 +601,8 @@ macro_rules! run_and_retain {
         .execution
         .as_ref()
         .and_then(|execution| execution.grounding_route.as_ref());
-    if grounding_route.is_none_or(|route| route != &structured_candidate.input.grounded.input.route) {
+    if grounding_route.is_none_or(|route| route != &structured_candidate.input.grounded.input.route)
+    {
         return failed_run(
             stages,
             outputs,
@@ -622,7 +638,8 @@ macro_rules! run_and_retain {
         || inputs.probes.affordances.scope != bundle.scope_id
         || inputs.probes.affordances.state_fence != bundle.state_fence
         || probe_rivals.bundle_digest != model_outcome.bundle_digest
-        || probe_rivals.validated_input_digest != structured_candidate.validated.receipt.input_digest
+        || probe_rivals.validated_input_digest
+            != structured_candidate.validated.receipt.input_digest
         || probe_rivals.task_id.as_str() != bundle.task_id
         || probe_rivals.scope != bundle.scope_id
         || probe_rivals.state_fence != bundle.state_fence
@@ -703,7 +720,9 @@ fn check_conflict_binding(
         || stage.supplements.frozen_bundle_digest != candidate.validated.receipt.bundle_digest
         || stage.supplements.frozen_manifest_digest != grounded.manifest_digest
     {
-        return Err(PulseError::Boundary("conflict structured grounding predecessor"));
+        return Err(PulseError::Boundary(
+            "conflict structured grounding predecessor",
+        ));
     }
     Ok(())
 }
@@ -766,7 +785,9 @@ fn check_understanding_binding(
         || binding != &stage.quality.binding
         || binding != &projections.binding
     {
-        return Err(PulseError::Boundary("understanding and projection identity"));
+        return Err(PulseError::Boundary(
+            "understanding and projection identity",
+        ));
     }
     Ok(())
 }
@@ -782,7 +803,9 @@ fn check_grounding_binding(
         .as_ref()
         .and_then(|execution| execution.grounding_route.as_ref())
     else {
-        return Err(PulseError::Boundary("model owner has no physical grounding route"));
+        return Err(PulseError::Boundary(
+            "model owner has no physical grounding route",
+        ));
     };
     if &request.bundle != bundle
         || &draft.bundle != bundle
@@ -858,7 +881,11 @@ fn residue(kind: &str, text: &str, source: &str) -> OrientationResidue {
     }
 }
 
-fn canonical_residue<T: Serialize>(kind: &str, value: &T, source: &str) -> Option<OrientationResidue> {
+fn canonical_residue<T: Serialize>(
+    kind: &str,
+    value: &T,
+    source: &str,
+) -> Option<OrientationResidue> {
     let text = String::from_utf8(canonical_bytes(value).ok()?).ok()?;
     Some(residue(kind, &text, source))
 }
