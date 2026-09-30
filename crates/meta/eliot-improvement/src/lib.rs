@@ -142,7 +142,7 @@
 //!   `crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml`
 //!   projection.
 //! - `stamp_outcome_budget` — exactly one external caller,
-//!   `bins/eliotd/src/improvement_intake.rs:46`, inside
+//!   `bins/eliotd/src/improvement_intake.rs:58`, inside
 //!   `stamp_promotion_budget`. `git grep -n "stamp_promotion_budget"` returns
 //!   only that definition. So the one budget-stamping bridge is itself
 //!   uncalled, and `BudgetProof` and `OutcomeEvidence` are named in
@@ -286,7 +286,7 @@
 //! Nothing in this crate RUNS an experiment. What it holds is record and
 //! validation only:
 //!
-//! - `ReplayPlan` (`lib.rs:570`) names the fixed-replay, holdout, transfer and
+//! - `ReplayPlan` (`lib.rs:598`) names the fixed-replay, holdout, transfer and
 //!   counter-metric references. `ReplayPlan::validate` (`lib.rs:579`) refuses
 //!   empty reference groups and an empty `transfer_refs`. It matches
 //!   I12.24:67, "fixed replay as diagnostic evidence only".
@@ -295,7 +295,7 @@
 //!   them to be non-empty and never resolves them.
 //! - `BudgetProof` / `ComplexityEconomicsDelta` /
 //!   `require_matched_budget_for_promotion` are the I12.24:76 matched-budget
-//!   gate. `OutcomeEvidence::validate_for` (`lib.rs:1008`) refuses a
+//!   gate. `OutcomeEvidence::validate_for` (`lib.rs:1101`) refuses a
 //!   promotion-bound outcome that lacks a budget ledger, a conclusive
 //!   economics delta, affected checks, live shadow/canary evidence or
 //!   delayed-harm visibility. That is I12.24:76's "An unmatched ledger or
@@ -318,10 +318,10 @@
 //!   ledger or delta is recomputed, re-derived or substituted on either path.
 //! - The lifecycle enums carry the experiment states and enforce the edge
 //!   table: `AcceptedForExperiment` and `Running` exist only as transitions
-//!   `lifecycle_edge_allowed` (`lib.rs:517`) permits, and the promoting step
+//!   `lifecycle_edge_allowed` (`lib.rs:545`) permits, and the promoting step
 //!   "promote, narrow, rollback or archive" (I12.24:70) is gated so that
 //!   `transition_lifecycle` refuses `Supported`/`Narrowed` outright
-//!   (`lib.rs:892`) and only `promote_lifecycle` admits them, and only with a
+//!   (`lib.rs:915`) and only `promote_lifecycle` admits them, and only with a
 //!   budget proof.
 //! - `promotion_input::prepare_promotion_input` (`promotion_input.rs:551`) is a
 //!   pure gate over already-supplied evidence, and it has no production caller.

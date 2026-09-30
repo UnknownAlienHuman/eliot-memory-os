@@ -261,6 +261,12 @@ pub fn require_matched_budget_for_promotion(
 /// - a binding that differs in any way — refused with a typed
 ///   [`ImprovementError::BudgetGateViolation`] and nothing written.
 ///
+/// A PARTIAL binding — one canonical record without the other, or an evidence
+/// leg with no record at all — is refused by the same rule, never completed
+/// here: completing it would silently discard whichever half the caller had
+/// already recorded. An outcome that records nothing at all is unbound, and
+/// takes the write path, so a replay-only outcome stays stampable.
+///
 /// Without that refusal a second promotable proof could silently overwrite the
 /// first, and the record would name a budget the outcome was never evaluated
 /// under while still reading as gate-checked. Refusal is per-field, so
@@ -289,13 +295,26 @@ pub fn stamp_outcome_budget(
     let delta_ref = proof.complexity_delta.delta_ref.clone();
     let conclusive = proof.complexity_delta.is_conclusive();
 
-    // A binding exists as soon as EITHER canonical record is carried or named;
-    // a record that carries one without the other is half-bound, and it is
-    // refused below rather than repaired here.
+    // A binding exists as soon as EITHER canonical record is carried or named,
+    // OR as soon as ANY of the four evidence legs is recorded — the legs are
+    // written by the same call, so an outcome holding a leg is bound just as
+    // surely as one holding a record. The refusal below is therefore
+    // PER-FIELD and fail-closed: a record that carries one canonical record
+    // without the other, or that carries a leg without any record, is
+    // PARTIALLY bound and is REFUSED, never repaired here. Repairing it would
+    // silently drop the leg or the record the caller already recorded.
+    //
+    // An outcome that records nothing at all — every term below false, which is
+    // the replay-only shape: no ledger, no delta, no leg — is UNBOUND and still
+    // takes the write path, so the replay-only outcome stays stampable.
     let already_bound = !outcome.budget_ledger_ref.trim().is_empty()
         || !outcome.complexity_delta_ref.trim().is_empty()
         || outcome.budget_ledger.is_some()
-        || outcome.complexity_delta.is_some();
+        || outcome.complexity_delta.is_some()
+        || !outcome.affected_check_refs.is_empty()
+        || !outcome.live_shadow_refs.is_empty()
+        || !outcome.live_canary_refs.is_empty()
+        || !outcome.delayed_harm_window_ref.trim().is_empty();
     if already_bound {
         // The comparison is over the RECORD VALUES the outcome carries, not over
         // the names. `ledger_id` is a caller-chosen string, so a second ledger
