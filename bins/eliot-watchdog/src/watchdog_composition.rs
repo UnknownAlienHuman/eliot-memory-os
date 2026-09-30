@@ -270,7 +270,12 @@ fn manifest_evidence_fields(manifest: &IntervalCoverageReport) -> String {
 /// projection derives, read here through the manifest's public claims, so the
 /// adapter can never contradict the projection about one interval.
 fn manifest_gap_verdict(manifest: &IntervalCoverageReport) -> CoverageGapExplanation {
-    if !manifest.valid() || manifest.records().iter().any(|record| !record.interval_closed()) {
+    if !manifest.valid()
+        || manifest
+            .records()
+            .iter()
+            .any(|record| !record.interval_closed())
+    {
         return CoverageGapExplanation::Unknown;
     }
     let unexplained = manifest.records().iter().any(|record| {
