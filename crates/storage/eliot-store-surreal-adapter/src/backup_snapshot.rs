@@ -795,8 +795,7 @@ fn captures_scope_column(ddl: &'static str) -> bool {
 
 /// Reports whether the census captures any source erasure/purge ledger table.
 fn captures_purge_ledger() -> bool {
-    captured_member_tables()
-        .any(|table| SOURCE_PURGE_LEDGER_TABLES.contains(&table))
+    captured_member_tables().any(|table| SOURCE_PURGE_LEDGER_TABLES.contains(&table))
 }
 
 /// Reports whether the census captures any blob-residency member class.
@@ -2738,12 +2737,12 @@ fn row_index<'row>(
     field: &'static str,
     index_field: &'static str,
 ) -> Result<&'row str, StoreError> {
-    row.get(index_field).and_then(Value::as_str).ok_or(
-        StoreError::InvalidField {
+    row.get(index_field)
+        .and_then(Value::as_str)
+        .ok_or(StoreError::InvalidField {
             field,
             reason: "observed row does not carry its declared index column",
-        },
-    )
+        })
 }
 
 /// Reads one observed `revision_head` row and proves it belongs to this point.
@@ -2815,9 +2814,7 @@ fn observed_events(
         .map(|row| {
             let event: CanonicalEvent = row_body(row, ECXF_SOURCE_RECORD_FIELD)?;
             event.validate()?;
-            if row_index(row, ECXF_SOURCE_RECORD_FIELD, "event_id")?
-                != event.event_id.as_str()
-            {
+            if row_index(row, ECXF_SOURCE_RECORD_FIELD, "event_id")? != event.event_id.as_str() {
                 return Err(StoreError::IdentityConflict);
             }
             if row_index(row, ECXF_SOURCE_RECORD_FIELD, "operation_id")?
