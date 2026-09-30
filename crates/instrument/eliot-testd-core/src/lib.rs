@@ -1494,9 +1494,7 @@ impl SourceObservationGitCommand {
             Self::ShowTopLevel => &["rev-parse", "--show-toplevel"],
             Self::AbbreviatedBranch => &["rev-parse", "--abbrev-ref", "HEAD"],
             Self::VerifiedCommit => &["rev-parse", "--verify", "HEAD^{commit}"],
-            Self::PorcelainV2Status => {
-                &["status", "--porcelain=v2", "-z", "--untracked-files=all"]
-            }
+            Self::PorcelainV2Status => &["status", "--porcelain=v2", "-z", "--untracked-files=all"],
             Self::BinaryWorktreeDiff => &["diff", "--binary", "--no-ext-diff", "HEAD", "--"],
             Self::UntrackedListing => &["ls-files", "--others", "--exclude-standard", "-z"],
         }
@@ -1552,7 +1550,7 @@ impl TestdSourceObservation {
     /// truncated, or non-success observation fails closed.
     pub fn capture(
         repository_root: impl AsRef<Path>,
-        git: &impl SourceObservationGitPort,
+        git: &dyn SourceObservationGitPort,
     ) -> Result<Self, TestdError> {
         const MAX_GIT_OUTPUT: usize = 64 * 1024 * 1024;
         const MAX_OBSERVED_SOURCE_FILE_BYTES: usize = 64 * 1024 * 1024;
