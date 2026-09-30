@@ -738,11 +738,13 @@ fn bounded_residual_list(handles: &[PlatformHandle]) -> String {
     let mut text = handles
         .iter()
         .take(MAX_LISTED)
-        .map(|handle| handle.as_str())
+        .map(eliot_platform::PlatformHandle::as_str)
         .collect::<Vec<_>>()
         .join(", ");
     if handles.len() > MAX_LISTED {
-        text.push_str(&format!(", and {} more", handles.len() - MAX_LISTED));
+        text.push_str(", and ");
+        text.push_str(&(handles.len() - MAX_LISTED).to_string());
+        text.push_str(" more");
     }
     text
 }
