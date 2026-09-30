@@ -222,11 +222,14 @@ pub enum CaptureState {
 ///
 /// A [`StructurallyValidCandidate`] is never promoted to
 /// [`ProvenanceBoundCapture`] by this owner, because no retained-artifact owner
-/// exists in the repository today: there is no production
-/// `impl PublicationPort` (the only implementation is `MemPublisher` inside
-/// `bins/eliot-kernel/tests/backup_capture.rs`), and
-/// `KernelBackupCapture::capture` / `request_from_ports` have zero production
-/// callers. Nothing here may invent a capture receipt to cross that gap.
+/// is ever INJECTED into it. The production `PublicationPort` does exist —
+/// `BlobArchivePublicationOwner` over the single-owner blob CAS
+/// (`crates/storage/eliot-blob/src/publication_owner.rs`, issue #959) — but it
+/// binds a claimed blob-store root lease, the Kernel composition holds no such
+/// claim and does not carry that crate, and
+/// `KernelBackupCapture::capture` / `request_from_ports` still have zero
+/// production callers. Nothing here may invent a capture receipt to cross that
+/// gap.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CaptureEvidenceLevel {
     /// Bytes that decode and validate internally; carries no retained capture
@@ -835,8 +838,8 @@ impl KernelBackupCapture {
         let archived_fence_relation =
             classify_archived_fence(&bundle.export_fence.state_fence, kernel_fence);
         // Nothing on this path authenticates the archive as produced by THIS
-        // installation: no retained-artifact owner issues a capture receipt here
-        // (there is no production `impl PublicationPort`), so a relation computed
+        // installation: this contour is given no `PublicationPort` at all, so
+        // no owner can issue a capture receipt here and a relation computed
         // from caller-presented bytes is unproven structural evidence whatever
         // the relation is. #2862 owns the producer that will change this.
         let archived_fence_proof = ArchiveFenceProof::StructuralOnly;

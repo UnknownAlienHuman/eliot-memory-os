@@ -765,14 +765,22 @@ fn cancellation_reply(idempotency_key: &str, owner_reason: &str) -> Value {
 ///    production caller, and the accepted read is ASYNC while
 ///    `KernelComposition::dispatch_backup_frame` is the synchronous frame
 ///    route.
-/// 2. a production `PublicationPort`. `capture` publishes exactly once through
-///    it and reconciles a lost response by operation identity through it; the
-///    only implementation in the repository is `MemPublisher` inside
-///    `bins/eliot-kernel/tests/backup_capture.rs`.
+/// 2. a supplied `PublicationPort`. `capture` publishes exactly once through
+///    it and reconciles a lost response by operation identity through it. The
+///    production implementation EXISTS — `BlobArchivePublicationOwner` over the
+///    single-owner blob CAS
+///    (`crates/storage/eliot-blob/src/publication_owner.rs`, issue #959) — but
+///    it binds a claimed blob-store root lease, this composition holds no such
+///    claim and does not carry that crate, and the blob surface it does hold is
+///    `BlobStoreController`, a demand-lifecycle recorder with no blob I/O. So
+///    what is missing is the owner channel that supplies the port, not the port.
 /// 3. a `FrozenCapturePlan` whose `build_digest` and `policy_digest` are
 ///    owner-ISSUED approved 64-hex digests. This route holds no such digest and
 ///    will not synthesise one, because a plausible digest in that field is the
-///    laundered-absence this item names.
+///    laundered-absence this item names — and `gate_approved_manifest_digests`
+///    binds each of them to a carried artifact's OWN recorded digest, so a plan
+///    digest read off the very artifacts it gates would compare one caller list
+///    with itself and bind nothing.
 ///
 /// So the create arm does what the item says to do with an absent owner: it
 /// returns a TYPED FAILURE NAMING THE ABSENT OWNER BEHAVIOUR. It emits no
@@ -877,9 +885,10 @@ fn handle_backup_create(
         idempotency_key,
         "plan_gap",
         BACKUP_CREATE_MISSING_OWNER,
-        "capture owner entry KernelBackupCapture::capture is unreachable: no \
-         production PublicationPort and no producer of the accepted \
-         CaptureRequest evidence; #959 owns both",
+        "capture owner entry KernelBackupCapture::capture is unreachable: a \
+         production PublicationPort exists but no owner channel supplies it, \
+         and no owner issues the accepted CaptureRequest evidence or the \
+         approved plan digests; #959 owns both",
     ))
 }
 
