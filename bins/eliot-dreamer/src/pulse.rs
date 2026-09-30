@@ -539,9 +539,7 @@ pub(crate) fn run_classification_stage(
     )
 }
 
-pub(crate) fn run_cue_stage(
-    stage: Option<&CueActivationStage>,
-) -> Result<PulseStage, PulseError> {
+pub(crate) fn run_cue_stage(stage: Option<&CueActivationStage>) -> Result<PulseStage, PulseError> {
     stage.map_or_else(
         || Ok(PulseStage::pending(PulseStageId::CueActivation)),
         |inputs| {
@@ -609,14 +607,15 @@ pub(crate) fn run_grounding_stage(
             let output =
                 ground_draft_with_controls(inputs.clone()).map_err(|_| PulseError::Grounding)?;
             let commitment = output_digest(&output).ok_or(PulseError::Grounding)?;
-            Ok(PulseStage::executed(PulseStageId::Grounding, Some(commitment)))
+            Ok(PulseStage::executed(
+                PulseStageId::Grounding,
+                Some(commitment),
+            ))
         },
     )
 }
 
-pub(crate) fn run_rival_stage(
-    stage: Option<&RivalStage>,
-) -> Result<PulseStage, PulseError> {
+pub(crate) fn run_rival_stage(stage: Option<&RivalStage>) -> Result<PulseStage, PulseError> {
     stage.map_or_else(
         || Ok(PulseStage::pending(PulseStageId::Rivals)),
         |inputs| {
@@ -633,9 +632,7 @@ pub(crate) fn run_rival_stage(
     )
 }
 
-pub(crate) fn run_conflict_stage(
-    stage: Option<&ConflictStage>,
-) -> Result<PulseStage, PulseError> {
+pub(crate) fn run_conflict_stage(stage: Option<&ConflictStage>) -> Result<PulseStage, PulseError> {
     stage.map_or_else(
         || Ok(PulseStage::pending(PulseStageId::Conflict)),
         |inputs| {
