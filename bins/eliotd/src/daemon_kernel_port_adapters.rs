@@ -44,8 +44,8 @@ pub(crate) fn kind_value(
 /// carrying a second decoder. A wrong kind, undecodable bytes, or a revision
 /// the maintenance owner refuses is a contract refusal, never a substituted
 /// or defaulted job.
-fn decode_committed_job(value: serde_json::Value) -> Result<MaintenanceJob, KernelPortError> {
-    let value = kind_value(&value, "durable_job")?;
+fn decode_committed_job(value: &serde_json::Value) -> Result<MaintenanceJob, KernelPortError> {
+    let value = kind_value(value, "durable_job")?;
     let job: MaintenanceJob = serde_json::from_value(value)
         .map_err(|error| KernelPortError::Contract(error.to_string()))?;
     job.validate()
@@ -95,7 +95,7 @@ impl KernelDurableJobPort for DaemonKernelClient {
             "load_durable_job",
             serde_json::json!({ "job_id": job_id, "state_fence": state_fence }),
         )?;
-        Ok(Some(decode_committed_job(value)?))
+        Ok(Some(decode_committed_job(&value)?))
     }
 
     fn save_durable_job(&self, job: &MaintenanceJob) -> Result<(), KernelPortError> {
@@ -110,7 +110,7 @@ impl KernelDurableJobPort for DaemonKernelClient {
         // reply must carry the owner's own committed bytes binding this exact
         // job and trigger identity, or the save is refused and the trigger
         // stays retained and unacknowledged.
-        let committed = decode_committed_job(value)?;
+        let committed = decode_committed_job(&value)?;
         prove_job_intent_durable(job, &committed)
             .map_err(|error| KernelPortError::Contract(error.to_string()))?;
         // The save acknowledgement alone still proves nothing durable: close
