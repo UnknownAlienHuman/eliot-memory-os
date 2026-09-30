@@ -6,7 +6,7 @@
 
 use eliot_context_contracts::{
     ApprovedRecipeCatalogue, ContextError as ContractContextError, ContextRecipe,
-    RecipeResolutionRefusal, ReactiveInputError, SessionDeliverySnapshot,
+    ReactiveInputError, RecipeResolutionRefusal, SessionDeliverySnapshot,
 };
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_learning_contracts::{CampaignOwnerRecordId, CampaignOwnerRevision, CampaignSourceRole};
@@ -258,7 +258,9 @@ pub fn context_recipe_body_digest(
     body: &ContextCampaignRecipeBody,
 ) -> Result<String, ContextPublicationError> {
     let resolved = body.catalogue.resolve()?;
-    body.catalogue.governing.authorize(&resolved, &body.recipe)?;
+    body.catalogue
+        .governing
+        .authorize(&resolved, &body.recipe)?;
     body.compiler_input.validate()?;
     validate_recipe_input_binding(&body.recipe, &body.compiler_input)?;
     let bytes = canonical_json_bytes(body)

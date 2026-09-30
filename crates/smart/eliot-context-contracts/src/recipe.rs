@@ -918,7 +918,7 @@ pub enum RecipeApplicabilityDimension {
 
 impl RecipeApplicabilityDimension {
     /// The declared profile list of this dimension.
-    fn profiles<'a>(&self, applicability: &'a RecipeApplicability) -> &'a [String] {
+    fn profiles(self, applicability: &RecipeApplicability) -> &[String] {
         match self {
             Self::Task => &applicability.task_profiles,
             Self::Route => &applicability.route_profiles,
@@ -933,9 +933,7 @@ impl RecipeApplicabilityDimension {
 /// These are the three values that recover the immutable approved content: the
 /// policy identity, its owner-minted revision and the digest of its bytes in
 /// the policy digest domain.
-#[derive(
-    Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema,
-)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RecipePolicyIdentity {
     /// Stable identity of the selected policy.
@@ -1149,7 +1147,10 @@ impl ResolvedContextRecipe {
         {
             return Err(ContextError::IdentityConflict);
         }
-        validate_digest(&self.resolution_sha256, "recipe_resolution.resolution_sha256")?;
+        validate_digest(
+            &self.resolution_sha256,
+            "recipe_resolution.resolution_sha256",
+        )?;
         if self.canonical_resolution_digest()? != self.resolution_sha256 {
             return Err(ContextError::IdentityConflict);
         }
@@ -1269,8 +1270,7 @@ impl GoverningContextRequirements {
             .iter()
             .map(|budget| budget.semantic_role)
             .collect();
-        let mandatory: BTreeSet<SemanticRole> =
-            instance.mandatory_roles.iter().copied().collect();
+        let mandatory: BTreeSet<SemanticRole> = instance.mandatory_roles.iter().copied().collect();
         for role in &self.floor.mandatory_roles {
             if !features.contains(role) || !budgeted.contains(role) || !mandatory.contains(role) {
                 return Err(ContextError::MissingFloor);
@@ -1308,10 +1308,17 @@ impl GoverningContextRequirements {
         {
             return Err(ContextError::OmissionHandleInvalid);
         }
-        let non_recoverable: BTreeSet<NonRecoverableReason> =
-            policy.omission.non_recoverable_reasons.iter().copied().collect();
-        let ceiling: BTreeSet<NonRecoverableReason> =
-            self.permitted_non_recoverable_reasons.iter().copied().collect();
+        let non_recoverable: BTreeSet<NonRecoverableReason> = policy
+            .omission
+            .non_recoverable_reasons
+            .iter()
+            .copied()
+            .collect();
+        let ceiling: BTreeSet<NonRecoverableReason> = self
+            .permitted_non_recoverable_reasons
+            .iter()
+            .copied()
+            .collect();
         if !non_recoverable.is_subset(&ceiling) {
             return Err(ContextError::OmissionHandleInvalid);
         }
@@ -1398,14 +1405,13 @@ impl ApprovedRecipeCatalogue {
     /// The result is pinned by its own digest so the same revision cannot be
     /// reused for another compilation, task or generation.
     pub fn resolve(&self) -> Result<ResolvedContextRecipe, RecipeResolutionRefusal> {
-        self.validate().map_err(|error| RecipeResolutionRefusal::InvalidCatalogue {
-            reason: error.to_string(),
-        })?;
+        self.validate()
+            .map_err(|error| RecipeResolutionRefusal::InvalidCatalogue {
+                reason: error.to_string(),
+            })?;
         let unresolved = self.governing.applicability.unresolved();
         if !unresolved.is_empty() {
-            return Err(RecipeResolutionRefusal::UnresolvedGoverningInput {
-                inputs: unresolved,
-            });
+            return Err(RecipeResolutionRefusal::UnresolvedGoverningInput { inputs: unresolved });
         }
 
         let mut applicable: Vec<&ContextRecipePolicy> = Vec::new();
@@ -1424,11 +1430,16 @@ impl ApprovedRecipeCatalogue {
             return Err(RecipeResolutionRefusal::NoApplicableCandidate { rejected });
         }
 
-        let highest = applicable
-            .iter()
-            .map(|candidate| candidate.policy_revision)
-            .max()
-            .expect("applicable candidates were checked to be non-empty");
+        // `applicable` is non-empty here: the `is_empty` arm above returned.
+        // `max()` is still an `Option`, so the highest revision is taken by
+        // folding from the first candidate rather than unwrapping, which keeps
+        // that invariant structural instead of asserted.
+        let mut highest = applicable[0].policy_revision;
+        for candidate in &applicable[1..] {
+            if candidate.policy_revision > highest {
+                highest = candidate.policy_revision;
+            }
+        }
         let mut winners: Vec<&ContextRecipePolicy> = applicable
             .iter()
             .copied()
@@ -1454,11 +1465,11 @@ impl ApprovedRecipeCatalogue {
             resolution_sha256: "0".repeat(64),
         };
         resolution.resolution_sha256 =
-            resolution
-                .canonical_resolution_digest()
-                .map_err(|error| RecipeResolutionRefusal::InvalidCatalogue {
+            resolution.canonical_resolution_digest().map_err(|error| {
+                RecipeResolutionRefusal::InvalidCatalogue {
                     reason: error.to_string(),
-                })?;
+                }
+            })?;
         Ok(resolution)
     }
 
