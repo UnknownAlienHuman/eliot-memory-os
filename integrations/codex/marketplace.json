@@ -14,7 +14,20 @@
         "installation": "INSTALLED_BY_DEFAULT",
         "authentication": "ON_INSTALL"
       },
-      "category": "Developer Tools"
+      "category": "Developer Tools",
+      "eliot_mcp_server": {
+        "command": "bin/eliot-agent-bridge.exe",
+        "args": [
+          "mcp",
+          "--profile",
+          "codex_controller",
+          "--transport",
+          "stdio",
+          "--client-declaration",
+          "${PLUGIN_ROOT}/bin/agent-bridge/client-declaration-v2.json"
+        ],
+        "owner": "bins/eliot-agent-bridge"
+      }
     }
   ]
 }

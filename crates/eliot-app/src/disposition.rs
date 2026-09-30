@@ -133,19 +133,9 @@ const TRUSTED_CLI_LIVE_SIGNING_TEST: &str =
 /// cannot silently fall behind the declared consumer set.
 pub const CONSUMER_SURFACES: &[ConsumerSurface] = &[
     ConsumerSurface {
-        path: "integrations/opencode/opencode.json",
-        live_reference: "\"{env:ELIOT_GOVERNOR_EXE}\"",
-        body: OPENCODE_CONFIG,
-    },
-    ConsumerSurface {
         path: "integrations/opencode/plugins/eliot.js",
         live_reference: "host-integrations/opencode/bin/eliot-governor.exe",
         body: OPENCODE_PLUGIN,
-    },
-    ConsumerSurface {
-        path: "integrations/codex/marketplace.json",
-        live_reference: "\"installation\": \"INSTALLED_BY_DEFAULT\"",
-        body: CODEX_MARKETPLACE,
     },
     ConsumerSurface {
         path: "plugin/eliot-governor/.codex-plugin/plugin.json",
@@ -1119,20 +1109,6 @@ const INVENTORY_REVISION: &str = "2026-09-25";
 pub fn current_consumer_inventory() -> &'static [ConsumerEntry] {
     &[
         ConsumerEntry {
-            consumer: "OpenCode MCP server registration",
-            proof: "integrations/opencode/opencode.json",
-            live_reference: "\"{env:ELIOT_GOVERNOR_EXE}\"",
-            disposition: Disposition::ExtractToCurrentOwner,
-            expiry: "remove when the OpenCode MCP command resolves to bins/eliot-agent-bridge under #13",
-        },
-        ConsumerEntry {
-            consumer: "Codex plugin install route",
-            proof: "integrations/codex/marketplace.json",
-            live_reference: "\"installation\": \"INSTALLED_BY_DEFAULT\"",
-            disposition: Disposition::ExtractToCurrentOwner,
-            expiry: "remove when the default-installed Codex plugin is a current root plugin under #13",
-        },
-        ConsumerEntry {
             consumer: "Codex plugin identity manifest",
             proof: "plugin/eliot-governor/.codex-plugin/plugin.json",
             live_reference: "\"name\": \"eliot-governor\"",
@@ -1366,6 +1342,22 @@ pub const MIGRATED_CONSUMER_EDGES: &[MigratedConsumerEdge] = &[
         current_owner: "bins/eliot-agent-bridge hook intake (evaluation in crates/eliot-engine EliotHookService)",
         evidence: "bridge argv hook <event> (bins/eliot-agent-bridge/src/hook_intake.rs::run_hook_intake): per-event argv preserved (session-start, pre-tool-use, post-tool-use, subagent-start, subagent-stop, pre-compact, stop); host hook JSON stdin incl. empty-input {}, ELIOT_TASK_ID attach, and decision.stdout evaluated through eliot_engine::EliotHookService::for_session().process, the existing owner (crates/eliot-engine/src/plugin.rs), under the retired run_hook contract (crates/eliot-app/src/commands/execution.rs:305); the two host event --host claude --event rows (PostToolUseFailure, SessionEnd) are removed from this edge because record_event lease-gating plus reports/host-events writes are host-runtime behavior owned by the #77 host-request protocol migration and are not servable by the hook intake; host-observable output is unchanged (continue/suppress ack either way) and no current reader consumes reports/host-events",
     },
+    MigratedConsumerEdge {
+        consumer: "OpenCode MCP server registration",
+        proof: "integrations/opencode/opencode.json",
+        legacy_reference: "\"{env:ELIOT_GOVERNOR_EXE}\"",
+        current_owner_reference: "\"{env:ELIOT_AGENT_BRIDGE_EXE}\"",
+        current_owner: "bins/eliot-agent-bridge (SPINE_FUNCTIONAL contour)",
+        evidence: "bridge argv mcp --profile SPINE_FUNCTIONAL --transport stdio --client-declaration <installation-owned agent-bridge/client-declaration-v2.json>; opencode is a bridge-delegated host whose facade entry gate already redirects default-profile mcp stdio to this argv (crates/eliot-app/src/main.rs::BRIDGE_DELEGATED_MCP_HOSTS and crates/eliot-app/src/main.rs::delegate_host_mcp_to_agent_bridge); served on the admitted SPINE_FUNCTIONAL contour through the Kernel front door with no Governor, Store, WAL, or writer construction",
+    },
+    MigratedConsumerEdge {
+        consumer: "Codex plugin install route",
+        proof: "integrations/codex/marketplace.json",
+        legacy_reference: "\"command\": \"bin/eliot-governor.exe\"",
+        current_owner_reference: "\"command\": \"bin/eliot-agent-bridge.exe\"",
+        current_owner: "bins/eliot-agent-bridge (codex_controller MCP access edge; scope/capability admission in cli_contract)",
+        evidence: "the default-installed marketplace entry now declares its MCP server route explicitly as the bridge (integrations/codex/marketplace.json plugins[eliot-governor].eliot_mcp_server): bridge argv mcp --profile codex_controller --transport stdio --client-declaration <installation-owned agent-bridge/client-declaration-v2.json>, matching the staged plugin manifest the release builder stages beside the retained governor copy, binds in RELEASE.json codex_plugin_bridge, and verifies; the install policy and legacy plugin directory identity are unchanged and the installed plugin launches nothing but the bridge",
+    },
 ];
 
 /// Baked bytes of a migrated edge proof.
@@ -1376,6 +1368,8 @@ fn migrated_proof_body(path: &str) -> Option<&'static str> {
         "integrations/claude/eliot/.mcp.json" => Some(CLAUDE_PLUGIN_MCP),
         "plugin/eliot-governor/hooks/hooks.json" => Some(CODEX_PLUGIN_HOOKS),
         "integrations/claude/eliot/hooks/hooks.json" => Some(CLAUDE_PLUGIN_HOOKS),
+        "integrations/opencode/opencode.json" => Some(OPENCODE_CONFIG),
+        "integrations/codex/marketplace.json" => Some(CODEX_MARKETPLACE),
         _ => None,
     }
 }

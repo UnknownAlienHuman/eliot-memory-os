@@ -5,13 +5,14 @@
     "eliot": {
       "type": "local",
       "command": [
-        "{env:ELIOT_GOVERNOR_EXE}",
+        "{env:ELIOT_AGENT_BRIDGE_EXE}",
         "mcp",
+        "--profile",
+        "SPINE_FUNCTIONAL",
+        "--transport",
         "stdio",
-        "--host",
-        "opencode",
-        "--instance",
-        "default"
+        "--client-declaration",
+        "{env:ELIOT_AGENT_BRIDGE_DECLARATION}"
       ],
       "enabled": true,
       "timeout": 30000
