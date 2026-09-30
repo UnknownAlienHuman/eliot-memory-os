@@ -484,31 +484,7 @@ impl BootstrapScanEvidence {
             text(&adapter.adapter_ref, "adapters.adapter_ref")?;
             text(&adapter.kind, "adapters.kind")?;
         }
-        if let Some(candidates) = &self.governing_source_candidates {
-            Self::check_bounded(candidates.len(), 32, "governing_source_candidates")?;
-            for candidate in candidates {
-                text(
-                    &candidate.source_ref,
-                    "governing_source_candidates.source_ref",
-                )?;
-                if candidate
-                    .source_ref
-                    .split('/')
-                    .any(|part| part.is_empty() || part == "." || part == "..")
-                    || candidate.source_ref.starts_with('/')
-                    || candidate
-                        .source_ref
-                        .chars()
-                        .any(|character| character == '\\' || character == ':')
-                {
-                    return Err(WorkScopeError::InvalidSourceEvidence);
-                }
-            }
-            unique(
-                candidates.iter().map(|candidate| &candidate.source_ref),
-                "governing_source_candidates.source_ref",
-            )?;
-        }
+        validate_governing_source_candidates(self.governing_source_candidates.as_deref())?;
         Self::check_bounded(self.recent_changes.len(), 128, "recent_changes")?;
         for change in &self.recent_changes {
             text(
@@ -557,6 +533,56 @@ impl BootstrapScanEvidence {
         }
         Ok(())
     }
+}
+
+fn validate_governing_source_candidates(
+    candidates: Option<&[GoverningSourceCandidateEvidence]>,
+) -> Result<(), WorkScopeError> {
+    let Some(candidates) = candidates else {
+        return Ok(());
+    };
+    BootstrapScanEvidence::check_bounded(candidates.len(), 32, "governing_source_candidates")?;
+    for candidate in candidates {
+        text(
+            &candidate.source_ref,
+            "governing_source_candidates.source_ref",
+        )?;
+        if candidate
+            .source_ref
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+            || candidate.source_ref.starts_with('/')
+            || candidate
+                .source_ref
+                .chars()
+                .any(|character| character == '\\' || character == ':')
+        {
+            return Err(WorkScopeError::InvalidSourceEvidence);
+        }
+    }
+    unique(
+        candidates.iter().map(|candidate| &candidate.source_ref),
+        "governing_source_candidates.source_ref",
+    )
+}
+
+fn validate_governing_source_refs(
+    evidence: &BootstrapScanEvidence,
+    governing_source_refs: &[String],
+) -> Result<(), WorkScopeError> {
+    let observed = evidence
+        .governing_source_candidates
+        .as_deref()
+        .unwrap_or_default();
+    if observed.len() != governing_source_refs.len()
+        || observed
+            .iter()
+            .zip(governing_source_refs)
+            .any(|(candidate, source_ref)| candidate.source_ref != *source_ref)
+    {
+        return Err(WorkScopeError::BindingReceiptMismatch);
+    }
+    Ok(())
 }
 
 /// Durable record of what one scan was allowed, omitted, redacted, and left
@@ -1329,16 +1355,7 @@ impl BootstrapScanner {
             return Err(WorkScopeError::BindingReceiptMismatch);
         }
         evidence.validate()?;
-        let observed_source_refs = evidence
-            .governing_source_candidates
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .map(|candidate| candidate.source_ref.clone())
-            .collect::<Vec<_>>();
-        if governing_source_refs != observed_source_refs {
-            return Err(WorkScopeError::BindingReceiptMismatch);
-        }
+        validate_governing_source_refs(evidence, &governing_source_refs)?;
         check_verifier_candidates(verifier_candidates)?;
         let Some(boundary) = privacy_boundary else {
             return Ok(BootstrapScanOutcome::PrivacyBoundaryRequired {
@@ -1623,17 +1640,7 @@ pub fn run_bootstrap_discovery(
         policy.validate()?;
     }
     discovery.evidence.validate()?;
-    let observed_source_refs = discovery
-        .evidence
-        .governing_source_candidates
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .map(|candidate| candidate.source_ref.clone())
-        .collect::<Vec<_>>();
-    if discovery.governing_source_refs != observed_source_refs {
-        return Err(WorkScopeError::BindingReceiptMismatch);
-    }
+    validate_governing_source_refs(&discovery.evidence, &discovery.governing_source_refs)?;
     key.validate()?;
     lease
         .validate()
