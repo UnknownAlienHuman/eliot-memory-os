@@ -38,6 +38,13 @@ pub enum SecurityContractError {
     TaintLaundering,
     #[error("assessed source or profile is no longer current at the use boundary: {field}")]
     StaleSourceAssessment { field: &'static str },
+    #[error("security indicator {indicator} does not accept {evidence} evidence")]
+    SecurityIndicatorMismatch {
+        indicator: &'static str,
+        evidence: &'static str,
+    },
+    #[error("security indicator evidence does not establish its own class: {field}")]
+    IndicatorEvidenceUnproven { field: &'static str },
     #[error("revoked influence is still marked active")]
     RevokedInfluenceActive,
     #[error("revoked influence has no invalidation reason")]

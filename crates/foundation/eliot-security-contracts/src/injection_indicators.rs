@@ -1,0 +1,886 @@
+//! Finite indicator-to-source map for the I8.8 injection signals.
+//!
+//! The inventory is closed: exactly eight named indicator classes, each paired
+//! with one exact evidence shape, each mapped to one exact, source-revision
+//! scoped outcome. There is no textual classifier, no score and no threshold
+//! here. The producer supplies typed evidence; this map only decides which of
+//! the eight classes that evidence belongs to and what, if anything, that class
+//! is allowed to propose.
+//!
+//! Three properties are structural rather than documented:
+//!
+//! - A model-only observation resolves to
+//!   [`IndicatorResolution::CandidateOnly`]. That variant has no restriction
+//!   payload, so no quarantine, Incident or authority change is expressible
+//!   through it at any confidence.
+//! - The three content-shaped classes resolve to a candidate only even under a
+//!   deterministic rule, because instruction-like text is an observed or
+//!   suspected pattern and not proof of malicious intent.
+//! - A restriction carries no instruction taint of its own and no field for a
+//!   standing instruction, tool definition, policy, credential or Incident, so
+//!   no evidence payload and no source content can change one.
+
+use eliot_contracts::StateFence;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+use crate::surface_types::{
+    assessment_refs, assessment_text, AssessedSourceRevision, EffectCeiling, EpistemicUse,
+    SourceAssurance, SourceUseAuthority,
+};
+use crate::SecurityContractError;
+
+/// Number of indicator classes the I8.8 inventory fixes.
+pub const INDICATOR_CLASS_COUNT: usize = 8;
+
+/// The eight named I8.8 indicator classes, in inventory order.
+///
+/// This is the whole map. An observation belongs to exactly one of these, or it
+/// is not classified here.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum IndicatorClass {
+    /// External document attempts to issue system/tool instructions.
+    ExternalInstructionAttempt,
+    /// Tool Definition changes name/schema/defaults unexpectedly.
+    UnexpectedToolDefinitionChange,
+    /// Source asks to persist a standing instruction or secret.
+    StandingInstructionOrSecretPersistence,
+    /// Summary attempts to raise source authority.
+    SummaryAuthorityEscalation,
+    /// Multiple model outputs repeat one poisoned lineage.
+    RepeatedPoisonedLineage,
+    /// Remote Dream query attempts broad data extraction.
+    OverbroadRemoteDreamExtraction,
+    /// Memory transformation drops origin/minority evidence.
+    DroppedOriginOrMinorityEvidence,
+    /// Procedure candidate introduces an undeclared side effect.
+    UndeclaredProcedureEffect,
+}
+
+impl IndicatorClass {
+    /// Every indicator class, in inventory order.
+    pub const ALL: [Self; INDICATOR_CLASS_COUNT] = [
+        Self::ExternalInstructionAttempt,
+        Self::UnexpectedToolDefinitionChange,
+        Self::StandingInstructionOrSecretPersistence,
+        Self::SummaryAuthorityEscalation,
+        Self::RepeatedPoisonedLineage,
+        Self::OverbroadRemoteDreamExtraction,
+        Self::DroppedOriginOrMinorityEvidence,
+        Self::UndeclaredProcedureEffect,
+    ];
+
+    /// What this class is permitted to propose from a matching evidence row.
+    ///
+    /// I8.8 records that textual instruction-like content is an observed or
+    /// suspected pattern, not proof of malicious intent, so the three
+    /// content-shaped classes are confined to
+    /// [`IndicatorResponse::SuspectedPattern`] and can never produce a
+    /// restriction, whatever rule observes them. The five classes whose
+    /// evidence is an exact comparison — approved-schema delta, request
+    /// scope/effect comparison, or a verified transformation record — may
+    /// propose a bounded restriction, and only from an independent
+    /// deterministic rule.
+    pub const fn response(self) -> IndicatorResponse {
+        match self {
+            Self::ExternalInstructionAttempt
+            | Self::StandingInstructionOrSecretPersistence
+            | Self::SummaryAuthorityEscalation => IndicatorResponse::SuspectedPattern,
+            Self::UnexpectedToolDefinitionChange
+            | Self::RepeatedPoisonedLineage
+            | Self::OverbroadRemoteDreamExtraction
+            | Self::DroppedOriginOrMinorityEvidence
+            | Self::UndeclaredProcedureEffect => IndicatorResponse::BoundedRestriction,
+        }
+    }
+
+    /// The uses this class may leave admissible, before intersection.
+    ///
+    /// A suspected-pattern class has no restricted set, because it can never
+    /// reach a restriction; the empty slice it returns is what stops a
+    /// suspected pattern from ever removing a use.
+    pub const fn permitted_uses(self) -> &'static [EpistemicUse] {
+        const OBSERVED_CANDIDATE: &[EpistemicUse] = &[
+            EpistemicUse::Observation,
+            EpistemicUse::CandidateEvidence,
+        ];
+        const SUSPECTED_PATTERN_NONE: &[EpistemicUse] = &[];
+        match self {
+            Self::ExternalInstructionAttempt
+            | Self::StandingInstructionOrSecretPersistence
+            | Self::SummaryAuthorityEscalation => SUSPECTED_PATTERN_NONE,
+            Self::UnexpectedToolDefinitionChange
+            | Self::RepeatedPoisonedLineage
+            | Self::OverbroadRemoteDreamExtraction
+            | Self::DroppedOriginOrMinorityEvidence
+            | Self::UndeclaredProcedureEffect => OBSERVED_CANDIDATE,
+        }
+    }
+
+    /// The effect ceilings this class may leave admissible, before
+    /// intersection.
+    ///
+    /// The same rule applies: a suspected-pattern class contributes no effect
+    /// ceiling.
+    pub const fn permitted_effects(self) -> &'static [EffectCeiling] {
+        const READ_ONLY_NO_EXTERNAL: &[EffectCeiling] =
+            &[EffectCeiling::ReadOnly, EffectCeiling::NoExternalEffect];
+        const READ_ONLY_CANDIDATE: &[EffectCeiling] =
+            &[EffectCeiling::ReadOnly, EffectCeiling::CandidateOnly];
+        const SUSPECTED_PATTERN_NONE: &[EffectCeiling] = &[];
+        match self {
+            Self::ExternalInstructionAttempt
+            | Self::StandingInstructionOrSecretPersistence
+            | Self::SummaryAuthorityEscalation => SUSPECTED_PATTERN_NONE,
+            Self::RepeatedPoisonedLineage | Self::DroppedOriginOrMinorityEvidence => {
+                READ_ONLY_CANDIDATE
+            }
+            Self::UnexpectedToolDefinitionChange
+            | Self::OverbroadRemoteDreamExtraction
+            | Self::UndeclaredProcedureEffect => READ_ONLY_NO_EXTERNAL,
+        }
+    }
+
+    /// Whether this class accepts exactly the supplied evidence shape.
+    ///
+    /// This is the closed pairing of the map. A caller that supplies one
+    /// class's evidence under another class's name is refused.
+    pub fn accepts(self, evidence: &IndicatorEvidence) -> bool {
+        evidence.class() == self
+    }
+
+    /// Opaque class name, for contract error text and stable cross-owner
+    /// reference.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::ExternalInstructionAttempt => "EXTERNAL_INSTRUCTION_ATTEMPT",
+            Self::UnexpectedToolDefinitionChange => "UNEXPECTED_TOOL_DEFINITION_CHANGE",
+            Self::StandingInstructionOrSecretPersistence => {
+                "STANDING_INSTRUCTION_OR_SECRET_PERSISTENCE"
+            }
+            Self::SummaryAuthorityEscalation => "SUMMARY_AUTHORITY_ESCALATION",
+            Self::RepeatedPoisonedLineage => "REPEATED_POISONED_LINEAGE",
+            Self::OverbroadRemoteDreamExtraction => "OVERBROAD_REMOTE_DREAM_EXTRACTION",
+            Self::DroppedOriginOrMinorityEvidence => "DROPPED_ORIGIN_OR_MINORITY_EVIDENCE",
+            Self::UndeclaredProcedureEffect => "UNDECLARED_PROCEDURE_EFFECT",
+        }
+    }
+}
+
+/// How much of the eight classes a single class is allowed to propose.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum IndicatorResponse {
+    /// Recorded as an observed or suspected pattern. Never a restriction, and
+    /// never by itself a malicious-source finding.
+    SuspectedPattern,
+    /// May propose a bounded restriction, and only from an independent
+    /// deterministic rule over the exact comparison evidence.
+    BoundedRestriction,
+}
+
+/// What a producer states about a foreign instruction-shaped passage.
+///
+/// The producer classifies the passage's role in the retained bytes. A quoted
+/// example inside otherwise ordinary prose stays retained inert evidence, so a
+/// benign example cannot become an admitted malicious-source finding. This is a
+/// typed, finite choice, never a text match.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ExternalContentRole {
+    /// The retained bytes address the reader as system or tool.
+    DirectInstruction,
+    /// The retained bytes quote an instruction-shaped example inside prose.
+    QuotedExample,
+    /// The retained bytes describe an instruction without issuing one.
+    Narration,
+}
+
+/// Which exact approved-schema field a tool definition changed.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ToolDefinitionDelta {
+    Name,
+    Schema,
+    Default,
+}
+
+/// What a source asked to have persisted beyond the current operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PersistenceRequest {
+    StandingInstruction,
+    Secret,
+    StandingInstructionAndSecret,
+}
+
+/// Scope a remote Dream request reached for, against what was admitted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ExtractionScope {
+    /// Every project rather than the admitted scope.
+    AllProjects,
+    /// Every source revision rather than the named handles.
+    AllSourceRevisions,
+    /// Recipient domains outside the admitted disclosure domain.
+    CrossDomain,
+}
+
+/// Which kind of retained memory evidence a transformation dropped.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DroppedEvidenceKind {
+    OriginProvenance,
+    MinorityPosition,
+    OriginAndMinority,
+}
+
+/// External material that attempts to issue system or tool instructions.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalInstructionEvidence {
+    /// Retained immutable artifact the passage was read from.
+    pub retained_source_ref: String,
+    /// Retained handles for the passage itself, in the restricted store.
+    pub evidence_handles: Vec<String>,
+    /// The producer's classification of the passage's role.
+    pub content_role: ExternalContentRole,
+}
+
+/// An installed tool definition that departs from the approved schema.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ToolDefinitionChangeEvidence {
+    /// Installed tool definition revision observed.
+    pub observed_tool_ref: String,
+    /// The exact non-empty deltas, compared field by field.
+    pub deltas: Vec<ToolDefinitionDelta>,
+    /// Approved schema revision the deltas were computed against. Absent means
+    /// the comparison baseline is unknown, so the class bounds nothing.
+    pub approved_schema_revision: Option<String>,
+}
+
+/// A source asking to persist a standing instruction or a secret.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PersistenceRequestEvidence {
+    /// Retained immutable artifact the request was read from.
+    pub retained_source_ref: String,
+    /// Retained handles for the request itself, in the restricted store.
+    pub evidence_handles: Vec<String>,
+    /// Exactly what the source asked to have persisted.
+    pub requested: PersistenceRequest,
+}
+
+/// A derived summary claiming a use its source owner does not grant.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SummaryAuthorityEvidence {
+    /// The summary revision that made the claim.
+    pub summary_ref: String,
+    /// The use the summary claimed for its source.
+    pub claimed_use: EpistemicUse,
+    /// The uses the current source owner actually grants. Absent means the claim
+    /// cannot be compared, so the class bounds nothing.
+    pub owner_permitted_uses: Option<Vec<EpistemicUse>>,
+}
+
+/// Several outputs repeating one lineage a transformation record marks bad.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RepeatedLineageEvidence {
+    /// The lineage all the outputs repeat.
+    pub lineage_ref: String,
+    /// The distinct outputs that repeat it; at least two are required.
+    pub repeated_output_refs: Vec<String>,
+    /// Verified transformation record for the lineage. Absent means the lineage
+    /// cannot be verified, so the class bounds nothing.
+    pub transformation_ref: Option<String>,
+}
+
+/// A remote Dream request reaching beyond its admitted handles and question.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BroadExtractionEvidence {
+    /// The bounded request that was issued.
+    pub request_ref: String,
+    /// The exact handles the request was admitted for.
+    pub admitted_handle_refs: Vec<String>,
+    /// The scope the request actually reached for.
+    pub requested_scope: ExtractionScope,
+    /// The admitted-scope handles the request exceeded. Non-empty, or the
+    /// request reached nothing beyond its admitted scope.
+    pub exceeded_handle_refs: Vec<String>,
+}
+
+/// A transformation that dropped retained origin or minority evidence.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DroppedEvidenceRecord {
+    /// The transformation that dropped the evidence.
+    pub transformation_ref: String,
+    /// Which kind of evidence it dropped.
+    pub dropped: DroppedEvidenceKind,
+    /// Retained handles for the dropped origin provenance.
+    pub dropped_origin_refs: Vec<String>,
+    /// Retained handles for the dropped minority position.
+    pub dropped_minority_refs: Vec<String>,
+    /// Verified transformation record. Absent means the drop cannot be
+    /// attributed, so the class bounds nothing.
+    pub verified_transformation_ref: Option<String>,
+}
+
+/// A procedure candidate performing an effect it never declared.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UndeclaredEffectEvidence {
+    /// The procedure candidate revision.
+    pub procedure_ref: String,
+    /// The effect observed outside the candidate's declared effects.
+    pub observed_effect: EffectCeiling,
+    /// The effects the candidate declared. Absent means the declaration cannot
+    /// be compared, so the class bounds nothing.
+    pub declared_effects: Option<Vec<EffectCeiling>>,
+}
+
+/// The exact evidence shape that belongs to each indicator class.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "indicator", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+pub enum IndicatorEvidence {
+    ExternalInstructionAttempt(ExternalInstructionEvidence),
+    UnexpectedToolDefinitionChange(ToolDefinitionChangeEvidence),
+    StandingInstructionOrSecretPersistence(PersistenceRequestEvidence),
+    SummaryAuthorityEscalation(SummaryAuthorityEvidence),
+    RepeatedPoisonedLineage(RepeatedLineageEvidence),
+    OverbroadRemoteDreamExtraction(BroadExtractionEvidence),
+    DroppedOriginOrMinorityEvidence(DroppedEvidenceRecord),
+    UndeclaredProcedureEffect(UndeclaredEffectEvidence),
+}
+
+impl IndicatorEvidence {
+    /// The one indicator class this evidence shape belongs to.
+    pub const fn class(&self) -> IndicatorClass {
+        match self {
+            Self::ExternalInstructionAttempt(_) => IndicatorClass::ExternalInstructionAttempt,
+            Self::UnexpectedToolDefinitionChange(_) => {
+                IndicatorClass::UnexpectedToolDefinitionChange
+            }
+            Self::StandingInstructionOrSecretPersistence(_) => {
+                IndicatorClass::StandingInstructionOrSecretPersistence
+            }
+            Self::SummaryAuthorityEscalation(_) => IndicatorClass::SummaryAuthorityEscalation,
+            Self::RepeatedPoisonedLineage(_) => IndicatorClass::RepeatedPoisonedLineage,
+            Self::OverbroadRemoteDreamExtraction(_) => {
+                IndicatorClass::OverbroadRemoteDreamExtraction
+            }
+            Self::DroppedOriginOrMinorityEvidence(_) => {
+                IndicatorClass::DroppedOriginOrMinorityEvidence
+            }
+            Self::UndeclaredProcedureEffect(_) => IndicatorClass::UndeclaredProcedureEffect,
+        }
+    }
+
+    /// Whether every comparison input this class needs was available.
+    ///
+    /// A missing approved-schema baseline, transformation record, owner
+    /// assurance or declared-effect list is reported here, so a caller cannot
+    /// record a bounded restriction over a comparison that was never made. An
+    /// instruction-shaped passage that the producer classified as a quoted
+    /// example or as narration establishes no attempt by this source at all, so
+    /// it reports unknown coverage rather than complete.
+    pub const fn has_comparison_inputs(&self) -> bool {
+        match self {
+            Self::ExternalInstructionAttempt(evidence) => {
+                matches!(evidence.content_role, ExternalContentRole::DirectInstruction)
+            }
+            Self::StandingInstructionOrSecretPersistence(_) => true,
+            Self::UnexpectedToolDefinitionChange(evidence) => {
+                evidence.approved_schema_revision.is_some()
+            }
+            Self::SummaryAuthorityEscalation(evidence) => {
+                evidence.owner_permitted_uses.is_some()
+            }
+            Self::RepeatedPoisonedLineage(evidence) => evidence.transformation_ref.is_some(),
+            Self::OverbroadRemoteDreamExtraction(_) => true,
+            Self::DroppedOriginOrMinorityEvidence(evidence) => {
+                evidence.verified_transformation_ref.is_some()
+            }
+            Self::UndeclaredProcedureEffect(evidence) => evidence.declared_effects.is_some(),
+        }
+    }
+
+    /// Validates the evidence's own shape and the comparisons it claims.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a reference is blank or duplicated, a required
+    /// collection is empty, or the evidence does not actually establish its own
+    /// class.
+    pub fn validate(&self) -> Result<(), SecurityContractError> {
+        match self {
+            Self::ExternalInstructionAttempt(evidence)
+            | Self::StandingInstructionOrSecretPersistence(evidence) => {
+                validate_retained(&evidence.retained_source_ref, &evidence.evidence_handles)
+            }
+            Self::UnexpectedToolDefinitionChange(evidence) => {
+                assessment_text(
+                    &evidence.observed_tool_ref,
+                    "tool_definition.observed_tool_ref",
+                )?;
+                if evidence.deltas.is_empty() {
+                    return Err(SecurityContractError::EmptyCollection {
+                        field: "tool_definition.deltas",
+                    });
+                }
+                let mut seen = std::collections::BTreeSet::new();
+                for delta in &evidence.deltas {
+                    if !seen.insert(*delta) {
+                        return Err(SecurityContractError::DuplicateReference {
+                            field: "tool_definition.deltas",
+                        });
+                    }
+                }
+                if let Some(revision) = &evidence.approved_schema_revision {
+                    assessment_text(revision, "tool_definition.approved_schema_revision")?;
+                }
+                Ok(())
+            }
+            Self::SummaryAuthorityEscalation(evidence) => {
+                assessment_text(&evidence.summary_ref, "summary.summary_ref")?;
+                if let Some(permitted) = &evidence.owner_permitted_uses {
+                    if permitted.is_empty() {
+                        return Err(SecurityContractError::EmptyCollection {
+                            field: "summary.owner_permitted_uses",
+                        });
+                    }
+                    if permitted.contains(&evidence.claimed_use) {
+                        return Err(SecurityContractError::IndicatorEvidenceUnproven {
+                            field: "summary.claimed_use",
+                        });
+                    }
+                }
+                Ok(())
+            }
+            Self::RepeatedPoisonedLineage(evidence) => {
+                assessment_text(&evidence.lineage_ref, "lineage.lineage_ref")?;
+                if evidence.repeated_output_refs.len() < 2 {
+                    return Err(SecurityContractError::IndicatorEvidenceUnproven {
+                        field: "lineage.repeated_output_refs",
+                    });
+                }
+                assessment_refs(
+                    &evidence.repeated_output_refs,
+                    "lineage.repeated_output_refs",
+                )?;
+                if let Some(reference) = &evidence.transformation_ref {
+                    assessment_text(reference, "lineage.transformation_ref")?;
+                }
+                Ok(())
+            }
+            Self::OverbroadRemoteDreamExtraction(evidence) => {
+                assessment_text(&evidence.request_ref, "extraction.request_ref")?;
+                assessment_refs(
+                    &evidence.admitted_handle_refs,
+                    "extraction.admitted_handle_refs",
+                )?;
+                if evidence.exceeded_handle_refs.is_empty() {
+                    return Err(SecurityContractError::IndicatorEvidenceUnproven {
+                        field: "extraction.exceeded_handle_refs",
+                    });
+                }
+                assessment_refs(
+                    &evidence.exceeded_handle_refs,
+                    "extraction.exceeded_handle_refs",
+                )
+            }
+            Self::DroppedOriginOrMinorityEvidence(evidence) => {
+                assessment_text(
+                    &evidence.transformation_ref,
+                    "dropped.transformation_ref",
+                )?;
+                // The declared kind must match what was actually dropped, so a
+                // record cannot claim one kind while carrying the other's
+                // handles.
+                let declares_origin = !matches!(
+                    evidence.dropped,
+                    DroppedEvidenceKind::MinorityPosition
+                );
+                let declares_minority = !matches!(
+                    evidence.dropped,
+                    DroppedEvidenceKind::OriginProvenance
+                );
+                if declares_origin {
+                    if evidence.dropped_origin_refs.is_empty() {
+                        return Err(SecurityContractError::EmptyCollection {
+                            field: "dropped.dropped_origin_refs",
+                        });
+                    }
+                    assessment_refs(
+                        &evidence.dropped_origin_refs,
+                        "dropped.dropped_origin_refs",
+                    )?;
+                }
+                if declares_minority {
+                    if evidence.dropped_minority_refs.is_empty() {
+                        return Err(SecurityContractError::EmptyCollection {
+                            field: "dropped.dropped_minority_refs",
+                        });
+                    }
+                    assessment_refs(
+                        &evidence.dropped_minority_refs,
+                        "dropped.dropped_minority_refs",
+                    )?;
+                }
+                if let Some(reference) = &evidence.verified_transformation_ref {
+                    assessment_text(reference, "dropped.verified_transformation_ref")?;
+                }
+                Ok(())
+            }
+            Self::UndeclaredProcedureEffect(evidence) => {
+                assessment_text(&evidence.procedure_ref, "procedure.procedure_ref")?;
+                if let Some(declared) = &evidence.declared_effects {
+                    if declared.is_empty() {
+                        return Err(SecurityContractError::EmptyCollection {
+                            field: "procedure.declared_effects",
+                        });
+                    }
+                    if declared.contains(&evidence.observed_effect) {
+                        return Err(SecurityContractError::IndicatorEvidenceUnproven {
+                            field: "procedure.observed_effect",
+                        });
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// The retained references this record cites, sorted and de-duplicated.
+    fn cited_refs(&self) -> Vec<String> {
+        let mut refs = match self {
+            Self::ExternalInstructionAttempt(evidence) => {
+                evidence.evidence_handles.clone()
+            }
+            Self::StandingInstructionOrSecretPersistence(evidence) => {
+                evidence.evidence_handles.clone()
+            }
+            Self::UnexpectedToolDefinitionChange(evidence) => {
+                vec![evidence.observed_tool_ref.clone()]
+            }
+            Self::SummaryAuthorityEscalation(evidence) => vec![evidence.summary_ref.clone()],
+            Self::RepeatedPoisonedLineage(evidence) => {
+                let mut refs = vec![evidence.lineage_ref.clone()];
+                refs.extend(evidence.repeated_output_refs.iter().cloned());
+                refs
+            }
+            Self::OverbroadRemoteDreamExtraction(evidence) => {
+                vec![evidence.request_ref.clone()]
+            }
+            Self::DroppedOriginOrMinorityEvidence(evidence) => {
+                vec![evidence.transformation_ref.clone()]
+            }
+            Self::UndeclaredProcedureEffect(evidence) => vec![evidence.procedure_ref.clone()],
+        };
+        refs.sort();
+        refs.dedup();
+        refs
+    }
+}
+
+/// Coverage of the comparison inputs one indicator resolution used.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+pub enum IndicatorCoverage {
+    /// Every required baseline, lineage or sensor record was present.
+    Complete,
+    /// A required comparison input was absent, so the class bounds nothing.
+    UnknownComparisonInput,
+}
+
+/// Who produced the observation behind a resolution.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "origin", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+pub enum IndicatorObservation {
+    /// An independent observation, optionally bound to a deterministic rule.
+    ///
+    /// Without a bound rule revision this observation is still an observation
+    /// and not an authority: it resolves to
+    /// [`IndicatorResolution::CandidateOnly`].
+    Independent {
+        /// Opaque observer identity.
+        observer_ref: String,
+        /// Revision of the observation itself.
+        observation_revision: String,
+        /// Deterministic rule that produced the comparison.
+        rule_ref: Option<String>,
+        /// Revision of that rule, required whenever `rule_ref` is present.
+        rule_revision: Option<String>,
+    },
+    /// An optional model-proposed interpretation.
+    ///
+    /// This shape has no rule identity and no deterministic flag, so a model
+    /// cannot supply one. It always resolves to
+    /// [`IndicatorResolution::CandidateOnly`].
+    ModelProposal {
+        /// Opaque model identity.
+        model_ref: String,
+        /// Revision of that model.
+        model_revision: String,
+        /// Profile revision the proposal was made under.
+        profile_revision: String,
+    },
+}
+
+impl IndicatorObservation {
+    /// The deterministic rule binding, when an independent observation has one.
+    pub fn rule_binding(&self) -> Option<(&str, &str)> {
+        match self {
+            Self::Independent {
+                rule_ref: Some(rule_ref),
+                rule_revision: Some(rule_revision),
+                ..
+            } => Some((rule_ref.as_str(), rule_revision.as_str())),
+            _ => None,
+        }
+    }
+
+    /// Validates the observation's own provenance shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a provenance reference is blank, or when a rule
+    /// reference is present without its revision.
+    pub fn validate(&self) -> Result<(), SecurityContractError> {
+        match self {
+            Self::Independent {
+                observer_ref,
+                observation_revision,
+                rule_ref,
+                rule_revision,
+            } => {
+                assessment_text(observer_ref, "observation.observer_ref")?;
+                assessment_text(observation_revision, "observation.observation_revision")?;
+                if rule_ref.is_some() != rule_revision.is_some() {
+                    return Err(SecurityContractError::InvalidText {
+                        field: "observation.rule_binding",
+                    });
+                }
+                if let Some(reference) = rule_ref {
+                    assessment_text(reference, "observation.rule_ref")?;
+                }
+                if let Some(revision) = rule_revision {
+                    assessment_text(revision, "observation.rule_revision")?;
+                }
+                Ok(())
+            }
+            Self::ModelProposal {
+                model_ref,
+                model_revision,
+                profile_revision,
+            } => {
+                assessment_text(model_ref, "observation.model_ref")?;
+                assessment_text(model_revision, "observation.model_revision")?;
+                assessment_text(profile_revision, "observation.profile_revision")
+            }
+        }
+    }
+}
+
+/// A bounded, source-revision scoped restriction an indicator may propose.
+///
+/// Every permitted set here is later intersected with the assurance in force
+/// for the same operation, and the resolved instruction taint is taken from
+/// that assurance verbatim, so this record can only remove uses and effects. It
+/// has no field for a standing instruction, tool definition, policy, credential
+/// or Incident.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposedSourceRestriction {
+    /// The indicator class this restriction came from.
+    pub indicator: IndicatorClass,
+    /// The exact source revision, digest and scope it is bound to.
+    pub assessed_source: AssessedSourceRevision,
+    /// Uses this indicator may leave admissible, before intersection.
+    pub permitted_uses: &'static [EpistemicUse],
+    /// Effect ceilings this indicator may leave admissible, before
+    /// intersection.
+    pub permitted_effects: &'static [EffectCeiling],
+    /// The deterministic rule that supports the restriction.
+    pub rule_ref: String,
+    /// The revision of that rule.
+    pub rule_revision: String,
+    /// The condition under which the restriction may later be released.
+    pub release_condition: String,
+    /// The fence this restriction was prepared under.
+    pub state_fence: StateFence,
+}
+
+impl ProposedSourceRestriction {
+    /// Resolves the restricted use authority for one exact operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the fence in force is not the fence this
+    /// restriction was prepared under, or when the source revision no longer
+    /// matches the one this restriction names.
+    pub fn resolve_use(
+        &self,
+        current_assurance: &SourceAssurance,
+        state_fence: &StateFence,
+    ) -> Result<SourceUseAuthority, SecurityContractError> {
+        if self.state_fence != *state_fence {
+            return Err(SecurityContractError::FenceMismatch);
+        }
+        if self.assessed_source.source_ref != current_assurance.source_ref {
+            return Err(SecurityContractError::StaleSourceAssessment {
+                field: "restriction.assessed_source.source_ref",
+            });
+        }
+        Ok(SourceUseAuthority {
+            assessed_source: self.assessed_source.clone(),
+            permitted_uses: intersect(
+                self.permitted_uses,
+                &current_assurance.allowed_epistemic_use,
+            ),
+            permitted_effects: intersect(
+                self.permitted_effects,
+                &current_assurance.allowed_effects,
+            ),
+            instruction_taint: current_assurance.instruction_taint,
+            state_fence: state_fence.clone(),
+        })
+    }
+}
+
+/// What the map resolved one indicator to, for one exact source revision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IndicatorResolution {
+    /// Candidate evidence only.
+    ///
+    /// This variant has no restriction payload, so producing it performs zero
+    /// quarantine, Incident and authority mutations. A model-only proposal, an
+    /// incomplete comparison, and every content-shaped class resolve here.
+    CandidateOnly {
+        /// The indicator class that was recorded.
+        indicator: IndicatorClass,
+        /// The exact source revision the record is scoped to.
+        assessed_source: AssessedSourceRevision,
+        /// Coverage of the comparison inputs that were available.
+        coverage: IndicatorCoverage,
+        /// Retained evidence references, sorted and de-duplicated.
+        cited_refs: Vec<String>,
+    },
+    /// A bounded restriction a deterministic rule supports.
+    BoundedRestriction(ProposedSourceRestriction),
+}
+
+impl IndicatorResolution {
+    /// The restriction, when this resolution carries one.
+    pub fn restriction(&self) -> Option<&ProposedSourceRestriction> {
+        match self {
+            Self::CandidateOnly { .. } => None,
+            Self::BoundedRestriction(restriction) => Some(restriction),
+        }
+    }
+}
+
+/// The finite indicator-to-source map.
+pub struct IndicatorSourceMap;
+
+impl IndicatorSourceMap {
+    /// Resolves one indicator against one exact assessed source revision.
+    ///
+    /// The class and the evidence must be the closed pair the map defines, the
+    /// evidence must establish its own class, and the observation must carry
+    /// its own provenance. A restriction is produced only when the class may
+    /// propose one, every comparison input was present, and an independent
+    /// deterministic rule binding exists. Every other combination — a
+    /// model-only proposal, an incomplete comparison, or a content-shaped
+    /// class — resolves to [`IndicatorResolution::CandidateOnly`], which carries
+    /// no restriction and therefore mutates no authority.
+    ///
+    /// `release_condition` is required for a restriction and must state the
+    /// discriminating evidence that would release it. It is ignored for a
+    /// candidate-only resolution, which has no release to describe.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the evidence is malformed, when the class does not
+    /// accept it, when the observation provenance is malformed, or when a
+    /// restriction would be produced with no usable release condition.
+    pub fn resolve(
+        class: IndicatorClass,
+        evidence: &IndicatorEvidence,
+        observation: &IndicatorObservation,
+        assessed_source: &AssessedSourceRevision,
+        state_fence: &StateFence,
+        release_condition: Option<&str>,
+    ) -> Result<IndicatorResolution, SecurityContractError> {
+        if !class.accepts(evidence) {
+            return Err(SecurityContractError::SecurityIndicatorMismatch {
+                indicator: class.name(),
+                evidence: evidence.class().name(),
+            });
+        }
+        evidence.validate()?;
+        observation.validate()?;
+
+        let coverage = if evidence.has_comparison_inputs() {
+            IndicatorCoverage::Complete
+        } else {
+            IndicatorCoverage::UnknownComparisonInput
+        };
+        let candidate_only = |coverage: IndicatorCoverage| -> Result<_, SecurityContractError> {
+            Ok(IndicatorResolution::CandidateOnly {
+                indicator: class,
+                assessed_source: assessed_source.clone(),
+                coverage,
+                cited_refs: evidence.cited_refs(),
+            })
+        };
+        if coverage != IndicatorCoverage::Complete
+            || class.response() != IndicatorResponse::BoundedRestriction
+        {
+            return candidate_only(coverage);
+        }
+        let Some((rule_ref, rule_revision)) = observation.rule_binding() else {
+            return candidate_only(coverage);
+        };
+        let condition = release_condition
+            .map(str::trim)
+            .filter(|condition| !condition.is_empty())
+            .ok_or(SecurityContractError::InvalidText {
+                field: "restriction.release_condition",
+            })?;
+        Ok(IndicatorResolution::BoundedRestriction(
+            ProposedSourceRestriction {
+                indicator: class,
+                assessed_source: assessed_source.clone(),
+                permitted_uses: class.permitted_uses(),
+                permitted_effects: class.permitted_effects(),
+                rule_ref: rule_ref.to_owned(),
+                rule_revision: rule_revision.to_owned(),
+                release_condition: condition.to_owned(),
+                state_fence: state_fence.clone(),
+            },
+        ))
+    }
+}
+
+fn validate_retained(
+    source_ref: &str,
+    evidence_handles: &[String],
+) -> Result<(), SecurityContractError> {
+    assessment_text(source_ref, "retained_source_ref")?;
+    assessment_refs(evidence_handles, "evidence_handles")
+}
+
+fn intersect<T: Copy + PartialEq>(left: &[T], right: &[T]) -> Vec<T> {
+    let mut narrowed: Vec<T> = Vec::new();
+    for value in left {
+        if right.contains(value) && !narrowed.contains(value) {
+            narrowed.push(*value);
+        }
+    }
+    narrowed
+}
