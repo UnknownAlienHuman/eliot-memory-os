@@ -722,14 +722,17 @@ fn mcp_observation_envelope(
     expected_ordering_sequence: u64,
     task_selection: Option<&TaskSelectionAdmissionBinding>,
 ) -> Result<CanonicalWriteEnvelope, CompositionError> {
-    let submission_value = serde_json::to_value(submission)
+    let submission_json = serde_json::to_string(submission)
         .map_err(|error| owner_refused(error.to_string()))?;
     let mut parameters = BTreeMap::new();
     parameters.insert(
         "subject".to_owned(),
         serde_json::Value::String(submission.record.record_id.clone()),
     );
-    parameters.insert("observation_submission".to_owned(), submission_value);
+    parameters.insert(
+        "observation_submission_json".to_owned(),
+        serde_json::Value::String(submission_json),
+    );
     let fence = &identity.request.metadata.state_fence;
     let mut envelope = CanonicalWriteEnvelope {
         operation_id: operation_id.clone(),
