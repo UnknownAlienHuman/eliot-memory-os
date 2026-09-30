@@ -5,7 +5,7 @@
 //! Implementation: I8.2 (docs/architecture/I08-02-independent-observation-routes.md#i82-independent-observation-routes),
 //! I8.3 (docs/architecture/I08-03-supervision-decisions-and-containment.md#i83-supervision-decisions-and-containment),
 //! I8.18 (docs/architecture/I08-18-system-feedback-memorycontext-health-and-maintenance-debt.md#i818-system-feedback-memorycontext-health-and-maintenance-debt).
-//! Issue #2381 steps 1, 2 and 4.
+//! Issue #2381 steps 1, 2, 3 and 4.
 //!
 //! The five I8.18 rules are pure functions in `eliot_watchdog_core::health_detectors`.
 //! They were written, exported, and never invoked: nothing joined them to an
@@ -58,21 +58,26 @@
 //! Observation projection only. This module reads, computes, and publishes a
 //! bounded trace. It writes no spool record, mints no lease, epoch, authority,
 //! or intent, performs no canonical, ORS, or HostStateJournal write, and starts
-//! no second escalation path. `#1761` routes and Diagnostic Brief compilation
-//! consume these signals; they are not re-owned here.
+//! no second escalation path. Persistent or cross-cutting drift is compiled here
+//! into one Diagnostic Brief input with one bounded Dreamer/Watchdog-Agent
+//! analysis request through the existing #1761 [`RiskRoute`] contract
+//! ([`RiskRoute::CheapDiagnosis`]); the request is published on the same bounded
+//! trace the signals use, so no parallel escalation path and no Dreamer
+//! dependency are introduced.
 
 use std::sync::Mutex;
 
 use eliot_contracts::sha256_hex;
 use eliot_watchdog_core::{
-    ClockDomain, ContextQualityBounds, ContextQualityObservation, CountDelta, CoverageRef,
-    CoverageGapExplanation, EvidenceRef, ExpectedRevision, HealthDetection, HealthEvidenceHandles,
-    HealthNoSignalReason, HealthObservationPair, HealthOutputFamily, HealthSignalContext,
-    MaintenanceDebtInput, MemoryUtilityDeltas, ObservedTime, PolicyBound, ProhibitedEffectAttempt,
-    ProhibitedEffectClass, ProhibitedEffectDenial, ProfileRevision, RecordedValue, Signal,
-    SignalReferences, SignalTarget, SourceEventRef, StateDeltaPresence, TimeUnit,
+    BriefPersistence, ClockDomain, ContextQualityBounds, ContextQualityObservation, CountDelta,
+    CoverageRef, CoverageGapExplanation, EvidenceRef, ExpectedRevision, HealthAnalysisRequest,
+    HealthDetection, HealthDiagnosticBrief, HealthEvidenceHandles, HealthNoSignalReason,
+    HealthObservationPair, HealthOutputFamily, HealthSignalContext, MaintenanceDebtInput,
+    MemoryUtilityDeltas, ObservedTime, PolicyBound, ProhibitedEffectAttempt, ProhibitedEffectClass,
+    ProhibitedEffectDenial, ProfileRevision, RecordedValue, RiskRoute, Signal, SignalReferences,
+    SignalTarget, SourceEventRef, StateDeltaPresence, TimeUnit, compile_health_brief,
     evaluate_agent_loop, evaluate_context_quality, evaluate_maintenance_debt,
-    evaluate_memory_utility, evaluate_observation_coverage,
+    evaluate_memory_utility, evaluate_observation_coverage, request_health_analysis,
 };
 
 use crate::PROTOCOL_VERSION;
@@ -207,6 +212,16 @@ struct HealthProjectionState {
     revisions: Option<ObservedRevisions>,
     /// The previous closed interval, or `None` before the second one.
     previous: Option<IntervalRecord>,
+    /// Rule identities the last compared interval emitted, or empty when it
+    /// emitted nothing or was never compared. At most one entry per rule, so
+    /// this never exceeds the five I8.18 rule families. A non-compared interval
+    /// clears it, so persistence always means consecutive compared intervals.
+    previous_emission_rules: Vec<&'static str>,
+    /// Compiled-brief identities already requested, oldest first, with the
+    /// request count each has drawn. Bounded by [`MAX_TRACKED_BRIEFS`]: the
+    /// oldest identity is evicted first, which only loses degradation memory
+    /// for drift that stopped recurring.
+    requested_briefs: Vec<BriefRequestRecord>,
 }
 
 /// The bounded comparison state of this owner's health projection.
@@ -242,6 +257,40 @@ pub struct HealthSignalEmission {
     pub subject: String,
     /// One fail-closed denial per prohibited effect class.
     pub denied_effects: Vec<ProhibitedEffectDenial>,
+}
+
+/// Maximum compiled-brief identities retained for ineffective-analysis counting.
+///
+/// The history exists only so a recompiled brief proves its earlier analysis
+/// request did not clear the drift. It is an observation buffer, not durable
+/// state: a restart loses it, which only restarts degradation counting and can
+/// never fabricate a request.
+const MAX_TRACKED_BRIEFS: usize = 8;
+
+/// One compiled-brief identity with the bounded analysis requests it has drawn.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BriefRequestRecord {
+    /// Deterministic identity of the compiled brief.
+    brief_id: String,
+    /// Bounded analysis requests already published for this identity.
+    requests: u32,
+}
+
+/// One compiled Diagnostic Brief with its bounded analysis request.
+///
+/// The brief carries the member health signals whole with the explicit analysis
+/// question and stop condition; the request carries both unchanged onto the
+/// existing #1761 diagnosis route. The denials bound both outputs: three
+/// fail-closed refusals against the brief and three against the request, so no
+/// memory delete, policy alter, or work termination can be derived from either.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HealthBriefEmission {
+    /// The compiled persistent or cross-cutting drift input.
+    brief: HealthDiagnosticBrief,
+    /// The one bounded analysis request this compilation drew.
+    request: HealthAnalysisRequest,
+    /// Fail-closed denials for every prohibited class on both outputs.
+    denied_effects: Vec<ProhibitedEffectDenial>,
 }
 
 impl HealthProjectionCell {
@@ -555,6 +604,11 @@ fn publish(emissions: &[HealthSignalEmission]) {
 
 /// Runs the five I8.18 rules over one closed supervision interval.
 ///
+/// When the opened signals show persistent or cross-cutting drift,
+/// [`consider_diagnostic_brief`] compiles one Diagnostic Brief input with one
+/// bounded Dreamer/Watchdog-Agent analysis request through the existing #1761
+/// diagnosis route and publishes it beside the signals.
+///
 /// This is the production caller of `evaluate_agent_loop`,
 /// `evaluate_context_quality`, `evaluate_memory_utility`,
 /// `evaluate_observation_coverage`, and `evaluate_maintenance_debt`, reached
@@ -584,6 +638,7 @@ pub fn evaluate_interval_health(
 ) {
     let Some(evidence) = evidence else {
         trace_unavailable(HealthNoSignalReason::OwnerEvidenceUnknown);
+        reset_emission_history(cell);
         return;
     };
     let Ok(mut state) = cell.state.lock() else {
@@ -592,6 +647,7 @@ pub fn evaluate_interval_health(
     };
     let Some(revisions) = state.revisions.clone() else {
         trace_unavailable(HealthNoSignalReason::OwnerEvidenceUnknown);
+        state.previous_emission_rules = Vec::new();
         return;
     };
     let observation = observe_interval(report, &evidence.corpus);
@@ -608,7 +664,9 @@ pub fn evaluate_interval_health(
         // tick has a real previous observation to compare against, and no rule
         // runs: with one source event there is no delta any of them could
         // prove, and inventing the other side of the pair is exactly what the
-        // pairwise contract forbids.
+        // pairwise contract forbids. Nothing was emitted, so no later interval
+        // may claim persistence against this one.
+        state.previous_emission_rules = Vec::new();
         state.previous = Some(IntervalRecord {
             target: current.target,
             event: current_event,
@@ -691,6 +749,12 @@ pub fn evaluate_interval_health(
         blocking_channels: observation.blocking_channels,
         non_continuum_channels: observation.non_continuum_channels,
     });
+    // I8.18 (#2381 W3/A2): persistent or cross-cutting drift compiles exactly
+    // one Diagnostic Brief input with exactly one bounded Dreamer/Watchdog-Agent
+    // analysis request through the existing #1761 diagnosis route. The history
+    // update and the compilation happen under the projection lock, so two ticks
+    // can never compile one interval twice.
+    let brief = consider_diagnostic_brief(&mut state, &emissions);
     // The comparison slot is released before anything is traced, so a slow
     // subscriber can never hold the projection against the next tick.
     drop(state);
@@ -705,6 +769,207 @@ pub fn evaluate_interval_health(
         );
     }
     publish(&emissions);
+    if let Some(brief) = brief.as_ref() {
+        publish_brief(brief);
+    }
+}
+
+/// Forgets the last compared interval's emission rules.
+///
+/// A non-compared interval breaks persistence: the next compared interval must
+/// not claim continuity with an emission from before the gap.
+fn reset_emission_history(cell: &HealthProjectionCell) {
+    if let Ok(mut state) = cell.state.lock() {
+        state.previous_emission_rules = Vec::new();
+    }
+}
+
+/// Compiles persistent or cross-cutting drift into one Diagnostic Brief input.
+///
+/// Persistent drift is one rule family opening on two consecutive compared
+/// intervals; cross-cutting drift is two or more rule families opening on this
+/// interval. Either compiles the member signals whole — with the explicit
+/// analysis question and stop condition — and draws exactly one bounded
+/// Dreamer/Watchdog-Agent analysis request through the existing #1761
+/// [`RiskRoute::CheapDiagnosis`] route: never a campaign, and no parallel
+/// escalation path.
+///
+/// The ineffective-analysis history is the recompiled-brief identity itself: the
+/// brief identity derives deterministically from its member signals, so the same
+/// identity compiling again proves the earlier analysis request did not clear
+/// the drift, and the route degrades per I09-17's rollback rule — one
+/// ineffective analysis steps the route down, a repeated one requires Human
+/// review. The request is published on the bounded trace; nothing is written,
+/// dispatched, or authorized here.
+fn consider_diagnostic_brief(
+    state: &mut HealthProjectionState,
+    emissions: &[HealthSignalEmission],
+) -> Option<HealthBriefEmission> {
+    let mut rules: Vec<&'static str> = emissions
+        .iter()
+        .map(|emission| emission.rule_id)
+        .collect();
+    rules.sort_unstable();
+    rules.dedup();
+    let persistent = rules
+        .iter()
+        .any(|rule| state.previous_emission_rules.contains(rule));
+    let cross_cutting = rules.len() >= 2;
+    state.previous_emission_rules = rules.clone();
+    let persistence = match (persistent, cross_cutting) {
+        (true, true) => BriefPersistence::PersistentAndCrossCutting,
+        (true, false) => BriefPersistence::Persistent,
+        (false, true) => BriefPersistence::CrossCutting,
+        (false, false) => return None,
+    };
+    let signals: Vec<Signal> = emissions
+        .iter()
+        .map(|emission| emission.signal.clone())
+        .collect();
+    let (question, stop_condition) = brief_question_and_stop(persistence, &rules);
+    let brief = match compile_health_brief(question, stop_condition, persistence, signals) {
+        Ok(brief) => brief,
+        Err(error) => {
+            tracing::debug!(
+                event = "watchdog.health_brief_refused",
+                observation = "refused",
+                detail = ?error,
+                "I8.18 drift could not compile into a Diagnostic Brief input"
+            );
+            return None;
+        }
+    };
+    let prior_ineffective_analyses = state
+        .requested_briefs
+        .iter()
+        .find(|record| record.brief_id == brief.brief_id)
+        .map_or(0, |record| record.requests);
+    let request =
+        request_health_analysis(&brief, RiskRoute::CheapDiagnosis, prior_ineffective_analyses);
+    let subject = brief
+        .signals
+        .first()
+        .map(|signal| signal.revision().target.subject_id.clone())
+        .unwrap_or_default();
+    let denied_effects = deny_brief_effects(&brief, &request, subject);
+    if let Some(record) = state
+        .requested_briefs
+        .iter_mut()
+        .find(|record| record.brief_id == brief.brief_id)
+    {
+        record.requests += 1;
+    } else {
+        if state.requested_briefs.len() >= MAX_TRACKED_BRIEFS {
+            state.requested_briefs.remove(0);
+        }
+        state.requested_briefs.push(BriefRequestRecord {
+            brief_id: brief.brief_id.clone(),
+            requests: 1,
+        });
+    }
+    Some(HealthBriefEmission {
+        brief,
+        request,
+        denied_effects,
+    })
+}
+
+/// Builds the explicit question and stop condition one brief carries.
+///
+/// Both derive deterministically from the persistence classification and the
+/// sorted member rule identities, so the same drift always asks the same
+/// question under the same stop condition. The question names the I08-18
+/// proposal vocabulary only; the stop condition repeats the prose bar, so the
+/// bounded analysis is asked for a proposal and stopped before any effect.
+fn brief_question_and_stop(
+    persistence: BriefPersistence,
+    rules: &[&'static str],
+) -> (String, String) {
+    let question = format!(
+        "which observed {} drift across {} requires a smaller packet, scope resync, curation, new discriminator, route change, maintenance plan, or Human decision?",
+        persistence.as_str(),
+        rules.join("+")
+    );
+    let stop_condition = "stop when the member signals clear on a later interval, when the route degrades to Human review, or when the members no longer compile into one brief; the analysis proposes only and deletes no memory, alters no policy, and terminates no work."
+        .to_owned();
+    (question, stop_condition)
+}
+
+/// Names the #1761 route one bounded analysis request travels.
+///
+/// The match is exhaustive with no fallback arm, so a new route variant fails
+/// compilation here instead of silently travelling under a wrong name.
+fn risk_route_name(route: RiskRoute) -> &'static str {
+    match route {
+        RiskRoute::Observe => "observe",
+        RiskRoute::RequestResync => "request_resync",
+        RiskRoute::CheapDiagnosis => "cheap_diagnosis",
+        RiskRoute::StrongDiagnosis => "strong_diagnosis",
+        RiskRoute::Concilium => "concilium",
+        RiskRoute::PreauthorizedContainment => "preauthorized_containment",
+        RiskRoute::HumanEscalation => "human_escalation",
+    }
+}
+
+/// Denies every prohibited effect class against the brief and its request.
+///
+/// Three fail-closed refusals name the brief, three name the bounded analysis
+/// request, and each names the subject that stayed untouched. There is no exit
+/// that admits a memory delete, a policy alter, or a work termination.
+fn deny_brief_effects(
+    brief: &HealthDiagnosticBrief,
+    request: &HealthAnalysisRequest,
+    subject: String,
+) -> Vec<ProhibitedEffectDenial> {
+    [
+        ProhibitedEffectClass::MemoryDelete,
+        ProhibitedEffectClass::PolicyAlter,
+        ProhibitedEffectClass::WorkTerminate,
+    ]
+    .into_iter()
+    .flat_map(|class| {
+        [
+            ProhibitedEffectAttempt::for_health_brief(class, brief, subject.clone()).deny(),
+            ProhibitedEffectAttempt::for_health_analysis(class, request, subject.clone()).deny(),
+        ]
+    })
+    .collect()
+}
+
+/// Publishes the compiled Brief, its bounded request, and the refusals.
+///
+/// The trace is the same bounded operator evidence the signal publication
+/// emits: the brief identity, persistence classification, member signal
+/// identities, the explicit question and stop condition, the #1761 route the
+/// request names with its ineffective-analysis history, and the exact reason
+/// each forbidden effect was refused. It is a trace, not a route: nothing is
+/// written, dispatched, or authorized here.
+fn publish_brief(emission: &HealthBriefEmission) {
+    let brief = &emission.brief;
+    let request = &emission.request;
+    let member_ids = brief
+        .signals
+        .iter()
+        .map(|signal| signal.revision().signal_id.0.clone())
+        .collect::<Vec<_>>();
+    let denied = emission
+        .denied_effects
+        .iter()
+        .map(|denial| format!("{}={}", denial.class.as_str(), denial.reason))
+        .collect::<Vec<_>>();
+    tracing::warn!(
+        event = "watchdog.health_brief_compiled",
+        observation = "observed",
+        brief_id = brief.brief_id.as_str(),
+        persistence = brief.persistence.as_str(),
+        member_signals = ?member_ids,
+        question = brief.question.as_str(),
+        stop_condition = brief.stop_condition.as_str(),
+        route = risk_route_name(request.route),
+        prior_ineffective_analyses = request.prior_ineffective_analyses,
+        denied_effects = ?denied,
+        "I8.18 persistent or cross-cutting drift compiled into one Diagnostic Brief with one bounded Watchdog-Agent analysis request; the analysis proposes only and derives no memory delete, policy alter, or work termination"
+    );
 }
 
 /// Traces that no health evidence is established, and names the reason.
