@@ -18,7 +18,7 @@ use eliot_evaluation_contracts::ObservationCoverageManifest;
 
 use crate::{
     AllowedHostManifestView, CoverageManifestPlan, DurableHostEventJournal, IngestError,
-    ResolvedHostComplianceFacts,
+    ObservedReconnectOutcome, ReplayItem, ResolvedHostComplianceFacts, drive_reconnect_observed,
 };
 
 /// Journal-owner run input for one product/session/attempt/route fingerprint
@@ -89,6 +89,45 @@ pub fn run_coverage_manifest(
         .cloned()
         .ok_or(IngestError::InvalidInput("coverage_manifest.fingerprint"))?;
     Ok(CoverageManifestRunOutcome { facts, manifest })
+}
+
+/// Complete production output of one fingerprint ingestion run (issue #1936
+/// W1, I7.23): the per-stream observed drives plus the retained coverage
+/// denominator, all from the same run, so they always agree on the
+/// fingerprint.
+#[derive(Clone, Debug)]
+pub struct FingerprintIngestRunOutcome {
+    /// Observed reconnect drive per stream of the fingerprint, in roster
+    /// order: commit recovery, downstream delivery, intake projection, and
+    /// drop gaps.
+    pub observed: Vec<ObservedReconnectOutcome>,
+    /// Resolved facts plus the denominator retained under the fingerprint.
+    pub manifest: CoverageManifestRunOutcome,
+}
+
+/// Runs the host-event ingestion run flow for one product/session/attempt/
+/// route fingerprint: drives the observed reconnect for every stream in the
+/// run roster, then persists the coverage denominator through
+/// [`run_coverage_manifest`].
+///
+/// The drive comes first because it is the functional precondition of the
+/// denominator: commit recovery commits staged-but-uncommitted records, which
+/// would otherwise abort persistence with [`IngestError::NotCommitted`]
+/// before anything is retained. A refused downstream delivery stops only that
+/// stream's drive (`stopped_early`); its committed records still belong to
+/// the denominator, so the manifest run still proceeds. Every failure is
+/// typed and retains nothing partial.
+pub fn run_ingest_for_fingerprint(
+    owner: &mut DurableHostEventJournal,
+    run: &CoverageManifestRun<'_>,
+    mut deliver: impl FnMut(&ReplayItem) -> bool,
+) -> Result<FingerprintIngestRunOutcome, IngestError> {
+    let mut observed = Vec::with_capacity(run.stream_ids.len());
+    for stream_id in run.stream_ids.iter().copied() {
+        observed.push(drive_reconnect_observed(owner, stream_id, &mut deliver)?);
+    }
+    let manifest = run_coverage_manifest(owner, run)?;
+    Ok(FingerprintIngestRunOutcome { observed, manifest })
 }
 
 /// Drives coverage-denominator production for one fingerprint: resolve facts
