@@ -4336,7 +4336,7 @@ impl AgentFabric {
             snapshot,
             config,
             ports,
-            semantic_revisions,
+            semantic_revisions.as_ref(),
             capability,
         )
     }
