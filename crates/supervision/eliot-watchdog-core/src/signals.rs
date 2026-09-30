@@ -4,6 +4,8 @@
 //! describe what the observer saw; they do not authorize the signal or actions
 //! based on it. A reported resolution is likewise not authenticated here.
 
+use std::fmt::{Display, Formatter, Result as FmtResult};
+
 /// A stable identity shared by every revision of one signal.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SignalId(pub String);
@@ -484,6 +486,33 @@ pub enum SignalValidationError {
         expected: u64,
         actual: u64,
     },
+}
+
+impl Display for SignalValidationError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
+        match self {
+            Self::EmptyField(field) => {
+                write!(formatter, "watchdog signal field is empty: {field}")
+            }
+            Self::InvalidText(field) => {
+                write!(
+                    formatter,
+                    "watchdog signal field carries invalid text: {field}"
+                )
+            }
+            Self::ZeroValue(field) => {
+                write!(formatter, "watchdog signal field is zero: {field}")
+            }
+            Self::IdentityChanged => {
+                formatter.write_str("watchdog signal identity changed across revisions")
+            }
+            Self::RevisionOverflow => formatter.write_str("watchdog signal revision overflowed"),
+            Self::UnexpectedRevision { expected, actual } => write!(
+                formatter,
+                "watchdog signal revision {actual} does not follow expected revision {expected}"
+            ),
+        }
+    }
 }
 
 pub(crate) fn text(value: &str, field: &'static str) -> Result<(), SignalValidationError> {

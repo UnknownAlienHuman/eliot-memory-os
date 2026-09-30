@@ -73,11 +73,12 @@ use eliot_watchdog_core::{
     CoverageGapExplanation, CoverageRef, EvidenceRef, ExpectedRevision, HealthAnalysisRequest,
     HealthDetection, HealthDiagnosticBrief, HealthEvidenceHandles, HealthNoSignalReason,
     HealthObservationPair, HealthOutputFamily, HealthSignalContext, MaintenanceDebtInput,
-    MemoryUtilityDeltas, ObservedTime, PolicyBound, ProfileRevision, ProhibitedEffectAttempt,
-    ProhibitedEffectClass, ProhibitedEffectDenial, RecordedValue, RiskRoute, Signal,
-    SignalReferences, SignalTarget, SourceEventRef, StateDeltaPresence, TimeUnit,
-    compile_health_brief, evaluate_agent_loop, evaluate_context_quality, evaluate_maintenance_debt,
-    evaluate_memory_utility, evaluate_observation_coverage, request_health_analysis,
+    MemoryUtilityDeltas, ObservationCoverageInput, ObservedTime, PolicyBound, ProfileRevision,
+    ProhibitedEffectAttempt, ProhibitedEffectClass, ProhibitedEffectDenial, RecordedValue,
+    RiskRoute, Signal, SignalReferences, SignalTarget, SourceEventRef, StateDeltaPresence,
+    TimeUnit, compile_health_brief, evaluate_agent_loop, evaluate_context_quality,
+    evaluate_maintenance_debt, evaluate_memory_utility, evaluate_observation_coverage,
+    request_health_analysis,
 };
 
 use crate::PROTOCOL_VERSION;

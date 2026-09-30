@@ -19,7 +19,7 @@ use eliot_watchdog_core::{
 };
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction};
 
-use self::health_projection::{WatchdogHealthCorpus, encode_identity};
+use crate::health_projection::{WatchdogHealthCorpus, encode_identity};
 use crate::{
     AdmittedIsolatedDestination, SERVICE_NAME, SpoolError, WatchdogRuntimeBinding, current_unix_ms,
 };
