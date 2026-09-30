@@ -1882,73 +1882,31 @@ impl DaemonComposition {
             ));
         }
         let outcome = self.map_activation_outcome(ticket, now, successor_observation.as_ref());
-        let outcome = match outcome {
-            Ok(result)
-                if result.resolved_binding().is_some() && ticket.workspace_selector.is_some() =>
-            {
-                // Issue #2900 W12/B2: the installation-bound owner supply is
-                // STITCH — no live `eliotd` thread holds the canonical
-                // `Arc<dyn ScanDisclosureRecordOwner>` (Kernel
-                // `RedbRecoveryStore` lives in the separate kernel process;
-                // `eliotd` owns no store client and takes no new store
-                // dependency) and no installation/session owner issues the
-                // per-operation `ScanDisclosureOwnerBinding` yet — so the
-                // port stays disconnected and the question leg runs
-                // storeless with typed fail-closed completion.
-                Self::attach_cold_start_question(ticket, now, result, None)
-            }
-            other => other,
-        };
         emit_activation_admission_diagnostics(ticket, &outcome);
         outcome
     }
 
-    /// Runs the reachable, non-ready attach discovery leg for an explicit
-    /// workspace selector. The Host observer supplies filesystem/VCS facts;
-    /// the scanner may return only its smallest privacy-boundary question
-    /// until an installation-backed disclosure owner is supplied.
+    /// Attaches the bounded pre-owner question using the exact Host observation
+    /// retained by the activation dispatch. The lease/key/evidence are carried
+    /// forward unchanged for the post-acceptance trigger owner route.
     ///
     /// Issue #2900 W12: this is the live attach/cold-start ingress that
-    /// reaches the scan port. When the installation-bound durable owner is
-    /// supplied, it is connected before `BootstrapScanner::scan` through
-    /// [`Self::attach_cold_start_owner_receipt`]: the scan charges the
-    /// observed lease once, persists through the owner, replays the handle
-    /// back under the same binding, and the completed activation stands on
-    /// that durable receipt — no in-memory-only or loose-file fallback
-    /// exists anywhere on this route. An owner refusal of
-    /// `ScanContourNotAdmitted` (no persistable inputs) falls through to
-    /// the storeless question projection below, which charges nothing and
-    /// persists nothing; any other owner refusal fails closed with its
-    /// typed cause. Without the owner the pre-owner question leg below
-    /// runs without a store (no lease charge, no persistence), and a
-    /// completed scan fails closed with the typed inaccessible cause.
-    /// Caller: live `DaemonComposition::resolve_agent_activation_v2`; the
-    /// owner supply behind the owner arm is STITCH (see call site).
-    fn attach_cold_start_question(
-        ticket: &AgentActivationResolutionTicket,
-        now: u64,
+    /// reaches the scan port. An installation-bound durable owner, when
+    /// available, is connected before `BootstrapScanner::scan`; its exact
+    /// receipt is read back under the same binding. Without that owner, only
+    /// the storeless smallest-question leg may run and completion fails closed.
+    /// Caller: `daemon_runtime::resolve_valid_ticket`, which retains this
+    /// Host observation for the accepted-result trigger after Kernel ACK.
+    pub fn attach_cold_start_question(
         result: AgentActivationResolutionResult,
+        observed: &mut crate::task_binding_admission::ColdStartDiscoveryInput,
         owner: Option<(
             &mut eliot_governor::InstallationScanDisclosureStore,
             &eliot_workscope::ScanDisclosureOwnerBinding,
         )>,
     ) -> Result<AgentActivationResolutionResult, DaemonError> {
-        let mut observed = crate::task_binding_admission::observe_cold_start_discovery(
-            ticket,
-            &ticket.state_fence,
-            now.max(1),
-        )
-        .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
         if let Some((store, binding)) = owner {
-            match Self::attach_cold_start_owner_receipt(store, binding, &mut observed) {
-                // The durable owner receipt stays retained in the
-                // installation-bound owner under its operation key with
-                // exact-replay semantics; the activation stands as
-                // resolved. The trigger-driven terminal compilation takes
-                // its own trigger-scan handle through
-                // `GovernorComposition::compile_cold_start_at_trigger`,
-                // which reads it back through the same store and binding
-                // before compiling.
+            match Self::attach_cold_start_owner_receipt(store, binding, observed) {
                 Ok(_handle) => return Ok(result),
                 Err(eliot_workscope::WorkScopeError::ScanContourNotAdmitted) => {}
                 Err(error) => {

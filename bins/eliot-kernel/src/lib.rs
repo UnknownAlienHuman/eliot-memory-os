@@ -290,6 +290,8 @@ pub mod reactive_restore_serve;
 mod request_dispatch;
 mod research_provider_route;
 mod runtime_identity;
+#[cfg(windows)]
+mod scan_disclosure_route;
 mod shutdown_drain;
 mod startup_coordinator;
 mod wasm_runtime_port_grant;
