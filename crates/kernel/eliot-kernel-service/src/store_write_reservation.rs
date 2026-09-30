@@ -546,7 +546,7 @@ impl ScopeStoreReserve {
     fn ledger(&self) -> MutexGuard<'_, BTreeMap<String, String>> {
         self.protected_held
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
