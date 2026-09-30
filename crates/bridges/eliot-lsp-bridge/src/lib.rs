@@ -53,6 +53,7 @@ pub use eliot_git_bridge::{
 use eliot_git_bridge::GitSnapshotError;
 pub use eliot_instrument_api::InstrumentInvocation;
 use eliot_instrument_api::{InstrumentContractError, InstrumentKind, RawEvidence, RawEvidenceSource};
+use eliot_process_executor::environment_projection_digest;
 pub use eliot_instrument_runner::{
     InstrumentSpec, InstrumentSpecParams, RegistryEntry, ResolvedExecutableIdentity,
 };
@@ -67,7 +68,7 @@ use eliot_process::{
 };
 pub use eliot_process::{
     OperationId, ProcessEvidence, ProcessExecutionAdmissionRequest, ProcessExecutionView,
-    ProcessStartReceipt,
+    ProcessLifecycle, ProcessStartReceipt,
 };
 pub use eliot_types::memory::GovernedGitScope;
 use serde::{Deserialize, Serialize};
@@ -1419,8 +1420,8 @@ pub struct LspAdoptionProjection {
 pub trait LspCapturePublicationPort {
     /// Output produced by the existing capture/publication owner.
     type Output;
-    /// Typed publication failure rendered into the bridge boundary.
-    type Error: std::fmt::Display;
+    /// Original typed publication failure.
+    type Error: std::error::Error + 'static;
 
     /// Publishes this exact record after live process and sidecar owner
     /// readback. `original_payload` is serialized from the same `record`.
@@ -1430,6 +1431,21 @@ pub trait LspCapturePublicationPort {
         projection: &'a LspAdoptionProjection,
         original_payload: &'a [u8],
     ) -> Pin<Box<dyn Future<Output = Result<Self::Output, Self::Error>> + 'a>>;
+}
+
+/// Failure to complete one live capture, preserving bridge and publisher
+/// errors as their original typed values.
+#[derive(Debug, Error)]
+pub enum LspCaptureCompletionError<PublicationError>
+where
+    PublicationError: std::error::Error + 'static,
+{
+    /// The bridge could not validate or construct the original live capture.
+    #[error(transparent)]
+    Bridge(#[from] BridgeError),
+    /// The existing owner rejected or failed publication of the exact capture.
+    #[error("LSP capture publication failed")]
+    Publication(#[source] PublicationError),
 }
 
 impl LspAdoptionProjection {
@@ -2669,7 +2685,7 @@ impl<P: LspProcessOwnerPort, G: GitProcessRunner> LspCurrentBridge<P, G> {
     /// source readback is unavailable, `None` still retains the original
     /// observation as Stale.
     #[allow(clippy::too_many_arguments)]
-    pub async fn retain_reconciled_result_with_source_artifact_proof<P: LspCapturePublicationPort>(
+    pub async fn retain_reconciled_result_with_source_artifact_proof<Pub: LspCapturePublicationPort>(
         &self,
         started: LspStartedInvocation,
         source_scope_after_run: Option<&GovernedGitScope>,
@@ -2678,8 +2694,15 @@ impl<P: LspProcessOwnerPort, G: GitProcessRunner> LspCurrentBridge<P, G> {
         invoked_at_unix_ms: u64,
         source_root: &RepoRoot,
         after_run_source_proof: Option<LspSourceArtifactProof>,
-        publisher: &P,
-    ) -> Result<(RetainedLspObservationV1, LspAdoptionProjection, P::Output), BridgeError> {
+        publisher: &Pub,
+    ) -> Result<
+        (
+            RetainedLspObservationV1,
+            LspAdoptionProjection,
+            Pub::Output,
+        ),
+        LspCaptureCompletionError<Pub::Error>,
+    > {
         let started = Arc::new(started);
         let operation_id = started.process_start.operation_id().clone();
         let process_evidence = self
@@ -2734,12 +2757,12 @@ impl<P: LspProcessOwnerPort, G: GitProcessRunner> LspCurrentBridge<P, G> {
         let projection = live_capture_projection(retained, started);
         let record = projection.retained_observation.as_ref();
         let original_payload = serde_json::to_vec(record)
-            .map_err(|error| BridgeError::CapturePublication(error.to_string()))?;
-        let published = publisher
+            .map_err(BridgeError::CaptureSerialization)?;
+        let output = publisher
             .publish(record, &projection, &original_payload)
             .await
-            .map_err(|error| BridgeError::CapturePublication(error.to_string()))?;
-        Ok((record.clone(), projection, published))
+            .map_err(LspCaptureCompletionError::Publication)?;
+        Ok((record.clone(), projection, output))
     }
 
     /// Adopts only after same-owner reconciliation and fresh source
@@ -3398,6 +3421,7 @@ fn validate_record_identities(
         || intent.executable() != resolved.canonical_path.as_str()
         || intent.executable_sha256() != resolved.content_digest.as_str()
         || resolved.arguments.as_slice() != intent.argv()
+        || resolved.environment_digest != environment_projection_digest(intent.environment())
         || resolved.executable_file_name() != path_file_name(&spec.executable)
         || registry
             .executable
@@ -3810,7 +3834,12 @@ fn capture_live_raw_outputs(
     process_evidence: &ProcessEvidence,
     captured_at_unix_ms: u64,
 ) -> Result<Vec<LspRawOutput>, BridgeError> {
-    if process_evidence.view().exit().is_none() {
+    if !matches!(
+        process_evidence.view().lifecycle(),
+        eliot_process::ProcessLifecycle::Exited
+            | eliot_process::ProcessLifecycle::Failed
+            | eliot_process::ProcessLifecycle::Reconciled
+    ) {
         return Err(BridgeError::CaptureNotTerminal);
     }
     let mut outputs = Vec::with_capacity(3);
@@ -3914,7 +3943,7 @@ fn live_raw_output(
     };
     let artifact_id = ArtifactId::new(format!(
         "lsp-raw:{}:{channel}",
-        started.process_intent.operation_id()
+        started.process_intent.operation_id().as_str()
     ))
     .map_err(|_| BridgeError::InvalidText {
         field: "raw_output.artifact_id",
@@ -4278,6 +4307,7 @@ fn validate_instrument_binding(
         || spec.environment_profile != registry.environment_class
         || intent.executable() != resolved.canonical_path.as_str()
         || intent.executable_sha256() != resolved.content_digest.as_str()
+        || resolved.environment_digest != environment_projection_digest(intent.environment())
         || intent.argv() != command.arguments.as_slice()
         || intent.working_directory() != command.working_directory.as_str()
         || spec
@@ -4651,6 +4681,9 @@ pub enum BridgeError {
     /// Authenticated Blob bytes are not a retained LSP observation envelope.
     #[error("captured LSP payload could not be decoded: {0}")]
     CapturedObservationDecode(#[from] serde_json::Error),
+    /// The original live retained observation could not be serialized for publication.
+    #[error("original LSP capture could not be serialized: {0}")]
+    CaptureSerialization(#[source] serde_json::Error),
     /// Analyzer configuration failed validation.
     #[error("invalid analyzer configuration: {0}")]
     InvalidConfig(String),
@@ -4738,9 +4771,6 @@ pub enum BridgeError {
     /// Capture time cannot be represented by the existing clock contract.
     #[error("LSP capture clock exceeds the existing clock contract")]
     InvalidCaptureClock,
-    /// The existing publication owner rejected the exact live LSP capture.
-    #[error("LSP capture publication failed: {0}")]
-    CapturePublication(String),
     /// A purported rename result claims that the bridge applied its edits.
     #[error("retained rename result claims applied edits")]
     AppliedRename,
