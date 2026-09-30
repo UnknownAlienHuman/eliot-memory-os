@@ -291,7 +291,7 @@ impl AdmittedDaemonRestartPolicy {
         admitted_generation: ResourceGeneration,
         state_fence: StateFence,
     ) -> Result<Self, RestartPolicyError> {
-        let binding = policy.bind(admitted_generation, state_fence.clone())?;
+        let binding = policy.bind(admitted_generation.clone(), state_fence.clone())?;
         binding.validate_for(&policy, &admitted_generation, &state_fence)?;
         Ok(Self { policy, binding })
     }
@@ -353,9 +353,8 @@ pub(crate) fn daemon_class_withholds_replacement(
     // longer matches the value it was admitted from, is refused before any
     // class is read. This is the check that makes the retained binding mean
     // something at the point the decision is actually taken.
-    let policy = match admitted.policy_for_generation(admitted_generation, state_fence) {
-        Ok(policy) => policy,
-        Err(_) => return Some(DaemonRestartRefusal::PolicyNotBoundToAdmittedGeneration),
+    let Ok(policy) = admitted.policy_for_generation(admitted_generation, state_fence) else {
+        return Some(DaemonRestartRefusal::PolicyNotBoundToAdmittedGeneration);
     };
     let (identity, failure) = daemon_restart_evidence(previous_status, view);
     let lifecycle = daemon_owner_restart_lifecycle(owner_state);
