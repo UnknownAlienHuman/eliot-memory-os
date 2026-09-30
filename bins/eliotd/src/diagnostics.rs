@@ -1122,6 +1122,22 @@ pub fn fabric_rejection_of(error: &FabricError) -> (RejectionReason, OwningCompo
         FabricError::ProviderEvidenceRequired => {
             (RejectionReason::Contract, OwningComponent::AgentFabric)
         }
+        // #1702 W2: an owner-separated revision was refused because its
+        // durable write could not be proven, so it is deliberately NOT
+        // reported as current. The residual String names the exact unproven
+        // step (absent store, lease, bounded size, write, readback, wire
+        // version or digest). This is an explicit arm, not a fall-in to the
+        // grouped contract arm above: that arm's nested `_ => Contract`
+        // catch-all would classify the variant without naming it, and the
+        // diagnostic would read as an ordinary wiring contract violation
+        // rather than "a revision exists only in memory and a crash erases
+        // it". The owning component is the durable agent-fabric wiring, the
+        // same owner that already maps `ProviderEvidenceRequired`, and
+        // `Contract` is the refusal-without-execution reason, which is
+        // exactly what withholding a revision is.
+        FabricError::DurabilityUnproven(_) => {
+            (RejectionReason::Contract, OwningComponent::AgentFabric)
+        }
         // #1700: the typed residual already names the exact port, owner,
         // state, blocked operation/work, disposition and next action (also
         // carried verbatim in the record detail via its `Display`), so the

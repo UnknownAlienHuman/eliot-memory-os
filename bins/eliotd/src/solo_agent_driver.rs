@@ -71,20 +71,20 @@ use std::sync::{Arc, Mutex};
 
 use eliot_agent_api::{AttemptId, RouteFingerprint};
 use eliot_agent_coordinator::{
-    AdmissionId, CandidateId, RUNTIME_PROFILE_FILE_NAME, SchedulingProfile, StaffingPlanRequest,
-    load_runtime_scheduling_profile,
+    AdmissionId, AdmittedProviderCapability, CandidateId, CoordinatorConfig, RUNTIME_PROFILE_FILE_NAME,
+    SchedulingProfile, StaffingPlanRequest, load_runtime_scheduling_profile,
 };
 use eliot_contracts::{fences_match_exact, sha256_hex};
 use serde::{Deserialize, Serialize};
 
 use crate::agent_fabric::{
     ActivationAuthorityPort, ActivationEvidence, AdmissionAuthorityPort, AgentFabric, DispatchAck,
-    DispatchEgressPort, DispatchIntent, FabricAdmission, FabricError, FabricSnapshot,
+    DispatchEgressPort, DispatchIntent, FabricAdmission, FabricError, FabricPorts, FabricSnapshot,
     PortBindingState, Reservation, RouteRequirements, SwarmDefinition, VerifiedProviderMaterial,
     daemon_coordinator_config,
 };
 #[cfg(test)]
-use crate::agent_fabric::{FabricPorts, ModelRegistryPort};
+use crate::agent_fabric::ModelRegistryPort;
 use crate::daemon_kernel_client::DaemonKernelClient;
 use crate::staffing_policy::{
     StaffingPlanReceipt, plan_coordinator_staffing, verify_receipt_digest,
@@ -1203,6 +1203,58 @@ pub fn drive_solo_delegate(
         "synchronous solo driving is disabled; use the async Kernel-verified entry point"
             .to_owned(),
     ))
+}
+
+/// Builds the one fabric that publishes owner-separated revisions durably.
+///
+/// Issue #1702 W2: this is the production seam where the daemon's state root
+/// is bound to the fabric. Every semantic revision published through the
+/// returned fabric is committed and verified durably *before* it is readable
+/// as current; without this binding the same writes are refused with
+/// [`FabricError::DurabilityUnproven`] rather than reported optimistically.
+///
+/// The store is attached before any revision is published, so no caller can
+/// reach the ordering guarantee by forgetting to attach it later.
+#[must_use]
+pub fn new_revision_durable_fabric(
+    config: CoordinatorConfig,
+    ports: FabricPorts,
+    capability: AdmittedProviderCapability,
+    state_root: &std::path::Path,
+) -> Result<AgentFabric, FabricError> {
+    let mut fabric = AgentFabric::new_with_admitted_provider(config, ports, capability)?;
+    fabric.attach_semantic_revision_store(state_root);
+    Ok(fabric)
+}
+
+/// Restores the one fabric that publishes owner-separated revisions durably
+/// from a verified capability (issue #1702 W2).
+///
+/// The reopened fabric re-attaches the same durable carrier as
+/// [`new_revision_durable_fabric`], so a revision published after restart is
+/// committed before it is reported current exactly as it was before, and the
+/// retained history of all three owners stays readable across the reopen.
+///
+/// # Errors
+///
+/// Returns the coordinator owner restore rejection, a stale-config conflict,
+/// or the capability construction rejection unchanged.
+pub fn restore_revision_durable_fabric(
+    snapshot: FabricSnapshot,
+    config: CoordinatorConfig,
+    ports: FabricPorts,
+    state_root: &std::path::Path,
+    capability: AdmittedProviderCapability,
+) -> Result<AgentFabric, FabricError> {
+    AgentFabric::restore_with_admitted_provider(
+        snapshot,
+        config,
+        ports,
+        Some(crate::semantic_revision_store::SemanticRevisionStore::new(
+            state_root,
+        )),
+        capability,
+    )
 }
 
 /// Returns true when the persisted projection needs no further drive.
