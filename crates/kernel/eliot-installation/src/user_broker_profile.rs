@@ -132,81 +132,7 @@ impl UserBrokerInstallationProfile {
     pub fn from_approved_launch(
         launch: &RuntimeLaunchDescriptor,
     ) -> Result<Self, InstallationError> {
-        let module_id = ContractId::new(USER_BROKER_MODULE_ID).map_err(|error| {
-            InstallationError::InvalidField {
-                field: "user_broker.module_id".to_owned(),
-                reason: error.to_string(),
-            }
-        })?;
-        let artifact_id = ArtifactId::new(launch.user_broker_artifact_digest.as_str()).map_err(
-            |error| InstallationError::InvalidField {
-                field: "user_broker.module_contract.artifact_id".to_owned(),
-                reason: error.to_string(),
-            },
-        )?;
-        let operations: Vec<String> = USER_BROKER_FRONT_DOOR_OPERATIONS
-            .iter()
-            .map(|operation| (*operation).to_owned())
-            .collect();
-        let contract = ModuleContract {
-            module_id: module_id.clone(),
-            version: USER_BROKER_MODULE_VERSION,
-            artifact_id: artifact_id.clone(),
-            protocols: vec![USER_BROKER_RUNTIME_PROTOCOL.to_owned()],
-            capabilities: Vec::new(),
-            required_capabilities: operations.clone(),
-            optional_capabilities: Vec::new(),
-            advisory_capabilities: Vec::new(),
-            state_owner: USER_BROKER_MODULE_ID.to_owned(),
-            failure_domain: USER_BROKER_MODULE_ID.to_owned(),
-            owner: USER_BROKER_MODULE_ID.to_owned(),
-            hot_replace: false,
-            startup_after: vec![USER_BROKER_REGISTRATION_OPERATION.to_owned()],
-            drain_before: vec![USER_BROKER_REGISTRATION_OPERATION.to_owned()],
-            invalidation_triggers: Vec::new(),
-            supervision_plan: "one_for_one".to_owned(),
-            child_restart: "transient".to_owned(),
-            restart_intensity: "3/10m".to_owned(),
-            resource_profile: "interactive-user".to_owned(),
-            privacy_classes: vec!["PUBLIC".to_owned()],
-            permissions: Vec::new(),
-            health_contract: "health/user-broker-v1".to_owned(),
-            checkpoint_contract: "checkpoint/user-broker-v1".to_owned(),
-            compatibility_state: "rebuildable".to_owned(),
-            independent_test_profile: "module/user-broker".to_owned(),
-            contract_fixture_set: format!(
-                "{USER_BROKER_RUNTIME_PROTOCOL}/{USER_BROKER_REGISTRATION_OPERATION}"
-            ),
-            affected_test_tags: vec!["user-broker".to_owned(), "process".to_owned()],
-            architecture: Vec::new(),
-            telemetry: "telemetry/user-broker-v1".to_owned(),
-            removal_boundary: "user-broker".to_owned(),
-        };
-        let state_fence = launch.authority_state_fence.clone();
-        let generation = ModuleGeneration {
-            module_id,
-            generation: state_fence.resource_generation,
-            artifact_id,
-            state: ModuleGenerationState::Ready,
-            health: HealthVector::healthy(),
-            state_fence,
-        };
-        let declaration = UserBrokerClientDeclaration {
-            wire_id: USER_BROKER_CLIENT_DECLARATION_WIRE_ID.to_owned(),
-            wire_version: USER_BROKER_CLIENT_DECLARATION_WIRE_VERSION,
-            module_id: USER_BROKER_MODULE_ID.to_owned(),
-            profile_id: "pending".to_owned(),
-            protocol_range: ProtocolRange {
-                minimum: ProtocolVersion::CURRENT,
-                maximum: ProtocolVersion::CURRENT,
-            },
-            module_contract: contract,
-            module_generation: generation,
-            capabilities: operations,
-            privacy_classes: vec!["PUBLIC".to_owned()],
-            max_frame: USER_BROKER_MAX_FRAME_BYTES,
-            declaration_sha256: String::new(),
-        };
+        let declaration = user_broker_client_declaration(launch)?;
         let host_state_root = launch.runtime_state_roots.host_state_root.clone();
         let mut profile = Self {
             wire_id: USER_BROKER_INSTALLATION_PROFILE_WIRE_ID.to_owned(),
@@ -231,26 +157,7 @@ impl UserBrokerInstallationProfile {
                     reason: error.to_string(),
                 })?,
         };
-        profile.validate_without_derived_digests()?;
-        let profile_id = profile.derive_profile_id()?;
-        profile.profile_id = profile_id;
-        profile.client_declaration.profile_id = profile.profile_id.as_str().to_owned();
-        profile.client_declaration = profile
-            .client_declaration
-            .clone()
-            .with_computed_digest()
-            .map_err(|error| InstallationError::InvalidField {
-                field: "user_broker.client_declaration".to_owned(),
-                reason: error.to_string(),
-            })?;
-        profile.profile_sha256 =
-            profile
-                .compute_digest()
-                .map_err(|error| InstallationError::InvalidField {
-                    field: "user_broker.profile_sha256".to_owned(),
-                    reason: error.to_string(),
-                })?;
-        profile.validate()?;
+        profile.bind_derived_digests()?;
         Ok(profile)
     }
 
@@ -439,6 +346,124 @@ impl UserBrokerInstallationProfile {
         PlatformHandle::new(sha256_hex(&bytes))
             .map_err(|error| InstallationError::Platform(error.to_string()))
     }
+
+    /// Binds the derived profile identity, the rebound client declaration
+    /// digest, and the profile digest, then re-validates the sealed record.
+    ///
+    /// This is the second, closing half of the only producer. It is split from
+    /// the field-population step so each step stays one coherent fail-closed
+    /// boundary; the order of the checks, the digest scheme, and the error
+    /// variants are unchanged.
+    fn bind_derived_digests(&mut self) -> Result<(), InstallationError> {
+        self.validate_without_derived_digests()?;
+        let profile_id = self.derive_profile_id()?;
+        self.profile_id = profile_id;
+        self.client_declaration.profile_id = self.profile_id.as_str().to_owned();
+        self.client_declaration = self
+            .client_declaration
+            .clone()
+            .with_computed_digest()
+            .map_err(|error| InstallationError::InvalidField {
+                field: "user_broker.client_declaration".to_owned(),
+                reason: error.to_string(),
+            })?;
+        self.profile_sha256 = self
+            .compute_digest()
+            .map_err(|error| InstallationError::InvalidField {
+                field: "user_broker.profile_sha256".to_owned(),
+                reason: error.to_string(),
+            })?;
+        self.validate()?;
+        Ok(())
+    }
+}
+
+/// Builds the static client declaration for one approved launch contour.
+///
+/// The module contract, generation, state fence, and the exact front-door
+/// operation-selector set are installation-owned: the operation set is read
+/// from [`USER_BROKER_FRONT_DOOR_OPERATIONS`], never from a caller argument, so
+/// a broker front door cannot be installed with an expanded or narrowed
+/// capability set. `profile_id` starts at `pending` and is rebound by
+/// `UserBrokerInstallationProfile::bind_derived_digests`.
+fn user_broker_client_declaration(
+    launch: &RuntimeLaunchDescriptor,
+) -> Result<UserBrokerClientDeclaration, InstallationError> {
+    let module_id = ContractId::new(USER_BROKER_MODULE_ID).map_err(|error| {
+        InstallationError::InvalidField {
+            field: "user_broker.module_id".to_owned(),
+            reason: error.to_string(),
+        }
+    })?;
+    let artifact_id = ArtifactId::new(launch.user_broker_artifact_digest.as_str()).map_err(
+        |error| InstallationError::InvalidField {
+            field: "user_broker.module_contract.artifact_id".to_owned(),
+            reason: error.to_string(),
+        },
+    )?;
+    let operations: Vec<String> = USER_BROKER_FRONT_DOOR_OPERATIONS
+        .iter()
+        .map(|operation| (*operation).to_owned())
+        .collect();
+    let contract = ModuleContract {
+        module_id: module_id.clone(),
+        version: USER_BROKER_MODULE_VERSION,
+        artifact_id: artifact_id.clone(),
+        protocols: vec![USER_BROKER_RUNTIME_PROTOCOL.to_owned()],
+        capabilities: Vec::new(),
+        required_capabilities: operations.clone(),
+        optional_capabilities: Vec::new(),
+        advisory_capabilities: Vec::new(),
+        state_owner: USER_BROKER_MODULE_ID.to_owned(),
+        failure_domain: USER_BROKER_MODULE_ID.to_owned(),
+        owner: USER_BROKER_MODULE_ID.to_owned(),
+        hot_replace: false,
+        startup_after: vec![USER_BROKER_REGISTRATION_OPERATION.to_owned()],
+        drain_before: vec![USER_BROKER_REGISTRATION_OPERATION.to_owned()],
+        invalidation_triggers: Vec::new(),
+        supervision_plan: "one_for_one".to_owned(),
+        child_restart: "transient".to_owned(),
+        restart_intensity: "3/10m".to_owned(),
+        resource_profile: "interactive-user".to_owned(),
+        privacy_classes: vec!["PUBLIC".to_owned()],
+        permissions: Vec::new(),
+        health_contract: "health/user-broker-v1".to_owned(),
+        checkpoint_contract: "checkpoint/user-broker-v1".to_owned(),
+        compatibility_state: "rebuildable".to_owned(),
+        independent_test_profile: "module/user-broker".to_owned(),
+        contract_fixture_set: format!(
+            "{USER_BROKER_RUNTIME_PROTOCOL}/{USER_BROKER_REGISTRATION_OPERATION}"
+        ),
+        affected_test_tags: vec!["user-broker".to_owned(), "process".to_owned()],
+        architecture: Vec::new(),
+        telemetry: "telemetry/user-broker-v1".to_owned(),
+        removal_boundary: "user-broker".to_owned(),
+    };
+    let state_fence = launch.authority_state_fence.clone();
+    let generation = ModuleGeneration {
+        module_id,
+        generation: state_fence.resource_generation,
+        artifact_id,
+        state: ModuleGenerationState::Ready,
+        health: HealthVector::healthy(),
+        state_fence,
+    };
+    Ok(UserBrokerClientDeclaration {
+        wire_id: USER_BROKER_CLIENT_DECLARATION_WIRE_ID.to_owned(),
+        wire_version: USER_BROKER_CLIENT_DECLARATION_WIRE_VERSION,
+        module_id: USER_BROKER_MODULE_ID.to_owned(),
+        profile_id: "pending".to_owned(),
+        protocol_range: ProtocolRange {
+            minimum: ProtocolVersion::CURRENT,
+            maximum: ProtocolVersion::CURRENT,
+        },
+        module_contract: contract,
+        module_generation: generation,
+        capabilities: operations,
+        privacy_classes: vec!["PUBLIC".to_owned()],
+        max_frame: USER_BROKER_MAX_FRAME_BYTES,
+        declaration_sha256: String::new(),
+    })
 }
 
 fn validate_absolute_root(root: &Path, field: &str) -> Result<(), InstallationError> {
