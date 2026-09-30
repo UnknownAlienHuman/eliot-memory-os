@@ -76,12 +76,12 @@ use std::sync::Arc;
 
 use eliot_authority::GrantStatus;
 use eliot_contracts::StateFence;
-use eliot_governor::CompositionError;
+use eliot_governor::{CompositionError, KernelGenerationSnapshotProvider};
 use eliot_receipts::{GrantClosureReceipt, GrantClosureState};
 use eliot_store_api::REVOCATION_HISTORY_MAX_RECORDS;
 
-use super::daemon_kernel_client::DaemonKernelClient;
 use super::DaemonComposition;
+use super::daemon_kernel_client::DaemonKernelClient;
 
 /// Daemon->Kernel front-door read of one committed closure receipt.
 const GRANT_CLOSURE_RECEIPT_OPERATION: &str = "grant_closure_receipt";
@@ -106,8 +106,7 @@ const RECEIPT_NOT_FOUND_REASON: &str = "receipt not found";
 /// canonical second phase is real, actionable, durable state, and today
 /// nothing in the shipped daemon can finish it. Reporting it without naming
 /// the blocker would present an unfinished obligation as a handled one.
-pub const AUTHORITY_REVOCATION_RESUME_BLOCKED: &str =
-    "no admitted owner drives the canonical second phase: the authenticated \
+pub const AUTHORITY_REVOCATION_RESUME_BLOCKED: &str = "no admitted owner drives the canonical second phase: the authenticated \
      Human/Policy maintenance-request ingress held at explicit_request=false \
      in bins/eliotd/src/maintenance_trigger_evaluator.rs (#1692) must admit the \
      revocation decision naming the target grant, its snapshot and its \
@@ -299,8 +298,8 @@ pub async fn scan_authority_revocation_ingress(
     let mut committed_closures = 0usize;
     let mut pending_second_phase = Vec::new();
     for candidate in &plan.candidates {
-        let Some(closure) = read_committed_closure(kernel, &plan.state_fence, &candidate.grant_id)
-            .await?
+        let Some(closure) =
+            read_committed_closure(kernel, &plan.state_fence, &candidate.grant_id).await?
         else {
             // The Kernel's own owner holds no committed closure for this
             // target: no first phase ever ran against it. That is a fact
@@ -355,15 +354,11 @@ async fn read_committed_closure(
             ))
         })?;
     let object = value.as_object().ok_or_else(|| {
-        CompositionError::Owner(
-            "grant closure receipt read is not a typed object".to_owned(),
-        )
+        CompositionError::Owner("grant closure receipt read is not a typed object".to_owned())
     })?;
     let payload = match object.get("kind").and_then(serde_json::Value::as_str) {
         Some(GRANT_CLOSURE_RECEIPT_KIND) => object.get("value").cloned().ok_or_else(|| {
-            CompositionError::Owner(
-                "grant closure receipt read is missing its payload".to_owned(),
-            )
+            CompositionError::Owner("grant closure receipt read is missing its payload".to_owned())
         })?,
         Some(GRANT_CLOSURE_RECEIPT_REFUSAL_KIND) => {
             let reason = object
