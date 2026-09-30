@@ -4942,6 +4942,14 @@ impl KernelStoreGateway {
         // classifies as possible-effect is first put to the schedule owner, which
         // is the only party that can say whether the effect landed; a row it
         // answers for settles here and any other answer keeps it reconciling.
+        //
+        // The gate is the durable `Reconciling` classification and nothing else.
+        // Two neighbouring outcomes deliberately do NOT reach the owner, because a
+        // readback would destroy the only evidence each of them carries: a row
+        // whose retained answer no longer decodes stays unresolved so the
+        // corruption remains visible instead of being overwritten with a fresh
+        // answer, and a row holding a wake-cancellation retry claim is not a
+        // horizon obligation at all.
         let retained = self.retain_user_automation_obligation(sealed, &obligation);
         if matches!(
             &retained,
