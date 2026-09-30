@@ -62,6 +62,10 @@ pub const MAX_NORMALIZED_RECORDS: usize = 10_000;
 pub const MAX_SCIP_SIDECAR_BYTES: u64 = 256 * 1024 * 1024;
 /// SCIP occurrence role bit marking a definition occurrence.
 pub const SCIP_ROLE_DEFINITION: u64 = 0x01;
+/// Schema attached to versioned candidate references and observation receipts.
+pub const OBSERVATION_BINDING_SCHEMA_V1: &str = "eliot.lsp.observation-binding.v1";
+/// Schema attached to versioned source candidate references.
+pub const SOURCE_CANDIDATE_REFERENCE_SCHEMA_V1: &str = "eliot.lsp.source-candidate-reference.v1";
 
 /// One-shot analyzer path. Both variants invoke terminating subcommands of
 /// the configured executable; neither opens a persistent session.
@@ -144,6 +148,10 @@ pub struct SourceCandidate {
     pub path: Option<String>,
     /// Optional exact SCIP symbol string scoping the request.
     pub symbol: Option<String>,
+    /// Owner-issued immutable tree identity for the candidate under analysis.
+    pub candidate_tree_identity: String,
+    /// Owner-issued overlay commitment for the candidate under analysis.
+    pub overlay_commitment: String,
 }
 
 impl SourceCandidate {
@@ -156,18 +164,181 @@ impl SourceCandidate {
         if let Some(symbol) = &self.symbol {
             checked_text(symbol, "symbol")?;
         }
+        checked_text(&self.candidate_tree_identity, "candidate_tree_identity")?;
+        checked_text(&self.overlay_commitment, "overlay_commitment")?;
         Ok(())
     }
 
-    /// Canonical candidate reference bound into observation receipts.
+    /// Versioned structured candidate reference bound into receipts and cache
+    /// identities. `Option` fields remain distinct from literal values such
+    /// as `"-"`; the owner-provided tree and overlay identities bind changed
+    /// bytes at the same workspace path to a different source candidate.
     #[must_use]
     pub fn reference(&self) -> String {
-        format!(
-            "{}|{}|{}",
-            self.workspace_root,
-            self.path.as_deref().unwrap_or("-"),
-            self.symbol.as_deref().unwrap_or("-")
-        )
+        serde_json::json!({
+            "schema": SOURCE_CANDIDATE_REFERENCE_SCHEMA_V1,
+            "workspace_root": &self.workspace_root,
+            "path": &self.path,
+            "symbol": &self.symbol,
+            "candidate_tree_identity": &self.candidate_tree_identity,
+            "overlay_commitment": &self.overlay_commitment,
+        })
+        .to_string()
+    }
+}
+
+/// Owner snapshot observed at finalization to revalidate the analyzed source.
+///
+/// The bridge compares this exact tree and overlay identity with the admitted
+/// [`SourceCandidate`]. A mismatch makes the result stale while leaving the
+/// invocation's candidate reference and historical tool evidence intact.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct CandidateSnapshotRevalidation {
+    /// Owner identity of the source tree observed at finalization.
+    pub candidate_tree_identity: String,
+    /// Owner commitment of the overlay observed at finalization.
+    pub overlay_commitment: String,
+    /// Owner-issued immutable snapshot handle for this revalidation.
+    pub snapshot_handle: String,
+}
+
+impl CandidateSnapshotRevalidation {
+    /// Validates the observation and reports whether it still names the exact
+    /// source admitted for this invocation.
+    pub fn matches_candidate(&self, candidate: &SourceCandidate) -> Result<bool, BridgeError> {
+        for (value, field) in [
+            (self.candidate_tree_identity.as_str(), "revalidated_tree_identity"),
+            (self.overlay_commitment.as_str(), "revalidated_overlay_commitment"),
+            (self.snapshot_handle.as_str(), "source_snapshot_handle"),
+        ] {
+            checked_text(value, field)?;
+        }
+        Ok(self.candidate_tree_identity == candidate.candidate_tree_identity
+            && self.overlay_commitment == candidate.overlay_commitment)
+    }
+}
+
+/// Owner-provided execution identity paired with one sealed `ProcessRequest`.
+///
+/// The bridge validates every request field represented here before launch,
+/// then carries these exact owner values through the command and receipt.
+/// The strings are opaque identities: the bridge never derives them from a
+/// workspace path, executable name, profile name, or parser implementation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct ObservationAdmissionBinding {
+    /// Binding schema; must equal [`OBSERVATION_BINDING_SCHEMA_V1`].
+    pub schema: String,
+    /// Owner-issued admitted executable identity.
+    pub executable_identity: String,
+    /// Exact admitted executable path.
+    pub executable_path: String,
+    /// Exact admitted executable SHA-256 from the process owner.
+    pub executable_sha256: String,
+    /// Owner-issued instrument specification identity.
+    pub spec_identity: String,
+    /// Owner-issued parser identity for normalized results.
+    pub parser_identity: String,
+    /// Exact `ProcessRequest` operation ID.
+    pub operation_id: String,
+    /// Exact sealed `ProcessRequest` invocation digest.
+    pub request_digest: String,
+    /// Exact sealed `ProcessRequest` effect digest.
+    pub effect_digest: String,
+}
+
+impl ObservationAdmissionBinding {
+    /// Validates owner identity shape without deriving or normalizing values.
+    pub fn validate(&self) -> Result<(), BridgeError> {
+        if self.schema != OBSERVATION_BINDING_SCHEMA_V1 {
+            return Err(BridgeError::InvalidAdmissionBinding(
+                "unsupported observation binding schema".to_owned(),
+            ));
+        }
+        for (value, field) in [
+            (self.executable_identity.as_str(), "executable_identity"),
+            (self.executable_path.as_str(), "executable_path"),
+            (self.spec_identity.as_str(), "spec_identity"),
+            (self.parser_identity.as_str(), "parser_identity"),
+            (self.operation_id.as_str(), "operation_id"),
+            (self.request_digest.as_str(), "request_digest"),
+            (self.effect_digest.as_str(), "effect_digest"),
+        ] {
+            checked_text(value, field)?;
+        }
+        validate_lower_hex_digest(&self.executable_sha256, "executable_sha256")?;
+        validate_lower_hex_digest(&self.request_digest, "request_digest")?;
+        validate_lower_hex_digest(&self.effect_digest, "effect_digest")?;
+        Ok(())
+    }
+
+    /// Confirms that this owner-issued binding names this exact sealed request.
+    pub fn matches_request(&self, request: &ProcessRequest) -> bool {
+        self.validate().is_ok()
+            && request.executable() == self.executable_path
+            && request.executable_sha256() == self.executable_sha256
+            && request.operation_id().as_str() == self.operation_id
+            && request.invocation_digest() == self.request_digest
+            && request.effect_digest() == self.effect_digest
+    }
+}
+
+/// Owner-retained identity of one SCIP artifact emitted by one invocation.
+///
+/// The retained artifact handle is supplied by the execution/artifact owner.
+/// The bridge checks its exact output path, byte length and SHA-256 against
+/// the bounded sidecar read, and checks its operation and request identities
+/// against [`ObservationAdmissionBinding`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct ScipInvocationArtifactBinding {
+    /// Owner-retained immutable artifact handle.
+    pub artifact_handle: String,
+    /// Exact path declared in the admitted SCIP command.
+    pub output_path: String,
+    /// Exact byte length recorded by the artifact owner.
+    pub byte_length: u64,
+    /// Lowercase SHA-256 over the exact retained bytes.
+    pub sha256: String,
+    /// Process operation that emitted the artifact.
+    pub operation_id: String,
+    /// Sealed process request that emitted the artifact.
+    pub request_digest: String,
+}
+
+impl ScipInvocationArtifactBinding {
+    /// Checks owner identity shape and equality with the exact bounded bytes.
+    pub fn validate_bytes(
+        &self,
+        path: &str,
+        bytes: &[u8],
+        admission: &ObservationAdmissionBinding,
+    ) -> Result<(), BridgeError> {
+        for (value, field) in [
+            (self.artifact_handle.as_str(), "artifact_handle"),
+            (self.output_path.as_str(), "artifact_output_path"),
+            (self.operation_id.as_str(), "artifact_operation_id"),
+            (self.request_digest.as_str(), "artifact_request_digest"),
+        ] {
+            checked_text(value, field)?;
+        }
+        validate_lower_hex_digest(&self.sha256, "artifact_sha256")?;
+        if path != self.output_path
+            || self.byte_length != bytes.len() as u64
+            || self.sha256 != hex_bytes(Sha256::digest(bytes).as_slice())
+            || self.operation_id != admission.operation_id
+            || self.request_digest != admission.request_digest
+        {
+            return Err(BridgeError::InvalidArtifactBinding(
+                "retained artifact does not match the path, bytes, or admitted invocation"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -185,11 +356,16 @@ pub struct AnalyzerConfig {
     pub severity_minimum: Option<String>,
     /// Bridge-named SCIP sidecar output path (required for [`AnalyzerKind::Scip`]).
     pub scip_output_path: Option<String>,
+    /// Owner-issued executable, specification, parser, and request binding.
+    pub admission: ObservationAdmissionBinding,
 }
 
 impl AnalyzerConfig {
     /// Builds a default configuration invoking `rust-analyzer` on `PATH`.
-    pub fn for_workspace(executable: impl Into<String>) -> Result<Self, BridgeError> {
+    pub fn for_workspace(
+        executable: impl Into<String>,
+        admission: ObservationAdmissionBinding,
+    ) -> Result<Self, BridgeError> {
         let executable = checked_text_owned(executable.into(), "executable")?;
         Ok(Self {
             executable,
@@ -197,12 +373,19 @@ impl AnalyzerConfig {
             disable_proc_macros: false,
             severity_minimum: None,
             scip_output_path: None,
+            admission,
         })
     }
 
     /// Validates text shape and flag vocabulary.
     pub fn validate(&self) -> Result<(), BridgeError> {
         checked_text(&self.executable, "executable")?;
+        self.admission.validate()?;
+        if self.executable != self.admission.executable_path {
+            return Err(BridgeError::InvalidAdmissionBinding(
+                "configured executable differs from the admitted executable path".to_owned(),
+            ));
+        }
         if let Some(severity) = &self.severity_minimum {
             checked_text(severity, "severity_minimum")?;
             if !matches!(
@@ -223,15 +406,23 @@ impl AnalyzerConfig {
     /// Deterministic configuration hash bound into observation receipts.
     #[must_use]
     pub fn config_hash(&self) -> String {
-        let canonical = format!(
-            "{}\0{}\0{}\0{}\0{}",
-            self.executable,
-            self.disable_build_scripts,
-            self.disable_proc_macros,
-            self.severity_minimum.as_deref().unwrap_or("-"),
-            self.scip_output_path.as_deref().unwrap_or("-")
-        );
-        hex_bytes(Sha256::digest(canonical.as_bytes()).as_slice())
+        let stable_admission = serde_json::json!({
+            "executable_identity": &self.admission.executable_identity,
+            "executable_path": &self.admission.executable_path,
+            "executable_sha256": &self.admission.executable_sha256,
+            "spec_identity": &self.admission.spec_identity,
+            "parser_identity": &self.admission.parser_identity,
+        });
+        let canonical = serde_json::json!({
+            "schema": OBSERVATION_BINDING_SCHEMA_V1,
+            "executable": &self.executable,
+            "disable_build_scripts": self.disable_build_scripts,
+            "disable_proc_macros": self.disable_proc_macros,
+            "severity_minimum": &self.severity_minimum,
+            "scip_output_path": &self.scip_output_path,
+            "admission": stable_admission,
+        });
+        hex_bytes(Sha256::digest(canonical.to_string().as_bytes()).as_slice())
     }
 
     /// Reports whether this configuration narrows analyzed coverage past what
@@ -273,6 +464,10 @@ pub struct LspCommand {
     pub arguments: Vec<String>,
     /// Working directory of the invocation.
     pub working_directory: String,
+    /// Exact structured source reference attached to this invocation.
+    candidate_reference: String,
+    /// Exact owner-issued admission binding paired with its request.
+    admission: ObservationAdmissionBinding,
 }
 
 impl LspCommand {
@@ -288,6 +483,8 @@ impl LspCommand {
             executable: config.executable.clone(),
             arguments: vec!["--version".to_owned()],
             working_directory: candidate.workspace_root.clone(),
+            candidate_reference: candidate.reference(),
+            admission: config.admission.clone(),
         })
     }
 
@@ -308,6 +505,8 @@ impl LspCommand {
             executable: config.executable.clone(),
             arguments,
             working_directory: candidate.workspace_root.clone(),
+            candidate_reference: candidate.reference(),
+            admission: config.admission.clone(),
         })
     }
 
@@ -336,15 +535,30 @@ impl LspCommand {
             executable: config.executable.clone(),
             arguments,
             working_directory: candidate.workspace_root.clone(),
+            candidate_reference: candidate.reference(),
+            admission: config.admission.clone(),
         })
     }
 
     /// Checks that a caller-owned process request is exactly this projection.
     #[must_use]
     pub fn matches_request(&self, request: &ProcessRequest) -> bool {
-        request.executable().eq_ignore_ascii_case(&self.executable)
+        self.admission.matches_request(request)
+            && request.executable() == self.executable
             && request.working_directory() == self.working_directory
             && request.argv() == self.arguments
+    }
+
+    /// Returns the exact source reference carried into this command.
+    #[must_use]
+    pub fn candidate_reference(&self) -> &str {
+        &self.candidate_reference
+    }
+
+    /// Returns the exact owner binding paired with this command.
+    #[must_use]
+    pub const fn admission(&self) -> &ObservationAdmissionBinding {
+        &self.admission
     }
 }
 
@@ -567,6 +781,8 @@ pub enum FailureDisposition {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ObservationReceipt {
+    /// Receipt schema; must equal [`OBSERVATION_BINDING_SCHEMA_V1`].
+    pub schema: String,
     /// Exact analyzer executable as invoked.
     pub executable: String,
     /// Analyzer version text from the identity probe, when available.
@@ -575,6 +791,12 @@ pub struct ObservationReceipt {
     pub config_hash: String,
     /// Canonical candidate reference (`workspace|path|symbol`).
     pub candidate: String,
+    /// Exact owner-issued executable/spec/parser and process binding.
+    pub admission: ObservationAdmissionBinding,
+    /// Owner-retained SCIP output identity, present only for SCIP runs.
+    pub invocation_artifact: Option<ScipInvocationArtifactBinding>,
+    /// Owner snapshot observed at finalization for exact-current freshness.
+    pub source_revalidation: CandidateSnapshotRevalidation,
     /// Invocation time as Unix milliseconds, supplied by the caller.
     pub invoked_at_unix_ms: u64,
     /// Freshness of the result.
@@ -599,7 +821,11 @@ impl ObservationReceipt {
         executable: &str,
         executable_version: Option<String>,
         config_hash: &str,
-        candidate: &str,
+        candidate: &SourceCandidate,
+        admission: &ObservationAdmissionBinding,
+        invocation_artifact: Option<&ScipInvocationArtifactBinding>,
+        source_revalidation: &CandidateSnapshotRevalidation,
+        source_current: bool,
         invoked_at_unix_ms: u64,
         coverage: Coverage,
         output_handles: Vec<String>,
@@ -621,14 +847,25 @@ impl ObservationReceipt {
                 },
                 FailureDisposition::OutputTruncated,
             )
+        } else if !source_current {
+            (
+                Freshness::Stale {
+                    reason: "source candidate changed before observation finalization".to_owned(),
+                },
+                FailureDisposition::Success,
+            )
         } else {
             (Freshness::Current, FailureDisposition::Success)
         };
         Self {
+            schema: OBSERVATION_BINDING_SCHEMA_V1.to_owned(),
             executable: executable.to_owned(),
             executable_version,
             config_hash: config_hash.to_owned(),
-            candidate: candidate.to_owned(),
+            candidate: candidate.reference(),
+            admission: admission.clone(),
+            invocation_artifact: invocation_artifact.cloned(),
+            source_revalidation: source_revalidation.clone(),
             invoked_at_unix_ms,
             freshness,
             coverage,
@@ -739,6 +976,106 @@ impl NormalizedResult {
                 contradicted_by_higher_authority: false,
             },
         )
+    }
+
+    /// Adopts a received or deserialized result only when its complete receipt
+    /// matches the owner-supplied invocation, source snapshot, config, and
+    /// expected operation. This check also rejects applied rename claims.
+    pub fn adopt_received(
+        received: Self,
+        config: &AnalyzerConfig,
+        candidate: &SourceCandidate,
+        revalidation: &CandidateSnapshotRevalidation,
+        operation: &SemanticOperation,
+        artifact: Option<&ScipInvocationArtifactBinding>,
+    ) -> Result<Self, BridgeError> {
+        config.validate()?;
+        candidate.validate()?;
+        revalidation.matches_candidate(candidate)?;
+        if let Some(artifact) = artifact {
+            artifact.validate_shape(&config.admission)?;
+        }
+
+        let receipt = received.receipt();
+        let source_matches = revalidation.matches_candidate(candidate)?;
+        let valid_freshness = match (&receipt.freshness, &receipt.disposition) {
+            (Freshness::Current, FailureDisposition::Success) => source_matches,
+            (Freshness::Stale { .. }, FailureDisposition::Success) => !source_matches,
+            (Freshness::Stale { .. }, _) => true,
+            (Freshness::Current, _) => false,
+        };
+        let expected_coverage = if matches!(
+            receipt.disposition,
+            FailureDisposition::UnsupportedOperation
+        ) {
+            Coverage::ProbeOnly
+        } else {
+            coverage_for_operation(operation, candidate)
+        };
+        let expected_artifact = artifact.cloned();
+        let expected_sidecar_handle = artifact.map(ScipInvocationArtifactBinding::sidecar_handle);
+        let artifact_handle_matches = match (expected_sidecar_handle, receipt.output_handles.as_slice()) {
+            (Some(expected), [observed]) => *observed == expected,
+            (None, handles) => handles.iter().all(|handle| !handle.starts_with("scip:")),
+            _ => false,
+        };
+        let result_shape_matches = match (&received, operation) {
+            (Self::Definitions { .. }, SemanticOperation::Definitions { .. })
+            | (Self::References { .. }, SemanticOperation::References { .. })
+            | (Self::Symbols { .. }, SemanticOperation::Symbols { .. })
+            | (Self::Diagnostics { .. }, SemanticOperation::Diagnostics)
+            | (Self::Rename { .. }, SemanticOperation::Rename { .. })
+            | (Self::Version { .. }, SemanticOperation::ProbeVersion) => true,
+            _ => false,
+        };
+        if receipt.schema != OBSERVATION_BINDING_SCHEMA_V1
+            || receipt.executable != config.executable
+            || receipt.config_hash != config.config_hash()
+            || receipt.candidate != candidate.reference()
+            || receipt.admission != config.admission
+            || receipt.invocation_artifact != expected_artifact
+            || receipt.source_revalidation != *revalidation
+            || receipt.coverage != expected_coverage
+            || !valid_freshness
+            || !artifact_handle_matches
+            || !result_shape_matches
+        {
+            return Err(BridgeError::ForeignObservation);
+        }
+        if let Self::Rename { candidate, .. } = &received {
+            if candidate.applied
+                || !matches!(operation, SemanticOperation::Rename { symbol, new_name }
+                    if candidate.symbol == *symbol && candidate.new_name == *new_name)
+                || candidate.edits.iter().any(|edit| {
+                    edit.replacement != candidate.new_name
+                        || edit.line != edit.end_line
+                        || edit.column != edit.end_column
+                })
+            {
+                return Err(BridgeError::AppliedOrForeignRename);
+            }
+        }
+        Ok(received)
+    }
+}
+
+fn coverage_for_operation(
+    operation: &SemanticOperation,
+    candidate: &SourceCandidate,
+) -> Coverage {
+    match operation {
+        SemanticOperation::Definitions { symbol }
+        | SemanticOperation::References { symbol }
+        | SemanticOperation::Rename { symbol, .. } => Coverage::SingleSymbol {
+            symbol: symbol.clone(),
+        },
+        SemanticOperation::Symbols { path_scope } => Coverage::SymbolSubset {
+            path_scope: path_scope.clone(),
+        },
+        SemanticOperation::Diagnostics => Coverage::Workspace {
+            root: candidate.workspace_root.clone(),
+        },
+        SemanticOperation::ProbeVersion => Coverage::ProbeOnly,
     }
 }
 
@@ -1095,7 +1432,11 @@ pub fn rename_candidate(
 /// The size pre-check rejects obviously oversized sidecars early; the bound
 /// is enforced again after the read so a sidecar that grows mid-read still
 /// cannot pass an over-limit payload to the decoder.
-pub fn read_scip_sidecar(path: &str) -> Result<Vec<u8>, BridgeError> {
+pub fn read_scip_sidecar(
+    path: &str,
+    artifact: &ScipInvocationArtifactBinding,
+    admission: &ObservationAdmissionBinding,
+) -> Result<Vec<u8>, BridgeError> {
     checked_text(path, "scip_output_path")?;
     let metadata = std::fs::metadata(path).map_err(|error| BridgeError::SidecarUnreadable {
         detail: error.to_string(),
@@ -1109,6 +1450,7 @@ pub fn read_scip_sidecar(path: &str) -> Result<Vec<u8>, BridgeError> {
     if bytes.len() as u64 > MAX_SCIP_SIDECAR_BYTES {
         return Err(BridgeError::OutputTooLarge);
     }
+    artifact.validate_bytes(path, &bytes, admission)?;
     Ok(bytes)
 }
 
@@ -1212,6 +1554,7 @@ fn empty_scip_result(
 pub fn finalize_diagnostics(
     config: &AnalyzerConfig,
     candidate: &SourceCandidate,
+    revalidation: &CandidateSnapshotRevalidation,
     executable_version: Option<&str>,
     stdout: &[u8],
     truncated: bool,
@@ -1219,6 +1562,7 @@ pub fn finalize_diagnostics(
     completed: bool,
     invoked_at_unix_ms: u64,
 ) -> NormalizedResult {
+    let source_current = revalidation.matches_candidate(candidate).unwrap_or(false);
     let coverage = Coverage::Workspace {
         root: candidate.workspace_root.clone(),
     };
@@ -1227,7 +1571,11 @@ pub fn finalize_diagnostics(
             &config.executable,
             executable_version.map(str::to_owned),
             &config.config_hash(),
-            &candidate.reference(),
+            candidate,
+            &config.admission,
+            None,
+            revalidation,
+            source_current,
             invoked_at_unix_ms,
             coverage.clone(),
             vec![stream_handle("stdout", stdout)],
@@ -1266,17 +1614,23 @@ pub fn finalize_diagnostics(
 pub fn finalize_version(
     config: &AnalyzerConfig,
     candidate: &SourceCandidate,
+    revalidation: &CandidateSnapshotRevalidation,
     stdout: &[u8],
     truncated: bool,
     exit_code: Option<i32>,
     completed: bool,
     invoked_at_unix_ms: u64,
 ) -> NormalizedResult {
+    let source_current = revalidation.matches_candidate(candidate).unwrap_or(false);
     let mut receipt = ObservationReceipt::assemble(
         &config.executable,
         None,
         &config.config_hash(),
-        &candidate.reference(),
+        candidate,
+        &config.admission,
+        None,
+        revalidation,
+        source_current,
         invoked_at_unix_ms,
         Coverage::ProbeOnly,
         vec![stream_handle("stdout", stdout)],
@@ -1389,12 +1743,52 @@ fn wrap_cached_items(
 pub fn finalize_scip(
     config: &AnalyzerConfig,
     candidate: &SourceCandidate,
+    revalidation: &CandidateSnapshotRevalidation,
     operation: &SemanticOperation,
     index_bytes: &[u8],
     sidecar_path: &str,
+    artifact: &ScipInvocationArtifactBinding,
     invoked_at_unix_ms: u64,
     cache: Option<&mut ScipProjectionCache>,
 ) -> NormalizedResult {
+    let source_current = revalidation.matches_candidate(candidate).unwrap_or(false);
+    let invalid_binding = config
+        .validate()
+        .and_then(|()| candidate.validate())
+        .and_then(|()| revalidation.matches_candidate(candidate).map(|_| ()))
+        .and_then(|()| {
+            if config.scip_output_path.as_deref() != Some(sidecar_path) {
+                return Err(BridgeError::InvalidArtifactBinding(
+                    "SCIP artifact path differs from the admitted output path".to_owned(),
+                ));
+            }
+            artifact.validate_bytes(sidecar_path, index_bytes, &config.admission)
+        });
+    if let Err(error) = invalid_binding {
+        let mut receipt = ObservationReceipt::assemble(
+            &config.executable,
+            None,
+            &config.config_hash(),
+            candidate,
+            &config.admission,
+            Some(artifact),
+            revalidation,
+            source_current,
+            invoked_at_unix_ms,
+            Coverage::ProbeOnly,
+            vec![sidecar_handle(sidecar_path, index_bytes)],
+            None,
+            false,
+            false,
+        );
+        receipt.disposition = FailureDisposition::ParseFailed {
+            detail: error.to_string(),
+        };
+        receipt.freshness = Freshness::Stale {
+            reason: "SCIP artifact did not match its admitted invocation".to_owned(),
+        };
+        return empty_scip_result(operation, receipt);
+    }
     let coverage = match operation {
         SemanticOperation::Definitions { symbol }
         | SemanticOperation::References { symbol }
@@ -1409,7 +1803,11 @@ pub fn finalize_scip(
                 &config.executable,
                 None,
                 &config.config_hash(),
-                &candidate.reference(),
+                candidate,
+                &config.admission,
+                Some(artifact),
+                revalidation,
+                source_current,
                 invoked_at_unix_ms,
                 Coverage::ProbeOnly,
                 vec![sidecar_handle(sidecar_path, index_bytes)],
@@ -1429,7 +1827,11 @@ pub fn finalize_scip(
             &config.executable,
             None,
             &config.config_hash(),
-            &candidate.reference(),
+            candidate,
+            &config.admission,
+            Some(artifact),
+            revalidation,
+            source_current,
             invoked_at_unix_ms,
             coverage.clone(),
             vec![sidecar_handle(sidecar_path, index_bytes)],
@@ -1448,7 +1850,15 @@ pub fn finalize_scip(
     if let Some(cache) = cache {
         let target = candidate.reference();
         let config_hash = config.config_hash();
-        match cache.reuse_or_derive(index_bytes, &config_hash, operation, &target, |index| {
+        let cache_scope = serde_json::json!({
+            "schema": OBSERVATION_BINDING_SCHEMA_V1,
+            "config_hash": &config_hash,
+            "candidate": &target,
+            "candidate_tree_identity": &candidate.candidate_tree_identity,
+            "overlay_commitment": &candidate.overlay_commitment,
+        })
+        .to_string();
+        match cache.reuse_or_derive(index_bytes, &cache_scope, operation, &target, |index| {
             project_cached_items(index, operation)
         }) {
             Ok(cached) => return wrap_cached_items(operation, cached.items, ok_receipt()),
@@ -1638,6 +2048,12 @@ pub enum BridgeError {
     /// Analyzer configuration failed validation.
     #[error("invalid analyzer configuration: {0}")]
     InvalidConfig(String),
+    /// Owner-issued admission binding is malformed or mismatches its request.
+    #[error("invalid observation admission binding: {0}")]
+    InvalidAdmissionBinding(String),
+    /// Owner-retained output artifact does not match the exact invocation.
+    #[error("invalid invocation artifact binding: {0}")]
+    InvalidArtifactBinding(String),
     /// Candidate, symbol, or text field failed validation.
     #[error("invalid {field}: must be non-blank and free of control characters")]
     InvalidText {
@@ -1704,6 +2120,19 @@ fn checked_text(value: &str, field: &'static str) -> Result<(), BridgeError> {
 fn checked_text_owned(value: String, field: &'static str) -> Result<String, BridgeError> {
     checked_text(&value, field)?;
     Ok(value)
+}
+
+fn validate_lower_hex_digest(value: &str, field: &'static str) -> Result<(), BridgeError> {
+    if value.len() != 64
+        || value
+            .bytes()
+            .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
+    {
+        return Err(BridgeError::InvalidAdmissionBinding(format!(
+            "{field} must be a lowercase 64-character hex digest"
+        )));
+    }
+    Ok(())
 }
 
 fn checked_identifier(value: &str) -> Result<(), BridgeError> {
