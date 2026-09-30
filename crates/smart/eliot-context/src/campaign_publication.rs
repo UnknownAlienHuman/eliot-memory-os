@@ -6,15 +6,73 @@
 
 use eliot_context_contracts::{
     ApprovedRecipeCatalogue, ContextError as ContractContextError, ContextRecipe,
-    ReactiveInputError, RecipeResolutionRefusal, SafetyFloorIdentity, SessionDeliverySnapshot,
+    EXECUTED_CONTEXT_STAGE, EXECUTED_REPETITION_POLICY, EXECUTED_SECTION_DEGRADATION,
+    ReactiveInputError, RecipeExecutionSupport, RecipeResolutionRefusal, SafetyFloorIdentity,
+    SessionDeliverySnapshot,
 };
-use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
+use eliot_contracts::{ArtifactId, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_learning_contracts::{CampaignOwnerRecordId, CampaignOwnerRevision, CampaignSourceRole};
 use eliot_protocol::ReactiveContextStage;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{ContextError, ContextInput};
+
+/// The exact settings the current Context execution path applies.
+///
+/// #1724 W4. This is the execution owner's own statement of what it runs, built
+/// from the values the compiling and rendering cells actually use:
+///
+/// - the stage is the single whole-unit compile-and-render stage;
+/// - the ordering revision is `eliot_context_assembly::ASSEMBLY_ORDERING_REVISION`,
+///   the revision `assemble_active_view` renders under, read from that crate
+///   rather than restated here;
+/// - the repetition treatment is `EXECUTED_REPETITION_POLICY`, which is what
+///   the renderer does today: project each admitted record once, with
+///   `AdmittedContextSet::validate` refusing a repeated atom identity;
+/// - the section degradation is `EXECUTED_SECTION_DEGRADATION`, which is what
+///   admission and assembly do today: refuse the dependent operation rather
+///   than narrow a section behind a declared degradation;
+/// - the optional-feature disable is `false`, because neither cell has one.
+///
+/// A policy declaring anything outside this record is refused at publication
+/// and at every re-derivation of the body digest, instead of being certified
+/// into a digest while being ignored.
+fn context_execution_support() -> Result<RecipeExecutionSupport, ContextPublicationError> {
+    let stage = ArtifactId::new(EXECUTED_CONTEXT_STAGE)
+        .map_err(|error| ContextPublicationError::Serialization(error.to_string()))?;
+    let ordering_revision = ArtifactId::new(eliot_context_assembly::ASSEMBLY_ORDERING_REVISION)
+        .map_err(|error| ContextPublicationError::Serialization(error.to_string()))?;
+    let support = RecipeExecutionSupport {
+        executed_stage: stage,
+        ordering_revision,
+        repetition: EXECUTED_REPETITION_POLICY,
+        section_degradation: EXECUTED_SECTION_DEGRADATION,
+        supports_feature_disable: false,
+    };
+    support
+        .validate()
+        .map_err(ContextPublicationError::Recipe)?;
+    Ok(support)
+}
+
+/// Resolve, authorize and require the selected revision to be executable by the
+/// current execution path.
+///
+/// Every owner entry point below goes through this one closure, so a policy is
+/// never certified by a publication, a floor identity or a body digest unless
+/// the executing path actually runs what that policy declares.
+fn resolve_executable(
+    catalogue: &ApprovedRecipeCatalogue,
+    recipe: &ContextRecipe,
+) -> Result<eliot_context_contracts::ResolvedContextRecipe, ContextPublicationError> {
+    let resolved = catalogue.resolve()?;
+    catalogue.governing.authorize(&resolved, recipe)?;
+    resolved
+        .policy
+        .require_executable(&context_execution_support()?)?;
+    Ok(resolved)
+}
 
 /// Canonical owner identity for the immutable Context Compiler recipe.
 pub const CONTEXT_RECIPE_CAMPAIGN_OWNER_ID: &str = "owner:eliot-context/context-compiler";
@@ -200,13 +258,17 @@ impl ContextSourcePublication {
 /// independent governing requirements, and against the instance through
 /// `binds_recipe`, which compares the policy's own recorded digest with the
 /// digest the instance recorded in its `DecisionRevision`.
+/// W4: the resolved revision must additionally be executable by
+/// [`context_execution_support`], the executing path's own statement, so a
+/// policy that declares a stage, repetition treatment, section degradation or
+/// optional-feature disable this path does not run refuses here instead of
+/// being published inside a certified digest while being ignored.
 pub fn context_recipe_publication(
     recipe: &ContextRecipe,
     catalogue: &ApprovedRecipeCatalogue,
     compiler_input: &ContextInput,
 ) -> Result<ContextSourcePublication, ContextPublicationError> {
-    let resolved = catalogue.resolve()?;
-    catalogue.governing.authorize(&resolved, recipe)?;
+    resolve_executable(catalogue, recipe)?;
     compiler_input.validate()?;
     validate_recipe_input_binding(recipe, compiler_input)?;
 
@@ -326,10 +388,7 @@ pub fn context_delivery_publication(
 pub fn context_safety_floor_identity(
     body: &ContextCampaignRecipeBody,
 ) -> Result<SafetyFloorIdentity, ContextPublicationError> {
-    let resolved = body.catalogue.resolve()?;
-    body.catalogue
-        .governing
-        .authorize(&resolved, &body.recipe)?;
+    let resolved = resolve_executable(&body.catalogue, &body.recipe)?;
     let identity = SafetyFloorIdentity {
         floor_id: resolved.policy.admission.safety_floor.clone(),
         decision: body.recipe.decision.clone(),
@@ -349,10 +408,7 @@ pub fn context_safety_floor_identity(
 pub fn context_recipe_body_digest(
     body: &ContextCampaignRecipeBody,
 ) -> Result<String, ContextPublicationError> {
-    let resolved = body.catalogue.resolve()?;
-    body.catalogue
-        .governing
-        .authorize(&resolved, &body.recipe)?;
+    resolve_executable(&body.catalogue, &body.recipe)?;
     body.compiler_input.validate()?;
     validate_recipe_input_binding(&body.recipe, &body.compiler_input)?;
     let bytes = canonical_json_bytes(body)

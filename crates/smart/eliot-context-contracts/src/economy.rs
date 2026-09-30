@@ -55,6 +55,19 @@ pub struct ContextEconomyReceipt {
     pub allocations: EconomyAllocations,
     /// Digest of the recipe that admitted this set (`ContextRecipe.recipe_sha256`).
     pub recipe_digest: String,
+    /// Digest of the approved reusable Context policy revision this admission
+    /// ran under, read unchanged from that instance's own recorded
+    /// `DecisionRevision::policy_sha256`.
+    ///
+    /// #1724 W5. `recipe_digest` is a digest OF this compilation's instance, so
+    /// it cannot say which approved policy revision the instance was issued
+    /// under; the policy content digest is that fact, and
+    /// `ContextRecipePolicy::binds_recipe` compares exactly this recorded value
+    /// with the approved revision's own `policy_sha256`. Carrying it here makes
+    /// the approved policy identifiable from the receipt alone, and
+    /// `ActiveUnderstandingView::validate_against` compares it against the
+    /// View's own recorded value rather than each record hashing itself.
+    pub policy_sha256: String,
     pub receipt_digest: String,
 }
 
@@ -64,6 +77,7 @@ impl ContextEconomyReceipt {
         self.binding.validate()?;
         self.measurement.validate()?;
         validate_digest(&self.recipe_digest, "economy.recipe_digest")?;
+        validate_digest(&self.policy_sha256, "economy.policy_sha256")?;
         validate_digest(&self.receipt_digest, "economy.receipt_digest")?;
         if self.decision_id != self.binding.decision_id {
             return Err(ContextError::IdentityConflict);

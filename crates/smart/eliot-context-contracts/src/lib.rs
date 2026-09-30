@@ -79,7 +79,8 @@ pub use learning_ticket::{
     learning_ticket_digest, ticket_fresh_for,
 };
 pub use measurement::{
-    MeasurementStatus, SerializedContextMeasurement, StuEstimate, TokenizerObservation,
+    ContextExecutionIdentity, MeasurementStatus, SerializedContextMeasurement, StuEstimate,
+    TokenizerObservation,
 };
 pub use omission::{ExpansionHandle, NonRecoverableReason, OmissionReason, OmissionRecord};
 pub use quality::{
@@ -113,10 +114,12 @@ pub use readback::{
 pub use recipe::{
     ApprovedRecipeCatalogue, CONTEXT_RECIPE_POLICY_DIGEST_DOMAIN,
     CONTEXT_RECIPE_POLICY_SCHEMA_VERSION, CONTEXT_RECIPE_RESOLUTION_DIGEST_DOMAIN,
-    ContextRecipePolicy, ContextSectionBudget, CounterMetricMovement, GoverningContextRequirements,
+    ContextRecipePolicy, ContextSectionBudget, CounterMetricMovement, EXECUTED_CONTEXT_STAGE,
+    EXECUTED_REPETITION_POLICY, EXECUTED_SECTION_DEGRADATION, GoverningContextRequirements,
     ProtectedReservePolicy, RecipeAdmissionPolicy, RecipeApplicability,
     RecipeApplicabilityDimension, RecipeCandidateRejection, RecipeCounterMetric,
-    RecipeExecutionContour, RecipeLayoutPolicy, RecipeOmissionPolicy, RecipePolicyIdentity,
+    RecipeExecutionContour, RecipeExecutionSupport, RecipeLayoutPolicy, RecipeOmissionPolicy,
+    RecipePolicyIdentity,
     RecipeQualification, RecipeQualificationState, RecipeRejectionReason, RecipeResolutionRefusal,
     RecipeRolePosition, RecipeStage, RecipeSupersession, ResolvedContextRecipe,
 };

@@ -160,6 +160,7 @@ fn admitted() -> AdmittedContextSet {
                 route_capacity: 100_000,
             },
             recipe_digest: recipe(&context).recipe_sha256.clone(),
+            policy_sha256: recipe(&context).decision.policy_sha256.clone(),
             receipt_digest: digest(),
         },
     };
@@ -895,6 +896,7 @@ fn admitted_multi_role() -> (AdmittedContextSet, ContextRecipe) {
                 route_capacity: 100_000,
             },
             recipe_digest: digest(),
+            policy_sha256: digest(),
             receipt_digest: digest(),
         },
     };
@@ -1499,6 +1501,7 @@ fn admitted_with_omission() -> (AdmittedContextSet, ContextRecipe) {
                 route_capacity: 100_000,
             },
             recipe_digest: digest(),
+            policy_sha256: digest(),
             receipt_digest: digest(),
         },
     };

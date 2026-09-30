@@ -133,6 +133,38 @@ pub const CONTEXT_RECIPE_POLICY_SCHEMA_VERSION: u32 = 1;
 /// left exactly as it was.
 pub const CONTEXT_RECIPE_POLICY_DIGEST_DOMAIN: &str = "eliot.smart.context.recipe-policy.v1";
 
+/// The one stage the current consolidated Context execution path runs.
+///
+/// I12.13 lets a policy declare a stage graph. The current path is a single
+/// whole-unit compile-and-render stage with no predecessor edge, so a policy
+/// that declares anything else is declaring a graph this path does not execute.
+/// #1724 W4 requires such a policy to refuse at the point it would otherwise be
+/// certified into a digest, instead of contributing a stage graph nothing reads.
+pub const EXECUTED_CONTEXT_STAGE: &str = "context.stage.compile-and-render.v1";
+
+/// The whole-unit disposition the current path applies when a section floor
+/// cannot be preserved.
+///
+/// `BlockDependentDecisionOrEffect` is the boundary owner's own vocabulary for
+/// "this operation applied no permitted degradation": the current admission and
+/// assembly path never narrows, extracts or summarizes a section behind a
+/// declared degradation, it refuses the dependent operation instead
+/// (`ContextError::MissingFloor` / `AssemblyError::Incomplete`). A policy that
+/// declares any other degradation would be describing behaviour this path does
+/// not have, so it refuses rather than being digested.
+pub const EXECUTED_SECTION_DEGRADATION: BoundaryDisposition =
+    BoundaryDisposition::BlockDependentDecisionOrEffect;
+
+/// The repetition treatment the current renderer actually applies.
+///
+/// `render` projects every admitted record exactly once, and
+/// `AdmittedContextSet::validate` already refuses a repeated atom identity, so
+/// the implemented treatment is "an identical unit is represented once". A
+/// policy declaring a bounded repeat allowance or a repeat suppression would be
+/// describing behaviour the renderer does not have.
+pub const EXECUTED_REPETITION_POLICY: RecipeRepetitionPolicy =
+    RecipeRepetitionPolicy::DeduplicateIdentical;
+
 /// I12.13 `applicable_task_route_impact_and_governance_profiles`.
 ///
 /// A profile is a named, owner-declared profile, not a caller-supplied value
@@ -795,6 +827,63 @@ impl ContextRecipePolicy {
         Ok(())
     }
 
+    /// Refuse a policy that declares anything this execution path does not run.
+    ///
+    /// This is #1724 W4's refusal clause. Every field of a policy is inside
+    /// `policy_sha256`, so an unsupported declaration would otherwise be
+    /// certified: a re-hashed policy with a different stage graph, a different
+    /// repetition treatment, a whole-unit degradation the path never applies or
+    /// a feature disable it cannot perform would pass every digest check while
+    /// changing nothing about the output. Acceptance A2 requires the opposite:
+    /// a policy change must move the revision/digest and the effective compiler
+    /// behaviour together, or refuse.
+    ///
+    /// The four comparisons are exact and one-directional — the policy must
+    /// declare exactly what this path applies. Nothing here reads a value the
+    /// policy did not declare, and no comparison is against a value derived
+    /// from the policy itself. The refusal is a typed
+    /// [`RecipeResolutionRefusal::UnsupportedSetting`] naming the exact field
+    /// and the identity of the revision that declares it, so a dependent
+    /// compilation is blocked with a name rather than a silent degradation.
+    pub fn require_executable(
+        &self,
+        support: &RecipeExecutionSupport,
+    ) -> Result<(), RecipeResolutionRefusal> {
+        self.validate().map_err(|error| RecipeResolutionRefusal::InvalidCatalogue {
+            reason: error.to_string(),
+        })?;
+        support.validate().map_err(|error| RecipeResolutionRefusal::InvalidCatalogue {
+            reason: error.to_string(),
+        })?;
+        let identity = RecipePolicyIdentity::of(self);
+        let unsupported = |field: &str| RecipeResolutionRefusal::UnsupportedSetting {
+            identity: identity.clone(),
+            field: field.to_owned(),
+        };
+        if self.stages.len() != 1
+            || self.stages[0].stage_id != support.executed_stage
+            || !self.stages[0].predecessors.is_empty()
+        {
+            return Err(unsupported("recipe_policy.stages"));
+        }
+        if self.layout.repetition != support.repetition {
+            return Err(unsupported("recipe_policy.layout.repetition"));
+        }
+        for budget in &self.section_budgets {
+            if budget.degradation_behavior != support.section_degradation {
+                return Err(unsupported("section_budget.degradation_behavior"));
+            }
+            if budget.disable_feature_when_floor_cannot_be_preserved
+                && !support.supports_feature_disable
+            {
+                return Err(unsupported(
+                    "section_budget.disable_feature_when_floor_cannot_be_preserved",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn configured_features(&self) -> Result<BTreeSet<SemanticRole>, ContextError> {
         if self.candidate_features.is_empty() || self.candidate_features.len() > 64 {
             return Err(ContextError::Bounds {
@@ -886,6 +975,61 @@ impl ContextRecipePolicy {
                 ));
             }
         }
+        Ok(())
+    }
+}
+
+/// The independent denominator of what one Context execution path actually runs.
+///
+/// #1724 W4: the current candidate admission, ordering, rendering and
+/// scorecard/measurement must consume the pinned recipe rather than independent
+/// hidden defaults, and a stage or feature that is not supported must refuse
+/// instead of appearing in a certified digest while being ignored.
+///
+/// This record is the executing path's own statement of the concrete settings it
+/// applies. It is built by the execution owner, never by a candidate recipe, so
+/// [`ContextRecipePolicy::require_executable`] compares a policy against an
+/// independent answer rather than against a copy of the policy's own
+/// declarations. A member is only admitted here when the path that publishes
+/// this record reads that value when it compiles and renders; adding a member
+/// therefore means adding the execution that reads it, not widening a check.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RecipeExecutionSupport {
+    /// Stage identity this path runs for every compilation.
+    pub executed_stage: ArtifactId,
+    /// Rendered-ordering revision this path applies. I12.13 makes ordering part
+    /// of the recipe, so the revision that fixes the order is a compiled-in
+    /// execution fact and is bound next to the stage it belongs to.
+    pub ordering_revision: ArtifactId,
+    /// Repetition treatment this path applies to repeated content.
+    pub repetition: RecipeRepetitionPolicy,
+    /// Whole-unit disposition this path applies when a section floor cannot be
+    /// preserved.
+    pub section_degradation: BoundaryDisposition,
+    /// Whether this path can disable an optional feature when a section floor
+    /// cannot be preserved.
+    ///
+    /// The current whole-unit admission and assembly path has no such disable:
+    /// an unpreservable section blocks the dependent decision instead. The
+    /// field is required rather than defaulted so an executing path that gains
+    /// the capability states it explicitly, and a policy that relies on it
+    /// refuses until it does.
+    pub supports_feature_disable: bool,
+}
+
+impl RecipeExecutionSupport {
+    /// Validate the closed support record before it is compared to a policy.
+    pub fn validate(&self) -> Result<(), ContextError> {
+        validate_text(
+            self.executed_stage.as_str(),
+            "recipe_support.executed_stage",
+        )?;
+        validate_text(
+            self.ordering_revision.as_str(),
+            "recipe_support.ordering_revision",
+        )?;
+        self.repetition.validate()?;
         Ok(())
     }
 }
@@ -1039,6 +1183,15 @@ pub enum RecipeResolutionRefusal {
         /// The indistinguishable candidates, in policy-identity order.
         candidates: Vec<RecipePolicyIdentity>,
     },
+    /// The selected revision declares a setting the executing Context path does
+    /// not run, so certifying it would place that setting inside a delivered
+    /// digest while ignoring it.
+    UnsupportedSetting {
+        /// Identity of the revision that declares the unsupported setting.
+        identity: RecipePolicyIdentity,
+        /// Exact policy field the execution path does not implement.
+        field: String,
+    },
 }
 
 fn applicability_input_label(input: QualityApplicabilityInput) -> &'static str {
@@ -1074,6 +1227,11 @@ impl fmt::Display for RecipeResolutionRefusal {
                 formatter,
                 "{} applicable approved recipes share the highest policy revision",
                 candidates.len()
+            ),
+            Self::UnsupportedSetting { identity, field } => write!(
+                formatter,
+                "approved recipe {} declares {field}, which this execution path does not run",
+                identity.policy_id.as_str()
             ),
         }
     }

@@ -539,10 +539,23 @@ pub fn reseal_context_view(
     let mut measurement = active_seed.measurement.clone();
     measurement.envelope_digest.clone_from(&rendered_digest);
     measurement.rendered_utf8_bytes = rendered_payload_bytes.len() as u64;
+    // The execution identity states the revisions that produced the delivered
+    // bytes; `ActiveUnderstandingView::validate` cross-checks it against the
+    // measurement recorded beside it, so a fixture must describe the same one.
+    let execution = eliot_context_contracts::ContextExecutionIdentity {
+        ordering_revision: "a18.role-provider-atom.v1".to_owned(),
+        serializer_id: measurement.serializer_id.clone(),
+        serializer_version: measurement.serializer_version.clone(),
+        serializer_options_digest: measurement.serializer_options_digest.clone(),
+        route_id: measurement.route_id.clone(),
+        model_id: measurement.model_id.clone(),
+        measurement_status: measurement.status,
+    };
     let active = eliot_context_contracts::ActiveUnderstandingView::assemble(
         &admitted,
         active_seed.quality.clone(),
         measurement,
+        execution,
         rendered_digest,
         active_seed.recipe_digest.clone(),
         active_seed.fence_digest.clone(),

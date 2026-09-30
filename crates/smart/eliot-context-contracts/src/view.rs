@@ -9,9 +9,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AdmittedAtom, AdmittedContextSet, AtomAvailability, AuthorityClass, ContextBinding,
-    ContextError, LossPolicy, MeasurementRef, PrivacyClass, ProofBinding, QualityDimension,
-    QualityOperation, QualityRefusal, QualityRefusalKind, QualityScorecard, QualitySuitability,
-    SerializedContextMeasurement,
+    ContextError, ContextExecutionIdentity, LossPolicy, MeasurementRef, PrivacyClass,
+    ProofBinding, QualityDimension, QualityOperation, QualityRefusal, QualityRefusalKind,
+    QualityScorecard, QualitySuitability, SerializedContextMeasurement,
 };
 
 /// Rendered projection of one admitted atom, retaining all load-bearing fields.
@@ -119,8 +119,27 @@ pub struct ActiveUnderstandingView {
     pub selection: SelectionIntegrityProof,
     pub quality: QualityScorecard,
     pub measurement: SerializedContextMeasurement,
+    /// Revisions that produced these exact delivered bytes.
+    ///
+    /// #1724 W4/W5. The rendered ordering, serializer identity/options, route
+    /// and model all change the output, and this view is the record a consumer
+    /// receives, so the execution is named here rather than being implied by a
+    /// crate constant. It is cross-checked against the independently recorded
+    /// `measurement` in `validate`, so an execution identity that does not
+    /// describe this view's own measurement is refused rather than trusted.
+    pub execution: ContextExecutionIdentity,
     pub output_digest: String,
     pub recipe_digest: String,
+    /// Digest of the approved reusable Context policy revision this View was
+    /// compiled under, read unchanged from the recipe instance's own recorded
+    /// `DecisionRevision::policy_sha256`.
+    ///
+    /// #1724 W5. This is the cross-record half of the recipe binding:
+    /// `validate_against` compares it with `AdmittedContextSet::economy`'s own
+    /// recorded value, so a View, a scorecard and an economy receipt produced
+    /// under different approved policy revisions cannot be joined by hashing
+    /// each of them.
+    pub policy_sha256: String,
     pub fence_digest: String,
 }
 
@@ -171,6 +190,7 @@ impl ActiveUnderstandingView {
         admitted: &AdmittedContextSet,
         quality: QualityScorecard,
         measurement: SerializedContextMeasurement,
+        execution: ContextExecutionIdentity,
         output_digest: String,
         recipe_digest: String,
         fence_digest: String,
@@ -237,8 +257,10 @@ impl ActiveUnderstandingView {
             selection,
             quality,
             measurement,
+            execution,
             output_digest: derived_output_digest,
             recipe_digest,
+            policy_sha256: admitted.economy.policy_sha256.clone(),
             fence_digest,
         };
         view.validate_against(admitted)?;
@@ -256,7 +278,20 @@ impl ActiveUnderstandingView {
         // admission.  A view built from a different recipe must not validate
         // against this admitted set, so the two digests are compared here rather
         // than only hashed into the view's own payload.
-        if self.recipe_digest != admitted.economy.recipe_digest {
+        //
+        // #1724 W5: the SAME comparison is made for the approved reusable policy
+        // revision, on both records. `recipe_digest` identifies one compilation's
+        // instance and says nothing about which approved policy it was issued
+        // under; `policy_sha256` is that fact on each side, produced by
+        // different stages (admission read it off the instance it admitted, the
+        // assembly read it off the recipe it rendered). Neither value is an input
+        // to a digest the other is checked against, so a View and a receipt
+        // issued under different policy revisions are refused here even when
+        // both are individually well-formed and share a task, attempt, scope,
+        // decision and fence.
+        if self.recipe_digest != admitted.economy.recipe_digest
+            || self.policy_sha256 != admitted.economy.policy_sha256
+        {
             return Err(ContextError::IdentityConflict);
         }
         // The admitted half of the scorecard's output binding, compared against
@@ -372,6 +407,14 @@ impl ActiveUnderstandingView {
         }
         self.quality.validate()?;
         self.measurement.validate()?;
+        // The execution that produced these bytes, compared against the view's
+        // own independently recorded measurement. The two are separate records
+        // written by different steps (the assembly owner states the ordering and
+        // serializer it applied; the measurement owner reports what it
+        // measured), and neither is an input to a digest the other is checked
+        // against, so a view carrying one execution identity and another
+        // measurement is refused here.
+        self.execution.binds_measurement(&self.measurement)?;
         // The rendered half of the scorecard's output binding, compared against
         // the rendered half of this view. `derived_output_digest` is the one
         // existing canonical digest of the ordered rendered payload and it
@@ -423,6 +466,7 @@ impl ActiveUnderstandingView {
         }
         crate::validate_digest(&self.output_digest, "view.output_digest")?;
         crate::validate_digest(&self.recipe_digest, "view.recipe_digest")?;
+        crate::validate_digest(&self.policy_sha256, "view.policy_sha256")?;
         crate::validate_digest(&self.fence_digest, "view.fence_digest")
     }
 }
