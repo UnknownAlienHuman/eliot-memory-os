@@ -417,7 +417,9 @@ impl SemanticRevisionStore {
         // from a copy the caller carried in.
         let committed = self.load()?;
         if revision.already_committed(&committed) {
-            return Ok(SemanticPublishOutcome::Replayed { recovered: committed });
+            return Ok(SemanticPublishOutcome::Replayed {
+                recovered: committed,
+            });
         }
         // An identity the committed image does not carry cannot have been
         // interrupted here, so it is an honest first publish rather than a
@@ -469,7 +471,9 @@ impl SemanticRevisionStore {
         let committed = self.load()?;
         match committed.executions.get(attempt_id) {
             None => Ok(SemanticPublishOutcome::NotCommitted),
-            Some(_) => Ok(SemanticPublishOutcome::Replayed { recovered: committed }),
+            Some(_) => Ok(SemanticPublishOutcome::Replayed {
+                recovered: committed,
+            }),
         }
     }
 }
@@ -486,7 +490,14 @@ impl SemanticRevisionStore {
 pub enum SemanticRevision {
     /// A Task-Controller-owned plan definition revision, as the registering and
     /// superseding writers present it.
-    Definition(SwarmPlanDefinition),
+    ///
+    /// Boxed because `SwarmPlanDefinition` is by far the largest of the three
+    /// records, and unboxed it would make every `SemanticRevision` — including
+    /// the admission and execution arms, which never carry a definition — as
+    /// large as the definition. The caller already holds the definition by
+    /// reference or by value from its own writer, so the indirection costs one
+    /// allocation and changes nothing a caller does.
+    Definition(Box<SwarmPlanDefinition>),
     /// A Governor-owned admission revision, as the binding and disposition
     /// writers present it.
     Admission(SwarmPlanAdmission),
@@ -509,15 +520,13 @@ impl SemanticRevision {
     fn already_committed(&self, committed: &RecoveredSemanticRevisions) -> bool {
         match self {
             Self::Definition(definition) => {
-                committed.definitions.get(definition.definition_id.as_str())
-                    == Some(definition)
-                    && definition
-                        .supersedes
-                        .as_ref()
-                        .is_none_or(|link| {
-                            committed.supersessions.get(definition.definition_id.as_str())
-                                == Some(link)
-                        })
+                committed.definitions.get(definition.definition_id.as_str()) == Some(definition)
+                    && definition.supersedes.as_ref().is_none_or(|link| {
+                        committed
+                            .supersessions
+                            .get(definition.definition_id.as_str())
+                            == Some(link)
+                    })
             }
             Self::Admission(admission) => {
                 committed.admissions.get(admission.admission_id.as_str()) == Some(admission)
