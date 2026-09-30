@@ -126,9 +126,27 @@ pub struct OperatorArtifact {
 }
 
 impl OperatorArtifact {
+    /// Admission for the installation-approved Operator image.
+    ///
+    /// `executable` is held to the rule this file already applies to an
+    /// approved launch `executable`: it must be an absolute path and must carry
+    /// no wildcard. A relative path, a wildcard, a bare name, or a `..` segment
+    /// names no single image — it resolves against the working directory or
+    /// against a set of candidates, so it binds this artifact to nothing.
+    ///
+    /// `artifact_digest` remains a SHAPE check only: 64 hex characters. It is
+    /// NOT verification against the file's bytes — that needs a filesystem read
+    /// inside a pure check, which is a separate decision. `text` supplies the
+    /// remaining rule the launch boundary applies: no control characters.
     pub fn validate(&self) -> Result<(), BrokerError> {
         text(&self.image_id, "operator_image_id")?;
         text(&self.executable, "operator_executable")?;
+        if self.executable.contains('*')
+            || self.executable.contains('?')
+            || !absolute_executable_path(&self.executable)
+        {
+            return Err(BrokerError::InvalidField("operator_executable"));
+        }
         text(&self.artifact_digest, "operator_artifact_digest")?;
         hex_digest(&self.artifact_digest, "operator_artifact_digest")
     }
@@ -393,6 +411,21 @@ fn path_is_within_root(executable: &str, root: &str) -> bool {
     executable
         .strip_prefix(root)
         .is_some_and(|rest| rest.starts_with(['\\', '/']))
+}
+
+/// The `ApprovedLaunch` absolute-path rule, reduced to the one string it is
+/// applied to here.  Drive-absolute (`C:\...`, `C:/...`) or UNC (`\\server\...`).
+///
+/// Deliberately NOT imposed, because they are not part of that rule and each
+/// would reject a value the owner can mint today: canonicalisation, existence of
+/// the file, and a required extension.
+fn absolute_executable_path(executable: &str) -> bool {
+    let bytes = executable.as_bytes();
+    let drive_absolute = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/');
+    drive_absolute || executable.starts_with(r"\\")
 }
 
 /// A typed provider gap; A-09 never substitutes a local authority.

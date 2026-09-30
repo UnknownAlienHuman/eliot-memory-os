@@ -143,15 +143,51 @@ public static class LegacyOperatorAdapter
     /// remains issue #11.
     public const string ProofCeiling = "OPERATOR_USER_SESSION_EDGE_CANDIDATE";
 
-    /// Expiry/removal criteria: remove this adapter (and migrate reads to the
-    /// current ControlBoard/runtime-status owner and mutations to the current
-    /// typed Operator-intent owner) as soon as the Governor serves a
-    /// current-owner route on the UI pipe, or when the #1189 retirement owner
-    /// lands. The adapter must never gain a fifth tool, a new command shape,
-    /// or a wider capability.
+    /// Expiry/removal criteria: migrate reads to the current
+    /// ControlBoard/runtime-status owner and mutations to the current typed
+    /// Operator-intent owner, then delete these four tools. Every precondition
+    /// below is a fact a maintainer can check in the tree, and ALL of them must
+    /// hold first.
+    ///
+    /// 1. A current-owner ControlBoard read route is served on the Operator
+    ///    pipe and this client consumes it. It is not served today:
+    ///    `git grep "controlboard.status" -- apps/` matches nothing.
+    /// 2. The consumed page carries an owner-issued State Fence that this
+    ///    client validates, replacing the `owner_unissued` constant
+    ///    (`OperatorResponseBounds.cs:151`). The current owner already computes
+    ///    one that this client does not read: `ControlBoardContour.view_fence`
+    ///    (`controlboard_projection.rs:199`) and
+    ///    `RenderedControlBoard.view_fence` (`controlboard_consumer.rs:534`).
+    /// 3. Mutations no longer ride `eliot_operator_command`. The legacy page is
+    ///    `OperatorProjectionPage` (`crates/eliot-types/src/cognition.rs:1302`
+    ///    -`:1323`; `task_revision` only, no fence or epoch), produced only by
+    ///    `crates/eliot-app/src/mcp_stdio/operator.rs:821` -`:840`, in a crate
+    ///    that calls itself "not a current production composition root"
+    ///    (`crates/eliot-app/Cargo.toml:7`) and depends on no `eliot-contracts`.
+    /// 4. The UI pipe carries one protocol for this client. It carries two
+    ///    today: the broker redeem leg (`BrokerPipeClient.cs:75` -`:134`) and
+    ///    the Governor handshake leg, which writes `eliot_ipc_handshake`
+    ///    (`GovernorPipeClient.cs:579` -`:594`) on the pipe the broker's only
+    ///    server for that name binds (`bins/eliot-user-broker/src/main.rs:872`)
+    ///    and where anything other than `operator_challenge` then
+    ///    `redeem_operator_handoff` is answered
+    ///    `BROKER_PROTOCOL_SEQUENCE_REJECTED` (`:941` -`:954`, `:979` -`:990`).
+    /// 5. `Consumer` has no remaining call site of the four tools.
+    ///
+    /// An unmet precondition leaves the adapter exactly as it is. It must never
+    /// gain a fifth tool, a new command shape, or a wider capability.
+    ///
+    /// The five preconditions are the path that retires this adapter on its own
+    /// merits. The second, independent path is unchanged: this adapter is legacy
+    /// core, so when the #1189 retirement owner (with #18) retires that core, it
+    /// is removed then regardless of how many preconditions above still hold.
     public const string ExpiryRemoval =
-        "Remove when the Governor serves a current-owner ControlBoard/OperatorIntent route " +
-        "on the UI pipe or the #1189 retirement owner lands; no new tool or command shape may be added.";
+        "Remove when all five preconditions in the comment above hold: a served, " +
+        "consumed current-owner ControlBoard read route; an owner-issued State Fence on " +
+        "the consumed page; mutations served by the current typed Operator-intent owner; " +
+        "one protocol on the UI pipe; and no remaining call site of the four tools. " +
+        "Also remove when the #1189 retirement owner retires this legacy core. " +
+        "No new tool or command shape may be added.";
 
     /// The exact closed set of routes this adapter may issue. A tool outside
     /// the set is refused before it is written to the pipe, so the adapter

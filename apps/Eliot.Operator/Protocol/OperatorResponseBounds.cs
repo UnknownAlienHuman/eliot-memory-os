@@ -100,9 +100,12 @@ public enum OperatorReadConsistency
     /// pinned to the bound revision but is not an exact count.
     AtLeastRevision = 1,
 
-    /// I5.20:20 — all listed dependency revisions must match. The owner issued
-    /// an exact count and a bound task revision, so every revision key this
-    /// page carries is owner-issued and comparable.
+    /// I5.20:20 — all listed dependency revisions must match. This client
+    /// never reports it: `OperatorProjectionPage` carries `task_revision` and
+    /// no `state_fence`, `authority_epoch`, `resource_generation` or `epoch`,
+    /// so there are no owner-issued dependency revisions to match and the
+    /// guarantee cannot be made. The member stays in the closed vocabulary
+    /// with its exact I5.20 token; only the classifier refuses to reach it.
     ExactFence = 2
 }
 
@@ -157,14 +160,30 @@ public sealed record OperatorProjectionBinding(
         TimeSpan.FromSeconds(OperatorProtocol.HandoffLifetimeSeconds);
 
     /// Classifies the owner-issued page fields into the closed I5.20
-    /// `ReadConsistency` vocabulary, strongest match first. This is a
-    /// classification of what the owner sent, never a level the client picks.
+    /// `ReadConsistency` vocabulary, reporting only the consistency this
+    /// client can actually evidence. This is a classification of what the
+    /// owner sent, never a level the client picks.
+    ///
+    /// `ExactFence` is unreachable here. I5.20:20 requires that all listed
+    /// dependency revisions match, but `OperatorProjectionPage` carries
+    /// `task_revision` and no `state_fence`, `authority_epoch`,
+    /// `resource_generation` or `epoch`, so no owner-issued State Fence exists
+    /// on this contract and an exact count plus a bound task revision is not
+    /// that match. The word is refused rather than asserted.
+    ///
+    /// `AtLeastRevision` (I5.20:18, read-your-write after receipt) is reported
+    /// only when the owner actually issued a `task_revision` to read after.
+    /// With no owner-issued revision there is nothing to be read-your-write
+    /// against, so the honest floor I5.20:17 `Eventual` applies.
     public static OperatorReadConsistency ClassifyReadConsistency(OperatorProjectionPage page)
     {
         ArgumentNullException.ThrowIfNull(page);
-        if (page.TotalIsExact && page.TaskRevision is not null) return OperatorReadConsistency.ExactFence;
-        if (!page.TotalIsExact) return OperatorReadConsistency.AtLeastRevision;
-        return OperatorReadConsistency.Eventual;
+        // `total_is_exact` is deliberately not read here: it is a count
+        // qualifier, not a generation/revision/fence axis, and the owner
+        // revision is compared directly in `DiffersFrom`.
+        return page.TaskRevision is not null
+            ? OperatorReadConsistency.AtLeastRevision
+            : OperatorReadConsistency.Eventual;
     }
 
     public static OperatorProjectionBinding From(OperatorProjectionPage page, DateTimeOffset nowUtc)
