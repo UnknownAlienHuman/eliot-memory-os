@@ -1967,7 +1967,7 @@ fn canonical_dispatch_entry(tool: &ToolRequest) -> CanonicalDispatchEntry {
             completion_join: "daemon-side admit_material_decision invocation over Governor owner-resolved inputs with dispatch-time revalidation through a live act claim/flight (Kernel submit gate check_act_submit_binding and bridge dispatch revalidation done; #1742 W4)",
         },
         ToolRequest::Verify(_) => CanonicalDispatchEntry::SubmitAdmitOnly {
-            completion_join: "verifier-owner invocation through the existing verifier owner with not-executed/partial/unknown evidence preserved",
+            completion_join: "verifier-owner invocation through the existing verifier owner with not-executed/partial/unknown evidence preserved; Kernel submit gate check_verify_submit_binding (dispatch binding revalidated before staging, #1739 W5)",
         },
         ToolRequest::Coordinate(_) => CanonicalDispatchEntry::SubmitAdmitOnly {
             completion_join: "execution-fabric owner join with the same durable work/attempt identity (#1740)",

@@ -3771,6 +3771,19 @@ pub(crate) const OBSERVE_CAPABILITY: &str = "eliot.observe";
 /// write path; I07-08 step 7).
 pub(crate) const ACT_CAPABILITY: &str = "eliot.act";
 
+/// Closed capability admitted to the verify submit entry (issue #1739 W5:
+/// the Kernel-side verify submit path, serially after the act gate on the
+/// same carrier).
+///
+/// Digest-only `eliot.verify` invocations ride the shared submit entry through
+/// [`KernelComposition::admit_and_queue_observe_submit`]. The Kernel owns
+/// only the mechanical dispatch binding here — capability plus invocation
+/// kind, checked before any staging — never the verification verdict or the
+/// not-executed/partial/unknown evidence: those belong to the verifier owner
+/// the bridge dispatch row names (I01-08 canonical write path; I07-08 step
+/// 10).
+pub(crate) const VERIFY_CAPABILITY: &str = "eliot.verify";
+
 /// Whether one requested capability is task-relative or effectful and
 /// therefore needs the exact applicable task binding (issue #1746, W2).
 ///
@@ -3946,6 +3959,32 @@ pub(crate) fn check_act_submit_binding(
     Ok(())
 }
 
+/// Validates one digest-only verify submit binding before any staging (no IO).
+///
+/// Runs only the mechanical dispatch join the Kernel owns on this entry:
+/// the envelope must name the admitted `eliot.verify` capability and the
+/// `Invocation` kind the submit entry serves. A swapped capability or a
+/// non-invocation kind fails closed as `SessionFenced` before the caller
+/// stages anything. Pure: validation performs no IO by construction.
+///
+/// Digest-only verify submits carry no tool bytes, so there is no payload
+/// digest to link here — the envelope digest already commits to the exact
+/// canonical request through admission, and the live session/fence/
+/// connection binding is enforced by the frame gateway plus the admission
+/// gates. The verification verdict itself stays the verifier owner's,
+/// never a Kernel verdict (I01-08 canonical write path; I07-08 step 10).
+pub(crate) fn check_verify_submit_binding(
+    envelope: &HostRequestEnvelope,
+) -> Result<(), TransportError> {
+    if envelope.identity.capability != VERIFY_CAPABILITY {
+        return Err(TransportError::SessionFenced);
+    }
+    if envelope.kind != HostRequestKind::Invocation {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(())
+}
+
 fn observe_tool_requires_exact_task_binding(
     tool: &serde_json::Value,
 ) -> Result<bool, TransportError> {
@@ -3972,6 +4011,10 @@ impl KernelComposition {
     /// Kernel-owned dispatch binding ([`check_act_submit_binding`]) is
     /// revalidated before admission, while the material admission verdict
     /// stays the Governor owner's `admit_material_decision` (I01-08).
+    /// Digest-only `eliot.verify` invocations take the same entry next, in
+    /// row order: the Kernel-owned dispatch binding
+    /// ([`check_verify_submit_binding`]) is revalidated before admission,
+    /// while the verification verdict stays the verifier owner's.
     pub(crate) fn admit_and_queue_observe_submit(
         &self,
         envelope: &HostRequestEnvelope,
@@ -3987,6 +4030,14 @@ impl KernelComposition {
         // (`eliot-context-admission::admit_material_decision`).
         if !is_observe && envelope.identity.capability == ACT_CAPABILITY {
             check_act_submit_binding(envelope)?;
+        }
+        // Verify effect dispatch (issue #1739 W5): digest-only
+        // `eliot.verify` submits ride this same entry, serially after the
+        // act gate. Revalidate the Kernel-owned dispatch binding before
+        // staging; the verification verdict itself stays the verifier
+        // owner's, never a Kernel verdict (I01-08).
+        if !is_observe && envelope.identity.capability == VERIFY_CAPABILITY {
+            check_verify_submit_binding(envelope)?;
         }
         let task_relative_tool = if is_observe {
             tool.map(|tool| check_observe_tool_linkage(envelope, tool))

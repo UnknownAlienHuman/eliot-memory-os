@@ -5709,7 +5709,12 @@ impl BridgeRunner {
         };
         match response.kind {
             ResponseKind::Candidate | ResponseKind::Projection => {}
-            ResponseKind::PlanGap | ResponseKind::Unsupported => return None,
+            // Issue #1739 W6: an owner rejection carries no deliverable
+            // evidence bytes to retain — its typed failure already reached
+            // the caller through the negative response.
+            ResponseKind::PlanGap | ResponseKind::Unsupported | ResponseKind::OwnerRejected => {
+                return None;
+            }
         }
         let bytes = serde_json::to_vec(&response.content).ok()?;
         if bytes.len() <= MAX_PREVIEW_BYTES {

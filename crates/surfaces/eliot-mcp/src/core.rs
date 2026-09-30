@@ -733,6 +733,13 @@ pub enum ResponseKind {
     PlanGap,
     /// Provider contract is not supported.
     Unsupported,
+    /// Trusted owner returned a typed non-success (issue #1739 W6).
+    ///
+    /// Carries the Kernel-authored failure end to end — stable disposition,
+    /// open reason code, recovery directive and original operation identity —
+    /// never generic success and never empty data. Like the other negative
+    /// classes it renders with `isError: true`.
+    OwnerRejected,
 }
 
 /// Bounded, correlated, non-authoritative MCP response.
@@ -878,7 +885,7 @@ impl McpCore {
         };
         let active_session_binding = match port.resolve_active_session(&resolution_request) {
             Ok(binding) => binding,
-            Err(failure @ (PortFailure::PlanGap { .. } | PortFailure::Unsupported { .. })) => {
+            Err(failure) if is_typed_negative(&failure) => {
                 return negative_response(
                     &correlation.request_id,
                     &correlation.idempotency_key,
@@ -893,7 +900,7 @@ impl McpCore {
         let owner_evidence =
             match port.resolve_source_assurance(&resolution_request, &active_session_binding) {
                 Ok(evidence) => evidence,
-                Err(failure @ (PortFailure::PlanGap { .. } | PortFailure::Unsupported { .. })) => {
+                Err(failure) if is_typed_negative(&failure) => {
                     return negative_response(
                         &correlation.request_id,
                         &correlation.idempotency_key,
@@ -917,7 +924,7 @@ impl McpCore {
         };
         let projection = match port.dispatch(&forwarded) {
             Ok(value) => value,
-            Err(failure @ (PortFailure::PlanGap { .. } | PortFailure::Unsupported { .. })) => {
+            Err(failure) if is_typed_negative(&failure) => {
                 return negative_response(
                     &correlation.request_id,
                     &correlation.idempotency_key,
@@ -983,6 +990,22 @@ impl KernelGovernorPort for NoProviderPort {
     }
 }
 
+/// Returns whether one port failure already carries its exact MCP-visible
+/// negative shape (issue #1739 W6).
+///
+/// The absent-provider gaps plus the Kernel-authored failure envelope: its
+/// stable disposition, open reason code, recovery directive and original
+/// operation identity reach the caller unchanged through
+/// [`negative_response`] instead of degrading to a generic port error.
+fn is_typed_negative(failure: &PortFailure) -> bool {
+    matches!(
+        failure,
+        PortFailure::PlanGap { .. }
+            | PortFailure::Unsupported { .. }
+            | PortFailure::AgentResponse { .. }
+    )
+}
+
 fn negative_response(
     request_id: &str,
     idempotency_key: &str,
@@ -1008,6 +1031,28 @@ fn negative_response(
                 "code": "UNSUPPORTED",
                 "capability": capability,
                 "reason": reason,
+            }),
+        ),
+        // Issue #1739 W6: the Kernel-authored envelope crosses end to end.
+        // Every field below was validated at decode: the closed disposition,
+        // the open reason code, the owner recovery directive and the exact
+        // operation identity the failure reports on (`None` only when the
+        // Kernel refused before minting one). A queue/Store/semantic-owner
+        // failure is never generic success and never empty data here.
+        PortFailure::AgentResponse { failure } => (
+            ResponseKind::OwnerRejected,
+            json!({
+                "code": "OWNER_REJECTED",
+                "disposition": failure.disposition.as_str(),
+                "reason_code": failure.reason_code,
+                "directive": {
+                    "reason": failure.directive.reason,
+                    "next_action": failure.directive.next_action,
+                    "required_authority": failure.directive.required_authority,
+                    "evidence_refs": failure.directive.evidence_refs,
+                },
+                "operation_identity": failure.operation_identity,
+                "envelope_sha256": failure.envelope_sha256,
             }),
         ),
         other => return Err(BridgeError::Port(other)),
@@ -2823,7 +2868,7 @@ pub fn render_responded_result(
     })?;
     let is_error = matches!(
         response.kind,
-        ResponseKind::PlanGap | ResponseKind::Unsupported
+        ResponseKind::PlanGap | ResponseKind::Unsupported | ResponseKind::OwnerRejected
     );
     Ok(json!({
         "content": [{ "type": "text", "text": text }],
