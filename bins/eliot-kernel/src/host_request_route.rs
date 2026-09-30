@@ -2044,7 +2044,10 @@ impl KernelComposition {
         record: &HostRequestRecord,
     ) -> Result<Option<eliot_store_api::WriteSubmission>, TransportError> {
         if record.capability_ref.as_str() != OBSERVE_CAPABILITY
-            || matches!(record.state, HostRequestState::ResultReceived | HostRequestState::Terminal)
+            || matches!(
+                record.state,
+                HostRequestState::ResultReceived | HostRequestState::Terminal
+            )
         {
             return Ok(None);
         }
@@ -2064,8 +2067,7 @@ impl KernelComposition {
         {
             return Ok(None);
         }
-        let original_submission =
-            Self::original_write_submission_from_tool_request(&tool_request)?;
+        let original_submission = Self::original_write_submission_from_tool_request(&tool_request)?;
         let operation_identity = OperationIdentity::new(record.operation_id.as_str())
             .map_err(|_| TransportError::SessionFenced)?;
         let Some(reservation) = self
@@ -2119,11 +2121,8 @@ impl KernelComposition {
         {
             return Err(TransportError::IdentityConflict);
         }
-        let admission = Self::staged_observe_admission_projection(
-            &operation,
-            &reservation,
-            &staged,
-        )?;
+        let admission =
+            Self::staged_observe_admission_projection(&operation, &reservation, &staged)?;
         eliot_store_api::WriteSubmission::staged(&admission)
             .map(Some)
             .map_err(|_| TransportError::SessionFenced)
@@ -2139,10 +2138,9 @@ impl KernelComposition {
             .write_binding
             .as_ref()
             .ok_or(TransportError::SessionFenced)?;
-        let state_fence: eliot_contracts::StateFence = serde_json::from_str(
-            &write_binding.state_fence.canonical_json,
-        )
-        .map_err(|_| TransportError::SessionFenced)?;
+        let state_fence: eliot_contracts::StateFence =
+            serde_json::from_str(&write_binding.state_fence.canonical_json)
+                .map_err(|_| TransportError::SessionFenced)?;
         let scopes = token
             .scopes
             .iter()
@@ -2164,7 +2162,11 @@ impl KernelComposition {
                 .predecessor
                 .as_ref()
                 .map(|epoch| epoch.lineage_id.as_str().to_owned()),
-            predecessor_epoch: token.writer_epoch.predecessor.as_ref().map(|epoch| epoch.epoch),
+            predecessor_epoch: token
+                .writer_epoch
+                .predecessor
+                .as_ref()
+                .map(|epoch| epoch.epoch),
         };
         eliot_store_api::WriteAdmissionProjection::bind(
             &operation.transition,
@@ -7817,8 +7819,7 @@ impl KernelComposition {
             || staged_fence != input.application_binding.state_fence
             || write_binding.payload_created_at_ms != staged.created_at_ms
             || write_binding.payload_known_at_ms != staged.known_at_ms
-            || write_binding.payload_expires_at_ms
-                != staged.expires_at_ms
+            || write_binding.payload_expires_at_ms != staged.expires_at_ms
             || staged.expires_at_ms
                 != Some(
                     i64::try_from(record.deadline_unix_ms)
