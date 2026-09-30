@@ -1783,34 +1783,6 @@ fn host_request_observe_submit_frame(
     Ok(frame)
 }
 
-/// Builds the State submit frame carrying the exact canonical tool bytes
-/// (issue #2564).
-///
-/// Rides the same `agent_host_request_submit` entry as the digest-only
-/// submits; only the payload gains the exact `ToolRequest` JSON the future
-/// Kernel state linkage gate binds to the admitted envelope digest before
-/// admission. The Kernel retains the linked bytes for the daemon state flight
-/// instead of dropping to a digest-only stage, so a successful admission
-/// stays recoverable input — the same contract as the Observe submit frame
-/// (issue #2565). Until the Kernel state binding/retention half lands, the
-/// entry admits exactly as the digest-only shape did; the Accepted reply
-/// stays an operation handle either way.
-fn host_request_state_submit_frame(
-    request: &HostInvocationRequest,
-    envelope: &HostRequestEnvelope,
-    facts: &TransportFacts,
-) -> Result<Frame, PortFailure> {
-    let mut frame =
-        host_request_frame_for_envelope(AGENT_HOST_REQUEST_SUBMIT_OPERATION, envelope, facts)?;
-    let tool = serde_json::to_value(&request.tool).map_err(|_| request_failure())?;
-    let ProtocolPayload::Json(payload) = &mut frame.payload else {
-        return Err(request_failure());
-    };
-    payload["tool"] = tool;
-    frame.validate().map_err(|_| request_failure())?;
-    Ok(frame)
-}
-
 /// One finite dispatch row for every canonical tool (Implements #1739 item 1).
 ///
 /// This is the single recorded dispatch map [`KernelHostRequestClient::invoke`]
@@ -1823,7 +1795,7 @@ fn host_request_state_submit_frame(
 ///
 /// | tool | bridge entry | Kernel operation | completion boundary |
 /// |---|---|---|---|
-/// | `eliot.state` | submit frame (tool bytes) | `agent_host_request_submit` | admission handle only; serving flight `governor_local_read::serve_admitted_state_pair` over the task/scope/attention/health projection owners; Kernel state submit binding/retention plus the state queue/claim/submit lane pending |
+/// | `eliot.state` | submit frame (digest-only) | `agent_host_request_submit` | admission handle only; projection-owner readback join missing |
 /// | `eliot.packet` | invoke-read frame (tool bytes) | `agent_host_request_invoke_read` | exact bounded compiler result with revision via Governor read owner |
 /// | `eliot.observe` | submit frame (tool bytes) | `agent_host_request_submit` | daemon observe flight claims the retained pair, decodes the closed vocabulary and routes to the Governor observation owner; retained result via the governed submit leg |
 /// | `eliot.query` | invoke-read frame (tool bytes) | `agent_host_request_invoke_read` | exact bounded read result with revision via Governor read owner |
@@ -1868,17 +1840,6 @@ enum CanonicalDispatchEntry {
     /// and enqueues the admitted pair. The Accepted reply stays an operation
     /// handle until the flight submits the retained result.
     SubmitObservePair,
-    /// State submit carrying the exact canonical tool bytes (issue #2564).
-    /// Rides the same `agent_host_request_submit` entry as the digest-only
-    /// submits; the bytes travel so the future Kernel state linkage gate can
-    /// bind them to the admitted envelope digest before admission and retain
-    /// them for the daemon state flight (`include` selectors must travel, or
-    /// the flight cannot project them). The Kernel state binding/retention
-    /// half is not this client's verdict: until it lands, the submit entry
-    /// admits exactly as the digest-only shape did. The Accepted reply stays
-    /// an operation handle until the flight submits the retained result.
-    /// `completion_join` names that exact missing Kernel half.
-    SubmitStatePair { completion_join: &'static str },
     /// Non-hot operator carrier on the submit leg with tool bytes. Only
     /// [`ToolRequest::UserAutomation`] rides here.
     SubmitCarryingBytes,
@@ -1892,8 +1853,8 @@ enum CanonicalDispatchEntry {
 /// above. Behavior is byte-identical to the previous scattered predicates.
 fn canonical_dispatch_entry(tool: &ToolRequest) -> CanonicalDispatchEntry {
     match tool {
-        ToolRequest::State(_) => CanonicalDispatchEntry::SubmitStatePair {
-            completion_join: "kernel state submit binding/retention plus the state queue/claim/submit lane (Kernel pair + daemon flight governor_local_read::serve_admitted_state_pair + task/scope/attention/health projection owners)",
+        ToolRequest::State(_) => CanonicalDispatchEntry::SubmitAdmitOnly {
+            completion_join: "projection-owner readback: submit-record execution (Kernel pair + daemon flight + task/scope projection owner)",
         },
         ToolRequest::Packet(_)
         | ToolRequest::Query(_)
@@ -3220,9 +3181,6 @@ impl KernelHostRequestPort for KernelHostRequestClient {
             }
             CanonicalDispatchEntry::SubmitObservePair => {
                 host_request_observe_submit_frame(request, &envelope, &facts)?
-            }
-            CanonicalDispatchEntry::SubmitStatePair { .. } => {
-                host_request_state_submit_frame(request, &envelope, &facts)?
             }
         };
         let reply = match self.exchange(&frame) {

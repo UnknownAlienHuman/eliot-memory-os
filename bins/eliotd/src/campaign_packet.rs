@@ -1618,14 +1618,8 @@ fn source_reference_from_head(head: &CampaignSourceHead) -> CampaignSourceRevisi
 /// `CampaignSourceRevisionRead::validate` `Current` read always carries a
 /// receipt, so its presence here is guaranteed by the store contract, not
 /// re-established by this function.
-///
-/// Shared crate-internal owner: the campaign packet composition and the
-/// `eliot.state` serving edge (`governor_local_read::serve_admitted_state_pair`,
-/// issue #2564) resolve the same authenticated Task Controller `TaskPlan`
-/// recipe from the same admitted task/scope/fence binding, so there is one
-/// task-plan reader, not one per lane.
 #[allow(clippy::type_complexity)]
-pub(crate) async fn read_task_plan_recipe(
+async fn read_task_plan_recipe(
     kernel: &DaemonKernelClient,
     binding: &CampaignPacketBinding,
 ) -> Result<
