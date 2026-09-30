@@ -10,8 +10,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use eliot_contracts::{ArtifactId, ContractId, ResourceGeneration, SourceId, TaskId};
 use eliot_blob_api::{BlobLocator, BlobReadyReceipt};
+use eliot_contracts::{ArtifactId, ContractId, ResourceGeneration, SourceId, TaskId};
 pub use eliot_contracts::{
     ContractError, ContractVersion, ErrorCode, OperationId, PolicyRevision, ReceiptId,
     RequestMetadata, StateFence, TransactionSequence, canonical_json_bytes, sha256_hex,
@@ -5898,13 +5898,7 @@ pub fn issue_store_receipt_envelope(
         parent_receipt_id: None,
         predecessor_receipt_ids: Vec::new(),
     };
-    issue_store_receipt_envelope_with_causal(
-        context,
-        transition,
-        receipt,
-        commit_sequence,
-        &causal,
-    )
+    issue_store_receipt_envelope_with_causal(context, transition, receipt, commit_sequence, &causal)
 }
 
 /// Issues a store-owned receipt envelope using causal facts independently
@@ -5921,9 +5915,7 @@ pub fn issue_store_receipt_envelope_with_causal(
     validate_receipt_inputs(context, transition, receipt, commit_sequence)?;
 
     let state_fence = context.state_fence.clone();
-    if causal.state_fence != state_fence
-        || causal.transaction_sequence.value() != commit_sequence
-    {
+    if causal.state_fence != state_fence || causal.transaction_sequence.value() != commit_sequence {
         return Err(StoreError::InvalidReceipt);
     }
     let task = receipt_task(context, transition, &state_fence)?;
@@ -6001,7 +5993,13 @@ pub fn issue_genesis_receipt_envelope(
         parent_receipt_id: None,
         predecessor_receipt_ids: Vec::new(),
     };
-    issue_store_receipt_envelope_with_causal(context, &transition, receipt, commit_sequence, &causal)
+    issue_store_receipt_envelope_with_causal(
+        context,
+        &transition,
+        receipt,
+        commit_sequence,
+        &causal,
+    )
 }
 
 /// Validates a recovered genesis receipt against the canonical neutral
@@ -6252,8 +6250,13 @@ pub fn validate_store_receipt_envelope_with_causal(
     let commit_sequence = committed_receipt_sequence(receipt)?;
     let mut candidate = receipt.clone();
     candidate.envelope = None;
-    let expected =
-        issue_store_receipt_envelope_with_causal(context, transition, &candidate, commit_sequence, causal)?;
+    let expected = issue_store_receipt_envelope_with_causal(
+        context,
+        transition,
+        &candidate,
+        commit_sequence,
+        causal,
+    )?;
     match receipt.envelope.as_ref() {
         Some(actual) if actual == &expected => Ok(()),
         Some(_) => Err(StoreError::InvalidReceipt),

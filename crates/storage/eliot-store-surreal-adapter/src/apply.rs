@@ -14,11 +14,11 @@ use crate::plan::{
     validate_receipt_identity_with_expected_heads_and_causal, validate_revision_heads,
 };
 use crate::readiness::{CompiledMigration, MigrationReceipt, SemanticReadiness};
+use crate::source_artifact_context::CanonicalCausalProjection;
 use crate::write_execution::{
     AttemptOutcome, ExclusiveOpKind, ExecutableAttempt, OpExecution, ProviderGate,
     ReconcileOutcome, ReservedAttemptTransport, current_time_ms,
 };
-use crate::source_artifact_context::CanonicalCausalProjection;
 use crate::{client, schema, schema_inventory};
 #[cfg(test)]
 use eliot_store_api::{CONTRACT_VERSION, validate_genesis_receipt_envelope};

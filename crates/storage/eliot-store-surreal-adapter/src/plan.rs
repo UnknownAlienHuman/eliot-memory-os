@@ -9,17 +9,20 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_store_api::{
-    CanonicalEvent, CanonicalRequestView, CommitId, EventId, EventProjectionRelationIntents,
-    ExactJsonBytes, NamedMutationOperation, ORDERING_LINK_GENESIS_HASH, OrderingHead,
-    OrderingHeadExpectation, OrderingScopeId, OutboxIntent, OutboxIntentKind, OutboxState,
-    PAYLOAD_AUTHORITY_VERSION, PayloadEncoding, PayloadSource, PreparedTransition, ProjectionMode,
-    ProjectionPublicationId, ProjectionPublicationRecord, ProjectionStatus, RequestMeta,
-    Resubmission, RevisionDelta, RevisionHead, RevisionHeadExpectation, RevisionKey, SplitView,
-    CausalBinding, StoreError, WriteReceipt, WriteReceiptStatus, canonical_json_bytes,
-    canonical_request_hash, issue_store_receipt_envelope, issue_store_receipt_envelope_with_causal,
-    sha256_hex, validate_store_receipt_envelope, validate_store_receipt_envelope_with_causal,
-    verify_canonical_request_hash, verify_ordering_scope_binding,
+    CanonicalEvent, CanonicalRequestView, CausalBinding, CommitId, EventId,
+    EventProjectionRelationIntents, ExactJsonBytes, NamedMutationOperation,
+    ORDERING_LINK_GENESIS_HASH, OrderingHead, OrderingHeadExpectation, OrderingScopeId,
+    OutboxIntent, OutboxIntentKind, OutboxState, PAYLOAD_AUTHORITY_VERSION, PayloadEncoding,
+    PayloadSource, PreparedTransition, ProjectionMode, ProjectionPublicationId,
+    ProjectionPublicationRecord, ProjectionStatus, RequestMeta, Resubmission, RevisionDelta,
+    RevisionHead, RevisionHeadExpectation, RevisionKey, SplitView, StoreError, WriteReceipt,
+    WriteReceiptStatus, canonical_json_bytes, canonical_request_hash,
+    issue_store_receipt_envelope_with_causal, sha256_hex,
+    validate_store_receipt_envelope_with_causal, verify_canonical_request_hash,
+    verify_ordering_scope_binding,
 };
+#[cfg(test)]
+use eliot_store_api::{issue_store_receipt_envelope, validate_store_receipt_envelope};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -166,7 +169,7 @@ fn next_projection_generations(
 ///
 /// An allocation-contention retry re-enters through
 /// [`recompute_allocation`], which by contract preserves every semantic value
-/// from the established plan — but the projection generation is read from the
+/// from the established plan â€” but the projection generation is read from the
 /// store's retained publications, and the partner that won the contended
 /// allocation may have published a newer one. Re-binding here keeps the
 /// publication generation equal to "the retained generation plus one" on the
@@ -470,8 +473,8 @@ pub(crate) fn plan_apply_with_payload_authority(
 
 /// Issues the one canonical event this transition commits (issue #1931).
 ///
-/// One event identity for the whole transition — even across several Ordering
-/// Scopes (`I5.8`) — with exactly one [`eliot_store_api::OrderingLink`] per
+/// One event identity for the whole transition â€” even across several Ordering
+/// Scopes (`I5.8`) â€” with exactly one [`eliot_store_api::OrderingLink`] per
 /// declared scope. Each link takes its OWN reserved sequence from
 /// `next_ordering_heads` and its OWN prior chain tip from `current_chain_tips`
 /// (genesis [`ORDERING_LINK_GENESIS_HASH`] for a scope with no prior tip), and
@@ -515,7 +518,7 @@ fn canonical_event(
 ///
 /// `TransitionClass` already owns the canonical `snake_case` name of the class
 /// (its serde representation), so the event type is that exact admitted name
-/// under the closed `store.apply.` prefix — never a free-form label.
+/// under the closed `store.apply.` prefix â€” never a free-form label.
 fn transition_event_type(transition: &PreparedTransition) -> Result<String, StoreError> {
     let rendered = serde_json::to_value(transition.transition_class)
         .map_err(|error| StoreError::Serialization(error.to_string()))?;
@@ -539,8 +542,8 @@ struct AuditChainPreimage<'a> {
 /// Honest scope, stated exactly: this store has no separate audit journal,
 /// table, or chain-head column, so there is no wider audit chain to hash. The
 /// digest covers the durable audit material the one canonical transaction
-/// writes beside the receipt — the committed capture-evidence records on the
-/// `write_receipt` row — bound to the transition's one canonical event
+/// writes beside the receipt â€” the committed capture-evidence records on the
+/// `write_receipt` row â€” bound to the transition's one canonical event
 /// identity. It is committed on the `canonical_event` row in the same
 /// transaction, so a later reader can detect a rewritten evidence set or a
 /// substituted event identity. It does not claim a full append-only audit
@@ -578,9 +581,9 @@ fn committed_at_for(next_commit_sequence: u64) -> String {
 /// `next_commit_sequence`, the outbox record
 /// sequences plus `next_outbox_sequence`, and the evidence capture order.
 /// The caller's [`build_receipt_with_expected_heads`] then rebinds the
-/// receipt fields that carry those allocation values. Every semantic field — event and
+/// receipt fields that carry those allocation values. Every semantic field â€” event and
 /// command identities, payloads and digests, projections, relations,
-/// revision deltas, ordering-head results, semantic receipt bindings — is
+/// revision deltas, ordering-head results, semantic receipt bindings â€” is
 /// preserved byte-for-byte from `semantic_plan`, never re-derived: the
 /// bounded allocation retry loop re-enters through here and never through
 /// the full planner, so retry planning cannot duplicate or drift from
@@ -838,6 +841,7 @@ pub(crate) fn build_receipt(
 }
 
 /// Validates that a returned receipt matches the transition that requested it.
+#[cfg(test)]
 pub(crate) fn validate_receipt_identity(
     receipt: &WriteReceipt,
     ctx: &RequestMeta,
@@ -912,8 +916,9 @@ pub(crate) fn verify_apply_canonical_hash(
 ///
 /// Verifies first, then binds `WriteReceipt.canonical_request_hash` to the
 /// recomputed value (never a blind copy of the supplied claim). This is the
-/// live receipt path for `apply_prepared_with_authority` (via `apply.rs`),
+/// legacy fixture receipt path; production uses the causal owner projection,
 /// so non-empty-heads applies bind the identical digest Governor computed.
+#[cfg(test)]
 pub(crate) fn build_receipt_with_expected_heads(
     ctx: &RequestMeta,
     transition: &PreparedTransition,
@@ -1042,8 +1047,9 @@ pub(crate) fn build_receipt_with_expected_heads_and_causal(
 ///
 /// Checks supplied == recomputed (typed mismatch otherwise), receipt ==
 /// recomputed, and the legacy identity/envelope rules. This is the live
-/// replay/commit validation for `apply.rs` idempotency and post-commit
+/// fixture replay/commit validation; production uses the causal owner projection for
 /// receipt checks.
+#[cfg(test)]
 pub(crate) fn validate_receipt_identity_with_expected_heads(
     receipt: &WriteReceipt,
     ctx: &RequestMeta,

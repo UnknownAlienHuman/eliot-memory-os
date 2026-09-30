@@ -3300,7 +3300,7 @@ impl CandidateSourceSnapshotV1 {
 impl CandidateDiff {
     /// Returns the recorded tree OID only for the supported owner snapshot
     /// revision. An absent legacy field or unsupported/malformed revision is
-    /// unknown and must not be reconstructed from other CandidateDiff fields.
+    /// unknown and must not be reconstructed from other `CandidateDiff` fields.
     /// This accessor does not validate the canonical write receipt or join an
     /// immutable source artifact; those checks belong to the record reader.
     #[must_use]

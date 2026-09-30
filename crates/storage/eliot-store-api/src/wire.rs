@@ -17,16 +17,16 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    BackupOperationReconciliation, CanonicalRequestView, CanonicalRestoreBatch, CausalBinding,
-    CanonicalValidationSnapshot, ErasureIntentRecord, ErasureSurfaceKind, ExactJsonBytes,
-    IsolatedDestination, IsolatedDestinationReceipt, MAX_STORE_FAILURE_DETAIL_LEN,
+    BackupOperationReconciliation, CanonicalRequestView, CanonicalRestoreBatch,
+    CanonicalValidationSnapshot, CausalBinding, ErasureIntentRecord, ErasureSurfaceKind,
+    ExactJsonBytes, IsolatedDestination, IsolatedDestinationReceipt, MAX_STORE_FAILURE_DETAIL_LEN,
     NamedReadRequest, NamedReadResponse, OperationId, OperationIdentity, OrderingHead,
     OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RequestMeta,
     ReservedWriteRequest, RestoreValidationReceipt, RevisionHead, RevisionHeadExpectation,
     RevisionKey, ScopeId, SnapshotBeginRequest, SnapshotCursor, SnapshotEndReceipt, SnapshotHandle,
     SnapshotPage, StateFence, StoreError, StoreGenesisRequest, StoreHealth, StoreRecoveryRequest,
-    StoreRecoverySnapshot, WriteReceipt, canonical_json_bytes, dreamer_job::map_durable_error,
-    committed_receipt_sequence, json_shape_name, reconcile_same_operation, sha256_hex,
+    StoreRecoverySnapshot, WriteReceipt, canonical_json_bytes, committed_receipt_sequence,
+    dreamer_job::map_durable_error, json_shape_name, reconcile_same_operation, sha256_hex,
     validate_causal_write_receipt, verify_canonical_request_hash,
 };
 use schemars::JsonSchema;
@@ -1212,9 +1212,9 @@ impl StoreResponse {
             Self::ReceiptWithCausal {
                 receipt: Some(receipt),
                 causal: Some(causal),
-            } => validate_receipt_causal_projection(receipt, causal)
-                .map_err(StoreWireError::Store),
-            Self::Receipt { receipt: None } | Self::ReceiptWithCausal {
+            } => validate_receipt_causal_projection(receipt, causal).map_err(StoreWireError::Store),
+            Self::Receipt { receipt: None }
+            | Self::ReceiptWithCausal {
                 receipt: None,
                 causal: None,
             } => Ok(()),

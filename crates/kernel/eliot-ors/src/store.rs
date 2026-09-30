@@ -24546,8 +24546,9 @@ impl RedbRecoveryStore {
         {
             if projections.len() == MAX_PROCESS_STREAM_RECOVERY_LIVE_SET_ROWS {
                 return Err(ProcessStreamRecoveryLoadError::InterruptedRead {
-                    reason: "process-stream recovery family exceeds the bounded complete live-set scan"
-                        .to_owned(),
+                    reason:
+                        "process-stream recovery family exceeds the bounded complete live-set scan"
+                            .to_owned(),
                 });
             }
             let (key, value) =
