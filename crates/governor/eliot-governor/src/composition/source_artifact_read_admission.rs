@@ -32,7 +32,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// evidence.
     pub fn admit_source_artifact_read(
         &mut self,
-        input: crate::SourceArtifactReadRequest,
+        input: &crate::SourceArtifactReadRequest,
     ) -> Result<SourceArtifactAdmission, SourceArtifactAdmissionError> {
         if self.readiness != CompositionReadiness::Ready {
             return Err(SourceArtifactAdmissionError::Owner(
@@ -40,9 +40,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             ));
         }
         let fence = self.snapshot.state_fence();
-        let original = validate_original_read_request(&input, &fence)?;
-        let owners = read_current_owner_bindings(self, &input, &original, &fence)?;
-        let admission = source_artifact_read_admission_request(&input, &original, owners, &fence)?;
+        let original = validate_original_read_request(input, &fence)?;
+        let owners = read_current_owner_bindings(self, input, &original, &fence)?;
+        let admission = source_artifact_read_admission_request(input, &original, owners, &fence)?;
         if self.owners.authority.state_fence() != &fence {
             return Err(SourceArtifactAdmissionError::Binding(
                 "source-artifact AuthorityOwner is stale against the current Governor fence",
@@ -138,7 +138,7 @@ fn validate_original_read_request<'a>(
     if task_frame.operation() != NamedReadOperation::GetTaskState
         || task_frame.request_id() != &metadata.request_id
         || task_frame.state_fence() != fence
-        || task_frame.scope_id().map(|scope| scope.as_str()) != Some(work_scope_ref)
+        || task_frame.scope_id().map(eliot_store_api::ScopeId::as_str) != Some(work_scope_ref)
         || task_frame_principal.product_id() != &metadata.product_id
         || task_frame_principal.source_id() != &metadata.source_id
         || task_frame_principal.session_id() != Some(metadata_session)
