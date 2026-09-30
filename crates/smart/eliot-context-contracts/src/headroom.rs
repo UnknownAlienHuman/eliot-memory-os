@@ -594,16 +594,18 @@ impl DownstreamHeadroomResult {
                     // `Granted` outcome whose admitted amount the owner could
                     // not determine is a self-contradicting grant, and the
                     // module rule is that `Unknown` is its own state and never
-                    // reads as satisfied. Do NOT "fix" this to
-                    // `Some(dimension.owner_unit())` or
-                    // `admitted_demand.unit().unwrap_or(...)`; either one turns
-                    // an undetermined admission into an accepted one.
-                    // `known().is_none()` below is deliberately redundant with
-                    // the `None` arm above and is kept as an independent
-                    // statement that a grant must carry a positive amount, so
-                    // widening or changing the unit comparison cannot silently
-                    // drop the amount requirement.
-                    if admitted_demand.unit() != dimension.owner_unit()
+                    // reads as satisfied. The right-hand side is wrapped in `Some(..)` so both
+                    // sides share a type; that wrapping REFUSES rather than accepts, because
+                    // `None != Some(owner_unit)` is true. It does not assert the owner's unit
+                    // on the owner's behalf: `!=` never equates an absent unit with a
+                    // stated one.
+                    //
+                    // Do NOT "fix" this by SUBSTITUTING the owner's unit, i.e.
+                    // `admitted_demand.unit().unwrap_or(dimension.owner_unit())` or
+                    // `.map(|u| u == dimension.owner_unit()).unwrap_or(true)`. Either turns an
+                    // undetermined admission into an accepted one, which is the fabrication
+                    // this contract exists to refuse.
+                    if admitted_demand.unit() != Some(dimension.owner_unit())
                         || admitted_demand.known().is_none()
                     {
                         return Err(ContextError::UnknownMeasurement);
@@ -682,6 +684,23 @@ pub struct HeadroomAttempt {
     pub omissions: Vec<OmissionRecord>,
     /// Why dependent action-ready publication is withheld.
     pub refusal: HeadroomRefusal,
+}
+
+impl std::fmt::Display for HeadroomAttempt {
+    /// Names the recipe revision this compilation actually attempted and the
+    /// owner-issued refusal that withheld publication.
+    ///
+    /// This is a diagnostic rendering, not authority: the digests and the
+    /// refusal are the owner's records and are reproduced verbatim. Nothing is
+    /// derived, defaulted or normalised here, so an error message can never
+    /// restate a failed admission as a satisfied one.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "recipe {} withheld: {:?}",
+            self.attempted_recipe_digest, self.refusal
+        )
+    }
 }
 
 /// The release instruction the owner must execute for one granted dimension.
