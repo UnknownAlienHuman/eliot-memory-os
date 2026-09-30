@@ -13,7 +13,7 @@ use eliot_governor::{
 };
 use eliot_instrument_api::InstrumentInvocation;
 use eliot_protocol::RequestIdentity;
-use eliot_store_api::{WriteReceipt, WriteReceiptStatus};
+use eliot_store_api::{TaskContractAcceptanceSet, WriteReceipt, WriteReceiptStatus};
 use eliot_testd_core::{
     JobState as TestdJobState, TestJob, TestdPendingVerifierDispatch, TestdStore,
     TestdTerminalCompletionEvidence, TestdTerminalCompletionNotice, TestdVerifierDispatchBinding,
@@ -430,12 +430,31 @@ impl DaemonComposition {
             .map_err(DaemonError::Finish)
     }
 
+    /// Refreshes the canonical owner image this row's evidence join reads.
+    ///
+    /// The synchronous `refresh_from_kernel` runs under the caller's `&mut
+    /// self`, because the evidence join must read the verifier-execution fact
+    /// the fact leg actually published and never a pre-publish snapshot, and
+    /// because the contract-owner acceptance read that follows must be admitted
+    /// against the same refreshed fence. It is a separate step from
+    /// [`Self::plan_testd_terminal_owner_evidence`] so the acceptance read runs
+    /// after the refresh rather than before it.
+    pub fn refresh_testd_terminal_owner(&mut self) -> Result<(), DaemonError> {
+        self.governor
+            .refresh_from_kernel()
+            .map_err(|error| DaemonError::Finish(error.into()))
+    }
+
     /// Derives the exact exchange that publishes the Governor-owned
     /// canonical finish-evidence image for this row.
     ///
-    /// The synchronous `refresh_from_kernel` runs here, under the caller's
-    /// `&mut self`, because the evidence join must read the verifier-execution
-    /// fact the fact leg actually published and never a pre-publish snapshot.
+    /// `contract_acceptance` is the contract owner's rehydrated acceptance-item
+    /// enumeration for this row's exact task id and task revision (issue #1741,
+    /// I7.9), read after [`Self::refresh_testd_terminal_owner`] so it is bound to
+    /// the same refreshed fence this join reads. The caller rehydrates it
+    /// because that read is asynchronous and this phase must stay synchronous
+    /// with no Kernel round trip inside it.
+    ///
     /// Nothing is transported, so the guard is released again before the
     /// evidence exchange. `None` means the derived image is already the
     /// current canonical owner image, so the row owes no evidence exchange.
@@ -444,12 +463,10 @@ impl DaemonComposition {
         identity: &RequestIdentity,
         operation_id: &OperationId,
         draft: &FinishAttemptDraft,
+        contract_acceptance: &TaskContractAcceptanceSet,
     ) -> Result<Option<PreparedKernelExchange>, DaemonError> {
         self.governor
-            .refresh_from_kernel()
-            .map_err(|error| DaemonError::Finish(error.into()))?;
-        self.governor
-            .prepare_finish_evidence(identity, operation_id, draft)
+            .prepare_finish_evidence(identity, operation_id, draft, contract_acceptance)
             .map_err(DaemonError::Finish)
     }
 }
@@ -553,14 +570,33 @@ pub async fn commit_testd_terminal_owner_fact(
     // (2) no guard: the verifier-execution fact exchange.
     let committed = exchange_testd_owner_finish_leg(kernel, fact).await?;
     // (3) guard held, no exchange: revalidate the fact, publish its image,
-    // refresh, and derive the finish-evidence leg against that image.
+    // refresh, rehydrate the contract owner's acceptance-item enumeration, and
+    // derive the finish-evidence leg against that image.
+    //
+    // Issue #1741, I7.9: the denominator is the contract owner's enumeration at
+    // the exact task id and task revision, never the plan's own declared list.
+    // The rehydration is one bounded read on the existing authenticated Kernel
+    // named-read route and is taken after the refresh, so it runs against the
+    // canonical owner image this phase just published. A refusal is the
+    // Governor's typed `AcceptanceDenominatorError` and rejects the row
+    // owner-side; there is no fallback to the plan's list.
     let evidence_leg = {
         let mut guard = composition.lock().await;
         guard.accept_testd_terminal_owner_fact(fact)?;
+        guard
+            .refresh_testd_terminal_owner()?;
+        let task_id = TaskId::new(plan.finish_draft.task_id.clone()).map_err(|error| {
+            completion_error(format!("finish draft names an invalid task: {error}"))
+        })?;
+        let contract_acceptance = guard
+            .rehydrate_task_contract_acceptance(&task_id, plan.finish_draft.expected_task_revision)
+            .await
+            .map_err(DaemonError::Finish)?;
         guard.plan_testd_terminal_owner_evidence(
             &evidence.request_identity,
             &plan.finish_operation_id,
             &plan.finish_draft,
+            &contract_acceptance,
         )?
     };
     // (4) no guard: the finish-evidence exchange, if the Governor owes one.

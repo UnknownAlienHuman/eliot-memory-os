@@ -107,7 +107,7 @@ use eliot_session::{SessionLifecycleOwner, SessionLifecycleSnapshot, SessionStat
 use eliot_skill::{SkillLifecycleView, SkillRegistry};
 use eliot_store_api::{
     CanonicalReadClient, OrderingHeadExpectation, PreparedTransition, RevisionHeadExpectation,
-    ScopeRevisionView, StoreHealth, WriteReceipt,
+    ScopeRevisionView, StoreHealth, TaskContractAcceptanceSet, WriteReceipt,
 };
 use eliot_task::{TaskLifecycleOwner, TaskLifecycleSnapshot, TaskRecord, TaskState};
 use eliot_testd_core::{
@@ -252,6 +252,35 @@ pub trait KernelTransitionPort: Send + Sync {
         Box::pin(async {
             Err(KernelPortError::NotAdmitted(
                 "Task Controller campaign source-head read is not admitted".to_owned(),
+            ))
+        })
+    }
+
+    /// Reads the contract owner's exact `TaskContract` acceptance-item
+    /// enumeration for one task at one task revision under the exact fence
+    /// (issue #1741, I7.9).
+    ///
+    /// I7.9 requires the Finish service to rehydrate the current
+    /// `TaskContract` and its acceptance items. This read is the only route
+    /// that can produce them: the canonical plan enumerates the obligations a
+    /// plan *declares*, and the task-selection evidence states an acceptance
+    /// identity that is caller-stated at intake, so neither is an enumeration
+    /// the contract owner issued.
+    ///
+    /// Implementations must forward the exact task id, the exact task revision,
+    /// and the exact fence unchanged, and must return the owner's own
+    /// committed set. Implementations that do not expose this route fail
+    /// closed; no consumer may synthesize the denominator locally, guess an
+    /// empty obligation set, or fall back to the plan's own list.
+    fn task_contract_acceptance_set(
+        &self,
+        _task_id: &TaskId,
+        _task_revision: u64,
+        _state_fence: &StateFence,
+    ) -> KernelPortFuture<'_, TaskContractAcceptanceSet> {
+        Box::pin(async {
+            Err(KernelPortError::NotAdmitted(
+                "TaskContract owner acceptance-set read is not admitted".to_owned(),
             ))
         })
     }
@@ -2735,6 +2764,110 @@ impl ContractAcceptanceDenominator {
     /// carries, so `admits` never has to trust a digest reported by the plan.
     fn task_acceptance_set_commitment(&self) -> Result<String, CompositionError> {
         task_acceptance_set_commitment(&self.item_ids)
+    }
+}
+
+/// Closed failure set of the contract-owner acceptance denominator join.
+///
+/// Every arm is a refusal: no arm has a success meaning, and no arm names a
+/// fallback set. In particular there is no arm that keeps the plan's declared
+/// enumeration when the owner set is absent, because that is precisely the
+/// narrowing defect I7.9 closes.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum AcceptanceDenominatorError {
+    /// The contract owner published no acceptance set for this task id.
+    #[error("the contract owner has no acceptance item set for this task")]
+    OwnerSetAbsent,
+    /// The rehydrated set belongs to a different task than the finish attempt.
+    #[error("the rehydrated contract acceptance set names another task")]
+    TaskSubstituted,
+    /// The rehydrated set is not current at the exact admitted task revision.
+    #[error("the rehydrated contract acceptance set is not at the admitted task revision")]
+    TaskRevisionStale,
+    /// The rehydrated set was read under a different State Fence.
+    #[error("the rehydrated contract acceptance set was read under another State Fence")]
+    FenceStale,
+    /// The owner set does not validate against the closed owner contract.
+    #[error("the rehydrated contract acceptance set is malformed: {0}")]
+    Malformed(String),
+    /// The plan's declared enumeration is not the contract owner's enumeration.
+    ///
+    /// Reported item by item, never as a count alone, so the mismatch names
+    /// exactly which obligations each side claims.
+    #[error(
+        "the canonical plan declares {plan_only} acceptance item(s) the contract owner does not \
+         require, and omits {owner_only} obligation(s) it does"
+    )]
+    PlanDisagreesWithContract {
+        /// Obligations the plan declares that the contract owner does not require.
+        plan_only: Vec<String>,
+        /// Obligations the contract owner requires that the plan does not declare.
+        owner_only: Vec<String>,
+    },
+}
+
+impl AcceptanceDenominatorError {
+    /// Joins the contract owner's enumeration with the plan's declared
+    /// enumeration and returns the denominator the coverage gate is computed
+    /// over.
+    ///
+    /// The denominator's `item_ids` are the CONTRACT OWNER's enumeration. The
+    /// plan's `required_acceptance_item_ids` are compared against it item by
+    /// item and are never adopted: a plan that declares a strict subset would
+    /// otherwise report a smaller denominator as complete, and a plan that
+    /// declares a strict superset would make the gate carry an obligation the
+    /// contract never required. Neither is silently preferred over the other.
+    ///
+    /// `acceptance_digest` is the owner's OWN recorded value, never recomputed
+    /// here and never taken from the caller. The existing
+    /// [`CanonicalContractAcceptance::validate`] then proves that recorded
+    /// value commits to the owner enumeration retained beside it, so a
+    /// caller-stated digest issued for a different (larger) set cannot ride
+    /// under an owner enumeration.
+    pub(crate) fn bind(
+        task_id: &str,
+        task_revision: u64,
+        owner_set: &TaskContractAcceptanceSet,
+        verifier_plan: &CanonicalVerifierPlanBinding,
+    ) -> Result<CanonicalContractAcceptance, Self> {
+        owner_set
+            .validate()
+            .map_err(|error| Self::Malformed(error.to_string()))?;
+        if owner_set.task_id.as_str() != task_id {
+            return Err(Self::TaskSubstituted);
+        }
+        if owner_set.task_revision != task_revision {
+            return Err(Self::TaskRevisionStale);
+        }
+        let owner_item_ids = owner_set.item_ids();
+        if owner_item_ids.is_empty() {
+            return Err(Self::OwnerSetAbsent);
+        }
+        let plan_only = verifier_plan
+            .required_acceptance_item_ids
+            .difference(&owner_item_ids)
+            .cloned()
+            .collect::<Vec<_>>();
+        let owner_only = owner_item_ids
+            .difference(&verifier_plan.required_acceptance_item_ids)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !plan_only.is_empty() || !owner_only.is_empty() {
+            return Err(Self::PlanDisagreesWithContract {
+                plan_only,
+                owner_only,
+            });
+        }
+        let acceptance = CanonicalContractAcceptance {
+            task_id: task_id.to_owned(),
+            task_revision,
+            acceptance_digest: owner_set.acceptance_digest.clone(),
+            item_ids: owner_item_ids,
+        };
+        acceptance
+            .validate(task_id, task_revision)
+            .map_err(|error| Self::Malformed(error.to_string()))?;
+        Ok(acceptance)
     }
 }
 
@@ -5946,9 +6079,41 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .prepare_testd_verifier_execution_fact_from_evidence(evidence)
     }
 
+    /// Rehydrates the contract owner's acceptance-item enumeration for one
+    /// finish candidate, at the exact task id and task revision the admitted
+    /// request carries (issue #1741, I7.9).
+    ///
+    /// This is the async half of the denominator join and the only place the
+    /// finish path may obtain it. It is deliberately separate from
+    /// [`Self::prepare_finish_evidence`], which stays synchronous: the
+    /// preparation is pure, so a caller can run this read first and then
+    /// prepare with the owner's set in hand instead of holding a composition
+    /// borrow across a Kernel round trip for the write legs.
+    ///
+    /// A read that is absent, refused, unadmitted, or bound to another task,
+    /// revision or fence is a typed
+    /// [`AcceptanceDenominatorError`], never a substituted plan list.
+    pub async fn rehydrate_task_contract_acceptance(
+        &self,
+        task_id: &TaskId,
+        task_revision: u64,
+    ) -> Result<TaskContractAcceptanceSet, FinishAttemptError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(FinishAttemptError::Composition(CompositionError::NotReady));
+        }
+        self.finish_attempt_service()
+            .rehydrate_task_contract_acceptance(task_id, task_revision)
+            .await
+    }
+
     /// Prepares the exact exchange that publishes the Governor-derived
     /// canonical finish-evidence owner image for one candidate. `None` means
     /// the derived image is already current, so nothing is owed.
+    ///
+    /// `contract_acceptance` is the contract owner's rehydrated enumeration
+    /// from [`Self::rehydrate_task_contract_acceptance`]. The caller supplies
+    /// it rather than this method reading it, so the whole preparation stays
+    /// pure and no composition borrow crosses the read.
     ///
     /// This method transports nothing, so the caller may hold its composition
     /// borrow for this call alone. The refresh that publishes the evidence leg's
@@ -5958,12 +6123,17 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         identity: &RequestIdentity,
         operation_id: &OperationId,
         draft: &FinishAttemptDraft,
+        contract_acceptance: &TaskContractAcceptanceSet,
     ) -> Result<Option<PreparedKernelExchange>, FinishAttemptError> {
         if self.readiness != CompositionReadiness::Ready {
             return Err(FinishAttemptError::Composition(CompositionError::NotReady));
         }
-        self.finish_attempt_service()
-            .prepare_finish_evidence(identity, operation_id, draft)
+        self.finish_attempt_service().prepare_finish_evidence(
+            identity,
+            operation_id,
+            draft,
+            contract_acceptance,
+        )
     }
 
     /// Prepares the exact exchange that persists the finish decision.
@@ -6026,7 +6196,16 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         operation_id: OperationId,
         draft: FinishAttemptDraft,
     ) -> Result<FinishDecisionReceipt, FinishAttemptError> {
-        let evidence = self.prepare_finish_evidence(identity, &operation_id, &draft)?;
+        // I7.9, issue #1741: the contract owner's acceptance-item enumeration is
+        // rehydrated first, so the evidence leg's denominator is the owner's
+        // enumeration rather than the plan's declared list.
+        let task_id = TaskId::new(draft.task_id.clone())
+            .map_err(|error| FinishAttemptError::Serialization(error.to_string()))?;
+        let contract_acceptance = self
+            .rehydrate_task_contract_acceptance(&task_id, draft.expected_task_revision)
+            .await?;
+        let evidence =
+            self.prepare_finish_evidence(identity, &operation_id, &draft, &contract_acceptance)?;
         if let Some(prepared) = evidence.as_ref() {
             let _receipt = prepared.exchange(self.kernel.as_ref()).await?;
             self.accept_prepared_exchange(prepared)?;
