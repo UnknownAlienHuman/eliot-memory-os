@@ -649,33 +649,14 @@ impl fmt::Display for StorageReplacementStage {
     }
 }
 
-/// One irreversible occurrence that closes the generation-rollback path.
-///
-/// `I5.11` allows switching generation back only when no irreversible
-/// migration/effect occurred. These are the two occurrences the issue names;
-/// the coordinator records them as an append-only set and never clears one,
-/// because an observed irreversible effect cannot be un-observed.
-#[derive(
-    Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum IrreversibleStorageEffect {
-    /// The candidate's imported state cannot be reconciled back into the
-    /// incumbent store, so a generation switch back would lose canonical data.
-    IrreversibleMigration,
-    /// A canonical or external effect was already issued through the candidate
-    /// route, so the effect must be reconciled forward rather than undone.
-    ExternalEffectIssued,
-}
-
-impl fmt::Display for IrreversibleStorageEffect {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::IrreversibleMigration => "irreversible_migration",
-            Self::ExternalEffectIssued => "external_effect_issued",
-        })
-    }
-}
+// The durable owner's copy of this class is `eliot_ors::IrreversibleStorageEffect`
+// (crates/kernel/eliot-ors/src/irreversible_effect.rs), which also records WHEN it
+// occurred in a durable row. This module re-exports that exact type rather than
+// declaring a second one, so the coordinator's in-memory ledger and the durable
+// record cannot drift into two vocabularies: there is one class, one spelling and
+// one wire name. ORS is the lower crate and cannot depend on this one, so the
+// declaration belongs there.
+pub use eliot_ors::IrreversibleStorageEffect;
 
 /// The disposition of one rollback request against the `canonical_store` route.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
