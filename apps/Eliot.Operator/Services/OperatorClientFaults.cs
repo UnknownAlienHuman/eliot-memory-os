@@ -87,22 +87,36 @@ public sealed class OperatorNotAttemptedException(
 /// the transport that carried it was incomplete.
 ///
 /// This is deliberately distinct from
-/// [`OperatorUnknownOutcomeException`]: `OwnerAnswerObserved` says the owner
-/// did answer, so the operation's owner outcome is not unknown, and only the
-/// local connection cleanup is limited. The primary outcome is never replaced
-/// by this fault, and the retained operation identity is unchanged.
-public sealed class OperatorCleanupIncompleteException(
+/// [`OperatorUnknownOutcomeException`]: the settled, fully-validated owner
+/// answer travels ON this fault in [`OwnerAnswer`], so the operation's owner
+/// outcome is not unknown and the caller processes it exactly as a normally
+/// returned answer. Only the local connection cleanup is limited, and that
+/// limitation is reported separately under the same operation identity, never
+/// by rewriting the settled answer into an unknown phase. The retained
+/// operation identity is unchanged.
+///
+/// The answer travels typed, never re-serialized: `T` is the same
+/// deserialized outcome the exchange would have returned, so no caller has to
+/// prove the bytes a second time. The message carries only the closed
+/// identity, tool, stage and reason codes; the answer itself never enters it,
+/// so no owner payload can leak through a banner or the bounded startup log
+/// built from the message.
+public sealed class OperatorCleanupIncompleteException<T>(
     string operationId,
     string tool,
     string detail,
     string stage,
-    bool ownerAnswerObserved)
-    : IOException($"Operator cleanup incomplete for {operationId} via {tool} at {stage}: {detail} (owner answer observed: {ownerAnswerObserved})")
+    T ownerAnswer)
+    : IOException($"Operator cleanup incomplete for {operationId} via {tool} at {stage}: {detail} (owner answer observed: True)")
 {
     public string OperationId { get; } = operationId;
     public string Tool { get; } = tool;
     public string Stage { get; } = stage;
-    public bool OwnerAnswerObserved { get; } = ownerAnswerObserved;
+
+    /// The settled owner answer the incomplete cleanup followed. It was fully
+    /// validated and deserialized before the teardown ran, so receiving this
+    /// fault proves the owner outcome; only the local cleanup is limited.
+    public T OwnerAnswer { get; } = ownerAnswer;
 }
 
 /// The closed set of stages one caller operation can fail in. A stage is a
