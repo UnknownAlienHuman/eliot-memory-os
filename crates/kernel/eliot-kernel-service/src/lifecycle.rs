@@ -1642,6 +1642,20 @@ fn native_worker_claim_staged_record(
             "native_worker_claim.predecessor_revision",
         )?,
         resource_envelope_digest: native_worker_claim_resource_envelope_digest(request)?,
+        capability_cell: request
+            .executable_binding
+            .as_ref()
+            .map(|binding| {
+                native_worker_claim_identity(
+                    OpaqueLabel::new(binding.capability_cell.as_str()),
+                    "native_worker_claim.capability_cell",
+                )
+            })
+            .transpose()?,
+        capability_cell_registry_digest: request
+            .executable_binding
+            .as_ref()
+            .map(|binding| binding.capability_cell_registry_digest.clone()),
         state: NativeWorkerClaimState::Requested,
         receipt_digest: None,
         admitted_at_unix_ms: None,
@@ -1708,6 +1722,14 @@ fn native_worker_claim_changed_fields(
     note(
         durable.resource_envelope_digest == staged.resource_envelope_digest,
         "resource_envelope",
+    );
+    note(
+        durable.capability_cell == staged.capability_cell,
+        "capability_cell",
+    );
+    note(
+        durable.capability_cell_registry_digest == staged.capability_cell_registry_digest,
+        "capability_cell_registry_digest",
     );
     note(
         durable.request_digest == staged.request_digest,

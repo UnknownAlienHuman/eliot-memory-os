@@ -8639,6 +8639,13 @@ pub struct NativeWorkerClaimRecord {
     /// Opaque digest of the presenting worker generation's resource
     /// envelope (installation, artifact, and configuration identity).
     pub resource_envelope_digest: String,
+    /// Functional capability cell selected by the owner-validated
+    /// executable join, absent only for legacy requests without that join.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_cell: Option<OpaqueLabel>,
+    /// Registry digest bound to `capability_cell` by the executable join.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_cell_registry_digest: Option<String>,
     /// Durable claim state.
     pub state: NativeWorkerClaimState,
     /// Canonical digest of the immutable admission receipt. `None` while
@@ -8685,6 +8692,8 @@ impl NativeWorkerClaimRecord {
             && self.execution_unit_schema_version == other.execution_unit_schema_version
             && self.predecessor_revision == other.predecessor_revision
             && self.resource_envelope_digest == other.resource_envelope_digest
+            && self.capability_cell == other.capability_cell
+            && self.capability_cell_registry_digest == other.capability_cell_registry_digest
     }
 
     /// Validates identity shape and state/receipt coherence.
@@ -8720,6 +8729,25 @@ impl NativeWorkerClaimRecord {
             ),
         ] {
             validate_digest(value, field)?;
+        }
+        match (
+            &self.capability_cell,
+            &self.capability_cell_registry_digest,
+        ) {
+            (Some(cell), Some(registry_digest)) => {
+                validate_text(cell.as_str(), "native_worker_claim_capability_cell")?;
+                validate_digest(
+                    registry_digest,
+                    "native_worker_claim_capability_cell_registry_digest",
+                )?;
+            }
+            (None, None) => {}
+            _ => {
+                return Err(OrsError::InvalidField {
+                    field: "native_worker_claim_capability_cell_binding",
+                    reason: "cell identity and registry digest must be bound together",
+                });
+            }
         }
         if self.worker_generation == 0
             || self.deadline_unix_ms == 0
