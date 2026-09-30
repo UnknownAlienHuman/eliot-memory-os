@@ -47,18 +47,45 @@ pub(crate) enum DaemonRuntimeStatus {
 /// Observation only, via #895's facade: fixed `kernel.supervision.*` event
 /// names plus a bounded stable outcome. Subordinate infos only; the single
 /// terminal for a failed supervision operation stays with the owning
-/// publication/renewal boundary. Never carries lease material, cursors,
-/// digests, evidence, or owner error strings (I15.4, I07.20).
-fn observe_supervision(event: &'static str, outcome: &'static str) {
+/// publication/renewal boundary. Identity references live only on the
+/// operation span after screening (I15.4, I07.20).
+fn observe_supervision(context: &tracing::Span, event: &'static str, outcome: &'static str) {
     use super::kernel_diagnostics::{KERNEL_DIAGNOSTICS_TARGET, bound_field};
     let event_bound = bound_field(event);
     let outcome_bound = bound_field(outcome);
     tracing::info!(
         target: KERNEL_DIAGNOSTICS_TARGET,
+        parent: context,
         event = event_bound.text(),
         outcome = outcome_bound.text(),
         "daemon supervision observation"
     );
+}
+
+#[cfg(windows)]
+fn record_progress_observation_refs(
+    context: &tracing::Span,
+    observation: &DaemonProgressObservation,
+) {
+    use super::kernel_diagnostics::bound_field;
+
+    let lease = bound_field(&observation.lease_id);
+    context.record("lease", lease.text());
+    let receipt = bound_field(&observation.predecessor_receipt_sha256);
+    context.record("receipt", receipt.text());
+}
+
+#[cfg(windows)]
+fn record_live_receipt_context(context: &tracing::Span, expected: &EliotdLiveReceipt) {
+    use super::kernel_diagnostics::bound_field;
+
+    if expected.validate().is_err() || expected.supervision.validate().is_err() {
+        return;
+    }
+    let lease = bound_field(&expected.supervision.lease_id);
+    context.record("lease", lease.text());
+    let receipt = bound_field(&expected.supervision.receipt_sha256);
+    context.record("receipt", receipt.text());
 }
 
 pub(crate) const fn daemon_status_proves_ready(status: &DaemonRuntimeStatus) -> bool {
@@ -475,17 +502,19 @@ pub(crate) enum EliotdLiveReceiptDisposition {
 }
 
 #[cfg(windows)]
-pub(crate) fn classify_eliotd_live_receipt_transition(
+pub(crate) fn classify_eliotd_live_receipt_transition_in_context(
+    context: &tracing::Span,
     old: &EliotdLiveReceipt,
     expected: &EliotdLiveReceipt,
     status_is_ready: bool,
     activation_predecessor: Option<&SupervisionLeasePredecessorIdentity>,
     supervision_successor: Option<&EliotdSupervisionSuccessorEvidence>,
 ) -> Result<EliotdLiveReceiptDisposition, KernelServiceError> {
+    record_live_receipt_context(context, expected);
     if old == expected {
         // F-LOG-KERNEL-3 (#901): exact replay is an observation of the
         // existing receipt, not another publication.
-        observe_supervision("kernel.supervision.receipt_replayed", "success");
+        observe_supervision(context, "kernel.supervision.receipt_replayed", "success");
         return Ok(EliotdLiveReceiptDisposition::ExactReplay);
     }
     let exact_activation_predecessor = activation_predecessor.is_some_and(|predecessor| {
@@ -497,6 +526,7 @@ pub(crate) fn classify_eliotd_live_receipt_transition(
     });
     if !status_is_ready && exact_activation_predecessor {
         observe_supervision(
+            context,
             "kernel.supervision.receipt_replaced",
             "activation_predecessor",
         );
@@ -526,12 +556,16 @@ pub(crate) fn classify_eliotd_live_receipt_transition(
             && old.supervision.public_key_fingerprint == expected.supervision.public_key_fingerprint
     });
     if status_is_ready && exact_renewal_predecessor {
-        observe_supervision("kernel.supervision.receipt_replaced", "renewal_predecessor");
+        observe_supervision(
+            context,
+            "kernel.supervision.receipt_replaced",
+            "renewal_predecessor",
+        );
         return Ok(EliotdLiveReceiptDisposition::ReplaceRenewalPredecessor);
     }
     // Subordinate observation only; the owning publication boundary emits the
     // single terminal for the rejected transition.
-    observe_supervision("kernel.supervision.receipt_rejected", "fenced");
+    observe_supervision(context, "kernel.supervision.receipt_rejected", "fenced");
     Err(KernelServiceError::ReadinessNotProven)
 }
 
@@ -662,13 +696,14 @@ impl DaemonSupervisionProgressState {
         self.last_monotonic_ms = self.last_monotonic_ms.max(observed_monotonic_ms);
     }
 
-    /// Records one blocked (non-renewing) evaluation. The request identity is
-    /// deliberately not recorded: refusals re-evaluate deterministically, and
-    /// only recorded renewals participate in replay/identity-conflict.
-    pub(crate) fn note_missed_renewal(&mut self) {
+    /// Records one blocked (non-renewing) evaluation under the caller's
+    /// original operation context. Refusals do not write an accepted request
+    /// identity, so the caller supplies the current attempt's context rather
+    /// than reusing an earlier successful renewal.
+    pub(crate) fn note_missed_renewal_in_context(&mut self, context: &tracing::Span) {
         // F-LOG-KERNEL-3 (#901): blocked-renewal observation; the stale-expiry
         // decision stays with the renewal join.
-        observe_supervision("kernel.supervision.renewal_missed", "deferred");
+        observe_supervision(context, "kernel.supervision.renewal_missed", "deferred");
         self.missed_renewals = self.missed_renewals.saturating_add(1);
     }
 
@@ -676,13 +711,15 @@ impl DaemonSupervisionProgressState {
     /// monotonic evidence, and the idempotency triple, resets the miss
     /// counter, stamps eligibility, and clears reconciliation. Call only
     /// after the ORS commit and post-verify both succeed.
-    pub(crate) fn record_renewed(
+    pub(crate) fn record_renewed_in_context(
         &mut self,
+        context: &tracing::Span,
         observation: &DaemonProgressObservation,
         observation_sha256: String,
         successor_revision: u64,
         now_ms: u64,
     ) {
+        record_progress_observation_refs(context, observation);
         if let Some(entry) = self
             .accepted_cursors
             .iter_mut()
@@ -705,16 +742,16 @@ impl DaemonSupervisionProgressState {
         // F-LOG-KERNEL-3 (#901): verified-renewal observation. Only the
         // outcome is logged; cursors, digests, and revision identities stay
         // with the owner.
-        observe_supervision("kernel.supervision.renewal_recorded", "success");
+        observe_supervision(context, "kernel.supervision.renewal_recorded", "success");
     }
 
     /// Marks the durable outcome unknown after a failed renew commit. The
     /// renewal join then reports `ReconciliationRequired` instead of minting
     /// a successor until exact reconciliation.
-    pub(crate) fn note_reconciliation_pending(&mut self) {
+    pub(crate) fn note_reconciliation_pending_in_context(&mut self, context: &tracing::Span) {
         // F-LOG-KERNEL-3 (#901): unknown-outcome observation; the outcome
         // stays unknown until the owner reconciles it exactly.
-        observe_supervision("kernel.supervision.reconciliation_required", "unknown");
+        observe_supervision(context, "kernel.supervision.reconciliation_required", "unknown");
         self.reconciliation_pending = true;
     }
 }
@@ -811,16 +848,17 @@ mod daemon_supervision_diagnostics_tests {
         let policy = test_policy();
         let mut progress = test_progress();
         assert!(!progress.stale_renewal_expired(&policy, 1_000_000));
-        progress.note_missed_renewal();
-        progress.note_missed_renewal();
+        let context = crate::kernel_diagnostics::operation_context(None, None, None, None);
+        progress.note_missed_renewal_in_context(&context);
+        progress.note_missed_renewal_in_context(&context);
         assert!(!progress.stale_renewal_expired(&policy, 1_000_000));
         assert_eq!(progress.missed_renewals, 2);
-        progress.note_missed_renewal();
+        progress.note_missed_renewal_in_context(&context);
         assert!(progress.stale_renewal_expired(&policy, 1_000_000));
 
         // An unknown outcome blocks successors until exact reconciliation.
         assert!(!progress.reconciliation_pending);
-        progress.note_reconciliation_pending();
+        progress.note_reconciliation_pending_in_context(&context);
         assert!(progress.reconciliation_pending);
 
         // Monotonic evidence never regresses, so rolled-back observations
@@ -833,10 +871,15 @@ mod daemon_supervision_diagnostics_tests {
         // reach the sink (helpers accept `&'static str`, so no `String`
         // payload can be passed at all).
         let text = capture(|| {
-            observe_supervision("kernel.supervision.renewal_missed", "deferred");
-            observe_supervision("kernel.supervision.reconciliation_required", "unknown");
-            observe_supervision("kernel.supervision.renewal_recorded", "success");
-            observe_supervision("kernel.supervision.receipt_replayed", "success");
+            let context = crate::kernel_diagnostics::operation_context(None, None, None, None);
+            observe_supervision(&context, "kernel.supervision.renewal_missed", "deferred");
+            observe_supervision(
+                &context,
+                "kernel.supervision.reconciliation_required",
+                "unknown",
+            );
+            observe_supervision(&context, "kernel.supervision.renewal_recorded", "success");
+            observe_supervision(&context, "kernel.supervision.receipt_replayed", "success");
         });
         for marker in [
             "kernel.supervision.renewal_missed",
