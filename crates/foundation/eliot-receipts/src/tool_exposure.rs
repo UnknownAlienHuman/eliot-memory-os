@@ -1583,17 +1583,17 @@ pub fn dispose_exposure_revision(
 
 /// Revision lineage of one history entry: the identities that join revisions
 /// of a single evaluation. Stage observations play no part in the lineage.
-fn history_lineage(
-    entry: &ToolExposureHistoryEntry,
-) -> (
-    &str,
-    &str,
-    Option<&String>,
-    Option<&String>,
-    Option<&String>,
-    Option<&String>,
-    Option<&String>,
-) {
+type HistoryLineage<'a> = (
+    &'a str,
+    &'a str,
+    Option<&'a String>,
+    Option<&'a String>,
+    Option<&'a String>,
+    Option<&'a String>,
+    Option<&'a String>,
+);
+
+fn history_lineage(entry: &ToolExposureHistoryEntry) -> HistoryLineage<'_> {
     (
         entry.tool_definition.as_str(),
         entry.definition_version.as_str(),
@@ -1663,10 +1663,11 @@ pub fn persist_exposure_history_revision(
 
 /// Canonical digest of one history entry's recorded bytes.
 fn digest_history_entry(entry: &ToolExposureHistoryEntry) -> Result<String, ToolExposureError> {
-    let bytes = crate::canonical_json_bytes(entry).map_err(|_| ToolExposureError::InvalidField {
-        field: "history.revision",
-        reason: "exposure history entry is not canonically serializable",
-    })?;
+    let bytes =
+        crate::canonical_json_bytes(entry).map_err(|_| ToolExposureError::InvalidField {
+            field: "history.revision",
+            reason: "exposure history entry is not canonically serializable",
+        })?;
     Ok(crate::sha256_hex(&bytes))
 }
 

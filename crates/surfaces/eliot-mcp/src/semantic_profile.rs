@@ -12,9 +12,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_receipts::ProofCeiling;
-use eliot_receipts::tool_exposure::{
-    OwnerStageFact, ToolExposureError, ToolExposureHistoryEntry,
-};
+use eliot_receipts::tool_exposure::{OwnerStageFact, ToolExposureError, ToolExposureHistoryEntry};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -376,7 +374,7 @@ impl SemanticRegistry {
     /// same revision naming the publish seam records. A live lookup miss is
     /// explicitly unresolved: this registry binds nothing for the queried
     /// identity, while another owner (provider/native catalogue,
-    /// FacetManifest) may still own its registration. Unknown stays unknown
+    /// `FacetManifest`) may still own its registration. Unknown stays unknown
     /// and is never coerced to `false`, and no other stage is inferred.
     ///
     /// # Errors
@@ -393,12 +391,13 @@ impl SemanticRegistry {
         match self.resolve(canonical_name, definition_version) {
             Ok(profile) => OwnerStageFact::supplied(
                 true,
-                format!("{}@{}", profile.method.canonical_name, profile.profile_version),
+                format!(
+                    "{}@{}",
+                    profile.method.canonical_name, profile.profile_version
+                ),
             )
             .map_err(|error| map_fact_error(&error)),
-            Err(SemanticProfileError::MissingProfile { .. }) => {
-                Ok(OwnerStageFact::unresolved())
-            }
+            Err(SemanticProfileError::MissingProfile { .. }) => Ok(OwnerStageFact::unresolved()),
             Err(error) => Err(error),
         }
     }
@@ -428,9 +427,7 @@ impl SemanticRegistry {
         }
         entry.registered =
             self.registration_fact(&entry.tool_definition, &entry.definition_version)?;
-        entry
-            .validate()
-            .map_err(|error| map_fact_error(&error))?;
+        entry.validate().map_err(|error| map_fact_error(&error))?;
         Ok(entry)
     }
 
