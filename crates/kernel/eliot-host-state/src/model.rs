@@ -142,7 +142,9 @@ pub enum RecoveryLineageReason {
 }
 
 /// External evidence for an explicitly recovered, globally distinct Host lineage.
-#[derive(Clone, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(deny_unknown_fields)]
 pub struct RecoveryLineageEvidence {
     pub reason: RecoveryLineageReason,

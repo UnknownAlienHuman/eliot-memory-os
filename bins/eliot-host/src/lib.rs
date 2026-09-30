@@ -2782,11 +2782,8 @@ impl HostJobBranches {
             host_state_root,
             store_data_root,
         )?;
-        let module_build_provenance = Self::readback_module_build_provenance_for_startup(
-            journal,
-            &evidence,
-            candidate,
-        )?;
+        let module_build_provenance =
+            Self::readback_module_build_provenance_for_startup(journal, &evidence, candidate)?;
         Self::send_bound_host_startup_evidence(
             transport,
             &evidence,
@@ -2895,7 +2892,11 @@ impl HostJobBranches {
         if fence.host != state.host
             || fence.host.installation != candidate.installation_id
             || fence.host.epoch.current.lineage_id.as_str()
-                != candidate.supervision_incarnation.host_epoch.lineage_id.as_str()
+                != candidate
+                    .supervision_incarnation
+                    .host_epoch
+                    .lineage_id
+                    .as_str()
             || fence.host.epoch.current.sequence.get() != candidate.host_epoch.value()
             || fence.activation_id != candidate.activation_id
             || fence.activation_generation.current.lineage_id.as_str()

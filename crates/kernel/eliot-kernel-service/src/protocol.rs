@@ -3190,7 +3190,11 @@ impl HostStartupEvidenceReport {
                 })?;
             if record.fence.host.installation != candidate.installation_id
                 || record.fence.host.epoch.current.lineage_id.as_str()
-                    != candidate.supervision_incarnation.host_epoch.lineage_id.as_str()
+                    != candidate
+                        .supervision_incarnation
+                        .host_epoch
+                        .lineage_id
+                        .as_str()
                 || record.fence.host.epoch.current.sequence.get() != candidate.host_epoch.value()
                 || record.fence.activation_id != candidate.activation_id
                 || record
@@ -3204,12 +3208,7 @@ impl HostStartupEvidenceReport {
                         .activation_generation
                         .lineage_id
                         .as_str()
-                || record
-                    .fence
-                    .activation_generation
-                    .current
-                    .sequence
-                    .get()
+                || record.fence.activation_generation.current.sequence.get()
                     != candidate
                         .supervision_incarnation
                         .activation_generation
