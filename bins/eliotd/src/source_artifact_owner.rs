@@ -232,8 +232,7 @@ impl SourceArtifactOwner {
         let ready = chunk.ready_receipt();
         if ready.locator() != &payload.locator
             || ready.metadata_sha256() != payload.metadata_sha256.as_str()
-            || ready.receipt().identity.receipt_id.as_str()
-                != payload.ready_receipt_id.as_str()
+            || ready.receipt().identity.receipt_id.as_str() != payload.ready_receipt_id.as_str()
             || ready.policy() != &policy
             || !matches_residency_domains(&ready.locator().residency, &residency)
             || ready.plaintext_length() != payload.plaintext_length
