@@ -519,33 +519,12 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
             .await?
         };
         let evidence = self.acquire_evidence(ctx, request, &ordering).await?;
-        let affordances = self
-            .acquire_state(
-                ctx,
-                request,
-                &ordering,
-                NamedReadOperation::GetCapabilityEvidenceState,
-                affordance_parameters(request)?,
-                SelectorBinding {
-                    key: "skill_id",
-                    expected: Some(&request.affordance_skill_id),
-                },
-            )
-            .await?;
+        let affordances = self.acquire_affordances(ctx, request, &ordering).await?;
         let heads_after = self.scope_heads(ctx, request).await?;
         if heads_after != heads_before {
             return Err(ContextInputsError::SourceHeadsChanged);
         }
-        // The Diagnostic Brief is compiled from the attention role this same
-        // reconstruction already read (I13.11, issue #1759 I7), under the same
-        // coherent closure: it adds no read, no store operation and no second
-        // Problem model. A Problem-scoped read is the only scope in which a
-        // brief exists; an unscoped attention request names no Problem, so it
-        // produces no brief rather than one about an arbitrary record.
-        let diagnostic_brief = match request.attention_problem_id.as_deref() {
-            Some(problem_id) => compile_problem_diagnostic_brief(&attention, problem_id)?,
-            None => None,
-        };
+        let diagnostic_brief = compile_requested_problem_brief(&attention, request)?;
         Ok(SevenRoleInputs {
             scope_id: request.scope_id.clone(),
             state_fence: ctx.state_fence.clone(),
@@ -562,6 +541,31 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
             evidence,
             affordances,
         })
+    }
+
+    /// Acquires the affordances role with its exact closed selectors.
+    ///
+    /// One role, one read, under the same closure and ordering binding as every
+    /// other role: the helper only names the operation, its owner-resolved
+    /// selector map and the `skill_id` the handler must echo back.
+    async fn acquire_affordances(
+        &self,
+        ctx: &RequestMetadata,
+        request: &ContextReconstructionRequest,
+        ordering: &ReadOrderingBinding,
+    ) -> Result<RoleAcquisition, ContextInputsError> {
+        self.acquire_state(
+            ctx,
+            request,
+            ordering,
+            NamedReadOperation::GetCapabilityEvidenceState,
+            affordance_parameters(request)?,
+            SelectorBinding {
+                key: "skill_id",
+                expected: Some(&request.affordance_skill_id),
+            },
+        )
+        .await
     }
 
     async fn scope_heads(
@@ -957,6 +961,30 @@ fn affordance_parameters(
             ),
         ]),
     )
+}
+
+/// Compiles the Diagnostic Brief for the Problem this request actually names.
+///
+/// The Diagnostic Brief is compiled from the attention role this same
+/// reconstruction already read (I13.11, issue #1759 I7), under the same
+/// coherent closure: it adds no read, no store operation and no second
+/// Problem model. A Problem-scoped read is the only scope in which a
+/// brief exists; an unscoped attention request names no Problem, so it
+/// produces no brief rather than one about an arbitrary record.
+///
+/// `None` is an honest outcome of an empty attention page, never a brief
+/// compiled from nothing. Every committed transition it describes is decoded
+/// through the store's own owner-state mutation decoder and validated as a
+/// `Problem` before it reaches this boundary; a page that fails either is
+/// `ContextInputsError::AttentionPageUndecodable`, not a partial brief.
+fn compile_requested_problem_brief(
+    attention: &RoleAcquisition,
+    request: &ContextReconstructionRequest,
+) -> Result<Option<ProblemDiagnosticBrief>, ContextInputsError> {
+    let Some(problem_id) = request.attention_problem_id.as_deref() else {
+        return Ok(None);
+    };
+    compile_problem_diagnostic_brief(attention, problem_id).map_err(ContextInputsError::from)
 }
 
 /// Rejects a blank or control-bearing owner-resolved selector.
