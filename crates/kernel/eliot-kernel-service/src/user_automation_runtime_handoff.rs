@@ -1486,9 +1486,12 @@ impl UserAutomationOperatorTransition {
                             // absence is the correct answer beside a committed
                             // occurrence whose own owner record binds it. A
                             // retained readback still has to equal that
-                            // committed intent in full above.
-                            UserAutomationWakePhase::NotApplicable { .. } => {}
-                            UserAutomationWakePhase::UnknownOutcome { .. }
+                            // committed intent in full above. An unknown or
+                            // unavailable phase proves nothing, and is
+                            // reconciled rather than joined, so all three
+                            // absent-evidence phases share this arm.
+                            UserAutomationWakePhase::NotApplicable { .. }
+                            | UserAutomationWakePhase::UnknownOutcome { .. }
                             | UserAutomationWakePhase::Unavailable { .. } => {}
                             _ => {
                                 return Err(
