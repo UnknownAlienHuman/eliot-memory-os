@@ -76,16 +76,16 @@ use eliot_context_assembly::{
     ActiveUnderstandingViewResult, AssemblyError, AssemblyPolicy, assemble_active_view,
 };
 use eliot_context_candidates::{
-    CANDIDATE_SCHEMA_VERSION, CandidatePolicy, CandidateRequest, OpaqueProjection,
-    PROVIDER_AFFORDANCE, PROVIDER_NEGATIVE_MEMORY, PROVIDER_TASK_FRAME, ProjectionSchema,
-    ProjectionState as CandidateProjectionState, construct_context_candidates,
+    CANDIDATE_SCHEMA_VERSION, CandidatePolicy, CandidateRequest, ContextCandidateSetResult,
+    OpaqueProjection, PROVIDER_AFFORDANCE, PROVIDER_NEGATIVE_MEMORY, PROVIDER_TASK_FRAME,
+    ProjectionSchema, ProjectionState as CandidateProjectionState, construct_context_candidates,
 };
 use eliot_context_contracts::{
-    AdmissionDisposition, AdmissionInput, AdmissionMeasurement, AdmissionRuleIdentity,
-    AdmittedContextSet, CONTEXT_CONTRACT_VERSION, ContextBinding, ContextError, ContextOutcome,
-    ContextRecipe, DecisionContextIncomplete, MeasurementCompositionProfile,
-    PriorityPolicyIdentity, ProviderId, QualityRefusal, QualityScorecard, SafetyFloorIdentity,
-    SerializedContextMeasurement, SuppliedOmissionBinding,
+    AdmissionDisposition, AdmissionInput, AdmissionMeasurement, AdmissionResult,
+    AdmissionRuleIdentity, AdmittedContextSet, CONTEXT_CONTRACT_VERSION, ContextBinding,
+    ContextError, ContextOutcome, ContextRecipe, DecisionContextIncomplete,
+    MeasurementCompositionProfile, PriorityPolicyIdentity, ProviderId, QualityRefusal,
+    QualityScorecard, SafetyFloorIdentity, SerializedContextMeasurement, SuppliedOmissionBinding,
 };
 use eliot_contracts::{
     ArtifactId, ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence,
@@ -121,6 +121,53 @@ use super::{DaemonKernelClient, SERVICE_NAME};
 /// fence fails closed after transport.
 pub struct KernelContextReadClient {
     kernel: Arc<DaemonKernelClient>,
+}
+
+/// Original outputs and inputs retained from one native Context compilation.
+///
+/// Borrowed request, recipe, policy, assembly policy and role inputs remain the
+/// exact values supplied by their owners. Candidate and admission owner values
+/// are retained as typed records, including the candidate omission records,
+/// admission omissions, full denominator and any incomplete outcome. An
+/// incomplete admission is a readback result, not a reason to discard its
+/// original decision.
+pub struct ContextCompilationOwnerReadback<'a> {
+    /// Exact candidate request admitted for this compilation.
+    pub request: &'a CandidateRequest,
+    /// Exact native policy recipe consumed by the candidate/admission owners.
+    pub recipe: &'a ContextRecipe,
+    /// Exact candidate policy supplied by its owner.
+    pub candidate_policy: &'a CandidatePolicy,
+    /// Exact assembly policy supplied by its owner.
+    pub assembly_policy: &'a AssemblyPolicy,
+    /// Original seven-role read closure with per-role owner payloads/receipts.
+    pub role_inputs: &'a SevenRoleInputs,
+    /// Original scorecard consumed by the assembly owner.
+    pub quality: QualityScorecard,
+    /// Exact mapper result, including native candidate-stage omissions.
+    pub candidates: ContextCandidateSetResult,
+    /// Exact validated input passed to the admission owner.
+    pub admission_input: AdmissionInput,
+    /// Exact admission decision, including its original incomplete state and
+    /// evidence omissions when applicable.
+    pub admission: AdmissionResult,
+    /// Owner-authored per-material decision traces.
+    pub rank_trace_delivery: MaterialRankTraceDelivery,
+    /// Terminal native owner disposition.
+    pub outcome: ContextCompilationOwnerOutcome,
+}
+
+/// Terminal result of candidate, admission and assembly owners.
+pub enum ContextCompilationOwnerOutcome {
+    /// Admission completed and the native assembly output passed boundary and
+    /// delivered-trace conservation.
+    Complete(ActiveUnderstandingViewResult),
+    /// Admission returned its typed incomplete result; no assembly was run.
+    Incomplete(Box<DecisionContextIncomplete>),
+    /// Admission completed, but a native assembly/output acceptance owner
+    /// refused the result. The original candidate/admission readback remains
+    /// available beside this typed refusal.
+    Refused(Box<PacketCompositionError>),
 }
 
 /// Closed local-read selectors for one admitted `eliot.query` pair.
@@ -1522,12 +1569,12 @@ impl KernelContextReadClient {
     /// evidence are never assembled here merely to satisfy the renderer. The
     /// pieces are closed into the one admission bundle by
     /// [`PacketAdmissionBundle::build`], so an unvalidated or foreign piece
-    /// fails before any candidate is admitted. An explicit admission gap fails as
-    /// [`PacketCompositionError::AdmissionIncomplete`] with the owner's gaps,
-    /// never as a silently cut view. The packet dispatch invokes this edge with
-    /// the admitted pair's binding, recipe, and owner evidence; large output
-    /// cannot pass `policy.max_serialized_bytes`, and genuinely deferred
-    /// compilation uses a durable job, never an unconsumed handle.
+    /// fails before any candidate is admitted. An explicit admission gap is
+    /// retained as the owner's typed incomplete `AdmissionResult` in the
+    /// returned [`ContextCompilationOwnerReadback`]; no assembly is run for a
+    /// partial floor. Large output cannot pass
+    /// `policy.max_serialized_bytes`, and genuinely deferred compilation uses
+    /// a durable job, never an unconsumed handle.
     ///
     /// STITCH-2564-PACKET-SUPPLY: the production invoker is the campaign
     /// packet composition
@@ -1538,11 +1585,11 @@ impl KernelContextReadClient {
     /// measurement). Until those suppliers call this edge with owner-minted
     /// pieces, the packet keeps its unbound-closure gap.
     #[allow(clippy::too_many_arguments)]
-    pub fn compile_context_packet(
-        seven: &SevenRoleInputs,
-        request: &CandidateRequest,
-        recipe: &ContextRecipe,
-        policy: &CandidatePolicy,
+    pub fn compile_context_packet<'a>(
+        seven: &'a SevenRoleInputs,
+        request: &'a CandidateRequest,
+        recipe: &'a ContextRecipe,
+        policy: &'a CandidatePolicy,
         floor: SafetyFloorIdentity,
         priority: PriorityPolicyIdentity,
         rule: AdmissionRuleIdentity,
@@ -1550,9 +1597,9 @@ impl KernelContextReadClient {
         supplied_omissions: Vec<SuppliedOmissionBinding>,
         measurements: Vec<AdmissionMeasurement>,
         quality: QualityScorecard,
-        assembly: &AssemblyPolicy,
+        assembly: &'a AssemblyPolicy,
         measure: impl FnOnce(&[u8]) -> Result<SerializedContextMeasurement, ContextError>,
-    ) -> Result<(ActiveUnderstandingViewResult, MaterialRankTraceDelivery), PacketCompositionError>
+    ) -> Result<ContextCompilationOwnerReadback<'a>, PacketCompositionError>
     {
         if seven.scope_id.as_str() != request.binding.scope_id.as_str()
             || seven.state_fence != request.binding.state_fence
@@ -1626,6 +1673,9 @@ impl KernelContextReadClient {
             policy,
         )
         .map_err(|error| PacketCompositionError::Candidates(Box::new(error)))?;
+        candidates
+            .validate()
+            .map_err(|error| PacketCompositionError::Candidates(Box::new(error)))?;
         let input = AdmissionInput {
             schema_version: CONTEXT_CONTRACT_VERSION,
             binding: request.binding.clone(),
@@ -1642,24 +1692,46 @@ impl KernelContextReadClient {
         input
             .validate()
             .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
-        let (admitted, delivery) = admit_packet_candidates(&input)?;
-        let assembled = assemble_active_view(&admitted, recipe, quality, assembly, measure)
-            .map_err(|error| composition_failure(error, recipe, &request.binding))?;
-        check_delivered_traces(&delivery, &assembled)
-            .map_err(PacketCompositionError::TraceDelivery)?;
-        // #1727: the assembled packet is not delivered on the strength of its
-        // rendered atoms alone. Each logical unit must still round-trip through
-        // packing with its own source identity, scope/fence and admitted source
-        // order intact, and the whole set must still match the output identity
-        // bound at production against the upstream admission receipt. The check
-        // is made here, at the delivery-acceptance owner, so a substituted
-        // boundary, a reordered source member, a foreign source revision or a
-        // lost unit fails closed before the packet leaves this composition
-        // rather than after it has been consumed.
-        assembled
-            .verify_boundaries()
-            .map_err(|error| PacketCompositionError::Assembly(Box::new(error)))?;
-        Ok((assembled, delivery))
+        let (admission_result, delivery) = admit_packet_candidates(&input)?;
+        let outcome = match admission_result.outcome.clone() {
+            ContextOutcome::Incomplete(gaps) => {
+                ContextCompilationOwnerOutcome::Incomplete(Box::new(gaps))
+            }
+            ContextOutcome::Complete(admitted) => {
+                match assemble_active_view(&admitted, recipe, quality.clone(), assembly, measure)
+                {
+                    Err(error) => ContextCompilationOwnerOutcome::Refused(Box::new(
+                        composition_failure(error, recipe, &request.binding),
+                    )),
+                    Ok(assembled) => {
+                        if let Err(error) = check_delivered_traces(&delivery, &assembled) {
+                            ContextCompilationOwnerOutcome::Refused(Box::new(
+                                PacketCompositionError::TraceDelivery(error),
+                            ))
+                        } else if let Err(error) = assembled.verify_boundaries() {
+                            ContextCompilationOwnerOutcome::Refused(Box::new(
+                                PacketCompositionError::Assembly(Box::new(error)),
+                            ))
+                        } else {
+                            ContextCompilationOwnerOutcome::Complete(assembled)
+                        }
+                    }
+                }
+            }
+        };
+        Ok(ContextCompilationOwnerReadback {
+            request,
+            recipe,
+            candidate_policy: policy,
+            assembly_policy: assembly,
+            role_inputs: seven,
+            quality,
+            candidates,
+            admission_input: input,
+            admission: admission_result,
+            rank_trace_delivery: delivery,
+            outcome,
+        })
     }
 }
 
@@ -1692,17 +1764,16 @@ fn composition_failure(
 }
 
 /// Admits one packet candidate set through the admission owner with the
-/// input/result join checked, and returns the per-material rank-trace delivery
-/// record beside the admitted set.
+/// input/result join checked, and retains the original decision beside the
+/// per-material rank-trace delivery record.
 ///
 /// Runs the admission owner's traced join
 /// ([`eliot_context_admission::admit_context_traced`]) over the caller-built
 /// [`AdmissionInput`], proves the result against that same input
 /// ([`AdmissionResult::validate_for`](eliot_context_contracts::AdmissionInput)),
-/// and returns the admitted set only for an explicit `Complete` outcome. An
-/// `Incomplete` outcome returns the owner's gaps as
-/// [`PacketCompositionError::AdmissionIncomplete`]: a partial floor is typed
-/// incompleteness, never a silently cut view.
+/// and returns the exact [`AdmissionResult`] for either outcome. `Complete` is
+/// assembled by the caller; `Incomplete` remains a typed partial readback and
+/// never becomes an empty or silently cut view.
 ///
 /// I12.26: the returned [`MaterialRankTraceDelivery`] is the delivery
 /// acceptance record for this packet. It carries one handle-bound
@@ -1713,7 +1784,7 @@ fn composition_failure(
 /// location; it is never dropped.
 fn admit_packet_candidates(
     input: &AdmissionInput,
-) -> Result<(AdmittedContextSet, MaterialRankTraceDelivery), PacketCompositionError> {
+) -> Result<(AdmissionResult, MaterialRankTraceDelivery), PacketCompositionError> {
     let (result, traces) = admit_context_traced(input)
         .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
     result
@@ -1721,13 +1792,7 @@ fn admit_packet_candidates(
         .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
     let delivery = MaterialRankTraceDelivery::new(&result, traces)
         .map_err(PacketCompositionError::TraceDelivery)?;
-    let admitted = match result.outcome {
-        ContextOutcome::Complete(admitted) => admitted,
-        ContextOutcome::Incomplete(gaps) => {
-            return Err(PacketCompositionError::AdmissionIncomplete(Box::new(gaps)));
-        }
-    };
-    Ok((admitted, delivery))
+    Ok((result, delivery))
 }
 
 /// Binds one per-material rank-trace delivery record to the assembled packet.

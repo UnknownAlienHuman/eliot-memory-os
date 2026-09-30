@@ -450,27 +450,19 @@ fn negative_memory_triggers(
     records: &[eliot_dreamer_failure::NegativeMemoryFingerprint],
     policies: &[eliot_dreamer_failure::NegativeMemoryActionPolicy],
 ) -> Option<Vec<String>> {
-    let Some(rows) = payload
+    let rows = payload
         .and_then(|payload| payload.get("records"))
-        .and_then(Value::as_array)
-    else {
-        return None;
-    };
+        .and_then(Value::as_array)?;
     if rows.len() != records.len() || records.len() != policies.len() {
         return None;
     }
     let mut seen = BTreeSet::new();
     let mut triggers = Vec::new();
     for (row, (record, policy)) in rows.iter().zip(records.iter().zip(policies)) {
-        let Some(record_json) = row.get("record_json").and_then(Value::as_str) else {
-            return None;
-        };
-        let Ok(document) = serde_json::from_str::<crate::NegativeMemoryActivationDocument>(record_json) else {
-            return None;
-        };
-        let Some(handle) = row.get("handle").and_then(Value::as_str) else {
-            return None;
-        };
+        let record_json = row.get("record_json").and_then(Value::as_str)?;
+        let document =
+            serde_json::from_str::<crate::NegativeMemoryActivationDocument>(record_json).ok()?;
+        let handle = row.get("handle").and_then(Value::as_str)?;
         if row.get("record_kind").and_then(Value::as_str)
             != Some(eliot_store_api::LearningRecordKind::ActivationReceipt.as_str())
             || handle != document.handle()
@@ -866,11 +858,7 @@ fn continuity_projection(
         };
         return None;
     };
-    let continuity_note = match retained_active_decision_action(
-        payload,
-        &input.binding,
-        memory_revision,
-    ) {
+    let continuity_note = match retained_active_decision_action(payload, input.binding, memory_revision) {
         Ok(action) => action,
         Err(state) => {
             *disposition = state;
@@ -937,6 +925,30 @@ fn retained_active_decision_action(
         .map_err(|_| ProjectionState::Unknown {
             reason: "latest task row has a malformed original receipt StateFence".to_owned(),
         })?;
+    let receipt_value = current
+        .get("write_receipt")
+        .cloned()
+        .ok_or_else(|| ProjectionState::Unknown {
+            reason: "latest task row omits its original committed WriteReceipt".to_owned(),
+        })?;
+    let receipt: eliot_store_api::WriteReceipt =
+        serde_json::from_value(receipt_value).map_err(|_| ProjectionState::Unknown {
+            reason: "latest task row has a malformed original WriteReceipt".to_owned(),
+        })?;
+    receipt.validate().map_err(|_| ProjectionState::Unknown {
+        reason: "latest task row's original WriteReceipt fails validation".to_owned(),
+    })?;
+    let receipt_envelope = receipt
+        .require_reconciliation_envelope()
+        .map_err(|_| ProjectionState::Unknown {
+            reason: "latest task row's original WriteReceipt lacks its owner envelope".to_owned(),
+        })?;
+    let read_scope_id = payload
+        .get("scope_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ProjectionState::Unknown {
+            reason: "GetTaskState omitted the exact retained read scope".to_owned(),
+        })?;
     let event: eliot_task::TaskLifecycleEvent = serde_json::from_str(event_json).map_err(|_| {
         ProjectionState::Unknown {
             reason: "retained TaskController event does not decode as its original type".to_owned(),
@@ -961,10 +973,24 @@ fn retained_active_decision_action(
         || current.get("actor_ref").and_then(Value::as_str) != Some(event.actor_ref.as_str())
         || !task_state_row_matches_event(current, &event)
         || event.task_id.as_str() != binding.task_id.as_str()
-        || decision.task_id.as_str() != binding.task_id.as_str()
+        || decision.task_id.to_string() != binding.task_id.as_str()
         || active != decision.as_ref()
         || event.state_fence.validate().is_err()
         || receipt_fence != event.state_fence
+        || receipt.operation_id.as_str() != operation_id
+        || receipt.status != eliot_store_api::WriteReceiptStatus::Committed
+        || receipt.state_fence != event.state_fence
+        || receipt_envelope.core.work_scope.scope_id.as_str() != read_scope_id
+        || receipt_envelope.core.task.as_ref().is_none_or(|task| {
+            task.task_id.as_str() != binding.task_id.as_str()
+                || task.task_revision.value() != expected_revision
+                || task.state_fence != event.state_fence
+        })
+        || receipt.ordering_sequences.len() != 1
+        || receipt
+            .ordering_sequences
+            .first()
+            .is_none_or(|head| head.scope.as_str() != "scope:governor")
         || !same_fence_lineage_except_task_revision(&event.state_fence, &binding.state_fence)
         || event
             .state_fence

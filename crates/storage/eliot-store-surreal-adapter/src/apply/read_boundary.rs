@@ -1423,13 +1423,17 @@ fn infer_authority_operation(
     }
 }
 
-struct IndexedAuthority {
+struct IndexedAuthority<'a> {
     capture_index: u64,
     operation: eliot_store_api::NamedMutationOperation,
-    operation_id: OperationId,
-    receipt_state_fence: StateFence,
+    operation_id: &'a OperationId,
+    receipt_state_fence: &'a StateFence,
+    /// The exact original receipt joined from the immutable receipt row.
+    /// Task-state consumers validate this retained value; it is not rebuilt
+    /// from the operation parameters or current fence.
+    receipt: &'a WriteReceipt,
     parameters: BTreeMap<String, Value>,
-    scope_id: String,
+    scope_id: &'a str,
 }
 
 /// Walks authority rows in durable commit order and returns indexed records
@@ -1446,7 +1450,9 @@ struct IndexedAuthority {
 ///
 /// Only `Committed` receipts contribute, so every record this returns is state
 /// the store actually committed.
-fn indexed_authorities(rows: &[AuthorityReceiptRow]) -> Result<Vec<IndexedAuthority>, StoreError> {
+fn indexed_authorities<'a>(
+    rows: &'a [AuthorityReceiptRow],
+) -> Result<Vec<IndexedAuthority<'a>>, StoreError> {
     let mut ordered: Vec<&AuthorityReceiptRow> = rows.iter().collect();
     ordered.sort_by_key(|row| row.commit_sequence.unwrap_or(0));
     let mut indexed = Vec::new();
@@ -1469,25 +1475,32 @@ fn indexed_authorities(rows: &[AuthorityReceiptRow]) -> Result<Vec<IndexedAuthor
             }
             Some((
                 receipt.transition_class,
-                binding.scope_id.as_str().to_owned(),
-                receipt.operation_id.clone(),
-                receipt.state_fence.clone(),
+                binding.scope_id.as_str(),
+                &receipt.operation_id,
+                &receipt.state_fence,
+                receipt,
             ))
         };
         for record in authorities {
             let parameters = validate_authority_record(row, record)?;
             let capture_index = operation_base.saturating_add(record.operation_index as u64);
-            if let Some((transition_class, scope_id, operation_id, receipt_state_fence)) =
-                &in_scope_receipt
+            if let Some((
+                transition_class,
+                scope_id,
+                operation_id,
+                receipt_state_fence,
+                receipt,
+            )) = &in_scope_receipt
             {
                 let operation = infer_authority_operation(*transition_class, &parameters)?;
                 indexed.push(IndexedAuthority {
                     capture_index,
                     operation,
-                    operation_id: operation_id.clone(),
-                    receipt_state_fence: receipt_state_fence.clone(),
+                    operation_id: *operation_id,
+                    receipt_state_fence: *receipt_state_fence,
+                    receipt: *receipt,
                     parameters,
-                    scope_id: scope_id.clone(),
+                    scope_id: *scope_id,
                 });
             }
         }
@@ -1545,7 +1558,7 @@ fn task_state_payload(
         return Err(StoreError::FenceMismatch);
     }
     let indexed = indexed_authorities(rows)?;
-    let matched: Vec<&IndexedAuthority> = indexed
+    let matched: Vec<&IndexedAuthority<'_>> = indexed
         .iter()
         .filter(|record| {
             record.scope_id == scope_id.as_str()
@@ -1562,8 +1575,9 @@ fn task_state_payload(
         );
         current.insert(
             "receipt_state_fence".to_owned(),
-            json!(&record.receipt_state_fence),
+            json!(record.receipt_state_fence),
         );
+        current.insert("write_receipt".to_owned(), json!(record.receipt));
         Value::Object(current)
     });
     let records: Vec<Value> = matched
@@ -1691,7 +1705,7 @@ fn attention_problems_payload(
         return Err(StoreError::FenceMismatch);
     }
     let indexed = indexed_authorities(rows)?;
-    let matched: Vec<&IndexedAuthority> = indexed
+    let matched: Vec<&IndexedAuthority<'_>> = indexed
         .iter()
         .filter(|record| {
             record.scope_id == scope_id.as_str()
@@ -1762,7 +1776,7 @@ fn understanding_inputs_payload(
         return Err(StoreError::FenceMismatch);
     }
     let indexed = indexed_authorities(rows)?;
-    let matched: Vec<&IndexedAuthority> = indexed
+    let matched: Vec<&IndexedAuthority<'_>> = indexed
         .iter()
         .filter(|record| {
             record.scope_id == scope_id.as_str()
@@ -1846,7 +1860,7 @@ fn capability_evidence_payload(
         )?),
     };
     let indexed = indexed_authorities(rows)?;
-    let matched: Vec<&IndexedAuthority> = indexed
+    let matched: Vec<&IndexedAuthority<'_>> = indexed
         .iter()
         .filter(|record| {
             record.scope_id == scope_id.as_str()
