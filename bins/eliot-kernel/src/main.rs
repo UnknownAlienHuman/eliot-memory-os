@@ -275,7 +275,16 @@ async fn main() {
             "Host launch must inject the independent native worker executable digest",
         );
     };
-    kernel_config = kernel_config.with_native_worker_artifact_sha256(native_worker_artifact_sha256);
+    let Some(native_worker_executable_path) = options.native_worker_executable_path.clone() else {
+        exit_error(
+            "NATIVE_WORKER_PATH_CONTRACT_REQUIRED",
+            "Host launch must inject the exact native-worker executable path bound to the digested role",
+        );
+    };
+    kernel_config = kernel_config.with_native_worker_artifact_binding(
+        native_worker_executable_path,
+        native_worker_artifact_sha256,
+    );
     let Some(user_broker_executable_path) = options.user_broker_executable_path.clone() else {
         exit_error(
             "USER_BROKER_ARTIFACT_CONTRACT_REQUIRED",
@@ -374,7 +383,15 @@ async fn main() {
                 "Host launch must inject the independent native worker executable digest",
             );
         };
-        if let Err(error) = compose_production_native_worker_front_door(&native_worker_digest) {
+        let Some(native_worker_path) = options.native_worker_executable_path.clone() else {
+            exit_error(
+                "NATIVE_WORKER_PATH_CONTRACT_REQUIRED",
+                "Host launch must inject the exact native-worker executable path bound to the digested role",
+            );
+        };
+        if let Err(error) =
+            compose_production_native_worker_front_door(&native_worker_path, &native_worker_digest)
+        {
             exit_error("DISPATCH_COMPOSITION_FAILURE", &error.to_string());
         }
     }
