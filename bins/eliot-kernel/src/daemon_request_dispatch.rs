@@ -9296,7 +9296,7 @@ impl KernelComposition {
         for readback in actual_ordering_heads {
             let head = readback.head;
             head.validate().map_err(|error| error.to_string())?;
-            if !seen_ordering_scopes.insert(head.scope.as_str()) {
+            if !seen_ordering_scopes.insert(head.scope.clone()) {
                 return Err("canonical ordering-head observation contains duplicates".to_owned());
             }
             let canonical_head =
@@ -11122,7 +11122,7 @@ impl KernelComposition {
     }
 
     #[cfg(windows)]
-    fn retained_store_gateway(&self) -> Result<Arc<KernelStoreGateway>, TransportError> {
+    pub(crate) fn retained_store_gateway(&self) -> Result<Arc<KernelStoreGateway>, TransportError> {
         self.canonical_store_gateway
             .lock()
             .map_err(|_| TransportError::SessionFenced)?
