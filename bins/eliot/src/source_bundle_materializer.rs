@@ -2229,80 +2229,110 @@ fn verify_resumed_bundle(
     Ok(())
 }
 
-fn resume_intent_publication(
+enum IntentRoleLeaseVerification {
+    Verified,
+    Unknown(Box<CanarySourceBundleMaterializeOutcome>),
+}
+
+enum IntentPublicationResume {
+    Ready(OwnedDirectoryPublication),
+    Unknown(Box<CanarySourceBundleMaterializeOutcome>),
+}
+
+fn resume_owned_publication_or_unknown(
     store: &RedbInstallationTransactionStore,
     journal: &SourceBundlePublicationJournal,
-    precommit_files: Vec<MaterializedRolePrecommitReceipt>,
+    precommit_files: &[MaterializedRolePrecommitReceipt],
     selected_profile_anchor: &SelectedProfileAnchor<'_>,
-    mut retained_role_leases: Option<BTreeMap<String, TrustedSourceFileLease>>,
-) -> Result<CanarySourceBundleMaterializeOutcome, MaterializeError> {
+) -> Result<IntentPublicationResume, MaterializeError> {
     selected_profile_anchor.revalidate()?;
-    let publication = match OwnedDirectoryPublication::resume(
+    match OwnedDirectoryPublication::resume(
         &journal.output_bundle,
         &journal.temporary_path,
         &journal.temporary_name,
         journal.parent_identity,
         journal.source_identity,
     ) {
-        Ok(publication) => publication,
-        Err(error) => {
-            return persist_unknown_publication(
-                store,
-                journal,
-                precommit_files,
-                format!("recorded temporary publication cannot be resumed: {error}"),
-                selected_profile_anchor,
-            );
-        }
-    };
+        Ok(publication) => Ok(IntentPublicationResume::Ready(publication)),
+        Err(error) => persist_unknown_publication(
+            store,
+            journal,
+            precommit_files.to_vec(),
+            format!("recorded temporary publication cannot be resumed: {error}"),
+            selected_profile_anchor,
+        )
+        .map(|outcome| IntentPublicationResume::Unknown(Box::new(outcome))),
+    }
+}
+
+fn verify_intent_roles_and_release_leases(
+    store: &RedbInstallationTransactionStore,
+    journal: &SourceBundlePublicationJournal,
+    publication: &OwnedDirectoryPublication,
+    precommit_files: &[MaterializedRolePrecommitReceipt],
+    selected_profile_anchor: &SelectedProfileAnchor<'_>,
+    retained_role_leases: Option<BTreeMap<String, TrustedSourceFileLease>>,
+) -> Result<IntentRoleLeaseVerification, MaterializeError> {
     let (manifest, expected, _) = typed_bundle_from_journal(journal)?;
-    let mut retained_role_leases = match retained_role_leases.take() {
+    let retained_role_leases = match retained_role_leases {
         Some(leases) => leases,
-        None => match retain_journal_role_leases(&publication, &precommit_files) {
+        None => match retain_journal_role_leases(publication, precommit_files) {
             Ok(leases) => leases,
             Err(error) => {
                 return persist_unknown_publication(
                     store,
                     journal,
-                    precommit_files,
+                    precommit_files.to_vec(),
                     format!("recorded source roles cannot be retained: {error}"),
                     selected_profile_anchor,
-                );
+                )
+                .map(|outcome| IntentRoleLeaseVerification::Unknown(Box::new(outcome)));
             }
         },
     };
-    if let Err(error) = verify_role_lease_set(&retained_role_leases, &precommit_files) {
+    if let Err(error) = verify_role_lease_set(&retained_role_leases, precommit_files) {
         return persist_unknown_publication(
             store,
             journal,
-            precommit_files,
+            precommit_files.to_vec(),
             format!("recorded source-role leases differ from Intent: {error}"),
             selected_profile_anchor,
-        );
+        )
+        .map(|outcome| IntentRoleLeaseVerification::Unknown(Box::new(outcome)));
     }
     if let Err(error) = verify_resumed_bundle(
-        &publication,
+        publication,
         journal,
-        &precommit_files,
+        precommit_files,
         &manifest,
         &expected,
     ) {
         return persist_unknown_publication(
             store,
             journal,
-            precommit_files,
+            precommit_files.to_vec(),
             format!("recorded temporary publication readback rejected: {error}"),
             selected_profile_anchor,
-        );
+        )
+        .map(|outcome| IntentRoleLeaseVerification::Unknown(Box::new(outcome)));
     }
     selected_profile_anchor.revalidate()?;
     // Windows refuses a directory rename while any child file handle remains
-    // open. Keep all exact role leases through Intent and final pre-move
-    // verification, then release them at the rename boundary. The durable
-    // journal still carries the original create-handle identities; the
-    // post-move verifier accepts Published only when those exact objects and
-    // bytes remain at the destination, otherwise the result stays unknown.
-    retained_role_leases.clear();
+    // open. Keep the exact role leases through Intent and final pre-move
+    // verification, then release them immediately before the rename. The
+    // journal retains original create-handle identities; post-move readback
+    // must match those identities or the result remains unknown.
+    drop(retained_role_leases);
+    Ok(IntentRoleLeaseVerification::Verified)
+}
+
+fn finish_intent_publication(
+    store: &RedbInstallationTransactionStore,
+    journal: &SourceBundlePublicationJournal,
+    publication: OwnedDirectoryPublication,
+    precommit_files: Vec<MaterializedRolePrecommitReceipt>,
+    selected_profile_anchor: &SelectedProfileAnchor<'_>,
+) -> Result<CanarySourceBundleMaterializeOutcome, MaterializeError> {
     let directory_publication = match publication.publish(journal.source_identity) {
         Ok(outcome) => outcome,
         Err(error) => {
@@ -2378,6 +2408,42 @@ fn resume_intent_publication(
             selected_profile_anchor,
         ),
     }
+}
+
+fn resume_intent_publication(
+    store: &RedbInstallationTransactionStore,
+    journal: &SourceBundlePublicationJournal,
+    precommit_files: Vec<MaterializedRolePrecommitReceipt>,
+    selected_profile_anchor: &SelectedProfileAnchor<'_>,
+    retained_role_leases: Option<BTreeMap<String, TrustedSourceFileLease>>,
+) -> Result<CanarySourceBundleMaterializeOutcome, MaterializeError> {
+    let publication = match resume_owned_publication_or_unknown(
+        store,
+        journal,
+        &precommit_files,
+        selected_profile_anchor,
+    )? {
+        IntentPublicationResume::Ready(publication) => publication,
+        IntentPublicationResume::Unknown(outcome) => return Ok(*outcome),
+    };
+    match verify_intent_roles_and_release_leases(
+        store,
+        journal,
+        &publication,
+        &precommit_files,
+        selected_profile_anchor,
+        retained_role_leases,
+    )? {
+        IntentRoleLeaseVerification::Verified => {}
+        IntentRoleLeaseVerification::Unknown(outcome) => return Ok(*outcome),
+    }
+    finish_intent_publication(
+        store,
+        journal,
+        publication,
+        precommit_files,
+        selected_profile_anchor,
+    )
 }
 
 fn reconcile_existing_journal_destination(
