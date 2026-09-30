@@ -44,6 +44,8 @@
 //! authenticated Kernel client, and restore re-queries Kernel through a fresh
 //! [`AdmittedProviderCapability`].
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use eliot_agent_api::{EpochId, StateFence};
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_kernel_service::{
@@ -53,7 +55,7 @@ use eliot_kernel_service::{
 
 use crate::core::{ProviderProofKind, ProviderVerifier};
 use crate::model::{
-    CoordinatorError, ProviderAdmissionReceipt, ProviderBindingSnapshot,
+    CoordinatorError, PlanGap, ProviderAdmissionReceipt, ProviderBindingSnapshot,
     ProviderCancellationReconciliation, ProviderExecutionBindingSubmission, ProviderIdentity,
     ProviderReassignmentReceipt, ProviderUnknownOutcomeReconciliation, ProviderWorkerFenceReceipt,
     ResultSubmission, validate_text,
@@ -389,31 +391,57 @@ impl AdmittedProviderCapability {
 /// [`AgentCoordinator::restore_with_admitted_provider`](crate::core::AgentCoordinator::restore_with_admitted_provider);
 /// never public, never caller-implementable.
 ///
-///
-/// Closed until owner-proved: construction alone never reports `Verified`.
-/// The binding stays a typed `PLAN_GAP` until one `verify` call on this
-/// instance succeeds through the owner verifier, and only that success flips
-/// it. A constructed-but-unverified capability therefore cannot mint
-/// `Verified`.
+/// Closed until owner-proved: construction alone (including factory-gated
+/// construction through
+/// [`AdmittedProviderFactory::admit`](crate::admitted_provider::AdmittedProviderFactory::admit))
+/// never reports `Verified`. The binding stays a typed `PLAN_GAP` until one
+/// `verify` call on this instance succeeds through the owner verifier, and
+/// only that success flips it. A constructed-but-unverified capability
+/// therefore cannot mint `Verified`.
 pub(crate) struct KernelProviderVerifier {
     capability: AdmittedProviderCapability,
+    /// Flipped exactly once a `verify` call on this instance returns owner
+    /// `Ok`. `AtomicBool` (not `Cell`/`RefCell`: the sealed
+    /// [`ProviderVerifier`](crate::core::ProviderVerifier) is `Send + Sync`,
+    /// and this file otherwise carries no interior-mutability idiom) because
+    /// `verify` borrows `&self` while the trait signature stays frozen.
+    verified: AtomicBool,
 }
+
+/// Typed `PLAN_GAP` reason reported while this verifier instance has no
+/// successful owner verification yet. A fixed string, so pre-verification
+/// snapshots compare equal across construction and restore.
+const UNVERIFIED_GAP_REASON: &str =
+    "provider admission unverified: no successful owner verification on this verifier instance";
 
 impl KernelProviderVerifier {
     pub(crate) fn new(capability: AdmittedProviderCapability) -> Self {
-        Self { capability }
+        Self {
+            capability,
+            verified: AtomicBool::new(false),
+        }
     }
 }
 
 impl ProviderVerifier for KernelProviderVerifier {
     fn binding(&self) -> ProviderBindingSnapshot {
-        // Conditional by construction: this value exists only because
-        // `AdmittedProviderCapability::new` proved presented-versus-owner
-        // coherence through the pure verifier. A serialized `Verified`
-        // label alone still grants nothing: restore rebuilds this verifier
-        // from freshly supplied capability data and replays every event.
-        ProviderBindingSnapshot::Verified {
-            identity: self.capability.identity.clone(),
+        // Closed by instance state, not by construction: this value reports
+        // `Verified` only after a `verify` call on THIS instance succeeded
+        // through the owner verifier. Before that it is a typed `PLAN_GAP`,
+        // so a merely constructed capability cannot impersonate production
+        // execution readiness, and a serialized `Verified` label alone still
+        // grants nothing: restore rebuilds this verifier from freshly
+        // supplied capability data and replays every event through it.
+        if self.verified.load(Ordering::SeqCst) {
+            ProviderBindingSnapshot::Verified {
+                identity: self.capability.identity.clone(),
+            }
+        } else {
+            ProviderBindingSnapshot::Gap {
+                gap: PlanGap::G11Unavailable {
+                    reason: UNVERIFIED_GAP_REASON.to_owned(),
+                },
+            }
         }
     }
 
@@ -517,7 +545,13 @@ impl ProviderVerifier for KernelProviderVerifier {
             &live_fence_digest,
             &currentness.live_epoch(),
         )
-        .map_err(map_capability_error)
+        .map_err(map_capability_error)?;
+        // Only a successful owner verification on this instance flips the
+        // binding: every `Err` above returns before this store, so a failed
+        // or stale proof never mints `Verified`, and the flag is never set
+        // from a recomputed stand-in, only from the owner `Ok` just observed.
+        self.verified.store(true, Ordering::SeqCst);
+        Ok(())
     }
 }
 
