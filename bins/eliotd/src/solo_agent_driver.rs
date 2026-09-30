@@ -65,6 +65,23 @@
 //! activation, or dispatch. The test-only historical dispatch projection is
 //! persisted under the daemon state root before `emit`; uncertain ownership
 //! is never released without an observed terminal disposition.
+//!
+//! # Durable restore ingress
+//!
+//! The production restore seam is a JSON ingress, not a typed-snapshot
+//! hand-off (issue #370 R2, W24/W25/W26/A2/A28). The coordinator owner image
+//! it hands to the coordinator is the document durable storage actually holds
+//! — read back under the projection file's own
+//! [`eliot_platform_windows::ProtectedRuntimePathLease`], bounded, and
+//! digest-verified — never a snapshot this process serialized from the typed
+//! value it also decoded. That is what keeps the coordinator's legacy-wire
+//! classification on the live path: a persisted pre-candidate-only,
+//! version-mismatched, or misdirected result wire is refused at the restore
+//! boundary instead of being laundered through a typed round trip. The durable
+//! bytes and the decode are reachable in a non-test build today; the admitted
+//! provider capability they restore against remains the recorded #1108
+//! residual, stated at `admitted_solo_restore_capability` and not worked around
+//! here.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -111,6 +128,11 @@ pub const SOLO_PROJECTION_MAX_BYTES: u64 = 1_048_576;
 pub const SOLO_QUEUE_MAX_LEN: usize = 16;
 /// Wire version of the persisted solo projection envelope.
 pub const SOLO_PROJECTION_WIRE_VERSION: u32 = 1;
+/// JSON pointer to the coordinator owner document inside the persisted solo
+/// projection envelope: `payload.snapshot.coordinator_snapshot`. It names the
+/// persisted wire the coordinator restore boundary decodes (issue #370 R2).
+#[cfg(not(test))]
+const SOLO_COORDINATOR_SNAPSHOT_POINTER: &str = "/payload/snapshot/coordinator_snapshot";
 
 fn require_text(value: &str, field: &'static str) -> Result<(), FabricError> {
     if value.trim().is_empty() || value.chars().any(char::is_control) {
@@ -897,11 +919,16 @@ fn persist_projection(
     Ok(())
 }
 
-fn load_projection(
+/// Reads the exact durable bytes of one persisted solo projection envelope.
+///
+/// The lease is opened per read, the path identity is checked against it, and
+/// the read is bounded, so the returned bytes are the file this daemon state
+/// root owns. Every persisted read starts here — the typed readback and the
+/// JSON ingress both validate the same bytes, never a re-encoded copy.
+fn read_verified_projection_bytes(
     state_root: &std::path::Path,
     operation_id: &str,
-) -> Result<SoloPersistedAttempt, DaemonError> {
-    require_text(operation_id, "operation identity").map_err(DaemonError::ProviderAdmission)?;
+) -> Result<Vec<u8>, DaemonError> {
     let path = solo_projection_path(state_root, operation_id);
     let lease = eliot_platform_windows::ProtectedRuntimePathLease::open_or_create_absolute(&path)
         .map_err(DaemonError::Protected)?;
@@ -910,10 +937,18 @@ fn load_projection(
             "solo projection path identity changed".to_owned(),
         )));
     }
-    let bytes = lease
+    lease
         .read_bounded(SOLO_PROJECTION_MAX_BYTES)
-        .map_err(DaemonError::Protected)?;
-    let file: SoloProjectionFile = serde_json::from_slice(&bytes).map_err(|error| {
+        .map_err(DaemonError::Protected)
+}
+
+/// Validates one persisted solo projection envelope: wire version, the recorded
+/// digest against the payload, and the exact operation identity it addresses.
+fn verify_projection(
+    bytes: &[u8],
+    operation_id: &str,
+) -> Result<SoloProjectionFile, DaemonError> {
+    let file: SoloProjectionFile = serde_json::from_slice(bytes).map_err(|error| {
         DaemonError::Composition(CompositionError::Recovery(format!(
             "solo projection decode: {error}"
         )))
@@ -934,13 +969,72 @@ fn load_projection(
         )));
     }
     if file.payload.operation_id != operation_id {
-        return Err(DaemonError::ProviderAdmission(
-            FabricError::IdentityConflict(
-                "solo projection addresses a foreign operation".to_owned(),
-            ),
-        ));
+        return Err(DaemonError::ProviderAdmission(FabricError::IdentityConflict(
+            "solo projection addresses a foreign operation".to_owned(),
+        )));
     }
-    Ok(file.payload)
+    Ok(file)
+}
+
+fn load_projection(
+    state_root: &std::path::Path,
+    operation_id: &str,
+) -> Result<SoloPersistedAttempt, DaemonError> {
+    require_text(operation_id, "operation identity").map_err(DaemonError::ProviderAdmission)?;
+    let bytes = read_verified_projection_bytes(state_root, operation_id)?;
+    Ok(verify_projection(&bytes, operation_id)?.payload)
+}
+
+/// Returns the persisted coordinator snapshot document of one solo projection
+/// (issue #370 R2, W24).
+///
+/// The content is the document the daemon state root holds: the bytes come
+/// from the leased, bounded, digest-verified read of the projection file, the
+/// envelope is verified against its recorded digest and operation identity
+/// first, and the coordinator document is then selected out of those bytes by
+/// JSON pointer. No typed snapshot is ever a byte source here — the
+/// in-memory [`FabricSnapshot`] this same read produced is not serialized to
+/// feed the ingress, so the coordinator's own decode and legacy-wire
+/// classification run over the persisted document itself rather than over a
+/// value that was laundered out of one.
+///
+/// The selected value is re-encoded through [`serde_json::Value`], so the
+/// document handed on is JSON-equivalent to the persisted sub-document (key
+/// order may differ; no field is added, dropped or renamed) and decodes to the
+/// same [`crate::agent_fabric::FabricSnapshot::coordinator_snapshot`]. The
+/// envelope decode above already refused any byte sequence that does not
+/// deserialize into the current typed shape, so this cannot smuggle a
+/// different document past the coordinator — it only lets the coordinator
+/// classify the wire it is actually given.
+///
+/// A pointer that does not resolve, or that resolves to a non-object, fails
+/// closed as a recovery error rather than substituting a default document.
+#[cfg(not(test))]
+fn load_persisted_coordinator_snapshot_json(
+    state_root: &std::path::Path,
+    operation_id: &str,
+) -> Result<String, DaemonError> {
+    require_text(operation_id, "operation identity").map_err(DaemonError::ProviderAdmission)?;
+    let bytes = read_verified_projection_bytes(state_root, operation_id)?;
+    verify_projection(&bytes, operation_id)?;
+    let document: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        DaemonError::Composition(CompositionError::Recovery(format!(
+            "solo projection envelope re-read: {error}"
+        )))
+    })?;
+    let coordinator = document
+        .pointer(SOLO_COORDINATOR_SNAPSHOT_POINTER)
+        .filter(|value| value.is_object())
+        .ok_or_else(|| {
+            DaemonError::Composition(CompositionError::Recovery(
+                "persisted solo projection carries no coordinator snapshot document".to_owned(),
+            ))
+        })?;
+    serde_json::to_string(coordinator).map_err(|error| {
+        DaemonError::Composition(CompositionError::Recovery(format!(
+            "persisted coordinator snapshot re-read: {error}"
+        )))
+    })
 }
 
 /// Guards the solo slice shape: one lane, no fanout, the solo recipe.
@@ -1313,16 +1407,123 @@ fn restore_solo_fabric(
     Ok(fabric)
 }
 
+/// The admitted provider capability one production durable restore needs
+/// (issue #1108, #370 R2).
+///
+/// This is the pre-existing production residual, unchanged by the JSON
+/// ingress: the Kernel provider claim row retains no independently
+/// owner-verified executable-binding digest, so a non-test build holds no
+/// owner-issued material it could present to
+/// [`eliot_agent_coordinator::AdmittedProviderCapability::new`]. Building one
+/// from the projected claim halves would mint owner authority out of a value
+/// no owner verified. The capability is therefore the parameter the ingress
+/// takes, and this is where the residual is stated, not a place where it is
+/// manufactured.
 #[cfg(not(test))]
-fn restore_solo_fabric(
-    _composition: &DaemonComposition,
-    _kernel: &Arc<DaemonKernelClient>,
-    _projection: &SoloPersistedAttempt,
-) -> Result<AgentFabric, DaemonError> {
+fn admitted_solo_restore_capability(
+) -> Result<eliot_agent_coordinator::AdmittedProviderCapability, DaemonError> {
     Err(DaemonError::Kernel(
         "solo restore is blocked until Kernel retains an independently owner-verified executable-binding digest"
             .to_owned(),
     ))
+}
+
+/// Production durable restore of one solo attempt, over the persisted JSON wire
+/// (issue #370 R2, W24/W25/W26/A2/A28).
+///
+/// The coordinator owner is decoded by
+/// [`AgentFabric::restore_snapshot_json`] from
+/// [`load_persisted_coordinator_snapshot_json`] — the bytes durable storage
+/// actually holds — rather than from the typed
+/// [`crate::agent_fabric::FabricSnapshot`] the same read produced. That is what
+/// makes the legacy-wire classification live on this path: a persisted
+/// coordinator document that the coordinator boundary refuses as
+/// pre-candidate-only, version-mismatched or a misdirected result wire is
+/// refused here, before any event replays, instead of being laundered through
+/// a typed snapshot that never crossed a decode boundary.
+///
+/// Everything around that decode is the pre-existing production behaviour,
+/// unchanged: the frozen plan digest must still bind a stored definition, the
+/// live fence must still match it, the owner-separated durable store is
+/// re-attached before the first semantic write, and an emitted dispatch with no
+/// ingested result still reconciles to unknown rather than relaunching or
+/// releasing.
+///
+/// The one residual hop is the admitted provider capability, and it is the
+/// same refusal this path returned before the JSON ingress existed: the Kernel
+/// provider claim row retains no independently owner-verified
+/// executable-binding digest, so a production build holds no owner-issued
+/// material to present to
+/// [`eliot_agent_coordinator::AdmittedProviderCapability::new`], and the
+/// capability is a parameter of the ingress below rather than something this
+/// seam manufactures. The durable read and the ingress call above and below
+/// that hop are compiled and reachable in a non-test build today.
+///
+/// # Errors
+///
+/// Returns the readback, capability, or fabric-restore rejection unchanged.
+#[cfg(not(test))]
+fn restore_solo_fabric(
+    composition: &DaemonComposition,
+    kernel: &Arc<DaemonKernelClient>,
+    projection: &SoloPersistedAttempt,
+) -> Result<AgentFabric, DaemonError> {
+    // The persisted coordinator document, read back from the daemon state root
+    // under its own lease and digest check, before anything refuses. Typed
+    // `projection.snapshot` remains the fabric's own state carrier; only the
+    // coordinator owner image comes from the wire.
+    let coordinator_json = load_persisted_coordinator_snapshot_json(
+        composition.state_root(),
+        &projection.operation_id,
+    )?;
+    let definition = projection
+        .snapshot
+        .definitions
+        .values()
+        .find(|definition| definition.definition_digest == projection.plan_digest)
+        .ok_or_else(|| {
+            DaemonError::ProviderAdmission(FabricError::BrokenOwnershipLink(
+                "solo restore finds no definition binding the frozen plan digest".to_owned(),
+            ))
+        })?
+        .clone();
+    let live_fence = kernel.kernel_fence();
+    if !fences_match_exact(&live_fence, &definition.fence) {
+        return Err(DaemonError::ProviderAdmission(FabricError::StaleFence(
+            "solo restore refuses a fence-moved definition".to_owned(),
+        )));
+    }
+    // Pre-existing production residual (#1108 / the native-worker owner leg),
+    // unchanged and not worked around: no owner-verified executable-binding
+    // digest means no admitted capability, and none is fabricated here to
+    // reach the ingress below.
+    let capability = admitted_solo_restore_capability()?;
+    let mut fabric = AgentFabric::restore_snapshot_json(
+        projection.snapshot.clone(),
+        &coordinator_json,
+        daemon_coordinator_config()?,
+        composition.production_fabric_ports()?,
+        Some(&crate::semantic_revision_store::SemanticRevisionStore::new(
+            composition.state_root(),
+        )),
+        capability,
+    )?;
+    // #1702 W2: the durable carrier is attached before the first semantic
+    // write, so a revision published after this restore is committed and
+    // verified durably before it is reported current, exactly as on the
+    // verified test seam.
+    fabric.attach_semantic_revision_store(composition.state_root());
+    // Reconcile the unknown: an emitted dispatch with no ingested result
+    // cannot relaunch and cannot release; its outcome stays unknown until
+    // the worker observation arrives through the ingest leg.
+    if projection.emitted && projection.result_digest.is_none() {
+        let attempt = AttemptId::new(projection.attempt_id.clone())
+            .map_err(|error| DaemonError::ProviderAdmission(contract(error)))?;
+        if fabric.attempt_of(&attempt) == Some(crate::agent_fabric::AttemptLifecycle::Dispatched) {
+            fabric.mark_unknown_outcome(&attempt)?;
+        }
+    }
+    Ok(fabric)
 }
 
 /// Re-persists the projection after a control operation.
@@ -1388,14 +1589,16 @@ fn load_scheduling_profile(
 /// are not `cfg(test)`-gated, so this join is compiled and callable in
 /// production. It is one documented fail-closed hop short of live work today,
 /// and that hop is not this issue's: in a non-test build
-/// `restore_solo_fabric` refuses with "solo restore is blocked until Kernel
-/// retains an independently owner-verified executable-binding digest", and
-/// `drive_solo_delegate_async` refuses before any fabric effect, so no
-/// production build yet holds an admitted coordinator projection to pull over.
-/// The two residuals above are the Kernel native-worker owner and the G-11
-/// admission owner (issue #1678). The join is placed on the release path
-/// because that is where I14.8 says the wake happens, not on a site that would
-/// be reachable only by pulling over an empty plan-only coordinator.
+/// `restore_solo_fiber` reads the persisted snapshot and reaches the
+/// coordinator JSON ingress, then stops at the admitted provider capability
+/// with "solo restore is blocked until Kernel retains an independently
+/// owner-verified executable-binding digest", and `drive_solo_delegate_async`
+/// refuses before any fabric effect, so no production build yet holds an
+/// admitted coordinator projection to pull over. The two residuals above are
+/// the Kernel native-worker owner and the G-11 admission owner (issue #1678).
+/// The join is placed on the release path because that is where I14.8 says the
+/// wake happens, not on a site that would be reachable only by pulling over an
+/// empty plan-only coordinator.
 fn drive_fair_pull_after_release(
     composition: &DaemonComposition,
     fabric: &mut AgentFabric,
@@ -1469,9 +1672,11 @@ pub enum FairPullRecovery {
 /// production caller is `daemon_runtime::maybe_start_fair_pull_recovery`, which
 /// runs it on the daemon's existing `ACTIVATION_POLL_INTERVAL` cadence. The
 /// same fail-closed residual as the release arm applies and is not worked
-/// around here: a non-test `restore_solo_fabric` refuses, so the poll reports
-/// that typed refusal until the Kernel native-worker owner and the G-11
-/// admission owner (#1678) land. Both arms go live together, at the same owner.
+/// around here: a non-test `restore_solo_fiber` reaches the coordinator JSON
+/// ingress and then refuses at the admitted provider capability, so the poll
+/// reports that typed refusal until the Kernel native-worker owner and the
+/// G-11 admission owner (#1678) land. Both arms go live together, at the same
+/// owner.
 ///
 /// The Kernel handle is used only for the restore's live-fence revalidation
 /// that [`restore_solo_fabric`] already performs; this poll performs no

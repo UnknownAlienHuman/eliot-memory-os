@@ -3272,11 +3272,13 @@ impl AgentCoordinator {
     /// misdirected result wires fail with structured errors before any replay.
     /// Every replayed event then re-verifies through the admitted provider
     /// exactly as [`Self::restore_with_admitted_provider`] does.
-    /// STITCH (#370 W24/W25/W26/A2/A28): the daemon JSON-restore path
-    /// stitches its real persisted-snapshot ingress here; BLOCKED-BY the
-    /// durable fabric-restore driver (#1108 lane). Forbidden: serializing
-    /// an already-typed snapshot and reparsing it (no-op shim, not a
-    /// live ingress).
+    /// STITCHED (#370 W24/W25/W26/A2/A28): the daemon's durable JSON ingress
+    /// calls this from `AgentFabric::restore_snapshot_json` in
+    /// `bins/eliotd`, fed the coordinator document its leased, bounded,
+    /// digest-verified projection read holds — never a snapshot the daemon
+    /// serialized from a value it had already decoded. The admitted provider
+    /// capability it restores against is still the #1108 residual, recorded at
+    /// `solo_agent_driver::admitted_solo_restore_capability`.
     pub fn restore_snapshot_json(
         json: &str,
         live_config: CoordinatorConfig,

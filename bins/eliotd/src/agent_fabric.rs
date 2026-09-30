@@ -3792,6 +3792,89 @@ impl AgentFabric {
             config.clone(),
             capability,
         )?;
+        Self::install_admitted_coordinator(
+            snapshot,
+            admission_by_definition,
+            coordinator,
+            config,
+            ports,
+            semantic_revisions,
+        )
+    }
+
+    /// Restores the fabric from a durable snapshot whose coordinator owner
+    /// image arrives as the persisted JSON bytes read back from durable
+    /// storage (issue #370 R2, W24/W25/W26/A2/A28).
+    ///
+    /// This is the daemon's live JSON ingress. Everything the typed
+    /// [`Self::restore_with_admitted_provider`] does still holds — the same
+    /// stale-config conflict, the same strict semantic-ownership verification,
+    /// and the same coordinator restore re-verifying every replayed event
+    /// against the freshly supplied capability — with one difference that is
+    /// the whole point of the entry: the coordinator owner is decoded by
+    /// [`AgentCoordinator::restore_snapshot_json`] from
+    /// `coordinator_snapshot_json`, so the pre-candidate-only, version-mismatched
+    /// and misdirected result wires that durable storage may still hold are
+    /// classified into their structured errors before any event is replayed,
+    /// instead of being installed as a typed snapshot that never crossed a
+    /// decode boundary.
+    ///
+    /// `coordinator_snapshot_json` must be the persisted coordinator document
+    /// of the same durable envelope `snapshot` was decoded from — the bytes
+    /// the daemon read back from its state root — not a document this process
+    /// serialized from the typed snapshot it already holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns the coordinator owner wire rejection (unsupported snapshot,
+    /// legacy result wire, stale/revoked binding, snapshot digest or rollback)
+    /// unchanged, a stale-config conflict, or a broken semantic ownership
+    /// link.
+    pub fn restore_snapshot_json(
+        snapshot: FabricSnapshot,
+        coordinator_snapshot_json: &str,
+        config: CoordinatorConfig,
+        ports: FabricPorts,
+        semantic_revisions: Option<&SemanticRevisionStore>,
+        capability: AdmittedProviderCapability,
+    ) -> Result<Self, FabricError> {
+        if snapshot.coordinator_snapshot.config != config {
+            return Err(FabricError::IdentityConflict(
+                "restore config does not match the snapshotted coordinator config".to_owned(),
+            ));
+        }
+        // Issue #1702: contradictory semantic ownership never restores
+        // authority. Legacy snapshots carry no semantic records and pass
+        // trivially.
+        verify_snapshot_semantics(&snapshot)?;
+        let admission_by_definition = rebuild_admission_by_definition(&snapshot)?;
+        let coordinator = AgentCoordinator::restore_snapshot_json(
+            coordinator_snapshot_json,
+            config.clone(),
+            capability,
+        )?;
+        Self::install_admitted_coordinator(
+            snapshot,
+            admission_by_definition,
+            coordinator,
+            config,
+            ports,
+            semantic_revisions,
+        )
+    }
+
+    /// Installs one already-restored coordinator into the fabric state carried
+    /// by the same durable snapshot. Shared by the two admitted-provider
+    /// restore entries so the typed and the JSON ingress cannot install
+    /// different fabric state from the same snapshot.
+    fn install_admitted_coordinator(
+        snapshot: FabricSnapshot,
+        admission_by_definition: BTreeMap<String, String>,
+        coordinator: AgentCoordinator,
+        config: CoordinatorConfig,
+        ports: FabricPorts,
+        semantic_revisions: Option<&SemanticRevisionStore>,
+    ) -> Result<Self, FabricError> {
         let mut definition_bytes = BTreeMap::new();
         for (key, definition) in &snapshot.definitions {
             definition_bytes.insert(key.clone(), definition.definition_digest.clone());
