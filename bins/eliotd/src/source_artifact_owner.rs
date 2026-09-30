@@ -118,8 +118,8 @@ impl SourceArtifactOwner {
         if admission.operation().effect != EffectClass::ReversibleMutation {
             return Err(SourceArtifactOwnerError::WrongEffect);
         }
-        identity.validate()?;
         identity.verify_content(bytes)?;
+        identity.validate()?;
         profile.validate_for(admission, SOURCE_BLOB_KEY_LINEAGE, self.key_generation)?;
 
         let policy = blob_policy_binding(profile)?;
@@ -156,6 +156,7 @@ impl SourceArtifactOwner {
             if admission.operation().effect != EffectClass::Read {
                 return Err(SourceArtifactOwnerError::WrongEffect);
             }
+            reference.validate()?;
             profile.validate_for(admission, SOURCE_BLOB_KEY_LINEAGE, self.key_generation)?;
             let policy = blob_policy_binding(profile)?;
             let residency = blob_residency_domains(profile)?;
