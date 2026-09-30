@@ -2169,6 +2169,14 @@ impl<P: KernelTransitionPort + ?Sized> GovernorObservationReconciliation<'_, P> 
     /// expected record revision does not match the committed record, the source
     /// Signal or presented authorization does not hold, the state machine refuses
     /// the verb, or the canonical commit cannot be completed or reconciled.
+    ///
+    /// [`CompositionError::ProblemOwnerTransitionUncommittable`] is the one
+    /// refusal that is a statement about the *record* rather than about the
+    /// request: the committed Problem retains no ownership-lease identity, so the
+    /// store would refuse the commit under every presented lease. The caller's
+    /// response is to repair that record — assign an eligible successor under a
+    /// newly issued lease, or record an actually observed owner loss — and not to
+    /// retry this transition, which cannot commit either way.
     pub async fn commit_problem_owner_transition(
         &self,
         request: &ProblemOwnerTransitionRequest<'_>,

@@ -36,6 +36,7 @@ use crate::owner_closure_feed::{
     synchronize_owner_feed_with_quarantine_evidence,
 };
 use crate::owner_projection_refresh::{coherence_result, compare_scope_heads};
+use crate::problem_owner_transitions::ProblemOwnerAuthorizationRefusal;
 use crate::scan_disclosure_owner::{InstallationScanContour, InstallationScanDisclosureStore};
 use crate::scope_identity_admission::{ensure_snapshot_fresh, require_fresh_matched_binding};
 use crate::skill_lifecycle::GovernorSkillLifecycle;
@@ -106,8 +107,9 @@ use eliot_security_contracts::{PrivacyClass, RevocationReason};
 use eliot_session::{SessionLifecycleOwner, SessionLifecycleSnapshot, SessionState};
 use eliot_skill::{SkillLifecycleView, SkillRegistry};
 use eliot_store_api::{
-    CanonicalReadClient, OrderingHeadExpectation, PreparedTransition, RevisionHeadExpectation,
-    ScopeRevisionView, StoreHealth, TaskContractAcceptanceSet, WriteReceipt,
+    CanonicalReadClient, OrderingHeadExpectation, PreparedTransition, ProblemOwnerTransition,
+    RevisionHeadExpectation, ScopeRevisionView, StoreHealth, TaskContractAcceptanceSet,
+    WriteReceipt,
 };
 use eliot_task::{TaskLifecycleOwner, TaskLifecycleSnapshot, TaskRecord, TaskState};
 use eliot_testd_core::{
@@ -1247,6 +1249,30 @@ pub enum CompositionError {
     /// A pure owner could not be built at the requested fence.
     #[error("owner construction failed: {0}")]
     Owner(String),
+    /// A named Problem owner transition was refused because the store cannot
+    /// re-derive the authorization its candidate record implies.
+    ///
+    /// The store compares the presented `authorization_digest` against one
+    /// re-derived from the candidate record's *own* retained ownership-lease
+    /// identity, so a record that retains none produces no digest the presented
+    /// authorization could equal and the commit is refused there. Refusing here
+    /// is what keeps the semantic verdict and the commit verdict one verdict: a
+    /// prepare the store is bound to reject is not a weaker answer than success,
+    /// it is a false one, and it arrives as a variant here so a caller can tell
+    /// the two apart without reading prose.
+    #[error(
+        "problem owner transition {transition:?} refused for problem {problem_id} at revision {revision}: {reason}"
+    )]
+    ProblemOwnerTransitionUncommittable {
+        /// The Problem whose owner transition was refused.
+        problem_id: String,
+        /// The revision the refused transition would have replaced.
+        revision: u64,
+        /// The named transition that was refused.
+        transition: ProblemOwnerTransition,
+        /// Which retained-identity shape the candidate record has.
+        reason: ProblemOwnerAuthorizationRefusal,
+    },
     /// Kernel snapshot or transition-port identity was not exact.
     #[error("Kernel provider mismatch: {0}")]
     Provider(String),

@@ -272,6 +272,21 @@ fn map_composition_error(error: CompositionError, ctx: &StoreFailureIdentityCont
             StoreRecoveryAction::None,
             ctx,
         ),
+        // A Problem owner transition whose candidate record retains no
+        // ownership-lease identity is refused deterministically, at the semantic
+        // boundary that will have to change: the same record cannot commit
+        // through any presented lease, so retrying this identity can only fail
+        // again. Recovery is to give the record a retained lease identity — a
+        // successor assignment, or an actual observed loss — not to re-send.
+        CompositionError::ProblemOwnerTransitionUncommittable { .. } => {
+            map_composition_store_failure(
+                StoreFailureDisposition::DeterministicRejection,
+                "PROBLEM_OWNER_TRANSITION_UNCOMMITTABLE",
+                StoreRetryDirective::DoNotRetry,
+                StoreRecoveryAction::None,
+                ctx,
+            )
+        }
         CompositionError::Authority(_) => map_composition_store_failure(
             StoreFailureDisposition::Denied,
             "AUTHORITY_REJECTED",
