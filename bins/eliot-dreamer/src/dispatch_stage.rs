@@ -79,6 +79,7 @@ use crate::admitted_material::{
 use crate::controller::verify_admitted_binding;
 use crate::curation_pulse::compose_curation_pulse;
 use crate::curation_screen_stage::{CurationProtection, CurationProtectionSet, ProtectionClass};
+use crate::production_orientation::OrientationSupply;
 use crate::{
     CurationCandidate, DreamJobInput, DreamPacket, DreamResult, DreamerError, Interpretation,
     KernelJobAdmission, SourceCoverage,
@@ -194,16 +195,19 @@ fn dispatch_denied(error: &ContractViolation) -> DreamerError {
 /// the structured A-05 validated candidate (`Some` for every non-Curation
 /// admitted class, carried from the validation stage; `None` for Curation,
 /// which owns its separate carrier, and for refused classes, which never
-/// reach validation). Returns the owner-typed [`DreamResult`].
+/// reach validation), and the Governor-injected Orientation owner supply
+/// (`Some` only where the Governor injected one; production passes `None`).
+/// Returns the owner-typed [`DreamResult`].
 ///
 /// Fail-closed: the admission/job binding is verified first, then the class
 /// parameter is bound against the semantic job, then the exhaustive nine-arm
 /// match runs with no wildcard. Orientation proves the structured receipt
 /// binding first ([`require_validated_binding`]), then derives the v1
 /// hypothesis pair, validates it through the real v1 A-05 entry, resolves
-/// the production carrier prerequisites, and returns the typed
-/// [`DreamResult::Orientation`] complete/partial/blocked result (blocked
-/// until the Governor supply channel lands); Curation checks the carrier first
+/// the production carrier from the owner supply, and returns the typed
+/// [`DreamResult::Orientation`] complete/partial/blocked result (blocked with
+/// every missing boundary and stage owner named when the Governor wired no
+/// supply); Curation checks the carrier first
 /// (a missing carrier refuses before any screen or registry work, so no
 /// generic stage burns on a job that cannot route), then the screen binding
 /// together with the protection assessment derived from that binding, then the
@@ -219,6 +223,7 @@ pub(crate) fn dispatch_admitted(
     curation_carrier: Option<CurationExecutionCarrier<'_>>,
     job_class: JobClass,
     validated: Option<&ValidatedGroundingCandidate>,
+    orientation_supply: Option<&OrientationSupply<'_>>,
 ) -> Result<DreamResult, DreamerError> {
     verify_admitted_binding(admission, job)?;
     if job.job_class != job_class {
@@ -251,7 +256,7 @@ pub(crate) fn dispatch_admitted(
             let Some(candidate) = validated else {
                 return Err(DreamerError::InvalidAdmission(VALIDATION_RECEIPT_REFUSAL));
             };
-            dispatch_orientation(admission, job, candidate)
+            dispatch_orientation(admission, job, candidate, orientation_supply)
         }
         // Native owner: eliot-dreamer-research-synthesis `synthesize`. The
         // owner takes its own `SynthesisRequest` vocabulary (a
@@ -357,11 +362,10 @@ fn dispatch_orientation(
     admission: &KernelJobAdmission,
     job: &DreamJobInput,
     validated: &ValidatedGroundingCandidate,
+    supply: Option<&OrientationSupply<'_>>,
 ) -> Result<DreamResult, DreamerError> {
     require_validated_binding(admission, job, validated)?;
-    let admitted = admission_of(admission, job)?;
-    let bundle = bundle_of(admission, job)?;
-    let frame_source = orientation_frame_source(&bundle)?;
+    let (admitted, bundle, admitted_job) = orientation_admitted_pair(admission, job)?;
     let model = v1_model_of(admission, job)?;
     let grounded = v1_grounded_of(&model)?;
     let usage = usage_of(&admitted.budget);
@@ -386,8 +390,6 @@ fn dispatch_orientation(
         }
         Err(error) => return Err(v1_denied(&error)),
     };
-    let frame = orientation_frame_of(admission, &admitted, job, frame_source.as_str())?;
-    let admitted_job = orientation_admitted_job(admitted, frame);
     let policy = orientation_dispatch_policy()?;
     match crate::production_orientation::resolve_production_inputs(
         admission,
@@ -395,6 +397,7 @@ fn dispatch_orientation(
         &candidate,
         &bundle,
         &policy,
+        supply,
     ) {
         Ok(inputs) => crate::production_orientation::compose_production_result(inputs, job)
             .map(DreamResult::Orientation)
@@ -418,6 +421,31 @@ fn orientation_frame_source(bundle: &DreamInputBundle) -> Result<String, Dreamer
         .find(|material| !matches!(material.disposition, SourceDisposition::Excluded))
         .map(|material| material.handle.clone())
         .ok_or(DreamerError::InvalidAdmission(FRAME_SOURCE_REFUSAL))
+}
+
+/// Derives the exact admitted Orientation triple from the admitted pair.
+///
+/// The validated job admission, the bounded input bundle, and the admitted
+/// Orientation job are one derivation: they share the frame the bundle plants
+/// and the task/scope/fence triple the carrier re-proves against, so resolving
+/// them separately would let the Governor supply see records the composer never
+/// binds. The frame source is the deterministic first non-excluded material
+/// (see [`orientation_frame_source`]), and a bundle with no bindable material
+/// refuses rather than inventing one.
+///
+/// Shared by [`dispatch_orientation`] and
+/// [`AuthenticatedKernelJobPort`](crate::AuthenticatedKernelJobPort)'s
+/// supply resolution, so both sides of the carrier read the identical values.
+pub(crate) fn orientation_admitted_pair(
+    admission: &KernelJobAdmission,
+    job: &DreamJobInput,
+) -> Result<(DreamJobAdmission, DreamInputBundle, AdmittedOrientationJob), DreamerError> {
+    let admitted = admission_of(admission, job)?;
+    let bundle = bundle_of(admission, job)?;
+    let frame_source = orientation_frame_source(&bundle)?;
+    let frame = orientation_frame_of(admission, &admitted, job, frame_source.as_str())?;
+    let admitted_job = orientation_admitted_job(admitted.clone(), frame);
+    Ok((admitted, bundle, admitted_job))
 }
 
 /// Builds the admitted Orientation job over one validated frame.
@@ -1805,7 +1833,7 @@ mod slice_7_native_owner_tests {
             None,
             JobClass::Orientation,
             Some(&validated),
-        );
+            None);
         let Ok(DreamResult::Packet(packet)) = result else {
             panic!("orientation must project, got {result:?}");
         };
@@ -1875,7 +1903,7 @@ mod slice_7_native_owner_tests {
             None,
             JobClass::Orientation,
             Some(&validated),
-        );
+            None);
         assert!(
             matches!(
                 refused,
@@ -1902,7 +1930,7 @@ mod slice_7_native_owner_tests {
             None,
             JobClass::Orientation,
             None,
-        );
+            None);
         assert!(
             matches!(
                 refused,
@@ -1924,7 +1952,7 @@ mod slice_7_native_owner_tests {
         let admission = admission();
         let mut job = semantic_job(JobClass::Orientation);
         job.job_id = "caller-switched-job".to_owned();
-        let refused = dispatch_admitted(&admission, &job, None, None, JobClass::Orientation, None);
+        let refused = dispatch_admitted(&admission, &job, None, None, JobClass::Orientation, None, None);
         assert_eq!(
             refused.map_err(|error| error.code()),
             Err(KERNEL_ADMISSION_REQUIRED)
@@ -1942,7 +1970,7 @@ mod slice_7_native_owner_tests {
             None,
             JobClass::Curation,
             None,
-        );
+            None);
         assert!(
             matches!(
                 refused,
@@ -1964,7 +1992,7 @@ mod slice_7_native_owner_tests {
             None,
             JobClass::Curation,
             None,
-        );
+            None);
         assert!(
             matches!(
                 refused,
@@ -1999,7 +2027,7 @@ mod slice_7_native_owner_tests {
             None,
             JobClass::Curation,
             None,
-        );
+            None);
         assert!(
             matches!(
                 refused,
@@ -2025,7 +2053,7 @@ mod slice_7_native_owner_tests {
             Some(harness.carrier()),
             JobClass::Curation,
             None,
-        );
+            None);
         assert!(
             matches!(
                 refused,
@@ -2058,7 +2086,7 @@ mod slice_7_native_owner_tests {
             Some(carrier),
             JobClass::Curation,
             None,
-        );
+            None);
         assert!(
             matches!(
                 refused,
@@ -2095,7 +2123,7 @@ mod slice_7_native_owner_tests {
             Some(harness.carrier()),
             JobClass::Curation,
             None,
-        );
+            None);
         let Ok(DreamResult::Curation {
             job_id,
             candidates,
@@ -2189,7 +2217,15 @@ mod slice_7_native_owner_tests {
             let admission = admission();
             let job = semantic_job(class);
             let validated = validated_for(&admission, &job);
-            let refused = dispatch_admitted(&admission, &job, None, None, class, Some(&validated));
+            let refused = dispatch_admitted(
+                &admission,
+                &job,
+                None,
+                None,
+                class,
+                Some(&validated),
+                None,
+            );
             assert!(
                 matches!(refused, Err(DreamerError::InvalidAdmission(got)) if got == reason),
                 "class {class:?} must name its governed input, got {refused:?}"
@@ -2216,7 +2252,7 @@ mod slice_7_native_owner_tests {
             JobClass::ConfigurationAssistance,
         ] {
             let refused =
-                dispatch_admitted(&admission(), &semantic_job(class), None, None, class, None);
+                dispatch_admitted(&admission(), &semantic_job(class), None, None, class, None, None);
             assert!(
                 matches!(refused, Err(DreamerError::UnsupportedJobClass(refused_class)) if refused_class == class),
                 "class {class:?} must refuse with UnsupportedJobClass({class:?}), got {refused:?}"

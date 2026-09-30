@@ -9,11 +9,12 @@ use eliot_contracts::StateFence;
 use eliot_dreamer_contracts::ContractViolation;
 use eliot_dreamer_contracts::ScreenBinding;
 use eliot_dreamer_contracts::registry::{CurationHandlerRegistry, canonical_registry};
-use eliot_dreamer_orientation::OrientationDisposition;
+use eliot_dreamer_orientation::{AdmittedOrientationJob, OrientationDisposition};
 use eliot_protocol::dreamer_job::{DurableJobResponse, JobState as ProtocolJobState};
 use serde::{Deserialize, Serialize};
 
 use crate::dispatch_stage::CurationExecutionCarrier;
+use crate::production_orientation::OrientationSupply;
 use crate::kernel_port::{ClaimTransport, KernelClaimTransport};
 
 mod admitted_material;
@@ -161,6 +162,30 @@ pub trait CurationCarrierSource {
     ) -> Result<CurationExecutionCarrier<'s>, DreamerError>;
 }
 
+/// Governor injection point for the Orientation owner supply.
+///
+/// Production carries no source: the CC-002 model-route execution and the
+/// CC-004 canonical projection set are owned outside this binary, so without a
+/// Governor-wired source there is nothing to compose from and Orientation
+/// returns the typed blocked result. The Governor (or a test harness) supplies a
+/// source via
+/// [`AuthenticatedKernelJobPort::with_orientation_source`], and `submit`
+/// resolves the owner records from the admitted pair before running the
+/// admitted pipeline.
+///
+/// Object-safe by construction, exactly like [`CurationCarrierSource`]: the
+/// resolved supply borrows the source (`'s`), so `submit` consumes it before
+/// any `&mut` use of the port holding the source.
+pub trait OrientationSupplySource {
+    /// Resolves the owner records for one admitted Orientation admission.
+    fn resolve_supply<'s>(
+        &'s self,
+        admission: &KernelJobAdmission,
+        job: &AdmittedOrientationJob,
+        bundle: &DreamInputBundle,
+    ) -> Result<OrientationSupply<'s>, DreamerError>;
+}
+
 /// Authenticated production adapter over the installation-owned Kernel client.
 ///
 /// The port owns the validated one-shot claim: connecting loads the
@@ -186,6 +211,12 @@ pub struct AuthenticatedKernelJobPort<'a> {
     /// refuses at the carrier check); `Some` where the Governor wired one via
     /// [`AuthenticatedKernelJobPort::with_curation_source`].
     curation_source: Option<&'a dyn CurationCarrierSource>,
+    /// Optional Governor-injected Orientation owner supply. `None` in
+    /// production (the CC-002 route execution and the CC-004 projection set
+    /// live outside this binary, so Orientation returns the typed blocked
+    /// result); `Some` where the Governor wired one via
+    /// [`AuthenticatedKernelJobPort::with_orientation_source`].
+    orientation_source: Option<&'a dyn OrientationSupplySource>,
 }
 
 impl<'a> AuthenticatedKernelJobPort<'a> {
@@ -233,6 +264,7 @@ impl<'a> AuthenticatedKernelJobPort<'a> {
             handshake,
             transport: Box::new(transport),
             curation_source: None,
+            orientation_source: None,
         })
     }
 
@@ -245,6 +277,19 @@ impl<'a> AuthenticatedKernelJobPort<'a> {
     pub fn with_curation_source(self, source: &'a dyn CurationCarrierSource) -> Self {
         Self {
             curation_source: Some(source),
+            ..self
+        }
+    }
+
+    /// Wires a Governor-injected Orientation owner supply into the port.
+    ///
+    /// The Governor calls this after `connect()`; `submit` resolves the
+    /// CC-002/CC-004 boundary records and every stage-owner record from this
+    /// source for Orientation jobs only. Non-Orientation jobs never consult it.
+    #[must_use]
+    pub fn with_orientation_source(self, source: &'a dyn OrientationSupplySource) -> Self {
+        Self {
+            orientation_source: Some(source),
             ..self
         }
     }
@@ -283,6 +328,7 @@ impl<'a> AuthenticatedKernelJobPort<'a> {
             handshake,
             transport,
             curation_source,
+            orientation_source: None,
         })
     }
 
@@ -340,6 +386,36 @@ impl<'a> AuthenticatedKernelJobPort<'a> {
             None => Ok(None),
             Some(source) => source.resolve_carrier(screen, admission, job).map(Some),
         }
+    }
+
+    /// Resolves the Governor-injected Orientation owner supply, if any.
+    ///
+    /// Same shape as [`Self::resolve_curation_carrier`]: the source reference
+    /// is copied out of `self` first so the resolved supply borrows the source
+    /// rather than this port, and `submit` consumes it inside the pipeline call
+    /// before observing the live view. `None` (production) flows to the
+    /// carrier resolution inside dispatch, which returns the typed blocked
+    /// Orientation result naming the absent CC-002/CC-004 boundaries.
+    ///
+    /// Non-Orientation jobs never consult the source: the supply is only
+    /// resolved for the Orientation class, where the admitted pair is re-derived
+    /// so the source sees exactly the records the carrier will bind against.
+    fn resolve_orientation_supply(
+        &self,
+        admission: &KernelJobAdmission,
+        job: &DreamJobInput,
+    ) -> Result<Option<OrientationSupply<'_>>, DreamerError> {
+        let source = self.orientation_source;
+        if job.job_class != JobClass::Orientation {
+            return Ok(None);
+        }
+        let Some(source) = source else {
+            return Ok(None);
+        };
+        let (_, bundle, admitted_job) = dispatch_stage::orientation_admitted_pair(admission, job)?;
+        source
+            .resolve_supply(admission, &admitted_job, &bundle)
+            .map(Some)
     }
 
     /// Observes the live Kernel-proved disposition of the claimed job.
@@ -531,6 +607,7 @@ fn run_admitted_pipeline(
     admission: &KernelJobAdmission,
     job: &DreamJobInput,
     curation_carrier: Option<dispatch_stage::CurationExecutionCarrier<'_>>,
+    orientation_supply: Option<OrientationSupply<'_>>,
 ) -> Result<DreamResult, DreamerError> {
     let screen = curation_screen_stage::resolve_screen_inputs(admission, job)?;
     if job.job_class == JobClass::Curation {
@@ -577,6 +654,7 @@ fn run_admitted_pipeline(
         None,
         job.job_class,
         Some(&validated),
+        orientation_supply.as_ref(),
     )
 }
 
@@ -625,7 +703,7 @@ impl KernelJobPort for AuthenticatedKernelJobPort<'_> {
                 }
             };
             let carrier = self.resolve_curation_carrier(&binding, admission, job)?;
-            let result = run_admitted_pipeline(admission, job, carrier)?;
+            let result = run_admitted_pipeline(admission, job, carrier, None)?;
             return self.finish_with_result(result);
         }
         let (state, observed, policy, observation_time_ms) =
@@ -634,7 +712,7 @@ impl KernelJobPort for AuthenticatedKernelJobPort<'_> {
             controller::step_admitted_cycle(&state, &observed, &policy, observation_time_ms)?;
         let request = bundle_stage::resolve_bundle_request(admission, job)?;
         let _plan = bundle_stage::plan_admitted_bundle(request)?;
-        let result = run_admitted_pipeline(admission, job, None)?;
+        let result = run_admitted_pipeline(admission, job, None, self.resolve_orientation_supply(admission, job)?)?;
         self.finish_with_result(result)
     }
 

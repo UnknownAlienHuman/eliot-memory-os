@@ -982,15 +982,18 @@ impl KernelBackupRestore {
     /// the owner's answer must agree before any import, and neither value is
     /// computed here.
     ///
-    /// What the cross-check does NOT cover, stated rather than implied: an
-    /// archive that carries no purge entry has no owner-issued revision, so no
-    /// comparison is performed for it and none is claimed — the empty-ledger
-    /// path applies nothing and reports no revision, and the published field
-    /// remains the archive's own declared value. A resumed transaction that
+    /// What the cross-check does NOT cover, stated rather than implied: only the
+    /// per-entry completeness of a carried ledger. An archive that carries no
+    /// purge entry has no owner-issued per-entry revision to compare, but its
+    /// DECLARED revision is still reconciled against the owner's own counter —
+    /// including the case where the owner answered nothing, which refuses — so
+    /// the empty ledger cannot pass as a closure this phase never established.
+    /// For that archive the finalize evidence reports the purge obligation as
+    /// not established rather than `Satisfied`. A resumed transaction that
     /// reconciles the purge phase from its journaled receipt does not re-apply
     /// the ledger either, so the check is a property of the phase execution
-    /// that applied the entries, and that phase's receipt is what the purge
-    /// obligation evidence binds.
+    /// that applied the entries, and that phase's receipt is what a non-empty
+    /// purge obligation binds.
     pub fn restore_with_ors_journal(
         &self,
         ors: &std::sync::Arc<RedbRecoveryStore>,
@@ -1884,7 +1887,11 @@ struct KernelRestoreTarget<'a> {
     /// `None` is a real, declared posture — the injected-journal seam
     /// [`KernelBackupRestore::restore`] has no composition owner to name — and
     /// the purge phase refuses on it rather than degrading (see
-    /// [`KernelRestoreTarget::apply_purge_ledger`]). It is never a silent
+    /// [`KernelRestoreTarget::apply_purge_ledger`]): for a carried ledger
+    /// because nothing can be applied, and for an empty one because the
+    /// revision that archive declares still has to be reconciled against the
+    /// owner that alone can answer for it
+    /// ([`check_purge_revision_closure`]). It is never a silent
     /// skip and never a locally allocated revision.
     ors: Option<std::sync::Arc<RedbRecoveryStore>>,
     /// Revisions the purge phase actually consumed from the ORS purge-ledger
@@ -1985,9 +1992,14 @@ impl<'a> KernelRestoreTarget<'a> {
     /// (A13.7, A0.3: recovery cannot resurrect invalid state). The absence is
     /// the injected-journal seam's declared posture, not a fallback.
     ///
-    /// An archive whose purge ledger is empty has nothing to apply, so the
-    /// absence changes nothing that could have been applied: that case applies
-    /// no entry, reports no revision, and is not a skip of an application.
+    /// An archive whose purge ledger is empty still reaches the revision
+    /// cross-check, because it still DECLARES a purge-ledger revision: there is
+    /// no entry to apply, so this returns the owner's own counter with no
+    /// per-entry revision, and [`check_purge_revision_closure`] reconciles the
+    /// declaration against that answer. An empty ledger is therefore not a
+    /// licence to pass the owner by — with no ORS handle the answer is `None`
+    /// and the phase refuses at that cross-check, the same typed refusal the
+    /// non-empty case meets.
     ///
     /// ## Rehearsal refusal rule
     ///
@@ -2021,10 +2033,12 @@ impl<'a> KernelRestoreTarget<'a> {
     /// today's one — a guard that is unreachable only by accident is not a
     /// guard.
     ///
-    /// An archive whose purge ledger is EMPTY still succeeds under a
-    /// rehearsal, unchanged and byte-for-byte: there is nothing that could
-    /// have been written, so the empty-ledger path applies no entry, reports
-    /// no revision, and is not a skip of an application.
+    /// An archive whose purge ledger is EMPTY is not a rehearsal-shaped
+    /// exception: this guard keys off the entries actually carried, so an empty
+    /// ledger still reads the owner and still has its declared revision
+    /// reconciled against the owner below. A rehearsal that carries no purge
+    /// entry is not a way to obtain purge evidence, and it does not make the
+    /// phase's obligation `Satisfied` for an archive that purged nothing.
     ///
     /// ## Ordering against the revision cross-check
     ///
@@ -3220,8 +3234,28 @@ impl<'a> KernelRestoreTarget<'a> {
                 RestoreObligationState::MissingCapability,
             )
         };
+        // An archive that carried no purge entry established no privacy-purge
+        // closure for this restore: the purge phase applied nothing, so there is
+        // no purge effect of this restore for `owners::PURGE` to attest, and a
+        // phase receipt over an empty ledger is a receipt that says "nothing was
+        // purged", not a closure. Publishing `Satisfied` here on the strength
+        // of the caller's own emptiness is the substitution this restore must
+        // not make — do not fill a missing obligation with `Satisfied` to make
+        // the slice return success — and it is the shape the two neighbouring
+        // slots above already refuse. The obligation is therefore reported as
+        // not established in the existing unbound-owner vocabulary, and
+        // `require_cutover_obligations` refuses this slot on that state rather
+        // than accepting a closure no owner issued. The revision itself was
+        // still reconciled against the purge owner before any evidence was
+        // staged (see [`check_purge_revision_closure`]); that reconciliation
+        // is not a substitute for a purge effect that never happened.
+        let purge_obligation = if bundle.purge_ledger.is_empty() {
+            missing(owners::PURGE)
+        } else {
+            Self::obligation(owners::PURGE, purge_ref, RestoreObligationState::Satisfied)
+        };
         let obligations = RestoreObligations {
-            purge: Self::obligation(owners::PURGE, purge_ref, RestoreObligationState::Satisfied),
+            purge: purge_obligation,
             canonical_validation: Self::obligation(
                 owners::CANONICAL,
                 canonical_ref.clone(),
@@ -3742,29 +3776,41 @@ fn check_ors_journal_budget(bundle: &BackupBundle) -> Result<(), KernelRestoreEr
 ///
 /// ## An archive with no purge entry
 ///
-/// When the archive carries no purge entry there is no owner-issued revision
-/// to compare and none is invented, so this function returns without
-/// comparing. That is NOT a cross-checked agreement and is not reported as
-/// one: the empty ledger applied nothing, so there is no purge closure this
-/// phase established, and the published revision remains the archive's own
-/// declared value with nothing of the owner's behind it (see
-/// [`KernelRestoreTarget::apply_purge_ledger`], whose empty-ledger posture is
-/// "applies no entry, reports no revision, and is not a skip of an
-/// application"). A closure this phase never established cannot be claimed as
-/// owner-corroborated, and the obligation the finalize evidence publishes
-/// binds the phase receipt of the phase that actually ran.
+/// An archive that carries no purge entry has no owner-issued per-entry
+/// revision, so the per-entry completeness arm above has nothing to check. That
+/// is a property of the emptiness itself and is NOT a cross-checked agreement.
+///
+/// What still has to hold is the DECLARED revision. It names the purge-ledger
+/// position this archive was taken at; the destination holds that position only
+/// if the purge owner reports it, and a ledger with nothing in it cannot put the
+/// destination there. So the owner comparison above is not skipped for an empty
+/// ledger: an owner that answered no revision at all — the absent-owner seam —
+/// and a destination whose ledger position is not the declared one both refuse
+/// with the same typed `FenceMismatch` naming `purge ledger revision`. `I5.13:44`
+/// binds the purge-ledger revision into the receipt precisely so an unexplained
+/// revision gap fails rather than reading as coherent.
+///
+/// An empty ledger therefore establishes no privacy-purge closure, and the
+/// restore does not claim one: [`KernelRestoreTarget::apply_finalize`] reports
+/// the purge obligation as NOT established for an archive that carried no purge
+/// entry — the same posture its blob and ORS slots already take — instead of
+/// publishing `Satisfied` on the strength of the caller's own emptiness.
 fn check_purge_revision_closure(
     declared: u64,
     owner_revision: Option<u64>,
     entries: &[PurgeLedgerEntry],
     applied: &[AppliedPurgeRevision],
 ) -> Result<(), BackupError> {
-    if entries.is_empty() {
-        return Ok(());
-    }
     // One owner-issued revision per carried entry, and no owner-issued
-    // revision may be the owner's own "nothing was applied" zero.
-    if applied.len() != entries.len() || applied.iter().any(|record| record.revision == 0) {
+    // revision may be the owner's own "nothing was applied" zero. This arm is
+    // about the entries the archive actually carries: an archive carrying none
+    // has no per-entry revision to expect, and `applied` is then empty by
+    // construction because it is built only by iterating `entries`. A
+    // completeness check is never performed against a copy of the caller's own
+    // list, in this arm or the other.
+    if !entries.is_empty()
+        && (applied.len() != entries.len() || applied.iter().any(|record| record.revision == 0))
+    {
         return Err(BackupError::FenceMismatch {
             subject: PURGE_LEDGER_REVISION_SUBJECT.to_owned(),
         });
@@ -3773,6 +3819,15 @@ fn check_purge_revision_closure(
     // moved it, against the archive's declaration. `None` — the owner answered
     // with no revision at all — is compared as itself, so it refuses rather
     // than standing in for agreement.
+    //
+    // This comparison is NOT conditional on the ledger being non-empty. An
+    // archive that carries no purge entry still DECLARES a purge-ledger
+    // revision: that number names the ledger position the source was taken at,
+    // and the destination holds that position only if the purge owner says so —
+    // nothing this phase applied puts it there. So the declaration is
+    // reconciled against the owner here in the empty arm exactly as it is for a
+    // carried ledger, and an uncorroborated declaration — including one no owner
+    // was ever asked about — refuses instead of being passed over.
     if owner_revision != Some(declared) {
         return Err(BackupError::FenceMismatch {
             subject: PURGE_LEDGER_REVISION_SUBJECT.to_owned(),

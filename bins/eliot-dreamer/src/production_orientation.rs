@@ -12,12 +12,12 @@
 //!
 //! | Responsibility | Actual runtime owner | Status |
 //! |---|---|---|
-//! | Construct/admit `ModelRouteRequest` | none in-repo: no producer exists outside the contract owner and its tests | named implementation work |
-//! | Execute the admitted provider route, return `ModelRouteOutcome` | none: provider text lives outside the dreamer binary | named implementation work |
-//! | Read/build the exact `CanonicalProjectionSet` from Governor/canonical owners | none in-binary: no Governor orientation-supply channel exists | named implementation work |
-//! | Acquire each mandatory stage's owner input/receipt | none in-binary: records must arrive owner-built via the future carrier supply | named implementation work |
-//! | Invoke the pure composer | [`compose_production_result`] below (this module) | compiled, UNREACHABLE: no production call site can supply its carrier |
-//! | Publish the typed result | `dispatch_stage::dispatch_orientation` as `DreamResult::Orientation` | blocked leg reachable; complete/partial legs are not |
+//! | Construct/admit `ModelRouteRequest` | the owner supply channel ([`OrientationSupplySource`](crate::OrientationSupplySource)), which resolves it from admitted material | wired through [`resolve_production_inputs`] |
+//! | Execute the admitted provider route, return `ModelRouteOutcome` | the same supply channel; provider text lives outside the dreamer binary | wired through [`resolve_production_inputs`] |
+//! | Read/build the exact `CanonicalProjectionSet` from Governor/canonical owners | `eliot_governor::compose_canonical_projection_set`, supplied by the same channel | wired through [`resolve_production_inputs`] |
+//! | Acquire each mandatory stage's owner input/receipt | the same supply channel, carrying each stage's owner-built record | wired through [`resolve_production_inputs`] |
+//! | Invoke the pure composer | [`compose_production_result`] below (this module) | reachable: `dispatch_stage::dispatch_orientation` calls it on the resolved carrier |
+//! | Publish the typed result | `dispatch_stage::dispatch_orientation` as `DreamResult::Orientation` | all three dispositions reachable |
 //!
 //! A missing adapter is implementation work, never substituted with local
 //! data: the v1 hypothesis pair derived in dispatch cannot impersonate the
@@ -159,48 +159,157 @@ pub(crate) struct ProductionOrientationInputs<'a> {
     pub cancelled: bool,
 }
 
-/// Resolves the production carrier from admitted dispatch artifacts.
+/// Governor-resolved owner records for one admitted Orientation pulse.
 ///
-/// The Governor orientation-supply channel does not exist in-binary, so no
-/// CC-002 outcome, CC-004 set, or stage-owner record can be acquired here and
-/// this always returns the typed blocked result naming the missing adapters.
-/// The `Ok` arm stays compiled-live: when the channel lands, assembly fills
-/// the carrier from admitted artifacts plus the Governor supply and the same
-/// composer below produces complete/partial results with no dispatch change.
+/// The carrier's mandatory members are owner values, not derivations: the
+/// CC-002 outcome carries provider text and observed usage that live outside
+/// this binary, the CC-004 set is composed by
+/// `eliot_governor::compose_canonical_projection_set`, and every stage input
+/// is an owner-built record. This is the one shape that carries all of them
+/// across the process boundary, mirroring the Curation
+/// [`CurationExecutionCarrier`](crate::dispatch_stage::CurationExecutionCarrier)
+/// exactly: an owned value the source hands out per admission, which the
+/// composer then borrows for the life of one synchronous composition.
 ///
-/// MEASURED UNREACHABLE (A1/W1, #40): this body is a single unconditional
-/// `Err`, so no execution can reach
-/// `Ok(inputs) => compose_production_result(...)` at
-/// `dispatch_stage.rs::dispatch_orientation` — the entire complete/partial
-/// composition, including [`build_projection`](eliot_dreamer_orientation::projection::build_projection),
-/// is statically dead in production. Measured on the current base by
-/// enumerating every construction of [`ProductionOrientationInputs`] in the
-/// tree: there are ZERO. Not one struct literal, in this module or anywhere
-/// else in the workspace, and the file carries no test module, so no fixture
-/// reaches the composer either. The only references to the type are this
-/// module's own signatures and helpers plus one doc link in
-/// `pulse.rs`. The `Ok` arm is therefore genuinely required by the signature
-/// and is deliberately not deleted: removing it would delete the only seam the
-/// Governor supply channel can be wired into, and the current typed blocked
-/// behaviour is correct per I9.2. The missing piece is an owner that mints the
-/// mandatory CC-002/CC-004 records, not a dispatch edit. A future owner must add
-/// the real `Ok` construction here; it must NOT be satisfied by synthesising
-/// an outcome, projecting an empty set, or attaching a blocking read, all of
-/// which are self-issued authority.
+/// Identity is not carried here. `operation_id`, `task_id`, `scope_id`, and
+/// `state_fence` are read from the admitted job, which
+/// [`validate_identity_closure`] already proves equal to the bundle, the frame,
+/// and the semantic job, so a second copy in the supply could only disagree.
+pub(crate) struct OrientationSupply<'a> {
+    /// CC-002 admitted model-route request (denominator, timeout, privacy).
+    pub model_request: ModelRouteRequest,
+    /// CC-002 admitted model-route outcome (mandatory boundary).
+    pub model_outcome: ModelRouteOutcome,
+    /// CC-004 canonical projection set (mandatory boundary).
+    pub projections: CanonicalProjectionSet,
+    /// Governor-resolved epistemic-position handles for the packet.
+    pub cep_handles: Vec<CurrentEpistemicPositionHandle>,
+    /// Classification stage inputs.
+    pub classification: ClassificationStage<'a>,
+    /// Cue-activation stage inputs.
+    pub cue_activation: CueActivationStage<'a>,
+    /// Epistemic resolution request over admitted records.
+    pub epistemic: PositionRequest,
+    /// Understanding stage inputs with the route measurement.
+    pub understanding: UnderstandingStage<'a, MeasureFn>,
+    /// Claim-grounding request (cloned; the owner takes owned input).
+    pub grounding: GroundingRequest,
+    /// Rival-structuring stage inputs.
+    pub rivals: RivalStage<'a>,
+    /// Conflict-analysis stage inputs.
+    pub conflict: ConflictStage<'a>,
+    /// Discriminative probe-plan parameters.
+    pub probes: ProbePlanParams<'a>,
+    /// Context-candidate stage inputs.
+    pub candidates: CandidateStage<'a>,
+    /// True when cancellation was observed by the owner before composition.
+    pub cancelled: bool,
+}
+
+/// Resolves the production carrier from admitted dispatch artifacts plus the
+/// owner supply.
+///
+/// The identity half (operation/task/scope/fence) is read from the admitted job
+/// and the deadline from the Kernel admission, so it cannot drift from the
+/// records it is re-proved against. Every other member is the owner value the
+/// supply handed over verbatim: nothing here synthesizes an outcome, projects
+/// an empty set, fills a usage receipt, or builds a lookalike stage record, so
+/// a missing supply member is the typed blocked result rather than filler.
+///
+/// # Errors
+///
+/// Returns the typed blocked [`OrientationPulseResult`] naming the absent
+/// boundaries and every stage owner when `supply` is [`None`].
 pub(crate) fn resolve_production_inputs<'a>(
     admission: &'a KernelJobAdmission,
     admitted_job: &'a AdmittedOrientationJob,
     candidate: &'a ValidatedCandidate,
     bundle: &'a DreamInputBundle,
     policy: &'a OrientationPolicy,
+    supply: Option<&'a OrientationSupply<'a>>,
 ) -> Result<ProductionOrientationInputs<'a>, Box<OrientationPulseResult>> {
-    Err(Box::new(missing_prerequisites_blocked(
-        admission,
+    let Some(supply) = supply else {
+        return Err(Box::new(missing_prerequisites_blocked(
+            admission,
+            admitted_job,
+            candidate,
+            bundle,
+            policy,
+        )));
+    };
+    let job = &admitted_job.job;
+    Ok(ProductionOrientationInputs {
+        schema_version: PRODUCTION_ORIENTATION_INPUTS_SCHEMA_VERSION,
         admitted_job,
-        candidate,
         bundle,
+        validated_candidate: candidate,
         policy,
-    )))
+        model_request: &supply.model_request,
+        model_outcome: &supply.model_outcome,
+        projections: &supply.projections,
+        cep_handles: &supply.cep_handles,
+        // Each stage input is copied out of the supply field by field: the
+        // stage records are plain aggregates of references, so this borrows
+        // the owner's records without moving or duplicating any of them.
+        classification: ClassificationStage {
+            input: supply.classification.input,
+            context: supply.classification.context,
+            policy: supply.classification.policy,
+        },
+        cue_activation: CueActivationStage {
+            candidate: supply.cue_activation.candidate,
+            request: supply.cue_activation.request,
+            profile: supply.cue_activation.profile,
+        },
+        epistemic: &supply.epistemic,
+        understanding: UnderstandingStage {
+            admitted: supply.understanding.admitted,
+            recipe: supply.understanding.recipe,
+            quality: supply.understanding.quality.clone(),
+            policy: supply.understanding.policy,
+            measure: supply.understanding.measure,
+        },
+        grounding: &supply.grounding,
+        rivals: RivalStage {
+            bundle: supply.rivals.bundle,
+            validated_draft: supply.rivals.validated_draft,
+            current_position: supply.rivals.current_position,
+            policy: supply.rivals.policy,
+        },
+        conflict: ConflictStage {
+            item: supply.conflict.item,
+            draft: supply.conflict.draft,
+            grounded: supply.conflict.grounded,
+            conflict_set: supply.conflict.conflict_set,
+            supplements: supply.conflict.supplements,
+            policy: supply.conflict.policy,
+        },
+        probes: ProbePlanParams {
+            plan_id: supply.probes.plan_id.clone(),
+            bundle: supply.probes.bundle,
+            draft: supply.probes.draft,
+            rivals: supply.probes.rivals,
+            affordances: supply.probes.affordances,
+            limits: supply.probes.limits,
+            policy: supply.probes.policy,
+        },
+        candidates: CandidateStage {
+            request: supply.candidates.request,
+            recipe: supply.candidates.recipe,
+            measurements: supply.candidates.measurements,
+            attention_and_conflicts: supply.candidates.attention_and_conflicts,
+            epistemic_position: supply.candidates.epistemic_position,
+            cue_activation_result: supply.candidates.cue_activation_result,
+            evidence: supply.candidates.evidence,
+            policy: supply.candidates.policy,
+        },
+        operation_id: job.operation_id.clone(),
+        task_id: job.task_id.clone(),
+        scope_id: job.scope_id.clone(),
+        state_fence: job.state_fence.clone(),
+        deadline_unix_ms: admission.deadline_unix_ms,
+        cancelled: supply.cancelled,
+    })
 }
 
 /// Composes one typed production pulse from the versioned carrier.
