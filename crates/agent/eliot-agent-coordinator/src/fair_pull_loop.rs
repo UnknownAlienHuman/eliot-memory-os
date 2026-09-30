@@ -1,0 +1,171 @@
+//! Bounded, release-driven fair-pull progress over the coordinator's own
+//! admitted projection (issue #1683 W1, I14.8).
+//!
+//! I14.8 closes with: "Scheduler is pull-based: terminal/deferred/blocked
+//! attempt releases its slot, then the next currently admissible Ready Work
+//! Item is selected. Mechanical queue progress never depends on an LLM
+//! remembering to start another agent." The selector behind that sentence is
+//! [`AgentCoordinator::pull_next`](crate::AgentCoordinator::pull_next); the
+//! types here are the *join* around it — what arms it, what one drive is
+//! allowed to do, and what the caller is told. The drive itself is
+//! [`AgentCoordinator::drive_fair_pull`], next to the selector it drives.
+//!
+//! Three facts make that a real join rather than a restatement:
+//!
+//! 1. **The wake is a coordinator transition, not a notification.** The four
+//!    transitions that release a slot — `reconcile_cancellation`,
+//!    `mark_worker_lost`, `submit_result` and `reconcile_unknown_outcome` —
+//!    and the three that change what is queued — `admit`, `reassign` and
+//!    `start_attempt` — each arm the loop through
+//!    `AgentCoordinator::note_selection_inputs_changed`. There is no
+//!    notification bus to miss because there is no separate wake: the event
+//!    that releases the slot is the same event that arms the drive.
+//! 2. **The cursor is the durable event log.** The published cursor is
+//!    `events.len()` at the newest observed selection-input change, so
+//!    `AgentCoordinator::replay_snapshot_events` re-derives it by running the
+//!    same seven transitions, and a restart can neither strand eligible work
+//!    nor renew anyone's age.
+//! 3. **The bound is derived, never invented.** A drive starts at most one
+//!    attempt per currently non-terminal admitted attempt, and `admit` /
+//!    `reassign` refuse to push the coordinator past the validated
+//!    `CoordinatorConfig::max_admitted_attempts`, so the loop is finite with no
+//!    constant chosen by this module.
+//!
+//! Selection is not execution. A drive turns a selection into a `Running`
+//! attempt through the existing [`AgentCoordinator::start_attempt`] transition,
+//! which remains the only transition that starts an attempt and still
+//! authorizes nothing: provider execution binding is a later, separately proven
+//! step ([`AgentCoordinator::bind_provider_execution`]).
+//!
+//! # Production reachability
+//!
+//! Reachable in a non-test build: `AgentFabric::drive_fair_pull` in
+//! `bins/eliotd/src/agent_fabric.rs` calls
+//! [`AgentCoordinator::drive_fair_pull`] on the daemon's live coordinator, and
+//! `solo_agent_driver::solo_ingest_result` calls that on the production worker
+//! settle path. Neither is `cfg(test)`-gated.
+//!
+//! Still blocked, and stated here rather than hidden: this coordinator's
+//! `attempts` map is empty in production because nothing in the tree
+//! constructs the provider-verified `ProviderAdmissionReceipt` that
+//! `AgentCoordinator::admit` requires — the G-11 admission owner, issue #1678.
+//! A production drive therefore performs one pull, selects nothing and stops,
+//! which is the correct bounded behaviour of an empty projection, and it
+//! becomes live the moment that owner lands. Nothing here waits for it and
+//! nothing here forges an admission to make it look live.
+//!
+//! Proof ceiling: [`FAIR_PULL_LOOP_PROOF_CEILING`]. This loop starts
+//! coordinator attempts and nothing else: no process, no provider/admission/
+//! lease/route evidence, no canonical Task write, no Finish authority.
+
+use eliot_agent_api::AttemptId;
+use serde::Serialize;
+
+use crate::model::{AdmissionId, ReadySelectionOutcome, WorkClass};
+
+/// Proof ceiling of [`AgentCoordinator::drive_fair_pull`](crate::AgentCoordinator::drive_fair_pull):
+/// it starts coordinator attempts under their own admission and nothing else.
+pub const FAIR_PULL_LOOP_PROOF_CEILING: &str = "FAIR_PULL_LOOP_CANDIDATE_ONLY";
+
+/// Wake and coalescing state of the pull-based scheduler.
+///
+/// In-memory scheduler state, exactly like the fair virtual times it drives: it
+/// is not a snapshot field and not canonical work state, and the durable part it
+/// points at (the coordinator's event log) is what a restore replays.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct FairPullLoop {
+    /// `events.len()` at the newest observed selection-input change.
+    cursor: u64,
+    /// A selection input changed since the last drive consumed a wake.
+    pending: bool,
+    /// Wakes observed since the last drive consumed one.
+    coalesced: u64,
+}
+
+impl FairPullLoop {
+    /// Records that a selection input changed at `event_sequence`, coalescing
+    /// with any wake already pending.
+    pub(crate) fn arm(&mut self, event_sequence: u64) {
+        self.cursor = event_sequence;
+        self.coalesced = self.coalesced.saturating_add(1);
+        self.pending = true;
+    }
+
+    /// Consumes the pending wake as `(cursor, coalesced_wakes)`, or `None` when
+    /// no selection input has changed since the last drive.
+    pub(crate) fn take_wake(&mut self) -> Option<(u64, u64)> {
+        if !self.pending {
+            return None;
+        }
+        self.pending = false;
+        let coalesced = self.coalesced;
+        self.coalesced = 0;
+        Some((self.cursor, coalesced))
+    }
+
+    /// The durable cursor: `events.len()` at the newest armed transition, or
+    /// zero while nothing has changed yet.
+    pub(crate) const fn cursor(&self) -> u64 {
+        self.cursor
+    }
+}
+
+/// One attempt a single drive selected and started.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct FairPullStart {
+    pub attempt_id: AttemptId,
+    /// The admission this attempt was started under, read from the attempt's
+    /// own stored record and never synthesized.
+    pub admission_id: AdmissionId,
+    pub work_class: WorkClass,
+    /// Canonical enqueue ordinal of the started item, under the age rule named
+    /// in [`crate::FAIR_PULL_ALGORITHM`]. It is the age that won the pull, published
+    /// so a caller sees the ordering decision instead of re-deriving it.
+    pub enqueue_sequence: u64,
+}
+
+/// Exact outcome of one bounded fair-pull drive (issue #1683 W1, I14.8).
+///
+/// The real effects of the drive plus its exact decision record. `started` is
+/// not a claim: each entry names an attempt the coordinator actually
+/// transitioned to `Running` through its own admission, and `last_selection` is
+/// the complete selector record of the pull that ended the drive — including
+/// the limiting dimension of every class it could not serve, so an empty drive
+/// is an explained refusal rather than a silent `None`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct FairPullOutcome {
+    /// Always [`crate::FAIR_PULL_ALGORITHM`], which also names the frozen within-class
+    /// age rule and its clock domain.
+    pub algorithm: &'static str,
+    /// Always [`FAIR_PULL_LOOP_PROOF_CEILING`].
+    pub proof_ceiling: &'static str,
+    /// Profile revision every per-class ceiling in `last_selection` was taken
+    /// from. Not optional: this drive is profile-bound and refuses rather than
+    /// running without per-class partitions.
+    pub profile_revision: String,
+    pub capacity_identity: String,
+    pub capacity_revision: eliot_agent_contracts::RevisionId,
+    /// Durable cursor this drive read: the coordinator's event-log length at
+    /// the newest observed selection-input change. A restore replays that log
+    /// and re-derives the same value.
+    pub cursor_event_sequence: u64,
+    /// `Some((cursor, coalesced_wakes))` when a selection input had changed
+    /// since the last drive, `None` when the caller re-polled unchanged state.
+    ///
+    /// This is evidence, not a gate: the drive runs its bounded loop either
+    /// way, which is what makes a missed wake unable to strand eligible work.
+    pub consumed_wake: Option<(u64, u64)>,
+    /// Upper bound this drive enforced: the number of non-terminal admitted
+    /// attempts it could have started. Derived from the projection, never a
+    /// constant chosen here.
+    pub poll_bound: usize,
+    /// Pulls actually performed. At most `poll_bound + 1`: one per started
+    /// attempt plus the pull that observed the state which ended the drive.
+    pub pulls_performed: usize,
+    /// Attempts started, in selection order.
+    pub started: Vec<FairPullStart>,
+    /// The pull that ended this drive, in full. Its `deferrals` name the exact
+    /// limiting dimension, observed value, limit and profile revision for every
+    /// class that held ready work and was closed.
+    pub last_selection: ReadySelectionOutcome,
+}

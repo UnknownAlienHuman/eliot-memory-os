@@ -70,7 +70,10 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use eliot_agent_api::{AttemptId, RouteFingerprint};
-use eliot_agent_coordinator::{AdmissionId, CandidateId, StaffingPlanRequest};
+use eliot_agent_coordinator::{
+    AdmissionId, CandidateId, RUNTIME_PROFILE_FILE_NAME, StaffingPlanRequest,
+    load_runtime_scheduling_profile,
+};
 use eliot_contracts::{fences_match_exact, sha256_hex};
 use serde::{Deserialize, Serialize};
 
@@ -1317,6 +1320,66 @@ fn repersist_after_control(
     persist_projection(composition.state_root(), projection)
 }
 
+/// Drives the coordinator's fair pull over the capacity a settled attempt just
+/// released (issue #1683 W1, I14.8 "Scheduler is pull-based").
+///
+/// This is the daemon's production call of `AgentFabric::drive_fair_pull`, on
+/// the I14.8 release path: `submit_attempt_result` has just settled an attempt,
+/// so the coordinator is asked for the next currently admissible item instead of
+/// waiting for another agent command. It runs after
+/// [`repersist_after_control`], so the candidate result and settlement state are
+/// already durable and a refused queue profile cannot lose an observation.
+///
+/// Reachable in a non-test build: [`solo_ingest_result`] and
+/// [`DaemonComposition::solo_ingest_result`](crate::DaemonComposition::solo_ingest_result)
+/// are not `cfg(test)`-gated, so this join is compiled and callable in
+/// production. It is one documented fail-closed hop short of live work today,
+/// and that hop is not this issue's: in a non-test build
+/// `restore_solo_fabric` refuses with "solo restore is blocked until Kernel
+/// retains an independently owner-verified executable-binding digest", and
+/// `drive_solo_delegate_async` refuses before any fabric effect, so no
+/// production build yet holds an admitted coordinator projection to pull over.
+/// The two residuals above are the Kernel native-worker owner and the G-11
+/// admission owner (issue #1678). The join is placed on the release path
+/// because that is where I14.8 says the wake happens, not on a site that would
+/// be reachable only by pulling over an empty plan-only coordinator.
+///
+/// The Kernel-owned `runtime.toml` is resolved beside the Host-approved launch
+/// config — the same protected runtime root `daemon_config` derives
+/// `state_root` from — and not from an environment variable, a working
+/// directory or a legacy Governor file. An absent, unreadable, malformed,
+/// wrongly-versioned or incomplete document is the loader's own typed refusal
+/// and is returned unchanged: it is never defaulted, because I14.1 requires a
+/// bounded byte profile for all nine classes and I14.2 states an item ceiling
+/// for only five of them, so "no file" cannot compile a nine-class policy
+/// without inventing numbers no fragment states.
+fn drive_fair_pull_after_release(
+    composition: &DaemonComposition,
+    fabric: &mut AgentFabric,
+    projection: &mut SoloPersistedAttempt,
+) -> Result<(), DaemonError> {
+    let runtime_root = composition.config_path().parent().ok_or_else(|| {
+        DaemonError::Composition(CompositionError::Recovery(
+            "approved launch config has no runtime parent for the Kernel queue profile".to_owned(),
+        ))
+    })?;
+    let profile = load_runtime_scheduling_profile(&runtime_root.join(RUNTIME_PROFILE_FILE_NAME))
+        .map_err(|error| DaemonError::ProviderAdmission(FabricError::from(error)))?;
+    let outcome = fabric.drive_fair_pull(&profile)?;
+    // The drive advances the coordinator's fairness credit and may have started
+    // attempts, so the digest-bound snapshot is re-persisted after it rather
+    // than before.
+    repersist_after_control(composition, fabric, projection)?;
+    tracing::info!(
+        algorithm = outcome.algorithm,
+        profile_revision = outcome.profile_revision.as_str(),
+        started = outcome.started.len(),
+        pulls = outcome.pulls_performed,
+        "bounded fair pull over released coordinator capacity"
+    );
+    Ok(())
+}
+
 /// Reads the attempt status under the same durable identity.
 ///
 /// Serves the persisted projection when no live slot exists, so inspect
@@ -1433,6 +1496,10 @@ pub fn solo_ingest_result(
     fabric.submit_attempt_result(&record)?;
     projection.result_digest = Some(result_digest.to_owned());
     repersist_after_control(composition, &fabric, &mut projection)?;
+    // Issue #1683 W1 / I14.8: the settled attempt released its slot, so the
+    // coordinator's bounded fair pull runs now instead of on the next agent
+    // command. The candidate result is already durable above.
+    drive_fair_pull_after_release(composition, &mut fabric, &mut projection)?;
     solo_status(composition, operation_id)
 }
 

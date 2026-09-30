@@ -19,6 +19,9 @@ use eliot_receipts::ProofCeiling;
 use serde::Serialize;
 
 use crate::SNAPSHOT_SCHEMA_VERSION;
+use crate::fair_pull_loop::{
+    FAIR_PULL_LOOP_PROOF_CEILING, FairPullLoop, FairPullOutcome, FairPullStart,
+};
 use crate::model::{
     AdmissionId, AttemptRecord, CancelCommand, CancellationFinalReceipt, CancellationReceipt,
     CancellationReconciliationId, CandidateId, CandidateResultReceipt, CapacityDeferral,
@@ -871,6 +874,13 @@ pub struct AgentCoordinator {
     /// this state cannot grow without bound. It is in-memory scheduler state,
     /// not canonical work state: a restore starts it from zero.
     fair_virtual_time: [u64; 9],
+    /// I14.8 pull-based scheduler wake state (issue #1683 W1). Armed by the
+    /// transitions that change what is queued or release a slot, and consumed
+    /// by [`Self::drive_fair_pull`]. In-memory like `fair_virtual_time`, and
+    /// like it the durable part is the event log: `cursor` is `events.len()` at
+    /// the newest armed transition, so replay re-derives it and a restart
+    /// cannot strand eligible work.
+    fair_pull_loop: FairPullLoop,
     events: Vec<CoordinatorEvent>,
 }
 
@@ -999,6 +1009,7 @@ impl AgentCoordinator {
             enqueue_sequence: BTreeMap::new(),
             next_enqueue_sequence: 0,
             fair_virtual_time: [0; 9],
+            fair_pull_loop: FairPullLoop::default(),
             events: Vec::new(),
         })
     }
@@ -1435,6 +1446,9 @@ impl AgentCoordinator {
         self.events.push(CoordinatorEvent::PlanAdmitted {
             receipt: Box::new(receipt.clone()),
         });
+        // Issue #1683 W1: new admitted work is exactly what a pull can now
+        // serve, so this arms the I14.8 pull loop at the event that created it.
+        self.note_selection_inputs_changed();
         Ok(receipt)
     }
 
@@ -1587,6 +1601,137 @@ impl AgentCoordinator {
         Ok(self.select_ready(Some(profile), true))
     }
 
+    /// One bounded, release-driven pull-based drive (issue #1683 W1, I14.8).
+    ///
+    /// I14.8: "Scheduler is pull-based: terminal/deferred/blocked attempt
+    /// releases its slot, then the next currently admissible Ready Work Item is
+    /// selected." This is that sentence as an operation. It pulls through the
+    /// same [`Self::pull_next`] selector under the same profile, and each
+    /// selection becomes a `Running` attempt through the existing
+    /// [`Self::start_attempt`] transition, so released capacity advances work
+    /// without another agent command and without a notification this method
+    /// could miss.
+    ///
+    /// The `ExecutionContext` each started attempt receives is derived through
+    /// `ExecutionContext::from` from the coordinator's **own stored admission
+    /// receipt** — the same sealed-verifier-admitted evidence `start_attempt`
+    /// requires a caller to present — and from the attempt's own stored record
+    /// and enqueue ordinal. No provider, admission, lease or route evidence is
+    /// minted, synthesized or re-derived, so a drive can never admit work.
+    ///
+    /// Bounded, and the bound is derived rather than chosen here: the drive
+    /// starts at most one attempt per currently non-terminal admitted attempt,
+    /// and `admit`/`reassign` refuse to push the projection past the validated
+    /// `CoordinatorConfig::max_admitted_attempts`, so the loop is finite. It
+    /// also stops at the first pull that selects nothing, so re-polling an
+    /// unchanged projection costs exactly one pull instead of spinning.
+    ///
+    /// A missed wake cannot strand work, and a restart cannot renew an age.
+    /// [`Self::note_selection_inputs_changed`] arms the loop from the seven
+    /// transitions that change the projection, and the published cursor is the
+    /// durable `events.len()` at the newest of them, which
+    /// `replay_snapshot_events` re-derives. `consumed_wake` reports the
+    /// coalesced count when a wake was pending, and the drive runs either way:
+    /// it is evidence for the caller, not a gate on correctness.
+    ///
+    /// What it publishes is the exact disposition I14.8 W7 requires: for every
+    /// class that held ready work and was closed, `last_selection.deferrals`
+    /// names the limiting dimension, the observed value, the limit reached and
+    /// the profile revision whose change re-opens it. The pull-versus-retry
+    /// directive itself stays with the admission owner; a pull declining to
+    /// start one item is not a durable `DEFERRED_CAPACITY` transition, so this
+    /// method does not restate that vocabulary.
+    ///
+    /// Production residual, unchanged by this method and not worked around here:
+    /// no issuer of the provider-verified [`ProviderAdmissionReceipt`] that
+    /// [`Self::admit`] requires exists in this tree, so in production `attempts`
+    /// is empty, a drive performs one pull, selects nothing, and stops. That is
+    /// the correct bounded behaviour of an empty projection, and the drive goes
+    /// live when that owner lands (issue #1678). It is called from production
+    /// by `AgentFabric::drive_fair_pull` in `bins/eliotd/src/agent_fabric.rs`.
+    ///
+    /// Proof ceiling: [`FAIR_PULL_LOOP_PROOF_CEILING`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the profile's own validation failure when it is not a valid
+    /// versioned nine-class set — the drive is then refused whole rather than
+    /// run without per-class partitions — and any owner rejection from
+    /// [`Self::start_attempt`], which is the same rejection a caller driving
+    /// the pull by hand would receive.
+    pub fn drive_fair_pull(
+        &mut self,
+        profile: &SchedulingProfile,
+    ) -> Result<FairPullOutcome, CoordinatorError> {
+        profile.validate()?;
+        let consumed_wake = self.fair_pull_loop.take_wake();
+        let cursor = self.fair_pull_loop.cursor();
+        let poll_bound = self.active_attempt_count();
+        let mut started = Vec::new();
+        let mut pulls_performed = 0usize;
+        let mut last_selection = self.select_ready(Some(profile), true);
+        pulls_performed += 1;
+        while let Some(attempt_id) = last_selection.selected_attempt_id.clone() {
+            if started.len() >= poll_bound {
+                break;
+            }
+            // The selected attempt is `Admitted`, so it carries a stored
+            // record, a canonical enqueue ordinal and the admission receipt
+            // that admitted it. All three are read; none is constructed.
+            let record = self
+                .attempts
+                .get(&attempt_id)
+                .cloned()
+                .ok_or(CoordinatorError::UnknownAttempt)?;
+            let enqueue_sequence = self
+                .enqueue_sequence
+                .get(&attempt_id)
+                .copied()
+                .ok_or(CoordinatorError::UnknownAttempt)?;
+            let receipt = self
+                .admissions
+                .get(&record.admission_id)
+                .ok_or(CoordinatorError::UnknownAdmission)?
+                .receipt
+                .clone();
+            let work_class = record.work_class;
+            let admission_id = record.admission_id.clone();
+            self.start_attempt(ExecutionContext::from(&receipt), attempt_id.clone())?;
+            started.push(FairPullStart {
+                attempt_id,
+                admission_id,
+                work_class,
+                enqueue_sequence,
+            });
+            pulls_performed += 1;
+            last_selection = self.select_ready(Some(profile), true);
+        }
+        Ok(FairPullOutcome {
+            algorithm: FAIR_PULL_ALGORITHM,
+            proof_ceiling: FAIR_PULL_LOOP_PROOF_CEILING,
+            profile_revision: profile.profile_revision.clone(),
+            capacity_identity: last_selection.capacity_identity.clone(),
+            capacity_revision: last_selection.capacity_revision.clone(),
+            cursor_event_sequence: cursor,
+            consumed_wake,
+            poll_bound,
+            pulls_performed,
+            started,
+            last_selection,
+        })
+    }
+
+    /// Arms the I14.8 pull loop after a transition that changed what is queued
+    /// or released a slot.
+    ///
+    /// Every such transition calls this exactly once, after its own event is
+    /// recorded, so the durable cursor is the event-log length at that change
+    /// and duplicate notifications coalesce into one pending wake. Replay runs
+    /// the same transitions, so a restore re-derives the same cursor.
+    fn note_selection_inputs_changed(&mut self) {
+        self.fair_pull_loop.arm(count_as_u64(self.events.len()));
+    }
+
     /// The bounded deterministic selector behind [`Self::next_ready`] and
     /// [`Self::pull_next`].
     ///
@@ -1696,6 +1841,9 @@ impl AgentCoordinator {
             context,
             attempt_id,
         });
+        // Issue #1683 W1: a start moves one item out of the ready queue, so it
+        // changes what the next pull can select.
+        self.note_selection_inputs_changed();
         Ok(record)
     }
 
@@ -1989,6 +2137,9 @@ impl AgentCoordinator {
             context,
             receipt: Box::new(receipt),
         });
+        // Issue #1683 W1 / I14.8: a terminal attempt releases its slot, which
+        // is the pull-based scheduler's wake.
+        self.note_selection_inputs_changed();
         Ok(final_receipt)
     }
 
@@ -2043,6 +2194,9 @@ impl AgentCoordinator {
             context,
             receipt: Box::new(receipt),
         });
+        // Issue #1683 W1 / I14.8: a terminal attempt releases its slot, which
+        // is the pull-based scheduler's wake.
+        self.note_selection_inputs_changed();
         Ok(result)
     }
 
@@ -2183,6 +2337,9 @@ impl AgentCoordinator {
             context,
             receipt: Box::new(receipt),
         });
+        // Issue #1683 W1: a reassigned attempt re-enters the ready queue as new
+        // work under a new canonical enqueue ordinal.
+        self.note_selection_inputs_changed();
         Ok(result)
     }
 
@@ -2305,6 +2462,9 @@ impl AgentCoordinator {
             context,
             submission: Box::new(submission),
         });
+        // Issue #1683 W1 / I14.8: a terminal attempt releases its slot, which
+        // is the pull-based scheduler's wake.
+        self.note_selection_inputs_changed();
         Ok(receipt)
     }
 
@@ -2631,6 +2791,9 @@ impl AgentCoordinator {
                 context,
                 receipt: Box::new(receipt),
             });
+        // Issue #1683 W1 / I14.8: a reconciled attempt is the release of the
+        // exclusion an unknown outcome had been holding, so it is the wake.
+        self.note_selection_inputs_changed();
         Ok(final_receipt)
     }
 
