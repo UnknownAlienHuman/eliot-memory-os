@@ -2830,6 +2830,135 @@ impl OnboardingSingleFlight {
         }
     }
 
+    /// Drives one live attach trigger end to end over the evidence-bound join:
+    /// join, compile, publish.
+    ///
+    /// This is the evidence-bound variant of
+    /// [`OnboardingSingleFlight::compile_and_publish`] and the
+    /// Governor/WorkScopeResolver-owned live-trigger entry point (I4.4.1) for
+    /// callers that carry candidate and scanner evidence: first UI project
+    /// open, agent attach/launch, unknown-workspace event, explicit onboarding
+    /// request, stale generation, or resume without a current task. Beyond
+    /// [`OnboardingSingleFlight::compile_and_publish`], the proposed lease key
+    /// is verified against the exact candidate (filesystem/VCS identity,
+    /// privacy boundary, governing-source generation) and the scan evidence
+    /// (canonical/filesystem roots equal the candidate roots) through
+    /// [`OnboardingSingleFlight::join_with_evidence`], and the trigger's
+    /// scanner pass is authorized against the discovery lease *and* the scan
+    /// evidence ([`ColdStartController::check_discovery_with_scan`]) before
+    /// anything compiles. An attach whose governing-source digests or
+    /// dirty-base summary changed splits the lease even at the same generation
+    /// and receives a fresh `Created` lease instead of the first lease's
+    /// scope/task decision. Only the trigger that creates the lease compiles
+    /// exactly one [`OnboardingReadinessReceipt`] through
+    /// [`ColdStartController::compile`] and publishes it as the lease
+    /// terminal; an already-terminal lease returns its `JoinedTerminal`
+    /// surface without recompiling and a lease owned by an in-flight trigger
+    /// returns `Joined` without a second compilation. No worker independently
+    /// creates a second `WorkScope` or "latest task" while the lease is
+    /// active.
+    /// Live status: owning driver for the Governor attach/event invocation
+    /// leg; no live attach ingress supplies candidate and scan evidence yet
+    /// (BLOCKED-BY attach-transport: `bins/eliotd` `ScopeAttachIngress`
+    /// carries no discovery or onboarding lease). Caller: STITCH.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompileDriverError::Lease`] when the proposed lease,
+    /// candidate, scan evidence, or trigger scanner pass is refused, or
+    /// [`CompileDriverError::Compile`] when compilation, surface projection,
+    /// or terminal publish fails closed.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "evidence-bound live-trigger driver carries trigger, leases, key proposal, candidate, sources, scan evidence, and every frozen receipt field in one fail-closed constructor"
+    )]
+    pub fn compile_and_publish_with_evidence(
+        &mut self,
+        trigger: ColdStartTrigger,
+        discovery_lease: &DiscoveryReadLease,
+        proposed: OnboardingLease,
+        candidate: &WorkScopeCandidate,
+        sources: &GoverningSourceSet,
+        scan: &BootstrapScanEvidence,
+        receipt_ref: impl Into<String>,
+        principal_ref: impl Into<String>,
+        session_ref: impl Into<String>,
+        scope: &ScopeIdentity,
+        instance: &WorkspaceInstanceIdentity,
+        lineage: Option<&RepositoryLineageIdentity>,
+        state_fence: &StateFence,
+        governance_profile_ref: impl Into<String>,
+        limiting_integration_evidence: Vec<String>,
+        route_profile_ref: impl Into<String>,
+        serializer_id: impl Into<String>,
+        serializer_version: impl Into<String>,
+        serializer_options_digest: impl Into<String>,
+        tokenizer_id: impl Into<String>,
+        tokenizer_version: impl Into<String>,
+        tokenizer_hash: impl Into<String>,
+        projection_source_ref: impl Into<String>,
+        projection_generation: u64,
+        privacy: &PrivacyProfile,
+        task: TaskBindingInput,
+        scan_receipt: Option<&ScanReceiptHandle>,
+        now: u64,
+    ) -> Result<LeaseJoin, CompileDriverError> {
+        let created_ref = proposed.lease_ref.clone();
+        match self
+            .join_with_evidence(
+                trigger,
+                discovery_lease,
+                proposed,
+                candidate,
+                sources,
+                scan,
+                now,
+            )
+            .map_err(CompileDriverError::Lease)?
+        {
+            already @ (LeaseJoin::JoinedTerminal { .. } | LeaseJoin::Joined { .. }) => Ok(already),
+            LeaseJoin::Created { .. } => {
+                let lease = self
+                    .entries
+                    .iter()
+                    .find(|entry| entry.lease.lease_ref == created_ref)
+                    .map(|entry| entry.lease.clone())
+                    .ok_or(WorkScopeError::BindingReceiptMismatch)?;
+                let receipt = ColdStartController.compile(
+                    receipt_ref,
+                    &lease,
+                    principal_ref,
+                    session_ref,
+                    scope,
+                    instance,
+                    lineage,
+                    candidate,
+                    sources,
+                    state_fence,
+                    governance_profile_ref,
+                    limiting_integration_evidence,
+                    route_profile_ref,
+                    serializer_id,
+                    serializer_version,
+                    serializer_options_digest,
+                    tokenizer_id,
+                    tokenizer_version,
+                    tokenizer_hash,
+                    projection_source_ref,
+                    projection_generation,
+                    privacy,
+                    task,
+                    scan_receipt,
+                    now,
+                )?;
+                // `join_with_evidence` already bound this entry to the source
+                // digest set and dirty summary above, so no refresh is needed
+                // before publishing the terminal.
+                self.publish_fresh(&created_ref, receipt, now)
+            }
+        }
+    }
+
     /// Publishes one freshly compiled receipt as the lease terminal and
     /// returns the terminal join every waiter of the lease receives.
     ///

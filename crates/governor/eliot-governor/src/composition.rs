@@ -119,9 +119,9 @@ use eliot_workscope::{
     ColdStartController, ColdStartTrigger, DiscoveryLeaseKey, DiscoveryReadLease,
     GenerationEvidence, GoverningSourceAdmission, GoverningSourceSet, GuardTrigger, GuardVerdict,
     IdentityEvidence, IdentityLegOutcome, LeaseJoin, LooseScanQuarantine, MaterialAdmission,
-    MaterialReadinessDirective, MaterialReadinessInputs, ObservedScopeResources, OnboardingLease,
-    PrivacyBoundary, PrivacyProfile, QuarantinedScopeRecord, ReadinessLifecycle,
-    RepositoryLineageIdentity, RequestedEffect, ResolutionAuthentication, ResolutionRequest,
+    MaterialReadinessDirective, MaterialReadinessInputs, MemoryState, ObservedScopeResources,
+    OnboardingLease, PrivacyBoundary, PrivacyProfile, QuarantinedScopeRecord, ReadinessLifecycle,
+    ReadinessSurface, RepositoryLineageIdentity, RequestedEffect, ResolutionAuthentication, ResolutionRequest,
     ScanDisclosureOwnerBinding, ScanReceiptHandle, ScannerResolverInputs, ScopeBinding,
     ScopeBindingDisposition, ScopeBindingGuard, ScopeIdentity, ScopeKind,
     ScopeRelocationOrAttachReceipt, ScopeResolution, SourceAdmissionRequest, TaskBindingInput,
@@ -4973,6 +4973,38 @@ pub struct ColdStartSurfaceView {
     pub projection_generation: u64,
 }
 
+/// Human-board projection of one retained terminal cold-start receipt (issue
+/// #1790, Human-surface production type).
+///
+/// The agent compact surface answers "what is missing right now"; this answers
+/// what a Human board must keep visible until accepted, waived, or superseded
+/// (I4.4.1): the readiness token, the smallest missing question, the memory
+/// disposition compilation observed (never manufactured), the minimum
+/// understanding seed the first useful work grounds on, and the proposed
+/// first-maintenance job handles (proposed, never started here).
+///
+/// Like [`ColdStartSurfaceView`] this is a projection, not an authenticated
+/// receipt or an integrity proof. It has no clock input, so it cannot
+/// independently establish that the lease has not expired or been revoked;
+/// the live caller must revalidate those facts before using readiness.
+/// `readiness` is the `SCREAMING_SNAKE_CASE`
+/// [`eliot_workscope::ReadinessLifecycle`] token, the same token set the
+/// bridge intake parses.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ColdStartHumanBoardView {
+    pub receipt_ref: String,
+    pub lease_ref: String,
+    pub readiness: String,
+    pub smallest_missing_question: Option<String>,
+    pub next_safe_action: String,
+    pub memory_state: MemoryState,
+    pub minimum_understanding_seed: Vec<String>,
+    pub maintenance_recommendations: Vec<String>,
+    pub lease_deadline: u64,
+    pub receipt_revision: u64,
+}
+
 /// Ephemeral capability held only by the composition invocation that won the
 /// durable ORS claim. Restart recovery uses ORS readback and never restores
 /// this process-local compile capability from serialized data.
@@ -7736,17 +7768,171 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         Self::readiness_join_from_record(&terminal_record, now, false)
     }
 
-    /// Projects the retained terminal cold-start surface for one exact lease
-    /// key (issue #1790, readiness-surface production caller).
+    /// Drives one I4.4.1 event end to end — trigger scan, lease join, compile,
+    /// publish — through the privacy-bounded scanner (issue #1790, cold-start
+    /// event production driver).
     ///
-    /// Reads and validates the terminal receipt the retained single-flight
-    /// registry published for the exact workspace filesystem/VCS identity,
-    /// privacy boundary and governing-source generation. The returned
-    /// [`ColdStartSurfaceView`] copies its principal/session, scope, task or
-    /// selection state, fence, profile/source references and generations,
-    /// readiness, source-status evidence and recovery prompts directly from
-    /// that receipt (plus the exact lease deadline). A key with no published
-    /// terminal fails closed instead of projecting an uncompiled disposition.
+    /// The caller names the event's trigger (first project open,
+    /// attach/launch, unknown workspace, onboarding request, stale
+    /// generation, or resume without a current task) and supplies every exact
+    /// identity the freeze requires: the discovery lease, lease key,
+    /// installation-bound scan store, owner binding, privacy boundary, scan
+    /// evidence and scanner identity inputs for the trigger's discovery pass,
+    /// plus the proposed onboarding lease and every frozen receipt field for
+    /// the join and compilation. The scan runs first through
+    /// [`Self::run_cold_start_trigger_scan`]; a scan that cannot complete
+    /// without a privacy boundary refuses here with its discriminative
+    /// question instead of compiling. The join runs next through
+    /// [`Self::join_cold_start_lease`] against the durable single-flight
+    /// owner, so compatible concurrent attaches coalesce on exact workspace
+    /// filesystem/VCS identity plus privacy boundary plus governing-source
+    /// generation and a changed digest or dirty-base summary at the same
+    /// generation splits the lease instead of reusing the first lease's
+    /// scope/task decision. An already-terminal lease returns its
+    /// `JoinedTerminal` surface without recompiling; a lease owned by an
+    /// in-flight trigger returns `Joined` without a second compilation; only
+    /// the event that creates the lease compiles exactly one
+    /// [`eliot_workscope::OnboardingReadinessReceipt`] through
+    /// [`Self::compile_cold_start_at_trigger`] — always bound to the durable
+    /// scan receipt the trigger scan returned — and publishes it as the lease
+    /// terminal before the first scope-sensitive work. Joining and compilation
+    /// never create a `WorkScope` and never infer a latest task.
+    /// Live status: owning thin driver for attach/onboarding ingress; no live
+    /// attach ingress builds the scanner and lease inputs yet (BLOCKED-BY
+    /// attach-transport: `bins/eliotd` `ScopeAttachIngress` carries no
+    /// discovery or onboarding lease). Caller: STITCH.
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the cold-start event driver threads the trigger, scanner, lease, and every frozen receipt field through the scan, join, and compile legs in one owner-checked entry"
+    )]
+    pub fn drive_cold_start_for_event(
+        &mut self,
+        trigger: ColdStartTrigger,
+        discovery_lease: &mut DiscoveryReadLease,
+        lease_key: &DiscoveryLeaseKey,
+        scan_store: &mut InstallationScanDisclosureStore,
+        scan_binding: &ScanDisclosureOwnerBinding,
+        candidate_privacy: PrivacyClass,
+        privacy_boundary: Option<&PrivacyBoundary>,
+        scan: &BootstrapScanEvidence,
+        proposed_kind: ScopeKind,
+        identity_fingerprint: &str,
+        verifier_candidates: &[String],
+        governing_source_refs: Vec<String>,
+        proposed: &OnboardingLease,
+        receipt_ref: &str,
+        principal_ref: &str,
+        session_ref: &str,
+        scope: &ScopeIdentity,
+        instance: &WorkspaceInstanceIdentity,
+        lineage: Option<&RepositoryLineageIdentity>,
+        candidate: &WorkScopeCandidate,
+        sources: &GoverningSourceSet,
+        state_fence: &StateFence,
+        governance_profile_ref: &str,
+        limiting_integration_evidence: Vec<String>,
+        route_profile_ref: &str,
+        serializer_id: &str,
+        serializer_version: &str,
+        serializer_options_digest: &str,
+        tokenizer_id: &str,
+        tokenizer_version: &str,
+        tokenizer_hash: &str,
+        projection_source_ref: &str,
+        projection_generation: u64,
+        privacy: &PrivacyProfile,
+        task: TaskBindingInput,
+        now: u64,
+    ) -> Result<LeaseJoin, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        let outcome = Self::run_cold_start_trigger_scan(
+            trigger,
+            &mut *discovery_lease,
+            lease_key,
+            &mut *scan_store,
+            scan_binding,
+            candidate_privacy,
+            privacy_boundary,
+            scan,
+            proposed_kind,
+            identity_fingerprint,
+            verifier_candidates,
+            governing_source_refs,
+            now,
+        )?;
+        let persisted: &ScanReceiptHandle = match &outcome {
+            BootstrapScanOutcome::Completed { persisted, .. } => persisted,
+            BootstrapScanOutcome::PrivacyBoundaryRequired {
+                code,
+                discriminative_question,
+            } => {
+                return Err(CompositionError::Recovery(format!(
+                    "cold-start scan needs a privacy boundary before compilation: {code} {discriminative_question}"
+                )));
+            }
+        };
+        let joined = self.join_cold_start_lease(
+            trigger,
+            discovery_lease,
+            proposed,
+            candidate,
+            sources,
+            privacy,
+            scan,
+            scan_store,
+            scan_binding,
+            persisted,
+            now,
+        )?;
+        match joined {
+            already @ (LeaseJoin::JoinedTerminal { .. } | LeaseJoin::Joined { .. }) => Ok(already),
+            LeaseJoin::Created { .. } => self.compile_cold_start_at_trigger(
+                trigger,
+                discovery_lease,
+                proposed,
+                receipt_ref,
+                principal_ref,
+                session_ref,
+                scope,
+                instance,
+                lineage,
+                candidate,
+                sources,
+                state_fence,
+                governance_profile_ref,
+                limiting_integration_evidence,
+                route_profile_ref,
+                serializer_id,
+                serializer_version,
+                serializer_options_digest,
+                tokenizer_id,
+                tokenizer_version,
+                tokenizer_hash,
+                projection_source_ref,
+                projection_generation,
+                privacy,
+                task,
+                scan,
+                scan_store,
+                scan_binding,
+                Some(persisted),
+                now,
+            ),
+        }
+    }
+
+    /// Compatibility entry for callers holding only a partial lease identity
+    /// (issue #1790, readiness-surface production caller).
+    ///
+    /// A partial identity cannot reproduce the ORS binding digest, so this
+    /// entry deliberately fails closed instead of projecting an uncompiled
+    /// disposition: supply the full readiness claim through
+    /// [`Self::cold_start_surface_for_claim`] (full view),
+    /// [`Self::cold_start_agent_surface_for_claim`] (compact agent answer), or
+    /// [`Self::cold_start_human_board_for_claim`] (Human-board projection).
     /// Live status: owning thin entry for the bridge delivery path; the live
     /// bridge note path consumes no governor surface yet (BLOCKED-BY
     /// bridge-transport: `bins/eliot-agent-bridge` `BootstrapContext`
@@ -7777,6 +7963,69 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     ) -> Result<ColdStartSurfaceView, CompositionError> {
         self.cold_start_owner_readback_for_claim(claim, now)
             .map(|(_, surface)| surface)
+    }
+
+    /// Projects the compact agent-facing readiness answer for one exact
+    /// durable terminal (issue #1790, agent-surface production caller).
+    ///
+    /// Reads the exact terminal named by the full owner claim through
+    /// [`Self::cold_start_owner_readback_for_claim`] and returns its
+    /// [`ReadinessSurface`]: the current readiness state, the single smallest
+    /// missing question (`None` when nothing is missing), the next safe
+    /// action, and the lease deadline after which the readiness expires. The
+    /// readiness state travels with the receipt instead of staying buried in
+    /// internal setup state, so an agent caller receives the stable,
+    /// inspectable answer it needs before attempting scope-sensitive work.
+    /// Live status: owning thin entry for agent callers; the live bridge note
+    /// path consumes no governor surface yet (BLOCKED-BY bridge-transport:
+    /// `BridgeRunner::note_owner_snapshot` intake in
+    /// `bins/eliot-agent-bridge/src/lib.rs`). Caller: STITCH.
+    pub fn cold_start_agent_surface_for_claim(
+        &self,
+        claim: &ColdStartReadinessClaim,
+        now: u64,
+    ) -> Result<ReadinessSurface, CompositionError> {
+        let (lease, receipt) = self.cold_start_readiness_terminal_for_claim(claim, now)?;
+        receipt
+            .surface(&lease)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))
+    }
+
+    /// Projects the Human-board view for one exact durable terminal (issue
+    /// #1790, Human-surface production caller).
+    ///
+    /// Reads the exact terminal named by the full owner claim through
+    /// [`Self::cold_start_owner_readback_for_claim`] and returns its
+    /// [`ColdStartHumanBoardView`]: the readiness token, the smallest missing
+    /// question, the observed memory disposition, the minimum understanding
+    /// seed, and the proposed first-maintenance job handles a Human board
+    /// keeps visible until accepted, waived, or superseded (I4.4.1). Like the
+    /// agent surface this is a projection of the retained terminal, never a
+    /// second compilation.
+    /// Live status: owning thin entry for Human callers; no live Human board
+    /// consumes this projection yet (BLOCKED-BY bridge-transport: the live
+    /// note path supplies no governor surface). Caller: STITCH.
+    pub fn cold_start_human_board_for_claim(
+        &self,
+        claim: &ColdStartReadinessClaim,
+        now: u64,
+    ) -> Result<ColdStartHumanBoardView, CompositionError> {
+        let (lease, receipt) = self.cold_start_readiness_terminal_for_claim(claim, now)?;
+        let surface = receipt
+            .surface(&lease)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        Ok(ColdStartHumanBoardView {
+            receipt_ref: receipt.receipt_ref.clone(),
+            lease_ref: receipt.lease_ref.clone(),
+            readiness: cold_start_readiness_token(surface.readiness).to_owned(),
+            smallest_missing_question: surface.smallest_missing_question,
+            next_safe_action: receipt.next_safe_action.clone(),
+            memory_state: receipt.memory_state,
+            minimum_understanding_seed: receipt.minimum_understanding_seed.clone(),
+            maintenance_recommendations: receipt.maintenance_recommendations.clone(),
+            lease_deadline: surface.lease_deadline,
+            receipt_revision: receipt.receipt_revision,
+        })
     }
 
     /// Reads the exact retained terminal lease and surface from ORS after
