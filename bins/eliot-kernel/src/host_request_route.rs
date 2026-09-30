@@ -5869,6 +5869,7 @@ impl KernelComposition {
                         &identity.request.state_fence,
                         identity.deadline_unix_ms,
                         None,
+                        None,
                     )?
                 } else {
                     self.with_live_bridge_application_binding(
@@ -5881,6 +5882,7 @@ impl KernelComposition {
                                 &identity.request.state_fence,
                                 identity.deadline_unix_ms,
                                 Some(binding.work_scope_id.as_str()),
+                                Some(binding.session_id.as_str()),
                             )
                         },
                     )?
@@ -5899,7 +5901,14 @@ impl KernelComposition {
                 self.with_live_bridge_application_binding(
                     session,
                     &identity.request.state_fence,
-                    |_| self.admit_bridge_event_gap(session, &gap, &identity.request.state_fence),
+                    |binding| {
+                        self.admit_bridge_event_gap(
+                            session,
+                            &gap,
+                            &identity.request.state_fence,
+                            Some(binding.session_id.as_str()),
+                        )
+                    },
                 )?
             }
             AGENT_BRIDGE_EVENT_RECONCILE_OPERATION => {
@@ -5907,11 +5916,12 @@ impl KernelComposition {
                 self.with_live_bridge_application_binding(
                     session,
                     &identity.request.state_fence,
-                    |_| {
+                    |binding| {
                         self.answer_bridge_event_reconcile_under_transition(
                             session,
                             &scope,
                             &identity.request.state_fence,
+                            Some(binding.session_id.as_str()),
                         )
                     },
                 )?
@@ -6094,6 +6104,7 @@ impl KernelComposition {
         frame_fence: &eliot_contracts::StateFence,
         deadline_unix_ms: u64,
         work_scope_id: Option<&str>,
+        owner_session_id: Option<&str>,
     ) -> Result<serde_json::Value, TransportError> {
         // Authority check against the retained Session, never caller text:
         // the event must cohere with the presenting live fence (same
@@ -6115,7 +6126,8 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         }
         // Owner evidence for the append right comes from the retained
-        // Session and the presenting fence only (issue #2729, item 2): a
+        // Session, the presenting fence, the Host startup contour, and the
+        // retained application session only (issue #2729, items 1-2): a
         // new transport authentication recovers old streams through
         // reconcile, but a fresh event still requires the live producer
         // generation above — never a relabeled old one. Best-effort
@@ -6142,6 +6154,7 @@ impl KernelComposition {
                     ));
                 }
                 let work_scope_id = work_scope_id.ok_or(TransportError::SessionFenced)?;
+                let owner_session_id = owner_session_id.ok_or(TransportError::SessionFenced)?;
                 let envelope_bytes = eliot_contracts::canonical_json_bytes(event)
                     .map_err(|_| TransportError::SessionFenced)?;
                 let envelope_sha = eliot_contracts::sha256_hex(&envelope_bytes);
@@ -6158,6 +6171,7 @@ impl KernelComposition {
                     event,
                     &envelope_bytes,
                     work_scope_id,
+                    owner_session_id,
                 )?;
                 let privacy = RedbRecoveryStore::bridge_event_privacy_decision(
                     &envelope_bytes,
@@ -6165,7 +6179,7 @@ impl KernelComposition {
                 );
                 let now = unix_ms();
                 let expired = activation_deadline_expired(now, deadline_unix_ms);
-                let evidence = bridge_owner_evidence(session, frame_fence)?;
+                let evidence = bridge_owner_evidence(session, frame_fence, Some(owner_session_id))?;
                 self.stage_bridge_event_durable(
                     session,
                     event,
@@ -6236,6 +6250,7 @@ impl KernelComposition {
         event: &EventEnvelope,
         envelope_bytes: &[u8],
         work_scope_id: &str,
+        owner_session_id: &str,
     ) -> Result<serde_json::Value, TransportError> {
         let source_sha256 = eliot_contracts::sha256_hex(envelope_bytes);
         // The scope commits to the Governor-resolved scope as well as the
@@ -6243,12 +6258,14 @@ impl KernelComposition {
         // through the owner's own namespace digest: the recorded verdict and
         // the row it describes cannot drift, and two events identical except
         // for their scope resolve to different authorizations.
-        let evidence = bridge_owner_evidence(session, frame_fence)?;
+        let evidence = bridge_owner_evidence(session, frame_fence, Some(owner_session_id))?;
         let scope = RedbRecoveryStore::bridge_event_privacy_scope(
+            &evidence.installation_id,
             &evidence.authority_lineage,
             &evidence.principal,
             &event.producer_id,
             &event.stream_id,
+            evidence.owner_session_id.as_deref(),
             work_scope_id,
         )
         .map_err(|_| TransportError::SessionFenced)?;
@@ -6365,6 +6382,8 @@ impl KernelComposition {
             "requested_route": AGENT_BRIDGE_EVENT_FORWARD_OPERATION,
             "owner_principal": evidence.principal,
             "owner_authority_lineage": evidence.authority_lineage,
+            "owner_installation_id": evidence.installation_id,
+            "owner_session_id": evidence.owner_session_id,
             "owner_connection": evidence.connection,
             "owner_launch_nonce": evidence.launch_nonce,
             "owner_session_epoch": evidence.session_epoch,
@@ -6476,6 +6495,8 @@ impl KernelComposition {
         let query = serde_json::json!({
             "owner_authority_lineage": evidence.authority_lineage,
             "owner_principal": evidence.principal,
+            "owner_installation_id": evidence.installation_id,
+            "owner_session_id": evidence.owner_session_id,
             "producer_id": event.producer_id,
             "stream_id": event.stream_id,
             "event_id": event.event_id,
@@ -6559,6 +6580,7 @@ impl KernelComposition {
         session: &Session,
         gap: &serde_json::Value,
         frame_fence: &eliot_contracts::StateFence,
+        owner_session_id: Option<&str>,
     ) -> Result<serde_json::Value, TransportError> {
         if !matches!(
             self.service_state()
@@ -6567,7 +6589,8 @@ impl KernelComposition {
         ) {
             return Err(TransportError::SessionFenced);
         }
-        let evidence = bridge_owner_evidence(session, frame_fence)?;
+        let owner_session_id = owner_session_id.ok_or(TransportError::SessionFenced)?;
+        let evidence = bridge_owner_evidence(session, frame_fence, Some(owner_session_id))?;
         let mut gap = gap.clone();
         let object = gap.as_object_mut().ok_or(TransportError::SessionFenced)?;
         object.insert(
@@ -6578,6 +6601,16 @@ impl KernelComposition {
             "owner_authority_lineage".to_owned(),
             serde_json::Value::String(evidence.authority_lineage),
         );
+        object.insert(
+            "owner_installation_id".to_owned(),
+            serde_json::Value::String(evidence.installation_id),
+        );
+        if let Some(owner_session_id) = evidence.owner_session_id {
+            object.insert(
+                "owner_session_id".to_owned(),
+                serde_json::Value::String(owner_session_id),
+            );
+        }
         object.insert(
             "owner_connection".to_owned(),
             serde_json::Value::String(evidence.connection),
@@ -6678,6 +6711,7 @@ impl KernelComposition {
         session: &Session,
         scope: &BridgeReconcileScope,
         frame_fence: &eliot_contracts::StateFence,
+        owner_session_id: Option<&str>,
     ) -> Result<serde_json::Value, TransportError> {
         // The bridge event dispatcher holds the transition read guard across
         // this owner read and any consumed-frontier batch commit; profile
@@ -6694,7 +6728,7 @@ impl KernelComposition {
         if live_generation == 0 {
             return Err(TransportError::SessionFenced);
         }
-        let evidence = bridge_owner_evidence(session, frame_fence)?;
+        let evidence = bridge_owner_evidence(session, frame_fence, owner_session_id)?;
         // Continuation selectors are pure reads. They cannot carry a
         // consumed frontier because acknowledging one would mutate the
         // durable cursor before the bounded owner page is accepted.
@@ -7644,17 +7678,22 @@ const BRIDGE_EVENT_PHASE_DURABLE: &str = "DURABLE";
 /// Kernel-derived owner evidence for one bridge-event operation (issue
 /// #2729).
 ///
-/// Built from the retained Session and the presenting fence only: the
-/// principal is the platform-verified peer identity, the lineage is the
-/// presenting authority lineage, and the occurrence is the admitted
-/// transport session. No bridge-authored session text is accepted — the
-/// frame carries none by design, and the Kernel builds the sender binding
-/// itself from the retained Session. A matching Windows identity, a
+/// Built from the retained Session, the presenting fence, the authenticated
+/// Host startup contour, and the retained Governor-resolved application
+/// session only: the principal is the platform-verified peer identity, the
+/// lineage is the presenting authority lineage, the installation is the
+/// contour-composed Host identity, the owner session is the retained
+/// activation binding's application session, and the occurrence is the
+/// admitted transport session. No bridge-authored session text is accepted —
+/// the frame carries none by design, and the Kernel builds the sender
+/// binding itself from the retained Session. A matching Windows identity, a
 /// current generation, or an earlier connection alone never satisfies
 /// this evidence: the store still requires the full binding tuple.
 struct BridgeOwnerEvidence {
     principal: String,
     authority_lineage: String,
+    installation_id: String,
+    owner_session_id: Option<String>,
     connection: String,
     launch_nonce: String,
     session_epoch: u64,
@@ -7675,13 +7714,20 @@ struct BridgeEventPrivacyLegs<'a> {
 }
 
 /// Derives the owner evidence for one bridge-event operation from the
-/// retained Session and the presenting fence (issue #2729, item 2). The
-/// fence already proved compatibility with the retained Session at
+/// retained Session, the presenting fence, the authenticated Host startup
+/// contour, and the retained application session (issue #2729, items 1-2).
+/// The fence already proved compatibility with the retained Session at
 /// dispatch; this entry only projects the Kernel-owned facts the store
-/// binds into the versioned owner namespace.
+/// binds into the versioned owner namespace. The installation is the
+/// contour-composed Host identity — absent or empty fences closed — and the
+/// owner session is the retained activation binding's Governor-resolved
+/// application session. No narrower attempt is proven at these sites, so
+/// none is carried: the store still compares the creating occurrence on
+/// reuse.
 fn bridge_owner_evidence(
     session: &Session,
     fence: &eliot_contracts::StateFence,
+    application_session_id: Option<&str>,
 ) -> Result<BridgeOwnerEvidence, TransportError> {
     let principal = match &session.peer {
         PeerIdentity::Authenticated { user_identity, .. } => {
@@ -7704,9 +7750,24 @@ fn bridge_owner_evidence(
     {
         return Err(TransportError::SessionFenced);
     }
+    let installation_id = super::dispatch_contour()
+        .map(|contour| contour.installation_id())
+        .filter(|installation| !installation.trim().is_empty())
+        .ok_or(TransportError::SessionFenced)?;
+    let owner_session_id = application_session_id
+        .map(|session_id| {
+            if session_id.trim().is_empty() {
+                Err(TransportError::SessionFenced)
+            } else {
+                Ok(session_id.to_owned())
+            }
+        })
+        .transpose()?;
     Ok(BridgeOwnerEvidence {
         principal,
         authority_lineage: authority_lineage.to_owned(),
+        installation_id: installation_id.to_owned(),
+        owner_session_id,
         connection: session.connection_id.clone(),
         launch_nonce: session.launch_nonce.clone(),
         session_epoch: session.session_epoch,

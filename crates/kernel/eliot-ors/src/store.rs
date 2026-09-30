@@ -11514,16 +11514,17 @@ impl RedbRecoveryStore {
         principal: &str,
         producer_id: &str,
         stream_id: &str,
-        owner_scope: &BridgeEventOwnerScope,
+        owner_session_id: Option<&str>,
         work_scope_id: &str,
     ) -> Result<String, OrsError> {
+        let owner_scope = bridge_owner_scope_from_parts(owner_session_id, None, None)?;
         let namespace = Self::bridge_stream_owner_digest(
             installation_id,
             authority_lineage,
             principal,
             producer_id,
             stream_id,
-            owner_scope,
+            &owner_scope,
         )?;
         Self::bridge_event_privacy_scope_for(&namespace, work_scope_id)
     }
