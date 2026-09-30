@@ -31441,10 +31441,6 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         })
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one snapshot-bound index page validates each retained operation mapping"
-    )]
     fn scan_write_idempotency(
         &self,
         cursor: WriteIdempotencyRecoveryCursor,
@@ -35081,6 +35077,15 @@ fn validate_write_reservation_primary_in_read(
         }
     }
 
+    validate_write_reservation_scopes_in_read(read, record, observe)
+}
+
+fn validate_write_reservation_scopes_in_read(
+    read: &redb::ReadTransaction,
+    record: &ReservationRecord,
+    observe: &mut impl FnMut(&str, &str, &str),
+) -> Result<(), OrsError> {
+    let token = &record.token;
     let heads = read.open_table(SCOPE_HEADS).map_err(storage)?;
     for reserved in &token.scopes {
         let head = heads
