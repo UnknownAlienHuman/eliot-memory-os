@@ -1,16 +1,20 @@
 # OpenCode ELIOT integration
 
-`ELIOT_GOVERNOR_EXE` must use slash-normalized Windows syntax such as
-`C:/path/to/eliot-governor.exe`. OpenCode substitutes environment variables
-before parsing JSONC, so raw backslashes would become invalid JSON escapes.
+`ELIOT_AGENT_BRIDGE_EXE` and `ELIOT_AGENT_BRIDGE_DECLARATION` must use
+slash-normalized Windows syntax such as `C:/path/to/eliot-agent-bridge.exe`
+and `C:/path/to/agent-bridge/client-declaration-v2.json`. OpenCode substitutes
+environment variables before parsing JSONC, so raw backslashes would become
+invalid JSON escapes.
 
 Supervised launches set an ELIOT-owned isolated `XDG_CONFIG_HOME`. OpenCode's
 host-managed data/auth root is unchanged, while unrelated user MCP definitions
 are excluded from the bounded invocation. Interactive launches keep the normal
 merged user configuration.
 
-For an ephemeral bundle smoke, set `ELIOT_GOVERNOR_EXE` to the absolute release
-binary and `OPENCODE_CONFIG_DIR` to this directory, then launch the installed
+For an ephemeral bundle smoke, set `ELIOT_AGENT_BRIDGE_EXE` to the absolute
+release bridge binary and `ELIOT_AGENT_BRIDGE_DECLARATION` to the
+installation-owned `agent-bridge/client-declaration-v2.json` shipped beside
+it, and `OPENCODE_CONFIG_DIR` to this directory, then launch the installed
 OpenCode CLI. OpenCode merges this additive directory with existing settings;
 this bundle does not set a provider, model, agent, or credential.
 
