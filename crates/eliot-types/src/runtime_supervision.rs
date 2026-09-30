@@ -6,6 +6,7 @@ pub const OPERATION_RUNTIME_CHECKPOINT_SCHEMA_VERSION: &str = "eliot-operation-r
 pub const OPERATION_RESTART_WINDOW_SCHEMA_VERSION: &str = "eliot-operation-restart-window-v1";
 pub const SEAL_STAGING_CHECKPOINT_SCHEMA_VERSION: &str = "eliot-seal-staging-checkpoint-v1";
 pub const RUNTIME_INTEGRITY_REPORT_SCHEMA_VERSION: &str = "eliot-runtime-integrity-v1";
+pub const RUNTIME_RECONCILE_DRY_RUN_SCHEMA_VERSION: &str = "eliot-runtime-reconcile-dry-run-v1";
 
 /// Bounded refusal for a control-wal schema version this build does not own.
 ///
@@ -59,6 +60,54 @@ where
     } else {
         Err(unsupported_schema_version(
             SEAL_STAGING_CHECKPOINT_SCHEMA_VERSION,
+        ))
+    }
+}
+
+fn deserialize_descendants_at_root_exit_schema_version<'de, D>(
+    deserializer: D,
+) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value == DESCENDANTS_AT_ROOT_EXIT_SCHEMA_VERSION {
+        Ok(value)
+    } else {
+        Err(unsupported_schema_version(
+            DESCENDANTS_AT_ROOT_EXIT_SCHEMA_VERSION,
+        ))
+    }
+}
+
+fn deserialize_runtime_integrity_report_schema_version<'de, D>(
+    deserializer: D,
+) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value == RUNTIME_INTEGRITY_REPORT_SCHEMA_VERSION {
+        Ok(value)
+    } else {
+        Err(unsupported_schema_version(
+            RUNTIME_INTEGRITY_REPORT_SCHEMA_VERSION,
+        ))
+    }
+}
+
+fn deserialize_runtime_reconcile_dry_run_schema_version<'de, D>(
+    deserializer: D,
+) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value == RUNTIME_RECONCILE_DRY_RUN_SCHEMA_VERSION {
+        Ok(value)
+    } else {
+        Err(unsupported_schema_version(
+            RUNTIME_RECONCILE_DRY_RUN_SCHEMA_VERSION,
         ))
     }
 }
@@ -191,11 +240,23 @@ pub struct OperationRestartWindow {
     pub restart_timestamps: Vec<String>,
     pub circuit_state: AdapterCircuitState,
     pub consecutive_failures: u32,
+    // Each `default` below covers a last-observed timestamp, not a protected
+    // identifier, version or discriminator: "this adapter has not succeeded
+    // yet" is a real restart-window state that a window written before the
+    // adapter ever succeeded has to express by leaving the key out. The bounds
+    // this window exists to enforce are carried by the required `schema_version`,
+    // `circuit_state`, `consecutive_failures` and `restart_timestamps` fields,
+    // and `last_failure_class` beside them is likewise required, so a silent
+    // default can never stand in for an absent bound.
     #[serde(default)]
     pub last_success_at: Option<String>,
     #[serde(default)]
     pub last_failure_at: Option<String>,
     pub last_failure_class: Option<String>,
+    // Same reasoning as the timestamps above, and the absence is load-bearing in
+    // both directions: an adapter that has never driven an operation to a
+    // terminal phase has no such reference, and the supervising read maps a
+    // window without one onto a `RuntimeAdapterHealth` that reports none.
     #[serde(default)]
     pub last_terminal_operation_ref: Option<String>,
     pub updated_at: String,
@@ -262,6 +323,12 @@ pub enum DescendantsCaptureErrorKind {
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DescendantsAtRootExitCaptured {
+    // `DescendantsAtRootExit::validate` re-checks this field, but that method is
+    // not run by `Deserialize`. A snapshot written by a capture build whose
+    // layout this build does not own would otherwise decode and then be read as
+    // an authoritative empty-or-populated descendant list, so the version is
+    // bound at the decoder and the refusal is typed.
+    #[serde(deserialize_with = "deserialize_descendants_at_root_exit_schema_version")]
     pub schema_version: String,
     pub root_pid: u32,
     pub root_exit_code: Option<i32>,
@@ -272,6 +339,10 @@ pub struct DescendantsAtRootExitCaptured {
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DescendantsAtRootExitFailed {
+    // Bound at the decoder for the same reason as the captured variant: a
+    // failure record is the one that decides whether a capture attempt carried
+    // any descendant evidence at all, so an unowned version must not decode.
+    #[serde(deserialize_with = "deserialize_descendants_at_root_exit_schema_version")]
     pub schema_version: String,
     pub root_pid: Option<u32>,
     pub root_exit_code: Option<i32>,
@@ -502,6 +573,13 @@ pub struct RuntimeAdapterHealth {
     pub last_success_at: Option<String>,
     pub last_failure_at: Option<String>,
     pub last_failure_class: Option<String>,
+    // Added after the report had already shipped, so an older artifact on disk
+    // omits this key entirely. Absence is the meaningful state — this adapter has
+    // not yet produced a terminal operation to attribute — and the neighbouring
+    // `last_*` observation fields in the same struct are required rather than
+    // defaulted. A silent `None` here therefore reports an honest absence, and
+    // it cannot mask an authority, version or discriminator: this struct carries
+    // no such field, so there is nothing protected to default over.
     #[serde(default)]
     pub last_terminal_operation_ref: Option<String>,
 }
@@ -578,6 +656,13 @@ pub enum RuntimeOverallStatus {
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeSupervisionReport {
+    // The report is the durable `reports/runtime-supervision/latest.json`
+    // artifact and every downstream read of its `overall`, `reason`,
+    // `provider_dispatch_safe` and `integrity_errors` acts on this generation's
+    // readiness verdict. The constant is minted by this crate precisely so the
+    // decoder can refuse any other generation rather than let one be read as a
+    // current integrity verdict.
+    #[serde(deserialize_with = "deserialize_runtime_integrity_report_schema_version")]
     pub schema_version: String,
     pub generated_at: String,
     pub core: RuntimeCoreHealth,
@@ -604,6 +689,11 @@ pub struct RuntimeReconcileDecision {
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeReconcileDryRun {
+    // The dry run publishes the reconcile decisions an operator would apply. A
+    // decision list minted under another generation names a different decision
+    // vocabulary, so it must be refused at the decoder instead of being read as
+    // this build's proposed reconciliation plan.
+    #[serde(deserialize_with = "deserialize_runtime_reconcile_dry_run_schema_version")]
     pub schema_version: String,
     pub generated_at: String,
     pub dry_run: bool,

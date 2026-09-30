@@ -291,10 +291,40 @@ pub struct ModuleRegistryReport {
     pub generated_at: OffsetDateTime,
 }
 
+// The single envelope version this build owns. It is the spelling the envelope
+// minting path writes today, so exactly one value decodes and an envelope from
+// another generation is refused instead of being routed on an authority,
+// causality and payload-hash shape it was never minted with. The constant is
+// private because the accepted version has no consumer outside this decoder.
+const EXCHANGE_ENVELOPE_SCHEMA_VERSION: &str = "1";
+
+// Bounded refusal for an envelope schema version this build does not own. The
+// message is fixed and never echoes the received version back onto an operator
+// surface, mirroring the control-wal refusals in `runtime_supervision`.
+fn unsupported_schema_version<E>(expected: &str) -> E
+where
+    E: serde::de::Error,
+{
+    E::custom(format!("unsupported schema version; expected {expected}"))
+}
+
+fn deserialize_exchange_envelope_schema_version<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value == EXCHANGE_ENVELOPE_SCHEMA_VERSION {
+        Ok(value)
+    } else {
+        Err(unsupported_schema_version(EXCHANGE_ENVELOPE_SCHEMA_VERSION))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EliotExchangeEnvelope<T> {
     pub envelope_id: String,
+    #[serde(deserialize_with = "deserialize_exchange_envelope_schema_version")]
     pub schema_version: String,
     pub project_id: ProjectId,
     pub task_id: Option<TaskId>,
