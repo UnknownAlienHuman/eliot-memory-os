@@ -165,16 +165,14 @@ pub fn resolve_quality_applicability(
     // reach the partition in the first place. A shape failure here is a
     // malformed owner answer, not an unresolved input: it is a boundary error,
     // and it is kept distinct from the typed `Unknown` an absent owner gets.
-    resolutions
-        .validate()
-        .map_err(|error| QualityApplicabilityError::InvalidOwnerValue(
-            match error {
-                eliot_context_contracts::ContextError::InvalidField(
-                    "quality.applicability.missing_owner",
-                ) => "applicability_missing_owner",
-                _ => "applicability_answer",
-            },
-        ))?;
+    resolutions.validate().map_err(|error| {
+        QualityApplicabilityError::InvalidOwnerValue(match error {
+            eliot_context_contracts::ContextError::InvalidField(
+                "quality.applicability.missing_owner",
+            ) => "applicability_missing_owner",
+            _ => "applicability_answer",
+        })
+    })?;
     Ok(resolutions)
 }
 
@@ -328,19 +326,15 @@ fn resolve_task_acceptance(
         return Ok(unknown(TASK_ACCEPTANCE_OWNER));
     };
     if !owner_text(record.task_id.as_str()) || !owner_text(record.goal.as_str()) {
-        return Err(QualityApplicabilityError::InvalidOwnerValue(
-            "task_record",
-        ));
+        return Err(QualityApplicabilityError::InvalidOwnerValue("task_record"));
     }
     if record.task_id != binding.task_id {
         return Ok(unknown(TASK_ACCEPTANCE_OWNER));
     }
     // The Controller's counter must be a real contract counter before it can
     // be compared; a revision of zero is not an owner-issued revision.
-    let controller_revision =
-        TaskRevision::new(record.revision).map_err(|_| {
-            QualityApplicabilityError::InvalidOwnerValue("task_record.revision")
-        })?;
+    let controller_revision = TaskRevision::new(record.revision)
+        .map_err(|_| QualityApplicabilityError::InvalidOwnerValue("task_record.revision"))?;
     if binding.state_fence.task_revision != Some(controller_revision) {
         return Ok(unknown(TASK_ACCEPTANCE_OWNER));
     }
@@ -403,9 +397,7 @@ fn resolve_impact(
         // Refused here rather than resolved, and spelled out so the match is
         // exhaustive without a wildcard arm that could mask a future class.
         ImpactClass::Forbidden => {
-            return Err(QualityApplicabilityError::InvalidOwnerValue(
-                "impact_class",
-            ));
+            return Err(QualityApplicabilityError::InvalidOwnerValue("impact_class"));
         }
     };
     Ok(resolved(IMPACT_OWNER, answer.to_owned()))
