@@ -78,7 +78,7 @@ use eliot_store_api::{StoreError, SwarmOwnerRevision, WriteReceipt, WriteReceipt
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::semantic_revision_store::SemanticRevisionStore;
+use crate::semantic_revision_store::{RecoveredSemanticRevisions, SemanticRevisionStore};
 use crate::staffing_policy::{
     PolicyAuthorizedDegradation, StaffingPlanReceipt, check_attempt_route_continuity,
     enforce_plan_receipt, plan_coordinator_staffing, verify_receipt_digest,
@@ -1205,6 +1205,20 @@ pub enum FabricError {
     /// revision; it never grants an unrecorded one.
     #[error("fabric durability unproven: {0}")]
     DurabilityUnproven(String),
+    /// Restart recovery could not rehydrate the owner-separated history, so
+    /// recovery stays explicitly BLOCKED (issue #1702 W6).
+    ///
+    /// This is not an empty new plan. A committed owner revision that is
+    /// missing its immutable content, a torn persistence boundary, a
+    /// contradictory pair of stored records, or a snapshot whose links
+    /// disagree with the records they point at all land here: the operator
+    /// sees a blocked recovery with the exact cause instead of a fabric that
+    /// silently starts over on empty maps. Nothing in this state is
+    /// reportable as current authority, and no new revision may be published
+    /// until the retained history is repaired or the affected owner
+    /// dispositioned by its owner.
+    #[error("fabric semantic recovery blocked: {0}")]
+    SemanticRecoveryBlocked(String),
     /// A load-bearing injected port reports no accepted interface binding
     /// for the blocked operation (issue #1700). The boxed residual names
     /// the exact port, owner, binding state, blocked operation/work,
@@ -1362,7 +1376,54 @@ fn verify_snapshot_semantics(snapshot: &FabricSnapshot) -> Result<(), FabricErro
     for receipt in snapshot.staffing_receipts.values() {
         verify_receipt_digest(receipt).map_err(|error| staffing_rejection(&error))?;
     }
-    for (key, definition) in &snapshot.semantic_definitions {
+    verify_semantic_record_set(
+        &snapshot.semantic_definitions,
+        &snapshot.semantic_admissions,
+        &snapshot.semantic_executions,
+        &snapshot.semantic_supersessions,
+    )
+}
+
+/// Verifies one owner-separated record set as strictly as fresh admission
+/// (issue #1702 W6).
+///
+/// This is the single strictness gate both the snapshot restore and the reopen
+/// of real storage run, so a recovered record set is never held to a weaker
+/// standard than a freshly admitted one. It verifies, over the four owner maps
+/// alone:
+///
+/// 1. every definition revalidates (shape plus its bound content digest) and
+///    its map key equals its own record identity — map key versus record
+///    identity is checked, never assumed;
+/// 2. every admission revalidates, binds exactly one stored frozen definition
+///    with narrowed (never widened) ceilings, and no definition has two
+///    conflicting stored admissions (duplicate reverse-index mapping);
+/// 3. every execution revalidates, its map key equals its identity, and it
+///    satisfies the structural ownership links against its stored definition
+///    and admission;
+/// 4. every supersession link joins its stored prior and replacement, matches
+///    the replacement's own carried link, and the whole chain stays acyclic so
+///    one current authority always resolves.
+///
+/// Recovered cross-record INDEXES are rebuilt from these records as
+/// projections rather than accepted from any supplied reverse link; the only
+/// reverse mapping consulted is each record's own embedded link, which must
+/// agree with the record it points at. A missing record or any contradiction
+/// fails closed, so torn persistence or a contradictory snapshot restores
+/// nothing.
+///
+/// This function verifies the STORED RECORD SET only. It does not rehydrate
+/// live coherence: nothing here re-derives a lease, an active disposition or
+/// an open process, so a saved `Verified`/`Active` label is evidence about the
+/// stored record and never about a live lease. A caller that needs live
+/// authority must re-resolve it from its own owner.
+fn verify_semantic_record_set(
+    definitions: &BTreeMap<String, SwarmPlanDefinition>,
+    admissions: &BTreeMap<String, SwarmPlanAdmission>,
+    executions: &BTreeMap<String, SwarmExecutionRevision>,
+    supersessions: &BTreeMap<String, SupersessionLink>,
+) -> Result<(), FabricError> {
+    for (key, definition) in definitions {
         definition.validate().map_err(contract_rejection)?;
         if key != definition.definition_id.as_str() {
             return Err(FabricError::BrokenOwnershipLink(
@@ -1370,24 +1431,22 @@ fn verify_snapshot_semantics(snapshot: &FabricSnapshot) -> Result<(), FabricErro
             ));
         }
     }
-    verify_snapshot_admissions(snapshot)?;
-    for (key, execution) in &snapshot.semantic_executions {
+    verify_record_set_admissions(definitions, admissions)?;
+    for (key, execution) in executions {
         execution.validate().map_err(contract_rejection)?;
         if key != execution.execution_id.as_str() {
             return Err(FabricError::BrokenOwnershipLink(
                 "semantic execution map key does not match record identity".to_owned(),
             ));
         }
-        let definition = snapshot
-            .semantic_definitions
+        let definition = definitions
             .get(execution.definition_id.as_str())
             .ok_or_else(|| {
                 FabricError::BrokenOwnershipLink(
                     "semantic execution without stored definition".to_owned(),
                 )
             })?;
-        let admission = snapshot
-            .semantic_admissions
+        let admission = admissions
             .get(execution.admission_id.as_str())
             .ok_or_else(|| {
                 FabricError::BrokenOwnershipLink(
@@ -1396,14 +1455,13 @@ fn verify_snapshot_semantics(snapshot: &FabricSnapshot) -> Result<(), FabricErro
             })?;
         check_stored_links(definition, admission, execution).map_err(contract_rejection)?;
     }
-    for (key, link) in &snapshot.semantic_supersessions {
-        let next = snapshot.semantic_definitions.get(key).ok_or_else(|| {
+    for (key, link) in supersessions {
+        let next = definitions.get(key).ok_or_else(|| {
             FabricError::BrokenOwnershipLink(
                 "supersession without stored replacement definition".to_owned(),
             )
         })?;
-        let prior = snapshot
-            .semantic_definitions
+        let prior = definitions
             .get(link.prior_definition_id.as_str())
             .ok_or_else(|| {
                 FabricError::BrokenOwnershipLink(
@@ -1417,21 +1475,22 @@ fn verify_snapshot_semantics(snapshot: &FabricSnapshot) -> Result<(), FabricErro
         }
         check_supersession(prior, next).map_err(contract_rejection)?;
     }
-    check_supersession_chains(snapshot)?;
-    Ok(())
+    check_record_set_supersession_chains(supersessions)
 }
 
-/// Rejects cyclic replacement chains in a durable snapshot.
+/// Rejects cyclic replacement chains in an owner-separated record set.
 ///
 /// Each link is valid on its own, but a cycle (A supersedes B while B
 /// transitively supersedes A) orders no current authority: revision order
 /// must stay a DAG. The walk follows prior links from every replacement; a
 /// revisited replacement is contradictory history and restores nothing.
-fn check_supersession_chains(snapshot: &FabricSnapshot) -> Result<(), FabricError> {
-    for start in snapshot.semantic_supersessions.keys() {
+fn check_record_set_supersession_chains(
+    supersessions: &BTreeMap<String, SupersessionLink>,
+) -> Result<(), FabricError> {
+    for start in supersessions.keys() {
         let mut visited = BTreeSet::new();
         let mut current = start.as_str();
-        while let Some(link) = snapshot.semantic_supersessions.get(current) {
+        while let Some(link) = supersessions.get(current) {
             if !visited.insert(current) {
                 return Err(FabricError::BrokenOwnershipLink(
                     "semantic supersession chain is cyclic".to_owned(),
@@ -1445,9 +1504,12 @@ fn check_supersession_chains(snapshot: &FabricSnapshot) -> Result<(), FabricErro
 
 /// Revalidates every persisted semantic admission against its immutable
 /// definition while retaining valid terminal dispositions as history.
-fn verify_snapshot_admissions(snapshot: &FabricSnapshot) -> Result<(), FabricError> {
+fn verify_record_set_admissions(
+    definitions: &BTreeMap<String, SwarmPlanDefinition>,
+    admissions: &BTreeMap<String, SwarmPlanAdmission>,
+) -> Result<(), FabricError> {
     let mut admission_by_definition = BTreeMap::new();
-    for (key, admission) in &snapshot.semantic_admissions {
+    for (key, admission) in admissions {
         admission.validate().map_err(contract_rejection)?;
         if key != admission.admission_id.as_str() {
             return Err(FabricError::BrokenOwnershipLink(
@@ -1463,8 +1525,7 @@ fn verify_snapshot_admissions(snapshot: &FabricSnapshot) -> Result<(), FabricErr
                 admission.definition_id.as_str()
             )));
         }
-        let definition = snapshot
-            .semantic_definitions
+        let definition = definitions
             .get(admission.definition_id.as_str())
             .ok_or_else(|| {
                 FabricError::BrokenOwnershipLink(
@@ -1626,6 +1687,79 @@ fn rebuild_admission_by_definition(
     }
 
     Ok(admission_by_definition)
+}
+
+/// Rehydrates the owner-separated semantic record set from real durable storage
+/// on reopen (issue #1702 W6, A5).
+///
+/// This is the missing recovery leg: the write path commits the owner-separated
+/// revisions through [`SemanticRevisionStore::commit`], and this reads the same
+/// committed bytes back so a restarted daemon restores the retained history of
+/// all three owners instead of starting over on empty maps.
+///
+/// The recovered set is validated as strictly as fresh admission through
+/// [`verify_semantic_record_set`]: map key versus record identity, full
+/// definition digest, admission-to-definition binding with narrowed ceilings,
+/// execution-to-admission structural links, and acyclic supersession — all over
+/// the recovered records themselves. Cross-record indexes are reconstructed
+/// here as projections of those verified records; no supplied reverse link is
+/// taken as truth.
+///
+/// A committed record whose immutable content or cross-record link does not
+/// hold, or any contradiction between the store's committed image and the
+/// supplied snapshot, leaves recovery explicitly BLOCKED with
+/// [`FabricError::SemanticRecoveryBlocked`] — never an empty new plan and never
+/// a partially trusted set. Current authority (a live lease or active
+/// disposition) is not re-derived from these bytes: a saved label or an open
+/// process never restores a lease, and the caller re-resolves live authority
+/// from its own owner after this returns the retained history.
+///
+/// # Errors
+///
+/// Returns [`FabricError::SemanticRecoveryBlocked`] when the store cannot be
+/// read, the recovered set fails strict verification, or the supplied snapshot
+/// contradicts the committed durable image.
+pub fn recover_semantic_revisions(
+    store: &SemanticRevisionStore,
+    supplied_snapshot: &FabricSnapshot,
+) -> Result<RecoveredSemanticRevisions, FabricError> {
+    let recovered = store.load().map_err(|error| {
+        FabricError::SemanticRecoveryBlocked(format!(
+            "owner-separated history cannot be rehydrated from real storage: {error}"
+        ))
+    })?;
+    verify_semantic_record_set(
+        &recovered.definitions,
+        &recovered.admissions,
+        &recovered.executions,
+        &recovered.supersessions,
+    )
+    .map_err(|error| {
+        FabricError::SemanticRecoveryBlocked(format!(
+            "recovered owner-separated history fails strict recovery verification: {error}"
+        ))
+    })?;
+    // The durable store is the commit point for the owner-separated image. A
+    // supplied snapshot that disagrees with it is contradictory persistence, not
+    // a newer truth: refuse rather than choose one side. (An empty supplied
+    // snapshot is the normal case where the caller carries no in-image copy.)
+    if !supplied_snapshot.semantic_definitions.is_empty()
+        || !supplied_snapshot.semantic_admissions.is_empty()
+        || !supplied_snapshot.semantic_executions.is_empty()
+        || !supplied_snapshot.semantic_supersessions.is_empty()
+    {
+        let supplied_consistent = supplied_snapshot.semantic_definitions == recovered.definitions
+            && supplied_snapshot.semantic_admissions == recovered.admissions
+            && supplied_snapshot.semantic_executions == recovered.executions
+            && supplied_snapshot.semantic_supersessions == recovered.supersessions;
+        if !supplied_consistent {
+            return Err(FabricError::SemanticRecoveryBlocked(
+                "supplied snapshot contradicts the committed durable owner-separated image"
+                    .to_owned(),
+            ));
+        }
+    }
+    Ok(recovered)
 }
 
 /// B-MOD model registry seam (#694). The fabric resolves routes only through
@@ -3957,6 +4091,22 @@ impl AgentFabric {
         // trivially.
         verify_snapshot_semantics(&snapshot)?;
         verify_snapshot_tool_evidence(&snapshot)?;
+        // Issue #1702 W6/A5: when real storage holds a committed owner-separated
+        // image, recovery must be as strict as fresh admission. The supplied
+        // snapshot is a PROJECTION and cannot be trusted to describe the durable
+        // image, so the two are compared and the durable record set is
+        // re-verified through the same single gate the snapshot path uses.
+        //
+        // The presence probe is what keeps "never committed" and "committed but
+        // unreadable" apart: a fabric that has published no owner revision yet
+        // is an honest empty start, while a store that cannot be read, decoded
+        // or verified leaves recovery explicitly BLOCKED instead of starting
+        // over on empty maps.
+        if let Some(store) = semantic_revisions
+            && store.has_committed_image()
+        {
+            recover_semantic_revisions(store, &snapshot)?;
+        }
         let admission_by_definition = rebuild_admission_by_definition(&snapshot)?;
         let coordinator = AgentCoordinator::restore(
             snapshot.coordinator_snapshot.clone(),
@@ -4045,6 +4195,22 @@ impl AgentFabric {
         // trivially.
         verify_snapshot_semantics(&snapshot)?;
         verify_snapshot_tool_evidence(&snapshot)?;
+        // Issue #1702 W6/A5: when real storage holds a committed owner-separated
+        // image, recovery must be as strict as fresh admission. The supplied
+        // snapshot is a PROJECTION and cannot be trusted to describe the durable
+        // image, so the two are compared and the durable record set is
+        // re-verified through the same single gate the snapshot path uses.
+        //
+        // The presence probe is what keeps "never committed" and "committed but
+        // unreadable" apart: a fabric that has published no owner revision yet
+        // is an honest empty start, while a store that cannot be read, decoded
+        // or verified leaves recovery explicitly BLOCKED instead of starting
+        // over on empty maps.
+        if let Some(store) = semantic_revisions
+            && store.has_committed_image()
+        {
+            recover_semantic_revisions(store, &snapshot)?;
+        }
         let admission_by_definition = rebuild_admission_by_definition(&snapshot)?;
         let coordinator = AgentCoordinator::restore_with_admitted_provider(
             snapshot.coordinator_snapshot.clone(),

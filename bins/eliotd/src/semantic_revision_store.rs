@@ -78,6 +78,26 @@ pub struct SemanticRevisionEnvelope {
     supersessions: BTreeMap<String, SupersessionLink>,
 }
 
+/// Owner-separated revisions rehydrated from real storage (issue #1702 W6).
+///
+/// This is the value a reopen reads back, not an authority: every record in it
+/// is re-verified through the existing owner contracts before it can be
+/// reported, and a record whose immutable content or cross-record link does not
+/// hold leaves recovery explicitly blocked rather than producing an empty new
+/// plan.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RecoveredSemanticRevisions {
+    /// Definition revisions read back, keyed exactly as the owner map keys
+    /// them.
+    pub definitions: BTreeMap<String, SwarmPlanDefinition>,
+    /// Admission revisions read back.
+    pub admissions: BTreeMap<String, SwarmPlanAdmission>,
+    /// Execution revisions read back.
+    pub executions: BTreeMap<String, SwarmExecutionRevision>,
+    /// Supersession links read back, keyed by replacement definition identity.
+    pub supersessions: BTreeMap<String, SupersessionLink>,
+}
+
 impl SemanticRevisionEnvelope {
     fn from_snapshot(snapshot: &FabricSnapshot) -> Self {
         Self {
@@ -130,6 +150,21 @@ impl SemanticRevisionStore {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Returns whether this store has ever committed an owner-separated image.
+    ///
+    /// This distinguishes two states recovery must not conflate. A store that
+    /// has never committed anything means this daemon has published no
+    /// owner-separated revision yet, which is an honest empty start and not a
+    /// recovery failure. A store whose file exists but cannot be read, decoded
+    /// or verified is a torn or tampered persistence boundary, and recovery
+    /// must report that as explicitly blocked rather than proceed on an empty
+    /// plan. Callers therefore test presence here and let
+    /// [`Self::load`] decide every other outcome.
+    #[must_use]
+    pub fn has_committed_image(&self) -> bool {
+        std::fs::symlink_metadata(&self.path).is_ok()
     }
 
     /// Durably commits the owner-separated revisions of one snapshot.
@@ -213,12 +248,17 @@ impl SemanticRevisionStore {
     /// instead of returning an empty revision set that would look like a
     /// clean plan.
     ///
+    /// The returned value is the rehydrated RECORD SET, not restored
+    /// authority: the caller re-verifies every record and cross-record link
+    /// through the existing owner contracts before anything may report one as
+    /// current, and a lease a snapshot claims is never re-derived here.
+    ///
     /// # Errors
     ///
     /// Returns [`FabricError::DurabilityUnproven`] when the file is missing,
     /// the wire version does not match, the recorded digest does not match its
     /// payload, or the bounded read fails.
-    pub fn load(&self) -> Result<SemanticRevisionEnvelope, FabricError> {
+    pub fn load(&self) -> Result<RecoveredSemanticRevisions, FabricError> {
         let lease =
             eliot_platform_windows::ProtectedRuntimePathLease::open_existing_absolute(&self.path)
                 .map_err(|error| {
@@ -247,7 +287,12 @@ impl SemanticRevisionStore {
                 "owner-separated revision digest does not match its payload".to_owned(),
             ));
         }
-        Ok(file.payload)
+        Ok(RecoveredSemanticRevisions {
+            definitions: file.payload.definitions,
+            admissions: file.payload.admissions,
+            executions: file.payload.executions,
+            supersessions: file.payload.supersessions,
+        })
     }
 }
 

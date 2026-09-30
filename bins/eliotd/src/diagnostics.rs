@@ -1067,6 +1067,7 @@ pub fn fabric_rejection_of(error: &FabricError) -> (RejectionReason, OwningCompo
         | FabricError::ForeignOwnerField(_)
         | FabricError::BrokenOwnershipLink(_)
         | FabricError::RevisionNotDurable(_)
+        | FabricError::SemanticRecoveryBlocked(_)
         | FabricError::Quarantined(_) => {
             let reason = match error {
                 FabricError::ReceiptBinding(_)
