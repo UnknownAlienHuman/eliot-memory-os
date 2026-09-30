@@ -43,7 +43,8 @@ use crate::provider_admission::{
     AdmittedProviderCapability, KernelProviderVerifier, ProviderSelectionHealth,
 };
 use crate::swarm_definition_admission::{
-    SwarmDefinitionAdmissionPrep, compile_swarm_definition_admission,
+    SwarmDefinitionAdmissionPrep, admit_swarm_definition, begin_swarm_execution,
+    compile_swarm_definition_admission, launch_swarm_child,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -1245,6 +1246,77 @@ impl AgentCoordinator {
         maps: &eliot_swarm::SealedIndependentMaps,
     ) -> Result<SwarmDefinitionAdmissionPrep, CoordinatorError> {
         compile_swarm_definition_admission(&self.config, proposal, maps)
+    }
+
+    /// Admits one prepared swarm definition through the Governor admission
+    /// owner without performing any durable write (issue #1699 R2).
+    ///
+    /// This is the production caller of `admit_swarm_definition`: the prep
+    /// must bind the presented definition, and the exact Governor admission
+    /// receipt is validated through the injected receipt verifier inside the
+    /// existing `eliot_swarm::admit_plan` owner entrypoint. An unavailable
+    /// prerequisite port fails typed and is never presented as admitted. No
+    /// task store, attempt journal, scheduler, write authority, or recovery
+    /// path is owned here.
+    ///
+    /// Expected production invocation (sibling STITCH, manager scope):
+    /// `bins/eliotd/src/agent_fabric.rs` next to
+    /// `prepare_swarm_definition_admission_candidate`.
+    pub fn admit_swarm_definition(
+        &self,
+        prep: &SwarmDefinitionAdmissionPrep,
+        proposal: &eliot_swarm::SwarmPlanProposal,
+        maps: &eliot_swarm::SealedIndependentMaps,
+        admission_receipt: eliot_receipts::ReceiptEnvelope,
+        verifier: Option<&dyn eliot_swarm::ReceiptVerificationPort>,
+    ) -> Result<eliot_swarm::AdmittedSwarmPlan, CoordinatorError> {
+        admit_swarm_definition(prep, proposal, maps, admission_receipt, verifier)
+    }
+
+    /// Begins provider-owned P3 execution for one admitted swarm plan through
+    /// the injected A-02 activation port (issue #1699 R2).
+    ///
+    /// This is the production caller of `begin_swarm_execution`: the provider
+    /// seals the first execution state over the injected
+    /// `eliot_swarm::AgentRouteProvider`, bound by the injected receipt
+    /// verifier to the plan admission. This performs no durable write and
+    /// starts no process.
+    ///
+    /// Expected production invocation (sibling STITCH, manager scope):
+    /// `bins/eliotd/src/agent_fabric.rs` next to
+    /// `prepare_swarm_definition_admission_candidate`.
+    pub fn begin_swarm_execution(
+        &self,
+        plan: &eliot_swarm::AdmittedSwarmPlan,
+        a02: Option<&dyn eliot_swarm::AgentRouteProvider>,
+        verifier: Option<&dyn eliot_swarm::ReceiptVerificationPort>,
+    ) -> Result<eliot_swarm::ExecutionState, CoordinatorError> {
+        begin_swarm_execution(plan, a02, verifier)
+    }
+
+    /// Dispatches one sealed swarm child through the existing injected
+    /// dispatch ports (issue #1699 R2).
+    ///
+    /// This is the production caller of `launch_swarm_child`: the dispatch is
+    /// built and re-verified through the existing
+    /// `eliot_swarm::adapter_launch` owner path and returned candidate-only.
+    /// The daemon composition persists the intent through the owner-side
+    /// `DurableWorkStore` append path BEFORE calling the `WorkExecutor`; the
+    /// store and executor travel here only to pin that feeding seam, and this
+    /// performs no store append, no executor call, and no scheduler step.
+    ///
+    /// Expected production invocation (sibling STITCH, manager scope):
+    /// `bins/eliotd/src/agent_fabric.rs` next to
+    /// `prepare_swarm_definition_admission_candidate`.
+    pub fn launch_swarm_child(
+        &self,
+        plan: &eliot_swarm::AdmittedSwarmPlan,
+        attachment: &eliot_swarm::durable_dispatch::DurableJobAttachment,
+        inputs: eliot_swarm::adapter_launch::SealedChildInputs<'_>,
+        store: &dyn eliot_swarm::durable_work::DurableWorkStore,
+        executor: &dyn eliot_swarm::durable_work::WorkExecutor,
+    ) -> Result<eliot_swarm::adapter_launch::SealedChildLaunch, CoordinatorError> {
+        launch_swarm_child(plan, attachment, inputs, store, executor)
     }
 
     /// Reconciles only an admission accepted by the sealed verifier.
