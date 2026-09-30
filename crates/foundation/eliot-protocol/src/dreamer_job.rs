@@ -314,6 +314,10 @@ pub struct DurableJobRuntimeOwnerExecutionInput {
     /// Orientation publisher. It remains separate from `ContextInput`, the
     /// recipe catalogue and `ContextReconstruction` readback.
     pub context_compilation_input: serde_json::Value,
+    /// Original Governor `CampaignSourceRevisionRead` for the Orientation
+    /// classification profile. The daemon preserves it opaquely; Governor
+    /// performs native decoding and validates the record, receipt and fence.
+    pub orientation_classification_source_readback: serde_json::Value,
     /// Original semantic-source named-read claim.
     pub semantic_source: crate::task_controller::TaskControllerOrientationSourceClaim,
     /// Original output-contract reference.
@@ -359,6 +363,7 @@ impl DurableJobRuntimeOwnerExecutionInput {
             || !self.context_campaign_recipe.is_object()
             || !self.context_campaign_recipe_catalogue.is_object()
             || !self.context_compilation_input.is_object()
+            || !self.orientation_classification_source_readback.is_object()
             || self.native_worker_claim_id.trim().is_empty()
             || self.native_worker_claim_id.chars().any(char::is_control)
             || self.output_schema_recipe.schema_version == 0

@@ -169,6 +169,9 @@ pub struct TaskControllerOrientationInput {
     /// authenticated by this Task Controller invocation and copied into the
     /// durable runtime publication without deriving it from `ContextInput`.
     pub context_compilation_input: Value,
+    /// Original Governor `CampaignSourceRevisionRead` for the Orientation
+    /// classification profile, retained for downstream native validation.
+    pub orientation_classification_source_readback: Value,
     /// Distinct named-read claim for the semantic `DreamJobInput` publication.
     pub semantic_source: TaskControllerOrientationSourceClaim,
     /// Exact original `OutputSchema` role declaration from the job recipe.
@@ -227,12 +230,18 @@ impl TaskControllerOrientationInput {
             &self.context_compilation_input,
             "task_controller_invocation.orientation.context_compilation_input",
         )?;
+        structured_object(
+            &self.orientation_classification_source_readback,
+            "task_controller_invocation.orientation.classification_source_readback",
+        )?;
         if runtime_input.semantic_source != self.semantic_source
             || runtime_input.native_worker_claim_id != self.native_worker_claim_id
             || runtime_input.output_contract != submission.output_contract
             || runtime_input.context_reconstruction_result
                 != self.context_reconstruction_result
             || runtime_input.context_compilation_input != self.context_compilation_input
+            || runtime_input.orientation_classification_source_readback
+                != self.orientation_classification_source_readback
             || runtime_input.output_schema_recipe != self.output_schema_recipe
             || runtime_input.schema_source != self.schema_source
             || runtime_input.materials != self.materials
