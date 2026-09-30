@@ -18,10 +18,11 @@ use crate::schema;
 use eliot_store_api::{
     CanonicalValidationSnapshot, EVIDENCE_PACK_MAX_RECORDS, ExactJsonBytes,
     FencedProjectionPublication, NamedReadOperation, NamedReadRequest, NamedReadResponse,
-    OperationId, OrderingHead, OrderingScopeId, PAYLOAD_AUTHORITY_VERSION, PayloadEncoding,
-    PayloadSource, ProjectionPublicationRecord, RevisionHead, RevisionKey, ScopeId,
-    ScopeRevisionView, StateFence, StoreError, WriteReceipt, WriteReceiptStatus,
-    audit_heads_digest, generated_operation_manifests, named_mutation_operation_name,
+    OperationId, OrderingHead, OrderingHeadReadback, OrderingScopeId,
+    PAYLOAD_AUTHORITY_VERSION, PayloadEncoding, PayloadSource, ProjectionPublicationRecord,
+    RevisionHead, RevisionKey, ScopeId, ScopeRevisionView, StateFence, StoreError,
+    WriteReceipt, WriteReceiptStatus, audit_heads_digest, canonical_json_bytes,
+    generated_operation_manifests, named_mutation_operation_name, sha256_hex,
 };
 
 use super::{
@@ -212,12 +213,44 @@ pub(crate) async fn read_ordering_heads(
     adapter: &SurrealStoreAdapter,
     scopes: Vec<OrderingScopeId>,
 ) -> Result<Vec<OrderingHead>, AdapterError> {
+    Ok(read_ordering_head_readbacks(adapter, scopes)
+        .await?
+        .into_iter()
+        .map(|readback| readback.head)
+        .collect())
+}
+
+pub(crate) async fn read_ordering_head_readbacks(
+    adapter: &SurrealStoreAdapter,
+    scopes: Vec<OrderingScopeId>,
+) -> Result<Vec<OrderingHeadReadback>, AdapterError> {
     ensure_unique_ordering_scopes(&scopes)?;
     let db = super::client(adapter).await?;
     ensure_ready(adapter, db).await?;
     if scopes.is_empty() {
         return Ok(Vec::new());
     }
+    let readbacks = read_ordering_head_readbacks_inner(db, &adapter.config, &scopes).await?;
+    for readback in &readbacks {
+        if !scopes.contains(&readback.head.scope) {
+            return Err(AdapterError::Store(StoreError::IdentityConflict));
+        }
+        readback.validate().map_err(AdapterError::Store)?;
+    }
+    plan::validate_ordering_heads(
+        &readbacks
+            .iter()
+            .map(|readback| readback.head.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    Ok(readbacks)
+}
+
+async fn read_ordering_head_readbacks_inner(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    scopes: &[OrderingScopeId],
+) -> Result<Vec<OrderingHeadReadback>, AdapterError> {
     let mut bindings = Map::new();
     bindings.insert(
         "scopes".to_owned(),
@@ -225,15 +258,29 @@ pub(crate) async fn read_ordering_heads(
     );
     let mut response = client::query(
         db,
-        &adapter.config,
-        "read.ordering_heads",
+        config,
+        "read.ordering_heads_readback",
         schema::READ_ORDERING_HEADS_BY_SCOPES,
         bindings,
     )
     .await?;
-    let heads = take_vec::<OrderingHead>(&mut response, 0)?;
-    plan::validate_ordering_heads(&heads)?;
-    Ok(heads)
+    let rows = take_vec::<Value>(&mut response, 0)?;
+    rows.into_iter()
+        .map(|body| {
+            let canonical_bytes = canonical_json_bytes(&body)
+                .map_err(|error| StoreError::Serialization(error.to_string()))?;
+            let head = serde_json::from_value::<OrderingHead>(body)
+                .map_err(|error| StoreError::Serialization(error.to_string()))?;
+            let readback = OrderingHeadReadback {
+                head,
+                canonical_sha256: sha256_hex(&canonical_bytes),
+                canonical_bytes,
+            };
+            readback.validate()?;
+            Ok(readback)
+        })
+        .collect::<Result<Vec<_>, StoreError>>()
+        .map_err(AdapterError::Store)
 }
 
 pub(crate) async fn read_scope_view(

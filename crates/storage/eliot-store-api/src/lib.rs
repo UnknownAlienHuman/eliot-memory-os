@@ -4396,6 +4396,46 @@ impl OrderingHead {
     }
 }
 
+/// Store-owned readback of one canonical ordering-head body.
+///
+/// `canonical_bytes` are the deterministic bytes of the persisted canonical
+/// body as returned by the storage owner. `canonical_sha256` is computed by
+/// that owner over those bytes; consumers can validate the binding without
+/// inventing a digest from caller expectations or a lossy projection.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrderingHeadReadback {
+    /// Fully typed canonical head body.
+    pub head: OrderingHead,
+    /// Canonical bytes of the exact persisted head body.
+    pub canonical_bytes: Vec<u8>,
+    /// Lowercase SHA-256 of `canonical_bytes`, produced by the store owner.
+    pub canonical_sha256: String,
+}
+
+impl OrderingHeadReadback {
+    /// Validates the typed head, exact canonical body bytes, and their digest.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        self.head.validate()?;
+        let canonical_head_bytes = canonical_json_bytes(&self.head)
+            .map_err(|error| StoreError::Serialization(error.to_string()))?;
+        if self.canonical_bytes != canonical_head_bytes {
+            return Err(StoreError::InvalidField {
+                field: "ordering_head.canonical_bytes",
+                reason: "must encode the complete canonical ordering head",
+            });
+        }
+        validate_digest(&self.canonical_sha256, "ordering_head.canonical_sha256")?;
+        if sha256_hex(&self.canonical_bytes) != self.canonical_sha256 {
+            return Err(StoreError::TransitionDigestMismatch {
+                expected: self.canonical_sha256.clone(),
+                observed: sha256_hex(&self.canonical_bytes),
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Compare-and-swap expectation for one ordering head.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -6591,6 +6631,17 @@ pub trait CanonicalStoreClient: Send + Sync {
         &self,
         scopes: Vec<OrderingScopeId>,
     ) -> Result<Vec<OrderingHead>, StoreError>;
+    /// Reads store-owned canonical ordering-head bodies and their exact
+    /// canonical bytes/digests for reservation seeding.
+    ///
+    /// Implementations without a source-byte owner fail closed. They must not
+    /// synthesize this proof from `ordering_heads` or caller expectations.
+    async fn ordering_head_readbacks(
+        &self,
+        _scopes: Vec<OrderingScopeId>,
+    ) -> Result<Vec<OrderingHeadReadback>, StoreError> {
+        Err(StoreError::Unavailable)
+    }
     /// Executes one closed named read; raw query strings are impossible here.
     async fn execute_named(&self, query: NamedReadRequest)
     -> Result<NamedReadResponse, StoreError>;
