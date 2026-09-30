@@ -71,7 +71,6 @@ mod dreamer_materials;
 mod dreamer_model_adapter;
 /// Joins original context reconstruction, compilation and canonical projection owners.
 pub mod dreamer_orientation_context;
-pub mod dreamer_orientation_context;
 pub mod dreamer_orientation_model;
 /// Executes the admitted CC-002 worker from retained semantic source bytes.
 pub mod dreamer_orientation_model_worker;
@@ -4036,6 +4035,26 @@ impl DaemonComposition {
                 task_binding_admission::TaskSelectionResponse::Current(evidence),
             ),
         }
+    }
+
+    /// Returns the exact retained Governor projection sources for one
+    /// authenticated Orientation `ContextBinding`.
+    ///
+    /// This is the live daemon bridge to the Governor's task, session,
+    /// WorkScope, and observation owners. The returned projection set keeps
+    /// the Governor's explicit omissions, and the WorkScope snapshot comes
+    /// from the same retained owner and StateFence.
+    pub fn orientation_projection_sources(
+        &self,
+        binding: &eliot_context_contracts::ContextBinding,
+    ) -> Result<
+        (
+            eliot_governor::GovernorProjectionSet,
+            eliot_workscope::WorkScopeBindingSnapshot,
+        ),
+        CompositionError,
+    > {
+        self.governor.orientation_projection_sources(binding)
     }
 
     /// Compiles and retains the reconciliation receipt for one attach of an

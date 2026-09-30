@@ -76,7 +76,7 @@ use eliot_store_api::{
     NamedReadOperation, NamedReadRequest, NamedReadResponse, ReadConsistency, RevisionHead,
     RevisionKey, ScopeId,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
@@ -223,17 +223,18 @@ pub async fn serve_context_reconstruction(
     attempt: &LocalReadAttempt,
 ) -> Result<HostRequestResultBody, ReconstructionPrerequisite> {
     let owner = reconstruct_context_owner_inputs(kernel, envelope, tool, attempt).await?;
-    let compilation = if owner.context_recipe.body.compiler_suppliers.is_some() {
-        Some(
-            crate::dreamer_orientation_context::compile_dreamer_orientation_context(&owner)
-                .map_err(|error| {
-                    ReconstructionPrerequisite::ReconstructionRefused(error.to_string())
-                })?,
-        )
-    } else {
-        None
-    };
-    context_reconstruction_result_body(&owner, compilation.as_ref())
+    let compilation_publication = Some(
+        match crate::dreamer_orientation_context::compile_dreamer_orientation_context(&owner) {
+            Ok(compilation) => {
+                crate::dreamer_orientation_context::compilation_owner_publication(&compilation)
+                    .map_err(ReconstructionPrerequisite::ReconstructionRefused)?
+            }
+            Err(error) => {
+                crate::dreamer_orientation_context::compilation_failure_publication(&error)
+            }
+        },
+    );
+    context_reconstruction_result_body(&owner, compilation_publication)
 }
 
 /// Reconstructs one authenticated input closure while retaining every owner
@@ -381,7 +382,8 @@ impl ContextReconstructionOwnerReadback<'_> {
 
 /// The authenticated task recipe together with the revision heads the daemon
 /// observed on the very read that returned it.
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AuthenticatedTaskRecipe {
     pub(crate) recipe: LearningStateViewRecipe,
     /// The typed owner value, including its original read receipt.
@@ -391,7 +393,8 @@ pub(crate) struct AuthenticatedTaskRecipe {
 }
 
 /// Exact current Context owner source declared by the authenticated TaskPlan.
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AuthenticatedContextRecipe {
     /// Validated native recipe and exact admitted compiler input.
     pub(crate) body: ContextCampaignRecipeBody,
@@ -403,7 +406,8 @@ pub(crate) struct AuthenticatedContextRecipe {
 
 /// Exact ContextToolPolicy owner row and original readback, when the
 /// authenticated TaskPlan declared that source role.
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AuthenticatedContextToolPolicy {
     /// Typed suppliers decoded only after the exact current source row passed
     /// its original ContextToolPolicy receipt and recipe-derived projection
@@ -416,7 +420,8 @@ pub(crate) struct AuthenticatedContextToolPolicy {
 }
 
 /// Exact original named read of the immutable campaign learning-state view.
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AuthenticatedCampaignLearningView {
     /// Original lookup, including view, task and scope selectors.
     pub(crate) lookup: CampaignLearningStateViewLookup,
@@ -1264,17 +1269,10 @@ fn reconstruction_context(
 /// action authority.
 fn context_reconstruction_result_body(
     owner: &ContextReconstructionOwnerReadback<'_>,
-    compilation: Option<&crate::kernel_context_read_client::ContextCompilationOwnerReadback<'_>>,
+    compilation_publication: Option<serde_json::Value>,
 ) -> Result<HostRequestResultBody, ReconstructionPrerequisite> {
     let closure = serde_json::to_value(&owner.seven_role_inputs)
         .map_err(|error| ReconstructionPrerequisite::ReconstructionRefused(error.to_string()))?;
-    let compilation_publication = match compilation {
-        Some(compilation) => Some(
-            crate::dreamer_orientation_context::compilation_owner_publication(compilation)
-                .map_err(ReconstructionPrerequisite::ReconstructionRefused)?,
-        ),
-        None => None,
-    };
     let owner_publication = json!({
         "source_envelope": owner.source_envelope,
         "source_attempt": owner.source_attempt,

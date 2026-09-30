@@ -5559,6 +5559,51 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .map_err(|error| CompositionError::Owner(error.to_string()))
     }
 
+    /// Reads the original Governor owners used to bind one Orientation
+    /// projection join.
+    ///
+    /// Unlike [`Self::canonical_projections`], this preserves the Governor's
+    /// own set (including explicit omissions) and the exact WorkScope snapshot
+    /// needed by the CC-004 member join. Both values come from this ready
+    /// composition's retained task, session, WorkScope, and observation
+    /// owners at the binding's exact fence; callers cannot supply substitute
+    /// projections or a lookalike scope.
+    pub fn orientation_projection_sources(
+        &self,
+        binding: &ContextBinding,
+    ) -> Result<(crate::GovernorProjectionSet, WorkScopeBindingSnapshot), CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        let fence = self.snapshot.state_fence();
+        if !fences_match_exact(&binding.state_fence, &fence) {
+            return Err(CompositionError::Owner(
+                GovernorProjectionError::FenceMismatch.to_string(),
+            ));
+        }
+        let scope_snapshot = self
+            .owners
+            .work_scope
+            .as_ref()
+            .ok_or_else(|| {
+                CompositionError::Owner(
+                    GovernorProjectionError::MemberOmitted("affordance").to_string(),
+                )
+            })?
+            .read_current(&fence)
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        let projections = compose_canonical_projections(
+            &self.owners.task.snapshot(),
+            &self.owners.session.snapshot(),
+            &scope_snapshot,
+            &self.owners.observation.snapshot(),
+            &binding.task_id,
+            &fence,
+        )
+        .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        Ok((projections, scope_snapshot))
+    }
+
     /// Borrows the single Skill lifecycle owner as a canonical
     /// [`SkillLifecycleApi`](eliot_skill::SkillLifecycleApi) adapter.
     ///
