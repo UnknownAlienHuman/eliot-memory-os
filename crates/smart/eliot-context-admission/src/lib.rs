@@ -14,9 +14,18 @@
 //! `crates/governor/eliot-workscope` (`PrivacyProfile::admits`, `WorkScopeError::PrivacyDenied`).
 //! An earlier version of this note claimed the opposite ("never refused by admission");
 //! it was wrong, and the rule it denied is two calls away in `admission_input.rs`.
+//!
+//! Issue #1862 adds the campaign learning-state join this cell owns:
+//! [`check_campaign_view_for_admission`] refuses an immutable
+//! `CampaignLearningStateView` whose State Fence, task/scope identity or
+//! load-bearing Context recipe owner revision does not join the exact binding
+//! the admission decision is made under. It re-derives that join from this
+//! cell's own binding and inherits no other cell's verdict. The #40-frozen
+//! `eliot_context::ContextCompiler` decides nothing on this route.
 
 #![forbid(unsafe_code)]
 
+pub mod campaign_view;
 pub mod closure;
 pub mod decision;
 #[cfg(not(target_arch = "wasm32"))]
@@ -24,6 +33,7 @@ pub mod learning_gate;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod material_floor;
 
+pub use campaign_view::check_campaign_view_for_admission;
 pub use closure::{ClosureParts, assemble_closure};
 
 pub use decision::{
@@ -264,17 +274,21 @@ fn validate_admission_contract(input: &AdmissionInput) -> Result<(), ContextErro
 ///   fixtures. The live `eliot.packet` daemon poller
 ///   (`daemon_runtime::run_campaign_packet_poll` ->
 ///   `campaign_packet::serve_campaign_packet_pair`) never reaches any context
-///   admission stage at all: it compiles through the learning-state view owner
+///   admission *decision*: it compiles through the learning-state view owner
 ///   `eliot_learning_state_view::compile_campaign_learning_state_view`, not
 ///   through this crate, and `eliot-context` does not depend on this crate.
-///   #1862 routes the immutable campaign view into the *candidate* cell
-///   instead (`eliot_context_candidates::check_campaign_learning_state_view`,
-///   called from `bins/eliotd/src/campaign_packet.rs`), which owns that view's
-///   State Fence, task/scope/request identity and load-bearing Context recipe
-///   owner-revision joins. That join is deliberately not a second copy of this
-///   crate's checks, and it does not make this cell reachable: the four
-///   admission-closure identities named above still have no production
-///   construction site, so `admit_context_traced` remains uncalled. The
+///   #1862 reaches this crate twice without making the decision callable: the
+///   candidate cell
+///   (`eliot_context_candidates::check_campaign_learning_state_view`, called
+///   from `bins/eliotd/src/campaign_packet.rs`) owns the candidate-stage join,
+///   and this crate's own
+///   [`check_campaign_view_for_admission`] now owns the admission-stage join
+///   against the binding an admission decision would be made under, called
+///   from the same route and from
+///   `kernel_context_read_client::compile_context_packet`. The two are separate
+///   comparisons against different bindings, so neither inherits the other.
+///   Neither makes [`admit_context_traced`] reachable: the four admission-closure
+///   identities named above still have no production construction site. The
 ///   `#40`-frozen
 ///   `eliot_context::ContextCompiler::compile_with_campaign_learning_state`
 ///   named by an earlier revision of this note has NO call site either, so it

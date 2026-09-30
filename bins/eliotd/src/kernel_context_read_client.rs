@@ -71,14 +71,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use eliot_context_admission::{MaterialRankTraceDelivery, admit_context_traced};
+use eliot_context_admission::{
+    MaterialRankTraceDelivery, admit_context_traced, check_campaign_view_for_admission,
+};
 use eliot_context_assembly::{
     ActiveUnderstandingViewResult, AssemblyError, AssemblyPolicy, assemble_active_view,
+    check_campaign_view_for_assembly,
 };
 use eliot_context_candidates::{
-    CANDIDATE_SCHEMA_VERSION, CandidatePolicy, CandidateRequest, OpaqueProjection,
-    PROVIDER_AFFORDANCE, PROVIDER_NEGATIVE_MEMORY, PROVIDER_TASK_FRAME, ProjectionSchema,
-    ProjectionState as CandidateProjectionState, construct_context_candidates,
+    CANDIDATE_SCHEMA_VERSION, CandidatePolicy, CandidateRequest, ContextCandidateSetResult,
+    OpaqueProjection, PROVIDER_AFFORDANCE, PROVIDER_NEGATIVE_MEMORY, PROVIDER_TASK_FRAME,
+    ProjectionSchema, ProjectionState as CandidateProjectionState, construct_context_candidates,
 };
 use eliot_context_contracts::{
     AdmissionDisposition, AdmissionInput, AdmissionMeasurement, AdmissionRuleIdentity,
@@ -97,6 +100,7 @@ use eliot_governor::{
     ROLE_CUE_ACTIVATION, ROLE_EPISTEMIC_POSITION, ROLE_EVIDENCE_ASSURANCE, ROLE_NEGATIVE_MEMORY,
     ROLE_TASK_FRAME, SevenRoleInputs,
 };
+use eliot_learning_contracts::CampaignLearningStateView;
 use eliot_protocol::{
     HOST_REQUEST_INVOKE_READ_WIRE_ID, HostRequestEnvelope, HostRequestInvokeReadPayload,
 };
@@ -1304,6 +1308,19 @@ pub enum PacketCompositionError {
     /// The admission owner left explicit gaps instead of a complete set.
     #[error("packet admission left explicit gaps")]
     AdmissionIncomplete(Box<DecisionContextIncomplete>),
+    /// The admission cell refused the immutable campaign learning-state view
+    /// for this compilation.
+    ///
+    /// #1862: the view is well formed but does not join the exact task, scope
+    /// and State Fence this admission decides under. The typed cause is kept
+    /// rather than flattened, so a stale-fence view stays distinguishable from a
+    /// cross-compilation one. The candidate cell performs the same class of join
+    /// independently through
+    /// `eliot_context_candidates::check_campaign_learning_state_view`; this
+    /// variant names the admission cell's own refusal and never a verdict
+    /// inherited from it.
+    #[error("packet admission refused the campaign learning-state view: {0}")]
+    CampaignView(Box<ContextError>),
     /// The assembly owner rejected the admitted set.
     #[error("packet assembly failed: {0}")]
     Assembly(Box<AssemblyError>),
@@ -1537,12 +1554,67 @@ impl KernelContextReadClient {
     /// policy, admission identities, quality card, assembly policy,
     /// measurement). Until those suppliers call this edge with owner-minted
     /// pieces, the packet keeps its unbound-closure gap.
+    ///
+    /// #1862: `campaign_view` is the validated immutable
+    /// `CampaignLearningStateView` this compilation is bound to, and
+    /// `context_recipe_body_digest` is the Context owner's own re-derivation of
+    /// the exact recipe body its publication validator accepted. The candidate
+    /// cell already joined the view to `request` through
+    /// `eliot_context_candidates::check_campaign_learning_state_view`; here the
+    /// admission and assembly cells each re-derive the same join from the
+    /// binding *they* run under, so no stage inherits another's verdict. The
+    /// admission join runs before any candidate is constructed; the assembly
+    /// join runs against the admitted set actually about to be rendered, which
+    /// is the only binding that describes the delivery.
+    /// The admission cell's own campaign-view join (I12.24, #1862).
+    ///
+    /// Admission compares the immutable view against the very binding its own
+    /// decision is made under, and never trusts the candidate cell's verdict. The
+    /// refusal keeps the owner's typed `ContextError` rather than being flattened.
+    fn require_campaign_view_for_admission(
+        request: &CandidateRequest,
+        campaign_view: &CampaignLearningStateView,
+        context_recipe_body_digest: &str,
+    ) -> Result<(), PacketCompositionError> {
+        check_campaign_view_for_admission(
+            &request.binding,
+            campaign_view,
+            context_recipe_body_digest,
+        )
+        .map_err(|error| PacketCompositionError::CampaignView(Box::new(error)))
+    }
+
+    /// The assembly cell's own campaign-view join (I12.24, #1862).
+    ///
+    /// Assembly compares the immutable view against the admitted set it is about to
+    /// render — the binding this delivery actually renders under — and never trusts
+    /// that admission established the join.
+    fn require_campaign_view_for_assembly(
+        admitted: &AdmittedContextSet,
+        campaign_view: &CampaignLearningStateView,
+        context_recipe_body_digest: &str,
+    ) -> Result<(), PacketCompositionError> {
+        check_campaign_view_for_assembly(admitted, campaign_view, context_recipe_body_digest)
+            .map_err(|error| PacketCompositionError::Assembly(Box::new(error)))
+    }
+
+    /// #1727: the assembled packet is not delivered on the strength of its
+    /// rendered atoms alone. Each logical unit must still round-trip through
+    /// packing with its own source identity, scope/fence and admitted source
+    /// order intact, and the whole set must still match the output identity
+    /// bound at production against the upstream admission receipt. That check is
+    /// made here, at the delivery-acceptance owner, so a substituted boundary, a
+    /// reordered source member, a foreign source revision or a lost unit fails
+    /// closed before the packet leaves this composition rather than after it has
+    /// been consumed.
     #[allow(clippy::too_many_arguments)]
     pub fn compile_context_packet(
         seven: &SevenRoleInputs,
         request: &CandidateRequest,
         recipe: &ContextRecipe,
         policy: &CandidatePolicy,
+        campaign_view: &CampaignLearningStateView,
+        context_recipe_body_digest: &str,
         floor: SafetyFloorIdentity,
         priority: PriorityPolicyIdentity,
         rule: AdmissionRuleIdentity,
@@ -1568,6 +1640,11 @@ impl KernelContextReadClient {
         policy
             .validate()
             .map_err(|error| PacketCompositionError::Candidates(Box::new(error)))?;
+        Self::require_campaign_view_for_admission(
+            request,
+            campaign_view,
+            context_recipe_body_digest,
+        )?;
         let admission = PacketAdmissionBundle::build(
             PacketAdmissionParts {
                 floor,
@@ -1626,40 +1703,53 @@ impl KernelContextReadClient {
             policy,
         )
         .map_err(|error| PacketCompositionError::Candidates(Box::new(error)))?;
-        let input = AdmissionInput {
-            schema_version: CONTEXT_CONTRACT_VERSION,
-            binding: request.binding.clone(),
-            recipe: recipe.clone(),
-            candidates: candidates.set.clone(),
-            learning_tickets: Vec::new(),
-            floor: admission.floor.clone(),
-            priority: admission.priority.clone(),
-            rule: admission.rule.clone(),
-            measurement_profile: admission.measurement_profile.clone(),
-            supplied_omissions: admission.supplied_omissions.clone(),
-            measurements: admission.measurements.clone(),
-        };
+        let input = packet_admission_input(request, recipe, &candidates, &admission);
         input
             .validate()
             .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
         let (admitted, delivery) = admit_packet_candidates(&input)?;
+        Self::require_campaign_view_for_assembly(
+            &admitted,
+            campaign_view,
+            context_recipe_body_digest,
+        )?;
         let assembled = assemble_active_view(&admitted, recipe, quality, assembly, measure)
             .map_err(|error| composition_failure(error, recipe, &request.binding))?;
         check_delivered_traces(&delivery, &assembled)
             .map_err(PacketCompositionError::TraceDelivery)?;
-        // #1727: the assembled packet is not delivered on the strength of its
-        // rendered atoms alone. Each logical unit must still round-trip through
-        // packing with its own source identity, scope/fence and admitted source
-        // order intact, and the whole set must still match the output identity
-        // bound at production against the upstream admission receipt. The check
-        // is made here, at the delivery-acceptance owner, so a substituted
-        // boundary, a reordered source member, a foreign source revision or a
-        // lost unit fails closed before the packet leaves this composition
-        // rather than after it has been consumed.
         assembled
             .verify_boundaries()
             .map_err(|error| PacketCompositionError::Assembly(Box::new(error)))?;
         Ok((assembled, delivery))
+    }
+}
+
+/// Closes the candidate stage's set and the owner's admission pieces into the
+/// one admission input.
+///
+/// Every field is a recorded value carried by the request, the recipe, the
+/// candidate set or the owner's own bundle, so this closure invents no piece:
+/// `candidates` is the candidate stage's own result and the floor, priority,
+/// rule, measurement profile, omissions and measurements are exactly what
+/// [`PacketAdmissionBundle::build`] admitted.
+fn packet_admission_input(
+    request: &CandidateRequest,
+    recipe: &ContextRecipe,
+    candidates: &ContextCandidateSetResult,
+    admission: &PacketAdmissionBundle,
+) -> AdmissionInput {
+    AdmissionInput {
+        schema_version: CONTEXT_CONTRACT_VERSION,
+        binding: request.binding.clone(),
+        recipe: recipe.clone(),
+        candidates: candidates.set.clone(),
+        learning_tickets: Vec::new(),
+        floor: admission.floor.clone(),
+        priority: admission.priority.clone(),
+        rule: admission.rule.clone(),
+        measurement_profile: admission.measurement_profile.clone(),
+        supplied_omissions: admission.supplied_omissions.clone(),
+        measurements: admission.measurements.clone(),
     }
 }
 
