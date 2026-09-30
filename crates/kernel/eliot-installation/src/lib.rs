@@ -10366,7 +10366,10 @@ where
         before_run: F,
     ) -> Result<CurrentUserTaskRunReceipt, InstallationError>
     where
-        F: FnOnce(&CurrentUserTaskReceipt, &CurrentUserTaskRunIntent) -> Result<(), InstallationError>,
+        F: FnOnce(
+            &CurrentUserTaskReceipt,
+            &CurrentUserTaskRunIntent,
+        ) -> Result<(), InstallationError>,
     {
         let mut transaction = self.load_transaction(transaction_id)?;
         transaction.validate()?;
@@ -10374,9 +10377,11 @@ where
         let task_receipt = transaction.effect_progress[task_index]
             .current_user_task_receipt
             .clone()
-            .ok_or_else(|| InstallationError::IncompleteObservation(
-                "Task Scheduler RunEx requires a durable registration receipt".to_owned(),
-            ))?;
+            .ok_or_else(|| {
+                InstallationError::IncompleteObservation(
+                    "Task Scheduler RunEx requires a durable registration receipt".to_owned(),
+                )
+            })?;
         if !matches!(
             transaction.effect_progress[task_index].state,
             InstallationEffectProgressState::Applied { .. }
@@ -10402,14 +10407,13 @@ where
         }
         let live_client = eliot_platform_windows::current_process_named_pipe_expectation()
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
-        if live_client.expected_sid() != task_receipt.sid
-            || live_client.expected_session_id() == 0
+        if live_client.expected_sid() != task_receipt.sid || live_client.expected_session_id() == 0
         {
             return Err(InstallationError::IdentityConflict);
         }
         let expected = TransactionVersion::of(&transaction)?;
-        let intent = transaction
-            .record_current_user_task_run_intent(live_client.expected_session_id())?;
+        let intent =
+            transaction.record_current_user_task_run_intent(live_client.expected_session_id())?;
         self.store.compare_and_save(expected, &transaction)?;
 
         // The Host must have the same durable operation identity before Task
@@ -10424,7 +10428,9 @@ where
             .current_user_task_run_intent
             .as_ref()
             != Some(&intent)
-            || persisted.effect_progress[task_index].current_user_task_receipt.as_ref()
+            || persisted.effect_progress[task_index]
+                .current_user_task_receipt
+                .as_ref()
                 != Some(&task_receipt)
         {
             return Err(InstallationError::IdentityConflict);
@@ -13285,19 +13291,24 @@ where
         before_run: F,
     ) -> Result<CurrentUserTaskRunReceipt, InstallationError>
     where
-        F: FnOnce(&CurrentUserTaskReceipt, &CurrentUserTaskRunIntent) -> Result<(), InstallationError>,
+        F: FnOnce(
+            &CurrentUserTaskReceipt,
+            &CurrentUserTaskRunIntent,
+        ) -> Result<(), InstallationError>,
     {
-        self.inner.run_current_user_task_once(transaction_id, before_run)
+        self.inner
+            .run_current_user_task_once(transaction_id, before_run)
     }
 
     /// Reconciles the exact Host registry readiness acknowledgment after the
-    /// one-shot Task intent and its durable RunEx acceptance receipt.
+    /// one-shot Task intent and its durable `RunEx` acceptance receipt.
     pub fn reconcile_current_user_task_host_ack(
         &mut self,
         transaction_id: &PlatformHandle,
         ack: &UserModeTaskRunHostAck,
     ) -> Result<(), InstallationError> {
-        self.inner.reconcile_current_user_task_host_ack(transaction_id, ack)
+        self.inner
+            .reconcile_current_user_task_host_ack(transaction_id, ack)
     }
 
     /// Reconciles an exact Host registry terminal into the sole durable

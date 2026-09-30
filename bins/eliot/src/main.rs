@@ -4056,9 +4056,10 @@ fn finish_user_mode_task_activation(
     leases
         .verify_stable_identity()
         .map_err(|error| InstallationError::Platform(error.to_string()))?;
-    let run_receipt = coordinator.run_current_user_task_once(transaction_id, |task_receipt, intent| {
-        stage_user_mode_task_run_intent(&registered, task_receipt, intent)
-    });
+    let run_receipt = coordinator
+        .run_current_user_task_once(transaction_id, |task_receipt, intent| {
+            stage_user_mode_task_run_intent(&registered, task_receipt, intent)
+        });
     leases
         .verify_stable_identity()
         .map_err(|error| InstallationError::Platform(error.to_string()))?;
@@ -4117,11 +4118,12 @@ fn stage_user_mode_task_run_intent(
     task_receipt: &eliot_platform_windows::profile_supervision::CurrentUserTaskReceipt,
     run_intent: &eliot_installation::CurrentUserTaskRunIntent,
 ) -> std::result::Result<(), InstallationError> {
-    let projection = inspect_host_activation_registry_for_terminal(transaction)?.ok_or_else(|| {
-        InstallationError::IncompleteObservation(
-            "UserMode Host registry is absent before Task Scheduler RunEx".to_owned(),
-        )
-    })?;
+    let projection =
+        inspect_host_activation_registry_for_terminal(transaction)?.ok_or_else(|| {
+            InstallationError::IncompleteObservation(
+                "UserMode Host registry is absent before Task Scheduler RunEx".to_owned(),
+            )
+        })?;
     projection.read_committed_activation_receipt(
         &transaction.transaction_id,
         &transaction.installer_plan_digest,
@@ -5460,10 +5462,8 @@ fn reconcile_host_activation_terminal(
                     evidence_refs: evidence,
                 }));
             }
-            let task_outcome = finish_user_mode_task_activation(
-                &mut coordinator,
-                &transaction.transaction_id,
-            )?;
+            let task_outcome =
+                finish_user_mode_task_activation(&mut coordinator, &transaction.transaction_id)?;
             if !matches!(&task_outcome, InstallationStepOutcome::Applied { .. }) {
                 return Ok(Some(task_outcome));
             }
@@ -5522,11 +5522,12 @@ fn read_user_mode_task_host_ack(
                 "UserMode Task RunEx has no exact retained registration and intent".to_owned(),
             )
         })?;
-    let registry = inspect_host_activation_registry_for_terminal(transaction)?.ok_or_else(|| {
-        InstallationError::IncompleteObservation(
-            "UserMode Host registry is absent after Task Scheduler RunEx".to_owned(),
-        )
-    })?;
+    let registry =
+        inspect_host_activation_registry_for_terminal(transaction)?.ok_or_else(|| {
+            InstallationError::IncompleteObservation(
+                "UserMode Host registry is absent after Task Scheduler RunEx".to_owned(),
+            )
+        })?;
     let record = registry.user_mode_task_run_record().ok_or_else(|| {
         InstallationError::IncompleteObservation(
             "UserMode Host registry has no staged Task RunEx intent".to_owned(),
