@@ -2021,6 +2021,35 @@ impl ControlPollClass {
 /// admission instead of growing work without bound.
 const CONTROL_POLL_READ_BUDGET: usize = WASM_CONTROL_SPOOL_MAX_DELIVERIES * 3;
 
+/// Evidence disposition for one delivery's declared predecessor link
+/// (audit 5868408122, defect 2: "Replace predecessor Boolean read-failure
+/// handling with verified/pending/deferred/conflict outcomes").
+///
+/// Four values, because a `bool` cannot say which of three non-verified
+/// answers it holds: only [`Self::Conflict`] authorizes a terminal
+/// `Refused` ack, the two pending values leave the delivery staged and
+/// unacknowledged for a later poll, and only [`Self::Verified`] admits it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreviousDisposition {
+    /// The declared link was compared against retained predecessor evidence
+    /// and agrees with it — or sequence zero legitimately declares no link.
+    /// The only value that admits the delivery.
+    Verified,
+    /// Predecessor evidence exists but has not been read yet, so the declared
+    /// link was never compared against anything. Pending, never an admission
+    /// and never a refusal: the delivery stays staged and a later poll reads
+    /// the evidence.
+    AwaitingEvidence,
+    /// The bounded control-poll read budget was spent before the predecessor
+    /// evidence could be read. This is deferred work, not a finding: the walk
+    /// stops and resumes on the next tick, and the delivery is never refused
+    /// for a read that did not happen.
+    BudgetDeferred,
+    /// The declared link was compared against retained predecessor evidence
+    /// and disagrees with it — proven conflict. The only value that refuses.
+    Conflict,
+}
+
 /// Resolution of one delivery's ack slot.
 #[derive(Clone, Debug)]
 enum AckSlot {
@@ -2084,6 +2113,13 @@ type ControlSlotList = Vec<ControlSlot>;
 /// `refused` ack naming the refusal and recorded as the loop's residual —
 /// never acknowledged as enqueued; a step that only waits for the occupied
 /// command slot stays staged and is re-offered.
+///
+/// The ordering link is dispositioned, never guessed: a delivery's declared
+/// `previous_delivery_digest` is admitted only as
+/// [`PreviousDisposition::Verified`], refused only as
+/// [`PreviousDisposition::Conflict`], and otherwise left staged for a later
+/// poll. A deferred read and an unread predecessor are therefore never
+/// reported as proof, in either direction (audit 5868408122, defect 2).
 pub struct KernelControlReader {
     /// Loader-derived install directory holding the delivery set and spool.
     directory: PathBuf,
@@ -2293,15 +2329,29 @@ impl KernelControlReader {
                 self.refuse_slot(generation, sequence, &delivery, refusal.field, slot_taken);
                 continue;
             }
-            if !self.check_previous(generation, sequence, &delivery, &mut reads) {
-                self.refuse_slot(
-                    generation,
-                    sequence,
-                    &delivery,
-                    "control-previous",
-                    slot_taken,
-                );
-                continue;
+            match self.check_previous(generation, sequence, &delivery, &mut reads) {
+                PreviousDisposition::Verified => {}
+                // A read that ran out of budget is deferred work, not a
+                // finding: stop the walk and resume on the next tick rather
+                // than refusing a delivery whose predecessor was never
+                // compared.
+                PreviousDisposition::BudgetDeferred => return None,
+                // Predecessor evidence is retained but not yet read, so the
+                // declared link was never compared. Leave the delivery staged
+                // and unacknowledged: a later poll reads the evidence.
+                PreviousDisposition::AwaitingEvidence => continue,
+                // Only a compared-and-disagreeing link is a proven conflict,
+                // and only a proven conflict is refused.
+                PreviousDisposition::Conflict => {
+                    self.refuse_slot(
+                        generation,
+                        sequence,
+                        &delivery,
+                        "control-previous",
+                        slot_taken,
+                    );
+                    continue;
+                }
             }
             let kind = identity.control_kind;
             if !class.admits(kind) {
@@ -2377,35 +2427,84 @@ impl KernelControlReader {
         }
     }
 
-    /// Checks the previous-delivery link: sequence zero must open the stream,
-    /// and a later sequence must chain to its retained predecessor. A retired
-    /// predecessor (no ack to check against) cannot wedge the stream: the
-    /// delivery is accepted without the link.
+    /// Resolves one delivery's declared previous-digest link against
+    /// retained predecessor evidence and reports which of the four
+    /// dispositions it earned.
+    ///
+    /// Sequence zero opens the stream, so it verifies only when it declares
+    /// no link; a sequence that declares one there is a proven conflict. A
+    /// later sequence must chain to its retained predecessor, and the link is
+    /// compared against whatever evidence the owner still retains: the
+    /// predecessor ack first (the primary evidence, staged once the
+    /// predecessor was admitted and enqueued), then the staged predecessor
+    /// delivery itself. The second read is what keeps the interruption lane
+    /// honest *and* live: the urgent lane preempts a head `Reconcile` it
+    /// never enqueues, so no ack for that predecessor is ever written, and an
+    /// ack-only check would leave every chained `Cancel`/`Shutdown` with
+    /// permanently absent evidence — admitted unchecked, or never admitted at
+    /// all. The immutable delivery is the owner's own evidence of the digest
+    /// the link names, so comparing it is a comparison, not a bypass.
+    ///
+    /// Absent or undecodable evidence on both paths is
+    /// [`PreviousDisposition::AwaitingEvidence`] — pending, never an
+    /// admission and never a refusal. A spent read budget is
+    /// [`PreviousDisposition::BudgetDeferred`], checked before every read so
+    /// this arm is reachable and deferred work is never reported as a
+    /// finding. Only a compared-and-disagreeing link is
+    /// [`PreviousDisposition::Conflict`].
     fn check_previous(
         &self,
         generation: u64,
         sequence: u64,
         delivery: &WasmControlDelivery,
         reads: &mut usize,
-    ) -> bool {
-        let previous = delivery.identity.previous_delivery_digest.as_ref();
+    ) -> PreviousDisposition {
+        let previous = delivery.identity.previous_delivery_digest.as_deref();
         if sequence == 0 {
-            return previous.is_none();
+            return if previous.is_none() {
+                PreviousDisposition::Verified
+            } else {
+                PreviousDisposition::Conflict
+            };
         }
         if *reads >= CONTROL_POLL_READ_BUDGET {
-            return false;
+            return PreviousDisposition::BudgetDeferred;
         }
         *reads += 1;
-        let path = self
+        let ack_path = self
             .directory
             .join(control_ack_name(generation, sequence - 1));
-        let Ok(bytes) = read_control_bytes(&path) else {
-            return true;
+        if let Ok(bytes) = read_control_bytes(&ack_path)
+            && let Ok(ack) = serde_json::from_slice::<WasmControlAck>(&bytes)
+        {
+            return Self::compare_previous(previous, ack.delivery_digest.as_str());
+        }
+        if *reads >= CONTROL_POLL_READ_BUDGET {
+            return PreviousDisposition::BudgetDeferred;
+        }
+        *reads += 1;
+        let delivery_path = self
+            .directory
+            .join(control_delivery_name(generation, sequence - 1));
+        let Ok(bytes) = read_control_bytes(&delivery_path) else {
+            return PreviousDisposition::AwaitingEvidence;
         };
-        let Ok(ack) = serde_json::from_slice::<WasmControlAck>(&bytes) else {
-            return true;
+        let Ok(staged) = parse_control_delivery(&bytes) else {
+            return PreviousDisposition::AwaitingEvidence;
         };
-        previous.is_some_and(|digest| *digest == ack.delivery_digest)
+        Self::compare_previous(previous, staged.delivery_digest.as_str())
+    }
+
+    /// Compares one declared predecessor link against retained evidence. A
+    /// later sequence with no declared link disagrees with that evidence
+    /// exactly like a mismatching one: only sequence zero may declare no
+    /// link, so a missing declaration is a proven conflict, not a pass.
+    fn compare_previous(previous: Option<&str>, evidence: &str) -> PreviousDisposition {
+        if previous == Some(evidence) {
+            PreviousDisposition::Verified
+        } else {
+            PreviousDisposition::Conflict
+        }
     }
 
     /// Stages one typed refused ack at an exact free slot. Best-effort: a
