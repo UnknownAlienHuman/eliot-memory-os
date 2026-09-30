@@ -115,7 +115,10 @@
 //!   [`admit_canonical_write`], so the fence leg of the W6/A5 dispatch
 //!   revalidation runs on the direct-internal entrypoint. The fuller
 //!   [`revalidate_dispatched_binding`] (live task/scope plus bootstrap/profile
-//!   revision) stays STITCH: no live owner read supplies those live values.
+//!   revision plus the `MaterialEffect` scope-identity legs over the
+//!   gate-supplied retained/observed bindings and source closure) stays STITCH:
+//!   no live caller passes that retained/observed pair — the daemon holds no
+//!   retained `ScopeBinding` — so the owner legs run wired-but-unreached.
 //! - [`DaemonComposition::admit_scope_attach`](super::DaemonComposition) — the
 //!   only caller of [`ScopeAttachIngress`] — has **zero call sites**, and
 //!   `GovernorComposition::admit_observed_scope_attach` fails closed unless a
@@ -1715,6 +1718,18 @@ pub fn resolve_task_selection(
 ///
 /// It reads no caller-supplied `TaskSelectionEvidence`: structural validation
 /// of evidence a request carried is never sufficient here.
+///
+/// Owner seam, stated exactly: the TaskContract revision, `WorkScope`,
+/// principal/session, and fence are rechecked against the live
+/// [`eliot_governor::GovernorActivationSnapshot`], which carries all four;
+/// the acceptance digest and owner-proven selection source/evidence refs rest
+/// on the Governor-compiled receipt (`ColdStartController::compile` through
+/// the retained cold-start terminal) plus structural validation. That snapshot
+/// carries no acceptance digest and no selection source/evidence refs —
+/// verified on this base and on `origin/main` — so a digest/source liveness
+/// recheck against a second live owner value needs that owner extension in
+/// `crates/governor` first; it is named here, never synthesized, never read
+/// from the request.
 pub fn bind_current_task_selection(
     activation: Option<&eliot_governor::GovernorActivationSnapshot>,
     receipt: &OnboardingReadinessReceipt,
@@ -2716,6 +2731,37 @@ pub fn revalidate_dispatched_binding(
     )
 }
 
+/// Renders one non-`MATCHED` `MaterialEffect` trigger report as a
+/// conflict/rebind refusal preserving the exact disposition (issue #1746, W3).
+///
+/// `DIFFERENT_INSTANCE` and `AMBIGUOUS` quarantine: the retained binding is
+/// preserved and only an explicit owner receipt (`rebind_with_receipt`)
+/// establishes a new binding — never a silent move, never a task or memory
+/// transfer, never another scope's memory. `STALE_BINDING` withholds for
+/// refresh/rebind at the live generation. An identity-clear observation
+/// without a `MATCHED` receipt (source closure absent or unmatched — the
+/// provisional case) withholds pending source closure instead of allowing.
+fn material_effect_guard_detail(report: &eliot_workscope::TriggerReport) -> String {
+    match report.identity {
+        eliot_workscope::IdentityLegOutcome::DifferentInstance => {
+            "effect gate scope identity DIFFERENT_INSTANCE: quarantined, retained binding preserved; rebind with an explicit owner receipt, no silent move"
+                .to_owned()
+        }
+        eliot_workscope::IdentityLegOutcome::Ambiguous => {
+            "effect gate scope identity AMBIGUOUS: quarantined, retained binding preserved; rebind with an explicit owner receipt, no silent move"
+                .to_owned()
+        }
+        eliot_workscope::IdentityLegOutcome::StaleBinding => {
+            "effect gate scope identity STALE_BINDING: withheld; refresh or rebind at the live generation, no silent rebind"
+                .to_owned()
+        }
+        eliot_workscope::IdentityLegOutcome::IdentityClear => {
+            "effect gate scope identity is provisional: withheld pending source closure, never allowed without a MATCHED receipt"
+                .to_owned()
+        }
+    }
+}
+
 /// Revalidates one admitted task-bound transition at the effect gate against
 /// the live fence (issue #1746, W6/A5).
 ///
@@ -2742,9 +2788,11 @@ pub fn revalidate_dispatched_binding(
 /// envelope scope, the readiness fence as presented, and the live Governor
 /// kernel-snapshot fence as live. Callers holding a sealed [`DispatchedBinding`]
 /// prefer [`revalidate_dispatched_binding`], which checks the carried
-/// task/scope/bootstrap revision first and delegates here for the fence leg;
-/// that fuller entry stays STITCH until a live owner read supplies the live
-/// task/scope and receipt/profile revisions without invention.
+/// task/scope/bootstrap revision first, runs the `MaterialEffect`
+/// scope-identity legs over the gate-supplied retained/observed bindings,
+/// and delegates here for the fence leg; that fuller entry stays STITCH
+/// until the effect gate passes the retained/observed pair with source
+/// closure without invention.
 pub fn revalidate_task_bound_for_effect(
     evidence: &TaskSelectionEvidence,
     admitted_task_ref: Option<&str>,
