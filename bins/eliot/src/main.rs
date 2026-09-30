@@ -17,7 +17,8 @@ use eliot_installation::{
     InstallationProfile, InstallationStage, InstallationStepOutcome, InstallationTransaction,
     InstallationTransactionStore, PlatformHandle, PostBootstrapRejectionClass, ProfileRootAnchors,
     ProfileSelectionInput, RedbInstallationRegistry, RedbInstallationTransactionStore,
-    WindowsInstallationCoordinator, parse_installation_transaction_id,
+    SystemServiceHostRootReceipt, WindowsInstallationCoordinator,
+    parse_installation_transaction_id,
     post_bootstrap_rejection_pending_ref, require_published_source_bundle_journal,
     validate_installation_transaction_json,
 };
@@ -3435,6 +3436,116 @@ fn open_system_service_host_root(
         .map_err(|error| InstallationError::Platform(error.to_string()))
 }
 
+fn validate_recorded_system_service_host_root_receipt_before_effects(
+    transaction: &InstallationTransaction,
+    transaction_receipt: &SystemServiceHostRootReceipt,
+    candidate_host_state_root: &str,
+    recover: bool,
+) -> std::result::Result<(), InstallationError> {
+    let host_root = open_system_service_host_root(candidate_host_state_root)?;
+    transaction_receipt.validate_against(&host_root, candidate_host_state_root)?;
+
+    let first_install_preprojection = transaction.current_active_manifest.is_none()
+        && transaction.stage() == InstallationStage::Registering
+        && !transaction.has_activation_projection_intent();
+    if first_install_preprojection {
+        if recover {
+            if let Some(registry) = RedbInstallationRegistry::open_existing_at_for_preprojection(
+                host_root,
+                transaction_receipt,
+                candidate_host_state_root,
+            )? {
+                let approved = registry.load()?;
+                if !approved.is_uninitialized_for_system_service_bootstrap() {
+                    return Err(missing_system_service_host_root_receipt(
+                        "first-install registry has projected state before its activation intent",
+                    ));
+                }
+            }
+        } else {
+            let registry = RedbInstallationRegistry::open_at(host_root)?;
+            let approved = registry.load()?;
+            if approved
+                .system_service_host_root_receipt()
+                .is_some_and(|receipt| receipt != transaction_receipt)
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+            if !approved.is_uninitialized_for_system_service_bootstrap() {
+                return Err(missing_system_service_host_root_receipt(
+                    "first-install registry has projected state before its activation intent",
+                ));
+            }
+        }
+        return Ok(());
+    }
+
+    let registry = RedbInstallationRegistry::open_existing_at(host_root)?.ok_or_else(|| {
+        missing_system_service_host_root_receipt(
+            "SystemService registry is missing after its Host-root receipt was committed",
+        )
+    })?;
+    let approved = registry.load()?;
+    let registry_receipt = approved.system_service_host_root_receipt().ok_or_else(|| {
+        missing_system_service_host_root_receipt(
+            "existing SystemService registry has no Host-root receipt",
+        )
+    })?;
+    if registry_receipt != transaction_receipt {
+        return Err(InstallationError::IdentityConflict);
+    }
+    Ok(())
+}
+
+fn inherit_system_service_host_root_receipt_before_effects(
+    store_path: &Path,
+    transaction: &InstallationTransaction,
+    current_host_state_root: &str,
+    candidate_host_state_root: &str,
+) -> std::result::Result<InstallationTransaction, InstallationError> {
+    let existing_host_root = open_system_service_host_root(current_host_state_root)?;
+    let registry = RedbInstallationRegistry::open_existing_at(existing_host_root)?
+        .ok_or_else(|| {
+            missing_system_service_host_root_receipt(
+                "SystemService update has no existing registry from which to inherit the Host-root receipt",
+            )
+        })?;
+    let registry_receipt = registry
+        .load()?
+        .system_service_host_root_receipt()
+        .cloned()
+        .ok_or_else(|| {
+            missing_system_service_host_root_receipt(
+                "existing SystemService registry has no Host-root receipt",
+            )
+        })?;
+    drop(registry);
+
+    // `open_existing_at` retained and validated the old Host object. Reopen
+    // the exact candidate root only while preserving the copied registry
+    // receipt, then prove that it names the same object before persisting
+    // that binding on the update transaction.
+    let candidate_host_root = open_system_service_host_root(candidate_host_state_root)?;
+    registry_receipt.validate_against(&candidate_host_root, candidate_host_state_root)?;
+    let recorded =
+        RedbInstallationTransactionStore::bind_system_service_host_root_receipt_at_exact_path(
+            store_path,
+            &transaction.transaction_id,
+            &registry_receipt,
+            &candidate_host_root,
+        )?;
+    let recorded_receipt = recorded.system_service_host_root_receipt().ok_or_else(|| {
+        missing_system_service_host_root_receipt(
+            "SystemService update did not retain the validated registry Host-root receipt",
+        )
+    })?;
+    if recorded_receipt != &registry_receipt {
+        return Err(InstallationError::IdentityConflict);
+    }
+    recorded_receipt.validate_against(&candidate_host_root, candidate_host_state_root)?;
+    Ok(recorded)
+}
+
 fn ensure_system_service_host_root_receipt_before_effects(
     store_path: &Path,
     transaction: &InstallationTransaction,
@@ -3449,123 +3560,43 @@ fn ensure_system_service_host_root_receipt_before_effects(
         .runtime_launch
         .runtime_state_roots
         .host_state_root;
+    let candidate_host_state_root = candidate_host_state_root.as_str();
     let current_host_state_root = transaction
         .current_active_manifest
         .as_ref()
-        .map(|manifest| &manifest.runtime_launch.runtime_state_roots.host_state_root);
+        .map(|manifest| {
+            manifest
+                .runtime_launch
+                .runtime_state_roots
+                .host_state_root
+                .as_str()
+        });
     if let Some(current_host_state_root) = current_host_state_root
         && !eliot_platform_windows::windows_paths_equal(
-            Path::new(current_host_state_root.as_str()),
-            Path::new(candidate_host_state_root.as_str()),
+            Path::new(current_host_state_root),
+            Path::new(candidate_host_state_root),
         )
     {
         return Err(InstallationError::IdentityConflict);
     }
 
     if let Some(transaction_receipt) = transaction.system_service_host_root_receipt() {
-        let host_root = open_system_service_host_root(candidate_host_state_root.as_str())?;
-        transaction_receipt.validate_against(&host_root, candidate_host_state_root.as_str())?;
-
-        let first_install_preprojection = transaction.current_active_manifest.is_none()
-            && transaction.stage() == InstallationStage::Registering
-            && !transaction.has_activation_projection_intent();
-        if first_install_preprojection {
-            if recover {
-                if let Some(registry) =
-                    RedbInstallationRegistry::open_existing_at_for_preprojection(
-                        host_root,
-                        transaction_receipt,
-                        candidate_host_state_root.as_str(),
-                    )?
-                {
-                    let approved = registry.load()?;
-                    if !approved.is_uninitialized_for_system_service_bootstrap() {
-                        return Err(missing_system_service_host_root_receipt(
-                            "first-install registry has projected state before its activation intent",
-                        ));
-                    }
-                }
-            } else {
-                let registry = RedbInstallationRegistry::open_at(host_root)?;
-                let approved = registry.load()?;
-                if approved
-                    .system_service_host_root_receipt()
-                    .is_some_and(|receipt| receipt != transaction_receipt)
-                {
-                    return Err(InstallationError::IdentityConflict);
-                }
-                if !approved.is_uninitialized_for_system_service_bootstrap() {
-                    return Err(missing_system_service_host_root_receipt(
-                        "first-install registry has projected state before its activation intent",
-                    ));
-                }
-            }
-            return Ok(transaction.clone());
-        }
-
-        let registry = RedbInstallationRegistry::open_existing_at(host_root)?;
-        let registry = registry.ok_or_else(|| {
-            missing_system_service_host_root_receipt(
-                "SystemService registry is missing after its Host-root receipt was committed",
-            )
-        })?;
-        let approved = registry.load()?;
-        let registry_receipt = approved.system_service_host_root_receipt().ok_or_else(|| {
-            missing_system_service_host_root_receipt(
-                "existing SystemService registry has no Host-root receipt",
-            )
-        })?;
-        if registry_receipt != transaction_receipt {
-            return Err(InstallationError::IdentityConflict);
-        }
+        validate_recorded_system_service_host_root_receipt_before_effects(
+            transaction,
+            transaction_receipt,
+            candidate_host_state_root,
+            recover,
+        )?;
         return Ok(transaction.clone());
     }
 
     if let Some(current_host_state_root) = current_host_state_root {
-        let existing_host_root = open_system_service_host_root(current_host_state_root.as_str())?;
-        let registry = RedbInstallationRegistry::open_existing_at(existing_host_root)?
-            .ok_or_else(|| {
-                missing_system_service_host_root_receipt(
-                    "SystemService update has no existing registry from which to inherit the Host-root receipt",
-                )
-            })?;
-        let registry_receipt = registry
-            .load()?
-            .system_service_host_root_receipt()
-            .cloned()
-            .ok_or_else(|| {
-                missing_system_service_host_root_receipt(
-                    "existing SystemService registry has no Host-root receipt",
-                )
-            })?;
-        drop(registry);
-
-        // `open_existing_at` retained and validated the old Host object. Reopen
-        // the exact candidate root only while preserving the copied registry
-        // receipt, then prove that it names the same object before persisting
-        // that binding on the update transaction.
-        let candidate_host_root =
-            open_system_service_host_root(candidate_host_state_root.as_str())?;
-        registry_receipt
-            .validate_against(&candidate_host_root, candidate_host_state_root.as_str())?;
-        let recorded =
-            RedbInstallationTransactionStore::bind_system_service_host_root_receipt_at_exact_path(
-                store_path,
-                &transaction.transaction_id,
-                &registry_receipt,
-                &candidate_host_root,
-            )?;
-        let recorded_receipt = recorded.system_service_host_root_receipt().ok_or_else(|| {
-            missing_system_service_host_root_receipt(
-                "SystemService update did not retain the validated registry Host-root receipt",
-            )
-        })?;
-        if recorded_receipt != &registry_receipt {
-            return Err(InstallationError::IdentityConflict);
-        }
-        recorded_receipt
-            .validate_against(&candidate_host_root, candidate_host_state_root.as_str())?;
-        return Ok(recorded);
+        return inherit_system_service_host_root_receipt_before_effects(
+            store_path,
+            transaction,
+            current_host_state_root,
+            candidate_host_state_root,
+        );
     }
 
     let progressed = transaction.effect_progress().iter().any(|progress| {
@@ -4644,15 +4675,12 @@ fn run_installation_effect(
                         }
                     },
                 };
-                let recorded_root_receipt = match recorded.system_service_host_root_receipt() {
-                    Some(receipt) => receipt,
-                    None => {
-                        write_installation_error(
-                            "INSTALLATION_APPLY_RECOVERY_REQUIRED",
-                            "Host-root receipt persistence returned without a durable SystemService receipt",
-                        );
-                        return Ok(UNKNOWN_OUTCOME_EXIT);
-                    }
+                let Some(recorded_root_receipt) = recorded.system_service_host_root_receipt() else {
+                    write_installation_error(
+                        "INSTALLATION_APPLY_RECOVERY_REQUIRED",
+                        "Host-root receipt persistence returned without a durable SystemService receipt",
+                    );
+                    return Ok(UNKNOWN_OUTCOME_EXIT);
                 };
                 if let Err(error) =
                     recorded_root_receipt.validate_against(&host_root, host_state_root.as_str())
@@ -4926,18 +4954,15 @@ fn run_installation_effect(
                     );
                     return Ok(INVALID_REQUEST_EXIT);
                 }
-                let selection = match current.profile_selection_receipt() {
-                    Some(selection) => selection,
-                    None => {
-                        let error = InstallationError::MigrationRequired {
-                            reason: "current-user bootstrap transaction has no persisted profile selection receipt".to_owned(),
-                        };
-                        write_installation_error(
-                            "INSTALLATION_APPLY_RECOVERY_REQUIRED",
-                            &error.to_string(),
-                        );
-                        return Ok(INVALID_REQUEST_EXIT);
-                    }
+                let Some(selection) = current.profile_selection_receipt() else {
+                    let error = InstallationError::MigrationRequired {
+                        reason: "current-user bootstrap transaction has no persisted profile selection receipt".to_owned(),
+                    };
+                    write_installation_error(
+                        "INSTALLATION_APPLY_RECOVERY_REQUIRED",
+                        &error.to_string(),
+                    );
+                    return Ok(INVALID_REQUEST_EXIT);
                 };
                 let registry = match RedbInstallationRegistry::open_user_owned_at(
                     host_root,
@@ -5205,18 +5230,9 @@ fn rollback_with_activation_owner(
     coordinator.rollback_with_activation_owner(host_state_root, &host, transaction_id)
 }
 
-/// Reconciles only an exact Host-committed registry terminal.  A missing
-/// terminal is the expected fenced first-install state and remains pending;
-/// this query never starts services, rewrites descriptors, or retries a
-/// credential/SCM effect.
-fn reconcile_host_activation_terminal(
-    store_path: &Path,
+fn inspect_host_activation_registry_for_terminal(
     transaction: &InstallationTransaction,
-    complete_user_mode_task: bool,
-) -> Result<Option<InstallationStepOutcome>, InstallationError> {
-    if uses_user_owned_supervision(transaction.profile) {
-        revalidate_recorded_profile_selection_receipt(store_path, transaction)?;
-    }
+) -> Result<Option<RedbInstallationRegistry>, InstallationError> {
     let host_state_root = Path::new(
         transaction
             .candidate_manifest
@@ -5225,14 +5241,11 @@ fn reconcile_host_activation_terminal(
             .host_state_root
             .as_str(),
     );
-    let registry = match transaction.profile {
+    match transaction.profile {
         InstallationProfile::SystemService => {
             let host_root = ProtectedRootLease::open_existing(host_state_root)
                 .map_err(|error| InstallationError::Platform(error.to_string()))?;
-            let Some(registry) = RedbInstallationRegistry::inspect_existing_at(host_root)? else {
-                return Ok(None);
-            };
-            registry
+            RedbInstallationRegistry::inspect_existing_at(host_root)
         }
         InstallationProfile::UserMode | InstallationProfile::PortableDev => {
             let host_root = UserOwnedRootLease::open_existing(host_state_root)
@@ -5271,14 +5284,28 @@ fn reconcile_host_activation_terminal(
             host_root
                 .verify_stable_identity()
                 .map_err(|error| InstallationError::Platform(error.to_string()))?;
-            let Some(registry) = RedbInstallationRegistry::inspect_existing_user_owned_at(
+            RedbInstallationRegistry::inspect_existing_user_owned_at(
                 host_root,
                 transaction.profile,
-            )? else {
-                return Ok(None);
-            };
-            registry
+            )
         }
+    }
+}
+
+/// Reconciles only an exact Host-committed registry terminal.  A missing
+/// terminal is the expected fenced first-install state and remains pending;
+/// this query never starts services, rewrites descriptors, or retries a
+/// credential/SCM effect.
+fn reconcile_host_activation_terminal(
+    store_path: &Path,
+    transaction: &InstallationTransaction,
+    complete_user_mode_task: bool,
+) -> Result<Option<InstallationStepOutcome>, InstallationError> {
+    if uses_user_owned_supervision(transaction.profile) {
+        revalidate_recorded_profile_selection_receipt(store_path, transaction)?;
+    }
+    let Some(registry) = inspect_host_activation_registry_for_terminal(transaction)? else {
+        return Ok(None);
     };
     let receipt = match registry.read_committed_activation_receipt(
         &transaction.transaction_id,
