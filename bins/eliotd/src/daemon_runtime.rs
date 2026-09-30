@@ -5656,7 +5656,8 @@ enum ImprovementIntakeFlight {
 /// branch of the improvement funnel, which is the one place a maintenance
 /// result is least likely to be interesting and most likely to be dropped.
 ///
-/// Two reads and one pure assembly, all under the lock:
+/// Two reads and one pure assembly, all under the lock, over evidence the caller
+/// already read and decisions it already claimed:
 ///
 /// - the admitted Kernel fence for this pass, which is also the fence the
 ///   deduplication registry is read back at;
@@ -5780,18 +5781,24 @@ fn improvement_intake_artifact(
 /// bounded by [`IMPROVEMENT_DECISION_DRAIN_BOUND`] — the Kernel's own declared
 /// retained ceiling for that queue, and the maximum number of answers a queue of
 /// that size can return before an empty one — and stops at the first empty
-/// answer. An entry this pass then cannot place is REPORTED here by name rather
-/// than dropped: `improvement_intake_dispatch::record_brief_disposition` records
-/// an entry only when its `brief_id` names the brief this pass assembled, and an
-/// entry naming any other brief revision has no `Candidate` artifact on this
-/// pass to be recorded against. The owner's selection is therefore visible in the
-/// daemon's own operational surface as an unplaced claim instead of vanishing,
-/// and the note names exactly which `brief_id` it was made over.
+/// answer. An entry this pass then cannot place is REPORTED, not dropped:
+/// `improvement_intake_dispatch::record_brief_disposition` records an entry only
+/// when its `brief_id` names the brief this pass assembled, and an entry naming
+/// any other brief revision has no `Candidate` artifact on this pass to be
+/// recorded against. [`report_owner_decision_placement`] names each such entry,
+/// so the owner's selection is visible in the daemon's own operational surface
+/// as an unplaced claim instead of vanishing.
 ///
 /// The bound is not a substitute for a requeue and does not pretend to be: the
 /// loss is a property of the claim API, it is named in the module documentation
 /// of `improvement_intake_dispatch` under "The residual loss, measured", and
-/// repairing it needs a peek on the Kernel side, not a different loop here.
+/// repairing it needs a peek on the Kernel side, not a different loop here. An
+/// entry the Kernel itself dropped before this drain — its queue is bounded
+/// process memory, so a restart loses what it holds — is not observable from here
+/// at all, and the claim answer for an empty queue is the same `null`; that
+/// absence and the symbols that would close it are named in
+/// `improvement_intake_dispatch`'s "Undecided is not representable, and the gap
+/// is named rather than faked".
 async fn claim_owner_decisions(
     kernel: &Arc<DaemonKernelClient>,
 ) -> Result<Vec<ClaimedOwnerDecision>, eliotd::DaemonError> {
@@ -5819,6 +5826,53 @@ async fn claim_owner_decisions(
                 reported without being placed",
     );
     Ok(claimed)
+}
+
+/// Reports every claimed owner decision this pass did not record against the
+/// brief it assembled (issue #1867 A2, I12.24:65).
+///
+/// # Why the report exists at all
+///
+/// The Kernel's claim is a destructive pop with no peek and no requeue, so an
+/// entry this drain removed is already gone by the time this pass knows whether
+/// it can be placed. This function is the only trace such an entry leaves: the
+/// `eliotd.improvement_owner_decision_claimed` line at the drain says the entry
+/// arrived, and this one says whether anything was recorded from it. Without it
+/// an owner's selection would vanish with no record that it ever existed.
+///
+/// `placed_brief_id` is the brief this pass actually recorded against, and
+/// `None` means the assembly refused and there is no brief to record on at all —
+/// the STRANDED case, in which every claimed entry is lost. The comparison is
+/// exact string equality on the content-derived `brief_id`, the same comparison
+/// `improvement_intake_dispatch::record_brief_disposition` makes, so this report
+/// and the record cannot disagree about which entry was placed.
+///
+/// It reports and does not repair: `KernelComposition::claim_owner_decision`
+/// offers no requeue, and fabricating a `Candidate` artifact for a brief
+/// revision this pass never assembled would be inventing a candidate this
+/// daemon never observed.
+fn report_owner_decision_placement(
+    claimed: &[ClaimedOwnerDecision],
+    placed_brief_id: Option<&str>,
+) {
+    for entry in claimed {
+        if placed_brief_id.is_some_and(|placed| placed == entry.brief_id) {
+            continue;
+        }
+        tracing::warn!(
+            target: "eliotd::diagnostics",
+            event = "eliotd.improvement_owner_decision_unplaced",
+            brief_id = %entry.brief_id,
+            decision = %entry.decision,
+            principal = %entry.principal,
+            assembled_brief_id = placed_brief_id.unwrap_or("<assembly refused>"),
+            note = "the Kernel's owner-decision claim removed this entry and exposes no peek and \
+                    no requeue, so this selection is reported here and is NOT recorded against any \
+                    brief: the brief revision it names is not the one this pass assembled, or the \
+                    assembly refused. The entry's own brief_id is named above; no Candidate \
+                    artifact is fabricated for it",
+        );
+    }
 }
 
 /// Admits the assembled artifact into the deduplication registry restored from
@@ -5978,22 +6032,42 @@ fn admit_over_restored_registry(
 /// the SAME committed artifact shape is seen by this pass with no additional
 /// read and needs no new record kind or document shape.
 ///
-/// What phase 1c adds is the WRITE half of that pair, and it is now present:
+/// What phase 1d adds is the WRITE half of that pair, and it is now present:
 /// the Kernel's operator route answers an authenticated
 /// `UserAutomationOperation::DecideImprovementBrief` through
 /// `KernelComposition::queue_owner_decision_response`, which admits the
 /// selection into that bounded queue, and the Kernel serves the claim leg to
 /// this poll. So the `owner_decision` in a row this pass commits is an owner's
-/// own selection — carrying the principal that owner's Session authenticated —
-/// whenever one named the brief; and it is this daemon's own triage, under
-/// `SERVICE_NAME`, only when none did. `assemble_improvement_artifact` chooses
-/// between the two and the recorded `owner` field is what tells a later reader
-/// which happened.
+/// own PRESENTED selection — carrying the principal that owner's Session
+/// authenticated — whenever a claim named the brief, and otherwise it is the
+/// disposition the maintenance (`G-19`) owner ISSUED from its own recorded
+/// state. `assemble_improvement_artifact` chooses between the two through
+/// `improvement_intake_dispatch::record_brief_disposition`, and the recorded
+/// `owner` field is what tells a later reader which happened; this daemon's own
+/// service identity is on neither arm.
 ///
-/// The phase 1d claim is a destructive pop with no requeue, so an entry this
-/// pass cannot place, and an entry stranded by an assembly refusal immediately
-/// after, are the residual this API shape allows. Both are named at the claim
-/// site and in `improvement_intake_dispatch`'s "The residual loss, measured".
+/// # What the claim's own loss is, and what this pass can say about it
+///
+/// The phase 1d claim is a destructive pop with no peek and no requeue, so
+/// three things can go missing and this pass REPORTS each rather than absorbing
+/// it. See `report_owner_decision_placement` for the placed/unplaced
+/// accounting and `claim_owner_decisions` for the drain's own bound:
+///
+/// - an entry naming a brief revision this pass is not assembling is unplaced,
+///   and is named here with its `brief_id` and the principal that selected over
+///   it;
+/// - every entry claimed into a pass whose assembly refused immediately after is
+///   stranded, and is named the same way;
+/// - an entry the Kernel never held, because the bounded queue is process memory
+///   and a restart dropped it, is NOT observable from here at all: the claim
+///   answer for an empty queue and the answer after a lost entry are the same
+///   `null`. The note on the issued disposition therefore claims only that no
+///   claim NAMING THIS BRIEF REVISION was observed on this pass. The exact
+///   symbols that would let this daemon say more — an `Undecided` member on
+///   `OwnerDecisionKind`, an `Option` on `ImprovementArtifact::decision`, and a
+//!   queue depth or epoch on the `improvement_decision_claim` answer — are named
+///   in `improvement_intake_dispatch`'s "Undecided is not representable, and
+///   the gap is named rather than faked".
 async fn run_improvement_intake(
     kernel: &Arc<DaemonKernelClient>,
     composition: &SharedComposition,
@@ -6080,17 +6154,20 @@ async fn run_improvement_intake(
     // this pass can strand. See `claim_owner_decisions`.
     //
     // An exchange failure is this phase's own diagnostic and STOPS the pass: a
-    // pass that cannot read the owner queue must not record a daemon triage as
-    // though no owner had ruled, because it does not know that. Retaining
-    // nothing new and reporting is the honest outcome; the prior admitted record
-    // stays.
+    // pass that could not read the owner queue does not know whether an owner
+    // presented a selection over this brief, so it must not record the no-claim
+    // arm's issued disposition as though it had observed that none did.
+    // Retaining nothing new and reporting is the honest outcome; the prior
+    // admitted record stays.
     //
     // RESIDUAL, stated rather than hidden: the claim above is destructive, so an
     // assembly refusal in the very next block strands the entries claimed into
-    // it. This is the same property of the claim API as the unplaced-entry loss
-    // named in `claim_owner_decisions` — the Kernel offers no peek and no
-    // requeue — and it is the reason the claim is the last thing before the
-    // assembly rather than the first thing in the pass.
+    // it, and an entry this pass does not place is unplaced. Both are REPORTED by
+    // `report_owner_decision_placement` on either outcome. This is the same
+    // property of the claim API as the unplaced-entry loss named in
+    // `claim_owner_decisions` — the Kernel offers no peek and no requeue — and it
+    // is the reason the claim is the last thing before the assembly rather than
+    // the first thing in the pass.
     let claimed_owner_decisions = match claim_owner_decisions(kernel).await {
         Ok(claimed) => claimed,
         Err(error) => {
@@ -6122,11 +6199,21 @@ async fn run_improvement_intake(
                 &error,
             )
             .emit();
+            // The claim above was destructive, so every entry it returned is
+            // STRANDED by this refusal: the Kernel offers no peek and no requeue,
+            // and there is no brief here to record one against. Reported by name
+            // rather than dropped, so an owner's selection is visible as a loss
+            // instead of vanishing.
+            report_owner_decision_placement(&claimed_owner_decisions, None);
             // A pass that never assembled a candidate reached no route, so it
             // retains nothing new; the prior admitted record stays.
             return retained.cloned();
         }
     };
+    // The claim was destructive, so the accounting has to be explicit: an entry
+    // naming any brief revision other than the one this pass assembled is
+    // unplaced, and the Kernel cannot be asked to serve it again.
+    report_owner_decision_placement(&claimed_owner_decisions, Some(&artifact.brief.brief_id));
     // The deduplication registry, read back from the records this daemon
     // committed, at the fence this pass admitted under. Unguarded: the read is
     // an authenticated Kernel exchange and the composition guard is not held

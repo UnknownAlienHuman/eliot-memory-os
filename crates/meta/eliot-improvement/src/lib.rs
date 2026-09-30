@@ -72,7 +72,7 @@
 //! | `ImprovementCandidate::validate` | `improvement_dedup_read.rs:639` (and internally at `evidence_sources.rs:114`, `brief.rs:317`) |
 //! | `brief::SafeBoundary::from_observed_closure_record` | `improvement_intake_dispatch.rs:829` |
 //! | `brief::brief_at_safe_boundary` | `improvement_intake_dispatch.rs:823` |
-//! | `brief::record_owner_decision` | `improvement_intake.rs:46` (from `improvement_intake_dispatch.rs:994`) |
+//! | `brief::record_owner_decision` | `improvement_intake.rs:46`, reached from `improvement_intake_dispatch::record_claimed_owner_disposition` and from `::record_owner_disposition` (the two production call sites, one per disposition arm) |
 //! | `application_class::classify` | `improvement_intake_dispatch.rs:1488` |
 //! | `application_class::check_class_gate` | `improvement_intake_dispatch.rs:1490` |
 //! | `application_class::ChangeDescriptor::from_recorded_surface` | `improvement_intake_dispatch.rs:1487` |

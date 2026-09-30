@@ -6036,8 +6036,9 @@ impl KernelComposition {
     ///
     /// The reason names the principal the Session proved, the brief the
     /// selection was made over, and the one claim leg that still owes a
-    /// readback, so a later reader of the answer can tell an owner's selection
-    /// from the daemon's own triage of its own observation.
+    /// readback, so a later reader of the answer can tell an owner's PRESENTED
+    /// selection from the disposition the maintenance owner issues on its own
+    /// recorded verdict when no claim named a brief.
     #[cfg(windows)]
     fn owner_decision_queued_response(
         request: &eliot_kernel_service::UserAutomationServiceRequest,

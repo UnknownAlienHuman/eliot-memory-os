@@ -385,11 +385,11 @@
 //! because reaching them would require a work item or an experiment this intake
 //! does not hold, and both are mutating kinds.
 //!
-//! # What is still missing: no Human presents a selection, and the BRIEF reaches
-//! no owner by itself
+//! # What is still missing: the BRIEF reaches no owner by itself
 //!
-//! Claiming closes HOW a decision reaches this module, not how a Human learns
-//! the brief exists. Measured on this tree rather than assumed:
+//! The ingress closes HOW a decision reaches this module. It does not close how a
+//! Human learns the brief exists, and nothing else on this path does either.
+//! Measured on this tree rather than assumed:
 //!
 //! | candidate ingress surface | measured result |
 //! |---|---|
@@ -729,11 +729,13 @@ const IMPROVEMENT_SURFACE_NAME: ImprovementTargetSurface = ImprovementTargetSurf
 /// sole admission owner for `meta.learning.closure` and
 /// `meta.improvement.promotion_input` candidates
 /// (`crates/governor/eliot-maintenance/src/improvement_admission.rs:3-4`).
-/// It names an ADMISSION authority and nothing else, and is deliberately not
-/// the `owner` of the recorded decision below: that value names the principal
-/// that SELECTED the disposition, and no admission authority has selected one.
-/// See "The recorded disposition is the DAEMON's own, and no owner ingress
-/// exists" in the module documentation.
+/// It names an ADMISSION authority and nothing else, and it is deliberately not
+/// the `owner` of the recorded decision below: that value is COPIED OUT of the
+/// admission policy record by
+/// [`eliot_maintenance::select_non_mutating_disposition`], so a caller cannot
+/// substitute this constant (or any other) for a principal that issued a
+/// selection. See "What the recorded disposition IS, on the two arms this module
+/// now has" in the module documentation.
 const IMPROVEMENT_OWNER: &str = IMPROVEMENT_ADMISSION_AUTHORITY;
 
 /// Closed store scope for durable improvement-candidate learning records.
