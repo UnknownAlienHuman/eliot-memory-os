@@ -1138,6 +1138,27 @@ pub fn issue_process_admission(
     {
         return Err(TestdError::InvalidBinding);
     }
+    // Closed-template argv gate (issue #1814 W1): the sealed process argv
+    // must equal the fixed argv the closed testd binding seals for the
+    // requested profile and slot suffix. Identity, fence, roots, and
+    // generation are proved above; this compares content, so an
+    // agent-composed argv combination fails before any grant exists. No
+    // private map is consulted: the binding is recomputed from the closed
+    // registry in this owner crate on every issuance.
+    let slot_suffix: &[String] = if is_slotted_testd_profile(&request.invocation.profile) {
+        &request.invocation.arguments
+    } else {
+        &[]
+    };
+    let binding = testd_profile_binding_with_slots(
+        &request.invocation.profile,
+        evidence.process.executable_sha256(),
+        slot_suffix,
+    )
+    .map_err(|_| TestdError::InvalidBinding)?;
+    if evidence.process.argv() != binding.fixed_argv.as_slice() {
+        return Err(TestdError::InvalidBinding);
+    }
     let grant = ExecutionContourGrant::issue(
         evidence.contour_root,
         request.job_id.clone(),

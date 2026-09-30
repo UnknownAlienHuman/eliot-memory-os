@@ -1154,6 +1154,40 @@ pub fn reconcile_testd_delivery(
         && admission.generation == request.generation)
 }
 
+/// Revalidates the consuming process argv against the closed testd template
+/// at dispatch, immediately before process creation.
+///
+/// The envelope, invocation, fence, generation, kernel admission, and slot
+/// schema are already proved above; this compares content. The closed
+/// binding is recomputed from the presented invocation profile, its slot
+/// suffix, and the process request's own executable digest, and the request
+/// argv must equal the binding's sealed fixed argv. A composed request whose
+/// argv skews from the admitted template fails closed here with a typed
+/// admission failure and never reaches the executor.
+fn check_drive_closed_argv(
+    invocation: &InstrumentInvocation,
+    process: &ProcessRequest,
+) -> Result<(), TestdIpcError> {
+    let slot_suffix: &[String] =
+        if eliot_testd_core::is_slotted_testd_profile(&invocation.profile) {
+            &invocation.arguments
+        } else {
+            &[]
+        };
+    let binding = eliot_testd_core::testd_profile_binding_with_slots(
+        &invocation.profile,
+        process.executable_sha256(),
+        slot_suffix,
+    )
+    .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+    if process.argv() != binding.fixed_argv.as_slice() {
+        return Err(TestdIpcError::Contract(
+            "testd process argv differs from the admitted closed template".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Drives exactly one admitted one-shot admission to exactly one typed
 /// outcome.
 ///
@@ -1258,6 +1292,7 @@ where
             job_id: request.job_id.clone(),
         });
     }
+    check_drive_closed_argv(&invocation, &process)?;
     match executor.start(process, sink).await {
         Ok(_receipt) => Ok(TestdDriveOutcome::Completed {
             job_id: request.job_id.clone(),

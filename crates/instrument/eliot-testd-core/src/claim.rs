@@ -443,7 +443,7 @@ mod tests {
                 generation,
                 "C:\\tools\\worker.exe",
                 "c".repeat(64),
-                vec!["--check".to_owned()],
+                vec!["--version".to_owned()],
                 source_root,
                 EnvironmentProjection::new(
                     BTreeMap::from([

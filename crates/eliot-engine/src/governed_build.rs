@@ -387,8 +387,8 @@ impl<E: ProcessExecutor + 'static> GovernedBuildRuntime<E> {
         })
     }
 
-    /// Runs one admitted profile DAG end to end: compile, plan, launch,
-    /// aggregate.
+    /// Runs one admitted profile DAG end to end: compile, plan, live-admit,
+    /// launch, aggregate.
     ///
     /// The profile name compiles through the single [`ProfileCompiler`], so
     /// the same admitted name always resolves to the same revision and stage
@@ -396,11 +396,13 @@ impl<E: ProcessExecutor + 'static> GovernedBuildRuntime<E> {
     /// here; the single-invocation [`GovernedBuildRuntime::run`] path keeps
     /// serving it. Every planned stage launches through the existing
     /// [`InstrumentRunner`]/[`ProcessExecutor`](eliot_process::ProcessExecutor)
-    /// composition with caller-supplied [`StageLauncher`] provisions, and the
-    /// returned [`ProfileAggregate`] retains every success, partial-failure,
-    /// missing-stage, and evidence-handle state. A non-successful aggregate
-    /// is refused as an error instead of being representable as successful
-    /// verification.
+    /// composition with caller-supplied [`StageLauncher`] provisions, admitted
+    /// at use against the live registry the profile compiled against, so a
+    /// replaced spec, parser, receipt, or route becomes a missing stage
+    /// instead of a launch. The returned [`ProfileAggregate`] retains every
+    /// success, partial-failure, missing-stage, and evidence-handle state. A
+    /// non-successful aggregate is refused as an error instead of being
+    /// representable as successful verification.
     ///
     /// # Errors
     ///
@@ -427,7 +429,10 @@ impl<E: ProcessExecutor + 'static> GovernedBuildRuntime<E> {
                 service: "instrument-profile".to_owned(),
                 reason: format!("profile execution requires a governed admission: {error}"),
             })?;
-        let aggregate = self.runner.run_profile_stages(admitted, launcher).await;
+        let aggregate = self
+            .runner
+            .run_profile_stages_live(&instrument_registry, admitted, launcher)
+            .await;
         if aggregate.is_success() {
             Ok(aggregate)
         } else {

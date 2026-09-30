@@ -1265,6 +1265,26 @@ impl<E: ProcessExecutor + 'static> InstrumentRunner<E> {
         let runs = StageOrchestrator::launch_plan(self, &plan, launcher).await;
         ProfileAggregate::assemble(&plan, runs)
     }
+
+    /// Runs one admitted profile end to end against the live registry: plan,
+    /// live-admit, launch, aggregate.
+    ///
+    /// This is the caller-side consumption of [`AdmittedStage::admit_live`]:
+    /// the plan carries the compiled-against registry generation and digest,
+    /// and every stage admits against the registry held here, so a spec,
+    /// parser, supply-chain receipt, or route replaced after compilation
+    /// becomes an explicit missing run instead of a launch. Historical run
+    /// evidence is untouched: this path only gates new admission.
+    pub async fn run_profile_stages_live(
+        &self,
+        registry: &InstrumentRegistry,
+        admitted: &AdmittedProfile,
+        launcher: &dyn StageLauncher,
+    ) -> ProfileAggregate {
+        let plan = StageOrchestrator::plan(admitted);
+        let runs = StageOrchestrator::launch_plan_live(self, registry, &plan, launcher).await;
+        ProfileAggregate::assemble(&plan, runs)
+    }
 }
 
 /// Production [`StageLauncher`] serving composition-root-admitted invocations.
