@@ -88,8 +88,8 @@ jobs:
       # invoke #1229's one declared preparation entrypoint on the clean runner
       # before the read-only offline gate, exactly as
       # scripts/verify-dependency-policy.py names it (PREPARATION_ENTRYPOINT,
-      # line 3769) and for the profile that gate actually runs (offline-source,
-      # scripts/verify.ps1 line 72). That entrypoint owns discovery of the
+      # line 3769) and for the profile that gate actually runs (offline-source).
+      # That entrypoint owns discovery of
       # pinned scanner identity, of the project-local Surreal provisioner, and
       # of the standalone resolver inputs; this file no longer re-implements
       # that discovery and no longer declines a leg. The only operations kept
@@ -214,8 +214,11 @@ jobs:
           exit $LASTEXITCODE
 
       # Quarantined legacy lane (issue #1813 W6): the MergeCompile gates
-      # execute cargo/dotnet directly with no governed profile receipt.
-      # Thin-invoker migration awaits W4 stage-execution provisions.
+      # execute cargo/dotnet directly with no governed PER-GATE receipt. The
+      # profile ADMISSION is governed, and it happens inside the shared owner:
+      # that owner performs the minimal bootstrap build (I18.21:14) and then
+      # calls eliot-profile-resolver, so this file names no verifier command,
+      # no alias, and no second gate-order source at all.
       - name: Run MergeCompile verification profile
         shell: pwsh
         run: pwsh -NoProfile -File scripts/verify.ps1 -Profile MergeCompile
@@ -255,9 +258,9 @@ jobs:
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Python dependencies: hash-locked requirements-verification.txt"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- NuGet: locked-mode restore of Eliot.Operator and Eliot.Operator.Tests packages.lock.json files"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Operator harness: built, zero execution; no Operator test claim"
-          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Profile: MergeCompile (sole gate-definition owner scripts/verify.ps1, closed MergeCompile profile); the versioned verification routes are named only by their closed profile aliases (package-verification, bundle-verification), never as a command list"
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Profile: MergeCompile (sole gate-definition owner scripts/verify.ps1, closed MergeCompile profile); the versioned verification routes are named only by their closed profile aliases, which the shared owner resolves through eliot_instrument_runner::profile::PROFILE_ALIASES, never as a command list"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Package denominator: exact count bound at runtime by VERIFY_WORKSPACE_MEMBERS and VERIFY_DENOMINATOR lines (cargo metadata --locked --no-deps)"
-          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Gate order: not restated here (issue #1914 W4). This run names closed profile aliases only — package-verification, bundle-verification (eliot_instrument_runner::profile::PROFILE_ALIASES) — and the authoritative order, every gate state, and the denominator come solely from the shared owner scripts/verify.ps1 -Profile MergeCompile, recorded in this run's VERIFY_RESULT / VERIFY_GATE / VERIFY_DENOMINATOR lines. A gate this file names but the owner does not select, or the reverse, fails here; there is no second gate-order source"
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Gate order: not restated in this file (issue #1914 W4). The single executed gate list and the single executed profile admission are the shared owner's: the MergeCompile step above enters that owner, which builds the verifier/runner bootstrap, resolves its closed profile alias, issues this run's VerificationProfileReceipt, and records it in its VERIFY_PROFILE_* lines. No step in this workflow restates a verifier command list, names a profile alias, or selects a gate."
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Gate states: every mandatory gate reports pass/fail-exit/fail-exception/cancelled/not-run via VERIFY_GATE; any nonpass fails this check"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Cache: key binds OS+toolchain+lockfile+profile+event-class; fork pull requests restore-only; hit/miss run the same gates; no pass receipt from cache"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Proof ceiling: MERGE_COMPILE_SOURCE_ONLY (compile-only; zero test execution; no lint-cleanliness claim; not Review/release/source-candidate, not installed-runtime/store/Product-Pulse proof)"

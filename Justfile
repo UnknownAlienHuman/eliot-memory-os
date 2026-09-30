@@ -139,7 +139,12 @@ sync-skills:
 # Bounded Quick profile as ordered by scripts/verify.ps1 -Profile Quick. Quick
 # success is never Review/release proof. The dependency list below is the
 # retained just-quick baseline pinned by scripts/docs_closure_audit.py
-# (DOC-GATE-JUST); it runs each bounded gate once.
+# (DOC-GATE-JUST) and by the repository-policy WIRING checker; it runs each
+# bounded gate once and is deliberately not routed through the shared profile
+# owner, so unlike `verify`/`merge-compile` it does not perform the versioned
+# profile admission (issue #1914 W2/W4). `verify` and `merge-compile` below are
+# the local entrypoints that reach the one shared resolver; `just quick` is a
+# bounded source oracle baseline and claims no versioned-profile parity.
 # Quarantined legacy verification lane (issue #1813 W6): the cargo recipes below execute
 # directly with no governed profile receipt. Thin-invoker migration to the same named
 # profile awaits W4 stage-execution provisions; until then no governed claim rests on
@@ -147,6 +152,9 @@ sync-skills:
 quick: docs-shards-self-test docs-shards docs-router-self-test docs-router docs-read-self-test doc-code-conformance-self-test doc-code-conformance code-navigation-self-test code-navigation docs-closure-audit standalone-crates cognitive-donor-dispositions core-daemon-inventory-self-test core-daemon-inventory normative architecture-boundaries-self-test architecture-boundaries agent-guardrails-self-test agent-guardrails agent-route-bundles-self-test agent-route-bundles runtime-source-hygiene-self-test runtime-source-hygiene agent-bridge-protocol-self-test agent-bridge-protocol metadata fmt-check check
 
 # Complete locked Review profile, sole definition in scripts/verify.ps1.
+# Thin invoker only: the shared owner below performs the minimal bootstrap
+# build and then resolves the closed profile alias through the one shared
+# resolver, so this recipe holds no verifier command list of its own.
 verify:
     pwsh -NoProfile -File scripts/verify.ps1 -Profile Review
 
@@ -156,7 +164,9 @@ verify-review:
 
 # Automatic merge compile check (accepted issue #3004); sole definition in
 # scripts/verify.ps1. Compile-only: zero test execution, no lint-cleanliness
-# claim. Same versioned profile the automatic ci.yml check invokes.
+# claim. It enters the same owner, the same closed alias, and the same
+# resolver that the automatic ci.yml check reaches through this same script,
+# so the revision resolved here is the revision CI resolves.
 merge-compile:
     pwsh -NoProfile -File scripts/verify.ps1 -Profile MergeCompile
 
