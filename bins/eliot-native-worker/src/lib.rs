@@ -1376,27 +1376,35 @@ impl eliot_native_worker_core::CapabilityAdmissionPort for PresentationEchoAdmis
             AdmissionLivenessFacts, AdmissionLivenessOutcome, NativeHeartbeatEnvelope,
             NativeHeartbeatId,
         };
-        let sealed = match self.sealed.lock() {
-            Ok(guard) => guard.clone(),
-            Err(_) => {
+        let sealed_read = {
+            match self.sealed.lock() {
+                Ok(guard) => Ok(guard.clone()),
+                Err(_) => Err(()),
+            }
+        };
+        let sealed = match sealed_read {
+            Ok(Some(sealed)) => sealed,
+            Ok(None) => return self.reject_liveness("no retained admission to revalidate"),
+            Err(()) => {
                 return self.reject_liveness(
                     "retained admission lock poisoned; Kernel liveness was not established",
                 );
             }
         };
-        let Some(sealed) = sealed else {
-            return self.reject_liveness("no retained admission to revalidate");
+        let lifecycle_binding_read = {
+            match self.lifecycle_binding.lock() {
+                Ok(guard) => Ok(guard.clone()),
+                Err(_) => Err(()),
+            }
         };
-        let lifecycle_binding = match self.lifecycle_binding.lock() {
-            Ok(guard) => guard.clone(),
-            Err(_) => {
+        let lifecycle_binding = match lifecycle_binding_read {
+            Ok(Some(lifecycle_binding)) => lifecycle_binding,
+            Ok(None) => return self.reject_liveness("no retained claim identity to revalidate"),
+            Err(()) => {
                 return self.reject_liveness(
                     "retained claim identity lock poisoned; Kernel liveness was not established",
                 );
             }
-        };
-        let Some(lifecycle_binding) = lifecycle_binding else {
-            return self.reject_liveness("no retained claim identity to revalidate");
         };
         if request.admission_id() != sealed.admission_id()
             || request.admission_revision() != sealed.admission_revision()
