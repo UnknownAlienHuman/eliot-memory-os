@@ -286,13 +286,25 @@
 //! Product Pulse reference and a contract digest belong to #13's generated
 //! registry and to #11's executed evidence, not to the read owner.
 //!
-//! What is deliberately absent is the executed half of A10. One live read, a
-//! cache rebuild and a stale/conflict degradation path are runtime facts, and a
+//! # The degradation path is production code; the executed proof is not
+//!
+//! A10's stale/conflict degradation half is a real production path, not a
+//! source-reachability claim. The single read engine already refuses a stale
+//! dependency and a moved closure ([`ReadError::StaleRevision`],
+//! [`ReadError::RevisionChurn`], both produced in [`ReadService::execute`]), and
+//! the daemon's live `eliot.query` reconstruction route
+//! (`bins/eliotd/src/context_reconstruction_route.rs::serve_context_reconstruction`)
+//! settles a moved closure as this owner's typed [`ReadOutcome::Conflicted`]
+//! rather than serving a mixed snapshot. That is the path; whether it ran and
+//! degraded correctly on a live system is still the #11 Product Pulse.
+//!
+//! What remains deliberately absent is the *executed* half: one live read, a
+//! cache rebuild and a stale/conflict degradation are runtime facts, and a
 //! source fact about which function the run loop calls is not one of them. This
-//! package states the proof *entrypoint* it declares; whether that command ran,
-//! and whether a read degraded correctly, is the #11 Product Pulse and cannot be
-//! claimed from here. Until it runs, the ceiling stays `CURRENT_UNVERIFIED`
-//! (I0.5), and production activation of this owner remains #11's to grant.
+//! package states the proof *entrypoint* it declares; whether that command ran
+//! cannot be claimed from here. Until it runs, the ceiling stays
+//! `CURRENT_UNVERIFIED` (I0.5), and production activation of this owner remains
+//! #11's to grant.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
