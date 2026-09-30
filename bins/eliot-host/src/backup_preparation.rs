@@ -333,14 +333,15 @@
 //! - the record version and the stored operation identity, so a frame written
 //!   for another operation is refused and never reattributed to the requested
 //!   one;
+//! - the result's own `admission_digest` and `config_projection_digest` against
+//!   the intent's, so a result cannot claim a configuration the admission never
+//!   carried;
 //! - the lifecycle, structurally: a cleanup `transition` reports the owner's
 //!   reclamation disposition, a cancellation `status` marks an envelope whose
 //!   prior receipt is historical evidence, and an unknown version or state is
 //!   never defaulted to `Prepared`;
-//! - the result's own `admission_digest` and `config_projection_digest` against
-//!   the intent's, and its root, destination id and epoch against the intent's,
-//!   so a result cannot claim a configuration or a destination the admission
-//!   never carried;
+//! - the result's own root, destination id and epoch against the intent's, so
+//!   a result cannot name a destination the admission never carried;
 //! - the absence of a forensic audit note, by the same rule that refuses a
 //!   presented one;
 //! - and only then the owner proof itself, the same
@@ -607,7 +608,9 @@ pub enum PreparationError {
 // /`reject_reparse`/`reverify_recorded_destination`/`protected_path_to_preparation`
 // /`projection_to_preparation`/`intent_json`/`result_json`/`cleanup_transition_json`
 // /`destination_from_result`/`recorded_result_lifecycle`
-// /`verified_recorded_destination`/`recorded_outcome`/`projected_disposition`
+// /`verified_recorded_destination`/`verified_recorded_frames`
+// /`require_live_recorded_result`/`verified_recorded_destination_fields`
+// /`refused_recorded_field`/`recorded_outcome`/`projected_disposition`
 // /`owner_identity_evidence`
 // /`reject_audit_note`
 // (private steps whose outcome surfaces with its exact category at the owning
@@ -2592,75 +2595,61 @@ fn destination_from_result(
     })
 }
 
-/// One shared record-validation helper, consumed by both the prepare replay and
-/// reconciliation, so neither can enforce a weaker root proof than the other.
+/// Builds the one refusal shape every arm of the shared record validator uses:
+/// the looked-up operation, tagged with the field that refused it.
 ///
-/// Everything here is checked against the **recorded intent**, never against a
-/// freshly observed registry revision, because a record that cannot be joined
-/// back to the intent that admitted it is not this operation's outcome no
-/// matter what the filesystem currently shows:
+/// It is a named function rather than a closure inside
+/// [`verified_recorded_destination`] because the validator's checks are split
+/// across named helpers, and a refusal must not change shape depending on which
+/// helper raised it. The reason is taken by reference because a refusal is
+/// formatted from it, never consumed from it.
+fn refused_recorded_field(
+    operation_id: &str,
+    field: &'static str,
+    reason: &str,
+) -> PreparationError {
+    PreparationError::UnknownState {
+        operation: operation_id.to_owned(),
+        reason: format!("{field}: {reason}"),
+    }
+}
+
+/// Proves the two stored frames answer to each other: the version they carry,
+/// the operation they were written for, and the admission and configuration
+/// projection they both name.
 ///
-/// * the stored record version and the stored operation identity against the
-///   lookup key, so a record written for another operation can never be
-///   reattributed to this one. A mismatching stored operation id is refused;
-///   it is never overwritten with the requested id;
-/// * the recorded admission digest and the result's own
-///   `admission_digest`/`config_projection_digest` against that intent, so a
-///   result cannot claim a configuration the admission never carried;
-/// * the recorded destination root, destination id and epoch, which
-///   [`HostStatePreparationJournal::record_result`] retains and which therefore
-///   are the record's own account of what it created rather than a name this
-///   module resolves again;
-/// * the permitted absence of a forensic audit note, which
-///   [`reject_audit_note`] already refuses on every path that owns a receipt.
-///
-/// `require_live` is the ONE thing the two callers answer differently, and it
-/// is a question about the caller, not about the record: `true` for a prepare
-/// replay, which must hand back a live prepared destination or refuse, and
-/// `false` for the reclamation sweep, which legitimately still needs a
-/// cancelled record's root so an owner-authorized reclamation can reach it.
-/// The root proof below is identical either way, so the weaker argument can
-/// never become the stronger one by omission.
-///
-/// Only after all of that is the root re-proved through the real protected-root
-/// owner by [`reverify_recorded_destination`], which containment-checks it,
-/// pins the contour by retained handle, re-proves the retained identity and
-/// compares the owner-observed identity against the recorded one. The retained
-/// lease is **not** returned here: this helper only decides whether a recorded
-/// destination is still an owned object, and a decision is not a reason to hold
-/// delete authority. The reclamation path takes its own proof immediately
-/// before its effect.
-fn verified_recorded_destination(
+/// This is the FIRST conjunct of [`verified_recorded_destination`] and it stays
+/// first. Version and operation identity come before every other field: a frame
+/// this module did not write, or one written for another operation, is refused
+/// before anything else in it is believed. The stored operation id is compared
+/// against the lookup key and never overwritten with it.
+fn verified_recorded_frames(
     operation_id: &str,
     intent: &serde_json::Value,
     result: &serde_json::Value,
-    require_live: bool,
-) -> Result<PreparedDestination, PreparationError> {
-    let refused = |field: &'static str, reason: String| PreparationError::UnknownState {
-        operation: operation_id.to_owned(),
-        reason: format!("{field}: {reason}"),
-    };
-    // Version and operation identity come first: a frame this module did not
-    // write, or one written for another operation, is refused before any other
-    // field of it is believed. The stored operation id is compared against the
-    // lookup key and never overwritten with it.
+) -> Result<(), PreparationError> {
     for (frame, label) in [(intent, "intent"), (result, "result")] {
         if frame.get("version").and_then(serde_json::Value::as_u64)
             != Some(u64::from(PREPARATION_VERSION))
         {
-            return Err(refused(
+            return Err(refused_recorded_field(
+                operation_id,
                 "version",
-                format!(
+                &format!(
                     "recorded {label} frame is missing or does not carry this preparation version"
                 ),
             ));
         }
-        match frame.get("operation_id").and_then(serde_json::Value::as_str) {
+        match frame
+            .get("operation_id")
+            .and_then(serde_json::Value::as_str)
+        {
             Some(stored) if stored == operation_id => {}
             _ => {
-                return Err(refused(
+                return Err(refused_recorded_field(
+                    operation_id,
                     "operation_id",
-                    format!(
+                    &format!(
                         "recorded {label} frame names a different or absent operation and is never \
                          reattributed to the requested one"
                     ),
@@ -2675,9 +2664,10 @@ fn verified_recorded_destination(
         .get("admission_digest")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| {
-            refused(
+            refused_recorded_field(
+                operation_id,
                 "admission_digest",
-                "recorded intent carries no admission digest to answer".to_owned(),
+                "recorded intent carries no admission digest to answer",
             )
         })?;
     let intent_projection = intent
@@ -2685,73 +2675,165 @@ fn verified_recorded_destination(
         .and_then(|admission| admission.get("config_projection_digest"))
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| {
-            refused(
+            refused_recorded_field(
+                operation_id,
                 "config_projection_digest",
-                "recorded intent carries no configuration projection digest to answer".to_owned(),
+                "recorded intent carries no configuration projection digest to answer",
             )
         })?;
-    if result.get("admission_digest").and_then(serde_json::Value::as_str) != Some(intent_digest) {
-        return Err(refused(
+    if result
+        .get("admission_digest")
+        .and_then(serde_json::Value::as_str)
+        != Some(intent_digest)
+    {
+        return Err(refused_recorded_field(
+            operation_id,
             "admission_digest",
-            "recorded result does not answer the recorded intent".to_owned(),
+            "recorded result does not answer the recorded intent",
         ));
     }
-    if result.get("config_projection_digest").and_then(serde_json::Value::as_str)
+    if result
+        .get("config_projection_digest")
+        .and_then(serde_json::Value::as_str)
         != Some(intent_projection)
     {
-        return Err(refused(
+        return Err(refused_recorded_field(
+            operation_id,
             "config_projection_digest",
-            "recorded result does not answer the recorded intent".to_owned(),
+            "recorded result does not answer the recorded intent",
         ));
     }
-    // The lifecycle decision, before the destination is decoded. A
-    // prepare replay requires a live prepared result: a cancelled or reclaimed
-    // record is terminal for preparation and its prior receipt is historical
-    // evidence, never authority to hand back. The reclamation sweep does not
-    // require it, because it needs exactly that record's root to reclaim.
+    Ok(())
+}
+
+/// Answers the lifecycle question, before the destination is decoded, so a
+/// terminal frame is refused before any of it is interpreted as a destination.
+///
+/// A prepare replay requires a live prepared result: a cancelled or reclaimed
+/// record is terminal for preparation and its prior receipt is historical
+/// evidence, never authority to hand back. The reclamation sweep does not
+/// require it, because it needs exactly that record's root to reclaim. The
+/// lifecycle itself is read structurally by [`recorded_result_lifecycle`] and is
+/// never defaulted to prepared.
+fn require_live_recorded_result(
+    operation_id: &str,
+    result: &serde_json::Value,
+    require_live: bool,
+) -> Result<(), PreparationError> {
     if require_live && !recorded_result_lifecycle(result)? {
-        return Err(refused(
+        return Err(refused_recorded_field(
+            operation_id,
             "state",
             "recorded outcome is not a live prepared destination; its prior receipt is preserved \
-             as evidence and is never republished as current preparation authority"
-                .to_owned(),
+             as evidence and is never republished as current preparation authority",
         ));
     }
-    let Some(destination) = destination_from_result(operation_id, result) else {
-        return Err(refused(
-            "result",
-            "recorded result is not a decodable prepared destination; preserved for inspection"
-                .to_owned(),
-        ));
-    };
-    // The record's own account of what it created, never a name resolved again
-    // or an identity re-derived from a newly observed registry revision.
+    Ok(())
+}
+
+/// Proves the decoded destination is the one the recorded intent admitted.
+///
+/// The destination root, destination id and epoch compared here are the ones
+/// [`HostStatePreparationJournal::record_result`] retained, so this is the
+/// record's own account of what it created, compared against the intent that
+/// authorized it — never a name resolved again and never an identity re-derived
+/// from a newly observed registry revision.
+fn verified_recorded_destination_fields(
+    operation_id: &str,
+    intent: &serde_json::Value,
+    destination: &PreparedDestination,
+) -> Result<(), PreparationError> {
     if intent.get("root").and_then(serde_json::Value::as_str)
         != Some(destination.root.to_string_lossy().into_owned().as_str())
     {
-        return Err(refused(
+        return Err(refused_recorded_field(
+            operation_id,
             "root",
-            "recorded result names a different root than the recorded intent admitted".to_owned(),
+            "recorded result names a different root than the recorded intent admitted",
         ));
     }
-    if intent.get("destination_id").and_then(serde_json::Value::as_str)
+    if intent
+        .get("destination_id")
+        .and_then(serde_json::Value::as_str)
         != Some(destination.destination_id.as_str())
     {
-        return Err(refused(
+        return Err(refused_recorded_field(
+            operation_id,
             "destination_id",
-            "recorded result carries a different destination identity than the recorded intent"
-                .to_owned(),
+            "recorded result carries a different destination identity than the recorded intent",
         ));
     }
-    if intent.get("destination_epoch").and_then(serde_json::Value::as_u64)
+    if intent
+        .get("destination_epoch")
+        .and_then(serde_json::Value::as_u64)
         != Some(destination.destination_epoch)
     {
-        return Err(refused(
+        return Err(refused_recorded_field(
+            operation_id,
             "destination_epoch",
-            "recorded result carries a different lineage marker than the recorded intent"
-                .to_owned(),
+            "recorded result carries a different lineage marker than the recorded intent",
         ));
     }
+    Ok(())
+}
+
+/// Prepares nothing and proves everything: the one record validator both the
+/// prepare replay and reconciliation run.
+///
+/// The order is the guarantee. Every conjunct below is checked against the
+/// **recorded intent**, never against a freshly observed registry revision,
+/// because a record that cannot be joined back to the intent that admitted it is
+/// not this operation's outcome no matter what the filesystem currently shows:
+///
+/// 1. [`verified_recorded_frames`] — the stored record version and the stored
+///   operation identity against the lookup key, so a record written for another
+///   operation can never be reattributed to this one. A mismatching stored
+///   operation id is refused; it is never overwritten with the requested id;
+///   the recorded admission digest and the result's own
+///   `admission_digest`/`config_projection_digest` are then joined against that
+///   same intent, so a result cannot claim a configuration the admission never
+///   carried;
+/// 2. [`require_live_recorded_result`] — the lifecycle, structurally;
+/// 3. the recorded destination root, destination id and epoch, which
+///   [`HostStatePreparationJournal::record_result`] retains and which therefore
+///   are the record's own account of what it created rather than a name this
+///   module resolves again ([`verified_recorded_destination_fields`]);
+/// 4. the permitted absence of a forensic audit note, which
+///   [`reject_audit_note`] already refuses on every path that owns a receipt;
+/// 5. and only then the owner proof.
+///
+/// `require_live` is the ONE thing the two callers answer differently, and it
+/// is a question about the caller, not about the record: `true` for a prepare
+/// replay, which must hand back a live prepared destination or refuse, and
+/// `false` for the reclamation sweep, which legitimately still needs a
+/// cancelled record's root so an owner-authorized reclamation can reach it.
+/// The root proof is identical either way, so the weaker argument can never
+/// become the stronger one by omission.
+///
+/// The owner proof comes last, through the real protected-root owner:
+/// [`reverify_recorded_destination`] containment-checks the root, pins the
+/// contour by retained handle, re-proves the retained identity and compares the
+/// owner-observed identity against the recorded one. The retained lease is
+/// **not** returned here: this helper only decides whether a recorded
+/// destination is still an owned object, and a decision is not a reason to hold
+/// delete authority. The reclamation path takes its own proof immediately
+/// before its effect.
+fn verified_recorded_destination(
+    operation_id: &str,
+    intent: &serde_json::Value,
+    result: &serde_json::Value,
+    require_live: bool,
+) -> Result<PreparedDestination, PreparationError> {
+    verified_recorded_frames(operation_id, intent, result)?;
+    require_live_recorded_result(operation_id, result, require_live)?;
+    let Some(destination) = destination_from_result(operation_id, result) else {
+        return Err(refused_recorded_field(
+            operation_id,
+            "result",
+            "recorded result is not a decodable prepared destination; preserved for inspection",
+        ));
+    };
+    verified_recorded_destination_fields(operation_id, intent, &destination)?;
     // The forensic note is never carried in a receipt, so a record that has one
     // is refused by the same rule that refuses a presented one.
     reject_audit_note(destination.audit_fence_note.as_ref())?;
