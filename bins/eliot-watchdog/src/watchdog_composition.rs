@@ -629,6 +629,32 @@ impl WatchdogComposition {
                         // delta is traced with its own named reason.
                         let now_ms = current_unix_ms().unwrap_or(0);
                         if let Some(closed) = coverage.latest() {
+                            // I8.18 A4 (#2381): project the actual #1755
+                            // interval manifest the five rules are about to
+                            // run on, and publish its own interval identity,
+                            // evidence handle, and gap verdict as bounded
+                            // operator evidence on the same tick. The
+                            // coverage-gap rule derives its explanation from
+                            // these same public manifest claims, so the two
+                            // can never contradict each other about one
+                            // interval; the trace makes that agreement
+                            // checkable per interval. Read-only: no store is
+                            // touched beyond the closed report, and no effect
+                            // is authorized.
+                            let manifest = project_actual_coverage_manifest(&closed);
+                            let manifest_verdict = match manifest.explanation {
+                                CoverageGapExplanation::Explained => "explained",
+                                CoverageGapExplanation::Unexplained => "unexplained",
+                                CoverageGapExplanation::Unknown => "unknown",
+                            };
+                            tracing::debug!(
+                                event = "watchdog.health_manifest_projected",
+                                observation = "observed",
+                                manifest_interval_id = manifest.interval_id.as_str(),
+                                manifest_evidence = manifest.evidence.evidence_id.as_str(),
+                                manifest_verdict = manifest_verdict,
+                                "I8.18 health rules run against the owner-issued #1755 manifest on this interval"
+                            );
                             evaluate_interval_health(
                                 health.as_ref(),
                                 &closed,
