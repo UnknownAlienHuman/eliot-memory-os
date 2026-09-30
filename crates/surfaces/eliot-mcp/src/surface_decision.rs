@@ -15,12 +15,18 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_protocol::HARD_STRUCTURED_RESPONSE_BYTES;
 use eliot_receipts::surface::{
-    MaterialGrantStanding, authorize_material_grant, resolve_material_grant,
+    BudgetReplaySignal, MaterialGrantStanding, authorize_material_grant, detect_budget_replay,
+    resolve_material_grant,
 };
 use eliot_receipts::{
     BudgetCoverage, BudgetOverflow, GrantClosureReceipt, OverflowDisposition, RenderedToolCost,
     SurfaceBudgetInput, TOOL_SURFACE_CONTRACT_VERSION, TokenCountObservation,
     TokenCountUnavailableReason, ToolExposureError, ToolSurfaceBudget, compile_surface_budget,
+};
+use eliot_receipts::tool_exposure::{
+    DeliveredToolRepresentation, EXPOSURE_HISTORY_VERSION, ExposureIdentities, ExposureReplaySignal,
+    OwnerStageFact, ProducedToolResultIdentity, ToolExposureHistoryEntry, ToolExposureReceiptV2,
+    detect_exposure_replay,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -1084,6 +1090,213 @@ fn bounded_text(value: &str, field: &'static str) -> Result<(), SurfaceDecisionE
             field,
             reason: "exceeds the bounded text length",
         });
+    }
+    Ok(())
+}
+
+fn map_exposure_error(error: ToolExposureError) -> SurfaceDecisionError {
+    match error {
+        ToolExposureError::InvalidField { field, reason } => {
+            SurfaceDecisionError::InvalidField { field, reason }
+        }
+        _ => SurfaceDecisionError::IncompleteSurface {
+            detail: "exposure history fact failed its owner validation",
+        },
+    }
+}
+
+/// Recompiles the `tools/list` budget from the current rendering and
+/// classifies it against the retained prior.
+///
+/// Repeated publication of identical rendered bytes yields
+/// [`BudgetReplaySignal::IdempotentReplay`]: the caller retains the prior
+/// revision — publication executes nothing, so no duplicate execution arises.
+/// Divergent bytes on the same compilation scope yield
+/// [`BudgetReplaySignal::SuccessorRevision`]: the new revision persists
+/// alongside the retained prior through the existing observation/receipt
+/// path, never as an overwrite. Unrelated scopes yield `None` and route to
+/// their owners.
+///
+/// # Errors
+///
+/// Returns an error when the current rendering is not measurable, or when the
+/// replayed fingerprint carries conflicting recorded evidence.
+pub fn replay_list_surface_budget(
+    previous: &ToolSurfaceBudget,
+    rendered_tools: &[Value],
+) -> Result<(ToolSurfaceBudget, Option<BudgetReplaySignal>), ToolExposureError> {
+    let current = bind_list_surface_budget(rendered_tools)?;
+    let signal = detect_budget_replay(previous, &current)?;
+    Ok((current, signal))
+}
+
+/// Builds a later authorized expansion delivery and checks its replay-safe
+/// lineage.
+///
+/// Calls [`ToolExposureReceiptV2::record_expanded_delivery`] on the recorded
+/// original, then classifies the pair with [`detect_exposure_replay`]: only a
+/// [`ExposureReplaySignal::LinkedExpansion`] leaves this seam toward the
+/// existing observation/receipt path. Anything else fails closed with the
+/// classifier's typed error instead of persisting a suspect revision, so the
+/// original truncation is preserved and never rewritten as `FULL`.
+///
+/// # Errors
+///
+/// Returns an error when the original is inconsistent or not expandable, when
+/// the new identity or supplied evidence is malformed, or when the resulting
+/// revision does not link its recorded prior.
+pub fn link_expanded_delivery(
+    original: &ToolExposureReceiptV2,
+    new_receipt_id: String,
+    produced: ProducedToolResultIdentity,
+    delivered: DeliveredToolRepresentation,
+) -> Result<ToolExposureReceiptV2, ToolExposureError> {
+    let expanded = original.record_expanded_delivery(new_receipt_id, produced, delivered)?;
+    match detect_exposure_replay(original, &expanded)? {
+        Some(ExposureReplaySignal::LinkedExpansion) => Ok(expanded),
+        _ => Err(ToolExposureError::InvalidField {
+            field: "receipt.delivered_representation.prior_delivery_receipt_id",
+            reason: "expansion revision does not link its recorded prior",
+        }),
+    }
+}
+
+/// Populates the exposure-history stages owned at the publish seam.
+///
+/// Registered and advertised facts come from the compiled decision joined
+/// with the derived permitted subset: a considered method carries its live
+/// profile revision as registration evidence, and the permitted check carries
+/// the decision reference as advertisement evidence. Eligibility follows the
+/// same owner join — permitted (admitted with a live grant standing and a
+/// compatible owner binding) implies eligible, a forbidden disposition
+/// implies ineligible, and anything else stays explicitly unresolved for the
+/// dispatch seam to revalidate at call time. Selection, call, transport,
+/// retry, use, delivery, and outcome stay explicitly unresolved: the planner,
+/// execution, transport, bridge/host projection, and verifier owners populate
+/// them, never this seam. Unknown coverage is recorded as `None`, never
+/// coerced to `false` and never inferred from a neighbouring stage.
+///
+/// The surface identity defaults to the decision's task reference when the
+/// caller supplies none, so every entry joins a revision lineage; turn, run,
+/// and attempt identities arrive from their owners or stay unresolved.
+///
+/// # Errors
+///
+/// Returns an error when the decision is invalid, the method is outside the
+/// decision's considered set, or the populated entry is inconsistent.
+pub fn advertise_exposure_history(
+    decision: &ToolSurfaceDecision,
+    surface: &PermittedTaskSurface,
+    method: &str,
+    mut identities: ExposureIdentities,
+) -> Result<ToolExposureHistoryEntry, SurfaceDecisionError> {
+    decision.validate()?;
+    let considered = decision
+        .considered
+        .iter()
+        .find(|entry| entry.method.canonical_name == method)
+        .ok_or_else(|| SurfaceDecisionError::UnknownMethod {
+            method: method.to_owned(),
+        })?;
+    let disposition = decision
+        .disposition_of(method)
+        .ok_or_else(|| SurfaceDecisionError::UnknownMethod {
+            method: method.to_owned(),
+        })?;
+    let permitted = surface
+        .permitted
+        .iter()
+        .any(|descriptor| descriptor.name == method);
+    if identities.surface_ref.is_none() {
+        identities.surface_ref = Some(decision.task_ref.clone());
+    }
+    let decision_source = format!("surface-decision:{}", decision.task_ref);
+    let profile_source = format!(
+        "{}@{}",
+        considered.method.canonical_name, considered.profile_version
+    );
+    let registered =
+        OwnerStageFact::supplied(true, profile_source).map_err(map_exposure_error)?;
+    let advertised =
+        OwnerStageFact::supplied(permitted, decision_source.clone()).map_err(map_exposure_error)?;
+    let eligible = match (permitted, disposition) {
+        (true, _) => OwnerStageFact::supplied(
+            true,
+            format!(
+                "surface-decision:{}+grant:{}",
+                decision.task_ref, decision.grant_revision
+            ),
+        )
+        .map_err(map_exposure_error)?,
+        (false, SurfaceDisposition::Forbidden) => {
+            OwnerStageFact::supplied(false, decision_source).map_err(map_exposure_error)?
+        }
+        (false, _) => OwnerStageFact::unresolved(),
+    };
+    let entry = ToolExposureHistoryEntry {
+        schema_version: EXPOSURE_HISTORY_VERSION,
+        tool_definition: method.to_owned(),
+        definition_version: considered.method.definition_version.clone(),
+        route_fingerprint: Some(decision.route_fingerprint.clone()),
+        identities,
+        registered,
+        advertised_to_route: advertised,
+        eligible_under_scope_policy_and_grant: eligible,
+        selected_by_planner_or_model: OwnerStageFact::unresolved(),
+        called: OwnerStageFact::unresolved(),
+        transport_completed: OwnerStageFact::unresolved(),
+        result_delivery: None,
+        delivery_source_ref: None,
+        expanded_or_retried: OwnerStageFact::unresolved(),
+        observably_used_in_decision_action_or_verifier: OwnerStageFact::unresolved(),
+        terminal_task_or_product_outcome_ref: None,
+    };
+    entry.validate().map_err(map_exposure_error)?;
+    Ok(entry)
+}
+
+/// Admits an owner-populated exposure-history entry against the independent
+/// decision set.
+///
+/// The decision's considered method/version set is the independent expected
+/// set: it was compiled from the live registry plus owner conditions,
+/// independently of whoever populated the entry. Admission requires the entry
+/// to validate supplied-or-explicitly-unresolved, its tool identity to be a
+/// considered method, its definition version to agree with the considered
+/// owner binding, and — when the entry names a route — agreement with the
+/// admitting decision's route. A method outside the set, a version the owner
+/// no longer binds, or a disagreeing route fails closed.
+///
+/// # Errors
+///
+/// Returns an error when the decision or entry is invalid, the tool is not in
+/// the considered set, versions disagree, or routes disagree.
+pub fn admit_exposure_history(
+    decision: &ToolSurfaceDecision,
+    entry: &ToolExposureHistoryEntry,
+) -> Result<(), SurfaceDecisionError> {
+    decision.validate()?;
+    entry.validate().map_err(map_exposure_error)?;
+    let considered = decision
+        .considered
+        .iter()
+        .find(|candidate| candidate.method.canonical_name == entry.tool_definition)
+        .ok_or_else(|| SurfaceDecisionError::UnknownMethod {
+            method: entry.tool_definition.clone(),
+        })?;
+    if considered.method.definition_version != entry.definition_version {
+        return Err(SurfaceDecisionError::InvalidField {
+            field: "history.definition_version",
+            reason: "exposure history version disagrees with the live owner binding",
+        });
+    }
+    if let Some(route) = &entry.route_fingerprint {
+        if route != &decision.route_fingerprint {
+            return Err(SurfaceDecisionError::InvalidField {
+                field: "history.route_fingerprint",
+                reason: "exposure history route disagrees with the admitting surface decision",
+            });
+        }
     }
     Ok(())
 }

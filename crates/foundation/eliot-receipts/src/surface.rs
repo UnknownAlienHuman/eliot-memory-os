@@ -734,3 +734,64 @@ pub fn admit_dispatch_surface(
     binding.validate()?;
     Ok(binding)
 }
+
+/// Replay disposition for two recorded surface budgets on one compilation
+/// scope.
+///
+/// Returned by [`detect_budget_replay`]: evidence for the publishing seam to
+/// reconcile, never permission to execute — `tools/list` publication executes
+/// nothing, so an [`BudgetReplaySignal::IdempotentReplay`] retains the prior
+/// revision, while a [`BudgetReplaySignal::SuccessorRevision`] persists
+/// alongside it through the existing observation/receipt path. The recorded
+/// original is never rewritten.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BudgetReplaySignal {
+    /// Identical recorded fingerprint with identical recorded evidence: a
+    /// replayed publication, not new work.
+    IdempotentReplay,
+    /// Different recorded bytes on the same recorded compilation scope: a new
+    /// revision that persists alongside the retained prior.
+    SuccessorRevision,
+}
+
+/// Classifies a repeated surface publication against the recorded prior budget.
+///
+/// Both budgets validate as recorded first:
+/// [`ToolSurfaceBudget::validate`] checks the original recorded digest values
+/// and never recomputes them. The recorded actual fingerprints then decide,
+/// compared with this operation: identical fingerprints with identical
+/// recorded bytes and counts are an idempotent publication replay; identical
+/// fingerprints with divergent recorded evidence are a typed conflict, so a
+/// replay can never validate as a quiet rewrite. Different fingerprints on
+/// the same recorded compilation scope (role, route, profile revision) are a
+/// successor revision, never an overwrite. Different scopes return `Ok(None)`:
+/// not a replay pair, routed to their owners.
+///
+/// # Errors
+///
+/// Returns an error when either budget is inconsistent, or when one recorded
+/// fingerprint carries conflicting recorded evidence.
+pub fn detect_budget_replay(
+    previous: &ToolSurfaceBudget,
+    current: &ToolSurfaceBudget,
+) -> Result<Option<BudgetReplaySignal>, ToolExposureError> {
+    previous.validate()?;
+    current.validate()?;
+    if previous.actual_fingerprint == current.actual_fingerprint {
+        if previous == current {
+            return Ok(Some(BudgetReplaySignal::IdempotentReplay));
+        }
+        return Err(ToolExposureError::InvalidField {
+            field: "budget.actual_fingerprint",
+            reason: "replayed surface fingerprint carries conflicting recorded evidence; persist a successor revision instead of rewriting",
+        });
+    }
+    if previous.role == current.role
+        && previous.route_fingerprint == current.route_fingerprint
+        && previous.profile_revision == current.profile_revision
+    {
+        return Ok(Some(BudgetReplaySignal::SuccessorRevision));
+    }
+    Ok(None)
+}

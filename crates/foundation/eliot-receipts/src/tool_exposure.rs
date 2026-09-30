@@ -1013,6 +1013,323 @@ impl ToolExposureReceiptV2 {
     }
 }
 
+/// Wire version for [`ToolExposureHistoryEntry`].
+pub const EXPOSURE_HISTORY_VERSION: u16 = 1;
+
+/// Replay disposition for two recorded exposure revisions on one lineage.
+///
+/// Returned by [`detect_exposure_replay`]. A signal is evidence for the
+/// caller to reconcile through the existing observation/receipt path; it is
+/// never permission to execute again. An
+/// [`ExposureReplaySignal::IdempotentReplay`] obliges the caller to reconcile
+/// the original event — execute nothing again and record no new use — while a
+/// conflicting same-identity revision fails as a typed error so it can never
+/// validate as a quiet rewrite.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ExposureReplaySignal {
+    /// Same receipt identity with identical recorded evidence: a replayed
+    /// publication or result redelivery, not new work.
+    IdempotentReplay,
+    /// New receipt identity linked through the recorded
+    /// `prior_delivery_receipt_id` to the recorded prior while retaining the
+    /// same produced result digest: a later authorized expansion delivery of
+    /// the same result.
+    LinkedExpansion,
+}
+
+/// Classifies a repeated exposure revision against the recorded original.
+///
+/// Both revisions validate as recorded first:
+/// [`ToolExposureReceiptV2::validate`] checks the original recorded digest
+/// values and never recomputes them. Recorded content then decides, compared
+/// with this operation:
+/// - same `receipt_id` with identical recorded evidence is
+///   [`ExposureReplaySignal::IdempotentReplay`];
+/// - same `receipt_id` with divergent recorded evidence is a typed conflict;
+///   the caller persists a linked revision through the existing
+///   observation/receipt path instead of rewriting, so a replay can produce
+///   neither duplicate execution nor false usage evidence;
+/// - different identities link only through the recorded
+///   `prior_delivery_receipt_id` on the current revision plus the same
+///   retained produced result digest, yielding
+///   [`ExposureReplaySignal::LinkedExpansion`];
+/// - anything else is `Ok(None)`: not a replay pair, routed to its owners.
+///
+/// An unrecorded produced digest never proves same-result lineage: pairs with
+/// a missing digest on either side stay `None` for owner reconciliation
+/// instead of validating as expansions.
+///
+/// # Errors
+///
+/// Returns an error when either revision is inconsistent, or when one receipt
+/// identity carries conflicting recorded evidence.
+pub fn detect_exposure_replay(
+    previous: &ToolExposureReceiptV2,
+    current: &ToolExposureReceiptV2,
+) -> Result<Option<ExposureReplaySignal>, ToolExposureError> {
+    previous.validate()?;
+    current.validate()?;
+    if previous.receipt_id == current.receipt_id {
+        if previous == current {
+            return Ok(Some(ExposureReplaySignal::IdempotentReplay));
+        }
+        return Err(ToolExposureError::InvalidField {
+            field: "receipt.receipt_id",
+            reason: "replayed receipt identity carries conflicting recorded evidence; persist a linked revision instead of rewriting",
+        });
+    }
+    let linked = current
+        .delivered_representation
+        .as_ref()
+        .and_then(|representation| representation.prior_delivery_receipt_id.as_deref())
+        == Some(previous.receipt_id.as_str());
+    if linked && produced_digest_agrees(previous, current) {
+        return Ok(Some(ExposureReplaySignal::LinkedExpansion));
+    }
+    Ok(None)
+}
+
+/// Whether both revisions retain the same produced result digest as recorded.
+fn produced_digest_agrees(
+    previous: &ToolExposureReceiptV2,
+    current: &ToolExposureReceiptV2,
+) -> bool {
+    matches!(
+        (&previous.produced_result, &current.produced_result),
+        (Some(previous_produced), Some(current_produced))
+            if previous_produced.result_digest == current_produced.result_digest
+    )
+}
+
+/// One owner-supplied fact for a single exposure stage: supplied or explicitly
+/// unresolved.
+///
+/// `observed: Some(_)` is a positive owner claim and requires a non-blank
+/// `source_ref` naming the owner evidence (definition revision, grant
+/// verdict, attempt record, projection handle). `observed: None` is explicitly
+/// unresolved unknown coverage — never a silent `false`, never omitted: the
+/// field stays present under `deny_unknown_fields`, so deserialization fails
+/// closed on omission instead of validating a valid-looking gap.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OwnerStageFact {
+    /// Owner observation for the stage; `None` means explicitly unresolved.
+    pub observed: Option<bool>,
+    /// Owner evidence reference; required with a supplied observation.
+    pub source_ref: Option<String>,
+}
+
+impl OwnerStageFact {
+    /// Records an owner-supplied observation bound to its evidence reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the source reference is blank or carries control
+    /// characters.
+    pub fn supplied(observed: bool, source_ref: String) -> Result<Self, ToolExposureError> {
+        let fact = Self {
+            observed: Some(observed),
+            source_ref: Some(source_ref),
+        };
+        fact.validate("history.stage")?;
+        Ok(fact)
+    }
+
+    /// Records explicitly unresolved coverage for a stage owned elsewhere.
+    #[must_use]
+    pub const fn unresolved() -> Self {
+        Self {
+            observed: None,
+            source_ref: None,
+        }
+    }
+
+    /// Validates the supplied-or-unresolved shape without consulting any owner.
+    ///
+    /// A supplied observation without its owner source reference fails; an
+    /// unresolved stage without a source stays unresolved and is never
+    /// coerced.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a supplied observation lacks its source
+    /// reference, or when a carried reference is blank or carries control
+    /// characters.
+    pub fn validate(&self, field: &'static str) -> Result<(), ToolExposureError> {
+        match (&self.observed, &self.source_ref) {
+            (Some(_), Some(source)) => text(source, field)?,
+            (Some(_), None) => {
+                return Err(ToolExposureError::InvalidField {
+                    field,
+                    reason: "a supplied stage observation requires its owner source reference",
+                });
+            }
+            (None, Some(source)) => text(source, field)?,
+            (None, None) => {}
+        }
+        Ok(())
+    }
+}
+
+/// Turn/run/attempt/surface identities bound to one exposure-history entry.
+///
+/// Identities arrive from their owners; a seam that never mints an identity
+/// binds `None` (explicitly unresolved) rather than inventing one. The
+/// surface identity is always required: a history fact about no surface
+/// proves nothing and cannot join any revision lineage.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ExposureIdentities {
+    /// Turn identity from the loop owner, when joined.
+    pub turn_ref: Option<String>,
+    /// Run identity from the execution owner, when joined.
+    pub run_ref: Option<String>,
+    /// Attempt identity from the attempt-history owner, when joined.
+    pub attempt_ref: Option<String>,
+    /// Surface identity the history is bound to; always required.
+    pub surface_ref: Option<String>,
+}
+
+impl ExposureIdentities {
+    /// Validates carried identity text and the required surface binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a carried identity is blank or carries control
+    /// characters, or when the surface identity is missing.
+    pub fn validate(&self) -> Result<(), ToolExposureError> {
+        if let Some(turn) = &self.turn_ref {
+            text(turn, "history.identities.turn_ref")?;
+        }
+        if let Some(run) = &self.run_ref {
+            text(run, "history.identities.run_ref")?;
+        }
+        if let Some(attempt) = &self.attempt_ref {
+            text(attempt, "history.identities.attempt_ref")?;
+        }
+        match &self.surface_ref {
+            Some(surface) => text(surface, "history.identities.surface_ref")?,
+            None => {
+                return Err(ToolExposureError::InvalidField {
+                    field: "history.identities.surface_ref",
+                    reason: "exposure history requires its surface identity",
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Orthogonal owner-populated exposure history for one tool on one surface.
+///
+/// Every applicable stage field is present on the wire
+/// (`deny_unknown_fields`, no defaults): each stage is either supplied
+/// (`Some` with its owner source reference) or explicitly unresolved
+/// (`None`), never omitted to obtain a valid-looking record. Unknown stays
+/// unknown: no stage is inferred from another, `None` never coerces to
+/// `false`, and model-authored success flags without an owner source
+/// reference fail validation. Revisions persist as immutable linked revisions
+/// through the existing observation/receipt path keyed by the bound receipt
+/// lineage — never rewrites (see [`detect_exposure_replay`]) — while lost
+/// acknowledgements reconcile the original event and unavailable writeback
+/// stays a visible pending obligation on the owning seam.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ToolExposureHistoryEntry {
+    /// Wire contract revision. Must equal [`EXPOSURE_HISTORY_VERSION`].
+    pub schema_version: u16,
+    /// Versioned tool definition identity this history is about.
+    pub tool_definition: String,
+    /// Tool Definition version bound by the populating owner.
+    pub definition_version: String,
+    /// Route fingerprint, when the joining seam owns one.
+    pub route_fingerprint: Option<String>,
+    /// Owner-supplied turn/run/attempt/surface identities.
+    pub identities: ExposureIdentities,
+    /// The tool version is registered (definition/facet owner).
+    pub registered: OwnerStageFact,
+    /// The tool was advertised to the route (publish seam).
+    pub advertised_to_route: OwnerStageFact,
+    /// The tool was eligible under scope, policy, and grant (Governor/Kernel
+    /// owners).
+    pub eligible_under_scope_policy_and_grant: OwnerStageFact,
+    /// The planner or model selected the tool (selection owner).
+    pub selected_by_planner_or_model: OwnerStageFact,
+    /// The tool was called (execution owner).
+    pub called: OwnerStageFact,
+    /// Transport for the call completed (transport owner).
+    pub transport_completed: OwnerStageFact,
+    /// Delivery completeness; `None` means explicitly unresolved.
+    pub result_delivery: Option<ResultDelivery>,
+    /// Owner evidence reference for the delivery observation.
+    pub delivery_source_ref: Option<String>,
+    /// The call was expanded or retried (retry owner).
+    pub expanded_or_retried: OwnerStageFact,
+    /// The result was observably used in a public decision, action, or
+    /// verifier (use owner).
+    pub observably_used_in_decision_action_or_verifier: OwnerStageFact,
+    /// Terminal task or product outcome reference, when known.
+    pub terminal_task_or_product_outcome_ref: Option<String>,
+}
+
+impl ToolExposureHistoryEntry {
+    /// Validates identities and every stage's supplied-or-unresolved shape
+    /// without consulting any owner or inferring any stage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unsupported schema version, blank identity or
+    /// version text, a supplied stage without its owner source reference, a
+    /// supplied delivery without its source, or a blank reference.
+    pub fn validate(&self) -> Result<(), ToolExposureError> {
+        if self.schema_version != EXPOSURE_HISTORY_VERSION {
+            return Err(ToolExposureError::InvalidField {
+                field: "history.schema_version",
+                reason: "unsupported exposure history version",
+            });
+        }
+        text(&self.tool_definition, "history.tool_definition")?;
+        text(&self.definition_version, "history.definition_version")?;
+        if let Some(route) = &self.route_fingerprint {
+            text(route, "history.route_fingerprint")?;
+        }
+        self.identities.validate()?;
+        self.registered.validate("history.registered")?;
+        self.advertised_to_route
+            .validate("history.advertised_to_route")?;
+        self.eligible_under_scope_policy_and_grant
+            .validate("history.eligible_under_scope_policy_and_grant")?;
+        self.selected_by_planner_or_model
+            .validate("history.selected_by_planner_or_model")?;
+        self.called.validate("history.called")?;
+        self.transport_completed
+            .validate("history.transport_completed")?;
+        match (&self.result_delivery, &self.delivery_source_ref) {
+            (Some(_), Some(source)) => text(source, "history.delivery_source_ref")?,
+            (Some(_), None) => {
+                return Err(ToolExposureError::InvalidField {
+                    field: "history.delivery_source_ref",
+                    reason: "a supplied delivery observation requires its owner source reference",
+                });
+            }
+            (None, Some(source)) => text(source, "history.delivery_source_ref")?,
+            (None, None) => {}
+        }
+        self.expanded_or_retried
+            .validate("history.expanded_or_retried")?;
+        self.observably_used_in_decision_action_or_verifier
+            .validate("history.observably_used_in_decision_action_or_verifier")?;
+        if let Some(reference) = &self.terminal_task_or_product_outcome_ref {
+            text(
+                reference,
+                "history.terminal_task_or_product_outcome_ref",
+            )?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
