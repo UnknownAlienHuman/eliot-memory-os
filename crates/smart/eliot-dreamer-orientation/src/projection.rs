@@ -162,6 +162,8 @@ pub struct InertProbe {
 pub struct OrientationStageOutput {
     pub stage: String,
     pub input_digest: String,
+    /// Exact boundary and executed predecessor commitments in product order.
+    pub predecessor_commitments: Vec<String>,
     pub output_digest: String,
     pub canonical_output: Option<Vec<u8>>,
 }
@@ -287,7 +289,11 @@ impl OrientationPacketCandidate {
             if closure.denominator != ORIENTATION_PRODUCT_DENOMINATOR {
                 return Err(OrientationError::Binding("product denominator"));
             }
-            validate_native_outputs(&closure.stage_outputs)?;
+            validate_native_outputs(
+                &closure.stage_outputs,
+                &closure.model_outcome,
+                &closure.projections,
+            )?;
         }
         if self
             .sections
@@ -520,7 +526,11 @@ fn validate_owner_projection(
     {
         return Err(OrientationError::Binding("canonical projection identity"));
     }
-    validate_native_outputs(owners.semantics.stage_outputs)?;
+    validate_native_outputs(
+        owners.semantics.stage_outputs,
+        owners.model_outcome,
+        owners.projections,
+    )?;
     bounded_json_size(
         &(
             owners.model_request,
@@ -533,12 +543,27 @@ fn validate_owner_projection(
     Ok(())
 }
 
-fn validate_native_outputs(outputs: &[OrientationStageOutput]) -> Result<(), OrientationError> {
+fn validate_native_outputs(
+    outputs: &[OrientationStageOutput],
+    model_outcome: &eliot_dreamer_contracts::ModelRouteOutcome,
+    projections: &CanonicalProjectionSet,
+) -> Result<(), OrientationError> {
     if outputs.len() != EXPECTED_OWNER_STAGES.len() {
         return Err(OrientationError::Binding("native output denominator"));
     }
+    let mut predecessors = vec![
+        sha256_hex(
+            &canonical_json_bytes(model_outcome)
+                .map_err(|_| OrientationError::Encoding("original model outcome"))?,
+        ),
+        sha256_hex(
+            &canonical_json_bytes(projections)
+                .map_err(|_| OrientationError::Encoding("original projection set"))?,
+        ),
+    ];
     for (output, expected) in outputs.iter().zip(EXPECTED_OWNER_STAGES) {
         if output.stage != expected
+            || output.predecessor_commitments != predecessors
             || !eliot_dreamer_contracts::is_hex64_lower(&output.input_digest)
             || !eliot_dreamer_contracts::is_hex64_lower(&output.output_digest)
             || output
@@ -551,6 +576,7 @@ fn validate_native_outputs(outputs: &[OrientationStageOutput]) -> Result<(), Ori
                 "native original output commitment",
             ));
         }
+        predecessors.push(output.output_digest.clone());
     }
     Ok(())
 }

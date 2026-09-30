@@ -57,7 +57,7 @@ pub use cue_composition::{
     MAX_CACHED_CUE_RECONSTRUCTIONS, evidence_projection_payload, reconstruct_cue_snapshot,
 };
 pub use epistemic_composition::{GovernorEpistemicComposition, ObservedEpistemicProposal};
-pub use epistemic_orientation_read::EpistemicOrientationRead;
+pub use epistemic_orientation_read::{EpistemicOrientationRead, EpistemicOrientationReadError};
 pub use experience_commit::{commit_experience_bank, commit_experience_feedback};
 pub use finish_attempt::{
     FinishAttemptError, GOVERNOR_SCOPE_ID, GovernorFinishAttempt, PreparedFinishDecision,

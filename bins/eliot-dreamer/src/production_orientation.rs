@@ -877,9 +877,31 @@ fn pulse_error_terminal(error: &PulseError) -> (OrientationDisposition, &'static
             OrientationDisposition::Blocked,
             PulseStageId::EpistemicPosition.refusal_reason(),
         ),
-        PulseError::EpistemicBinding => (
-            OrientationDisposition::Blocked,
-            "original admitted epistemic position binding refused",
+        PulseError::EpistemicBinding(eliot_epistemic::AdmittedBindingError::Mismatch { field }) => {
+            (OrientationDisposition::Bound, field)
+        }
+        PulseError::EpistemicBinding(eliot_epistemic::AdmittedBindingError::Unsupported {
+            field,
+        }) => (OrientationDisposition::Unsupported, field),
+        PulseError::EpistemicBinding(eliot_epistemic::AdmittedBindingError::CandidateContract) => (
+            OrientationDisposition::Invalid,
+            "original epistemic candidate contract",
+        ),
+        PulseError::EpistemicBinding(eliot_epistemic::AdmittedBindingError::PositionContract) => (
+            OrientationDisposition::Invalid,
+            "original admitted position contract",
+        ),
+        PulseError::EpistemicBinding(eliot_epistemic::AdmittedBindingError::ResolverRequest) => (
+            OrientationDisposition::Invalid,
+            "native epistemic resolver request",
+        ),
+        PulseError::EpistemicBinding(eliot_epistemic::AdmittedBindingError::Observation) => (
+            OrientationDisposition::Invalid,
+            "original source observation contract",
+        ),
+        PulseError::EpistemicBinding(eliot_epistemic::AdmittedBindingError::Canonicalization) => (
+            OrientationDisposition::Invalid,
+            "epistemic source canonicalization",
         ),
         PulseError::Understanding => (
             OrientationDisposition::Blocked,

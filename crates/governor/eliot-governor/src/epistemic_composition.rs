@@ -414,10 +414,7 @@ impl<P: KernelTransitionPort + ?Sized, R: CanonicalReadClient + ?Sized>
         &self,
         request: &'a ContextReconstructionRequest,
         role_inputs: &'a SevenRoleInputs,
-    ) -> Result<
-        crate::EpistemicOrientationRead<'a>,
-        crate::EpistemicOrientationReadError,
-    > {
+    ) -> Result<crate::EpistemicOrientationRead<'a>, crate::EpistemicOrientationReadError> {
         crate::EpistemicOrientationRead::from_context_readback(request, role_inputs)
     }
 
