@@ -906,14 +906,12 @@ fn validate_original_submission(
             operation_id: operation_id.to_owned(),
             detail: "original Observe submission is only valid for CaptureObservation".to_owned(),
         }),
-        (_, Some(source)) => {
-            source
-                .validate()
-                .map_err(|error| ReservationWriteError::Admission {
-                    operation_id: operation_id.to_owned(),
-                    detail: format!("original Observe submission is invalid: {error}"),
-                })
-        }
+        (_, Some(source)) => source
+            .validate()
+            .map_err(|error| ReservationWriteError::Admission {
+                operation_id: operation_id.to_owned(),
+                detail: format!("original Observe submission is invalid: {error}"),
+            }),
         (false, None) => Ok(()),
     }
 }

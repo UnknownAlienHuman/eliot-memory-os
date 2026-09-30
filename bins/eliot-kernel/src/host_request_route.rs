@@ -2051,15 +2051,18 @@ impl KernelComposition {
             .as_ref()
             .ok_or(TransportError::SessionFenced)?;
         let (envelope, tool_request) = self.read_observe_executable_input(record)?;
-        let arguments = tool_request.get("arguments").and_then(serde_json::Value::as_object);
-        if arguments.and_then(|value| value.get("kind")).and_then(serde_json::Value::as_str)
+        let arguments = tool_request
+            .get("arguments")
+            .and_then(serde_json::Value::as_object);
+        if arguments
+            .and_then(|value| value.get("kind"))
+            .and_then(serde_json::Value::as_str)
             != Some("observation")
             || !arguments.is_some_and(|value| value.contains_key("write_submission"))
         {
             return Ok(None);
         }
-        let original_submission =
-            Self::original_write_submission_from_tool_request(&tool_request)?;
+        let original_submission = Self::original_write_submission_from_tool_request(&tool_request)?;
         if original_submission.response_mode != "accept_after_stage" {
             return Ok(None);
         }
@@ -2076,15 +2079,10 @@ impl KernelComposition {
         }
         let (operation, _, _) =
             self.validate_original_staged_observe_plan(record, input, &operation_identity)?;
-        let original_source: RequestIdentity = serde_json::from_value(
-            input.application_binding.source_request_identity.clone(),
-        )
-        .map_err(|_| TransportError::SessionFenced)?;
-        let operation_id = operation
-            .transition
-            .identity
-            .operation_id
-            .as_str();
+        let original_source: RequestIdentity =
+            serde_json::from_value(input.application_binding.source_request_identity.clone())
+                .map_err(|_| TransportError::SessionFenced)?;
+        let operation_id = operation.transition.identity.operation_id.as_str();
         if operation.original_write_submission.as_ref() != Some(&original_submission)
             || host_request_operation_id(&envelope) != record.operation_id.as_str()
             || operation_id != record.operation_id.as_str()
@@ -6095,8 +6093,8 @@ impl KernelComposition {
         app: &HostRequestApplicationBinding,
         receipt: &AgentBridgePeerAdmissionReceipt,
     ) -> Result<(), TransportError> {
-        let identity_value = serde_json::to_value(&envelope.identity)
-            .map_err(|_| TransportError::SessionFenced)?;
+        let identity_value =
+            serde_json::to_value(&envelope.identity).map_err(|_| TransportError::SessionFenced)?;
         let identity_sha = sha256_hex(
             &canonical_json_bytes(&identity_value).map_err(|_| TransportError::SessionFenced)?,
         );
@@ -7841,8 +7839,7 @@ impl KernelComposition {
             &input.application_binding,
             transition,
         )?;
-        if operation.original_write_submission.as_ref() != Some(original_submission)
-        {
+        if operation.original_write_submission.as_ref() != Some(original_submission) {
             return Err(TransportError::IdentityConflict);
         }
         eliot_store_api::prepared_transition_digest(transition)
@@ -7882,9 +7879,8 @@ impl KernelComposition {
         }
         if transition.task_id.as_deref().is_some_and(|task_id| {
             binding.task_ref.as_ref().map(OpaqueLabel::as_str) != Some(task_id)
-        })
-            || binding.task_ref.is_some()
-                && binding.task_revision != transition.state_fence.task_revision
+        }) || binding.task_ref.is_some()
+            && binding.task_revision != transition.state_fence.task_revision
         {
             return Err(TransportError::IdentityConflict);
         }
