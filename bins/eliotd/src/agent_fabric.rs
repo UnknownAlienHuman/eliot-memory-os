@@ -51,7 +51,7 @@
 //! ceiling, and route-owner class/privacy evidence are bound into the canonical
 //! receipt persisted with the definition.
 //!
-/// Issue #1702 adds the two operations that act on owner-separated swarm
+//! Issue #1702 adds the two operations that act on owner-separated swarm
 //! semantics rather than merely record them.
 //! [`AgentFabric::replace_semantic_active_work`] is the explicit replacement of
 //! active work: it drives the Task Controller's replacement revision, the
@@ -1543,9 +1543,7 @@ fn verify_semantic_record_set(
 /// admitted wave is checked by, and the replacement work is already frozen by
 /// the supersession link alone. `Cancel` and `Supersede` are distinguished,
 /// never collapsed — the Governor's own words are what the admission carries.
-fn mirrored_disposition(
-    disposition: OldWaveDisposition,
-) -> Option<SwarmPlanAdmissionDisposition> {
+fn mirrored_disposition(disposition: OldWaveDisposition) -> Option<SwarmPlanAdmissionDisposition> {
     match disposition {
         OldWaveDisposition::Drain => None,
         OldWaveDisposition::Cancel => Some(SwarmPlanAdmissionDisposition::Cancelled),
@@ -3605,7 +3603,7 @@ impl AgentFabric {
     pub fn replace_semantic_active_work(
         &mut self,
         replacement: SwarmPlanDefinition,
-        supersession: SupersessionLink,
+        supersession: &SupersessionLink,
         old_execution_id: &SwarmExecutionId,
         controller_holder: &str,
         controller_epoch: u64,
@@ -3618,17 +3616,20 @@ impl AgentFabric {
         // carries are one disposition, not two claims. They are checked against
         // each other here so the old-wave disposition cannot be admitted under a
         // link the replacement does not itself carry.
-        if replacement.supersedes.as_ref() != Some(&supersession) {
+        if replacement.supersedes.as_ref() != Some(supersession) {
             return Err(FabricError::BrokenOwnershipLink(
                 "presented supersession link does not match the replacement definition".to_owned(),
             ));
         }
         let prior_key = supersession.prior_definition_id.as_str().to_owned();
         let execution_key = old_execution_id.as_str().to_owned();
-        let old_execution =
-            self.semantic_executions.get(&execution_key).cloned().ok_or_else(
-                || FabricError::Contract(format!("unknown semantic execution {execution_key}")),
-            )?;
+        let old_execution = self
+            .semantic_executions
+            .get(&execution_key)
+            .cloned()
+            .ok_or_else(|| {
+                FabricError::Contract(format!("unknown semantic execution {execution_key}"))
+            })?;
         // The wave being replaced is resolved through the link's own prior
         // definition, so a link that points at some other wave's definition
         // cannot be used to drain this execution.
@@ -3660,30 +3661,30 @@ impl AgentFabric {
         // admission, which is what lets it finish under the identical guard, and
         // the freeze that blocks replacement work comes from the supersession
         // link rather than from revoking the admission a live wave still needs.
-        if let Some(mirrored) = mirrored_disposition(supersession.disposition) {
-            if let Err(error) = self.note_semantic_admission_disposition(
+        if let Some(mirrored) = mirrored_disposition(supersession.disposition)
+            && let Err(error) = self.note_semantic_admission_disposition(
                 &old_execution.admission_id,
                 mirrored,
                 disposition_owner_revision,
                 disposition_receipt,
-            ) {
-                // Restore the explicit current authority this composition is
-                // withdrawing. Every record the wave had — its definition, its
-                // admission, its execution, every dispatch already made — is
-                // still there verbatim; what returns is its authority to receive
-                // new execution identities. Only the NEW replacement revision,
-                // which never admitted, is withdrawn: the wave is not
-                // resurrected with the replacement, it is merely left in the
-                // authority it provably still had.
-                let _ = self.supersede_semantic_definition(
-                    replacement,
-                    controller_holder,
-                    controller_epoch,
-                    definition_owner_revision,
-                    definition_receipt,
-                );
-                return Err(error);
-            }
+            )
+        {
+            // Restore the explicit current authority this composition is
+            // withdrawing. Every record the wave had — its definition, its
+            // admission, its execution, every dispatch already made — is
+            // still there verbatim; what returns is its authority to receive
+            // new execution identities. Only the NEW replacement revision,
+            // which never admitted, is withdrawn: the wave is not
+            // resurrected with the replacement, it is merely left in the
+            // authority it provably still had.
+            let _ = self.supersede_semantic_definition(
+                replacement,
+                controller_holder,
+                controller_epoch,
+                definition_owner_revision,
+                definition_receipt,
+            );
+            return Err(error);
         }
 
         // (3) Drain what this wave still owns through the cancellation owner. A
@@ -3706,9 +3707,14 @@ impl AgentFabric {
         // request stays outstanding and the unknown stays exactly as unknown.
         if old_execution.state != SwarmExecutionState::UnknownOutcome {
             for attempt_key in &cancelled_attempts {
-                self.reconcile_terminal_cancellation(&AttemptId::try_from(
-                    attempt_key.as_str(),
-                )?)?;
+                // The attempt key was minted by `request_cancellation` from the typed
+                // `AttemptId` this loop walked, so a parse failure is a broken
+                // ownership link rather than a shape problem; route it through
+                // the one total contract mapping so the typed rejection is
+                // preserved instead of collapsing into a generic contract error.
+                self.reconcile_terminal_cancellation(
+                    &AttemptId::try_from(attempt_key.as_str()).map_err(contract_rejection)?,
+                )?;
             }
         }
 
@@ -3803,8 +3809,11 @@ impl AgentFabric {
         receipt: &WriteReceipt,
     ) -> Result<(), FabricError> {
         let execution_key = execution_id.as_str().to_owned();
-        let stored =
-            self.semantic_executions.get(&execution_key).cloned().ok_or_else(|| {
+        let stored = self
+            .semantic_executions
+            .get(&execution_key)
+            .cloned()
+            .ok_or_else(|| {
                 FabricError::Contract(format!("unknown semantic execution {execution_key}"))
             })?;
         if stored.coordinator != *lost_lease {
@@ -3961,10 +3970,7 @@ impl AgentFabric {
     /// dispatch lifecycle never rewrites it. An attempt of another admission is
     /// therefore never reached by a drain or a fence, which is what keeps
     /// either operation inside its own owner's effects.
-    fn attempts_under_semantic_admission(
-        &self,
-        admission_id: &SwarmAdmissionId,
-    ) -> Vec<AttemptId> {
+    fn attempts_under_semantic_admission(&self, admission_id: &SwarmAdmissionId) -> Vec<AttemptId> {
         let admission_key = admission_id.as_str();
         self.intents
             .values()
