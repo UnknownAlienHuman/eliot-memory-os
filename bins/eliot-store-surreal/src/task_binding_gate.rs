@@ -357,6 +357,11 @@ fn require_exact_binding(
             "task binding fence is not the current State Fence",
         ));
     }
+    if context.state_fence.task_revision.is_none() {
+        return Err(TaskBindingRejection::selection_required(
+            "task-bound capture/control requires a task revision in the current State Fence",
+        ));
+    }
     if task_id.trim().is_empty() {
         return Err(TaskBindingRejection::selection_required(
             "task binding handle is blank",
@@ -389,6 +394,11 @@ fn require_finish_binding(
     if context.state_fence != transition.state_fence {
         return Err(TaskBindingRejection::selection_required(
             "finish binding fence is not the current State Fence",
+        ));
+    }
+    if context.state_fence.task_revision.is_none() {
+        return Err(TaskBindingRejection::selection_required(
+            "task-bound finish requires a task revision in the current State Fence",
         ));
     }
     if task_id.trim().is_empty() {
@@ -424,6 +434,18 @@ fn require_general_task_binding(
     if context.state_fence != transition.state_fence {
         return Err(TaskBindingRejection::selection_required(
             "task binding fence is not the current State Fence",
+        ));
+    }
+    // EpistemicRevision carries and validates its exact task revision in its
+    // closed payload, and the store receipt uses that revision when the
+    // daemon-generation fence is deliberately unscoped. Other task-relative
+    // families require the task revision directly in the current fence.
+    let revision_is_in_payload = transition.named_operations.len() == 1
+        && transition.named_operations[0].operation
+            == NamedMutationOperation::ApplyEpistemicRevision;
+    if !revision_is_in_payload && context.state_fence.task_revision.is_none() {
+        return Err(TaskBindingRejection::selection_required(
+            "task-bearing write requires a task revision in the current State Fence",
         ));
     }
     if task_id.trim().is_empty() {
