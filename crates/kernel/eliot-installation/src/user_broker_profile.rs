@@ -162,11 +162,7 @@ impl UserBrokerInstallationProfile {
 
     /// Returns canonical bytes covered by `profile_sha256`.
     pub fn canonical_unsigned_bytes(&self) -> Result<Vec<u8>, InstallationError> {
-        canonical_profile_unsigned_bytes(
-            self,
-            "profile_sha256",
-            "user_broker.profile_sha256",
-        )
+        canonical_profile_unsigned_bytes(self, "profile_sha256", "user_broker.profile_sha256")
     }
 
     /// Computes the lowercase SHA-256 profile digest.
