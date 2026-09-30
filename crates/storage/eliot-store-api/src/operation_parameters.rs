@@ -359,10 +359,11 @@ static RECONCILE_RECOVERY_PARAMETERS: [ParameterDeclaration; 10] = [
 /// carries — the source Signal, the re-proved current authorization digest,
 /// the expected record revision and the candidate record digest — plus the
 /// Problem identity and the named-transition discriminator. Membership is
-/// exact and every field is required, so a transition cannot be admitted with a
-/// binding missing; `validate_problem_owner_state_params` then closes the verb
-/// set and compares the candidate record against them.
-static APPLY_PROBLEM_OWNER_STATE_PARAMETERS: [ParameterDeclaration; 7] = [
+/// exact and every one of them is required, so a transition cannot be admitted
+/// with a binding missing; `validate_problem_owner_state_params` then closes the
+/// verb set, compares the candidate record against them, and gates the optional
+/// retained closure record to exactly the two verbs that produce one.
+static APPLY_PROBLEM_OWNER_STATE_PARAMETERS: [ParameterDeclaration; 8] = [
     ParameterDeclaration {
         name: "transition",
         shape: ParameterShape::Subject,
@@ -397,6 +398,11 @@ static APPLY_PROBLEM_OWNER_STATE_PARAMETERS: [ParameterDeclaration; 7] = [
         name: "record_json",
         shape: ParameterShape::ProblemOwnerState,
         required: true,
+    },
+    ParameterDeclaration {
+        name: "closure_json",
+        shape: ParameterShape::ProblemOwnerState,
+        required: false,
     },
 ];
 /// Owner-approved Governor finish persistence fields. The receipt remains an

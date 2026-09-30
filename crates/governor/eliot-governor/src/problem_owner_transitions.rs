@@ -39,9 +39,11 @@
 //! canonical commit of the envelope the candidate produced, and the store
 //! derives that transition's outbox row from the one declared event id inside
 //! the same transaction that writes the command's durable record, so the history
-//! write and the required outbox intent cannot diverge. A readback through the
-//! committed-only `GetAttentionAndProblems` projection therefore reflects
-//! exactly the transitions that committed.
+//! write and the required outbox intent cannot diverge. A closure record — the
+//! admitted waiver or the accepted replacement obligation — is committed in that
+//! same transition as its state change, so neither is durable only in a caller's
+//! return value. A readback through the committed-only `GetAttentionAndProblems`
+//! projection therefore reflects exactly the transitions that committed.
 //!
 //! Honesty about reachability: no production
 //! [`OwnerLeaseIssuer`](eliot_problem::OwnerLeaseIssuer) exists in this tree, so
@@ -63,12 +65,14 @@ use eliot_problem::{
 };
 use eliot_store_api::{
     EffectClass, EventId, EventProjectionRelationIntents, OperationManifestDigest,
-    OrderingHeadExpectation, OrderingScopeId, PROBLEM_PARAM_AUTHORIZATION_DIGEST,
+    OrderingHeadExpectation, OrderingScopeId, PROBLEM_CLOSURE_SUPERSEDED_BY,
+    PROBLEM_CLOSURE_WAIVED, PROBLEM_PARAM_AUTHORIZATION_DIGEST, PROBLEM_PARAM_CLOSURE_JSON,
     PROBLEM_PARAM_EXPECTED_REVISION, PROBLEM_PARAM_PROBLEM_ID, PROBLEM_PARAM_RECORD_DIGEST,
     PROBLEM_PARAM_RECORD_JSON, PROBLEM_PARAM_SOURCE_SIGNAL_ID, PROBLEM_PARAM_TRANSITION,
     ProblemOwnerTransition, RevisionHeadExpectation, ScopeId, SecurityContext, StateFence,
     TransitionClass, problem_owner_state_mutation_request, problem_revision_key,
 };
+use serde_json::Value;
 
 use crate::composition::CompositionError;
 
@@ -86,7 +90,9 @@ fn owner_refused(detail: impl Into<String>) -> CompositionError {
 }
 
 fn problem_refused(error: eliot_problem::ProblemError) -> CompositionError {
-    CompositionError::Owner(format!("problem state machine refused the transition: {error}"))
+    CompositionError::Owner(format!(
+        "problem state machine refused the transition: {error}"
+    ))
 }
 
 /// The closed per-verb bodies of the nine named transitions.
@@ -185,10 +191,15 @@ impl ProblemOwnerTransitionBody {
     }
 }
 
-/// The retained record a closure transition returns, exactly as the state
-/// machines issue it. `Problem` has no waiver or supersession field — the
-/// committed transition history is where both are read back from — so this is
-/// carried beside the candidate rather than inside it.
+/// The retained record a closure transition produces, exactly as the state
+/// machines issue it.
+///
+/// `Problem` carries no waiver or supersession field, so the committed
+/// transition is where both closures are durable: this value is rendered into
+/// the transition's `closure_json` parameter, travels inside the canonical
+/// request hash, and is read back from the committed transition through
+/// `GetAttentionAndProblems`. It is also returned to the caller so a reader does
+/// not have to re-derive it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProblemOwnerClosure {
     /// The authority, limits, expiry and residual risk an accepted risk rests on.
@@ -299,6 +310,36 @@ fn check_retained_authorization(
     }
 }
 
+/// Renders the retained closure record as its committed wire value.
+///
+/// `Problem` carries no waiver or supersession field, so the committed
+/// transition is where both closures are durable: the record the state machine
+/// returned is rendered here, verbatim from the state machine's own output, and
+/// travels inside the canonical request hash. The `kind` member is added so the
+/// bridge can hold the record to exactly the member set its verb admitted, and
+/// so the readback can tell an accepted risk from a supersession.
+fn closure_value(closure: &ProblemOwnerClosure) -> Result<Value, CompositionError> {
+    let (mut value, kind) = match closure {
+        ProblemOwnerClosure::Waived(record) => (
+            serde_json::to_value(record).map_err(|error| {
+                owner_refused(format!("cannot render the waiver record: {error}"))
+            })?,
+            PROBLEM_CLOSURE_WAIVED,
+        ),
+        ProblemOwnerClosure::SupersededBy(record) => (
+            serde_json::to_value(record).map_err(|error| {
+                owner_refused(format!("cannot render the supersession record: {error}"))
+            })?,
+            PROBLEM_CLOSURE_SUPERSEDED_BY,
+        ),
+    };
+    let object = value.as_object_mut().ok_or_else(|| {
+        owner_refused("a retained closure record did not render as a JSON object".to_owned())
+    })?;
+    object.insert("kind".to_owned(), Value::String(kind.to_owned()));
+    Ok(value)
+}
+
 /// Builds the canonical envelope for one validated candidate record.
 ///
 /// The four bindings all live here and all travel inside the canonical request
@@ -324,6 +365,7 @@ fn problem_owner_envelope(
     source_signal: &Signal,
     transition: ProblemOwnerTransition,
     authorization: &str,
+    closure: Option<&ProblemOwnerClosure>,
 ) -> Result<CanonicalWriteEnvelope, CompositionError> {
     let fence = &identity.request.metadata.state_fence;
     if candidate.state_fence != *fence {
@@ -366,6 +408,23 @@ fn problem_owner_envelope(
     ] {
         parameters.insert(name.to_owned(), value);
     }
+    // The retained closure record travels with the transition it was produced
+    // by, so an accepted risk or a supersession is durable in the committed
+    // history rather than only in the caller's return value. The store gate
+    // holds it to exactly the two verbs that may carry one.
+    if let Some(closure) = closure {
+        parameters.insert(
+            PROBLEM_PARAM_CLOSURE_JSON.to_owned(),
+            closure_value(closure)?,
+        );
+    } else if matches!(
+        transition,
+        ProblemOwnerTransition::Waive | ProblemOwnerTransition::Supersede
+    ) {
+        return Err(owner_refused(
+            "a waive or supersede transition must commit its retained closure record".to_owned(),
+        ));
+    }
     let envelope = CanonicalWriteEnvelope {
         operation_id: operation_id.clone(),
         request: identity.request.metadata.clone(),
@@ -387,12 +446,14 @@ fn problem_owner_envelope(
         operation_manifest_digest: manifest_digest.clone(),
         semantic_commands: vec![problem_owner_state_mutation_request(parameters)],
         event_projection_relation_intents: EventProjectionRelationIntents {
-            event_ids: vec![EventId::new(format!(
-                "event-problem-owner-{}-{}",
-                candidate.problem_id.as_str(),
-                candidate.revision
-            ))
-            .map_err(|error| owner_refused(error.to_string()))?],
+            event_ids: vec![
+                EventId::new(format!(
+                    "event-problem-owner-{}-{}",
+                    candidate.problem_id.as_str(),
+                    candidate.revision
+                ))
+                .map_err(|error| owner_refused(error.to_string()))?,
+            ],
             projection_kinds: Vec::new(),
             relation_kinds: Vec::new(),
         },
@@ -486,19 +547,22 @@ pub fn prepare_problem_owner_transition(
     // The state machine runs on a candidate copy. A refused transition throws the
     // copy away, so the caller's committed record is never partially mutated.
     let (candidate, closure) = match (current, body) {
-        (None, ProblemOwnerTransitionBody::Create {
-            problem_id,
-            class,
-            title,
-            symptom,
-            scope_id,
-            affected_dependencies,
-            hypotheses,
-            next_probe,
-            resolution_condition,
-            expected_resolution,
-            containment,
-        }) => (
+        (
+            None,
+            ProblemOwnerTransitionBody::Create {
+                problem_id,
+                class,
+                title,
+                symptom,
+                scope_id,
+                affected_dependencies,
+                hypotheses,
+                next_probe,
+                resolution_condition,
+                expected_resolution,
+                containment,
+            },
+        ) => (
             Problem::new(
                 problem_id.clone(),
                 source_signal,
@@ -520,6 +584,10 @@ pub fn prepare_problem_owner_transition(
         ),
         (Some(record), body) => {
             let mut candidate = record.clone();
+            // Only `Waive` and `Supersede` produce a retained closure record, so
+            // only those two arms bind it. Every other verb leaves it `None`
+            // because it has no closure to retain.
+            let mut closure: Option<ProblemOwnerClosure> = None;
             match body {
                 ProblemOwnerTransitionBody::Create { .. } => {
                     return Err(owner_refused(
@@ -553,50 +621,48 @@ pub fn prepare_problem_owner_transition(
                         }
                         candidate.repair_history.push(record.clone());
                     }
-                    candidate.transition(fence, *next).map_err(problem_refused)?;
-                    None
+                    candidate
+                        .transition(fence, *next)
+                        .map_err(problem_refused)?;
                 }
                 ProblemOwnerTransitionBody::Assign => {
                     candidate
                         .assign_owner(fence, lease, now_ms)
                         .map_err(problem_refused)?;
-                    None
                 }
                 ProblemOwnerTransitionBody::Unassign(loss) => {
                     candidate
                         .record_owner_loss(fence, loss)
                         .map_err(problem_refused)?;
-                    None
                 }
                 ProblemOwnerTransitionBody::Escalate { evidence } => {
                     candidate
                         .escalate_obligation(fence, evidence.clone())
                         .map_err(problem_refused)?;
-                    None
                 }
                 ProblemOwnerTransitionBody::Resolve(evidence) => {
-                    candidate.resolve(fence, evidence).map_err(problem_refused)?;
-                    None
+                    candidate
+                        .resolve(fence, evidence)
+                        .map_err(problem_refused)?;
                 }
                 ProblemOwnerTransitionBody::Waive(waiver) => {
                     let record = candidate
                         .accept_risk(fence, waiver)
                         .map_err(problem_refused)?;
-                    Some(ProblemOwnerClosure::Waived(record))
+                    closure = Some(ProblemOwnerClosure::Waived(record));
                 }
                 ProblemOwnerTransitionBody::Supersede(supersession) => {
                     let record = candidate
                         .supersede(fence, supersession)
                         .map_err(problem_refused)?;
-                    Some(ProblemOwnerClosure::SupersededBy(record))
+                    closure = Some(ProblemOwnerClosure::SupersededBy(record));
                 }
                 ProblemOwnerTransitionBody::Reopen { evidence } => {
                     candidate
                         .reopen(fence, evidence.clone())
                         .map_err(problem_refused)?;
-                    None
                 }
-            }
+            };
             (candidate, closure)
         }
         (None, _) => {
@@ -633,6 +699,7 @@ pub fn prepare_problem_owner_transition(
         source_signal,
         transition,
         &authorization,
+        closure.as_ref(),
     )?;
     Ok(PreparedProblemOwnerTransition {
         transition,

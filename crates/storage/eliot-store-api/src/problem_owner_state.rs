@@ -55,6 +55,18 @@ pub const PROBLEM_PARAM_AUTHORIZATION_DIGEST: &str = "authorization_digest";
 pub const PROBLEM_PARAM_RECORD_DIGEST: &str = "record_digest";
 /// The complete canonical candidate Problem record.
 pub const PROBLEM_PARAM_RECORD_JSON: &str = "record_json";
+/// The retained closure record a `WAIVE` or `SUPERSEDE` transition commits.
+///
+/// `Problem` carries no waiver or supersession field, so the committed
+/// transition is where both closures are durable. It is present for exactly
+/// those two verbs and absent for every other one, so a closure can never be
+/// attached to a transition that did not produce one.
+pub const PROBLEM_PARAM_CLOSURE_JSON: &str = "closure_json";
+
+/// `closure_json.kind` for an accepted risk.
+pub const PROBLEM_CLOSURE_WAIVED: &str = "WAIVED";
+/// `closure_json.kind` for a supersession.
+pub const PROBLEM_CLOSURE_SUPERSEDED_BY: &str = "SUPERSEDED_BY";
 
 /// Wire value of the `create` transition.
 pub const PROBLEM_TRANSITION_CREATE: &str = "CREATE";
@@ -165,6 +177,9 @@ pub struct DecodedProblemOwnerState {
     pub record_digest: String,
     /// The complete canonical candidate Problem record.
     pub record_json: Value,
+    /// The retained closure record, present for exactly `WAIVE` and
+    /// `SUPERSEDE`.
+    pub closure_json: Option<Value>,
 }
 
 impl DecodedProblemOwnerState {
@@ -225,13 +240,12 @@ impl DecodedProblemOwnerState {
                 });
             }
         }
-        let bound = record
-            .get("signal_refs")
-            .and_then(Value::as_array)
-            .ok_or(StoreError::InvalidField {
+        let bound = record.get("signal_refs").and_then(Value::as_array).ok_or(
+            StoreError::InvalidField {
                 field: "record_json.signal_refs",
                 reason: "candidate record must retain its source Signal identities",
-            })?;
+            },
+        )?;
         if !bound
             .iter()
             .any(|value| value.as_str() == Some(self.source_signal_id.as_str()))
@@ -299,20 +313,117 @@ fn required_digest(
     Ok(value.to_owned())
 }
 
+/// The exact member set of one `closure_json` kind.
+fn closure_members(kind: &str) -> &'static [&'static str] {
+    match kind.as_bytes() {
+        b"WAIVED" => &[
+            "authority",
+            "decision_ref",
+            "evidence",
+            "expires_at_ms",
+            "kind",
+            "limits",
+            "residual_risk",
+        ],
+        _ => &[
+            "evidence",
+            "kind",
+            "replacement_holder",
+            "replacement_obligation_ref",
+        ],
+    }
+}
+
+/// Whether this transition commits a retained closure record.
+fn transition_closes(transition: ProblemOwnerTransition) -> bool {
+    matches!(
+        transition,
+        ProblemOwnerTransition::Waive | ProblemOwnerTransition::Supersede
+    )
+}
+
+/// Validates the retained closure record for one verb.
+///
+/// Exact membership per `kind`, so a waiver cannot carry a supersession's
+/// members, a supersession cannot carry a waiver's, and neither can hide a
+/// member the admitted decision did not have. This is what makes the closure
+/// durable *as admitted* rather than as a restatement.
+fn validate_closure_json(
+    transition: ProblemOwnerTransition,
+    value: &Value,
+) -> Result<(), StoreError> {
+    let Value::Object(object) = value else {
+        return Err(StoreError::InvalidField {
+            field: PROBLEM_PARAM_CLOSURE_JSON,
+            reason: "retained closure record must be a JSON object",
+        });
+    };
+    let kind = object
+        .get("kind")
+        .and_then(Value::as_str)
+        .ok_or(StoreError::InvalidField {
+            field: "closure_json.kind",
+            reason: "retained closure record must name its kind",
+        })?;
+    let expected_kind = match transition {
+        ProblemOwnerTransition::Waive => PROBLEM_CLOSURE_WAIVED,
+        ProblemOwnerTransition::Supersede => PROBLEM_CLOSURE_SUPERSEDED_BY,
+        _ => {
+            return Err(StoreError::InvalidField {
+                field: PROBLEM_PARAM_CLOSURE_JSON,
+                reason: "only a waive or supersede transition commits a closure record",
+            });
+        }
+    };
+    if kind != expected_kind {
+        return Err(StoreError::InvalidField {
+            field: "closure_json.kind",
+            reason: "retained closure kind does not match the named transition",
+        });
+    }
+    let members = closure_members(kind);
+    if object.len() != members.len() || object.keys().any(|name| !members.contains(&name.as_str()))
+    {
+        return Err(StoreError::InvalidField {
+            field: PROBLEM_PARAM_CLOSURE_JSON,
+            reason: "retained closure record does not carry exactly its admitted members",
+        });
+    }
+    if kind == PROBLEM_CLOSURE_WAIVED
+        && !matches!(object.get("expires_at_ms").and_then(Value::as_u64), Some(expiry) if expiry > 0)
+    {
+        return Err(StoreError::InvalidField {
+            field: "closure_json.expires_at_ms",
+            reason: "an accepted-risk closure must retain a positive expiry",
+        });
+    }
+    for name in ["authority", "replacement_holder"] {
+        if let Some(holder) = object.get(name)
+            && !matches!(holder, Value::Object(_))
+        {
+            return Err(StoreError::InvalidField {
+                field: PROBLEM_PARAM_CLOSURE_JSON,
+                reason: "retained closure holder must be a JSON object",
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Validates the closed `ApplyProblemOwnerState` parameter map.
 ///
 /// The declaration table in `operation_parameters` owns exact membership and
 /// per-value shape; this enforces the closed verb set, the non-zero expected
-/// revision, the digest shapes, and the presence of the candidate record. It
-/// grants no authority: the bindings it checks are still compared against live
-/// state by the store bridge.
+/// revision, the digest shapes, the presence of the candidate record, and the
+/// verb-gated retained closure. It grants no authority: the bindings it checks
+/// are still compared against live state by the store bridge.
 pub fn validate_problem_owner_state_params(
     parameters: &BTreeMap<String, Value>,
 ) -> Result<(), StoreError> {
     let verb = required_text(parameters, PROBLEM_PARAM_TRANSITION)?;
-    if ProblemOwnerTransition::by_name(verb).is_none() {
+    let Some(transition) = ProblemOwnerTransition::by_name(verb) else {
         return Err(StoreError::UnknownOperation);
-    }
+    };
     required_text(parameters, PROBLEM_PARAM_PROBLEM_ID)?;
     required_text(parameters, PROBLEM_PARAM_SOURCE_SIGNAL_ID)?;
     let expected = required_text(parameters, PROBLEM_PARAM_EXPECTED_REVISION)?;
@@ -327,11 +438,24 @@ pub fn validate_problem_owner_state_params(
     }
     required_digest(parameters, PROBLEM_PARAM_AUTHORIZATION_DIGEST)?;
     required_digest(parameters, PROBLEM_PARAM_RECORD_DIGEST)?;
-    if !matches!(parameters.get(PROBLEM_PARAM_RECORD_JSON), Some(Value::Object(_))) {
+    if !matches!(
+        parameters.get(PROBLEM_PARAM_RECORD_JSON),
+        Some(Value::Object(_))
+    ) {
         return Err(StoreError::InvalidField {
             field: PROBLEM_PARAM_RECORD_JSON,
             reason: "problem owner transition must carry its candidate record object",
         });
+    }
+    match parameters.get(PROBLEM_PARAM_CLOSURE_JSON) {
+        Some(value) => validate_closure_json(transition, value)?,
+        None if transition_closes(transition) => {
+            return Err(StoreError::InvalidField {
+                field: PROBLEM_PARAM_CLOSURE_JSON,
+                reason: "a waive or supersede transition must retain its closure record",
+            });
+        }
+        None => {}
     }
     Ok(())
 }
@@ -342,11 +466,9 @@ pub fn decode_problem_owner_state_mutation(
     parameters: &BTreeMap<String, Value>,
 ) -> Result<DecodedProblemOwnerState, StoreError> {
     validate_problem_owner_state_params(parameters)?;
-    let transition = ProblemOwnerTransition::by_name(required_text(
-        parameters,
-        PROBLEM_PARAM_TRANSITION,
-    )?)
-    .ok_or(StoreError::UnknownOperation)?;
+    let transition =
+        ProblemOwnerTransition::by_name(required_text(parameters, PROBLEM_PARAM_TRANSITION)?)
+            .ok_or(StoreError::UnknownOperation)?;
     let expected_revision = required_text(parameters, PROBLEM_PARAM_EXPECTED_REVISION)?
         .parse::<u64>()
         .map_err(|_error| StoreError::InvalidField {
@@ -360,13 +482,13 @@ pub fn decode_problem_owner_state_mutation(
         source_signal_id: required_text(parameters, PROBLEM_PARAM_SOURCE_SIGNAL_ID)?.to_owned(),
         authorization_digest: required_digest(parameters, PROBLEM_PARAM_AUTHORIZATION_DIGEST)?,
         record_digest: required_digest(parameters, PROBLEM_PARAM_RECORD_DIGEST)?,
-        record_json: parameters
-            .get(PROBLEM_PARAM_RECORD_JSON)
-            .cloned()
-            .ok_or(StoreError::InvalidField {
+        record_json: parameters.get(PROBLEM_PARAM_RECORD_JSON).cloned().ok_or(
+            StoreError::InvalidField {
                 field: PROBLEM_PARAM_RECORD_JSON,
                 reason: "problem owner transition must carry its candidate record object",
-            })?,
+            },
+        )?,
+        closure_json: parameters.get(PROBLEM_PARAM_CLOSURE_JSON).cloned(),
     };
     decoded.record_satisfies_bindings()?;
     Ok(decoded)

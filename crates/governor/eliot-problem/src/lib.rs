@@ -1303,10 +1303,7 @@ impl Problem {
     ) -> Result<OwnershipObligation, ProblemError> {
         same_fence(expected_fence, &self.state_fence)?;
         nonempty(&evidence, "escalation.evidence")?;
-        let evidence_text = evidence
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>();
+        let evidence_text = evidence.iter().map(ToString::to_string).collect::<Vec<_>>();
         unique_text(&evidence_text, "escalation.evidence")?;
         let Ownership::Unassigned(unassigned) = &self.ownership else {
             return Err(ProblemError::IllegalTransition {

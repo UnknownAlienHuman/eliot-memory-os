@@ -175,13 +175,13 @@ use eliot_store_api::{
     TransitionClass, WriteReceipt, WriteReceiptStatus,
 };
 
-use crate::{
-    CanonicalAdmissionOwner, CompositionError, CompositionReadiness, KernelPortError,
-    KernelTransitionPort,
-};
 use crate::problem_owner_transitions::{
     ProblemOwnerTransitionBody, ProblemOwnerTransitionOutcome, prepare_problem_owner_transition,
     problem_owner_operation_id,
+};
+use crate::{
+    CanonicalAdmissionOwner, CompositionError, CompositionReadiness, KernelPortError,
+    KernelTransitionPort,
 };
 
 /// Production adapter manifest name from the Surreal adapter.
