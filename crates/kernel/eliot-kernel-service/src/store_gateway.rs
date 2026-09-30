@@ -1332,14 +1332,17 @@ impl KernelStoreGateway {
             &expected_ordering_heads,
         )
         .map_err(|error| error.to_string())?;
-        self.execute_reserved(
+        // The reserved-execution future carries the staged transition bytes
+        // (17 KiB); it is boxed onto the heap so the caller's own future
+        // stays bounded. Normal allocation is permitted on this path.
+        Box::pin(self.execute_reserved(
             &owner,
             sealed,
             context,
             transition,
             expected_revision_heads,
             expected_ordering_heads,
-        )
+        ))
         .await
     }
 
@@ -1407,14 +1410,15 @@ impl KernelStoreGateway {
             &expected_ordering_heads,
         )
         .map_err(|error| error.to_string())?;
-        self.execute_reserved(
+        // Boxed for the same 17 KiB staged-transition future as above.
+        Box::pin(self.execute_reserved(
             &owner,
             sealed,
             context,
             transition,
             expected_revision_heads,
             expected_ordering_heads,
-        )
+        ))
         .await
     }
 
@@ -1570,14 +1574,12 @@ impl KernelStoreGateway {
             writer_epoch_for_fence_from_epoch(&fence.authority_epoch).map_err(|e| e.to_string())?;
         drop(service);
         match self.store_scopes.clone() {
-            Some(store_scopes) => {
-                CompositionReservation::bind_with_store_reserve(
-                    Arc::clone(commit_ors),
-                    writer_epoch,
-                    store_scopes,
-                )
-                .map_err(|error| error.to_string())
-            }
+            Some(store_scopes) => CompositionReservation::bind_with_store_reserve(
+                Arc::clone(commit_ors),
+                writer_epoch,
+                store_scopes,
+            )
+            .map_err(|error| error.to_string()),
             None => CompositionReservation::bind(Arc::clone(commit_ors), writer_epoch)
                 .map_err(|error| error.to_string()),
         }

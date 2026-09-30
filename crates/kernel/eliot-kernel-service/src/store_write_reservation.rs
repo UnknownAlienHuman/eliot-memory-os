@@ -971,9 +971,15 @@ impl Drop for SealedReservation {
     /// partitions. Both steps are local and infallible; an unbound
     /// reservation drops as a no-op.
     fn drop(&mut self) {
+        // Unregister the protected-scope hold first (holder-checked), then
+        // return the permits to their exact owner partitions: taking the
+        // vector here both reads the field and enforces the documented
+        // release order, since plain field drop would run in declaration
+        // order (permits before the hold).
         if let Some(hold) = self.protected_hold.take() {
             hold.release();
         }
+        drop(std::mem::take(&mut self.store_permits));
     }
 }
 
