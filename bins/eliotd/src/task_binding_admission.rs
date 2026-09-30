@@ -1747,7 +1747,10 @@ pub fn resolve_task_selection(
                 || evidence.selection_source_ref != *selection_source_ref
                 || evidence.evidence_ref != *evidence_ref
                 || evidence.work_scope_ref != receipt.scope.scope_ref
-                || receipt.state_fence.task_revision.map(|revision| revision.value())
+                || receipt
+                    .state_fence
+                    .task_revision
+                    .map(|revision| revision.value())
                     != Some(evidence.task_revision)
             {
                 return Err(TaskBindingError::scope_incompatible(
