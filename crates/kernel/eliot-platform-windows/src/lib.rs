@@ -130,11 +130,14 @@ pub(crate) use directory_publication::{
     validate_directory_publication_absolute, verify_directory_publication_contour,
 };
 pub use event_log::{
-    AdmittedEventLogEvent, EVENT_LOG_MAX_INSERTION_BYTES, EVENT_LOG_MAX_INSERTION_UTF16_UNITS,
-    EVENT_LOG_MAX_INSERTIONS, EVENT_LOG_QUEUE_CAPACITY, EVENT_LOG_SERVICE_FAILURE_ID,
-    EVENT_LOG_SERVICE_START_ID, EVENT_LOG_SERVICE_STOP_ID, EVENT_LOG_SOURCE, EventLogError,
-    EventLogReceipt, EventLogSeverity, EventLogSourceAvailability, is_event_log_supported,
-    report_local_event, validate_event_log_insertion,
+    AdmittedEventLogEvent, AdmittedKernelEventLogEvent, EVENT_LOG_MAX_INSERTION_BYTES,
+    EVENT_LOG_MAX_INSERTION_UTF16_UNITS, EVENT_LOG_MAX_INSERTIONS, EVENT_LOG_QUEUE_CAPACITY,
+    EVENT_LOG_SERVICE_FAILURE_ID, EVENT_LOG_SERVICE_START_ID, EVENT_LOG_SERVICE_STOP_ID,
+    EVENT_LOG_SOURCE, EventLogError, EventLogReceipt, EventLogSeverity,
+    EventLogSourceAvailability, KERNEL_EVENT_LOG_CRASH_ID, KERNEL_EVENT_LOG_QUARANTINE_ID,
+    KERNEL_EVENT_LOG_RECOVERY_ID, KERNEL_EVENT_LOG_RESTART_EXHAUSTED_ID,
+    KERNEL_EVENT_LOG_SOURCE, KERNEL_EVENT_LOG_STARTUP_ID, KernelEventLogReceipt,
+    is_event_log_supported, report_kernel_event, report_local_event, validate_event_log_insertion,
 };
 pub use installer_authority_key::{
     INSTALLATION_AUTHORITY_KEY_FILE_BYTES, INSTALLATION_AUTHORITY_KEY_FILE_VERSION,
