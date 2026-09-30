@@ -30125,10 +30125,7 @@ impl RedbRecoveryStore {
                 .open_table(CANONICAL_STORE_ROUTE_OWNERSHIP)
                 .map_err(storage)?;
             current
-                .insert(
-                    record.route_scope_hash.as_str(),
-                    encode(record)?.as_str(),
-                )
+                .insert(record.route_scope_hash.as_str(), encode(record)?.as_str())
                 .map_err(storage)?;
         }
         write.commit().map_err(storage)?;
@@ -30147,10 +30144,7 @@ impl RedbRecoveryStore {
         &self,
         route_scope_hash: &str,
     ) -> Result<Option<crate::CanonicalStoreRouteOwnership>, OrsError> {
-        crate::model::validate_digest(
-            route_scope_hash,
-            "canonical_store_route_scope_hash",
-        )?;
+        crate::model::validate_digest(route_scope_hash, "canonical_store_route_scope_hash")?;
         let read = self.database.begin_read().map_err(storage)?;
         let current = read
             .open_table(CANONICAL_STORE_ROUTE_OWNERSHIP)

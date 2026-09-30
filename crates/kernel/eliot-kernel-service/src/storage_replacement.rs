@@ -422,8 +422,7 @@ pub fn canonical_store_route_owner(
         return Ok(Some(active));
     }
     let scope = canonical_store_route_scope()?;
-    let recorded = match ors.load_canonical_store_route_ownership(scope.route_scope_hash.as_str())
-    {
+    let recorded = match ors.load_canonical_store_route_ownership(scope.route_scope_hash.as_str()) {
         Ok(recorded) => recorded,
         Err(error) if is_absent_route_ownership_table(&error) => None,
         Err(error) => return Err(ors_refusal(&error)),

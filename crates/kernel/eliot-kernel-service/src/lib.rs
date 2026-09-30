@@ -219,7 +219,8 @@ pub use storage_replacement::{
     CANONICAL_STORE_WORK_SCOPE, IrreversibleStorageEffect, STORAGE_REPLACEMENT_TRANSFER_FORMAT,
     StorageReplacement, StorageReplacementCutoverReceipt, StorageReplacementStage,
     StorageReplacementTransfer, StorageRollbackDisposition, active_canonical_store_generation,
-    canonical_store_route_owner, canonical_store_route_scope, establish_canonical_store_route_owner,
+    canonical_store_route_owner, canonical_store_route_scope,
+    establish_canonical_store_route_owner,
 };
 pub use store_client::{
     EbpCanonicalStoreClient, EbpStoreTransport, StoreBackupClientError, StoreClientError,
