@@ -74,7 +74,7 @@ use eliot_context_contracts::{
 };
 use eliot_receipts::ProofCeiling;
 
-use crate::unit_group::{UnitGroupBinding, UnitGroupContext};
+use crate::unit_group::UnitGroupBinding;
 
 const UNKNOWN_AVAILABILITY_CONSTRAINT: &str =
     "candidate availability is unknown; admission deferred until availability is known";
