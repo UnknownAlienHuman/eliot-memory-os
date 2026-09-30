@@ -28,7 +28,7 @@ use eliot_platform_windows::{
 };
 use eliot_runtime_contracts::{
     RUNTIME_LIVE_STORE_BIND, RUNTIME_LIVE_STORE_ENDPOINT, RUNTIME_LIVE_STORE_NAMESPACE,
-    RuntimeLiveStoreIdentity,
+    RestartPolicyV1, RuntimeLiveStoreIdentity,
 };
 use eliot_store_surreal::{StoreLaunchConfig, launch_config_digest};
 use serde::Serialize;
@@ -122,6 +122,16 @@ pub struct CanarySourceBundleMaterializeInput {
     pub transaction_id: PlatformHandle,
     /// Explicit destination staging root used by the bound generation planner.
     pub staging_root: PlatformHandle,
+    /// Approved versioned restart policy for the Kernel-supervised `eliotd`
+    /// child (I14.10, I8.12).
+    ///
+    /// The operator supplies the whole shared `RestartPolicyV1` declaration
+    /// from the approved config/fault profile. I8.12 keeps every number in that
+    /// profile, so this materializer declares none of them: there is no default
+    /// window, backoff, jitter, cooldown, healthy-reset interval, quarantine
+    /// threshold or escalation target here. `None` publishes the fail-closed
+    /// disposition and is never read as an unlimited restart budget.
+    pub eliotd_restart_policy: Option<RestartPolicyV1>,
 }
 
 /// One receipt fact for a published source role.
@@ -900,6 +910,7 @@ fn build_typed_bundle(
         launch_nonce: eliotd_launch_nonce.clone(),
         authority_epoch,
         generation: authority_generation,
+        restart_policy: input.eliotd_restart_policy.clone(),
         descriptor_sha256: String::new(),
     }
     .with_computed_digest()
@@ -2067,6 +2078,7 @@ mod tests {
                     .to_string_lossy()
                     .into_owned(),
             ),
+            eliotd_restart_policy: None,
         }
     }
 

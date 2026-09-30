@@ -21,6 +21,7 @@ use eliot_installation::{
     require_published_source_bundle_journal, validate_installation_transaction_json,
 };
 use eliot_kernel_core::KernelRuntimeHealthEvidence;
+use eliot_kernel_service::ELIOTD_RESTART_POLICY_SUBJECT_ID;
 use eliot_live_canary::{
     CANARY_COMPLETION_SCHEMA, CanaryConfig, CanaryError, ProductionCanary,
     ProductionCanaryCompletionBinding, Pulse, publish_production_evidence,
@@ -33,7 +34,7 @@ use eliot_platform_windows::{
     is_eliot_governor_running, is_process_elevated, observe_current_user_config,
     windows_path_identity_digest,
 };
-use eliot_runtime_contracts::RuntimeLiveStoreIdentity;
+use eliot_runtime_contracts::{RestartPolicyV1, RuntimeLiveStoreIdentity};
 use eliot_store_surreal::{StoreLaunchConfig, launch_config_digest};
 mod backup_entry;
 #[cfg(windows)]
@@ -439,6 +440,15 @@ enum InstallationCommand {
         profile_anchor_root: PathBuf,
         #[arg(long)]
         installation_key: Option<String>,
+        /// Path to the approved versioned restart policy document for the
+        /// Kernel-supervised `eliotd` child (I14.10, I8.12).
+        ///
+        /// The file is the operator's approved config/fault profile: this
+        /// command declares no restart number of its own. Omitting it
+        /// publishes the fail-closed disposition, which withholds automatic
+        /// restart entirely; it is never read as an unlimited budget.
+        #[arg(long, value_parser = absolute_path)]
+        eliotd_restart_policy: Option<PathBuf>,
     },
     /// Publish the per-user Notify fallback declaration and register the
     /// signed Task Scheduler fallback. Runs in the interactive session
@@ -2743,7 +2753,14 @@ fn run_installation_materialize_source_bundle(
     installation_key: Option<String>,
     agent_bridge_exe: Option<PathBuf>,
     agent_bridge_account: Option<String>,
+    eliotd_restart_policy: Option<PathBuf>,
 ) -> Result<i32> {
+    // The admitted restart policy is read from the operator's approved profile
+    // and is proved by the shared contract's OWN validator before it reaches the
+    // descriptor. An unreadable or inadmissible profile is refused here; it is
+    // never replaced by a default, and a declared policy naming a different
+    // child is refused rather than re-pointed at this one.
+    let eliotd_restart_policy = read_admitted_restart_policy(eliotd_restart_policy.as_deref())?;
     let materialize_input = source_bundle_materializer::CanarySourceBundleMaterializeInput {
         eliot_host_exe: eliot_host,
         eliot_watchdog_exe: eliot_watchdog,
@@ -2775,6 +2792,7 @@ fn run_installation_materialize_source_bundle(
             .transpose()?,
         transaction_id: cli_handle(transaction_id.clone(), "transaction_id")?,
         staging_root: cli_path_handle(&staging_root, "staging_root")?,
+        eliotd_restart_policy,
     };
     let receipt =
         match source_bundle_materializer::materialize_canary_source_bundle(&materialize_input) {
@@ -4228,6 +4246,40 @@ fn cli_path_handle(path: &Path, field: &str) -> Result<PlatformHandle> {
         anyhow::bail!("{field} must be absolute");
     }
     cli_handle(path.to_string_lossy().into_owned(), field)
+}
+
+/// Reads the operator's approved versioned restart policy for the
+/// Kernel-supervised `eliotd` child (I14.10, I8.12).
+///
+/// The document is the approved config/fault profile, so this command declares
+/// no restart number of its own: absent input stays absent and withholds
+/// automatic restart. A present document is parsed as the shared
+/// `RestartPolicyV1` value and proved with that contract's OWN validator, and it
+/// must name the `eliotd` child this descriptor admits. It is never re-pointed
+/// at another child, defaulted, or widened on rejection.
+fn read_admitted_restart_policy(path: Option<&Path>) -> Result<Option<RestartPolicyV1>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let bytes = std::fs::read(path)
+        .map_err(|error| anyhow::anyhow!("read approved restart policy {}: {error}", path.display()))?;
+    let policy: RestartPolicyV1 = serde_json::from_slice(&bytes).map_err(|error| {
+        anyhow::anyhow!(
+            "parse approved restart policy {}: {error}",
+            path.display()
+        )
+    })?;
+    policy
+        .validate()
+        .map_err(|error| anyhow::anyhow!("approved restart policy {}: {error}", path.display()))?;
+    if policy.subject_id != ELIOTD_RESTART_POLICY_SUBJECT_ID {
+        anyhow::bail!(
+            "approved restart policy names child {}, not the admitted {}",
+            policy.subject_id,
+            ELIOTD_RESTART_POLICY_SUBJECT_ID
+        );
+    }
+    Ok(Some(policy))
 }
 
 /// Writes a create-new diagnostic projection of the already committed plan.

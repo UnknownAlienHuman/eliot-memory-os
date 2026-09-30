@@ -163,7 +163,7 @@ pub use process_execution_client::{
 pub use protocol::{
     AGENT_BRIDGE_ADMISSION_DESCRIPTOR_WIRE_ID, AGENT_BRIDGE_ADMISSION_DESCRIPTOR_WIRE_VERSION,
     AGENT_BRIDGE_MODULE_ID, AgentBridgeAdmissionDescriptor, AgentBridgeCallerSessionPolicy,
-    AgentBridgeProcessPolicy, ContainmentAction, DAEMON_STARTUP_EVIDENCE_OPERATION,
+    AgentBridgeProcessPolicy, ContainmentAction, DAEMON_STARTUP_EVIDENCE_OPERATION, ELIOTD_RESTART_POLICY_SUBJECT_ID,
     DaemonStartupEvidence, EliotdLaunchDescriptor, HostFileIdentity, HostJobBinding,
     HostJobIdentity, HostJobRoot, HostKernelCandidateBinding, HostProcessBinding,
     HostStartupEvidence, HostStartupEvidenceReport, HostStoreBootstrapRequirement,

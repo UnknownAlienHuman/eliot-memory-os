@@ -1498,6 +1498,7 @@ fn materialize_descriptor_bound_host_fixture(
         launch_nonce: eliotd_nonce,
         authority_epoch: launch.authority_state_fence.authority_epoch.clone(),
         generation: descriptor_generation,
+        restart_policy: None,
         descriptor_sha256: String::new(),
     }
     .with_computed_digest()?;

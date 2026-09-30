@@ -497,6 +497,16 @@ impl RestartOperationIdentity {
 pub struct RestartDecisionRecord {
     /// Content the operation identity is derived from.
     pub operation: RestartOperationIdentity,
+    /// The admitted policy revision this decision was taken under, bound to
+    /// the generation the decision acts on.
+    ///
+    /// I14.10 binds the restart policy to the generation it governs: the
+    /// generation a restart decision acts on and the policy revision that
+    /// decided it are one admitted pair, so a decision cannot be read under a
+    /// policy revision the admitted generation was never admitted with. This is
+    /// the exact value [`RestartPolicyV1::bind`] produces, and it carries the
+    /// policy digest the operation identity is derived from.
+    pub policy_admission: RestartPolicyAdmissionBinding,
     /// Derived operation identity; recomputed and compared on validation.
     pub restart_operation_id: String,
     /// Manifest revision the policy was read from.
@@ -526,15 +536,29 @@ impl RestartDecisionRecord {
         policy.validate()?;
         self.operation.validate()?;
         state_fence.validate().map_err(RuntimeContractError::from)?;
+        // The admitted binding is validated with its own `validate_for`, which
+        // recomputes the digest from the ORIGINAL policy value and compares the
+        // recorded one. It is not recomputed here and not treated as a matching
+        // shape: a binding that names a different generation, fence, or policy
+        // revision is refused before the record is read at all.
+        self.policy_admission
+            .validate_for(policy, admitted_generation, state_fence)?;
+        // I14.10 / I8.12: the operational record is decided under one exact
+        // admitted policy. The record carries the digest of THAT original policy
+        // value in its operation identity, so it is compared against the digest
+        // the admitted binding already proved for this policy. Without this the
+        // admitted revision would not actually bound the decision identity.
         if self.operation.subject_id != policy.subject_id
             || self.operation.original_state_fence != *state_fence
             || self.operation.original_generation != *admitted_generation
+            || self.operation.policy_digest != self.policy_admission.policy_digest
             || self.source_manifest_revision != policy.source_manifest_revision
             || self.source_profile_revision != policy.source_profile_revision
         {
             return Err(invalid(
                 "restart_decision_record",
-                "child, generation, state fence, or source revision does not match the policy",
+                "child, generation, state fence, policy digest, or source revision does not match \
+                 the admitted policy",
             )
             .into());
         }

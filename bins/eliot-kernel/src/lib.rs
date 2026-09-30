@@ -493,7 +493,7 @@ use eliot_protocol::{
 };
 use eliot_runtime::{Runtime, RuntimeConfig, ShutdownOutcome};
 #[cfg(windows)]
-use eliot_runtime_contracts::RestartPolicyV1;
+use eliot_runtime_contracts::{RestartPolicyAdmissionBinding, RestartPolicyV1};
 #[cfg(test)]
 pub use eliot_runtime_contracts::SupervisionLeasePredecessorIdentity;
 #[cfg(windows)]
@@ -654,6 +654,16 @@ pub struct KernelComposition {
     /// construction, like the launch descriptor it describes.
     #[cfg(windows)]
     daemon_restart_policy: Option<RestartPolicyV1>,
+    /// The same admitted policy bound to this admitted generation and its
+    /// State Fence (I14.10).
+    ///
+    /// It is the value `RestartPolicyV1::bind` produced at assembly, and it
+    /// carries the digest the operational restart record is compared against.
+    /// It is retained beside the policy so the two cannot be admitted
+    /// independently, and it is `None` exactly when the policy is `None`: an
+    /// absent declaration admits no generation and withholds automatic restart.
+    #[cfg(windows)]
+    daemon_restart_policy_admission: Option<RestartPolicyAdmissionBinding>,
     kernel_artifact_sha256: Option<String>,
     eliotd_descriptor_artifact_sha256: Option<String>,
     /// Host-approved WASM-host executable path retained for the grant-arm

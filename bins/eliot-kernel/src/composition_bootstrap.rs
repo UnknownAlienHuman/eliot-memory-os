@@ -1353,6 +1353,21 @@ impl KernelComposition {
                 ));
             }
         }
+        // I14.10: the admitted policy is bound to the admitted generation and its
+        // State Fence here, once, at startup. The binding carries the policy
+        // digest the operational restart record is checked against, so a decision
+        // cannot be read under a policy revision this generation was never
+        // admitted with. `bind` recomputes the digest from THIS original policy
+        // value; it does not accept a caller-supplied digest.
+        #[cfg(windows)]
+        let daemon_restart_policy_admission = match &daemon_restart_policy {
+            Some(policy) => Some(
+                policy
+                    .bind(generation, StateFence::new(canonical_epoch.clone(), generation))
+                    .map_err(|error| KernelBuildError::Service(error.to_string()))?,
+            ),
+            None => None,
+        };
         let artifact_id = daemon_launch
             .as_ref()
             .map_or_else(
@@ -1655,6 +1670,8 @@ impl KernelComposition {
             daemon_launch,
             #[cfg(windows)]
             daemon_restart_policy,
+            #[cfg(windows)]
+            daemon_restart_policy_admission,
             eliotd_receipt_binding,
             kernel_artifact_sha256,
             eliotd_descriptor_artifact_sha256,

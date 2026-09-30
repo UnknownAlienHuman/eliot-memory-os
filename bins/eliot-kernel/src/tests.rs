@@ -1522,6 +1522,7 @@ fn test_daemon_launch(root: &Path) -> EliotdLaunchDescriptor {
         launch_nonce: nonce,
         authority_epoch: test_epoch(1),
         generation: ResourceGeneration::genesis(),
+        restart_policy: None,
         descriptor_sha256: String::new(),
     }
     .with_computed_digest()

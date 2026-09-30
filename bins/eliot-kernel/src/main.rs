@@ -231,6 +231,16 @@ async fn main() {
         kernel_config = kernel_config.with_store_bootstrap(prepared.requirement.clone());
     }
     if let Some(daemon_launch) = daemon_launch {
+        // I14.10 / I8.12: the Host-approved, digest-bound launch descriptor
+        // carries the admitted versioned restart policy for this child. It is
+        // injected through the existing config seam so the Kernel reads the
+        // declaration the installer published rather than a locally chosen one.
+        // An absent policy stays absent and withholds automatic restart; it is
+        // never widened into an unlimited budget.
+        #[cfg(windows)]
+        if let Some(policy) = daemon_launch.restart_policy.clone() {
+            kernel_config = kernel_config.with_daemon_restart_policy(policy);
+        }
         kernel_config = kernel_config.with_daemon_launch(daemon_launch);
     }
     let Some(kernel_artifact_sha256) = options.kernel_artifact_sha256.clone() else {
