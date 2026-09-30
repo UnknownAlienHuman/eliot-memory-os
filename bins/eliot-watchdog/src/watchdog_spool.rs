@@ -1679,7 +1679,7 @@ impl WatchdogSpool {
         // The episode table is opened through the write transaction's own
         // inherent `open_table`, which creates it when absent, and the read
         // guard is released before anything else opens it for writing.
-        let mut state = {
+        let state = {
             let table = write
                 .open_table(episode::SIGNAL_EPISODE_TABLE)
                 .map_err(|error| SpoolError::Database(error.to_string()))?;
@@ -1702,77 +1702,15 @@ impl WatchdogSpool {
             }
         };
         let admission = state.classify(&source_event)?;
-        let (outcome, emission) = match admission {
-            eliot_watchdog_core::SourceEventAdmission::Retransmission { .. } => {
-                // Already accepted under the same identity and digest: reuse
-                // the accepted revision and write nothing, so the uncommitted
-                // transaction is dropped below.
-                let (revision, record) = state.accepted()?;
-                let progress = state.progress();
-                (
-                    episode::SignalEpisodeOutcome::Reused {
-                        revision,
-                        independent_occurrences: progress.independent_occurrences,
-                        evidence_observed_at_ms: progress.evidence_observed_at_ms,
-                        record,
-                    },
-                    None,
-                )
-            }
-            eliot_watchdog_core::SourceEventAdmission::ConflictingPayload {
-                recorded_payload_digest,
-            } => (
-                episode::SignalEpisodeOutcome::Refused(
-                    episode::SignalEpisodeRefusal::ConflictingSourceEventPayload {
-                        event_id: source_event.event_id.clone(),
-                        recorded_payload_digest,
-                    },
-                ),
-                None,
-            ),
-            eliot_watchdog_core::SourceEventAdmission::NewEvidence { .. } => {
-                if let Some(refusal) = state.bound_refusal(&admission) {
-                    (episode::SignalEpisodeOutcome::Refused(refusal), None)
-                } else {
-                    let payload = WatchdogSpoolPayload::Gap {
-                        service: SERVICE_NAME.to_owned(),
-                        reason: record_reason,
-                        coverage_claimed: false,
-                    };
-                    let (_appended, created) =
-                        Self::append_in_transaction(&write, observed_at_ms, payload)?;
-                    // The identity of the record this transaction just created,
-                    // bound the way an export batch binds it. A
-                    // retention-pressure gap record written ahead of it can
-                    // never be mistaken for this observation, and an interleaved
-                    // append can never substitute another entry's sequence.
-                    let raw = encode_entry(&created)?;
-                    let (_payload_digest, record_digest) = export_record_digests(&created, &raw);
-                    let record = episode::StoredSignalRecordRef {
-                        sequence: created.sequence,
-                        record_digest,
-                        observed_at_ms: created.observed_at_ms,
-                    };
-                    let reopened = state.accept(
-                        &source_event,
-                        observed_at_ms,
-                        producer_generation,
-                        &admission,
-                        record.clone(),
-                    )?;
-                    let progress = state.progress();
-                    (
-                        episode::SignalEpisodeOutcome::Accepted {
-                            revision: progress.revision,
-                            independent_occurrences: progress.independent_occurrences,
-                            record,
-                            reopened,
-                        },
-                        Some(state),
-                    )
-                }
-            }
-        };
+        let (outcome, emission) = Self::resolve_signal_episode_admission(
+            &write,
+            state,
+            &admission,
+            &source_event,
+            observed_at_ms,
+            producer_generation,
+            record_reason,
+        )?;
         let Some(state) = emission else {
             // Retransmission and refusal wrote nothing; dropping the
             // uncommitted transaction is the durable outcome, and reporting it
@@ -1828,6 +1766,112 @@ impl WatchdogSpool {
             evidence_observed_at_ms: progress.evidence_observed_at_ms,
             record,
         })
+    }
+
+    /// Turns one already-classified admission into the outcome its caller can
+    /// commit, inside the write transaction the caller already holds.
+    ///
+    /// This opens, closes and commits no transaction of its own: the one
+    /// `redb` write transaction its caller opened stays open across this call,
+    /// which is what keeps the appended record, the advanced episode row and
+    /// the spool's own high-water update one durability point. The append is
+    /// still [`Self::append_in_transaction`] on the caller's transaction and
+    /// still happens before the episode row naming that record is accepted, so
+    /// no side effect moves relative to a `?` or to the caller's `commit()`.
+    ///
+    /// The returned pair carries the advanced row when this admission wrote
+    /// something and `None` when it wrote nothing. A retransmission and a
+    /// refusal advance no occurrence count, no evidence time and no accepted
+    /// revision, so handing their caller a row to write would offer exactly the
+    /// write the deduplication guarantee forbids: the caller drops its
+    /// uncommitted transaction instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when the episode is at a bound, the record cannot
+    /// be encoded, or the append inside the caller's transaction fails. The
+    /// caller's transaction is then dropped uncommitted, exactly as it would be
+    /// had this step failed in place.
+    fn resolve_signal_episode_admission(
+        write: &WriteTransaction,
+        mut state: episode::StoredSignalEpisode,
+        admission: &eliot_watchdog_core::SourceEventAdmission,
+        source_event: &eliot_watchdog_core::AcceptedSourceEvent,
+        observed_at_ms: u64,
+        producer_generation: u64,
+        record_reason: crate::GapRecoveryReason,
+    ) -> Result<(episode::SignalEpisodeOutcome, Option<episode::StoredSignalEpisode>), SpoolError> {
+        match admission {
+            eliot_watchdog_core::SourceEventAdmission::Retransmission { .. } => {
+                // Already accepted under the same identity and digest: reuse
+                // the accepted revision and write nothing, so the caller's
+                // uncommitted transaction is dropped without a write.
+                let (revision, record) = state.accepted()?;
+                let progress = state.progress();
+                Ok((
+                    episode::SignalEpisodeOutcome::Reused {
+                        revision,
+                        independent_occurrences: progress.independent_occurrences,
+                        evidence_observed_at_ms: progress.evidence_observed_at_ms,
+                        record,
+                    },
+                    None,
+                ))
+            }
+            eliot_watchdog_core::SourceEventAdmission::ConflictingPayload {
+                recorded_payload_digest,
+            } => Ok((
+                episode::SignalEpisodeOutcome::Refused(
+                    episode::SignalEpisodeRefusal::ConflictingSourceEventPayload {
+                        event_id: source_event.event_id.clone(),
+                        recorded_payload_digest: recorded_payload_digest.clone(),
+                    },
+                ),
+                None,
+            )),
+            eliot_watchdog_core::SourceEventAdmission::NewEvidence { .. } => {
+                if let Some(refusal) = state.bound_refusal(admission) {
+                    Ok((episode::SignalEpisodeOutcome::Refused(refusal), None))
+                } else {
+                    let payload = WatchdogSpoolPayload::Gap {
+                        service: SERVICE_NAME.to_owned(),
+                        reason: record_reason,
+                        coverage_claimed: false,
+                    };
+                    let (_appended, created) =
+                        Self::append_in_transaction(write, observed_at_ms, payload)?;
+                    // The identity of the record this transaction just created,
+                    // bound the way an export batch binds it. A
+                    // retention-pressure gap record written ahead of it can
+                    // never be mistaken for this observation, and an interleaved
+                    // append can never substitute another entry's sequence.
+                    let raw = encode_entry(&created)?;
+                    let (_payload_digest, record_digest) = export_record_digests(&created, &raw);
+                    let record = episode::StoredSignalRecordRef {
+                        sequence: created.sequence,
+                        record_digest,
+                        observed_at_ms: created.observed_at_ms,
+                    };
+                    let reopened = state.accept(
+                        source_event,
+                        observed_at_ms,
+                        producer_generation,
+                        admission,
+                        record.clone(),
+                    )?;
+                    let progress = state.progress();
+                    Ok((
+                        episode::SignalEpisodeOutcome::Accepted {
+                            revision: progress.revision,
+                            independent_occurrences: progress.independent_occurrences,
+                            record,
+                            reopened,
+                        },
+                        Some(state),
+                    ))
+                }
+            }
+        }
     }
 
     /// Closes every open failure episode after a live admission, retaining each
