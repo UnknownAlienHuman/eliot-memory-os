@@ -787,7 +787,6 @@ impl HostReserve {
             RecoveryCommitStatus::None,
         )
     }
-}
 
     /// Publishes the live partition evidence for both Host dimensions as
     /// claimed [`BottleneckCapacityProfile`] rows, in frozen contract order.
