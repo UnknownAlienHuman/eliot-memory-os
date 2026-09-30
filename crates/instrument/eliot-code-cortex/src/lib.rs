@@ -160,7 +160,7 @@ pub struct SemanticIndex {
 #[derive(Clone, Debug)]
 struct RetainedLspProjection {
     workspace_root: String,
-    observation_identity: String,
+    process_operation_id: String,
     raw_handles: Vec<String>,
     result: NormalizedResult,
     currentness: LspFreshness,
@@ -236,15 +236,13 @@ impl SemanticIndex {
         &mut self,
         record: RetainedLspObservationV1,
     ) -> Result<GraphRevision, CodeCortexError> {
-        let observation_identity = record
-            .binding_sha256()
-            .map_err(|error| CodeCortexError::InvalidEvidence(error.to_string()))?;
+        let process_operation_id = record.process_evidence.operation_id().as_str().to_owned();
         let result = adopt_retained_observation(record.clone())
             .map_err(|error| CodeCortexError::InvalidEvidence(error.to_string()))?;
         self.admit_lsp_observation(
             record,
             result,
-            observation_identity,
+            process_operation_id,
             LspFreshness::Stale {
                 reason: "retained envelope supplied without live source-owner adoption".to_owned(),
             },
@@ -261,9 +259,12 @@ impl SemanticIndex {
         record: RetainedLspObservationV1,
         projection: &LspAdoptionProjection,
     ) -> Result<GraphRevision, CodeCortexError> {
-        let observation_identity = projection
-            .validate_retained_observation(&record)
-            .map_err(|error| CodeCortexError::InvalidEvidence(error.to_string()))?;
+        if !projection.matches_retained_observation(&record) {
+            return Err(CodeCortexError::InvalidEvidence(
+                "LSP adoption projection is bound to a different retained observation".to_owned(),
+            ));
+        }
+        let process_operation_id = record.process_evidence.operation_id().as_str().to_owned();
         let result = adopt_retained_observation(record.clone())
             .map_err(|error| CodeCortexError::InvalidEvidence(error.to_string()))?;
         if projection.observation() != &result {
@@ -275,7 +276,7 @@ impl SemanticIndex {
         self.admit_lsp_observation(
             record,
             result,
-            observation_identity,
+            process_operation_id,
             projection.currentness().clone(),
         )
     }
@@ -284,7 +285,7 @@ impl SemanticIndex {
         &mut self,
         record: RetainedLspObservationV1,
         result: NormalizedResult,
-        observation_identity: String,
+        process_operation_id: String,
         currentness: LspFreshness,
     ) -> Result<GraphRevision, CodeCortexError> {
         if self.retained_lsp.len() >= MAX_RETAINED_LSP_OBSERVATIONS {
@@ -362,7 +363,7 @@ impl SemanticIndex {
             "raw_outputs": raw_metadata,
         });
         let evidence = NormalizedEvidence {
-            evidence_id: observation_identity.clone(),
+            evidence_id: raw_artifact_id.clone(),
             raw_artifact_id,
             normalizer,
             kind: LSP_NORMALIZED_EVIDENCE_KIND.to_owned(),
@@ -386,18 +387,20 @@ impl SemanticIndex {
         evidence
             .validate()
             .map_err(|error| CodeCortexError::InvalidEvidence(error.to_string()))?;
-        if self.retained_lsp.contains_key(&observation_identity) {
+        if self.retained_lsp.contains_key(&process_operation_id)
+            || self.evidence.contains_key(&process_operation_id)
+        {
             return Err(CodeCortexError::InvalidEvidence(
-                "the same retained LSP observation was admitted more than once".to_owned(),
+                "the original process operation is already used as an evidence key".to_owned(),
             ));
         }
-        let key = observation_identity.clone();
+        let key = process_operation_id.clone();
         self.evidence.insert(key.clone(), evidence);
         self.retained_lsp.insert(
             key,
             RetainedLspProjection {
                 workspace_root,
-                observation_identity,
+                process_operation_id,
                 raw_handles,
                 result,
                 currentness,
@@ -648,11 +651,11 @@ fn project_retained_lsp_observations(
         }
         if !report
             .evidence_handles
-            .contains(&observation.observation_identity)
+            .contains(&observation.process_operation_id)
         {
             report
                 .evidence_handles
-                .push(observation.observation_identity.clone());
+                .push(observation.process_operation_id.clone());
         }
         let receipt = observation.result.receipt();
         let workspace_complete = matches!(
@@ -711,14 +714,14 @@ fn project_retained_lsp_observations(
                         symbol.clone(),
                         format!("{node_freshness}_lsp_symbol_observation"),
                         Some(item.symbol.clone()),
-                        &observation.observation_identity,
+                        &observation.process_operation_id,
                     )? || !admit_lsp_node(
                         request,
                         report,
                         location.clone(),
                         format!("{node_freshness}_lsp_definition_observation"),
                         Some(item.symbol.clone()),
-                        &observation.observation_identity,
+                        &observation.process_operation_id,
                     )? {
                         node_limit_reached = true;
                         break;
@@ -729,7 +732,7 @@ fn project_retained_lsp_observations(
                         symbol,
                         location,
                         "lsp_definition_observed",
-                        &observation.observation_identity,
+                        &observation.process_operation_id,
                         relation_freshness,
                     ) {
                         relation_limit_reached = true;
@@ -753,14 +756,14 @@ fn project_retained_lsp_observations(
                         symbol.clone(),
                         format!("{node_freshness}_lsp_symbol_observation"),
                         Some(item.symbol.clone()),
-                        &observation.observation_identity,
+                        &observation.process_operation_id,
                     )? || !admit_lsp_node(
                         request,
                         report,
                         location.clone(),
                         format!("{node_freshness}_lsp_reference_observation"),
                         Some(item.symbol.clone()),
-                        &observation.observation_identity,
+                        &observation.process_operation_id,
                     )? {
                         node_limit_reached = true;
                         break;
@@ -771,7 +774,7 @@ fn project_retained_lsp_observations(
                         symbol,
                         location,
                         "lsp_reference_observed",
-                        &observation.observation_identity,
+                        &observation.process_operation_id,
                         relation_freshness,
                     ) {
                         relation_limit_reached = true;
@@ -801,7 +804,7 @@ fn project_retained_lsp_observations(
                         coordinate,
                         format!("{node_freshness}_lsp_symbol_kind_{}", item.kind),
                         item.display_name.clone(),
-                        &observation.observation_identity,
+                        &observation.process_operation_id,
                     )? {
                         node_limit_reached = true;
                         break;
@@ -829,7 +832,7 @@ fn project_retained_lsp_observations(
                         ),
                         format!("{node_freshness}_lsp_diagnostic_{severity}"),
                         Some(item.code.clone()),
-                        &observation.observation_identity,
+                        &observation.process_operation_id,
                     )? {
                         node_limit_reached = true;
                         break;
@@ -849,7 +852,7 @@ fn project_retained_lsp_observations(
                     symbol.clone(),
                     format!("{node_freshness}_lsp_symbol_observation"),
                     Some(candidate.symbol.clone()),
-                    &observation.observation_identity,
+                    &observation.process_operation_id,
                 )? {
                     node_limit_reached = true;
                 }
@@ -870,7 +873,7 @@ fn project_retained_lsp_observations(
                         location.clone(),
                         format!("{node_freshness}_lsp_unapplied_rename_candidate"),
                         Some(candidate.new_name.clone()),
-                        &observation.observation_identity,
+                        &observation.process_operation_id,
                     )? {
                         node_limit_reached = true;
                         break;
@@ -881,7 +884,7 @@ fn project_retained_lsp_observations(
                         symbol.clone(),
                         location,
                         "lsp_rename_candidate_observed",
-                        &observation.observation_identity,
+                        &observation.process_operation_id,
                         relation_freshness,
                     ) {
                         relation_limit_reached = true;

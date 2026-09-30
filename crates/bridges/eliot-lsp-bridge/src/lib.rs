@@ -1338,16 +1338,6 @@ pub struct RetainedLspObservationV1 {
     pub result: NormalizedResult,
 }
 
-impl RetainedLspObservationV1 {
-    /// Stable digest of this complete serialized observation envelope.
-    ///
-    /// This is an identity for downstream provenance joins, not a receipt or
-    /// an authority token; callers must still pass through bridge adoption.
-    pub fn binding_sha256(&self) -> Result<String, BridgeError> {
-        retained_observation_binding(self).map(|binding| hex_bytes(&binding))
-    }
-}
-
 /// Independently supplied current expectations at a result-adoption boundary.
 /// Values must come from current task/source/executable owners, never from the
 /// retained envelope being checked. They support exact comparison but do not
@@ -1385,9 +1375,9 @@ pub struct LspAdoptionProjection {
     /// Freshness established at this adoption boundary, separate from the
     /// historical receipt carried by `observation`.
     currentness: Freshness,
-    /// Binds this live projection to the exact retained envelope that was
-    /// reconciled and revalidated by the original owners.
-    retained_observation_sha256: [u8; 32],
+    /// Original immutable retained envelope reconciled and revalidated by the
+    /// owners; downstream consumers must compare their received value to it.
+    retained_observation: Arc<RetainedLspObservationV1>,
 }
 
 impl LspAdoptionProjection {
@@ -1406,53 +1396,12 @@ impl LspAdoptionProjection {
     /// Checks that this owner-adopted projection belongs to the exact
     /// retained envelope supplied to a downstream evidence consumer.
     ///
-    /// The digest is private and only constructed after original process and
-    /// source-owner reconciliation. A result from one invocation therefore
-    /// cannot be paired with another envelope that happens to normalize to
-    /// the same semantic items.
+    /// Equality covers the complete source, request, process, executable,
+    /// parser, raw-output, and normalized-result envelope, so another
+    /// invocation with the same semantic items cannot be paired here.
     #[must_use]
     pub fn matches_retained_observation(&self, record: &RetainedLspObservationV1) -> bool {
-        self.validate_retained_observation(record).is_ok()
-    }
-
-    /// Validates the exact envelope and returns its stable identity digest for
-    /// provenance-preserving downstream keys.
-    pub fn validate_retained_observation(
-        &self,
-        record: &RetainedLspObservationV1,
-    ) -> Result<String, BridgeError> {
-        let binding = retained_observation_binding(record)?;
-        if binding != self.retained_observation_sha256 {
-            return Err(BridgeError::InconsistentBinding(
-                "retained observation does not match this owner-adopted projection".to_owned(),
-            ));
-        }
-        Ok(hex_bytes(&binding))
-    }
-}
-
-fn retained_observation_binding(
-    record: &RetainedLspObservationV1,
-) -> Result<[u8; 32], BridgeError> {
-    let mut writer = Sha256Writer(Sha256::new());
-    serde_json::to_writer(&mut writer, record).map_err(|error| {
-        BridgeError::InconsistentBinding(format!(
-            "retained LSP observation cannot be bound to its adoption projection: {error}"
-        ))
-    })?;
-    Ok(writer.0.finalize().into())
-}
-
-struct Sha256Writer(Sha256);
-
-impl std::io::Write for Sha256Writer {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.update(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
+        self.retained_observation.as_ref() == record
     }
 }
 
@@ -2921,6 +2870,7 @@ impl<P: LspProcessOwnerPort, G: GitProcessRunner> LspCurrentBridge<P, G> {
         source_root: &RepoRoot,
         current_source_proof: Option<LspSourceArtifactProof>,
     ) -> Result<LspAdoptionProjection, BridgeError> {
+        let record = Arc::new(record);
         validate_retained_record_matches_started(&record, started)?;
         let operation_id = started.process_start.operation_id().clone();
         let process_evidence = self
@@ -2936,9 +2886,9 @@ impl<P: LspProcessOwnerPort, G: GitProcessRunner> LspCurrentBridge<P, G> {
         }
         let currentness = received_result_currentness(&record, current);
         let mut projection = LspAdoptionProjection {
-            observation: adopt_received_result(record.clone(), current)?,
+            observation: adopt_received_result(record.as_ref().clone(), current)?,
             currentness,
-            retained_observation_sha256: retained_observation_binding(&record)?,
+            retained_observation: Arc::clone(&record),
         };
         let Some(dispatch_proof) = started.source_artifact_proof.as_ref() else {
             return Ok(projection);
