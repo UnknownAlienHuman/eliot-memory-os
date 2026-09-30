@@ -212,19 +212,27 @@ pub(super) fn maintenance_trigger_decision_commit_identity(
 /// `PreparedTransition` → Kernel → named Store transaction and returns the
 /// exact canonical receipt the trigger ack requires (#1694 W4).
 ///
-/// Production caller: `bins/eliotd/src/maintenance_trigger_evaluator.rs`
-/// `DaemonComposition::evaluate_maintenance_trigger` — the #1688 decision it
-/// returns, joined with the current #1692 policy evidence through
-/// `MaintenanceTriggerDecisionCommit::for_decision`, is committed here; the
+/// The exact-retry [`RequestIdentity`] is derived here from the live fence,
+/// the authenticated daemon connection reference, the commit, and the
+/// applicability deadline — never accepted from a caller — so a lost commit
+/// response replays under the same derived identity (convergent Store
+/// idempotency) instead of minting a competing decision (#1694 W5: the retry
+/// identity is preserved by derivation, not by trusting the retrier).
+///
+/// STITCH: adopted by the eliotd daemon commit lane. The #1688 decision
+/// joined with the current #1692 policy evidence through
+/// [`MaintenanceTriggerDecisionCommit::for_decision`] is committed here; the
 /// trigger is acked only on the returned receipt. A transport
 /// acknowledgement (`Ok(())`) or an arbitrary receipt ID is never
 /// sufficient: the Governor commit validates the exact canonical receipt
 /// before returning. Failures stay typed as [`CompositionError`]; this seam
-/// adds no stringified error and no second decision owner.
+/// adds no second decision owner.
 pub(crate) async fn commit_maintenance_trigger_decision(
     composition: &GovernorComposition<dyn KernelGenerationPort>,
-    identity: RequestIdentity,
+    fence: &StateFence,
+    connection_ref: &str,
     commit: MaintenanceTriggerDecisionCommit,
+    applicable_until_unix_ms: u64,
     proof_refs: Vec<String>,
     expected_revision_heads: Vec<RevisionHeadExpectation>,
     expected_ordering_heads: Vec<OrderingHeadExpectation>,
@@ -236,6 +244,13 @@ pub(crate) async fn commit_maintenance_trigger_decision(
         trigger = %super::diagnostics::sanitize_identity(&commit.trigger_id)
     );
     async move {
+        let identity = maintenance_trigger_decision_commit_identity(
+            fence,
+            connection_ref,
+            &commit,
+            applicable_until_unix_ms,
+        )
+        .map_err(|error| CompositionError::Owner(error.to_string()))?;
         composition
             .commit_maintenance_trigger_decision(
                 &identity,
