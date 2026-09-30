@@ -176,11 +176,17 @@ public static class LegacyOperatorAdapter
     ///
     /// An unmet precondition leaves the adapter exactly as it is. It must never
     /// gain a fifth tool, a new command shape, or a wider capability.
+    ///
+    /// The five preconditions are the path that retires this adapter on its own
+    /// merits. The second, independent path is unchanged: this adapter is legacy
+    /// core, so when the #1189 retirement owner (with #18) retires that core, it
+    /// is removed then regardless of how many preconditions above still hold.
     public const string ExpiryRemoval =
-        "Remove only when all five preconditions in the comment above hold: a served, " +
+        "Remove when all five preconditions in the comment above hold: a served, " +
         "consumed current-owner ControlBoard read route; an owner-issued State Fence on " +
         "the consumed page; mutations served by the current typed Operator-intent owner; " +
         "one protocol on the UI pipe; and no remaining call site of the four tools. " +
+        "Also remove when the #1189 retirement owner retires this legacy core. " +
         "No new tool or command shape may be added.";
 
     /// The exact closed set of routes this adapter may issue. A tool outside
