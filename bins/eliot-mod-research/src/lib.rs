@@ -1472,6 +1472,21 @@ pub fn project_admitted_inquiry(
     // is not an unfetchable source, a policy denial is not incomplete coverage,
     // and an exhausted budget is neither.
     let degradation = acquisition_coverage_degradation(failure);
+    // W2 (`#1765`): this projection carries the admitted request, the provider
+    // admission and the terminal receipt — and no retained source bytes. The
+    // crate that owns the observation states that a handle absent from
+    // `retained_revisions` is "a real finding rather than a skip", so the
+    // honest value here is the EMPTY map: every excerpt offered from a source
+    // this projection admitted then fails verification with
+    // `NoRetainedRevision`, which is the truthful W2 outcome for a run that did
+    // not persist before synthesis.
+    //
+    // It is deliberately NOT populated from the receipt, and no artifact
+    // reference is invented: this subtree has no canonical-store write
+    // authority, so a digest of bytes nobody holds is not a retained original.
+    // The provider path that DOES persist before synthesis supplies this map
+    // through the governed source-admission owner.
+    let retained_revisions = std::collections::BTreeMap::new();
     let observation = InquiryObservation {
         inquiry_id: receipt.exchange_id.clone(),
         evidence_set_id: request.allowed_references.run_id.clone(),
@@ -1498,6 +1513,7 @@ pub fn project_admitted_inquiry(
         candidates: retained_provider_material(request, receipt, &route)
             .into_iter()
             .collect(),
+        retained_revisions,
         outcome: acquisition_outcome(receipt),
         reason_code: degradation
             .inquiry_reason_code()
