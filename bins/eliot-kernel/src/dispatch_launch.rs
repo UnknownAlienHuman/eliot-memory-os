@@ -5663,6 +5663,14 @@ pub fn prepare_dreamer_launch(
             "admitted dreamer response does not answer the presented job attempt".to_owned(),
         ));
     }
+    let semantic_input = material
+        .queued
+        .semantic_input
+        .as_ref()
+        .ok_or(DreamerMaterialError::SemanticInputUnavailable)?;
+    semantic_input
+        .validate("semantic_input.sha256")
+        .map_err(|_| DreamerMaterialError::SemanticInputStale)?;
     let (authority_epoch, generation) = {
         let service = kernel
             .service
@@ -5723,6 +5731,8 @@ pub fn prepare_dreamer_launch(
         job_id: material.keys.job_id.to_owned(),
         attempt_id: material.keys.attempt_id.to_owned(),
         revision,
+        semantic_input: semantic_input.clone(),
+        semantic_input_bytes: material.queued.semantic_input_bytes.clone(),
         scope_id: scope_id.clone(),
         fence: fence.clone(),
         executable_sha256: material.child.executable_sha256.to_owned(),
@@ -5739,6 +5749,8 @@ pub fn prepare_dreamer_launch(
         job_id: material.keys.job_id.to_owned(),
         attempt_id: material.keys.attempt_id.to_owned(),
         revision,
+        semantic_input: Some(semantic_input.clone()),
+        semantic_input_bytes: material.queued.semantic_input_bytes.clone(),
         scope_id,
         fence,
         epoch: authority_epoch.clone(),

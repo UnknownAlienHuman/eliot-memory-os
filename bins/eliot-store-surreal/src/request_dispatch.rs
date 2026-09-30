@@ -1041,6 +1041,19 @@ mod dreamer_dispatch_tests {
             "job_id": "job-s2",
             "attempt_id": "attempt-s2",
             "scope": work_scope_json(),
+            "semantic_input": match &request.operation {
+                JobOperation::Submit { submission } => {
+                    serde_json::to_value(&submission.semantic_input).expect("semantic input")
+                }
+                _ => serde_json::Value::Null,
+            },
+            "semantic_input_bytes": match &request.operation {
+                JobOperation::Submit { submission } => {
+                    serde_json::to_value(&submission.semantic_input_bytes)
+                        .expect("semantic input bytes")
+                }
+                _ => serde_json::Value::Null,
+            },
             "revision": 1,
             "state": "QUEUED",
             "disposition": "COMMITTED",

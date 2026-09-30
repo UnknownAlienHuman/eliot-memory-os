@@ -390,6 +390,7 @@ mod tests {
             attempt_id: ArtifactId::new("attempt-1")?,
             work_scope: work_scope.clone(),
             semantic_input: content_ref("input", 8, &"b".repeat(64))?,
+            semantic_input_bytes: None,
             output_contract: content_ref("output", 8, &"c".repeat(64))?,
             admission: AdmissionRef {
                 authority: AuthorityBinding {
@@ -607,6 +608,8 @@ mod tests {
             job_id: submission.job_id.clone(),
             attempt_id: submission.attempt_id.clone(),
             scope: submission.work_scope.clone(),
+            semantic_input: Some(submission.semantic_input.clone()),
+            semantic_input_bytes: submission.semantic_input_bytes.clone(),
             revision: 1,
             state: JobState::Queued,
             disposition: Some(MutationDisposition::Committed),
@@ -640,6 +643,8 @@ mod tests {
             job_id: submission.job_id.clone(),
             attempt_id: submission.attempt_id.clone(),
             scope: submission.work_scope.clone(),
+            semantic_input: Some(submission.semantic_input.clone()),
+            semantic_input_bytes: submission.semantic_input_bytes.clone(),
             revision: 1,
             state: JobState::Leased,
             disposition: Some(MutationDisposition::Committed),
