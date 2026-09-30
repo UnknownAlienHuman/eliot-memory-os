@@ -7066,7 +7066,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// relocation still needs its explicit owner receipt through
     /// [`Self::admit_scope_relocation`].
     ///
-    /// Source-effect admission reads the current WorkScope, task, and session
+    /// Source-effect admission reads the current `WorkScope`, task, and session
     /// owners before invoking the original GrantGraph/EffectAuthorizer path.
     /// Its result is non-Serde and remains in the same request stack through
     /// source capture and the Kernel P-03 handoff.
@@ -8388,7 +8388,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// Applies a Canonical-admitted transition and retains the independently
     /// projected causal receipt returned by the canonical owner. This is the
     /// required entrypoint for consumers that must validate post-genesis
-    /// receipts; it has the same readiness and fresh WorkScope guards as
+    /// receipts; it has the same readiness and fresh `WorkScope` guards as
     /// [`Self::commit_canonical`].
     pub async fn commit_canonical_with_causal(
         &self,
