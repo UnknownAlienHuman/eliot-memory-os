@@ -71,6 +71,25 @@ fn refuse_campaign_staged_repeat(
     Ok(())
 }
 
+/// Evicts one stale (non-live) campaign-packet candidate across scopes.
+///
+/// Returns whether a slot was freed; when nothing is evictable the queue is
+/// genuinely full and the caller refuses with backpressure.
+fn evict_one_stale_campaign_packet(
+    index: &mut std::collections::BTreeMap<String, Vec<HostRequestOperationRef>>,
+) -> bool {
+    for refs in index.values_mut() {
+        if let Some(position) = refs.iter().position(|candidate| {
+            candidate.campaign_packet_envelope.is_some()
+                && !candidate.campaign_packet_attempt.is_live()
+        }) {
+            refs.remove(position);
+            return true;
+        }
+    }
+    false
+}
+
 impl KernelComposition {
     pub(super) fn enqueue_campaign_packet_pair_under_transition(
         &self,
@@ -125,21 +144,8 @@ impl KernelComposition {
             .flatten()
             .filter(|candidate| candidate.campaign_packet_envelope.is_some())
             .count();
-        if queued >= MAX_QUEUED_LOCAL_READS {
-            let mut evicted = false;
-            for refs in index.values_mut() {
-                if let Some(position) = refs.iter().position(|candidate| {
-                    candidate.campaign_packet_envelope.is_some()
-                        && !candidate.campaign_packet_attempt.is_live()
-                }) {
-                    refs.remove(position);
-                    evicted = true;
-                    break;
-                }
-            }
-            if !evicted {
-                return Err(TransportError::Backpressure);
-            }
+        if queued >= MAX_QUEUED_LOCAL_READS && !evict_one_stale_campaign_packet(&mut index) {
+            return Err(TransportError::Backpressure);
         }
         let campaign_packet_attempt = LocalReadAttemptState {
             enqueue_salt: LOCAL_READ_ENQUEUE_SALT.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
@@ -182,14 +188,9 @@ impl KernelComposition {
         // original is reconciled, never duplicated. Best-effort like every
         // observation: a populate failure is terminal-visible but never
         // changes the staged admission.
-        match crate::tool_exposure::dispatch_exposure_draft(envelope, tool, &admission) {
-            Ok(draft) => {
-                self.audit_observe(draft);
-            }
-            Err(_) => crate::kernel_diagnostics::observe_terminal_error(
-                crate::kernel_audit::KERNEL_AUDIT_APPEND_TERMINAL_CODE,
-            ),
-        }
+        crate::tool_exposure::observe_dispatch_exposure(envelope, tool, &admission, |draft| {
+            self.audit_observe(draft);
+        });
         Ok(())
     }
 

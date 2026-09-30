@@ -2739,14 +2739,9 @@ impl KernelComposition {
         // without new evidence. Best-effort like every observation: a
         // populate failure is terminal-visible but never changes the staged
         // admission.
-        match super::tool_exposure::dispatch_exposure_draft(envelope, tool, &admission) {
-            Ok(draft) => {
-                self.audit_observe(draft);
-            }
-            Err(_) => crate::kernel_diagnostics::observe_terminal_error(
-                crate::kernel_audit::KERNEL_AUDIT_APPEND_TERMINAL_CODE,
-            ),
-        }
+        super::tool_exposure::observe_dispatch_exposure(envelope, tool, &admission, |draft| {
+            self.audit_observe(draft);
+        });
         // I16.5 (issue #1841): the queue gauges are read from the owner's own
         // live index at admission, so a sample measures the current contour
         // rather than a total carried forward.
