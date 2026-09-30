@@ -76,8 +76,8 @@ use eliot_dreamer_conflict_analysis::{
     analyze_grounded_conflict,
 };
 use eliot_dreamer_contracts::{
-    ClassificationInput, CurationAcceptanceCtx, DreamInputBundle, GroundedDreamDraft,
-    ModelRouteDisposition, ModelRouteOutcome, ValidatedCurationItem, ValidatedDreamDraft,
+    ClassificationInput, CurationAcceptanceCtx, DreamInputBundle, ModelRouteDisposition,
+    ModelRouteOutcome, ValidatedCurationItem,
     ValidatedGroundingCandidate, bundle_digest_of, canonical_bytes, digest_hex,
 };
 use eliot_dreamer_contracts::grounding::GroundedDreamDraft as StructuredGroundedDreamDraft;
@@ -155,10 +155,6 @@ pub(crate) struct RivalStage<'a> {
 pub(crate) struct ConflictStage<'a> {
     /// Validated curation item under analysis.
     pub item: &'a ValidatedCurationItem,
-    /// Validator-bound draft under analysis.
-    pub draft: &'a ValidatedDreamDraft,
-    /// Claim-grounded draft under analysis.
-    pub grounded: &'a GroundedDreamDraft,
     /// Admitted conflict set under analysis.
     pub conflict_set: &'a ConflictSet,
     /// Expected receipts and supplement bounds.
@@ -439,15 +435,28 @@ impl PulseStage {
 
 /// Native result values returned by the mandatory stage owners.
 pub(crate) enum StageOwnerOutput {
-    Classification(ClassificationResult),
+    Classification(Box<ClassificationResult>),
     CueActivation(CueActivationEvaluation),
     EpistemicPosition(CurrentEpistemicPosition),
     Understanding(ActiveUnderstandingViewResult),
-    Grounding(StructuredGroundedDreamDraft),
+    Grounding(Box<StructuredGroundedDreamDraft>),
     Rivals(RivalModelSet),
     Conflict(ConflictAnalysisCandidate),
     Probes(ProbePlan),
     Candidates(ContextCandidateSetResult),
+}
+
+#[derive(serde::Serialize)]
+struct GroundingInput<'a> {
+    job: &'a eliot_dreamer_contracts::DreamJobAdmission,
+    bundle: &'a DreamInputBundle,
+    manifest: &'a eliot_dreamer_contracts::grounding::AllowedReferenceManifest,
+    draft: &'a eliot_dreamer_contracts::grounding::StructuredModelDraft,
+    policy: &'a eliot_dreamer_contracts::grounding::GroundingPolicy,
+    whole_claim_quota: Option<usize>,
+    cancellation: &'static str,
+    cancellation_reason: Option<&'a str>,
+    deadline_exceeded: bool,
 }
 
 /// Canonical content digest over one owner output value.
@@ -662,7 +671,7 @@ pub(crate) fn run_classification_stage(
                 PulseStageId::Classification,
                 input_commitment,
                 commitment,
-                StageOwnerOutput::Classification(output),
+                StageOwnerOutput::Classification(Box::new(output)),
                 canonical,
             ))
         },
@@ -832,18 +841,6 @@ pub(crate) fn run_grounding_stage(
                     ("cancelled", Some(reason.as_str()))
                 }
             };
-            #[derive(serde::Serialize)]
-            struct GroundingInput<'a> {
-                job: &'a eliot_dreamer_contracts::DreamJobAdmission,
-                bundle: &'a DreamInputBundle,
-                manifest: &'a eliot_dreamer_contracts::grounding::AllowedReferenceManifest,
-                draft: &'a eliot_dreamer_contracts::grounding::StructuredModelDraft,
-                policy: &'a eliot_dreamer_contracts::grounding::GroundingPolicy,
-                whole_claim_quota: Option<usize>,
-                cancellation: &'static str,
-                cancellation_reason: Option<&'a str>,
-                deadline_exceeded: bool,
-            }
             // Controls are part of this owner's exact invocation and are
             // committed without interpreting or manufacturing new control
             // values.
@@ -877,7 +874,7 @@ pub(crate) fn run_grounding_stage(
                 PulseStageId::Grounding,
                 input_commitment,
                 commitment,
-                StageOwnerOutput::Grounding(output),
+                StageOwnerOutput::Grounding(Box::new(output)),
                 canonical,
             ))
         },
