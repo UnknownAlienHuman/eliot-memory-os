@@ -111,14 +111,14 @@ pub enum AdmissionReservationState {
 /// the receipt the canonical owner issued. The ORS half names the resulting row.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct AdmissionReservationActivation {
+pub struct AdmissionReservationActivationEvidence {
     /// Owner-issued canonical admission receipt for the exact `ADMITTED` write.
     pub canonical_admission_receipt: ReceiptIdentity,
     /// ORS activation receipt committed alongside the resulting active row.
     pub activation_receipt: ReceiptIdentity,
 }
 
-impl AdmissionReservationActivation {
+impl AdmissionReservationActivationEvidence {
     /// Validates both receipt references as well-shaped owner evidence.
     ///
     /// The two references are checked with the shape rules the receipts crate
@@ -428,7 +428,7 @@ pub struct AdmissionReservationTransitionRequest {
     /// this reservation, so a replay of the same operation identity is
     /// decidable by comparing this whole request.
     #[serde(default)]
-    pub activation: Option<AdmissionReservationActivation>,
+    pub activation: Option<AdmissionReservationActivationEvidence>,
 }
 
 /// Required owner evidence for one exact `StagedInactive`/`Reconciling` →
