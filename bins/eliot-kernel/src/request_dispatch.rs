@@ -121,15 +121,14 @@
 //! - `backup.restore-test` rehearses the shape path reachable without
 //!   owner-held state (bounded decode, exact shapes, digest shapes, lineage
 //!   admissibility, provisioning shape, store-level isolation inequality),
-//!   then returns `blocked` naming the three real owners rather than a
-//!   Governor transition type: the Kernel restore coordinator and the
-//!   production call to it (#960), the owner-issued restore evidence - a
-//!   `RestoreJournalAdmission` plus a `DestinationManifestEvidence` - (#962),
-//!   and the front-door connection (#2569), all open. Measured on this tree,
-//!   none of those three exists yet: there is no `restore_transitions` symbol
-//!   and no `CoordinationCommit` type anywhere, and the composition's
-//!   isolated-restore entry has no production caller. Owner-backed gates are
-//!   marked `-deferred` in `gates_passed` and never claimed as proven.
+//!   then returns `blocked` naming the ONE genuinely absent owner capability
+//!   rather than a Governor transition type. That capability is the ORS
+//!   restore-journal STREAM ESTABLISHMENT the owner-issued admission is proved
+//!   against; see [`BACKUP_RESTORE_TEST_MISSING_OWNER`] for the re-measurement
+//!   and the exact seam that would close it. The gates that ran are reported in
+//!   `gates_passed` and the gates that did not run are reported in
+//!   `gates_not_admitted`; the two sets are disjoint, so a gate is never
+//!   reported as passed and as deferred-to-owner at the same time.
 //!
 //! The dispatch-matrix arm is [`crate::frame_dispatch`]'s closed `backup`
 //! operation gate; this file holds only the route. The arm fences the frame
@@ -190,6 +189,49 @@ pub(crate) const BACKUP_VERIFY_OPERATION: &str = "backup.verify";
 /// CLI surface; rehearsal only, never cutover).
 pub(crate) const BACKUP_RESTORE_TEST_OPERATION: &str = "backup.restore-test";
 
+/// The one genuinely absent owner capability the isolated restore-test refusal
+/// names, re-measured on this tree.
+///
+/// This literal replaced a refusal that named THREE owners, and re-measured on
+/// the base this route runs on, all three of those EXIST — so naming them absent
+/// was a false claim in production prose:
+///
+/// - the Kernel restore coordinator and its production call — #960 — EXISTS:
+///   `KernelComposition::backup_restore_with_ors_journal` (`lib.rs`) and
+///   `KernelBackupRestore::restore_with_ors_journal` (`backup_restore.rs`), landed
+///   together in `332e6d0db` (PR #4431);
+/// - the owner-issued `RestoreJournalAdmission` and
+///   `DestinationManifestEvidence` — #962 — EXIST:
+///   `RestoreJournalAdmission::issue_for_operation`
+///   (`crates/storage/eliot-backup/src/restore_journal_admission.rs`) and
+///   `DestinationManifestEvidence::issue_from_owner_manifest`
+///   (`backup_restore_ports.rs`);
+/// - the front-door connection — #2569 — EXISTS: `ce06e7824` (PR #4368).
+///
+/// What is actually missing is ONE thing, named exactly: the ORS
+/// restore-journal STREAM ESTABLISHMENT the owner-issued admission is proved
+/// against. `RestoreJournalAdmission::issue_for_operation` calls
+/// `binds_owner_record`, which requires that the live journal ALREADY hold this
+/// plan's transaction and that the admission's `journal_identity_ref` equal the
+/// per-plan stream key `sha256(plan_id, bundle_sha256)`. Neither holds on this
+/// tree: the only writer of the durable `RestoreJournalStreamBinding` row is the
+/// engine's own genesis compare-and-swap, which runs strictly AFTER admission,
+/// and the owner that produces the admission
+/// (`OrsRestoreJournalOwner::durable_journal_record`, `backup_restore_ports.rs`)
+/// reports the fixed channel constant `RESTORE_JOURNAL_IDENTITY` rather than the
+/// per-plan key. So a first run is refused for want of a row, and the
+/// per-plan-identity requirement contradicts the channel requirement
+/// (`check_ors_journal_binding` in `backup_restore.rs` requires the constant) for
+/// every run.
+///
+/// The owner seam that closes that circle is
+/// `RestoreJournalAdmissionOwner::issue_journal_stream`, which does not exist on
+/// this tree (`git grep issue_journal_stream` — zero matches) and whose
+/// implementation belongs to `crates/storage/eliot-backup/src/restore_journal_admission.rs`,
+/// outside this route's mutable scope. `plan_gap` therefore stays on this arm,
+/// and it stays for that one named reason only.
+pub(crate) const BACKUP_RESTORE_TEST_MISSING_OWNER: &str = "restore-journal-stream-establishment (RestoreJournalAdmissionOwner::issue_journal_stream in crates/storage/eliot-backup/src/restore_journal_admission.rs; the ORS RestoreJournalStreamBinding row has no producer that runs before admission)";
+
 /// Maximum inline bundle bytes admitted on one backup frame payload.
 ///
 /// Byte-exact with the CLI surface: JSON hex inflation doubles input bytes on
@@ -228,21 +270,37 @@ const BACKUP_VERIFY_REQUEST_DOMAIN: &str = "eliot.kernel.backup-verify.request";
 /// version a change to that field set must move.
 const BACKUP_VERIFY_REQUEST_ENCODING_VERSION: u16 = 1;
 
-/// Gates reported by the restore-test rehearsal, in pass order.
+/// The gates the isolated restore-test route ACTUALLY executes, in the order
+/// this file runs them, reported as `gates_passed`.
 ///
-/// Gates without a `-deferred` suffix ran here for real against the frame
-/// bytes; gates with the suffix need owner-held state and are named as
-/// deferred, never claimed as proven. See [`handle_backup_restore_test`].
-const RESTORE_TEST_GATES: [&str; 8] = [
+/// Every name in this list is a gate that ran for real against the presented
+/// frame bytes before this route answered, so the list is the executed route
+/// and not a restatement of what the route intended to do. It was one
+/// eight-element list before, whose two owner-held entries were suffixed
+/// `-deferred` and were emitted INSIDE `gates_passed` — a field whose name
+/// asserts every entry passed. A gate that needs owner-held state and therefore
+/// did not run is now named in
+/// [`RESTORE_TEST_GATES_NOT_ADMITTED`] and reported under
+/// `gates_not_admitted` instead, so a reader of `gates_passed` sees only gates
+/// that passed. See [`handle_backup_restore_test`].
+const RESTORE_TEST_GATES_ADMITTED: [&str; 6] = [
     "decode",
     "validate",
     "shape",
     "authorization-shape",
-    "currency-deferred",
     "provisioning",
     "isolation",
-    "admission-deferred",
 ];
+
+/// The gates this route did NOT run, reported as `gates_not_admitted`.
+///
+/// Each needs owner-held state this front door does not hold, so naming one in
+/// `gates_passed` would assert an admission that never happened. They are
+/// reported here, in their own field, and the operator surface refuses a reply
+/// that lists the same gate in both sets — that contradiction is the defect this
+/// split exists to make impossible.
+const RESTORE_TEST_GATES_NOT_ADMITTED: [&str; 2] =
+    ["restore-journal-admission", "owner-fence-currency"];
 
 /// Field-bound shape failure, rendered as an `invalid` reply by the handlers.
 struct InvalidShape {
@@ -3041,31 +3099,34 @@ fn restore_provisioning_shape(provisioning: &Map<String, Value>) -> Result<Strin
 /// without owner-held state, then returns `blocked` naming the exact missing
 /// Governor inputs.
 ///
-/// Gates that run here for real: `decode` (both inline hex bodies admit
-/// bounded even-length lowercase hex and decode non-empty), `validate`
-/// (bounded lengths, non-blank texts, digest shapes, lineage/sequence/
-/// generation admissibility), `shape` (exact-key payload/target/provisioning
-/// shapes plus an explicit introductions array of JSON objects),
-/// `authorization-shape` (destination authorization present, bounded, and
-/// hex-shaped only — never cryptographic verification), `provisioning`
-/// (provisioning exact shape plus digest shapes), and `isolation`
-/// (target identity differs from the destination store identity at shape
-/// level only). Gates marked `-deferred` need owner-held state:
-/// `currency-deferred` (live fence currency needs the owner-held fence) and
-/// `admission-deferred` (journal production admission, introduction exact-set
-/// verification against live owner readback, and the admission mint need the
-/// owner-held journal). Typed projection decode of introductions likewise
-/// waits for the owner edge; each entry must already be a JSON object so
-/// malformed rows refuse before any owner readback.
+/// Gates that run here for real, reported in `gates_passed` in pass order:
+/// `decode` (both inline hex bodies admit bounded even-length lowercase hex and
+/// decode non-empty), `validate` (bounded lengths, non-blank texts, digest
+/// shapes, lineage/sequence/generation admissibility), `shape` (exact-key
+/// payload/target/provisioning shapes plus an explicit introductions array of
+/// JSON objects), `authorization-shape` (destination authorization present,
+/// bounded, and hex-shaped only — never cryptographic verification),
+/// `provisioning` (provisioning exact shape plus digest shapes), and
+/// `isolation` (target identity differs from the destination store identity at
+/// shape level only).
 ///
-/// Execution itself refuses with `plan_gap` naming the real owners rather
-/// than a Governor transition type: the Kernel restore coordinator and the
-/// production call to it (#960), the owner-issued `RestoreJournalAdmission`
-/// and `DestinationManifestEvidence` (#962), and the front-door connection
-/// (#2569), all open. Provisioning the isolated destination, admitting the
-/// durable ORS restore journal and importing restore-class bytes without that
-/// owner evidence would fabricate owner authority, and rehearsal never
-/// activates, retires, or cuts over.
+/// Gates that need owner-held state and therefore DID NOT RUN are reported
+/// separately in `gates_not_admitted`, never inside `gates_passed`:
+/// `owner-fence-currency` (live fence currency needs the owner-held fence) and
+/// `restore-journal-admission` (journal production admission, introduction
+/// exact-set verification against live owner readback, and the admission mint
+/// need the owner-held journal). The two sets are disjoint by construction and
+/// the operator surface refuses a reply that overlaps them, so a gate can never
+/// be reported as both passed and not admitted. Typed projection decode of
+/// introductions likewise waits for the owner edge; each entry must already be
+/// a JSON object so malformed rows refuse before any owner readback.
+///
+/// Execution refuses with `plan_gap` naming the ONE capability that is
+/// genuinely absent — see [`BACKUP_RESTORE_TEST_MISSING_OWNER`], which carries
+/// the re-measurement that retired the three owner names this reply used to
+/// claim were open. Rehearsal never activates, retires, or cuts over, and that
+/// boundary is unchanged by this repair: no path here reaches cutover
+/// qualification, activation or retirement.
 #[allow(
     clippy::too_many_lines,
     reason = "one linear shape-validation sequence per rehearsal gate; splitting it would hide the exact admission order the blocked reply reports"
@@ -3251,22 +3312,34 @@ fn handle_backup_restore_test(payload: &Value, idempotency_key: &str) -> Value {
             ("code", Value::String("plan_gap".to_owned())),
             (
                 "missing_owner",
-                Value::String(
-                    "backup-restore-owners (#960 Kernel restore coordinator and its production call; #962 owner-issued RestoreJournalAdmission and DestinationManifestEvidence; #2569 front-door connection)"
-                        .to_owned(),
-                ),
+                Value::String(BACKUP_RESTORE_TEST_MISSING_OWNER.to_owned()),
             ),
             (
                 "reason",
                 Value::String(
-                    "the six rehearsal shape gates ran for real; the isolated destination, the durable ORS journal admission and the restore-class import are owner evidence no production owner supplies, and the composition's isolated-restore entry has no production caller"
+                    "the six rehearsal shape gates ran for real and are reported in gates_passed; the two owner-held gates in gates_not_admitted did not run, because admitting the durable ORS restore journal needs a RestoreJournalStreamBinding row whose only producer is the engine's own genesis compare-and-swap, which runs after admission"
                         .to_owned(),
                 ),
             ),
+            // The route this handler ACTUALLY executed, and nothing else. A gate
+            // that did not run can never appear in this array, so its name is a
+            // claim this route can keep.
             (
                 "gates_passed",
                 Value::Array(
-                    RESTORE_TEST_GATES
+                    RESTORE_TEST_GATES_ADMITTED
+                        .iter()
+                        .map(|gate| Value::String((*gate).to_owned()))
+                        .collect(),
+                ),
+            ),
+            // The gates that did NOT run, in their own field. The operator
+            // surface refuses a reply that lists one gate in both arrays, so a
+            // gate can never be reported as passed and not-admitted at once.
+            (
+                "gates_not_admitted",
+                Value::Array(
+                    RESTORE_TEST_GATES_NOT_ADMITTED
                         .iter()
                         .map(|gate| Value::String((*gate).to_owned()))
                         .collect(),
