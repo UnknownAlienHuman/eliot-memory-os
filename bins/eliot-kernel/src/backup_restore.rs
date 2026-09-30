@@ -56,9 +56,14 @@
 //! responsible capability; reconciliation answers from persisted identity
 //! receipts AND from the material those receipts attest (`Applied` only on
 //! exact transaction/phase/input match with that material still present and
-//! still the digested bytes, `NotApplied` only when the phase receipt itself is
-//! proven absent, `Unknown` for undecidable bytes so the engine takes its
-//! explicit rollback-required disposition). All effects here are synchronous
+//! still the digested bytes; `NotApplied` only where the phase's own material
+//! is proven absent, which is the only phase-specific positive no-effect
+//! evidence this target holds; `Unknown` for undecidable bytes — a missing
+//! receipt over material that IS published among them — so the engine takes
+//! its explicit rollback-required disposition). A receipt file that cannot be
+//! read is never an absence: `Path::exists()` collapses missing, inaccessible
+//! and broken paths into one silent `false`, and every absence test here is a
+//! fallible read that distinguishes them. All effects here are synchronous
 //! and local with a persisted identity receipt per phase, so no ambiguous
 //! external commit exists in this target and no `Unknown` outcome is
 //! manufactured: async owner-channel unknowns belong to the #962 wire layer,
@@ -2367,6 +2372,29 @@ impl<'a> KernelRestoreTarget<'a> {
         }
     }
 
+    /// Whether a phase's own material is present under the destination.
+    ///
+    /// This is the readback of [`Self::phase_material`] for the one case where
+    /// the receipt that would have carried the digest is itself gone, so
+    /// presence of the phase-owned member is the only phase-specific evidence
+    /// still available. Exactly that member is consulted — never a directory
+    /// listing, a count, or a name the phase did not write — and the probe is a
+    /// fallible read, so an inaccessible member refuses
+    /// ([`BackupError::Target`]) rather than reading as an absence.
+    fn phase_material_published(&self, phase: &RestorePhase) -> Result<bool, BackupError> {
+        let Some(member) = self.phase_material(phase)?.member else {
+            // The phase publishes no member at all under this execution's
+            // authority (a rehearsal prepare carries no Host admission to
+            // pin), so there is nothing of its own that could exist.
+            return Ok(false);
+        };
+        match std::fs::metadata(&member) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(BackupError::Target(error.to_string())),
+        }
+    }
+
     /// Material for a phase whose receipt digest IS the digest of the bytes it
     /// published, because the `apply_*` method either staged that same buffer
     /// or read it back through [`Self::staged_bytes`] and handed it to
@@ -2424,7 +2452,28 @@ impl<'a> KernelRestoreTarget<'a> {
     /// the substitution being fixed: a receipt is a description, and a
     /// description is not its own evidence.
     ///
-    /// The absence test is a FALLIBLE READ, not an existence probe.
+    /// A MISSING receipt is not the same fact, and it is not a proven no-effect
+    /// verdict. The engine reaches `IntentPersisted` before the phase executes
+    /// and calls this reconciliation first, so a crash inside the phase leaves
+    /// the receipt absent while the phase's own material may already be
+    /// published and, since [`Self::write_file`], already durable. The
+    /// phase-specific question is therefore asked of the material
+    /// ([`Self::phase_material_published`]), never of the receipt's absence:
+    ///
+    /// - material PRESENT means the phase DID publish. That is positive
+    ///   evidence of an effect and never of no-effect, and the receipt that
+    ///   would have described it is gone, so the observation cannot be
+    ///   reconstructed. The state is [`ObservedEffect::Undecidable`], so the
+    ///   engine pauses this Ordering Scope, keeps the intent and opens a
+    ///   Problem State rather than duplicating a published effect (I14.21).
+    /// - material ABSENT means the phase produced nothing durable. Every phase
+    ///   here publishes exactly the member [`Self::phase_material`] names and
+    ///   nothing else, and that member is flushed to stable storage before the
+    ///   receipt is written, so a phase that had completed would have left it
+    ///   behind. That is the phase-specific positive no-effect evidence this
+    ///   target holds, and only it returns [`ObservedEffect::NotAttempted`].
+    ///
+    /// The receipt test itself is a FALLIBLE READ, not an existence probe:
     /// `Path::exists()` collapses a missing file, a permission denial and a
     /// broken path into one silent `false`, so inaccessible evidence would be
     /// reported as evidence of absence and the phase would be re-applied over
@@ -2438,7 +2487,11 @@ impl<'a> KernelRestoreTarget<'a> {
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(ObservedEffect::NotAttempted);
+                return if self.phase_material_published(&intent.phase)? {
+                    Ok(ObservedEffect::Undecidable)
+                } else {
+                    Ok(ObservedEffect::NotAttempted)
+                };
             }
             // Inaccessible receipt state is not absence: it is a refusal.
             Err(error) => return Err(BackupError::Target(error.to_string())),
@@ -3164,16 +3217,22 @@ impl RestoreTarget for KernelRestoreTarget<'_> {
         // that never produced what the journal and the finalize obligations say
         // it produced (A13.7 ARCH-RES-03).
         //
-        // Its absence is NotApplied and the coordinator re-applies idempotently
-        // (byte staging overwrites, re-sealing mints fresh bytes with a fresh
-        // receipt — no prior receipt exists to contradict), and that absence is
-        // read as a fallible read, so a permission denial is a refusal and never
-        // a fabricated no-effect. Bytes that parse as nothing are Undecidable
-        // and propagate as Unknown: the coordinator takes the explicit
-        // rollback-required disposition (I14.21) with no new identity and no
-        // blind retry. Async owner-channel unknowns belong to the #962 wire
-        // layer, which must upgrade reconciliation there, never downgrade
-        // readback here.
+        // Its ABSENCE is never a proven no-effect by itself. Only the absence
+        // of the phase's own material is, because that member is the phase's
+        // entire durable effect and `write_file` flushes it to stable storage
+        // before any receipt that could describe it is written; there the
+        // coordinator re-applies idempotently (byte staging overwrites,
+        // re-sealing mints fresh bytes with a fresh receipt — no prior receipt
+        // exists to contradict). A missing receipt over material that IS
+        // published is evidence of an effect whose observation was lost, so it
+        // is Undecidable, not NotApplied, and both the receipt test and the
+        // material test are fallible reads — a permission denial is a refusal,
+        // never a fabricated no-effect. Bytes that parse as nothing are
+        // likewise Undecidable and propagate as Unknown: the coordinator takes
+        // the explicit rollback-required disposition (I14.21) with no new
+        // identity and no blind duplicate effect. Async owner-channel unknowns
+        // belong to the #962 wire layer, which must upgrade reconciliation
+        // there, never downgrade readback here.
         match &intent.phase {
             RestorePhase::Pending => Err(BackupError::RestorePhaseMismatch),
             _ => match self.load_applied(intent)? {
