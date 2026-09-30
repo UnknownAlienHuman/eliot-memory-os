@@ -9,6 +9,7 @@ use eliot_runtime_contracts::{
     HealthDimension, KernelActivationState, ServiceProcessRecord, ServiceProcessState,
     SupervisionLeasePredecessorIdentity, WakeIntent, WakeIntentState,
 };
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -129,7 +130,9 @@ pub(crate) fn epoch_transition_is_direct_child_of(
 }
 
 /// Reasons that require a fresh Host lineage instead of continuing a counter.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum RecoveryLineageReason {
     Corruption,
@@ -139,7 +142,9 @@ pub enum RecoveryLineageReason {
 }
 
 /// External evidence for an explicitly recovered, globally distinct Host lineage.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(deny_unknown_fields)]
 pub struct RecoveryLineageEvidence {
     pub reason: RecoveryLineageReason,
@@ -161,7 +166,7 @@ impl RecoveryLineageEvidence {
 /// The epoch is the canonical [`EpochTransition`]: equality (not ordering)
 /// is the authority rule, so this type keeps `Eq` but deliberately has no
 /// `Ord` and no `Hash` over the transition.
-#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostInstallationEpoch {
     pub installation: PlatformHandle,
@@ -235,7 +240,9 @@ pub fn host_owner_epoch_digest(
 }
 
 /// Stable mutation identity used for replay and conflict detection.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(deny_unknown_fields)]
 pub struct IdempotencyIdentity {
     pub operation_id: PlatformHandle,
@@ -250,7 +257,7 @@ impl IdempotencyIdentity {
 }
 
 /// Every record carries the current Host and activation fence.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecordFence {
     pub host: HostInstallationEpoch,
@@ -2702,7 +2709,7 @@ pub(crate) fn store_rebind_transition(
 /// artifact/source proof joined to the exact admitted module contract and
 /// launch inputs. This row proves the bytes Host observed under its active
 /// fence; it does not grant process, semantic, or generation authority.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModuleBuildProvenanceRecord {
     pub fence: RecordFence,
@@ -2740,7 +2747,11 @@ impl ModuleBuildProvenanceRecord {
         clippy::too_many_lines,
         reason = "the closed provenance record validates its field shapes, pinned build, and activation binding as one invariant"
     )]
-    fn validate(&self) -> Result<(), JournalError> {
+    /// Validates this complete canonical row before it crosses a protocol boundary.
+    ///
+    /// The row is still evidence only: successful validation does not grant
+    /// generation, process, or semantic authority.
+    pub fn validate(&self) -> Result<(), JournalError> {
         self.fence.validate()?;
         self.operation.validate()?;
         for (value, field) in [

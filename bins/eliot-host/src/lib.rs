@@ -1649,9 +1649,9 @@ use eliot_kernel_core::KernelRuntimeHealthEvidence;
 use eliot_kernel_service::KERNEL_CONTROL_PIPE;
 use eliot_kernel_service::{
     EliotdLaunchDescriptor, HostJobBinding, HostKernelCandidateBinding, HostProcessBinding,
-    HostStartupEvidence, HostStoreBootstrapRequirement, KernelActivationPermit,
-    KernelActivationQuery, KernelActivationReceipt, KernelControlCommand, KernelControlRequest,
-    KernelControlResponse, KernelReadyReceipt, KernelServiceState,
+    HostStartupEvidence, HostStartupEvidenceReport, HostStoreBootstrapRequirement,
+    KernelActivationPermit, KernelActivationQuery, KernelActivationReceipt, KernelControlCommand,
+    KernelControlRequest, KernelControlResponse, KernelReadyReceipt, KernelServiceState,
     ProcessAuthorityHandoffDescriptor, RestartBudget, StoreBootstrapHandoff, StoreProcessBinding,
     StoreRebindHandoff, StoreRebindQuery, StoreRebindReceipt, control_request_frame,
     decode_control_response_frame, semantic_store_config_hash_from_json,
@@ -2782,9 +2782,12 @@ impl HostJobBranches {
             host_state_root,
             store_data_root,
         )?;
+        let module_build_provenance =
+            Self::readback_module_build_provenance_for_startup(journal, &evidence, candidate)?;
         Self::send_bound_host_startup_evidence(
             transport,
             &evidence,
+            Some(module_build_provenance),
             candidate,
             generation_handle,
             sequence,
@@ -2809,6 +2812,7 @@ impl HostJobBranches {
     async fn send_bound_host_startup_evidence(
         transport: &mut NamedPipeTransport,
         evidence: &HostStartupEvidence,
+        module_build_provenance: Option<Vec<ModuleBuildProvenanceRecord>>,
         candidate: &HostKernelCandidateBinding,
         generation_handle: &PlatformHandle,
         sequence: u64,
@@ -2816,7 +2820,10 @@ impl HostJobBranches {
         let request = kernel_control_request(
             candidate,
             evidence.state_fence.resource_generation,
-            KernelControlCommand::ReportHostStartupEvidence(evidence.clone()),
+            KernelControlCommand::ReportHostStartupEvidence(HostStartupEvidenceReport {
+                startup_evidence: evidence.clone(),
+                module_build_provenance,
+            }),
             sequence,
         )?;
         let frame = control_request_frame(
@@ -2855,6 +2862,95 @@ impl HostJobBranches {
             ));
         }
         Ok(())
+    }
+
+    /// Returns the exact current-activation module rows Host journaled and read
+    /// back before it sends candidate startup evidence. The journal head must
+    /// still equal the head observed by the evidence producer so a stale row
+    /// set cannot be paired with a later or earlier checksum.
+    #[cfg(windows)]
+    fn readback_module_build_provenance_for_startup<B: JournalBackend>(
+        journal: &HostStateJournalService<B>,
+        evidence: &HostStartupEvidence,
+        candidate: &HostKernelCandidateBinding,
+    ) -> Result<Vec<ModuleBuildProvenanceRecord>, HostError> {
+        let state = journal
+            .snapshot()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        if state.last_checksum.as_deref() != Some(evidence.host_record_checksum.as_str()) {
+            return Err(HostError::RecoveryRequired(
+                "Host provenance readback no longer matches the startup-evidence journal head"
+                    .to_owned(),
+            ));
+        }
+        let activation = state.activation.as_ref().ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "Host activation is missing during module provenance readback".to_owned(),
+            )
+        })?;
+        let fence = &activation.fence;
+        if fence.host != state.host
+            || fence.host.installation != candidate.installation_id
+            || fence.host.epoch.current.lineage_id.as_str()
+                != candidate
+                    .supervision_incarnation
+                    .host_epoch
+                    .lineage_id
+                    .as_str()
+            || fence.host.epoch.current.sequence.get() != candidate.host_epoch.value()
+            || fence.activation_id != candidate.activation_id
+            || fence.activation_generation.current.lineage_id.as_str()
+                != candidate
+                    .supervision_incarnation
+                    .activation_generation
+                    .lineage_id
+                    .as_str()
+            || fence.activation_generation.current.sequence.get()
+                != candidate
+                    .supervision_incarnation
+                    .activation_generation
+                    .sequence
+        {
+            return Err(HostError::RecoveryRequired(
+                "Host provenance fence differs from the current candidate activation".to_owned(),
+            ));
+        }
+        let records = state.module_build_provenance;
+        if records.is_empty() {
+            return Err(HostError::RecoveryRequired(
+                "Host journal has no module provenance rows for candidate startup".to_owned(),
+            ));
+        }
+        for record in &records {
+            if record.fence != *fence {
+                return Err(HostError::RecoveryRequired(
+                    "Host journal contains a module provenance row from another activation fence"
+                        .to_owned(),
+                ));
+            }
+            record
+                .validate()
+                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+            let journal_record = HostStateRecord::ModuleBuildProvenance(record.clone());
+            let expected_checksum = record_checksum(&journal_record)
+                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+            let matching_operations = state
+                .applied_operations
+                .iter()
+                .filter(|applied| applied.identity == record.operation)
+                .collect::<Vec<_>>();
+            if matching_operations.len() != 1
+                || matching_operations
+                    .first()
+                    .is_none_or(|applied| applied.checksum != expected_checksum)
+            {
+                return Err(HostError::RecoveryRequired(
+                    "Host module provenance row lacks its exact journal operation readback"
+                        .to_owned(),
+                ));
+            }
+        }
+        Ok(records)
     }
 
     /// Completes the authenticated Host↔Kernel lifecycle before Host
@@ -4282,6 +4378,7 @@ impl HostJobBranches {
             HostJobBranches::send_bound_host_startup_evidence(
                 &mut transport,
                 supervision_evidence,
+                None,
                 candidate,
                 approved_generation,
                 1,

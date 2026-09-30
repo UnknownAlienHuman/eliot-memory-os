@@ -383,6 +383,9 @@ impl KernelComposition {
                 .map_err(|_| TransportError::SessionFenced)?;
         }
         if let KernelControlCommand::ReportHostStartupEvidence(evidence) = &request.command {
+            evidence
+                .validate(&request.candidate, request.generation)
+                .map_err(|_| TransportError::SessionFenced)?;
             // I1.5/A8.1: this carrier is the one owner-correct route by which a
             // Host-observed Watchdog branch reaches Kernel. Host just
             // revalidated the live SCM Watchdog incarnation (bound PID/start
@@ -395,10 +398,18 @@ impl KernelComposition {
             {
                 let target =
                     StateFence::new(request.candidate.kernel_epoch.clone(), request.generation);
-                self.admit_host_observed_watchdog_branch(evidence, &request.candidate, &target)
-                    .map_err(|_| TransportError::SessionFenced)?;
+                self.admit_host_observed_watchdog_branch(
+                    &evidence.startup_evidence,
+                    &request.candidate,
+                    &target,
+                )
+                .map_err(|_| TransportError::SessionFenced)?;
             }
-            self.consume_host_startup_evidence(evidence)?;
+            // Typed provenance rows are validated as transport input above.
+            // They are not an I1.11 probe and have no Kernel candidate
+            // admission/readback owner yet, so this path does not turn them
+            // into startup or generation authority.
+            self.consume_host_startup_evidence(&evidence.startup_evidence)?;
         }
         if let Some(handoff) = bootstrap {
             self.install_store_bootstrap(handoff.clone())
