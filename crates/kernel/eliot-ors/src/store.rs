@@ -11178,10 +11178,13 @@ impl RedbRecoveryStore {
                 request_digest: request_digest.to_owned(),
             });
         }
-        let produced = receipt.produced_result.as_ref().ok_or(OrsError::InvalidField {
-            field: "host_request_tool_exposure_receipt",
-            reason: "retained receipt must bind the produced result it evidences",
-        })?;
+        let produced = receipt
+            .produced_result
+            .as_ref()
+            .ok_or(OrsError::InvalidField {
+                field: "host_request_tool_exposure_receipt",
+                reason: "retained receipt must bind the produced result it evidences",
+            })?;
         let key = format!("{}::{}", operation_id.as_str(), request_digest);
         let write = self.database.begin_write().map_err(storage)?;
         let existing: Option<crate::HostRequestRecord> = {

@@ -16,9 +16,8 @@ use eliot_receipts::{
     LoopSignal, ToolCallClass, ToolCallIntent, ToolCallRequest, ToolExposureError,
     ToolExposureReceiptV2,
     tool_exposure::{
-        AttemptEvidence, DeliveredToolRepresentation, EXPOSURE_HISTORY_VERSION,
-        OwnerStageFact, ProducedToolResultIdentity, TokenCountObservation,
-        TokenCountUnavailableReason,
+        AttemptEvidence, DeliveredToolRepresentation, EXPOSURE_HISTORY_VERSION, OwnerStageFact,
+        ProducedToolResultIdentity, TokenCountObservation, TokenCountUnavailableReason,
         detect_repeat_without_progress_with_evidence,
     },
 };
@@ -253,11 +252,10 @@ pub(crate) fn observe_persisted_delivery(
             reason: "produced digest does not bind the exact delivered bytes",
         });
     }
-    let byte_count =
-        u64::try_from(bytes.len()).map_err(|_| ToolExposureError::InvalidField {
-            field: "receipt.delivered_representation.byte_count",
-            reason: "delivered byte count exceeds the addressable bound",
-        })?;
+    let byte_count = u64::try_from(bytes.len()).map_err(|_| ToolExposureError::InvalidField {
+        field: "receipt.delivered_representation.byte_count",
+        reason: "delivered byte count exceeds the addressable bound",
+    })?;
     skeleton.record_full_delivery(
         ProducedToolResultIdentity {
             result_digest: measured.clone(),

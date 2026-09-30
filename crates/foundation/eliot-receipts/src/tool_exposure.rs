@@ -1053,10 +1053,7 @@ impl ToolExposureReceiptV2 {
         outcome_ref: String,
     ) -> Result<Self, ToolExposureError> {
         self.validate()?;
-        text(
-            &outcome_ref,
-            "receipt.terminal_task_or_product_outcome_ref",
-        )?;
+        text(&outcome_ref, "receipt.terminal_task_or_product_outcome_ref")?;
         if self.terminal_task_or_product_outcome_ref.is_some() {
             return Err(ToolExposureError::InvalidField {
                 field: "receipt.terminal_task_or_product_outcome_ref",
