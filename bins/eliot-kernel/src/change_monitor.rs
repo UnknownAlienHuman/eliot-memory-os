@@ -827,28 +827,69 @@ struct GitHeadObservation {
     exact_bytes: Vec<u8>,
 }
 
-/// Reads the real Git HEAD substrate under one workspace root: `.git/HEAD`
-/// plus the symref target (loose ref first, then the packed-refs file), or
-/// the detached HEAD commit directly. Every byte that feeds the returned
-/// observation comes from those files. Anything else — a missing `.git`,
-/// an unparsable HEAD, an unresolvable symref — is
+/// Reads the real Git HEAD substrate for one governed working directory:
+/// `.git/HEAD` plus the symref target (loose ref first, then the
+/// packed-refs file), or the detached HEAD commit directly. Every byte that
+/// feeds the returned observation comes from those files. The working
+/// directory itself is searched first, then each ancestor up to the
+/// enclosing repository root: a governed install root or workspace member
+/// carries no `./.git` of its own, and refusing before any hint is
+/// admitted would lose the emission half of the unknown-origin block
+/// (I10.21 A2, audit 5910747803 A2). Anything else — no ancestor with a
+/// readable `.git`, an unparsable HEAD, an unresolvable symref — is
 /// [`ChangeMonitorError::NoGitSubstrate`], never a synthesized claim.
+/// `.git` resolves through [`resolve_git_dir`], so a worktree `gitdir:`
+/// pointer file claims its target exactly like a plain directory.
 fn read_git_head_substrate(
     workspace_root: &std::path::Path,
 ) -> Result<GitHeadObservation, ChangeMonitorError> {
-    let repository = workspace_root.to_string_lossy().into_owned();
-    if !text(&repository) {
+    if !text(&workspace_root.to_string_lossy()) {
         return Err(ChangeMonitorError::NoGitSubstrate);
     }
-    let git_dir = workspace_root.join(".git");
-    let head_bytes =
-        std::fs::read(git_dir.join("HEAD")).map_err(|_| ChangeMonitorError::NoGitSubstrate)?;
+    let mut current = if workspace_root.is_dir() {
+        workspace_root.to_path_buf()
+    } else {
+        workspace_root
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or(ChangeMonitorError::NoGitSubstrate)?
+    };
+    loop {
+        // An empty ancestor (only reachable from a relative root) would
+        // resolve `.git` against the process working directory instead of
+        // the governed tree: refuse rather than claim a foreign substrate.
+        if !text(&current.to_string_lossy()) {
+            return Err(ChangeMonitorError::NoGitSubstrate);
+        }
+        if let Some(git_dir) = resolve_git_dir(&current.join(".git"))
+            && let Some(observation) = read_substrate_in(&current, &git_dir)
+        {
+            return Ok(observation);
+        }
+        current = current
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or(ChangeMonitorError::NoGitSubstrate)?;
+    }
+}
+
+/// Reads the HEAD substrate from one candidate repository root: the exact
+/// HEAD bytes plus the symref target's exact bytes (loose ref first, then
+/// the packed-refs file), or the detached HEAD commit directly. Returns
+/// `None` when this directory claims no readable substrate, so the caller
+/// keeps walking up instead of inventing repository state. The returned
+/// handle names the claiming ancestor, matching [`read_git_head`].
+fn read_substrate_in(
+    repository_root: &std::path::Path,
+    git_dir: &std::path::Path,
+) -> Option<GitHeadObservation> {
+    let head_bytes = std::fs::read(git_dir.join("HEAD")).ok()?;
     let mut exact_bytes = head_bytes.clone();
     let head_text = String::from_utf8(head_bytes)
         .map(|contents| contents.trim().to_owned())
-        .map_err(|_| ChangeMonitorError::NoGitSubstrate)?;
+        .ok()?;
     if !text(&head_text) {
-        return Err(ChangeMonitorError::NoGitSubstrate);
+        return None;
     }
     let head = if let Some(refname) = head_text.strip_prefix("ref: ") {
         if refname.is_empty()
@@ -858,19 +899,17 @@ fn read_git_head_substrate(
                 .split('/')
                 .any(|part| part.is_empty() || part == "." || part == ".." || part == ".git")
         {
-            return Err(ChangeMonitorError::NoGitSubstrate);
+            return None;
         }
         if let Ok(ref_bytes) = std::fs::read(git_dir.join(refname)) {
             exact_bytes.extend_from_slice(&ref_bytes);
             String::from_utf8(ref_bytes)
                 .map(|contents| contents.trim().to_owned())
-                .map_err(|_| ChangeMonitorError::NoGitSubstrate)?
+                .ok()?
         } else {
-            let packed_bytes = std::fs::read(git_dir.join("packed-refs"))
-                .map_err(|_| ChangeMonitorError::NoGitSubstrate)?;
+            let packed_bytes = std::fs::read(git_dir.join("packed-refs")).ok()?;
             exact_bytes.extend_from_slice(&packed_bytes);
-            let packed =
-                String::from_utf8(packed_bytes).map_err(|_| ChangeMonitorError::NoGitSubstrate)?;
+            let packed = String::from_utf8(packed_bytes).ok()?;
             let mut found = None;
             for line in packed.lines() {
                 let line = line.trim();
@@ -885,16 +924,16 @@ fn read_git_head_substrate(
                     break;
                 }
             }
-            found.ok_or(ChangeMonitorError::NoGitSubstrate)?
+            found?
         }
     } else {
         head_text
     };
     if !text(&head) {
-        return Err(ChangeMonitorError::NoGitSubstrate);
+        return None;
     }
-    Ok(GitHeadObservation {
-        repository,
+    Some(GitHeadObservation {
+        repository: repository_root.to_string_lossy().into_owned(),
         head,
         exact_bytes,
     })
@@ -967,7 +1006,7 @@ pub(crate) fn observe_filesystem_notification(
         diff_handle: None,
     };
     let artifact = crate::sha256_hex(notification.resource.as_bytes());
-    let hint_id = filesystem_hint_id(&artifact, before_digest.unwrap_or("absent"));
+    let hint_id = poll_reconcile_hint_id(&artifact, before_digest.unwrap_or("absent"));
     let hint = KernelChangeHint {
         hint_id: hint_id.clone(),
         resource: notification.resource.clone(),
