@@ -29,7 +29,7 @@ use tracing::Instrument as _;
 
 use super::{DaemonKernelClient, kernel_port_error, kind_value};
 
-struct OwnerTaskSelectionContext<'a> {
+struct OwnerSelectionContext<'a> {
     request_identity: (&'a str, &'a str, &'a str, &'a str),
     owner: &'a eliot_governor::TaskSelectionAdmissionBinding,
     observed_scope: &'a eliot_workscope::ObservedScopeResources,
@@ -65,7 +65,7 @@ fn check_identity_binding_with_selection(
     transition: &PreparedTransition,
     expected_revision_heads: &[RevisionHeadExpectation],
     expected_ordering_heads: &[OrderingHeadExpectation],
-    task_selection: Option<&OwnerTaskSelectionContext<'_>>,
+    task_selection: Option<&OwnerSelectionContext<'_>>,
 ) -> Result<(), KernelPortError> {
     identity
         .validate()
@@ -260,7 +260,7 @@ impl DaemonKernelClient {
         observed_scope: &'a eliot_workscope::ObservedScopeResources,
         live_fence: &'a StateFence,
     ) -> KernelPortFuture<'a, WriteReceipt> {
-        let context = OwnerTaskSelectionContext {
+        let context = OwnerSelectionContext {
             request_identity,
             owner,
             observed_scope,
@@ -281,7 +281,7 @@ impl DaemonKernelClient {
         transition: PreparedTransition,
         expected_revision_heads: Vec<RevisionHeadExpectation>,
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
-        task_selection: OwnerTaskSelectionContext<'a>,
+        task_selection: OwnerSelectionContext<'a>,
     ) -> KernelPortFuture<'a, WriteReceipt> {
         let identity = identity.clone();
         let span = tracing::info_span!(
