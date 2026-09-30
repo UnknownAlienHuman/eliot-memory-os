@@ -1663,13 +1663,12 @@ impl<C: CanonicalReadClient> LocalReadPort for ReadService<C> {
         // this call site would be a second answer to a decision the declared
         // table already states and checks, and the two could disagree.
         let binding = owner_inventory::local_read_port_binding(LocalReadPortMethod::EvidenceQuery)?;
-        let subject_selector =
-            binding
-                .subject_selector
-                .ok_or_else(|| ReadError::InvalidField {
-                    field: "local_read_port.EvidenceQuery.subject".to_owned(),
-                    reason: "the store declares no required subject selector".to_owned(),
-                })?;
+        let subject_selector = binding
+            .subject_selector
+            .ok_or_else(|| ReadError::InvalidField {
+                field: "local_read_port.EvidenceQuery.subject".to_owned(),
+                reason: "the store declares no required subject selector".to_owned(),
+            })?;
         let bound_selector =
             binding
                 .result_set_bound_selector
