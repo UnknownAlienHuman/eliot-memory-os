@@ -454,6 +454,32 @@ public sealed record UserAutomationRevision(
 {
     public void Validate()
     {
+        // Each nested record below is a required reference-typed member that
+        // decodes to null when the member is absent, and every one of them is
+        // dereferenced by this method: either directly, or by a nested
+        // `Validate()` call, which is an instance call on that same null
+        // reference and faults identically. `ResourceCeiling` and
+        // `RecursionPolicy` hold no reference-typed member of their own, but
+        // that does not make them safe here — the call itself is the
+        // dereference. A `NullReferenceException` is not an
+        // `InvalidOperationException`, so it would escape every handler written
+        // to contain a closed-shape refusal — the retained-byte readers, the
+        // pending journal, the reconciliation loop — as an untyped fault
+        // instead of the withheld, still-reconciling outcome they are written
+        // to produce. They are therefore refused by name here, one fixed
+        // sentence over a literal field name, exactly as the two revision
+        // payloads are refused in `create` and `edit`. This adds no bound, no
+        // wire member and no digest input: a previously valid revision carried
+        // every one of them, so its retained bytes still validate and still
+        // re-derive the same idempotency key.
+        if (WorkScope is null) throw new InvalidOperationException("work_scope must be present.");
+        if (Schedule is null) throw new InvalidOperationException("schedule must be present.");
+        if (Task is null) throw new InvalidOperationException("task must be present.");
+        if (RouteCostPolicy is null) throw new InvalidOperationException("route_cost_policy must be present.");
+        if (ProviderPolicy is null) throw new InvalidOperationException("provider_policy must be present.");
+        if (DeliveryTarget is null) throw new InvalidOperationException("delivery_target must be present.");
+        if (ResourceCeiling is null) throw new InvalidOperationException("resource_ceiling must be present.");
+        if (RecursionPolicy is null) throw new InvalidOperationException("recursion_policy must be present.");
         UserAutomationContract.RequireText(AutomationId, "automation_id");
         UserAutomationContract.RequireText(Revision, "revision");
         UserAutomationContract.RequireText(OwnerPrincipal, "owner_principal");
