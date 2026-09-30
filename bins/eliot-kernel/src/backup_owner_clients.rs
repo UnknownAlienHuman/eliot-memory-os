@@ -414,6 +414,43 @@ impl OwnerRole {
     }
 }
 
+/// Returns whether `op` requires a separate cutover admission on `owner`'s
+/// channel.
+///
+/// This is the single statement of the cutover-admission policy and it is
+/// exhaustive over the whole canonical operation family *and* over both owner
+/// roles: only `AdmitCutover` carries a separate admission, and only on the
+/// Host channel, because `BackupRole::InstallationAuthority` is the only role
+/// whose capability projection carries `AdmitCutover` at all. No arm is a
+/// wildcard, so a new canonical variant is a compile error here until its
+/// cutover disposition has been reviewed: cutover authority can never be
+/// inherited by a future operation, and never appears on a channel whose
+/// authenticated role does not carry it.
+///
+/// This is a narrowing of the accepted tables above, not a generator of them:
+/// the closed accepted sets stay the explicit component policy, and the
+/// canonical role matrix stays an additional admission check applied on top of
+/// it (see [`check_role_permits_effect`]).
+const fn requires_separate_cutover_admission(
+    owner: OwnerRole,
+    op: BackupOperationKind,
+) -> bool {
+    match op {
+        BackupOperationKind::AdmitCutover => match owner {
+            OwnerRole::Host => true,
+            OwnerRole::Watchdog => false,
+        },
+        BackupOperationKind::RequestCapture
+        | BackupOperationKind::ReadSnapshotPage
+        | BackupOperationKind::VerifyArchive
+        | BackupOperationKind::PrepareIsolatedRestore
+        | BackupOperationKind::RestoreStep
+        | BackupOperationKind::ReconcileRestore
+        | BackupOperationKind::RestoreStatus
+        | BackupOperationKind::CompleteRehearsal => false,
+    }
+}
+
 /// Maps one typed [`eliot_protocol::backup::BackupError`] onto the
 /// owner-channel error vocabulary without collapsing any class.
 ///
@@ -686,7 +723,7 @@ impl HostBackupOwnerClient {
     /// Only `AdmitCutover` does; prepare admission never satisfies it.
     #[must_use]
     pub const fn requires_cutover_admission(op: BackupOperationKind) -> bool {
-        matches!(op, BackupOperationKind::AdmitCutover)
+        requires_separate_cutover_admission(OwnerRole::Host, op)
     }
 
     /// Exact authority check: the candidate peer must equal the bound
@@ -827,11 +864,13 @@ impl WatchdogBackupOwnerClient {
         WATCHDOG_SUPPORTED_OPS.contains(&op)
     }
 
-    /// The Watchdog owner never admits cutover: always false. Cutover
-    /// authority belongs to the Host owner under a separate admission.
+    /// The Watchdog owner never admits cutover, because the spool owner carries
+    /// no cutover capability at all. The disposition is still stated for every
+    /// canonical operation, so a new variant is reviewed here instead of
+    /// inheriting an unreviewed cutover disposition.
     #[must_use]
-    pub const fn requires_cutover_admission(_op: BackupOperationKind) -> bool {
-        false
+    pub const fn requires_cutover_admission(op: BackupOperationKind) -> bool {
+        requires_separate_cutover_admission(OwnerRole::Watchdog, op)
     }
 
     /// Exact authority check: the candidate peer must equal the bound
