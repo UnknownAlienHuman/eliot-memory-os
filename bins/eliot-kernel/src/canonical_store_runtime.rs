@@ -46,13 +46,11 @@ use eliot_kernel_core::RouteScope;
 #[cfg(windows)]
 use eliot_kernel_service::{EbpCanonicalStoreClient, StoreClientError};
 #[cfg(windows)]
-use eliot_platform_windows::{NamedPipePeerExpectation, observe_named_pipe_peer_process_in_job};
+use eliot_ors::{RecoveryPayload, ReservationState, StateFenceSnapshot};
 #[cfg(windows)]
 use eliot_platform_windows::ProtectedSecret;
 #[cfg(windows)]
-use eliot_ors::{
-    RecoveryPayload, ReservationState, StateFenceSnapshot,
-};
+use eliot_platform_windows::{NamedPipePeerExpectation, observe_named_pipe_peer_process_in_job};
 #[cfg(windows)]
 use std::fmt;
 
@@ -552,11 +550,9 @@ impl KernelComposition {
         }
         let state_fence: StateFence = serde_json::from_str(&token.state_fence.canonical_json)
             .map_err(|error| error.to_string())?;
-        let recaptured = StateFenceSnapshot::capture(
-            &state_fence,
-            token.state_fence.observed_authority_epoch,
-        )
-        .map_err(|error| error.to_string())?;
+        let recaptured =
+            StateFenceSnapshot::capture(&state_fence, token.state_fence.observed_authority_epoch)
+                .map_err(|error| error.to_string())?;
         if recaptured != token.state_fence {
             return Err("retained Observe reservation fence did not round-trip".to_owned());
         }
@@ -568,15 +564,19 @@ impl KernelComposition {
         let staged_access = envelope.privacy_and_visibility_class.clone();
         let ciphertext = match envelope.payload {
             RecoveryPayload::Encrypted { key, ciphertext }
-                if key.provider.as_str() == "dpapi"
-                    && key.key.as_str() == "current-user" =>
+                if key.provider.as_str() == "dpapi" && key.key.as_str() == "current-user" =>
             {
                 ciphertext
             }
-            _ => return Err("retained Observe reservation payload is not its protected operation".to_owned()),
+            _ => {
+                return Err(
+                    "retained Observe reservation payload is not its protected operation"
+                        .to_owned(),
+                );
+            }
         };
-        let protected = ProtectedSecret::from_ciphertext(ciphertext)
-            .map_err(|error| error.to_string())?;
+        let protected =
+            ProtectedSecret::from_ciphertext(ciphertext).map_err(|error| error.to_string())?;
         let original_bytes = self
             .platform
             .unprotect_secret(&protected)
@@ -592,11 +592,12 @@ impl KernelComposition {
         {
             return Err("retained Observe operation differs from its reservation token".to_owned());
         }
-        let input = super::daemon_request_dispatch::KernelComposition::retained_observe_reservation_input(
-            &host_record,
-            &operation,
-        )?
-        .ok_or_else(|| "retained Observe operation has no executable input".to_owned())?;
+        let input =
+            super::daemon_request_dispatch::KernelComposition::retained_observe_reservation_input(
+                &host_record,
+                &operation,
+            )?
+            .ok_or_else(|| "retained Observe operation has no executable input".to_owned())?;
         let original_submission = operation
             .original_write_submission
             .as_ref()
