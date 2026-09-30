@@ -42,9 +42,36 @@
 //! trusted readback caller supplies, and every record is keyed by its own
 //! exact hint or operation identity: a lease/session/operation bound to
 //! one operation is never reused for another.
+//!
+//! Durability (I10.21 defect 3): the ledger above is process-local memory,
+//! so on its own pending hints and unreconciled unknown-origin blockers
+//! would vanish on restart instead of being rebuilt. Every admitted ledger
+//! mutation therefore writes its rows through to the existing ORS owner
+//! (`eliot_ors::RedbRecoveryStore`, table `ors_change_monitor_ledger_v1`)
+//! once [`bind_durable_store`] installs the store handle, and process start
+//! rebuilds the live projection from those rows through
+//! [`rebuild_from_durable_store`]. The durable rows reuse this ledger's own
+//! row shapes verbatim; the ORS table is the only durable copy, never a
+//! second ledger. Rebuild replays only immutable admitted observations and
+//! recomputes every derived flag from that evidence: the operation index is
+//! rebuilt, unproven reconciliation links are dropped, and each
+//! unknown-origin `reconciled` flag is re-derived from matching governed
+//! evidence or a proven link. Stored flags are never trusted, so tampered
+//! rows fail closed to unreconciled rather than to silent acceptance, and a
+//! row that fails shape validation poisons the ledger instead: every typed
+//! operation then fails with [`ChangeMonitorError::LedgerPoisoned`] and the
+//! acceptance queries report blocked, so corruption can never loosen a
+//! gate. Persistence is best-effort after a committed admission — a store
+//! failure never converts an admitted result into an error — and the next
+//! mutation retries the write. Durability retains admitted observations; it
+//! cannot retro-observe mutations from before the first write, because the
+//! Kernel never invents source bytes.
 
 use std::collections::{BTreeMap, btree_map::Entry};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use eliot_ors::{ChangeMonitorLedgerRow, ChangeMonitorLedgerRowKind, RedbRecoveryStore};
+use serde::{Deserialize, Serialize};
 
 /// Typed `ChangeMonitor` failures. Every variant is constructed below; there
 /// is no stringly error and no silent drop.
@@ -80,6 +107,11 @@ pub(crate) enum ChangeMonitorError {
     UnknownChange,
     /// Reconciliation evidence does not prove the exact recorded transition.
     TransitionMismatch,
+    /// A durable ledger row fails shape or semantic validation, so nothing
+    /// in it is admitted. The ledger is poisoned alongside: every typed
+    /// operation then fails with [`ChangeMonitorError::LedgerPoisoned`] and
+    /// the acceptance queries report blocked.
+    InvalidDurableRow,
 }
 
 impl std::fmt::Display for ChangeMonitorError {
@@ -96,6 +128,7 @@ impl std::fmt::Display for ChangeMonitorError {
             Self::OperationReuse => "change_monitor_operation_reuse",
             Self::UnknownChange => "change_monitor_unknown_change",
             Self::TransitionMismatch => "change_monitor_transition_mismatch",
+            Self::InvalidDurableRow => "change_monitor_invalid_durable_row",
         };
         f.write_str(code)
     }
@@ -114,7 +147,7 @@ impl std::error::Error for ChangeMonitorError {}
 /// read-only (see [`GitReadback`]) and performs no porcelain status, so a
 /// filesystem-sourced transition surfaces as an unknown-origin Material
 /// change on real content evidence, never as an invented repository claim.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) enum HintOrigin {
     HostEvent,
     FilesystemNotification,
@@ -127,7 +160,7 @@ pub(crate) enum HintOrigin {
 /// ingests each governed tool operation as a host-event hint;
 /// [`observe_filesystem_notification`] ingests each received OS filesystem
 /// notification as a filesystem hint with real Git-substrate evidence.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct KernelChangeHint {
     pub hint_id: String,
     pub resource: String,
@@ -243,7 +276,7 @@ pub(crate) enum HintAdmission {
 /// Outcome of confirming one hint: either the re-read proves no Material
 /// transition, or a Material transition was recorded (with whether
 /// matching governed evidence already reconciled it).
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) enum HintConfirmation {
     VerifiedImmaterial,
     MaterialRecorded { change_id: String, reconciled: bool },
@@ -256,13 +289,13 @@ pub(crate) enum GovernedAdmission {
     Replayed,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct HintEntry {
     hint: KernelChangeHint,
     confirmation: Option<HintConfirmation>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct GovernedChangeRecord {
     resource: String,
     path: String,
@@ -280,7 +313,7 @@ struct GovernedChangeRecord {
     fence_invalidated: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct UnknownOriginRecord {
     resource: String,
     before_digest: Option<String>,
@@ -289,7 +322,7 @@ struct UnknownOriginRecord {
     reconciled: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct UnknownReconciliation {
     unknown_change_id: String,
     evidence_change_id: String,
@@ -302,15 +335,53 @@ struct KernelChangeLedger {
     governed_by_operation: BTreeMap<String, Vec<String>>,
     unknown: BTreeMap<String, UnknownOriginRecord>,
     reconciliations: Vec<UnknownReconciliation>,
+    /// Set only when a durable rebuild finds the persisted rows unusable.
+    /// A poisoned ledger fails closed: every typed operation returns
+    /// [`ChangeMonitorError::LedgerPoisoned`] and the acceptance queries
+    /// report blocked. Only a successful [`rebuild_from_durable_store`]
+    /// clears it, by wholesale replacement from the durable authority.
+    poisoned: bool,
 }
 
 static CHANGE_LEDGER: OnceLock<Mutex<KernelChangeLedger>> = OnceLock::new();
 
+/// ORS owner handle this ledger writes through to once bound. The table is
+/// the only durable copy; the [`KernelChangeLedger`] above is its live
+/// projection. `None` (never bound) keeps the ledger purely in-memory.
+static DURABLE_STORE: OnceLock<Arc<RedbRecoveryStore>> = OnceLock::new();
+
+/// Installs the ORS owner handle ledger mutations write through to. First
+/// binding wins; the startup leg calls this once before
+/// [`rebuild_from_durable_store`].
+pub(crate) fn bind_durable_store(store: Arc<RedbRecoveryStore>) {
+    let _ = DURABLE_STORE.set(store);
+}
+
+fn durable_store() -> Option<Arc<RedbRecoveryStore>> {
+    DURABLE_STORE.get().cloned()
+}
+
 fn ledger() -> Result<std::sync::MutexGuard<'static, KernelChangeLedger>, ChangeMonitorError> {
-    CHANGE_LEDGER
+    let guard = CHANGE_LEDGER
         .get_or_init(|| Mutex::new(KernelChangeLedger::default()))
         .lock()
-        .map_err(|_| ChangeMonitorError::LedgerPoisoned)
+        .map_err(|_| ChangeMonitorError::LedgerPoisoned)?;
+    if guard.poisoned {
+        return Err(ChangeMonitorError::LedgerPoisoned);
+    }
+    Ok(guard)
+}
+
+/// Poisons the live ledger after a durable failure: every typed operation
+/// then fails closed and the acceptance queries report blocked, so a
+/// corrupt or unreachable durable copy can never loosen a gate.
+fn poison_ledger() {
+    if let Ok(mut ledger) = CHANGE_LEDGER
+        .get_or_init(|| Mutex::new(KernelChangeLedger::default()))
+        .lock()
+    {
+        ledger.poisoned = true;
+    }
 }
 
 fn text(value: &str) -> bool {
@@ -426,13 +497,21 @@ pub(crate) fn ingest_hint(hint: KernelChangeHint) -> Result<HintAdmission, Chang
         }
         return Ok(HintAdmission::Replayed);
     }
+    let hint_id = hint.hint_id.clone();
     ledger.hints.insert(
-        hint.hint_id.clone(),
+        hint_id.clone(),
         HintEntry {
             hint,
             confirmation: None,
         },
     );
+    let rows = ledger
+        .hints
+        .get(hint_id.as_str())
+        .and_then(hint_ledger_row)
+        .into_iter()
+        .collect::<Vec<_>>();
+    persist_ledger_rows_best_effort(&rows);
     Ok(HintAdmission::Accepted)
 }
 
@@ -516,6 +595,13 @@ pub(crate) fn confirm_hint(
             .get_mut(hint_id)
             .ok_or(ChangeMonitorError::UnknownHint)?;
         entry.confirmation = Some(HintConfirmation::VerifiedImmaterial);
+        let rows = ledger
+            .hints
+            .get(hint_id)
+            .and_then(hint_ledger_row)
+            .into_iter()
+            .collect::<Vec<_>>();
+        persist_ledger_rows_best_effort(&rows);
         return Ok(HintConfirmation::VerifiedImmaterial);
     }
     let evidence_id = ledger
@@ -548,11 +634,14 @@ pub(crate) fn confirm_hint(
             newly
         }
     };
+    let mut rows = Vec::new();
     if newly_reconciled && let Some(evidence_id) = evidence_id {
-        ledger.reconciliations.push(UnknownReconciliation {
+        let link = UnknownReconciliation {
             unknown_change_id: change_id.clone(),
             evidence_change_id: evidence_id,
-        });
+        };
+        rows.extend(link_ledger_row(&link));
+        ledger.reconciliations.push(link);
     }
     let entry = ledger
         .hints
@@ -562,6 +651,14 @@ pub(crate) fn confirm_hint(
         change_id: change_id.clone(),
         reconciled,
     });
+    rows.extend(ledger.hints.get(hint_id).and_then(hint_ledger_row));
+    rows.extend(
+        ledger
+            .unknown
+            .get(change_id.as_str())
+            .and_then(|record| unknown_ledger_row(&change_id, record)),
+    );
+    persist_ledger_rows_best_effort(&rows);
     Ok(HintConfirmation::MaterialRecorded {
         change_id,
         reconciled,
@@ -861,6 +958,12 @@ pub(crate) fn record_governed_tool_change(
         .or_default()
         .push(change.change_id.clone());
     ledger.governed.insert(change.change_id.clone(), record);
+    let mut rows: Vec<ChangeMonitorLedgerRow> = ledger
+        .governed
+        .get(change.change_id.as_str())
+        .and_then(|record| governed_ledger_row(&change.change_id, record))
+        .into_iter()
+        .collect();
     let matched: Vec<(String, String)> = ledger
         .unknown
         .iter()
@@ -876,11 +979,20 @@ pub(crate) fn record_governed_tool_change(
         if let Some(unknown) = ledger.unknown.get_mut(&unknown_id) {
             unknown.reconciled = true;
         }
-        ledger.reconciliations.push(UnknownReconciliation {
-            unknown_change_id: unknown_id,
+        let link = UnknownReconciliation {
+            unknown_change_id: unknown_id.clone(),
             evidence_change_id: evidence_id,
-        });
+        };
+        rows.extend(link_ledger_row(&link));
+        rows.extend(
+            ledger
+                .unknown
+                .get(unknown_id.as_str())
+                .and_then(|record| unknown_ledger_row(&unknown_id, record)),
+        );
+        ledger.reconciliations.push(link);
     }
+    persist_ledger_rows_best_effort(&rows);
     Ok(GovernedAdmission::Accepted)
 }
 
@@ -912,11 +1024,383 @@ pub(crate) fn reconcile_unknown_change(
         return Ok(());
     }
     unknown.reconciled = true;
-    ledger.reconciliations.push(UnknownReconciliation {
+    let link = UnknownReconciliation {
         unknown_change_id: change_id.to_owned(),
         evidence_change_id: format!("transition:{evidence_transition_digest}"),
-    });
+    };
+    let mut rows = link_ledger_row(&link).into_iter().collect::<Vec<_>>();
+    rows.extend(
+        ledger
+            .unknown
+            .get(change_id)
+            .and_then(|record| unknown_ledger_row(change_id, record)),
+    );
+    ledger.reconciliations.push(link);
+    persist_ledger_rows_best_effort(&rows);
     Ok(())
+}
+
+/// Outcome of [`rebuild_from_durable_store`]: admitted rows per collection,
+/// plus reconciliation links dropped as unproven. A dropped link is
+/// fail-closed: the unknown-origin flag it would have cleared stays set,
+/// so the gate stays blocked until proven evidence reconciles it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RebuildOutcome {
+    pub hints: usize,
+    pub governed: usize,
+    pub unknown: usize,
+    pub reconciliations: usize,
+    pub dropped_links: usize,
+}
+
+fn ledger_body<T: Serialize>(value: &T) -> Option<String> {
+    serde_json::to_string(value).ok()
+}
+
+fn hint_ledger_row(entry: &HintEntry) -> Option<ChangeMonitorLedgerRow> {
+    ledger_body(entry).map(|body| {
+        ChangeMonitorLedgerRow::new(
+            ChangeMonitorLedgerRowKind::Hint,
+            entry.hint.hint_id.clone(),
+            body,
+        )
+    })
+}
+
+fn governed_ledger_row(
+    change_id: &str,
+    record: &GovernedChangeRecord,
+) -> Option<ChangeMonitorLedgerRow> {
+    ledger_body(record).map(|body| {
+        ChangeMonitorLedgerRow::new(
+            ChangeMonitorLedgerRowKind::Governed,
+            change_id.to_owned(),
+            body,
+        )
+    })
+}
+
+fn unknown_ledger_row(
+    change_id: &str,
+    record: &UnknownOriginRecord,
+) -> Option<ChangeMonitorLedgerRow> {
+    ledger_body(record).map(|body| {
+        ChangeMonitorLedgerRow::new(
+            ChangeMonitorLedgerRowKind::Unknown,
+            change_id.to_owned(),
+            body,
+        )
+    })
+}
+
+fn link_ledger_row(link: &UnknownReconciliation) -> Option<ChangeMonitorLedgerRow> {
+    ledger_body(link).map(|body| {
+        ChangeMonitorLedgerRow::new(
+            ChangeMonitorLedgerRowKind::Reconciliation,
+            format!(
+                "{}:{}",
+                link.unknown_change_id, link.evidence_change_id
+            ),
+            body,
+        )
+    })
+}
+
+/// Persists admitted rows through the bound ORS owner. Best-effort by
+/// contract: a store failure never converts an admitted ledger result into
+/// an error, and an unbound ledger persists nothing. The next mutation
+/// retries the write, so a transient failure only narrows the crash window
+/// instead of forking authority: the table stays the one durable copy.
+fn persist_ledger_rows_best_effort(rows: &[ChangeMonitorLedgerRow]) {
+    if rows.is_empty() {
+        return;
+    }
+    let Some(store) = durable_store() else {
+        return;
+    };
+    for row in rows {
+        let _ = store.record_change_monitor_ledger_row(row);
+    }
+}
+
+/// Rebuilds the live projection from the durable ORS owner (I10.21 defect
+/// 3): pending hints and unreconciled unknown-origin blockers survive
+/// restart because they are admitted rows, restored as-is, while every
+/// derived flag is recomputed from immutable evidence. The rebuilt ledger
+/// replaces the live one wholesale — the table is the authority, never a
+/// merge source — so a second call re-heals whatever the first left
+/// behind. Any failure poisons the live ledger and reports it typed, so
+/// corruption fails closed to blocked instead of to silent acceptance.
+///
+/// Caller: the Kernel startup leg that owns the `RedbRecoveryStore`
+/// handle, once per boot before governed acceptance is queried.
+pub(crate) fn rebuild_from_durable_store(
+    store: &Arc<RedbRecoveryStore>,
+) -> Result<RebuildOutcome, ChangeMonitorError> {
+    bind_durable_store(Arc::clone(store));
+    let rows = match store.load_change_monitor_ledger_rows() {
+        Ok(rows) => rows,
+        Err(_) => {
+            poison_ledger();
+            return Err(ChangeMonitorError::LedgerPoisoned);
+        }
+    };
+    let (rebuilt, outcome) = match rebuild_ledger_from_rows(&rows) {
+        Ok(rebuilt) => rebuilt,
+        Err(error) => {
+            poison_ledger();
+            return Err(error);
+        }
+    };
+    match CHANGE_LEDGER
+        .get_or_init(|| Mutex::new(KernelChangeLedger::default()))
+        .lock()
+    {
+        Ok(mut ledger) => {
+            *ledger = rebuilt;
+            Ok(outcome)
+        }
+        Err(_) => Err(ChangeMonitorError::LedgerPoisoned),
+    }
+}
+
+/// Rebuilds a live ledger from durable rows: admitted hints, governed
+/// records and unknown-origin records are restored as-is, reconciliation
+/// links replay only when proven against the rebuilt maps, and every
+/// derived flag (operation index, `reconciled` marks, hint confirmations)
+/// is recomputed from that evidence. Stored flags are never trusted. A
+/// hint confirmation naming an unknown-origin change the rows do not carry
+/// drops to pending — fail-closed block — rather than trusted. Any shape
+/// violation refuses the whole image with
+/// [`ChangeMonitorError::InvalidDurableRow`]: a half-admitted ledger would
+/// be a silent coverage change.
+fn rebuild_ledger_from_rows(
+    rows: &[ChangeMonitorLedgerRow],
+) -> Result<(KernelChangeLedger, RebuildOutcome), ChangeMonitorError> {
+    let mut ledger = KernelChangeLedger::default();
+    let mut dropped_links = 0usize;
+    for row in rows
+        .iter()
+        .filter(|row| row.row_kind == ChangeMonitorLedgerRowKind::Hint)
+    {
+        let entry: HintEntry =
+            serde_json::from_str(&row.body).map_err(|_| ChangeMonitorError::InvalidDurableRow)?;
+        validate_hint(&entry.hint).map_err(|_| ChangeMonitorError::InvalidDurableRow)?;
+        if entry.hint.hint_id != row.row_id {
+            return Err(ChangeMonitorError::InvalidDurableRow);
+        }
+        if let Some(HintConfirmation::MaterialRecorded { change_id, .. }) = &entry.confirmation {
+            expect_hint_change_id(&entry.hint.hint_id, change_id)?;
+        }
+        ledger.hints.insert(row.row_id.clone(), entry);
+    }
+    for row in rows
+        .iter()
+        .filter(|row| row.row_kind == ChangeMonitorLedgerRowKind::Governed)
+    {
+        let record: GovernedChangeRecord =
+            serde_json::from_str(&row.body).map_err(|_| ChangeMonitorError::InvalidDurableRow)?;
+        validate_rebuilt_governed_record(&row.row_id, &record)?;
+        ledger
+            .governed_by_operation
+            .entry(record.operation.clone())
+            .or_default()
+            .push(row.row_id.clone());
+        ledger.governed.insert(row.row_id.clone(), record);
+    }
+    for row in rows
+        .iter()
+        .filter(|row| row.row_kind == ChangeMonitorLedgerRowKind::Unknown)
+    {
+        let mut record: UnknownOriginRecord =
+            serde_json::from_str(&row.body).map_err(|_| ChangeMonitorError::InvalidDurableRow)?;
+        validate_rebuilt_unknown_record(&row.row_id, &record)?;
+        // Stored flags are never trusted: reconciliation re-derives below
+        // from governed evidence or a proven link.
+        record.reconciled = false;
+        ledger.unknown.insert(row.row_id.clone(), record);
+    }
+    for row in rows
+        .iter()
+        .filter(|row| row.row_kind == ChangeMonitorLedgerRowKind::Reconciliation)
+    {
+        let link: UnknownReconciliation =
+            serde_json::from_str(&row.body).map_err(|_| ChangeMonitorError::InvalidDurableRow)?;
+        if !text(&link.unknown_change_id) || !text(&link.evidence_change_id) {
+            return Err(ChangeMonitorError::InvalidDurableRow);
+        }
+        if row.row_id != format!("{}:{}", link.unknown_change_id, link.evidence_change_id) {
+            return Err(ChangeMonitorError::InvalidDurableRow);
+        }
+        if link_proven_against(&ledger, &link) {
+            ledger.reconciliations.push(link);
+        } else {
+            dropped_links += 1;
+        }
+    }
+    for (unknown_id, unknown) in ledger.unknown.iter_mut() {
+        unknown.reconciled = governed_match_exists(&ledger.governed, unknown)
+            || ledger
+                .reconciliations
+                .iter()
+                .any(|link| link.unknown_change_id == *unknown_id);
+    }
+    for entry in ledger.hints.values_mut() {
+        if let Some(HintConfirmation::MaterialRecorded { change_id, .. }) =
+            entry.confirmation.clone()
+            && let Some(unknown) = ledger.unknown.get(&change_id)
+        {
+            entry.confirmation = Some(HintConfirmation::MaterialRecorded {
+                change_id,
+                reconciled: unknown.reconciled,
+            });
+        } else if matches!(
+            entry.confirmation,
+            Some(HintConfirmation::MaterialRecorded { .. })
+        ) {
+            entry.confirmation = None;
+        }
+    }
+    let outcome = RebuildOutcome {
+        hints: ledger.hints.len(),
+        governed: ledger.governed.len(),
+        unknown: ledger.unknown.len(),
+        reconciliations: ledger.reconciliations.len(),
+        dropped_links,
+    };
+    Ok((ledger, outcome))
+}
+
+/// Checks that a rebuilt hint confirmation names a change identity bound to
+/// its own hint through the ledger's transition binder.
+fn expect_hint_change_id(hint_id: &str, change_id: &str) -> Result<(), ChangeMonitorError> {
+    let rest = change_id
+        .strip_prefix("cmu:")
+        .ok_or(ChangeMonitorError::InvalidDurableRow)?;
+    let rest = rest
+        .strip_prefix(hint_id)
+        .ok_or(ChangeMonitorError::InvalidDurableRow)?;
+    let digest = rest
+        .strip_prefix(':')
+        .ok_or(ChangeMonitorError::InvalidDurableRow)?;
+    if !is_sha256_hex(digest) {
+        return Err(ChangeMonitorError::InvalidDurableRow);
+    }
+    Ok(())
+}
+
+/// Re-validates a rebuilt governed-transition record with the same shape
+/// contract the admission path enforces, including the diff-handle binding
+/// through the ledger's own transition binder (never a second resolver).
+fn validate_rebuilt_governed_record(
+    change_id: &str,
+    record: &GovernedChangeRecord,
+) -> Result<(), ChangeMonitorError> {
+    if !text(change_id)
+        || !text(&record.resource)
+        || !validate_relative_path(&record.path)
+        || !text(&record.session)
+        || !text(&record.action_lease)
+        || !text(&record.operation)
+        || !text(&record.attempt_receipt)
+        || !text(&record.diff_handle)
+    {
+        return Err(ChangeMonitorError::InvalidDurableRow);
+    }
+    if let Some(before_path) = &record.before_path
+        && !validate_relative_path(before_path)
+    {
+        return Err(ChangeMonitorError::InvalidDurableRow);
+    }
+    for revision in [&record.before_revision, &record.after_revision]
+        .into_iter()
+        .flatten()
+    {
+        if !text(revision) {
+            return Err(ChangeMonitorError::InvalidDurableRow);
+        }
+    }
+    let (Some(before_digest), Some(after_digest)) = (&record.before_digest, &record.after_digest)
+    else {
+        return Err(ChangeMonitorError::InvalidDurableRow);
+    };
+    if !is_sha256_hex(before_digest) || !is_sha256_hex(after_digest) || before_digest == after_digest
+    {
+        return Err(ChangeMonitorError::InvalidDurableRow);
+    }
+    let (_, transition_digest) = material_transition_ids(
+        change_id,
+        Some(before_digest.as_str()),
+        Some(after_digest.as_str()),
+    );
+    if record.diff_handle != transition_digest {
+        return Err(ChangeMonitorError::InvalidDurableRow);
+    }
+    Ok(())
+}
+
+/// Re-validates a rebuilt unknown-origin record: the transition digest must
+/// be the ledger binder's digest of the exact before/after pair, and the
+/// change identity must scope that digest to one hint.
+fn validate_rebuilt_unknown_record(
+    change_id: &str,
+    record: &UnknownOriginRecord,
+) -> Result<(), ChangeMonitorError> {
+    if !text(change_id) || !text(&record.resource) {
+        return Err(ChangeMonitorError::InvalidDurableRow);
+    }
+    for digest in [&record.before_digest, &record.after_digest]
+        .into_iter()
+        .flatten()
+    {
+        if !is_sha256_hex(digest) {
+            return Err(ChangeMonitorError::InvalidDurableRow);
+        }
+    }
+    let (_, transition_digest) = material_transition_ids(
+        "",
+        record.before_digest.as_deref(),
+        record.after_digest.as_deref(),
+    );
+    if record.transition_digest != transition_digest {
+        return Err(ChangeMonitorError::InvalidDurableRow);
+    }
+    if !change_id.starts_with("cmu:")
+        || !change_id.ends_with(format!(":{transition_digest}").as_str())
+    {
+        return Err(ChangeMonitorError::InvalidDurableRow);
+    }
+    Ok(())
+}
+
+/// Whether a governed record already proves the exact resource transition
+/// an unknown-origin record names — the same predicate the confirm and
+/// record paths use, reused here so rebuild agrees with admission.
+fn governed_match_exists(
+    governed: &BTreeMap<String, GovernedChangeRecord>,
+    unknown: &UnknownOriginRecord,
+) -> bool {
+    governed.values().any(|record| {
+        record.resource == unknown.resource
+            && record.before_digest == unknown.before_digest
+            && record.after_digest == unknown.after_digest
+    })
+}
+
+/// Whether a rebuilt reconciliation link proves its unknown-origin change:
+/// either the named governed record proves the exact same resource
+/// transition, or the evidence names the transition digest itself (the
+/// explicit-reconciliation leg). Anything else replays nothing.
+fn link_proven_against(ledger: &KernelChangeLedger, link: &UnknownReconciliation) -> bool {
+    let Some(unknown) = ledger.unknown.get(&link.unknown_change_id) else {
+        return false;
+    };
+    if let Some(record) = ledger.governed.get(&link.evidence_change_id) {
+        return record.resource == unknown.resource
+            && record.before_digest == unknown.before_digest
+            && record.after_digest == unknown.after_digest;
+    }
+    link.evidence_change_id == format!("transition:{}", unknown.transition_digest)
 }
 
 /// Returns whether governed acceptance is currently blocked: a host-event

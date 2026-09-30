@@ -1152,7 +1152,26 @@ fn source_bound_exclusions() -> Vec<DispositionedTable> {
     tables.extend(projection_family_exclusions());
     tables.extend(effect_replay_family_exclusions());
     tables.extend(purge_ledger_exclusions());
+    tables.extend(change_monitor_exclusions());
     tables
+}
+
+/// The ChangeMonitor ledger exclusion (issue #1824, defect 3).
+///
+/// Ledger rows are the Kernel ledger's admitted before/after transition and
+/// reconciliation-link observations. `ForensicOnly` for the same reason as
+/// the verification-results sibling: this crate has no durable import path
+/// that replays rows into a live gate, so `Restorable` would advertise a
+/// re-import that does not exist. An exported row lands as forensics and
+/// never as a live blocker; the receiving kernel re-establishes its gate
+/// from its own readbacks. Reviving pending gates across restore stays an
+/// open owner follow-up.
+fn change_monitor_exclusions() -> Vec<DispositionedTable> {
+    vec![excluded(
+        super::CHANGE_MONITOR_LEDGER,
+        RowDisposition::ForensicOnly,
+        "change monitor ledger rows are the Kernel ledger's admitted transition and reconciliation-link observations with no durable import path; a restored row is forensics, never a live gate, and the receiving kernel re-establishes its gate from its own readbacks",
+    )]
 }
 
 /// The six exclusions that are owner state: four re-established by the

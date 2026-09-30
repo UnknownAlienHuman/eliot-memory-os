@@ -247,6 +247,146 @@ const UNKNOWN_COMMIT_RECOVERY: TableDefinition<&str, &str> =
 /// canonical ordering write attempt.
 const SCAN_DISCLOSURE_RECORDS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_scan_disclosure_v1");
+/// Durable ChangeMonitor ledger rows (issue #1824, defect 3; I10.21).
+///
+/// One row per admitted ledger record, keyed `<kind>:<identity>` (`hint:…`,
+/// `governed:…`, `unknown:…`, `reconciliation:…`), holding the ledger's own
+/// row shape verbatim as versioned JSON. A new table in the existing ORS
+/// family with the single Kernel change-monitor ledger as its one writer;
+/// it never reuses [`PROCESS_EVIDENCE`], because these rows are the
+/// ledger's admitted before/after transition and reconciliation-link
+/// records with their own pending/blocking lifecycle, not process-stream
+/// locator evidence. The table is the only durable copy: the in-memory
+/// ledger is a projection rebuilt from these rows at startup, and every
+/// derived flag (operation index, `reconciled` marks) is re-derived by the
+/// ledger on rebuild rather than trusted from storage.
+const CHANGE_MONITOR_LEDGER: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_change_monitor_ledger_v1");
+
+/// Schema version carried on every [`ChangeMonitorLedgerRow`]. A row stamped
+/// with any other version is refused: its schema is unknown here, so
+/// admitting it would be invention.
+const CHANGE_MONITOR_LEDGER_SCHEMA_VERSION: u32 = 1;
+/// Bounds for one ledger row envelope (issue #1824, defect 3). Ledger rows
+/// are digests and labels (~1 KiB); the bounds only stop a corrupt store
+/// from feeding unbounded bytes into a startup rebuild.
+const MAX_CHANGE_MONITOR_ROW_ID_BYTES: usize = 1024;
+const MAX_CHANGE_MONITOR_ROW_BODY_BYTES: usize = 64 * 1024;
+const MAX_CHANGE_MONITOR_LEDGER_ROWS: usize = 262_144;
+
+/// Which ledger collection one [`ChangeMonitorLedgerRow`] belongs to. The
+/// durable key is `<kind>:<identity>`, so a row filed under another kind's
+/// key is an integrity failure rather than a cross-kind alias.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ChangeMonitorLedgerRowKind {
+    Hint,
+    Governed,
+    Unknown,
+    Reconciliation,
+}
+
+impl ChangeMonitorLedgerRowKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Hint => "hint",
+            Self::Governed => "governed",
+            Self::Unknown => "unknown",
+            Self::Reconciliation => "reconciliation",
+        }
+    }
+}
+
+/// Outcome of [`RedbRecoveryStore::record_change_monitor_ledger_row`]: an
+/// absent key inserts, an identical re-write replays, and a single-writer
+/// forward update (confirmation set, reconciled flag set) overwrites. A
+/// conflicting replacement from any other writer is impossible by
+/// construction — the Kernel ledger is the one writer — so overwrite here
+/// is forward progress, never history rewrite; the ledger itself admits
+/// only forward transitions and rebuilds re-derive every flag from
+/// evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChangeMonitorRowWriteOutcome {
+    Stored,
+    Replayed,
+    Updated,
+}
+
+/// One durable ChangeMonitor ledger row (issue #1824, defect 3; I10.21).
+/// Envelope owned here; `body` is the ledger's own row shape verbatim.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChangeMonitorLedgerRow {
+    pub schema_version: u32,
+    pub row_kind: ChangeMonitorLedgerRowKind,
+    pub row_id: String,
+    pub body: String,
+}
+
+impl ChangeMonitorLedgerRow {
+    /// Envelope constructor owned here so the schema version stays with the
+    /// table, never with callers: the ledger supplies kind, identity and
+    /// its own row-shape bytes, and the owner stamps the version it reads.
+    pub fn new(row_kind: ChangeMonitorLedgerRowKind, row_id: String, body: String) -> Self {
+        Self {
+            schema_version: CHANGE_MONITOR_LEDGER_SCHEMA_VERSION,
+            row_kind,
+            row_id,
+            body,
+        }
+    }
+
+    /// Canonical durable key for this row: `<kind>:<identity>`.
+    pub fn record_key(&self) -> String {
+        format!("{}:{}", self.row_kind.as_str(), self.row_id)
+    }
+
+    /// Envelope integrity gate: schema version, identity bounds, body size
+    /// and JSON well-formedness. Observation semantics stay with the
+    /// ledger's rebuild.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        if self.schema_version != CHANGE_MONITOR_LEDGER_SCHEMA_VERSION {
+            return Err(OrsError::InvalidField {
+                field: "change_monitor_ledger_row.schema_version",
+                reason: "unsupported change monitor ledger schema version",
+            });
+        }
+        if self.row_id.trim().is_empty()
+            || self.row_id.len() > MAX_CHANGE_MONITOR_ROW_ID_BYTES
+            || self.row_id.chars().any(char::is_control)
+        {
+            return Err(OrsError::InvalidField {
+                field: "change_monitor_ledger_row.row_id",
+                reason: "ledger row identity must be exact, bounded text",
+            });
+        }
+        if self.body.is_empty() || self.body.len() > MAX_CHANGE_MONITOR_ROW_BODY_BYTES {
+            return Err(OrsError::InvalidField {
+                field: "change_monitor_ledger_row.body",
+                reason: "ledger row body must be bounded, non-empty bytes",
+            });
+        }
+        let body: Value = serde_json::from_str(&self.body).map_err(|_| OrsError::InvalidField {
+            field: "change_monitor_ledger_row.body",
+            reason: "ledger row body is not JSON",
+        })?;
+        if !body.is_object() {
+            return Err(OrsError::InvalidField {
+                field: "change_monitor_ledger_row.body",
+                reason: "ledger row body is not a JSON object",
+            });
+        }
+        Ok(())
+    }
+}
+
+impl persistence_codec::PersistedValue for ChangeMonitorLedgerRow {
+    const RECORD_TYPE: &'static str = "change_monitor_ledger_row";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
 /// Durable cold-start lease and terminal readiness rows (issue #1790). These
 /// three tables share one readiness owner: immutable revision rows preserve
 /// terminal receipts, the base-identity head allocates the next revision, and
@@ -6980,6 +7120,89 @@ impl RedbRecoveryStore {
         }
         records.sort_by(|left, right| left.operation_key.cmp(&right.operation_key));
         Ok(records)
+    }
+
+    /// Durable ChangeMonitor ledger rows (issue #1824, defect 3; I10.21).
+    ///
+    /// The envelope is owned here; the `body` is the Kernel change-monitor
+    /// ledger's own row shape verbatim (hint entry, governed-transition
+    /// record, unknown-origin record, or reconciliation link) as canonical
+    /// JSON. The owner validates envelope integrity only — schema version,
+    /// kind/key agreement, identity bounds, body size and JSON
+    /// well-formedness — while the ledger validates observation semantics on
+    /// rebuild with its own validators and evidence matching. There is one
+    /// row type for the one table, never a second ledger encoding.
+    pub fn record_change_monitor_ledger_row(
+        &self,
+        row: &ChangeMonitorLedgerRow,
+    ) -> Result<ChangeMonitorRowWriteOutcome, OrsError> {
+        row.validate()?;
+        let key = row.record_key();
+        let write = self.database.begin_write().map_err(storage)?;
+        let outcome = {
+            let mut table = write.open_table(CHANGE_MONITOR_LEDGER).map_err(storage)?;
+            let existing = table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| value.value().to_owned());
+            match existing {
+                None => {
+                    let payload = encode(row)?;
+                    table
+                        .insert(key.as_str(), payload.as_str())
+                        .map_err(storage)?;
+                    ChangeMonitorRowWriteOutcome::Stored
+                }
+                Some(bytes) => {
+                    let stored: ChangeMonitorLedgerRow = decode(&bytes)?;
+                    if stored != *row {
+                        let payload = encode(row)?;
+                        table
+                            .insert(key.as_str(), payload.as_str())
+                            .map_err(storage)?;
+                        ChangeMonitorRowWriteOutcome::Updated
+                    } else {
+                        ChangeMonitorRowWriteOutcome::Replayed
+                    }
+                }
+            }
+        };
+        write.commit().map_err(storage)?;
+        Ok(outcome)
+    }
+
+    /// Loads every durable ChangeMonitor ledger row for a startup rebuild
+    /// (issue #1824, defect 3; I10.21).
+    ///
+    /// Rows read back in key order under a bounded row budget; every row is
+    /// re-validated through the same ORS codec every sibling reader uses, so
+    /// a row whose envelope no longer holds is an integrity failure rather
+    /// than a rebuildable observation. A key that is not the row's own
+    /// canonical key is the same failure. Semantic admission (shape checks,
+    /// evidence matching, flag re-derivation) stays with the ledger's
+    /// rebuild, which drops unproven links instead of replaying them.
+    pub fn load_change_monitor_ledger_rows(&self) -> Result<Vec<ChangeMonitorLedgerRow>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read.open_table(CHANGE_MONITOR_LEDGER).map_err(storage)?;
+        let mut rows = Vec::new();
+        for entry in table.iter().map_err(storage)? {
+            let (key, value) = entry.map_err(storage)?;
+            let row: ChangeMonitorLedgerRow = decode(value.value())?;
+            if key.value() != row.record_key() {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "change_monitor_ledger_row",
+                    reason: "change monitor ledger key does not match its row".to_owned(),
+                });
+            }
+            rows.push(row);
+            if rows.len() > MAX_CHANGE_MONITOR_LEDGER_ROWS {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "change_monitor_ledger_row",
+                    reason: "change monitor ledger exceeds the bounded rebuild budget".to_owned(),
+                });
+            }
+        }
+        Ok(rows)
     }
 
     /// Loads one durable `backup.verify` result by exact idempotency key
@@ -27058,6 +27281,12 @@ impl RedbRecoveryStore {
         drop(write.open_table(AUTHORITY_HANDOFFS).map_err(storage)?);
         drop(write.open_table(PROCESS_EVIDENCE).map_err(storage)?);
         drop(write.open_table(PROCESS_STREAM_RECOVERY).map_err(storage)?);
+        // #1824 (defect 3): the ChangeMonitor ledger table is part of the
+        // base family, materialized empty on every open like every other
+        // base table, so a rebuild on a store that never admitted a
+        // transition reads authoritatively empty instead of failing on a
+        // missing table. No row is backfilled or inferred here.
+        drop(write.open_table(CHANGE_MONITOR_LEDGER).map_err(storage)?);
         drop(
             write
                 .open_table(SUPERVISION_LEASE_STAGED)
