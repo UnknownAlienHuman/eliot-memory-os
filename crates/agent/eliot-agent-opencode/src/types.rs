@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, path::Path};
 use eliot_agent_api::{
     AdmittedRouteReceipt, AgentAttempt, AgentAttemptId, AssistantDeltaObservation, AttemptState,
     CONTRACT_VERSION, CancellationState, ClockReading, ContractError, ErrorObservation,
-    EventCursor, EventId, ExecutionOutcome, HOST_EVENT_CONTRACT_VERSION,
+    EventCursor, EventId, ExecutionOutcome, ExecutionUnitObservation, HOST_EVENT_CONTRACT_VERSION,
     HOST_EVENT_DIGEST_ALGORITHM, HOST_EVENT_RAW_BYTES_DIGEST_ALGORITHM,
     HostEventDeliveryDisposition, HostEventNormalizationReceipt, HostEventPrivacyClass,
     LowercaseSha256, NativeSession, NormalizationCoverage, NormalizedHostEventEnvelope,
@@ -2680,6 +2680,40 @@ impl AdmittedOpenCodeAttempt {
             body.event_sequence,
             body.cancellation,
         )
+    }
+
+    /// Builds the exact execution-unit lineage a sealed physical observation
+    /// justifies at durable staging (issue #2645 W1/W3).
+    ///
+    /// `observation` is the [`OpenCodeWireRouteReceipt::to_physical_observation`]
+    /// output carried by the sealed disposition: it is re-validated here against this attempt's
+    /// exact binding and governing admission — attempt/lease/fence/generation
+    /// agreement, embedded-binding equality, bound start-request commitment,
+    /// admitted-digest linkage, and the legitimate admission-selection
+    /// boundary — reusing the existing digest methods and
+    /// [`PhysicalRouteObservationReceipt::validate_against`]. No new hash
+    /// recipe is invented and no caller hash is trusted. The returned lineage
+    /// reuses the observation's own cursor/sequence, so the staging
+    /// observation-applicability gate (observation position equals lineage
+    /// position) holds by construction. An observation from another attempt,
+    /// binding, fence, generation, admission, or cursor/sequence boundary
+    /// fails closed with [`OpenCodeObservationConversionError`]. The staging
+    /// caller normalizes the event envelope under this lineage and stages
+    /// through the journal's execution-unit constructor with
+    /// `Some(observation)`, so the actual-route column derives from this
+    /// validated owner material, never from a caller-supplied digest.
+    pub fn execution_unit_lineage_for(
+        &self,
+        observation: &PhysicalRouteObservationReceipt,
+    ) -> Result<ExecutionUnitObservation, OpenCodeObservationConversionError> {
+        observation.validate_against(&self.binding, &self.admission)?;
+        let lineage = ExecutionUnitObservation {
+            binding: self.binding.clone(),
+            cursor: observation.event_cursor.clone(),
+            sequence: observation.event_sequence,
+        };
+        lineage.validate()?;
+        Ok(lineage)
     }
 }
 
