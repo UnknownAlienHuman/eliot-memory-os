@@ -1,4 +1,4 @@
-//! Windows Event Log startup/recovery surface for the `system_service`
+//! Host Windows Event Log compatibility surface for the `system_service`
 //! profile (I16.2).
 //!
 //! The Event Log FFI stays in `eliot-platform-windows`; this module owns the
@@ -14,7 +14,7 @@ use eliot_platform_windows::{
 
 use crate::critical_path::{CriticalEventRecord, SinkStatus, UnavailableReason};
 
-/// Host/Kernel lifecycle events admitted to the Windows Event Log.
+/// Host lifecycle events admitted to the Windows Event Log.
 ///
 /// I16.2 names startup and recovery for the `system_service` profile; I16.4
 /// requires process start, restart, and restart-intensity exhaustion to be
@@ -133,16 +133,23 @@ impl EventLogReport {
         }
     }
 
-    /// Writes one critical record to the last-resort Event Log stage.
+    /// Writes one explicitly named Host critical record to the last-resort
+    /// Event Log stage.
     ///
     /// The insertion is rebuilt from the record's own bounded fields, so an
     /// arbitrary payload can never reach the OS insertion string.
     pub fn write(&self, record: &CriticalEventRecord) -> SinkStatus {
+        let Some(event) = event_for(&record.event) else {
+            return SinkStatus::Unavailable(UnavailableReason::NotApplicable);
+        };
+        if record.profile != "system_service" {
+            return SinkStatus::Unavailable(UnavailableReason::NotApplicable);
+        }
         let insertion = format!(
             "event={} profile={} detail={}",
             record.event, record.profile, record.detail
         );
-        match self.report(event_for(&record.event), &insertion) {
+        match self.report(event, &insertion) {
             Ok(EventLogOutcome::Accepted) => SinkStatus::Delivered,
             Ok(outcome) | Err(outcome) => SinkStatus::Unavailable(outcome.unavailable_reason()),
         }
@@ -164,10 +171,13 @@ impl EventLogOutcome {
     }
 }
 
-fn event_for(name: &str) -> SystemServiceEvent {
+fn event_for(name: &str) -> Option<SystemServiceEvent> {
     match name {
-        "service_stop" | "quiesce" | "stop" => SystemServiceEvent::ServiceStop,
-        "crash" | "restart" | "restart_exhausted" | "quarantine" => SystemServiceEvent::Crash,
-        _ => SystemServiceEvent::ServiceStart,
+        "host.service_start" => Some(SystemServiceEvent::ServiceStart),
+        "host.service_stop" => Some(SystemServiceEvent::ServiceStop),
+        "host.crash" => Some(SystemServiceEvent::Crash),
+        "host.restart" => Some(SystemServiceEvent::Restart),
+        "host.restart_exhausted" => Some(SystemServiceEvent::RestartExhausted),
+        _ => None,
     }
 }

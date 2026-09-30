@@ -175,6 +175,25 @@ async fn main() {
         };
     #[cfg(windows)]
     observe_entrypoint(EntrypointStage::HostStartupBinding);
+    let authority_path = options.authority_descriptor.clone();
+    let authority_contour =
+        startup_binding::authority_contour(&options.work_root, &authority_path);
+    #[cfg(windows)]
+    let (supervision_profile, portable_dev_repository_root) = startup_binding
+        .supervision_profile_binding(profile_root_leases.as_ref())
+        .unwrap_or_else(|error| exit_error("PRINCIPAL_FAILURE", &error));
+    #[cfg(windows)]
+    if supervision_profile == eliot_installation::InstallationProfile::SystemService
+        && matches!(
+            &authority_contour,
+            eliot_kernel::AuthorityDescriptorContour::ProgramData
+        )
+    {
+        // This fixed event says only that the validated SystemService Kernel
+        // entered startup. Its queue admission is independent of readiness and
+        // cannot replace a later lifecycle result or failure.
+        let _ = eliot_kernel::windows_event_log::start_and_enqueue_startup();
+    }
     // Issue #1836 (W1): install the shared observability runtime from the
     // roots the Host injected, before the store bootstrap, the launch
     // contract, the composition, and the front-door loop start. Best-effort
@@ -185,7 +204,7 @@ async fn main() {
     let _observability = eliot_observability_runtime::install(&observability_config(
         &startup_binding.receipt_root,
         &startup_binding.kernel_ors_root,
-        &startup_binding::authority_contour(&options.work_root, &options.authority_descriptor),
+        &authority_contour,
     ));
     let prepared_store = match startup_binding::prepare_store_bootstrap(&options) {
         Ok(prepared) => prepared,
@@ -205,11 +224,10 @@ async fn main() {
         KernelConfig::new(options.work_root.clone()).require_descriptor_supervision_authority();
     #[cfg(windows)]
     {
-        let (profile, portable_dev_repository_root) = startup_binding
-            .supervision_profile_binding(profile_root_leases.as_ref())
-            .unwrap_or_else(|error| exit_error("PRINCIPAL_FAILURE", &error));
-        kernel_config = kernel_config
-            .with_supervision_installation_profile(profile, portable_dev_repository_root);
+        kernel_config = kernel_config.with_supervision_installation_profile(
+            supervision_profile,
+            portable_dev_repository_root,
+        );
     }
     #[cfg(windows)]
     let pipe_name = startup_binding.control_pipe.clone();
@@ -320,8 +338,6 @@ async fn main() {
         user_broker_executable_path,
         user_broker_artifact_sha256,
     );
-    let authority_path = options.authority_descriptor.clone();
-    let authority_contour = startup_binding::authority_contour(&options.work_root, &authority_path);
     // I16.2/I16.5 (issue #1841): install the bounded-label OpenMetrics stack
     // and publish the local scrape surface. Best-effort by contract (A13.10):
     // a refused configuration is reported and the launch funnel continues, so
