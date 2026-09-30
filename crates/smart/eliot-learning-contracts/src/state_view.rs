@@ -212,10 +212,24 @@ pub enum CampaignSourceRole {
     EvaluationPosition,
     /// Economics progress position record.
     EconomicsProgress,
+    /// Separate owner-published Orientation classification profile.
+    ///
+    /// This source is read by the Orientation stage owner and deliberately is
+    /// not part of the 26-role campaign learning-view recipe denominator.
+    OrientationClassification,
+    /// Canonical owner-issued Orientation job admission evidence.
+    ///
+    /// This source is read independently from the classification profile and
+    /// deliberately is not part of the fixed campaign learning-view denominator.
+    OrientationAdmission,
 }
 
 impl CampaignSourceRole {
-    /// Return every closed source role a recipe must enumerate exactly once.
+    /// Return every required closed source role a campaign recipe must enumerate once.
+    ///
+    /// The separately-read `OrientationClassification` profile and
+    /// `OrientationAdmission` evidence are not rows in this fixed 26-role
+    /// learning-view denominator.
     #[must_use]
     pub const fn all() -> [Self; 26] {
         [

@@ -216,10 +216,10 @@ fn validate_admitted_position(
     Ok(())
 }
 
-fn admitted_single_observation(
-    candidate: &EpistemicPositionCandidate,
+fn admitted_single_observation<'a>(
+    candidate: &'a EpistemicPositionCandidate,
     admitted: &AdmittedPosition,
-) -> Result<(&ClaimEntry, &SupportRecord), AdmittedBindingError> {
+) -> Result<(&'a ClaimEntry, &'a SupportRecord), AdmittedBindingError> {
     if candidate.claims.len() != 1 || candidate.support.len() != 1 {
         return Err(AdmittedBindingError::Unsupported {
             field: "candidate must be the existing single-observation producer shape",
