@@ -2518,11 +2518,13 @@ impl KernelComposition {
     ///
     /// The decision is the coordinator's own and is not re-derived here:
     /// [`StorageReplacement::request_rollback`] reloads the ORS-committed cut
-    /// ownership row the receipt names, so a durable `forward_repair_required`
+    /// ownership rows of the pinned scope, so a durable `forward_repair_required`
     /// migration refuses the request even when the in-process ledger is silent.
     /// A refused rollback is answered as a refusal carrying the coordinator's
-    /// disposition and the cutover state it leaves behind — never as a
-    /// switched-back route and never as an effect-free success.
+    /// forward-repair disposition and the cutover state it leaves behind — never
+    /// as a switched-back route, never as an effect-free success, and never as a
+    /// `generation_rollback_permitted` disposition beside the refusal code that
+    /// reports the same request was fenced.
     fn storage_replacement_rollback_operation(
         &self,
         session: &Session,
@@ -2561,11 +2563,17 @@ impl KernelComposition {
                 None,
             ),
             // The I5.14 refusal: an irreversible migration or external effect is
-            // recorded, so the request is refused as a generation rollback and
-            // the disposition names the forward-repair state that follows. The
-            // state is the coordinator's own classification, read back from it.
+            // recorded — by the ledger or by the durable ORS row the coordinator
+            // re-reads — so the request is refused as a generation rollback and
+            // the disposition names the forward-repair state that follows. That
+            // state is the coordinator's own, and it is the forward-repair path
+            // rather than this coordinator's ledger-only projection: a refusal
+            // that the durable record produced can happen with an empty ledger,
+            // and reporting `generation_rollback_permitted` beside
+            // `REPLACEMENT_GENERATION_FENCED` would be a reply contradicting the
+            // refusal it reports.
             Err(error @ KernelServiceError::GenerationFenced) => {
-                let disposition = replacement.rollback_disposition();
+                let disposition = StorageReplacement::forward_repair_path();
                 (
                     Some(StorageRollbackAnswer {
                         disposition: disposition.to_string(),

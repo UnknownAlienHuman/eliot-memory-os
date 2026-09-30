@@ -1057,7 +1057,11 @@ impl KernelComposition {
 ///    and the row it writes takes its route scope and its two store generations
 ///    from that coordinator — never from this payload — while the remaining
 ///    `I14.14` step-7 content is the claim's own and is validated by ORS on the
-///    original recorded values;
+///    original recorded values. The claim's `migration` is the one field of that
+///    content this ingress does not take on trust: it is required to agree with
+///    the coordinator's irreversible-effect ledger before the row is staged, so
+///    the durable record a later rollback refusal reads cannot be a claim's own
+///    account of whether an irreversible effect occurred;
 /// 5. the coordinator then re-derives the receipt from the committed row itself,
 ///    which reloads the row, refuses anything that is not `Committed`, and
 ///    cross-checks the route scope, the two store generations and the state
@@ -1117,6 +1121,14 @@ fn commit_canonical_store_cutover_ownership(
             reason: "the canonical_store route cutover is committed only after every preceding I5.11 stage is recorded",
         });
     }
+    // The claim's `migration` is the value the row below is written from, so it
+    // is bound to the coordinator's own irreversible-effect ledger here, BEFORE
+    // ORS persists it. The coordinator re-checks the committed row's decision
+    // after the write, but that is already the durable linearization point: a
+    // mismatch caught only there leaves a row that says no irreversible effect
+    // occurred while this replacement recorded one, and that row is what the
+    // rollback refusal reads. The same rule, not a second one, is asked twice.
+    coordinator.require_declared_state_migration(replacement.cutover.migration)?;
     commit_canonical_store_cutover_ownership_row(
         ors,
         &coordinator,

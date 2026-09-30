@@ -101,6 +101,12 @@
 //!   replacement from the durable cutover receipt plus the ORS-committed record
 //!   that receipt names, restoring the irreversible-effect ledger fixed at the
 //!   cutover.
+//! - The durable record of irreversibility is a committed row's own `migration`
+//!   content, and it cannot be written from a claim that disagrees with the
+//!   coordinator's ledger. The `I5.11` stage-8 ingress is the only writer of
+//!   that row, and it asks [`StorageReplacement::require_declared_state_migration`]
+//!   of the value it is about to stage, so the row a later rollback refusal
+//!   reads is the coordinator's own account rather than the caller's.
 //! - The two data-transfer stages cannot be recorded without the transfer
 //!   record that binds the exact exported bytes and their export fence, and the
 //!   cutover receipt binds that transfer, so a cutover cannot be proven against
@@ -193,17 +199,40 @@
 //! [`StorageReplacement::rollback_disposition`] is a pure classifier over the
 //! recorded irreversible effects. [`StorageReplacement::request_rollback`]
 //! enforces it, and it does not decide from that ledger alone: it reloads the
-//! ORS-committed cutover ownership row its own receipt names, and a row that
-//! already records a forward-repair-required state migration refuses the request
-//! even when the in-process ledger is silent, so the durable record of
-//! irreversibility is the authority and the caller cannot obtain a permitted
-//! generation rollback by declining to record an effect. While no irreversible
-//! effect is recorded the generation rollback is admitted (and the route switch
-//! itself is another committed cutover with a newer epoch, never a local flag
-//! flip); once one is recorded the request is refused as
+//! ORS-committed cutover ownership row its own receipt names, requires that row
+//! to be the newest cutover committed for the pinned scope, and reads the
+//! `migration` decision of *every* committed cutover of that scope, so the
+//! durable record of irreversibility is the authority and the caller cannot
+//! obtain a permitted generation rollback by declining to record an effect or by
+//! presenting a receipt for a switch that has since been superseded. While no
+//! irreversible effect is recorded the generation rollback is admitted (and the
+//! route switch itself is another committed cutover with a newer epoch, never a
+//! local flag flip); once one is recorded the request is refused as
 //! [`KernelServiceError::GenerationFenced`] and only the explicit forward-repair
-//! path follows. A post-cutover irreversible effect is not yet in the committed
-//! row and the ledger does not survive a restart; that residual gap is stated on
+//! path follows.
+//!
+//! The refusal is not confined to that request path, because a generation
+//! rollback does not have to arrive as one: it also arrives as a replacement
+//! presented to the Kernel Generation Registry cutover ingress.
+//! [`StorageReplacement::begin`] is the constructor every such replacement is
+//! rebuilt through, and it refuses a candidate generation that is not newer
+//! than the newest generation this route has committed whenever a committed
+//! cutover of the pinned scope records
+//! [`StateMigrationDecision::ForwardRepairRequired`] — read from those rows,
+//! never from the presented ledger. A forward replacement is not gated, so the
+//! forward repair the refusal names stays reachable on the same route.
+//!
+//! Both refusals read one durable record, so the write of that record is
+//! bounded too: the `I5.11` stage-8 ingress stages its row's `migration` only
+//! after [`StorageReplacement::require_declared_state_migration`] has bound the
+//! claim's value to this coordinator's own irreversible-effect ledger. Without
+//! that, a row could be committed claiming `retain_compatible` for a replacement
+//! that recorded an irreversible effect, and every later refusal — on the switch
+//! and on the request — would read that claim as the absence of one.
+//!
+//! A post-cutover irreversible effect is issued after the linearization point,
+//! so no committed row of the scope carries it and the in-memory ledger does not
+//! survive a restart; that residual gap is stated on
 //! [`StorageReplacement::request_rollback`] and named there as the `I5.14`
 //! durable-effect-ledger owner's, because inventing a second durable store for
 //! it here would be a second canonical path beside the one that already exists.
@@ -359,6 +388,54 @@ fn committed_canonical_store_cutovers(
         .into_iter()
         .filter(|record| record.scope.route_scope_hash == scope.route_scope_hash)
         .collect())
+}
+
+/// Refuses a generation rollback on the pinned `canonical_store` route whose
+/// permission the durable route record does not prove.
+///
+/// `I14.14`: "Rollback is another cutover with a newer epoch; an old epoch is
+/// never reactivated. … Irreversible state migration requires forward repair or
+/// a separately proven rollback path." This is the separately proven path, and it
+/// is decided here, on the route switch itself, because a rollback reaches the
+/// switch through this constructor and not through
+/// [`StorageReplacement::request_rollback`]: the Kernel Generation Registry
+/// ingress rebuilds the presented replacement here before it stages any ORS row
+/// (`bins/eliot-kernel/src/generation_control.rs::commit_canonical_store_cutover_ownership`),
+/// so a refusal at the request classifier alone would leave the switch reachable
+/// by presenting a fresh replacement with an empty ledger.
+///
+/// The rollback is recognised from durable content, not from a presented claim:
+/// [`ResourceGeneration`] is the monotonic counter `I14.14` numbers generations
+/// with, so a candidate that is not strictly newer than the newest generation
+/// this route has already committed is a return to a generation the route has
+/// left. Its permission is then read from those same committed rows — a
+/// [`StateMigrationDecision::ForwardRepairRequired`] on any committed cutover of
+/// this route is the durable record that an irreversible migration or external
+/// effect occurred, and it refuses the rollback with
+/// [`KernelServiceError::GenerationFenced`] whatever the in-process ledger or the
+/// request payload says. A forward replacement, whose candidate is strictly
+/// newer than every generation this route has committed, is not a rollback and
+/// is not gated here, so the forward repair the refusal names stays reachable on
+/// this same route and scope.
+fn refuse_unproven_generation_rollback(
+    committed: &[GenerationCutoverOwnership],
+    candidate_generation: ResourceGeneration,
+) -> Result<(), KernelServiceError> {
+    let Some(newest) = committed.iter().map(|record| record.new_generation).max() else {
+        // This route has never switched, so it has left no generation to return
+        // to and there is no committed record that could prove anything.
+        return Ok(());
+    };
+    if candidate_generation > newest {
+        return Ok(());
+    }
+    if committed
+        .iter()
+        .any(|record| record.migration == StateMigrationDecision::ForwardRepairRequired)
+    {
+        return Err(KernelServiceError::GenerationFenced);
+    }
+    Ok(())
 }
 
 /// Whether an ORS refusal is only the absence of the optional cutover
@@ -826,7 +903,11 @@ impl StorageReplacement {
     /// the candidate is active before its own evidence is recorded. A candidate
     /// generation that already owns the route through a committed cutover is
     /// refused, so a restarted process cannot reopen a replacement from the top:
-    /// it must resume through [`Self::resume_after_committed_cutover`].
+    /// it must resume through [`Self::resume_after_committed_cutover`]. A
+    /// candidate that returns the route to a generation it has left is a
+    /// generation rollback and is refused on the committed rows of this scope by
+    /// [`refuse_unproven_generation_rollback`], so a rollback cannot be obtained
+    /// by presenting a fresh replacement whose ledger happens to be empty.
     pub fn begin(
         ors: &RedbRecoveryStore,
         replacement_id: impl Into<String>,
@@ -852,6 +933,7 @@ impl StorageReplacement {
                 reason: "the candidate generation already owns the canonical_store route through a committed cutover, so the replacement must be resumed from its durable cutover receipt",
             });
         }
+        refuse_unproven_generation_rollback(&committed, candidate_generation)?;
         Ok(Self {
             replacement_id,
             scope,
@@ -1177,14 +1259,7 @@ impl StorageReplacement {
                 field: "storage_replacement_store_generations",
             });
         }
-        if (record.migration == StateMigrationDecision::ForwardRepairRequired)
-            == self.irreversible_effects.is_empty()
-        {
-            return Err(KernelServiceError::InvalidField {
-                field: "storage_replacement_migration",
-                reason: "the declared state migration must name forward repair exactly when an irreversible effect is recorded",
-            });
-        }
+        self.require_declared_state_migration(record.migration)?;
         let committed_cutover = GenerationCutoverOwnershipReceipt::from_committed(&record)
             .map_err(|error| ors_refusal(&error))?;
         let receipt = StorageReplacementCutoverReceipt {
@@ -1221,21 +1296,75 @@ impl StorageReplacement {
         self.irreversible_effects.insert(effect);
     }
 
+    /// Requires one declared state migration to agree with this replacement's own
+    /// irreversible-effect ledger.
+    ///
+    /// The committed row's `migration` decision is the durable record of
+    /// irreversibility that both refusals read — [`refuse_unproven_generation_rollback`]
+    /// on the route switch and [`Self::request_rollback`] on the request — so a
+    /// decision that disagrees with the coordinator's own ledger is refused rather
+    /// than committed. A row may never record that no irreversible effect
+    /// occurred while this replacement has recorded one, and it may never name
+    /// forward repair for a replacement that has recorded none; the comparison is
+    /// exactly that pair of cases, so any other `StateMigrationDecision`
+    /// (a checkpoint transfer, a rebuild) is read as the non-forward-repair side
+    /// and is refused whenever an effect is recorded, rather than as a third
+    /// answer this coordinator does not own.
+    ///
+    /// The ingress that writes the row asks this of the value it is about to
+    /// stage, and [`Self::commit_canonical_store_route_cutover`] asks it of the
+    /// committed row, so the same rule bounds the write and the read. Asking it
+    /// only after the commit would be too late for the write: ORS commit is the
+    /// durable linearization point, so a row that under-reports an irreversible
+    /// effect would already be durable and would then answer every later rollback
+    /// decision with the absence of one.
+    pub fn require_declared_state_migration(
+        &self,
+        declared: StateMigrationDecision,
+    ) -> Result<(), KernelServiceError> {
+        if (declared == StateMigrationDecision::ForwardRepairRequired)
+            == self.irreversible_effects.is_empty()
+        {
+            return Err(KernelServiceError::InvalidField {
+                field: "storage_replacement_migration",
+                reason: "the declared state migration must name forward repair exactly when an irreversible effect is recorded",
+            });
+        }
+        Ok(())
+    }
+
+    /// The disposition an `I5.11` rollback refusal leaves behind.
+    ///
+    /// This is the forward-repair path named by every refusal this coordinator
+    /// issues, and it is one value with one spelling so a reply cannot report a
+    /// permitted rollback beside a forward-repair refusal, or a forward-repair
+    /// state that no decision produced. It is the outcome the decision already
+    /// reached, not a second decision: whether irreversibility was recorded in
+    /// this process or is read from the durable row is
+    /// [`Self::rollback_disposition`] and [`Self::request_rollback`]'s question,
+    /// and both of them answer it by refusing.
+    #[must_use]
+    pub const fn forward_repair_path() -> StorageRollbackDisposition {
+        StorageRollbackDisposition::ForwardRepairRequired {
+            state: GenerationCutoverState::FailedRequiresForwardCutover,
+        }
+    }
+
     /// Classifies a rollback request without changing any state.
     ///
-    /// This is the pure form of the `I5.11` rule; it reads only the recorded
-    /// irreversible effects. It is a projection, not the decision:
-    /// [`Self::request_rollback`] also consults the durable ORS cutover
-    /// ownership row, so a caller cannot obtain a permitted generation rollback
-    /// by simply declining to record an effect.
+    /// This is the pure form of the `I5.11` rule over the recorded irreversible
+    /// effects. It is a projection, not the decision: [`Self::request_rollback`]
+    /// also consults the durable ORS cutover ownership row, so a caller cannot
+    /// obtain a permitted generation rollback by simply declining to record an
+    /// effect — and a caller that obtains no such refusal on a request refused
+    /// for the durable record must still be answered with
+    /// [`Self::forward_repair_path`], not with this ledger-only projection.
     #[must_use]
     pub fn rollback_disposition(&self) -> StorageRollbackDisposition {
         if self.irreversible_effects.is_empty() {
             StorageRollbackDisposition::GenerationRollbackPermitted
         } else {
-            StorageRollbackDisposition::ForwardRepairRequired {
-                state: GenerationCutoverState::FailedRequiresForwardCutover,
-            }
+            Self::forward_repair_path()
         }
     }
 
@@ -1245,28 +1374,36 @@ impl StorageReplacement {
     /// ever offered, not to the caller's own bookkeeping. The ORS-committed
     /// [`GenerationCutoverOwnership`] row this replacement's receipt names is
     /// reloaded by cutover identity and re-derived, so a rollback can only be
-    /// admitted against the very record the cutover receipt was built from. When
-    /// the coordinator's ledger records no irreversible effect, that durable
-    /// row's `migration` decision is the authority: a row that already names
-    /// [`StateMigrationDecision::ForwardRepairRequired`] refuses the request
-    /// even though the in-process ledger is silent, so a caller cannot obtain a
-    /// permitted generation rollback by declining to record an effect. Any other
-    /// mismatch between the row and the receipt is refused rather than read as
-    /// an absence of irreversible effect.
+    /// admitted against the very record the cutover receipt was built from, and
+    /// that record must still be the newest cutover committed for the pinned
+    /// `canonical_store` scope, so a receipt naming a superseded switch answers
+    /// nothing. When the coordinator's ledger records no irreversible effect, the
+    /// durable route record is the authority: a committed cutover of this scope
+    /// that already names [`StateMigrationDecision::ForwardRepairRequired`]
+    /// refuses the request even though the in-process ledger is silent, so a
+    /// caller cannot obtain a permitted generation rollback by declining to
+    /// record an effect. Any other mismatch between the row and the receipt is
+    /// refused rather than read as an absence of irreversible effect.
     ///
     /// Once an irreversible effect is recorded — by the ledger or by the durable
     /// row — the request is refused as a generation rollback with
     /// [`KernelServiceError::GenerationFenced`] and only the forward-repair path
     /// named by [`Self::rollback_disposition`] follows. The rollback itself, when
     /// admitted, is another committed cutover with a newer epoch, never a local
-    /// flag flip.
+    /// flag flip, and it is admitted on the route switch itself by
+    /// [`refuse_unproven_generation_rollback`] rather than only here: a
+    /// replacement presented to the generation registry is refused there on the
+    /// same durable record, so a fresh replacement with an empty presented
+    /// ledger cannot buy the switch this request refuses.
     ///
     /// A post-cutover irreversible effect is the one case this cannot prove: it
-    /// is not yet in the committed row, and the `I5.11` documents name no
-    /// durable record for an effect issued after the linearization point. The
-    /// ledger still refuses the request in this process, and a restart that
-    /// loses it is a gap the owner of the `I5.14` durable effect ledger has to
-    /// close; it is named here rather than papered over with a second store.
+    /// is issued after the linearization point, so no committed row of this scope
+    /// carries it, and the `I5.11` documents name no durable record for an effect
+    /// issued after that point. The ledger still refuses the request in this
+    /// process, and a restart that loses it is a gap the owner of the `I5.14`
+    /// durable effect ledger has to close; it is named here rather than papered
+    /// over with a second durable store for irreversibility beside the one that
+    /// already owns it.
     pub fn request_rollback(
         &self,
         ors: &RedbRecoveryStore,
@@ -1287,8 +1424,31 @@ impl StorageReplacement {
                     field: "storage_replacement_cutover_receipt_binding",
                 });
             }
+            // The receipt is the operator's own label for the cutover, so it is
+            // bound to this route's durable position before it is trusted to
+            // answer anything. A later committed cutover of the pinned scope
+            // supersedes the switch this receipt describes, and a receipt naming
+            // a superseded switch is refused rather than read as the absence of
+            // an irreversible effect.
+            let scope_committed = committed_canonical_store_cutovers(ors, &self.scope)?;
+            let newest = scope_committed
+                .iter()
+                .max_by_key(|committed| committed.new_epoch.value());
+            if newest.is_none_or(|committed| committed.cutover_id != record.cutover_id) {
+                return Err(KernelServiceError::HandshakeMismatch {
+                    field: "storage_replacement_rollback_current_cutover",
+                });
+            }
+            // The durable record of irreversibility for this route is every
+            // committed cutover of the pinned scope, not only the one this
+            // receipt names: a cutover committed on this route before this one
+            // already recorded that an irreversible migration or external effect
+            // occurred, and the route cannot return to a generation it has left
+            // while that record stands.
             if self.irreversible_effects.is_empty()
-                && record.migration == StateMigrationDecision::ForwardRepairRequired
+                && scope_committed.iter().any(|committed| {
+                    committed.migration == StateMigrationDecision::ForwardRepairRequired
+                })
             {
                 return Err(KernelServiceError::GenerationFenced);
             }
