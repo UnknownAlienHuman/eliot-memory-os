@@ -744,6 +744,12 @@ impl AuthorityOwner {
     }
 
     /// Emits the complete deterministic typed authority recovery payload.
+    ///
+    /// The emitted snapshot is serializable history only: it never proves
+    /// durable persistence of this generation's transitions. Dispatch and
+    /// observation progress observed since restore are owner-retained (see
+    /// `effect_obligations`) until the durable owner write path persists
+    /// them; only validated receipts reconcile a transition.
     pub fn snapshot(&self) -> Result<AuthorityOwnerSnapshot, CompositionError> {
         let grant_graph = self
             .grants
@@ -1428,9 +1434,13 @@ impl AuthorityOwner {
     /// treated as an empty permissive grant), currently contested
     /// authorizations, and any obligation that already left
     /// `AuthorizedNotDispatched` — including immutable terminal history.
-    /// This records the owner's observation; execution permission itself was
-    /// joined by `admit_effect_execution` against the live lease, executor,
-    /// and contest state.
+    /// CURRENT revocation evidence must have been rebuilt first: an owner
+    /// restored without history-bound evidence keeps every dispatch refused
+    /// until a history-bound restore completes, so empty contest overlays
+    /// are never read as absence of revocation. This records the owner's
+    /// observation; execution permission itself was joined by
+    /// `admit_effect_execution` against the live lease, executor, and
+    /// contest state.
     pub fn note_effect_dispatch_admitted(
         &mut self,
         idempotency_key: &str,
@@ -1443,6 +1453,12 @@ impl AuthorityOwner {
                     "effect dispatch names an identity with no retained authorization".to_owned(),
                 )
             })?;
+        if self.last_revocation_source_revision.is_none() {
+            return Err(CompositionError::Recovery(
+                "effect dispatch requires CURRENT revocation evidence; rebuild it with a history-bound restore before dependent use"
+                    .to_owned(),
+            ));
+        }
         if self
             .effects
             .dependent_effect_state(idempotency_key)
@@ -1643,15 +1659,21 @@ impl AuthorityOwner {
     /// Per-identity dispatch fence, consulted before dependent dispatch.
     ///
     /// Returns true (blocked) when no retained authorization exists for the
-    /// identity, when the current contest state challenges it, or when its
+    /// identity, when CURRENT revocation evidence was never rebuilt for this
+    /// owner (an owner restored without history-bound evidence stays fenced
+    /// until a history-bound restore completes, even with empty contest
+    /// overlays), when the current contest state challenges it, or when its
     /// obligation already left `AuthorizedNotDispatched` — dispatched but
     /// unobserved, unknown, or terminally reconciled identities never
     /// re-dispatch under the same identity. Only a known, uncontested,
-    /// never-dispatched authorization reports false. A retried operation
-    /// needs its own explicitly linked new-operation identity and fresh
-    /// admission.
+    /// never-dispatched authorization on a history-bound owner reports
+    /// false. A retried operation needs its own explicitly linked
+    /// new-operation identity and fresh admission.
     #[must_use]
     pub fn effect_dispatch_blocked(&self, idempotency_key: &str) -> bool {
+        if self.last_revocation_source_revision.is_none() {
+            return true;
+        }
         let Some(obligation) = self.effect_obligations.get(idempotency_key) else {
             return true;
         };
