@@ -1248,8 +1248,7 @@ static STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 /// keeps two console requests distinct for the drain replay rule without
 /// logging anything the operator typed.
 #[cfg(windows)]
-static CONSOLE_TRIGGER_SEQ: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static CONSOLE_TRIGGER_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(windows)]
 fn run_as_scm_service() -> Result<bool, u32> {

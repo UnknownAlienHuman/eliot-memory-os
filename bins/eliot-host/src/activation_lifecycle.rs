@@ -1280,8 +1280,9 @@ impl HostComposition {
                 NextGenerationWakeSchedule::Due | NextGenerationWakeSchedule::Expired => {
                     Some((ActivationTriggerClass::ScheduledWake, wake.wake_id.clone()))
                 }
-                NextGenerationWakeSchedule::NoOwnerPolicy
-                | NextGenerationWakeSchedule::NotDue => None,
+                NextGenerationWakeSchedule::NoOwnerPolicy | NextGenerationWakeSchedule::NotDue => {
+                    None
+                }
             }
         }))
     }
@@ -1424,12 +1425,15 @@ impl HostComposition {
                     .activation_generation
                     .current
                     .is_direct_child_of(&wake.fence.activation_generation.current)
-                && state.drain_commit.as_ref().is_some_and(|commit: &DrainCommitRecord| {
-                    commit
-                        .drain_generation
-                        .current
-                        .is_same_authority(&wake.fence.activation_generation.current)
-                })
+                && state
+                    .drain_commit
+                    .as_ref()
+                    .is_some_and(|commit: &DrainCommitRecord| {
+                        commit
+                            .drain_generation
+                            .current
+                            .is_same_authority(&wake.fence.activation_generation.current)
+                    })
                 && wake.required_capabilities.iter().all(|capability| {
                     activation
                         .requested_capabilities
@@ -1439,15 +1443,14 @@ impl HostComposition {
             let mut next = wake.clone();
             next.operation = operation("host-wake-revalidation")?;
             next.reason_evidence_refs.push(evidence.clone());
-            next.intent.state =
-                if (same_generation && same_authority && capabilities_covered)
-                    || next_generation_claim
-                {
-                    claimed += 1;
-                    WakeIntentState::Claimed
-                } else {
-                    WakeIntentState::Cancelled
-                };
+            next.intent.state = if (same_generation && same_authority && capabilities_covered)
+                || next_generation_claim
+            {
+                claimed += 1;
+                WakeIntentState::Claimed
+            } else {
+                WakeIntentState::Cancelled
+            };
             self.append_record(HostStateRecord::Wake(next))?;
         }
         host_lifecycle_observe_scm(BOUNDARY_WAKE_REVALIDATION_OBSERVED);
