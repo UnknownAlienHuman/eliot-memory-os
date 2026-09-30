@@ -4520,6 +4520,10 @@ impl KernelComposition {
     /// durable rows stay untouched. Store read errors fail closed without
     /// discarding the pair or its possible-effect evidence. Local-read pairs
     /// are never served here.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the claim gate keeps order, state, durability-bind, attempt, and prune joins in one audited order"
+    )]
     pub(crate) fn claim_observe_pair(
         &self,
         session: &Session,
@@ -4599,12 +4603,15 @@ impl KernelComposition {
                 // Issue #1739 W2: execution consumes the exact typed bytes off
                 // the durable #1713 row; a queue body that is not the admitted
                 // bytes conflicts instead of replacing the admitted operation.
-                // Rows staged before this binding existed keep serving their
-                // linkage-checked pair.
+                // No durably bound bytes means not executable: prune the
+                // unbound pair; the waiter reconciles via the durable record.
                 let tool = match stored.payload_body.as_ref() {
                     Some(durable) if tool == durable => durable.clone(),
                     Some(_) => return Err(TransportError::IdentityConflict),
-                    None => tool.clone(),
+                    None => {
+                        refs.remove(position);
+                        continue;
+                    }
                 };
                 let envelope = envelope.clone();
                 let durable_attempt = self.persist_observe_claim_attempt(

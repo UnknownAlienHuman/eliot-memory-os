@@ -37,10 +37,11 @@ use eliot_mcp::{
 };
 use eliot_protocol::{
     AgentHostRequestFailure, EncodingProfile, FINISH_INVOKE_PAYLOAD_SCHEMA_ID, Frame, FrameKind,
-    HARD_STRUCTURED_RESPONSE_BYTES, HOST_REQUEST_RESULT_BODY_WIRE_ID, HOST_REQUEST_WIRE_ID,
-    HostRequestAdmissionReceipt, HostRequestEnvelope, HostRequestIdentity, HostRequestKind,
-    HostRequestResultBody, HostRequestResultClass, HostRequestResultLineage, MessageType,
-    ProtocolPayload, ProtocolVersion, REACTIVE_RESTORE_CAPABILITY, REACTIVE_RESTORE_OPERATION,
+    HARD_STRUCTURED_RESPONSE_BYTES, HOST_REQUEST_PAYLOAD_SCHEMA_ID,
+    HOST_REQUEST_RESULT_BODY_WIRE_ID, HOST_REQUEST_WIRE_ID, HostRequestAdmissionReceipt,
+    HostRequestEnvelope, HostRequestIdentity, HostRequestKind, HostRequestResultBody,
+    HostRequestResultClass, HostRequestResultLineage, MessageType, ProtocolPayload,
+    ProtocolVersion, REACTIVE_RESTORE_CAPABILITY, REACTIVE_RESTORE_OPERATION,
     REACTIVE_RESTORE_PAYLOAD_SCHEMA_ID, ReactiveRestoreQuery, ReactiveRestoreReply,
     RequestIdentity, host_request_operation_id, restore_correlation,
 };
@@ -127,8 +128,6 @@ const RESOLVE_HANDLE_CAPABILITY_FILLER: &str = "eliot.resolve.lookup";
 /// never-bind contract as [`RESOLVE_HANDLE_CAPABILITY_FILLER`].
 const RESOLVE_HANDLE_PAYLOAD_FILLER: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
-/// Exact payload-schema identity for the canonical `ToolRequest` bytes.
-const HOST_REQUEST_PAYLOAD_SCHEMA_ID: &str = "eliot.mcp.tool-request.v1";
 /// Bridge-proposed relative deadline when the host states no preference.
 /// Added to the local clock to form the submitted absolute deadline. The
 /// Kernel enforces expiry at admission but neither re-derives nor clamps
@@ -1912,7 +1911,7 @@ fn host_request_observe_submit_frame(
 /// |---|---|---|---|
 /// | `eliot.state` | submit frame (digest-only) | `agent_host_request_submit` | admission handle only; projection-owner readback join missing |
 /// | `eliot.packet` | invoke-read frame (tool bytes) | `agent_host_request_invoke_read` | exact bounded compiler result with revision via Governor read owner |
-/// | `eliot.observe` | submit frame (tool bytes) | `agent_host_request_submit` | daemon observe flight claims the retained pair, decodes the closed vocabulary and routes to the Governor observation owner; retained result via the governed submit leg |
+/// | `eliot.observe` | submit frame (tool bytes, dispatch-time revalidated) | `agent_host_request_submit` | daemon observe flight claims the retained pair, decodes the closed vocabulary and routes to the Governor observation owner; retained result via the governed submit leg |
 /// | `eliot.query` | invoke-read frame (tool bytes) | `agent_host_request_invoke_read` | exact bounded read result with revision via Governor read owner |
 /// | `eliot.act` | submit frame (digest-only, dispatch-time revalidated) | `agent_host_request_submit` | admission handle only; bridge revalidates session/fence/connection/payload linkage at dispatch and the Kernel submit gate revalidates the act dispatch binding pre-staging; the daemon-side `admit_material_decision` invocation over owner-resolved inputs with dispatch-time revalidation through a live act claim/flight is the remaining join (#1742 W4) |
 /// | `eliot.verify` | submit frame (digest-only) | `agent_host_request_submit` | admission handle only; verifier-owner invocation + evidence preservation missing |
@@ -1950,10 +1949,13 @@ enum CanonicalDispatchEntry {
     SubmitActGated { completion_join: &'static str },
     /// Observe submit carrying the exact canonical tool bytes (issue #2565).
     /// Rides the same `agent_host_request_submit` entry as the digest-only
-    /// submits; the Kernel linkage gate binds the bytes to the admitted
-    /// envelope before admission, retains them for the daemon observe flight,
-    /// and enqueues the admitted pair. The Accepted reply stays an operation
-    /// handle until the flight submits the retained result.
+    /// submits; the bridge revalidates the observe dispatch binding
+    /// (capability, payload schema, live session/fence/connection, exact
+    /// payload digest) before building the frame, then the Kernel linkage
+    /// gate binds the bytes to the admitted envelope before admission,
+    /// retains them for the daemon observe flight, and enqueues the admitted
+    /// pair. The Accepted reply stays an operation handle until the flight
+    /// submits the retained result.
     SubmitObservePair,
     /// Non-hot operator carrier on the submit leg with tool bytes. Only
     /// [`ToolRequest::UserAutomation`] rides here.
@@ -2040,6 +2042,68 @@ fn revalidate_act_dispatch(
     if expected_payload != envelope.identity.payload_sha256 {
         return Err(PortFailure::TransportBindingRejected {
             reason: "act dispatch payload does not match the admitted payload digest".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Dispatch-time revalidation for one `eliot.observe` submit (issue #1739 W2/W5).
+///
+/// Re-checks at dispatch, against live Kernel-issued facts, only what the
+/// bridge owns: the tool is still the exact `eliot.observe` request admitted,
+/// the envelope still stamps the shared tool-request payload schema, names the
+/// live session/fence/connection, and the canonical payload digest still binds
+/// the exact tool bytes the submit frame will carry. A swapped packet, forged
+/// binding, mislabeled schema, or stale fence fails closed here before any
+/// submit frame is built, so the Kernel linkage gate only ever sees bytes the
+/// bridge already bound to the admitted envelope. The five observe kinds stay
+/// the daemon flight's closed vocabulary to decode, and the retained result
+/// stays the governed submit leg's to store — this seam neither interprets
+/// observe semantics nor synthesizes a result (I01-08 canonical write path;
+/// I07-08 step 8). Failures are typed (I07-20): fence mismatch stays
+/// `FenceMismatch`, binding mismatches stay `TransportBindingRejected`, a
+/// missing session stays `PlanGap`.
+fn revalidate_observe_dispatch(
+    request: &HostInvocationRequest,
+    envelope: &HostRequestEnvelope,
+    facts: &TransportFacts,
+) -> Result<(), PortFailure> {
+    if !matches!(request.tool, ToolRequest::Observe(_)) {
+        return Err(request_failure());
+    }
+    if request.tool.canonical_name() != "eliot.observe"
+        || envelope.identity.capability != request.tool.canonical_name()
+    {
+        return Err(PortFailure::TransportBindingRejected {
+            reason: "observe dispatch capability does not match the admitted tool".to_owned(),
+        });
+    }
+    if envelope.identity.payload_schema_id != HOST_REQUEST_PAYLOAD_SCHEMA_ID {
+        return Err(PortFailure::TransportBindingRejected {
+            reason: "observe dispatch schema does not match the admitted tool-request schema"
+                .to_owned(),
+        });
+    }
+    let live_session = facts.session.clone().ok_or_else(plan_gap_no_session)?;
+    if envelope.identity.session_id.as_deref() != Some(live_session.as_str()) {
+        return Err(PortFailure::TransportBindingRejected {
+            reason: "observe dispatch session does not match the live attach session".to_owned(),
+        });
+    }
+    if envelope.state_fence != facts.state_fence {
+        return Err(PortFailure::FenceMismatch);
+    }
+    if envelope.connection_id != facts.connection_id {
+        return Err(PortFailure::TransportBindingRejected {
+            reason: "observe dispatch connection does not match the live admitted connection"
+                .to_owned(),
+        });
+    }
+    let expected_payload = canonical_payload_digest(&request.tool)?;
+    if expected_payload != envelope.identity.payload_sha256 {
+        return Err(PortFailure::TransportBindingRejected {
+            reason: "observe dispatch payload does not match the admitted payload digest"
+                .to_owned(),
         });
     }
     Ok(())
@@ -3310,6 +3374,7 @@ impl KernelHostRequestPort for KernelHostRequestClient {
                 host_request_user_automation_frame(request, &envelope, &facts)?
             }
             CanonicalDispatchEntry::SubmitObservePair => {
+                revalidate_observe_dispatch(request, &envelope, &facts)?;
                 host_request_observe_submit_frame(request, &envelope, &facts)?
             }
         };
