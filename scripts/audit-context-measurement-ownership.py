@@ -441,7 +441,9 @@ def load_producer(root: Path) -> Any:
 # ---------------------------------------------------------------------------
 
 
-def _read_inventory_artifact(root: Path, producer: Any) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], str]:
+def _read_inventory_artifact(
+    root: Path, producer: Any
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], str, bytes]:
     target = root / INVENTORY_REL
     if not target.is_file() or target.is_symlink():
         raise OracleError(
@@ -463,58 +465,60 @@ def _read_inventory_artifact(root: Path, producer: Any) -> tuple[dict[str, Any],
             "INVENTORY_MALFORMED",
             f"the inventory artifact is malformed or internally inconsistent: {exc.code}: {exc.detail}",
         ) from exc
-    return header, rows, worksets, str(artifact["inventory_digest"])
+    return header, rows, worksets, str(artifact["inventory_digest"]), raw
 
 
-def _producer_check(root: Path, producer: Any) -> tuple[str, str]:
-    """Run the producer's own read-only ``check`` to obtain its verdict.
+def _producer_rebuild(
+    root: Path, producer: Any, header: dict[str, Any], rows: list[dict[str, Any]], stored_raw: bytes
+) -> tuple[str, str, list[dict[str, Any]], list[dict[str, Any]]]:
+    """Re-derive the inventory through the producer and judge freshness.
 
-    We call the producer's check exactly once and surface its status /
-    detail. We do not interpret or soften it: a non-ok status becomes a typed
-    finding by the caller. ``check`` never writes; it only reads the stored
-    artifact, re-validates and rebuilds for freshness.
+    This is the same operation the producer's own ``check`` performs, scoped
+    to *the universe the stored artifact declares* rather than to the
+    producer's hardcoded global default, so it is equally authoritative for
+    the real repository and for a bounded synthetic tree. Freshness is decided
+    by asking the producer to rebuild from its own rules and byte-comparing
+    the emitted artifact to the stored one -- never by recomputing a digest to
+    trust it, and never by trusting a commit SHA.
+
+    Returns ``(status, detail, file_records, candidates)`` where ``status`` is
+    ``ok`` when the producer's re-emission is byte-identical to the stored
+    artifact, and a typed non-ok token otherwise. The ``candidates`` are the
+    producer's freshly discovered candidates for the declared universe and are
+    the oracle's sole candidate accounting.
     """
-    import io
-    import contextlib
-
-    buffer = io.StringIO()
+    # Reconstruct the declared case set from the stored rows: this is the
+    # artifact's own declared universe (case_ref, owner, path, signal).
+    declared_cases = tuple(
+        (str(r["case_ref"]), str(r["owner"]), str(r["path"]), str(r["signal"])) for r in rows
+    )
     try:
-        with contextlib.redirect_stdout(buffer):
-            code = int(producer.cmd_check(root))
+        owner_map_tuple = producer.load_owner_map(root)
     except producer.InventoryError as exc:
-        return "error", f"{exc.code}: {exc.detail}"
-    detail = buffer.getvalue().strip()
-    if code == 0:
-        return "ok", detail
-    # Parse a JSON status if the producer emitted one.
-    status = "blocked"
+        return "error", f"{exc.code}: {exc.detail}", [], []
     try:
-        parsed = json.loads(detail) if detail else {}
-        status = str(parsed.get("status", "blocked"))
-    except json.JSONDecodeError:
-        pass
-    return status, detail
-
-
-def _producer_candidates(root: Path, producer: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Obtain the discovered candidates and file records from the producer.
-
-    This is the *only* source of candidate accounting. The oracle calls the
-    producer's ``discover_context_measurements`` on the producer's own
-    declared denominator (``DENOMINATOR_CASES``), so the candidate set is
-    exactly what #866 classifies. It never re-locates signals itself.
-    """
-    try:
-        file_records, candidates = producer.discover_context_measurements(
-            root, producer.DENOMINATOR_CASES
+        # The sole producer builds; we never build the inventory ourselves.
+        fresh = producer.build_inventory(root, declared_cases, str(header.get("generation_command", "")), owner_map_tuple)
+        fresh_candidates = producer.discover_context_measurements(root, declared_cases)[1]
+    except producer.InventoryError as exc:
+        return "error", f"{exc.code}: {exc.detail}", [], []
+    fresh_raw = producer._emit_toml(fresh)
+    if fresh_raw == stored_raw:
+        return "ok", "producer re-emission is byte-identical to the stored artifact", [], fresh_candidates
+    # Distinguish a coverage block (unresolved rows / absent owner map) from a
+    # genuine staleness (the re-emission differs because an input moved).
+    fresh_header = fresh["header"] if isinstance(fresh, dict) else {}
+    if str(fresh_header.get("coverage_disposition", "")) != "COMPLETE" or str(
+        fresh_header.get("owner_map_status", "")
+    ) != "SUPPLIED":
+        return (
+            "blocked",
+            f"producer rebuild leaves coverage {fresh_header.get('coverage_disposition')!r} / "
+            f"owner map {fresh_header.get('owner_map_status')!r}: {fresh_header.get('coverage_reason')}",
+            [],
+            fresh_candidates,
         )
-    except producer.InventoryError as exc:
-        raise OracleError(
-            "INVENTORY_MALFORMED",
-            f"the #{PRODUCER_ISSUE} producer could not rediscover its declared "
-            f"denominator: {exc.code}: {exc.detail}",
-        ) from exc
-    return file_records, candidates
+    return "stale", "producer re-emission differs from the stored artifact", [], fresh_candidates
 
 
 def _unaccounted_candidates(
