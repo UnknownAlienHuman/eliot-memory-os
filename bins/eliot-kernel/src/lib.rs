@@ -4700,18 +4700,36 @@ impl KernelComposition {
             _ => return Err(DrainHalt::new("authority-revoke-unproven")),
         }
 
-        // JobsCheckpointed: observe the daemon contour under drain. Job
-        // checkpoint/cancel semantics stay Governor-owned (handoff); Kernel
-        // admits no new daemon launches while `Draining`.
+        // JobsCheckpointed: bind the daemon owner's contour observation to
+        // this drain generation and the currently admitted State Fence, so
+        // the response names its drain, job owner and fence instead of a
+        // bare phase label. Job checkpoint/cancel semantics stay
+        // Governor-owned (handoff); Kernel neither requests checkpoints it
+        // does not own nor fabricates their artifacts, and admits no new
+        // daemon launches while `Draining`. The owner's status text is kept
+        // verbatim: completed or unknown external effects stay visible even
+        // when an owner-reported cancellation succeeds — Kernel never
+        // rewrites them into a generic rollback or CANCELLED/no-effect
+        // claim. An unreadable fence is stated, not hidden, per the
+        // fenceless-shape posture of `current_state_fence`.
         let daemon_status = self
             .daemon_runtime
             .lock()
             .map(|guard| format!("daemon-status:{:?}", guard.status))
             .map_err(|_| DrainHalt::new("daemon-contour-unavailable"))?;
+        let checkpoint_fence = self.current_state_fence().map_or_else(
+            || "fence:unreadable".to_owned(),
+            |fence| {
+                format!(
+                    "fence:{}:{}",
+                    fence.authority_epoch.lineage_id, fence.authority_epoch.sequence
+                )
+            },
+        );
         record(
             ShutdownPhase::JobsCheckpointed,
             format!(
-                "{daemon_status};no-new-daemon-launches-while-draining;job-checkpoint-owned-by-eliotd-governor-handoff"
+                "drain:{generation};{daemon_status};no-new-daemon-launches-while-draining;{checkpoint_fence};job-checkpoint-owned-by-eliotd-governor-handoff"
             ),
         )?;
 
@@ -4802,8 +4820,51 @@ impl KernelComposition {
             .map_err(|_| DrainHalt::new("module-contour-unprovable"))?;
         record(
             ShutdownPhase::ModulesQuiescedReverse,
-            format!("quiesce-requested:{}", quiescence.join(">")),
+            format!(
+                "drain:{generation};quiesce-requested:{}",
+                quiescence.join(">")
+            ),
         )?;
+        // Quiescence completion is observed from the owners after the
+        // request, never inferred from the request string above (which
+        // `record_phase` refuses to rewrite). New work is stopped only while
+        // the service still reads `Draining` here; every branch dependency
+        // the order names stays retained for the remaining writes/flushes
+        // below instead of stopping with its dependent. The completion goes
+        // on the audit chain Host and Watchdog already read, separate from
+        // the phase's request evidence, with the owner's contour kept
+        // verbatim so completed or unknown effects survive even a successful
+        // stop — no rollback or CANCELLED/no-effect wording.
+        if !matches!(self.service_state(), Ok(KernelServiceState::Draining)) {
+            return Err(DrainHalt::new("quiescence-new-work-unstopped"));
+        }
+        let quiesced_contour = self
+            .daemon_runtime
+            .lock()
+            .map(|guard| format!("daemon-status:{:?}", guard.status))
+            .map_err(|_| DrainHalt::new("daemon-contour-unavailable"))?;
+        #[cfg(windows)]
+        let retained_dependency = match self.canonical_store_gateway.lock() {
+            Ok(gateway) => {
+                if gateway.is_some() {
+                    "store-bridge"
+                } else {
+                    "store-bridge-absent"
+                }
+            }
+            Err(_) => return Err(DrainHalt::new("store-contour-unavailable")),
+        };
+        #[cfg(not(windows))]
+        let retained_dependency = "store-bridge-absent";
+        self.audit_observe(AuditEventDraft::process_daemon_status(
+            AuditEventKind::PROCESS_QUIESCED,
+            None,
+            &format!(
+                "quiescence-completed:drain:{generation};order:{};retained:{retained_dependency};{quiesced_contour}",
+                quiescence.join(">"),
+            ),
+            self.current_state_fence().as_ref(),
+        ));
 
         // Close the Store bridge before taking the final owner observation.
         // `Drain` above has already closed service admission; this fences new
