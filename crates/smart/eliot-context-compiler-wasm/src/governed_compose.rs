@@ -228,7 +228,7 @@ pub fn compose_governed_compilation<F>(
     presented: PresentedLearning<'_>,
     mut input: AdmissionInput,
     recipe: &ContextRecipe,
-    quality: QualityScorecard,
+    quality: &QualityScorecard,
     policy: &AssemblyPolicy,
     measure: F,
 ) -> Result<GovernedCompilation, ComposeError>
