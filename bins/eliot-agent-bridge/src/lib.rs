@@ -205,6 +205,14 @@ struct KernelTransportOwner {
     /// text-keyed base, held receipts, and consumed offers. Bounded by the
     /// same stream eviction as the held receipts.
     owner_identity: BTreeMap<String, OwnerStreamIdentity>,
+    /// Issue #2885 W1/W8: bounded incarnation-lifecycle ledger per stream.
+    /// At most one entry per live stream — a single pending closure plus
+    /// the highest retired incarnation — created only on genuine successor
+    /// adoption and dropped with the whole stream entry under the existing
+    /// `MAX_DELIVERED_STREAMS` eviction. A namespace that lives
+    /// indefinitely therefore never retains one exact record per
+    /// incarnation or per event.
+    incarnation_ledger: BTreeMap<String, StreamIncarnationLedger>,
     /// At most one outstanding consumed-frontier offer (issue #2800).
     /// While it is unresolved, every reconcile re-offers its exact bytes
     /// under its exact identity; changed frontiers wait (deferred with
@@ -348,12 +356,119 @@ impl OwnerStreamIdentity {
     }
 }
 
+/// Issue #2885 W1: the local closure record of one stream incarnation.
+///
+/// A stream incarnation `(owner namespace, producer, incarnation)` lives
+/// from the first adoption of its exact verified recovery facts until an
+/// exact successor page — same namespace and producer, strictly greater
+/// incarnation — is adopted. That successor page is the owner receipt
+/// that closes it, so closure is derived from #2729 owner evidence, never
+/// asserted by the bridge. The record names the closed predecessor and
+/// the successor that closed it. The durable ORS-side close receipt
+/// remains #2729-owned; this ledger is the bridge's process-memory
+/// enforcement of the same lifetime (I07-02 durable identity, I07-23
+/// reconnect by exact cursor).
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct IncarnationClosure {
+    /// Predecessor identity closed by the successor adoption.
+    closed: OwnerStreamIdentity,
+    /// Adopted successor identity that closed the predecessor.
+    successor: OwnerStreamIdentity,
+}
+
+/// Issue #2885 W1/W8: bounded incarnation-lifecycle ledger for one stream.
+///
+/// At most one entry per live stream: a single pending closure plus the
+/// highest retired incarnation. Entries are created only on genuine
+/// successor adoption and dropped with the whole stream entry under the
+/// existing `MAX_DELIVERED_STREAMS` eviction, so a namespace that lives
+/// indefinitely never retains one exact record per incarnation or per
+/// event (I14-03 independent bounded queues; I05-27 explicit retention
+/// horizon).
+#[derive(Clone, Debug, Default)]
+struct StreamIncarnationLedger {
+    /// Pending closure of the most recent predecessor, if any. Cleared on
+    /// retire or when the stream entry is evicted.
+    closure: Option<IncarnationClosure>,
+    /// Highest incarnation retired through authenticated successor
+    /// evidence. Terminal within this stream entry: never lowered, never
+    /// re-adopted.
+    retired_incarnation: u64,
+}
+
+impl StreamIncarnationLedger {
+    /// Issue #2885 W8: reconnect adoption guard. Refuses a retired
+    /// incarnation replay — a candidate at or below the retired
+    /// high-water mark that is not the currently adopted identity — and a
+    /// stale predecessor page — same namespace and producer below the
+    /// adopted incarnation. Anything refused leaves bases, receipts, and
+    /// the adopted identity untouched, so a retired incarnation never
+    /// reopens and its ranges can never be adopted into another
+    /// generation (I07-23 duplicates stay idempotent under exact identity).
+    fn reconnect_may_adopt(
+        &self,
+        candidate: &OwnerStreamIdentity,
+        adopted: Option<&OwnerStreamIdentity>,
+    ) -> bool {
+        if candidate.incarnation <= self.retired_incarnation
+            && adopted.is_none_or(|current| current != candidate)
+        {
+            return false;
+        }
+        if let Some(current) = adopted
+            && current.owner_namespace == candidate.owner_namespace
+            && current.producer_id == candidate.producer_id
+            && candidate.incarnation < current.incarnation
+        {
+            return false;
+        }
+        true
+    }
+
+    /// Issue #2885 W1: records the close of `prior` by `successor`. Only
+    /// a genuine successor — same namespace and producer, strictly
+    /// greater incarnation — closes; cross-owner replacement keeps the
+    /// existing reset behavior without recording a closure.
+    fn close_on_successor(&mut self, prior: OwnerStreamIdentity, successor: OwnerStreamIdentity) {
+        if prior.owner_namespace != successor.owner_namespace
+            || prior.producer_id != successor.producer_id
+            || successor.incarnation <= prior.incarnation
+        {
+            return;
+        }
+        self.closure = Some(IncarnationClosure {
+            closed: prior,
+            successor,
+        });
+    }
+
+    /// Issue #2885 W8: retires the closed predecessor once `confirmed`
+    /// proves the recorded successor. Callers pass only authenticated
+    /// owner evidence: an owner-confirmed consumed offer (Kernel
+    /// acknowledgement receipt) or a jointly imported owner-confirmed
+    /// frontier. Retirement advances the terminal high-water mark and
+    /// drops the pending closure.
+    fn retire_if_successor_confirmed(&mut self, confirmed: &OwnerStreamIdentity) {
+        let Some(closure) = self.closure.as_ref() else {
+            return;
+        };
+        if closure.successor != *confirmed {
+            return;
+        }
+        if closure.closed.incarnation > self.retired_incarnation {
+            self.retired_incarnation = closure.closed.incarnation;
+        }
+        self.closure = None;
+    }
+}
+
 fn project_reconciled_owner_ack_state(
     candidate_streams: &[RecoveryCandidateStreamFacts],
     owner_acked: &mut BTreeMap<String, u64>,
     delivered_sequences: &mut BTreeMap<String, BTreeMap<u64, DeliveredEventReceipt>>,
     owner_identity: &mut BTreeMap<String, OwnerStreamIdentity>,
     offer_stream_identities: &BTreeMap<String, OwnerStreamIdentity>,
+    incarnation_ledgers: &mut BTreeMap<String, StreamIncarnationLedger>,
 ) -> Vec<String> {
     let mut replaced_offer_streams = Vec::new();
     // A later non-pure reconciliation receives the aggregate facts that Core
@@ -370,6 +485,16 @@ fn project_reconciled_owner_ack_state(
         };
         let prior_identity = owner_identity.get(stream_id);
         let offered_identity = offer_stream_identities.get(stream_id);
+        // Issue #2885 W8: a retired incarnation never reopens and a stale
+        // predecessor page never rolls the adopted identity backward.
+        // Pages refused here leave bases, receipts, and the adopted
+        // identity untouched: a lower compatible page stays a no-op.
+        let may_adopt = incarnation_ledgers
+            .get(stream_id)
+            .is_none_or(|ledger| ledger.reconnect_may_adopt(&identity, prior_identity));
+        if !may_adopt {
+            continue;
+        }
         // Only a changed adopted identity resets the text-keyed base and
         // held receipts: the new incarnation starts exactly from its own
         // owner-confirmed cursor and never inherits the predecessor's. A
@@ -382,6 +507,18 @@ fn project_reconciled_owner_ack_state(
             replaced_offer_streams.push(stream_id.to_owned());
         }
         if replaced {
+            // Issue #2885 W1: a genuine successor adoption closes the
+            // prior incarnation. The close receipt is this exact verified
+            // page — same namespace and producer, strictly greater
+            // incarnation — so closure is derived from #2729 owner
+            // evidence, never asserted. Cross-owner replacement keeps the
+            // existing reset without recording a closure.
+            if let Some(prior) = prior_identity {
+                incarnation_ledgers
+                    .entry(stream_id.to_owned())
+                    .or_default()
+                    .close_on_successor(prior.clone(), identity.clone());
+            }
             owner_acked.insert(stream_id.to_owned(), stream.acked_cursor());
             delivered_sequences.remove(stream_id);
         } else {
@@ -3552,6 +3689,7 @@ impl KernelMcpForwardingPort {
             owner.delivered_sequences.remove(&oldest);
             owner.owner_acked.remove(&oldest);
             owner.owner_identity.remove(&oldest);
+            owner.incarnation_ledger.remove(&oldest);
         }
         let held = owner
             .delivered_sequences
@@ -3888,6 +4026,17 @@ impl KernelMcpForwardingPort {
         owner.delivered_sequences = delivered_sequences;
         offer.acknowledgement_receipt = Some(acknowledgement_receipt);
         offer.disposition = ConsumedOfferDisposition::OwnerConfirmed;
+        // Issue #2885 W8: the owner-confirmed offer is authenticated
+        // successor evidence. Retire each closed predecessor whose
+        // recorded successor this offer proves; field writes only.
+        for (stream_id, identity) in &stream_identities {
+            let adopted_matches = owner.owner_identity.get(stream_id) == Some(identity);
+            if adopted_matches
+                && let Some(ledger) = owner.incarnation_ledger.get_mut(stream_id)
+            {
+                ledger.retire_if_successor_confirmed(identity);
+            }
+        }
         Ok(())
     }
 
@@ -4463,7 +4612,13 @@ impl McpForwardingPort for KernelMcpForwardingPort {
         if result.is_pure_recovery_read() {
             return Ok(());
         }
-        let (mut owner_acked, mut delivered_sequences, mut owner_identity, offer_snapshot) = {
+        let (
+            mut owner_acked,
+            mut delivered_sequences,
+            mut owner_identity,
+            mut incarnation_ledgers,
+            offer_snapshot,
+        ) = {
             let owner = self
                 .shared
                 .try_borrow()
@@ -4472,6 +4627,7 @@ impl McpForwardingPort for KernelMcpForwardingPort {
                 owner.owner_acked.clone(),
                 owner.delivered_sequences.clone(),
                 owner.owner_identity.clone(),
+                owner.incarnation_ledger.clone(),
                 owner.consumed_offer.clone(),
             )
         };
@@ -4486,6 +4642,7 @@ impl McpForwardingPort for KernelMcpForwardingPort {
             &mut delivered_sequences,
             &mut owner_identity,
             &offer_stream_identities,
+            &mut incarnation_ledgers,
         );
         // The offer proof is evaluated here, against the projected adopted
         // identities, so the commit below applies it inside the same single
@@ -4493,6 +4650,30 @@ impl McpForwardingPort for KernelMcpForwardingPort {
         let offer_proven = offer_snapshot.as_ref().is_some_and(|offer| {
             Self::consumed_offer_proven_by_import(offer, &owner_identity, result)
         });
+        // Issue #2885 W8: precompute retirements while every input is a
+        // pure clone. A closed predecessor retires only when the adopted
+        // identity is its recorded successor and that successor carries
+        // authenticated confirmation — an already owner-confirmed offer or
+        // the joint import proven just above. No allocation, parsing, or
+        // owner call follows on the commit path.
+        let mut retired_successors: Vec<(String, OwnerStreamIdentity)> = Vec::new();
+        if let Some(offer) = offer_snapshot.as_ref()
+            && (matches!(
+                offer.disposition,
+                ConsumedOfferDisposition::OwnerConfirmed
+            ) || offer_proven)
+        {
+            for (stream_id, identity) in &offer.stream_identities {
+                let successor_adopted = owner_identity.get(stream_id) == Some(identity);
+                let closes_predecessor = incarnation_ledgers
+                    .get(stream_id)
+                    .and_then(|ledger| ledger.closure.as_ref())
+                    .is_some_and(|closure| closure.successor == *identity);
+                if successor_adopted && closes_predecessor {
+                    retired_successors.push((stream_id.clone(), identity.clone()));
+                }
+            }
+        }
         let mut owner = self
             .shared
             .try_borrow_mut()
@@ -4525,6 +4706,14 @@ impl McpForwardingPort for KernelMcpForwardingPort {
         owner.owner_acked = owner_acked;
         owner.delivered_sequences = delivered_sequences;
         owner.owner_identity = owner_identity;
+        owner.incarnation_ledger = incarnation_ledgers;
+        // Issue #2885 W8: precomputed retirements apply here with field
+        // writes only. A retired incarnation never reopens below.
+        for (stream_id, identity) in retired_successors {
+            if let Some(ledger) = owner.incarnation_ledger.get_mut(&stream_id) {
+                ledger.retire_if_successor_confirmed(&identity);
+            }
+        }
         if offer_was_replaced && let Some(offer) = owner.consumed_offer.as_mut() {
             offer.disposition = ConsumedOfferDisposition::Replaced;
         }
@@ -4730,6 +4919,7 @@ fn kernel_faces_from_admission(
         delivered_sequences: BTreeMap::new(),
         owner_acked: BTreeMap::new(),
         owner_identity: BTreeMap::new(),
+        incarnation_ledger: BTreeMap::new(),
         consumed_offer: None,
     }));
     let host: Box<dyn HostActivationPort> = Box::new(KernelHostActivationPort {
