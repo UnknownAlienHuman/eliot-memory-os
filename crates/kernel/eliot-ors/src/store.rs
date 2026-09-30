@@ -52,6 +52,9 @@ mod restore_journal;
 mod backup_snapshot;
 
 mod recovery_projection;
+mod stop_census;
+
+pub use stop_census::{StoreStopObligationCensus, StoreStopObligationCounts};
 
 use crate::cutover_ownership::{
     GenerationCutoverOwnership, GenerationCutoverOwnershipReceipt, StoredCutoverOwnership,
@@ -4634,6 +4637,8 @@ pub struct RuntimeLeaseCensusRows {
     pub supervision: SupervisionLeaseSnapshot,
     /// Exact-fence `RuntimeLease` rows ordered by lease id.
     pub runtime_leases: Vec<RuntimeLease>,
+    /// Complete Store-stop obligation projection from the same redb snapshot.
+    pub store_stop: StoreStopObligationCensus,
 }
 
 impl RedbRecoveryStore {
@@ -25462,8 +25467,26 @@ impl RedbRecoveryStore {
         fence: &eliot_contracts::StateFence,
         supervision_lease_id: &crate::OperationIdentity,
     ) -> Result<RuntimeLeaseCensusRows, OrsError> {
-        let supervision = self
-            .load_current_supervision_lease(supervision_lease_id)?
+        let read = self.database.begin_read().map_err(storage)?;
+        let supervision_table = read
+            .open_table(SUPERVISION_LEASE_CURRENT)
+            .map_err(storage)?;
+        let supervision = supervision_table
+            .get(supervision_lease_id.as_str())
+            .map_err(storage)?
+            .map(|value| {
+                let snapshot: SupervisionLeaseSnapshot =
+                    decode_named(value.value(), "supervision_lease_current")?;
+                snapshot.validate()?;
+                if snapshot.record.lease_id != *supervision_lease_id {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "supervision_lease_current",
+                        reason: "current key does not match lease identity".to_owned(),
+                    });
+                }
+                Ok(snapshot)
+            })
+            .transpose()?
             .ok_or(OrsError::IntegrityProblem {
                 record_type: "runtime_lease_census",
                 reason: "supervision head absent for census identity".to_owned(),
@@ -25471,10 +25494,31 @@ impl RedbRecoveryStore {
         if supervision.record.binding.state_fence != *fence {
             return Err(OrsError::FenceMismatch);
         }
-        let runtime_leases = self.load_runtime_leases_by_state_fence(fence)?;
+        let current = read.open_table(RUNTIME_LEASE_CURRENT).map_err(storage)?;
+        let mut runtime_leases = Vec::new();
+        for row in current.iter().map_err(storage)? {
+            let (key, value) = row.map_err(storage)?;
+            let lease: RuntimeLease = decode(value.value())?;
+            if key.value() != lease.lease_id {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "runtime_lease_current",
+                    reason: "current key does not match lease identity".to_owned(),
+                });
+            }
+            if lease.state_fence == *fence {
+                runtime_leases.push(lease);
+            }
+        }
+        runtime_leases.sort_by(|first, second| first.lease_id.cmp(&second.lease_id));
+        let store_stop = stop_census::census_in_read(
+            &read,
+            fence,
+            Some(supervision.record.binding.activation_id.as_str()),
+        )?;
         Ok(RuntimeLeaseCensusRows {
             supervision,
             runtime_leases,
+            store_stop,
         })
     }
 
