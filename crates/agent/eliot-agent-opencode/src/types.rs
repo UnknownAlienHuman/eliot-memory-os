@@ -1599,6 +1599,8 @@ pub struct UsageTelemetry {
 #[derive(Debug, thiserror::Error)]
 #[error("OpenCode assistant returned malformed structured output: {reason}")]
 pub struct MalformedProviderOutput {
+    /// Exact provider message identity when the host exposed it.
+    pub message_id: Option<String>,
     /// Provider/model identity observed in the assistant message.
     pub observed_model: ModelSelection,
     /// Exact UTF-8 assistant output text returned by the provider.
@@ -1632,6 +1634,35 @@ pub struct ProviderOutputObservation {
     pub actual_route: Option<OpenCodeWireRouteReceipt>,
     /// Original physical receipt, only if the route-observation owner created it.
     pub physical_route: Option<PhysicalRouteObservationReceipt>,
+    /// Separate exact assistant-message observations. A committed execution
+    /// unit can expose more than one assistant message; those messages and
+    /// their payload/usage are not one output and must not replace or be
+    /// concatenated into a last-message summary.
+    pub assistant_messages: Vec<ProviderAssistantMessageObservation>,
+}
+
+/// One exact assistant-message observation retained by the route owner.
+///
+/// Event-only observations carry message identity, model and usage when
+/// exposed, but have no raw payload unless the owner actually read the
+/// message body. Partial message snapshots remain separate entries even when
+/// they share a message ID.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProviderAssistantMessageObservation {
+    /// Provider message identity exactly as exposed, or `None` if absent.
+    pub message_id: Option<String>,
+    /// Provider/model identity observed on this message, if valid.
+    pub observed_model: Option<ModelSelection>,
+    /// Exact UTF-8 assistant text from this message, if the message body was read.
+    pub raw_output: Option<String>,
+    /// Usage reported on this exact message, including partial telemetry.
+    pub usage: Option<UsageTelemetry>,
+    /// Whether this exact message carried the owner's terminal attestation.
+    pub terminal: bool,
+    /// Wire route identity attached to this observed message, when available.
+    pub actual_route: Option<OpenCodeWireRouteReceipt>,
+    /// Validated physical route receipt attached to this observation, when available.
+    pub physical_route: Option<PhysicalRouteObservationReceipt>,
 }
 
 impl ProviderOutputObservation {
@@ -1642,6 +1673,7 @@ impl ProviderOutputObservation {
             || self.raw_output.is_some()
             || self.usage.is_some()
             || self.usage_availability.is_some()
+            || !self.assistant_messages.is_empty()
             || !self.events.is_empty()
             || self.actual_route.is_some()
             || self.physical_route.is_some()
