@@ -5704,28 +5704,50 @@ impl InquiryGovernance {
         // a record to make the receipt look complete. The evaluator route that
         // will fill it is BLOCKED-BY #1762/#1767.
         //
-        // #2893 item 12 is the seam this is, and the exact owner values it still
-        // needs are enumerated field by field on `AbsenceEvidence` above. Eight of
-        // the twenty commitments a `NoMatchEvaluationIssuer` holds have no
-        // producer on this path at all — predicate identity and bytes, issuer,
-        // evaluator and admission-receipt identity, index, source and scope
-        // revisions — so an issuer constructed here would be eight fabricated
-        // attestations that `issue_for` then joins and reports as owner-issued.
-        // The ninth, the frozen scope digest, is a separate and smaller matter:
-        // the value presented below is the run-bound *reference allowlist* digest
-        // rather than a scope-snapshot digest, while
-        // `profile.admitted_denominator_digest` is the value this crate's own
-        // `scope_snapshot_matches_admission` check expects here. Threading it is
-        // a one-value change and is deferred with the other eight rather than
-        // half-applied, because on its own it would not make the seam fillable.
-        // The seam therefore stays `None` until the live evaluator composition
-        // holds a real issuer; the closure gate above it already refuses to
-        // publish anything without this record.
+        // #2893 item 12 is the seam this is. The eight commitments a
+        // `NoMatchEvaluationIssuer` holds that have no producer on this path at
+        // all — predicate identity and bytes, issuer, evaluator and
+        // admission-receipt identity, index, source and scope revisions — remain
+        // exactly as absent as they were, so an issuer constructed here would
+        // still be eight fabricated attestations that `issue_for` then joins and
+        // reports as owner-issued. The ninth, the frozen scope digest, was a
+        // separate and smaller matter and is now corrected at the call site
+        // below: the run-bound *reference allowlist* digest is replaced there by
+        // `profile.admitted_denominator_digest`, the Kernel-admitted digest this
+        // crate's own `scope_snapshot_matches_admission` check already compares
+        // against.
+        //
+        // What #2893 item 12 asks for is not that this seam be filled — it is
+        // that the *final* `NO_MATCH`/closure decision be connected to the
+        // evidence record, which is now done at
+        // `terminal_disposition`/`terminal_record`: the closure decision reads
+        // the receipt's retained absence verdict and the retained
+        // `absence_evidence_digest` together, and a closing
+        // `NO_MATCH_IN_COMPLETE_SCOPE` is published only over a receipt that
+        // carries both. Package-level `Proven` alone can no longer close
+        // anything, and the seam stays `None` until the live evaluator
+        // composition holds a real issuer, so a run that cannot be backed by an
+        // owner-issued record remains `INCOMPLETE_COVERAGE`.
         let absence_evidence: Option<AbsenceEvidence> = None;
         let coverage_receipt = CoverageReceipt::compute(CoverageReceiptParams {
             profile: &profile,
             requested_scope: &observation.scope,
-            frozen_scope_digest: &observation.reference_manifest.digest,
+            // #2893: this is the frozen scope/denominator snapshot digest, and
+            // the only value on this path that is one. It was the run-bound
+            // *reference allowlist* digest, which is a different commitment from a
+            // different owner, so the receipt's own
+            // `scope_snapshot_matches_admission` comparison could never be true
+            // for a run that reached this line — the crate stated in code that
+            // the two are expected to be equal and then supplied a value that
+            // was not. The Kernel-admitted denominator digest is already read on
+            // this path (it is `profile.admitted_denominator_digest`, itself
+            // frozen from `observation.denominator_digest`), so this is the
+            // ninth, one-value correction the crate documented and deferred; it
+            // is now threaded. The reference-allowlist digest remains published
+            // in its own right, as `profile.reference_manifest_digest` and
+            // `InquiryGovernance::run_reference_manifest`, which is where a
+            // reader of an allowlist commitment looks for it.
+            frozen_scope_digest: &profile.admitted_denominator_digest,
             account: &account,
             records: &admissibility,
             absence_evidence: absence_evidence.as_ref(),
