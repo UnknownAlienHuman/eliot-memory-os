@@ -97,6 +97,25 @@
 //!   anywhere in the workspace. The only owner spelling is
 //!   [`QualityApplicabilityInput::ActiveDirective`], so that is what is
 //!   resolved: an unresolved directive input refuses the whole resolution.
+//!
+//! # W7 — supersession and rollback as new owner decisions
+//!
+//! [`RecipeActivationRecord`] is the decision that made an approved revision
+//! current; it names the exact predecessor it supersedes and the applicability
+//! and compiler-generation scope it is confined to.
+//! [`RecipeRevocationRecord`] is the decision that killed or rolled a revision
+//! back, naming the previous compatible revision a rollback returns to.
+//!
+//! Neither is stored ON the approved content. That is the whole point: a kill or
+//! a rollback used to be a mutable field of [`RecipeSupersession`], so revoking
+//! a revision meant editing the bytes that revision's `policy_sha256` covers.
+//! Every View and `ContextEconomyReceipt` produced under it still names that
+//! digest, so the edit silently relabelled historical evidence instead of
+//! superseding it. With the decision held beside the content, the approved
+//! revision is immutable forever: a View that names `policy_sha256` P keeps
+//! naming P whether or not P was later revoked, and a re-resolution under a
+//! newer catalogue produces a different `resolution_sha256` rather than
+//! restamping the old one.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -626,18 +645,22 @@ impl RecipeQualification {
 ///
 /// The parent revision is the existing `ContextRecipe::predecessor` of the
 /// instance, and the invalidation identity is its existing `invalidation`;
-/// neither is repeated here. What is new is the owner decision that made this
-/// revision current and the owner decisions that killed it or rolled back to an
-/// earlier compatible revision.
+/// neither is repeated here. What the policy record keeps is the ONE owner
+/// decision that made this revision current: [`RecipeActivationRecord`].
+///
+/// #1724 W7 removed the kill and rollback identities from this struct on
+/// purpose. They were mutable fields ON the approved content, so a kill or a
+/// rollback had to be expressed by editing the revision it revoked — which
+/// re-hashes the approved content, destroys the immutability of the revision
+/// that produced an existing View, and lets a later receipt be re-labelled
+/// under a new `policy_sha256`. They are now
+/// [`RecipeRevocationRecord`]s held beside the candidates: a new owner decision
+/// naming the revoked identity, never a rewrite of that identity's bytes.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RecipeSupersession {
     /// Scoped activation record that made this revision current.
     pub activation: ArtifactId,
-    /// Owner kill decision, when this revision was killed.
-    pub kill: Option<ArtifactId>,
-    /// Owner rollback decision that returned to an earlier compatible revision.
-    pub rollback: Option<ArtifactId>,
 }
 
 impl RecipeSupersession {
@@ -645,17 +668,165 @@ impl RecipeSupersession {
         validate_text(
             self.activation.as_str(),
             "recipe_policy.supersession.activation",
+        )
+    }
+}
+
+/// Digest domain separator for one owner activation decision.
+pub const RECIPE_ACTIVATION_DIGEST_DOMAIN: &str = "eliot.smart.context.recipe-activation.v1";
+
+/// Digest domain separator for one owner kill/rollback decision.
+pub const RECIPE_REVOCATION_DIGEST_DOMAIN: &str = "eliot.smart.context.recipe-revocation.v1";
+
+/// The owner decision that made one approved revision current.
+///
+/// #1724 W7. A newly accepted recipe produces a NEW immutable revision plus this
+/// record, which is what makes the change observable: it names the activated
+/// identity, the exact predecessor it supersedes, and the applicability and
+/// compiler-generation scope the activation is confined to. A decision confined
+/// to a scope cannot be read as a global activation, and
+/// [`ApprovedRecipeCatalogue::validate`] refuses a compilation whose own
+/// applicability the activation does not cover, so a future decision revalidates
+/// applicability rather than inheriting an old activation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RecipeActivationRecord {
+    /// Owner decision identity that made `activated` current.
+    pub decision: ArtifactId,
+    /// The exact approved revision this decision activated.
+    pub activated: RecipePolicyIdentity,
+    /// The exact revision this one supersedes, when there is a predecessor.
+    ///
+    /// It is an identity, not content: the predecessor keeps its own bytes and
+    /// its own activation, so a View produced under it still names a revision
+    /// the owner actually approved.
+    pub predecessor: Option<RecipePolicyIdentity>,
+    /// Applicability scope this activation is confined to.
+    pub applicability: RecipeApplicability,
+    /// Compiler-generation scope this activation is confined to.
+    pub execution: RecipeExecutionContour,
+    /// Digest of this activation record.
+    pub record_sha256: String,
+}
+
+#[derive(Serialize)]
+struct RecipeActivationDigestInput<'a> {
+    domain: &'static str,
+    activation: &'a RecipeActivationRecord,
+}
+
+impl RecipeActivationRecord {
+    /// Compute the digest expected in `record_sha256`.
+    pub fn canonical_record_digest(&self) -> Result<String, ContextError> {
+        let mut canonical = self.clone();
+        canonical.record_sha256 = "0".repeat(64);
+        let input = RecipeActivationDigestInput {
+            domain: RECIPE_ACTIVATION_DIGEST_DOMAIN,
+            activation: &canonical,
+        };
+        let bytes = eliot_contracts::canonical_json_bytes(&input)
+            .map_err(|_| ContextError::InvalidField("recipe_activation.canonical"))?;
+        Ok(eliot_contracts::sha256_hex(&bytes))
+    }
+
+    /// Validate the closed decision record and its own recorded digest.
+    pub fn validate(&self) -> Result<(), ContextError> {
+        validate_text(self.decision.as_str(), "recipe_activation.decision")?;
+        validate_text(self.activated.policy_id.as_str(), "recipe_activation.activated")?;
+        validate_digest(
+            &self.activated.policy_sha256,
+            "recipe_activation.activated.policy_sha256",
         )?;
-        for (decision, field) in [
-            (self.kill.as_ref(), "recipe_policy.supersession.kill"),
-            (
-                self.rollback.as_ref(),
-                "recipe_policy.supersession.rollback",
-            ),
-        ] {
-            if let Some(reference) = decision {
-                validate_text(reference.as_str(), field)?;
+        if let Some(predecessor) = &self.predecessor {
+            if predecessor == &self.activated {
+                return Err(ContextError::IdentityConflict);
             }
+            validate_text(
+                predecessor.policy_id.as_str(),
+                "recipe_activation.predecessor",
+            )?;
+            validate_digest(
+                &predecessor.policy_sha256,
+                "recipe_activation.predecessor.policy_sha256",
+            )?;
+        }
+        self.applicability.validate()?;
+        self.execution.validate()?;
+        validate_digest(&self.record_sha256, "recipe_activation.record_sha256")?;
+        if self.canonical_record_digest()? != self.record_sha256 {
+            return Err(ContextError::IdentityConflict);
+        }
+        Ok(())
+    }
+}
+
+/// The owner decision that killed or rolled back one approved revision.
+///
+/// #1724 W7. Rollback is a NEW decision naming the previous COMPATIBLE revision
+/// the owner still holds; it never overwrites the revoked revision's content and
+/// never edits the revision being returned to. `replacement` absent is a kill
+/// with no replacement; present is a rollback to an identity the catalogue still
+/// carries, which [`ApprovedRecipeCatalogue::validate`] requires.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RecipeRevocationRecord {
+    /// Owner decision identity that revoked the revision.
+    pub decision: ArtifactId,
+    /// The exact approved revision this decision revoked.
+    pub revoked: RecipePolicyIdentity,
+    /// The previous compatible revision this returns to, for a rollback.
+    pub replacement: Option<RecipePolicyIdentity>,
+    /// Digest of this revocation record.
+    pub record_sha256: String,
+}
+
+#[derive(Serialize)]
+struct RecipeRevocationDigestInput<'a> {
+    domain: &'static str,
+    revocation: &'a RecipeRevocationRecord,
+}
+
+impl RecipeRevocationRecord {
+    /// Compute the digest expected in `record_sha256`.
+    pub fn canonical_record_digest(&self) -> Result<String, ContextError> {
+        let mut canonical = self.clone();
+        canonical.record_sha256 = "0".repeat(64);
+        let input = RecipeRevocationDigestInput {
+            domain: RECIPE_REVOCATION_DIGEST_DOMAIN,
+            revocation: &canonical,
+        };
+        let bytes = eliot_contracts::canonical_json_bytes(&input)
+            .map_err(|_| ContextError::InvalidField("recipe_revocation.canonical"))?;
+        Ok(eliot_contracts::sha256_hex(&bytes))
+    }
+
+    /// Validate the closed decision record and its own recorded digest.
+    pub fn validate(&self) -> Result<(), ContextError> {
+        validate_text(self.decision.as_str(), "recipe_revocation.decision")?;
+        validate_text(
+            self.revoked.policy_id.as_str(),
+            "recipe_revocation.revoked",
+        )?;
+        validate_digest(
+            &self.revoked.policy_sha256,
+            "recipe_revocation.revoked.policy_sha256",
+        )?;
+        if let Some(replacement) = &self.replacement {
+            if replacement == &self.revoked {
+                return Err(ContextError::IdentityConflict);
+            }
+            validate_text(
+                replacement.policy_id.as_str(),
+                "recipe_revocation.replacement",
+            )?;
+            validate_digest(
+                &replacement.policy_sha256,
+                "recipe_revocation.replacement.policy_sha256",
+            )?;
+        }
+        validate_digest(&self.record_sha256, "recipe_revocation.record_sha256")?;
+        if self.canonical_record_digest()? != self.record_sha256 {
+            return Err(ContextError::IdentityConflict);
         }
         Ok(())
     }
@@ -1507,8 +1678,9 @@ impl GoverningContextRequirements {
 ///
 /// This is the owner catalogue, not the compiler. It carries the compilation's
 /// own applicability dimensions and compiler-generation profile, the
-/// independent governing requirements, and every approved candidate revision the
-/// owner currently holds. The pure compiler receives the result of
+/// independent governing requirements, every approved candidate revision the
+/// owner currently holds, and — #1724 W7 — the owner decisions that made those
+/// revisions current or revoked them. The pure compiler receives the result of
 /// [`ApprovedRecipeCatalogue::resolve`]; it never consults this record, a
 /// mutable registry, the filesystem, the network or a model.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -1522,15 +1694,49 @@ pub struct ApprovedRecipeCatalogue {
     pub governing: GoverningContextRequirements,
     /// Owner-published approved candidate policy revisions.
     pub candidates: Vec<ContextRecipePolicy>,
+    /// Owner activation decisions for the candidates, newest revision last.
+    pub activations: Vec<RecipeActivationRecord>,
+    /// Owner kill/rollback decisions for candidates this owner no longer serves.
+    pub revocations: Vec<RecipeRevocationRecord>,
 }
 
 impl ApprovedRecipeCatalogue {
     /// Validate the closed owner configuration before any candidate is
     /// compared.
+    ///
+    /// #1724 W7 adds the decision closure. Every candidate must be named by
+    /// exactly one activation decision whose `decision` identity equals the
+    /// candidate's own recorded `supersession.activation`, so a revision cannot
+    /// be served without the decision that made it current or be made current
+    /// by a decision that belongs to another revision. Each activation names
+    /// the exact predecessor it supersedes, which must be a revision this owner
+    /// still holds, and each revocation names either nothing (a kill) or the
+    /// previous compatible revision it returns to, which must likewise still be
+    /// held. A rollback therefore cannot name a revision the owner does not
+    /// have, and cannot be expressed at all by editing the revoked revision.
+    ///
+    /// #1724 A4 follows from the same shape: nothing in this record, and nothing
+    /// in a View or a `ContextEconomyReceipt`, can rewrite an approved
+    /// revision's `policy_sha256`. Evidence that names a digest keeps naming it
+    /// after a later revocation, and a new compilation resolves a new
+    /// `resolution_sha256` rather than restamping the old evidence.
     pub fn validate(&self) -> Result<(), ContextError> {
         if self.candidates.is_empty() || self.candidates.len() > 64 {
             return Err(ContextError::Bounds {
                 field: "recipe_catalogue.candidates",
+            });
+        }
+        if self.activations.len() > 64 {
+            return Err(ContextError::Bounds {
+                field: "recipe_catalogue.activations",
+            });
+        }
+        if self.activations.len() != self.candidates.len() {
+            return Err(ContextError::IdentityConflict);
+        }
+        if self.revocations.len() > 64 {
+            return Err(ContextError::Bounds {
+                field: "recipe_catalogue.revocations",
             });
         }
         self.execution.validate()?;
@@ -1543,6 +1749,77 @@ impl ApprovedRecipeCatalogue {
                 return Err(ContextError::Duplicate("recipe_catalogue.candidates"));
             }
         }
+        let held: BTreeSet<RecipePolicyIdentity> =
+            self.candidates.iter().map(RecipePolicyIdentity::of).collect();
+
+        let mut decisions = BTreeSet::new();
+        let mut activated = BTreeSet::new();
+        for activation in &self.activations {
+            activation.validate()?;
+            if !decisions.insert(activation.decision.clone())
+                || !activated.insert(activation.activated.clone())
+            {
+                return Err(ContextError::Duplicate("recipe_catalogue.activations"));
+            }
+            if !held.contains(&activation.activated) {
+                return Err(ContextError::IdentityConflict);
+            }
+            // The activation is confined to the contour and transform
+            // identity it was decided under. Its `generation` is deliberately
+            // not compared here: a contour generation is the owner's monotone
+            // execution counter, and freezing every historical activation on it
+            // would make the catalogue unusable after one bump. Generation
+            // staleness is already a per-candidate rejection
+            // (`RecipeRejectionReason::StaleCompilerGeneration`), which is the
+            // narrower and correct place for it.
+            if activation.execution.contour != self.execution.contour
+                || activation.execution.transform != self.execution.transform
+            {
+                return Err(ContextError::IdentityConflict);
+            }
+            if !RecipeApplicability::declared_covers(
+                &activation.applicability,
+                &self.applicability,
+            ) {
+                return Err(ContextError::IdentityConflict);
+            }
+            if activation
+                .predecessor
+                .as_ref()
+                .is_some_and(|predecessor| !held.contains(predecessor))
+            {
+                return Err(ContextError::IdentityConflict);
+            }
+        }
+        for candidate in &self.candidates {
+            let identity = RecipePolicyIdentity::of(candidate);
+            if !self.activations.iter().any(|activation| {
+                activation.activated == identity && activation.decision == candidate.supersession.activation
+            }) {
+                return Err(ContextError::IdentityConflict);
+            }
+        }
+
+        let mut revoked = BTreeSet::new();
+        let mut revocation_decisions = BTreeSet::new();
+        for revocation in &self.revocations {
+            revocation.validate()?;
+            if !revoked.insert(revocation.revoked.clone())
+                || !revocation_decisions.insert(revocation.decision.clone())
+            {
+                return Err(ContextError::Duplicate("recipe_catalogue.revocations"));
+            }
+            if !held.contains(&revocation.revoked) {
+                return Err(ContextError::IdentityConflict);
+            }
+            if revocation
+                .replacement
+                .as_ref()
+                .is_some_and(|replacement| !held.contains(replacement))
+            {
+                return Err(ContextError::IdentityConflict);
+            }
+        }
         Ok(())
     }
 
@@ -1552,7 +1829,7 @@ impl ApprovedRecipeCatalogue {
     ///
     /// 1. an unresolved governing applicability input refuses the compilation
     ///    before any candidate is read;
-    /// 2. a candidate revoked by an owner kill or rollback decision, issued
+    /// 2. a candidate named by an owner kill or rollback decision, issued
     ///    under another compiler-generation or route profile, or not declaring
     ///    every applicability profile of this compilation is rejected with that
     ///    exact reason;
@@ -1635,13 +1912,18 @@ impl ApprovedRecipeCatalogue {
         &self,
         candidate: &ContextRecipePolicy,
     ) -> Option<RecipeRejectionReason> {
-        if let Some(decision) = candidate
-            .supersession
-            .kill
-            .clone()
-            .or(candidate.supersession.rollback.clone())
+        // #1724 W7: revocation is an owner decision held BESIDE the approved
+        // content, read from the identity the candidate records. A kill or a
+        // rollback can therefore be observed and audited without rewriting the
+        // revoked revision, and a revision the owner still serves is unaffected.
+        if let Some(revocation) = self
+            .revocations
+            .iter()
+            .find(|revocation| revocation.revoked == RecipePolicyIdentity::of(candidate))
         {
-            return Some(RecipeRejectionReason::Revoked { decision });
+            return Some(RecipeRejectionReason::Revoked {
+                decision: revocation.decision.clone(),
+            });
         }
         if candidate.execution != self.execution {
             return Some(RecipeRejectionReason::StaleCompilerGeneration {
