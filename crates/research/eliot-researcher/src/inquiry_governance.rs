@@ -3926,6 +3926,27 @@ impl EvidenceFreeze {
         self.supersedes.is_some()
     }
 
+    /// Whether `handle` is an **admitted included member** of this freeze.
+    ///
+    /// This is the one membership question W2 and W3 ask, and it is deliberately
+    /// not "is this handle mentioned anywhere on the record": an excluded member
+    /// is named here too, with the reason it was excluded, and a handle that
+    /// appears only in `excluded_evidence` is precisely the member that must not
+    /// enter a synthesis pack or back a freeze commit. So membership is answered
+    /// against the included set alone.
+    #[must_use]
+    pub fn includes(&self, handle: &str) -> bool {
+        self.included_evidence_refs
+            .iter()
+            .any(|member| member == handle)
+    }
+
+    /// The admitted included members, in the freeze's own canonical order.
+    #[must_use]
+    pub fn included_members(&self) -> &[String] {
+        &self.included_evidence_refs
+    }
+
     /// Re-proves the successor relation, if this freeze declares one.
     ///
     /// The three fields move together by construction, and this re-proves that
