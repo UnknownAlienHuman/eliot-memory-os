@@ -418,7 +418,9 @@ impl RedbInstallationRegistry {
     pub fn open_user_owned_at(
         host_root: UserOwnedRootLease,
         profile: crate::InstallationProfile,
+        selection: &eliot_platform_windows::profile_supervision::ProfileSelectionReceipt,
     ) -> Result<Self, InstallationError> {
+        Self::verify_user_owned_registry_root_binding(&host_root, profile, selection)?;
         let path = installation_registry_path_user_owned(&host_root, profile)?;
         let file = UserOwnedPathLease::open_or_create(&host_root, &path)
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
