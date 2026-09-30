@@ -2786,20 +2786,21 @@ fn verified_recorded_destination_fields(
 /// not this operation's outcome no matter what the filesystem currently shows:
 ///
 /// 1. [`verified_recorded_frames`] — the stored record version and the stored
-///   operation identity against the lookup key, so a record written for another
-///   operation can never be reattributed to this one. A mismatching stored
-///   operation id is refused; it is never overwritten with the requested id;
-///   the recorded admission digest and the result's own
-///   `admission_digest`/`config_projection_digest` are then joined against that
-///   same intent, so a result cannot claim a configuration the admission never
-///   carried;
+///    operation identity against the lookup key, so a record written for
+///    another operation can never be reattributed to this one. A mismatching
+///    stored operation id is refused; it is never overwritten with the
+///    requested id; the recorded admission digest and the result's own
+///    `admission_digest`/`config_projection_digest` are then joined against
+///    that same intent, so a result cannot claim a configuration the admission
+///    never carried;
 /// 2. [`require_live_recorded_result`] — the lifecycle, structurally;
 /// 3. the recorded destination root, destination id and epoch, which
-///   [`HostStatePreparationJournal::record_result`] retains and which therefore
-///   are the record's own account of what it created rather than a name this
-///   module resolves again ([`verified_recorded_destination_fields`]);
+///    [`HostStatePreparationJournal::record_result`] retains and which
+///    therefore are the record's own account of what it created rather than a
+///    name this module resolves again
+///    ([`verified_recorded_destination_fields`]);
 /// 4. the permitted absence of a forensic audit note, which
-///   [`reject_audit_note`] already refuses on every path that owns a receipt;
+///    [`reject_audit_note`] already refuses on every path that owns a receipt;
 /// 5. and only then the owner proof.
 ///
 /// `require_live` is the ONE thing the two callers answer differently, and it
