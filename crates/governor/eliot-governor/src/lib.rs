@@ -41,7 +41,6 @@ mod capability_evidence;
 mod capability_evidence_commit;
 mod composition;
 mod context_inputs;
-mod coordination_owner_commit;
 mod cue_composition;
 mod epistemic_composition;
 mod experience_commit;
