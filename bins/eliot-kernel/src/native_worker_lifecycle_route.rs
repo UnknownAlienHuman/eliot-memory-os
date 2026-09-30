@@ -1265,10 +1265,10 @@ impl KernelComposition {
         let Some(executable_binding) = request.executable_binding.as_ref() else {
             return false;
         };
-        !presented
+        presented
             .claim_id
             .as_deref()
-            .is_some_and(|claim_id| claim_id != request.claim_id)
+            .is_none_or(|claim_id| claim_id == request.claim_id.as_str())
             && presented.worker_generation == request.worker_generation
             && presented.state_fence == request.state_fence
             && *presented_fence == request.state_fence
