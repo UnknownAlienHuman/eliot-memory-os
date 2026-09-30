@@ -939,6 +939,7 @@ name = "eliot-blob"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "eliot-backup",
  "eliot-blob-api",
  "eliot-platform",
  "eliot-platform-windows",

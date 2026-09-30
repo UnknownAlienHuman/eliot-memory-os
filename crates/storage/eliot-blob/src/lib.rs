@@ -52,6 +52,7 @@ pub use backup_io::{
 };
 pub mod demand;
 pub mod key_ports;
+pub mod publication_owner;
 pub mod stream_sink;
 pub use demand::{
     ApprovedBlobView, BlobGenerationProbe, BlobProbeError, StoreBlobDemand,
@@ -75,6 +76,7 @@ use eliot_receipts::{
     ReceiptKind, contract_identity,
 };
 pub use key_ports::{DpapiUserAeadPort, DpapiUserKeyPort, KEY_PORT_ALGORITHM, KEY_PORT_VERSION};
+pub use publication_owner::{BlobArchivePublicationBinding, BlobArchivePublicationOwner};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 pub use stream_sink::{BlobStoreStreamSink, BlobStreamSinkStoreBinding};

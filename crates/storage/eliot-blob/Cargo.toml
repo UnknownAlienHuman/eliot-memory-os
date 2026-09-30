@@ -7,6 +7,13 @@ license.workspace = true
 description = "Single-owner filesystem CAS implementation for ELIOT S-04"
 
 [dependencies]
+# Issue #959: `publication_owner` is the real current consumer of
+# `eliot_backup::PublicationPort`. The edge is legal and acyclic: this crate is
+# a leaf of the storage subtree (its only dependent is the shipped store
+# runtime) and nothing in `eliot-backup`'s closure reaches back to it. Declared
+# by explicit path because `eliot-backup` is not a `[workspace.dependencies]`
+# entry, matching `bins/eliot-store-surreal/Cargo.toml`.
+eliot-backup = { path = "../eliot-backup", version = "0.1.0" }
 eliot-blob-api.workspace = true
 eliot-platform.workspace = true
 eliot-platform-windows.workspace = true
