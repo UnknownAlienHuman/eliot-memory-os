@@ -1422,16 +1422,23 @@ impl PacketAdmissionBundle {
     /// as policy, or a foreign measurement fails here as a typed composition
     /// error, never as an admitted bundle.
     ///
-    /// STITCH-2564-PACKET-SUPPLY: no production owner mints these pieces yet
-    /// (measured on `origin/main`: `SafetyFloorIdentity`,
-    /// `PriorityPolicyIdentity`, `AdmissionRuleIdentity` and
-    /// `MeasurementCompositionProfile` are constructed only in `tests/`
-    /// fixtures). The future suppliers — Decision Safety Floor owner,
-    /// candidate-policy owner, quality scorecard owner, route
+    /// STITCH-2564-PACKET-SUPPLY, re-measured for #1862: one of the four now
+    /// has a real owner source. `SafetyFloorIdentity` is resolved on the live
+    /// campaign packet route by the Context owner's own publication,
+    /// `eliot_context::campaign_publication::context_safety_floor_identity`,
+    /// which reads the floor out of the authenticated recipe body's
+    /// `GoverningContextRequirements::floor` and the resolved revision's own
+    /// `RecipeAdmissionPolicy::safety_floor` reference. `PriorityPolicyIdentity`,
+    /// `AdmissionRuleIdentity` and `MeasurementCompositionProfile` still have no
+    /// production construction site; the per-identity account of what each one
+    /// lacks is recorded on
+    /// `bins/eliotd/src/campaign_packet.rs::CampaignPacketGapCode::AdmissionClosureUnbound`.
+    /// The remaining suppliers — candidate-policy owner, priority-policy owner,
+    /// admission-rule record owner, quality scorecard owner, route
     /// capacity/measurement owner — call this builder and feed the resulting
-    /// bundle to [`KernelContextReadClient::compile_context_packet`]; until
-    /// they do, the campaign packet reports the unbound-closure gap instead
-    /// of compiling.
+    /// bundle to [`KernelContextReadClient::compile_context_packet`]; until they
+    /// do, the campaign packet reports the unbound-closure gap instead of
+    /// compiling.
     pub fn build(
         parts: PacketAdmissionParts,
         recipe: &ContextRecipe,
@@ -1546,14 +1553,25 @@ impl KernelContextReadClient {
     /// cannot pass `policy.max_serialized_bytes`, and genuinely deferred
     /// compilation uses a durable job, never an unconsumed handle.
     ///
-    /// STITCH-2564-PACKET-SUPPLY: the production invoker is the campaign
-    /// packet composition
-    /// (`bins/eliotd/src/campaign_packet.rs::resolve_compile_and_bind_result`),
-    /// which holds the admitted binding and the owner recipe today and still
-    /// lacks the remaining owner suppliers (seven-role converters, candidate
-    /// policy, admission identities, quality card, assembly policy,
-    /// measurement). Until those suppliers call this edge with owner-minted
-    /// pieces, the packet keeps its unbound-closure gap.
+    /// STITCH-2564-PACKET-SUPPLY, re-measured for #1862: the campaign packet
+    /// composition
+    /// (`bins/eliotd/src/campaign_packet.rs::resolve_compile_and_bind_result`)
+    /// now holds the admitted binding, the owner recipe AND the owner-issued
+    /// `SafetyFloorIdentity` — the floor is resolved there through
+    /// `eliot_context::campaign_publication::context_safety_floor_identity` and
+    /// checked by this edge's own admission join. The remaining suppliers
+    /// (seven-role converters, candidate policy, priority policy, admission
+    /// rule record, quality card, measurement profile, assembly policy,
+    /// measurement callback) are still absent, so the packet keeps its
+    /// unbound-closure gap. Two of them are additionally unreachable by
+    /// construction rather than merely unminted:
+    /// `PacketAdmissionBundle::build` runs BEFORE
+    /// `construct_context_candidates`, while `AdmissionInput::validate` forces
+    /// `priority.priorities` and `measurements` to equal the candidate atom set
+    /// exactly; and `QualityScorecard::output` must name the admitted and
+    /// rendered digests that only the admission and assembly stages inside this
+    /// function produce. Until those owners exist, this edge stays uncalled
+    /// rather than being fed a stand-in.
     ///
     /// #1862: `campaign_view` is the validated immutable
     /// `CampaignLearningStateView` this compilation is bound to, and
@@ -1570,16 +1588,23 @@ impl KernelContextReadClient {
     ///
     /// Admission compares the immutable view against the very binding its own
     /// decision is made under, and never trusts the candidate cell's verdict. The
-    /// refusal keeps the owner's typed `ContextError` rather than being flattened.
+    /// floor it admits against is the owner-minted one this composition was
+    /// handed, so the I7.11 protected floor is checked against this decision
+    /// boundary here rather than being assumed by a later stage. The refusal
+    /// keeps the owner's typed `ContextError` rather than being flattened.
     fn require_campaign_view_for_admission(
         request: &CandidateRequest,
         campaign_view: &CampaignLearningStateView,
         context_recipe_body_digest: &str,
+        floor: &SafetyFloorIdentity,
+        recipe: &ContextRecipe,
     ) -> Result<(), PacketCompositionError> {
         check_campaign_view_for_admission(
             &request.binding,
             campaign_view,
             context_recipe_body_digest,
+            floor,
+            recipe,
         )
         .map_err(|error| PacketCompositionError::CampaignView(Box::new(error)))
     }
@@ -1644,6 +1669,8 @@ impl KernelContextReadClient {
             request,
             campaign_view,
             context_recipe_body_digest,
+            &floor,
+            recipe,
         )?;
         let admission = PacketAdmissionBundle::build(
             PacketAdmissionParts {

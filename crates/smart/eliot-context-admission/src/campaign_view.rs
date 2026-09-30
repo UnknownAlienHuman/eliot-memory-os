@@ -12,6 +12,12 @@
 //! - the State Fence, task and scope come from [`ContextBinding`], the exact
 //!   binding the admission decision itself is made under, and are compared
 //!   against the immutable view's own recorded binding;
+//! - the protected floor comes from the Context owner's own publication
+//!   (`eliot_context::campaign_publication::context_safety_floor_identity` over
+//!   the authenticated recipe body), so the floor this cell admits against is
+//!   the floor that owner published for this decision boundary, and every
+//!   relation `AdmissionInput::validate_contract` states about it is re-derived
+//!   here rather than assumed;
 //! - the load-bearing Context recipe revision is compared against
 //!   `context_recipe_body_digest`, which the Context owner re-derived from the
 //!   exact recipe body its own publication validator accepted — not against the
@@ -31,7 +37,7 @@
 //! another's verdict, and skipping any one of them refuses nothing in the
 //! others.
 
-use eliot_context_contracts::{ContextBinding, ContextError};
+use eliot_context_contracts::{ContextBinding, ContextError, ContextRecipe, SafetyFloorIdentity};
 use eliot_contracts::fences_match_exact;
 use eliot_learning_contracts::{
     CampaignLearningStateView, CampaignSourceResolutionStatus, CampaignSourceRole, Completeness,
@@ -45,11 +51,52 @@ use eliot_learning_contracts::{
 /// recipe binding, and its floor binding. It is the admission cell's own
 /// fact, not a value forwarded from the candidate stage.
 ///
+/// `floor` is the protected floor the Context owner published for exactly this
+/// decision boundary, resolved through
+/// `eliot_context::campaign_publication::context_safety_floor_identity` from the
+/// authenticated Context recipe body rather than minted here. I7.11 makes that
+/// floor the set of currently applicable non-droppable atoms for a
+/// Material/Critical boundary, so an admission decision that would render
+/// without it is not the decision the owner authorized. I12.13 states the
+/// relation as "a recipe cannot weaken Decision Safety Floor", and
+/// `AdmissionInput::validate_contract` states it as a closed set of equalities.
+/// Every one of those equalities is CONTENT-COMPARED here, against the
+/// admission cell's own `binding` and `recipe`:
+///
+/// - the floor is bound to this decision — the same equality
+///   `AdmissionInput::validate` forces between its own binding and its floor
+///   binding — so a floor published for a neighbouring decision is refused here
+///   as `InvalidFence`;
+/// - the floor's own `DecisionRevision` equals the admitted recipe's, in full
+///   (`decision_id`, `recipe_revision` and `policy_sha256`), and its decision
+///   identity names this binding's decision. A floor that matches only on
+///   `decision_id` while carrying another revision or another policy digest is
+///   refused here as `IdentityConflict`; that is the substituted-identity case,
+///   and a presence check would accept it;
+/// - the floor's capacity envelope equals the recipe's, which is the exact
+///   equality `AdmissionInput::validate_contract` forces and the one that stops
+///   a floor being shaved or widened to fit a caller-chosen route;
+/// - the floor's owner-declared `mandatory_roles` cover every role this
+///   compilation's recipe makes mandatory. A recipe role the floor does not make
+///   mandatory is `MissingFloor`.
+///
+/// A floor whose own record is invalid refuses through the contract owner's
+/// [`SafetyFloorIdentity::validate`], not through a second rule here, and the
+/// recipe this comparison uses is likewise the contract owner's
+/// [`ContextRecipe::validate`].
+///
 /// Typed refusals, in the order they are decided:
 ///
-/// - a view whose recorded State Fence does not fence-match the decision's is
-///   [`ContextError::InvalidFence`] — the I12.26 packet-refresh arm;
-/// - a task or scope disagreement is [`ContextError::IdentityConflict`];
+/// - a floor that does not satisfy its own closed contract, or a recipe that
+///   does not, is that owner's typed `ContextError`;
+/// - a floor bound to another decision, or a view whose recorded State Fence
+///   does not fence-match the decision's, is [`ContextError::InvalidFence`] — the
+///   I12.26 packet-refresh arm;
+/// - a task or scope disagreement, a floor whose decision revision or capacity
+///   envelope is not this recipe's, or a floor whose decision identity is not
+///   this binding's decision, is [`ContextError::IdentityConflict`];
+/// - a recipe role the floor does not make mandatory is
+///   [`ContextError::MissingFloor`];
 /// - an invalidated view, or one whose completeness is `STALE` or `BLOCKED`,
 ///   is `InvalidField("campaign_view.completeness")`;
 /// - a Context-owned row read under another fence is
@@ -69,8 +116,25 @@ pub fn check_campaign_view_for_admission(
     binding: &ContextBinding,
     view: &CampaignLearningStateView,
     context_recipe_body_digest: &str,
+    floor: &SafetyFloorIdentity,
+    recipe: &ContextRecipe,
 ) -> Result<(), ContextError> {
     binding.validate()?;
+    recipe.validate()?;
+    floor.validate()?;
+    if floor.floor.binding != *binding {
+        return Err(ContextError::InvalidFence);
+    }
+    if floor.decision != recipe.decision || floor.decision.decision_id != binding.decision_id {
+        return Err(ContextError::IdentityConflict);
+    }
+    if floor.floor.capacity != recipe.capacity {
+        return Err(ContextError::IdentityConflict);
+    }
+    let floor_roles: std::collections::BTreeSet<_> = floor.floor.mandatory_roles.iter().collect();
+    if !recipe.mandatory_roles.iter().all(|role| floor_roles.contains(role)) {
+        return Err(ContextError::MissingFloor);
+    }
     if !fences_match_exact(&view.binding.state_fence, &binding.state_fence) {
         return Err(ContextError::InvalidFence);
     }
