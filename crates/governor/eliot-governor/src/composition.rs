@@ -10432,7 +10432,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         if activation != pending.activation
             || selected != pending.selected
             || current_scope != pending.work_scope
-            || !fences_match_exact(&self.snapshot.state_fence(), &pending.activation.state_fence)
+            || !fences_match_exact(
+                &self.snapshot.state_fence(),
+                &pending.activation.state_fence,
+            )
         {
             return Err(CompositionError::ActivationStaleFence);
         }

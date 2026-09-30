@@ -32,8 +32,8 @@ use eliot_protocol::{
 };
 use eliot_store_api::{
     BackupOperationReconciliation, CAPABILITIES, CanonicalRequestView, CanonicalRestoreBatch,
-    CanonicalSnapshotPort, CanonicalStoreClient, CanonicalValidationSnapshot, CausalBinding, EFFECTS,
-    ExactJsonBytes, IsolatedDestination, IsolatedDestinationReceipt, IsolatedRestorePort,
+    CanonicalSnapshotPort, CanonicalStoreClient, CanonicalValidationSnapshot, CausalBinding,
+    EFFECTS, ExactJsonBytes, IsolatedDestination, IsolatedDestinationReceipt, IsolatedRestorePort,
     NamedReadRequest, NamedReadResponse, OperationId, OperationIdentity, OrderingHead,
     OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RequestMeta,
     ReservedWriteRequest, RestoreValidationReceipt, RevisionHead, RevisionHeadExpectation,

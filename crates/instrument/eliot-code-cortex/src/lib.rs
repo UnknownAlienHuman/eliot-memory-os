@@ -560,10 +560,7 @@ impl CodeCortexService {
         current_read_causal_binding: &CausalBinding,
         observations: Vec<(CapturedLspObservation, LspAdoptionProjection)>,
     ) -> Result<Self, CodeCortexError> {
-        validate_current_read_binding(
-            &current_read_task_binding,
-            current_read_causal_binding,
-        )?;
+        validate_current_read_binding(&current_read_task_binding, current_read_causal_binding)?;
         let mut index = SemanticIndex::new();
         for (observation, projection) in observations {
             index.admit_lsp_adoption_projection(

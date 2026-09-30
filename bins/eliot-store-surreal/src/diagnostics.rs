@@ -706,12 +706,9 @@ impl BridgeIdentity {
         match response {
             Response::Transaction { receipt }
             | Response::TransactionWithCausal { receipt, .. }
-            | Response::Genesis { receipt } => {
-                Self::from_receipt(receipt)
-                    .with_manifest_digest(receipt.operation_manifest_digest.as_str())
-            }
-            Response::Receipt { receipt }
-            | Response::ReceiptWithCausal { receipt, .. } => receipt
+            | Response::Genesis { receipt } => Self::from_receipt(receipt)
+                .with_manifest_digest(receipt.operation_manifest_digest.as_str()),
+            Response::Receipt { receipt } | Response::ReceiptWithCausal { receipt, .. } => receipt
                 .as_ref()
                 .map(|entry| {
                     Self::from_receipt(entry)

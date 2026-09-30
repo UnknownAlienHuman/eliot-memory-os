@@ -322,10 +322,8 @@ fn response_for_receipt_lookup_with_causal(
                 }
             } else {
                 let sanitized = sanitized_identity_context(context);
-                match StoreFailure::from_store_error(
-                    StoreError::InvalidReceipt,
-                    sanitized.clone(),
-                ) {
+                match StoreFailure::from_store_error(StoreError::InvalidReceipt, sanitized.clone())
+                {
                     Ok(failure) => Response::canonical_failure(failure),
                     Err(_) => internal_defect_fallback(&sanitized),
                 }
@@ -442,10 +440,9 @@ async fn dispatch_receipt_lookup(
             | ReplayVerdict::RequiresGapDisposition,
         )) => match receipt {
             Some(receipt) => match store.committed_receipt_with_causal(&receipt).await {
-                Ok((receipt, causal)) => response_for_receipt_lookup_with_causal(
-                    Some((receipt, causal)),
-                    context,
-                ),
+                Ok((receipt, causal)) => {
+                    response_for_receipt_lookup_with_causal(Some((receipt, causal)), context)
+                }
                 Err(error) => map_store_error(error, context),
             },
             None => response_for_receipt_lookup_with_causal(None, context),

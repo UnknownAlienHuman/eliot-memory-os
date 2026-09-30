@@ -2514,6 +2514,7 @@ dependencies = [
  "eliot-instrument-scip",
  "eliot-observability",
  "eliot-platform",
+ "eliot-platform-windows",
  "eliot-process",
  "eliot-types",
  "serde",
