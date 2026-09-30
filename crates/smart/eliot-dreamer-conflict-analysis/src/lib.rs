@@ -116,7 +116,11 @@
 //!   observed status, the matched control and the competent evaluator result,
 //!   the intervention execution and receipt where one is claimed, the
 //!   rival/confounder denominator with its omissions, and the retained
-//!   [`EvidenceRecord`] envelopes.
+//!   [`EvidenceRecord`] envelopes. Each envelope's named owner is the source
+//!   identity the envelope itself records, and its receipt digest is reproduced
+//!   by the receipt bytes its owner retained, so the evaluator identity and the
+//!   intervention receipt a claim leans on are read from owner-issued records
+//!   rather than from strings chosen beside them.
 //!
 //! Absent, stale, mixed-fence, or incomplete owner records are an explicit
 //! inert result: the relation stays [`CompatibilityRelation::Ambiguous`], the
@@ -152,8 +156,14 @@
 //!   A claim digest matching no retained bytes is a string, not the source's own
 //!   declared claim.
 //! - an intervention receipt must be the receipt of a retained evidence
-//!   envelope. A 64-character digest matching no envelope is a string, not an
-//!   execution receipt.
+//!   envelope, and that envelope's own receipt identity must be reproduced by
+//!   the receipt bytes its owner retained. A 64-character digest matching no
+//!   envelope is a string, not an execution receipt, and a digest matching an
+//!   envelope whose retained receipt bytes do not reproduce it is still one.
+//! - an evidence envelope's named owner must be the source identity the
+//!   envelope itself records in its provenance. Otherwise the rule that the
+//!   evaluator verdict belongs to the control owner that issued it compares two
+//!   caller strings instead of an owner identity to the record that issued it.
 //! - every envelope's own fence must match the current item fence by exact
 //!   tuple, because the envelope contract proves a fence is well formed, not
 //!   that it is the current one; its provenance must name the current scope and
@@ -163,7 +173,11 @@
 //! - the competent/unqualified/absent evaluator verdict must belong to the
 //!   control owner the record names, and must be carried by an envelope that
 //!   owner issued. A verdict paired with somebody else's retained envelope is a
-//!   caller assertion with a handle on it.
+//!   caller assertion with a handle on it. That comparison is only a comparison
+//!   at all because [`EvidenceRecord::validate`] requires the envelope's named
+//!   owner to equal the source identity the envelope itself records, so
+//!   `control.owner` is read against an owner-issued record rather than against
+//!   a second string the same caller chose.
 //!
 //! Three rules bound the causal ceiling, and each is read from a denominator
 //! that is independent of the others. An envelope's own recorded COVERAGE is the
@@ -346,6 +360,8 @@ pub const MAX_ENVELOPES_PER_RECORD: usize = 16;
 pub const MAX_RETAINED_SOURCE_BYTES: usize = 65_536;
 /// Maximum retained mechanism claim bytes per owner-issued causal record.
 pub const MAX_MECHANISM_CLAIM_BYTES: usize = 16_384;
+/// Maximum retained receipt bytes per owner-issued evidence envelope.
+pub const MAX_RECEIPT_BYTES: usize = 65_536;
 /// Maximum owner-issued comparison profile descriptors.
 pub const MAX_PROFILE_DESCRIPTORS: usize = 8;
 /// Maximum bytes for one owner-issued profile definition.
@@ -778,7 +794,7 @@ pub struct SuppliedComparison {
 /// | [`SourceMemberRecord`] | the source owner that retained the bytes | `position_source` + `record_digest` + `source_revision` under one `state_fence` |
 /// | [`OwnerComparisonProfile`] | the normalization/comparison profile owner | `profile_id` + `owner` + `definition_digest` |
 /// | [`DimensionObservation`] | the profile owner, applied to one source member | `source` + `dimension` + `source_member_digest` |
-/// | [`EvidenceRecord`] | the evidence-source owner | `evidence_id` + `envelope` provenance + `receipt_digest` |
+/// | [`EvidenceRecord`] | the evidence-source owner | `evidence_id` + `envelope` provenance (`source_id`) + `receipt_digest` over `receipt_bytes` |
 /// | [`CausalEvidenceRecord`] | the evaluator/verifier owner | `source_handle` + `mechanism.claim_id` + `mechanism.claim_digest` over `claim_bytes` + fence |
 ///
 /// A-39 reads those identities, validates them against the item's own
@@ -1011,26 +1027,46 @@ impl DimensionObservation {
 /// freshness, coverage, epistemic status, and assertability are read from the
 /// envelope itself and validated by its own contract, so a caller cannot
 /// assert a ceiling it did not earn.
+///
+/// Two identities on this record are checked against the envelope's OWN
+/// recorded content rather than against a parallel caller field, because both
+/// otherwise carry a verdict as a pair of free strings. `owner` must equal the
+/// envelope's own `provenance.source_id`, the source it records as having
+/// produced or contained it; without that the "the evaluator verdict belongs to
+/// the control owner that issued it" rule would compare
+/// [`CausalEvidenceRecord::control`]'s owner string against
+/// [`EvidenceRecord::owner`], which is the same caller supplying both sides.
+/// `receipt_digest` must equal the digest the retained receipt bytes reproduce,
+/// the recorded-digest/retained-bytes pairing
+/// [`SourceMemberRecord::validate`] already applies to a source member and
+/// [`MechanismBinding::validate`] to a declaration; a receipt identity matching
+/// no retained receipt is a string, not a receipt.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EvidenceRecord {
     /// Evidence identity as issued by its owner.
     pub evidence_id: String,
-    /// Authoritative owner identity that captured this evidence.
+    /// Authoritative owner identity that captured this evidence; it must equal
+    /// the source identity the envelope itself records.
     pub owner: String,
     /// The normalized evidence envelope.
     pub envelope: EvidenceEnvelope,
     /// Canonical digest of the retained material this evidence is tied to.
     pub material_digest: String,
-    /// Canonical digest of the receipt that issued this evidence.
+    /// Canonical digest the receipt owner RECORDED for the retained receipt.
     pub receipt_digest: String,
+    /// Exact bytes the receipt owner retained for the issuing receipt.
+    pub receipt_bytes: Vec<u8>,
 }
 
 impl EvidenceRecord {
-    /// Validates the envelope intrinsically plus the material/receipt digests.
+    /// Validates the envelope intrinsically plus the material, issuer, and
+    /// receipt bindings.
     ///
     /// The envelope's own contract supplies the status, authority, and
     /// assertability invariants, including that `Verified` carries an actual
-    /// verification binding.
+    /// verification binding. The receipt digest is the value the owner recorded;
+    /// the retained bytes are compared against it and are never recomputed here
+    /// and substituted for the check.
     pub fn validate(&self) -> Result<(), ConflictAnalysisError> {
         check_handle(&self.evidence_id, "evidence.evidence_id")?;
         check_handle(&self.owner, "evidence.owner")?;
@@ -1042,6 +1078,24 @@ impl EvidenceRecord {
                 field: "evidence.envelope".to_owned(),
                 detail: redact(&err.to_string()),
             })?;
+        if self.owner != self.envelope.provenance.source_id.as_str() {
+            return Err(ConflictAnalysisError::Binding {
+                field: "evidence.owner".to_owned(),
+                detail: "the named owner is not the source identity the envelope records"
+                    .to_owned(),
+            });
+        }
+        if self.receipt_bytes.is_empty() || self.receipt_bytes.len() > MAX_RECEIPT_BYTES {
+            return Err(ConflictAnalysisError::Bounds {
+                phase: "evidence.receipt_bytes".to_owned(),
+                detail: "retained receipt bytes are empty or exceed their ceiling".to_owned(),
+            });
+        }
+        if sha256_hex(&self.receipt_bytes) != self.receipt_digest {
+            return Err(ConflictAnalysisError::Digest {
+                detail: "retained receipt bytes do not reproduce the recorded digest".to_owned(),
+            });
+        }
         Ok(())
     }
 
@@ -1211,9 +1265,11 @@ pub struct ControlBinding {
 /// The receipt is the proof that the execution happened, so it is read as the
 /// receipt of a retained evidence envelope rather than as a digest string:
 /// [`CausalEvidenceRecord::validate`] refuses a record whose receipt matches no
-/// retained envelope. Without that join an intervention would be supportable on
-/// any well-formed 64-character digest, which is precisely the "two hashes look
-/// right" substitution the owner contract exists to prevent.
+/// retained envelope, and that envelope's own `receipt_digest` is in turn
+/// refused unless the receipt bytes its owner retained reproduce it. Without
+/// both joins an intervention would be supportable on any well-formed
+/// 64-character digest, which is precisely the "two hashes look right"
+/// substitution the owner contract exists to prevent.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InterventionBinding {
     /// Execution identity of the intervention.
@@ -1440,7 +1496,11 @@ impl CausalEvidenceRecord {
         // be one that same owner issued. Naming an evaluator handle and pairing
         // it with any retained envelope would otherwise make `Competent` a
         // caller-set field with a handle attached rather than a matched control
-        // backed by a competent evaluator's own record.
+        // backed by a competent evaluator's own record. The comparison below is
+        // only that comparison because `EvidenceRecord::validate` already
+        // required the envelope's `owner` to equal the source identity the
+        // envelope itself records, so this joins an owner identity to an
+        // owner-issued record rather than one caller string to another.
         if let Some(control_evidence) = self
             .evidence
             .iter()
@@ -1457,7 +1517,10 @@ impl CausalEvidenceRecord {
         // issued, so the receipt is read as that receipt rather than as a
         // well-formed digest. A digest matching no retained envelope is the
         // same unbound string the other two legs refuse: without this join an
-        // intervention state would be reachable on any 64 hex characters.
+        // intervention state would be reachable on any 64 hex characters. The
+        // envelope's own `receipt_digest` is itself reproduced by the receipt
+        // bytes `EvidenceRecord::validate` requires, so the matched receipt is
+        // a retained receipt rather than another well-formed digest.
         if let Some(intervention) = &self.intervention
             && !receipt_digests.contains(&intervention.receipt_digest)
         {
@@ -2878,6 +2941,10 @@ fn count_causal_evidence_bytes(records: &[CausalEvidenceRecord]) -> usize {
                 evidence.material_digest.as_str(),
                 evidence.receipt_digest.as_str(),
             ]));
+            // The retained receipt bytes are counted the same way the mechanism
+            // claim's are: a record cannot buy unbounded receipt text with a
+            // digest that costs 64 bytes on the ceiling.
+            total = total.saturating_add(evidence.receipt_bytes.len());
         }
     }
     total
@@ -4810,10 +4877,14 @@ fn owner_causal_record(record: &CausalEvidenceRecord) -> CausalClaimRecord {
 
 /// Preserves every supplied and every owner-issued causal claim.
 ///
-/// An owner-issued record for a source is the one that carries an assessment;
-/// a legacy declaration for the same source is still preserved under its own
-/// unverified ceiling rather than dropped, so the declaration stays visible
-/// beside the evidence that qualified or refused it.
+/// Both are kept, at their own ceilings, even when they name the same source.
+/// An owner-issued record carries the evidence-qualified assessment; a legacy
+/// declaration for that source is still preserved under its own unverified
+/// ceiling rather than dropped. Collapsing the two would let an owner record
+/// silently delete a source's own declared claim, and W6's first requirement is
+/// that the declaration survive verbatim. They stay distinguishable because
+/// `supplement_version` is read on each record, so the unverified entry cannot
+/// be mistaken for the qualified one, and neither is recomputed from the other.
 fn collect_causal_claims(supplements: &ConflictSupplements) -> Vec<CausalClaimRecord> {
     let mut out: Vec<CausalClaimRecord> = supplements
         .owner_records
@@ -4821,17 +4892,20 @@ fn collect_causal_claims(supplements: &ConflictSupplements) -> Vec<CausalClaimRe
         .iter()
         .map(owner_causal_record)
         .collect();
-    let qualified: Vec<String> = out
-        .iter()
-        .map(|record| record.source_handle.clone())
-        .collect();
     for claim in &supplements.causal_claims {
-        if qualified.contains(&claim.source_handle) {
-            continue;
-        }
         out.push(effective_causal_claim(claim));
     }
-    out.sort_by(|left, right| left.source_handle.cmp(&right.source_handle));
+    // `SupplementVersion` carries no `Ord`, so the ceiling is ordered by its
+    // canonical spelling. The spelling is total and distinct per variant, so the
+    // order is deterministic without adding an ordering the enum does not need
+    // for anything else.
+    out.sort_by(|left, right| {
+        left.source_handle.cmp(&right.source_handle).then(
+            left.supplement_version
+                .as_str()
+                .cmp(right.supplement_version.as_str()),
+        )
+    });
     out
 }
 
