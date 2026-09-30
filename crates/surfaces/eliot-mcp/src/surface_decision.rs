@@ -1169,6 +1169,15 @@ pub fn link_expanded_delivery(
 /// caller supplies none, so every entry joins a revision lineage; turn, run,
 /// and attempt identities arrive from their owners or stay unresolved.
 ///
+/// STITCH(bridge/host projection + eliot.observe): no production caller
+/// populates this seam on main yet. The owning caller — the bridge/host
+/// projection that renders the advertised surface — supplies the decision,
+/// the derived permitted subset, and its owner identities, then persists the
+/// returned entry with its [`ExposureRevisionLineage`] through the existing
+/// observation/receipt path (`eliot.observe` capture via
+/// ReceiptEnvelope/CausalBinding). This seam never persists and never mints
+/// execution, transport, or use facts for other owners.
+///
 /// # Errors
 ///
 /// Returns an error when the decision is invalid, the method is outside the
