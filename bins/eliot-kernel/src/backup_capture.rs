@@ -68,7 +68,8 @@ use std::path::{Path, PathBuf};
 
 use eliot_backup::{
     BackupArtifact, BackupBlob, BackupBundle, BackupClass, BackupInput, CanonicalRecord,
-    ExportFence, HostStateAuditFence, OrsSnapshotFence, RestoreEvidenceLevel, WatchdogSpoolFence,
+    ExportFence, HostStateAuditFence, OrsSnapshotFence, PublicationError, PublicationPort,
+    PublishedArchive, RestoreEvidenceLevel, WatchdogSpoolFence,
 };
 use eliot_contracts::{EpochRelation, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_security_contracts::PurgeLedgerEntry;
@@ -76,9 +77,9 @@ use eliot_store_api::WriteReceipt;
 
 use super::backup_capture_ports::{
     CaptureBudgets, CaptureCallerAuth, CapturePorts, FrozenCapturePlan, KernelCaptureError,
-    MEMBER_DOMAIN_PROJECTION, PublicationPort, PublishedArchive, SnapshotRelation,
-    owner_fence_dispositions, owner_residency_key_digest, owner_suspended_recovery_refs,
-    require_capture_admitted, validate_disposition_identities,
+    MEMBER_DOMAIN_PROJECTION, SnapshotRelation, owner_fence_dispositions,
+    owner_residency_key_digest, owner_suspended_recovery_refs, require_capture_admitted,
+    validate_disposition_identities,
 };
 
 /// Owner order for per-owner budget accounting: canonical, blob, purge, ORS,
@@ -674,8 +675,12 @@ impl KernelBackupCapture {
         }
         let receipt = match publisher.publish_once(&operation_id, &idempotency_key, &bytes) {
             Ok(receipt) => receipt,
-            Err(KernelCaptureError::PublicationUnknown(_)) => publisher.reconcile(&operation_id)?,
-            Err(other) => return Err(other),
+            // Only an unknown publication outcome is reconciled, and it is
+            // reconciled in the lower crate's own typed vocabulary: a refusal
+            // that reached this arm is a proven non-publication, and
+            // reconciling it would treat a refusal as a lost response.
+            Err(PublicationError::Unknown(_)) => publisher.reconcile(&operation_id)?,
+            Err(other) => return Err(KernelCaptureError::from(other)),
         };
         let archive = PublishedArchive {
             backup_id: identities.backup_id.clone(),
