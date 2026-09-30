@@ -367,6 +367,11 @@ fn decode_reserved_apply_outcome(
                 .map_err(|error| KernelPortError::Contract(error.to_string()))?;
             validate_store_receipt_envelope(&identity.request.metadata, transition, &receipt)
                 .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+            let _ = super::diagnostics::emit_handoff(
+                super::diagnostics::HandoffKind::Committed,
+                identity.idempotency_key.as_str(),
+                receipt.operation_id.as_str(),
+            );
             Ok(PreparedWriteOutcome::Receipt(Box::new(receipt)))
         }
         WireOutcome::AcceptedPending { value, recovery } => {
@@ -382,7 +387,8 @@ fn decode_reserved_apply_outcome(
             submission
                 .validate()
                 .map_err(|error| KernelPortError::Contract(error.to_string()))?;
-            if submission.operation_id != transition.identity.operation_id
+            if submission.state != eliot_store_api::WriteSubmissionState::Staged
+                || submission.operation_id != transition.identity.operation_id
                 || submission.request_hash != transition.identity.canonical_request_hash
             {
                 return Err(KernelPortError::Contract(
