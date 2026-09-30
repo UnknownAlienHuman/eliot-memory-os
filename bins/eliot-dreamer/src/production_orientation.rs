@@ -17,8 +17,8 @@
 //! | Build the `GroundingRequest` | `grounding_stage::resolve_grounding_inputs` over the same admitted pair | wired |
 //! | Ground the admitted draft | `grounding_stage::ground_admitted_draft` | wired |
 //! | Validate the grounded draft | `validation_stage::validate_admitted_draft` (`ValidatedGroundingCandidate`) | wired |
-//! | Read/build the exact `CanonicalProjectionSet` from Governor/canonical owners | `eliot_governor::canonical_projections::emit_canonical_projection_set`, delivered over [`OrientationSupply`] | wired |
-//! | Acquire the remaining mandatory stages' owner input/receipt | Governor owner records over the same [`OrientationSupply`] channel | wired |
+//! | Read/build the exact `CanonicalProjectionSet` from Governor/canonical owners | `eliot_governor::canonical_projections::emit_canonical_projection_set`, delivered over [`OrientationSupply`] | producer exists in the Governor; the production channel is wired and measures it absent |
+//! | Acquire the remaining mandatory stages' owner input/receipt | Governor owner records over the same [`OrientationSupply`] channel | producer exists in the Governor; the production channel is wired and measures them absent |
 //! | Invoke the pure composer | [`compose_production_result`] below (this module) | wired |
 //! | Publish the typed result | `dispatch_stage::dispatch_orientation` as `DreamResult::Orientation` | wired |
 //!
@@ -30,6 +30,35 @@
 //! hypothesis pair enters beside them as explicit parameters, because
 //! `dispatch_orientation` is what derived and validated that pair. Only values
 //! a Governor/canonical owner publishes travel over [`OrientationSupply`].
+//!
+//! The last two owner-channel rows are measured, not aspirational. The
+//! Governor's producer exists
+//! (`eliot_governor::canonical_projections::emit_canonical_projection_set`) and
+//! a production [`OrientationSupplySource`](crate::OrientationSupplySource) is
+//! wired: `AuthenticatedKernelJobPort::connect` installs
+//! [`KERNEL_STAGED_OWNER_RECORD_SOURCE`](crate::orientation_supply_source::KERNEL_STAGED_OWNER_RECORD_SOURCE),
+//! which reads the owner record the Kernel published with the job and reports,
+//! per member, whether the record it holds publishes it. The record travels the
+//! live seam: `KernelComposition::execute_dreamer_request` publishes the
+//! content-addressed record on
+//! `JobSubmission::owner_record`, the durable owner projects it onto
+//! `DurableJobResponse::owner_record`, and
+//! `kernel_port::validate_owner_response_binding` re-proves the ORIGINAL
+//! recorded digest and byte length against the owner's own reference rather
+//! than recomputing them. The record publishes no member here: it is opaque,
+//! this binary holds no typed seam for its content, and the worker records its
+//! presence, digest and byte length without interpreting it. So the channel is
+//! consulted, and the answer is still absence.
+//!
+//! That absence is reported through the typed disposition this module already
+//! publishes: [`resolve_production_inputs`] returns the
+//! [`OrientationDisposition::Blocked`] result from [`supply_missing_blocked`],
+//! carrying no packet, `CC004_MISSING` on the CC-004 boundary record, and
+//! `missing_owners` naming the canonical projection owner plus every stage
+//! owner. The carrier is not relaxed, no member is defaulted, no lookalike value
+//! is synthesized, and no check is skipped to make a stage fire. The difference
+//! from the unwired channel is only that the verdict now comes from a real read
+//! of a real owner record rather than from a hardcoded `None`.
 //!
 //! A missing adapter is implementation work, never substituted with local
 //! data: the v1 hypothesis pair derived in dispatch is reported only as the
