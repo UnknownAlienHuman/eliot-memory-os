@@ -2,14 +2,15 @@
   "mcpServers": {
     "eliot": {
       "type": "stdio",
-      "command": "${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe",
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/eliot-agent-bridge.exe",
       "args": [
         "mcp",
+        "--profile",
+        "SPINE_FUNCTIONAL",
+        "--transport",
         "stdio",
-        "--host",
-        "claude",
-        "--instance",
-        "default"
+        "--client-declaration",
+        "${CLAUDE_PLUGIN_ROOT}/bin/agent-bridge/client-declaration-v2.json"
       ]
     }
   }
