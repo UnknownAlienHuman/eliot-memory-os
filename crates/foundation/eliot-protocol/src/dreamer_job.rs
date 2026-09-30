@@ -502,6 +502,58 @@ impl DurableJobRuntimeOwnerExecutionInput {
     }
 }
 
+/// One provider-staffing source publication carried with an admitted
+/// Orientation runtime input.
+///
+/// The reference and bytes are retained as one source-owned publication;
+/// this protocol wrapper verifies that the bytes still match the original
+/// content address and canonical JSON encoding. It does not interpret the
+/// provider profile or grant admission. The owning runtime validates the
+/// profile contract identity and its fields before using them.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderStaffingRuntimeSourcePublication {
+    /// Original immutable source reference issued by the provider-runtime
+    /// configuration owner.
+    pub reference: OpaqueContentRef,
+    /// Exact canonical source bytes named by `reference`.
+    pub canonical_bytes: Vec<u8>,
+}
+
+impl ProviderStaffingRuntimeSourcePublication {
+    /// Checks the original reference, byte length, content digest, and
+    /// canonical JSON encoding without replacing or resealing the reference.
+    pub fn validate(&self) -> Result<(), DurableJobError> {
+        self.reference
+            .validate("provider_staffing_source.reference")?;
+        let byte_length = u64::try_from(self.canonical_bytes.len()).map_err(|_| {
+            DurableJobError::InvalidField {
+                field: "provider_staffing_source.canonical_bytes",
+                reason: "byte length is not representable",
+            }
+        })?;
+        if byte_length != self.reference.byte_length
+            || sha256_hex(&self.canonical_bytes) != self.reference.sha256
+        {
+            return Err(DurableJobError::InvalidField {
+                field: "provider_staffing_source.canonical_bytes",
+                reason: "bytes do not match the original content reference",
+            });
+        }
+        let value: serde_json::Value = serde_json::from_slice(&self.canonical_bytes)
+            .map_err(|error| DurableJobError::Serialization(error.to_string()))?;
+        let canonical = canonical_json_bytes(&value)
+            .map_err(|error| DurableJobError::Serialization(error.to_string()))?;
+        if canonical != self.canonical_bytes {
+            return Err(DurableJobError::InvalidField {
+                field: "provider_staffing_source.canonical_bytes",
+                reason: "source bytes are not canonical JSON",
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Fresh transport correlation, separate from the stable mutation identity.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]

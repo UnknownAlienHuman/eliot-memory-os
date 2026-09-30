@@ -2,8 +2,8 @@
 
 use eliot_agent_api::{AttemptId, RouteFingerprint};
 use eliot_agent_coordinator::{
-    HumanModelPreferencePolicy, ModelCatalogueSnapshot, ModelControlError, ModelRole,
-    ModelSelectionReceipt, compile_model_selection,
+    AgentCoordinator, HumanModelPreferencePolicy, ModelCatalogueSnapshot, ModelControlError,
+    ModelRole, ModelSelectionReceipt, PlanGap, compile_model_selection,
 };
 use eliot_agent_opencode::{
     AdmittedOpenCodeAttempt, ModelSelection, ModelSelectionError, OpenCodeClient,
@@ -18,16 +18,25 @@ use eliot_dreamer_contracts::{
     ContractViolation, DreamInputBundle, DreamJobAdmission, DreamJobInput, ModelRouteRequestError,
     PROVIDER_OUTPUT_SCHEMA_VERSION, RecipeInput, provider_output_schema_v2,
 };
-use eliot_protocol::dreamer_job::{DurableJobError, OpaqueContentRef};
+use eliot_protocol::dreamer_job::{
+    DurableJobError, OpaqueContentRef, ProviderStaffingRuntimeSourcePublication,
+};
 use eliot_read::LocalReadPort;
 use eliot_store_api::ScopeId;
 use serde_json::Value;
 
-use super::agent_fabric::{AdmittedOpenCodeAttemptProjectionError, AgentFabric};
-use super::dreamer_materials::{AdmittedSourceClaim, DreamerMaterialsError, resolve_source_claim};
+use super::agent_fabric::{
+    AdmittedOpenCodeAttemptProjectionError, AgentFabric, daemon_coordinator_config,
+};
+use super::dreamer_materials::{
+    AdmittedSourceClaim, DreamerMaterialsError, resolve_source_claim,
+};
 use super::dreamer_orientation_model::{
     DreamerOrientationModelAttempt, DreamerOrientationModelInput,
     admitted_model_route_context_bytes, run_admitted_model_route,
+};
+use super::dreamer_model_adapter::{
+    DreamerProviderStaffingRuntimeProfile, DreamerProviderStaffingRuntimeProfileError,
 };
 
 /// Per-call immutable semantic, admission, route, and runtime owner inputs.
@@ -40,6 +49,10 @@ pub struct DreamerOrientationModelWorkerInput<'a, R: LocalReadPort> {
     pub bundle: &'a DreamInputBundle,
     pub catalogue: &'a ModelCatalogueSnapshot,
     pub policy: &'a HumanModelPreferencePolicy,
+    /// Original provider-runtime staffing profile publication. Missing is a
+    /// typed residual: provider/model selection alone does not supply recipe,
+    /// role, capacity, launch or provider identity.
+    pub provider_staffing_source: Option<&'a ProviderStaffingRuntimeSourcePublication>,
     pub now_unix_ms: u64,
     /// Exact recipe member from the original admitted output-schema role.
     pub output_schema_recipe: &'a RecipeInput,
@@ -74,6 +87,12 @@ pub enum DreamerOrientationModelWorkerError {
     JobContract(#[from] ContractViolation),
     #[error(transparent)]
     Selection(#[from] ModelControlError),
+    #[error("provider staffing source is absent from the original runtime input")]
+    ProviderStaffingSourceMissing,
+    #[error(transparent)]
+    ProviderStaffingProfile(#[from] DreamerProviderStaffingRuntimeProfileError),
+    #[error("original staffing request is invalid: {0}")]
+    StaffingPlan(String),
     #[error(transparent)]
     ConfiguredRoute(#[from] OpenCodeRouteSelectionError),
     #[error(transparent)]
@@ -138,6 +157,25 @@ pub async fn execute_admitted_orientation_model(
     }
     let prompt_bytes = admitted_model_route_context_bytes(&job, input.admission, input.bundle)?;
 
+    let staffing_publication = input
+        .provider_staffing_source
+        .ok_or(DreamerOrientationModelWorkerError::ProviderStaffingSourceMissing)?;
+    let staffing_profile = DreamerProviderStaffingRuntimeProfile::from_publication(
+        staffing_publication,
+    )?;
+    let coordinator_config = daemon_coordinator_config()
+        .map_err(|error| DreamerOrientationModelWorkerError::StaffingPlan(error.to_string()))?;
+    let mut coordinator = AgentCoordinator::new(
+        coordinator_config,
+        PlanGap::G11Unavailable {
+            reason: "provider admission is issued only by the external Governor owner".to_owned(),
+        },
+    )
+    .map_err(|error| DreamerOrientationModelWorkerError::StaffingPlan(error.to_string()))?;
+    let staffing_candidate = coordinator
+        .plan(staffing_profile.staffing_request.clone())
+        .map_err(|error| DreamerOrientationModelWorkerError::StaffingPlan(error.to_string()))?;
+
     let selection = compile_model_selection(
         input.catalogue,
         input.policy,
@@ -152,6 +190,21 @@ pub async fn execute_admitted_orientation_model(
         .any(|route| route == &selection.selected.entry_id)
     {
         return Err(ModelRouteRequestError::SelectedRouteOutsideDenominator.into());
+    }
+    staffing_profile.validate_for_orientation(
+        &job,
+        input.admission,
+        input.bundle,
+        &selection.selected.route,
+    )?;
+    let planned_lane = staffing_candidate.lanes.iter().find(|lane| {
+        lane.work_unit_id == staffing_profile.orientation_work_unit_id
+            && lane.role_id == staffing_profile.orientation_role_id
+    });
+    if planned_lane.and_then(|lane| lane.routing.selected.as_ref())
+        != Some(&selection.selected.route)
+    {
+        return Err(DreamerProviderStaffingRuntimeProfileError::OperationBinding.into());
     }
     select_opencode_route(
         route_admission,

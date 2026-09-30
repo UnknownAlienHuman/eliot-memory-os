@@ -72,14 +72,20 @@ use eliot_agent_api::{
 };
 use eliot_agent_coordinator::{
     AgentCoordinator, CoordinatorConfig, HumanModelPreferencePolicy, ModelCatalogueSnapshot,
-    ModelRole, PlanGap, StaffingPlanCandidate, StaffingPlanRequest,
+    ModelRole, PlanGap, ProviderIdentity, RoleProfileId, StaffingPlanCandidate,
+    StaffingPlanRequest,
 };
+use eliot_agent_api::WorkUnitId;
 use eliot_agent_opencode::{OpenCodeClient, OpenCodeRouteAdmission};
-use eliot_contracts::{ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence};
-use eliot_governor::{CompositionError, CompositionReadiness, RouteScopeFingerprint};
-use eliot_protocol::ContinuityKind;
 use eliot_read::LocalReadPort;
-use serde::Deserialize;
+use eliot_contracts::{
+    ClockReading, ContractIdentity, ContractVersion, ProductId, RequestId, RequestMetadata,
+    SourceId, StateFence, canonical_json_bytes, contract_identity,
+};
+use eliot_governor::{CompositionError, CompositionReadiness, RouteScopeFingerprint};
+use eliot_protocol::{ContinuityKind, dreamer_job::ProviderStaffingRuntimeSourcePublication};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 use super::capability_admission::{
     CapabilityEvidenceRecord, CapabilityEvidenceStatus, DynamicCapabilityPulse,
@@ -99,6 +105,151 @@ use super::route_execution_identity::{
 };
 use super::route_receipts::{RuntimeObservedFacts, effective_route_key};
 use super::{DaemonComposition, DaemonKernelClient, SERVICE_NAME, kernel_port_error};
+
+/// Contract name for the explicit daemon/provider staffing source used by
+/// one native Orientation execution.
+pub const DREAMER_PROVIDER_STAFFING_RUNTIME_SOURCE_CONTRACT_NAME: &str =
+    "eliot.dreamer.provider-staffing-runtime-source";
+/// Contract version for the provider staffing source.
+pub const DREAMER_PROVIDER_STAFFING_RUNTIME_SOURCE_CONTRACT_VERSION: ContractVersion =
+    ContractVersion::new(1, 0, 0);
+const DREAMER_PROVIDER_STAFFING_RUNTIME_SOURCE_SCHEMA_VERSION: u32 = 1;
+
+/// Native provider-runtime configuration carried unchanged by the original
+/// source publication. Staffing, recipe, role, launch, privacy, capacity and
+/// provider identity all remain values issued by their existing owners; this
+/// profile does not synthesize them from the model selection.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DreamerProviderStaffingRuntimeProfile {
+    /// Exact profile schema version.
+    pub schema_version: u32,
+    /// Canonical DreamJobAdmission identity this profile was issued for.
+    pub admitted_job_id: String,
+    /// Provider identity supplied by the configured provider owner.
+    pub provider_identity: ProviderIdentity,
+    /// Original explicit staffing request, including recipe and launch data.
+    pub staffing_request: StaffingPlanRequest,
+    /// Exact lane this Orientation call is authorized to use.
+    pub orientation_work_unit_id: WorkUnitId,
+    /// Exact role profile for the Orientation lane.
+    pub orientation_role_id: RoleProfileId,
+}
+
+/// Rejection while resolving one original provider-staffing source.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum DreamerProviderStaffingRuntimeProfileError {
+    /// The outer source reference or bytes are invalid.
+    #[error("provider staffing source publication is invalid: {0}")]
+    Publication(String),
+    /// The content reference names another source contract.
+    #[error("provider staffing source contract identity does not match the runtime schema")]
+    ContractIdentity,
+    /// The source carries another profile revision.
+    #[error("provider staffing source has an unsupported schema version")]
+    SchemaVersion,
+    /// The selected route, job, bundle, or provider capacity differs from
+    /// the exact original staffing owner input.
+    #[error("provider staffing source does not bind the admitted Orientation operation")]
+    OperationBinding,
+}
+
+impl DreamerProviderStaffingRuntimeProfile {
+    /// Returns the content-addressed profile contract identity.
+    pub fn contract_identity(
+    ) -> Result<ContractIdentity, DreamerProviderStaffingRuntimeProfileError> {
+        let shape = serde_json::json!({
+            "schema_version": DREAMER_PROVIDER_STAFFING_RUNTIME_SOURCE_SCHEMA_VERSION,
+            "admitted_job_id": "DreamJobAdmission::canonical_id()",
+            "provider_identity": "eliot_agent_coordinator::ProviderIdentity",
+            "staffing_request": "eliot_agent_coordinator::StaffingPlanRequest",
+            "orientation_work_unit_id": "eliot_agent_coordinator::WorkUnitId",
+            "orientation_role_id": "eliot_agent_coordinator::RoleProfileId",
+        });
+        contract_identity(
+            DREAMER_PROVIDER_STAFFING_RUNTIME_SOURCE_CONTRACT_NAME,
+            DREAMER_PROVIDER_STAFFING_RUNTIME_SOURCE_CONTRACT_VERSION,
+            &shape,
+        )
+        .map_err(|_| DreamerProviderStaffingRuntimeProfileError::ContractIdentity)
+    }
+
+    /// Decodes only the exact, original canonical source publication.
+    pub fn from_publication(
+        publication: &ProviderStaffingRuntimeSourcePublication,
+    ) -> Result<Self, DreamerProviderStaffingRuntimeProfileError> {
+        publication
+            .validate()
+            .map_err(|error| DreamerProviderStaffingRuntimeProfileError::Publication(error.to_string()))?;
+        if publication.reference.contract != Self::contract_identity()? {
+            return Err(DreamerProviderStaffingRuntimeProfileError::ContractIdentity);
+        }
+        let profile: Self = serde_json::from_slice(&publication.canonical_bytes)
+            .map_err(|error| DreamerProviderStaffingRuntimeProfileError::Publication(error.to_string()))?;
+        if profile.schema_version != DREAMER_PROVIDER_STAFFING_RUNTIME_SOURCE_SCHEMA_VERSION {
+            return Err(DreamerProviderStaffingRuntimeProfileError::SchemaVersion);
+        }
+        if canonical_json_bytes(&profile)
+            .map_err(|error| DreamerProviderStaffingRuntimeProfileError::Publication(error.to_string()))?
+            != publication.canonical_bytes
+        {
+            return Err(DreamerProviderStaffingRuntimeProfileError::Publication(
+                "typed provider staffing profile differs from its original canonical bytes".to_owned(),
+            ));
+        }
+        Ok(profile)
+    }
+
+    /// Joins the explicit profile lane to the original job/bundle and exact
+    /// model route selected by the current catalogue and Human policy.
+    pub fn validate_for_orientation(
+        &self,
+        job: &eliot_dreamer_contracts::DreamJobInput,
+        admission: &eliot_dreamer_contracts::DreamJobAdmission,
+        bundle: &eliot_dreamer_contracts::DreamInputBundle,
+        selected_route: &eliot_agent_api::RouteFingerprint,
+    ) -> Result<(), DreamerProviderStaffingRuntimeProfileError> {
+        let request = &self.staffing_request;
+        if self.schema_version != DREAMER_PROVIDER_STAFFING_RUNTIME_SOURCE_SCHEMA_VERSION
+            || self.admitted_job_id != admission.canonical_id()
+            || self.admitted_job_id != bundle.job_id
+            || admission.job_class != job.job_class
+            || admission.requester.principal != job.requester
+            || admission.scope_id != job.scope_id
+            || admission.scope_id != bundle.scope_id
+            || admission.task_id != bundle.task_id
+            || admission.privacy_profile != job.privacy_profile
+            || admission.state_fence != job.state_fence
+            || request.launch.task_id.as_str() != bundle.task_id
+            || request.state_fence != bundle.state_fence
+            || request.state_fence != job.state_fence
+        {
+            return Err(DreamerProviderStaffingRuntimeProfileError::OperationBinding);
+        }
+        let lane = request.lanes.iter().find(|lane| {
+            lane.work_unit_id == self.orientation_work_unit_id
+                && lane.role_id == self.orientation_role_id
+        });
+        let Some(lane) = lane else {
+            return Err(DreamerProviderStaffingRuntimeProfileError::OperationBinding);
+        };
+        let route = lane
+            .route_candidates
+            .iter()
+            .find(|candidate| candidate.route == *selected_route);
+        let Some(route) = route else {
+            return Err(DreamerProviderStaffingRuntimeProfileError::OperationBinding);
+        };
+        if route.capacity_identity != self.provider_identity.capacity_identity
+            || route.capacity_revision != self.provider_identity.capacity_revision
+            || selected_route.provider.trim().is_empty()
+            || selected_route.model.trim().is_empty()
+        {
+            return Err(DreamerProviderStaffingRuntimeProfileError::OperationBinding);
+        }
+        Ok(())
+    }
+}
 
 /// Closed model-execution port behind the governed invoke.
 ///
