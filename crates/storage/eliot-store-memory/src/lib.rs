@@ -49,12 +49,14 @@ use eliot_store_api::{
     is_genesis_fence, issue_genesis_receipt_envelope,
     named_mutation_operation_name, sha256_hex, validate_automation_read_params,
     validate_genesis_receipt_envelope, validate_reactive_ledger_read_params,
-    validate_resource_snapshot_read_params, validate_store_receipt_envelope,
+    validate_resource_snapshot_read_params,
     issue_store_receipt_envelope_with_causal, validate_store_receipt_envelope_with_causal,
     verify_canonical_request_hash,
     verify_ordering_scope_binding,
 };
 use schemars::JsonSchema;
+#[cfg(test)]
+use eliot_store_api::validate_store_receipt_envelope;
 use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
