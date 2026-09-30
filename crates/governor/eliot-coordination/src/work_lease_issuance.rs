@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use eliot_agent_contracts::AgentAttemptId;
 use eliot_contracts::{
     EpochId, StateFence, WORK_LEASE_NAMESPACE, WORK_LEASE_WIRE_REVISION,
     WorkLeaseId as CanonicalWorkLeaseId, canonical_json_bytes, sha256_hex,
@@ -10,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Revision of the complete owner-issued `WorkLease` evidence encoding.
-pub const WORK_LEASE_ISSUANCE_REVISION: &str = "eliot.governor.work-lease-issuance.v1";
+pub const WORK_LEASE_ISSUANCE_REVISION: &str = "eliot.governor.work-lease-issuance.v2";
+const LEGACY_WORK_LEASE_ISSUANCE_REVISION: &str = "eliot.governor.work-lease-issuance.v1";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -29,6 +31,8 @@ pub enum WorkLeaseIssuanceError {
     EvidenceEncodingRejected,
     #[error("canonical WorkLease identity contract rejected owner-issued evidence")]
     CanonicalContractRejected,
+    #[error("owner-issued Agent attempt identity was rejected by its contract")]
+    AttemptIdentityRejected,
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -46,6 +50,14 @@ pub struct WorkLeaseIssuanceProvenance {
     source_request: super::WorkLeaseRequest,
     source_decision: super::WorkLeaseDecision,
     evidence_commitment_sha256: String,
+    /// Explicit provenance revision. Absent only on historical v1 records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    issuance_revision: Option<String>,
+    /// Original attempt allocated atomically with this lease issuance.
+    /// Missing is accepted only when decoding legacy provenance written
+    /// before attempt correlation was added; such records do not gain an ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent_attempt_id: Option<AgentAttemptId>,
 }
 
 impl WorkLeaseIssuanceProvenance {
@@ -69,11 +81,29 @@ impl WorkLeaseIssuanceProvenance {
         &self.evidence_commitment_sha256
     }
 
+    /// Returns the original owner-issued logical attempt, or `None` for a
+    /// legacy lease whose issuance predates attempt correlation.
+    #[must_use]
+    pub const fn agent_attempt_id(&self) -> Option<&AgentAttemptId> {
+        self.agent_attempt_id.as_ref()
+    }
+
     fn validate(&self) -> Result<(), WorkLeaseIssuanceError> {
         validate_request_binding(&self.source_request, &self.source_decision)?;
-        let expected = issue_provenance(self.source_request.clone(), self.source_decision.clone())?;
+        let expected = match self.issuance_revision.as_deref() {
+            None if self.agent_attempt_id.is_none() => issue_provenance_with_revision(
+                self.source_request.clone(),
+                self.source_decision.clone(),
+                LEGACY_WORK_LEASE_ISSUANCE_REVISION,
+            )?,
+            Some(revision) if revision == WORK_LEASE_ISSUANCE_REVISION => {
+                issue_provenance(self.source_request.clone(), self.source_decision.clone())?
+            }
+            _ => return Err(WorkLeaseIssuanceError::InconsistentOwnerEvidence),
+        };
         if expected.canonical_work_lease_id != self.canonical_work_lease_id
             || expected.evidence_commitment_sha256 != self.evidence_commitment_sha256
+            || expected.agent_attempt_id != self.agent_attempt_id
         {
             return Err(WorkLeaseIssuanceError::InconsistentOwnerEvidence);
         }
@@ -111,6 +141,13 @@ impl WorkLeaseIssuanceResult {
     #[must_use]
     pub fn evidence_commitment_sha256(&self) -> &str {
         self.provenance.evidence_commitment_sha256()
+    }
+
+    /// Returns the exact logical attempt allocated with this owner-issued
+    /// lease, or `None` when replaying a legacy issuance without one.
+    #[must_use]
+    pub const fn agent_attempt_id(&self) -> Option<&AgentAttemptId> {
+        self.provenance.agent_attempt_id()
     }
 }
 
@@ -472,8 +509,20 @@ fn issue_provenance(
     source_request: super::WorkLeaseRequest,
     source_decision: super::WorkLeaseDecision,
 ) -> Result<WorkLeaseIssuanceProvenance, WorkLeaseIssuanceError> {
+    issue_provenance_with_revision(
+        source_request,
+        source_decision,
+        WORK_LEASE_ISSUANCE_REVISION,
+    )
+}
+
+fn issue_provenance_with_revision(
+    source_request: super::WorkLeaseRequest,
+    source_decision: super::WorkLeaseDecision,
+    revision: &'static str,
+) -> Result<WorkLeaseIssuanceProvenance, WorkLeaseIssuanceError> {
     let evidence = WorkLeaseIssuanceEvidence {
-        revision: WORK_LEASE_ISSUANCE_REVISION,
+        revision,
         source_request: &source_request,
         source_decision: &source_decision,
     };
@@ -481,11 +530,22 @@ fn issue_provenance(
         .map_err(|_| WorkLeaseIssuanceError::EvidenceEncodingRejected)?;
     let evidence_commitment_sha256 = sha256_hex(&bytes);
     let canonical_work_lease_id = canonical_work_lease_id(&evidence_commitment_sha256)?;
+    let agent_attempt_id = if revision == WORK_LEASE_ISSUANCE_REVISION {
+        Some(
+            AgentAttemptId::new(format!("coord-attempt-{evidence_commitment_sha256}"))
+                .map_err(|_| WorkLeaseIssuanceError::AttemptIdentityRejected)?,
+        )
+    } else {
+        None
+    };
     Ok(WorkLeaseIssuanceProvenance {
         canonical_work_lease_id,
         source_request,
         source_decision,
         evidence_commitment_sha256,
+        issuance_revision: (revision == WORK_LEASE_ISSUANCE_REVISION)
+            .then(|| revision.to_owned()),
+        agent_attempt_id,
     })
 }
 

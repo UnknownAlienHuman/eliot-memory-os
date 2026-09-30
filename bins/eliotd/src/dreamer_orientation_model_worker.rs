@@ -2,8 +2,8 @@
 
 use eliot_agent_api::{AttemptId, RouteFingerprint};
 use eliot_agent_coordinator::{
-    AgentCoordinator, HumanModelPreferencePolicy, ModelCatalogueSnapshot, ModelControlError,
-    ModelRole, ModelSelectionReceipt, PlanGap, compile_model_selection,
+    HumanModelPreferencePolicy, ModelCatalogueSnapshot, ModelControlError, ModelRole,
+    ModelSelectionReceipt, ProviderAdmissionReceipt, compile_model_selection,
 };
 use eliot_agent_opencode::{
     AdmittedOpenCodeAttempt, ModelSelection, ModelSelectionError, OpenCodeClient, OpenCodeRouteAdmission,
@@ -14,6 +14,7 @@ use eliot_contracts::{
     ContractVersion, RequestMetadata, StateFence, canonical_json_bytes, contract_identity,
     sha256_hex,
 };
+use eliot_coordination::{CoordinationOwner, WorkLeaseRequest};
 use eliot_dreamer_contracts::{
     ContractViolation, DreamInputBundle, DreamJobAdmission, DreamJobInput, ModelRouteRequestError,
     PROVIDER_OUTPUT_SCHEMA_VERSION, RecipeInput, provider_output_schema_v2,
@@ -22,11 +23,12 @@ use eliot_protocol::dreamer_job::{
     DurableJobError, OpaqueContentRef, ProviderStaffingRuntimeSourcePublication,
 };
 use eliot_read::LocalReadPort;
+use eliot_receipts::WorkScopeBinding;
 use eliot_store_api::ScopeId;
 use serde_json::Value;
 
 use super::agent_fabric::{
-    AdmittedOpenCodeAttemptProjectionError, AgentFabric, daemon_coordinator_config,
+    AdmittedOpenCodeAttemptProjectionError, AgentFabric,
 };
 use super::dreamer_materials::{
     AdmittedSourceClaim, DreamerMaterialsError, resolve_source_claim,
@@ -47,6 +49,9 @@ pub struct DreamerOrientationModelWorkerInput<'a, R: LocalReadPort> {
     pub semantic_input_bytes: &'a [u8],
     pub admission: &'a DreamJobAdmission,
     pub bundle: &'a DreamInputBundle,
+    /// Original WorkScope from the durable submit, retained unchanged by the
+    /// Task Controller runtime-owner input.
+    pub work_scope: &'a WorkScopeBinding,
     pub catalogue: &'a ModelCatalogueSnapshot,
     pub policy: &'a HumanModelPreferencePolicy,
     /// Original provider-runtime staffing profile publication. Missing is a
@@ -66,8 +71,15 @@ pub struct DreamerOrientationModelWorkerInput<'a, R: LocalReadPort> {
     pub source_read_context: &'a RequestMetadata,
     pub source_scope: &'a ScopeId,
     /// Actual runtime AgentFabric that retains the original attempt record.
-    pub fabric: &'a AgentFabric,
-    pub attempt_id: &'a AttemptId,
+    pub fabric: &'a mut AgentFabric,
+    /// Live Coordination owner used to acquire or exactly replay this
+    /// operation's original logical lease issuance.
+    pub coordination_owner: &'a mut CoordinationOwner,
+    /// Original authenticated work-lease request for this model operation.
+    pub work_lease_request: WorkLeaseRequest,
+    /// Original Governor-issued provider admission, verified again by the
+    /// sealed AgentCoordinator on use.
+    pub provider_admission: Option<&'a ProviderAdmissionReceipt>,
     pub current_fence: &'a StateFence,
 }
 
@@ -89,6 +101,8 @@ pub enum DreamerOrientationModelWorkerError {
     Selection(#[from] ModelControlError),
     #[error("provider staffing source is absent from the original runtime input")]
     ProviderStaffingSourceMissing,
+    #[error("original provider admission is absent from the runtime owner input")]
+    ProviderAdmissionMissing,
     #[error(transparent)]
     ProviderStaffingProfile(#[from] DreamerProviderStaffingRuntimeProfileError),
     #[error("original staffing request is invalid: {0}")]
@@ -107,6 +121,16 @@ pub enum DreamerOrientationModelWorkerError {
     AttemptOwner(#[from] AdmittedOpenCodeAttemptProjectionError),
     #[error("original recipe, durable output-contract reference and job output schema differ")]
     OutputSchemaBindingMismatch,
+    #[error("original Coordination lease has no owner-issued Agent attempt identity")]
+    LegacyWorkLeaseAttemptIdentity,
+    #[error("original Coordination lease does not bind this admitted model operation")]
+    WorkLeaseBindingMismatch,
+    #[error("original durable WorkScope does not bind this admitted model operation")]
+    WorkScopeBindingMismatch,
+    #[error("original Governor provider admission does not bind the owner-issued attempt, lease, candidate, or selected lane")]
+    ProviderAdmissionBindingMismatch,
+    #[error(transparent)]
+    WorkLeaseIssuance(#[from] eliot_coordination::WorkLeaseIssuanceFailure),
     #[error("original output-contract identity does not describe the resolved schema")]
     OutputSchemaIdentityMismatch,
     #[error("resolved output schema is not a canonical JSON object")]
@@ -149,6 +173,19 @@ pub async fn execute_admitted_orientation_model(
     }
     input.admission.validate()?;
     input.bundle.validate()?;
+    input.work_scope
+        .state_fence
+        .validate()
+        .map_err(|_| DreamerOrientationModelWorkerError::WorkScopeBindingMismatch)?;
+    if input.work_scope.scope_id.as_str() != job.scope_id.as_str()
+        || input.work_scope.scope_id.as_str() != input.bundle.scope_id.as_str()
+        || input.work_scope.state_fence != job.state_fence
+        || input.work_scope.state_fence != input.bundle.state_fence
+        || input.work_scope.resource_generation != job.state_fence.resource_generation
+        || input.work_scope.resource_generation != input.bundle.state_fence.resource_generation
+    {
+        return Err(DreamerOrientationModelWorkerError::WorkScopeBindingMismatch);
+    }
     let output_schema = resolve_original_output_schema(&input, &job).await?;
     if input.source_read_context.state_fence != job.state_fence
         || input.source_scope.as_str() != job.scope_id.as_str()
@@ -163,17 +200,9 @@ pub async fn execute_admitted_orientation_model(
     let staffing_profile = DreamerProviderStaffingRuntimeProfile::from_publication(
         staffing_publication,
     )?;
-    let coordinator_config = daemon_coordinator_config()
-        .map_err(|error| DreamerOrientationModelWorkerError::StaffingPlan(error.to_string()))?;
-    let mut coordinator = AgentCoordinator::new(
-        coordinator_config,
-        PlanGap::G11Unavailable {
-            reason: "provider admission is issued only by the external Governor owner".to_owned(),
-        },
-    )
-    .map_err(|error| DreamerOrientationModelWorkerError::StaffingPlan(error.to_string()))?;
-    let staffing_candidate = coordinator
-        .plan(staffing_profile.staffing_request.clone())
+    let (_, staffing_candidate) = input
+        .fabric
+        .define_and_plan(staffing_profile.staffing_request.clone())
         .map_err(|error| DreamerOrientationModelWorkerError::StaffingPlan(error.to_string()))?;
 
     let selection = compile_model_selection(
@@ -206,6 +235,49 @@ pub async fn execute_admitted_orientation_model(
     {
         return Err(DreamerProviderStaffingRuntimeProfileError::OperationBinding.into());
     }
+    let work_lease_request = &input.work_lease_request;
+    if job.task_id.as_deref() != Some(input.bundle.task_id.as_str())
+        || work_lease_request.work_item_id != input.bundle.task_id
+        || input.source_read_context.session_id.as_deref()
+            != Some(work_lease_request.session_id.as_str())
+        || work_lease_request.state_fence != *input.current_fence
+        || work_lease_request.state_fence != job.state_fence
+        || work_lease_request.authority_epoch != input.current_fence.authority_epoch
+    {
+        return Err(DreamerOrientationModelWorkerError::WorkLeaseBindingMismatch);
+    }
+    let work_lease = input
+        .coordination_owner
+        .acquire_work_with_issuance(work_lease_request.clone())?;
+    let attempt_id = work_lease
+        .agent_attempt_id()
+        .cloned()
+        .ok_or(DreamerOrientationModelWorkerError::LegacyWorkLeaseAttemptIdentity)?;
+    if work_lease.decision().lease.state_fence != *input.current_fence {
+        return Err(DreamerOrientationModelWorkerError::WorkLeaseBindingMismatch);
+    }
+    let provider_admission = input
+        .provider_admission
+        .ok_or(DreamerOrientationModelWorkerError::ProviderAdmissionMissing)?;
+    let admitted_lane = provider_admission.admitted_lanes.iter().find(|lane| {
+        lane.work_unit_id == staffing_profile.orientation_work_unit_id
+            && lane.role_id == staffing_profile.orientation_role_id
+    });
+    if provider_admission.candidate_id != staffing_candidate.candidate_id
+        || provider_admission.state_fence != *input.current_fence
+        || provider_admission.coordinator_lease != *work_lease.work_lease_id()
+        || provider_admission.provider_identity != staffing_profile.provider_identity
+        || admitted_lane.is_none_or(|lane| {
+            lane.attempt_id != attempt_id
+                || lane.lease_id != *work_lease.work_lease_id()
+                || lane.route != selection.selected.route
+        })
+    {
+        return Err(DreamerOrientationModelWorkerError::ProviderAdmissionBindingMismatch);
+    }
+    input
+        .fabric
+        .admit_provider_admission(provider_admission.clone())?;
     select_opencode_route(
         route_admission,
         &selection.selected.route,
@@ -218,7 +290,8 @@ pub async fn execute_admitted_orientation_model(
         selection.selected.model_id.clone(),
     )?;
     let admitted = input.fabric.admitted_open_code_attempt(
-        input.attempt_id,
+        &attempt_id,
+        work_lease.work_lease_id(),
         &selection.selected.route,
         model,
         input.current_fence,
