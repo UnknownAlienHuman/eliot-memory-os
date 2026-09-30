@@ -23,11 +23,13 @@ use eliot_process::{
 
 use super::diagnostic_brief::DiagnosticTrigger;
 use super::kernel_audit::{AuditEventDraft, AuditEventKind};
+#[cfg(windows)]
+use super::DaemonRestartRefusal;
 use super::{
-    ACTIVE_DAEMON_CALLER, DaemonRuntimeStatus, ELIOTD_MAX_RECOVERY_ATTEMPTS, KernelBuildError,
-    KernelComposition, daemon_class_withholds_replacement, daemon_refuses_replacement,
-    daemon_restart_refusal_reason, daemon_status_proves_ready, eliotd_launch_attempt_identity,
-    eliotd_operation_id, fresh_eliotd_launch_descriptor, probe_ready_state_admitted, sha256_hex,
+    ACTIVE_DAEMON_CALLER, DaemonRuntimeStatus, KernelBuildError, KernelComposition,
+    daemon_class_withholds_replacement, daemon_refuses_replacement, daemon_restart_refusal_reason,
+    daemon_status_proves_ready, eliotd_launch_attempt_identity, eliotd_operation_id,
+    fresh_eliotd_launch_descriptor, probe_ready_state_admitted, sha256_hex,
     stable_owner_principal_digest,
 };
 
@@ -466,6 +468,110 @@ impl KernelComposition {
         Ok(evidence.view().clone())
     }
 
+    /// Decides one automatic restart attempt against the owner's DURABLE
+    /// restart record and returns the refusal that withholds it, or `None`
+    /// when the attempt is admitted.
+    ///
+    /// `attempt` is the Kernel's restart ordinal for this process lifetime and
+    /// is NOT the budget: it names the replacement generation and is compared
+    /// against the threshold the admitted declaration itself declares. The
+    /// decision that must survive a daemon restart is the durable one, and it
+    /// is read from this owner's retained ORS restart record - keyed to the
+    /// supervised child's stable identity (`ACTIVE_DAEMON_CALLER`) and to the
+    /// admitted generation being replaced.
+    ///
+    /// Two refusals can arise here, and both are absences rather than
+    /// defaults:
+    ///
+    /// * no admitted restart policy means this child has no declared restart
+    ///   budget at all, so its replacement is refused as
+    ///   `DaemonRestartRefusal::PolicyNotAdmitted` BEFORE the previous
+    ///   generation is closed. That ordering matters: a withheld replacement
+    ///   must never destroy a child it cannot replace.
+    /// * a durable record that already exists under this child's identity and
+    ///   admitted generation means the restart disposition for this lineage was
+    ///   already decided durably, so the attempt is refused as
+    ///   `DaemonRestartRefusal::RestartBudgetExhausted` and no fresh window is
+    ///   opened. That record is what a recreated supervisor reads back.
+    ///
+    /// The third outcome is an unreadable or invalid durable record, which is
+    /// returned as a mechanical failure: an unreadable record is never read as
+    /// an absent one and never as permission.
+    #[cfg(windows)]
+    fn admit_daemon_restart_attempt(
+        &self,
+        launch: &EliotdLaunchDescriptor,
+        attempt: u64,
+        previous_receipt: Option<&ProcessStartReceipt>,
+    ) -> Result<Option<DaemonRestartRefusal>, KernelBuildError> {
+        let admitted_generation = launch.generation;
+        let admitted_state_fence = eliot_contracts::StateFence::new(
+            launch.authority_epoch.clone(),
+            admitted_generation,
+        );
+        let Some(admitted) = self.daemon_restart_policy.as_ref() else {
+            return Ok(Some(DaemonRestartRefusal::PolicyNotAdmitted));
+        };
+        // The threshold is read only while the retained binding still proves
+        // the exact admitted generation and fence the caller observed. A
+        // binding that does not prove them is the same defect the class rule
+        // already names for this identity, so it is refused with that same
+        // reason instead of being reported as a budget of its own.
+        let declared_threshold = match admitted
+            .declared_attempt_threshold(admitted_generation, &admitted_state_fence)
+        {
+            Ok(declared) => declared,
+            Err(_) => return Ok(Some(DaemonRestartRefusal::PolicyNotBoundToAdmittedGeneration)),
+        };
+        let store = self.generation_gateway.ors.as_ref();
+        let recorded = store
+            .load_kernel_restart_reconciliation(ACTIVE_DAEMON_CALLER, admitted_generation.value())
+            .map_err(|error| {
+                KernelBuildError::Service(format!(
+                    "eliotd durable restart record is unreadable: {error}"
+                ))
+            })?;
+        // ANY durable row under this child's identity and generation means the
+        // restart disposition for this lineage was already decided and
+        // committed. It is therefore read back as the decision it is, and this
+        // boundary never rewrites a row it did not read as absent: an existing
+        // durable disposition is never treated as permission and never
+        // replaced by a locally recomputed one.
+        if recorded.is_some() {
+            return Ok(Some(DaemonRestartRefusal::RestartBudgetExhausted));
+        }
+        if attempt < u64::from(declared_threshold) {
+            return Ok(None);
+        }
+        let observed_at_ms = i64::try_from(super::unix_ms()).unwrap_or(i64::MAX);
+        store
+            .persist_kernel_restart_reconciliation(&eliot_ors::KernelReconciliationItem {
+                kind: eliot_ors::KernelReconciliationKind::ManifestRestartBudgetExhausted,
+                module_id: ACTIVE_DAEMON_CALLER.to_owned(),
+                generation: admitted_generation,
+                bound_manifest_sha256: None,
+                recorded_manifest_sha256: None,
+                lease_id: None,
+                operation_id: None,
+                observed_at_ms,
+            })
+            .map_err(|error| {
+                KernelBuildError::Service(format!(
+                    "eliotd durable restart record could not be persisted: {error}"
+                ))
+            })?;
+        // Issue #1839 (I16.4 restart-intensity exhaustion): the bounded
+        // recovery budget admitted no further restart for this child identity.
+        // The observation is subordinate; the refusal above owns the terminal.
+        self.audit_observe(AuditEventDraft::process_daemon_status(
+            AuditEventKind::PROCESS_RESTART_INTENSITY_EXHAUSTED,
+            previous_receipt,
+            "eliotd bounded restart budget is spent for this child identity",
+            self.current_state_fence().as_ref(),
+        ));
+        Ok(Some(DaemonRestartRefusal::RestartBudgetExhausted))
+    }
+
     /// Performs one Kernel-owned bounded recovery of a failed daemon
     /// attempt. The old process effect must be known terminal before the
     /// active descriptor, nonce, and operation identity are replaced.
@@ -556,20 +662,35 @@ impl KernelComposition {
             ));
         }
         let attempt = self.daemon_recovery_attempts.fetch_add(1, Ordering::AcqRel);
-        if attempt >= ELIOTD_MAX_RECOVERY_ATTEMPTS {
-            let reason = "eliotd bounded recovery budget is exhausted".to_owned();
-            // Issue #1839 (I16.4 restart-intensity exhaustion): the bounded
-            // recovery budget admitted no further restart for this lineage.
-            let detail = format!(
-                "recovery_budget_exhausted:attempt={attempt}:maximum={ELIOTD_MAX_RECOVERY_ATTEMPTS}"
-            );
-            self.audit_observe(AuditEventDraft::process_daemon_status(
-                AuditEventKind::PROCESS_RESTART_INTENSITY_EXHAUSTED,
-                previous_receipt.as_ref(),
-                &detail,
-                self.current_state_fence().as_ref(),
-            ));
-            return Err(self.daemon_failure_error(reason));
+        // I14.10 / I08.12 / #1682 W4: the bounded restart budget is a DURABLE
+        // operational fact of the supervised child, not process-local state.
+        // `attempt` above is only the ordinal that names the replacement
+        // generation; it is not a budget, and the budget is not recomputed from
+        // it. The decision below is read from this owner's retained ORS
+        // restart record, which is keyed to the child's stable identity
+        // (`ACTIVE_DAEMON_CALLER`, the very identity an admitted restart
+        // policy's `subject_id` must name) and to the admitted generation being
+        // replaced, and is written through that same ORS owner before the
+        // refusal is returned. A daemon restart therefore cannot hand out a
+        // fresh window: the record IS the window.
+        //
+        // Absence stays absence. `Ok(None)` means this child's declared budget
+        // was never recorded as spent, and it is never widened into an
+        // unlimited budget; an unreadable or invalid record is a mechanical
+        // failure, not a permission. The declared THRESHOLD is read only from
+        // an admitted policy, and a child with no admitted policy has no
+        // declared budget at all, so its replacement is refused as
+        // `PolicyNotAdmitted` rather than being given a synthesised default.
+        if previous_receipt.is_some() {
+            let refused =
+                self.admit_daemon_restart_attempt(&launch, attempt, previous_receipt.as_ref())?;
+            if let Some(refusal) = refused {
+                let reason = daemon_restart_refusal_reason(&refusal);
+                observe_daemon_runtime("kernel.daemon.restart_refused", reason);
+                return Err(self.daemon_failure_error(format!(
+                    "eliotd automatic restart refused: {reason}"
+                )));
+            }
         }
         // The two refusals that no declared restart class may bypass (I14.10)
         // are decided here, on the exact reconciled evidence of the generation
