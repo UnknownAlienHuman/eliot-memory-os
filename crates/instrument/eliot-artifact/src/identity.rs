@@ -4,7 +4,7 @@ use crate::{
     ArtifactError, ArtifactKind, ContentAddress, HashAlgorithm, SchemaBinding, SourceBinding,
     validate_digest,
 };
-use eliot_contracts::{ArtifactId, ClockReading};
+use eliot_contracts::{ArtifactId, ClockReading, OperationId, SourceId};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -32,6 +32,36 @@ pub struct ArtifactIdentity {
 }
 
 impl ArtifactIdentity {
+    /// Binds the complete source archive captured for one admitted Instrument
+    /// invocation. The operation identity namespaces the artifact handle; the
+    /// existing ArtifactIdentity content address is computed from every exact
+    /// archive byte. Callers must first establish that `operation` is the
+    /// retained, admitted invocation for the selected source candidate.
+    pub fn bind_source_snapshot(
+        operation: &OperationId,
+        source_id: SourceId,
+        source_revision: impl Into<String>,
+        bytes: &[u8],
+        schema: Option<SchemaBinding>,
+        created_at: ClockReading,
+    ) -> Result<Self, ArtifactError> {
+        let artifact_id = ArtifactId::new(format!("source-snapshot:{}", operation.as_str()))?;
+        let content = ContentAddress::of_bytes(bytes);
+        let source = SourceBinding {
+            source_id,
+            revision: source_revision.into(),
+            integrity: Some(content.digest_hex),
+        };
+        Self::bind(
+            artifact_id,
+            ArtifactKind::RawEvidence,
+            bytes,
+            schema,
+            Some(source),
+            created_at,
+        )
+    }
+
     /// Derives an identity from exact content bytes and bindings.
     pub fn bind(
         artifact_id: ArtifactId,
