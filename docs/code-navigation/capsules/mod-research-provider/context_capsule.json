@@ -24,7 +24,7 @@
   },
   "source_token_estimate": {
     "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
-    "source_stu": 126312,
+    "source_stu": 126374,
     "test_stu": 0,
     "selected_file_count": 10,
     "inline_cfg_test_modules": 6,
@@ -41,9 +41,9 @@
       },
       {
         "path": "bins/eliot-mod-research/src/capability_cell.rs",
-        "bytes": 14990,
-        "sha256": "c2c1696c34d45cd40a5bd43df528e3076bd007f94bc11ce51d92fa339cb53c07",
-        "stu": 4997,
+        "bytes": 15176,
+        "sha256": "33243176849be0b227ca1dba7b07a80bcc9daed819fd20da6c3f561c8479b5df",
+        "stu": 5059,
         "inline_cfg_test": false
       },
       {
@@ -104,7 +104,7 @@
       }
     ],
     "selected_tests": [],
-    "source_selection_digest": "c962200d5bf22521ea593a31d53b8bfa1a314dd9c73feba0982fb52cc4d3a5a5"
+    "source_selection_digest": "a21401d54df0a2d74be61b3145c98288a7dd2a692dae2c0984c37f059538ca0f"
   },
   "one_hop_providers": [
     "eliot-contracts",
@@ -152,7 +152,7 @@
     "qualification": "UNVALIDATED (I2.16, I0.5)",
     "reference_capsule_handle": "I2.20"
   },
-  "bound_contract_digest": "b8e5e3eebfdde065821e9d344f2708e150ece5e7a0d065a8269614254e181d76",
+  "bound_contract_digest": "8ed8fd4d367d7c75e52e6e3579872bfc9684825d2cea53552967095692178672",
   "source_provenance": {
     "input_digests": {
       "workspace_manifest": {
@@ -178,15 +178,15 @@
       "module_manifest": null,
       "selected_source": {
         "path_count": 10,
-        "sha256": "c962200d5bf22521ea593a31d53b8bfa1a314dd9c73feba0982fb52cc4d3a5a5"
+        "sha256": "a21401d54df0a2d74be61b3145c98288a7dd2a692dae2c0984c37f059538ca0f"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "77547162dcce422a00e5e865f18e9e1d560180f5d63c60bf8168cd8aadab7010",
+  "artifact_digest": "fbb0eaa6eaeb078b006caa631185f65c5b5588c7e9088a54e45de39d1b7c6586",
   "contract_revision": {
     "derivation": "first 16 hex characters of the artifact digest",
-    "value": "77547162dcce422a"
+    "value": "fbb0eaa6eaeb078b"
   }
 }

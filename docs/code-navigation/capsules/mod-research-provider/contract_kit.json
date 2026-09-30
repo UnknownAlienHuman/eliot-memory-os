@@ -241,15 +241,15 @@
       "module_manifest": null,
       "selected_source": {
         "path_count": 10,
-        "sha256": "c962200d5bf22521ea593a31d53b8bfa1a314dd9c73feba0982fb52cc4d3a5a5"
+        "sha256": "a21401d54df0a2d74be61b3145c98288a7dd2a692dae2c0984c37f059538ca0f"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "b8e5e3eebfdde065821e9d344f2708e150ece5e7a0d065a8269614254e181d76",
+  "artifact_digest": "8ed8fd4d367d7c75e52e6e3579872bfc9684825d2cea53552967095692178672",
   "contract_revision": {
     "derivation": "first 16 hex characters of the artifact digest",
-    "value": "b8e5e3eebfdde065"
+    "value": "8ed8fd4d367d7c75"
   }
 }

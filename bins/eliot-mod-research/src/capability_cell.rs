@@ -104,12 +104,14 @@ static RESEARCH_PROVIDER_CELL: OnceLock<Result<CapabilityCellRegistry, String>> 
 pub fn resolve_admitted_cell(
     admission: &ProviderAdmission,
 ) -> Result<CapabilityCellProof, AdmissionRefusal> {
-    let registry = match RESEARCH_PROVIDER_CELL.get_or_init(|| {
+    // `get_or_init` keeps the decode lazy: the registry is parsed on the first
+    // admitted operation, not at module load, and the `else` arm refuses with the
+    // same typed reason the decode failure always mapped to.
+    let Ok(registry) = RESEARCH_PROVIDER_CELL.get_or_init(|| {
         serde_json::from_str(RESEARCH_PROVIDER_CAPABILITY_CELL_REGISTRY_JSON)
             .map_err(|_| "embedded research-provider cell registry is not decodable".to_owned())
-    }) {
-        Ok(registry) => registry,
-        Err(_) => return Err(AdmissionRefusal::UndeclaredCapabilityCell),
+    }) else {
+        return Err(AdmissionRefusal::UndeclaredCapabilityCell);
     };
     // The expected cell and package identity are generated from the same input
     // chain as the record and are read as typed #13 references.
@@ -203,7 +205,7 @@ pub fn resolve_admitted_cell(
 
 /// Parses the generated support claim into #13's own closed vocabulary.
 ///
-/// The generated constant is the SCREAMING_SNAKE spelling the record's wire
+/// The generated constant is the `SCREAMING_SNAKE` spelling the record's wire
 /// form uses, so it is parsed through the same spelling rather than being
 /// pattern-matched against a second local list. An unknown spelling returns
 /// `None` and is refused; it is never mapped onto a default.
