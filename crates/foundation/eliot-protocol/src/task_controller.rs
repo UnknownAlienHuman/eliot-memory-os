@@ -230,6 +230,17 @@ impl TaskControllerOrientationInput {
             &self.context_compilation_input,
             "task_controller_invocation.orientation.context_compilation_input",
         )?;
+        if self
+            .context_compilation_input
+            .get("schema_version")
+            .and_then(Value::as_u64)
+            != Some(1)
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "task_controller_invocation.orientation.context_compilation_input",
+                reason: "must use ContextCompilerSupplierProfileV1",
+            });
+        }
         structured_object(
             &self.orientation_classification_source_readback,
             "task_controller_invocation.orientation.classification_source_readback",
