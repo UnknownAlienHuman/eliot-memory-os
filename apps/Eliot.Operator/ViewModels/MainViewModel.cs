@@ -1493,6 +1493,23 @@ public sealed class MainViewModel : INotifyPropertyChanged
     /// actionably; it is never treated as a success. A refusal whose outcome is
     /// the owner's `STALE_STATE_FENCE` reason code is terminal and distinct from
     /// a plain rejection and from an unknown outcome.
+    ///
+    /// This method only REPORTS the accepted-but-unproven shape; it does not
+    /// enforce the invalidity. The single caller is `SubmitIntentAsync`, which
+    /// this view model reaches from `ExecuteSelectedActionAsync`,
+    /// `RunCommandAsync` and `ReconcilePendingAsync`, and the enforcement is the
+    /// `accepted && executed && receiptId is null` branch immediately after
+    /// that call in `SubmitIntentAsync`: it retains the SAME operation identity
+    /// under `UnknownReconciling` and reports the owner-named text "was
+    /// accepted without a canonical receipt; use Reconcile before any retry"
+    /// instead of a success. A reader looking for the guarantee that an
+    /// `accepted && executed` receipt carrying no canonical receipt is never
+    /// treated as a durable success must read that branch in
+    /// `SubmitIntentAsync`, not this method: a caller that ignored the null
+    /// `ReceiptId` could still read this tuple as a success. The conformance
+    /// harness (`tests/Eliot.Operator.Tests/Program.cs`) pins that branch, not
+    /// this method, and pins it by the message text above plus the retained
+    /// unknown set.
     private static (bool Accepted, bool Executed, bool StaleFence, string Outcome, string? ReceiptId) ReadCommandReceipt(
         JsonElement receipt,
         OperatorPendingOperation pending)

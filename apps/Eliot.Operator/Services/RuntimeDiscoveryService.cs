@@ -225,6 +225,22 @@ public sealed class RuntimeDiscoveryService
         // OperatorHandoffAuthority::issue) mints the full ordered capability
         // set and re-checks it against the request and again on redemption;
         // only that owner check is authoritative.
+        //
+        // Two names are NOT this method and must never be cited as its
+        // implementation. `OperatorFaultReason.EndpointInvalid`
+        // (OperatorClientFaults.cs) is the production fault-reason CONSTANT this
+        // method throws at the bottom of this block; it is a reason string with
+        // no validation logic and no conformance surface, so a grep that finds
+        // it proves only that the reason exists. The conformance harness
+        // asserts these refusals through its own local helper
+        // `RefusesCapabilities` in `tests/Eliot.Operator.Tests/Program.cs`,
+        // which calls this method and reports the typed `endpoint_invalid`
+        // code; that helper is the only harness symbol for these cases, and the
+        // harness file contains no `EndpointInvalid` at all. In this file the
+        // name occurs only as the qualified `OperatorFaultReason.EndpointInvalid`
+        // reference. The production callers of this method are
+        // `DiscoverAsync` below and
+        // `BrokerPipeClient.RedeemOperatorHandoffAsync`.
         if (string.IsNullOrWhiteSpace(endpoint.PipeName)
             || !endpoint.PipeName.StartsWith(@"\\.\pipe\", StringComparison.OrdinalIgnoreCase)
             || endpoint.BrokerEpoch == 0
