@@ -8,16 +8,43 @@
 //! prerequisites yield a typed blocked [`OrientationPulseResult`](crate::OrientationPulseResult),
 //! never a packet.
 //!
-//! Production owner chain (frozen by this issue):
+//! # Measured ceiling on main (`#40`)
 //!
-//! | Responsibility | Actual runtime owner | Status |
+//! [`resolve_production_inputs`] fills 10 of the carrier's 24 members from the
+//! dispatch arguments it already receives (schema version, admitted job,
+//! bundle, validated candidate, sealed policy, the four shared identity
+//! members, and the Kernel deadline). **The other 14 have no producer reachable
+//! from this binary**, so the function returns `Err` unconditionally, the
+//! `Ok(inputs) => compose_production_result` arm at
+//! `dispatch_stage::dispatch_orientation` is statically unreachable, and
+//! [`compose_production_result`] has no reachable caller. The blocked result
+//! below is the measured current behaviour and is correct per I9.2; it is not a
+//! placeholder awaiting one adapter.
+//!
+//! ## Absent member, measured owner, and the sentence that would authorise it
+//!
+//! | Absent carrier member | Measured owner status | Authorising sentence |
 //! |---|---|---|
-//! | Construct/admit `ModelRouteRequest` | none in-repo: no producer exists outside the contract owner and its tests | named implementation work |
-//! | Execute the admitted provider route, return `ModelRouteOutcome` | none: provider text lives outside the dreamer binary | named implementation work |
-//! | Read/build the exact `CanonicalProjectionSet` from Governor/canonical owners | none in-binary: no Governor orientation-supply channel exists | named implementation work |
-//! | Acquire each mandatory stage's owner input/receipt | none in-binary: records must arrive owner-built via the future carrier supply | named implementation work |
-//! | Invoke the pure composer | [`compose_production_result`] below (this module) | wired |
-//! | Publish the typed result | `dispatch_stage::dispatch_orientation` as `DreamResult::Orientation` | wired |
+//! | `model_request` (CC-002 admitted request) | no producer outside `eliot-dreamer-contracts` and its tests | `model_route.rs`: "Provider SDKs, route selection, account/capacity reservation, and retry scheduling stay outside Smart: the runtime chooses one of the admitted `allowed_routes`" |
+//! | `model_outcome` (CC-002 outcome) | no provider SDK exists in this workspace; `eliot-dreamer/Cargo.toml` carries none | same sentence: the runtime "returns one `ModelRouteOutcome`"; the executing adapter does not exist here |
+//! | `projections` (CC-004 set) | `compose_canonical_projections` exists Governor-side but returns `GovernorProjectionSet`, a different type with zero callers in the workspace | `canonical_projections.rs`: "The mapper never retrieves canonical state and never invents missing role prose: a missing or incompatible projection stays an explicit omission, never filler" |
+//! | `cep_handles` | no producer; Governor-resolved handles are minted only in tests | module manifest `providers`: "Current Epistemic Position projection" |
+//! | `classification` | no producer | manifest `inputs`: "DreamJobAdmission class=Orientation, `DreamInputBundle`, `ValidatedDreamDraft`, `CurrentEpistemicPosition handles`" |
+//! | `cue_activation` | no producer | same manifest input list |
+//! | `epistemic` | no producer | same manifest input list |
+//! | `understanding` | no producer | same manifest input list |
+//! | `grounding` | no producer | same manifest input list |
+//! | `rivals` | no producer | same manifest input list |
+//! | `candidates` | no producer | same manifest input list |
+//! | `probes` | no producer | same manifest input list |
+//! | `cancelled` | `KernelJobAdmission` carries a `cancellation_id` but nothing in this binary observes cancellation | `I0.10`/`A2.3` require one named owner per effect; no such owner is declared |
+//! | `conflict` | **structurally unsatisfiable on an Orientation admission** | `ClassificationInput` and `ConflictStage` both embed a `ValidatedCurationItem`, a Curation-class record. The orientation manifest's declared `inputs` do not include it, and the only mint site in this binary is `#[cfg(test)] mod curation_test_support` |
+//!
+//! The last row is not a missing adapter. Even a complete CC-002 and CC-004
+//! supply channel would leave the mandatory denominator unfillable, because the
+//! classification and conflict stages require a Curation-owned record that an
+//! Orientation admission never carries and that this cell's manifest does not
+//! declare as an input. Supplying it here would be self-issued authority.
 //!
 //! A missing adapter is implementation work, never substituted with local
 //! data: the v1 hypothesis pair derived in dispatch cannot impersonate the
@@ -26,7 +53,7 @@
 //! reads, retries, leases, policy/authority decisions, and persistence execute
 //! in runtime/Governor adapters before composition; the composer receives
 //! immutable admitted records and performs no external effects. Owner inputs
-//! are acquired without holding any Dreamer composition mutex, and the
+//! must arrive pre-built without holding any Dreamer composition mutex, and the
 //! synchronous composer runs only on frozen records.
 //!
 //! Overall result rule: `Complete` requires every denominator member executed
@@ -77,6 +104,13 @@ pub(crate) const CC002_MISSING: &str =
 pub(crate) const CC004_MISSING: &str = "production orientation requires a canonical projection set";
 /// Blocked reason naming the absent Governor supply channel.
 pub(crate) const ORIENTATION_SUPPLY_MISSING: &str = "governor orientation supply channel absent";
+/// Blocked reason naming the structurally absent Curation-record owner.
+///
+/// The classification and conflict stages require a `ValidatedCurationItem`,
+/// which an Orientation admission never carries. This is separate from the
+/// absent supply channel: supplying CC-002 and CC-004 would not resolve it.
+pub(crate) const ORIENTATION_CURATION_RECORD_MISSING: &str =
+    "orientation stages require a curation record the admission does not carry";
 /// Blocked reason when the admitted outcome is malformed.
 pub(crate) const MODEL_OUTCOME_MALFORMED: &str = "admitted model-route outcome is malformed";
 /// Blocked reason when the admitted outcome is cancelled.
@@ -91,6 +125,20 @@ const DIGEST_UNAVAILABLE: &str = "digest unavailable";
 const OWNER_MODEL_ROUTE: &str = "model-route runtime owner";
 /// Missing-owner identity for the CC-004 projection owner.
 const OWNER_PROJECTIONS: &str = "governor canonical projection owner";
+/// Missing-owner identity for the in-binary cancellation observer.
+///
+/// `KernelJobAdmission` carries a `cancellation_id`, but nothing in this
+/// binary observes it, so the carrier's `cancelled` member has no source here.
+const OWNER_CANCELLATION: &str = "cancellation observation owner";
+/// Missing-owner identity for the Curation record the classification and
+/// conflict stages require.
+///
+/// `ClassificationInput` and the `ConflictStage` carrier both embed a
+/// `ValidatedCurationItem`, a Curation-class record an Orientation admission
+/// never carries. This owner is absent for a structural reason, not a missing
+/// adapter: it is why the mandatory denominator cannot be filled even once
+/// CC-002 and CC-004 land.
+const OWNER_CURATION_RECORD: &str = "curation record owner for orientation stages";
 
 /// Immutable route-measurement function supplied with the understanding record.
 ///
@@ -161,12 +209,21 @@ pub(crate) struct ProductionOrientationInputs<'a> {
 
 /// Resolves the production carrier from admitted dispatch artifacts.
 ///
-/// The Governor orientation-supply channel does not exist in-binary, so no
-/// CC-002 outcome, CC-004 set, or stage-owner record can be acquired here and
-/// this always returns the typed blocked result naming the missing adapters.
-/// The `Ok` arm stays compiled-live: when the channel lands, assembly fills
-/// the carrier from admitted artifacts plus the Governor supply and the same
-/// composer below produces complete/partial results with no dispatch change.
+/// The dispatch arguments supply 10 of the carrier's 24 members. The other 14
+/// have no producer reachable from this binary, so this always returns the
+/// typed blocked result naming the missing owners (see the module's measured
+/// ceiling table). There is no `Ok` construction on any path, so the
+/// `Ok(inputs) => compose_production_result` arm at
+/// `dispatch_stage::dispatch_orientation` is statically unreachable and
+/// [`compose_production_result`] has no reachable caller today.
+///
+/// Unblocking requires, in order: an executing runtime adapter that returns a
+/// `ModelRouteOutcome`; a Governor channel that maps its
+/// `GovernorProjectionSet` onto the neutral `CanonicalProjectionSet`; owner
+/// records for the seven stage members this cell declares as inputs; an
+/// in-binary cancellation observation; and an architecture decision on the
+/// `ValidatedCurationItem` that the classification and conflict stages require,
+/// which this cell's manifest does not declare as an input.
 pub(crate) fn resolve_production_inputs<'a>(
     admission: &'a KernelJobAdmission,
     admitted_job: &'a AdmittedOrientationJob,
@@ -668,7 +725,12 @@ fn missing_prerequisites_blocked(
         .iter()
         .map(|id| blocked_stage_record(*id, id.missing_reason()))
         .collect();
-    let mut missing_owners = vec![OWNER_MODEL_ROUTE.to_owned(), OWNER_PROJECTIONS.to_owned()];
+    let mut missing_owners = vec![
+        OWNER_MODEL_ROUTE.to_owned(),
+        OWNER_PROJECTIONS.to_owned(),
+        OWNER_CANCELLATION.to_owned(),
+        OWNER_CURATION_RECORD.to_owned(),
+    ];
     missing_owners.extend(
         PulseStageId::ORDER
             .iter()
@@ -709,6 +771,7 @@ fn missing_prerequisites_blocked(
             CC002_MISSING.to_owned(),
             CC004_MISSING.to_owned(),
             ORIENTATION_SUPPLY_MISSING.to_owned(),
+            ORIENTATION_CURATION_RECORD_MISSING.to_owned(),
         ],
         missing_owners,
     })
