@@ -82,25 +82,25 @@ use crate::{
     GrantClosureProjection, GrantClosureState, HostRequestRecord, HostRequestState, JobCheckpoint,
     KernelAuthoritySnapshot, LegacyFenceBoundBackupVerificationClass,
     LegacyTwoValueRelationBackupVerificationClass, LegacyUnscopedBackupVerificationClass,
-    NativeWorkerClaimAdmission, NativeWorkerClaimRecord, NativeWorkerClaimStageOutcome,
-    NativeWorkerClaimState, OpaqueLabel, OperationIdentity, OperationalCurrentRecoveryCursor,
-    OperationalCurrentRecoveryEntry, OperationalCurrentRecoveryPage, OperationalMutationReceipt,
-    OperationalPhase, OperationalRecordContext, OperationalRecordInput, OrsError,
-    OrsSnapshotReceipt, OrsSnapshotRequest, PendingOperationPage, ProcessEvidenceReadback,
-    ProcessEvidenceRecord, ProcessStartReplayAbort, ProcessStartReplayRecord,
-    ProcessStartReplayState, ProcessStreamRecoveryFence, ProcessStreamRecoveryLoadError,
-    ProcessStreamRecoveryProjection, ProcessStreamRecoveryRevalidation,
-    ProcessStreamRecoveryStatusProjection, ProcessStreamRecoveryWriteOutcome,
-    ProcessStreamRetirementProof, ProcessStreamSourceResolver, RecoveredAuthoritySnapshot,
-    RecoveryCursor, RecoveryInboxDisposition, RecoveryInboxItem, RecoveryInboxReceipt,
-    RecoveryInboxRecoveryCursor, RecoveryInboxRecoveryEntry, RecoveryInboxRecoveryPage,
-    RecoveryInventorySnapshot, RecoveryInventorySource, RecoveryPage, RecoveryPayload,
-    RecoveryPayloadEnvelope, RecoveryProblem, RecoveryProblemKind, RecoveryProblemRecoveryCursor,
-    RecoveryProblemRecoveryPage, RecoveryWriteBinding, ReservationRecord, ReservationRequest,
-    ReservationState, ReservedScope, RetryState, RootTransitionCommit,
-    RootTransitionCommitProjection, ScopeTerminalReceipt, ScopeTerminalView, SessionBindingReceipt,
-    SessionDetach, StageReceipt, StagedOperation, StateFenceSnapshot, StreamRecoveryActivation,
-    StreamRecoveryReconciliationState, SupervisionLeaseCommitTicket,
+    MaintenanceTriggerStagingReceipt, MaintenanceTriggerStagingRequest, NativeWorkerClaimAdmission,
+    NativeWorkerClaimRecord, NativeWorkerClaimStageOutcome, NativeWorkerClaimState, OpaqueLabel,
+    OperationIdentity, OperationalCurrentRecoveryCursor, OperationalCurrentRecoveryEntry,
+    OperationalCurrentRecoveryPage, OperationalMutationReceipt, OperationalPhase,
+    OperationalRecordContext, OperationalRecordInput, OrsError, OrsSnapshotReceipt,
+    OrsSnapshotRequest, PendingOperationPage, ProcessEvidenceReadback, ProcessEvidenceRecord,
+    ProcessStartReplayAbort, ProcessStartReplayRecord, ProcessStartReplayState,
+    ProcessStreamRecoveryFence, ProcessStreamRecoveryLoadError, ProcessStreamRecoveryProjection,
+    ProcessStreamRecoveryRevalidation, ProcessStreamRecoveryStatusProjection,
+    ProcessStreamRecoveryWriteOutcome, ProcessStreamRetirementProof, ProcessStreamSourceResolver,
+    RecoveredAuthoritySnapshot, RecoveryCursor, RecoveryInboxDisposition, RecoveryInboxItem,
+    RecoveryInboxReceipt, RecoveryInboxRecoveryCursor, RecoveryInboxRecoveryEntry,
+    RecoveryInboxRecoveryPage, RecoveryInventorySnapshot, RecoveryInventorySource, RecoveryPage,
+    RecoveryPayload, RecoveryPayloadEnvelope, RecoveryProblem, RecoveryProblemKind,
+    RecoveryProblemRecoveryCursor, RecoveryProblemRecoveryPage, RecoveryWriteBinding,
+    ReservationRecord, ReservationRequest, ReservationState, ReservedScope, RetryState,
+    RootTransitionCommit, RootTransitionCommitProjection, ScopeTerminalReceipt, ScopeTerminalView,
+    SessionBindingReceipt, SessionDetach, StageReceipt, StagedOperation, StateFenceSnapshot,
+    StreamRecoveryActivation, StreamRecoveryReconciliationState, SupervisionLeaseCommitTicket,
     SupervisionLeasePrepareRequest, SupervisionLeaseProjection, SupervisionLeaseReceipt,
     SupervisionLeaseReceiptInput, SupervisionLeaseRecord, SupervisionLeaseSnapshot,
     SupervisionLeaseStageReceipt, SupervisionLeaseStageResolution,
@@ -6689,6 +6689,29 @@ impl RedbRecoveryStore {
             });
         }
         Ok(Some(record))
+    }
+
+    /// Stages one maintenance-trigger intake before any acknowledgement (issue #1694 W2).
+    ///
+    /// This is the concrete intake-staging entry on the ORS owner object. It
+    /// runs the intake staging extension in `maintenance_trigger_staging`
+    /// against this store: where a retained canonical source envelope exists,
+    /// it is reused by owner read-back with hash equality and only its
+    /// delivery obligation is stored, otherwise the complete opaque caller
+    /// envelope is staged as-is through the existing recovery-inbox owner. An
+    /// exact identity/hash replay returns the same staging receipt; changed
+    /// content under the same identity conflicts and never overwrites.
+    /// Capacity, key/signer, integrity, and durable-write failures return the
+    /// exact typed `OrsError` with no receipt, so the producer keeps its retry
+    /// identity and its cursor must not advance. This adds no table, no second
+    /// trigger database, no Store receipt bypass, and no Governor semantic
+    /// type: inbox rows stay opaque staged envelopes indexed by item identity
+    /// like every other inbox obligation.
+    pub fn stage_maintenance_trigger_intake(
+        &self,
+        request: &MaintenanceTriggerStagingRequest,
+    ) -> Result<MaintenanceTriggerStagingReceipt, OrsError> {
+        crate::maintenance_trigger_staging::stage_maintenance_trigger_intake(self, request)
     }
 
     /// Stages one scan disclosure record as `Prepared` (issue #2900).
