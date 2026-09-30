@@ -496,6 +496,9 @@ pub fn operation_context(
         authority_epoch = authority_epoch.text(),
         authority_epoch_redaction = authority_epoch.redaction_status().unwrap_or("none"),
         process_tree = "unavailable",
+        process_id = "unavailable",
+        process_start_100ns = "unavailable",
+        image_sha256 = "unavailable",
         lease = "unavailable",
         receipt = "unavailable",
     )

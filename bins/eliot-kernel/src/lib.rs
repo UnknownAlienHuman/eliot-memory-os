@@ -152,7 +152,7 @@ pub use process_execution::{ProcessExecutionAuthorityConfig, WindowsDispatchSnap
 #[cfg(test)]
 use process_execution::{
     ProcessStartGuard, ProcessStartPorts, RESERVED_STORE_SNAPSHOT_HEAD, ValidationContextSlot,
-    authorize_process_owner, project_store_snapshot, run_process_start,
+    project_store_snapshot, run_process_start,
 };
 pub use process_execution_client::process_execution_client;
 pub(crate) use shutdown_drain::{

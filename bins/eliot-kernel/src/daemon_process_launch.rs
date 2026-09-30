@@ -355,6 +355,13 @@ impl KernelComposition {
                 return Err(KernelBuildError::Service(error.to_string()));
             }
         };
+        // The gateway has validated this original receipt. Project its existing
+        // OS identity and image digest without another handle/PID/image query.
+        let physical = receipt.identity().physical();
+        record_launch_context_field(context, "process_id", &physical.process_id().to_string());
+        record_launch_context_field(context, "process_start_100ns", &physical.start_time_100ns().to_string());
+        record_launch_context_field(context, "image_sha256", receipt.identity().executable_sha256());
+        observe_daemon_launch("kernel.daemon.launch_identity_observed", "validated_receipt", context);
         let mut state = self
             .daemon_runtime
             .lock()

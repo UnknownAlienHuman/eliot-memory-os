@@ -59,6 +59,9 @@ fn record_live_receipt_context_field(context: &tracing::Span, field: &'static st
 /// Builds a live-receipt context from the exact process receipt binding.
 #[cfg(windows)]
 fn process_receipt_context(process: &ProcessStartReceipt) -> tracing::Span {
+    if process.validate().is_err() {
+        return super::kernel_diagnostics::operation_context(None, None, None, None);
+    }
     let generation = process.accepted_generation().get().to_string();
     let epoch_digest = process.binding().state_fence().canonical_epoch_digest();
     super::kernel_diagnostics::operation_context(
