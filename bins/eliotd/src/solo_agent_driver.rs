@@ -1756,7 +1756,7 @@ fn map_binding_observation_to_poll(
             task_id,
             claim_state,
             observed_at_unix_ms,
-        } => Ok(SoloPollOutcome::OwnerBindingPending {
+        } => SoloPollOutcome::OwnerBindingPending {
             claim_id,
             attempt_id,
             operation_id,
@@ -1767,7 +1767,7 @@ fn map_binding_observation_to_poll(
                 SoloBindingPendingReason::BindingPublicationPending
             },
             observed_at_unix_ms,
-        }),
+        },
         eliot_governor::NativeWorkerBindingObservation::GovernorCurrentButProviderRevisionsUnavailable {
             claim_id,
             attempt_id,
@@ -1775,13 +1775,13 @@ fn map_binding_observation_to_poll(
             task_id,
             observed_at_unix_ms,
             ..
-        } => Ok(SoloPollOutcome::ProviderRevisionsUnavailable {
+        } => SoloPollOutcome::ProviderRevisionsUnavailable {
             claim_id,
             attempt_id,
             operation_id,
             task_id,
             observed_at_unix_ms,
-        }),
+        },
         eliot_governor::NativeWorkerBindingObservation::Revoked {
             claim_id,
             attempt_id,
@@ -1789,13 +1789,13 @@ fn map_binding_observation_to_poll(
             task_id,
             observed_at_unix_ms,
             ..
-        } => Ok(SoloPollOutcome::OwnerBindingRevoked {
+        } => SoloPollOutcome::OwnerBindingRevoked {
             claim_id,
             attempt_id,
             operation_id,
             task_id,
             observed_at_unix_ms,
-        }),
+        },
         eliot_governor::NativeWorkerBindingObservation::UnknownOutcome {
             claim_id,
             attempt_id,
@@ -1803,13 +1803,13 @@ fn map_binding_observation_to_poll(
             task_id,
             observed_at_unix_ms,
             ..
-        } => Ok(SoloPollOutcome::OwnerBindingUnknownOutcome {
+        } => SoloPollOutcome::OwnerBindingUnknownOutcome {
             claim_id,
             attempt_id,
             operation_id,
             task_id,
             observed_at_unix_ms,
-        }),
+        },
     }
 }
 
