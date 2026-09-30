@@ -4654,6 +4654,10 @@ impl KernelComposition {
         clippy::too_many_lines,
         reason = "the ordered I14.23 drain phases keep one visible admission-to-linearization boundary"
     )]
+    #[allow(
+        unreachable_code,
+        reason = "the flush gate halts every pass until the Governor audit/outbox ack port exists (#1686 item 5 residual); trailing phases execute once the gate opens and must not be deleted"
+    )]
     async fn run_shutdown_drain(
         &self,
         coordinator: &Arc<shutdown_drain::ShutdownDrainCoordinator>,

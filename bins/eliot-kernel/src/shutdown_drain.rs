@@ -620,7 +620,7 @@ impl ReceiptOwnerFamily {
     /// the shared registry. Identities no family claims keep the historical
     /// absence-removal semantics; an identity another family claims is
     /// retained for that family's own pass.
-    fn owns_identity(&self, identity: &str) -> bool {
+    fn owns_identity(self, identity: &str) -> bool {
         match self {
             Self::StoreRebind => identity.starts_with("store-rebind:"),
             Self::StoreUnknownOutcome => {
@@ -635,7 +635,7 @@ impl ReceiptOwnerFamily {
     /// obligation stays pending even under a complete snapshot whose absence
     /// would otherwise resolve, because absence in one family's read is never
     /// evidence about another family's rows.
-    fn foreign_identity(&self, identity: &str) -> bool {
+    fn foreign_identity(self, identity: &str) -> bool {
         match self {
             Self::StoreRebind => {
                 Self::StoreUnknownOutcome.owns_identity(identity)
@@ -904,6 +904,10 @@ fn registry() -> &'static Mutex<BTreeMap<PathBuf, Arc<ShutdownDrainCoordinator>>
     REGISTRY.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "sequential bound-checks over every durable field; splitting would scatter one validation"
+)]
 fn validate_durable_state(durable: &DurableDrainState) -> Result<(), String> {
     if durable.version != DRAIN_STATE_VERSION {
         return Err("shutdown state version is unsupported".to_owned());
