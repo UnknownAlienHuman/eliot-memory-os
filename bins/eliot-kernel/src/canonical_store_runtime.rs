@@ -35,6 +35,8 @@ use eliot_ipc::NamedPipeTransport;
 #[cfg(windows)]
 use eliot_kernel_core::RouteScope;
 #[cfg(windows)]
+use std::fmt;
+#[cfg(windows)]
 use eliot_kernel_service::{EbpCanonicalStoreClient, StoreClientError};
 #[cfg(windows)]
 use eliot_platform_windows::{NamedPipePeerExpectation, observe_named_pipe_peer_process_in_job};
@@ -457,6 +459,181 @@ impl KernelComposition {
         Ok(gateway)
     }
 
+    /// Observes the three independent canonical-Store facts and refuses
+    /// canonical-sensitive authority unless all three hold (issue #1681,
+    /// I14.11, I14.20).
+    ///
+    /// Each fact is read from its own owner and recorded in its own field:
+    ///
+    /// - **connectivity** from the retained-gateway owner. A poisoned owner
+    ///   is [`StoreConnectivity::Unreadable`], which is *not* the same answer
+    ///   as the clean [`StoreConnectivity::Detached`] absence. This is the
+    ///   `Path::exists` distinction made explicit: a denied traversal, a
+    ///   poisoned lock and an empty slot are three different facts, and only
+    ///   the last is a proven negative.
+    /// - **process readiness** from the Store's own bounded health round trip
+    ///   over that transport. A Store that declines to answer is
+    ///   [`StoreProcessReadiness::Unreadable`], not `NotReady`: a timeout is
+    ///   not evidence that the process is not running.
+    /// - **semantic freshness** from the Store's own validated snapshot
+    ///   compared against the caller's *current* request fence. A snapshot
+    ///   bound to a different fence is [`StoreSemanticFreshness::Stale`],
+    ///   which is refused; it is never served and never read as an outage.
+    ///
+    /// On success it also returns the two owner-issued values the readiness
+    /// receipt cites, taken from those same two round trips. Proving the three
+    /// facts therefore costs no additional Store IO.
+    ///
+    /// The whole observation is bounded and performs no waiting beyond the two
+    /// bounded Store round trips the readiness proof already performed, and it
+    /// holds no lock across either of them: the gateway `Arc` is cloned out of
+    /// its owner and the owner guard is dropped before any Store IO. Control
+    /// and cancellation therefore stay responsive during an outage — nothing
+    /// here waits on a reconnect, and no control-reserve slot is drawn.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`StoreFactRefusal`] naming the first owner that has not
+    /// established its fact. The refusal is returned rather than a boolean or
+    /// a bare `Unavailable`, so the caller can tell an absent transport from
+    /// an unreadable owner and stale truth from a Store that is not running.
+    #[cfg(windows)]
+    pub async fn observe_canonical_store_availability(
+        &self,
+        request_fence: &eliot_contracts::StateFence,
+    ) -> Result<(CanonicalStoreAvailability, StoreTruthEvidence), StoreFactRefusal> {
+        // F-LOG-KERNEL-2 (#899): Store availability phases only; no operation,
+        // digest, process, job or owner-error material is emitted.
+        let gateway = match self.canonical_store_gateway.lock() {
+            Ok(retained) => retained.clone(),
+            // Inability to read the owner is not absence. The composition
+            // cannot prove a transport is missing, so the fact is recorded
+            // unreadable and both downstream facts are left unread rather
+            // than inferred from it.
+            Err(_) => {
+                observe_entrypoint_with_detail(
+                    EntrypointStage::StoreBootstrap,
+                    "kernel.store.availability:connectivity_owner_unreadable",
+                );
+                return Err(StoreFactRefusal::OwnerUnreadable {
+                    owner: StoreFactOwner::Connectivity,
+                    reason: StoreOwnerUnreadable::GatewayOwnerPoisoned,
+                });
+            }
+        };
+        let Some(gateway) = gateway else {
+            observe_entrypoint_with_detail(
+                EntrypointStage::StoreBootstrap,
+                "kernel.store.availability:connectivity_detached",
+            );
+            return Err(StoreFactRefusal::NotEstablished {
+                owner: StoreFactOwner::Connectivity,
+                reason: StoreFactNotEstablished::NoRetainedTransport,
+            });
+        };
+        // The gateway is fenced when it is a superseded generation awaiting
+        // replacement. That is a distinct fact from "no transport": the
+        // transport exists and this one is closed to new work.
+        if gateway.is_fenced() {
+            observe_entrypoint_with_detail(
+                EntrypointStage::StoreBootstrap,
+                "kernel.store.availability:connectivity_detached",
+            );
+            return Err(StoreFactRefusal::NotEstablished {
+                owner: StoreFactOwner::Connectivity,
+                reason: StoreFactNotEstablished::NoRetainedTransport,
+            });
+        }
+        observe_entrypoint_with_detail(
+            EntrypointStage::StoreBootstrap,
+            "kernel.store.availability:connectivity_attached",
+        );
+        let health = match gateway.health().await {
+            Ok(health) => health,
+            Err(_) => {
+                observe_entrypoint_with_detail(
+                    EntrypointStage::StoreBootstrap,
+                    "kernel.store.availability:process_owner_unreadable",
+                );
+                return Err(StoreFactRefusal::OwnerUnreadable {
+                    owner: StoreFactOwner::ProcessReadiness,
+                    reason: StoreOwnerUnreadable::StoreDidNotAnswer,
+                });
+            }
+        };
+        let process_readiness = if health.status == eliot_store_api::StoreHealthStatus::Ready {
+            observe_entrypoint_with_detail(
+                EntrypointStage::StoreBootstrap,
+                "kernel.store.availability:process_ready",
+            );
+            StoreProcessReadiness::Ready
+        } else {
+            observe_entrypoint_with_detail(
+                EntrypointStage::StoreBootstrap,
+                "kernel.store.availability:process_not_ready",
+            );
+            StoreProcessReadiness::NotReady
+        };
+        let snapshot = match gateway.validation_snapshot().await {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                observe_entrypoint_with_detail(
+                    EntrypointStage::StoreBootstrap,
+                    "kernel.store.availability:freshness_owner_unreadable",
+                );
+                return Err(StoreFactRefusal::OwnerUnreadable {
+                    owner: StoreFactOwner::SemanticFreshness,
+                    reason: StoreOwnerUnreadable::StoreDidNotAnswer,
+                });
+            }
+        };
+        // The snapshot is validated through the Store's own existing
+        // `validate()`; no digest is recomputed here to make a comparison
+        // succeed.
+        if snapshot.validate().is_err() {
+            observe_entrypoint_with_detail(
+                EntrypointStage::StoreBootstrap,
+                "kernel.store.availability:freshness_owner_unreadable",
+            );
+            return Err(StoreFactRefusal::OwnerUnreadable {
+                owner: StoreFactOwner::SemanticFreshness,
+                reason: StoreOwnerUnreadable::StoreAnswerInvalid,
+            });
+        }
+        // Freshness is judged against the fence the caller presented *now*.
+        // A snapshot bound to any other fence is stale truth: refused, named
+        // as stale, and never reported as an outage.
+        let semantic_freshness = if &snapshot.state_fence == request_fence {
+            observe_entrypoint_with_detail(
+                EntrypointStage::StoreBootstrap,
+                "kernel.store.availability:fresh",
+            );
+            StoreSemanticFreshness::Fresh
+        } else {
+            observe_entrypoint_with_detail(
+                EntrypointStage::StoreBootstrap,
+                "kernel.store.availability:stale",
+            );
+            StoreSemanticFreshness::Stale
+        };
+        let availability = CanonicalStoreAvailability {
+            connectivity: StoreConnectivity::Attached,
+            process_readiness,
+            semantic_freshness,
+        };
+        availability.refuse_canonical_sensitive_authority()?;
+        Ok((
+            availability,
+            StoreTruthEvidence {
+                // The health object is the Store's own neutral observation and
+                // was already validated by the gateway before it was returned;
+                // its recorded manifest digest is cited verbatim.
+                manifest_digest: health.manifest_digest,
+                validation_revision: snapshot.validation_revision,
+            },
+        ))
+    }
+
     pub(crate) fn claim_canonical_store_slot(&self) -> Result<(), KernelBuildError> {
         // F-LOG-KERNEL-2 (#899): slot-claim phase only; the outer connect
         // owns the terminal. No gateway/pipe material is emitted.
@@ -714,4 +891,333 @@ pub(crate) fn is_store_rebind_latest_committed(
         );
     }
     Ok(is_latest)
+}
+
+/// The independent owner of one canonical-Store availability fact (#1681).
+///
+/// I14.11 speaks of "the canonical Store is unavailable" as if that were one
+/// condition. It is not. Whether a transport is attached, whether the Store
+/// process behind it is ready, and whether the Store's semantic truth is
+/// fresh under the current request fence are three separately owned facts.
+/// Reporting all three as "outage" — or all three as "ready" — destroys the
+/// distinction the caller needs in order to know whether to retry, wait, or
+/// reconcile. This enum is the vocabulary that keeps them apart.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StoreFactOwner {
+    /// The retained Store transport (the Kernel gateway attachment).
+    Connectivity,
+    /// The Store process behind that transport.
+    ProcessReadiness,
+    /// The Store's semantic truth under the current request fence.
+    SemanticFreshness,
+}
+
+#[cfg(windows)]
+impl StoreFactOwner {
+    /// Bounded owner code carried in refusals and diagnostics (I15.4).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Connectivity => "store_connectivity",
+            Self::ProcessReadiness => "store_process_readiness",
+            Self::SemanticFreshness => "store_semantic_freshness",
+        }
+    }
+}
+
+/// Why one availability fact's owner could not be read.
+///
+/// An unreadable owner is NOT a clean absence and is NOT readiness. It defers
+/// the decision and names itself, so the caller learns which observation is
+/// missing instead of learning the word "outage". A poisoned composition
+/// mutex and a Store that declined to answer are both unreadable here, and
+/// neither may be reported as a proven negative.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StoreOwnerUnreadable {
+    /// The composition could not read its own retained-gateway owner.
+    GatewayOwnerPoisoned,
+    /// The Store did not complete a bounded round trip, so every fact behind
+    /// that transport is unknown rather than false.
+    StoreDidNotAnswer,
+    /// The Store answered with material its own `validate()` rejected, so the
+    /// answer is not a usable observation.
+    StoreAnswerInvalid,
+}
+
+#[cfg(windows)]
+impl StoreOwnerUnreadable {
+    /// Bounded reason code (I15.4).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::GatewayOwnerPoisoned => "gateway_owner_poisoned",
+            Self::StoreDidNotAnswer => "store_did_not_answer",
+            Self::StoreAnswerInvalid => "store_answer_invalid",
+        }
+    }
+}
+
+/// Why one availability fact was read and does not hold.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StoreFactNotEstablished {
+    /// The retained-gateway owner was readable and holds no transport. This is
+    /// the only fact in this module that is a clean absence, and it is clean
+    /// only because the owner answered.
+    NoRetainedTransport,
+    /// The Store process answered a bounded round trip and reported itself
+    /// not ready.
+    ProcessNotReady,
+    /// The Store answered under a State Fence that is not the caller's
+    /// current request fence. Its semantic truth is stale, not absent, and
+    /// stale truth is refused rather than served.
+    SemanticTruthStale,
+}
+
+#[cfg(windows)]
+impl StoreFactNotEstablished {
+    /// Bounded reason code (I15.4).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoRetainedTransport => "no_retained_store_transport",
+            Self::ProcessNotReady => "store_process_not_ready",
+            Self::SemanticTruthStale => "store_semantic_truth_stale",
+        }
+    }
+}
+
+/// The connectivity fact: is a Store transport attached to this composition?
+///
+/// `Attached` is the only state that carries no claim about the process or its
+/// semantic truth. `Detached` is a proven absence, and it is only ever
+/// reported by an owner that was actually read.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StoreConnectivity {
+    /// A retained, unfenced Store gateway is attached.
+    Attached,
+    /// The retained-gateway owner was read and holds no transport.
+    Detached,
+    /// The owner could not be read. Never a clean absence, never readiness.
+    Unreadable(StoreOwnerUnreadable),
+}
+
+/// The process-readiness fact: is the Store process behind that transport
+/// ready to serve?
+///
+/// Independent of connectivity: a Store process can be running while its
+/// transport is not attached, and a transport can be attached while the Store
+/// answers that it is not ready.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StoreProcessReadiness {
+    /// The Store answered a bounded round trip and reported itself ready.
+    Ready,
+    /// The Store answered and reported itself degraded or unavailable.
+    NotReady,
+    /// The owner could not be read, so readiness is unknown rather than false.
+    Unreadable(StoreOwnerUnreadable),
+}
+
+/// The semantic-freshness fact: is the Store's semantic truth fresh under the
+/// caller's CURRENT request fence?
+///
+/// This is the fact a canonical-sensitive decision turns on, and it is the one
+/// a running process says nothing about. I14.11 requires stale truth to be
+/// refused; `Stale` is therefore a refusal state and never a degraded-but-
+/// acceptable one.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StoreSemanticFreshness {
+    /// The Store's own validated snapshot is bound to the current request
+    /// fence.
+    Fresh,
+    /// The Store's snapshot is bound to a different fence than the one the
+    /// caller presented.
+    Stale,
+    /// The owner could not be read, so freshness is unknown rather than stale
+    /// and rather than fresh.
+    Unreadable(StoreOwnerUnreadable),
+}
+
+/// The three independent canonical-Store facts, recorded separately.
+///
+/// This is deliberately not a `bool` and deliberately not a single `Ready`
+/// verdict: each field keeps its own state, and
+/// [`Self::refuse_canonical_sensitive_authority`] fails closed by naming the
+/// first owner that has not established its fact.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CanonicalStoreAvailability {
+    /// Whether a Store transport is attached.
+    pub connectivity: StoreConnectivity,
+    /// Whether the Store process behind it is ready.
+    pub process_readiness: StoreProcessReadiness,
+    /// Whether its semantic truth is fresh under the current request fence.
+    pub semantic_freshness: StoreSemanticFreshness,
+}
+
+/// The two owner-issued values a readiness receipt cites once all three Store
+/// facts hold.
+///
+/// Both are the Store's OWN recorded values, taken from the same bounded round
+/// trips that proved the facts. Neither is recomputed, re-derived or
+/// substituted: the point of carrying them is that a caller can cite the exact
+/// evidence the refusal decision was taken against without paying for a second
+/// Store read.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StoreTruthEvidence {
+    /// The Store-reported operation-manifest digest from its health
+    /// observation.
+    pub manifest_digest: eliot_store_api::OperationManifestDigest,
+    /// The Store-reported canonical validation revision from the validated
+    /// snapshot whose fence matched the current request fence.
+    pub validation_revision: u64,
+}
+
+/// A fail-closed refusal of canonical-sensitive authority that names the owner
+/// whose fact is missing.
+///
+/// It is a refusal, not a fault: the caller learns exactly which of the three
+/// facts could not be established, so a stale-truth refusal is never read as
+/// an outage and an unreadable owner is never read as a proven negative.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StoreFactRefusal {
+    /// The owner was read and its fact does not hold.
+    NotEstablished {
+        /// The owner whose fact does not hold.
+        owner: StoreFactOwner,
+        /// Why it does not hold.
+        reason: StoreFactNotEstablished,
+    },
+    /// The owner could not be read, so the fact is unknown. The decision
+    /// defers and names the owner; it never assumes the fact holds and never
+    /// assumes it fails.
+    OwnerUnreadable {
+        /// The owner that could not be read.
+        owner: StoreFactOwner,
+        /// Why it could not be read.
+        reason: StoreOwnerUnreadable,
+    },
+}
+
+#[cfg(windows)]
+impl StoreFactRefusal {
+    /// The owner whose fact blocked the decision.
+    #[must_use]
+    pub const fn owner(self) -> StoreFactOwner {
+        match self {
+            Self::NotEstablished { owner, .. } | Self::OwnerUnreadable { owner, .. } => owner,
+        }
+    }
+
+    /// Projects the refusal onto the closed existing Kernel service error
+    /// vocabulary.
+    ///
+    /// The projection is typed, not prose: the owner and the bounded reason
+    /// survive as the variant's own fields, and the stale-truth case keeps the
+    /// existing `HandshakeMismatch` fence-mismatch shape it already had, so no
+    /// consumer learns a new string. Nothing here grants, retries, or
+    /// re-observes anything.
+    #[must_use]
+    pub const fn kernel_service_error(self) -> super::KernelServiceError {
+        match self {
+            Self::NotEstablished {
+                reason: StoreFactNotEstablished::SemanticTruthStale,
+                ..
+            } => super::KernelServiceError::HandshakeMismatch {
+                field: "store_semantic_freshness",
+            },
+            Self::NotEstablished { owner, reason } => super::KernelServiceError::InvalidField {
+                field: owner.as_str(),
+                reason: reason.as_str(),
+            },
+            Self::OwnerUnreadable { owner, reason } => super::KernelServiceError::InvalidField {
+                field: owner.as_str(),
+                reason: reason.as_str(),
+            },
+        }
+    }
+}
+
+#[cfg(windows)]
+impl fmt::Display for StoreFactRefusal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotEstablished { owner, reason } => {
+                write!(formatter, "{} not established: {}", owner.as_str(), reason.as_str())
+            }
+            Self::OwnerUnreadable { owner, reason } => {
+                write!(formatter, "{} owner unreadable: {}", owner.as_str(), reason.as_str())
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl std::error::Error for StoreFactRefusal {}
+
+#[cfg(windows)]
+impl CanonicalStoreAvailability {
+    /// Refuses canonical-sensitive authority unless all three facts hold.
+    ///
+    /// Connectivity is decided first, then process readiness, then semantic
+    /// freshness, because each later fact is only observable through the
+    /// earlier one. Every arm fails closed: an unreadable owner defers with
+    /// its name and is never treated as "nothing changed", and stale truth is
+    /// refused rather than served. There is no arm that returns "probably
+    /// fine" and no path that consults only a subset of the three.
+    pub const fn refuse_canonical_sensitive_authority(&self) -> Result<(), StoreFactRefusal> {
+        match self.connectivity {
+            StoreConnectivity::Unreadable(reason) => {
+                return Err(StoreFactRefusal::OwnerUnreadable {
+                    owner: StoreFactOwner::Connectivity,
+                    reason,
+                });
+            }
+            StoreConnectivity::Detached => {
+                return Err(StoreFactRefusal::NotEstablished {
+                    owner: StoreFactOwner::Connectivity,
+                    reason: StoreFactNotEstablished::NoRetainedTransport,
+                });
+            }
+            StoreConnectivity::Attached => {}
+        }
+        match self.process_readiness {
+            StoreProcessReadiness::Unreadable(reason) => {
+                return Err(StoreFactRefusal::OwnerUnreadable {
+                    owner: StoreFactOwner::ProcessReadiness,
+                    reason,
+                });
+            }
+            StoreProcessReadiness::NotReady => {
+                return Err(StoreFactRefusal::NotEstablished {
+                    owner: StoreFactOwner::ProcessReadiness,
+                    reason: StoreFactNotEstablished::ProcessNotReady,
+                });
+            }
+            StoreProcessReadiness::Ready => {}
+        }
+        match self.semantic_freshness {
+            StoreSemanticFreshness::Unreadable(reason) => {
+                return Err(StoreFactRefusal::OwnerUnreadable {
+                    owner: StoreFactOwner::SemanticFreshness,
+                    reason,
+                });
+            }
+            StoreSemanticFreshness::Stale => {
+                return Err(StoreFactRefusal::NotEstablished {
+                    owner: StoreFactOwner::SemanticFreshness,
+                    reason: StoreFactNotEstablished::SemanticTruthStale,
+                });
+            }
+            StoreSemanticFreshness::Fresh => {}
+        }
+        Ok(())
+    }
 }
