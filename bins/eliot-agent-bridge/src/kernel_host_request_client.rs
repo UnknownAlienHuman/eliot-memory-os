@@ -223,7 +223,7 @@ struct ResourceAuthorizationPreimage<'a> {
 /// crate's own `Serialize` derive instead of repeating a mapping here: a
 /// hand-written table would be a second place to forget a variant, and a
 /// mismatch would silently bind a different string than the row records.
-fn result_class_wire_name(class: &HostRequestResultClass) -> Result<String, PortFailure> {
+fn result_class_wire_name(class: HostRequestResultClass) -> Result<String, PortFailure> {
     serde_json::to_value(class)
         .ok()
         .and_then(|value| value.as_str().map(str::to_owned))
@@ -2785,10 +2785,13 @@ fn decode_record_view(
         // rather than presented to a consumer as an admitted record. Both
         // comparisons below use ORIGINALLY RECORDED values; nothing is
         // recomputed over the bytes in hand.
-        if let Some(lineage) = &record.result_lineage {
-            if lineage.validate_retained(digest).is_err() {
-                return None;
-            }
+        // An ABSENT lineage is an unknown, not a failure, so the let-chain
+        // leaves the record produced: only a lineage that IS present and then
+        // fails the rule refuses this read.
+        if let Some(lineage) = &record.result_lineage
+            && lineage.validate_retained(digest).is_err()
+        {
+            return None;
         }
     }
     Some(record)
@@ -2848,7 +2851,7 @@ fn resource_authorization_digest(
         .as_ref()
         .map(|lineage| lineage.result_class)
         .ok_or_else(resource_source_refused)?;
-    let result_class = result_class_wire_name(&recorded_class)?;
+    let result_class = result_class_wire_name(recorded_class)?;
     let preimage = ResourceAuthorizationPreimage {
         // Version 2 binds the owner-recorded result class (issue #1809 item 7).
         // A binding captured before the class was part of the preimage can no
