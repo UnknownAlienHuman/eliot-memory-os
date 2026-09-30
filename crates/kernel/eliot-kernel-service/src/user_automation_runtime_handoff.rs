@@ -961,6 +961,23 @@ pub enum UserAutomationExecutionPhase {
         /// Stable revision-bound failure class fingerprint.
         failure_fingerprint: String,
     },
+    /// The runtime owner refused the occurrence before any owner effect.
+    ///
+    /// A rejection is a decided owner answer, not a lost one: the owner read
+    /// the typed admission request and refused it, so the occurrence provably
+    /// admitted nothing and there is no effect to reconcile. The reason is the
+    /// owner's own value, threaded through from `UserAutomationRuntimeError::Rejected`
+    /// (and, at the pre-Store contour, `UserAutomationRejectedValue::reason`);
+    /// it is never re-derived here, because only the refusing owner can say
+    /// why it refused. Reporting a refusal as `UnknownOutcome` would claim an
+    /// effect may have issued that must be reconciled, and reporting it as
+    /// `Admitted` would claim a job that does not exist: both are the exact
+    /// false claims this transition refuses to express, so a rejection is its
+    /// own resolved disposition with no recovery directive.
+    Rejected {
+        /// Closed owner reason the occurrence was refused.
+        reason: String,
+    },
     /// The owner may have acted and the occurrence must be reconciled.
     UnknownOutcome {
         /// Closed reason the execution disposition is unresolved.
@@ -975,6 +992,10 @@ pub enum UserAutomationExecutionPhase {
 
 impl UserAutomationExecutionPhase {
     /// Reports whether the owner proved this phase.
+    ///
+    /// A rejection is owner-proven: the owner decided the refusal itself, so
+    /// the disposition is complete and carries no recovery directive, exactly
+    /// like an admission, a deferral, or a blocked configuration.
     #[must_use]
     pub fn resolved(&self) -> bool {
         matches!(
@@ -983,6 +1004,7 @@ impl UserAutomationExecutionPhase {
                 | Self::Admitted { .. }
                 | Self::Deferred { .. }
                 | Self::BlockedConfig { .. }
+                | Self::Rejected { .. }
         )
     }
 }
@@ -1143,7 +1165,8 @@ impl UserAutomationOperatorTransition {
             UserAutomationExecutionPhase::NotApplicable { .. }
             | UserAutomationExecutionPhase::Admitted { .. }
             | UserAutomationExecutionPhase::Deferred { .. }
-            | UserAutomationExecutionPhase::BlockedConfig { .. } => {}
+            | UserAutomationExecutionPhase::BlockedConfig { .. }
+            | UserAutomationExecutionPhase::Rejected { .. } => {}
         }
         // The retained obligations are the last source of a directive, so a
         // runtime obligation this operation still owns can never be reported
@@ -1254,6 +1277,7 @@ impl UserAutomationOperatorTransition {
             match &self.execution {
                 UserAutomationExecutionPhase::NotApplicable { reason }
                 | UserAutomationExecutionPhase::UnknownOutcome { reason }
+                | UserAutomationExecutionPhase::Rejected { reason }
                 | UserAutomationExecutionPhase::Unavailable { reason } => Some(reason.as_str()),
                 UserAutomationExecutionPhase::Admitted { .. }
                 | UserAutomationExecutionPhase::Deferred { .. }
@@ -1502,7 +1526,7 @@ impl UserAutomationOperatorTransition {
                         }
                         // A wake phase that names this occurrence — the owner's
                         // retained record or its complete negative — is what an
-                        // admitted, blocked, or unresolved execution may sit
+                        // admitted, blocked, rejected, or unresolved execution may sit
                         // beside. An unresolved wake proves neither and never
                         // admits an occurrence.
                         let wake_proven = matches!(
@@ -1526,6 +1550,15 @@ impl UserAutomationOperatorTransition {
                                     )) => {}
                             UserAutomationExecutionPhase::BlockedConfig { .. }
                             | UserAutomationExecutionPhase::UnknownOutcome { .. }
+                                if wake_proven => {}
+                            // A rejected occurrence provably admitted nothing: the
+                            // owner refused the typed admission before any effect,
+                            // so the refusal sits beside the same proven wake a
+                            // blocked or unresolved execution sits beside. A
+                            // rejection beside an unresolved wake is refused
+                            // rather than joined, because that wake proves
+                            // neither for this occurrence.
+                            UserAutomationExecutionPhase::Rejected { .. }
                                 if wake_proven => {}
                             UserAutomationExecutionPhase::Unavailable { .. } => {}
                             _ => {
