@@ -46,7 +46,9 @@ use super::{
     observed_session_principal_binding,
 };
 use eliot_contracts::{
-    CapabilityCellId, CapabilityCellRegistry, ResourceGeneration, SupportStatus,
+    CapabilityCellExpectation, CapabilityCellId, CapabilityCellProof, CapabilityCellProofError,
+    CapabilityCellRegistry, ContractDigest, ExecutionContour, ProofEntrypointRef, ResourceGeneration,
+    SourceCrateRef, SupportStatus,
 };
 use eliot_platform_windows::ProtectedPathLease;
 use std::collections::BTreeMap;
@@ -66,72 +68,247 @@ use crate::kernel_diagnostics::{
 // BEGIN GENERATED native-worker capability-cell registry (scripts/gen_capability_cell_registry.py; do not hand-edit)
 const NATIVE_WORKER_CAPABILITY_CELL_ID: &str = "native-worker-core";
 const NATIVE_WORKER_CAPABILITY_SOURCE_PACKAGE: &str = "eliot-native-worker-core";
-const NATIVE_WORKER_CAPABILITY_CELL_REGISTRY_JSON: &str = r#"{"cells":[{"affected_edges":[],"allowed_effect_classes":[],"cell":"native-worker-core","cell_revision":{"major":1,"minor":0,"patch":0},"contract_digest":"418bf928930a0ce60690ffa67964ab863a18f637b4b7021561aead29e60f423c","contract_digest_source":"crates/modules/eliot-native-worker-core/capability-cell.contract.toml#contract-surface","execution_contour":"DELEGATED_BUNDLE","freshness":{"current_support":"CURRENT_UNVERIFIED","invalidation":[]},"generation_owner":"A-13","lifecycle_owner":"A-13","maintenance_owner":"A-13","manifest":{"context_capsule":{"owner":"A-13","present":true},"contract_kit":{"owner":"A-13","present":true},"test_capsule":{"owner":"A-13","present":true}},"product_pulse":{"NOT_APPLICABLE":{"reason":"This internal process protocol core has no independent Product Pulse; product behavior is measured at the native-worker bundle contour."}},"proof_ceiling":"STATIC_FIELD_AND_MIGRATION_CONTRACT_ONLY","proof_entrypoint":"cargo test -p eliot-native-worker-core --all-targets --all-features","removal_boundary":"Stop claim admission, drain and cancel the exact native-worker process generation through Kernel, then replace the worker bundle.","replacement_class":"isolate_dependency","runtime_bundle":"eliot-native-worker","semantic_owner":"A-13","source_crate":"eliot-native-worker-core","state_owners":[{"owner":"A-13","state":"WorkerCore lifecycle, grant, process binding and start receipt, connection, and last-event sequence"}],"stateless":false}],"generator_version":"1.0.0","pair_key":"sha256:ab2011bd67557d89b2f094061d350a297389f7f57d0478be5e1ff8d2da8ed1c1","registry_version":1,"source_identity":{"cargo_lock_digest":"fc31e3176125cb717e6d665772d3181e11f7e11d64b3c47215402346b94863aa","generator_version":"1.0.0","toolchain":"rustc 1.97.1 (8bab26f4f 2026-07-14); binary: rustc; commit-hash: 8bab26f4f68e0e26f0bb7960be334d5b520ea452; commit-date: 2026-07-14; host: x86_64-pc-windows-msvc; release: 1.97.1; LLVM version: 22.1.6","tree_digest":"e3e9c54ef161b3838f0fe75b6bda0edeb3a8723cd46ae369d13fc94635767616"}}"#;
+const NATIVE_WORKER_CAPABILITY_CONTRACT_DIGEST: &str = "418bf928930a0ce60690ffa67964ab863a18f637b4b7021561aead29e60f423c";
+const NATIVE_WORKER_CAPABILITY_PROOF_ENTRYPOINT: &str = "cargo test -p eliot-native-worker-core --all-targets --all-features";
+const NATIVE_WORKER_CAPABILITY_CURRENT_SUPPORT: &str = "CURRENT_UNVERIFIED";
+const NATIVE_WORKER_CAPABILITY_CELL_REGISTRY_JSON: &str = r#"{"cells":[{"affected_edges":[],"allowed_effect_classes":[],"cell":"native-worker-core","cell_revision":{"major":1,"minor":0,"patch":0},"contract_digest":"418bf928930a0ce60690ffa67964ab863a18f637b4b7021561aead29e60f423c","contract_digest_source":"crates/modules/eliot-native-worker-core/capability-cell.contract.toml#contract-surface","execution_contour":"DELEGATED_BUNDLE","freshness":{"current_support":"CURRENT_UNVERIFIED","invalidation":[]},"generation_owner":"A-13","lifecycle_owner":"A-13","maintenance_owner":"A-13","manifest":{"context_capsule":{"owner":"A-13","present":true},"contract_kit":{"owner":"A-13","present":true},"test_capsule":{"owner":"A-13","present":true}},"product_pulse":{"NOT_APPLICABLE":{"reason":"This internal process protocol core has no independent Product Pulse; product behavior is measured at the native-worker bundle contour."}},"proof_ceiling":"STATIC_FIELD_AND_MIGRATION_CONTRACT_ONLY","proof_entrypoint":"cargo test -p eliot-native-worker-core --all-targets --all-features","removal_boundary":"Stop claim admission, drain and cancel the exact native-worker process generation through Kernel, then replace the worker bundle.","replacement_class":"isolate_dependency","runtime_bundle":"eliot-native-worker","semantic_owner":"A-13","source_crate":"eliot-native-worker-core","state_owners":[{"owner":"A-13","state":"WorkerCore lifecycle, grant, process binding and start receipt, connection, and last-event sequence"}],"stateless":false}],"generator_version":"1.0.0","pair_key":"sha256:ab2011bd67557d89b2f094061d350a297389f7f57d0478be5e1ff8d2da8ed1c1","registry_version":1,"source_identity":{"cargo_lock_digest":"0edff9845221d821ce0cef521d9503a8902a091760a8e571244c0c90e36878d8","generator_version":"1.0.0","toolchain":"rustc 1.97.1 (8bab26f4f 2026-07-14); binary: rustc; commit-hash: 8bab26f4f68e0e26f0bb7960be334d5b520ea452; commit-date: 2026-07-14; host: x86_64-pc-windows-msvc; release: 1.97.1; LLVM version: 22.1.6","tree_digest":"f1d8ef891dcfbeca7daab3667fe69a16435a6ba8eb9cc4ddca6913a14bb9f9f1"}}"#;
 // END GENERATED native-worker capability-cell registry
 
 struct ValidatedNativeWorkerCellRegistry {
-    registry: CapabilityCellRegistry,
-    original_digest: String,
+    /// #13's typed proof surface for this cell, resolved once through the owner
+    /// primitive against the values the package manifest and the contract file
+    /// independently declare. It owns its identity, so the registry it was read
+    /// out of is not retained alongside it.
+    proof: CapabilityCellProof,
 }
 
-static NATIVE_WORKER_CELL_REGISTRY: OnceLock<Result<ValidatedNativeWorkerCellRegistry, String>> =
-    OnceLock::new();
+static NATIVE_WORKER_CELL_REGISTRY: OnceLock<
+    Result<ValidatedNativeWorkerCellRegistry, NativeWorkerCellRefusal>,
+> = OnceLock::new();
+
+/// What Kernel independently DECLARES about the cell its generated registry
+/// carries.
+///
+/// Each value is read from the source that declares it and is generated into
+/// this file from that source by the same pass that writes the record — the
+/// contract digest of `crates/modules/eliot-native-worker-core/
+/// capability-cell.contract.toml`, the proof entrypoint from the package
+/// manifest, and the support claim from the contract. They are therefore a
+/// second reading of the same declaration inputs rather than a second,
+/// independent authority.
+///
+/// What that buys is that the comparison against the record is BY VALUE, which
+/// is the whole point of resolving here. Presence is not a proof surface: any
+/// non-empty entrypoint satisfies a presence test, and a support claim is not
+/// distinguished by refusing only `Stale`/`Suspended`. A record that therefore
+/// names a different entrypoint, a different support claim, or a different
+/// contract digest than the declaring sources is refused, and the refusal
+/// carries both values. The digest is only validated here, never recomputed: the
+/// ORIGINAL recorded value the sources declare is what the record is compared
+/// against.
+fn native_worker_cell_expectation() -> Result<CapabilityCellExpectation, CapabilityCellProofError> {
+    CapabilityCellExpectation::new(
+        CapabilityCellId::new(NATIVE_WORKER_CAPABILITY_CELL_ID)
+            .map_err(|_| CapabilityCellProofError::InvalidRegistry)?,
+        SourceCrateRef::new(NATIVE_WORKER_CAPABILITY_SOURCE_PACKAGE)
+            .map_err(|_| CapabilityCellProofError::InvalidRegistry)?,
+        ProofEntrypointRef::new(NATIVE_WORKER_CAPABILITY_PROOF_ENTRYPOINT)
+            .map_err(|_| CapabilityCellProofError::InvalidRegistry)?,
+        ContractDigest::new(NATIVE_WORKER_CAPABILITY_CONTRACT_DIGEST)
+            .map_err(|_| CapabilityCellProofError::InvalidRegistry)?,
+        native_worker_declared_support()?,
+    )
+}
+
+/// Parses the declared support claim through #13's own closed vocabulary.
+///
+/// The generated constant carries the SCREAMING_SNAKE spelling the record's wire
+/// form uses, so it is parsed through that same spelling rather than matched
+/// against a second local list. An unknown spelling is a refusal, never a
+/// default.
+fn native_worker_declared_support() -> Result<SupportStatus, CapabilityCellProofError> {
+    serde_json::from_value(serde_json::Value::String(
+        NATIVE_WORKER_CAPABILITY_CURRENT_SUPPORT.to_owned(),
+    ))
+    .map_err(|_| CapabilityCellProofError::InvalidRegistry)
+}
 
 fn validated_native_worker_cell_registry()
--> Result<&'static ValidatedNativeWorkerCellRegistry, &'static str> {
+-> Result<&'static ValidatedNativeWorkerCellRegistry, NativeWorkerCellRefusal> {
     match NATIVE_WORKER_CELL_REGISTRY.get_or_init(|| {
         let registry: CapabilityCellRegistry =
             serde_json::from_str(NATIVE_WORKER_CAPABILITY_CELL_REGISTRY_JSON)
-                .map_err(|_| "embedded registry JSON failed typed decoding".to_owned())?;
-        registry
-            .validate()
-            .map_err(|_| "embedded capability-cell registry failed validation".to_owned())?;
-        let original_digest = registry
-            .registry_digest()
-            .map_err(|_| "validated registry digest could not be calculated".to_owned())?;
-        Ok(ValidatedNativeWorkerCellRegistry {
-            registry,
-            original_digest,
-        })
+                .map_err(|_| NativeWorkerCellRefusal::InvalidRegistry)?;
+        registry.validate().map_err(|_| NativeWorkerCellRefusal::InvalidRegistry)?;
+        // The registry is validated first, then the one cell this composition
+        // admits is resolved through the #13 owner primitive. Both refusals are
+        // kept as the owner's own typed values so the compared evidence
+        // survives into the diagnostic instead of collapsing to a bare reason.
+        let proof = registry
+            .resolve_cell_proof(&native_worker_cell_expectation()?)
+            .map_err(NativeWorkerCellRefusal::Proof)?;
+        Ok(ValidatedNativeWorkerCellRegistry { proof })
     }) {
         Ok(registry) => Ok(registry),
-        Err(_) => Err("embedded native-worker capability-cell registry is invalid"),
+        Err(refusal) => Err(refusal.clone()),
     }
 }
 
-pub(super) fn validate_native_worker_cell_registry() -> Result<(), &'static str> {
+/// One fail-closed refusal from this composition's native-worker capability-cell
+/// binding.
+///
+/// Every variant names what was compared and refuses the request. A record that
+/// cannot prove the presented identity proves nothing about it, so no variant is
+/// answered with a default cell and none is downgraded to a warning.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum NativeWorkerCellRefusal {
+    /// The embedded registry could not be typed-decoded, failed #13's own
+    /// validation, or carried a declaration this composition cannot express as
+    /// #13 types. Nothing in it is proven.
+    InvalidRegistry,
+    /// #13 refused the presented cell identity. The owner's error carries the
+    /// cell and the values it compared.
+    Proof(CapabilityCellProofError),
+    /// The claim selected a cell other than the one this generated registry
+    /// declares.
+    PresentedCellMismatch {
+        /// Cell identity the claim presented.
+        presented: String,
+        /// Cell identity the generated registry declares.
+        declared: String,
+    },
+    /// The record claims no delegated runtime bundle, so an admitted Module
+    /// generation has no owner-declared bundle to be bound to.
+    NoDeclaredRuntimeBundle {
+        /// Cell identity whose record delegates to no named bundle.
+        cell: String,
+        /// Execution contour the record does declare.
+        contour: ExecutionContour,
+    },
+    /// The admitted Module generation names a different runtime bundle than the
+    /// record declares for this cell.
+    RuntimeBundleMismatch {
+        /// Cell identity whose record declares another bundle.
+        cell: String,
+        /// Runtime bundle the record declares.
+        declared: String,
+        /// Runtime bundle the admitted Module generation names.
+        admitted: String,
+    },
+}
+
+impl std::fmt::Display for NativeWorkerCellRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidRegistry => {
+                write!(formatter, "embedded native-worker capability-cell registry is invalid")
+            }
+            Self::Proof(error) => write!(formatter, "native-worker cell proof refused: {error}"),
+            Self::PresentedCellMismatch { presented, declared } => write!(
+                formatter,
+                "claim selected capability cell '{presented}', but this composition declares '{declared}'"
+            ),
+            Self::NoDeclaredRuntimeBundle { cell, contour } => write!(
+                formatter,
+                "capability cell '{cell}' declares no runtime bundle (contour={contour:?}), so an admitted Module generation has nothing to bind to"
+            ),
+            Self::RuntimeBundleMismatch {
+                cell,
+                declared,
+                admitted,
+            } => write!(
+                formatter,
+                "capability cell '{cell}' declares runtime bundle '{declared}', but the admitted Module generation names '{admitted}'"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for NativeWorkerCellRefusal {}
+
+impl From<CapabilityCellProofError> for NativeWorkerCellRefusal {
+    fn from(error: CapabilityCellProofError) -> Self {
+        Self::Proof(error)
+    }
+}
+
+pub(super) fn validate_native_worker_cell_registry() -> Result<(), NativeWorkerCellRefusal> {
     validated_native_worker_cell_registry().map(|_| ())
 }
 
-/// Resolves the worker's presented cell against the independent generated
-/// registry and returns that validated record-set's original digest.
+/// Resolves the worker's presented cell through #13's owner primitive and
+/// returns that validated record-set's original digest.
+///
+/// The digest is the digest of the ORIGINAL recorded registry value the record
+/// was read out of — the same validated value `resolve_cell_proof` digested — so
+/// a caller can receipt exactly which compiled record answered it.
 pub(super) fn native_worker_cell_registry_digest(
     selected_cell: &CapabilityCellId,
-) -> Result<&'static str, &'static str> {
+) -> Result<&'static str, NativeWorkerCellRefusal> {
     let loaded = validated_native_worker_cell_registry()?;
-    if selected_cell.as_str() != NATIVE_WORKER_CAPABILITY_CELL_ID {
-        return Err("claim selected a cell outside the native-worker contract");
+    if loaded.proof.cell().as_str() != selected_cell.as_str() {
+        return Err(NativeWorkerCellRefusal::PresentedCellMismatch {
+            presented: selected_cell.as_str().to_owned(),
+            declared: loaded.proof.cell().as_str().to_owned(),
+        });
     }
-    let mut records = loaded
-        .registry
-        .cells
-        .iter()
-        .filter(|record| record.cell.as_str() == selected_cell.as_str());
-    let record = records
-        .next()
-        .ok_or("selected native-worker cell is absent from registry")?;
-    if records.next().is_some()
-        || record.source_crate.as_str() != NATIVE_WORKER_CAPABILITY_SOURCE_PACKAGE
-        || record.proof_entrypoint.is_none()
-        || matches!(
-            record.freshness.current_support,
-            SupportStatus::Stale | SupportStatus::Suspended
-        )
-        || !record.freshness.invalidation.is_empty()
-    {
-        return Err("selected native-worker cell has no current validated proof surface");
+    Ok(loaded.proof.registry_digest())
+}
+
+/// Binds the admitted Module generation to the process cell the record declares.
+///
+/// This is the process-cell half of the binding. #13's
+/// `CapabilityCellRecord` declares **no** Module-generation field: its own
+/// field list is `cell`, `cell_revision`, the four owner references, `stateless`,
+/// `state_owners`, `contract_digest`, `contract_digest_source`, `runtime_bundle`,
+/// `execution_contour`, `allowed_effect_classes`, `replacement_class`,
+/// `removal_boundary`, `proof_entrypoint`, `proof_ceiling`, `affected_edges`,
+/// `product_pulse`, `freshness`, `source_crate`, `manifest` and
+/// `executable_capsule`
+/// (`crates/foundation/eliot-contracts/src/capability_cell_registry.rs`).
+/// `generation_owner` is a [`CellOwnerRef`](eliot_contracts::CellOwnerRef) — an
+/// accountable owner, not a generation identity — and the only process-cell
+/// identity on the record is `runtime_bundle: Option<RuntimeBundleId>`.
+///
+/// So the binding is made through that field, and it is a real one for this cell:
+/// the record declares `execution_contour = "DELEGATED_BUNDLE"` with
+/// `runtime_bundle = "eliot-native-worker"`, and Kernel admits the worker
+/// session under exactly that Module identity
+/// (`front_door_session::NATIVE_MODULE_ID`). `admitted_module_id` is therefore
+/// compared **by value** against the declared bundle: a record that delegated to
+/// another bundle, or claimed no bundle at all while a Module generation is
+/// admitted, is refused instead of being read as if it agreed.
+///
+/// A `None` bundle is a real declared value, not missing evidence, and it is
+/// refused here for the same reason the research provider's `HOST_INLINE` cell
+/// cannot be bound to a generation: this consumer admits a delegated process,
+/// so a record describing inline execution is describing a different cell.
+pub(super) fn native_worker_cell_admits_module_generation(
+    selected_cell: &CapabilityCellId,
+    admitted_module_id: &str,
+) -> Result<(), NativeWorkerCellRefusal> {
+    let loaded = validated_native_worker_cell_registry()?;
+    if loaded.proof.cell().as_str() != selected_cell.as_str() {
+        return Err(NativeWorkerCellRefusal::PresentedCellMismatch {
+            presented: selected_cell.as_str().to_owned(),
+            declared: loaded.proof.cell().as_str().to_owned(),
+        });
     }
-    Ok(loaded.original_digest.as_str())
+    let cell = loaded.proof.cell().as_str();
+    let Some(declared) = loaded.proof.runtime_bundle() else {
+        return Err(NativeWorkerCellRefusal::NoDeclaredRuntimeBundle {
+            cell: cell.to_owned(),
+            contour: loaded.proof.execution_contour(),
+        });
+    };
+    if declared.as_str() != admitted_module_id {
+        return Err(NativeWorkerCellRefusal::RuntimeBundleMismatch {
+            cell: cell.to_owned(),
+            declared: declared.as_str().to_owned(),
+            admitted: admitted_module_id.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// The single capability this Kernel's server-owned front-door policy grants to

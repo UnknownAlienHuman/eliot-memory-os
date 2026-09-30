@@ -1294,6 +1294,21 @@ impl KernelComposition {
                 field: "process_start_receipt",
             })?;
         let registry_digest = native_worker_registry_digest(&executable_binding.capability_cell)?;
+        // The process-cell half of the same binding: the Module generation this
+        // session was admitted under is bound to the runtime bundle the #13
+        // record declares for the cell it just proved. Both sides are compared
+        // by value and the refusal carries the two bundles, so a record that
+        // delegated elsewhere — or claimed no bundle at all — cannot answer for
+        // this Module generation. This runs on the authenticated control
+        // connection, before the claim is admitted, and adds no new owner: it
+        // re-reads the proof the call above already resolved.
+        super::composition_bootstrap::native_worker_cell_admits_module_generation(
+            &executable_binding.capability_cell,
+            session.module_generation.module_id.as_str(),
+        )
+        .map_err(|_| NativeWorkerRouteError::Fence {
+            field: "capability_cell_runtime_bundle",
+        })?;
         let durable = self.load_claim_record(&request.claim_id)?;
         durable
             .validate()

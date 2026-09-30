@@ -205,9 +205,19 @@ CELL_SOURCES = (
             "crates/modules/eliot-native-worker-core/src/generated/native_worker_facets_v1.rs.in",
             "crates/modules/eliot-native-worker-core/src/generated/native_worker_facets_v1.rs",
         ),
-        # The Kernel-side consumer still resolves this cell through its own
-        # local record check, so it needs no expectation constants.
-        expectation_constants=(),
+        # This cell's Kernel-side consumer compares the record's proof surface
+        # by value, so the sink carries the expectations it compares against.
+        # Each is read here from the package manifest or the contract file - the
+        # declaration sources - and NOT from the generated record, so the
+        # comparison is a check between two independent declarations rather than
+        # a restatement. `CapabilityCellExpectation::new` takes values that are
+        # already #13 types, so each constant is consumed through that same
+        # validating constructor.
+        expectation_constants=(
+            ("NATIVE_WORKER_CAPABILITY_CONTRACT_DIGEST", "contract_digest"),
+            ("NATIVE_WORKER_CAPABILITY_PROOF_ENTRYPOINT", "proof_entrypoint"),
+            ("NATIVE_WORKER_CAPABILITY_CURRENT_SUPPORT", "current_support"),
+        ),
     ),
     CellSource(
         key="research-provider",
@@ -579,8 +589,13 @@ def _source_tree_digest(
 
 def load_cell_registry(
     root: Path, cell_source: CellSource
-) -> tuple[str, dict[str, object], str, str]:
-    """Build one cell's registry from package, contract, capsule, and source inputs."""
+) -> tuple[str, dict[str, object], str, str, dict[str, str]]:
+    """Build one cell's registry from package, contract, capsule, and source inputs.
+
+    The returned expectations are this cell's independently DECLARED proof
+    surface, read from the package manifest and the contract file rather than
+    from the record built below.
+    """
     source = parse_toml(root, cell_source.manifest)
     package = _table(source.get("package"), "package", cell_source.manifest)
     metadata = _table(
