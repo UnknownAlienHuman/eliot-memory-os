@@ -1,0 +1,253 @@
+{
+  "attestation_required": true,
+  "bundle_bytes": 86608,
+  "bundle_sha256": "7892dd68c02017ead39fcaf3a4716b618f1dae7e4030f2aa64212bce156d8747",
+  "matched_routes": [
+    "generic-source"
+  ],
+  "pair_key": "sha256:ab2011bd67557d89b2f094061d350a297389f7f57d0478be5e1ff8d2da8ed1c1",
+  "paths": [
+    "bins/eliotd/src/daemon_kernel_client.rs",
+    "bins/eliotd/src/daemon_runtime.rs"
+  ],
+  "read_receipt_id": "sha256:6e699b74d0f004b8db72140f4ba95b8f7aa7e780e4024e6ca783ace477f24268",
+  "required": [
+    {
+      "bytes": 2790,
+      "kind": "file",
+      "path": "AGENTS.md",
+      "sha256": "c0a1322afc3550f343ae61cbc02a52bf623dc40d013887de2a60d245a1a64017"
+    },
+    {
+      "bytes": 8465,
+      "kind": "file",
+      "path": "WORKFLOW.md",
+      "sha256": "ceb5fa3190a88386c6e5a9fd233b5ef1a591a50f243f720036bffa9e6d3f6291"
+    },
+    {
+      "bytes": 4672,
+      "kind": "file",
+      "path": "bins/AGENTS.md",
+      "sha256": "e365a17ecec717656517759853620c949ca12d1aea720a7c60028419327d9e53"
+    },
+    {
+      "bytes": 5646,
+      "kind": "file",
+      "path": "docs/ARCHITECTURE_CONTRACT.md",
+      "sha256": "b047585cc9be9abeab7e7699cbbcfe160fa7d88e099611e80f5f7c1ff83d3df7"
+    },
+    {
+      "bytes": 14448,
+      "kind": "file",
+      "path": "docs/DEPENDENCY_POLICY.md",
+      "sha256": "ff3dbfeadc5db7f315df59dc419ae481306b215bf810c43b73571c8d4355742b"
+    },
+    {
+      "bytes": 2611,
+      "kind": "file",
+      "path": "docs/architecture/READING_PROTOCOL.md",
+      "sha256": "253cca0f078acd49545baed814c9319d72659ef1e2428edf1ead789beaa4e1c3"
+    },
+    {
+      "bytes": 2357,
+      "kind": "file",
+      "path": "workstreams/ACTIVE.toml",
+      "sha256": "13fc14e9d197b09256371a704dd02204eda087356602bd32285687e48308cc19"
+    },
+    {
+      "anchors": [
+        "a01-purpose-of-the-architecture"
+      ],
+      "bytes": 1871,
+      "handles": [
+        "A0.1"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A00-01-purpose-of-the-architecture.md",
+      "sha256": "ee540ede56579ec388e26da2b290759e78ad3bb8a70ba57d56364800a1692750"
+    },
+    {
+      "anchors": [
+        "a02-hierarchy-of-architectural-decisions"
+      ],
+      "bytes": 1867,
+      "handles": [
+        "A0.2"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A00-02-hierarchy-of-architectural-decisions.md",
+      "sha256": "342c67f670714c83bb4c68693447fd7597bc4a662b87d4fa6bae09df3cbaf6e5"
+    },
+    {
+      "anchors": [
+        "a03-hard-boundaries"
+      ],
+      "bytes": 821,
+      "handles": [
+        "A0.3"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A00-03-hard-boundaries.md",
+      "sha256": "695fe5e156e0dde052556e23c34b008009348742d4fc4a1146393b8b13a48bc0"
+    },
+    {
+      "anchors": [
+        "a04-conflict-resolution"
+      ],
+      "bytes": 1318,
+      "handles": [
+        "A0.4"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A00-04-conflict-resolution.md",
+      "sha256": "732d3b9a63973398e07e48691ba56f6538d9168f3102e0702a5ca2e08910f556"
+    },
+    {
+      "anchors": [
+        "a06-changing-the-architecture"
+      ],
+      "bytes": 858,
+      "handles": [
+        "A0.6"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A00-06-changing-the-architecture.md",
+      "sha256": "c086ee01cc243b7d7dee465bc0ddfca0c36cc3a344b3b3e803a5eb94ff6f68a8"
+    },
+    {
+      "anchors": [
+        "a23-modular-architecture"
+      ],
+      "bytes": 6133,
+      "handles": [
+        "A2.3"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A02-03-modular-architecture.md",
+      "sha256": "6f7d0566576ddfcb88bae531421b58082b44e3ba6cd2b974f55a46990e26fd52"
+    },
+    {
+      "anchors": [
+        "a104-delegation"
+      ],
+      "bytes": 1980,
+      "handles": [
+        "A10.4"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A10-04-delegation.md",
+      "sha256": "fd9c93b5e66ea93a0a2bb171706449ca8d07d2d48caeb99d1acdc57360014cd9"
+    },
+    {
+      "anchors": [
+        "a148-development-doctrine"
+      ],
+      "bytes": 3740,
+      "handles": [
+        "A14.8"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A14-08-development-doctrine.md",
+      "sha256": "c7da919cd6112e97780407b7a7ae9806185994c2de6a275ed2449cb1b9ca78bb"
+    },
+    {
+      "anchors": [
+        "i03-decision-sources"
+      ],
+      "bytes": 1265,
+      "handles": [
+        "I0.3"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I00-03-decision-sources.md",
+      "sha256": "c5d7586399d8640484edaa3cb949495bc99a82b50dabddac029b2d08c2d716e8"
+    },
+    {
+      "anchors": [
+        "i04-change-classes"
+      ],
+      "bytes": 3252,
+      "handles": [
+        "I0.4"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I00-04-change-classes.md",
+      "sha256": "3c1fc91d692bee9494327b7f5375fbe45cddc00c27d5a0bf0dc3b40300a2ae45"
+    },
+    {
+      "anchors": [
+        "i05-conformance-support-and-evidence-status"
+      ],
+      "bytes": 6368,
+      "handles": [
+        "I0.5"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I00-05-conformance-support-and-evidence-status.md",
+      "sha256": "bfb599eb462ebfb904ec97ba199a8447371bce91ab73b7bad9e71f150cb837f9"
+    },
+    {
+      "anchors": [
+        "i013-current-support-conformance-and-product-status"
+      ],
+      "bytes": 996,
+      "handles": [
+        "I0.13"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I00-13-current-support-conformance-and-product-status.md",
+      "sha256": "2d691986e973b4c9191cf5718f32b5035a8470b8355c5d82489df48c18651d2e"
+    },
+    {
+      "anchors": [
+        "i014-documentation-and-evidence-build-integrity"
+      ],
+      "bytes": 3413,
+      "handles": [
+        "I0.14"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I00-14-documentation-and-evidence-build-integrity.md",
+      "sha256": "e645a72c291c89a4bc3e2eae99527aa2476dcfab0280e429df80405dbebe3fd9"
+    },
+    {
+      "anchors": [
+        "i217-parallel-agent-development-contract"
+      ],
+      "bytes": 1834,
+      "handles": [
+        "I2.17"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I02-17-parallel-agent-development-contract.md",
+      "sha256": "6c333908b112859dbffe00c04a9e942b38c5d369a85d89d78788ab576a1d7cb1"
+    },
+    {
+      "anchors": [
+        "i220-module-contract-kit-crate-context-capsule-and-module-test-capsule"
+      ],
+      "bytes": 5497,
+      "handles": [
+        "I2.20"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+      "sha256": "8a5d8276f2e1357eb58dd06acc7e5ac4017a4515048a5049c84e33849c381ef5"
+    },
+    {
+      "anchors": [
+        "i18-testing-and-instrumental-grounding-strategy"
+      ],
+      "bytes": 52,
+      "handles": [
+        "I18"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I18-testing-and-instrumental-grounding-strategy.md",
+      "sha256": "facd29dfe4a6fdb98a70f5a5decb7d960f8ca95419924828a44596c57940fb10"
+    }
+  ],
+  "route_receipt_id": "sha256:6e1027077960cdd92db39e2f55bfbaf0bd6ff0c9ef517537b3ffdea2e2368ad5",
+  "schema_version": "eliot-doc-read-v1",
+  "topic": "eliotd handshake and readiness diagnostic records at owning boundaries"
+}
