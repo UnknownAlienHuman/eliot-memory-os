@@ -279,6 +279,7 @@ use super::{
     RequestMeta, RevisionHeadExpectation, StoreError, WriteReceipt, WriteReceiptStatus,
     canonical_json_bytes, generated_operation_manifests, named_mutation_operation_name, sha256_hex,
 };
+use crate::{NamedMutationOperation, TransitionClass};
 use eliot_contracts::{ErrorCode, StateFence};
 
 /// Closed contract version of the write-admission projection (I5.22).
