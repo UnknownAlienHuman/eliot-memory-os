@@ -12,7 +12,10 @@
 
 pub mod bridge_contract;
 mod coverage_manifest_driver;
-pub use coverage_manifest_driver::drive_coverage_manifest;
+pub use coverage_manifest_driver::{
+    CoverageManifestRun, CoverageManifestRunOutcome, FingerprintIngestRunOutcome,
+    drive_coverage_manifest, run_coverage_manifest, run_ingest_for_fingerprint,
+};
 mod durable_host_event_ingest;
 pub use durable_host_event_ingest::{
     AllowedHostManifestView, BestEffortDropGap, BestEffortDropReason, CoverageManifestPlan,
