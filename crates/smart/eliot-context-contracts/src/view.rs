@@ -9,9 +9,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AdmittedAtom, AdmittedContextSet, AtomAvailability, AuthorityClass, ContextBinding,
-    ContextError, ContextExecutionIdentity, LossPolicy, MeasurementRef, PrivacyClass,
-    ProofBinding, QualityDimension, QualityOperation, QualityRefusal, QualityRefusalKind,
-    QualityScorecard, QualitySuitability, SerializedContextMeasurement,
+    ContextError, ContextExecutionIdentity, LossPolicy, MeasurementRef, PrivacyClass, ProofBinding,
+    QualityDimension, QualityOperation, QualityRefusal, QualityRefusalKind, QualityScorecard,
+    QualitySuitability, SerializedContextMeasurement,
 };
 
 /// Rendered projection of one admitted atom, retaining all load-bearing fields.

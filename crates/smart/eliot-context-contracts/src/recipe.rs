@@ -732,7 +732,10 @@ impl RecipeActivationRecord {
     /// Validate the closed decision record and its own recorded digest.
     pub fn validate(&self) -> Result<(), ContextError> {
         validate_text(self.decision.as_str(), "recipe_activation.decision")?;
-        validate_text(self.activated.policy_id.as_str(), "recipe_activation.activated")?;
+        validate_text(
+            self.activated.policy_id.as_str(),
+            "recipe_activation.activated",
+        )?;
         validate_digest(
             &self.activated.policy_sha256,
             "recipe_activation.activated.policy_sha256",
@@ -803,10 +806,7 @@ impl RecipeRevocationRecord {
     /// Validate the closed decision record and its own recorded digest.
     pub fn validate(&self) -> Result<(), ContextError> {
         validate_text(self.decision.as_str(), "recipe_revocation.decision")?;
-        validate_text(
-            self.revoked.policy_id.as_str(),
-            "recipe_revocation.revoked",
-        )?;
+        validate_text(self.revoked.policy_id.as_str(), "recipe_revocation.revoked")?;
         validate_digest(
             &self.revoked.policy_sha256,
             "recipe_revocation.revoked.policy_sha256",
@@ -1020,12 +1020,15 @@ impl ContextRecipePolicy {
         &self,
         support: &RecipeExecutionSupport,
     ) -> Result<(), RecipeResolutionRefusal> {
-        self.validate().map_err(|error| RecipeResolutionRefusal::InvalidCatalogue {
-            reason: error.to_string(),
-        })?;
-        support.validate().map_err(|error| RecipeResolutionRefusal::InvalidCatalogue {
-            reason: error.to_string(),
-        })?;
+        self.validate()
+            .map_err(|error| RecipeResolutionRefusal::InvalidCatalogue {
+                reason: error.to_string(),
+            })?;
+        support
+            .validate()
+            .map_err(|error| RecipeResolutionRefusal::InvalidCatalogue {
+                reason: error.to_string(),
+            })?;
         let identity = RecipePolicyIdentity::of(self);
         let unsupported = |field: &str| RecipeResolutionRefusal::UnsupportedSetting {
             identity: identity.clone(),
@@ -1749,8 +1752,11 @@ impl ApprovedRecipeCatalogue {
                 return Err(ContextError::Duplicate("recipe_catalogue.candidates"));
             }
         }
-        let held: BTreeSet<RecipePolicyIdentity> =
-            self.candidates.iter().map(RecipePolicyIdentity::of).collect();
+        let held: BTreeSet<RecipePolicyIdentity> = self
+            .candidates
+            .iter()
+            .map(RecipePolicyIdentity::of)
+            .collect();
 
         let mut decisions = BTreeSet::new();
         let mut activated = BTreeSet::new();
@@ -1777,10 +1783,8 @@ impl ApprovedRecipeCatalogue {
             {
                 return Err(ContextError::IdentityConflict);
             }
-            if !RecipeApplicability::declared_covers(
-                &activation.applicability,
-                &self.applicability,
-            ) {
+            if !RecipeApplicability::declared_covers(&activation.applicability, &self.applicability)
+            {
                 return Err(ContextError::IdentityConflict);
             }
             if activation
@@ -1794,7 +1798,8 @@ impl ApprovedRecipeCatalogue {
         for candidate in &self.candidates {
             let identity = RecipePolicyIdentity::of(candidate);
             if !self.activations.iter().any(|activation| {
-                activation.activated == identity && activation.decision == candidate.supersession.activation
+                activation.activated == identity
+                    && activation.decision == candidate.supersession.activation
             }) {
                 return Err(ContextError::IdentityConflict);
             }
