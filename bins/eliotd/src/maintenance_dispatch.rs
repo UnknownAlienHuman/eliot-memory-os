@@ -28,9 +28,31 @@
 
 #![forbid(unsafe_code)]
 
-use eliot_maintenance::{
-    AutomationDecision, AutomationTriggerDecision, DecisionReason, MaintenanceFamily,
+use std::num::NonZeroU32;
+
+use eliot_contracts::{ResourceGeneration, StateFence};
+use eliot_kernel_service::{
+    KernelStoreGateway, MAX_MAINTENANCE_TRIGGER_CLAIM_LEASE_MS, MaintenanceTriggerClaimRequest,
+    MaintenanceTriggerDeliveryError,
 };
+use eliot_maintenance::{
+    AutomationDecision, AutomationTriggerDecision, DecisionReason, MaintenanceError,
+    MaintenanceFamily, MaintenanceTriggerIntake, TriggerIntakePayload, TriggerIntakePosition,
+    TriggerIntakeRequest, TriggerIntakeRouting, derive_trigger_intake,
+};
+use eliot_ors::{
+    MaintenanceTriggerStagingPayload, MaintenanceTriggerStagingPosition,
+    MaintenanceTriggerStagingRequest, MaintenanceTriggerStagingRoute, OpaqueLabel,
+    OperationalRecoveryStore, OrsError, stage_maintenance_trigger_intake,
+};
+use eliot_protocol::{
+    MAINTENANCE_TRIGGER_WIRE_ID, MAINTENANCE_TRIGGER_WIRE_VERSION, MaintenanceTriggerClaim,
+    MaintenanceTriggerContentRef, MaintenanceTriggerGap, MaintenanceTriggerIntakeReceipt,
+    MaintenanceTriggerPayloadRef, MaintenanceTriggerPendingSummary, MaintenanceTriggerPosition,
+    MaintenanceTriggerRecord, MaintenanceTriggerRouteGrant, MaintenanceTriggerRoutingClass,
+    MaintenanceTriggerSourceEvent, ProtocolError,
+};
+use thiserror::Error;
 
 use crate::maintenance_family_catalog::MaintenanceFamilyDecision;
 
@@ -314,4 +336,845 @@ impl MaintenanceDispatch {
             existing_job = %existing_job,
         );
     }
+}
+
+/// Owner-supplied durable payload binding for one front-door intake.
+///
+/// The delivery-obligation reference and payload digest name the exact staged
+/// bytes: for a retained canonical source they name the already-staged source
+/// envelope (re-proved by the ORS owner's read-back at staging time); for a
+/// complete opaque input they must equal the supplied envelope's own identity
+/// and digest, which the mapper checks before any write. The envelope itself
+/// is built by the payload owner under the existing `RecoveryPayloadEnvelope`
+/// rules — this front door never mints, encrypts, or re-wraps bytes.
+#[derive(Clone, Debug)]
+pub struct TriggerIntakeDurableBinding {
+    /// Complete durable payload: a retained source operation identity the
+    /// ORS owner resolves, or the full owner-built opaque envelope to stage.
+    pub payload: MaintenanceTriggerStagingPayload,
+    /// Lowercase SHA-256 of the exact staged envelope payload bytes.
+    pub payload_hash: String,
+}
+
+/// Owner-supplied producer authentication binding for one front-door intake.
+///
+/// The signer identity and signature authenticate the intake producer through
+/// the existing signer seam; the scheme is the caller's and verification is
+/// the bound evidence provider's. This front door invents neither.
+#[derive(Clone, Debug)]
+pub struct TriggerIntakeSignerBinding {
+    /// Intake producer authenticated through the existing signer seam.
+    pub signer_id: OpaqueLabel,
+    /// Producer signature over the staged item.
+    pub signature: Vec<u8>,
+    /// Intake arrival time as Unix milliseconds.
+    pub arrived_at_ms: i64,
+}
+
+/// Owner bindings the front-door intake caller does not derive itself.
+///
+/// The derived statement carries every verbatim field; these bindings carry
+/// only what derivation cannot produce: the owner-built durable payload with
+/// its digest, the producer signer binding, the admitted source fence, and
+/// the owner-issued protected-route grant when the intake is protected.
+#[derive(Clone, Debug)]
+pub struct TriggerIntakeOwnerBindings {
+    /// Owner-built durable payload with its staged-bytes digest.
+    pub durable: TriggerIntakeDurableBinding,
+    /// Producer signer binding for the staged inbox item.
+    pub signer: TriggerIntakeSignerBinding,
+    /// Source authority and resource fence carried on the wire record.
+    /// Producer generation travels separately in the source event.
+    pub source_fence: StateFence,
+    /// Owner-issued protected-route classification; present exactly when the
+    /// derived routing is protected.
+    pub route_grant: Option<MaintenanceTriggerRouteGrant>,
+}
+
+/// Fail-closed refusals of the front-door maintenance-trigger intake (I14.22,
+/// issue #1694 W2).
+///
+/// Every variant keeps its owner's exact typed failure and the producer's
+/// retry identity (trigger identity plus operation hash): a derivation
+/// refusal stays a [`MaintenanceError`], a statement-to-owner binding refusal
+/// stays a [`ProtocolError`], the ORS owner's durable-staging refusal stays
+/// an [`OrsError`], and the Kernel delivery owner's admission refusal stays a
+/// [`MaintenanceTriggerDeliveryError`]. No failure acknowledges acceptance or
+/// advances the producer cursor, and no variant invents a spill file:
+/// critical gaps travel the existing protected owner, never a new unbounded
+/// store.
+#[derive(Debug, Error)]
+pub enum MaintenanceTriggerIntakeError {
+    /// The intake request failed persist-before-ack derivation.
+    #[error("maintenance trigger intake derivation refused for trigger {trigger_id}: {source}")]
+    Derivation {
+        /// Stable trigger identity the producer retries under.
+        trigger_id: String,
+        /// Operation hash the producer retries under.
+        operation_hash: String,
+        /// Exact derivation refusal; nothing was staged.
+        #[source]
+        source: Box<MaintenanceError>,
+    },
+    /// The derived statement and the owner bindings name different
+    /// obligations, so the intake would acknowledge the wrong bytes.
+    #[error("maintenance trigger intake binding mismatch for trigger {trigger_id}: {source}")]
+    BindingConflict {
+        /// Stable trigger identity the producer retries under.
+        trigger_id: String,
+        /// Operation hash the producer retries under.
+        operation_hash: String,
+        /// Exact binding refusal; changed content conflicts.
+        #[source]
+        source: Box<ProtocolError>,
+    },
+    /// The ORS owner could not durably stage the complete input (capacity,
+    /// key, integrity, or durable-write refusal).
+    #[error("maintenance trigger intake staging refused for trigger {trigger_id}: {source}")]
+    Staging {
+        /// Stable trigger identity the producer retries under.
+        trigger_id: String,
+        /// Operation hash the producer retries under.
+        operation_hash: String,
+        /// Exact owner refusal; no receipt was issued.
+        #[source]
+        source: Box<OrsError>,
+    },
+    /// The Kernel delivery owner refused admission of the staged trigger, or
+    /// answered with a receipt that does not echo the admitted record.
+    #[error("maintenance trigger intake admission refused for trigger {trigger_id}: {source}")]
+    Admission {
+        /// Stable trigger identity the producer retries under.
+        trigger_id: String,
+        /// Operation hash the producer retries under.
+        operation_hash: String,
+        /// Exact owner refusal; nothing was admitted.
+        #[source]
+        source: Box<MaintenanceTriggerDeliveryError>,
+    },
+}
+
+impl MaintenanceTriggerIntakeError {
+    /// Returns the stable trigger identity the producer retries under.
+    #[must_use]
+    pub fn trigger_id(&self) -> &str {
+        match self {
+            Self::Derivation { trigger_id, .. }
+            | Self::BindingConflict { trigger_id, .. }
+            | Self::Staging { trigger_id, .. }
+            | Self::Admission { trigger_id, .. } => trigger_id,
+        }
+    }
+
+    /// Returns the operation hash the producer retries under.
+    #[must_use]
+    pub fn operation_hash(&self) -> &str {
+        match self {
+            Self::Derivation { operation_hash, .. }
+            | Self::BindingConflict { operation_hash, .. }
+            | Self::Staging { operation_hash, .. }
+            | Self::Admission { operation_hash, .. } => operation_hash,
+        }
+    }
+}
+
+/// Admits one retained maintenance trigger through the existing ORS and
+/// Kernel owners before any acknowledgement (I14.22, issue #1694 W2).
+///
+/// This is the production front-door intake route caller: it derives first,
+/// stages second, admits third, and acknowledges nothing itself. The producer
+/// cursor advances only on the returned
+/// [`MaintenanceTriggerIntakeReceipt`]; every error returns with the
+/// producer's retry identity and no acceptance.
+///
+/// Derivation is [`derive_trigger_intake`], so the source-attested operation
+/// hash travels verbatim and an exact identity/hash replay converges while
+/// changed content conflicts. Persistence is the Governor seam's two steps
+/// performed with owner-typed errors: [`stage_maintenance_trigger_intake`]
+/// commits the complete input (or the retained-source delivery obligation)
+/// through the ORS owner, then
+/// [`MaintenanceTriggerIntake::bind_staging_proof`] binds the owner-issued
+/// envelope reference and payload digest. The seam entry
+/// [`MaintenanceTriggerIntake::persist_before_ack`] is not used here on
+/// purpose: its seam error type is [`MaintenanceError`], which can only carry
+/// an owner staging refusal as an opaque string, while this caller must
+/// preserve the exact bounded [`OrsError`]. Admission is
+/// [`KernelStoreGateway::admit_maintenance_trigger`], which re-proves staging
+/// through the ORS read-back before admitting the wire record into the owned
+/// delivery ledger: an exact replay returns the same receipt, changed content
+/// conflicts, and any failure admits nothing.
+///
+/// This caller holds no ledger, opens no poller, creates no second database,
+/// and writes no spill file: delivery metadata stays with the Kernel ledger,
+/// staged bytes stay with the ORS inbox owner, and protected safety/recovery
+/// routing travels the existing owner-issued grant on both the staging
+/// request and the wire record.
+///
+/// # Errors
+///
+/// Returns [`MaintenanceTriggerIntakeError`] keeping each owner's typed
+/// refusal: a derivation refusal, a statement-to-owner binding mismatch, an
+/// ORS staging refusal, or a Kernel admission refusal.
+pub fn admit_maintenance_trigger_intake(
+    store: &impl OperationalRecoveryStore,
+    gateway: &KernelStoreGateway,
+    principal_ref: &str,
+    request: &TriggerIntakeRequest,
+    owner: &TriggerIntakeOwnerBindings,
+) -> Result<MaintenanceTriggerIntakeReceipt, MaintenanceTriggerIntakeError> {
+    let retry_id = (
+        request.input.trigger_id.clone(),
+        request.operation.operation_hash.clone(),
+    );
+    let statement = derive_trigger_intake(request).map_err(|source| {
+        MaintenanceTriggerIntakeError::Derivation {
+            trigger_id: retry_id.0.clone(),
+            operation_hash: retry_id.1.clone(),
+            source: Box::new(source),
+        }
+    })?;
+    let staging = map_intake_to_staging_request(&statement, &owner.durable, &owner.signer)
+        .map_err(|source| intake_binding_conflict(&statement, source))?;
+    // Persist before acknowledging: the complete opaque input (or the
+    // retained-source delivery obligation) commits through the ORS owner. An
+    // exact replay converges on the owner's existing receipt; changed content
+    // fails with a duplicate conflict. Any failure carries no receipt, so the
+    // producer keeps its retry identity and its cursor must not advance.
+    stage_maintenance_trigger_intake(store, &staging).map_err(|source| {
+        MaintenanceTriggerIntakeError::Staging {
+            trigger_id: statement.trigger_id.clone(),
+            operation_hash: statement.operation_hash.clone(),
+            source: Box::new(source),
+        }
+    })?;
+    // Bind the owner-issued staging output before it may advance any cursor.
+    // A mismatch is changed content under this identity and conflicts instead
+    // of replaying.
+    let persist = statement
+        .bind_staging_proof(&staging.envelope_reference, &staging.payload_hash)
+        .map_err(|source| {
+            let source = match source {
+                MaintenanceError::IdentityConflict => ProtocolError::ReplayConflict,
+                _ => ProtocolError::InvalidField {
+                    field: "maintenance_trigger.persist",
+                    reason: "staging binding is not well formed",
+                },
+            };
+            MaintenanceTriggerIntakeError::BindingConflict {
+                trigger_id: statement.trigger_id.clone(),
+                operation_hash: statement.operation_hash.clone(),
+                source: Box::new(source),
+            }
+        })?;
+    let record = map_intake_to_wire_record(
+        &statement,
+        &persist.envelope_reference,
+        &persist.payload_hash,
+        owner,
+    )
+    .map_err(|source| {
+        MaintenanceTriggerIntakeError::BindingConflict {
+            trigger_id: statement.trigger_id.clone(),
+            operation_hash: statement.operation_hash.clone(),
+            source: Box::new(source),
+        }
+    })?;
+    // Bind the delivery obligation before admission: the staged envelope
+    // reference, payload hash, trigger identity, and operation hash must name
+    // the same obligation on both sides. A staging that pointed beside its
+    // bytes would acknowledge the wrong obligation, so changed content
+    // conflicts here before any cursor could advance.
+    if staging.trigger_id != record.trigger_id
+        || staging.operation_hash != record.operation_hash
+        || staging.envelope_reference != record.payload.envelope_reference
+        || staging.payload_hash != record.payload.payload_hash
+    {
+        return Err(MaintenanceTriggerIntakeError::BindingConflict {
+            trigger_id: record.trigger_id.clone(),
+            operation_hash: record.operation_hash.clone(),
+            source: Box::new(ProtocolError::ReplayConflict),
+        });
+    }
+    // Admit the staged record into the owned delivery ledger. The owner entry
+    // re-proves staging through the ORS read-back, then admits: exact
+    // identity/hash replay returns the same receipt, changed content
+    // conflicts, and any failure admits nothing.
+    let (receipt, _) = gateway
+        .admit_maintenance_trigger(principal_ref, record)
+        .map_err(|source| MaintenanceTriggerIntakeError::Admission {
+            trigger_id: staging.trigger_id.clone(),
+            operation_hash: staging.operation_hash.clone(),
+            source: Box::new(source),
+        })?;
+    receipt
+        .validate()
+        .map_err(|source| MaintenanceTriggerIntakeError::Admission {
+            trigger_id: staging.trigger_id.clone(),
+            operation_hash: staging.operation_hash.clone(),
+            source: Box::new(MaintenanceTriggerDeliveryError::Protocol(source)),
+        })?;
+    if receipt.trigger_id != staging.trigger_id
+        || receipt.operation_hash != staging.operation_hash
+        || receipt.envelope_reference != staging.envelope_reference
+        || receipt.payload_hash != staging.payload_hash
+    {
+        return Err(MaintenanceTriggerIntakeError::Admission {
+            trigger_id: staging.trigger_id.clone(),
+            operation_hash: staging.operation_hash.clone(),
+            source: Box::new(MaintenanceTriggerDeliveryError::Protocol(
+                ProtocolError::ReplayConflict,
+            )),
+        });
+    }
+    Ok(receipt)
+}
+
+/// Builds the binding-conflict refusal for one derived intake statement.
+///
+/// The statement carries the retry identity, so every mapper, proof-binding,
+/// and obligation-equality refusal keeps the trigger identity and operation
+/// hash the producer retries under.
+fn intake_binding_conflict(
+    statement: &MaintenanceTriggerIntake,
+    source: ProtocolError,
+) -> MaintenanceTriggerIntakeError {
+    MaintenanceTriggerIntakeError::BindingConflict {
+        trigger_id: statement.trigger_id.clone(),
+        operation_hash: statement.operation_hash.clone(),
+        source: Box::new(source),
+    }
+}
+
+/// Copies one derived intake statement verbatim onto the ORS staging request.
+///
+/// Identity, generation, position, operation label and hash, opaque
+/// family/scope references, evidence locators, window, and routing travel
+/// unchanged; the durable payload, its digest, and the signer binding arrive
+/// from their owners. For a complete opaque input the supplied digest must
+/// equal the envelope's own digest, so a caller mix-up fails here before any
+/// write; for a retained source the digest is the expected content the ORS
+/// owner re-proves by read-back.
+fn map_intake_to_staging_request(
+    statement: &MaintenanceTriggerIntake,
+    durable: &TriggerIntakeDurableBinding,
+    signer: &TriggerIntakeSignerBinding,
+) -> Result<MaintenanceTriggerStagingRequest, ProtocolError> {
+    let (envelope_reference, payload) = match &durable.payload {
+        MaintenanceTriggerStagingPayload::RetainedCanonicalSource { operation_id } => {
+            if !matches!(
+                statement.payload,
+                TriggerIntakePayload::RetainedCanonicalSource { .. }
+            ) {
+                return Err(ProtocolError::ReplayConflict);
+            }
+            (
+                operation_id.as_str().to_owned(),
+                MaintenanceTriggerStagingPayload::RetainedCanonicalSource {
+                    operation_id: operation_id.clone(),
+                },
+            )
+        }
+        MaintenanceTriggerStagingPayload::CompleteOpaqueInput { envelope } => {
+            if !matches!(
+                statement.payload,
+                TriggerIntakePayload::CompleteOpaqueInput { .. }
+            ) {
+                return Err(ProtocolError::ReplayConflict);
+            }
+            if durable.payload_hash != envelope.payload_sha256 {
+                return Err(ProtocolError::ReplayConflict);
+            }
+            (
+                envelope.operation_or_checkpoint_id.as_str().to_owned(),
+                MaintenanceTriggerStagingPayload::CompleteOpaqueInput {
+                    envelope: envelope.clone(),
+                },
+            )
+        }
+    };
+    Ok(MaintenanceTriggerStagingRequest {
+        trigger_id: statement.trigger_id.clone(),
+        operation_hash: statement.operation_hash.clone(),
+        producer_id: statement.source_event.producer_id.clone(),
+        producer_generation: statement.source_event.producer_generation,
+        stream_id: statement.source_event.stream_id.clone(),
+        event_id: statement.source_event.event_id.clone(),
+        position: match &statement.source_position {
+            TriggerIntakePosition::Cursor { value } => {
+                MaintenanceTriggerStagingPosition::Cursor { value: *value }
+            }
+            TriggerIntakePosition::AcceptedOccurrence { occurrence_id } => {
+                MaintenanceTriggerStagingPosition::AcceptedOccurrence {
+                    occurrence_id: occurrence_id.clone(),
+                }
+            }
+        },
+        operation_label: statement.operation_label.clone(),
+        family_ref: statement.family_ref.clone(),
+        scope_ref: statement.scope_ref.clone(),
+        evidence_locators: statement.evidence_locators.clone(),
+        envelope_reference,
+        payload_hash: durable.payload_hash.clone(),
+        created_at_ms: statement.created_at_ms,
+        applicable_until_ms: statement.applicable_until_ms,
+        routing: match &statement.routing {
+            TriggerIntakeRouting::Ordinary => MaintenanceTriggerStagingRoute::Ordinary,
+            TriggerIntakeRouting::Protected {
+                owner_id,
+                route,
+                key_id,
+                grant_digest,
+            } => MaintenanceTriggerStagingRoute::Protected {
+                owner_id: owner_id.clone(),
+                route: route.clone(),
+                key_id: key_id.clone(),
+                grant_digest: grant_digest.clone(),
+            },
+        },
+        payload,
+        signer_id: signer.signer_id.clone(),
+        signature: signer.signature.clone(),
+        arrived_at_ms: signer.arrived_at_ms,
+    })
+}
+
+/// Copies one derived intake statement verbatim onto the provider-neutral
+/// wire record.
+///
+/// The source-attested operation hash travels unchanged — it is never
+/// recomputed here — and the payload obligation echoes the owner-bound
+/// staging proof, never the derivation-local payload binding. The source
+/// fence and the protected-route grant arrive from their owners; routing
+/// class and grant presence must agree, and the grant must bind this exact
+/// trigger identity and operation hash. Grant issuance proof stays with the
+/// issuing owner and the Kernel intake path.
+fn map_intake_to_wire_record(
+    statement: &MaintenanceTriggerIntake,
+    envelope_reference: &str,
+    payload_hash: &str,
+    owner: &TriggerIntakeOwnerBindings,
+) -> Result<MaintenanceTriggerRecord, ProtocolError> {
+    // Derivation already refused a zero producer generation, so this
+    // conversion cannot fail on a derived statement; a hand-built statement
+    // carrying one fails here before any write.
+    let producer_generation =
+        ResourceGeneration::new(statement.source_event.producer_generation)
+            .map_err(ProtocolError::Foundation)?;
+    let created_at_unix_ms =
+        u64::try_from(statement.created_at_ms).map_err(|_| ProtocolError::InvalidField {
+            field: "maintenance_trigger.created_at_unix_ms",
+            reason: "must be a non-negative time",
+        })?;
+    let applicable_until_unix_ms =
+        u64::try_from(statement.applicable_until_ms).map_err(|_| ProtocolError::InvalidField {
+            field: "maintenance_trigger.applicable_until_unix_ms",
+            reason: "must be a non-negative time",
+        })?;
+    let (routing_class, route_grant) = match (&statement.routing, &owner.route_grant) {
+        (TriggerIntakeRouting::Ordinary, None) => (MaintenanceTriggerRoutingClass::Ordinary, None),
+        (
+            TriggerIntakeRouting::Protected {
+                owner_id,
+                key_id,
+                grant_digest,
+                ..
+            },
+            Some(grant),
+        ) => {
+            grant.validate()?;
+            if !grant.binds(&statement.trigger_id, &statement.operation_hash)
+                || grant.owner_id != *owner_id
+                || grant.key_id != *key_id
+                || grant.grant_digest != *grant_digest
+            {
+                return Err(ProtocolError::ReplayConflict);
+            }
+            (
+                MaintenanceTriggerRoutingClass::Protected,
+                Some(grant.clone()),
+            )
+        }
+        _ => {
+            return Err(ProtocolError::InvalidField {
+                field: "maintenance_trigger.route_grant",
+                reason: "routing class and grant presence must agree",
+            });
+        }
+    };
+    let record = MaintenanceTriggerRecord {
+        wire_id: MAINTENANCE_TRIGGER_WIRE_ID.to_owned(),
+        wire_version: MAINTENANCE_TRIGGER_WIRE_VERSION,
+        source_event: MaintenanceTriggerSourceEvent {
+            producer_id: statement.source_event.producer_id.clone(),
+            producer_generation,
+            stream_id: statement.source_event.stream_id.clone(),
+            event_id: statement.source_event.event_id.clone(),
+        },
+        trigger_id: statement.trigger_id.clone(),
+        source_position: match &statement.source_position {
+            TriggerIntakePosition::Cursor { value } => {
+                MaintenanceTriggerPosition::Cursor { value: *value }
+            }
+            TriggerIntakePosition::AcceptedOccurrence { occurrence_id } => {
+                MaintenanceTriggerPosition::AcceptedOccurrence {
+                    occurrence_id: occurrence_id.clone(),
+                }
+            }
+        },
+        source_state_fence: owner.source_fence.clone(),
+        operation: statement.operation_label.clone(),
+        operation_hash: statement.operation_hash.clone(),
+        family: MaintenanceTriggerContentRef {
+            reference: statement.family_ref.clone(),
+        },
+        scope: MaintenanceTriggerContentRef {
+            reference: statement.scope_ref.clone(),
+        },
+        evidence_locators: statement.evidence_locators.clone(),
+        privacy_class_reference: statement.privacy_class_reference.clone(),
+        visibility_reference: statement.visibility_reference.clone(),
+        payload: MaintenanceTriggerPayloadRef {
+            envelope_reference: envelope_reference.to_owned(),
+            payload_hash: payload_hash.to_owned(),
+        },
+        routing_class,
+        route_grant,
+        created_at_unix_ms,
+        applicable_until_unix_ms,
+    };
+    record.validate()?;
+    Ok(record)
+}
+
+/// Daemon claim identity for one fenced maintenance-trigger claim.
+///
+/// Binds the claiming daemon's session within its generation, the stable
+/// delivery identity for this claim epoch, and the finite lease the claim
+/// authorizes. The fence itself travels separately as the live admitted
+/// fence: daemon fence and current fence are the same live value for a
+/// same-generation daemon, and a replacement generation passes its own new
+/// live fence so old-generation responses fail.
+#[derive(Clone, Debug)]
+pub struct TriggerClaimIdentity {
+    /// Claiming daemon's session identity within its generation.
+    pub daemon_session: String,
+    /// Stable delivery identity for this claim epoch.
+    pub delivery_id: String,
+    /// Latest time at which this claim authorizes delivery; must be finite
+    /// and within the owner lease bound.
+    pub claim_deadline_unix_ms: u64,
+    /// Issuance time as Unix milliseconds.
+    pub now_unix_ms: u64,
+}
+
+/// Fail-closed refusals of the front-door maintenance-trigger claim and page
+/// walk (I14.22, issue #1694 W3).
+///
+/// Every variant keeps the producer-visible identity (trigger identity plus
+/// delivery identity, or the page cursor): a malformed request stays a
+/// [`ProtocolError`], a Kernel delivery owner refusal stays a
+/// [`MaintenanceTriggerDeliveryError`], and a claim that fails the live
+/// fence, the identity echo, or expiry stays a stale-claim refusal. No
+/// failure mints a new trigger ID, authorizes repeating an uncertain effect,
+/// or resets a reconnect to a guessed complete-empty set.
+#[derive(Debug, Error)]
+pub enum MaintenanceTriggerClaimError {
+    /// The claim request is malformed: blank identities or a non-finite
+    /// deadline.
+    #[error("maintenance trigger claim request refused for trigger {trigger_id}: {source}")]
+    Request {
+        /// Stable trigger identity being claimed.
+        trigger_id: String,
+        /// Stable delivery identity for this claim epoch.
+        delivery_id: String,
+        /// Exact request refusal; nothing was issued.
+        #[source]
+        source: Box<ProtocolError>,
+    },
+    /// The Kernel delivery owner refused the claim or a page read.
+    #[error("maintenance trigger claim owner refused for trigger {trigger_id}: {source}")]
+    Owner {
+        /// Stable trigger identity being claimed.
+        trigger_id: String,
+        /// Stable delivery identity for this claim epoch.
+        delivery_id: String,
+        /// Exact owner refusal; concurrent claims conflict here.
+        #[source]
+        source: Box<MaintenanceTriggerDeliveryError>,
+    },
+    /// The issued claim does not answer this trigger under the live fence:
+    /// a stale generation, a substituted identity, or a lapsed deadline.
+    #[error("maintenance trigger claim is stale for trigger {trigger_id}: {source}")]
+    StaleClaim {
+        /// Stable trigger identity being claimed.
+        trigger_id: String,
+        /// Stable delivery identity for this claim epoch.
+        delivery_id: String,
+        /// Exact fence, echo, or expiry refusal.
+        #[source]
+        source: Box<ProtocolError>,
+    },
+    /// A bounded pending-page read failed or answered outside the page
+    /// contract.
+    #[error("maintenance trigger page walk refused: {source}")]
+    Page {
+        /// Exact page refusal; the walk resumes from its held cursor.
+        #[source]
+        source: Box<MaintenanceTriggerDeliveryError>,
+    },
+}
+
+impl MaintenanceTriggerClaimError {
+    /// Returns the stable trigger identity being claimed, when the failure
+    /// is claim-scoped.
+    #[must_use]
+    pub fn trigger_id(&self) -> Option<&str> {
+        match self {
+            Self::Request { trigger_id, .. }
+            | Self::Owner { trigger_id, .. }
+            | Self::StaleClaim { trigger_id, .. } => Some(trigger_id),
+            Self::Page { .. } => None,
+        }
+    }
+
+    /// Returns the stable delivery identity for this claim epoch, when the
+    /// failure is claim-scoped.
+    #[must_use]
+    pub fn delivery_id(&self) -> Option<&str> {
+        match self {
+            Self::Request { delivery_id, .. }
+            | Self::Owner { delivery_id, .. }
+            | Self::StaleClaim { delivery_id, .. } => Some(delivery_id),
+            Self::Page { .. } => None,
+        }
+    }
+}
+
+/// Builds the request refusal for one daemon claim attempt.
+///
+/// The retained record and the presented delivery identity carry the retry
+/// identity, so a malformed request keeps what the caller retries under.
+fn claim_request_error(
+    record: &MaintenanceTriggerRecord,
+    identity: &TriggerClaimIdentity,
+    source: ProtocolError,
+) -> MaintenanceTriggerClaimError {
+    MaintenanceTriggerClaimError::Request {
+        trigger_id: record.trigger_id.clone(),
+        delivery_id: identity.delivery_id.clone(),
+        source: Box::new(source),
+    }
+}
+
+/// Builds the owner refusal for one daemon claim attempt.
+fn claim_owner_error(
+    record: &MaintenanceTriggerRecord,
+    identity: &TriggerClaimIdentity,
+    source: MaintenanceTriggerDeliveryError,
+) -> MaintenanceTriggerClaimError {
+    MaintenanceTriggerClaimError::Owner {
+        trigger_id: record.trigger_id.clone(),
+        delivery_id: identity.delivery_id.clone(),
+        source: Box::new(source),
+    }
+}
+
+/// Builds the stale-claim refusal for one owner answer that does not
+/// authorize under the live fence.
+fn claim_stale_error(
+    record: &MaintenanceTriggerRecord,
+    identity: &TriggerClaimIdentity,
+    source: ProtocolError,
+) -> MaintenanceTriggerClaimError {
+    MaintenanceTriggerClaimError::StaleClaim {
+        trigger_id: record.trigger_id.clone(),
+        delivery_id: identity.delivery_id.clone(),
+        source: Box::new(source),
+    }
+}
+
+/// Builds the page-walk refusal for one failed or off-contract page read.
+fn page_walk_error(source: MaintenanceTriggerDeliveryError) -> MaintenanceTriggerClaimError {
+    MaintenanceTriggerClaimError::Page {
+        source: Box::new(source),
+    }
+}
+
+/// Issues one finite fenced claim for the calling daemon generation (I14.22,
+/// issue #1694 W3).
+///
+/// This is the production front-door claim caller: it binds the claim to the
+/// current compatible daemon generation/session, the retained trigger
+/// revision, and the delivery identity, then verifies the owner's answer
+/// before returning it. An exact retry returns the live claim from the
+/// owner; a concurrent claim under another identity is refused by the owner
+/// with `ClaimConflict`, never returned here; an old-generation response
+/// fails the fence check. Claim timeout permits owner-mediated redelivery
+/// under the same identity, never a new trigger ID or authority to repeat an
+/// uncertain downstream effect.
+///
+/// # Errors
+///
+/// Returns [`MaintenanceTriggerClaimError`]: a malformed request, a Kernel
+/// owner refusal, or a stale-claim fence/echo/expiry refusal.
+pub fn claim_maintenance_trigger_for_daemon(
+    gateway: &KernelStoreGateway,
+    principal_ref: &str,
+    record: &MaintenanceTriggerRecord,
+    live_fence: &StateFence,
+    identity: &TriggerClaimIdentity,
+) -> Result<MaintenanceTriggerClaim, MaintenanceTriggerClaimError> {
+    record
+        .validate()
+        .map_err(|source| claim_request_error(record, identity, source))?;
+    if identity.daemon_session.trim().is_empty() {
+        return Err(claim_request_error(
+            record,
+            identity,
+            ProtocolError::InvalidField {
+                field: "maintenance_trigger_claim.daemon_session",
+                reason: "claiming session must be named",
+            },
+        ));
+    }
+    if identity.delivery_id.trim().is_empty() {
+        return Err(claim_request_error(
+            record,
+            identity,
+            ProtocolError::InvalidField {
+                field: "maintenance_trigger_claim.delivery_id",
+                reason: "delivery identity must be named",
+            },
+        ));
+    }
+    // The lease is finite and bounded by the owner's own ceiling: a stale
+    // deadline fails here, before any ledger transition, and the row stays
+    // open under its existing disposition.
+    if identity.claim_deadline_unix_ms <= identity.now_unix_ms
+        || identity.claim_deadline_unix_ms - identity.now_unix_ms
+            > MAX_MAINTENANCE_TRIGGER_CLAIM_LEASE_MS
+    {
+        return Err(claim_request_error(
+            record,
+            identity,
+            ProtocolError::InvalidField {
+                field: "maintenance_trigger_claim.claim_deadline_unix_ms",
+                reason: "claim must be finite and within the claim lease bound",
+            },
+        ));
+    }
+    live_fence.validate().map_err(|source| {
+        claim_request_error(record, identity, ProtocolError::Foundation(source))
+    })?;
+    let (claim, _) = gateway
+        .claim_maintenance_trigger(
+            principal_ref,
+            MaintenanceTriggerClaimRequest {
+                trigger_id: record.trigger_id.clone(),
+                daemon_fence: live_fence.clone(),
+                daemon_session: identity.daemon_session.clone(),
+                delivery_id: identity.delivery_id.clone(),
+                claim_deadline_unix_ms: identity.claim_deadline_unix_ms,
+                current_fence: live_fence.clone(),
+                now_unix_ms: identity.now_unix_ms,
+            },
+        )
+        .map_err(|source| claim_owner_error(record, identity, source))?;
+    claim
+        .validate()
+        .map_err(MaintenanceTriggerDeliveryError::Protocol)
+        .map_err(|source| claim_owner_error(record, identity, source))?;
+    // The claim must answer this trigger under this delivery identity and
+    // session: a substituted answer fails here rather than authorizing work
+    // under the wrong obligation.
+    if claim.trigger_id != record.trigger_id
+        || claim.delivery_id != identity.delivery_id
+        || claim.daemon_session != identity.daemon_session
+        || claim.daemon_fence != *live_fence
+    {
+        return Err(claim_stale_error(
+            record,
+            identity,
+            ProtocolError::InvalidField {
+                field: "maintenance_trigger_claim.delivery_id",
+                reason: "claim answers a different trigger, delivery, session, or generation",
+            },
+        ));
+    }
+    // Old-generation claims fail after revocation and lapsed claims fail
+    // without minting a new trigger or delivery identity.
+    claim
+        .authorize_for(record, live_fence, identity.now_unix_ms)
+        .map_err(|source| claim_stale_error(record, identity, source))?;
+    Ok(claim)
+}
+
+/// One bounded walk over the pending-trigger set.
+#[derive(Clone, Debug)]
+pub struct PendingTriggerWalk {
+    /// Pending summaries listed across the walked pages, in owner order.
+    pub members: Vec<MaintenanceTriggerPendingSummary>,
+    /// Explicit gap records carried across the walked pages.
+    pub gaps: Vec<MaintenanceTriggerGap>,
+    /// Resume cursor for the next walk; `None` only when the owner closed
+    /// the set with no further page.
+    pub continuation: Option<String>,
+    /// Pages read during this walk, bounded by the caller's page budget.
+    pub pages_walked: u32,
+}
+
+/// Enumerates the pending set in bounded pages with stable continuation
+/// (I14.22, issue #1694 W3).
+///
+/// A reconnect resumes from its held cursor and never resets progress to a
+/// guessed complete-empty set: continuations are threaded opaquely — the
+/// caller's cursor starts the walk and only owner-issued cursors advance it
+/// — and every page is validated, so an empty page always carries at least
+/// one explicit gap. The walk stops after `max_pages` pages even when the
+/// owner has more: the partial accumulation returns with the resume cursor
+/// for the next walk rather than growing without bound.
+///
+/// # Errors
+///
+/// Returns [`MaintenanceTriggerClaimError::Page`] for a Kernel owner page
+/// refusal or a page that answers outside the page contract.
+pub fn collect_pending_maintenance_triggers(
+    gateway: &KernelStoreGateway,
+    principal_ref: &str,
+    continuation: Option<&str>,
+    now_unix_ms: u64,
+    max_pages: NonZeroU32,
+) -> Result<PendingTriggerWalk, MaintenanceTriggerClaimError> {
+    let mut walk = PendingTriggerWalk {
+        members: Vec::new(),
+        gaps: Vec::new(),
+        continuation: continuation.map(str::to_owned),
+        pages_walked: 0,
+    };
+    while walk.pages_walked < max_pages.get() {
+        let page = gateway
+            .maintenance_trigger_pending_page(
+                principal_ref,
+                walk.continuation.as_deref(),
+                now_unix_ms,
+            )
+            .map_err(page_walk_error)?;
+        page.validate().map_err(|source| {
+            page_walk_error(MaintenanceTriggerDeliveryError::Protocol(source))
+        })?;
+        walk.members.extend(page.members);
+        walk.gaps.extend(page.gaps);
+        walk.pages_walked += 1;
+        if page.has_more {
+            // Validated above: a further page always carries its cursor.
+            walk.continuation = page.continuation;
+        } else {
+            walk.continuation = None;
+            break;
+        }
+    }
+    // A closed walk with no members still carries the owner's explicit gaps:
+    // page validation refuses an empty gapless page, so absence here is the
+    // owner's witnessed incompleteness, never a certified-complete set.
+    Ok(walk)
 }
