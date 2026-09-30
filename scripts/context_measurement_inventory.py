@@ -1612,7 +1612,9 @@ def _build_consumer_worksets(
     verify_declared: bool,
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     bytes_by_path = {str(r["path"]): int(r["bytes"]) for r in file_records}  # type: ignore[arg-type]
-    unresolved_denominator = [row for row in rows if row["status"] != "owned"]
+    # Consumer readiness is local to its exact allocation. Unassigned rows
+    # still block family completeness below, but cannot block an unrelated
+    # consumer whose own rows all pass the frozen owner-map check.
     worksets: list[dict[str, object]] = []
     proposed_splits: list[dict[str, object]] = []
     test_owner: dict[str, str] = {}
@@ -1681,15 +1683,10 @@ def _build_consumer_worksets(
             block_reasons.append(
                 f"{len(unresolved_rows)} row(s) of this consumer have no confirmed exact-scope owner"
             )
-        if unresolved_denominator:
-            block_reasons.append(
-                f"{len(unresolved_denominator)} candidate(s) in the migration denominator have no "
-                "existing exact-scope owner; dispatch waits until every candidate is validated"
-            )
         if not band_ok:
             block_reasons.append(
                 f"workset {workset_stu} STU exceeds the {UPPER_REVIEW_BAND_STU} STU I2.16 upper review band; "
-                f"a blocking split proposal is required"
+                "a blocking split proposal is required"
             )
             # Proposed split, derived from the rows and test paths measured above.
             # It proposes; it never widens a write scope and never drops a row.
@@ -2182,6 +2179,7 @@ def _validate_artifact(
         raise InventoryError("EMPTY_SCAN", "empty inventory never succeeds")
     seen: set[str] = set()
     seen_ids: set[str] = set()
+    rows_by_id: dict[str, dict[str, object]] = {}
     typed_rows: list[dict[str, object]] = []
     measured_unresolved = 0
     for row in rows:
@@ -2227,6 +2225,7 @@ def _validate_artifact(
         if _sha256(_canonical_bytes(recomputed_row)) != row["row_digest"]:
             raise InventoryError("DIGEST_MISMATCH", f"row digest disagrees with content: {row['id']}")
         typed_rows.append(row)
+        rows_by_id[str(row["id"])] = row
     if measured_unresolved != unresolved_count:
         raise InventoryError(
             "COUNT_MISMATCH",
@@ -2269,21 +2268,37 @@ def _validate_artifact(
             raise InventoryError(
                 "EMPTY_ALLOCATION", f"dispatch-ready workset carries no rows: {issue}"
             )
-        for row_id in workset["row_ids"]:  # type: ignore[union-attr]
+        workset_row_ids = [str(row_id) for row_id in workset["row_ids"]]  # type: ignore[union-attr]
+        expected_row_ids = [
+            str(row["id"]) for row in typed_rows if row["owner"] == issue
+        ]
+        if workset_row_ids != expected_row_ids:
+            raise InventoryError(
+                "WORKSET_ROW_ALLOCATION_MISMATCH",
+                f"workset row IDs do not exactly match owner allocation: {issue}",
+            )
+        for row_id in workset_row_ids:
             if str(row_id) not in seen_ids:
                 raise InventoryError(
                     "MALFORMED_INVENTORY", f"workset references an unknown row: {row_id}"
                 )
+        assigned_rows = [rows_by_id[row_id] for row_id in workset_row_ids]
+        assigned_unresolved = sum(row["status"] != "owned" for row in assigned_rows)
+        if int(workset["unresolved_row_count"]) != assigned_unresolved:
+            raise InventoryError(
+                "COUNT_MISMATCH",
+                f"workset unresolved count disagrees with its assigned rows: {issue}",
+            )
         if bool(workset["dispatch_ready"]):
             if not workset["test_paths"]:
                 raise InventoryError(
                     "EMPTY_TEST_ALLOCATION",
                     f"dispatch-ready workset has no finite exact test_paths: {issue}",
                 )
-            if header["unresolved_count"] != 0 or header["owner_map_status"] != "SUPPLIED":
+            if assigned_unresolved != 0 or header["owner_map_status"] != "SUPPLIED":
                 raise InventoryError(
                     "UNRESOLVED_ROW_BLOCKS_DISPATCH",
-                    f"dispatch-ready workset with unresolved rows or an unsupplied owner map: {issue}",
+                    f"dispatch-ready workset has unresolved assigned rows or an unsupplied owner map: {issue}",
                 )
             if workset["band_disposition"] != "WITHIN_UPPER_REVIEW_BAND":
                 raise InventoryError(

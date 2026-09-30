@@ -1,4 +1,4 @@
-inventory_digest = "4af76c8588cfda6ff7cd0dec6238aa8b63679a2504b192b09c323847aef3df86"
+inventory_digest = "4a12711c073b33e239b7106f7cb7461506c8911fb028e89f9e4082d6fda514db"
 proposed_splits = []
 
 [header]
@@ -29,7 +29,7 @@ scan_roots = ["crates/eliot-app/src/commands/data_and_memory.rs", "crates/eliot-
 exclusions = ["exc/1|crates/eliot-app/src/cognitive_field_runner.rs:11659-11659|unrelated_byte_or_character_metric|83224db3c2de82a5|collection-length partition for execution chunking (executions/target_chunks); no byte/char/token/STU semantic|declared unrelated byte/character metric: 'executions.len().div_ceil(target_chunks)'; excluded with exact evidence, not a package skip", "exc/2|crates/eliot-app/src/host_runtime/event_and_authority.rs:2907-2907|unrelated_byte_or_character_metric|8a15cd14ee1d7efe|seconds-to-minutes ceiling for a TTL; no byte/char/token/STU semantic|declared unrelated byte/character metric: 'input.ttl_seconds.div_ceil(60)'; excluded with exact evidence, not a package skip", "exc/3|crates/eliot-app/src/host_runtime/supervised_process.rs:1545-1545|unrelated_byte_or_character_metric|2fb187414f7c18f4|digest text length bound on a hash string; no byte/char/token/STU semantic|declared unrelated byte/character metric: 'hash.chars().count() <= 128'; excluded with exact evidence, not a package skip", "exc/4|crates/eliot-app/src/host_runtime/supervised_process.rs:1576-1576|unrelated_byte_or_character_metric|1b53d5d338573ec6|log-detail truncation bound; no byte/char/token/STU semantic|declared unrelated byte/character metric: 'if detail.chars().count() > 512'; excluded with exact evidence, not a package skip", "exc/5|crates/eliot-engine/src/host.rs:82-82|unrelated_byte_or_character_metric|bd25287324ab7b71|nonblank markdown line count for a skill body; a documentation metric, never divided or relabelled as tokens|declared unrelated byte/character metric: 'let nonblank_lines = body.lines().filter(|line| !line.trim().is_empty()).count()'; excluded with exact evidence, not a package skip", "exc/6|crates/eliot-engine/src/host.rs:81-81|unrelated_byte_or_character_metric|5db7738cb55f0b03|summed description character count reported only as listing_characters; never divided or relabelled as tokens|declared unrelated byte/character metric: 'descriptions += description.chars().count()'; excluded with exact evidence, not a package skip"]
 classifications = ["exact-utf8-envelope", "normative-stu-estimate", "serializer-identity-bound", "route-identity-bound", "estimator-policy-unvalidated", "capacity-fit-analysis", "exact-observation", "stale-or-absent-observation", "transformed-observation", "test-only", "token_estimate_without_tokenizer", "character_count_mislabeled_as_tokens", "bare_measurement_field_or_conversion", "unrelated_byte_or_character_metric", "unresolved"]
 owner_allocations = ["#704:9", "#783:21", "#878:17", "#880:21", "unresolved:4"]
-consumer_worksets_digest = "477b9ab1543a2f8343f289957dfc04cd4549d627f0173449992bcdda1543c87f"
+consumer_worksets_digest = "6736fcb527e0cd8a7cee8e4182f549cbca61395920dfcf7f51ca93f84e8022a3"
 
 [[rows]]
 id = "c0001"
@@ -1860,10 +1860,10 @@ share_basis = "source_scope_stu / scan_root_stu: the exact source plus read-only
 upper_review_band_stu = 65000
 band_disposition = "WITHIN_UPPER_REVIEW_BAND"
 write_serialization_edges = ["single-writer: crates/smart/eliot-context-{measurement,assembly,contracts}/** is the #704 algorithm write scope", "read-only for #783/#878/#880: their 866.1 baseline rows inside these crates are carried as explicit read-only spans", "single-writer: .github/work-units/context-measurement-inventory.toml belongs to #787 only; every other consumer is read-only on it and regenerates nothing", "serialized-after: #787 regenerates the inventory once #704/#783/#878/#880 have merged"]
-dispatch_ready = false
-dispatch_block_reason = "4 candidate(s) in the migration denominator have no existing exact-scope owner; dispatch waits until every candidate is validated"
+dispatch_ready = true
+dispatch_block_reason = "none"
 unresolved_row_count = 0
-workset_digest = "b12c4dafbdd4ebea682dad5d9a08112ad36217834741aba371f7218ab3c484f5"
+workset_digest = "26cb0e322403a04b0886ad341bb55408ba1f151b1977a3702bfe1748833e6e9a"
 
 [[consumer_worksets]]
 issue = "#783"
@@ -1894,10 +1894,10 @@ share_basis = "source_scope_stu / scan_root_stu: the exact source plus read-only
 upper_review_band_stu = 65000
 band_disposition = "WITHIN_UPPER_REVIEW_BAND"
 write_serialization_edges = ["single-writer: crates/eliot-app/src/mcp_stdio.rs, crates/eliot-app/src/mcp_stdio/{memory,dispatch,task_handlers,operator,skill}.rs and crates/eliot-app/src/commands/data_and_memory.rs are the #783 app seam", "parallel-with: #878 and #880, on disjoint engine paths; no shared mutable source path between the three", "blocked-for-others: single-writer: .github/work-units/context-measurement-inventory.toml belongs to #787 only; every other consumer is read-only on it and regenerates nothing", "serialized-after: #704 algorithm merge, then #787 regeneration"]
-dispatch_ready = false
-dispatch_block_reason = "4 candidate(s) in the migration denominator have no existing exact-scope owner; dispatch waits until every candidate is validated"
+dispatch_ready = true
+dispatch_block_reason = "none"
 unresolved_row_count = 0
-workset_digest = "3e8f16b0b58229845bc641bf7b810ff003f3f3f0bdad9acdc3df423727407518"
+workset_digest = "726c455b52f8293a1fe4635bf5bcddde6185aa31c06fc93663510aceed89c10c"
 
 [[consumer_worksets]]
 issue = "#878"
@@ -1928,10 +1928,10 @@ share_basis = "source_scope_stu / scan_root_stu: the exact source plus read-only
 upper_review_band_stu = 65000
 band_disposition = "WITHIN_UPPER_REVIEW_BAND"
 write_serialization_edges = ["single-writer: crates/eliot-engine/src/{context.rs,context_contracts.rs,host.rs} and crates/eliot-engine/src/context/packet_quality.rs are the #878 Context/packet-quality/Host seam", "parallel-with: #783 and #880, on disjoint paths; no shared mutable source path between the three", "blocked-for-others: single-writer: .github/work-units/context-measurement-inventory.toml belongs to #787 only; every other consumer is read-only on it and regenerates nothing", "serialized-after: #704 algorithm merge, then #787 regeneration"]
-dispatch_ready = false
-dispatch_block_reason = "4 candidate(s) in the migration denominator have no existing exact-scope owner; dispatch waits until every candidate is validated"
+dispatch_ready = true
+dispatch_block_reason = "none"
 unresolved_row_count = 0
-workset_digest = "6aa01fe63a47b102eac7810856e78fa5eae41feeebb7d54a74025f850ff0b6be"
+workset_digest = "db52d4f057d1ba86d8f6a4c968b899428b6fa205470acb674965e4088d961e92"
 
 [[consumer_worksets]]
 issue = "#880"
@@ -1962,7 +1962,7 @@ share_basis = "source_scope_stu / scan_root_stu: the exact source plus read-only
 upper_review_band_stu = 65000
 band_disposition = "WITHIN_UPPER_REVIEW_BAND"
 write_serialization_edges = ["single-writer: crates/eliot-engine/src/{skill.rs,skill_curator.rs,memory_distillation.rs,memory_lifecycle.rs} are the #880 Skill/memory seam", "parallel-with: #783 and #878, on disjoint paths; no shared mutable source path between the three", "blocked-for-others: single-writer: .github/work-units/context-measurement-inventory.toml belongs to #787 only; every other consumer is read-only on it and regenerates nothing", "serialized-after: #704 algorithm merge, then #787 regeneration"]
-dispatch_ready = false
-dispatch_block_reason = "4 candidate(s) in the migration denominator have no existing exact-scope owner; dispatch waits until every candidate is validated"
+dispatch_ready = true
+dispatch_block_reason = "none"
 unresolved_row_count = 0
-workset_digest = "1f12ecbb72aa7d06508aafb1fa1039539a750eb3d86b336cbd35053c3611b1fc"
+workset_digest = "f1ac58644483624e4f5a0a283c5fa99e0302c86bdb513e383d3e747b385aee6f"
