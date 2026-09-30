@@ -714,8 +714,14 @@ fn classify_reconciliation_obligation(
         ("candidate_id", obligation.candidate_id.as_str()),
         ("owner_id", obligation.owner_id.as_str()),
         ("experiment_id", obligation.experiment_id.as_str()),
-        ("operation_ref", obligation.commitment.operation_ref.as_str()),
-        ("idempotency_key", obligation.commitment.idempotency_key.as_str()),
+        (
+            "operation_ref",
+            obligation.commitment.operation_ref.as_str(),
+        ),
+        (
+            "idempotency_key",
+            obligation.commitment.idempotency_key.as_str(),
+        ),
     ] {
         if value.trim().is_empty() {
             return Err(refused(format!(

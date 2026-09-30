@@ -2586,9 +2586,11 @@ pub fn reconcile_retained_unknown_effect(
     if let Some(receipt) = owner_outcome {
         obligation.with_settled_owner_outcome(receipt.clone())?;
     }
-    Ok(ImprovementTerminalDisposition::UnknownRequiresReconciliation {
-        obligation: Box::new(obligation),
-    })
+    Ok(
+        ImprovementTerminalDisposition::UnknownRequiresReconciliation {
+            obligation: Box::new(obligation),
+        },
+    )
 }
 
 /// Builds the unresolved external-effect identity from checked records only.
