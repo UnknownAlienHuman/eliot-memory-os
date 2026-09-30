@@ -92,7 +92,7 @@ use eliot_platform::SecretReference;
 use eliot_platform_windows::ProtectedSecret;
 use eliot_store_api::{
     CampaignLearningStateViewPublication, EVIDENCE_PACK_MAX_RECORDS, RevisionHead, RevisionKey,
-    ScopeId,
+    ScopeId, WriteReceipt,
 };
 use std::collections::BTreeMap;
 
@@ -6151,6 +6151,8 @@ impl KernelComposition {
             .result_lineage
             .as_ref()
             .ok_or(TransportError::SessionFenced)?;
+        let prepared_transition_sha256 =
+            self.validate_observe_result_against_staged_plan(&stored, &body.response, result_lineage)?;
         let persisted = self
             .generation_gateway
             .ors
@@ -6163,6 +6165,7 @@ impl KernelComposition {
                     result_response: &body.response,
                     result_evidence: retained.effect_evidence.as_ref(),
                     result_lineage: Some(result_lineage),
+                    prepared_transition_sha256: &prepared_transition_sha256,
                 },
             )
             .map_err(|error| match error {
@@ -6212,6 +6215,165 @@ impl KernelComposition {
         // pair so no later claim or submit can reuse this generation.
         self.retire_observe_pair_under_transition(&body.operation_id, &body.request_sha256);
         Ok(LocalReadSubmitDisposition::Persisted(Box::new(persisted)))
+    }
+
+    /// Validates a committed Observe receipt against the exact original
+    /// PreparedTransition protected by the Store reservation. A selected task
+    /// may differ from the request's initial applicability only when the
+    /// original admitted plan and its durable write binding prove that exact
+    /// selection.
+    fn validate_observe_result_against_staged_plan(
+        &self,
+        record: &HostRequestRecord,
+        response: &serde_json::Value,
+        lineage: &HostRequestRetainedLineage,
+    ) -> Result<String, TransportError> {
+        let input = record
+            .executable_input
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        let receipt_value = response
+            .get("receipt")
+            .cloned()
+            .ok_or(TransportError::SessionFenced)?;
+        let receipt: WriteReceipt =
+            serde_json::from_value(receipt_value).map_err(|_| TransportError::SessionFenced)?;
+        receipt
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if receipt.status != eliot_store_api::WriteReceiptStatus::Committed {
+            return Err(TransportError::IdentityConflict);
+        }
+        let receipt_envelope = receipt
+            .require_reconciliation_envelope()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if lineage.semantic_receipt_ref.as_deref()
+            != Some(receipt_envelope.identity.receipt_id.as_str())
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+
+        let operation_identity = OperationIdentity::new(record.operation_id.as_str())
+            .map_err(|_| TransportError::SessionFenced)?;
+        let gateway = self.retained_store_gateway()?;
+        let staged = gateway
+            .verify_staged_envelope(&input.application_binding.state_fence, &operation_identity)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let write_binding = staged
+            .write_binding
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        let staged_fence: eliot_contracts::StateFence =
+            serde_json::from_str(&write_binding.state_fence.canonical_json)
+            .map_err(|_| TransportError::SessionFenced)?;
+        if staged.operation_or_checkpoint_id != operation_identity
+            || staged.privacy_and_visibility_class
+                != input.protected_envelope.privacy_and_visibility_class
+            || write_binding.operation_id != operation_identity
+            || write_binding.idempotency_key.as_str() != record.idempotency_key.as_str()
+            || staged_fence != input.application_binding.state_fence
+            || write_binding.payload_expires_at_ms
+                != Some(i64::try_from(record.deadline_unix_ms).map_err(|_| TransportError::SessionFenced)?)
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        let RecoveryPayload::Encrypted { key, ciphertext } = &staged.payload else {
+            return Err(TransportError::SessionFenced);
+        };
+        let protected = ProtectedSecret::from_ciphertext(ciphertext.clone())
+            .map_err(|_| TransportError::SessionFenced)?;
+        let plaintext = self
+            .platform
+            .unprotect_secret(&protected)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let bytes = plaintext.expose();
+        if u64::try_from(bytes.len()).map_err(|_| TransportError::SessionFenced)?
+            != staged.payload_length
+            || sha256_hex(bytes) != staged.payload_sha256
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let transition: eliot_store_api::PreparedTransition =
+            serde_json::from_slice(bytes).map_err(|_| TransportError::SessionFenced)?;
+        if canonical_json_bytes(&transition).map_err(|_| TransportError::SessionFenced)? != bytes {
+            return Err(TransportError::SessionFenced);
+        }
+        transition
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let prepared_transition_sha256 = eliot_store_api::prepared_transition_digest(&transition)
+            .map_err(|_| TransportError::SessionFenced)?;
+        if prepared_transition_sha256 != write_binding.prepared_transition_sha256 {
+            return Err(TransportError::IdentityConflict);
+        }
+
+        let original_source: RequestIdentity = serde_json::from_value(
+            input.application_binding.source_request_identity.clone(),
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        let request = &receipt_envelope.core.request;
+        let operation = &receipt_envelope.core.operation;
+        let work_scope = &receipt_envelope.core.work_scope;
+        let actual_task = receipt_envelope.core.task.as_ref();
+        if receipt.operation_id.as_str() != record.operation_id.as_str()
+            || receipt.idempotency_key != record.idempotency_key.as_str()
+            || receipt.canonical_request_hash != write_binding.canonical_request_sha256
+            || receipt.canonical_request_hash != transition.identity.canonical_request_hash
+            || receipt.transition_class != transition.transition_class
+            || receipt.admission_digest != transition.admission_digest
+            || receipt.mutation_plan_digest != transition.mutation_plan_digest
+            || receipt.operation_manifest_digest != transition.operation_manifest_digest
+            || receipt.semantic_source_revisions != transition.semantic_source_revisions
+            || transition.identity.operation_id.as_str() != record.operation_id.as_str()
+            || transition.identity.idempotency_key.as_str() != record.idempotency_key.as_str()
+            || transition.state_fence != input.application_binding.state_fence
+            || !transition
+                .state_fence
+                .authority_epoch
+                .is_same_authority(&original_source.request.state_fence.authority_epoch)
+            || transition.state_fence.resource_generation
+                != original_source.request.state_fence.resource_generation
+            || transition.scope_id.as_str() != record.scope_ref.as_ref()
+                .map(OpaqueLabel::as_str)
+                .ok_or(TransportError::SessionFenced)?
+            || request.state_fence != transition.state_fence
+            || operation.state_fence != transition.state_fence
+            || work_scope.state_fence != transition.state_fence
+            || work_scope.scope_id.as_str() != transition.scope_id.as_str()
+            || operation.operation_id.as_str() != transition.identity.operation_id.as_str()
+            || operation.request_id != original_source.request.metadata.request_id
+            || operation.idempotency_key.as_str() != original_source.idempotency_key.as_str()
+            || original_source.cancellation_id.as_str() != record.cancellation_id.as_str()
+            || original_source.deadline_unix_ms != record.deadline_unix_ms
+            || original_source.request.metadata.request_id.as_str() != record.request_id.as_str()
+            || request.metadata.request_id != original_source.request.metadata.request_id
+            || request.metadata.product_id != original_source.request.metadata.product_id
+            || request.metadata.source_id != original_source.request.metadata.source_id
+            || request.metadata.clock != original_source.request.metadata.clock
+            || request.metadata.session_id.as_ref().map(|session| session.as_str())
+                != input.application_binding.session_ref.as_ref().map(OpaqueLabel::as_str)
+            || request.metadata.task_id.as_ref().map(|task| task.as_str())
+                != transition.task_id.as_deref()
+            || actual_task.map(|task| task.task_id.as_str()) != transition.task_id.as_deref()
+            || actual_task.is_some_and(|task| {
+                task.state_fence != transition.state_fence
+                    || Some(task.task_revision) != transition.state_fence.task_revision
+            })
+            || receipt_envelope.core.session.as_ref().map(|session| session.session_id.as_str())
+                != input.application_binding.session_ref.as_ref().map(OpaqueLabel::as_str)
+            || receipt_envelope
+                .core
+                .session
+                .as_ref()
+                .is_some_and(|session| session.state_fence != transition.state_fence)
+            || receipt_envelope.core.authority.state_fence != transition.state_fence
+            || receipt_envelope.core.causal.state_fence != transition.state_fence
+            || write_binding.recovery_access_class != staged.privacy_and_visibility_class
+            || key != &write_binding.payload_key_reference
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        Ok(prepared_transition_sha256)
     }
 
     /// Defers one claimed observe pair the daemon flight cannot execute yet.
