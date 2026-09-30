@@ -1275,7 +1275,7 @@ pub enum MaintenanceTriggerRecoveryOutcome {
     /// never treat receipt absence during an outage as proof of non-commit.
     ReplayRecord {
         /// The exact retained record, byte-identical to the admitted one.
-        record: MaintenanceTriggerRecord,
+        record: Box<MaintenanceTriggerRecord>,
     },
     /// Commit before ack: acknowledge this exact owner-looked-up receipt
     /// without another job, recommendation, or wake. The receipt is the
@@ -1329,29 +1329,28 @@ pub fn recover_maintenance_trigger_handoff(
             )),
         });
     }
-    match gateway.recover_maintenance_trigger_commit(principal_ref, trigger_id) {
-        Ok(receipt) => {
-            receipt
-                .validate()
-                .map_err(|source| MaintenanceTriggerRecoveryError::Receipt {
-                    trigger_id: trigger_id.to_owned(),
-                    source: Box::new(source),
-                })?;
-            Ok(MaintenanceTriggerRecoveryOutcome::AcknowledgeReceipt { receipt })
-        }
-        Err(_) => {
-            // No committed receipt answers this identity (open row, unknown
-            // trigger, or owner refusal): the crash happened before decision
-            // commit, so replay the same retained trigger. An owner outage
-            // fails this read too, and that refusal is the returned error.
-            let record = gateway
-                .replay_maintenance_trigger_after_crash(principal_ref, trigger_id)
-                .map_err(|source| MaintenanceTriggerRecoveryError::Replay {
-                    trigger_id: trigger_id.to_owned(),
-                    source: Box::new(source),
-                })?;
-            Ok(MaintenanceTriggerRecoveryOutcome::ReplayRecord { record })
-        }
+    if let Ok(receipt) = gateway.recover_maintenance_trigger_commit(principal_ref, trigger_id) {
+        receipt
+            .validate()
+            .map_err(|source| MaintenanceTriggerRecoveryError::Receipt {
+                trigger_id: trigger_id.to_owned(),
+                source: Box::new(source),
+            })?;
+        Ok(MaintenanceTriggerRecoveryOutcome::AcknowledgeReceipt { receipt })
+    } else {
+        // No committed receipt answers this identity (open row, unknown
+        // trigger, or owner refusal): the crash happened before decision
+        // commit, so replay the same retained trigger. An owner outage
+        // fails this read too, and that refusal is the returned error.
+        let record = gateway
+            .replay_maintenance_trigger_after_crash(principal_ref, trigger_id)
+            .map_err(|source| MaintenanceTriggerRecoveryError::Replay {
+                trigger_id: trigger_id.to_owned(),
+                source: Box::new(source),
+            })?;
+        Ok(MaintenanceTriggerRecoveryOutcome::ReplayRecord {
+            record: Box::new(record),
+        })
     }
 }
 
@@ -1813,7 +1812,8 @@ pub fn record_maintenance_trigger_damage(
 ) -> Result<(), MaintenanceTriggerRetentionError> {
     if matches!(
         kind,
-        MaintenanceTriggerGapKind::AmbiguousCommit | MaintenanceTriggerGapKind::IncompleteEnumeration
+        MaintenanceTriggerGapKind::AmbiguousCommit
+            | MaintenanceTriggerGapKind::IncompleteEnumeration
     ) {
         return Err(MaintenanceTriggerRetentionError::GapKind {
             trigger_id: trigger_id.to_owned(),
