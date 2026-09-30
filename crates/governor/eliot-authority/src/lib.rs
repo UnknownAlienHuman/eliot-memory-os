@@ -49,6 +49,10 @@ pub use grants::{
     RevocationOperationIdentity, RevocationTransitionDisposition, RevocationTransitionRequest,
     RevocationWriteReceipt, SnapshotId,
 };
+pub use grants::{
+    IMPROVEMENT_DISPOSITION_INVESTIGATE, IMPROVEMENT_DISPOSITION_REJECT, IMPROVEMENT_DISPOSITIONS,
+    ImprovementDisposition, improvement_disposition_resource,
+};
 pub use leases::{ActionLease, CapabilityToken, LeaseId, TokenId};
 pub use mechanical_subset::{
     ApprovalReference, AuthorityUseSite, CanonicalSourceCommitment,

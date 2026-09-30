@@ -32,11 +32,22 @@ pub enum IntakeBridgeError {
 /// `owner` is non-empty and copies it verbatim. It cannot tell a real principal
 /// from a fabricated one, so the value's integrity is entirely the caller's,
 /// and A12.02:3 — "Identity is not a model's self-declared string" — is
-/// discharged by the call site, not here. The single production caller,
-/// [`crate::improvement_intake_dispatch::assemble_improvement_artifact`],
-/// records the DAEMON's own triage under its own service identity and says so
-/// in the note; it does not name an owner that did not select the disposition,
-/// and it documents there why no owner's selection reaches this process today.
+/// discharged by the call site, not here.
+///
+/// Two production call sites exist, and each discharges A12.02:3 differently:
+///
+/// - [`crate::improvement_intake_dispatch::assemble_improvement_artifact`]
+///   records the DAEMON's own triage under its own service identity and says so
+///   in the note; it does not name an owner that did not select the
+///   disposition.
+/// - `daemon_runtime::improvement_intake_artifact` records the disposition only
+///   after a state-owner capability ISSUED FROM THE AUTHORITY OWNER'S OWN
+///   ADMITTED GRANT LINEAGE admits it
+///   (`eliot_authority::GrantGraph::admitted_improvement_disposition`), and
+///   names the exact capability the selection was read from. That is what makes
+///   the principal here not a self-declared string: it is the holder of an
+///   admitted grant, and the disposition it selected is read out of that
+///   grant's own operation set rather than passed in by the caller.
 pub fn record_brief_decision(
     brief: &ImprovementBrief,
     owner: &str,

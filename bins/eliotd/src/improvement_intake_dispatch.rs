@@ -341,26 +341,33 @@
 //!    (I12.24:82: "advisory … default; changes nothing until owner acts"), and
 //!    the artifact is truthful about WHO chose it. What is not true of it is that
 //!    an owner chose it.
-//! 2. **The SELECTION is now content-derived, and the four dispositions are
-//!    still not an owner's.** [`daemon_disposition_kind`] derives the kind from
-//!    the Governor maintenance owner's own recorded
+//! 2. **The SELECTION is now content-derived, and it is now an OWNER's when
+//!    the authority owner holds the capability.** [`daemon_disposition_kind`]
+//!    derives the kind from the Governor maintenance owner's own recorded
 //!    [`AutomationDecision`](eliot_maintenance::AutomationDecision) over the same
 //!    family and scope this artifact is assembled from, so
 //!    [`OwnerDecisionKind::Reject`] — which was previously unreachable from any
 //!    non-constant source, because the kind was spelled `Investigate` at the
 //!    call site — is now reached on a real recorded verdict, and the blocked
-//!    intake this module exists to serve is that verdict. What remains
-//!    unrepaired is the PRINCIPAL, not the selection: the maintenance owner
-//!    decided whether to run a maintenance JOB and never saw this brief, the
-//!    observed closure's `actor_id` is the principal that EXECUTED the
-//!    consequential attempt and selected nothing, and the `G-19` admission
-//!    authority issues learning-admission PERMITS, which is a different act from
-//!    selecting a disposition over a brief. So the daemon is still the recorded
-//!    selector, its verdict is still only EVIDENCE, and the note names both.
-//!    `WorkItem` and `Experiment` remain unproduced anywhere in `bins/`, because
-//!    reaching them would require a work item or an experiment this intake does
-//!    not hold — and both are mutating kinds, which I12.24:82 forbids without
-//!    an owner action that has no route here.
+//!    intake this module exists to serve is that verdict.
+//!
+//!    The DERIVATION is still the fallback, not the answer, and that is the
+//!    part issue #1867 A2 repairs. `daemon_runtime::improvement_intake_artifact`
+//!    overwrites this record from a state-owner capability ISSUED out of the
+//!    authority owner's OWN admitted grant lineage
+//!    (`eliot_authority::GrantGraph::issue_improvement_disposition_capability`,
+//!    which I11.3:15 requires: "Improvement Candidate disposition ... [is]
+//!    allowed only when the caller holds the corresponding task, budget, policy
+//!    or state-owner capability"). The disposition is read out of that grant's
+//!    own operation set
+//!    (`eliot_authority::ImprovementDisposition::from_operations`), so
+//!    [`OwnerDecisionKind::Investigate`] is no longer unreachable: it is
+//!    reached whenever the state owner names it. Both dispositions remain
+//!    non-mutating, so the reassignment authorizes nothing (I12.24:82).
+//!    `WorkItem` and `Experiment` remain unproduced anywhere in `bins/`,
+//!    because reaching them would require a work item or an experiment this
+//!    intake does not hold — and both are mutating kinds, which I12.24:82
+//!    forbids without an owner action that has no route here.
 //!
 //! # The exact missing route, named
 //!
@@ -922,15 +929,22 @@ pub fn assemble_improvement_artifact(
 ///
 /// # What this is NOT
 ///
-/// The principal recorded against the decision is still the DAEMON
+/// The principal recorded by THIS function is still the DAEMON
 /// ([`SERVICE_NAME`], see below), never the maintenance owner. The maintenance
 /// owner's `AutomationDecision` is the EVIDENCE this triage is derived from; it
 /// is not a selection over this brief, because that owner never saw the brief.
 /// Naming it as the selector is the false attribution this module exists to
 /// remove, and the note text says which principal chose and on whose recorded
-/// verdict. The route by which an OWNER's own selection reaches this process is
-/// still absent, and the full measurement of every candidate ingress surface is
-/// in the module documentation above under "The recorded disposition is the
+/// verdict.
+///
+/// It is also the FALLBACK, not the answer. `daemon_runtime`'s
+/// `improvement_intake_artifact` replaces this record from a state-owner
+/// capability issued out of the authority owner's own admitted grant lineage
+/// whenever one is admitted, so an OWNER's selection does reach this process on
+/// that path (I11.3:15). What is still absent is a brief-carrying ingress —
+/// the `DecideImprovementBrief` route is refused upstream in owners this change
+/// does not hold — and the full measurement of every candidate ingress surface
+/// is in the module documentation above under "The recorded disposition is the
 /// DAEMON's own, and no owner ingress exists".
 fn daemon_disposition_kind(
     decision: &eliot_maintenance::AutomationTriggerDecision,
@@ -993,15 +1007,21 @@ fn daemon_disposition_kind(
 /// conflating the two would overwrite the one route an owner's decision has a
 /// named place to arrive through.
 ///
-/// The four dispositions remain unreachable from an owner's selection, and
-/// `OwnerDecisionKind::WorkItem` and `OwnerDecisionKind::Experiment` in
-/// particular are not produced anywhere in `bins/`, and the two non-mutating
-/// kinds are reached only from the DAEMON's own triage of its own observation.
-/// The measurement of every candidate ingress surface, and the exact route by
-/// which an owner's own selection is missing and where it would attach, are
-/// recorded in the module documentation above under "The recorded disposition is
-/// the DAEMON's own, and no owner ingress exists". Nothing here substitutes a
-/// fabricated caller for it.
+/// The four dispositions are reachable, and the two non-mutating ones are the
+/// OWNER's when the authority owner admits the capability:
+/// `daemon_runtime::improvement_intake_artifact` overwrites this record from a
+/// state-owner capability issued out of that owner's own grant lineage, so
+/// [`OwnerDecisionKind::Investigate`] is reached on the owner's own operation
+/// rather than only on the daemon's derived verdict.
+/// `OwnerDecisionKind::WorkItem` and `OwnerDecisionKind::Experiment` are still
+/// not produced anywhere in `bins/`, because reaching them would require a work
+/// item or an experiment this intake does not hold — and both are mutating
+/// kinds, which I12.24:82 forbids without an owner action that has no route
+/// here. The measurement of every candidate ingress surface, and the exact
+/// route by which a *brief-carrying* owner's selection is still missing and
+/// where it would attach, are recorded in the module documentation above under
+/// "The recorded disposition is the DAEMON's own, and no owner ingress exists".
+/// Nothing here substitutes a fabricated caller for it.
 ///
 /// `decision` is the Governor owner's own verdict this artifact is assembled
 /// from; the disposition is DERIVED from it by [`daemon_disposition_kind`] and

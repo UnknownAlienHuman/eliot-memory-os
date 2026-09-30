@@ -5452,6 +5452,125 @@ enum ImprovementIntakeFlight {
     InFlight(ImprovementIntakeFlightState),
 }
 
+/// What one state-owner capability admission produced for this pass.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StateOwnerDisposition {
+    /// The disposition the OWNER selected, read out of the owner's own
+    /// admitted grant operation set.
+    kind: eliot_improvement::OwnerDecisionKind,
+    /// The principal whose admitted grant carried that selection — the brief's
+    /// own `proposed_owner`, never the daemon's service identity.
+    owner: String,
+    /// The issued capability's own grant identity, so a later reader can name
+    /// the exact capability the disposition was recorded under.
+    grant_id: String,
+}
+
+/// Records the brief's disposition from the STATE OWNER's own issued
+/// capability, or reports that this composition holds none (issue #1867 A2).
+///
+/// I12.24:65 puts "decision owner selects reject / investigate / work item /
+/// experiment" immediately after the brief reaches one, and I11.3:15 requires
+/// that "Improvement Candidate disposition ... [is] allowed only when the
+/// caller holds the corresponding task, budget, policy or state-owner
+/// capability". This is the production site of that requirement:
+///
+/// 1. The live grant graph is read from the ALREADY-OWNED authority owner
+///    (`composition.governor.owners().authority.snapshot()`), the same
+///    owner-state read `authority_revocation_ingress::capture_authority_revocation_ingress_plan`
+///    performs, and is reassembled with the authority crate's own
+///    `GrantGraph::from_recovery_snapshot`. Nothing is presented by a caller.
+/// 2. The principal asked for is `brief.proposed_owner` — the brief's OWN
+///    recorded field, which I12.24:74 requires to name who decides. This does
+///    not read that field to manufacture agreement: it asks the owner state
+///    whether THAT principal holds a disposition capability, and an owner that
+///    holds none simply has no disposition here.
+/// 3. `GrantGraph::issue_improvement_disposition_capability` then narrows the
+///    capability out of the owner's own active admitted grant, and
+///    `GrantGraph::admitted_improvement_disposition` re-reads the issued
+///    grant's recorded content to decide which disposition it carries. The
+///    selection is therefore the OWNER'S: it lives in the owner's grant
+///    operation set, not in this file.
+///
+/// # What this replaces, and why it is not a widening
+///
+/// The disposition recorded on every pass until now came from
+/// `improvement_intake_dispatch::daemon_disposition_kind`, which DERIVES the
+/// kind from the Governor maintenance owner's `AutomationDecision`. Every
+/// registered family carries `UNRESOLVED_POLICY_MODE` = `Off`
+/// (`maintenance_family_catalog.rs:93`, applied at `:1245`), `Off` is the first
+/// match arm (`eliot-maintenance/src/lib.rs:821-823`), so the maintenance owner
+/// returned `Block` on every live pass, `Block` maps to `Reject`, and
+/// `Investigate` was unreachable while `Escalate` had no producer at all.
+/// That is a wall in the DERIVATION, not in the disposition vocabulary. Reading
+/// the disposition from the owner's own capability removes the dependency on an
+/// arm that cannot fire; the daemon's derived value is kept below as the
+/// fallback for a composition that genuinely holds no owner capability, so a
+/// deployment with no owner state behaves exactly as it did before.
+///
+/// # What this does NOT do
+///
+/// It does not reach the `operator.command` transport, and it does not admit
+/// `UserAutomationOperation::DecideImprovementBrief`. Both are refused upstream
+/// in owners this change does not hold: the Kernel operator route answers
+/// `TransportError::SessionFenced` for that one operation
+/// (`bins/eliot-kernel/src/daemon_request_dispatch.rs:5870-5875`), and the
+/// automation Store answers `StoreError::UnknownOperation`
+/// (`crates/kernel/eliot-kernel-service/src/user_automation_store.rs:1027-1029`
+/// and `:2527`), which is the correct classification for a brief that lives in
+/// the improvement owner's canonical record and not in the automation schema.
+/// `operator.command` additionally has no producer and four independent gates
+/// that are Kernel-side acts. Neither is on this path, so neither is repaired
+/// here; what is repaired is the missing issuer and its missing selection.
+///
+/// The capability is ISSUED here and not activated through the P-07 port: the
+/// port admits authority roots only (`grant_activation_port.rs:265-269`), and a
+/// delegation off an already-active owner grant is narrowed out of the
+/// authority owner's own current state on each pass rather than installed as a
+/// new live root. No grant is added to the graph by this call — the graph is
+/// the owner's admitted state, and this pass reads it.
+///
+/// An owner that holds no active admitted grant naming a disposition refuses
+/// with `AuthorityError::NoEffectivePath` / `UnauthorizedOperation`, which is
+/// reported as the fallback rather than as a disposition. There is no default
+/// authority, no fabricated principal and no stringly-typed pass.
+fn state_owner_disposition(
+    composition: &DaemonComposition,
+    brief: &eliot_improvement::ImprovementBrief,
+    observed_at_ms: u64,
+) -> Option<StateOwnerDisposition> {
+    let snapshot = composition.governor.owners().authority.snapshot().ok()?;
+    let graph = eliot_authority::GrantGraph::from_recovery_snapshot(&snapshot.grant_graph).ok()?;
+    let state_owner = eliot_authority::PrincipalRef::new(brief.proposed_owner.clone()).ok()?;
+    // Both identities the capability is bound to are read from the brief's OWN
+    // recorded fields, so the capability and the disposition it authorizes always
+    // name the SAME brief and the SAME candidate.
+    let capability = graph
+        .issue_improvement_disposition_capability(
+            &state_owner,
+            &brief.brief_id,
+            &brief.candidate_id,
+            eliot_authority::LogicalTime::new(observed_at_ms),
+        )
+        .ok()?;
+    let disposition = graph
+        .admitted_improvement_disposition(&capability, &brief.brief_id, &brief.candidate_id)
+        .ok()?;
+    let kind = match disposition {
+        eliot_authority::ImprovementDisposition::Reject => {
+            eliot_improvement::OwnerDecisionKind::Reject
+        }
+        eliot_authority::ImprovementDisposition::Investigate => {
+            eliot_improvement::OwnerDecisionKind::Investigate
+        }
+    };
+    Some(StateOwnerDisposition {
+        kind,
+        owner: brief.proposed_owner.clone(),
+        grant_id: capability.grant_id.as_str().to_owned(),
+    })
+}
+
 /// Assembles the owner-actionable improvement artifact over one already
 /// evaluated maintenance trigger decision, under the composition guard.
 ///
@@ -5514,12 +5633,40 @@ fn improvement_intake_artifact(
     // Governor-owned closure image, and `store()` hands back the canonical
     // learning-delta store whose newest committed record IS an
     // owner-observed consequential boundary.
-    let artifact = eliotd::improvement_intake_dispatch::assemble_improvement_artifact(
+    let mut artifact = eliotd::improvement_intake_dispatch::assemble_improvement_artifact(
         decision,
         &fence,
         composition.learning_closure().store(),
     )
     .map_err(|error| error.to_string())?;
+    // Issue #1867 A2: the recorded disposition is the STATE OWNER's when this
+    // composition's own authority owner holds a state-owner capability for the
+    // brief's `proposed_owner` (I11.3:15), and stays the daemon's derived triage
+    // when it does not. The reassignment is confined to the
+    // non-mutating dispositions the capability can carry, so nothing here can
+    // widen the recorded vocabulary, and the note names the capability the
+    // selection was read from rather than asserting an owner saw the brief.
+    let observed_at_ms = unix_ms(SystemTime::now())?;
+    if let Some(owner_selection) =
+        state_owner_disposition(composition, &artifact.brief, observed_at_ms)
+    {
+        artifact.decision = eliotd::improvement_intake::record_brief_decision(
+            &artifact.brief,
+            &owner_selection.owner,
+            owner_selection.kind,
+            &format!(
+                "the state owner {owner} selected {kind:?} over this brief under state-owner \
+                 capability {grant}, issued from the authority owner's own admitted grant lineage \
+                 at the maintenance decision {verdict:?}; the selection is non-mutating and \
+                 changes nothing until the owner acts",
+                owner = owner_selection.owner,
+                kind = owner_selection.kind,
+                grant = owner_selection.grant_id,
+                verdict = decision.decision,
+            ),
+        )
+        .map_err(|error| error.to_string())?;
+    }
     // The G-19 decision record, read through the EXISTING maintenance owner.
     // The operation and idempotency key bind this exact observation, so the
     // policy a candidate is admitted under names the observation it belongs to.

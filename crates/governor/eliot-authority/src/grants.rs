@@ -260,6 +260,103 @@ pub(crate) fn source_effect_rank(ceiling: EffectCeiling) -> u8 {
     }
 }
 
+/// The two non-mutating dispositions I12.24:65 gives the Improvement-Candidate
+/// decision owner, in the closed wire spelling they carry in an issued
+/// capability.
+///
+/// I12.24:65 names four dispositions — "decision owner selects reject /
+/// investigate / work item / experiment" — and I12.24:82 makes the advisory
+/// class "default; changes nothing until owner acts". Only `Reject` and
+/// `Investigate` change nothing, so only those two are spellable here; the two
+/// mutating kinds reach effect through the normal work-item/canary/rollback
+/// flow and are deliberately NOT expressible as a state-owner capability
+/// disposition, because a capability that could name one would let the issuer
+/// widen past the class its own documentation calls non-mutating.
+///
+/// These are the operation names an OWNER-ADMITTED grant carries. The issuer
+/// reads them from that grant, so the disposition is the OWNER's selection and
+/// never the issuer's or the requesting caller's choice.
+pub const IMPROVEMENT_DISPOSITION_REJECT: &str = "improvement.disposition.reject";
+/// See [`IMPROVEMENT_DISPOSITION_REJECT`].
+pub const IMPROVEMENT_DISPOSITION_INVESTIGATE: &str = "improvement.disposition.investigate";
+
+/// The closed non-mutating Improvement-Candidate disposition vocabulary.
+pub const IMPROVEMENT_DISPOSITIONS: [&str; 2] = [
+    IMPROVEMENT_DISPOSITION_REJECT,
+    IMPROVEMENT_DISPOSITION_INVESTIGATE,
+];
+
+/// One non-mutating Improvement-Candidate disposition over one brief.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ImprovementDisposition {
+    /// The state owner refused the brief. I12.24:65's `reject`.
+    Reject,
+    /// The state owner took the brief for diagnosis and has ruled nothing yet.
+    /// I12.24:65's `investigate`.
+    Investigate,
+}
+
+impl ImprovementDisposition {
+    /// The exact operation name this disposition carries in an issued
+    /// capability.
+    #[must_use]
+    pub const fn operation(self) -> &'static str {
+        match self {
+            Self::Reject => IMPROVEMENT_DISPOSITION_REJECT,
+            Self::Investigate => IMPROVEMENT_DISPOSITION_INVESTIGATE,
+        }
+    }
+
+    /// Reads one disposition out of an OWNER-ADMITTED operation set.
+    ///
+    /// Total over the closed vocabulary and no wider: a set naming neither
+    /// disposition names no disposition over a brief and refuses with
+    /// [`AuthorityError::UnauthorizedOperation`]; a set naming BOTH names no
+    /// single selection and refuses with
+    /// [`AuthorityError::InvalidField`]. A grant that carries both is not a
+    /// broader permission, it is an undecided one, and treating it as a
+    /// selection would let a caller pick which half of the owner's authority
+    /// counts.
+    pub fn from_operations<'a>(
+        operations: impl IntoIterator<Item = &'a String>,
+    ) -> Result<Self, AuthorityError> {
+        let mut selected: Option<Self> = None;
+        for name in operations {
+            let candidate = match name.as_str() {
+                IMPROVEMENT_DISPOSITION_REJECT => Self::Reject,
+                IMPROVEMENT_DISPOSITION_INVESTIGATE => Self::Investigate,
+                _ => continue,
+            };
+            if selected.is_some_and(|known| known != candidate) {
+                return Err(AuthorityError::InvalidField(
+                    "improvement_disposition_vocabulary",
+                ));
+            }
+            selected = Some(candidate);
+        }
+        selected.ok_or(AuthorityError::UnauthorizedOperation)
+    }
+}
+
+/// The exact resource facet ONE improvement brief occupies for the
+/// Improvement-Candidate disposition.
+///
+/// Both identities travel in the facet, so a capability issued for one brief
+/// can never be compared as if it covered another candidate's brief, and a
+/// candidate's brief can never be decided by a capability issued for a
+/// different candidate. This is the same content-bound comparison the
+/// mechanical authority subset requires (`mechanical_subset::admits`): the
+/// evidence names the resource it is bound to, and it is compared against that
+/// exact resource rather than against a shape.
+pub fn improvement_disposition_resource(
+    brief_id: &str,
+    candidate_id: &str,
+) -> Result<String, AuthorityError> {
+    validate_text(brief_id, "brief_id")?;
+    validate_text(candidate_id, "candidate_id")?;
+    Ok(format!("improvement-brief:{candidate_id}:{brief_id}"))
+}
+
 /// #2875 item 10: the single source-level meaning of "cross-root".
 ///
 /// Every authority-root comparison in this module — graph validation,
@@ -1945,6 +2042,180 @@ impl GrantGraph {
     /// would falsify any never-effective or fenced claim about it.
     pub fn grant_is_admitted(&self, grant_id: &GrantId) -> bool {
         self.grants.contains_key(grant_id)
+    }
+
+    /// The one ACTIVE, unfenced, admitted grant this graph holds for exactly
+    /// one holder principal, in deterministic grant-id order.
+    ///
+    /// This is the owner-state read the Improvement-Candidate disposition
+    /// issuer starts from: the capability is narrowed out of a grant the
+    /// authority owner already admitted for that principal, never out of
+    /// material a caller presents. A revoked, quarantined, expired-by-status
+    /// or absent grant is not returned, so a caller cannot name a principal
+    /// and receive a capability the owner's own lineage does not carry.
+    /// When a principal holds more than one admitted grant, the
+    /// lowest grant id is the one whose narrowing is applied and the answer is
+    /// deterministic; the disposition vocabulary of the other grants is not
+    /// merged into it, because a merged vocabulary is not an owner's
+    /// selection.
+    pub fn active_grant_held_by(&self, holder: &PrincipalRef) -> Option<&CapabilityGrant> {
+        self.grants
+            .values()
+            .filter(|grant| &grant.holder == holder)
+            .filter(|grant| {
+                grant.status == GrantStatus::Active && !self.revoked.contains(&grant.grant_id)
+            })
+            .min_by(|left, right| left.grant_id.cmp(&right.grant_id))
+    }
+
+    /// Issues the state-owner capability I11-03:15 requires for Improvement
+    /// Candidate disposition, narrowed out of this graph's OWNER-ADMITTED
+    /// lineage for exactly one holder.
+    ///
+    /// I11-03:15 reads: "Improvement Candidate disposition and
+    /// problem/attention resolution are allowed only when the caller holds the
+    /// corresponding task, budget, policy or state-owner capability." This is
+    /// that state-owner capability, and every authority input is READ FROM
+    /// OWNER STATE rather than presented by a caller:
+    ///
+    /// - the delegating grant is this graph's own active admitted grant for
+    ///   `state_owner`, found by [`Self::active_grant_held_by`];
+    /// - the DISPOSITION is read out of that grant's own operation set
+    ///   ([`ImprovementDisposition::from_operations`]), so `Reject` or
+    ///   `Investigate` is the owner's selection and not the issuer's or the
+    ///   requesting caller's choice;
+    /// - the resource facet is derived from the brief and candidate the
+    ///   capability is about;
+    /// - the effect ceiling is [`EffectClass::Candidate`], the strongest class
+    ///   that still records and effects nothing, and the source ceiling is the
+    ///   parent grant's own;
+    /// - the binding, authority root, issuer, holder and expiry are the parent
+    ///   grant's own, so the child cannot outlive, widen or re-root the
+    ///   authority it is derived from.
+    ///
+    /// The result goes through the existing [`check_narrowing`] and
+    /// [`CapabilityGrant::validate_local`] gates, so an issuer input that would
+    /// not narrow is refused rather than issued. It is not added to this graph:
+    /// the graph is the owner's admitted state, and a delegation narrowed from
+    /// it becomes lineage only where an owner admits it.
+    ///
+    /// A holder with no active admitted grant refuses with
+    /// [`AuthorityError::NoEffectivePath`], and a grant whose operation set
+    /// names no disposition — or both — refuses typed, so an absent owner
+    /// capability can never be reported as a disposition.
+    pub fn issue_improvement_disposition_capability(
+        &self,
+        state_owner: &PrincipalRef,
+        brief_id: &str,
+        candidate_id: &str,
+        observed_at: LogicalTime,
+    ) -> Result<CapabilityGrant, AuthorityError> {
+        let parent = self
+            .active_grant_held_by(state_owner)
+            .ok_or(AuthorityError::NoEffectivePath)?;
+        let disposition = ImprovementDisposition::from_operations(parent.authority.operations())?;
+        let resource = improvement_disposition_resource(brief_id, candidate_id)?;
+        // The parent's own effect ceiling must cover the non-mutating class
+        // before any narrowing is attempted, so a parent that cannot carry a
+        // candidate-class operation is refused with its own typed variant.
+        if effect_rank(parent.authority.max_effect()) > effect_rank(EffectClass::Candidate) {
+            return Err(AuthorityError::EffectCeilingExceeded);
+        }
+        let authority = AuthoritySet::new(
+            [String::from(disposition.operation())],
+            [resource.clone()],
+            EffectClass::Candidate,
+        )?;
+        let grant = CapabilityGrant {
+            grant_id: GrantId::new(format!(
+                "improvement-disposition:{}:{}:{}",
+                parent.grant_id.as_str(),
+                disposition.operation(),
+                resource
+            ))?,
+            parent_grant_id: Some(parent.grant_id.clone()),
+            authority_root_ref: parent.authority_root_ref.clone(),
+            // The issuer of a delegation is its parent's holder, and the holder
+            // of this narrowed capability is that same state owner.
+            issuer: parent.holder.clone(),
+            holder: parent.holder.clone(),
+            authority,
+            // The SOURCE of this delegation is the same source the parent's own
+            // authority descends from, so the inherited source ceiling is
+            // carried verbatim rather than computed from `max_effect` — those are
+            // two different vocabularies in two different crates, and
+            // `validate_local` ranks this grant's own `max_effect` against this
+            // field. Copying it cannot widen anything: `check_narrowing` has
+            // already proved the child is a strict narrowing of the parent, and
+            // a parent whose source ceiling could not carry the candidate class
+            // is refused here by `validate_local` exactly as it is for any
+            // other grant, never accepted by weakening the bound.
+            inherited_source_ceiling: parent.inherited_source_ceiling,
+            binding: parent.binding.clone(),
+            issued_at: observed_at,
+            // Never later than the authority it is derived from, and one use:
+            // recording a disposition is one record, so a second selection over
+            // the same brief is refused by the budget rather than overwriting
+            // the first.
+            expires_at: parent.expires_at,
+            max_uses: 1,
+            status: GrantStatus::Active,
+        };
+        check_narrowing(parent, &grant)?;
+        grant.validate_local()?;
+        Ok(grant)
+    }
+
+    /// The disposition an issued state-owner capability admits over exactly
+    /// this brief and candidate, compared against the capability's own
+    /// recorded content.
+    ///
+    /// The comparison is by CONTENT, not by shape: the capability's operation
+    /// set must name exactly one closed non-mutating disposition, its resource
+    /// facet must be the one derived from this brief and candidate, its effect
+    /// ceiling must not exceed the non-mutating class, and the delegation edge
+    /// back to its parent must still be an admitted, unfenced narrowing of the
+    /// lineage this graph holds. A capability whose lineage has moved, whose
+    /// parent is gone, or whose crossing was never authorized refuses with the
+    /// same typed variants the rest of this graph uses, so a stale capability
+    /// is distinguishable from an unauthorized one.
+    pub fn admitted_improvement_disposition(
+        &self,
+        capability: &CapabilityGrant,
+        brief_id: &str,
+        candidate_id: &str,
+    ) -> Result<ImprovementDisposition, AuthorityError> {
+        capability.validate_local()?;
+        if self.revoked.contains(&capability.grant_id) {
+            return Err(AuthorityError::GrantRevoked(capability.grant_id.clone()));
+        }
+        if capability.status != GrantStatus::Active {
+            return Err(AuthorityError::GrantInactive(capability.grant_id.clone()));
+        }
+        let parent_id = capability
+            .parent_grant_id
+            .clone()
+            .ok_or_else(|| AuthorityError::GrantNotNarrower(capability.grant_id.clone()))?;
+        let parent = self
+            .grants
+            .get(&parent_id)
+            .ok_or_else(|| AuthorityError::MissingParent(parent_id.clone()))?;
+        if !edge_is_authorized(parent, capability, &self.transitions) {
+            return Err(AuthorityError::GrantNotNarrower(
+                capability.grant_id.clone(),
+            ));
+        }
+        check_narrowing(parent, capability)?;
+        let disposition =
+            ImprovementDisposition::from_operations(capability.authority.operations())?;
+        let resource = improvement_disposition_resource(brief_id, candidate_id)?;
+        if !capability.authority.resources().contains(&resource) {
+            return Err(AuthorityError::UnauthorizedResource);
+        }
+        if effect_rank(capability.authority.max_effect()) > effect_rank(EffectClass::Candidate) {
+            return Err(AuthorityError::EffectCeilingExceeded);
+        }
+        Ok(disposition)
     }
 
     pub const fn revision(&self) -> u64 {
