@@ -40,10 +40,35 @@
 //! owning lane can make the evidence durable. I12.24:293 requires raw evidence
 //! to be durable and backlog/archive history not to stay process-local, so no
 //! receipt is dropped inside this crate.
+//!
+//! # The application class is never an input
+//!
+//! [`IntakeRequest`] carries no class flag, so the class gate
+//! ([`check_class_gate`], I12.24:78-95) cannot be talked into a class by the
+//! party presenting the evidence. Every value it reads is derived:
+//!
+//! - the descriptor is [`ChangeDescriptor::from_recorded_surface`] over the
+//!   candidate's OWN recorded surface, so `touches_protected` is the crate's
+//!   closed prohibited-surface rule and `bounded_tuning` / `has_work_item_ref`
+//!   have no parameter to be set through;
+//! - the live-experiment count is [`BoundedBacklog::active_for`] on that same
+//!   recorded surface, which is the entry set the backlog already bounds and
+//!   archives (I12.24:86 "one experiment per control surface");
+//! - the rollback reference is the candidate's own recorded `rollback`;
+//! - `work_item_ref` is `None`, `owner_approved` is `false` and
+//!   `migration_proof_ref` is `None` because no owner-issued work-item,
+//!   owner-decision or migration/proof record exists to read.
+//!
+//! The resulting class is
+//! [`ApplicationClass::Advisory`](crate::ApplicationClass::Advisory) or
+//! [`ApplicationClass::Protected`](crate::ApplicationClass::Protected), and a
+//! `Protected` one is REFUSED with
+//! [`ImprovementError::ApplicationClassViolation`]. That is a typed refusal,
+//! not a downgrade: an owner claim is never read as `false` to let a gate
+//! pass, and the two evidence-bound classes stay unreachable rather than
+//! reachable through an unverifiable flag.
 
-use crate::application_class::{
-    ChangeDescriptor, check_class_gate, classify, is_prohibited_tuning_surface,
-};
+use crate::application_class::{ChangeDescriptor, check_class_gate, classify};
 use crate::brief::{ImprovementBrief, SafeBoundary, brief_at_safe_boundary};
 use crate::budget_proof::{BudgetProof, require_matched_budget_for_promotion};
 use crate::candidate_bounds::{
@@ -109,18 +134,40 @@ pub struct RetainedReusableClosure {
 
 /// Everything an intake request source supplies, and nothing it may not.
 ///
-/// This type carries NO `touches_protected` field on purpose. Whether a change
-/// touches a protected surface (I12.24:93-94) is a fact about
-/// `target_surface`, which the candidate records, and `prepare_intake`
-/// derives the flag through the crate's own
-/// [`is_prohibited_tuning_surface`] rather than reading a caller's claim. A
-/// request therefore cannot disagree with the surface it names: there is no
-/// field in which to state the disagreement.
+/// This type carries NO application-class field at all, and that is the point.
+/// Every input the class gate of I12.24:78-95 reads is derived by
+/// `prepare_intake` from a record the requester does not author, so no
+/// application class can be ASSERTED by the party presenting the evidence:
 ///
-/// `bounded_tuning` and `has_work_item_ref` ARE caller-issued, because the
-/// evidence they stand for — a declared safe range (I12.24:85) and a real work
-/// item (I12.24:90-91) — exists on no candidate and can only be supplied by
-/// whoever holds it.
+/// - `touches_protected` is a fact about `target_surface`, which the candidate
+///   records, and `prepare_intake` derives it through the crate's own
+///   [`crate::application_class::is_prohibited_tuning_surface`] rather than
+///   reading a caller's claim. A request cannot disagree with the surface it
+///   names: there is no field in which to state the disagreement.
+/// - `bounded_tuning` — the DECLARED SAFE RANGE of I12.24:85 — and
+///   `has_work_item_ref` / `work_item_ref` — the REAL WORK ITEM of
+///   I12.24:90-91 — are ALSO gone. Neither exists on `ImprovementCandidate`
+///   (I12.24:20-38) or on any other record this crate holds, so a field for
+///   either would be a second caller-assertable scheme with no owner-issued
+///   record behind it. The descriptor is built by
+///   [`ChangeDescriptor::from_recorded_surface`], which exposes no parameter
+///   for them precisely because the evidence does not exist, and states the
+///   unreachability instead of minting a `true`.
+/// - `owner_approved` and `migration_proof_ref` — the EXPLICIT OWNER DECISION
+///   and MIGRATION/PROOF of I12.24:93-94 — are gone for the same reason: no
+///   owner-issued owner-decision or migration/proof record exists on main that
+///   this entry could read. The consequence is a refusal, not a weaker class: a
+///   change whose recorded surface is prohibited classifies `Protected` and
+///   `check_class_gate` refuses it with
+///   [`ImprovementError::ApplicationClassViolation`].
+/// - `live_experiments_on_surface` is gone because "one experiment per control
+///   surface" (I12.24:86) is COUNTED by `prepare_intake` from the bounded
+///   backlog's own retained entries. The requester cannot state the count, so
+///   it cannot state it is zero.
+///
+/// What remains here is content: the evidence, the brief text, the recorded
+/// delivery/canary/rollback/stop condition, the owner-assessed value and owner,
+/// and the budget proof. None of it selects an application class.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct IntakeRequest {
     pub project_id: String,
@@ -143,12 +190,6 @@ pub struct IntakeRequest {
     pub next_reversible_step: String,
     pub unknowns: Vec<String>,
     pub boundary: SafeBoundary,
-    pub bounded_tuning: bool,
-    pub has_work_item_ref: bool,
-    pub live_experiments_on_surface: usize,
-    pub work_item_ref: Option<String>,
-    pub owner_approved: bool,
-    pub migration_proof_ref: Option<String>,
     pub budget_proof: BudgetProof,
 }
 
@@ -221,8 +262,12 @@ struct PreparedIntake {
 /// evidence-bound candidate, move it to `Triaged`, produce the
 /// owner-actionable brief at the safe boundary, enforce the application-class
 /// gate, and require matched budget evidence. Nothing here mutates the
-/// backlog.
-fn prepare_intake(request: IntakeRequest) -> Result<PreparedIntake, ImprovementError> {
+/// backlog; it is read only to count the live experiments already running on
+/// the candidate's own target surface.
+fn prepare_intake(
+    backlog: &BoundedBacklog,
+    request: IntakeRequest,
+) -> Result<PreparedIntake, ImprovementError> {
     let IntakeRequest {
         project_id,
         target_surface,
@@ -244,12 +289,6 @@ fn prepare_intake(request: IntakeRequest) -> Result<PreparedIntake, ImprovementE
         next_reversible_step,
         unknowns,
         boundary,
-        bounded_tuning,
-        has_work_item_ref,
-        live_experiments_on_surface,
-        work_item_ref,
-        owner_approved,
-        migration_proof_ref,
         budget_proof,
     } = request;
     let mut candidate = candidate_from_evidence(
@@ -279,37 +318,46 @@ fn prepare_intake(request: IntakeRequest) -> Result<PreparedIntake, ImprovementE
         unknowns,
         &boundary,
     )?;
-    // The protected flag is DERIVED from the candidate's OWN recorded surface
-    // through the crate's closed rule, exactly as
-    // `ChangeDescriptor::from_recorded_surface` does, so this entry cannot
-    // present a descriptor that disagrees with the surface it recorded. I12.24:93-94
-    // routes a schema/authority/verifier/privacy/Architecture change onto the
-    // explicit owner decision and migration/proof path, and I12.24:87-88 keeps
-    // a verifier-definition or reserve surface off pre-authorized tuning; a
-    // caller-supplied boolean could under-claim either and route a prohibited
-    // surface into the advisory or tuning class. `check_class_gate` refuses
-    // such a descriptor, but a request source that can only build a consistent
-    // one needs no refusal to catch it.
+    // The descriptor is the candidate's OWN recorded surface read through the
+    // crate's existing constructor, so nothing here is a caller's claim:
     //
-    // `bounded_tuning` and `has_work_item_ref` stay owner-issued parameters:
-    // they stand for a declared safe range (I12.24:85) and a real work item
-    // (I12.24:90-91) that exist on no candidate, so they cannot be derived —
-    // only asserted, and `validate` refuses them on a prohibited surface.
-    let change = ChangeDescriptor {
-        target_surface: candidate.target_surface,
-        bounded_tuning,
-        touches_protected: is_prohibited_tuning_surface(candidate.target_surface),
-        has_work_item_ref,
-    };
+    // - `touches_protected` is `is_prohibited_tuning_surface` over the recorded
+    //   surface, the crate's closed rule rather than a spelled constant. I12.24:93-94
+    //   routes a schema/authority/verifier/privacy/Architecture change onto the
+    //   explicit owner decision and migration/proof path, and I12.24:87-88 keeps
+    //   a verifier-definition or reserve surface off pre-authorized tuning; a
+    //   caller-supplied boolean could under-claim either and route a prohibited
+    //   surface into the advisory or tuning class.
+    // - `bounded_tuning` and `has_work_item_ref` are not parameters of
+    //   `from_recorded_surface` at all, and cannot be: I12.24:85 admits
+    //   pre-authorized tuning only inside a declared safe range and the
+    //   I12.24:20-38 candidate schema lists none, and I12.24:90 admits
+    //   code/module/config delivery as a real work item that I12.24:65 places
+    //   after the decision owner's selection. A request that could set either
+    //   would be a fabricated `true` with no owner-issued record behind it, so
+    //   [`IntakeRequest`] has no field for either and the class they select is
+    //   unreachable here rather than assertable.
+    let change = ChangeDescriptor::from_recorded_surface(candidate.target_surface);
     let class = classify(&change);
+    // I12.24:86 "one experiment per control surface": the count is READ from the
+    // backlog's own active entries for the recorded surface, which is the same
+    // set `BoundedBacklog` bounds and archives, so a second concurrent
+    // experiment cannot be admitted by asserting the count is zero.
+    let live_experiments_on_surface = backlog.active_for(candidate.target_surface).len();
+    // The rollback reference the gate reads is the CANDIDATE's own recorded
+    // `rollback` — the same string `candidate_from_evidence` wrote onto it and
+    // `ImprovementCandidate::validate` required non-empty — not a free
+    // parameter that could name a rollback the admitted candidate does not
+    // carry. It is read off the candidate rather than off the destructured
+    // request so the two cannot drift.
     check_class_gate(
         class,
         &change,
         live_experiments_on_surface,
-        &rollback,
-        work_item_ref.as_deref(),
-        owner_approved,
-        migration_proof_ref.as_deref(),
+        &candidate.rollback,
+        None,
+        false,
+        None,
     )?;
     require_matched_budget_for_promotion(Some(&budget_proof))?;
     Ok(PreparedIntake {
@@ -341,7 +389,7 @@ pub fn intake_from_evidence(
     backlog: &mut BoundedBacklog,
     request: IntakeRequest,
 ) -> Result<IntakeOutcome, ImprovementError> {
-    let prepared = prepare_intake(request)?;
+    let prepared = prepare_intake(backlog, request)?;
     let outcome = backlog
         .admit(prepared.candidate, prepared.value, prepared.owner)
         .map_err(|e| ImprovementError::BacklogRefused(e.to_string()))?;
@@ -472,7 +520,7 @@ pub fn intake_from_evidence_governed(
         Some(candidate_id) => Some(backlog.active_reusable(candidate_id, verified)?.clone()),
         None => None,
     };
-    let prepared = prepare_intake(request)?;
+    let prepared = prepare_intake(backlog, request)?;
     let report = backlog.admit_reporting_pressure(
         prepared.candidate,
         prepared.value,
