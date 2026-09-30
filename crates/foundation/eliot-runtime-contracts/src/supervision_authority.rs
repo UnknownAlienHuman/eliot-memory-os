@@ -295,7 +295,7 @@ impl SupervisionAuthorityKeyReference {
         Ok(Self::SystemService(reference))
     }
 
-    /// Constructs one current-user `UserMode` Credential Manager reference.
+    /// Constructs one `UserMode` current-user reference; no caller builds one.
     pub fn user_mode(
         credential_target: impl Into<String>,
         owner_sid_receipt: SupervisionOwnerSidReceipt,
@@ -306,7 +306,7 @@ impl SupervisionAuthorityKeyReference {
         )?))
     }
 
-    /// Constructs one disposable `PortableDev` repository-local key reference.
+    /// Constructs one disposable `PortableDev` reference; no caller builds one.
     pub fn portable_dev(relative_path: impl Into<String>) -> Result<Self, SupervisionLeaseError> {
         Ok(Self::PortableDev(PortableDevSupervisionKeyReference::new(
             relative_path,
