@@ -146,8 +146,8 @@ mod tests {
         CONFORMANCE_CONTRACT_VERSION, CapabilitySupportRow, ContractMaturity,
         ControlBoardInstallation, ControlBoardObservationTime, ControlBoardRecoveryOwner,
         ControlBoardRowDisposition, ControlBoardSourceDigest, DomainCoverage, EvidenceDomain,
-        EvidenceExecutionStatus, ImplementationSupport, SupportObservationState,
-        build_controlboard_frame, open_controlboard_frame,
+        EvidenceExecutionStatus, ImplementationSupport, RenderedControlBoardRow,
+        SupportObservationState, build_controlboard_frame, open_controlboard_frame,
     };
 
     const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
