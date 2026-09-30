@@ -1,0 +1,16 @@
+bins\eliotd\src\observation_adapters.rs:276:8: error: function `durable_acknowledgement_for_batch` is never used
+bins\eliotd\src\observation_adapters.rs:295:8: error: function `unknown_acknowledgement_for_batch` is never used
+bins\eliotd\src\skill_lifecycle_adapters.rs:245:19: error: associated function `new` is never used
+bins\eliotd\src\experience_runtime.rs:353:26: error: using `clone` on type `ReadConsistency` which implements the `Copy` trait: help: try removing the `clone` call: `inputs.consistency`
+bins\eliotd\src\lib.rs:397:24: error: item in documentation is missing backticks
+bins\eliotd\src\lib.rs:1229:5: error: this function has too many arguments (8/7)
+bins\eliotd\src\lib.rs:1260:5: error: this function has too many arguments (8/7)
+bins\eliotd\src\lib.rs:2353:10: error: the `Err`-variant returned from this function is very large: the `Err`-variant is at least 448 bytes
+bins\eliotd\src\lib.rs:2372:10: error: the `Err`-variant returned from this function is very large: the `Err`-variant is at least 448 bytes
+bins\eliotd\src\lib.rs:2393:10: error: the `Err`-variant returned from this function is very large: the `Err`-variant is at least 448 bytes
+bins\eliotd\src\lib.rs:2419:10: error: the `Err`-variant returned from this function is very large: the `Err`-variant is at least 448 bytes
+bins\eliotd\src\lib.rs:2451:10: error: the `Err`-variant returned from this function is very large: the `Err`-variant is at least 448 bytes
+bins\eliotd\src\lib.rs:2485:10: error: the `Err`-variant returned from this function is very large: the `Err`-variant is at least 448 bytes
+bins\eliotd\src\lib.rs:2511:10: error: the `Err`-variant returned from this function is very large: the `Err`-variant is at least 448 bytes
+bins\eliotd\src\lib.rs:2724:10: error: the `Err`-variant returned from this function is very large: the `Err`-variant is at least 448 bytes
+bins\eliotd\src\lib.rs:2753:49: error: the `Err`-variant returned from this function is very large: the `Err`-variant is at least 448 bytes

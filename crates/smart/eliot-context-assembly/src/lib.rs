@@ -14,6 +14,11 @@
 //! disclosure boundary is owned by `crates/governor/eliot-workscope`
 //! (`PrivacyProfile::admits`, `WorkScopeError::PrivacyDenied`), and non-public delivery is
 //! withheld as `DeliveryDisposition::WithheldPrivacy` by `eliot-reactive-context-plan`.
+//!
+//! This crate also owns packet-scorecard production ([`grade_packet`]): the
+//! twelve I12.13 dimension results are graded here from the admitted set, the
+//! rendered payload and the governing owners' supported facts, rather than
+//! received pre-asserted from a caller.
 
 #![forbid(unsafe_code)]
 
@@ -27,6 +32,7 @@ mod learning_gate;
 mod measurement;
 mod readback;
 mod render;
+mod scorecard;
 
 pub use assemble::{
     ASSEMBLY_ORDERING_REVISION, ActiveUnderstandingViewResult, AssemblyPolicy, assemble_active_view,
@@ -42,6 +48,10 @@ pub use error::AssemblyError;
 pub use learning_gate::assemble_active_view_with_learning;
 pub use measurement::assemble_active_view_with_measurement;
 pub use readback::{ReopenedSource, gate_citation};
+pub use scorecard::{
+    GoverningEvidence, ImpactClassification, QualityObligation, QualityObligationReport, grade_packet,
+    mandatory_quality_dimensions, quality_obligation_of,
+};
 
 pub use eliot_context_contracts::{
     ActiveUnderstandingView, AdmittedContextSet, BoundaryMetadataSet, ContextError, ContextOutcome,
