@@ -3361,6 +3361,7 @@ fn append_m3_host_chain(
         work_item_id,
         base_commit: "base".to_owned(),
         worktree_head: Some(format!("head-{session_id}")),
+        source_snapshot: None,
         diff_hash: format!("hash:{session_id}"),
         diff_ref,
         changed_files: vec![path.to_owned()],

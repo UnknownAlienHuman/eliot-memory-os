@@ -181,9 +181,9 @@ impl StoreLaunchConfig {
 
     /// Refuses a Blob root that aliases a `SurrealKV` runtime root (issue #19).
     ///
-    /// This runs inside [`StoreLaunchConfig::validate`], hence before the
-    /// composition claims the Blob root owner and materializes the adapter, so
-    /// one directory can never receive two owners through this launch path.
+    /// This runs inside [`StoreLaunchConfig::validate`] before provider
+    /// materialization. The daemon's source-artifact owner claims its own
+    /// protected-state root; the Store launch path never claims a Blob root.
     fn validate_blob_root_binding(&self) -> Result<(), String> {
         let roots = &self.runtime_launch.runtime_state_roots;
         if let Some(field) = blob_root_alias_field(

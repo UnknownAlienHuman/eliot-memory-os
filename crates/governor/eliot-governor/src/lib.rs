@@ -108,6 +108,7 @@ pub use negative_memory_read::{
     NegativeMemoryReadRefusal, ResolvedNegativeMemoryRuleSet, plan_negative_memory_rule_read,
     resolve_negative_memory_rule_read,
 };
+mod captured_lsp_evidence;
 mod controlboard_projection;
 mod learning_admission;
 mod learning_closure;
@@ -138,6 +139,8 @@ mod scan_disclosure_owner;
 mod scope_identity_admission;
 mod selection_chain;
 mod skill_lifecycle;
+mod source_artifact_admission;
+mod source_artifact_blob_profile;
 mod swarm_plan_attachment_composition;
 mod swarm_plan_attachment_ownership;
 mod swarm_plan_attachment_service;
@@ -172,6 +175,7 @@ pub use capability_evidence_commit::{
     capability_evidence_idempotency_key, capability_evidence_mutation_request_for_record,
     commit_capability_evidence_record,
 };
+pub use captured_lsp_evidence::CapturedLspEvidenceError;
 pub use composition::*;
 pub use controlboard_projection::{
     ControlBoardAttentionEvaluationRow, ControlBoardGovernorSnapshot, ControlBoardOwnerBinding,
@@ -182,6 +186,7 @@ pub use controlboard_projection::{
 /// the daemon composition root can name the exact envelope type without a
 /// second canonical dependency path.
 pub use eliot_canonical::{CanonicalWriteEnvelope, FinishAttemptDraft, RequestedFinishOutcome};
+pub use eliot_code_cortex::CapturedLspObservation;
 pub use eliot_finish::FinishDecisionReceipt;
 /// Admission-receipt type re-exported so the daemon composition root can name
 /// the exact delivery-gate receipt type without a second dependency path (same
@@ -312,6 +317,22 @@ pub use selection_chain::{
     selection_chain_security_context, selection_claim_ceiling,
 };
 pub use skill_lifecycle::{GovernorSkillLifecycle, canonical_skill_tool_source};
+pub(crate) use source_artifact_admission::issue_source_artifact_admission;
+pub use source_artifact_admission::{
+    SourceArtifactAdmission, SourceArtifactAdmissionError, SourceArtifactAdmissionRequest,
+    SourceArtifactReadRequest,
+};
+pub use source_artifact_blob_profile::{
+    SOURCE_ARTIFACT_BLOB_ACCESS_DOMAIN_SETTING,
+    SOURCE_ARTIFACT_BLOB_CONFIDENTIALITY_DOMAIN_SETTING,
+    SOURCE_ARTIFACT_BLOB_EFFECT_CEILING_SETTING,
+    SOURCE_ARTIFACT_BLOB_ENCRYPTION_KEY_DOMAIN_SETTING,
+    SOURCE_ARTIFACT_BLOB_ERASURE_DOMAIN_SETTING, SOURCE_ARTIFACT_BLOB_INSTRUCTION_TAINT_SETTING,
+    SOURCE_ARTIFACT_BLOB_PRIVACY_CLASS_SETTING, SOURCE_ARTIFACT_BLOB_RETENTION_CLASS_SETTING,
+    SOURCE_ARTIFACT_BLOB_RETENTION_DOMAIN_SETTING, SOURCE_ARTIFACT_BLOB_SCOPE_DOMAIN_SETTING,
+    SourceArtifactBlobPolicy, SourceArtifactBlobProfile, SourceArtifactBlobProfileError,
+    SourceArtifactResidencyDomains, SourceArtifactRetentionClass,
+};
 pub use swarm_plan_attachment_composition::SwarmAttachmentComposition;
 pub use swarm_plan_attachment_ownership::{
     AttachmentOwnershipDomain, AttachmentOwnershipScope, OwnershipOutcome,

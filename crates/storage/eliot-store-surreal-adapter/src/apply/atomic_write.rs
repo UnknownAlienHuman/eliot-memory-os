@@ -18,9 +18,10 @@ use crate::config::SurrealAdapterConfig;
 use crate::error::AdapterError;
 use crate::plan::{ApplyPlan, EvidenceRecord, OrderingChainTips, PayloadAuthorityRecord};
 use crate::schema;
+use crate::source_artifact_context::CanonicalCausalProjection;
 use eliot_store_api::epistemic_revision::EpistemicCommit;
 use eliot_store_api::{
-    ORDERING_LINK_GENESIS_HASH, OrderingHead, OrderingHeadExpectation, RevisionHead,
+    ORDERING_LINK_GENESIS_HASH, OrderingHead, OrderingHeadExpectation, ReceiptId, RevisionHead,
     RevisionHeadExpectation, ScopeId, StateFence, StoreError, WriteReceipt,
 };
 
@@ -103,20 +104,16 @@ pub(super) enum TxLane {
     PooledWrite,
 }
 
-/// Provider markers proving the shared fence/sequence allocation moved while
-/// the transaction carried no semantic conflict marker.
-///
-/// Closed to the canonical fence CAS alone (S-CONC-TX, issue #989, audit
-/// `5919482812`): only the fence compare-and-set arbitrates the global
-/// commit/outbox cursors. Every owner-row/revision/snapshot marker lives in
-/// [`SEMANTIC_CONFLICT_MARKERS`]: such a marker proves an owner row read
-/// before the transaction changed before the transaction CAS, i.e.
-/// semantic/currentness drift for the named leg, never bare allocation
-/// movement. Matching is exact sentinel-token equality (see
-/// [`has_marker_token`]), never a substring search over provider prose.
+/// Provider markers for retryable global-allocation conflicts and the causal
+/// parent predecessor compare. The causal-parent marker is retried only after
+/// the next attempt rereads the original causal owner projection. Owner-row,
+/// revision, and snapshot conflicts remain exclusively classified by
+/// [`SEMANTIC_CONFLICT_MARKERS`]. Matching is exact sentinel-token equality
+/// (see [`has_marker_token`]), never a substring search over provider prose.
 const ALLOCATION_CONFLICT_MARKERS: &[&str] = &[
     "canonical_fence_cas_conflict",
     "canonical_fence_create_conflict",
+    "causal_parent_conflict",
 ];
 
 /// Provider markers proving a deterministic semantic conflict: a stale
@@ -358,6 +355,7 @@ pub(super) async fn write_transaction(
     transition: &eliot_store_api::PreparedTransition,
     plan: &ApplyPlan,
     receipt: &WriteReceipt,
+    causal: &CanonicalCausalProjection,
     initial_state: bool,
     expected_commit_sequence: u64,
     expected_outbox_sequence: u64,
@@ -500,6 +498,7 @@ pub(super) async fn write_canonical_transaction_with_expected_heads(
         transition,
         plan,
         receipt,
+        causal,
         initial_state,
         expected_commit_sequence,
         expected_outbox_sequence,
@@ -686,6 +685,7 @@ fn build_apply_statements(
     transition: &eliot_store_api::PreparedTransition,
     plan: &ApplyPlan,
     receipt: &WriteReceipt,
+    causal: &CanonicalCausalProjection,
     initial_state: bool,
     expected_commit_sequence: u64,
     expected_outbox_sequence: u64,
@@ -711,6 +711,20 @@ fn build_apply_statements(
         .request
         .metadata;
     let epistemic = EpistemicCommit::from_prepared(context, transition)?;
+
+    sql.push_str(schema::TX_GUARD_CAUSAL_PREDECESSOR);
+    bindings.insert(
+        "expected_causal_commit_sequence".to_owned(),
+        json!(causal.commit_sequence()),
+    );
+    bindings.insert(
+        "expected_parent_commit_sequence".to_owned(),
+        json!(causal.commit_sequence().saturating_sub(1)),
+    );
+    bindings.insert(
+        "expected_parent_receipt_id".to_owned(),
+        json!(causal.parent_receipt_id().map(ReceiptId::as_str)),
+    );
     if let Some(commit) = &epistemic {
         commit.readback(receipt)?;
         sql.push_str(EPISTEMIC_CAS);

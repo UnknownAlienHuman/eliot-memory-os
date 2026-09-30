@@ -52,7 +52,9 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(test)]
+use std::time::UNIX_EPOCH;
+use std::time::{Duration, SystemTime};
 
 use eliot_governor::{KernelGenerationSnapshotProvider, KernelTransitionPort};
 use eliot_improvement::candidate_bounds::BoundedBacklog;
@@ -4697,11 +4699,12 @@ async fn run_local_read_poll(
         // pair). The serve is reached through the daemon composition's
         // `DaemonComposition::reconstruction_composition` borrow: readiness is
         // checked there, and the exact admitted fence plus the task-bound
-        // scope are pinned at borrow time. The guard is dropped before any
-        // owner read, so no composition lock crosses the reconstruction
-        // awaits. A refused borrow, or a fence pin that no longer matches the
-        // admitted pair, is a typed step failure like any other prerequisite
-        // refusal, so the claimed pair is never silently discarded.
+        // scope are pinned at borrow time. The guard is dropped before the
+        // asynchronous seven-role reads; after they finish, the route briefly
+        // reacquires composition for synchronous source-read admission, Blob
+        // authentication and CodeCortex adoption. No composition lock crosses
+        // a reconstruction await. A refused borrow or moved fence is a typed
+        // step failure, so the claimed pair is never silently discarded.
         let reads = KernelContextReadClient::new(Arc::clone(kernel));
         let scope = reconstruction_borrow_scope(&envelope)?;
         {
@@ -4714,7 +4717,11 @@ async fn run_local_read_poll(
             }
         }
         let body = Box::pin(eliotd::serve_context_reconstruction(
-            kernel, &envelope, &tool, &attempt,
+            kernel,
+            &composition,
+            &envelope,
+            &tool,
+            &attempt,
         ))
         .await
         .map_err(|error| format!("daemon context reconstruction: {error}"))?;
@@ -7504,14 +7511,8 @@ fn transient_not_before(result: &AgentActivationResolutionResult) -> Option<u64>
     }
 }
 
-fn unix_ms(now: SystemTime) -> Result<u64, String> {
-    let elapsed = now
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| format!("daemon activation clock precedes Unix epoch: {error}"))?;
-    elapsed
-        .as_millis()
-        .try_into()
-        .map_err(|_| "daemon activation clock exceeds u64 milliseconds".to_owned())
+pub(crate) fn unix_ms(now: SystemTime) -> Result<u64, String> {
+    eliotd::try_unix_ms(now)
 }
 
 fn activation_deadline_expired(now: u64, deadline: u64) -> bool {

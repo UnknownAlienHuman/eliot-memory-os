@@ -18,15 +18,16 @@ use thiserror::Error;
 
 use crate::{
     BackupOperationReconciliation, CanonicalRequestView, CanonicalRestoreBatch,
-    CanonicalValidationSnapshot, ErasureIntentRecord, ErasureSurfaceKind, ExactJsonBytes,
-    IsolatedDestination, IsolatedDestinationReceipt, MAX_STORE_FAILURE_DETAIL_LEN,
+    CanonicalValidationSnapshot, CausalBinding, ErasureIntentRecord, ErasureSurfaceKind,
+    ExactJsonBytes, IsolatedDestination, IsolatedDestinationReceipt, MAX_STORE_FAILURE_DETAIL_LEN,
     NamedReadRequest, NamedReadResponse, OperationId, OperationIdentity, OrderingHead,
     OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RequestMeta,
     ReservedWriteRequest, RestoreValidationReceipt, RevisionHead, RevisionHeadExpectation,
     RevisionKey, ScopeId, SnapshotBeginRequest, SnapshotCursor, SnapshotEndReceipt, SnapshotHandle,
     SnapshotPage, StateFence, StoreError, StoreGenesisRequest, StoreHealth, StoreRecoveryRequest,
-    StoreRecoverySnapshot, WriteReceipt, canonical_json_bytes, dreamer_job::map_durable_error,
-    json_shape_name, reconcile_same_operation, sha256_hex, verify_canonical_request_hash,
+    StoreRecoverySnapshot, WriteReceipt, canonical_json_bytes, committed_receipt_sequence,
+    dreamer_job::map_durable_error, json_shape_name, reconcile_same_operation, sha256_hex,
+    validate_causal_write_receipt, verify_canonical_request_hash,
 };
 use schemars::JsonSchema;
 
@@ -1126,8 +1127,22 @@ pub enum StoreResponse {
     Transaction {
         receipt: WriteReceipt,
     },
+    /// Transaction response accompanied by the canonical owner’s independently
+    /// reread causal projection. The projection is checked against the receipt
+    /// and its committed sequence before a caller may consume it.
+    TransactionWithCausal {
+        receipt: WriteReceipt,
+        causal: CausalBinding,
+    },
     Receipt {
         receipt: Option<WriteReceipt>,
+    },
+    /// Exact-operation lookup accompanied by the canonical owner’s causal
+    /// projection. Receipt and projection are either both present or both
+    /// absent; callers never infer a missing projection from the envelope.
+    ReceiptWithCausal {
+        receipt: Option<WriteReceipt>,
+        causal: Option<CausalBinding>,
     },
     RevisionHeads {
         heads: Vec<RevisionHead>,
@@ -1182,18 +1197,27 @@ impl StoreResponse {
 
     /// Converts a write receipt into a reconciliation-safe response.
     pub fn from_transaction_receipt(receipt: WriteReceipt) -> Self {
-        let reason = match receipt.validate() {
-            Err(_) => Some("receipt_invalid"),
-            Ok(()) => match receipt.require_reconciliation_envelope() {
-                Ok(_) => None,
-                Err(_) => Some("receipt_envelope_missing"),
-            },
-        };
+        let reason = validate_legacy_genesis_receipt(&receipt).err();
         match reason {
             None => Self::Transaction { receipt },
-            Some(reason) => Self::Unknown {
+            Some(_) => Self::Unknown {
                 operation_id: receipt.operation_id.clone(),
-                reason: reason.to_owned(),
+                reason: "receipt_causal_projection_unavailable".to_owned(),
+            },
+        }
+    }
+
+    /// Converts a transaction receipt and the original owner’s causal
+    /// projection into a reconciliation-safe response.
+    pub fn from_transaction_receipt_with_causal(
+        receipt: WriteReceipt,
+        causal: CausalBinding,
+    ) -> Self {
+        match validate_receipt_causal_projection(&receipt, &causal) {
+            Ok(()) => Self::TransactionWithCausal { receipt, causal },
+            Err(_) => Self::Unknown {
+                operation_id: receipt.operation_id.clone(),
+                reason: "receipt_causal_projection_invalid".to_owned(),
             },
         }
     }
@@ -1202,24 +1226,42 @@ impl StoreResponse {
     pub fn from_receipt(receipt: Option<WriteReceipt>) -> Self {
         match receipt {
             Some(receipt) => {
-                let reason = match receipt.validate() {
-                    Err(_) => Some("receipt_invalid"),
-                    Ok(()) => match receipt.require_reconciliation_envelope() {
-                        Ok(_) => None,
-                        Err(_) => Some("receipt_envelope_missing"),
-                    },
-                };
+                let reason = validate_legacy_genesis_receipt(&receipt).err();
                 match reason {
                     None => Self::Receipt {
                         receipt: Some(receipt),
                     },
-                    Some(reason) => Self::Unknown {
+                    Some(_) => Self::Unknown {
                         operation_id: receipt.operation_id.clone(),
-                        reason: reason.to_owned(),
+                        reason: "receipt_causal_projection_unavailable".to_owned(),
                     },
                 }
             }
             None => Self::Receipt { receipt: None },
+        }
+    }
+
+    /// Converts an exact-operation lookup and its independent causal
+    /// projection into a reconciliation-safe response.
+    pub fn from_receipt_with_causal(
+        receipt: Option<WriteReceipt>,
+        causal: Option<CausalBinding>,
+    ) -> Result<Self, StoreWireError> {
+        match (receipt, causal) {
+            (Some(receipt), Some(causal)) => {
+                match validate_receipt_causal_projection(&receipt, &causal) {
+                    Ok(()) => Ok(Self::ReceiptWithCausal {
+                        receipt: Some(receipt),
+                        causal: Some(causal),
+                    }),
+                    Err(error) => Err(StoreWireError::Store(error)),
+                }
+            }
+            (None, None) => Ok(Self::ReceiptWithCausal {
+                receipt: None,
+                causal: None,
+            }),
+            _ => Err(StoreWireError::Store(StoreError::InvalidReceipt)),
         }
     }
 
@@ -1229,22 +1271,26 @@ impl StoreResponse {
             Self::Readiness { receipt } => receipt.validate(),
             Self::Named { response } => response.validate().map_err(StoreWireError::Store),
             Self::Transaction { receipt } => {
-                receipt.validate().map_err(StoreWireError::Store)?;
-                receipt
-                    .require_reconciliation_envelope()
-                    .map(|_| ())
-                    .map_err(StoreWireError::Store)
+                validate_legacy_genesis_receipt(receipt).map_err(StoreWireError::Store)
+            }
+            Self::TransactionWithCausal { receipt, causal } => {
+                validate_receipt_causal_projection(receipt, causal).map_err(StoreWireError::Store)
             }
             Self::Receipt {
                 receipt: Some(receipt),
-            } => {
-                receipt.validate().map_err(StoreWireError::Store)?;
-                receipt
-                    .require_reconciliation_envelope()
-                    .map(|_| ())
-                    .map_err(StoreWireError::Store)
+            } => validate_legacy_genesis_receipt(receipt).map_err(StoreWireError::Store),
+            Self::ReceiptWithCausal {
+                receipt: Some(receipt),
+                causal: Some(causal),
+            } => validate_receipt_causal_projection(receipt, causal).map_err(StoreWireError::Store),
+            Self::Receipt { receipt: None }
+            | Self::ReceiptWithCausal {
+                receipt: None,
+                causal: None,
+            } => Ok(()),
+            Self::ReceiptWithCausal { .. } => {
+                Err(StoreWireError::Store(StoreError::InvalidReceipt))
             }
-            Self::Receipt { receipt: None } => Ok(()),
             Self::RevisionHeads { heads } => {
                 bounded_unique(heads, "revision_heads", |head| head.key.clone())?;
                 for head in heads {
@@ -1274,11 +1320,7 @@ impl StoreResponse {
                         reason: "genesis receipt must use RecoverySchema",
                     }));
                 }
-                receipt.validate().map_err(StoreWireError::Store)?;
-                receipt
-                    .require_reconciliation_envelope()
-                    .map(|_| ())
-                    .map_err(StoreWireError::Store)
+                validate_legacy_genesis_receipt(receipt).map_err(StoreWireError::Store)
             }
             Self::Failure { failure } => failure
                 .validate()
@@ -1287,6 +1329,38 @@ impl StoreResponse {
             Self::Unknown { reason, .. } => validate_legacy_failure_text(reason, "unknown.reason"),
         }
     }
+}
+
+/// Validates the bounded legacy causal shape. Legacy responses do not carry an
+/// independent owner projection, so they are accepted only for the known
+/// genesis sequence with an empty predecessor chain.
+fn validate_legacy_genesis_receipt(receipt: &WriteReceipt) -> Result<(), StoreError> {
+    receipt.validate()?;
+    if committed_receipt_sequence(receipt)? != 1 {
+        return Err(StoreError::InvalidReceipt);
+    }
+    let envelope = receipt.require_reconciliation_envelope()?;
+    let expected = CausalBinding {
+        state_fence: receipt.state_fence.clone(),
+        transaction_sequence: crate::TransactionSequence::genesis(),
+        parent_receipt_id: None,
+        predecessor_receipt_ids: Vec::new(),
+    };
+    if envelope.core.causal != expected {
+        return Err(StoreError::InvalidReceipt);
+    }
+    Ok(())
+}
+
+/// Validates the response's independently supplied canonical causal
+/// projection against the committed sequence, receipt fence, and immutable
+/// envelope. The projection is compared as a whole; the envelope is never
+/// used to construct its own expected value.
+fn validate_receipt_causal_projection(
+    receipt: &WriteReceipt,
+    causal: &CausalBinding,
+) -> Result<(), StoreError> {
+    validate_causal_write_receipt(receipt, causal)
 }
 
 /// Errors while validating or encoding the neutral store wire.

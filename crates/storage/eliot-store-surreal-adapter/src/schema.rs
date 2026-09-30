@@ -564,6 +564,10 @@ pub(crate) const TX_COMMIT: &str = "COMMIT TRANSACTION;";
 
 /// Compare-and-set update of the canonical fence singleton.
 pub(crate) const TX_UPSERT_FENCE: &str = "LET $fence_cas = (UPDATE type::record($fence_table, $fence_key) CONTENT $fence WHERE state_fence = $expected_state_fence AND next_commit_sequence = $expected_commit_sequence AND next_outbox_sequence = $expected_outbox_sequence RETURN AFTER); IF array::len($fence_cas ?? []) != 1 { THROW 'canonical_fence_cas_conflict'; };";
+
+/// Refuses a receipt write unless its causal parent is still the unique
+/// sequence predecessor selected by the adapter's transaction readback.
+pub(crate) const TX_GUARD_CAUSAL_PREDECESSOR: &str = "IF $expected_causal_commit_sequence != $expected_commit_sequence { THROW 'causal_parent_conflict'; }; LET $causal_predecessors = (SELECT VALUE body.envelope.identity.receipt_id FROM write_receipt WHERE commit_sequence = $expected_parent_commit_sequence LIMIT 2); IF $expected_causal_commit_sequence = 1 { IF array::len((SELECT * FROM write_receipt)) != 0 { THROW 'causal_parent_conflict'; }; } ELSE { IF array::len($causal_predecessors ?? []) != 1 OR $causal_predecessors[0] != $expected_parent_receipt_id { THROW 'causal_parent_conflict'; }; };";
 pub(crate) const TX_CREATE_FENCE: &str = "LET $fence_create = (CREATE type::record($fence_table, $fence_key) CONTENT $fence RETURN AFTER); IF array::len($fence_create ?? []) != 1 { THROW 'canonical_fence_create_conflict'; };";
 /// Verify one independently declared revision dependency inside the canonical transaction.
 pub(crate) const TX_VERIFY_EXPECTED_REVISION: &str = "LET $expected_revision_head{i} = (SELECT VALUE { revision: body.revision, state_fence: body.state_fence } FROM ONLY type::record($expected_revision_table{i}, $expected_revision_key{i})); IF type::is_object($expected_revision_head{i}) { IF $expected_revision_head{i}.revision != $expected_revision_value{i} OR $expected_revision_head{i}.state_fence != $expected_revision_fence{i} { THROW 'revision_head_cas_conflict'; }; } ELSE { IF $expected_revision_value{i} != 1 { THROW 'revision_head_cas_conflict'; }; };";
@@ -736,6 +740,15 @@ pub(crate) fn forward_migration_expected_bindings() -> Vec<&'static str> {
 pub(crate) const READ_SCHEMA_META: &str = "SELECT VALUE { generation: generation, migrations: migrations, compatible_bridge_range: compatible_bridge_range, migration_state: migration_state, migration_id: migration_id, migration_checksum_sha256: migration_checksum_sha256, updated_at: updated_at } FROM ONLY schema_meta:current;";
 
 pub(crate) const READ_FENCE: &str = "SELECT VALUE { state_fence: state_fence, next_commit_sequence: next_commit_sequence, next_outbox_sequence: next_outbox_sequence } FROM ONLY canonical_fence:current;";
+
+/// Reads the canonical allocation cursor and its exact predecessor receipt in
+/// one provider transaction. The predecessor is selected by the sequence the
+/// database assigned, and `LIMIT 2` lets the adapter reject duplicate heads.
+pub(crate) const READ_CAUSAL_ALLOCATION: &str = "BEGIN TRANSACTION; SELECT VALUE { state_fence: state_fence, next_commit_sequence: next_commit_sequence, next_outbox_sequence: next_outbox_sequence } FROM ONLY canonical_fence:current; SELECT VALUE { commit_sequence: commit_sequence, receipt: body } FROM write_receipt ORDER BY commit_sequence DESC LIMIT 2; COMMIT TRANSACTION;";
+
+/// Reads one committed receipt and its parent row from the original Store
+/// transaction for independent replay validation.
+pub(crate) const READ_CAUSAL_REPLAY_BY_OPERATION: &str = "BEGIN TRANSACTION; SELECT VALUE { commit_sequence: commit_sequence, receipt: body } FROM write_receipt WHERE operation_id = $operation_id LIMIT 2; SELECT VALUE { commit_sequence: commit_sequence, receipt: body } FROM write_receipt WHERE commit_sequence IN (SELECT VALUE commit_sequence - 1 FROM write_receipt WHERE operation_id = $operation_id LIMIT 1) LIMIT 2; COMMIT TRANSACTION;";
 
 pub(crate) const READ_RECEIPT_BY_OPERATION: &str =
     "SELECT VALUE body FROM ONLY type::record($table, $key);";
