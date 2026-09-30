@@ -64,6 +64,78 @@ where
     }
 }
 
+/// Bounded refusal for a protected runtime identifier that decoded empty.
+///
+/// Operation, process and generation identity is what a checkpoint, a restart
+/// window, a reap receipt and a supervision report are trusted by. An empty
+/// string is not a weaker identifier, it is an absent one, so it must refuse
+/// at the decoder instead of becoming a current key. Absence already refuses
+/// through the missing-field path; this closes the spelled-out-empty spelling
+/// of the same defect. The message is fixed and never echoes the received
+/// value onto an operator surface.
+fn empty_protected_identifier<E>(field: &'static str) -> E
+where
+    E: de::Error,
+{
+    E::custom(format!("empty protected identifier: {field}"))
+}
+
+fn deserialize_protected_string<'de, D>(
+    deserializer: D,
+    field: &'static str,
+) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.is_empty() {
+        return Err(empty_protected_identifier(field));
+    }
+    Ok(value)
+}
+
+fn deserialize_operation_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_protected_string(deserializer, "operation_id")
+}
+
+fn deserialize_seal_attempt_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_protected_string(deserializer, "seal_attempt_id")
+}
+
+fn deserialize_run_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_protected_string(deserializer, "run_id")
+}
+
+fn deserialize_job_object_name<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_protected_string(deserializer, "job_object_name")
+}
+
+fn deserialize_adapter_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_protected_string(deserializer, "adapter_id")
+}
+
+fn deserialize_restart_window_key<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_protected_string(deserializer, "key")
+}
+
 fn deserialize_descendants_at_root_exit_schema_version<'de, D>(
     deserializer: D,
 ) -> Result<String, D::Error>
@@ -187,6 +259,7 @@ pub enum AdapterCircuitState {
 pub struct OperationRuntimeCheckpoint {
     #[serde(deserialize_with = "deserialize_operation_runtime_schema_version")]
     pub schema_version: String,
+    #[serde(deserialize_with = "deserialize_operation_id")]
     pub operation_id: String,
     pub invocation_id: Option<String>,
     pub adapter_id: Option<String>,
@@ -236,6 +309,7 @@ impl OperationRuntimeCheckpoint {
 pub struct OperationRestartWindow {
     #[serde(deserialize_with = "deserialize_restart_window_schema_version")]
     pub schema_version: String,
+    #[serde(deserialize_with = "deserialize_restart_window_key")]
     pub key: String,
     pub restart_timestamps: Vec<String>,
     pub circuit_state: AdapterCircuitState,
@@ -277,7 +351,9 @@ pub enum SealStagingState {
 pub struct SealStagingCheckpoint {
     #[serde(deserialize_with = "deserialize_seal_staging_schema_version")]
     pub schema_version: String,
+    #[serde(deserialize_with = "deserialize_seal_attempt_id")]
     pub seal_attempt_id: String,
+    #[serde(deserialize_with = "deserialize_run_id")]
     pub run_id: String,
     pub generation: u64,
     pub staging_root: String,
@@ -516,8 +592,10 @@ impl DescendantsAtRootExit {
 #[serde(deny_unknown_fields)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct ProcessReapReceipt {
+    #[serde(deserialize_with = "deserialize_operation_id")]
     pub operation_id: String,
     pub generation: u64,
+    #[serde(deserialize_with = "deserialize_job_object_name")]
     pub job_object_name: String,
     pub root_pid: Option<u32>,
     pub process_count_before: u32,
@@ -562,6 +640,7 @@ pub struct RuntimeCoreHealth {
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeAdapterHealth {
+    #[serde(deserialize_with = "deserialize_adapter_id")]
     pub adapter_id: String,
     pub installed: bool,
     pub authenticated: bool,
@@ -587,6 +666,7 @@ pub struct RuntimeAdapterHealth {
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeOperationDetail {
+    #[serde(deserialize_with = "deserialize_operation_id")]
     pub operation_id: String,
     pub generation: u64,
     pub phase: OperationPhase,
@@ -679,6 +759,7 @@ pub struct RuntimeSupervisionReport {
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeReconcileDecision {
+    #[serde(deserialize_with = "deserialize_operation_id")]
     pub operation_id: String,
     pub generation: u64,
     pub decision: String,
