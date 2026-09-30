@@ -56,6 +56,13 @@ use eliot_kernel_service::{RESERVATION_KEY_NAME, RESERVATION_KEY_PROVIDER};
 #[cfg(windows)]
 use std::fmt;
 
+#[cfg(windows)]
+struct VerifiedObserveReservation {
+    state_fence: StateFence,
+    operation: super::daemon_request_dispatch::StoreApplyOperation,
+    original_submission: eliot_store_api::OriginalWriteSubmission,
+}
+
 /// Maps one Store bootstrap/build failure to its stable owner-typed code.
 ///
 /// Only the variant name is emitted; any `String` payload is never logged.
@@ -434,8 +441,7 @@ impl KernelComposition {
         );
         let evidence = self
             .canonical_store_evidence
-            .as_ref()
-            .cloned()
+            .clone()
             .ok_or_else(|| {
                 KernelBuildError::Service(
                     "canonical Store evidence provider is unavailable".to_owned(),
@@ -550,6 +556,47 @@ impl KernelComposition {
         {
             return Ok(());
         }
+        let verified =
+            self.verify_staged_observe_reservation(gateway, reservation, &host_record)?;
+        let Ok(receipt) = gateway
+            .receipt(
+                &verified.state_fence,
+                verified.operation.transition.identity.operation_id.clone(),
+            )
+            .await
+        else {
+            return Ok(());
+        };
+        if receipt.is_none()
+            && !matches!(
+                reservation.state,
+                ReservationState::Reserved | ReservationState::Eligible
+            )
+        {
+            return Ok(());
+        }
+        gateway
+            .restore_staged_reserved(
+                &verified.operation.context,
+                verified.operation.transition,
+                verified.operation.expected_revision_heads,
+                verified.operation.expected_ordering_heads,
+                &verified.original_submission,
+                token.clone(),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn verify_staged_observe_reservation(
+        &self,
+        gateway: &KernelStoreGateway,
+        reservation: &eliot_ors::ReservationRecord,
+        host_record: &eliot_ors::HostRequestRecord,
+    ) -> Result<VerifiedObserveReservation, String> {
+        let token = &reservation.token;
         let state_fence: StateFence = serde_json::from_str(&token.state_fence.canonical_json)
             .map_err(|error| error.to_string())?;
         let recaptured =
@@ -595,50 +642,25 @@ impl KernelComposition {
         {
             return Err("retained Observe operation differs from its reservation token".to_owned());
         }
-        let input = Self::retained_observe_reservation_input(&host_record, &operation)?
+        let input = Self::retained_observe_reservation_input(host_record, &operation)?
             .ok_or_else(|| "retained Observe operation has no executable input".to_owned())?;
         let original_submission = operation
             .original_write_submission
             .as_ref()
             .ok_or_else(|| "retained Observe operation has no original write source".to_owned())?
             .clone();
-        self.validate_original_write_submission_source(&host_record, &original_submission)
+        self.validate_original_write_submission_source(host_record, &original_submission)
             .map_err(|error| format!("retained Observe source failed validation: {error}"))?;
         if staged_access != input.protected_envelope.privacy_and_visibility_class
             || input.payload_sha256 != host_record.payload_digest
         {
             return Err("retained Observe protected input does not match its owner row".to_owned());
         }
-        let receipt = match gateway
-            .receipt(
-                &state_fence,
-                operation.transition.identity.operation_id.clone(),
-            )
-            .await
-        {
-            Ok(receipt) => receipt,
-            Err(_) => return Ok(()),
-        };
-        if receipt.is_none()
-            && !matches!(
-                reservation.state,
-                ReservationState::Reserved | ReservationState::Eligible
-            )
-        {
-            return Ok(());
-        }
-        gateway
-            .restore_staged_reserved(
-                &operation.context,
-                operation.transition,
-                operation.expected_revision_heads,
-                operation.expected_ordering_heads,
-                &original_submission,
-                token.clone(),
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        Ok(())
+        Ok(VerifiedObserveReservation {
+            state_fence,
+            operation,
+            original_submission,
+        })
     }
 
     /// Observes the three independent canonical-Store facts and refuses
