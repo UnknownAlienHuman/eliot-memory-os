@@ -1493,8 +1493,7 @@ fn verify_context_reconstruction_table(
     if declared != admitted {
         return Err(ReadError::InvalidField {
             field: "context_reconstruction_operations".to_owned(),
-            reason: "the declared table names an operation the store has not activated"
-                .to_owned(),
+            reason: "the declared table names an operation the store has not activated".to_owned(),
         });
     }
     Ok(())
