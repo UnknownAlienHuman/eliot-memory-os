@@ -118,12 +118,14 @@ impl KernelDurableJobPort for DaemonKernelClient {
         // revision to bind the same intent. An absent or substituted read-back
         // leaves the outcome explicitly incomplete for receipt reconciliation,
         // never a success.
-        let retained = self.load_durable_job(&job.job_id, &job.state_fence)?.ok_or_else(|| {
-            KernelPortError::Contract(
-                "Kernel durable-job save has no retained revision for the saved job identity"
-                    .to_owned(),
-            )
-        })?;
+        let retained = self
+            .load_durable_job(&job.job_id, &job.state_fence)?
+            .ok_or_else(|| {
+                KernelPortError::Contract(
+                    "Kernel durable-job save has no retained revision for the saved job identity"
+                        .to_owned(),
+                )
+            })?;
         prove_job_intent_durable(job, &retained)
             .map_err(|error| KernelPortError::Contract(error.to_string()))?;
         Ok(())
