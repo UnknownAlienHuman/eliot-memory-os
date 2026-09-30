@@ -3930,6 +3930,18 @@ pub trait OperationalRecoveryStore: Send + Sync {
         &self,
         item: RecoveryInboxItem,
     ) -> Result<RecoveryInboxReceipt, OrsError>;
+    /// Reads back one imported recovery-inbox obligation by exact item
+    /// identity without interpreting its payload (issue #1694 W2).
+    ///
+    /// This is the owner read-back behind persist-before-ack proof: the
+    /// returned envelope is the durably committed staged bytes, including
+    /// envelopes that live only inside the inbox row and never in the
+    /// envelope table. A missing row reads back as `None`, never as a
+    /// synthesized envelope.
+    fn load_recovery_inbox_envelope(
+        &self,
+        item_id: &crate::OperationIdentity,
+    ) -> Result<Option<RecoveryPayloadEnvelope>, OrsError>;
     fn record_recovery_inbox_disposition(
         &self,
         item_id: crate::OperationIdentity,
@@ -33413,6 +33425,27 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         item: RecoveryInboxItem,
     ) -> Result<RecoveryInboxReceipt, OrsError> {
         recovery_projection::import_recovery_inbox(self, item)
+    }
+
+    fn load_recovery_inbox_envelope(
+        &self,
+        item_id: &crate::OperationIdentity,
+    ) -> Result<Option<RecoveryPayloadEnvelope>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read.open_table(RECOVERY_INBOX).map_err(storage)?;
+        let value = table.get(item_id.as_str()).map_err(storage)?;
+        value
+            .map(|stored| {
+                let record: DurableInboxRecord = decode_named(stored.value(), "recovery_inbox")?;
+                if record.item.item_id.as_str() != item_id.as_str() {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "recovery_inbox",
+                        reason: "row key differs from its imported item identity".to_owned(),
+                    });
+                }
+                Ok(record.item.envelope)
+            })
+            .transpose()
     }
 
     fn record_recovery_inbox_disposition(

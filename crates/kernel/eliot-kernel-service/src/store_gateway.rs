@@ -1742,6 +1742,7 @@ impl KernelStoreGateway {
         })?;
         prove_maintenance_trigger_staging(
             &*commit_ors,
+            &record.trigger_id,
             &record.payload.envelope_reference,
             &record.payload.payload_hash,
         )
