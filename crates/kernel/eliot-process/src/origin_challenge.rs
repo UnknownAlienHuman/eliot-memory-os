@@ -74,6 +74,33 @@ impl OriginControlOperation {
     }
 }
 
+/// Durable outcome of the one effect a decided origin grant funded.
+///
+/// A decided challenge proves authority, never that the physical effect
+/// happened. The entry starts [`Self::Unknown`] at issuance and stays there
+/// through decide and through crash or lost response: the authority journal
+/// then preserves the consumed one-shot plus its possible-effect state, and
+/// reconciliation queries the original target/operation instead of minting a
+/// fresh nonce to repeat an unknown effect. It advances to
+/// [`Self::Effected`] only when the effect boundary observes the effect
+/// receipt, and it never moves back.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OriginGrantEffectOutcome {
+    /// Authority consumed; the physical effect is unproven.
+    Unknown,
+    /// The effect boundary observed the effect receipt.
+    Effected,
+}
+
+impl Default for OriginGrantEffectOutcome {
+    /// Restores the fail-closed state: an effect recorded before this
+    /// outcome existed is unproven until reconciliation re-proves it.
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
 /// Neutral request for a Kernel-issued origin challenge.
 ///
 /// Built by the daemon consumer from a validated Governor observation plus the
@@ -497,6 +524,7 @@ pub struct OriginControlGrant {
     installation_id: String,
     state_fence: StateFence,
     expires_at_unix_ms: u64,
+    request_nonce: String,
     decided_at_unix_ms: u64,
     grant_digest: String,
 }
@@ -530,6 +558,16 @@ impl OriginControlGrant {
     /// Returns the challenge expiry time (inclusive) this grant inherits.
     pub const fn expires_at_unix_ms(&self) -> u64 {
         self.expires_at_unix_ms
+    }
+
+    /// Returns the one-shot caller nonce this grant was decided for.
+    ///
+    /// The nonce binds the proof to its exact issuance record, so the
+    /// effect boundary can journal and reconcile the funded effect against
+    /// the same identity the authority consumed — never a fresh nonce for
+    /// an unknown effect.
+    pub fn request_nonce(&self) -> &str {
+        &self.request_nonce
     }
 
     /// Returns the secret-bound decision tag.
@@ -635,6 +673,7 @@ impl OriginControlGrant {
             installation_id: &'a str,
             state_fence: &'a StateFence,
             expires_at_unix_ms: u64,
+            request_nonce: &'a str,
             decided_at_unix_ms: u64,
         }
         let bytes = serde_json::to_vec(&GrantMaterial {
@@ -646,6 +685,7 @@ impl OriginControlGrant {
             installation_id: &challenge.installation_id,
             state_fence: &challenge.state_fence,
             expires_at_unix_ms: challenge.expires_at_unix_ms,
+            request_nonce: &challenge.nonce,
             decided_at_unix_ms: now_unix_ms,
         })
         .map_err(|error| ContractError::Serialization(error.to_string()))?;
@@ -658,6 +698,7 @@ impl OriginControlGrant {
             installation_id: challenge.installation_id.clone(),
             state_fence: challenge.state_fence.clone(),
             expires_at_unix_ms: challenge.expires_at_unix_ms,
+            request_nonce: challenge.nonce.clone(),
             decided_at_unix_ms: now_unix_ms,
             grant_digest,
         })
@@ -675,6 +716,7 @@ struct IssuedOriginChallenge {
     operation: OriginControlOperation,
     issued_at_unix_ms: u64,
     expires_at_unix_ms: u64,
+    effect: OriginGrantEffectOutcome,
     revoked: bool,
 }
 
@@ -691,6 +733,11 @@ pub struct OriginChallengeReplayEntry {
     operation: OriginControlOperation,
     issued_at_unix_ms: u64,
     expires_at_unix_ms: u64,
+    /// Durable one-shot effect outcome. Older snapshots predate this field
+    /// and restore as `Unknown`: an effect recorded before the journal
+    /// existed is unproven until reconciliation re-proves it.
+    #[serde(default)]
+    effect: OriginGrantEffectOutcome,
     revoked: bool,
 }
 
@@ -836,6 +883,7 @@ impl OriginChallengeAuthority {
                         operation: entry.operation,
                         issued_at_unix_ms: entry.issued_at_unix_ms,
                         expires_at_unix_ms: entry.expires_at_unix_ms,
+                        effect: entry.effect,
                         revoked: entry.revoked,
                     },
                 )
@@ -868,6 +916,7 @@ impl OriginChallengeAuthority {
                     operation: entry.operation,
                     issued_at_unix_ms: entry.issued_at_unix_ms,
                     expires_at_unix_ms: entry.expires_at_unix_ms,
+                    effect: entry.effect,
                     revoked: entry.revoked,
                 })
                 .collect(),
@@ -953,6 +1002,10 @@ impl OriginChallengeAuthority {
                 operation: request.operation,
                 issued_at_unix_ms,
                 expires_at_unix_ms,
+                // Issuing or consuming a challenge never proves the physical
+                // effect: the funded effect starts unknown and advances only
+                // through the effect boundary's durable record.
+                effect: OriginGrantEffectOutcome::Unknown,
                 revoked: false,
             },
         );
@@ -1076,6 +1129,66 @@ impl OriginChallengeAuthority {
             presentation.request.generation,
             now_unix_ms,
         )
+    }
+
+    /// Records that the one effect a decided grant funded was observed.
+    ///
+    /// Called by the effect boundary with the consumed one-shot nonce after
+    /// it observes the effect receipt, so the durable journal keeps the
+    /// consumed authority plus its proven effect through crash or lost
+    /// response. The outcome is monotonic: `Unknown` advances to `Effected`
+    /// exactly once and never moves back, so a recorded effect can never be
+    /// un-recorded to fund a second execution. Recording for an unknown or
+    /// never-decided nonce fails with the existing typed nonce failures;
+    /// durability itself rides on the caller's snapshot persist, exactly
+    /// like issuance and consumption.
+    pub fn record_grant_effect(
+        &mut self,
+        request_nonce: &str,
+    ) -> Result<OriginGrantEffectOutcome, ContractError> {
+        let consumed = self.consumed_nonces.contains(request_nonce);
+        let entry = self.issued.get_mut(request_nonce).ok_or(ContractError::InvalidValue {
+            field: "request_nonce",
+            reason: "unknown challenge nonce",
+        })?;
+        if !consumed {
+            return Err(ContractError::InvalidValue {
+                field: "request_nonce",
+                reason: "challenge was never decided",
+            });
+        }
+        if entry.effect == OriginGrantEffectOutcome::Effected {
+            return Err(ContractError::InvalidValue {
+                field: "origin_grant_effect",
+                reason: "effect outcome is already recorded",
+            });
+        }
+        entry.effect = OriginGrantEffectOutcome::Effected;
+        Ok(entry.effect)
+    }
+
+    /// Returns the durable effect outcome for one issued challenge nonce.
+    ///
+    /// The reconciliation read half of [`Self::record_grant_effect`]: a
+    /// decided-but-unproven nonce reports `Unknown` so the caller returns
+    /// reconciliation-required instead of minting a fresh nonce to repeat
+    /// the unknown effect. Unknown and never-decided nonces fail with the
+    /// existing typed nonce failures, never with a fresh proof.
+    pub fn grant_effect_outcome(
+        &self,
+        request_nonce: &str,
+    ) -> Result<OriginGrantEffectOutcome, ContractError> {
+        let entry = self.issued.get(request_nonce).ok_or(ContractError::InvalidValue {
+            field: "request_nonce",
+            reason: "unknown challenge nonce",
+        })?;
+        if !self.consumed_nonces.contains(request_nonce) {
+            return Err(ContractError::InvalidValue {
+                field: "request_nonce",
+                reason: "challenge was never decided",
+            });
+        }
+        Ok(entry.effect)
     }
 
     /// Returns how many challenges were consumed by decisions.
