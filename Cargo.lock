@@ -673,6 +673,7 @@ dependencies = [
  "eliot-config",
  "eliot-contracts",
  "eliot-doctor",
+ "eliot-engine",
  "eliot-governor",
  "eliot-host",
  "eliot-host-state",
