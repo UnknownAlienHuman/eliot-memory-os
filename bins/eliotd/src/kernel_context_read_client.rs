@@ -1865,10 +1865,18 @@ fn validate_composition_inputs(
     policy: &CandidatePolicy,
     floor: &SafetyFloorIdentity,
 ) -> Result<(), PacketCompositionError> {
-    request.validate().map_err(|error| PacketCompositionError::Candidates(Box::new(error)))?;
-    recipe.validate().map_err(|error| PacketCompositionError::Candidates(Box::new(error)))?;
-    policy.validate().map_err(|error| PacketCompositionError::Candidates(Box::new(error)))?;
-    floor.validate().map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
+    request
+        .validate()
+        .map_err(|error| PacketCompositionError::Candidates(Box::new(error)))?;
+    recipe
+        .validate()
+        .map_err(|error| PacketCompositionError::Candidates(Box::new(error)))?;
+    policy
+        .validate()
+        .map_err(|error| PacketCompositionError::Candidates(Box::new(error)))?;
+    floor
+        .validate()
+        .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
     Ok(())
 }
 
@@ -1893,8 +1901,14 @@ fn recheck_packet_headroom(
     recipe: &ContextRecipe,
     headroom: &HeadroomContext<'_>,
 ) -> Result<(), PacketCompositionError> {
-    recheck_headroom_handoff(assembled, recipe, headroom.request, headroom.result, headroom.now_ms)
-        .map_err(|refusal| PacketCompositionError::HeadroomHandoff(Box::new(refusal)))
+    recheck_headroom_handoff(
+        assembled,
+        recipe,
+        headroom.request,
+        headroom.result,
+        headroom.now_ms,
+    )
+    .map_err(|refusal| PacketCompositionError::HeadroomHandoff(Box::new(refusal)))
 }
 
 /// Closes the candidate stage's set and the owner's admission pieces into the
