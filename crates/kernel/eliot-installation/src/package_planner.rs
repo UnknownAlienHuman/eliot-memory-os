@@ -87,7 +87,7 @@ pub(crate) fn package_inventory_roles(
 fn module_provenance_present(
     names: impl IntoIterator<Item = String>,
 ) -> Result<bool, InstallationError> {
-    let names = names.collect::<BTreeSet<_>>();
+    let names = names.into_iter().collect::<BTreeSet<_>>();
     let has_manifest = names.contains("module.eliotd.toml");
     let has_proof = names.contains("module.eliotd.provenance.json");
     if has_manifest != has_proof {
