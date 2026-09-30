@@ -29,7 +29,7 @@
 //! | `model_outcome` (CC-002 outcome) | no provider SDK exists in this workspace; `eliot-dreamer/Cargo.toml` carries none | same sentence: the runtime "returns one `ModelRouteOutcome`"; the executing adapter does not exist here |
 //! | `projections` (CC-004 set) | `compose_canonical_projections` exists Governor-side but returns `GovernorProjectionSet`, a different type with zero callers in the workspace | `canonical_projections.rs`: "The mapper never retrieves canonical state and never invents missing role prose: a missing or incompatible projection stays an explicit omission, never filler" |
 //! | `cep_handles` | no producer; Governor-resolved handles are minted only in tests | module manifest `providers`: "Current Epistemic Position projection" |
-//! | `classification` | no producer | manifest `inputs`: "DreamJobAdmission class=Orientation, `DreamInputBundle`, `ValidatedDreamDraft`, `CurrentEpistemicPosition handles`" |
+//! | `classification` | no producer | manifest `inputs`: "`DreamJobAdmission` class=Orientation, `DreamInputBundle`, `ValidatedDreamDraft`, `CurrentEpistemicPosition handles`" |
 //! | `cue_activation` | no producer | same manifest input list |
 //! | `epistemic` | no producer | same manifest input list |
 //! | `understanding` | no producer | same manifest input list |
