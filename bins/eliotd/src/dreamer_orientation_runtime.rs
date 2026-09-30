@@ -30,6 +30,9 @@ pub struct OrientationQueuedOwnerPublication {
     /// Exact original ContextReconstruction owner result carried into the
     /// sealed runtime publication and preserved through the claim handoff.
     pub context_reconstruction_result: eliot_protocol::HostRequestResultBody,
+    /// Exact versioned Context compiler supplier input preserved from the
+    /// authenticated Orientation Task Controller invocation.
+    pub context_compilation_input: serde_json::Value,
     /// Durable queue response bound to the exact request and original source.
     pub response: DurableJobResponse,
     /// Original semantic reference and exact canonical DreamJobInput bytes.
@@ -124,6 +127,7 @@ pub async fn submit_task_controller_orientation_claim(
 ) -> Result<OrientationQueuedOwnerPublication, OrientationRuntimeError> {
     let PreparedTaskControllerOrientation { claimed, input } = prepared;
     let context_reconstruction_result = input.context_reconstruction_result.clone();
+    let context_compilation_input = input.context_compilation_input.clone();
     let (readiness, admitted_fence) = {
         let guard = composition.lock().await;
         (
@@ -208,6 +212,7 @@ pub async fn submit_task_controller_orientation_claim(
         task_controller_claim: claimed,
         request,
         context_reconstruction_result,
+        context_compilation_input,
         response,
         semantic_input,
         runtime_owner_execution_input,
