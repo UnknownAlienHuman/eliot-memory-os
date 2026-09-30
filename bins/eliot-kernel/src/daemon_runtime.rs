@@ -116,6 +116,7 @@ fn record_daemon_recovery_operation_context(
         }
     }
     if let Some(receipt) = receipt {
+        super::daemon_live_receipt::record_process_receipt_context(context, receipt);
         let process_tree =
             super::kernel_diagnostics::bound_field(receipt.binding().process_tree_id().as_str());
         context.record("process_tree", process_tree.text());

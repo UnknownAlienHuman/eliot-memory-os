@@ -58,7 +58,10 @@ fn record_live_receipt_context_field(context: &tracing::Span, field: &'static st
 
 /// Records only validated original receipt fields on the caller's shared span.
 #[cfg(windows)]
-fn record_process_receipt_context(context: &tracing::Span, process: &ProcessStartReceipt) {
+pub(crate) fn record_process_receipt_context(
+    context: &tracing::Span,
+    process: &ProcessStartReceipt,
+) {
     if process.validate().is_err() {
         return;
     }

@@ -4868,6 +4868,10 @@ impl KernelComposition {
                 .ok_or(TransportError::SessionFenced)?;
             (contour, process, ready, launch, progress)
         };
+        super::daemon_live_receipt::record_process_receipt_context(context, &process);
+        // Keep the current validated progress operation's references while
+        // carrying the original process receipt's physical identity.
+        record_daemon_progress_operation_context(context, &request);
         let authority = self
             .supervision_lease_authority
             .as_ref()
