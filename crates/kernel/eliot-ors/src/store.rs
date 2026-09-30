@@ -60,12 +60,13 @@ use crate::{
     AcceptedPending, ActivationLifecycleRecord, ActivationLifecycleState,
     ActivationRecoverySnapshot, ActivationResultRetentionPhase, ActivationResultRetentionRecord,
     ActiveSessionBinding, AdmissionReservation, AdmissionReservationActivation,
-    AdmissionReservationActivationRequest, AdmissionReservationDisposition,
-    AdmissionReservationReceipt, AdmissionReservationRecord, AdmissionReservationRelease,
-    AdmissionReservationSnapshot, AdmissionReservationStage, AdmissionReservationState,
-    AdmissionReservationTransitionRequest, AlreadyTerminalWrite, AuthorityActivationReceipt,
-    AuthorityHandoffBegin, AuthorityHandoffRecord, AuthorityHandoffState, AuthorityRevocation,
-    AuthorityRevocationReceipt, AuthoritySnapshotReceipt, BACKUP_VERIFICATION_RESULT_RECORD_TYPE,
+    AdmissionReservationActivationEvidence, AdmissionReservationActivationRequest,
+    AdmissionReservationDisposition, AdmissionReservationReceipt, AdmissionReservationRecord,
+    AdmissionReservationRelease, AdmissionReservationSnapshot, AdmissionReservationStage,
+    AdmissionReservationState, AdmissionReservationTransitionRequest, AlreadyTerminalWrite,
+    AuthorityActivationReceipt, AuthorityHandoffBegin, AuthorityHandoffRecord,
+    AuthorityHandoffState, AuthorityRevocation, AuthorityRevocationReceipt,
+    AuthoritySnapshotReceipt, BACKUP_VERIFICATION_RESULT_RECORD_TYPE,
     BackupVerificationDisposition, BackupVerificationResultRecord, CanonicalDisposition,
     CanonicalReconciliation, CapabilityGrantActivation, CapabilityGrantProjection,
     CapabilityGrantRevocation, CapabilityIntroductionActivation, CapabilityIntroductionFence,
@@ -30217,7 +30218,7 @@ impl RedbRecoveryStore {
                 disposition.evidence.validate()?;
             }
             AdmissionReservationTransitionSpec::Activation { request } => {
-                AdmissionReservationActivation {
+                AdmissionReservationActivationEvidence {
                     canonical_admission_receipt: request.canonical_admission_receipt.clone(),
                     activation_receipt: request.activation_receipt.clone(),
                 }
@@ -30273,7 +30274,7 @@ impl RedbRecoveryStore {
                     authority_epoch: request.authority_epoch.clone(),
                     state_fence: request.state_fence.clone(),
                     now_ms: request.now_ms,
-                    activation: Some(AdmissionReservationActivation {
+                    activation: Some(AdmissionReservationActivationEvidence {
                         canonical_admission_receipt: request.canonical_admission_receipt.clone(),
                         activation_receipt: request.activation_receipt.clone(),
                     }),
