@@ -3324,7 +3324,10 @@ impl KernelComposition {
             DAEMON_SUPERVISION_PROGRESS_OPERATION => {
                 #[cfg(windows)]
                 {
-                    self.daemon_supervision_progress_operation(payload.clone())
+                    self.daemon_supervision_progress_operation(
+                        payload.clone(),
+                        subordinate_terminal_emitted,
+                    )
                 }
                 #[cfg(not(windows))]
                 {
@@ -4748,6 +4751,7 @@ impl KernelComposition {
     fn daemon_supervision_progress_operation(
         &self,
         payload: serde_json::Value,
+        subordinate_terminal_emitted: &mut bool,
     ) -> Result<serde_json::Value, TransportError> {
         let request_value = match payload {
             serde_json::Value::Object(mut object) => object
@@ -4760,6 +4764,7 @@ impl KernelComposition {
         request
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
+        let context = daemon_progress_operation_context(&request);
         let lease_id = request.observation.lease_id.clone();
         let (contour, process, ready, launch, mut progress) = {
             let mut state = self
@@ -4794,6 +4799,7 @@ impl KernelComposition {
             .as_ref()
             .ok_or(TransportError::SessionFenced)?;
         let artifact = self.supervision_kernel_artifact()?;
+        let mut child_terminal_owned = false;
         let renewal = Self::renew_current_supervision_with_progress(
             authority.as_ref(),
             &contour,
@@ -4802,6 +4808,8 @@ impl KernelComposition {
             &SUPERVISION_LEASE_RENEWAL_POLICY,
             unix_ms(),
             artifact,
+            &context,
+            &mut child_terminal_owned,
         );
         let (snapshot, decision, receipt) = match renewal {
             Ok(decided) => decided,
@@ -4818,6 +4826,9 @@ impl KernelComposition {
                 return self.progress_refusal_answer(&lease_id, &error);
             }
             Err(SupervisionProgressRenewalError::Authority(_)) => {
+                if child_terminal_owned {
+                    *subordinate_terminal_emitted = true;
+                }
                 self.retain_supervision_progress(progress, None, None)?;
                 return Err(TransportError::SessionFenced);
             }
