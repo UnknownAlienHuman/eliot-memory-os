@@ -108,7 +108,11 @@ pub fn check_campaign_view_for_admission(
         return Err(ContextError::IdentityConflict);
     }
     let floor_roles: std::collections::BTreeSet<_> = floor.floor.mandatory_roles.iter().collect();
-    if !recipe.mandatory_roles.iter().all(|role| floor_roles.contains(role)) {
+    if !recipe
+        .mandatory_roles
+        .iter()
+        .all(|role| floor_roles.contains(role))
+    {
         return Err(ContextError::MissingFloor);
     }
     if !fences_match_exact(&view.binding.state_fence, &binding.state_fence) {
