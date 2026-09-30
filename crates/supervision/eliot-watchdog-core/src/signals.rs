@@ -503,6 +503,9 @@ impl Display for SignalValidationError {
             Self::ZeroValue(field) => {
                 write!(formatter, "watchdog signal field is zero: {field}")
             }
+            Self::RuleNotApplicable => {
+                formatter.write_str("watchdog rule is not applicable at this revision")
+            }
             Self::IdentityChanged => {
                 formatter.write_str("watchdog signal identity changed across revisions")
             }
