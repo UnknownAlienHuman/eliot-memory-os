@@ -13,14 +13,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use eliot_canonical::{CanonicalWriteEnvelope, FinishAttemptDraft, FinishEvidence};
 use eliot_change_monitor::ChangeMonitor;
 use eliot_contracts::{
-    OperationId, StateFence, TaskId, canonical_json_bytes, fences_match_exact, sha256_hex,
+    OperationId, StateFence, TaskId, TaskRevision, canonical_json_bytes, fences_match_exact,
+    sha256_hex,
 };
 use eliot_coordination::{CoordinationOwner, FinishCoordinationProjection};
 use eliot_finish::{
     FinishAdmission, FinishAttempt, FinishClosureIntent, FinishContext, FinishDecisionReceipt,
     FinishError, FinishService, TaskLifecycleState,
 };
-use eliot_observation::{ObservationAdmissionResult, ObservationJournal, ObservationPlanBinding};
+use eliot_observation::{
+    CandidateDisposition, ObservationAdmissionResult, ObservationJournal,
+    ObservationPlanBinding,
+};
 use eliot_protocol::RequestIdentity;
 use eliot_store_api::{
     EffectClass, EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
@@ -370,8 +374,20 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
         task: &TaskRecord,
         plan: &CanonicalPlanBinding,
         fence: &StateFence,
+        contract_acceptance_set: &TaskContractAcceptanceSet,
         observation_refs: &mut BTreeSet<String>,
     ) -> Result<(), FinishAttemptError> {
+        if plan.task_id != *task_id
+            || fence.task_revision.map(TaskRevision::value) != Some(task.revision)
+            || contract_acceptance_set.task_id != *task_id
+            || contract_acceptance_set.task_revision != task.revision
+            || contract_acceptance_set.read_state_fence != *fence
+        {
+            return Err(FinishAttemptError::Composition(CompositionError::Recovery(
+                "task observation join does not match the current task, plan, acceptance set, and fence"
+                    .to_owned(),
+            )));
+        }
         let mut selection_identity: Option<String> = None;
         for entry in self.observation.snapshot() {
             let receipt = match &entry.result {
@@ -380,9 +396,13 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
                 ObservationAdmissionResult::Rejected { .. } => continue,
             };
             let Some(selection) = receipt.task_selection.as_ref().filter(|selection| {
-                receipt.state_fence == *fence
+                receipt.candidate_disposition == CandidateDisposition::TaskBound
+                    && !selection.is_contaminated()
+                    && receipt.state_fence == *fence
                     && selection.task_ref == task_id.as_str()
                     && selection.task_revision == task.revision
+                    && selection.acceptance_digest == contract_acceptance_set.acceptance_digest
+                    && selection.work_scope_ref == plan.work_scope_id
                     && matches_plan(receipt.plan.as_ref(), plan, fence)
             }) else {
                 continue;
@@ -563,6 +583,7 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
             task,
             plan,
             fence,
+            contract_acceptance_set,
             &mut observation_refs,
         )?;
         let verifier_plan = plan.verifier.as_ref().ok_or_else(|| {
