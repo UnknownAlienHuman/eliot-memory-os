@@ -71,9 +71,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use eliot_context_admission::{MaterialRankTraceDelivery, admit_context_traced};
+use eliot_context_admission::{
+    MaterialRankTraceDelivery, admit_context_traced, check_campaign_view_for_admission,
+};
 use eliot_context_assembly::{
     ActiveUnderstandingViewResult, AssemblyError, AssemblyPolicy, assemble_active_view,
+    check_campaign_view_for_assembly,
 };
 use eliot_context_candidates::{
     CANDIDATE_SCHEMA_VERSION, CandidatePolicy, CandidateRequest, OpaqueProjection,
@@ -97,6 +100,7 @@ use eliot_governor::{
     ROLE_CUE_ACTIVATION, ROLE_EPISTEMIC_POSITION, ROLE_EVIDENCE_ASSURANCE, ROLE_NEGATIVE_MEMORY,
     ROLE_TASK_FRAME, SevenRoleInputs,
 };
+use eliot_learning_contracts::CampaignLearningStateView;
 use eliot_protocol::{
     HOST_REQUEST_INVOKE_READ_WIRE_ID, HostRequestEnvelope, HostRequestInvokeReadPayload,
 };
@@ -1304,6 +1308,19 @@ pub enum PacketCompositionError {
     /// The admission owner left explicit gaps instead of a complete set.
     #[error("packet admission left explicit gaps")]
     AdmissionIncomplete(Box<DecisionContextIncomplete>),
+    /// The admission cell refused the immutable campaign learning-state view
+    /// for this compilation.
+    ///
+    /// #1862: the view is well formed but does not join the exact task, scope
+    /// and State Fence this admission decides under. The typed cause is kept
+    /// rather than flattened, so a stale-fence view stays distinguishable from a
+    /// cross-compilation one. The candidate cell performs the same class of join
+    /// independently through
+    /// `eliot_context_candidates::check_campaign_learning_state_view`; this
+    /// variant names the admission cell's own refusal and never a verdict
+    /// inherited from it.
+    #[error("packet admission refused the campaign learning-state view: {0}")]
+    CampaignView(Box<ContextError>),
     /// The assembly owner rejected the admitted set.
     #[error("packet assembly failed: {0}")]
     Assembly(Box<AssemblyError>),
@@ -1537,12 +1554,26 @@ impl KernelContextReadClient {
     /// policy, admission identities, quality card, assembly policy,
     /// measurement). Until those suppliers call this edge with owner-minted
     /// pieces, the packet keeps its unbound-closure gap.
+    ///
+    /// #1862: `campaign_view` is the validated immutable
+    /// `CampaignLearningStateView` this compilation is bound to, and
+    /// `context_recipe_body_digest` is the Context owner's own re-derivation of
+    /// the exact recipe body its publication validator accepted. The candidate
+    /// cell already joined the view to `request` through
+    /// `eliot_context_candidates::check_campaign_learning_state_view`; here the
+    /// admission and assembly cells each re-derive the same join from the
+    /// binding *they* run under, so no stage inherits another's verdict. The
+    /// admission join runs before any candidate is constructed; the assembly
+    /// join runs against the admitted set actually about to be rendered, which
+    /// is the only binding that describes the delivery.
     #[allow(clippy::too_many_arguments)]
     pub fn compile_context_packet(
         seven: &SevenRoleInputs,
         request: &CandidateRequest,
         recipe: &ContextRecipe,
         policy: &CandidatePolicy,
+        campaign_view: &CampaignLearningStateView,
+        context_recipe_body_digest: &str,
         floor: SafetyFloorIdentity,
         priority: PriorityPolicyIdentity,
         rule: AdmissionRuleIdentity,
@@ -1568,6 +1599,12 @@ impl KernelContextReadClient {
         policy
             .validate()
             .map_err(|error| PacketCompositionError::Candidates(Box::new(error)))?;
+        check_campaign_view_for_admission(
+            &request.binding,
+            campaign_view,
+            context_recipe_body_digest,
+        )
+        .map_err(PacketCompositionError::CampaignView)?;
         let admission = PacketAdmissionBundle::build(
             PacketAdmissionParts {
                 floor,
@@ -1643,6 +1680,12 @@ impl KernelContextReadClient {
             .validate()
             .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
         let (admitted, delivery) = admit_packet_candidates(&input)?;
+        // #1862: the assembly cell's own join, against the admitted set's binding
+        // — the binding this delivery actually renders under, not the one the
+        // request carried. A view that bound candidate and admission but drifted
+        // before delivery is refused here, before a single atom is rendered.
+        check_campaign_view_for_assembly(&admitted, campaign_view, context_recipe_body_digest)
+            .map_err(PacketCompositionError::Assembly)?;
         let assembled = assemble_active_view(&admitted, recipe, quality, assembly, measure)
             .map_err(|error| composition_failure(error, recipe, &request.binding))?;
         check_delivered_traces(&delivery, &assembled)

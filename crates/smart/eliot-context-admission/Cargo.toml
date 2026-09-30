@@ -24,6 +24,10 @@ agent_order = 17
 eliot-contracts = { path = "../../foundation/eliot-contracts", version = "0.1.0" }
 eliot-evidence = { path = "../../foundation/eliot-evidence", version = "0.1.0" }
 eliot-context-contracts = { path = "../eliot-context-contracts", version = "0.1.0" }
+# Issue #1862: the admission cell owns the campaign learning-state view join, so
+# it consumes the immutable view contract directly instead of a caller-carried
+# verdict. Same edge the candidate cell already declares.
+eliot-learning-contracts = { path = "../eliot-learning-contracts", version = "0.1.0" }
 eliot-receipts = { path = "../../foundation/eliot-receipts", version = "0.1.0" }
 eliot-reactive-context-plan = { path = "../eliot-reactive-context-plan", version = "0.1.0" }
 serde = { workspace = true }

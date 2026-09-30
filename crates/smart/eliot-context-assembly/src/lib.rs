@@ -14,12 +14,21 @@
 //! disclosure boundary is owned by `crates/governor/eliot-workscope`
 //! (`PrivacyProfile::admits`, `WorkScopeError::PrivacyDenied`), and non-public delivery is
 //! withheld as `DeliveryDisposition::WithheldPrivacy` by `eliot-reactive-context-plan`.
+//!
+//! Issue #1862 adds the campaign learning-state join this cell owns:
+//! [`check_campaign_view_for_assembly`] refuses an immutable
+//! `CampaignLearningStateView` whose State Fence, task/scope identity or
+//! load-bearing Context recipe owner revision does not join the admitted set
+//! about to be rendered. It re-derives that join from the admitted set's own
+//! binding and inherits no other cell's verdict. The #40-frozen
+//! `eliot_context::ContextCompiler` decides nothing on this route.
 
 #![forbid(unsafe_code)]
 
 mod assemble;
 mod boundary;
 mod bounds;
+mod campaign_view;
 mod cite;
 mod error;
 #[cfg(not(target_arch = "wasm32"))]
@@ -36,6 +45,7 @@ pub use boundary::{
     assembly_boundary_limits, boundary_binding_digest, project_assembly_boundaries,
     read_back_boundaries, verify_boundary_binding,
 };
+pub use campaign_view::check_campaign_view_for_assembly;
 pub use cite::project_citation;
 pub use error::AssemblyError;
 #[cfg(not(target_arch = "wasm32"))]

@@ -9,13 +9,22 @@
 //! the current owner pipeline decides whether it may be used:
 //! `eliot_learning_state_view::validate_campaign_learning_state_view_current`
 //! owns the view's own load-bearing revision and State Fence checks against a
-//! fresh authenticated owner-read set, and the current candidate cell
-//! `eliot_context_candidates::check_campaign_learning_state_view` then
-//! independently joins that view to this compilation's request identity and to
-//! the Context recipe revision the Context owner re-derived. The `#40`-frozen
+//! fresh authenticated owner-read set, and each current owner cell then
+//! independently joins that view to the compilation it acts on —
+//! `eliot_context_candidates::check_campaign_learning_state_view` against this
+//! compilation's request identity,
+//! `eliot_context_admission::check_campaign_view_for_admission` against the
+//! binding the admission decision would be made under, and
+//! `eliot_context_assembly::check_campaign_view_for_assembly` against the
+//! admitted set it is about to render. Every one of them re-derives the
+//! State-Fence, task/scope identity and load-bearing Context recipe owner
+//! revision joins itself, and every one of them compares the recipe revision
+//! against `context_recipe_body_digest`, which the Context owner re-derived
+//! from the exact recipe body its own publication validator accepted. No cell
+//! inherits another's verdict. The `#40`-frozen
 //! `eliot_context::ContextCompiler` is deliberately not called here: the
 //! frozen donor surface takes no new caller, and no legacy-only helper may
-//! accept a view the current owner refused.
+//! accept a view the current owner cells refused.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -23,6 +32,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use eliot_context::campaign_publication::{
     ContextCampaignRecipeBody, context_delivery_body_digest, context_recipe_body_digest,
 };
+use eliot_context_admission::check_campaign_view_for_admission;
 use eliot_context_candidates::{CandidateRequest, check_campaign_learning_state_view};
 use eliot_context_contracts::{
     ContextError, ContextRecipe, ProjectedCitation, SessionDeliverySnapshot,
@@ -197,8 +207,14 @@ enum CampaignPacketGapCode {
     /// owns the campaign view's State Fence, identity and load-bearing Context
     /// recipe revision joins; `construct_context_candidates` itself is still
     /// unreachable because the seven role projections have no production
-    /// owner, and the admission and assembly cells are unreachable for the
-    /// same missing-supplier reason.
+    /// owner. The admission cell reaches its own join from this route through
+    /// `eliot_context_admission::check_campaign_view_for_admission`, which
+    /// re-derives the join from the binding admission decides under rather than
+    /// inheriting the candidate cell's verdict. The assembly cell's join is
+    /// reached from `KernelContextReadClient::compile_context_packet`, which is
+    /// the only place an actual `AdmittedContextSet` exists to join against;
+    /// this route produces none because `admit_context` has no callable
+    /// argument set. Both full decisions stay unreachable for that same reason.
     ///
     /// Minting any of them here from a constant, a CLI flag, an env var, or a
     /// caller-supplied string would fabricate the exact selection record I12.26
@@ -211,6 +227,18 @@ enum CampaignPacketGapCode {
     /// stale, missing, invalidated, or partial across a load-bearing slot,
     /// owner revision, State Fence, or `RetrievalPlan` history.
     CampaignViewNotCurrent,
+    /// A current owner cell below the candidate stage refused the campaign view
+    /// for this compilation.
+    ///
+    /// The view passed both
+    /// `eliot_learning_state_view::validate_campaign_learning_state_view_current`
+    /// and the candidate cell's
+    /// `eliot_context_candidates::check_campaign_learning_state_view`, but
+    /// `eliot_context_admission::check_campaign_view_for_admission` compared it
+    /// against the binding the admission decision would be made under and
+    /// refused it. The two are independent comparisons against different
+    /// bindings, so passing the candidate cell is never evidence for admission.
+    OwnerCellRefusedCampaignView,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1131,6 +1159,43 @@ async fn resolve_compile_and_bind_result(
                 publication,
                 gap,
                 role,
+                &resolved.resolutions,
+                prior.is_some() && !prior_is_current,
+            ),
+        );
+    }
+    // #1862: the ADMISSION cell now reaches its own campaign-view join on this
+    // route, and it does not inherit the candidate cell's verdict.
+    //
+    // Admission re-derives the same class of join from the binding it owns: the
+    // exact `ContextBinding` the admission decision would be made under, which
+    // is the Context owner's own recipe binding. That value is the one
+    // `AdmissionInput::validate` forces equal to the admission input's own
+    // binding, its recipe binding and its floor binding, so it is the
+    // admission cell's fact and not a value forwarded from the candidate stage.
+    // The load-bearing Context recipe revision is compared against
+    // `context_recipe_digest`, which the Context owner re-derived from the exact
+    // recipe body its own publication validator accepted.
+    //
+    // The full `admit_context` decision stays unreachable on this route: the
+    // owner-minted admission closure has zero production construction sites
+    // (`AdmissionClosureUnbound` above). The join is the load-bearing revision
+    // and State Fence check the audit names; the decision it would feed is
+    // separately absent and is reported as absent rather than fabricated.
+    if check_campaign_view_for_admission(
+        &context_recipe_body.recipe.binding,
+        &publication.view,
+        &context_recipe_digest,
+    )
+    .is_err()
+    {
+        return campaign_packet_result_body(
+            envelope,
+            attempt,
+            context_blocked_response(
+                publication,
+                CampaignPacketGapCode::OwnerCellRefusedCampaignView,
+                None,
                 &resolved.resolutions,
                 prior.is_some() && !prior_is_current,
             ),
