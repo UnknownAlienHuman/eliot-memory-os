@@ -46,6 +46,20 @@ fn main() -> ExitCode {
     // `Status` and projects exactly that: no hardcoded state, no local
     // terminal invention. Any denial fails closed with exit 78.
     let admission = port.claimed_admission().clone();
+    // The production job path: the staged semantic input bytes the claim
+    // verified are decoded to the closed owner input here, before the port
+    // moves into the supervised loop. A worker launched with staged input
+    // runs it through `submit`; a worker launched without any staged input
+    // keeps the proved-disposition `status` projection instead of inventing
+    // a job. An undecodable, owner-invalid, or unbound presentation fails
+    // closed with exit 78.
+    let staged_job = match port.staged_job_input() {
+        Ok(staged_job) => staged_job,
+        Err(error) => {
+            write_error_stderr(&error);
+            return ExitCode::from(KERNEL_ADMISSION_EXIT);
+        }
+    };
     let mut service = match KernelSupervisedComposition::connect(port) {
         Ok(service) => service,
         Err(error) => {
@@ -53,7 +67,11 @@ fn main() -> ExitCode {
             return ExitCode::from(KERNEL_ADMISSION_EXIT);
         }
     };
-    match service.status(&admission) {
+    let proved = match staged_job {
+        Some(job) => service.submit(&admission, &job),
+        None => service.status(&admission),
+    };
+    match proved {
         Ok(view) => {
             if !write_view(&mut output, &view) {
                 write_error_stderr(&DreamerError::InvalidAdmission("result encoding failure"));
