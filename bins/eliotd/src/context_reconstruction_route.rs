@@ -359,43 +359,16 @@ pub async fn serve_context_reconstruction(
     };
     let captured =
         captured_lsp_payloads(seven.evidence.payload.as_ref(), task_id, &retained_fence)?;
-    let instrument_evidence = if captured.is_empty() {
-        Vec::new()
-    } else {
-        let task_frame_readback = seven.task_frame.identity.clone().ok_or_else(|| {
-            ReconstructionPrerequisite::CapturedEvidenceRefused(
-                "current task-frame read has no retained ReadIdentity".to_owned(),
-            )
-        })?;
-        let first_causal = captured[0].read_causal_binding.clone();
-        if captured
-            .iter()
-            .any(|payload| payload.read_causal_binding != first_causal)
-        {
-            return Err(ReconstructionPrerequisite::CapturedEvidenceRefused(
-                "captured LSP rows disagree on the Store read causal binding".to_owned(),
-            ));
-        }
-        let holder = eliot_authority::PrincipalRef::new(owner_session.kernel_principal.clone())
-            .map_err(crate::CapturedLspAdoptionError::from)?;
-        let mut composition = composition.lock().await;
-        let read_context = crate::CapturedLspReadContext {
-            envelope: envelope.clone(),
-            attempt: attempt.clone(),
-            request_metadata: ctx,
-            holder,
-            task_frame_readback,
-            causal_binding: first_causal,
-            now: eliot_authority::LogicalTime::new(crate::unix_ms()),
-        };
-        composition.consume_captured_lsp_payloads(
-            &read_context,
-            captured
-                .into_iter()
-                .map(|payload| (payload.reference, payload.task_binding))
-                .collect(),
-        )?
-    };
+    let instrument_evidence = adopt_captured_lsp_evidence(
+        composition,
+        envelope,
+        attempt,
+        ctx,
+        &owner_session,
+        &seven,
+        captured,
+    )
+    .await?;
     context_reconstruction_result_body(
         envelope,
         attempt,
@@ -404,6 +377,55 @@ pub async fn serve_context_reconstruction(
         &seven,
         &instrument_evidence,
     )
+}
+
+/// Adopts captured LSP observations against the exact successful seven-role
+/// read and its Store causal binding before projecting instrument evidence.
+async fn adopt_captured_lsp_evidence(
+    composition: &Arc<tokio::sync::Mutex<crate::DaemonComposition>>,
+    envelope: &HostRequestEnvelope,
+    attempt: &LocalReadAttempt,
+    request_metadata: RequestMetadata,
+    owner_session: &OwnerSessionFacts,
+    seven: &SevenRoleInputs,
+    captured: Vec<CapturedLspPayload>,
+) -> Result<Vec<eliot_instrument_api::NormalizedEvidence>, ReconstructionPrerequisite> {
+    if captured.is_empty() {
+        return Ok(Vec::new());
+    }
+    let task_frame_readback = seven.task_frame.identity.clone().ok_or_else(|| {
+        ReconstructionPrerequisite::CapturedEvidenceRefused(
+            "current task-frame read has no retained ReadIdentity".to_owned(),
+        )
+    })?;
+    let first_causal = captured[0].read_causal_binding.clone();
+    if captured
+        .iter()
+        .any(|payload| payload.read_causal_binding != first_causal)
+    {
+        return Err(ReconstructionPrerequisite::CapturedEvidenceRefused(
+            "captured LSP rows disagree on the Store read causal binding".to_owned(),
+        ));
+    }
+    let holder = eliot_authority::PrincipalRef::new(owner_session.kernel_principal.clone())
+        .map_err(crate::CapturedLspAdoptionError::from)?;
+    let mut composition = composition.lock().await;
+    let read_context = crate::CapturedLspReadContext {
+        envelope: envelope.clone(),
+        attempt: attempt.clone(),
+        request_metadata,
+        holder,
+        task_frame_readback,
+        causal_binding: first_causal,
+        now: eliot_authority::LogicalTime::new(crate::unix_ms()),
+    };
+    Ok(composition.consume_captured_lsp_payloads(
+        &read_context,
+        captured
+            .into_iter()
+            .map(|payload| (payload.reference, payload.task_binding))
+            .collect(),
+    )?)
 }
 
 /// Settles one claimed reconstruction pair whose read closure was DEGRADED.
