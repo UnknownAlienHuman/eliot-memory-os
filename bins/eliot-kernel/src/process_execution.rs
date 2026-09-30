@@ -338,9 +338,10 @@ impl KernelGovernedProcessEffectPort {
         let second = std::fs::read(executable);
         match (first, second) {
             (Ok(first_bytes), Ok(second_bytes)) => {
+                let agreed = first_bytes == second_bytes;
                 let first_digest = super::sha256_hex(&first_bytes);
                 let second_digest = super::sha256_hex(&second_bytes);
-                (first_bytes == second_bytes).then(|| TrackedSourceRead::Present {
+                agreed.then_some(TrackedSourceRead::Present {
                     bytes: first_bytes,
                     first_digest,
                     reread_digest: second_digest,
@@ -390,6 +391,157 @@ impl KernelGovernedProcessEffectPort {
             &notification,
             Some(before_digest),
         )
+    }
+
+    /// Confirms a proven-absent tracked image observed at pre-effect
+    /// capture (I10.21 AUD5): two agreeing not-found reads against the
+    /// retained digest are an external deletion, confirmed as a
+    /// filesystem hint with agreeing `Absent` reads through the same
+    /// [`Self::confirm_external_transition`] scheme as a present-image
+    /// transition. With no retained digest there is no transition to
+    /// confirm. A deletion already observed for the exact transition
+    /// needs no re-ingest; its unreconciled record keeps blocking
+    /// governed acceptance until a governed deletion reconciles it.
+    /// Read failures never reach this helper (`content_read_for` yields
+    /// `None` for them), so a monitor outage can neither mint nor replay
+    /// a deletion here. The retained digest is kept in both outcomes:
+    /// absence is not a digest and must not advance the baseline past
+    /// admitted evidence.
+    fn confirm_absent_at_capture(
+        &self,
+        resource: &str,
+        lane_path: &str,
+        artifact: &str,
+        binding: &GovernedProcessEffectBinding,
+    ) {
+        let previous = self
+            .last_observed
+            .lock()
+            .ok()
+            .and_then(|last| last.get(resource).cloned());
+        let Some(previous) = previous else {
+            observe_process("kernel.process.effect_baseline_unavailable", "unobserved");
+            return;
+        };
+        let hint_id = change_monitor::filesystem_hint_id(artifact, &previous);
+        let (change_id, transition_digest) =
+            change_monitor::material_transition_ids(&hint_id, Some(previous.as_str()), None);
+        let already_observed = change_monitor::deletion_observations_for(resource)
+            .iter()
+            .any(|observation| {
+                observation.change_id == change_id
+                    && observation.transition_digest == transition_digest
+                    && observation.before_digest.as_deref() == Some(previous.as_str())
+            });
+        if !already_observed {
+            let hint = change_monitor::KernelChangeHint {
+                hint_id: hint_id.clone(),
+                resource: resource.to_owned(),
+                path: lane_path.to_owned(),
+                origin: change_monitor::HintOrigin::FilesystemNotification,
+                origin_ref: Some(binding.owner.module_id().to_owned()),
+            };
+            let verification = change_monitor::HintVerification {
+                before_digest: Some(previous),
+                first_read: change_monitor::ContentRead::Absent,
+                reread: change_monitor::ContentRead::Absent,
+                git: None,
+            };
+            if !Self::confirm_external_transition(&hint_id, hint, &verification) {
+                observe_process("kernel.process.effect_baseline_unavailable", "unobserved");
+            }
+        }
+    }
+
+    /// Records the governed deletion for a proven-absent readback
+    /// (I10.21 AUD5): the readback proved absence (two agreeing not-found
+    /// reads) against an observed baseline, so the operation deleted the
+    /// tracked image. The record carries `after_bytes: None`; its diff
+    /// handle binds `(operation, before, absent)` through the ledger's own
+    /// transition binder, the same scheme as the present path. Returns the
+    /// accepted transition (for explicit reconciliation) with the agreeing
+    /// `Absent` confirmation evidence.
+    fn record_absent_transition(
+        operation: &str,
+        baseline: GovernedProcessEffectBaseline,
+        before_digest: String,
+        terminal_fence: FencingToken,
+    ) -> (Option<String>, change_monitor::HintVerification) {
+        let (_, transition) = change_monitor::material_transition_ids(
+            operation,
+            Some(before_digest.as_str()),
+            None,
+        );
+        let change = change_monitor::GovernedToolChange {
+            change_id: operation.to_owned(),
+            resource: baseline.resource.clone(),
+            path: baseline.lane_path.clone(),
+            before_path: None,
+            before_revision: Some(before_digest.clone()),
+            before_bytes: baseline.before_bytes,
+            after_revision: None,
+            after_bytes: None,
+            session: baseline.binding.session_id.as_str().to_owned(),
+            action_lease: baseline.binding.action_lease_ref.as_str().to_owned(),
+            operation: operation.to_owned(),
+            attempt_receipt: baseline.effect_digest,
+            diff_handle: transition.clone(),
+            fence_generation: terminal_fence.generation().get(),
+            fence_invalidated: terminal_fence != baseline.capture_fence,
+        };
+        let mut recorded_transition: Option<String> = None;
+        match change_monitor::record_governed_tool_change(&change) {
+            Ok(_) => {
+                recorded_transition = Some(transition);
+                observe_process("kernel.process.effect_observed", "recorded");
+            }
+            Err(_) => {
+                observe_process("kernel.process.effect_observed", "refused");
+            }
+        }
+        let verification = change_monitor::HintVerification {
+            before_digest: Some(before_digest),
+            first_read: change_monitor::ContentRead::Absent,
+            reread: change_monitor::ContentRead::Absent,
+            git: None,
+        };
+        (recorded_transition, verification)
+    }
+
+    /// Confirms one effect transition and reconciles it explicitly against
+    /// the exact recorded transition, and only when the ledger accepted
+    /// the governed record (I10.21 A2). A refused record reconciles
+    /// nothing: the unknown-origin change stays unreconciled and keeps
+    /// blocking governed acceptance until reconciled.
+    fn confirm_effect_transition(
+        hint_id: &str,
+        verification: &change_monitor::HintVerification,
+        recorded_transition: Option<String>,
+    ) {
+        match change_monitor::confirm_hint(hint_id, verification) {
+            Ok(change_monitor::HintConfirmation::VerifiedImmaterial) => {
+                observe_process("kernel.process.effect_observed", "immaterial");
+            }
+            Ok(change_monitor::HintConfirmation::MaterialRecorded {
+                change_id: unknown_id,
+                reconciled,
+            }) => {
+                let mut outcome = if reconciled { "reconciled" } else { "material" };
+                if !reconciled
+                    && let Some(transition) = recorded_transition.as_deref()
+                    && change_monitor::reconcile_unknown_change(&unknown_id, transition).is_ok()
+                {
+                    outcome = "reconciled";
+                }
+                observe_process("kernel.process.effect_observed", outcome);
+            }
+            Err(change_monitor::ChangeMonitorError::UnstableReadback) => {
+                observe_process("kernel.process.effect_observed", "unstable");
+            }
+            Err(_) => {
+                observe_process("kernel.process.effect_observed", "unobserved");
+            }
+        }
     }
 }
 
@@ -445,55 +597,9 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
         } = read
         else {
             // I10.21 AUD5: two agreeing not-found reads prove the tracked
-            // image is absent. With no retained digest there is no
-            // transition to confirm and no baseline to attribute, so the
-            // operation runs unobserved. Against a retained digest this is
-            // an external deletion: confirm it as a filesystem hint with
-            // agreeing `Absent` reads, the same scheme as the
-            // present-image transition below but with proven absence
-            // instead of fresh bytes. A deletion already observed for this
-            // exact transition needs no re-ingest; its unreconciled record
-            // keeps blocking governed acceptance until a governed deletion
-            // reconciles it. Read failures never reach this arm
-            // (`content_read_for` yields `None` for them), so a monitor
-            // outage can neither mint nor replay a deletion here.
-            let previous = self
-                .last_observed
-                .lock()
-                .ok()
-                .and_then(|last| last.get(&resource).cloned());
-            let Some(previous) = previous else {
-                observe_process("kernel.process.effect_baseline_unavailable", "unobserved");
-                return Ok(unobserved());
-            };
-            let hint_id = change_monitor::filesystem_hint_id(&artifact, &previous);
-            let (change_id, transition_digest) =
-                change_monitor::material_transition_ids(&hint_id, Some(previous.as_str()), None);
-            let already_observed = change_monitor::deletion_observations_for(resource.as_str())
-                .iter()
-                .any(|observation| {
-                    observation.change_id == change_id
-                        && observation.transition_digest == transition_digest
-                        && observation.before_digest.as_deref() == Some(previous.as_str())
-                });
-            if !already_observed {
-                let hint = change_monitor::KernelChangeHint {
-                    hint_id: hint_id.clone(),
-                    resource: resource.clone(),
-                    path: lane_path.clone(),
-                    origin: change_monitor::HintOrigin::FilesystemNotification,
-                    origin_ref: Some(binding.owner.module_id().to_owned()),
-                };
-                let verification = change_monitor::HintVerification {
-                    before_digest: Some(previous),
-                    first_read: change_monitor::ContentRead::Absent,
-                    reread: change_monitor::ContentRead::Absent,
-                    git: None,
-                };
-                if !Self::confirm_external_transition(&hint_id, hint, &verification) {
-                    observe_process("kernel.process.effect_baseline_unavailable", "unobserved");
-                }
-            }
+            // image is absent (see `confirm_absent_at_capture`). No
+            // baseline is attributable, so the operation runs unobserved.
+            self.confirm_absent_at_capture(&resource, &lane_path, &artifact, binding);
             return Ok(unobserved());
         };
         let previous = self
@@ -664,48 +770,16 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
         let mut recorded_transition: Option<String> = None;
         let verification = if receipt.after_absent {
             // I10.21 AUD5: the readback proved absence (two agreeing
-            // not-found reads) against an observed baseline, so this
-            // operation deleted the tracked image. The governed deletion
-            // record carries `after_bytes: None`; its diff handle binds
-            // `(operation, before, absent)` through the ledger's own
-            // transition binder, the same scheme as the present path.
-            let (_, transition) = change_monitor::material_transition_ids(
+            // not-found reads) against an observed baseline (see
+            // `record_absent_transition`).
+            let (recorded, verification) = Self::record_absent_transition(
                 &operation,
-                Some(before_digest.as_str()),
-                None,
+                baseline,
+                before_digest,
+                receipt.terminal_fence,
             );
-            let change = change_monitor::GovernedToolChange {
-                change_id: operation.clone(),
-                resource: baseline.resource.clone(),
-                path: baseline.lane_path.clone(),
-                before_path: None,
-                before_revision: Some(before_digest.clone()),
-                before_bytes: baseline.before_bytes,
-                after_revision: None,
-                after_bytes: None,
-                session: baseline.binding.session_id.as_str().to_owned(),
-                action_lease: baseline.binding.action_lease_ref.as_str().to_owned(),
-                operation: operation.clone(),
-                attempt_receipt: baseline.effect_digest,
-                diff_handle: transition.clone(),
-                fence_generation: receipt.terminal_fence.generation().get(),
-                fence_invalidated: receipt.terminal_fence != baseline.capture_fence,
-            };
-            match change_monitor::record_governed_tool_change(&change) {
-                Ok(_) => {
-                    recorded_transition = Some(transition);
-                    observe_process("kernel.process.effect_observed", "recorded");
-                }
-                Err(_) => {
-                    observe_process("kernel.process.effect_observed", "refused");
-                }
-            }
-            change_monitor::HintVerification {
-                before_digest: Some(before_digest),
-                first_read: change_monitor::ContentRead::Absent,
-                reread: change_monitor::ContentRead::Absent,
-                git: None,
-            }
+            recorded_transition = recorded;
+            verification
         } else {
             let (Some(after_first), Some(after_reread)) =
                 (receipt.after_first_digest, receipt.after_reread_digest)
@@ -757,35 +831,7 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
                 git: None,
             }
         };
-        match change_monitor::confirm_hint(&hint_id, &verification) {
-            Ok(change_monitor::HintConfirmation::VerifiedImmaterial) => {
-                observe_process("kernel.process.effect_observed", "immaterial");
-            }
-            Ok(change_monitor::HintConfirmation::MaterialRecorded {
-                change_id: unknown_id,
-                reconciled,
-            }) => {
-                // I10.21 A2: reconcile explicitly against the exact recorded
-                // transition, and only when the ledger accepted the governed
-                // record. A refused record reconciles nothing: the
-                // unknown-origin change stays unreconciled and keeps
-                // blocking governed acceptance until reconciled.
-                let mut outcome = if reconciled { "reconciled" } else { "material" };
-                if !reconciled
-                    && let Some(transition) = recorded_transition.as_deref()
-                    && change_monitor::reconcile_unknown_change(&unknown_id, transition).is_ok()
-                {
-                    outcome = "reconciled";
-                }
-                observe_process("kernel.process.effect_observed", outcome);
-            }
-            Err(change_monitor::ChangeMonitorError::UnstableReadback) => {
-                observe_process("kernel.process.effect_observed", "unstable");
-            }
-            Err(_) => {
-                observe_process("kernel.process.effect_observed", "unobserved");
-            }
-        }
+        Self::confirm_effect_transition(&hint_id, &verification, recorded_transition);
         Ok(())
     }
 }
