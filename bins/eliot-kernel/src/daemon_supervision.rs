@@ -386,6 +386,225 @@ impl DaemonSupervisionProgressState {
     }
 }
 
+// ============================================================================
+// Replacement startup + protected routing for retained maintenance trigger
+// claims (issue #1694, step 6 / W6).
+//
+// Loss moment: outstanding trigger claims issued to the lost daemon consumer
+// are retained, never dropped; the old consumer's authority is revoked
+// through the existing Kernel owner (`revoke_daemon_agent_bridge_profile`
+// and `revoke_supervision_evidence` — this seam revokes nothing itself, it
+// binds the exact lost-consumer identity the owner must revoke).
+//
+// Startup moment: after replacement authentication and the required ORS
+// mirror recovery, the bounded pending set is surfaced before the startup
+// path may claim maintenance reconciliation complete.
+//
+// Conformance: I1.8 (Kernel checks identity/authority/fence/idempotency/
+// ordering/generation only — it never invents trigger semantics, policy, or
+// classification); I14.22 lineage (unavailable evaluator, durable triggers,
+// single decision owner — classification arrives owner-issued with the claim);
+// I14.24 lineage (daemon/ORS failure containment — old authority fenced,
+// pending work retained as an explicit bounded set with visible gaps);
+// I5.2 lineage (opaque ORS payload — the Kernel indexes only operational
+// delivery metadata below); A13.3 (replacement fences the old epoch);
+// A13.6 (ORS carries identity/envelope/reconciliation state, grants no
+// authority); A13.11 (evaluator down degrades promises — protected routes
+// stay visible, ordinary debt never gates runtime liveness).
+//
+// Narrowness: two pure functions over caller-supplied pages. No new daemon
+// supervisor, database, or evaluator; no unbounded spill (one
+// `MAX_RECOVERY_PAGE` page per call, the existing recovery paging
+// denominator); no polling — the loss caller invokes the classifier once per
+// page, the startup path invokes the gate once its preconditions hold.
+
+/// Registered protected route on which an owner-classified safety/recovery
+/// trigger stays visible while the Governor evaluator is down (#1694 W6).
+///
+/// The route arrives with the claim from its owner; the Kernel never invents
+/// it. Ordinary maintenance claims carry no route and are visible only to
+/// the authenticated replacement generation, never on a protected route, so
+/// ordinary debt is never promoted to protected authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TriggerProtectedRoute {
+    Host,
+    Kernel,
+    Watchdog,
+    Doctor,
+}
+
+/// One outstanding maintenance trigger claim, as enumerated from the durable
+/// ORS page at daemon-loss time (#1694 W6).
+///
+/// Operational delivery metadata only: stable source event/trigger identity,
+/// delivery/claim identity, the consumer generation it was issued to, and
+/// the owner-issued protected-routing classification. The semantic payload
+/// stays opaque; the Kernel never queries the trigger as semantic memory nor
+/// evaluates its policy.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PendingTriggerClaimView {
+    /// Stable source event/trigger identity (exact replay key).
+    pub(crate) trigger_identity: String,
+    /// Delivery/claim identity bound to the consumer generation. Redelivery
+    /// reuses this identity, so duplicated delivery cannot authorize
+    /// duplicated containment; a claim timeout never mints a new trigger ID.
+    pub(crate) delivery_identity: String,
+    /// Consumer generation the claim was issued to.
+    pub(crate) issued_to_consumer: SupervisionGenerationBinding,
+    /// Owner-issued protected-routing classification. `None` marks ordinary
+    /// maintenance debt.
+    pub(crate) owner_issued_protected_route: Option<TriggerProtectedRoute>,
+}
+
+/// One claim retained across daemon loss, stripped to its replay keys.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RetainedTriggerClaim {
+    pub(crate) trigger_identity: String,
+    pub(crate) delivery_identity: String,
+    pub(crate) owner_issued_protected_route: Option<TriggerProtectedRoute>,
+}
+
+/// Settlement of one bounded outstanding-claim page at daemon-loss time.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DaemonLossClaimSettlement {
+    /// Lost consumer whose authority the existing Kernel owner must revoke.
+    /// Echoed so the revocation binds the exact fenced generation.
+    pub(crate) lost_consumer: SupervisionGenerationBinding,
+    /// Retained pending claims, bounded to one `MAX_RECOVERY_PAGE` page.
+    pub(crate) retained_pending: Vec<RetainedTriggerClaim>,
+    /// The page input claimed further pages. The startup path must surface
+    /// every page before claiming maintenance reconciliation complete; a
+    /// reconnect never resets progress to a guessed complete-empty set.
+    pub(crate) more_pages_pending: bool,
+    /// Matching claims dropped by the page cap. Explicit gap, never silent.
+    pub(crate) over_page_cap: u64,
+    /// Claims issued to another consumer. Left untouched, counted visibly.
+    pub(crate) foreign_consumer_skipped: u64,
+    /// Claims with an empty replay identity. Fail-closed, counted visibly.
+    pub(crate) malformed_identity_skipped: u64,
+}
+
+impl DaemonLossClaimSettlement {
+    /// Safety/recovery subset that stays visible on its registered
+    /// Host/Kernel/Watchdog/Doctor route while the evaluator is down.
+    /// Projection only; `retained_pending` stays the single store.
+    pub(crate) fn protected_visible(&self) -> Vec<(&str, TriggerProtectedRoute)> {
+        self.retained_pending
+            .iter()
+            .filter_map(|claim| {
+                claim
+                    .owner_issued_protected_route
+                    .map(|route| (claim.delivery_identity.as_str(), route))
+            })
+            .collect()
+    }
+}
+
+/// Caller-attested replacement startup preconditions for surfacing retained
+/// claims. Both facts are established by their existing owners (replacement
+/// authentication by the supervision/front-door path, mirror recovery by ORS
+/// mirror reconciliation); this gate only orders surfacing after them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ReplacementStartupEvidence {
+    pub(crate) replacement_authenticated: bool,
+    pub(crate) mirror_recovered: bool,
+}
+
+/// Bounded pending set surfaced to the replacement, with its completeness.
+///
+/// This gate binds only the maintenance-reconciliation claim. Ordinary
+/// pending debt surfaced here never keeps the runtime alive and never blocks
+/// unrelated safe work; unrelated admission stays with its own owner.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DaemonLossPendingSurface {
+    /// Claims to surface now. Empty while the gate is closed; the withheld
+    /// count below keeps that visible instead of silent.
+    pub(crate) surfaced: Vec<RetainedTriggerClaim>,
+    /// Retained claims withheld because the gate is closed.
+    pub(crate) withheld: u64,
+    /// True only once the gate is open and no further pages remain. Only
+    /// then may the startup path claim maintenance reconciliation complete.
+    pub(crate) reconciliation_complete: bool,
+}
+
+/// Classifies one bounded page of outstanding trigger claims at daemon-loss
+/// time: retain the lost consumer's pending claims, leave foreign-consumer
+/// claims untouched, and count every gap explicitly.
+///
+/// The caller (STITCH: `record_daemon_failed` in `daemon_runtime.rs`, next
+/// to the existing `revoke_daemon_agent_bridge_profile` call) supplies the
+/// lost consumer binding and the ORS-enumerated page, retains the returned
+/// settlement in Kernel-owned state, and revokes the old consumer authority
+/// through the existing Kernel owner. Pure: no I/O, no polling, no logging —
+/// the owning boundary observes the outcome.
+pub(crate) fn classify_daemon_loss_trigger_claims(
+    lost_consumer: &SupervisionGenerationBinding,
+    claims_page: &[PendingTriggerClaimView],
+    more_pages_pending: bool,
+) -> DaemonLossClaimSettlement {
+    let cap = usize::from(eliot_ors::MAX_RECOVERY_PAGE);
+    let mut retained_pending = Vec::new();
+    let mut over_page_cap = 0u64;
+    let mut foreign_consumer_skipped = 0u64;
+    let mut malformed_identity_skipped = 0u64;
+    for claim in claims_page {
+        if claim.trigger_identity.is_empty() || claim.delivery_identity.is_empty() {
+            malformed_identity_skipped = malformed_identity_skipped.saturating_add(1);
+            continue;
+        }
+        if claim.issued_to_consumer != *lost_consumer {
+            foreign_consumer_skipped = foreign_consumer_skipped.saturating_add(1);
+            continue;
+        }
+        if retained_pending.len() >= cap {
+            over_page_cap = over_page_cap.saturating_add(1);
+            continue;
+        }
+        retained_pending.push(RetainedTriggerClaim {
+            trigger_identity: claim.trigger_identity.clone(),
+            delivery_identity: claim.delivery_identity.clone(),
+            owner_issued_protected_route: claim.owner_issued_protected_route,
+        });
+    }
+    DaemonLossClaimSettlement {
+        lost_consumer: lost_consumer.clone(),
+        retained_pending,
+        more_pages_pending,
+        over_page_cap,
+        foreign_consumer_skipped,
+        malformed_identity_skipped,
+    }
+}
+
+/// Surfaces the retained pending set to the replacement once it is
+/// authenticated and mirror recovery is done. While either precondition is
+/// missing the claims stay retained-but-withheld (counted, never silent) and
+/// reconciliation stays incomplete.
+///
+/// The caller (STITCH: replacement startup path after
+/// `establish_daemon_supervision` in `lib.rs` plus ORS mirror
+/// reconciliation) attests the preconditions from their existing owners.
+/// Pure: no I/O, no polling.
+pub(crate) fn gate_daemon_loss_pending_surface(
+    settlement: &DaemonLossClaimSettlement,
+    startup: &ReplacementStartupEvidence,
+) -> DaemonLossPendingSurface {
+    let open = startup.replacement_authenticated && startup.mirror_recovered;
+    if open {
+        DaemonLossPendingSurface {
+            surfaced: settlement.retained_pending.clone(),
+            withheld: 0,
+            reconciliation_complete: !settlement.more_pages_pending,
+        }
+    } else {
+        DaemonLossPendingSurface {
+            surfaced: Vec::new(),
+            withheld: u64::try_from(settlement.retained_pending.len()).unwrap_or(u64::MAX),
+            reconciliation_complete: false,
+        }
+    }
+}
+
 #[cfg(all(test, windows))]
 mod daemon_supervision_diagnostics_tests {
     //! F-LOG-KERNEL-3 (#901) focused diagnostics proof: readiness versus
