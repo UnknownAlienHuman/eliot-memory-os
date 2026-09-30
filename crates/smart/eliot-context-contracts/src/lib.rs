@@ -54,11 +54,11 @@ pub use boundary::{
 };
 
 pub use canonical_projections::{
-    AffordanceProjection, CANONICAL_PROJECTIONS_SCHEMA_VERSION,
-    CANONICAL_PROJECTION_SOURCE_DENOMINATOR, CanonicalProjectionSourceDisposition,
-    CanonicalProjectionSourceReadback, CanonicalProjectionSourceRequirement,
-    CanonicalProjectionSourceRole, CanonicalProjectionSourceSnapshot,
-    CanonicalProjectionSourceTarget, CanonicalProjectionSet, ContinuityProjection,
+    AffordanceProjection, CANONICAL_PROJECTION_SOURCE_DENOMINATOR,
+    CANONICAL_PROJECTIONS_SCHEMA_VERSION, CanonicalProjectionSet,
+    CanonicalProjectionSourceDisposition, CanonicalProjectionSourceReadback,
+    CanonicalProjectionSourceRequirement, CanonicalProjectionSourceRole,
+    CanonicalProjectionSourceSnapshot, CanonicalProjectionSourceTarget, ContinuityProjection,
     MAX_PROJECTION_ENTRIES, MAX_PROJECTION_TEXT, MAX_SET_OMISSIONS, SafetyProjection,
     TaskProjection,
 };

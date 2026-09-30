@@ -242,7 +242,9 @@ impl CanonicalProjectionSet {
 }
 
 /// Owner-side source role needed to retain immutable lineage for CC-004.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum CanonicalProjectionSourceRole {
     /// Retained task-frame source used to bind task, continuity, and safety.
@@ -258,7 +260,9 @@ pub enum CanonicalProjectionSourceRole {
 }
 
 /// Projection or omission surface whose exact owner source is being retained.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum CanonicalProjectionSourceTarget {
     Task,
@@ -358,9 +362,9 @@ impl CanonicalProjectionSourceReadback {
         let missing = expected
             .iter()
             .filter(|required| {
-                !snapshots.iter().any(|source| {
-                    source.target == required.target && source.role == required.role
-                })
+                !snapshots
+                    .iter()
+                    .any(|source| source.target == required.target && source.role == required.role)
             })
             .copied()
             .collect::<Vec<_>>();
@@ -413,9 +417,11 @@ impl CanonicalProjectionSourceReadback {
             }
         }
         for source in &self.snapshots {
-            if let Some(shared_role) = self.snapshots.iter().find(|other| {
-                other.role == source.role && other.target != source.target
-            }) {
+            if let Some(shared_role) = self
+                .snapshots
+                .iter()
+                .find(|other| other.role == source.role && other.target != source.target)
+            {
                 if shared_role.snapshot != source.snapshot {
                     return Err(ContextError::InvalidField(
                         "projections.shared_source_lineage",
@@ -426,9 +432,10 @@ impl CanonicalProjectionSourceReadback {
         let expected_missing = CANONICAL_PROJECTION_SOURCE_DENOMINATOR
             .iter()
             .filter(|required| {
-                !self.snapshots.iter().any(|source| {
-                    source.target == required.target && source.role == required.role
-                })
+                !self
+                    .snapshots
+                    .iter()
+                    .any(|source| source.target == required.target && source.role == required.role)
             })
             .copied()
             .collect::<Vec<_>>();
