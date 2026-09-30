@@ -9548,9 +9548,7 @@ where
                         InstallerEffectPlan::ProvisionStoreCredential { .. }
                     );
                     match self.port.execute(&request) {
-                        PortOutcome::Known(execution)
-                            if execution.create_disposition.is_none() =>
-                        {
+                        PortOutcome::Known(execution) if execution.create_disposition.is_none() => {
                             // The dependent rollback is already running, so the
                             // composite is retained verbatim without touching
                             // the rollback disposition; the rollback loop's own
