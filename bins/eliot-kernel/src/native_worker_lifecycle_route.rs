@@ -1109,14 +1109,13 @@ impl KernelComposition {
         .map_err(|_| NativeWorkerRouteError::Fence {
             field: "process_start_receipt",
         })?;
-        let (registry_digest, claim_fence_digest) = self
-            .validate_native_worker_cell_currentness(
-                session,
-                &presented,
-                presented_fence,
-                &process_start,
-                peer,
-            )?;
+        let (registry_digest, claim_fence_digest) = self.validate_native_worker_cell_currentness(
+            session,
+            &presented,
+            presented_fence,
+            &process_start,
+            peer,
+        )?;
         let request = &process_start.request;
         let claim_receipt = &process_start.claim_receipt;
         let process_receipt = &process_start.receipt;
@@ -1284,9 +1283,7 @@ impl KernelComposition {
             && session.launch_nonce == process_start.launch_nonce
             && process_start.launch_nonce == executable_binding.launch_nonce
             && process_start.activation_epoch == request.authority_epoch
-            && process_start
-                .activation_epoch
-                .is_same_authority(live_epoch)
+            && process_start.activation_epoch.is_same_authority(live_epoch)
             && process_start.activation_generation.get() == live_activation_generation
             && live_activation_generation != 0
             && peer.process_id() == physical.process_id()

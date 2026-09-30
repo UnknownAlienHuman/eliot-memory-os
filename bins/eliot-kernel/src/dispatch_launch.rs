@@ -2866,8 +2866,7 @@ fn child_process_admission(
         working_directory_str,
         EnvironmentProjection::new(BTreeMap::new(), Vec::new(), EnvironmentInheritance::None)
             .map_err(gate_error)?,
-        ResourceLimits::new(86_400_000, None, None, 64 * 1024, 64 * 1024, 4)
-            .map_err(gate_error)?,
+        ResourceLimits::new(86_400_000, None, None, 64 * 1024, 64 * 1024, 4).map_err(gate_error)?,
     )
     .map_err(gate_error)?;
     let fence = FencingToken::new(
@@ -2965,27 +2964,26 @@ async fn spawn_ready_child(
         executable_file_identity.volume_serial_number,
         executable_file_identity.file_index,
     );
-    let pending_native_worker_claim = stage_pending_native_worker_process_start(
-        inputs,
-        &admission,
-        executable_file_identity,
-    )?;
+    let pending_native_worker_claim =
+        stage_pending_native_worker_process_start(inputs, &admission, executable_file_identity)?;
     match gateway.start(&owner, admission, proof, outer_binding).await {
         Ok(receipt) => Ok(SpawnOutcome::Started(
             Box::new(receipt),
             executable_file_identity,
         )),
         Err(ProcessExecutionError::UnknownOutcome) => {
-            if let Some((claim_id, contour)) =
-                pending_native_worker_claim.as_deref().zip(DISPATCH_CONTOUR.get())
+            if let Some((claim_id, contour)) = pending_native_worker_claim
+                .as_deref()
+                .zip(DISPATCH_CONTOUR.get())
             {
                 discard_native_worker_process_start_pending(contour, claim_id);
             }
             Ok(SpawnOutcome::Unknown(operation_id.clone()))
         }
         Err(error) => {
-            if let Some((claim_id, contour)) =
-                pending_native_worker_claim.as_deref().zip(DISPATCH_CONTOUR.get())
+            if let Some((claim_id, contour)) = pending_native_worker_claim
+                .as_deref()
+                .zip(DISPATCH_CONTOUR.get())
             {
                 discard_native_worker_process_start_pending(contour, claim_id);
             }
