@@ -677,7 +677,7 @@ pub struct ObservationReceipt {
     #[serde(default)]
     pub instrument_spec: Option<InstrumentSpec>,
     /// Exact existing registry parser and normalizer identities used by the
-    /// original RegistryEntry. They remain distinct from the bridge's final
+    /// original `RegistryEntry`. They remain distinct from the bridge's final
     /// operation-specific normalization.
     #[serde(default)]
     pub registry_identity: Option<LspRegistryIdentity>,
@@ -1412,6 +1412,10 @@ pub struct LspAdoptionProjection {
     started: Arc<LspStartedInvocation>,
 }
 
+/// Boxed future type returned by the capture publication callback.
+pub type LspCapturePublicationFuture<'a, Output, Error> =
+    Pin<Box<dyn Future<Output = Result<Output, Error>> + 'a>>;
+
 /// One-shot callback that publishes the exact live capture before the bridge
 /// returns its retained record to a caller. Implementations keep their
 /// original Governor/Store admission on-stack and receive only the immutable
@@ -1429,7 +1433,7 @@ pub trait LspCapturePublicationPort {
         record: &'a RetainedLspObservationV1,
         projection: &'a LspAdoptionProjection,
         original_payload: &'a [u8],
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Output, Self::Error>> + 'a>>;
+    ) -> LspCapturePublicationFuture<'a, Self::Output, Self::Error>;
 }
 
 /// Failure to complete one live capture, preserving bridge and publisher
@@ -2802,7 +2806,7 @@ impl<P: LspProcessOwnerPort, G: GitProcessRunner> LspCurrentBridge<P, G> {
         let currentness = self
             .source_artifact_currentness(
                 &record,
-                &started,
+                started,
                 current,
                 source_root,
                 received_result_currentness(&record, current),
@@ -2958,9 +2962,11 @@ impl<P: LspProcessOwnerPort, G: GitProcessRunner> LspCurrentBridge<P, G> {
             &started.config,
             &started.source_candidate,
             &started.operation,
-            &started.resolved_executable,
-            &started.instrument_spec,
-            &started.registry_identity,
+            (
+                &started.resolved_executable,
+                &started.instrument_spec,
+                &started.registry_identity,
+            ),
             &raw_outputs,
             &process_evidence,
             invoked_at_unix_ms,
@@ -3090,14 +3096,14 @@ fn validate_lsp_blob_receipt_binding(
         _ => false,
     };
     if core.operation.operation_kind != LSP_TOOL_OBSERVATION_RECEIPT_KIND
-        || &core.request.metadata != request
-        || &core.request.state_fence != &request.state_fence
-        || &core.operation.request_id != &request.request_id
-        || &core.operation.state_fence != &request.state_fence
-        || &core.causal.state_fence != &request.state_fence
-        || &core.authority.state_fence != &request.state_fence
-        || &core.work_scope.state_fence != &request.state_fence
-        || &core.work_scope.product_id != &request.product_id
+        || core.request.metadata != *request
+        || core.request.state_fence != request.state_fence
+        || core.operation.request_id != request.request_id
+        || core.operation.state_fence != request.state_fence
+        || core.causal.state_fence != request.state_fence
+        || core.authority.state_fence != request.state_fence
+        || core.work_scope.state_fence != request.state_fence
+        || core.work_scope.product_id != request.product_id
         || !task_matches
         || !session_matches
     {
@@ -3207,9 +3213,11 @@ fn validate_retained_observation(record: &RetainedLspObservationV1) -> Result<()
         &record.config,
         &record.source_candidate,
         &record.operation,
-        &record.resolved_executable,
-        &record.instrument_spec,
-        &record.registry_identity,
+        (
+            &record.resolved_executable,
+            &record.instrument_spec,
+            &record.registry_identity,
+        ),
         &record.raw_outputs,
         &record.process_evidence,
         receipt.invoked_at_unix_ms,
@@ -4414,13 +4422,16 @@ fn normalize_retained_operation(
     config: &AnalyzerConfig,
     candidate: &SourceCandidate,
     operation: &SemanticOperation,
-    resolved_identity: &ResolvedExecutableIdentityRecord,
-    instrument_spec: &InstrumentSpec,
-    registry_identity: &LspRegistryIdentity,
+    identities: (
+        &ResolvedExecutableIdentityRecord,
+        &InstrumentSpec,
+        &LspRegistryIdentity,
+    ),
     raw_outputs: &[LspRawOutput],
     process_evidence: &ProcessEvidence,
     invoked_at_unix_ms: u64,
 ) -> Result<NormalizedResult, BridgeError> {
+    let (resolved_identity, instrument_spec, registry_identity) = identities;
     let resolved = resolved_identity.resolve("lsp-retained-observation")?;
     let process_completed = process_completed(process_evidence);
     let exit_code = process_exit_code(process_evidence);
