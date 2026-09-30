@@ -25,7 +25,7 @@ use super::{
     PHASE_B_PENDING_SCM_DIGEST, PlatformAgentBridgeSecurityConvergenceReceipt,
     PlatformAgentBridgeStagePrepared, PlatformAgentBridgeStagingReceipt, PlatformHandle,
     ProvisionedSupervisionAuthority, ResourceGeneration, RuntimeLaunchDescriptor, StateFence,
-    canonical_json_bytes, handle, sha256_handle, sha256_hex, text,
+    canonical_json_bytes, handle, same_windows_root, sha256_handle, sha256_hex, text,
 };
 
 #[cfg(test)]
@@ -2656,6 +2656,20 @@ pub struct ApprovedGenerationRegistry {
     /// `INSTALLATION_REGISTRY_WIRE_VERSION`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) committed_cutover_activation: Option<CommittedCutoverActivation>,
+    /// Owner allocation of one isolated destination installation that is not
+    /// yet approved.
+    ///
+    /// This member is the *allocation* seam, not a generation seam: it carries
+    /// no `InstallationActivationApproval` and is not readable through
+    /// `generations`, `active()` or `pending_activation()`.  `skip_serializing_if`
+    /// is the same wire-compatibility mechanism `committed_cutover_activation`
+    /// uses: a registry that has never allocated a destination keeps
+    /// serializing byte-identically, so `registry_projection_identity` stays
+    /// stable against already-staged activation intents and
+    /// `INSTALLATION_REGISTRY_WIRE_VERSION` is not bumped for a member that is
+    /// legitimately absent in every earlier state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) isolated_installation_allocation: Option<IsolatedInstallationAllocation>,
 }
 
 impl Default for ApprovedGenerationRegistry {
@@ -2753,6 +2767,171 @@ impl CommittedCutoverActivation {
             || self.operation_id == self.target_generation
             || self.expected_predecessor == self.target_generation
         {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(())
+    }
+}
+
+/// Derives the installation key of one canonical
+/// `.../installations/<key>/host` root.  The key is read back out of the
+/// retained root instead of being a supplied field, so a caller cannot present
+/// one key and allocate at another.
+fn installation_host_root_key(
+    root: &PlatformHandle,
+    field: &str,
+) -> Result<String, InstallationError> {
+    super::validate_installation_host_root(Path::new(root.as_str()))?;
+    let identity = super::WindowsPathIdentity::parse_root(root.as_str(), field)?;
+    let key_index = identity.components.len().saturating_sub(2);
+    identity.components.get(key_index).cloned().ok_or_else(|| {
+        InstallationError::InvalidField {
+            field: field.to_owned(),
+            reason: "retained root must be an installation Host root".to_owned(),
+        }
+    })
+}
+
+/// Owner record of one isolated destination installation that has been
+/// **allocated but is not yet approved**.
+///
+/// Every row of [`ApprovedGenerationRegistry::generations`] is an *approved*
+/// generation and is structurally forced to carry an
+/// `InstallationActivationApproval`, for which this crate deliberately exposes
+/// no constructor and no deserializer
+/// (`installation_registry.rs`, `stage_pending_activation_from_transaction_store`:
+/// "This crate deliberately exposes no constructor or deserializer for that
+/// value").  A destination that exists as a fenced, empty directory has no
+/// approval, so it cannot be an `ApprovedGeneration`, and there was no
+/// representation for it at all.  This is that missing owner state: the
+/// allocation is the first durable fact about the destination, and it is
+/// strictly weaker than approval.
+///
+/// What the record proves, and what it does not:
+///
+/// - it proves that this installation authority allocated a **new, distinct**
+///   isolated installation identity at one exact canonical protected Host root
+///   for one exact preparation operation, bound to the exact source
+///   installation, target manifest/build/profile, proposed restoration
+///   requirements and current purge/reference closure the caller had already
+///   admitted;
+/// - it is **not** an approval, **not** an active generation, **not** an
+///   Authority Epoch, and **not** authority to launch, to accept materialized
+///   roots, or to cut over.  A13.7 keeps those separate: "Cutover requires
+///   separate authority."
+///
+/// Refusal is structural, not procedural.  The type carries no approval field
+/// and has no conversion to `ApprovedGeneration`, so an allocated destination
+/// has no representation from which a generation could be read; and
+/// [`Self::validate`] derives the destination installation key from the root
+/// and refuses a destination that is the source installation, that reuses the
+/// source root, or that is an arbitrary caller-supplied path.  A predictable
+/// directory name is not ownership: the allocation owns its root, it never
+/// adopts a preexisting foreign one, and the caller's protected-root lease
+/// proves containment while this record proves identity.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IsolatedInstallationAllocation {
+    /// Owner-issued allocation identity of this preparation.
+    pub allocation_id: PlatformHandle,
+    /// Installation identity this allocation creates; distinct from the source.
+    pub destination_installation: PlatformHandle,
+    /// Canonical protected Host root the destination is allocated at.
+    pub destination_host_root: PlatformHandle,
+    /// Installation the destination is prepared from.
+    pub source_installation: PlatformHandle,
+    /// Canonical protected Host root of the source installation that owns this
+    /// registry.
+    pub source_host_root: PlatformHandle,
+    /// Preparation operation identity that performed the allocation.
+    pub operation_id: PlatformHandle,
+    /// Admitted target manifest the destination is allocated for.
+    pub target_manifest_ref: PlatformHandle,
+    /// Admitted target build the destination is allocated for.
+    pub target_build_ref: PlatformHandle,
+    /// Admitted target profile the destination is allocated for.
+    pub target_profile: InstallationProfile,
+    /// Restoration requirements the caller proposed for this destination.
+    pub proposed_restoration_requirements: PlatformHandle,
+    /// Purge/reference closure observed by the caller when it allocated.
+    pub purge_reference_closure: PlatformHandle,
+}
+
+impl IsolatedInstallationAllocation {
+    /// Validates the allocation as a self-consistent, distinct, owner-rooted
+    /// binding.
+    ///
+    /// A degenerate binding — one that reuses the source installation, names
+    /// the source installation key as its own, or whose destination root is
+    /// not the exact `.../installations/<key>/host` contour — describes no
+    /// isolated installation that could have been allocated, and is refused
+    /// rather than stored.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallationError`] when a handle is malformed, when a root is
+    /// not an exact installation Host root, or when the binding is degenerate
+    /// or self-contradictory.
+    pub fn validate(&self) -> Result<(), InstallationError> {
+        for (value, field) in [
+            (
+                &self.allocation_id,
+                "isolated_installation_allocation.allocation_id",
+            ),
+            (
+                &self.destination_installation,
+                "isolated_installation_allocation.destination_installation",
+            ),
+            (
+                &self.destination_host_root,
+                "isolated_installation_allocation.destination_host_root",
+            ),
+            (
+                &self.source_installation,
+                "isolated_installation_allocation.source_installation",
+            ),
+            (
+                &self.source_host_root,
+                "isolated_installation_allocation.source_host_root",
+            ),
+            (
+                &self.operation_id,
+                "isolated_installation_allocation.operation_id",
+            ),
+            (
+                &self.target_manifest_ref,
+                "isolated_installation_allocation.target_manifest_ref",
+            ),
+            (
+                &self.target_build_ref,
+                "isolated_installation_allocation.target_build_ref",
+            ),
+            (
+                &self.proposed_restoration_requirements,
+                "isolated_installation_allocation.proposed_restoration_requirements",
+            ),
+            (
+                &self.purge_reference_closure,
+                "isolated_installation_allocation.purge_reference_closure",
+            ),
+        ] {
+            handle(value, field)?;
+        }
+        if self.allocation_id == self.destination_installation
+            || self.allocation_id == self.operation_id
+            || self.destination_installation == self.source_installation
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        let destination_key = installation_host_root_key(
+            &self.destination_host_root,
+            "isolated_installation_allocation.destination_host_root",
+        )?;
+        let source_key = installation_host_root_key(
+            &self.source_host_root,
+            "isolated_installation_allocation.source_host_root",
+        )?;
+        if destination_key == source_key {
             return Err(InstallationError::IdentityConflict);
         }
         Ok(())
@@ -2991,6 +3170,7 @@ impl ApprovedGenerationRegistry {
             aborted_activation_receipts: Vec::new(),
             active_phase_b_rebind: None,
             committed_cutover_activation: None,
+            isolated_installation_allocation: None,
         }
     }
 
@@ -4393,6 +4573,64 @@ impl ApprovedGenerationRegistry {
         self.committed_cutover_activation.as_ref()
     }
 
+    /// Records the owner allocation of one isolated destination installation
+    /// that is not yet approved.
+    ///
+    /// This is an allocation-binding record only. It creates no approval, no
+    /// pending activation, no active pointer, and no Phase-B state, so an
+    /// allocated destination can never be read as an approved or active
+    /// generation. The destination's own generation, approval and activation
+    /// remain a separate, later, separately-authorized transition.
+    ///
+    /// Exact replay of the identical allocation is idempotent and returns the
+    /// recorded value. A different binding under a recorded allocation
+    /// identity is `IdentityConflict`, and because the slot is single, an
+    /// unrecorded destination is never silently superseded by a newer one: an
+    /// allocated-but-unapproved destination cannot be abandoned by writing a
+    /// second allocation over it (ARCH-RES-03, "Recovery cannot resurrect
+    /// invalid state").
+    pub(crate) fn record_isolated_installation_allocation(
+        &mut self,
+        allocation: &IsolatedInstallationAllocation,
+    ) -> Result<IsolatedInstallationAllocation, InstallationError> {
+        self.validate()?;
+        allocation.validate()?;
+        if let Some(recorded) = &self.isolated_installation_allocation {
+            if recorded == allocation {
+                return Ok(recorded.clone());
+            }
+            return Err(InstallationError::IdentityConflict);
+        }
+        self.isolated_installation_allocation = Some(allocation.clone());
+        self.validate()?;
+        Ok(allocation.clone())
+    }
+
+    /// Returns the owner allocation of the isolated destination installation
+    /// that is not yet approved, when one has been recorded.
+    ///
+    /// A caller **may** conclude that this installation authority allocated
+    /// that destination identity at that canonical root for that preparation
+    /// operation, and that an exact repeat of the same preparation must return
+    /// the same destination rather than allocate another one.
+    ///
+    /// A caller **may not** conclude that:
+    ///
+    /// - the destination is approved, active, last-known-good, or pending
+    ///   activation — the allocation is not in `generations` and has no
+    ///   approval, so those reads cannot see it (#958);
+    /// - the destination has been materialized, launched, given an Authority
+    ///   Epoch, or is safe to activate, retire, or delete. Those remain
+    ///   separately authorized paths (A13.7: "Cutover requires separate
+    ///   authority");
+    /// - absence means no destination exists. A preparation whose response was
+    ///   lost must reconcile this record together with the actual root and
+    ///   lease state; an unknown outcome is retained, not guessed.
+    #[must_use]
+    pub fn isolated_installation_allocation(&self) -> Option<&IsolatedInstallationAllocation> {
+        self.isolated_installation_allocation.as_ref()
+    }
+
     /// Returns the currently active approved generation.
     #[must_use]
     pub fn active(&self) -> Option<&ApprovedGeneration> {
@@ -4633,6 +4871,26 @@ impl ApprovedGenerationRegistry {
             }
             if self.active_generation.as_ref() != Some(&committed.target_generation) {
                 return Err(InstallationError::IdentityConflict);
+            }
+        }
+        if let Some(allocation) = &self.isolated_installation_allocation {
+            allocation.validate()?;
+            // An allocation is a distinct, unapproved destination: the durable
+            // contradiction is a destination that this registry also records
+            // as an approved installation, by identity or by root.
+            for generation in &self.generations {
+                let launch = &generation.manifest.runtime_launch;
+                if launch.installation_epoch.installation == allocation.destination_installation
+                    || same_windows_root(
+                        launch.runtime_state_roots.host_state_root.as_str(),
+                        allocation.destination_host_root.as_str(),
+                    )?
+                {
+                    return Err(InstallationError::IncompleteObservation(
+                        "isolated installation allocation destination is already an approved installation"
+                            .to_owned(),
+                    ));
+                }
             }
         }
         if let Some(terminal) = &self.last_terminal_activation {

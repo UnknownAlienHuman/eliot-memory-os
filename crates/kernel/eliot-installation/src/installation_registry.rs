@@ -64,9 +64,9 @@ use crate::{
     ActivePhaseBRebindReceipt, ActivePhaseBRebindRecovery, AgentBridgeStagePrepared,
     ApprovedGenerationRegistry, CommittedCutoverActivation, HostPhaseBMaterializationIntent,
     HostPhaseBMaterializationReceipt, HostPhaseBPreparedMaterialization, HostPhaseBPreparedReceipt,
-    InstallationActivationApproval, InstallationError, PendingActivation,
-    PendingActivationAbortReceipt, WindowsPathIdentity, activation_terminal_digest,
-    candidate_manifest_digest, valid_installation_key,
+    InstallationActivationApproval, InstallationError, IsolatedInstallationAllocation,
+    PendingActivation, PendingActivationAbortReceipt, WindowsPathIdentity,
+    activation_terminal_digest, candidate_manifest_digest, valid_installation_key,
 };
 
 pub(super) const REGISTRY_TABLE: TableDefinition<&str, &[u8]> =
@@ -1285,6 +1285,64 @@ impl RedbInstallationRegistry {
         })
     }
 
+    /// Atomically records the owner allocation of one new, distinct, isolated
+    /// destination installation that is **not yet approved** (#958).
+    ///
+    /// This is the missing wire state, not a missing function. Every row of
+    /// `ApprovedGenerationRegistry::generations` is an approved generation and
+    /// structurally requires an `InstallationActivationApproval`, which this
+    /// crate deliberately exposes no constructor or deserializer for (see
+    /// [`Self::stage_pending_activation_from_transaction_store`]). A prepared
+    /// destination has no approval, so the allocation gets its own
+    /// owner-recorded shape rather than a placeholder approval. It is
+    /// recorded, not adopted: a caller-supplied arbitrary path, the source or
+    /// active installation, and a preexisting foreign owner at the proposed
+    /// root are all refused, and the allocated destination has no
+    /// representation from which an approved or active generation could be
+    /// read.
+    ///
+    /// `expected_revision` is checked against the registry snapshot inside the
+    /// same redb write transaction that commits the projection, the discipline
+    /// [`Self::stage_pending_activation_from_transaction_store`] and
+    /// [`Self::commit_cutover_activation`] already use. An exact retry is a
+    /// no-op that does not advance the revision and returns the recorded
+    /// allocation; a changed binding under a recorded allocation identity, or
+    /// any second allocation over an unapproved destination, is refused.
+    ///
+    /// The allocation is not authority to activate the destination. A13.7
+    /// keeps that separate: cutover requires separate authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallationError`] when the owner capability is not live, the
+    /// allocation is not a self-consistent distinct binding, the source
+    /// installation/root pair is not the retained owner binding of this
+    /// registry, the destination is already an approved installation, or the
+    /// expected revision disagrees with durable state.
+    pub fn allocate_isolated_installation(
+        &self,
+        host: &HostOwnerEpochCapability,
+        expected_revision: u64,
+        allocation: &IsolatedInstallationAllocation,
+    ) -> Result<IsolatedInstallationAllocation, InstallationError> {
+        let _guard = host
+            .live_guard()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        allocation.validate()?;
+        let allocation = allocation.clone();
+        self.mutate_atomic(expected_revision, |registry| {
+            // The source is this registry's own retained owner binding, proven
+            // against the live capability and the retained protected root
+            // lease — never against a caller-supplied path.
+            self.validate_host_owner_binding_for_identity(
+                host,
+                &allocation.source_installation,
+                &allocation.source_host_root,
+            )?;
+            registry.record_isolated_installation_allocation(&allocation)
+        })
+    }
+
     /// Test-only compatibility seam for registry state-machine fixtures.
     /// Production callers must provide the transaction-owned digest through
     /// [`Self::abort_pending_activation_exact`]; this fixture helper derives
@@ -1340,7 +1398,15 @@ pub(super) fn installation_registry_path(
     Ok(canonical_root.join(INSTALLATION_REGISTRY_FILE_NAME))
 }
 
-pub(super) fn validate_installation_host_root(path: &Path) -> Result<(), InstallationError> {
+/// Validates that one retained root is an exact installation Host root.
+///
+/// A caller-supplied arbitrary path, a root outside the
+/// `Eliot/installations/<key>/host` contour, and a reparse/verbatim alias of
+/// that contour are all refused, so the owner of an installation allocation can
+/// prove the foreign-owner rejection at the owner instead of re-deriving the
+/// rule at a call site. The path name is not ownership: this admits only the
+/// shape, and the caller's protected-root lease is what proves containment.
+pub fn validate_installation_host_root(path: &Path) -> Result<(), InstallationError> {
     let identity = WindowsPathIdentity::parse_root(
         &path.to_string_lossy(),
         "installation_registry.host_root",

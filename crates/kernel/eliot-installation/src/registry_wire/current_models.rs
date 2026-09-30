@@ -22,8 +22,9 @@ use super::super::{
     ApprovedGenerationRegistry, CandidateManifest, CommittedCutoverActivation, ContractVersion,
     HostPhaseBMaterializationIntent, HostPhaseBMaterializationReceipt,
     HostPhaseBPreparedMaterialization, HostPhaseBPreparedReceipt, InstallationActivationApproval,
-    InstallerServiceRegistrationApproval, PendingActivation, PendingActivationAbortReceipt,
-    PendingActivationState, PlatformHandle, ResourceGeneration, StateFence,
+    InstallerServiceRegistrationApproval, IsolatedInstallationAllocation, PendingActivation,
+    PendingActivationAbortReceipt, PendingActivationState, PlatformHandle, ResourceGeneration,
+    StateFence,
 };
 
 use super::{PendingActivationTerminal, PendingActivationTerminalDisposition};
@@ -208,6 +209,14 @@ pub(super) struct RegistryWireV11 {
     /// migration.
     #[serde(default)]
     committed_cutover_activation: Option<CommittedCutoverActivation>,
+    /// Owner allocation of one isolated destination installation that is not
+    /// yet approved.  Like `committed_cutover_activation`, this is a member
+    /// that is legitimately absent in every earlier state, so a missing
+    /// member decodes as `None` and `INSTALLATION_REGISTRY_WIRE_VERSION` is
+    /// unchanged.  It is deliberately not a `RequiredOption`: absence means no
+    /// destination has been allocated, not a schema migration.
+    #[serde(default)]
+    isolated_installation_allocation: Option<IsolatedInstallationAllocation>,
 }
 
 /// An optional wire member whose presence is mandatory.  Explicit `null` is
@@ -254,6 +263,7 @@ impl RegistryWireV11 {
                 .0
                 .map(ActivePhaseBRebindWireV11::into_rebind),
             committed_cutover_activation: self.committed_cutover_activation,
+            isolated_installation_allocation: self.isolated_installation_allocation,
         }
     }
 }
