@@ -908,6 +908,13 @@ impl KernelComposition {
     /// A caller that reached it from a non-rehearsal posture would need owner
     /// epoch and destination evidence this front door does not hold, and would
     /// be refused by the engine's own gates rather than by a rule added here.
+    ///
+    /// The fourth selector, `backup.restore-store`, does NOT reach this entry:
+    /// it reaches [`KernelComposition::execute_backup_store_restore`], which
+    /// sends one admitted canonical batch into its already-admitted isolated
+    /// destination through the retained `KernelStoreGateway` and restores into
+    /// no journal this composition owns. The two are different owners, and
+    /// neither is a substitute for the other.
     pub fn backup_restore_with_ors_journal(
         &self,
         bundle: &eliot_backup::BackupBundle,
@@ -1519,6 +1526,37 @@ pub enum KernelFrameAction {
         /// Closed operation name from the research-provider wire.
         operation: String,
         /// Bounded operation payload carrying the typed dispatch envelope.
+        payload: serde_json::Value,
+    },
+    /// Execute one authenticated isolated Store restore batch (issue #952,
+    /// external audit `5869992012`).
+    ///
+    /// The operation is `backup.restore-store`, the front-door method selector
+    /// for the one backup request that performs a destination effect. Its
+    /// payload is the admitted #950 restore carrier and nothing else: the
+    /// fenced Store `RequestMeta` under `context`, the destination-bound
+    /// `CanonicalRestoreBatch` under `restore_batch`, and the retained archive
+    /// under `bundle_hex` whose canonical members the batch's member list is
+    /// resolved against. Shape admission is owned by
+    /// [`KernelComposition::dispatch_backup_frame`] (the exact-key wire shape,
+    /// the batch's own `validate`, which checks the destination's external
+    /// admission evidence before anything else, and the join proving the batch
+    /// carries the request's OWN correlated identity).
+    ///
+    /// Ledger-bound execution itself is owned by
+    /// [`KernelComposition::execute_backup_store_restore`], which publishes the
+    /// retained archive members through the retained `KernelBackupRestore` and
+    /// performs exactly one `KernelStoreGateway::backup_restore_batch` call over
+    /// the Store client that gateway already owns. No second client, transport,
+    /// endpoint, credential or carrier is representable on this path, and no
+    /// destination is activated, unblocked or cut over by it: the batch restores
+    /// into the already-admitted isolated destination and nothing else.
+    Backup {
+        /// Correlation identity to echo in the response.
+        request_id: RequestId,
+        /// Closed operation name; must equal `BACKUP_RESTORE_STORE_OPERATION`.
+        operation: String,
+        /// Bounded operation payload carrying context, batch and archive.
         payload: serde_json::Value,
     },
     /// Return a typed rejection, then fence the connection.
@@ -4700,18 +4738,36 @@ impl KernelComposition {
             _ => return Err(DrainHalt::new("authority-revoke-unproven")),
         }
 
-        // JobsCheckpointed: observe the daemon contour under drain. Job
-        // checkpoint/cancel semantics stay Governor-owned (handoff); Kernel
-        // admits no new daemon launches while `Draining`.
+        // JobsCheckpointed: bind the daemon owner's contour observation to
+        // this drain generation and the currently admitted State Fence, so
+        // the response names its drain, job owner and fence instead of a
+        // bare phase label. Job checkpoint/cancel semantics stay
+        // Governor-owned (handoff); Kernel neither requests checkpoints it
+        // does not own nor fabricates their artifacts, and admits no new
+        // daemon launches while `Draining`. The owner's status text is kept
+        // verbatim: completed or unknown external effects stay visible even
+        // when an owner-reported cancellation succeeds — Kernel never
+        // rewrites them into a generic rollback or CANCELLED/no-effect
+        // claim. An unreadable fence is stated, not hidden, per the
+        // fenceless-shape posture of `current_state_fence`.
         let daemon_status = self
             .daemon_runtime
             .lock()
             .map(|guard| format!("daemon-status:{:?}", guard.status))
             .map_err(|_| DrainHalt::new("daemon-contour-unavailable"))?;
+        let checkpoint_fence = self.current_state_fence().map_or_else(
+            || "fence:unreadable".to_owned(),
+            |fence| {
+                format!(
+                    "fence:{}:{}",
+                    fence.authority_epoch.lineage_id, fence.authority_epoch.sequence
+                )
+            },
+        );
         record(
             ShutdownPhase::JobsCheckpointed,
             format!(
-                "{daemon_status};no-new-daemon-launches-while-draining;job-checkpoint-owned-by-eliotd-governor-handoff"
+                "drain:{generation};{daemon_status};no-new-daemon-launches-while-draining;{checkpoint_fence};job-checkpoint-owned-by-eliotd-governor-handoff"
             ),
         )?;
 
@@ -4802,8 +4858,51 @@ impl KernelComposition {
             .map_err(|_| DrainHalt::new("module-contour-unprovable"))?;
         record(
             ShutdownPhase::ModulesQuiescedReverse,
-            format!("quiesce-requested:{}", quiescence.join(">")),
+            format!(
+                "drain:{generation};quiesce-requested:{}",
+                quiescence.join(">")
+            ),
         )?;
+        // Quiescence completion is observed from the owners after the
+        // request, never inferred from the request string above (which
+        // `record_phase` refuses to rewrite). New work is stopped only while
+        // the service still reads `Draining` here; every branch dependency
+        // the order names stays retained for the remaining writes/flushes
+        // below instead of stopping with its dependent. The completion goes
+        // on the audit chain Host and Watchdog already read, separate from
+        // the phase's request evidence, with the owner's contour kept
+        // verbatim so completed or unknown effects survive even a successful
+        // stop — no rollback or CANCELLED/no-effect wording.
+        if !matches!(self.service_state(), Ok(KernelServiceState::Draining)) {
+            return Err(DrainHalt::new("quiescence-new-work-unstopped"));
+        }
+        let quiesced_contour = self
+            .daemon_runtime
+            .lock()
+            .map(|guard| format!("daemon-status:{:?}", guard.status))
+            .map_err(|_| DrainHalt::new("daemon-contour-unavailable"))?;
+        #[cfg(windows)]
+        let retained_dependency = match self.canonical_store_gateway.lock() {
+            Ok(gateway) => {
+                if gateway.is_some() {
+                    "store-bridge"
+                } else {
+                    "store-bridge-absent"
+                }
+            }
+            Err(_) => return Err(DrainHalt::new("store-contour-unavailable")),
+        };
+        #[cfg(not(windows))]
+        let retained_dependency = "store-bridge-absent";
+        self.audit_observe(AuditEventDraft::process_daemon_status(
+            AuditEventKind::PROCESS_QUIESCED,
+            None,
+            &format!(
+                "quiescence-completed:drain:{generation};order:{};retained:{retained_dependency};{quiesced_contour}",
+                quiescence.join(">"),
+            ),
+            self.current_state_fence().as_ref(),
+        ));
 
         // Close the Store bridge before taking the final owner observation.
         // `Drain` above has already closed service admission; this fences new

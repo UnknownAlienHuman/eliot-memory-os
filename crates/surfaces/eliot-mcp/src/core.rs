@@ -2727,6 +2727,11 @@ pub fn reject_list_cursor(params: &Value, method: &'static str) -> Result<(), Wi
 }
 
 /// Bounded evidence fields recorded with an admitted MCP result.
+///
+/// `delivery` carries the bridge's I7.24 disposition observed from the
+/// recorded view (the `DeliveryStatus` wire form). It is optional so
+/// five-key envelopes still parse; when present its shape is validated and
+/// it rides both wire views instead of being dropped.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HotEvidenceEnvelope {
@@ -2735,6 +2740,15 @@ struct HotEvidenceEnvelope {
     preview: String,
     total_bytes: u64,
     truncated: bool,
+    delivery: Option<String>,
+}
+
+/// Admits only the bridge-core `DeliveryStatus` wire tokens (I7.24
+/// `FULL | PARTIAL | TRUNCATED | MISSING`). Anything else fails closed at
+/// the existing internal-error gate. The shape is validated locally so this
+/// crate gains no new dependency.
+fn is_wire_delivery_status(value: &str) -> bool {
+    matches!(value, "FULL" | "PARTIAL" | "TRUNCATED" | "MISSING")
 }
 
 /// Validates the bridge's bounded evidence envelope and returns its wire views.
@@ -2769,20 +2783,35 @@ fn evidence_wire_projection(evidence: &Value) -> Result<(Value, Value), WireReje
         ));
     }
 
-    let response_content = json!({
+    if envelope
+        .delivery
+        .as_deref()
+        .is_some_and(|delivery| !is_wire_delivery_status(delivery))
+    {
+        return Err(WireRejection::new(
+            WIRE_INTERNAL_ERROR,
+            "admitted evidence envelope could not be rendered on the wire",
+        ));
+    }
+
+    let mut response_content = json!({
         "resource_uri": envelope.uri,
         "sha256": envelope.digest,
         "size_bytes": envelope.total_bytes,
         "preview": envelope.preview,
         "truncated": envelope.truncated,
     });
-    let evidence = json!({
+    let mut evidence = json!({
         "uri": envelope.uri,
         "digest": envelope.digest,
         "preview": envelope.preview,
         "total_bytes": envelope.total_bytes,
         "truncated": envelope.truncated,
     });
+    if let Some(delivery) = envelope.delivery.as_deref() {
+        response_content["delivery"] = Value::String(delivery.to_owned());
+        evidence["delivery"] = Value::String(delivery.to_owned());
+    }
     Ok((response_content, evidence))
 }
 

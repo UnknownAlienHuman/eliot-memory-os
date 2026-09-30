@@ -134,7 +134,7 @@ claude-package:
 # Rewrites the OpenCode and Claude skill copies from integrations/agent-skills.
 # The copies are generated: edit the canonical body, then run this.
 sync-skills:
-    cargo run --quiet -p eliot-app -- host skill-sync
+    cargo run --quiet -p eliot -- host skill-sync --repo-root "{{justfile_directory()}}"
 
 # Bounded Quick profile as ordered by scripts/verify.ps1 -Profile Quick. Quick
 # success is never Review/release proof. The dependency list below is the

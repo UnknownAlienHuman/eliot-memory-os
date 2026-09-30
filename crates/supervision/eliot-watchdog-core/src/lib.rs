@@ -386,6 +386,7 @@ pub fn unix_timestamp(now: SystemTime) -> u64 {
     now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
+mod episode;
 mod health_detectors;
 mod publication;
 mod reconciliation;
@@ -414,6 +415,11 @@ pub use signals::{
     SignalAttribution, SignalDelivery, SignalDisposition, SignalId, SignalProcessing,
     SignalReferences, SignalRevision, SignalSeverity, SignalTarget, SignalValidationError,
     SourceEventRef, TimeUnit,
+};
+
+pub use episode::{
+    AcceptedSourceEvent, FailureClass, FailureEpisodeIdentity, FailureEpisodeKey,
+    SourceEventAdmission, classify_source_event, reopen_permitted,
 };
 
 pub use reconciliation::{

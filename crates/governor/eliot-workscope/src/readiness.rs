@@ -897,6 +897,8 @@ mod tests {
             task_ref: "task:one".into(),
             task_revision: 1,
             acceptance_digest: "digest:acceptance:one".into(),
+            selection_source_ref: "owner:example".into(),
+            evidence_ref: "intake:example".into(),
         }
     }
 

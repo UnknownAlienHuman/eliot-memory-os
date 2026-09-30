@@ -800,6 +800,7 @@ pub(crate) fn validate_task_inputs_match_surface(
             task_ref,
             task_revision,
             acceptance_digest,
+            ..
         }
         | TaskBindingState::Exploratory {
             task_ref,

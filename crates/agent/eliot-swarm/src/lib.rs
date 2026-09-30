@@ -181,8 +181,25 @@ pub enum SwarmError {
     IllegalTransition,
     #[error("possible effect is unresolved; the scope stays blocked")]
     EffectUnresolved,
-    #[error("independent budget bound exceeded")]
-    BudgetExceeded,
+    /// An independent budget bound was exceeded (issue #1683 A8).
+    ///
+    /// `dimension` is the exact dimension whose own remaining balance the
+    /// comparison refused, carried from the caller's dimension rather than
+    /// re-derived: `consume_budget` and `reserve_budget` each compare one
+    /// dimension's account and name that same dimension here. Before this
+    /// carried the dimension, a refusal named no reason at all, so a caller
+    /// could not tell which of the independent bounds closed, and the fact
+    /// that the three are tracked separately — "one dimension over by one
+    /// still rejects even when the others are untouched" — was unobservable
+    /// from the refusal.
+    ///
+    /// It is a pure comparison over the work unit's own admitted accounts and
+    /// returns before any spend, reserve or commit is written, so it changes
+    /// no accounting: an over-budget request still consumes nothing.
+    #[error("independent {dimension:?} budget bound exceeded")]
+    BudgetExceeded {
+        dimension: durable_work::BudgetDimension,
+    },
     #[error("operation identity was already applied")]
     DuplicateOperation,
     #[error("admitted route is unavailable or stale; no local fallback")]
@@ -4940,7 +4957,7 @@ pub mod durable_work {
             let mut next = Self::begin_transition(&current, current.phase, operation_key);
             let account = Self::budget_account_mut(&mut next, dimension)?;
             if amount > account.remaining() {
-                return Err(SwarmError::BudgetExceeded);
+                return Err(SwarmError::BudgetExceeded { dimension });
             }
             account.spent = account.spent.saturating_add(amount);
             self.commit(next)
@@ -4964,7 +4981,7 @@ pub mod durable_work {
             let mut next = Self::begin_transition(&current, current.phase, operation_key);
             let account = Self::budget_account_mut(&mut next, dimension)?;
             if amount > account.remaining() {
-                return Err(SwarmError::BudgetExceeded);
+                return Err(SwarmError::BudgetExceeded { dimension });
             }
             account.reserved = account.reserved.saturating_add(amount);
             self.commit(next)

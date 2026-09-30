@@ -1729,6 +1729,12 @@ async fn run_loop(
     // independently polled flight so a cadence handler never suspends polling
     // of the owner-feed lock holder.
     let mut improvement_intake_flight = ImprovementIntakeFlight::Idle { retained: None };
+    // #1695: this step publishes its own pass's maintenance source result, so
+    // it carries its own repeated-failure guard rather than borrowing the
+    // maintenance cadence's. A standing refusal of that publication is this
+    // stream's fact; capping it against the cadence's counts would let one
+    // stream's refusals silence another's diagnostics.
+    let mut improvement_intake_failure_guard = RepeatedFailureGuard::new();
     // Issue #2559: one cadence observation may wait for the composition lock,
     // but its wait remains in this independently polled flight. A later tick
     // cannot replace the observation already retained here.
@@ -1882,6 +1888,7 @@ async fn run_loop(
                     &flight,
                     &readiness_projection,
                     &mut improvement_intake_flight,
+                    &mut improvement_intake_failure_guard,
                 );
             }
             completion = next_activation_completion(&mut flight) => {
@@ -1972,7 +1979,11 @@ async fn run_loop(
                 );
             }
             completion = next_improvement_intake_completion(&mut improvement_intake_flight) => {
-                settle_improvement_intake_completion(&mut improvement_intake_flight, completion);
+                settle_improvement_intake_completion(
+                    &mut improvement_intake_flight,
+                    completion,
+                    &mut improvement_intake_failure_guard,
+                );
             }
             heartbeat_completion = next_health_heartbeat_completion(&mut health_heartbeat_flight) => {
                 settle_health_heartbeat_completion(
@@ -2485,6 +2496,11 @@ async fn publish_maintenance_source_results(
     // route actually returned. A publication identity, the job's own
     // `outcome_ref`, and the fact that a job completed settle nothing here.
     let mut admitted: Vec<eliot_maintenance::AdmittedObservationReceipt> = Vec::new();
+    // Each admitted observation's own recorded instant, kept beside the exact
+    // receipt that admitted it. This is the only clock reading this function
+    // uses, and it comes from an admitted record rather than from a second
+    // reading of the wall clock.
+    let mut observation_instants: Vec<(String, u64)> = Vec::new();
     for obligation in &obligations {
         let publication = {
             let guard = composition.lock().await;
@@ -2496,8 +2512,13 @@ async fn publish_maintenance_source_results(
             Ok(
                 eliotd::maintenance_trigger_evaluator::MaintenanceResultPublication::Reconciled {
                     receipt,
+                    observed_at_unix_ms,
                 },
             ) => {
+                // The instant the admitted observation record itself carries, so
+                // a later delayed comparison is bounded below by an admitted
+                // observation rather than by when the evaluator runs.
+                observation_instants.push((obligation.publication_id.clone(), observed_at_unix_ms));
                 // Only a job-side obligation can be settled durably. The
                 // decision's own non-execution result has no retained job
                 // revision to admit onto, and inventing one would be a second
@@ -2685,6 +2706,186 @@ async fn publish_maintenance_source_results(
             }
         }
     }
+    // Delayed utility evaluation, after the coverage census rather than inside
+    // it. Coverage says which results owe an observation; this says whether the
+    // work improved the maintained subsystem, which is a different fact needing
+    // its own evidence. It runs only for a result whose observation the store
+    // actually admitted, because a comparison anchored to a publication the
+    // store never accepted measures nothing.
+    evaluate_admitted_maintenance_results(
+        composition,
+        &jobs,
+        &admitted,
+        &observation_instants,
+        failure_guard,
+    )
+    .await;
+}
+
+/// Appends one delayed utility evaluation per admitted maintenance result.
+///
+/// This is the production binding of delayed evaluation to the maintenance
+/// owner (I14.22, issue #1695 W4). For each declared job it reads the owner's
+/// own retained obligation chain through the existing durable-job route, and for
+/// the chain's latest result asks whether the canonical route admitted that
+/// result's observation. Only an admitted result is evaluated, and only the
+/// measurement set this daemon genuinely observed is presented.
+///
+/// What this function deliberately does **not** do is invent a comparison. This
+/// daemon observes no product pulse, no billed cost and no operator-time
+/// measurement, so it presents none: every required metric the comparison did
+/// not observe is appended as explicitly `UNKNOWN` over a preserved blind
+/// interval, and the verdict the maintenance owner records is `PENDING`. That
+/// is the honest state and it is the reason a completed job can never read as
+/// beneficial — the contract's own benefit predicate requires all five of its
+/// required metrics measured, and no daemon-side observation satisfies the cost
+/// one. A `BENEFICIAL` verdict becomes reachable only when a real measurement
+/// owner supplies the missing comparisons, which is a new evidence owner rather
+/// than a new verdict path.
+///
+/// The appended revision publishes through the existing
+/// [`publish_maintenance_source_results`] route on the next pass, because it is
+/// an ordinary entry in the same append-only obligation chain.
+///
+/// This function reaches no trigger, admits no job and appends no lifecycle
+/// transition. It is a pure read plus one durable append per admissible result,
+/// so a repeated unchanged result is refused by the owner rather than looping.
+///
+/// The three steps stay in this order in this function, because the order is
+/// what keeps an unadmitted result from ever being evaluated: the admission gate
+/// runs first and continues past a result the store never admitted, only then is
+/// the comparison window derived from admitted records alone, and only then is the
+/// durable append requested.
+async fn evaluate_admitted_maintenance_results(
+    composition: &SharedComposition,
+    jobs: &[eliot_maintenance::MaintenanceJob],
+    admitted: &[eliot_maintenance::AdmittedObservationReceipt],
+    observation_instants: &[(String, u64)],
+    failure_guard: &mut RepeatedFailureGuard,
+) {
+    for declared in jobs {
+        // The revision read above publication still carries `Pending` delivery,
+        // because a publication identity settles nothing on its own. The
+        // admission is settled on the durable revision, so the chain is re-read
+        // through the same authenticated durable-job route rather than trusted
+        // from the local snapshot.
+        let job = {
+            let guard = composition.lock().await;
+            guard.retained_maintenance_job(&declared.job_id)
+        };
+        let job = match job {
+            Ok(Some(job)) => job,
+            Ok(None) => continue,
+            Err(error) => {
+                if failure_guard.should_emit() {
+                    let _ = eliotd::diagnostics::ErrorRecord::of(
+                        eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                        "maintenance-utility-evaluation",
+                        &error.to_string(),
+                    )
+                    .emit();
+                }
+                continue;
+            }
+        };
+        let Some(source) = job.result_obligations.last() else {
+            continue;
+        };
+        // A chain whose tail is already an appended evaluation revision owes no
+        // further comparison: that result was evaluated, and re-evaluating it
+        // would be the autonomous loop the owner refuses. Later comparisons
+        // arrive through later source results, not by revisiting this one.
+        if source.utility_evaluation.is_some() {
+            continue;
+        }
+        let evaluable = match eliot_maintenance::result_is_evaluable(source, admitted) {
+            Ok(evaluable) => evaluable,
+            Err(error) => {
+                if failure_guard.should_emit() {
+                    let _ = eliotd::diagnostics::ErrorRecord::of(
+                        eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                        "maintenance-utility-evaluation",
+                        &error.to_string(),
+                    )
+                    .emit();
+                }
+                continue;
+            }
+        };
+        if !evaluable {
+            // The result's own observation is not admitted, so there is no
+            // admitted anchor for a comparison. Its verdict stays `PENDING`
+            // until the observation is admitted, which is not a failure here.
+            continue;
+        }
+        // The comparison window runs from the instant the admitted source
+        // observation itself carries to this evaluation.
+        let Some(window) = evaluation_window_for(&source.publication_id, observation_instants)
+        else {
+            continue;
+        };
+        // No comparison was observed in this pass, so none is presented. The
+        // owner records the explicit unknown with the reason it is unknown.
+        let evidence = eliot_maintenance::UtilityEvaluationEvidence::default();
+        let appended = {
+            let mut guard = composition.lock().await;
+            guard.evaluate_maintenance_utility(&job.job_id, window, &evidence)
+        };
+        match appended {
+            Ok(appended) => {
+                let evaluation = appended
+                    .result_obligations
+                    .last()
+                    .and_then(|obligation| obligation.utility_evaluation.as_ref());
+                tracing::info!(
+                    target: "eliotd::diagnostics",
+                    event = "eliotd.maintenance_utility_evaluated",
+                    job = %eliotd::diagnostics::sanitize_identity(&appended.job_id),
+                    source_publication_id =
+                        %eliotd::diagnostics::sanitize_identity(&source.publication_id),
+                    verdict = ?evaluation.map(|evaluation| evaluation.utility_verdict),
+                );
+            }
+            Err(error) => {
+                if failure_guard.should_emit() {
+                    let _ = eliotd::diagnostics::ErrorRecord::of(
+                        eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                        "maintenance-utility-evaluation",
+                        &error.to_string(),
+                    )
+                    .emit();
+                }
+            }
+        }
+    }
+}
+
+/// Derives the one comparison window an admitted maintenance result is evaluated
+/// over, or `None` when no admitted record bounds it.
+///
+/// Both bounds come from admitted records rather than from an assumed window
+/// length: the lower bound is the instant the source result's own admitted
+/// observation carries, and the upper bound is the latest instant any admitted
+/// record in this pass carries. Without the source's own admitted instant there
+/// is no admitted lower bound at all, so the comparison is not attempted rather
+/// than bounded by a guess.
+///
+/// A pure read over the caller's admitted instants. It reaches no lock, no
+/// composition, no store and no transaction: the append stays in the caller.
+fn evaluation_window_for(
+    source_publication_id: &str,
+    observation_instants: &[(String, u64)],
+) -> Option<eliot_observation_contracts::CoverageInterval> {
+    let start = observation_instants
+        .iter()
+        .find(|(publication_id, _)| publication_id.as_str() == source_publication_id)
+        .map(|(_, instant)| *instant)?;
+    let evaluated_at = observation_instants
+        .iter()
+        .map(|(_, instant)| *instant)
+        .max()
+        .unwrap_or(start);
+    eliot_observation_contracts::CoverageInterval::new(start, evaluated_at).ok()
 }
 
 /// Maps one terminal store receipt status onto the maintenance owner's refusal
@@ -3537,7 +3738,13 @@ async fn drain_flights_on_shutdown(
                 );
             }
             completion = next_improvement_intake_completion(improvement_intake_flight) => {
-                settle_improvement_intake_completion(improvement_intake_flight, completion);
+                // No new tick starts in the drain, so this stream's guard settles
+                // into the same throwaway slot the other in-flight guards use.
+                settle_improvement_intake_completion(
+                    improvement_intake_flight,
+                    completion,
+                    &mut shutdown_failure_guard,
+                );
             }
             heartbeat_completion = next_health_heartbeat_completion(health_heartbeat_flight) => {
                 discard_shutdown_heartbeat_completion(
@@ -5387,8 +5594,17 @@ enum ImprovementIntakeCompletion {
     /// The pipeline-checked current record the route admitted, which the NEXT
     /// pass compares against for its own repeat assessment. `None` on any pass
     /// that was not admitted, so an unadmitted pass never accumulates a record to
-    /// compare against.
-    Settled(Option<eliot_maintenance::RetainedImprovementProposal>),
+    /// compare against, together with the pass's own repeated-failure guard.
+    ///
+    /// The guard travels out and back for the same reason every other flight's
+    /// does (#740 A14): the step now publishes this pass's maintenance source
+    /// result, and a standing publication refusal must be capped against this
+    /// stream's own counts rather than conflated with the maintenance cadence's
+    /// or the health heartbeat's.
+    Settled(
+        Option<eliot_maintenance::RetainedImprovementProposal>,
+        RepeatedFailureGuard,
+    ),
 }
 
 struct ImprovementIntakeFlightState {
@@ -5426,12 +5642,21 @@ enum ImprovementIntakeFlight {
     InFlight(ImprovementIntakeFlightState),
 }
 
-/// Evaluates one real maintenance observation and assembles the
-/// owner-actionable improvement artifact over it, under the composition guard.
+/// Assembles the owner-actionable improvement artifact over one already
+/// evaluated maintenance trigger decision, under the composition guard.
 ///
-/// Four reads and one pure assembly, all under the lock:
+/// The decision is a parameter, not a step of this function, because it is
+/// itself a maintenance source result the moment the owner produces it. It is
+/// published by [`run_improvement_intake`] immediately after the owner returns
+/// it and before any assembly below is attempted, so a decision whose artifact
+/// cannot be assembled — or whose artifact is assembled and then refused at a
+/// later phase — is published on exactly the same route as a fully admitted
+/// pass. Evaluating here instead would have bound publication to the success
+/// branch of the improvement funnel, which is the one place a maintenance
+/// result is least likely to be interesting and most likely to be dropped.
 ///
-/// - the maintenance trigger decision, from the live observation;
+/// Three reads and one pure assembly, all under the lock:
+///
 /// - the admitted Kernel fence for this pass, which is also the fence the
 ///   deduplication registry is read back at;
 /// - the maintenance (`G-19`) improvement admission policy record, read from
@@ -5457,11 +5682,12 @@ enum ImprovementIntakeFlight {
 /// been released for the read — the same contour the Skill and ControlBoard
 /// reads already use.
 ///
-/// The guarded phase performs no exchange: evaluating, assembling and reading
-/// the policy are all pure with respect to the Kernel.
+/// The guarded phase performs no exchange: assembling and reading the policy
+/// are pure with respect to the Kernel, and the evaluation that produced the
+/// decision is its own guarded phase beside it.
 fn improvement_intake_artifact(
     composition: &DaemonComposition,
-    observation: MaintenanceObservation,
+    decision: &eliot_maintenance::AutomationTriggerDecision,
 ) -> Result<
     (
         eliotd::improvement_intake_dispatch::ImprovementArtifact,
@@ -5470,9 +5696,6 @@ fn improvement_intake_artifact(
     ),
     String,
 > {
-    let decision = composition
-        .evaluate_maintenance_trigger(observation)
-        .map_err(|error| error.to_string())?;
     let fence = composition
         .notification_state_admission_fence()
         .map_err(|error| error.to_string())?;
@@ -5482,7 +5705,7 @@ fn improvement_intake_artifact(
     // learning-delta store whose newest committed record IS an
     // owner-observed consequential boundary.
     let artifact = eliotd::improvement_intake_dispatch::assemble_improvement_artifact(
-        &decision,
+        decision,
         &fence,
         composition.learning_closure().store(),
     )
@@ -5492,8 +5715,8 @@ fn improvement_intake_artifact(
     // policy a candidate is admitted under names the observation it belongs to.
     let policy = composition
         .maintenance_improvement_admission_policy(
-            &eliotd::improvement_intake_dispatch::improvement_bound_operation(&decision),
-            &eliotd::improvement_intake_dispatch::improvement_bound_idempotency_key(&decision),
+            &eliotd::improvement_intake_dispatch::improvement_bound_operation(decision),
+            &eliotd::improvement_intake_dispatch::improvement_bound_idempotency_key(decision),
         )
         .map_err(|error| error.to_string())?;
     Ok((artifact, policy, fence))
@@ -5560,10 +5783,16 @@ fn admit_over_restored_registry(
 /// through the Governor `RecordLearningRecord` seam, and route the committed
 /// artifact through the Governor improvement pipeline.
 ///
-/// Six phases, and the lock is held for three of them:
+/// Six phases, and the lock is taken more than once because phase 1 is split
+/// around the publication:
 ///
-/// 1. guarded: evaluate the observation, capture the admitted fence, assemble
-///    the artifact, read the `G-19` admission policy;
+/// 1. guarded, in two steps: evaluate the observation into the maintenance
+///    owner's own decision; then, UNGUARDED, publish that decision's source
+///    result through [`publish_maintenance_source_results`]; then guarded again
+///    to capture the admitted fence, assemble the artifact and read the `G-19`
+///    admission policy. The split exists because the decision is a maintenance
+///    source result in its own right and owes its observation whether or not
+///    the phases below it ever run;
 /// 2. UNGUARDED: read the whole candidate scope back through the existing
 ///    authenticated `GetLearningRecordRange` route at the fence captured in
 ///    phase 1. No mutex is held across this await, exactly as the Skill
@@ -5601,15 +5830,65 @@ fn admit_over_restored_registry(
 /// refusal above returns the record it was handed rather than clearing it: a
 /// refused pass produced no new record, and that is not evidence the last
 /// admitted one stopped existing.
+///
+/// # The maintenance source result is published before any of it
+///
+/// Phase 1 here is the maintenance owner evaluating this pass's observation, and
+/// its answer is a maintenance source result in its own right — the same answer
+/// the idle cadence site and the health-heartbeat site already publish through
+/// [`publish_maintenance_source_results`]. It is published immediately after the
+/// owner returns it, unguarded, on that same route, so this pass's decision is
+/// in coverage whether or not the improvement funnel goes on to admit anything.
+///
+/// That is the whole point of the placement. Assembling the artifact, reading
+/// the registry, admitting, committing and routing are five later phases, each
+/// of which can refuse. Publishing at the end of the pass would have bound
+/// publication to the improvement funnel's success branch, and a maintenance
+/// decision that a broken funnel never got to act on is exactly the result whose
+/// absence would be least noticed and most costly to lose.
+///
+/// The exchange is NOT recursive: [`publish_maintenance_source_results`] writes
+/// the observation through the canonical route and settles the obligation on the
+/// retained job revision. Neither step evaluates a maintenance trigger, so
+/// admitting one result cannot produce another decision to publish. The
+/// publication here is bounded by the same 30s transport deadline the other two
+/// sites use, and the composition lock is not held across it.
 async fn run_improvement_intake(
     kernel: &Arc<DaemonKernelClient>,
     composition: &SharedComposition,
     observation: MaintenanceObservation,
     retained: Option<&eliot_maintenance::RetainedImprovementProposal>,
+    failure_guard: &mut RepeatedFailureGuard,
 ) -> Option<eliot_maintenance::RetainedImprovementProposal> {
+    // Phase 1a: the maintenance owner's own decision, under the guard. It is
+    // evaluated on its own so the decision is in hand even when the artifact
+    // assembly below refuses — an evaluation that produced nothing publishes
+    // nothing, which is the only correct outcome for a decision that was never
+    // made.
+    let decision = {
+        let guard = composition.lock().await;
+        guard.evaluate_maintenance_trigger(observation)
+    };
+    let decision = match decision {
+        Ok(decision) => decision,
+        Err(error) => {
+            let _ = eliotd::diagnostics::ErrorRecord::of(
+                eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                "improvement-intake",
+                &error.to_string(),
+            )
+            .emit();
+            // A pass that never got a decision retains nothing new; the prior
+            // admitted record stays.
+            return retained.cloned();
+        }
+    };
+    // Phase 1b: publish that decision's source result, unguarded, before any
+    // intake-specific phase can succeed or fail.
+    publish_maintenance_source_results(composition, &decision, failure_guard).await;
     let prepared = {
         let guard = composition.lock().await;
-        improvement_intake_artifact(&guard, observation)
+        improvement_intake_artifact(&guard, &decision)
     };
     let (artifact, policy, fence) = match prepared {
         Ok(prepared) => prepared,
@@ -6168,12 +6447,20 @@ async fn record_unknown_effect_obligation(
 /// or refuses still leaves the last admitted record in place for the pass after
 /// it. Only settlement replaces it, and only with a record the pipeline itself
 /// committed on an admitted pass.
+///
+/// This stream's repeated-failure guard is REPLACED into the future and returns
+/// in the completion, exactly as the maintenance cadence and health-heartbeat
+/// guards do. It is a distinct guard rather than a shared one because the step
+/// now performs its own canonical maintenance-result publication, and capping
+/// that stream against the maintenance cadence's counts would let one stream's
+/// refusals silence another's diagnostics.
 fn maybe_start_improvement_intake(
     kernel: &Arc<DaemonKernelClient>,
     composition: &SharedComposition,
     activation_flight: &ActivationFlight,
     startup_readiness: &StartupReadinessProjection,
     flight: &mut ImprovementIntakeFlight,
+    failure_guard: &mut RepeatedFailureGuard,
 ) {
     let retained = match flight {
         // The clone is a pointer copy: the flight's record is already boxed, so
@@ -6185,12 +6472,18 @@ fn maybe_start_improvement_intake(
     let observation = improvement_intake_observation(activation_flight, startup_readiness);
     let kernel = Arc::clone(kernel);
     let composition = Arc::clone(composition);
+    let mut failure_guard = std::mem::replace(failure_guard, RepeatedFailureGuard::new());
     *flight = ImprovementIntakeFlight::InFlight(ImprovementIntakeFlightState {
         future: Box::pin(async move {
-            let retained_next =
-                run_improvement_intake(&kernel, &composition, observation, retained.as_deref())
-                    .await;
-            ImprovementIntakeCompletion::Settled(retained_next)
+            let retained_next = run_improvement_intake(
+                &kernel,
+                &composition,
+                observation,
+                retained.as_deref(),
+                &mut failure_guard,
+            )
+            .await;
+            ImprovementIntakeCompletion::Settled(retained_next, failure_guard)
         }),
     });
 }
@@ -6213,11 +6506,18 @@ async fn next_improvement_intake_completion(
 /// The record the step retained goes back into `Idle` and is the input to the
 /// NEXT pass's repeat assessment. It is the pipeline's own checked record, not a
 /// recomputation; see [`ImprovementIntakeFlight`].
+///
+/// The guard the step carried goes back to the caller's slot at the same moment,
+/// so the next pass starts from the counts this pass actually reached. At
+/// shutdown the caller settles it into a throwaway slot instead, because no new
+/// tick starts there and the counts are meaningless.
 fn settle_improvement_intake_completion(
     flight: &mut ImprovementIntakeFlight,
     completion: ImprovementIntakeCompletion,
+    failure_guard: &mut RepeatedFailureGuard,
 ) {
-    let ImprovementIntakeCompletion::Settled(retained) = completion;
+    let ImprovementIntakeCompletion::Settled(retained, completion_guard) = completion;
+    *failure_guard = completion_guard;
     *flight = ImprovementIntakeFlight::Idle {
         // Boxed for the enum's arm-size balance only; the stored value and the
         // value the step returns are the same record, and boxing moves no

@@ -1100,6 +1100,15 @@ pub enum TaskBindingState {
         task_ref: String,
         task_revision: u64,
         acceptance_digest: String,
+        /// Owner-proven selection source carried from the promoting owner
+        /// (`TaskIntakeCandidate::promote`): the admitting decision owner or
+        /// the delegating binding. The bind path compares the resulting
+        /// evidence content against the live activation; it never synthesizes
+        /// this reference.
+        selection_source_ref: String,
+        /// Owner-proven selection evidence carried from the promoting owner:
+        /// the exact intake handle the selection was admitted from.
+        evidence_ref: String,
     },
     Ambiguous {
         candidate_handles: Vec<String>,
@@ -1281,42 +1290,7 @@ impl OnboardingReadinessReceipt {
         self.state_fence
             .validate()
             .map_err(|_| WorkScopeError::InvalidStateFence)?;
-        match &self.task_binding {
-            TaskBindingState::None_ => Ok(()),
-            TaskBindingState::Exploratory {
-                task_ref,
-                task_revision,
-                acceptance_digest,
-            }
-            | TaskBindingState::CurrentTaskContract {
-                task_ref,
-                task_revision,
-                acceptance_digest,
-            } => {
-                text(task_ref, "task_ref")?;
-                counter(*task_revision, "task_revision")?;
-                text(acceptance_digest, "acceptance_digest")
-            }
-            TaskBindingState::Ambiguous { candidate_handles } => {
-                if candidate_handles.len() < 2 || candidate_handles.len() > 16 {
-                    return Err(WorkScopeError::EmptyCollection {
-                        field: "candidate_handles",
-                    });
-                }
-                unique(candidate_handles.iter(), "candidate_handles")?;
-                for handle in candidate_handles {
-                    text(handle, "candidate_handles")?;
-                }
-                Ok(())
-            }
-            TaskBindingState::Stale {
-                task_ref,
-                task_revision,
-            } => {
-                text(task_ref, "task_ref")?;
-                counter(*task_revision, "task_revision")
-            }
-        }?;
+        self.validate_task_binding()?;
         if self.limiting_integration_evidence.is_empty()
             || self.limiting_integration_evidence.len() > 8
         {
@@ -1342,6 +1316,64 @@ impl OnboardingReadinessReceipt {
         Self::check_store_seed_maintenance(self)?;
         counter(self.expiry_tick, "expiry_tick")?;
         Ok(())
+    }
+
+    /// Validates the task-binding state of one receipt.
+    ///
+    /// Split from [`Self::validate`] so the receipt validator stays within its
+    /// line budget; the `Current` arm carries the owner-proven selection
+    /// source/evidence refs the promoting owner admitted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any binding reference is blank, a revision is
+    /// zero, a digest has the wrong shape, or a bounded collection leaves its
+    /// range.
+    fn validate_task_binding(&self) -> Result<(), WorkScopeError> {
+        match &self.task_binding {
+            TaskBindingState::None_ => Ok(()),
+            TaskBindingState::Exploratory {
+                task_ref,
+                task_revision,
+                acceptance_digest,
+            } => {
+                text(task_ref, "task_ref")?;
+                counter(*task_revision, "task_revision")?;
+                text(acceptance_digest, "acceptance_digest")
+            }
+            TaskBindingState::CurrentTaskContract {
+                task_ref,
+                task_revision,
+                acceptance_digest,
+                selection_source_ref,
+                evidence_ref,
+            } => {
+                text(task_ref, "task_ref")?;
+                counter(*task_revision, "task_revision")?;
+                text(acceptance_digest, "acceptance_digest")?;
+                text(selection_source_ref, "selection_source_ref")?;
+                text(evidence_ref, "evidence_ref")
+            }
+            TaskBindingState::Ambiguous { candidate_handles } => {
+                if candidate_handles.len() < 2 || candidate_handles.len() > 16 {
+                    return Err(WorkScopeError::EmptyCollection {
+                        field: "candidate_handles",
+                    });
+                }
+                unique(candidate_handles.iter(), "candidate_handles")?;
+                for handle in candidate_handles {
+                    text(handle, "candidate_handles")?;
+                }
+                Ok(())
+            }
+            TaskBindingState::Stale {
+                task_ref,
+                task_revision,
+            } => {
+                text(task_ref, "task_ref")?;
+                counter(*task_revision, "task_revision")
+            }
+        }
     }
 
     /// Validates the store, seed, and maintenance views of one receipt.
@@ -1477,6 +1509,11 @@ pub enum TaskBindingInput {
         task_ref: String,
         task_revision: u64,
         acceptance_digest: String,
+        /// Owner that established the selection: the admitting Human decision
+        /// owner, or the delegating binding for a delegated promotion.
+        selection_source_ref: String,
+        /// Exact intake evidence that produced the selection.
+        evidence_ref: String,
     },
     AmbiguousCandidates(Vec<String>),
     Stale {
@@ -1975,12 +2012,20 @@ impl ColdStartController {
                 task_ref,
                 task_revision,
                 acceptance_digest,
-            } => Self::check_task_ref(task_ref, task_revision, acceptance_digest, false),
+            } => Self::check_task_ref(task_ref, task_revision, acceptance_digest),
             TaskBindingInput::Current {
                 task_ref,
                 task_revision,
                 acceptance_digest,
-            } => Self::check_task_ref(task_ref, task_revision, acceptance_digest, true),
+                selection_source_ref,
+                evidence_ref,
+            } => Self::check_current_task_ref(
+                task_ref,
+                task_revision,
+                acceptance_digest,
+                selection_source_ref,
+                evidence_ref,
+            ),
             TaskBindingInput::AmbiguousCandidates(handles) => {
                 Self::check_ambiguous_handles(handles)
             }
@@ -2004,11 +2049,12 @@ impl ColdStartController {
         }
     }
 
-    fn check_task_ref(
+    fn check_current_task_ref(
         task_ref: String,
         task_revision: u64,
         acceptance_digest: String,
-        material: bool,
+        selection_source_ref: String,
+        evidence_ref: String,
     ) -> Result<
         (
             TaskBindingState,
@@ -2022,31 +2068,51 @@ impl ColdStartController {
         text(&task_ref, "task_ref")?;
         counter(task_revision, "task_revision")?;
         text(&acceptance_digest, "acceptance_digest")?;
-        if material {
-            Ok((
-                TaskBindingState::CurrentTaskContract {
-                    task_ref,
-                    task_revision,
-                    acceptance_digest,
-                },
-                ScopeResolutionState::Authenticated,
-                ReadinessLifecycle::ReadyMaterial,
-                Vec::new(),
-                "execute_current_task_contract".to_owned(),
-            ))
-        } else {
-            Ok((
-                TaskBindingState::Exploratory {
-                    task_ref,
-                    task_revision,
-                    acceptance_digest,
-                },
-                ScopeResolutionState::Provisional,
-                ReadinessLifecycle::ReadyReadOnly,
-                Vec::new(),
-                "read_only_governing_sources".to_owned(),
-            ))
-        }
+        text(&selection_source_ref, "selection_source_ref")?;
+        text(&evidence_ref, "evidence_ref")?;
+        Ok((
+            TaskBindingState::CurrentTaskContract {
+                task_ref,
+                task_revision,
+                acceptance_digest,
+                selection_source_ref,
+                evidence_ref,
+            },
+            ScopeResolutionState::Authenticated,
+            ReadinessLifecycle::ReadyMaterial,
+            Vec::new(),
+            "execute_current_task_contract".to_owned(),
+        ))
+    }
+
+    fn check_task_ref(
+        task_ref: String,
+        task_revision: u64,
+        acceptance_digest: String,
+    ) -> Result<
+        (
+            TaskBindingState,
+            ScopeResolutionState,
+            ReadinessLifecycle,
+            Vec<String>,
+            String,
+        ),
+        WorkScopeError,
+    > {
+        text(&task_ref, "task_ref")?;
+        counter(task_revision, "task_revision")?;
+        text(&acceptance_digest, "acceptance_digest")?;
+        Ok((
+            TaskBindingState::Exploratory {
+                task_ref,
+                task_revision,
+                acceptance_digest,
+            },
+            ScopeResolutionState::Provisional,
+            ReadinessLifecycle::ReadyReadOnly,
+            Vec::new(),
+            "read_only_governing_sources".to_owned(),
+        ))
     }
 
     fn check_ambiguous_handles(
@@ -3612,6 +3678,8 @@ mod tests {
             task_ref: "task:one".into(),
             task_revision: 1,
             acceptance_digest: "digest:acceptance:one".into(),
+            selection_source_ref: "owner:example".into(),
+            evidence_ref: "intake:example".into(),
         }
     }
 

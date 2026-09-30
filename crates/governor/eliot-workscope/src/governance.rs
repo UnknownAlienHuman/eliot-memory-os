@@ -671,6 +671,7 @@ fn validate_admission_request(request: &SourceAdmissionRequest) -> Result<(), Wo
                 task_ref,
                 task_revision,
                 acceptance_digest,
+                ..
             } => {
                 text(task_ref, "proven_binding.task_ref")?;
                 counter(*task_revision, "proven_binding.task_revision")?;
@@ -1353,7 +1354,11 @@ impl TaskIntakeCandidate {
     /// prompt text never authorizes itself. The admitting owner assigns the
     /// task revision, so promotion invents no contract identity. Completeness
     /// is recomputed from the fields; a forged `missing_fields` list fails
-    /// validation before any authority check.
+    /// validation before any authority check. The proven selection act travels
+    /// with the binding: `selection_source_ref` names the admitting decision
+    /// owner (or the delegating binding), and `evidence_ref` names this
+    /// intake, so the bind path can compare owner evidence instead of
+    /// request-supplied structure.
     ///
     /// # Errors
     ///
@@ -1368,10 +1373,19 @@ impl TaskIntakeCandidate {
     ) -> Result<TaskBindingInput, WorkScopeError> {
         self.validate()?;
         basis.validate()?;
-        match basis {
+        // The selection act this promotion records: the admitting Human
+        // decision owner, or the delegating binding for a delegated promotion.
+        // Both are proven above, never reconstructed from an unrelated handle.
+        let selection_source_ref = match basis {
             AuthorityBasis::HumanOwner { owner_ref }
-                if self.decision_owner_ref.as_deref() == Some(owner_ref.as_str()) => {}
-            AuthorityBasis::DelegatedTaskBinding { task_ref, .. } => {
+                if self.decision_owner_ref.as_deref() == Some(owner_ref.as_str()) =>
+            {
+                owner_ref.clone()
+            }
+            AuthorityBasis::DelegatedTaskBinding {
+                binding_ref,
+                task_ref,
+            } => {
                 let TaskBindingState::CurrentTaskContract {
                     task_ref: parent_ref,
                     ..
@@ -1382,11 +1396,12 @@ impl TaskIntakeCandidate {
                 if parent_ref != task_ref {
                     return Err(WorkScopeError::TaskAuthorityDenied);
                 }
+                binding_ref.clone()
             }
             AuthorityBasis::HumanOwner { .. } | AuthorityBasis::ProjectContract { .. } => {
                 return Err(WorkScopeError::TaskAuthorityDenied);
             }
-        }
+        };
         if !self.is_complete() {
             return Err(WorkScopeError::EmptyCollection {
                 field: "task_intake.missing_fields",
@@ -1402,6 +1417,8 @@ impl TaskIntakeCandidate {
             task_ref: self.intake_ref.clone(),
             task_revision,
             acceptance_digest,
+            selection_source_ref,
+            evidence_ref: self.intake_ref.clone(),
         })
     }
 

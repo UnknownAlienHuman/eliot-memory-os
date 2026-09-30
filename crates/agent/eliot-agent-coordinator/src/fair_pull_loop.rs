@@ -5,10 +5,25 @@
 //! attempt releases its slot, then the next currently admissible Ready Work
 //! Item is selected. Mechanical queue progress never depends on an LLM
 //! remembering to start another agent." The selector behind that sentence is
-//! [`AgentCoordinator::pull_next`](crate::AgentCoordinator::pull_next); the
-//! types here are the *join* around it — what arms it, what one drive is
-//! allowed to do, and what the caller is told. The drive itself is
-//! [`AgentCoordinator::drive_fair_pull`], next to the selector it drives.
+//! `AgentCoordinator::select_ready`; the types here are the *join* around it —
+//! what arms it, what one drive is allowed to do, and what the caller is told.
+//! The drive itself is [`AgentCoordinator::drive_fair_pull`], which calls that
+//! selector directly.
+//!
+//! It is worth being exact about which entry point the production path uses,
+//! because two sibling selectors sit next to it and neither is on that path.
+//! `drive_fair_pull` calls `AgentCoordinator::select_ready` twice per drive
+//! (once before the loop and once after every start), **not**
+//! [`AgentCoordinator::pull_next`], which is a thin profile-bound wrapper over
+//! the same selector and has no caller anywhere in the tree. Selecting over
+//! `select_ready` rather than over `pull_next` is not a stylistic choice: the
+//! drive needs the attempt record, the canonical enqueue ordinal and the stored
+//! admission receipt between the pull and the start, so an extra wrapper that
+//! returned only a `ReadySelectionOutcome` would be a hop it cannot use.
+//! [`AgentCoordinator::pull_next`] and [`AgentCoordinator::next_ready`] are
+//! single-shot reads for callers that want one decision and no drive; neither is
+//! reached from production, and this module's reachability claim below is a
+//! claim about `drive_fair_pull` only.
 //!
 //! # Event-driven *with* bounded recovery polling, and which of the two is
 //! # authoritative
@@ -45,7 +60,7 @@
 //! never depends on an LLM remembering to start another agent" is the
 //! normative consequence: a reminder that can be forgotten is not a scheduler.
 //!
-//! Three facts make that a real join rather than a restatement:
+//! Four facts make that a real join rather than a restatement:
 //!
 //! 1. **The wake is a coordinator transition, not a separate notification.**
 //!    The event that releases the slot is the same event that arms the drive,
@@ -63,6 +78,13 @@
 //!    `CoordinatorConfig::max_admitted_attempts`, so the loop is finite with no
 //!    constant chosen by this module. The recovery poll's own cadence belongs
 //!    to the caller's existing bounded tick; this crate names no interval.
+//! 4. **The selector is one function, and the drive is its only production
+//!    entry.** `drive_fair_pull` calls `AgentCoordinator::select_ready`
+//!    directly. The two sibling selectors named above, `pull_next` and
+//!    `next_ready`, are single-shot reads and neither is on the production path;
+//!    keeping the drive on the selector itself is what lets it re-pull over the
+//!    live view after every start, which a wrapper returning one decision could
+//!    not do.
 //!
 //! Selection is not execution. A drive turns a selection into a `Running`
 //! attempt through the existing [`AgentCoordinator::start_attempt`] transition,
@@ -80,22 +102,22 @@
 //!
 //! # Production reachability
 //!
-//! Reachable in a non-test build, and the two arms are separate callers:
+//! Reachable in a non-test build, and the two arms are separate callers. Each
+//! hop below is a `path.rs::symbol` name that `git grep` confirms, so the claim
+//! is checkable rather than a bare file path:
 //!
-//! - **Event arm.** `AgentFabric::drive_fair_pull` in
-//!   `bins/eliotd/src/agent_fabric.rs` calls
+//! - **Event arm.** `agent_fabric.rs::AgentFabric::drive_fair_pull` calls
 //!   [`AgentCoordinator::drive_fair_pull`] on the daemon's live coordinator, and
-//!   `solo_agent_driver::solo_ingest_result` calls that on the production
+//!   `solo_agent_driver.rs::solo_ingest_result` calls *that* on the production
 //!   worker settle path, so released capacity advances work in the same
 //!   operation that released it. Neither is `cfg(test)`-gated.
-//! - **Recovery-poll arm.** `solo_agent_driver::solo_fair_pull_recovery` in
-//!   `bins/eliotd/src/solo_agent_driver.rs` calls the same
-//!   [`AgentCoordinator::drive_fair_pull`] on the daemon's existing bounded
-//!   activation cadence, and `daemon_runtime::maybe_start_fair_pull_recovery`
-//!   starts it on **every** tick of that cadence. It is not gated on a pending
-//!   wake, on a prior failure, or on anything else: that is what makes it a
-//!   fallback rather than a degraded mode, and it is the arm that survives a
-//!   lost notification.
+//! - **Recovery-poll arm.** `solo_agent_driver.rs::solo_fair_pull_recovery`
+//!   calls the same [`AgentCoordinator::drive_fair_pull`] on the daemon's
+//!   existing bounded activation cadence, and
+//!   `daemon_runtime.rs::maybe_start_fair_pull_recovery` starts it on **every**
+//!   tick of that cadence. It is not gated on a pending wake, on a prior
+//!   failure, or on anything else: that is what makes it a fallback rather than
+//!   a degraded mode, and it is the arm that survives a lost notification.
 //!
 //! The recovery poll reuses the same `ACTIVATION_POLL_INTERVAL` tick every
 //! other bounded step in `run_loop` already rides. No new timer, no new
@@ -103,14 +125,25 @@
 //! drive over the *same* projection, differing only in that it does not wait
 //! to be told there is work.
 //!
-//! Still blocked, and stated here rather than hidden: this coordinator's
-//! `attempts` map is empty in production because nothing in the tree
+//! Still blocked, and stated here rather than hidden: nothing in the tree
 //! constructs the provider-verified `ProviderAdmissionReceipt` that
 //! `AgentCoordinator::admit` requires — the G-11 admission owner, issue #1678.
-//! A production drive therefore performs one pull, selects nothing and stops,
-//! which is the correct bounded behaviour of an empty projection, and it
-//! becomes live the moment that owner lands. Nothing here waits for it and
-//! nothing here forges an admission to make it look live.
+//! Every struct literal of that receipt is in `src/tests.rs`,
+//! `src/core/admission_normalization_tests.rs` or `tests/coordinator.rs`, and
+//! this crate is forbidden from minting one, because it is provider evidence.
+//! So a drive over a coordinator built by the plan/define path sees an empty
+//! `attempts` map, performs one pull, selects nothing, and stops — the correct
+//! bounded behaviour of an empty projection.
+//!
+//! The claim is deliberately narrower than "`admit` is unreachable".
+//! `AgentCoordinator::admit` *does* have a production path: its single non-test
+//! caller is `core.rs::replay_snapshot_events`, reached from three `bins/eliotd`
+//! restore sites via `AgentCoordinator::restore_with_admitted_provider`. A drive
+//! over a coordinator restored from an event log containing
+//! `CoordinatorEvent::PlanAdmitted` really does select and start. No such
+//! snapshot exists yet, because producing one needs the same absent issuer.
+//! Nothing here waits for that owner and nothing here forges an admission to
+//! make it look live.
 //!
 //! Proof ceiling: [`FAIR_PULL_LOOP_PROOF_CEILING`]. This loop starts
 //! coordinator attempts and nothing else: no process, no provider/admission/

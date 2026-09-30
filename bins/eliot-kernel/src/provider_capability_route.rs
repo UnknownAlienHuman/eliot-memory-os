@@ -292,21 +292,20 @@ impl ProviderCapabilityContext {
         };
         // W-A owner signature is the 9-parameter pure verifier
         // (request, expectation, loaded attempt/operation/binding/executable/
-        // generation/fence, live epoch). The ORS claim row carries no
-        // executable-binding column by design in this slice (no write
-        // migration; see the owner module residual), so the presented
-        // executable digest rides per call: the owner shape-checks it as
-        // lowercase SHA-256 and the durable equality gate in this slice is
-        // the binding digest from the exact row above. The durable
-        // attempt/operation/binding/generation/fence come from the row and
-        // the epoch is the freshly re-queried live authority epoch.
+        // generation/fence, live epoch). The presented executable digest is
+        // compared against the owner-verified digest retained on the durable
+        // claim row (issue #2567): a row that predates the column or carries
+        // no join retains empty and never verifies. The durable
+        // attempt/operation/binding/executable/generation/fence come from
+        // the row and the epoch is the freshly re-queried live authority
+        // epoch.
         verify_provider_capability(
             &request,
             &expectation,
             row.attempt_id.as_str(),
             row.operation_id.as_str(),
             row.binding_digest.as_str(),
-            executable_digest,
+            row.executable_binding_digest.as_str(),
             row.worker_generation,
             row.fence_digest.as_str(),
             &live_epoch,

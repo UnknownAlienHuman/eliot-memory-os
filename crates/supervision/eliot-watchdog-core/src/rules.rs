@@ -7,6 +7,7 @@
 //! owner-issued `SignalTarget`, profile, clock, coverage and revisions that the
 //! event itself does not carry.
 
+use crate::episode::{FailureClass, FailureEpisodeIdentity, FailureEpisodeKey};
 use crate::signals::{
     AcknowledgementFact, EvidenceRef, ExpectedRevision, ObservedTime, ProfileRevision,
     RecordedValue, ReopenCondition, RuleRevision, Signal, SignalAttribution, SignalDelivery,
@@ -216,39 +217,42 @@ fn build_signal(
     observation: &IntegrationGapObservation,
 ) -> Result<Signal, crate::signals::SignalValidationError> {
     let rule = provider_host_event_gap_rule();
-    let mut identity_fields = vec![
-        rule.rule_id.to_owned(),
-        rule.revision.to_string(),
+    // I8.3: the failure episode is keyed on owner-issued facts only — the rule
+    // revision, the exact scope, the actual attempt identity and its observed
+    // generation, and the discriminating failure class. The source event
+    // identity is deliberately **not** part of the key, so a second distinct
+    // host event observed under the same attempt, scope, generation and class
+    // appends evidence to this same Signal instead of opening a parallel one,
+    // and a retransmission of one event is recognised against the episode's
+    // separate source-event index rather than as a new episode.
+    let episode_key = FailureEpisodeKey::derive(&FailureEpisodeIdentity {
+        rule: RuleRevision {
+            rule_id: rule.rule_id.to_owned(),
+            revision: rule.revision,
+        },
+        target: observation.signal_context.target.clone(),
+        failure_class: FailureClass::ProviderHostEventSequenceGap,
+    })?;
+    let signal_id = episode_key.as_str().to_owned();
+    // Evidence stays per-observation: it names the exact event that was
+    // observed and the exact sequence skip that was proved, so distinct
+    // evidence remains distinguishable inside one episode while a
+    // retransmission of the same event re-derives the same evidence identity.
+    let evidence_id = encode_identity(&[
+        signal_id.clone(),
         observation.attempt.0.clone(),
         observation.event.0.clone(),
-        observation.signal_context.target.scope_id.clone(),
-        observation.signal_context.target.generation.to_string(),
+        observation.expected_sequence.to_string(),
+        observation.observed_sequence.to_string(),
         observation.state_fence.authority_lineage_id.clone(),
         observation.state_fence.authority_sequence.to_string(),
         observation.state_fence.resource_generation.to_string(),
-    ];
-    append_optional_identity(
-        &mut identity_fields,
-        observation.state_fence.task_revision.as_deref(),
-    );
-    append_optional_identity(
-        &mut identity_fields,
-        observation.state_fence.policy_revision.as_deref(),
-    );
-    append_optional_identity(
-        &mut identity_fields,
-        observation.state_fence.integration_revision.as_deref(),
-    );
-    let dedup_key = encode_identity(&identity_fields);
-    let signal_id = dedup_key.clone();
-    let mut evidence_fields = identity_fields;
-    evidence_fields.extend([
-        observation.expected_sequence.to_string(),
-        observation.observed_sequence.to_string(),
+        fence_optional_identity(observation.state_fence.task_revision.as_deref()),
+        fence_optional_identity(observation.state_fence.policy_revision.as_deref()),
+        fence_optional_identity(observation.state_fence.integration_revision.as_deref()),
     ]);
-    let evidence_id = encode_identity(&evidence_fields);
     Signal::new(SignalRevision {
-        signal_id: SignalId(signal_id),
+        signal_id: SignalId(signal_id.clone()),
         revision: 1,
         rule: RuleRevision {
             rule_id: rule.rule_id.to_owned(),
@@ -276,20 +280,23 @@ fn build_signal(
         disposition: SignalDisposition::Informational,
         acknowledgement: AcknowledgementFact::NotAcknowledged,
         resolution: crate::signals::ResolutionFact::Unresolved,
-        dedup_key: RecordedValue::Known(dedup_key),
+        dedup_key: RecordedValue::Known(signal_id.clone()),
         reopen_condition: ReopenCondition::RecurrenceWithNewSourceEvent,
         expected_context_revision: observation.signal_context.expected_context_revision.clone(),
         expected_authority_revision: observation.signal_context.expected_authority_revision.clone(),
     })
 }
 
-fn append_optional_identity(fields: &mut Vec<String>, value: Option<&str>) {
+/// Encodes one optional fence revision as an unambiguous presence-tagged field.
+///
+/// A bare value would be ambiguous against the length-prefixed encoding of a
+/// neighbouring field, so the presence itself is part of the material: an absent
+/// revision and a revision whose text happens to read like another field's can
+/// never derive the same evidence identity.
+fn fence_optional_identity(value: Option<&str>) -> String {
     match value {
-        Some(value) => {
-            fields.push("some".to_owned());
-            fields.push(value.to_owned());
-        }
-        None => fields.push("none".to_owned()),
+        Some(value) => format!("some:{value}"),
+        None => "none".to_owned(),
     }
 }
 

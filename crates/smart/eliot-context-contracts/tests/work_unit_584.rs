@@ -2339,16 +2339,22 @@ fn passing_dimension_result(
 /// card that is graded for its twelve dimensions does not need to name one
 /// packet's exact output. A card bound to a real packet's output is built by
 /// that packet's owner.
+///
+/// The serializer and route identities are the ones the assembled-view fixtures
+/// execute under, because `ActiveUnderstandingView::validate` compares the
+/// card's serializer/route binding against the view's own execution identity:
+/// a card naming a different serializer or route is not the grade of those
+/// bytes and is refused.
 fn fixture_output_binding() -> QualityOutputBinding {
     QualityOutputBinding {
         recipe_digest: digest(),
         fence_digest: digest(),
         admitted_digest: digest(),
         rendered_digest: digest(),
-        serializer_id: "fixture-serde-v1".to_owned(),
+        serializer_id: "serde-json".to_owned(),
         serializer_version: "1".to_owned(),
         serializer_options_digest: digest(),
-        route_id: "fixture-route".to_owned(),
+        route_id: "route".to_owned(),
         evidence_revisions: Vec::new(),
         omission_handles: Vec::new(),
     }
@@ -2374,7 +2380,7 @@ fn full_quality_scorecard(context: &ContextBinding) -> QualityScorecard {
 
 fn assembled_view() -> (AdmittedContextSet, ActiveUnderstandingView) {
     let admitted = admitted_single();
-    let quality = full_quality_scorecard(&admitted.binding);
+    let mut quality = full_quality_scorecard(&admitted.binding);
     let rendered: Vec<RenderedAtom> = admitted
         .records
         .iter()

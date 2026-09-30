@@ -1137,13 +1137,50 @@ impl DaemonComposition {
             eliot_workscope::RequestedEffect::CanonicalWrite,
         )
         .map_err(|error| DaemonError::Composition(CompositionError::Recovery(error.to_string())))?;
-        let admission = crate::task_binding_admission::admit_canonical_write(
-            envelope.operation_id.as_str().to_owned(),
-            &identity.request.metadata,
-            &envelope,
-            readiness.receipt,
-            readiness.fence,
-        )?;
+        let admission = if crate::task_binding_admission::envelope_is_task_relative(&envelope) {
+            // Issue #1746 (W4/A2): a task-relative write is admitted only
+            // against the live Governor-resolved activation, never on the
+            // caller-presented receipt alone. The lease key terms come from
+            // the presented readiness lease, but the snapshot comes from the
+            // Governor owner (`current_task_selection` reads the RETAINED
+            // terminal for that key and joins it to the unique live
+            // activation: principal, session, task, revision, and `WorkScope`
+            // at the live fence), so a structurally valid receipt naming
+            // another task, a moved revision/digest, another scope, or
+            // another fence fails closed with `TASK_SCOPE_INCOMPATIBLE`
+            // before any admission runs. Absent/ambiguous/exploratory/stale
+            // selections fall through to the cold candidate, the bounded
+            // intake answer, or the typed error inside; no task is created,
+            // none is chosen, and no cold capture is retroactively attached.
+            // A write with no retained terminal for its lease key fails
+            // closed here: re-resolve through the owner onboarding route.
+            // Captures and non-task-relative writes stay on the receipt-only
+            // leg below so permitted raw capture remains cold (issue #1746,
+            // A3) without a retained terminal.
+            let (activation, _) = self.governor.current_task_selection(
+                readiness.now,
+                readiness.lease.lineage_candidate_ref.as_str(),
+                readiness.lease.workspace_instance_candidate_ref.as_str(),
+                readiness.lease.privacy_class,
+                readiness.lease.governing_source_generation,
+            )?;
+            crate::task_binding_admission::admit_canonical_write_with_activation(
+                envelope.operation_id.as_str().to_owned(),
+                &identity.request.metadata,
+                &envelope,
+                readiness.receipt,
+                readiness.fence,
+                activation.as_ref(),
+            )?
+        } else {
+            crate::task_binding_admission::admit_canonical_write(
+                envelope.operation_id.as_str().to_owned(),
+                &identity.request.metadata,
+                &envelope,
+                readiness.receipt,
+                readiness.fence,
+            )?
+        };
         // Issue #1929: the durable retention of a cold unbound capture is NOT
         // this log line, and not this daemon. `ColdUnbound` here records only
         // the admission decision. The retention owner is the store, which
@@ -1165,6 +1202,37 @@ impl DaemonComposition {
                 reason_ref = %candidate.reason_ref,
                 "cold unbound observation candidate admitted at the daemon edge: durably retained by the store evidence record, no task activation, support/influence promotion, or finish relevance"
             );
+        }
+        // Issue #1746 (W6/A5): revalidate the sealed dispatch identity at the
+        // effect gate against the live owner fence before any scope-sensitive
+        // trigger or commit. `admit_canonical_write` admits against the
+        // caller-presented readiness fence (bootstrap time, I7.8 step 4);
+        // between that admission and this dispatch the generation may have
+        // moved, and "`MATCHED` is required again after any generation change
+        // that can alter the real target of the task" (I4.2.1). The ORIGINAL
+        // evidence is re-validated with the existing
+        // `TaskSelectionEvidence::validate`, contamination still refuses, and
+        // the presented fence must still match the live Governor
+        // kernel-snapshot fence exactly. A mismatch fails closed with
+        // `TASK_SCOPE_INCOMPATIBLE` for conflict/rebind: the old operation is
+        // never rewritten to a new task under its identity, never duplicated,
+        // and already-possible effects keep their original identity for
+        // reconciliation. Task/scope/revision moves are additionally covered
+        // at this same gate by the retained-binding
+        // `check_canonical_write_work_scope` check and the #1742
+        // `commit_canonical_with_readiness` material gate below. Cold/unbound
+        // and non-task-relative admissions carry no sealed identity and pass
+        // through untouched.
+        if let crate::task_binding_admission::TaskBindingAdmission::TaskBound(binding) = &admission
+        {
+            let live_fence = self.governor.kernel_snapshot().state_fence();
+            crate::task_binding_admission::revalidate_task_bound_for_effect(
+                &binding.evidence,
+                Some(binding.admitted_task_ref.as_str()),
+                binding.scope_ref.as_str(),
+                &binding.presented_fence,
+                &live_fence,
+            )?;
         }
         // Issue #1787: the scope-sensitive canonical-write trigger runs before
         // any commit. The caller must supply the actual observed `WorkScope` and
@@ -3377,6 +3445,13 @@ impl DaemonComposition {
     /// coordinator's closed admission. The `health` half rides input-only
     /// into the capability and never mints admission (issue #265, W6).
     ///
+    /// Projects already-verified material only: the caller runs the
+    /// authenticated Kernel owner probe first (which compares the presented
+    /// executable digest against the ORS-retained binding, issue #2567),
+    /// and the per-operation content comparison binds the projection to the
+    /// exact operation at hand. Any disagreement is the typed
+    /// `IdentityConflict` residual — never a substituted route or provider.
+    ///
     /// # Errors
     ///
     /// Returns the closed-port validation, the per-operation identity
@@ -3449,6 +3524,48 @@ impl DaemonComposition {
         )?)
     }
 
+    /// Requires a verified restore to continue the snapshot's retained
+    /// attempt (issue #2567, AUD17/I6).
+    ///
+    /// Same request resolves the original handle: a snapshot that already
+    /// retains provider frames or dispatch intents for the freshly verified
+    /// attempt restores that attempt, never a second operation. A snapshot
+    /// bound to a different attempt refuses with the typed
+    /// [`FabricError::IdentityConflict`]: changed material gets a separately
+    /// admitted revision instead of a blind relaunch, and uncertain
+    /// ownership is never released. An empty snapshot (nothing dispatched
+    /// yet) restores directly: restore re-verifies and rehydrates, it never
+    /// re-dispatches by itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FabricError::IdentityConflict`] when the retained snapshot
+    /// binds a different attempt than the freshly verified material.
+    fn require_restore_attempt_continuity(
+        snapshot: &FabricSnapshot,
+        material: &VerifiedProviderMaterial,
+    ) -> Result<(), FabricError> {
+        let retains_any = !snapshot.provider_frames.is_empty() || !snapshot.intents.is_empty();
+        let retains_attempt = snapshot
+            .provider_frames
+            .values()
+            .map(|frame| frame.attempt_id.as_str())
+            .chain(
+                snapshot
+                    .intents
+                    .values()
+                    .map(|intent| intent.attempt_id.as_str()),
+            )
+            .any(|attempt| attempt == material.attempt_id.as_str());
+        if !retains_any || retains_attempt {
+            return Ok(());
+        }
+        Err(FabricError::IdentityConflict(
+            "verified restore binds a different attempt than the retained snapshot; admit a separate revision instead of relaunching"
+                .to_owned(),
+        ))
+    }
+
     /// Restores the production fabric on freshly verified owner material in
     /// one call (issue #1108 A6/W2, verified restore for A8).
     ///
@@ -3485,6 +3602,7 @@ impl DaemonComposition {
     ) -> Result<AgentFabric, DaemonError> {
         let _span = tracing::info_span!("eliotd.fabric_restore_verified_async").entered();
         let material = self.resolve_verified_material(kernel, material)?;
+        Self::require_restore_attempt_continuity(&snapshot, &material)?;
         let owner = kernel.owner_session_facts().ok_or_else(|| {
             DaemonError::Kernel(
                 "daemon has no validated Kernel owner session; verified provider restore stays plan-only"
@@ -3548,9 +3666,13 @@ impl DaemonComposition {
     }
 
     /// Drives one solo delegate through the nonblocking authenticated Kernel
-    /// provider-binding check (issue #1108). Until native-worker claim records
-    /// retain an independently owner-verified executable-binding digest, this
-    /// entry fails closed before admitted capability construction or dispatch.
+    /// provider-binding check (issue #1108). The claim owner retains the
+    /// independently owner-verified executable-binding digest
+    /// (`NativeWorkerClaimRecord::executable_binding_digest`, compared
+    /// presented-against-retained Kernel-side, issue #2567); this entry still
+    /// fails closed before admitted capability construction or dispatch until
+    /// the authenticated probe receipt covers that retained binding, and a
+    /// caller-claimed digest is never evidence.
     pub async fn solo_drive_once_async(
         &self,
         kernel: &Arc<DaemonKernelClient>,
@@ -3688,9 +3810,9 @@ impl DaemonComposition {
     /// Readiness plus the exact live fence and the validated session binding
     /// gate the resolution: the threaded expectation must be current under
     /// the live session epoch (`is_same_authority`, the same rule the
-    /// coordinator enforces), and caller-supplied `live_fence` /
-    /// `session_binding` values are replaced with the session-observed
-    /// ones. Presented halves and the Governor expectation travel through
+    /// coordinator enforces), and the caller-supplied `live_fence` is replaced
+    /// with the session-observed one; a validated session must exist.
+    /// Presented halves and the Governor expectation travel through
     /// untouched for the coherence gates downstream to judge.
     fn resolve_verified_material(
         &self,
@@ -3701,16 +3823,12 @@ impl DaemonComposition {
             return Err(DaemonError::Composition(CompositionError::NotReady));
         }
         let live_fence = kernel.kernel_fence();
-        let session_binding = self
-            .owner_session
-            .as_ref()
-            .map(|facts| facts.session_binding().to_owned())
-            .ok_or_else(|| {
-                DaemonError::Kernel(
-                    "daemon has no validated Kernel session binding; verified provider admission stays plan-only"
-                        .to_owned(),
-                )
-            })?;
+        if self.owner_session_binding().is_none() {
+            return Err(DaemonError::Kernel(
+                "daemon has no validated Kernel session binding; verified provider admission stays plan-only"
+                    .to_owned(),
+            ));
+        }
         if !material
             .expectation
             .live_authority_epoch
@@ -3723,8 +3841,21 @@ impl DaemonComposition {
             .into());
         }
         material.live_fence = live_fence;
-        material.session_binding = session_binding;
         Ok(material)
+    }
+
+    /// Returns the validated Kernel session binding held by the composition,
+    /// if any (issue #1108 A12).
+    ///
+    /// Production solo-restore seam: the restore resolves the owner session
+    /// half over the live authenticated session by the same rule as the
+    /// session-bound resolution above, without a re-handshake and without
+    /// touching the retained facts. `None` (no validated handshake yet)
+    /// fails the restore closed; the daemon stays plan-only.
+    pub fn owner_session_binding(&self) -> Option<String> {
+        self.owner_session
+            .as_ref()
+            .map(|facts| facts.session_binding().to_owned())
     }
 
     /// Borrows the daemon-held Governor capability admission view (#1957).

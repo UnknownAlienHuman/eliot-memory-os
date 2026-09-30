@@ -320,12 +320,21 @@ const RESTORE_STATEMENT_PURGE_GUARD: &str = "LET $restore_purge_guard{i} = (SELE
 /// Create of one resolved canonical record in its own class table.
 ///
 /// `{i}` selects the binding index. This is the narrow owner-owned import path
-/// the audit requires: the resolved logical payload, the destination record
-/// address and the physical class table all travel as bound parameters, and the
-/// archive is never interpreted as executable text. Create-only, so a row a
-/// previous transaction already imported is a conflict resolved by exact
-/// readback rather than an overwrite.
-const RESTORE_STATEMENT_IMPORT: &str = "LET $restore_import{i} = (CREATE type::record($restore_class_table{i}, $restore_class_row_id{i}) CONTENT { body: $restore_class_record{i} } RETURN AFTER); IF array::len($restore_import{i} ?? []) != 1 { THROW 'restore_canonical_import_conflict'; };";
+/// the audit requires: the whole record document, the destination record address
+/// and the physical class table all travel as bound parameters, and the archive
+/// is never interpreted as executable text. Create-only, so a row a previous
+/// transaction already imported is a conflict resolved by exact readback rather
+/// than an overwrite.
+///
+/// `CONTENT` takes the bound record document whole, exactly as the canonical
+/// write path binds `revision_record` / `event{i}` / `projection{i}` and hands
+/// the assembled object to `schema::TX_*` (`apply/atomic_write.rs`). That is what
+/// carries the class's own key column beside `body`: the destination's canonical
+/// read paths select rows by that column (`READ_RECEIPT_BY_OPERATION`,
+/// `READ_REVISION_HEADS_BY_KEYS`, `READ_ORDERING_HEADS_BY_SCOPES`), so a row
+/// written with `body` alone would exist in the class table and still be
+/// unreachable through the destination's canonical read path.
+const RESTORE_STATEMENT_IMPORT: &str = "LET $restore_import{i} = (CREATE type::record($restore_class_table{i}, $restore_class_row_id{i}) CONTENT $restore_class_document{i} RETURN AFTER); IF array::len($restore_import{i} ?? []) != 1 { THROW 'restore_canonical_import_conflict'; };";
 
 /// Redacted operation label used in every restore error.
 ///

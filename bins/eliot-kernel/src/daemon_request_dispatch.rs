@@ -32,7 +32,7 @@ use eliot_kernel_service::{
     UserAutomationHorizonTrigger, UserAutomationHostExecutionClient,
     UserAutomationHostExecutionOperation, UserAutomationHostExecutionTransport,
     UserAutomationOperatorRuntime, UserAutomationOwnerLookup, UserAutomationRuntimeAdmission,
-    UserAutomationRuntimeError, UserAutomationRuntimePort, UserAutomationWakeCancellation,
+    UserAutomationRuntimeError, UserAutomationWakeCancellation,
     UserAutomationWakeEnumerationReceipt, UserAutomationWakeEnumerationRequest,
     UserAutomationWakeHorizonPublication, UserAutomationWakeOccurrenceDisposition,
     UserAutomationWakePort, UserAutomationWakePublication, UserAutomationWakeReadRequest,
@@ -227,6 +227,20 @@ const P07_DISPOSITION_UNAVAILABLE_OR_CAPACITY: &str = "UNAVAILABLE_OR_CAPACITY";
 /// Fence, operation identity, and canonical request hash from authenticated
 /// evidence, so the selector itself grants no authority.
 pub(crate) const USER_AUTOMATION_OPERATOR_OPERATION: &str = "eliot_user_automation";
+
+/// Authenticated named-read selector serving the complete owner-issued
+/// `UserAutomation` preflight projection (issue #1779, I11.12).
+///
+/// This is the exact string the Kernel core contract already publishes as
+/// `USER_AUTOMATION_PREFLIGHT_SELECTOR` and the notify client already sends as
+/// its outer frame selector, multiplexing the inner
+/// `GetUserAutomationPreflightProjection` marker. Until this arm existed the
+/// selector fell through every frame predicate and fenced the session, so a
+/// client asked and nothing answered. The arm below serves the projection from
+/// the same canonical owners the run-now path assembles from; it mints no
+/// receipt, publishes no wake, and admits no execution.
+pub(crate) const USER_AUTOMATION_PREFLIGHT_SELECTOR: &str =
+    eliot_kernel_core::user_automation::USER_AUTOMATION_PREFLIGHT_SELECTOR;
 
 /// Authenticated daemon operation that drives the Kernel-owned I5.11
 /// `canonical_store` storage-replacement coordinator (issue #1872).
@@ -2016,6 +2030,41 @@ struct UserAutomationOperatorIntent {
     idempotency_key: String,
 }
 
+/// Closed named-read route for one complete `UserAutomation` preflight
+/// projection (issue #1779, I11.12).
+///
+/// The shape mirrors [`UserAutomationOperatorRoute`]: the outer `operation` is
+/// the admitted frame selector the front door routed on, `request_identity` is
+/// the front-door-authenticated identity the frame router copied verbatim, and
+/// `payload` is the caller's closed read request. The inner payload repeats
+/// the exact fields the notify client sends — including the `trigger` and
+/// `mode` it read from its own invocation — so the owner can compare each one
+/// with its live state instead of merely receiving an automation identity.
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UserAutomationPreflightReadRoute {
+    operation: String,
+    /// Front-door-authenticated request identity copied by the frame router.
+    request_identity: RequestIdentity,
+    payload: UserAutomationPreflightReadPayload,
+}
+
+/// Closed `GetUserAutomationPreflightProjection` read request.
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UserAutomationPreflightReadPayload {
+    operation: String,
+    context: eliot_contracts::RequestMetadata,
+    state_fence: StateFence,
+    automation_id: String,
+    automation_revision: String,
+    occurrence_id: String,
+    trigger: eliot_kernel_core::user_automation::UserAutomationTrigger,
+    mode: eliot_kernel_core::user_automation::UserAutomationExecutionMode,
+}
+
 #[cfg(windows)]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -3003,6 +3052,29 @@ impl KernelComposition {
                 .validate()
                 .map_err(|_| TransportError::PeerIdentityUnavailable)?;
             let value = Box::pin(self.user_automation_operator_operation(
+                session,
+                request_id.clone(),
+                payload,
+            ))
+            .await?;
+            let mut frame = status_frame(session, FrameKind::Response, MessageType::Result, value)?;
+            frame.request_id = Some(request_id);
+            frame.validate()?;
+            return Ok(frame);
+        }
+        #[cfg(windows)]
+        if operation == USER_AUTOMATION_PREFLIGHT_SELECTOR {
+            // The complete preflight projection is a front-door read, not a
+            // daemon-module operation: the principal comes from the
+            // authenticated peer, the State Fence from the session, and every
+            // projection member from the canonical owner that attests it. No
+            // other daemon operation is reachable from this branch, and the
+            // branch mints nothing: no receipt, no wake, no execution.
+            session
+                .peer
+                .validate()
+                .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+            let value = Box::pin(self.user_automation_preflight_projection_operation(
                 session,
                 request_id.clone(),
                 payload,
@@ -5337,6 +5409,417 @@ impl KernelComposition {
         serde_json::to_value(envelope).map_err(|_| TransportError::SessionFenced)
     }
 
+    /// Serves one complete owner-issued `UserAutomation` preflight projection
+    /// (issue #1779 W4/A3, I11.12).
+    ///
+    /// The client already asks for this named read and the projection type
+    /// already knows how to assemble itself; what was missing was the
+    /// Kernel-side production owner that serves it. This route is that owner.
+    /// Every one of the fifteen members comes from the owner that attests it:
+    /// the immutable revision and the live configuration pointer from the
+    /// canonical owner readback, the persisted invocation lineage from the
+    /// Store, the complete config snapshot from the B-owned policy owner, the
+    /// source verification receipt from the committed `RunNow` Store receipt,
+    /// the execution projection from the Durable Job/history `Status` owner,
+    /// the normalization envelope the revision row retained, the Skill and
+    /// Tool Definition revisions the revision declares, and delivery
+    /// capability from the named platform observation. The observed provider
+    /// fingerprint stays absent because this boundary issues no provider call
+    /// before preflight — which is exactly what deterministic mode requires —
+    /// and `UserAutomationPreflightProjection::assemble` refuses every other
+    /// gap instead of letting it through. A member no reachable owner attests
+    /// is a typed refusal naming that owner, never a default.
+    #[cfg(windows)]
+    async fn user_automation_preflight_projection_operation(
+        &self,
+        session: &Session,
+        request_id: RequestId,
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let route: UserAutomationPreflightReadRoute =
+            serde_json::from_value(payload.clone()).map_err(|_| TransportError::SessionFenced)?;
+        if route.operation != USER_AUTOMATION_PREFLIGHT_SELECTOR
+            || route.payload.operation
+                != eliot_kernel_core::user_automation::USER_AUTOMATION_PREFLIGHT_OPERATION
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let identity = route.request_identity;
+        identity
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if identity.request.metadata.request_id != request_id
+            || identity.request.state_fence != session.module_generation.state_fence
+            || route.payload.context != identity.request.metadata
+            || route.payload.state_fence != session.module_generation.state_fence
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let principal = authenticated_user_automation_principal(session)?;
+        // Boxed because the join below is a large composed future; the box
+        // keeps this arm's own future small without changing what it awaits.
+        match Box::pin(self.read_user_automation_preflight_projection(
+            session,
+            &principal,
+            &route.payload,
+        ))
+        .await
+        {
+            Ok(projection) => {
+                let value =
+                    serde_json::to_value(projection).map_err(|_| TransportError::SessionFenced)?;
+                Ok(serde_json::json!({
+                    "status": "known",
+                    "value": value,
+                    "recovery": null,
+                }))
+            }
+            Err(error) => Ok(Self::user_automation_runtime_error_response(error)),
+        }
+    }
+
+    /// Joins the live owner readbacks behind one preflight projection.
+    ///
+    /// The join order is fixed: bind the current owner revision and its live
+    /// configuration pointer, then the persisted invocation lineage, then the
+    /// policy, execution, receipt, and normalization owners, and only then
+    /// assemble. A scheduled occurrence carries no committed `RunNow`
+    /// provenance, so it has no committed `RunNow` source receipt either, and
+    /// it is refused here by name rather than answered from an unrelated
+    /// receipt. A `blocked_config` pointer needs its owner-issued failure
+    /// projection, which only the Store-gateway run-now join can read, so it
+    /// is refused here by name rather than answered without its failure. Both
+    /// refusals name the missing owner instead of substituting a member.
+    #[cfg(windows)]
+    async fn read_user_automation_preflight_projection(
+        &self,
+        session: &Session,
+        principal: &str,
+        read: &UserAutomationPreflightReadPayload,
+    ) -> Result<
+        eliot_kernel_core::user_automation::UserAutomationPreflightProjection,
+        UserAutomationRuntimeError,
+    > {
+        use eliot_kernel_core::user_automation::UserAutomationConfigurationState;
+
+        let unavailable = UserAutomationRuntimeError::Unavailable;
+        let fence = session.module_generation.state_fence.clone();
+        let gateway = self.retained_store_gateway().map_err(|_| {
+            unavailable("canonical UserAutomation Store owner is unavailable".to_owned())
+        })?;
+        let (owner, invocation) = self
+            .user_automation_preflight_occurrence(&gateway, principal, read, &fence, unavailable)
+            .await?;
+        // The source verification receipt is the committed `RunNow` Store
+        // receipt's reconciliation envelope, proved under the provenance the
+        // persisted invocation carries. A scheduled occurrence never committed
+        // one, so there is no owner-issued receipt to serve here; that is a
+        // named missing owner, not a receipt this route may borrow from
+        // another occurrence.
+        let (source_receipt, provenance) = self
+            .user_automation_preflight_source_receipt(&gateway, &invocation, &fence)
+            .await?;
+        let source_identity = OperationIdentity {
+            operation_id: provenance.operation_id.clone(),
+            idempotency_key: provenance.idempotency_key.clone(),
+            canonical_request_hash: provenance.canonical_request_hash.clone(),
+        };
+        let provenance_context = provenance.request_metadata.clone();
+
+        let config_snapshot = self.read_user_automation_policy_snapshot(&fence).await?;
+        let execution = self
+            .user_automation_preflight_execution_view(
+                &gateway,
+                principal,
+                &owner,
+                &provenance_context,
+                &source_identity,
+                &fence,
+            )
+            .await?;
+        if execution.history_query_ref != owner.revision.execution_history_query_ref {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        // The blocked failure projection is owner-issued by the Store-gateway
+        // run-now join, which this binary cannot reach without sealing a
+        // canonical Store transition for a read. A `blocked_config` pointer
+        // therefore cannot be answered here; it is refused by name rather than
+        // served without its failure. Every other state assembles with no
+        // failure, and assembly itself refuses a failure where none belongs.
+        let failure = match owner.current_configuration_state {
+            UserAutomationConfigurationState::BlockedConfig => {
+                return Err(unavailable(
+                    "the current owner configuration state is blocked_config but its \
+                     owner-issued failure projection is readable only from the Store-gateway \
+                     run-now owner, so no preflight projection can be reported"
+                        .to_owned(),
+                ));
+            }
+            _ => None,
+        };
+        // The normalization envelope is the retained bytes the revision row
+        // carries, selected by the content-derived identity the immutable
+        // revision names — the same selection the run-now assembler makes —
+        // and assembly re-checks that those bytes name the compiled occurrence
+        // digest. A row that retained none leaves the occurrence unadmitted by
+        // name instead of receiving a substituted receipt.
+        let normalization_receipts = Self::user_automation_preflight_normalization_receipts(
+            &owner.revision,
+            owner.normalization_receipt.as_ref(),
+            unavailable,
+        )?;
+        // Live evidence below the Kernel decoding boundary. This read issues
+        // no provider call before preflight, so the only honest provider
+        // observation is none — which is exactly what deterministic mode
+        // requires and what assembly enforces for every other mode through the
+        // revision's own provider policy. The Tool Definition set is the exact
+        // closure the canonical owner revision declares, repeated here so
+        // assembly can compare the two instead of trusting this member.
+        let evidence = eliot_kernel_core::user_automation::UserAutomationPreflightEvidence {
+            observed_provider_fingerprint: None,
+            trusted_tool_definition_refs: owner.revision.trusted_tool_definition_refs.clone(),
+            delivery_available: Self::user_automation_preflight_delivery_capability(
+                &owner.revision,
+            ),
+            failure,
+        };
+        eliot_kernel_core::user_automation::UserAutomationPreflightProjection::assemble(
+            &eliot_kernel_core::user_automation::UserAutomationPreflightAssembly {
+                revision: &owner.revision,
+                configuration_state: owner.current_configuration_state,
+                config_snapshot: &config_snapshot,
+                source_receipt: &source_receipt,
+                normalization_receipts: &normalization_receipts,
+                execution: &execution,
+                invocation: &invocation,
+                request_metadata: &read.context,
+                evidence: &evidence,
+            },
+        )
+        .map_err(|error| {
+            UserAutomationRuntimeError::UnknownOutcome(format!(
+                "UserAutomation preflight assembly is not admitted: {error}"
+            ))
+        })
+    }
+
+    /// Reads and proves the owner revision and the persisted occurrence.
+    ///
+    /// Both readbacks are joined to the REQUEST, not merely to each other: the
+    /// owner snapshot must name the requested automation, revision and mode
+    /// under the requesting principal and the session fence, and the persisted
+    /// invocation must recompute to the requested occurrence identity while
+    /// agreeing with that owner on revision, trigger, mode, principal, work
+    /// scope and workdir. A disagreement on any axis is an identity conflict
+    /// rather than a projection of whichever record happened to be read.
+    #[cfg(windows)]
+    async fn user_automation_preflight_occurrence(
+        &self,
+        gateway: &eliot_kernel_service::KernelStoreGateway,
+        principal: &str,
+        read: &UserAutomationPreflightReadPayload,
+        fence: &StateFence,
+        unavailable: fn(String) -> UserAutomationRuntimeError,
+    ) -> Result<
+        (
+            eliot_kernel_service::UserAutomationOwnerSnapshot,
+            eliot_kernel_core::user_automation::UserAutomationInvocation,
+        ),
+        UserAutomationRuntimeError,
+    > {
+        let lookup = eliot_kernel_service::UserAutomationOwnerLookup {
+            automation_id: read.automation_id.clone(),
+            requested_revision: read.automation_revision.clone(),
+            authenticated_principal: principal.to_owned(),
+            state_fence: fence.clone(),
+        };
+        let owner = gateway
+            .read_user_automation_owner(&lookup)
+            .await
+            .map_err(unavailable)?;
+        if owner.automation_id != read.automation_id
+            || owner.revision.revision != read.automation_revision
+            || owner.revision.automation_id != read.automation_id
+            || owner.revision.mode != read.mode
+            || owner.authenticated_principal != principal
+            || owner.state_fence != *fence
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        let invocation = gateway
+            .read_user_automation_invocation(fence, &read.automation_id, &read.occurrence_id)
+            .await
+            .map_err(unavailable)?;
+        let occurrence_id = invocation
+            .occurrence_identity()
+            .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
+        if occurrence_id != read.occurrence_id
+            || invocation.automation_id != owner.revision.automation_id
+            || invocation.automation_revision != owner.revision.revision
+            || invocation.trigger != read.trigger
+            || invocation.mode != owner.revision.mode
+            || invocation.principal_ref != owner.authenticated_principal
+            || invocation.work_scope_ref != owner.revision.work_scope.scope_id
+            || invocation.workdir_ref != owner.revision.workdir_ref
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        Ok((owner, invocation))
+    }
+
+    /// Reads the Durable Job / history projection for this occurrence.
+    ///
+    /// The view reuses the committed occurrence identity the run-now provenance
+    /// already proved, and the leg is the closed `Status` operation, so it
+    /// issues no transition and mints no canonical identity: a read that sealed
+    /// a write would turn a projection request into a mutation.
+    #[cfg(windows)]
+    async fn user_automation_preflight_execution_view(
+        &self,
+        gateway: &eliot_kernel_service::KernelStoreGateway,
+        principal: &str,
+        owner: &eliot_kernel_service::UserAutomationOwnerSnapshot,
+        provenance_context: &eliot_contracts::RequestMetadata,
+        source_identity: &OperationIdentity,
+        fence: &StateFence,
+    ) -> Result<
+        eliot_kernel_core::user_automation::UserAutomationExecutionProjection,
+        UserAutomationRuntimeError,
+    > {
+        let unavailable = UserAutomationRuntimeError::Unavailable;
+        let sealed = eliot_kernel_service::UserAutomationServiceRequest {
+            context: provenance_context.clone(),
+            authenticated_principal: principal.to_owned(),
+            identity: source_identity.clone(),
+            intent: eliot_kernel_core::UserAutomationOperatorIntent {
+                intent_id: format!(
+                    "{}:preflight-owner-execution-view",
+                    source_identity.operation_id.as_str()
+                ),
+                principal_ref: principal.to_owned(),
+                state_fence: fence.clone(),
+                operation: eliot_kernel_core::UserAutomationOperation::Status {
+                    automation_id: owner.automation_id.clone(),
+                },
+            },
+        };
+        gateway
+            .read_user_automation_owner_execution_view(&sealed, &owner.automation_id)
+            .await
+            .map_err(unavailable)
+    }
+
+    /// Resolves the committed `RunNow` source receipt for one persisted
+    /// occurrence.
+    ///
+    /// The receipt is the Store owner's own record for the exact operation the
+    /// invocation's run-now provenance names, so the lookup key is derived from
+    /// that provenance rather than from the request. An occurrence with no
+    /// committed run-now provenance has no owner-issued source receipt to serve
+    /// and is refused by name; borrowing a receipt from another occurrence would
+    /// attest this occurrence with another's evidence.
+    ///
+    /// The provenance is returned alongside the envelope because the run-now
+    /// join proves the receipt's own request binding against the provenance the
+    /// invocation committed, and this read performs that same proof rather than
+    /// accepting the envelope on identity alone.
+    #[cfg(windows)]
+    async fn user_automation_preflight_source_receipt(
+        &self,
+        gateway: &eliot_kernel_service::KernelStoreGateway,
+        invocation: &eliot_kernel_core::user_automation::UserAutomationInvocation,
+        fence: &StateFence,
+    ) -> Result<
+        (
+            eliot_receipts::ReceiptEnvelope,
+            eliot_kernel_core::user_automation::UserAutomationInvocationProvenance,
+        ),
+        UserAutomationRuntimeError,
+    > {
+        let provenance = invocation.require_run_now_provenance(fence).map_err(|error| {
+            UserAutomationRuntimeError::Rejected(format!(
+                "UserAutomation preflight source receipt requires committed run-now provenance: {error}"
+            ))
+        })?;
+        let identity = OperationIdentity {
+            operation_id: provenance.operation_id.clone(),
+            idempotency_key: provenance.idempotency_key.clone(),
+            canonical_request_hash: provenance.canonical_request_hash.clone(),
+        };
+        let receipt = ensure_user_automation_store_receipt(gateway, fence, &identity).await?;
+        let envelope = receipt
+            .require_reconciliation_envelope()
+            .cloned()
+            .map_err(|error| {
+                UserAutomationRuntimeError::UnknownOutcome(format!(
+                    "canonical UserAutomation source receipt envelope is not retained: {error}"
+                ))
+            })?;
+        // The envelope must be THIS provenance's receipt, proven against the
+        // envelope's own request binding and work scope — the same joint the
+        // run-now join makes. An envelope that merely exists for some other
+        // operation, or one whose request body differs from the committed
+        // provenance, is not this occurrence's source evidence.
+        if envelope.core.request.metadata != provenance.request_metadata
+            || envelope.core.work_scope.product_id != provenance.request_metadata.product_id
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        Ok((envelope, provenance.clone()))
+    }
+
+    /// Selects the retained normalization envelopes the immutable revision names.
+    ///
+    /// Selection is by the content-derived receipt identity the revision declares,
+    /// never by position or by trusting the caller, and an empty selection is a
+    /// refusal rather than a default: a row that retained no matching envelope
+    /// leaves the compiled occurrence set self-asserted, which is exactly the
+    /// state the occurrence must not be admitted from.
+    #[cfg(windows)]
+    fn user_automation_preflight_normalization_receipts(
+        revision: &eliot_kernel_core::user_automation::UserAutomationRevision,
+        retained: Option<&eliot_receipts::ReceiptEnvelope>,
+        unavailable: fn(String) -> UserAutomationRuntimeError,
+    ) -> Result<Vec<eliot_receipts::ReceiptEnvelope>, UserAutomationRuntimeError> {
+        let declared = &revision.schedule.normalization_receipt;
+        let selected = retained
+            .filter(|envelope| {
+                envelope.identity.receipt_id.as_str() == declared.receipt_id.as_str()
+            })
+            .cloned()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if selected.is_empty() {
+            return Err(unavailable(
+                "no owner-issued schedule normalization receipt envelope is retained under this \
+                 State Fence for the receipt identity the immutable revision names, so the \
+                 compiled occurrence set stays self-asserted and the occurrence is not admitted"
+                    .to_owned(),
+            ));
+        }
+        Ok(selected)
+    }
+
+    /// Observes whether the declared delivery target is currently capable.
+    ///
+    /// This is the same named observation the run-now assembler applies: of
+    /// the canonical channels only native toast is gated on a live interactive
+    /// user session, so a declared toast target with no session behind it
+    /// reports the capability it actually observed instead of defaulting to
+    /// capable. The rule lives in one sentence here rather than behind a
+    /// second helper because the owner it observes — the platform session —
+    /// is the same one.
+    #[cfg(windows)]
+    fn user_automation_preflight_delivery_capability(
+        revision: &eliot_kernel_core::user_automation::UserAutomationRevision,
+    ) -> bool {
+        !revision
+            .delivery_target
+            .channels
+            .contains(&eliot_kernel_core::user_automation::DeliveryChannel::NativeToast)
+            || eliot_platform_windows::interactive_user_session_available()
+    }
+
     #[cfg(windows)]
     fn build_user_automation_operator_request(
         session: &Session,
@@ -6340,59 +6823,170 @@ impl KernelComposition {
         // the schedule owner read back from its own journal. Nothing here is
         // recomputed or re-derived by spelling.
         //
-        // It is then submitted through the existing runtime execution join,
-        // `UserAutomationOperatorRuntime` — the production
-        // `UserAutomationRuntimePort` over this already-authenticated Host
-        // channel, the same join `run-now` composes in
-        // `dispatch_user_automation_operator_transition`. That join revalidates
-        // the exact admission, resolves the complete owner-issued
+        // It is then submitted through the same execution join a committed `run-now`
+        // occurrence crosses. `KernelStoreGateway::due_wake_execution_join`
+        // assembles the complete owner-issued preflight projection from the live
+        // owners and calls `UserAutomationService::execute_occurrence_with_durable_job`,
+        // which runs the deterministic preflight decision and the
+        // complete-denominator refusal immediately before it reaches an effect
+        // owner, and resolves the complete owner-issued
         // `UserAutomationDurableJobMaterial` through
-        // `UserAutomationDurableJobMaterial::from_admitted_occurrence` when this
-        // ingress carries none, and validates the owner's answer. Calling
+        // `UserAutomationDurableJobMaterial::from_admitted_occurrence`. The
+        // transport it submits over is `UserAutomationOperatorRuntime` — the
+        // production `UserAutomationRuntimePort` over this already-authenticated
+        // Host channel — and the owner's answer is validated there. Calling
         // `UserAutomationDurableJobPort::admit_occurrence` on the bare client,
-        // as this contour did, reached the Durable Job owner with no
-        // `UserAutomationDurableJobMaterial` at all and so could never reach
-        // `HostDurableJobOwner::dreamer_job`.
-        let execution =
-            match Self::user_automation_due_wake_join(client, &request, &resolution, &readback)
-                .await
-            {
-                Ok(execution) => execution,
-                // Item 6, terminal leg. A refusal the Durable Job owner answered
-                // before any owner effect is a decided disposition about this
-                // occurrence, exactly as an admission is: the occurrence will not be
-                // admitted now, so leaving the recurring horizon pinned to it would
-                // wedge every later occurrence of the revision behind one
-                // permanently-refused wake. It advances through the same
-                // owner-acknowledged path the admitted branch uses, and it is
-                // reported as its own disposition rather than as a success.
-                //
-                // `Unavailable`, `NotRetained`, `UnknownOutcome` and
-                // `OutcomeSettled` deliberately do not reach this arm: none of them
-                // is an owner-acknowledged disposition about this occurrence. They
-                // respectively mean the owner could not answer, it answered about
-                // another record, it cannot say whether the effect landed, and the
-                // effect provably landed. Those keep the pre-existing fail-closed
-                // projection and do not advance.
-                Err(error @ UserAutomationRuntimeError::Rejected(_)) => {
-                    return Self::user_automation_due_wake_terminal_response(
-                        session,
-                        &resolution,
-                        &occurrence_id,
-                        &request,
-                        &readback,
-                        client,
-                        error,
-                    )
-                    .await;
-                }
-                Err(error) => {
-                    // No owner acknowledged a disposition, so the recurring horizon
-                    // does not advance: this wake is still unconsumed and a later
-                    // owner-issued submission can admit it.
-                    return Ok(Self::user_automation_runtime_error_response(error));
-                }
-            };
+        // as this contour did, reached the Durable Job owner without ever running
+        // the deterministic preflight, which is the blind rerun I11.12:59 and
+        // I14.21 forbid.
+        let outcome = match Self::user_automation_due_wake_join(
+            self,
+            client,
+            &request,
+            &resolution,
+            &readback,
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            // Item 6, terminal leg. A refusal the Durable Job owner answered
+            // before any owner effect is a decided disposition about this
+            // occurrence, exactly as an admission is: the occurrence will not be
+            // admitted now, so leaving the recurring horizon pinned to it would
+            // wedge every later occurrence of the revision behind one
+            // permanently-refused wake. It advances through the same
+            // owner-acknowledged path the admitted branch uses, and it is
+            // reported as its own disposition rather than as a success.
+            //
+            // `Unavailable`, `NotRetained`, `UnknownOutcome` and
+            // `OutcomeSettled` deliberately do not reach this arm: none of them
+            // is an owner-acknowledged disposition about this occurrence. They
+            // respectively mean the owner could not answer, it answered about
+            // another record, it cannot say whether the effect landed, and the
+            // effect provably landed. Those keep the pre-existing fail-closed
+            // projection and do not advance.
+            Err(UserAutomationRuntimeError::Rejected(reason)) => {
+                return Self::user_automation_due_wake_decided_response(
+                    session,
+                    &resolution,
+                    &occurrence_id,
+                    &request,
+                    &readback,
+                    client,
+                    DecidedDisposition {
+                        outcome: "rejected",
+                        reason,
+                    },
+                )
+                .await;
+            }
+            Err(error) => {
+                // No owner acknowledged a disposition, so the recurring horizon
+                // does not advance: this wake is still unconsumed and a later
+                // owner-issued submission can admit it.
+                return Ok(Self::user_automation_runtime_error_response(error));
+            }
+        };
+        // The join's own answer is the last step this contour owns, and
+        // materialising it into this route's response is one step of its own:
+        // either the occurrence is reported under the closed disposition the
+        // owner decided before any effect, or the one execution reference the
+        // owner issued is validated against the occurrence the schedule owner
+        // resolved and the recurring horizon advances beside it.
+        Self::user_automation_due_wake_execution_response(
+            session,
+            &occurrence_id,
+            client,
+            &request,
+            &resolution,
+            &readback,
+            outcome,
+        )
+        .await
+    }
+
+    /// Materialises the execution join's own answer into this route's response
+    /// (issue #2806 items 5 and 6).
+    ///
+    /// The deterministic preflight is a decided answer about this occurrence
+    /// before any owner effect, exactly like an admission and exactly like a
+    /// Durable Job refusal, so it reaches the same owner-acknowledged
+    /// disposition arm. A deferral is reported under its own owner reason and
+    /// never re-labelled as a rejection; a blocked configuration is reported
+    /// under its stable failure fingerprint and never as a success. Neither
+    /// carries a Durable Job reference, because none was issued.
+    /// `BlockedConfig` is structurally unreachable on this route - the preflight
+    /// projection this leg assembles is refused by the Store owner rather than
+    /// returned blocked - and the arm is retained because the join's answer is a
+    /// closed vocabulary this contour maps completely, not because that member
+    /// can be observed here.
+    ///
+    /// The admitted arm validates the owner's own reference against the resolved
+    /// occurrence before it reports anything, and then advances the recurring
+    /// horizon through the same `user_automation_due_wake_admitted_value`
+    /// projection an admitted occurrence has always used.
+    ///
+    /// This step opens, closes and commits no store transaction of its own: the
+    /// revalidation that precedes it, the recurring-window derivation inside the
+    /// existing horizon slice request, and the durable append inside the two
+    /// existing response projections all stay with their existing owners, in that
+    /// order.
+    #[cfg(windows)]
+    async fn user_automation_due_wake_execution_response(
+        session: &Session,
+        occurrence_id: &str,
+        client: &UserAutomationHostExecutionClient<
+            AuthenticatedUserAutomationHostExecutionTransport,
+        >,
+        request: &UserAutomationRuntimeAdmission,
+        resolution: &UserAutomationDueWakeResolution,
+        readback: &UserAutomationWakeReadback,
+        outcome: eliot_kernel_service::UserAutomationExecutionOutcome,
+    ) -> Result<serde_json::Value, TransportError> {
+        let execution = match outcome {
+            eliot_kernel_service::UserAutomationExecutionOutcome::Admitted {
+                execution, ..
+            } => execution,
+            eliot_kernel_service::UserAutomationExecutionOutcome::Deferred { reason, .. } => {
+                return Self::user_automation_due_wake_decided_response(
+                    session,
+                    resolution,
+                    occurrence_id,
+                    request,
+                    readback,
+                    client,
+                    DecidedDisposition {
+                        outcome: "deferred",
+                        reason: format!(
+                            "the deterministic preflight deferred occurrence {occurrence_id} with \
+                             reason {reason:?}, before any model or provider call"
+                        ),
+                    },
+                )
+                .await;
+            }
+            eliot_kernel_service::UserAutomationExecutionOutcome::BlockedConfig {
+                failure, ..
+            } => {
+                return Self::user_automation_due_wake_decided_response(
+                    session,
+                    resolution,
+                    occurrence_id,
+                    request,
+                    readback,
+                    client,
+                    DecidedDisposition {
+                        outcome: "blocked_config",
+                        reason: format!(
+                            "occurrence {occurrence_id} entered blocked_config under failure \
+                             fingerprint {} before any model call",
+                            failure.failure_fingerprint
+                        ),
+                    },
+                )
+                .await;
+            }
+        };
         if let Err(error) = execution.validate() {
             return Ok(Self::user_automation_runtime_error_response(
                 UserAutomationRuntimeError::Rejected(error.to_string()),
@@ -6405,10 +6999,10 @@ impl KernelComposition {
         }
         Ok(Self::user_automation_due_wake_admitted_value(
             session,
-            &resolution,
-            &occurrence_id,
-            &request,
-            &readback,
+            resolution,
+            occurrence_id,
+            request,
+            readback,
             client,
             execution,
         )
@@ -6456,47 +7050,22 @@ impl KernelComposition {
         })
     }
 
-    /// Assembles the admission this delivery submits to the runtime join.
+    /// Submits one due occurrence to the deterministic execution join and
+    /// returns the owner's answer (issue #2806 items 5 and 6).
     ///
-    /// Every member is the owner-proven value from this delivery, not a field
-    /// forwarded from the caller's asserted carrier: the current canonical
-    /// revision and the occurrence `scheduled_invocation` re-derived from it,
-    /// plus the `WakeIntent` the schedule owner read back from its own journal.
-    /// `preflight` and any owner-issued Durable Job material are carried across
-    /// unchanged when the ingress supplies them, and the join resolves the
-    /// material itself when it does not.
-    #[cfg(windows)]
-    fn user_automation_due_wake_admission(
-        request: &UserAutomationRuntimeAdmission,
-        resolution: &UserAutomationDueWakeResolution,
-        readback: &UserAutomationWakeReadback,
-    ) -> UserAutomationRuntimeAdmission {
-        UserAutomationRuntimeAdmission {
-            context: request.context.clone(),
-            authenticated_principal: request.authenticated_principal.clone(),
-            identity: request.identity.clone(),
-            revision: resolution.revision.clone(),
-            invocation: resolution.invocation.clone(),
-            preflight: request.preflight.clone(),
-            wake_intent: readback.intent.clone(),
-            durable_job: request.durable_job.clone(),
-        }
-    }
-
-    /// Submits one due occurrence to the runtime execution join and returns the
-    /// owner's answer (issue #2806 items 5 and 6).
-    ///
-    /// The admission is assembled and the join is awaited entirely inside this
-    /// contour, so `user_automation_due_wake_operation` never holds the join's
-    /// own state across its awaits. The join resolves the complete owner-issued
-    /// `UserAutomationDurableJobMaterial` through
-    /// `UserAutomationDurableJobMaterial::from_admitted_occurrence` whenever the
-    /// ingress carries none, and that compiler holds a whole canonical-JSON K0
-    /// `JobSubmission` and its digest inputs on the stack. Awaiting it inline
-    /// made the calling contour's future exceed the bounded size even though the
-    /// caller only ever reads the returned reference, so the join's future is
-    /// polled through one box: the transient allocation is released as soon as
-    /// the answer is back, and the caller's future stays bounded.
+    /// The join runs entirely inside this contour, so
+    /// `user_automation_due_wake_operation` never holds the join's own state
+    /// across its awaits. It assembles the complete owner-issued preflight
+    /// projection for the resolved occurrence from the live owners the canonical
+    /// Store gateway already reads, completes the owner-issued
+    /// `UserAutomationDurableJobMaterial`, and then crosses
+    /// `UserAutomationService::execute_occurrence_with_durable_job` - the same
+    /// join a committed `run-now` occurrence crosses, and the one that runs the
+    /// deterministic preflight decision and the complete-denominator refusal
+    /// immediately before it reaches an effect owner. That compiler holds a
+    /// whole canonical-JSON K0 `JobSubmission` and its digest inputs on the
+    /// stack, so the gateway polls it through its own box; the transient
+    /// allocation is released as soon as the owner's answer is back.
     ///
     /// The transport is already authenticated and bound to the current State
     /// Fence by the caller, so this adds no channel, no retry and no second
@@ -6504,44 +7073,54 @@ impl KernelComposition {
     /// channel.
     #[cfg(windows)]
     async fn user_automation_due_wake_join(
+        &self,
         client: &UserAutomationHostExecutionClient<
             AuthenticatedUserAutomationHostExecutionTransport,
         >,
         request: &UserAutomationRuntimeAdmission,
         resolution: &UserAutomationDueWakeResolution,
         readback: &UserAutomationWakeReadback,
-    ) -> Result<
-        eliot_kernel_core::user_automation::AutomationExecutionReference,
-        UserAutomationRuntimeError,
-    > {
+    ) -> Result<eliot_kernel_service::UserAutomationExecutionOutcome, UserAutomationRuntimeError>
+    {
+        let gateway = self.retained_store_gateway().map_err(|_| {
+            UserAutomationRuntimeError::Unavailable(
+                "canonical UserAutomation Store owner is unavailable".to_owned(),
+            )
+        })?;
         let runtime = UserAutomationOperatorRuntime::new(client);
-        Box::pin(
-            runtime.admit_occurrence(Self::user_automation_due_wake_admission(
-                request, resolution, readback,
-            )),
-        )
+        Box::pin(gateway.due_wake_execution_join(
+            request,
+            resolution,
+            readback.intent.clone(),
+            &runtime,
+        ))
         .await
     }
 
-    /// Advances the recurring horizon after an owner-acknowledged terminal
-    /// refusal and reports the occurrence as terminal (issue #2806 item 6).
+    /// Advances the recurring horizon after an owner-acknowledged decided
+    /// disposition and reports the occurrence under that disposition (issue #2806
+    /// item 6).
     ///
-    /// The Durable Job owner refused this occurrence before any owner effect, so
-    /// it issued a decided answer about it rather than a lost one. The horizon
-    /// therefore advances exactly as it does after an admission, through the
-    /// same `user_automation_due_wake_horizon` slice request, and its outcome
-    /// and replay handle travel beside the refusal.
+    /// Every disposition that reaches here is decided before any owner effect:
+    /// the deterministic preflight deferred or blocked this occurrence, or the
+    /// Durable Job owner refused it. None of them will be admitted now, so leaving
+    /// the recurring horizon pinned to it would wedge every later occurrence of
+    /// the revision behind one permanently-unadmitted wake. The horizon therefore
+    /// advances exactly as it does after an admission, through the same
+    /// `user_automation_due_wake_horizon` slice request, and its outcome and
+    /// replay handle travel beside the disposition.
     ///
-    /// The occurrence is reported as `accepted: false` with the owner's own
-    /// closed reason. It is not published, not admitted, and it carries no
-    /// Durable Job reference, so nothing here can be read as a success. The
+    /// The occurrence is reported as `accepted: false` under its own closed
+    /// `outcome` and the owner's own reason. It is not published, not admitted,
+    /// and it carries no Durable Job reference, so nothing here can be read as a
+    /// success, and one disposition is never re-labelled as another. The
     /// route-level `recovery` stays derived from the horizon alone and is never
-    /// fabricated: a decided refusal with a fully acknowledged horizon owes the
-    /// caller nothing, which is the same convention
+    /// fabricated: a decided disposition with a fully acknowledged horizon owes
+    /// the caller nothing, which is the same convention
     /// `user_automation_runtime_error_response` already uses for
     /// `UserAutomationRuntimeError::Rejected`.
     #[cfg(windows)]
-    async fn user_automation_due_wake_terminal_response(
+    async fn user_automation_due_wake_decided_response(
         session: &Session,
         resolution: &UserAutomationDueWakeResolution,
         occurrence_id: &str,
@@ -6550,11 +7129,8 @@ impl KernelComposition {
         client: &UserAutomationHostExecutionClient<
             AuthenticatedUserAutomationHostExecutionTransport,
         >,
-        error: UserAutomationRuntimeError,
+        disposition: DecidedDisposition<'_>,
     ) -> Result<serde_json::Value, TransportError> {
-        let UserAutomationRuntimeError::Rejected(reason) = error else {
-            return Ok(Self::user_automation_runtime_error_response(error));
-        };
         let horizon = Self::user_automation_due_wake_horizon(
             session,
             resolution,
@@ -6568,8 +7144,8 @@ impl KernelComposition {
             "status": if recovery.is_none() { "known" } else { "unknown" },
             "value": {
                 "accepted": false,
-                "outcome": "rejected",
-                "reason": reason,
+                "outcome": disposition.outcome,
+                "reason": disposition.reason,
                 "occurrence_id": occurrence_id,
                 "resolution": resolution,
                 "wake_readback": readback,
@@ -10692,6 +11268,30 @@ enum UserAutomationDueWakeRead {
     /// The wake is refused or the owner could not be read; this is the answer
     /// to return instead of admitting the occurrence.
     Answer(serde_json::Value),
+}
+
+/// The decided disposition one terminal due-wake occurrence reports.
+///
+/// The disposition name and the owner-issued reason that accompanies it are one
+/// value rather than two arguments because neither is meaningful apart from the
+/// other: the reason is the owner's own explanation of that name and of no
+/// other, so a signature accepting them separately would permit a caller to
+/// pair a name with the reason belonging to a different disposition. Binding
+/// them into one value also keeps the closed pair inside this module's private
+/// vocabulary instead of leaving it spelled as two trailing parameters that
+/// widen the arity of every step reporting a decided disposition.
+///
+/// The decided arm deliberately does not carry the whole
+/// `UserAutomationRuntimeError` it replaced: a disposition reached here is
+/// always owner-acknowledged, so the variants expressing an unanswered or
+/// ambiguous owner cannot be represented, and admitting them again would let an
+/// unacknowledged answer reach a projection that reports decided outcomes.
+#[cfg(windows)]
+struct DecidedDisposition<'a> {
+    /// The closed disposition name reported under `outcome`.
+    outcome: &'a str,
+    /// The owner-issued reason reported under `reason`.
+    reason: String,
 }
 
 /// Classifies the runtime handoff one closed operator operation owns.

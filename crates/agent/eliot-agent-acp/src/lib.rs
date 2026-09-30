@@ -27,7 +27,8 @@ pub use durable_host_event_ingest::{
 };
 mod host_event_producer;
 pub use host_event_producer::{
-    ProduceOutcome, ProducerError, ProducerFrame, produce_allowed, produce_redacted,
+    ExecutionUnitFrame, ProduceOutcome, ProducerError, ProducerFrame, produce_allowed,
+    produce_execution_unit_allowed, produce_execution_unit_redacted, produce_redacted,
 };
 mod persistence_owner;
 pub use persistence_owner::HostEventPersistenceOwner;

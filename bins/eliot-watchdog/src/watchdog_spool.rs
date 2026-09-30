@@ -24,6 +24,16 @@ use crate::{
 
 pub(crate) mod backup;
 mod codec;
+/// Durable failure-episode deduplication and recurrence state (I8.3, I8.9).
+///
+/// The episode key and the source-event admission decision are derived in the
+/// owner-neutral core; this module owns their durable form and the bounded
+/// histories, and it is written inside the caller's existing spool transaction
+/// together with the record one accepted revision produced. It is a table in
+/// this owner's own `watchdog.redb`, not a second store, a second database, or
+/// an in-memory set, and it is not a compaction candidate, so an unresolved
+/// episode is never dropped.
+pub(crate) mod episode;
 pub mod export_driver;
 /// Spool-local intent records (I8.1 `problem_intent` / `incident_intent`) and
 /// the Watchdog-owned deterministic escalation rule that mints them.
@@ -1592,6 +1602,344 @@ impl WatchdogSpool {
             .insert(SPOOL_INTENT_RULE_KEY, bytes.as_slice())
             .map_err(|error| SpoolError::Database(error.to_string()))?;
         Ok(())
+    }
+
+    /// Resolves one observed failure against its durable failure episode and
+    /// persists the deduplication state in the same owner transaction as the
+    /// record one accepted revision produced.
+    ///
+    /// The episode key is derived in the owner-neutral core from the
+    /// observation's own rule revision, scope, subject, generation and
+    /// discriminating failure class. The source event identity is **not** part
+    /// of that key: it is compared against the episode's separate, bounded
+    /// accepted-event index, which is what makes a retransmission inert.
+    ///
+    /// Three outcomes, and no fourth:
+    ///
+    /// * **New evidence.** The exact `(event id, payload digest)` pair has not
+    ///   been accepted by this episode. Exactly one `Gap` record — the same
+    ///   retained record the ordinary gap path already appends — is appended
+    ///   through [`Self::append_in_transaction`], never through a nested write,
+    ///   and the episode's accepted revision, occurrence count, evidence time,
+    ///   accepted-event index and the exact record reference (sequence plus
+    ///   record digest, bound the way an export batch binds it) all commit with
+    ///   the spool's own high-water update in one transaction. A failure before
+    ///   that commit leaves neither a record nor an advanced episode.
+    /// * **Retransmission.** The same identity was already accepted with the
+    ///   same digest. Nothing is written, no record is appended, the occurrence
+    ///   count and the evidence time are reported unchanged, and the caller is
+    ///   handed the revision and record this episode already accepted. A
+    ///   restart, a duplicate tick, or a lost acknowledgement therefore reuses
+    ///   the accepted revision instead of emitting a fresh alert.
+    /// * **Refused.** The same identity with a *different* digest is a typed
+    ///   conflict, and a bounded history that cannot grow without either
+    ///   dropping an already-accepted identity or erasing an unresolved
+    ///   episode's reopen history is refused rather than trimmed. Neither writes
+    ///   anything, and neither opens a second episode.
+    ///
+    /// When the commit outcome is uncertain, the call reconciles the offered
+    /// observation by its own identity before deciding: if that event is now
+    /// accepted it reports the accepted revision, otherwise it reports the
+    /// failure. Neither branch can mint a second record for one source event.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when the episode identity is unusable, the stored
+    /// row is not canonical, a bound is already reached, the record cannot be
+    /// encoded, or the spool cannot be read or written.
+    pub(crate) fn observe_signal_episode(
+        &self,
+        observation: episode::SignalEpisodeObservation,
+    ) -> Result<episode::SignalEpisodeOutcome, SpoolError> {
+        // The observation is owned exactly once and decomposed here, so each
+        // owner-supplied fact below is read from the value this function
+        // received rather than from a borrow of a caller's copy. The source
+        // event is taken over by value: it is the identity this function
+        // classifies against and later reconciles against, and keeping one
+        // owner of it means the reconciliation can never name a second event.
+        let episode::SignalEpisodeObservation {
+            identity,
+            source_event,
+            reopen_condition,
+            observed_at_ms,
+            producer_generation,
+            record_reason,
+        } = observation;
+        let episode_key =
+            eliot_watchdog_core::FailureEpisodeKey::derive(&identity).map_err(|error| {
+                SpoolError::Corrupt(format!(
+                    "watchdog signal episode identity is not derivable: {error:?}"
+                ))
+            })?;
+        let ledger_key = episode::episode_ledger_key(episode_key.as_str());
+        let write = self
+            .database
+            .begin_write()
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        // The episode table is opened through the write transaction's own
+        // inherent `open_table`, which creates it when absent, and the read
+        // guard is released before anything else opens it for writing.
+        let state = {
+            let table = write
+                .open_table(episode::SIGNAL_EPISODE_TABLE)
+                .map_err(|error| SpoolError::Database(error.to_string()))?;
+            if let Some(state) = episode::read_episode(&table, ledger_key.as_str())? {
+                state
+            } else {
+                // A new episode takes one table slot, and the table is
+                // bounded. The check is against the real retained row count
+                // rather than a caller's number, so an over-full table
+                // refuses the new episode instead of the closer later walking
+                // past it.
+                let stored = episode::stored_episode_keys(&table)?.len();
+                if stored >= episode::MAX_SIGNAL_EPISODES {
+                    return Err(SpoolError::Corrupt(
+                        "watchdog signal episode table is at its bound; refusing to open another episode rather than dropping an existing one"
+                            .to_owned(),
+                    ));
+                }
+                episode::StoredSignalEpisode::fresh(&identity, &episode_key, &reopen_condition)
+            }
+        };
+        let admission = state.classify(&source_event)?;
+        let (outcome, emission) = Self::resolve_signal_episode_admission(
+            &write,
+            state,
+            &admission,
+            &source_event,
+            observed_at_ms,
+            producer_generation,
+            record_reason,
+        )?;
+        let Some(state) = emission else {
+            // Retransmission and refusal wrote nothing; dropping the
+            // uncommitted transaction is the durable outcome, and reporting it
+            // is not a lost record.
+            drop(write);
+            return Ok(outcome);
+        };
+        episode::write_episode(&write, ledger_key.as_str(), &state)?;
+        match write.commit() {
+            Ok(()) => Ok(outcome),
+            Err(error) => {
+                // The commit outcome is uncertain. Reconcile this exact source
+                // event by its own identity before deciding, so the caller is
+                // never handed a second record for an event that already has
+                // one.
+                match self.reconcile_accepted_signal_event(ledger_key.as_str(), &source_event) {
+                    Some(reconciled) => Ok(reconciled),
+                    None => Err(SpoolError::Database(error.to_string())),
+                }
+            }
+        }
+    }
+
+    /// Reconciles the revision an episode already accepted for exactly this
+    /// source event identity and digest.
+    ///
+    /// Read-only, and reached only after an uncertain commit of the one arm
+    /// that writes — a genuinely new source event. It reports the accepted
+    /// revision when this exact event is now part of the episode, and `None`
+    /// otherwise, which is the honest answer: the caller is then told the
+    /// attempt failed rather than handed a revision that was never committed.
+    fn reconcile_accepted_signal_event(
+        &self,
+        ledger_key: &str,
+        source_event: &eliot_watchdog_core::AcceptedSourceEvent,
+    ) -> Option<episode::SignalEpisodeOutcome> {
+        let read = self.database.begin_read().ok()?;
+        // A read transaction's `open_table` is the other half of the same
+        // inherent pair, and unlike the write path it does not create the table:
+        // a spool that never opened an episode simply has nothing to reconcile.
+        let table = read.open_table(episode::SIGNAL_EPISODE_TABLE).ok()?;
+        let state = episode::read_episode(&table, ledger_key).ok()??;
+        if state.classify(source_event).ok()?.is_new_evidence() {
+            return None;
+        }
+        let (revision, record) = state.accepted().ok()?;
+        let progress = state.progress();
+        Some(episode::SignalEpisodeOutcome::Reused {
+            revision,
+            independent_occurrences: progress.independent_occurrences,
+            evidence_observed_at_ms: progress.evidence_observed_at_ms,
+            record,
+        })
+    }
+
+    /// Turns one already-classified admission into the outcome its caller can
+    /// commit, inside the write transaction the caller already holds.
+    ///
+    /// This opens, closes and commits no transaction of its own: the one
+    /// `redb` write transaction its caller opened stays open across this call,
+    /// which is what keeps the appended record, the advanced episode row and
+    /// the spool's own high-water update one durability point. The append is
+    /// still [`Self::append_in_transaction`] on the caller's transaction and
+    /// still happens before the episode row naming that record is accepted, so
+    /// no side effect moves relative to a `?` or to the caller's `commit()`.
+    ///
+    /// The returned pair carries the advanced row when this admission wrote
+    /// something and `None` when it wrote nothing. A retransmission and a
+    /// refusal advance no occurrence count, no evidence time and no accepted
+    /// revision, so handing their caller a row to write would offer exactly the
+    /// write the deduplication guarantee forbids: the caller drops its
+    /// uncommitted transaction instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when the episode is at a bound, the record cannot
+    /// be encoded, or the append inside the caller's transaction fails. The
+    /// caller's transaction is then dropped uncommitted, exactly as it would be
+    /// had this step failed in place.
+    fn resolve_signal_episode_admission(
+        write: &WriteTransaction,
+        mut state: episode::StoredSignalEpisode,
+        admission: &eliot_watchdog_core::SourceEventAdmission,
+        source_event: &eliot_watchdog_core::AcceptedSourceEvent,
+        observed_at_ms: u64,
+        producer_generation: u64,
+        record_reason: crate::GapRecoveryReason,
+    ) -> Result<
+        (
+            episode::SignalEpisodeOutcome,
+            Option<episode::StoredSignalEpisode>,
+        ),
+        SpoolError,
+    > {
+        match admission {
+            eliot_watchdog_core::SourceEventAdmission::Retransmission { .. } => {
+                // Already accepted under the same identity and digest: reuse
+                // the accepted revision and write nothing, so the caller's
+                // uncommitted transaction is dropped without a write.
+                let (revision, record) = state.accepted()?;
+                let progress = state.progress();
+                Ok((
+                    episode::SignalEpisodeOutcome::Reused {
+                        revision,
+                        independent_occurrences: progress.independent_occurrences,
+                        evidence_observed_at_ms: progress.evidence_observed_at_ms,
+                        record,
+                    },
+                    None,
+                ))
+            }
+            eliot_watchdog_core::SourceEventAdmission::ConflictingPayload {
+                recorded_payload_digest,
+            } => Ok((
+                episode::SignalEpisodeOutcome::Refused(
+                    episode::SignalEpisodeRefusal::ConflictingSourceEventPayload {
+                        event_id: source_event.event_id.clone(),
+                        recorded_payload_digest: recorded_payload_digest.clone(),
+                    },
+                ),
+                None,
+            )),
+            eliot_watchdog_core::SourceEventAdmission::NewEvidence { .. } => {
+                if let Some(refusal) = state.bound_refusal(admission) {
+                    Ok((episode::SignalEpisodeOutcome::Refused(refusal), None))
+                } else {
+                    let payload = WatchdogSpoolPayload::Gap {
+                        service: SERVICE_NAME.to_owned(),
+                        reason: record_reason,
+                        coverage_claimed: false,
+                    };
+                    let (_appended, created) =
+                        Self::append_in_transaction(write, observed_at_ms, payload)?;
+                    // The identity of the record this transaction just created,
+                    // bound the way an export batch binds it. A
+                    // retention-pressure gap record written ahead of it can
+                    // never be mistaken for this observation, and an interleaved
+                    // append can never substitute another entry's sequence.
+                    let raw = encode_entry(&created)?;
+                    let (_payload_digest, record_digest) = export_record_digests(&created, &raw);
+                    let record = episode::StoredSignalRecordRef {
+                        sequence: created.sequence,
+                        record_digest,
+                        observed_at_ms: created.observed_at_ms,
+                    };
+                    let reopened = state.accept(
+                        source_event,
+                        observed_at_ms,
+                        producer_generation,
+                        admission,
+                        record.clone(),
+                    )?;
+                    let progress = state.progress();
+                    Ok((
+                        episode::SignalEpisodeOutcome::Accepted {
+                            revision: progress.revision,
+                            independent_occurrences: progress.independent_occurrences,
+                            record,
+                            reopened,
+                        },
+                        Some(state),
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Closes every open failure episode after a live admission, retaining each
+    /// episode's accepted events, revision, record reference and reopen history.
+    ///
+    /// A live admission is the only closer: no timer, no export acknowledgement
+    /// and no caller-chosen reason reaches this. Closing withdraws nothing, so a
+    /// later recurrence is recognised against the episode it recurs from and
+    /// appends a reopen record rather than starting an unrelated first
+    /// observation.
+    ///
+    /// Every open episode is closed, not a bounded prefix of them. The bound is
+    /// the table's own cap: a new episode is refused at
+    /// [`episode::MAX_SIGNAL_EPISODES`] rather than displacing an existing one,
+    /// so the set of open episodes can never exceed what one pass over the table
+    /// can close. That is what makes this closer complete rather than a partial
+    /// pass that silently leaves an episode open. An episode that is already
+    /// closed is not rewritten, and a failure before the commit leaves every
+    /// episode exactly as it was.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when a stored row is not canonical, the table
+    /// holds more episodes than its own cap, or the state cannot be written.
+    pub(crate) fn close_signal_episodes(&self) -> Result<u64, SpoolError> {
+        let write = self
+            .database
+            .begin_write()
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        // One read pass over the episode table decides which rows actually
+        // change, and its read guard is released before the write pass reopens
+        // the same table for writing: redb gives a write transaction one guard
+        // per open table, and this closer must not hold two at once.
+        let to_close = {
+            let table = write
+                .open_table(episode::SIGNAL_EPISODE_TABLE)
+                .map_err(|error| SpoolError::Database(error.to_string()))?;
+            let keys = episode::stored_episode_keys(&table)?;
+            if keys.len() > episode::MAX_SIGNAL_EPISODES {
+                return Err(SpoolError::Corrupt(
+                    "watchdog signal episode table exceeds its bound; refusing to close a prefix of it"
+                        .to_owned(),
+                ));
+            }
+            let mut to_close = Vec::new();
+            for ledger_key in &keys {
+                let Some(mut state) = episode::read_episode(&table, ledger_key.as_str())? else {
+                    continue;
+                };
+                if state.close()? {
+                    to_close.push((ledger_key.clone(), state));
+                }
+            }
+            to_close
+        };
+        let mut closed: u64 = 0;
+        for (ledger_key, state) in &to_close {
+            episode::write_episode(&write, ledger_key.as_str(), state)?;
+            closed = closed.saturating_add(1);
+        }
+        write
+            .commit()
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        Ok(closed)
     }
 
     /// Reads every retained sequence that already holds a submit-once receipt.

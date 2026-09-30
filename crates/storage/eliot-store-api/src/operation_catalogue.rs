@@ -280,8 +280,13 @@ struct ActivatedReadDescriptor {
 /// scope-free); `GetLearningRecordRange` addresses its scope through the
 /// typed `scope_id` request field (issue #1868: proven by both adapter
 /// handlers) and filters through the declared optional closed
-/// `record_kind` selector plus the `max_records` bound.
-const ACTIVATED_READS: [ActivatedReadDescriptor; 22] = [
+/// `record_kind` selector plus the `max_records` bound;
+/// `GetTaskContractAcceptanceSet` addresses no scope and selects through the
+/// declared exact `task_id` and `task_revision` the caller was admitted
+/// against (issue #325 P1, I7.9: the obligation set belongs to the task's own
+/// contract rather than to a caller's scope, and it must be read at one exact
+/// contract revision rather than at whatever happens to be current).
+const ACTIVATED_READS: [ActivatedReadDescriptor; 23] = [
     ActivatedReadDescriptor {
         operation: NamedReadOperation::GetCurrentEpistemicPosition,
         requires_scope_id: true,
@@ -392,11 +397,16 @@ const ACTIVATED_READS: [ActivatedReadDescriptor; 22] = [
         requires_scope_id: true,
         scope_kind: SCOPE_KIND_SCOPE,
     },
+    ActivatedReadDescriptor {
+        operation: NamedReadOperation::GetTaskContractAcceptanceSet,
+        requires_scope_id: false,
+        scope_kind: SCOPE_KIND_NONE,
+    },
 ];
 
 /// Returns the activated read operations in canonical declaration order.
 #[must_use]
-pub const fn activated_read_operations() -> [NamedReadOperation; 22] {
+pub const fn activated_read_operations() -> [NamedReadOperation; 23] {
     [
         ACTIVATED_READS[0].operation,
         ACTIVATED_READS[1].operation,
@@ -420,6 +430,7 @@ pub const fn activated_read_operations() -> [NamedReadOperation; 22] {
         ACTIVATED_READS[19].operation,
         ACTIVATED_READS[20].operation,
         ACTIVATED_READS[21].operation,
+        ACTIVATED_READS[22].operation,
     ]
 }
 
@@ -474,11 +485,17 @@ struct ActivatedMutationDescriptor {
 /// authorization evidence travels with the write and is verified at this
 /// boundary — the record's own owner lease, the transition's authority epoch
 /// and the authenticated request source; committing a revision grants no
-/// admission, dispatch or lifecycle change to anyone). All
+/// admission, dispatch or lifecycle change to anyone);
+/// `RecordTaskContractAcceptanceSet` persists `ReversibleMutation` through
+/// the `TaskControl` family (issue #325 P1, I7.9: the create-only durable owner
+/// record of one `TaskContract` revision's acceptance obligations, keyed by
+/// `(task_id, task_revision)` — committing it asserts only what the contract
+/// owner already required and grants no coverage, support, admission or
+/// completion). All
 /// activated mutation rows address no store scope, mirroring the scope-free read
 /// descriptors. Every
 /// other mutation stays known-but-unsupported.
-const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 21] = [
+const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 22] = [
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ApplyEpistemicRevision,
         transition_classes: &[TransitionClass::Epistemic],
@@ -626,6 +643,22 @@ const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 21] = [
         operation: NamedMutationOperation::RecordCapabilityEvidenceRecord,
         transition_classes: &[TransitionClass::CaptureCandidate],
         maximum_effect: EffectClass::Candidate,
+        max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
+    },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::RecordTaskContractAcceptanceSet,
+        transition_classes: &[TransitionClass::TaskControl],
+        // The class maximum, exactly as `UpdateTaskState` and
+        // `ApplySwarmOwnerRevisions`: the row is one create-only durable record,
+        // so it is `ReversibleMutation` and never `Candidate` — a candidate
+        // ceiling would admit an owner obligation set with no live State Fence
+        // — and never `ExternalEffect`.
+        maximum_effect: EffectClass::ReversibleMutation,
+        // One acceptance set is an owner record with a bounded obligation
+        // enumeration, not a bulk payload. The parameter travels as canonical
+        // JSON inside the parameters object, so the bulk bound covers escaping
+        // and the enclosing structure without loosening the record's own
+        // closed validator.
         max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
     },
 ];
@@ -955,6 +988,10 @@ pub fn validate_transition_against_catalogue(
                 crate::decode_capability_evidence_mutation(command.operation, &command.parameters)
                     .map(|_| ())?;
             }
+            NamedMutationOperation::RecordTaskContractAcceptanceSet => {
+                validate_typed_mutation_parameters(command.operation, &command.parameters)?;
+                validate_task_contract_acceptance_transition(transition, &command.parameters)?;
+            }
             NamedMutationOperation::RecordAuthorityRevocation => {
                 return Err(StoreError::UnknownOperation);
             }
@@ -1003,6 +1040,33 @@ fn validate_parameter_size(
         .map_err(|error| StoreError::Serialization(error.to_string()))?;
     if u64::try_from(parameter_bytes.len()).map_or(true, |len| len > u64::from(max_input_bytes)) {
         return Err(StoreError::PayloadTooLarge);
+    }
+    Ok(())
+}
+
+/// Binds one owner acceptance-set record to the transition that carries it.
+///
+/// The record is the contract owner's own enumeration, so it must name the
+/// transition's task and be issued at the transition's live State Fence. A
+/// record bound to another task or another fence is refused here, before any
+/// provider I/O, so the durable row and the receipt always describe one task at
+/// one fence.
+fn validate_task_contract_acceptance_transition(
+    transition: &PreparedTransition,
+    parameters: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Result<(), StoreError> {
+    let record = crate::decode_task_contract_acceptance_record(
+        NamedMutationOperation::RecordTaskContractAcceptanceSet,
+        parameters,
+    )?;
+    if record.state_fence != transition.state_fence {
+        return Err(StoreError::FenceMismatch);
+    }
+    if transition.task_id.as_deref() != Some(record.task_id.as_str()) {
+        return Err(StoreError::InvalidField {
+            field: "task_contract_acceptance.task_id",
+            reason: "must match the prepared transition task",
+        });
     }
     Ok(())
 }

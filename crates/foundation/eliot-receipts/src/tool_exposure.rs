@@ -1376,6 +1376,50 @@ impl ToolExposureHistoryEntry {
         }
         Ok(())
     }
+
+    /// Opens a fresh entry with every owner-populated stage explicitly unresolved.
+    ///
+    /// Binds the tool identity, the definition version, the joining route when
+    /// the opening seam owns one, and the owner-joined turn/run/attempt/surface
+    /// identities; all ten stages (registered, advertised, eligible, selected,
+    /// called, transport, delivery, retry, use, outcome) stay unresolved
+    /// unknown coverage. Each stage is then populated only by its respective
+    /// owner with its source reference through the matching `record_*` stager
+    /// (or owner joins such as the semantic-registry `apply_registered_fact`); nothing is inferred from another stage here,
+    /// `None` never coerces to `false`, and the populated entry persists as a
+    /// replay-safe revision through [`persist_exposure_history_revision`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an identity, version, or route text is blank or
+    /// carries control characters, or when the surface identity is missing.
+    pub fn unpopulated(
+        tool_definition: String,
+        definition_version: String,
+        route_fingerprint: Option<String>,
+        identities: ExposureIdentities,
+    ) -> Result<Self, ToolExposureError> {
+        let entry = Self {
+            schema_version: EXPOSURE_HISTORY_VERSION,
+            tool_definition,
+            definition_version,
+            route_fingerprint,
+            identities,
+            registered: OwnerStageFact::unresolved(),
+            advertised_to_route: OwnerStageFact::unresolved(),
+            eligible_under_scope_policy_and_grant: OwnerStageFact::unresolved(),
+            selected_by_planner_or_model: OwnerStageFact::unresolved(),
+            called: OwnerStageFact::unresolved(),
+            transport_completed: OwnerStageFact::unresolved(),
+            result_delivery: None,
+            delivery_source_ref: None,
+            expanded_or_retried: OwnerStageFact::unresolved(),
+            observably_used_in_decision_action_or_verifier: OwnerStageFact::unresolved(),
+            terminal_task_or_product_outcome_ref: None,
+        };
+        entry.validate()?;
+        Ok(entry)
+    }
 }
 
 /// Refuses a second supply for one recorded history stage.
@@ -1644,6 +1688,34 @@ impl ToolExposureHistoryEntry {
         self.validate()?;
         Ok(self)
     }
+
+    /// Derives the content-bound persistence key for this recorded revision.
+    ///
+    /// The key is the existing foundation hash over the canonical bytes of
+    /// the recorded entry — every supplied-or-unresolved stage, identity,
+    /// and source reference as recorded, compared with this operation. The
+    /// owning observation/receipt/outbox seam keys its write on this value:
+    /// an identical redelivery (lost acknowledgement, replayed publication)
+    /// yields the identical key and reconciles the original event instead of
+    /// executing again, while any recorded difference yields a different key
+    /// instead of a false dedupe. Unknown coverage keys as recorded unknown,
+    /// never coerced to false. Like the receipt envelope's idempotency
+    /// identity, this is a dedupe locator only: it authorizes no replay and
+    /// mutates no store. The persistence seam is the STITCH caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the entry is inconsistent or its recorded
+    /// content cannot be canonically serialized for keying.
+    pub fn persistence_idempotency_key(&self) -> Result<String, ToolExposureError> {
+        self.validate()?;
+        let bytes =
+            crate::canonical_json_bytes(self).map_err(|_| ToolExposureError::InvalidField {
+                field: "history.revision.idempotency_key",
+                reason: "recorded exposure history cannot be canonically keyed for persistence",
+            })?;
+        Ok(crate::sha256_hex(&bytes))
+    }
 }
 
 /// Replay disposition for one exposure-history revision against the recorded prior.
@@ -1791,13 +1863,12 @@ pub fn persist_exposure_history_revision(
 }
 
 /// Canonical digest of one history entry's recorded bytes.
+///
+/// Delegates to [`ToolExposureHistoryEntry::persistence_idempotency_key`]:
+/// one content-bound key implementation serves both the public seam and the
+/// packaged revision.
 fn digest_history_entry(entry: &ToolExposureHistoryEntry) -> Result<String, ToolExposureError> {
-    let bytes =
-        crate::canonical_json_bytes(entry).map_err(|_| ToolExposureError::InvalidField {
-            field: "history.revision",
-            reason: "exposure history entry is not canonically serializable",
-        })?;
-    Ok(crate::sha256_hex(&bytes))
+    entry.persistence_idempotency_key()
 }
 
 /// Canonical digest of one history entry's revision lineage.

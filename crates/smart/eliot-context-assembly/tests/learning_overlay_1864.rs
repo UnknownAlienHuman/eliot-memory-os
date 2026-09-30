@@ -283,6 +283,28 @@ fn resolved_applicability() -> QualityApplicability {
     }
 }
 
+/// Intrinsically well-formed output binding for a card that is only checked for
+/// structural integrity, or for a packet assembly refuses before the grade is
+/// read. The serializer and route identities are the ones
+/// [`policy_for`] applies, because a card naming a different serializer or
+/// route is not the grade of the bytes produced under this policy and
+/// `require_graded_output` refuses it. The digests are placeholders: a card
+/// naming one packet's exact digests is built by that packet's owner.
+fn fixture_output_binding() -> QualityOutputBinding {
+    QualityOutputBinding {
+        recipe_digest: digest(),
+        fence_digest: digest(),
+        admitted_digest: digest(),
+        rendered_digest: digest(),
+        serializer_id: "fixture-serde-v1".to_owned(),
+        serializer_version: "1".to_owned(),
+        serializer_options_digest: digest(),
+        route_id: "route".to_owned(),
+        evidence_revisions: Vec::new(),
+        omission_handles: Vec::new(),
+    }
+}
+
 fn quality(context: &ContextBinding) -> QualityScorecard {
     let dimensions = [
         QualityDimension::AcceptanceDecisionCoverage,
@@ -299,7 +321,9 @@ fn quality(context: &ContextBinding) -> QualityScorecard {
         QualityDimension::TelemetryMeasurementCostCoverage,
     ];
     QualityScorecard {
+        schema_version: QUALITY_SCORECARD_SCHEMA_VERSION,
         binding: context.clone(),
+        output: fixture_output_binding(),
         applicability: resolved_applicability(),
         results: dimensions
             .into_iter()

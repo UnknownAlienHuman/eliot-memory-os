@@ -95,6 +95,9 @@ pub enum ModuleError {
     AdmissionReceiptUnverified,
     #[error("module catalog operation identity conflict")]
     IdentityConflict,
+    /// The declared required dependency edges contain a cycle.
+    #[error("module catalog required dependency cycle: {path}")]
+    RequiredDependencyCycle { path: String },
     #[error("module catalog serialization failed: {0}")]
     Serialization(String),
     #[error("module catalog contract failed: {0}")]
@@ -1190,6 +1193,7 @@ impl ModuleCatalogSnapshot {
                 return Err(ModuleError::FenceMismatch);
             }
         }
+        reject_required_dependency_cycle(&self.entries)?;
         digest(&self.catalog_digest, "catalog_digest")?;
         if self.computed_digest()? != self.catalog_digest {
             return Err(ModuleError::IdentityConflict);
@@ -1511,6 +1515,100 @@ fn reject_self_dependency(
         });
     }
     Ok(())
+}
+
+/// Refuses a cycle among the declared REQUIRED dependency edges.
+///
+/// I6.4 requires the required graph to be acyclic before a generation can
+/// reach `READY`, and W2 requires exactly this for the restart policy's
+/// required dependencies: only `RestartDependencyKind::Required` participates.
+/// An optional or advisory edge is deliberately excluded, because its absence
+/// degrades a capability rather than creating a liveness prerequisite
+/// (I6.4), so including it here would refuse a declaration the architecture
+/// admits.
+///
+/// The walk is over the catalog's own declared edges, so the refusal is a
+/// property of what the manifests say rather than of any caller's list. The
+/// offending path is reported, so the gap is named rather than summarized.
+fn reject_required_dependency_cycle(entries: &[ModuleCatalogEntry]) -> Result<(), ModuleError> {
+    let mut adjacency: BTreeMap<ModuleId, BTreeSet<ModuleId>> = BTreeMap::new();
+    let mut nodes: BTreeSet<ModuleId> = BTreeSet::new();
+    for entry in entries {
+        nodes.insert(entry.module_id.clone());
+        for dependency in &entry.manifest.dependencies {
+            if dependency.kind != RestartDependencyKind::Required {
+                continue;
+            }
+            // A required edge to a module outside this catalog is a leaf: that
+            // provider's own required edges are declared by its own manifest,
+            // not here, so this walk cannot traverse it and must not invent
+            // the missing declaration.
+            nodes.insert(dependency.module_id.clone());
+            adjacency
+                .entry(entry.module_id.clone())
+                .or_default()
+                .insert(dependency.module_id.clone());
+        }
+    }
+
+    let mut color: BTreeMap<ModuleId, RequiredDependencyColor> = nodes
+        .iter()
+        .map(|node| (node.clone(), RequiredDependencyColor::White))
+        .collect();
+    let mut stack: Vec<ModuleId> = Vec::new();
+    for node in &nodes {
+        if color.get(node) == Some(&RequiredDependencyColor::White)
+            && let Some(path) =
+                visit_required_dependency_edges(node, &adjacency, &mut color, &mut stack)
+        {
+            return Err(ModuleError::RequiredDependencyCycle { path });
+        }
+    }
+    Ok(())
+}
+
+/// Visit state of one node in the required-dependency acyclicity walk.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RequiredDependencyColor {
+    White,
+    Gray,
+    Black,
+}
+
+/// Visits one node's required edges, returning the cycle path when a node
+/// already on the current stack is reached again.
+fn visit_required_dependency_edges(
+    node: &ModuleId,
+    adjacency: &BTreeMap<ModuleId, BTreeSet<ModuleId>>,
+    color: &mut BTreeMap<ModuleId, RequiredDependencyColor>,
+    stack: &mut Vec<ModuleId>,
+) -> Option<String> {
+    color.insert(node.clone(), RequiredDependencyColor::Gray);
+    stack.push(node.clone());
+    if let Some(providers) = adjacency.get(node) {
+        for provider in providers {
+            match color.get(provider) {
+                Some(RequiredDependencyColor::Gray) => {
+                    let start = stack.iter().position(|id| id == provider).unwrap_or(0);
+                    let mut path: Vec<String> =
+                        stack[start..].iter().map(ToString::to_string).collect();
+                    path.push(provider.to_string());
+                    return Some(path.join(" -> "));
+                }
+                Some(RequiredDependencyColor::White) => {
+                    if let Some(path) =
+                        visit_required_dependency_edges(provider, adjacency, color, stack)
+                    {
+                        return Some(path);
+                    }
+                }
+                Some(RequiredDependencyColor::Black) | None => {}
+            }
+        }
+    }
+    stack.pop();
+    color.insert(node.clone(), RequiredDependencyColor::Black);
+    None
 }
 
 #[allow(async_fn_in_trait)]

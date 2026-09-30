@@ -229,6 +229,12 @@ fn resolved_applicability() -> QualityApplicability {
 /// Intrinsically well-formed output binding for a card that is only checked for
 /// structural integrity, or for a packet assembly refuses before the grade is
 /// read. [`quality_for`] is the card a real packet accepts.
+///
+/// The serializer and route identities here are the ones
+/// [`policy_for`] applies, because a card that names a different serializer or
+/// route than the bytes were produced under is not the grade of those bytes and
+/// `require_graded_output` refuses it. The digests stay placeholder values:
+/// those are the fields [`quality_for`] replaces with this packet's own.
 fn fixture_output_binding() -> QualityOutputBinding {
     QualityOutputBinding {
         recipe_digest: digest(),
@@ -238,7 +244,7 @@ fn fixture_output_binding() -> QualityOutputBinding {
         serializer_id: "fixture-serde-v1".to_owned(),
         serializer_version: "1".to_owned(),
         serializer_options_digest: digest(),
-        route_id: "fixture-route".to_owned(),
+        route_id: "route".to_owned(),
         evidence_revisions: Vec::new(),
         omission_handles: Vec::new(),
     }
@@ -286,7 +292,11 @@ fn quality(context: &ContextBinding) -> QualityScorecard {
 
 /// The card a real packet accepts: it records the exact output it graded, so
 /// the recipe revision, the fence, the admitted set's own canonical payload
-/// digest and the ordered rendered payload digest are this packet's values.
+/// digest, the ordered rendered payload digest, the serializer/route identity
+/// the bytes are produced under and the source revisions they are read from are
+/// this packet's values. A card that omits or forges any of them is refused by
+/// `require_graded_output` rather than accepted on the strength of its twelve
+/// passing dimensions.
 fn quality_for(admitted: &AdmittedContextSet, recipe: &ContextRecipe) -> QualityScorecard {
     let mut card = quality(&admitted.binding);
     let fence_digest =
@@ -306,6 +316,17 @@ fn quality_for(admitted: &AdmittedContextSet, recipe: &ContextRecipe) -> Quality
     )
     .expect("fixture rendered digest");
     card.output.omission_handles = admitted.economy.displaced.clone();
+    // The source revisions this packet was actually read from, deduplicated in
+    // canonical order exactly as the owner derives them from the admitted
+    // records. These are real observations, so the binding is satisfied by the
+    // packet and not by a self-referential list.
+    card.output.evidence_revisions = admitted
+        .records
+        .iter()
+        .map(|record| record.candidate.source.snapshot_id.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
     card
 }
 
@@ -2321,9 +2342,16 @@ fn successful_views_are_one_to_one_and_within_measured_bounds() {
     for (value, recipe) in &fixtures {
         let context = value.binding.clone();
         let max = 100_000;
-        let view = assemble_active_view(value, recipe, quality(&context), &policy(max), |bytes| {
-            Ok(measurement(&context, bytes))
-        })
+        // The card records the exact output it graded, including the source
+        // revisions these atoms were read from, so this asserts a real packet
+        // bound to its real grade.
+        let view = assemble_active_view(
+            value,
+            recipe,
+            quality_for(value, recipe),
+            &policy(max),
+            |bytes| Ok(measurement(&context, bytes)),
+        )
         .expect("bounded one-to-one view");
         let mut admitted_sorted = view.view.admitted_ids.clone();
         admitted_sorted.sort();

@@ -33,6 +33,26 @@
 //!    the binding is a comparison against owner-held state and not a value the
 //!    caller restated.
 //!
+//! The store boundary re-derives rather than trusts. `record_digest` and
+//! `authorization_digest` are the two bindings that are not a shape check, and
+//! [`eliot_store_api::decode_problem_owner_state_mutation`] now compares both:
+//! the record digest is re-taken over the candidate's own canonical bytes, and
+//! the authorization digest is re-taken over the ownership-lease identity and
+//! `state_fence` the committed record itself retains, under the one shared
+//! [`PROBLEM_AUTHORIZATION_DOMAIN`](eliot_store_api::PROBLEM_AUTHORIZATION_DOMAIN)
+//! this module prepares it from. A transition therefore cannot commit a record
+//! whose bytes, or whose retained lease, disagree with the authorization and
+//! digest it travels beside.
+//!
+//! Because the store refuses those two bindings rather than transporting them,
+//! the semantic verdict has to be the store's verdict: a candidate record
+//! retaining no ownership-lease identity yields no digest to compare, so it
+//! cannot commit through any presented lease. Preparing one anyway would hand
+//! the caller a transition it can never commit, dressed as an authorization. That
+//! refusal is therefore raised here, as the typed
+//! [`CompositionError::ProblemOwnerTransitionUncommittable`], rather than
+//! deferred to a commit that is certain to fail.
+//!
 //! Pure and effect-separated: the state machine runs on a **candidate copy** of
 //! the record and is validated before it replaces anything, so a refused
 //! transition leaves the live record byte-identical. The effect is the single
@@ -75,14 +95,16 @@ use eliot_problem::{
 };
 use eliot_store_api::{
     EffectClass, EventId, EventProjectionRelationIntents, OperationManifestDigest,
-    OrderingHeadExpectation, OrderingScopeId, PROBLEM_CLOSURE_SUPERSEDED_BY,
-    PROBLEM_CLOSURE_WAIVED, PROBLEM_PARAM_AUTHORIZATION_DIGEST, PROBLEM_PARAM_CLOSURE_JSON,
-    PROBLEM_PARAM_EXPECTED_REVISION, PROBLEM_PARAM_PROBLEM_ID, PROBLEM_PARAM_RECORD_DIGEST,
-    PROBLEM_PARAM_RECORD_JSON, PROBLEM_PARAM_SOURCE_SIGNAL_ID, PROBLEM_PARAM_TRANSITION,
-    ProblemOwnerTransition, RevisionHeadExpectation, ScopeId, SecurityContext, StateFence,
-    TransitionClass, problem_owner_state_mutation_request, problem_revision_key,
+    OrderingHeadExpectation, OrderingScopeId, PROBLEM_AUTHORIZATION_DOMAIN,
+    PROBLEM_CLOSURE_SUPERSEDED_BY, PROBLEM_CLOSURE_WAIVED, PROBLEM_PARAM_AUTHORIZATION_DIGEST,
+    PROBLEM_PARAM_CLOSURE_JSON, PROBLEM_PARAM_EXPECTED_REVISION, PROBLEM_PARAM_PROBLEM_ID,
+    PROBLEM_PARAM_RECORD_DIGEST, PROBLEM_PARAM_RECORD_JSON, PROBLEM_PARAM_SOURCE_SIGNAL_ID,
+    PROBLEM_PARAM_TRANSITION, ProblemOwnerTransition, RevisionHeadExpectation, ScopeId,
+    SecurityContext, StateFence, TransitionClass, problem_owner_state_mutation_request,
+    problem_revision_key,
 };
 use serde_json::Value;
+use thiserror::Error;
 
 use crate::composition::CompositionError;
 
@@ -92,8 +114,6 @@ const PROBLEM_SCOPE_ID: &str = "governor";
 /// sequence; the constant mirrors the existing problem/recovery legs so all
 /// canonical writes share one conflict-serialization scope.
 const PROBLEM_ORDERING_SCOPE: &str = "scope:governor";
-/// Domain separator for the re-proved current-authorization digest.
-const AUTHORIZATION_DOMAIN: &str = "eliot.problem.owner-transition-authorization.v1";
 
 fn owner_refused(detail: impl Into<String>) -> CompositionError {
     CompositionError::Owner(detail.into())
@@ -341,7 +361,10 @@ impl ProblemOwnerTransitionRequest<'_> {
 ///
 /// The digest is over the lease owner's own commitment as this crate re-derives
 /// it, bound to the exact fence and ownership epoch the transition runs under.
-/// It is *derived here*, never taken from the caller.
+/// It is *derived here*, never taken from the caller, and it is derived over the
+/// same domain-separated tuple the store re-derives from the committed record's
+/// own retained lease and fence — so the store's recheck is a comparison against
+/// this value rather than a second scheme that can drift from it.
 fn authorization_digest(
     lease: &AuthenticatedOwnerLease,
     epoch: &EpochId,
@@ -356,7 +379,7 @@ fn authorization_digest(
         ));
     }
     let bytes = canonical_json_bytes(&(
-        AUTHORIZATION_DOMAIN,
+        PROBLEM_AUTHORIZATION_DOMAIN,
         &commitment,
         &lease.identity().lease_id,
         lease.ownership_epoch(),
@@ -383,17 +406,50 @@ fn checked_source_signal<'a>(
     Ok(source)
 }
 
+/// Why a candidate record retains no ownership-lease identity for a named owner
+/// transition to be authorized over.
+///
+/// Typed and closed, not prose, because the same shape is refused at the store
+/// boundary and a caller has to be able to branch on *which* one it hit. The
+/// store names it in a [`StoreError`](eliot_store_api::StoreError) variant and
+/// an exact `field`; this names it as a value, so the refusal survives the
+/// crossing from the commit layer back to the semantic one instead of arriving as
+/// a message to re-parse. The set is closed: a record shape that is not one of
+/// these cannot be described by any reason here, so a new shape is a change to
+/// this enum rather than a widening of the check that raises it.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum ProblemOwnerAuthorizationRefusal {
+    /// The record is a legacy migration that never carried an ownership lease, so
+    /// it retains neither an assigned lease nor an observed lost lease and there
+    /// is nothing at all for the authorization digest to be taken over.
+    #[error(
+        "the record is a legacy migration that never carried an ownership lease, so it retains no ownership-lease identity for the authorization digest to be taken over"
+    )]
+    LeaseLessLegacyMigration,
+}
+
 /// Requires the candidate to retain exactly the authorization it was admitted
-/// under.
+/// under, and refuses any candidate the store could not commit.
 ///
 /// The lease identity is compared field for field — lease id, commitment and
 /// ownership epoch — so an assignment under a newly issued lease, a renewal that
 /// moved the commitment on, and a record whose owner was fenced all resolve
 /// correctly here instead of committing a history entry that describes an
 /// authorization the store never saw.
+///
+/// **The invariant: nothing this function admits is a transition the store
+/// cannot commit.** A prepare is handed to a caller as committable, so a prepare
+/// the store is bound to refuse is not a lesser answer — it is a false one, and
+/// the caller cannot tell it from success. The store's own
+/// `authorization_digest` comparison re-derives the digest from the candidate
+/// record's *own* retained lease identity, so a record retaining none yields no
+/// digest for the presented authorization to equal and the commit is refused. The
+/// refusal therefore happens here, as
+/// [`CompositionError::ProblemOwnerTransitionUncommittable`], carrying the same
+/// reason the store would name.
 fn check_retained_authorization(
     candidate: &Problem,
-    prior: Option<&Problem>,
+    transition: ProblemOwnerTransition,
     lease: &AuthenticatedOwnerLease,
 ) -> Result<(), CompositionError> {
     match &candidate.ownership {
@@ -407,29 +463,32 @@ fn check_retained_authorization(
                     "owner transition does not name the presented ownership lease".to_owned(),
                 )),
                 // A record migrated as legacy-without-lease has no lost lease to
-                // name, so there is no lease identity an escalation can present.
-                // Its authority is instead the record's own live predecessor: an
-                // `Escalate` on an already-unassigned record must restate an
-                // obligation the prior committed record already carried, or
-                // refuse. Without this, `Escalate` on a legacy-unassigned record
-                // is refused with "does not name the presented ownership lease"
-                // for every possible presented lease, which is the same
-                // undischargeable-obligation defect `Ownership::retained_epoch`
-                // was added to fix on the reassignment half.
-                None => match prior {
-                    Some(prior)
-                        if matches!(
-                            prior.ownership,
-                            eliot_problem::Ownership::Unassigned(_)
-                        ) =>
-                    {
-                        Ok(())
-                    }
-                    _ => Err(owner_refused(
-                        "an unassigned record with no lost lease is not the product of an owner transition"
-                            .to_owned(),
-                    )),
-                },
+                // name, so there is no lease identity a presented authorization
+                // can be *over* — and the store re-derives the digest it compares
+                // from that same retained identity, so a record retaining neither
+                // `ASSIGNED.lease` nor `UNASSIGNED.lost_lease` cannot commit
+                // through any presented lease at all. The two boundaries are held
+                // to one invariant, so this arm refuses rather than authorizing a
+                // transition that could only ever be rejected.
+                //
+                // The obligation such a record carries is still dischargeable, but
+                // by REASSIGNMENT rather than by escalating itself. `Assign` admits
+                // a successor under a strictly greater `Ownership::retained_epoch`,
+                // and that accessor is defined to read the unassigned epoch of
+                // exactly this legacy shape, so a successor can clear it. That
+                // repair is the reassignment half of this match and the state
+                // machine that mints the successor: it turns the record into an
+                // `Assigned` one that *does* retain a lease identity, and from
+                // there every verb, `Escalate` included, compares against a real
+                // identity on both sides. This arm only governs the unassigned
+                // half, so tightening it leaves the reassignment repair — and the
+                // stored record's own obligation — untouched.
+                None => Err(CompositionError::ProblemOwnerTransitionUncommittable {
+                    problem_id: candidate.problem_id.as_str().to_owned(),
+                    revision: candidate.revision,
+                    transition,
+                    reason: ProblemOwnerAuthorizationRefusal::LeaseLessLegacyMigration,
+                }),
             }
         }
         eliot_problem::Ownership::Assigned(assigned) => {
@@ -864,7 +923,7 @@ pub fn prepare_problem_owner_transition(
             "candidate record is not bound to the admitted source Signal".to_owned(),
         ));
     }
-    check_retained_authorization(&candidate, current, lease)?;
+    check_retained_authorization(&candidate, transition, lease)?;
     let bindings = problem_owner_parameters(
         &candidate,
         expected_revision,

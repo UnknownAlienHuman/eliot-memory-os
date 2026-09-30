@@ -553,6 +553,7 @@ fn build_apply_statements(
     append_experience_statements(&mut sql, &mut bindings, experience)?;
     append_swarm_owner_revision_statements(&mut sql, &mut bindings, transition)?;
     append_blackboard_item_statements(&mut sql, &mut bindings, transition)?;
+    append_task_contract_acceptance_statements(&mut sql, &mut bindings, transition)?;
     // #1868 learning-record writes commit atomically beside the experience
     // rows under the same create-or-converge contract.
     append_learning_statements(&mut sql, &mut bindings, learning)?;
@@ -1135,6 +1136,31 @@ fn append_blackboard_item_statements(
         if bindings.insert(name.clone(), value).is_some() {
             return Err(AdapterError::Serialization(
                 "blackboard binding collided with a canonical binding".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Appends the create-only owner acceptance-set row when the named operation is
+/// present in the transition (#325 P1, I7.9).
+///
+/// The durable owner record and the canonical receipt commit in this one
+/// transaction, so a reader can never observe an acceptance set that the
+/// receipt does not describe. Nothing here derives acceptance semantics: the
+/// row is the contract owner's own enumeration, carried verbatim.
+fn append_task_contract_acceptance_statements(
+    sql: &mut String,
+    bindings: &mut Map<String, Value>,
+    transition: &eliot_store_api::PreparedTransition,
+) -> Result<(), AdapterError> {
+    let (fragment, fragment_bindings) =
+        super::surreal_task_acceptance::task_contract_acceptance_statements(transition)?;
+    sql.push_str(&fragment);
+    for (name, value) in fragment_bindings {
+        if bindings.insert(name.clone(), value).is_some() {
+            return Err(AdapterError::Serialization(
+                "task contract acceptance binding collided with a canonical binding".to_owned(),
             ));
         }
     }

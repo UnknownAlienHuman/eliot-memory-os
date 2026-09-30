@@ -39,7 +39,8 @@ mod render;
 
 pub use assemble::{
     ASSEMBLY_ORDERING_REVISION, ActiveUnderstandingViewResult, AssemblyPolicy,
-    RenderedOutputIdentity, assemble_active_view, rendered_output_identity,
+    HeadroomHandoffRefusal, RenderedOutputIdentity, assemble_active_view, recheck_headroom_handoff,
+    rendered_output_identity,
 };
 pub use boundary::{
     BOUNDARY_ASSEMBLY_TRANSFORMER_ID, BOUNDARY_ASSEMBLY_TRANSFORMER_REVISION,
@@ -56,7 +57,10 @@ pub use readback::{ReopenedSource, gate_citation};
 
 pub use eliot_context_contracts::{
     ActiveUnderstandingView, AdmittedContextSet, BoundaryMetadataSet, ContextError, ContextOutcome,
-    IndexPreview, PreviewAuthority, ProjectedCitation, QualityScorecard, ReadbackRefusal,
-    ReadbackRefusalKind, ReadbackRequest, RenderedAtom, SelectionIntegrityProof,
-    SerializedContextMeasurement,
+    DownstreamHeadroomRequest, DownstreamHeadroomResult, HeadroomAllocationLedger, HeadroomAttempt,
+    HeadroomConsumer, HeadroomDecision, HeadroomDemand, HeadroomDimension, HeadroomOutcome,
+    HeadroomPurpose, HeadroomQuantity, HeadroomRefusal, HeadroomReleaseCondition,
+    HeadroomReleaseInstruction, IndexPreview, PreviewAuthority, ProjectedCitation,
+    QualityScorecard, ReadbackRefusal, ReadbackRefusalKind, ReadbackRequest, RenderedAtom,
+    SelectionIntegrityProof, SerializedContextMeasurement,
 };

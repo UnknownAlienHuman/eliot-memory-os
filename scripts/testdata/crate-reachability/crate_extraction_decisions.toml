@@ -49,6 +49,9 @@
 #        `path::symbol` outside the package whose owning manifest really declares a
 #        Cargo dependency on it, or carry an ISO-8601 expiry that is not already past
 #        together with a consumer string the crate's own `module.toml` declares;
+#        the expiry arm additionally requires that no other package declares a
+#        Cargo dependency on it: a "no first real consumer" premise the tree
+#        refutes is an `ADMISSION_CONSUMER_ABSENT` defect;
 #      - `affected_functional_cells_and_lifecycle_owners` and
 #        `source_maintenance_owner_and_vendor_type_boundary` must name the crate's real
 #        `functional_cell`, `lifecycle_owner` and `[agent_task].integration_owner`.
@@ -479,12 +482,12 @@ affected_functional_cells_and_lifecycle_owners = "functional cell smart.dreamer.
 current_source_dependency_and_change_closure = "path dependencies eliot-dreamer-contracts (path), eliot-receipts (path); dev dependencies eliot-contracts (path), eliot-evidence (path); no build script; declared consumers eliot-dreamer-curation"
 proposed_package_boundary = "workspace/core :: eliot-dreamer-failure"
 public_contract_and_independent_test_entrypoint = "crates/smart/eliot-dreamer-failure/tests/failure.rs::exact_failure_produces_sealed_hypothesis_decision; cargo test -p eliot-dreamer-failure --test failure exact_failure_produces_sealed_hypothesis_decision"
-first_real_consumer_or_time_bounded_migration_facade = "no first real consumer: the crate's own module manifest declares eliot-dreamer-curation as the intended consumer, which exists as a package (crates/smart/eliot-dreamer-curation) but declares no Cargo dependency edge on this crate and constructs no call site; bounded migration facade expiring 2027-03-31 owned by cognitive-wave-integrator"
+first_real_consumer_or_time_bounded_migration_facade = "real production consumer crates/governor/eliot-governor/src/negative_memory_gate.rs::evaluate_negative_memory_gate; no migration expiry applies because the boundary already has a consumer"
 source_maintenance_owner_and_vendor_type_boundary = "source maintenance owner cognitive-wave-integrator; only schemars/serde/serde_json/thiserror from crates.io, and no store, process, provider or model type appears in the public contract"
 dependency_security_license_and_build_isolation = "publish = false; the manifest carries no [workspace] table, so the package cannot become a federated contour by accident; no build script, no target-specific dependency and no network or credential configuration; it builds under the single root Cargo.lock"
-expected_agent_workset_context_and_reverse_fanout_delta = "an agent turn is package-local: 6599 non-blank lines and 55 test cases; measured Cargo reverse fan-out is no Cargo dependent"
+expected_agent_workset_context_and_reverse_fanout_delta = "an agent turn is package-local: 6599 non-blank lines and 55 test cases; measured Cargo reverse fan-out is eliot-governor and eliotd (2 production dependents)"
 expected_compile_test_integration_and_release_cost_delta = "one additional package-selective compile and 55 package-local tests; the package has no binary, example or release target, so the release cost delta is zero and the integration cost is the declared consumer's single call site"
-migration_reexport_rollback_removal_and_expiry = "removal test: delete the package directory and this record once the declared consumer constructs the capability or the pure logic is absorbed into it; expiry 2027-03-31; rollback is the unchanged package; no re-export shim is kept"
+migration_reexport_rollback_removal_and_expiry = "no re-export, no rollback step and no expiry: the package boundary is kept, so its removal condition is the loss of its last production consumer"
 counter_risks_merge_or_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
 evidence_status_and_review_owner = "workspace admission: admitted via #966 (T8-AS2) root workspace membership, so this package is a member of the contour above and is not in the root `exclude` array; the contour and proof entrypoint above are re-checked against the tree, not against this file, by scripts/crate_reachability_inventory.py::check_admission_decisions; review owner cognitive-wave-integrator"
 disposition = "extract_contract"

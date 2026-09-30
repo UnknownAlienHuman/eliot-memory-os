@@ -3737,7 +3737,7 @@ impl KernelComposition {
         // transition, or failed attach inside the two calls leaves the
         // submit disposition and the durability contract unchanged, so they
         // never gain a receipt-shaped failure mode.
-        if let Some(receipt) = advance_tool_exposure_receipt_for_persisted_result(
+        if let Some((request, receipt)) = advance_tool_exposure_receipt_for_persisted_result(
             queue,
             queued_envelope.as_ref(),
             queued_tool.as_ref(),
@@ -3751,6 +3751,26 @@ impl KernelComposition {
                     &persisted.request_digest,
                     &receipt,
                 );
+            // Issue #1745 R7 completion tail: the completion-owned exposure
+            // evidence (called/transport/delivery from the measured
+            // completion, use/outcome where lane-measured; every other stage
+            // explicitly unresolved) persists through the existing observation
+            // path under the same operation:digest idempotency lineage as the
+            // dispatch draft. Observational only: a populate failure is
+            // terminal-visible but never changes the submit disposition or the
+            // durability contract.
+            let campaign_lane = matches!(queue, DaemonReadQueue::CampaignPacket);
+            if let Some(envelope) = queued_envelope.as_ref() {
+                super::tool_exposure::observe_completion_exposure(
+                    envelope,
+                    &request,
+                    &receipt,
+                    campaign_lane,
+                    |draft| {
+                        self.audit_observe(draft);
+                    },
+                );
+            }
         }
         // The single completion consumes the attempt use budget: retire the
         // pair in the same queue ledger that authorized it so no later claim
@@ -3795,14 +3815,19 @@ impl KernelComposition {
 /// durability contract never gain a receipt-shaped failure mode. A returned
 /// receipt is passed by the caller into the durable operation row it
 /// evidences — never dropped.
-/// Returns the completed receipt for retention, or `None` when there is
-/// nothing to retain.
+/// Returns the admitted request with the completed receipt for retention, or
+/// `None` when there is nothing to retain. The request travels with the
+/// receipt so the completion-owned exposure draft joins the same evaluated
+/// tool and route without re-deriving admission.
 fn advance_tool_exposure_receipt_for_persisted_result(
     queue: DaemonReadQueue,
     envelope: Option<&HostRequestEnvelope>,
     tool: Option<&serde_json::Value>,
     persisted: &HostRequestRecord,
-) -> Option<eliot_receipts::ToolExposureReceiptV2> {
+) -> Option<(
+    eliot_receipts::ToolCallRequest,
+    eliot_receipts::ToolExposureReceiptV2,
+)> {
     let (Some(envelope), Some(tool)) = (envelope, tool) else {
         return None;
     };
@@ -3850,7 +3875,9 @@ fn advance_tool_exposure_receipt_for_persisted_result(
     // receipt is returned for retention on the durable operation row —
     // never dropped.
     let terminal_ref = format!("host-request-result-received:{operation}:{digest}");
-    used.record_terminal_outcome(terminal_ref).ok()
+    used.record_terminal_outcome(terminal_ref)
+        .ok()
+        .map(|receipt| (request, receipt))
 }
 
 /// Closed capability admitted to the observe queue (issue #2565: one
@@ -3874,6 +3901,20 @@ pub(crate) const OBSERVE_CAPABILITY: &str = "eliot.observe";
 /// `eliot-context-admission::admit_material_decision` (I01-08 canonical
 /// write path; I07-08 step 7).
 pub(crate) const ACT_CAPABILITY: &str = "eliot.act";
+
+/// Closed capability admitted to the coordinate submit entry (issue #1739
+/// W5; execution-fabric join owned by #1740).
+///
+/// Digest-only `eliot.coordinate` invocations ride the shared submit entry
+/// through [`KernelComposition::admit_and_queue_observe_submit`]. The Kernel
+/// owns only the mechanical dispatch binding here — capability plus
+/// invocation kind, checked before any staging — never the fabric verdict:
+/// the seven discriminators (delegate/audit/compare/wait/inspect/cancel/send)
+/// hand off to the execution-fabric owner at the future live coordinate
+/// claim/flight, and the durable work/attempt identity stays admission-owned
+/// (I01-08 canonical write path; I07-08 step 7). #1740 is parked with no live
+/// owner yet, so no tool bytes are retained here.
+pub(crate) const COORDINATE_CAPABILITY: &str = "eliot.coordinate";
 
 /// Whether one requested capability is task-relative or effectful and
 /// therefore needs the exact applicable task binding (issue #1746, W2).
@@ -4050,6 +4091,32 @@ pub(crate) fn check_act_submit_binding(
     Ok(())
 }
 
+/// Kernel-owned dispatch binding for one `eliot.coordinate` submit (issue
+/// #1739 W5; execution-fabric join owned by #1740).
+///
+/// `Invocation` kind the submit entry serves. A swapped capability or a
+/// non-invocation kind fails closed as `SessionFenced` before the caller
+/// stages anything. Pure: validation performs no IO by construction.
+///
+/// Digest-only coordinate submits carry no tool bytes, so there is no payload
+/// digest to link here — the envelope digest already commits to the exact
+/// canonical request through admission, and the live session/fence/
+/// connection binding is enforced by the frame gateway plus the admission
+/// gates. The fabric verdict itself stays the execution-fabric owner's at the
+/// future live coordinate claim/flight, never a Kernel verdict (I01-08
+/// canonical write path).
+pub(crate) fn check_coordinate_submit_binding(
+    envelope: &HostRequestEnvelope,
+) -> Result<(), TransportError> {
+    if envelope.identity.capability != COORDINATE_CAPABILITY {
+        return Err(TransportError::SessionFenced);
+    }
+    if envelope.kind != HostRequestKind::Invocation {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(())
+}
+
 fn observe_tool_requires_exact_task_binding(
     tool: &serde_json::Value,
 ) -> Result<bool, TransportError> {
@@ -4076,6 +4143,11 @@ impl KernelComposition {
     /// Kernel-owned dispatch binding ([`check_act_submit_binding`]) is
     /// revalidated before admission, while the material admission verdict
     /// stays the Governor owner's `admit_material_decision` (I01-08).
+    /// Digest-only `eliot.coordinate` invocations take the same entry: the
+    /// Kernel-owned dispatch binding ([`check_coordinate_submit_binding`])
+    /// is revalidated before admission, while the fabric verdict stays the
+    /// #1740 execution-fabric owner's at the future live coordinate
+    /// claim/flight.
     pub(crate) fn admit_and_queue_observe_submit(
         &self,
         envelope: &HostRequestEnvelope,
@@ -4091,6 +4163,14 @@ impl KernelComposition {
         // (`eliot-context-admission::admit_material_decision`).
         if !is_observe && envelope.identity.capability == ACT_CAPABILITY {
             check_act_submit_binding(envelope)?;
+        }
+        // Coordinate effect dispatch (issue #1739 W5; #1740 owns the fabric
+        // join): digest-only `eliot.coordinate` submits ride this same
+        // entry. Revalidate the Kernel-owned dispatch binding before
+        // staging; the fabric verdict itself runs at the execution-fabric
+        // owner at the future live coordinate claim/flight.
+        if !is_observe && envelope.identity.capability == COORDINATE_CAPABILITY {
+            check_coordinate_submit_binding(envelope)?;
         }
         let task_relative_tool = if is_observe {
             tool.map(|tool| check_observe_tool_linkage(envelope, tool))
@@ -4520,6 +4600,10 @@ impl KernelComposition {
     /// durable rows stay untouched. Store read errors fail closed without
     /// discarding the pair or its possible-effect evidence. Local-read pairs
     /// are never served here.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the claim gate keeps order, state, durability-bind, attempt, and prune joins in one audited order"
+    )]
     pub(crate) fn claim_observe_pair(
         &self,
         session: &Session,
@@ -4599,12 +4683,15 @@ impl KernelComposition {
                 // Issue #1739 W2: execution consumes the exact typed bytes off
                 // the durable #1713 row; a queue body that is not the admitted
                 // bytes conflicts instead of replacing the admitted operation.
-                // Rows staged before this binding existed keep serving their
-                // linkage-checked pair.
+                // No durably bound bytes means not executable: prune the
+                // unbound pair; the waiter reconciles via the durable record.
                 let tool = match stored.payload_body.as_ref() {
                     Some(durable) if tool == durable => durable.clone(),
                     Some(_) => return Err(TransportError::IdentityConflict),
-                    None => tool.clone(),
+                    None => {
+                        refs.remove(position);
+                        continue;
+                    }
                 };
                 let envelope = envelope.clone();
                 let durable_attempt = self.persist_observe_claim_attempt(

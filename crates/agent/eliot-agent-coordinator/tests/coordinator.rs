@@ -9,14 +9,14 @@ use eliot_agent_api::{
 };
 use eliot_agent_contracts::RevisionId;
 use eliot_agent_coordinator::{
-    AdmissionId, AdmittedLaneReceipt, AdmittedProviderCapability, AgentCoordinator, CandidateId,
-    CoordinatorConfig, CoordinatorError, CoordinatorEvent, ExecutionContext, LearningRole,
-    OwnerCurrentness, PlanGap, PresentedClaimMaterial, ProviderAdmissionReceipt,
+    AdmissionId, AdmittedLaneReceipt, AdmittedProviderCapability, AdmittedProviderFactory,
+    AgentCoordinator, CandidateId, CoordinatorConfig, CoordinatorError, CoordinatorEvent,
+    ExecutionContext, LearningRole, OwnerLoadedClaimRow, PlanGap, ProviderAdmissionReceipt,
     ProviderExecutionBindingSubmission, ProviderIdentity, RecipeId, RecipeManifest, RoleProfileId,
     RoleProfileManifest, RouteCandidateEvidence, StaffingLaneRequest, StaffingPlanCandidate,
     StaffingPlanRequest, WorkerId,
 };
-use eliot_contracts::{EpochLineageId, sha256_hex};
+use eliot_contracts::{EpochLineageId, canonical_json_bytes, sha256_hex};
 use eliot_evaluation_contracts::BudgetEvidence;
 use eliot_kernel_service::ProviderCapabilityExpectation;
 use eliot_receipts::ProofCeiling;
@@ -447,12 +447,29 @@ fn integration_provider_identity() -> TestResult<ProviderIdentity> {
     })
 }
 
-/// Builds daemon-supplied Kernel admission from exact owner records. Every
-/// digest is recomputed with the same `sha256_hex` validator the production
-/// verifier uses; no canned pass value is hardcoded.
+/// Builds daemon-supplied Kernel admission from exact owner records through the
+/// owner-witnessed factory: the loaded row repeats the presented identities
+/// and digests exactly as the daemon's ORS read projection would return them.
+/// Every digest is recomputed with the same `sha256_hex` validator the
+/// production verifier uses; no canned pass value is hardcoded.
 fn integration_capability(revoked: bool) -> TestResult<AdmittedProviderCapability> {
     let epoch = test_epoch(TEST_LINEAGE_A, 1);
-    let presented = PresentedClaimMaterial::new(
+    let presented_fence = fence();
+    let loaded = OwnerLoadedClaimRow::new(
+        "claim-integration-1".to_owned(),
+        "attempt-integration-1".to_owned(),
+        "op-integration-1".to_owned(),
+        sha256_hex(b"claim-binding-material-integration-1"),
+        sha256_hex(b"executable-material-integration-1"),
+        1,
+        sha256_hex(
+            &canonical_json_bytes(&presented_fence)
+                .map_err(|error| format!("integration fence must serialize: {error}"))?,
+        ),
+    )?;
+    let factory = AdmittedProviderFactory::new(loaded);
+    Ok(factory.admit(
+        integration_provider_identity()?,
         "claim-integration-1".to_owned(),
         "attempt-integration-1".to_owned(),
         "op-integration-1".to_owned(),
@@ -461,9 +478,7 @@ fn integration_capability(revoked: bool) -> TestResult<AdmittedProviderCapabilit
         "route-rev-7".to_owned(),
         "capacity-rev-3".to_owned(),
         1,
-        fence(),
-    )?;
-    let currentness = OwnerCurrentness::new(
+        presented_fence,
         ProviderCapabilityExpectation {
             current_route_revision: "route-rev-7".to_owned(),
             current_capacity_revision: "capacity-rev-3".to_owned(),
@@ -471,12 +486,6 @@ fn integration_capability(revoked: bool) -> TestResult<AdmittedProviderCapabilit
             revoked,
         },
         fence(),
-        "session-integration-binding".to_owned(),
-    )?;
-    Ok(AdmittedProviderCapability::new(
-        integration_provider_identity()?,
-        presented,
-        currentness,
         None,
         0,
     )?)

@@ -959,7 +959,13 @@ public sealed record UserAutomationOutcome(
 public sealed record UserAutomationResultValidationContext
 {
     // A reviewed decoder change must explicitly acknowledge the Rust result schema.
-    private const string SupportedUserAutomationResultSchemaSha256 = "785065c0d1839a65d8ea7dad8dd0415450470dfee1fab655472a49d0cd0c3a3e";
+    // Widened 785065c0 -> c71ee403 by #2806: one new closed execution-phase
+    // value, "rejected", carrying the refusing owner's own reason string. No
+    // existing member, shape, or kind changed, and no fallback spelling exists;
+    // the value was taken from the generator's own refusal message, not from a
+    // second hand-maintained digest. Reverting it makes every answer an
+    // UnverifiedOwnerAnswer.
+    private const string SupportedUserAutomationResultSchemaSha256 = "c71ee40384dba3eaebac57d4c92c9e7406a342d6901e532ee362c163e8f7cf1c";
 
     private UserAutomationResultValidationContext(
         string expectedOperationId,
@@ -1880,6 +1886,15 @@ public static class UserAutomationOutcomeClassifier
                 && TryReadClosedValue(phase, "reason", OperatorScheduleContract.USER_AUTOMATION_DEFER_REASONS, out _),
             "blocked_config" => HasExactProperties(phase, "kind", "failure_fingerprint")
                 && TryReadBoundedText(phase, "failure_fingerprint", 64, out _),
+            // A decided owner refusal. The owner read the typed admission
+            // request and refused it, so the occurrence provably admitted
+            // nothing and there is no effect to reconcile; unlike
+            // "unknown_outcome" it is resolved, so it carries no recovery
+            // directive and this decoder admits no retry path. The reason is
+            // the refusing owner's own value, read with the same closed bound
+            // as every other reason-carrying phase.
+            "rejected" => HasExactProperties(phase, "kind", "reason")
+                && TryReadBoundedText(phase, "reason", MaxRecoveryReasonChars, out _),
             "unknown_outcome" or "unavailable" => HasExactProperties(phase, "kind", "reason")
                 && TryReadBoundedText(phase, "reason", MaxRecoveryReasonChars, out _),
             _ => false

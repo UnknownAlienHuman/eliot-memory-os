@@ -58,6 +58,14 @@
 //! stable `field` in [`FacadeError::EnvelopeInvalid`], so no refusal path
 //! changed. This removed no public item and added none.
 //!
+//! The `legacy_row_id` refusal built on that rule was still written out five
+//! more times, each copy pairing the admissibility check with the same stable
+//! `field = "legacy_row_id"`. #1143 work item 4 collapsed those into the single
+//! crate-private owner [`validate_legacy_row_id`], which reports that exact
+//! field, so every site keeps the field path it already returned; a caller
+//! holding a slice of ids reads the same rule through
+//! [`validate_legacy_row_ids`]. This removed no public item and added none.
+//!
 //! Removed duplicates (compile-proof; see `tests/legacy_facade.rs`):
 //! local `CueKind`/`MatchMode`/`CueStrength`, all `normalize_value*`
 //! copies, `CueKey` constructors/comparison, `CueRecord` construction and
@@ -308,6 +316,44 @@ pub(crate) fn is_blank_or_control(value: &str) -> bool {
     value.trim().is_empty() || value.chars().any(char::is_control)
 }
 
+/// The single owner of the legacy row-id admissibility refusal.
+///
+/// "Not admissible as legacy text, therefore refuse the row id" was written
+/// out at five call sites across this crate and `legacy_adapter`, each copy
+/// pairing [`is_blank_or_control`] with the same stable
+/// `FacadeError::EnvelopeInvalid { field: "legacy_row_id" }`. Each pair was a
+/// second row-id validation rule that could drift into refusing a different
+/// input, or into reporting a different field for the same input, and that
+/// field is wire-visible. Every site now reads the rule from here and returns
+/// the exact field it returned before.
+///
+/// This stays separate from [`validate_legacy_identity`] on purpose: that
+/// owner names its own input as `legacy_identity`, so merging the two would
+/// move a field path a caller reads. [`validate_legacy_row_ids`] is the same
+/// rule over a slice of ids, and the refusal stays one field for the whole
+/// slice because each caller already reported exactly that.
+pub(crate) fn validate_legacy_row_id(legacy_row_id: &str) -> Result<(), FacadeError> {
+    if is_blank_or_control(legacy_row_id) {
+        return Err(FacadeError::EnvelopeInvalid {
+            field: "legacy_row_id",
+        });
+    }
+    Ok(())
+}
+
+/// The single owner of the legacy row-id admissibility refusal over a slice.
+///
+/// "At least one id in this set is inadmissible, therefore refuse the set" was
+/// written out twice in this crate, once per snapshot entry point. The per-id
+/// rule is [`validate_legacy_row_id`]'s, and the reported field stays
+/// `legacy_row_id` for every id, which is what both sites already returned.
+fn validate_legacy_row_ids(row_ids: &[String]) -> Result<(), FacadeError> {
+    for row_id in row_ids {
+        validate_legacy_row_id(row_id)?;
+    }
+    Ok(())
+}
+
 fn validate_legacy_identity(value: &str) -> Result<(), FacadeError> {
     if is_blank_or_control(value) {
         return Err(FacadeError::EnvelopeInvalid {
@@ -392,11 +438,7 @@ impl V1MigrationRejection {
 /// A replay claim without the original bytes is not a closed migration. Use
 /// [`preserve_v1_row_bytes`] with the exact v1 payload instead.
 pub fn preserve_v1_row(legacy_row_id: &str) -> Result<V1RowMigration, FacadeError> {
-    if is_blank_or_control(legacy_row_id) {
-        return Err(FacadeError::EnvelopeInvalid {
-            field: "legacy_row_id",
-        });
-    }
+    validate_legacy_row_id(legacy_row_id)?;
     Err(FacadeError::MigrationRequired {
         owner: "legacy-v1-replay",
         revision: "raw-bytes-required",
@@ -408,11 +450,7 @@ pub fn preserve_v1_row_bytes(
     legacy_row_id: &str,
     legacy_bytes: &[u8],
 ) -> Result<V1RowMigration, FacadeError> {
-    if is_blank_or_control(legacy_row_id) {
-        return Err(FacadeError::EnvelopeInvalid {
-            field: "legacy_row_id",
-        });
-    }
+    validate_legacy_row_id(legacy_row_id)?;
     if legacy_bytes.is_empty() {
         return Err(FacadeError::EnvelopeInvalid {
             field: "legacy_bytes",
@@ -434,14 +472,7 @@ pub fn preserve_v1_row_bytes(
 /// A replay claim without the original snapshot bytes is not closed. Use
 /// [`preserve_v1_snapshot_bytes`] with the exact v1 payload instead.
 pub fn preserve_v1_snapshot(row_ids: &[String]) -> Result<V1SnapshotMigration, FacadeError> {
-    if row_ids
-        .iter()
-        .any(|row_id| is_blank_or_control(row_id.as_str()))
-    {
-        return Err(FacadeError::EnvelopeInvalid {
-            field: "legacy_row_id",
-        });
-    }
+    validate_legacy_row_ids(row_ids)?;
     Err(FacadeError::MigrationRequired {
         owner: "legacy-v1-replay",
         revision: "raw-bytes-required",
@@ -465,14 +496,7 @@ pub fn preserve_v1_snapshot_bytes(
             field: "legacy_snapshot_bytes",
         });
     }
-    if row_ids
-        .iter()
-        .any(|row_id| is_blank_or_control(row_id.as_str()))
-    {
-        return Err(FacadeError::EnvelopeInvalid {
-            field: "legacy_row_id",
-        });
-    }
+    validate_legacy_row_ids(row_ids)?;
     Err(FacadeError::MigrationRequired {
         owner: "legacy-v1-replay",
         revision: "row-bytes-required",
@@ -530,6 +554,37 @@ pub fn preserve_v1_snapshot_conversion(
     Ok(snapshot)
 }
 
+/// The single owner of the v1 row-payload identity binding.
+///
+/// The retained-bytes/row binding — parse the supplied bytes against the
+/// supplied row id and refuse when the parsed row is not byte-equal to the row
+/// the caller passed in — was written out twice in this crate, in the same
+/// order, once in [`reject_v1_row_conversion`] and once in
+/// [`convert_v1_row`](legacy_adapter::convert_v1_row). Two copies of one
+/// identity rule are two owners that can drift into accepting different bytes.
+/// Both now read this one owner.
+///
+/// Order is preserved exactly: the payload is bound before the legacy identity
+/// is validated, so the first refusal a caller sees is unchanged, and the
+/// single stable pointer [`FacadeError::ResponseIdentityMismatch`] with
+/// `what = "migration.row_payload"` is the one every caller already receives.
+/// The two different field paths that follow the binding
+/// (`legacy_identity` vs `legacy_row_id`) deliberately stay at their own call
+/// sites, because each names its own input.
+pub(crate) fn bind_v1_row_payload(
+    legacy_row_id: &str,
+    row: &LegacyEliotCuesV1Row,
+    legacy_bytes: &[u8],
+) -> Result<(), FacadeError> {
+    let parsed = legacy_adapter::parse_bound_v1_row(legacy_bytes, legacy_row_id)?;
+    if &parsed != row {
+        return Err(FacadeError::ResponseIdentityMismatch {
+            what: "migration.row_payload",
+        });
+    }
+    Ok(())
+}
+
 /// Records a precise v1-to-v2 rejection while retaining the original row
 /// bytes and identity. The result is candidate-only and never an admission.
 pub fn reject_v1_row_conversion(
@@ -539,12 +594,7 @@ pub fn reject_v1_row_conversion(
     reason: V1MigrationRejection,
 ) -> Result<V1RowMigration, FacadeError> {
     row.validate_for_conversion()?;
-    let parsed = legacy_adapter::parse_bound_v1_row(legacy_bytes, legacy_row_id)?;
-    if &parsed != row {
-        return Err(FacadeError::ResponseIdentityMismatch {
-            what: "migration.row_payload",
-        });
-    }
+    bind_v1_row_payload(legacy_row_id, row, legacy_bytes)?;
     validate_legacy_identity(legacy_row_id)?;
     if legacy_bytes.is_empty() {
         return Err(FacadeError::EnvelopeInvalid {

@@ -138,6 +138,16 @@ pub struct MaintenanceResultObligation {
     pub evaluation_revision: u64,
     /// Prior obligation this one appends to, when this is not the first.
     pub predecessor_obligation_ref: Option<String>,
+    /// The delayed utility evaluation this obligation carries.
+    ///
+    /// `None` on a source result: the comparison has not run, and the record
+    /// says so with `PENDING` and explicitly unknown metrics. `Some` only on an
+    /// appended evaluation revision, where the evidence and verdict are durable
+    /// on the same revision the transition saved — so a restart re-reads the
+    /// same conclusion instead of recomputing one from nothing, and the source
+    /// result's own revision keeps its original uncertainty beside it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub utility_evaluation: Option<crate::utility_evaluation::MaintenanceUtilityEvaluation>,
 }
 
 impl MaintenanceResultObligation {
@@ -252,6 +262,40 @@ impl MaintenanceResultObligation {
                 ));
             }
             _ => {}
+        }
+        self.validate_utility_evaluation()
+    }
+
+    /// Checks a carried evaluation against the revision that carries it.
+    ///
+    /// An evaluation is only coherent on an appended revision: it must name the
+    /// revision it appends to, and every metric it reports must be bounded by
+    /// the window it declares. A source result carrying an evaluation, or an
+    /// evaluation naming a different predecessor, is refused rather than
+    /// published.
+    fn validate_utility_evaluation(&self) -> Result<(), MaintenanceError> {
+        let Some(evaluation) = &self.utility_evaluation else {
+            return Ok(());
+        };
+        if self.predecessor_obligation_ref.as_deref()
+            != Some(evaluation.source_publication_id.as_str())
+        {
+            return Err(MaintenanceError::InvalidField(
+                "result_obligation.utility_evaluation.source_publication_id",
+            ));
+        }
+        for metric in [
+            &evaluation.utility.recurrence,
+            &evaluation.utility.product_recovery_delta,
+            &evaluation.utility.false_changes,
+            &evaluation.utility.cost,
+            &evaluation.utility.operator_burden,
+        ] {
+            if metric.comparison_window != evaluation.comparison_window {
+                return Err(MaintenanceError::InvalidField(
+                    "result_obligation.utility_evaluation.comparison_window",
+                ));
+            }
         }
         Ok(())
     }
@@ -375,6 +419,10 @@ pub(crate) fn append_result_obligation(
         },
         evaluation_revision: predecessor.map_or(1, |prior| prior.evaluation_revision + 1),
         predecessor_obligation_ref: predecessor.map(|prior| prior.publication_id.clone()),
+        // A lifecycle transition or reconciliation states no utility
+        // conclusion: the delayed comparison has not run, and this revision
+        // says so rather than carrying a verdict.
+        utility_evaluation: None,
     };
     obligation.validate()?;
     job.result_obligations.push(obligation);
@@ -432,6 +480,9 @@ pub(crate) fn append_reconciliation_obligation(
         },
         evaluation_revision: revision,
         predecessor_obligation_ref: Some(predecessor.publication_id.clone()),
+        // A reconciliation resolves an uncertainty about the work. It is not a
+        // delayed utility comparison, so it carries no verdict.
+        utility_evaluation: None,
     };
     obligation.validate()?;
     job.result_obligations.push(obligation);
@@ -527,12 +578,24 @@ pub fn maintenance_observation_record(
         exposure_workload_change_refs: Vec::new(),
         rival_explanation_refs: Vec::new(),
     };
-    let utility = MaintenanceUtilityEvidenceV1 {
-        recurrence: metric(true, "recurrences-per-window"),
-        product_recovery_delta: metric(true, "recovery-events"),
-        false_changes: metric(true, "false-changes"),
-        cost: metric(attempted, "cost-units"),
-        operator_burden: metric(attempted, "operator-minutes"),
+    // The utility evidence and verdict come from the evaluation this revision
+    // carries, or from the honest source-side default when it carries none. The
+    // source-side default is the state this obligation always reaches on its
+    // own: immediate evidence preserved, every required comparison unobserved,
+    // and `PENDING`. Work performed is not utility, so nothing here can turn a
+    // completion into a verdict without a comparison that actually ran.
+    let (utility, utility_verdict) = match &obligation.utility_evaluation {
+        Some(evaluation) => (evaluation.utility.clone(), evaluation.utility_verdict),
+        None => (
+            MaintenanceUtilityEvidenceV1 {
+                recurrence: metric(true, "recurrences-per-window"),
+                product_recovery_delta: metric(true, "recovery-events"),
+                false_changes: metric(true, "false-changes"),
+                cost: metric(attempted, "cost-units"),
+                operator_burden: metric(attempted, "operator-minutes"),
+            },
+            MaintenanceUtilityVerdict::Pending,
+        ),
     };
     let result = MaintenanceResultV1 {
         contract_version: MAINTENANCE_RESULT_CONTRACT_VERSION,
@@ -561,7 +624,7 @@ pub fn maintenance_observation_record(
         predecessor_evaluation_ref: obligation.predecessor_obligation_ref.clone(),
         execution_outcome: obligation.execution_outcome,
         delivery_state: obligation.delivery.clone(),
-        utility_verdict: MaintenanceUtilityVerdict::Pending,
+        utility_verdict,
         utility,
     };
     let mut evidence = obligation.actual_effect_refs.clone();

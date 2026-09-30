@@ -268,6 +268,7 @@ fn stage_row(
         authority_epoch: epoch,
         binding_digest: binding_digest.to_owned(),
         request_digest: "e".repeat(64),
+        executable_binding_digest: "8".repeat(64),
         execution_unit_schema_version: 1,
         predecessor_revision: label("predecessor-t904"),
         resource_envelope_digest: "f".repeat(63) + "0",

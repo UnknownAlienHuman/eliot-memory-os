@@ -3272,11 +3272,13 @@ fn replay_claim_fixture(
         authority_epoch: epoch,
         binding_digest: "c".repeat(64),
         request_digest: "d".repeat(64),
+        executable_binding_digest: String::new(),
         execution_unit_schema_version: 1,
         predecessor_revision: OpaqueLabel::new("predecessor-replay-0")?,
         resource_envelope_digest: "e".repeat(64),
         // This fixture stages a durable row directly, with no presented
-        // executable join, so the cell pair is the modelled absent state
+        // executable join, so the cell pair and the binding digest are the
+        // modelled absent state
         // (`NativeWorkerClaimRecord`: "absent only for legacy requests without
         // that join"; `validate` accepts `(None, None)` and refuses a half-bound
         // pair). ORS preserves the pair opaquely and never derives one, so

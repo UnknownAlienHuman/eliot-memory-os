@@ -22,6 +22,11 @@ agent_order = 15
 eliot-contracts.workspace = true
 eliot-evidence.workspace = true
 eliot-observation-contracts.workspace = true
+# I14.29 `DownstreamHeadroomReservation`: the Context side owns budget meaning
+# only, so the owner-issued reservation evidence it validates against is the
+# existing Kernel capacity vocabulary (`CapacityRequest`, `CapacityPermitBinding`,
+# `CapacityReleaseEvidence`) reused verbatim, never restated locally.
+eliot-runtime-contracts.workspace = true
 eliot-receipts.workspace = true
 eliot-agent-contracts.workspace = true
 eliot-protocol.workspace = true

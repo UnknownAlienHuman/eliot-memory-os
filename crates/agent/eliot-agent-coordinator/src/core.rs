@@ -43,7 +43,8 @@ use crate::provider_admission::{
     AdmittedProviderCapability, KernelProviderVerifier, ProviderSelectionHealth,
 };
 use crate::swarm_definition_admission::{
-    SwarmDefinitionAdmissionPrep, compile_swarm_definition_admission,
+    SwarmDefinitionAdmissionPrep, admit_swarm_definition, begin_swarm_execution,
+    compile_swarm_definition_admission, launch_swarm_child,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -1126,10 +1127,10 @@ impl AgentCoordinator {
             lane.budget.validate().map_err(provider_contract)?;
             lane.budget
                 .is_within(&work.budget)
-                .map_err(|_| CoordinatorError::BudgetExceeded)?;
+                .map_err(budget_refusal)?;
             lane.budget
                 .is_within(&request.recipe.budget)
-                .map_err(|_| CoordinatorError::BudgetExceeded)?;
+                .map_err(budget_refusal)?;
             // A role may not admit effect kinds or external-effect counts
             // excluded by its manifest. Scope containment remains unresolved
             // until owner-validated manifest evidence is available.
@@ -1245,6 +1246,77 @@ impl AgentCoordinator {
         maps: &eliot_swarm::SealedIndependentMaps,
     ) -> Result<SwarmDefinitionAdmissionPrep, CoordinatorError> {
         compile_swarm_definition_admission(&self.config, proposal, maps)
+    }
+
+    /// Admits one prepared swarm definition through the Governor admission
+    /// owner without performing any durable write (issue #1699 R2).
+    ///
+    /// This is the production caller of `admit_swarm_definition`: the prep
+    /// must bind the presented definition, and the exact Governor admission
+    /// receipt is validated through the injected receipt verifier inside the
+    /// existing `eliot_swarm::admit_plan` owner entrypoint. An unavailable
+    /// prerequisite port fails typed and is never presented as admitted. No
+    /// task store, attempt journal, scheduler, write authority, or recovery
+    /// path is owned here.
+    ///
+    /// Expected production invocation (sibling STITCH, manager scope):
+    /// `bins/eliotd/src/agent_fabric.rs` next to
+    /// `prepare_swarm_definition_admission_candidate`.
+    pub fn admit_swarm_definition(
+        &self,
+        prep: &SwarmDefinitionAdmissionPrep,
+        proposal: &eliot_swarm::SwarmPlanProposal,
+        maps: &eliot_swarm::SealedIndependentMaps,
+        admission_receipt: eliot_receipts::ReceiptEnvelope,
+        verifier: Option<&dyn eliot_swarm::ReceiptVerificationPort>,
+    ) -> Result<eliot_swarm::AdmittedSwarmPlan, CoordinatorError> {
+        admit_swarm_definition(prep, proposal, maps, admission_receipt, verifier)
+    }
+
+    /// Begins provider-owned P3 execution for one admitted swarm plan through
+    /// the injected A-02 activation port (issue #1699 R2).
+    ///
+    /// This is the production caller of `begin_swarm_execution`: the provider
+    /// seals the first execution state over the injected
+    /// `eliot_swarm::AgentRouteProvider`, bound by the injected receipt
+    /// verifier to the plan admission. This performs no durable write and
+    /// starts no process.
+    ///
+    /// Expected production invocation (sibling STITCH, manager scope):
+    /// `bins/eliotd/src/agent_fabric.rs` next to
+    /// `prepare_swarm_definition_admission_candidate`.
+    pub fn begin_swarm_execution(
+        &self,
+        plan: &eliot_swarm::AdmittedSwarmPlan,
+        a02: Option<&dyn eliot_swarm::AgentRouteProvider>,
+        verifier: Option<&dyn eliot_swarm::ReceiptVerificationPort>,
+    ) -> Result<eliot_swarm::ExecutionState, CoordinatorError> {
+        begin_swarm_execution(plan, a02, verifier)
+    }
+
+    /// Dispatches one sealed swarm child through the existing injected
+    /// dispatch ports (issue #1699 R2).
+    ///
+    /// This is the production caller of `launch_swarm_child`: the dispatch is
+    /// built and re-verified through the existing
+    /// `eliot_swarm::adapter_launch` owner path and returned candidate-only.
+    /// The daemon composition persists the intent through the owner-side
+    /// `DurableWorkStore` append path BEFORE calling the `WorkExecutor`; the
+    /// store and executor travel here only to pin that feeding seam, and this
+    /// performs no store append, no executor call, and no scheduler step.
+    ///
+    /// Expected production invocation (sibling STITCH, manager scope):
+    /// `bins/eliotd/src/agent_fabric.rs` next to
+    /// `prepare_swarm_definition_admission_candidate`.
+    pub fn launch_swarm_child(
+        &self,
+        plan: &eliot_swarm::AdmittedSwarmPlan,
+        attachment: &eliot_swarm::durable_dispatch::DurableJobAttachment,
+        inputs: eliot_swarm::adapter_launch::SealedChildInputs<'_>,
+        store: &dyn eliot_swarm::durable_work::DurableWorkStore,
+        executor: &dyn eliot_swarm::durable_work::WorkExecutor,
+    ) -> Result<eliot_swarm::adapter_launch::SealedChildLaunch, CoordinatorError> {
+        launch_swarm_child(plan, attachment, inputs, store, executor)
     }
 
     /// Reconciles only an admission accepted by the sealed verifier.
@@ -1478,18 +1550,25 @@ impl AgentCoordinator {
     /// `max_active_per_route`, and a class may hold more admitted items than a
     /// single plan's `max_ready_items` would suggest.
     ///
-    /// Known limitation, stated here so a reader of the code does not need the
-    /// delivery report: the per-class partition is reachable only through the
-    /// profile-bound path [`Self::pull_next`], and in production this
+    /// **Reachability, measured.** This method has exactly two call sites in the
+    /// tree and both are in `src/tests.rs`; `git grep` finds no production
+    /// caller. It is a profile-free peek kept as a public read, and the
+    /// production join does not use it.
+    ///
+    /// The per-class partition is reachable only through the profile-bound
+    /// selector, and on a coordinator built by the plan/define path this
     /// coordinator's `attempts` map is **empty** — `AgentFabric` never calls
-    /// [`Self::admit`], because no production issuer of the provider-verified
-    /// [`ProviderAdmissionReceipt`] that `admit` requires exists in this tree.
-    /// So this method returns `None` on every production path today, no caller
-    /// invokes it, and `profile_revision` in any published outcome would be
-    /// `None`. A reader must not conclude from this method that saturated
-    /// low-priority work is prevented from consuming another class's
-    /// partition: nothing on this path does that. The full measurement is on
-    /// [`Self::pull_next`].
+    /// [`Self::admit`] directly, because no production issuer of the
+    /// provider-verified [`ProviderAdmissionReceipt`] that `admit` requires
+    /// exists in this tree. So this method returns `None` on every such
+    /// production path today, and `profile_revision` in any published outcome
+    /// would be `None`. As on [`Self::pull_next`], the honest claim is narrower
+    /// than "`admit` is unreachable": snapshot replay reaches it in production,
+    /// so this peek returns a real item over a coordinator restored from an
+    /// event log that contains an admission. A reader must not conclude from
+    /// this method that saturated low-priority work is prevented from consuming
+    /// another class's partition: nothing on this path does that. The full
+    /// measurement is on [`Self::pull_next`].
     pub fn next_ready(&mut self) -> Option<AttemptRecord> {
         let selected = self.select_ready(None, false).selected_attempt_id?;
         self.attempts.get(&selected).cloned()
@@ -1580,28 +1659,56 @@ impl AgentCoordinator {
     /// every start, so no selection it acts on is older than the view it was
     /// measured against.
     ///
-    /// Unreachable in production, and the reason is upstream of the profile.
-    /// Measured on `origin/main` @ `5d691922c`, the whole production gap is:
+    /// **This method has no caller anywhere in the tree.** That is measured, not
+    /// assumed: `git grep -nE '[.>]pull_next\('` over `origin/main` returns zero
+    /// hits, in production and in test alike. It is the profile-bound *single
+    /// pull* wrapper, and the production join reaches the same selector through
+    /// [`Self::drive_fair_pull`] instead, which calls the underlying selector
+    /// directly and needs the attempt record, enqueue ordinal and stored
+    /// admission receipt between pull and start — a hop this wrapper's return
+    /// type does not carry. It is retained as the public single-shot entry point
+    /// a caller outside this crate can use, and its selection behaviour is
+    /// identical to the drive's first pull; but a reader must not infer from its
+    /// existence that anything drives the loop through it.
+    ///
+    /// What a *freshly admitted* pull sees is a separate question, and the
+    /// answer is measured too:
     ///
     /// - No caller outside this crate constructs a [`ProviderAdmissionReceipt`].
     ///   Its `expires_at_unix_ms` doc records that "No production issuer exists
     ///   in this tree yet, so every construction site is a test fixture", and
-    ///   `git grep` finds no `bins/` construction site. The receipt is
-    ///   provider-verified on intake, so a pull cannot be fed a synthesized
-    ///   one without forging provider evidence.
-    /// - `AgentFabric` (`bins/eliotd/src/agent_fabric.rs`) calls exactly three
-    ///   coordinator methods — `plan` (twice), `snapshot`, and a lease
-    ///   `authorizes` on an unrelated `SwarmCoordinatorLease`. It never calls
-    ///   [`Self::admit`], so this coordinator's `attempts` map is empty in
-    ///   production and every pull over it would select nothing even if a
-    ///   profile were supplied.
+    ///   `git grep` finds no `bins/` construction site — every struct literal is
+    ///   in `src/tests.rs`, `src/core/admission_normalization_tests.rs` or
+    ///   `tests/coordinator.rs`. The receipt is provider-verified on intake, so a
+    ///   pull cannot be fed a synthesized one without forging provider evidence.
+    /// - `AgentFabric` (`bins/eliotd/src/agent_fabric.rs`) calls exactly four
+    ///   coordinator methods — `plan` (twice), `snapshot`, and
+    ///   [`Self::drive_fair_pull`] — plus a lease `authorizes` on an unrelated
+    ///   `SwarmCoordinatorLease`. It never calls [`Self::admit`], so on a
+    ///   coordinator built by the plan/define path this crate's `attempts` map
+    ///   is empty and every pull over it selects nothing even if a profile were
+    ///   supplied.
     ///
-    /// So the per-class partition is unexercised in production, and the
-    /// blocking join is `AgentFabric` -> [`Self::admit`], not a missing profile.
-    /// Building that join needs the #1678 admission saga's owner-issued
-    /// receipt; supplying only a `SchedulingProfile` would produce a selector
-    /// that is correct and permanently empty. See also the note on
-    /// [`Self::next_ready`].
+    /// One correction to a reading of that gap that has circulated: `admit` is
+    /// **not** unreachable in production. It has exactly one non-test call site,
+    /// `core.rs::replay_snapshot_events`, and that replay is production-reachable
+    /// through three `bins/eliotd` restore call sites
+    /// (`AgentCoordinator::restore_with_admitted_provider` at
+    /// `agent_fabric.rs:4257`, `agent_fabric.rs:4341` and `lib.rs:3553`).
+    /// Replaying an event log that contains `CoordinatorEvent::PlanAdmitted` does
+    /// repopulate `attempts`, and a drive over that restored coordinator selects
+    /// and starts for real. So the honest statement is not "no admitted
+    /// projection can exist in production" — it is that a fresh admit never
+    /// happens, so a populated projection can only ever come from a snapshot
+    /// some earlier coordinator wrote, and no such snapshot exists until the
+    /// #1678 admission saga's owner-issued receipt lands. Until then a drive
+    /// performs one pull over an empty projection and stops.
+    ///
+    /// So the per-class partition is unexercised in production today, and the
+    /// blocking join is an owner-issued [`ProviderAdmissionReceipt`] reaching
+    /// [`Self::admit`], not a missing profile. Supplying only a
+    /// `SchedulingProfile` would produce a selector that is correct and
+    /// permanently empty. See also the note on [`Self::next_ready`].
     ///
     /// # Errors
     ///
@@ -1621,11 +1728,11 @@ impl AgentCoordinator {
     /// I14.8: "Scheduler is pull-based: terminal/deferred/blocked attempt
     /// releases its slot, then the next currently admissible Ready Work Item is
     /// selected." This is that sentence as an operation. It pulls through the
-    /// same [`Self::pull_next`] selector under the same profile, and each
-    /// selection becomes a `Running` attempt through the existing
-    /// [`Self::start_attempt`] transition, so released capacity advances work
-    /// without another agent command and without a notification this method
-    /// could miss.
+    /// same bounded selector [`Self::pull_next`] wraps, called directly rather
+    /// than through that wrapper, and each selection becomes a `Running` attempt
+    /// through the existing [`Self::start_attempt`] transition, so released
+    /// capacity advances work without another agent command and without a
+    /// notification this method could miss.
     ///
     /// The `ExecutionContext` each started attempt receives is derived through
     /// `ExecutionContext::from` from the coordinator's **own stored admission
@@ -1677,14 +1784,30 @@ impl AgentCoordinator {
     /// start one item is not a durable `DEFERRED_CAPACITY` transition, so this
     /// method does not restate that vocabulary.
     ///
+    /// Production reachability, measured rather than asserted. This method has
+    /// three production call sites, none of them `cfg(test)`-gated:
+    /// `agent_fabric.rs::AgentFabric::drive_fair_pull` forwards to it, and that
+    /// forwarder has two production callers of its own —
+    /// `solo_agent_driver.rs::drive_fair_pull_after_release` (the event arm,
+    /// reached from `DaemonComposition::solo_ingest_result`) and
+    /// `solo_agent_driver.rs::solo_fair_pull_recovery` (the always-armed
+    /// recovery poll), the latter started on **every** tick of the daemon's
+    /// existing `ACTIVATION_POLL_INTERVAL` cadence by
+    /// `daemon_runtime.rs::maybe_start_fair_pull_recovery`. So the drive is
+    /// genuinely on the production path, not merely compiled.
+    ///
     /// Production residual, unchanged by this method and not worked around here:
     /// no issuer of the provider-verified [`ProviderAdmissionReceipt`] that
-    /// [`Self::admit`] requires exists in this tree, so in production `attempts`
-    /// is empty, a drive performs one pull, selects nothing, and stops. That is
-    /// the correct bounded behaviour of an empty projection, and the drive goes
-    /// live when that owner lands (issue #1678). It is called from production
-    /// by `AgentFabric::drive_fair_pull` in `bins/eliotd/src/agent_fabric.rs`,
-    /// from both the release event path and the bounded recovery poll.
+    /// [`Self::admit`] requires exists in this tree, so a drive over a freshly
+    /// built coordinator sees an empty `attempts` map, performs one pull, selects
+    /// nothing, and stops. That is the correct bounded behaviour of an empty
+    /// projection. The precise claim is narrower than "no admitted projection can
+    /// exist": [`Self::admit`] is reached in production through snapshot replay
+    /// (`core.rs::replay_snapshot_events`), so a drive over a *restored*
+    /// coordinator whose event log contains `CoordinatorEvent::PlanAdmitted`
+    /// does select and start for real. No such snapshot exists until the #1678
+    /// admission saga's owner-issued receipt lands (issue #1678). Full
+    /// measurement on [`Self::pull_next`].
     ///
     /// Proof ceiling: [`FAIR_PULL_LOOP_PROOF_CEILING`].
     ///
@@ -2391,7 +2514,7 @@ impl AgentCoordinator {
         receipt
             .budget
             .is_within(&old.budget)
-            .map_err(|_| CoordinatorError::BudgetExceeded)?;
+            .map_err(budget_refusal)?;
         if self.active_attempt_count().saturating_add(1) > self.config.max_admitted_attempts {
             return Err(CoordinatorError::Backpressure {
                 active: self.active_attempt_count(),
@@ -2857,16 +2980,25 @@ impl AgentCoordinator {
     }
 
     /// Observes one committed durable journal record through the neutral
-    /// intake view (issues #371 W7/A27: the journal→intake conversion edge).
+    /// intake view (issues #371 W7/A27: the journal→intake conversion edge;
+    /// issue #2645 W5: the view carries the validated route-evidence
+    /// relation).
     ///
     /// Every preserved fact on the view is re-verified against the carried
     /// envelope (receipt equality, recomputed output digest,
     /// identity/sequence/cursor/predecessor/delivery/payload-kind/
-    /// generation/fence agreement, stable-identity recomputation) before
-    /// delegating to [`Self::observe_provider_event`]: a view that drifted
-    /// from its envelope rejects here without mutation. Acknowledgement
-    /// state is observed, never advanced: cursor acknowledgement follows
-    /// durable linkage/disposition, not this in-memory return.
+    /// generation/fence agreement, stable-identity recomputation, and the
+    /// carried route-evidence relation agreement) before delegating to
+    /// [`Self::observe_provider_event`]: a view that drifted from its
+    /// envelope rejects here without mutation. The relation check keeps the
+    /// validated route claims with the intake: an execution-unit intake
+    /// stripped of its relation, a session intake carrying one, or a relation
+    /// whose admission reference no longer equals the envelope-carried
+    /// admission reference fails closed with a typed contract error, so a
+    /// route-claim consumer downstream of this observation receives the
+    /// validated relation or nothing. Acknowledgement state is observed,
+    /// never advanced: cursor acknowledgement follows durable
+    /// linkage/disposition, not this in-memory return.
     pub fn observe_committed_intake(
         &mut self,
         context: ExecutionContext,
@@ -3655,12 +3787,19 @@ fn validate_recipe(request: &StaffingPlanRequest) -> Result<(), CoordinatorError
         .recipe
         .budget
         .is_within(&request.launch.cumulative_descendant_budget)
-        .map_err(|_| CoordinatorError::BudgetExceeded)?;
+        .map_err(budget_refusal)?;
+    // The recipe's own descendant ceiling against the two budgets that admit it.
+    // This is a separate comparison from the envelope check above: that one
+    // compares `recipe.budget` with the launch's cumulative budget, this one
+    // compares `recipe.max_descendants` with each of them. Same named
+    // dimension, same refusal, and no attempt is written on the path either way.
     if request.recipe.max_descendants > request.recipe.budget.max_descendants
         || request.recipe.max_descendants
             > request.launch.cumulative_descendant_budget.max_descendants
     {
-        return Err(CoordinatorError::BudgetExceeded);
+        return Err(CoordinatorError::BudgetExceeded {
+            field: "max_descendants",
+        });
     }
 
     validate_recipe_references(&request.recipe)?;
@@ -4127,6 +4266,25 @@ fn validate_attempt_binding(
 
 fn provider_contract(error: impl std::fmt::Display) -> CoordinatorError {
     CoordinatorError::ProviderContract(error.to_string())
+}
+
+/// Names the exact budget dimension a refusal closed (issue #1683 W6/A8).
+///
+/// `BudgetEnvelope::is_within` reports which dimension it compared, and
+/// `eliot_agent_api` owns that vocabulary, so this carries the dimension
+/// through instead of re-deriving or discarding it: a caller learns that
+/// `output_bytes` is what is too wide, not merely that something was.
+///
+/// `is_within` also validates both envelopes, so it can refuse a *malformed*
+/// envelope rather than a wide one. That is a different condition and keeps
+/// the existing [`CoordinatorError::ProviderContract`] refusal that every other
+/// `validate()` failure on these paths already uses; relabelling it as a budget
+/// refusal is exactly the indistinguishability this refuses to introduce.
+fn budget_refusal(error: ContractError) -> CoordinatorError {
+    match error {
+        ContractError::ChildBudgetExceeded { field } => CoordinatorError::BudgetExceeded { field },
+        other => provider_contract(other),
+    }
 }
 
 fn binding_contract(error: ContractError) -> CoordinatorError {

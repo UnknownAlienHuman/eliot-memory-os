@@ -65,9 +65,10 @@
 //! every approved candidate revision the owner currently holds.
 //! [`ApprovedRecipeCatalogue::resolve`] returns exactly one
 //! [`ResolvedContextRecipe`] or a typed [`RecipeResolutionRefusal`]. There is
-//! no first-match, no latest-by-name and no default: precedence is the
-//! owner-minted [`PolicyRevision`], an exact tie between distinct policy
-//! identities refuses, and an unresolved governing input refuses before any
+//! no first-match, no latest-by-name and no default. Precedence used to be the
+//! owner-minted [`PolicyRevision`]; #1724 W6 replaced it with the owner's
+//! explicit current-recipe pointer, because a revision number is not an
+//! activation authority. An unresolved governing input still refuses before any
 //! candidate is examined.
 //!
 //! # W3 — validating against independent governing requirements
@@ -116,8 +117,58 @@
 //! naming P whether or not P was later revoked, and a re-resolution under a
 //! newer catalogue produces a different `resolution_sha256` rather than
 //! restamping the old one.
+//!
+//! # W6 — recipes change only through the existing improvement gate
+//!
+//! I12.13: "It may be changed only as an Improvement Candidate through replay,
+//! shadow/canary and rollback." The restated invariant is that a candidate, a
+//! valid hash, a smaller packet or a positive token saving is NOT permission to
+//! activate. Three mechanisms carry it, and none of them is a new gate: the
+//! existing [`RecipeActivationRecord`] is the owner promotion decision, and this
+//! slice adds only what it did not state.
+//!
+//! 1. [`ApprovedRecipeCatalogue::current`] is the current recipe pointer, an
+//!    explicit required owner-published field. [`ApprovedRecipeCatalogue::resolve`]
+//!    reads it and nothing else. It previously took the applicable candidate
+//!    with the greatest [`PolicyRevision`], which made a revision NUMBER the
+//!    authority: publishing a newer approved candidate silently promoted it
+//!    with no promotion decision at all. Revision ordering no longer appears in
+//!    selection. A held, unrevoked, applicable candidate the pointer does not
+//!    name is refused as
+//!    [`RecipeResolutionRefusal::ApplicableCandidateNotCurrent`] rather than
+//!    selected or ignored.
+//! 2. [`RecipePromotionBasis`] is the basis the promotion decision was made
+//!    under, held on that decision. `InitialBuiltInBaseline` preserves an
+//!    explicitly approved initial/built-in baseline with no fabricated prior
+//!    experimental evidence — it is the only basis with no predecessor, and it
+//!    is the only one that may carry
+//!    [`RecipeQualificationState::Unqualified`].
+//!    `ImprovementCandidate` carries a [`RecipeImprovementCandidate`] naming the
+//!    exact predecessor, the exact proposed content, the applicability it was
+//!    triaged against, the exact baseline, the replay/holdout evidence, the
+//!    shadow-or-isolated-canary evidence and the counter-metrics measured
+//!    against that baseline.
+//! 3. An unqualified metric stays labelled unqualified. `RecipeQualificationState`
+//!    is inside `policy_sha256`, so relabelling a revision produces a different
+//!    identity and the pointer stops naming it; the gate adds the other half —
+//!    a revision promoted as an Improvement Candidate whose own recorded metrics
+//!    are still `Unqualified` is refused, because the replay/holdout and
+//!    shadow/isolated-canary evidence the decision cites is then evidence about
+//!    different metrics than the revision it promotes.
+//!
+//! The improvement candidate itself is an OWNER record and is referenced, not
+//! copied: `eliot-improvement` (C1) depends on this crate, so `ImprovementSurface`
+//! cannot be named from here and the surface identity is not restated as a
+//! second vocabulary. This is the same owner-reference convention already used
+//! for [`RecipeAdmissionPolicy::admission_rule`],
+//! [`RecipeAdmissionPolicy::safety_floor`] and
+//! [`RecipeQualification::qualification`].
+//!
+//! Run-time qualification experiments are later product-phase work. Nothing here
+//! runs one, records an outcome, or defaults a missing one: the gate refuses
+//! when the evidence reference is absent.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use eliot_contracts::{ArtifactId, PolicyRevision};
@@ -615,29 +666,39 @@ pub struct RecipeQualification {
 }
 
 impl RecipeQualification {
+    /// Closed guardrail-set bound, shared with the W6 improvement candidate so
+    /// both records are checked by one rule instead of two that can drift. The
+    /// two field names are passed separately because every refusal names the
+    /// exact field it is about, and a runtime concatenation would not be a
+    /// `&'static str`.
+    pub(crate) fn validate_counter_metrics(
+        metrics: &[RecipeCounterMetric],
+        field: &'static str,
+        metric_field: &'static str,
+    ) -> Result<(), ContextError> {
+        if metrics.len() > 64 {
+            return Err(ContextError::Bounds { field });
+        }
+        let mut seen = BTreeSet::new();
+        for metric in metrics {
+            validate_text(metric.metric_id.as_str(), metric_field)?;
+            if !seen.insert(metric.metric_id.clone()) {
+                return Err(ContextError::Duplicate(metric_field));
+            }
+        }
+        Ok(())
+    }
+
     fn validate(&self) -> Result<(), ContextError> {
         validate_text(
             self.qualification.as_str(),
             "recipe_policy.qualification.qualification",
         )?;
-        if self.counter_metrics.len() > 64 {
-            return Err(ContextError::Bounds {
-                field: "recipe_policy.qualification.counter_metrics",
-            });
-        }
-        let mut seen = BTreeSet::new();
-        for metric in &self.counter_metrics {
-            validate_text(
-                metric.metric_id.as_str(),
-                "recipe_policy.qualification.counter_metrics.metric_id",
-            )?;
-            if !seen.insert(metric.metric_id.clone()) {
-                return Err(ContextError::Duplicate(
-                    "recipe_policy.qualification.counter_metrics.metric_id",
-                ));
-            }
-        }
-        Ok(())
+        Self::validate_counter_metrics(
+            &self.counter_metrics,
+            "recipe_policy.qualification.counter_metrics",
+            "recipe_policy.qualification.counter_metrics.metric_id",
+        )
     }
 }
 
@@ -678,16 +739,164 @@ pub const RECIPE_ACTIVATION_DIGEST_DOMAIN: &str = "eliot.smart.context.recipe-ac
 /// Digest domain separator for one owner kill/rollback decision.
 pub const RECIPE_REVOCATION_DIGEST_DOMAIN: &str = "eliot.smart.context.recipe-revocation.v1";
 
+/// One `PacketCompiler`-surface Improvement Candidate proposed against a recipe.
+///
+/// #1724 W6. I12.13: "It may be changed only as an Improvement Candidate through
+/// replay, shadow/canary and rollback." Every element that sentence names is a
+/// field here, and the two that only this crate can compare — the proposed
+/// content and the guardrails — are compared against the real records by
+/// [`RecipePromotionBasis`]'s check inside
+/// [`ApprovedRecipeCatalogue::validate`], not merely recorded.
+///
+/// The candidate, the replay/holdout evidence and the canary evidence are OWNER
+/// records and are referenced, not copied. `eliot-improvement` (C1) depends on
+/// this crate, so its `ImprovementSurface` cannot be named here and its closed
+/// vocabulary is deliberately not restated; naming a candidate by its owner
+/// identity keeps the reference resolvable at the owner instead of duplicating
+/// a spelling that a variant rename could desynchronize.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RecipeImprovementCandidate {
+    /// Owner Improvement Candidate record for this proposal.
+    pub candidate: ArtifactId,
+    /// Exact approved revision this candidate proposes to supersede.
+    ///
+    /// A candidate is tied to one predecessor, not to "whatever is current when
+    /// it is promoted", so a decision cannot silently rebase a proposal onto a
+    /// revision it was never measured against.
+    pub predecessor: RecipePolicyIdentity,
+    /// Exact approved revision this candidate proposes to make current.
+    ///
+    /// Checked against the activated identity of the promotion decision, so a
+    /// candidate cannot be cited as the evidence for different content than the
+    /// content it was measured on.
+    pub proposed: RecipePolicyIdentity,
+    /// Applicability this candidate was triaged and measured against.
+    pub applicability: RecipeApplicability,
+    /// Exact approved revision the replay/holdout comparison is measured
+    /// against.
+    ///
+    /// Required, not defaulted: a comparison with no named baseline has no
+    /// denominator. A built-in baseline carries no candidate record at all, so it
+    /// never reaches this field.
+    pub baseline: RecipePolicyIdentity,
+    /// Owner replay/holdout evidence reference.
+    pub replay_holdout: ArtifactId,
+    /// Owner shadow or isolated canary evidence reference.
+    pub canary: ArtifactId,
+    /// Guardrail counter-metrics measured against `baseline`.
+    ///
+    /// Required and non-empty: a candidate measured against no guardrail is not
+    /// a gated candidate, and a smaller packet or a positive token saving is
+    /// not a guardrail.
+    pub counter_metrics: Vec<RecipeCounterMetric>,
+}
+
+impl RecipeImprovementCandidate {
+    fn validate(&self) -> Result<(), ContextError> {
+        validate_text(self.candidate.as_str(), "improvement.candidate")?;
+        self.predecessor.validate_identity()?;
+        self.proposed.validate_identity()?;
+        if self.predecessor == self.proposed {
+            return Err(ContextError::IdentityConflict);
+        }
+        self.applicability.validate()?;
+        self.baseline.validate_identity()?;
+        validate_text(self.replay_holdout.as_str(), "improvement.replay_holdout")?;
+        validate_text(self.canary.as_str(), "improvement.canary")?;
+        RecipeQualification::validate_counter_metrics(
+            &self.counter_metrics,
+            "improvement.counter_metrics",
+            "improvement.counter_metrics.metric_id",
+        )?;
+        if self.counter_metrics.is_empty() {
+            return Err(ContextError::MissingField("improvement.counter_metrics"));
+        }
+        Ok(())
+    }
+
+    /// Whether every counter-metric the proposed policy declares was actually
+    /// measured against the baseline.
+    ///
+    /// This is the content comparison a positive token saving cannot pass: a
+    /// candidate that measured fewer guardrails than its proposed policy declares
+    /// has not been checked against the guardrails it would ship with. It is
+    /// candidate-versus-policy, NOT candidate-versus-an-independent denominator,
+    /// because no owner record of the required guardrail set exists; the residual
+    /// is named in the delivery report rather than papered over with a field
+    /// invented here.
+    fn covers_declared_counter_metrics(&self, policy: &ContextRecipePolicy) -> bool {
+        let measured: BTreeSet<&ArtifactId> = self
+            .counter_metrics
+            .iter()
+            .map(|metric| &metric.metric_id)
+            .collect();
+        policy
+            .qualification
+            .counter_metrics
+            .iter()
+            .all(|metric| measured.contains(&metric.metric_id))
+    }
+}
+
+/// The basis an owner promotion decision was made under.
+///
+/// #1724 W6. Exactly two, and the choice is the whole gate: a revision is either
+/// the explicitly approved initial/built-in baseline, or it is an Improvement
+/// Candidate that carried replay/holdout and shadow-or-isolated-canary evidence.
+/// There is no third "the owner felt like it" arm.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RecipePromotionBasis {
+    /// The explicitly approved initial or built-in baseline.
+    ///
+    /// It has no predecessor — a revision that supersedes one is a successor, not
+    /// a baseline — and it is the only basis that may record
+    /// [`RecipeQualificationState::Unqualified`]. I7.11: the existing byte/token
+    /// figures are unvalidated planning candidates until a route-specific profile
+    /// is qualified, and this is how that is preserved rather than fabricated
+    /// away: the baseline is current because it was explicitly approved, and its
+    /// metrics keep saying they are unqualified.
+    InitialBuiltInBaseline {
+        /// Owner approval that established this revision as the initial
+        /// baseline. Required, so a baseline is an approval and not a default.
+        approval: ArtifactId,
+    },
+    /// An Improvement Candidate promoted through the existing improvement gate.
+    ImprovementCandidate {
+        /// The exact candidate, its predecessor, proposed content, applicability,
+        /// baseline, replay/holdout, canary and counter-metrics.
+        candidate: Box<RecipeImprovementCandidate>,
+    },
+}
+
+impl RecipePromotionBasis {
+    fn validate(&self) -> Result<(), ContextError> {
+        match self {
+            Self::InitialBuiltInBaseline { approval } => {
+                validate_text(approval.as_str(), "promotion.initial_baseline.approval")
+            }
+            Self::ImprovementCandidate { candidate } => candidate.validate(),
+        }
+    }
+}
+
 /// The owner decision that made one approved revision current.
 ///
 /// #1724 W7. A newly accepted recipe produces a NEW immutable revision plus this
 /// record, which is what makes the change observable: it names the activated
-/// identity, the exact predecessor it supersedes, and the applicability and
-/// compiler-generation scope the activation is confined to. A decision confined
+/// identity, the exact predecessor it supersedes, the applicability and
+/// compiler-generation scope the activation is confined to, and — #1724 W6 — the
+/// [`RecipePromotionBasis`] the decision was made under. A decision confined
 /// to a scope cannot be read as a global activation, and
 /// [`ApprovedRecipeCatalogue::validate`] refuses a compilation whose own
 /// applicability the activation does not cover, so a future decision revalidates
 /// applicability rather than inheriting an old activation.
+///
+/// `basis` is inside `record_sha256`, so the gate evidence and the decision that
+/// relied on it are covered by the decision's own recorded digest. Changing the
+/// basis of an existing activation re-hashes that decision, which stops
+/// [`ApprovedRecipeCatalogue::current`] from naming it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RecipeActivationRecord {
@@ -705,6 +914,8 @@ pub struct RecipeActivationRecord {
     pub applicability: RecipeApplicability,
     /// Compiler-generation scope this activation is confined to.
     pub execution: RecipeExecutionContour,
+    /// The gate basis this decision was made under.
+    pub basis: RecipePromotionBasis,
     /// Digest of this activation record.
     pub record_sha256: String,
 }
@@ -730,31 +941,25 @@ impl RecipeActivationRecord {
     }
 
     /// Validate the closed decision record and its own recorded digest.
+    ///
+    /// The basis is validated here for its own shape; the comparisons that need
+    /// the activated policy's CONTENT — that the candidate's proposed content is
+    /// this revision, that it covered this revision's guardrails, that a
+    /// candidate's recorded metrics are qualified — belong to
+    /// [`ApprovedRecipeCatalogue::validate`], which is the only place that holds
+    /// the approved bytes.
     pub fn validate(&self) -> Result<(), ContextError> {
         validate_text(self.decision.as_str(), "recipe_activation.decision")?;
-        validate_text(
-            self.activated.policy_id.as_str(),
-            "recipe_activation.activated",
-        )?;
-        validate_digest(
-            &self.activated.policy_sha256,
-            "recipe_activation.activated.policy_sha256",
-        )?;
+        self.activated.validate_identity()?;
         if let Some(predecessor) = &self.predecessor {
             if predecessor == &self.activated {
                 return Err(ContextError::IdentityConflict);
             }
-            validate_text(
-                predecessor.policy_id.as_str(),
-                "recipe_activation.predecessor",
-            )?;
-            validate_digest(
-                &predecessor.policy_sha256,
-                "recipe_activation.predecessor.policy_sha256",
-            )?;
+            predecessor.validate_identity()?;
         }
         self.applicability.validate()?;
         self.execution.validate()?;
+        self.basis.validate()?;
         validate_digest(&self.record_sha256, "recipe_activation.record_sha256")?;
         if self.canonical_record_digest()? != self.record_sha256 {
             return Err(ContextError::IdentityConflict);
@@ -1272,6 +1477,17 @@ impl RecipePolicyIdentity {
         }
     }
 
+    /// Validate the identity's own recorded fields.
+    ///
+    /// An identity that names nothing, or whose digest is not a digest, cannot be
+    /// a predecessor, a proposed content, a baseline or a current pointer, so it
+    /// is refused before any content comparison is attempted. This checks the
+    /// ORIGINAL recorded values only; it derives no digest of its own.
+    fn validate_identity(&self) -> Result<(), ContextError> {
+        validate_text(self.policy_id.as_str(), "recipe_policy_identity.policy_id")?;
+        validate_digest(&self.policy_sha256, "recipe_policy_identity.policy_sha256")
+    }
+
     /// Check that this identity still names exactly this content.
     ///
     /// The ORIGINAL recorded values of both records are compared. No digest is
@@ -1346,16 +1562,25 @@ pub enum RecipeResolutionRefusal {
         /// Every unresolved input, in canonical order.
         inputs: Vec<QualityApplicabilityInput>,
     },
-    /// No approved, unrevoked, applicable candidate remains.
+    /// The revision the current pointer names is not an applicable candidate.
     NoApplicableCandidate {
-        /// Every candidate the owner published, with its rejection reason.
+        /// The pointed revision, with its exact rejection reason.
         rejected: Vec<RecipeCandidateRejection>,
     },
-    /// More than one approved, applicable candidate survived the precedence
-    /// rule at the same owner-minted revision.
-    AmbiguousCandidates {
-        /// The indistinguishable candidates, in policy-identity order.
-        candidates: Vec<RecipePolicyIdentity>,
+    /// The owner holds an approved, unrevoked, applicable revision that the
+    /// current pointer does not name.
+    ///
+    /// #1724 W6. This arm is the refusal a "newest candidate wins" rule could
+    /// not produce. A candidate is not permission to activate, so the resolution
+    /// neither silently adopts it nor silently continues on the older revision:
+    /// it blocks the dependent compilation until the owner promotion decision
+    /// that names the candidate is published.
+    ApplicableCandidateNotCurrent {
+        /// The revision the current pointer does name.
+        current: RecipePolicyIdentity,
+        /// Every applicable, unrevoked revision the pointer does not name, in
+        /// policy-identity order.
+        unpointed: Vec<RecipePolicyIdentity>,
     },
     /// The selected revision declares a setting the executing Context path does
     /// not run, so certifying it would place that setting inside a delivered
@@ -1397,10 +1622,11 @@ impl fmt::Display for RecipeResolutionRefusal {
                 "no applicable approved recipe among {} owner candidate(s)",
                 rejected.len()
             ),
-            Self::AmbiguousCandidates { candidates } => write!(
+            Self::ApplicableCandidateNotCurrent { current, unpointed } => write!(
                 formatter,
-                "{} applicable approved recipes share the highest policy revision",
-                candidates.len()
+                "current pointer {} leaves {} applicable approved recipe(s) not yet promoted",
+                current.policy_id.as_str(),
+                unpointed.len()
             ),
             Self::UnsupportedSetting { identity, field } => write!(
                 formatter,
@@ -1686,9 +1912,25 @@ impl GoverningContextRequirements {
 /// revisions current or revoked them. The pure compiler receives the result of
 /// [`ApprovedRecipeCatalogue::resolve`]; it never consults this record, a
 /// mutable registry, the filesystem, the network or a model.
+///
+/// `current` is the current recipe pointer and is a REQUIRED member with no
+/// default, because it is the only thing that decides what is current. Before
+/// #1724 W6 the pointer was implicit: `resolve` took the applicable candidate
+/// with the greatest [`PolicyRevision`], which made a revision number an
+/// activation authority and let a publisher change the current recipe by
+/// publishing a newer candidate, with no promotion decision anywhere.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ApprovedRecipeCatalogue {
+    /// The one approved revision this catalogue holds current.
+    ///
+    /// Nothing else changes what is current: not a higher revision number, not a
+    /// valid digest, not a smaller packet, not a favourable measurement. The
+    /// pointer is resolved to the owner promotion decision that made it current
+    /// by [`ApprovedRecipeCatalogue::validate`], which requires the pointed
+    /// revision's own recorded activation identity to name an activation record
+    /// this catalogue carries.
+    pub current: RecipePolicyIdentity,
     /// Compiler-generation and route profile this compilation runs under.
     pub execution: RecipeExecutionContour,
     /// Applicability dimensions of this compilation.
@@ -1697,7 +1939,10 @@ pub struct ApprovedRecipeCatalogue {
     pub governing: GoverningContextRequirements,
     /// Owner-published approved candidate policy revisions.
     pub candidates: Vec<ContextRecipePolicy>,
-    /// Owner activation decisions for the candidates, newest revision last.
+    /// Owner activation decisions for the candidates, one per candidate.
+    ///
+    /// Order carries no meaning. #1724 W6 removed the reading in which the
+    /// newest record here, or the highest revision, decided what was current.
     pub activations: Vec<RecipeActivationRecord>,
     /// Owner kill/rollback decisions for candidates this owner no longer serves.
     pub revocations: Vec<RecipeRevocationRecord>,
@@ -1717,6 +1962,18 @@ impl ApprovedRecipeCatalogue {
     /// previous compatible revision it returns to, which must likewise still be
     /// held. A rollback therefore cannot name a revision the owner does not
     /// have, and cannot be expressed at all by editing the revoked revision.
+    ///
+    /// #1724 W6 adds the pointer closure and the gate closure. `current` must
+    /// name a revision this owner holds. Every activation's
+    /// [`RecipePromotionBasis`] is then measured against the CONTENT of the
+    /// revision it activated: an initial/built-in baseline has no predecessor, a
+    /// candidate's declared predecessor is the decision's predecessor, the
+    /// candidate's declared proposed content IS the activated revision, the
+    /// candidate's applicability covers the scope the decision activates, the
+    /// candidate measured every counter-metric the activated revision declares,
+    /// and the activated revision records its metrics as qualified. A candidate,
+    /// a valid hash, a smaller packet or a positive token saving satisfies none
+    /// of those, so none of them can activate anything.
     ///
     /// #1724 A4 follows from the same shape: nothing in this record, and nothing
     /// in a View or a `ContextEconomyReceipt`, can rewrite an approved
@@ -1742,6 +1999,7 @@ impl ApprovedRecipeCatalogue {
                 field: "recipe_catalogue.revocations",
             });
         }
+        self.current.validate_identity()?;
         self.execution.validate()?;
         self.applicability.validate()?;
         self.governing.validate()?;
@@ -1752,11 +2010,15 @@ impl ApprovedRecipeCatalogue {
                 return Err(ContextError::Duplicate("recipe_catalogue.candidates"));
             }
         }
-        let held: BTreeSet<RecipePolicyIdentity> = self
-            .candidates
-            .iter()
-            .map(RecipePolicyIdentity::of)
-            .collect();
+        let mut held: BTreeMap<RecipePolicyIdentity, &ContextRecipePolicy> = BTreeMap::new();
+        for candidate in &self.candidates {
+            if held
+                .insert(RecipePolicyIdentity::of(candidate), candidate)
+                .is_some()
+            {
+                return Err(ContextError::IdentityConflict);
+            }
+        }
 
         let mut decisions = BTreeSet::new();
         let mut activated = BTreeSet::new();
@@ -1767,9 +2029,9 @@ impl ApprovedRecipeCatalogue {
             {
                 return Err(ContextError::Duplicate("recipe_catalogue.activations"));
             }
-            if !held.contains(&activation.activated) {
+            let Some(activated_policy) = held.get(&activation.activated) else {
                 return Err(ContextError::IdentityConflict);
-            }
+            };
             // The activation is confined to the contour and transform
             // identity it was decided under. Its `generation` is deliberately
             // not compared here: a contour generation is the owner's monotone
@@ -1790,10 +2052,11 @@ impl ApprovedRecipeCatalogue {
             if activation
                 .predecessor
                 .as_ref()
-                .is_some_and(|predecessor| !held.contains(predecessor))
+                .is_some_and(|predecessor| !held.contains_key(predecessor))
             {
                 return Err(ContextError::IdentityConflict);
             }
+            Self::validate_promotion_basis(activation, activated_policy)?;
         }
         for candidate in &self.candidates {
             let identity = RecipePolicyIdentity::of(candidate);
@@ -1805,6 +2068,20 @@ impl ApprovedRecipeCatalogue {
             }
         }
 
+        self.validate_revocations(&held)?;
+        if !held.contains_key(&self.current) {
+            return Err(ContextError::IdentityConflict);
+        }
+        Ok(())
+    }
+
+    /// #1724 W7. Every kill or rollback names a revision this owner still holds,
+    /// and a rollback names a replacement this owner still holds, so a rollback
+    /// cannot return to a revision that is not there.
+    fn validate_revocations(
+        &self,
+        held: &BTreeMap<RecipePolicyIdentity, &ContextRecipePolicy>,
+    ) -> Result<(), ContextError> {
         let mut revoked = BTreeSet::new();
         let mut revocation_decisions = BTreeSet::new();
         for revocation in &self.revocations {
@@ -1814,13 +2091,13 @@ impl ApprovedRecipeCatalogue {
             {
                 return Err(ContextError::Duplicate("recipe_catalogue.revocations"));
             }
-            if !held.contains(&revocation.revoked) {
+            if !held.contains_key(&revocation.revoked) {
                 return Err(ContextError::IdentityConflict);
             }
             if revocation
                 .replacement
                 .as_ref()
-                .is_some_and(|replacement| !held.contains(replacement))
+                .is_some_and(|replacement| !held.contains_key(replacement))
             {
                 return Err(ContextError::IdentityConflict);
             }
@@ -1828,22 +2105,79 @@ impl ApprovedRecipeCatalogue {
         Ok(())
     }
 
+    /// #1724 W6: measure one owner promotion decision against the approved
+    /// content it actually promoted.
+    ///
+    /// Every comparison here is against the activated revision's own recorded
+    /// values or against the candidate's own recorded values, never against a
+    /// value derived from the decision being checked, so a decision cannot pass
+    /// by agreeing with itself.
+    fn validate_promotion_basis(
+        activation: &RecipeActivationRecord,
+        activated_policy: &ContextRecipePolicy,
+    ) -> Result<(), ContextError> {
+        match &activation.basis {
+            // The built-in baseline is preserved as such: it supersedes nothing
+            // and it needs no fabricated prior experimental evidence, so it is
+            // the one basis that may leave `qualification.state` unqualified.
+            RecipePromotionBasis::InitialBuiltInBaseline { .. } => {
+                if activation.predecessor.is_some() {
+                    return Err(ContextError::IdentityConflict);
+                }
+            }
+            RecipePromotionBasis::ImprovementCandidate { candidate } => {
+                if activation.predecessor.as_ref() != Some(&candidate.predecessor)
+                    || candidate.proposed != activation.activated
+                {
+                    return Err(ContextError::IdentityConflict);
+                }
+                // The candidate was triaged and measured in a scope at least as
+                // broad as the scope this decision activates, so the evidence
+                // cited is evidence about the applicability being activated.
+                // `activation.applicability` is separately required to cover the
+                // compilation's own applicability, so the chain reaches the
+                // independent end rather than stopping at the candidate.
+                if !RecipeApplicability::declared_covers(
+                    &candidate.applicability,
+                    &activation.applicability,
+                ) {
+                    return Err(ContextError::IdentityConflict);
+                }
+                if !candidate.covers_declared_counter_metrics(activated_policy) {
+                    return Err(ContextError::QualityIncomplete);
+                }
+                // An unqualified metric stays labelled unqualified, and a
+                // revision whose own recorded metrics are unqualified cannot be
+                // promoted on the strength of evidence about different metrics.
+                if activated_policy.qualification.state != RecipeQualificationState::Qualified {
+                    return Err(ContextError::QualityIncomplete);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Resolve exactly one applicable approved recipe.
     ///
-    /// Precedence, in order and with no fallback:
+    /// #1724 W6. Selection reads [`ApprovedRecipeCatalogue::current`] and
+    /// nothing else. In order, with no fallback:
     ///
     /// 1. an unresolved governing applicability input refuses the compilation
     ///    before any candidate is read;
-    /// 2. a candidate named by an owner kill or rollback decision, issued
-    ///    under another compiler-generation or route profile, or not declaring
-    ///    every applicability profile of this compilation is rejected with that
-    ///    exact reason;
-    /// 3. among the surviving candidates the greatest owner-minted
-    ///    [`PolicyRevision`] wins; an exact tie between distinct policy
-    ///    identities refuses as ambiguous.
+    /// 2. the pointed revision named by an owner kill or rollback decision,
+    ///    issued under another compiler-generation or route profile, or not
+    ///    declaring every applicability profile of this compilation refuses with
+    ///    that exact reason;
+    /// 3. any OTHER held, unrevoked, applicable revision refuses as
+    ///    [`RecipeResolutionRefusal::ApplicableCandidateNotCurrent`]. It is
+    ///    neither adopted nor ignored: a candidate that has not been pointed at
+    ///    by a promotion decision is not permission to activate, so the
+    ///    dependent compilation blocks until the owner publishes that decision.
     ///
-    /// The result is pinned by its own digest so the same revision cannot be
-    /// reused for another compilation, task or generation.
+    /// There is no revision comparison anywhere in this function, because a
+    /// revision number is not an activation authority. The result is pinned by
+    /// its own digest so the same revision cannot be reused for another
+    /// compilation, task or generation.
     pub fn resolve(&self) -> Result<ResolvedContextRecipe, RecipeResolutionRefusal> {
         self.validate()
             .map_err(|error| RecipeResolutionRefusal::InvalidCatalogue {
@@ -1854,52 +2188,47 @@ impl ApprovedRecipeCatalogue {
             return Err(RecipeResolutionRefusal::UnresolvedGoverningInput { inputs: unresolved });
         }
 
-        let mut applicable: Vec<&ContextRecipePolicy> = Vec::new();
-        let mut rejected = Vec::new();
-        for candidate in &self.candidates {
-            match self.applicability_rejection(candidate) {
-                Some(reason) => rejected.push(RecipeCandidateRejection {
-                    identity: RecipePolicyIdentity::of(candidate),
-                    reason,
-                }),
-                None => applicable.push(candidate),
-            }
-        }
-        if applicable.is_empty() {
-            rejected.sort_by(|left, right| left.identity.cmp(&right.identity));
-            return Err(RecipeResolutionRefusal::NoApplicableCandidate { rejected });
-        }
-
-        // `applicable` is non-empty here: the `is_empty` arm above returned.
-        // `max()` is still an `Option`, so the highest revision is taken by
-        // folding from the first candidate rather than unwrapping, which keeps
-        // that invariant structural instead of asserted.
-        let mut highest = applicable[0].policy_revision;
-        for candidate in &applicable[1..] {
-            if candidate.policy_revision > highest {
-                highest = candidate.policy_revision;
-            }
-        }
-        let mut winners: Vec<&ContextRecipePolicy> = applicable
+        // `validate` proved `current` names a held revision, so this lookup
+        // cannot miss. It is still written as a checked lookup rather than an
+        // index so the pointer is never dereferenced on trust. `current` stays a
+        // `&ContextRecipePolicy`: a policy is content, not a `Copy` value, and
+        // every use below either borrows it or clones it deliberately.
+        let current = self
+            .candidates
             .iter()
-            .copied()
-            .filter(|candidate| candidate.policy_revision == highest)
-            .collect();
-        winners.sort_by(|left, right| left.policy_id.cmp(&right.policy_id));
-        if winners.len() != 1 {
-            return Err(RecipeResolutionRefusal::AmbiguousCandidates {
-                candidates: winners
-                    .iter()
-                    .map(|candidate| RecipePolicyIdentity::of(candidate))
-                    .collect(),
+            .find(|candidate| RecipePolicyIdentity::of(candidate) == self.current)
+            .ok_or_else(|| RecipeResolutionRefusal::InvalidCatalogue {
+                reason: ContextError::IdentityConflict.to_string(),
+            })?;
+
+        if let Some(reason) = self.applicability_rejection(current) {
+            return Err(RecipeResolutionRefusal::NoApplicableCandidate {
+                rejected: vec![RecipeCandidateRejection {
+                    identity: RecipePolicyIdentity::of(current),
+                    reason,
+                }],
             });
         }
-        let winner = winners[0];
+
+        let mut unpointed: Vec<RecipePolicyIdentity> = self
+            .candidates
+            .iter()
+            .filter(|candidate| RecipePolicyIdentity::of(candidate) != self.current)
+            .filter(|candidate| self.applicability_rejection(candidate).is_none())
+            .map(RecipePolicyIdentity::of)
+            .collect();
+        if !unpointed.is_empty() {
+            unpointed.sort();
+            return Err(RecipeResolutionRefusal::ApplicableCandidateNotCurrent {
+                current: self.current.clone(),
+                unpointed,
+            });
+        }
 
         let mut resolution = ResolvedContextRecipe {
-            identity: RecipePolicyIdentity::of(winner),
-            policy: winner.clone(),
-            approval: winner.supersession.activation.clone(),
+            identity: self.current.clone(),
+            policy: current.clone(),
+            approval: current.supersession.activation.clone(),
             applicability: self.applicability.clone(),
             execution: self.execution.clone(),
             resolution_sha256: "0".repeat(64),

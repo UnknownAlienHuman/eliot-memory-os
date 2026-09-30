@@ -36,6 +36,31 @@
 //!    `campaign_task_controller`), so step 3 stays blocked until those
 //!    consumers move to the owner cells.
 //! 3. Delete this crate after every consumer migrates, per issue #40 A4.
+//!
+//! ## Smaller-shape recipe callers (#1724 A6)
+//!
+//! #1724 acceptance: "Existing smaller-shape callers migrate explicitly or
+//! remain bounded compatibility consumers, never a parallel current owner." The
+//! smaller shape is the crate-root `ContextRecipe`/`ContextCompiler` pair —
+//! `recipe_revision: TaskRevision`, `total_cost`, per-ROLE maxima and
+//! `required_roles` — whose owner is the A-15
+//! `eliot_context_contracts::ContextRecipe`, plus the `campaign_publication`
+//! body that carries it. The two are not wire-equivalent and this crate holds
+//! both, so "is it a second current owner?" is answered per caller, not per
+//! type. Measured on this tree, `git grep` over `crates/**` and `bins/**`:
+//!
+//! | caller | classification |
+//! |---|---|
+//! | `ContextCompiler::compile`, `compile_with_revocation` | bounded compatibility consumer; `#[deprecated]`, `LegacyFrozen`, and only `tests/admission_integrity.rs` calls them |
+//! | `ContextCompiler::compile_with_campaign_learning_state` | bounded compatibility consumer; zero product callers, recorded in `cognitive-donor-map.toml` and `cognitive-edge-map.toml` |
+//! | `CampaignCompiledContext`, `CampaignLearningStateCompileInput`, `CampaignContextRolePolicy`, `CampaignContextCompileError` | bounded compatibility consumer; zero callers outside this crate |
+//! | `compile_plan`/`compile_control_unfinalized` in `crates/eliot-engine` and `crates/eliot-app` | NOT this surface; those are `eliot_engine::context::ContextCompiler`, a different type with its own owner, and they never name a crate-root item here |
+//! | `bins/eliotd` `campaign_packet.rs`, `campaign_context_owner.rs`, `campaign_task_controller.rs` | bounded compatibility consumer over `campaign_publication`; they re-derive through `ApprovedRecipeCatalogue::resolve` and `GoverningContextRequirements::authorize` and select nothing |
+//! | `ContextRecipe`/`RoleBudget`/`ContextInput`/`CompiledContext`/`PacketQualityScorecard` in `crates/smart/eliot-context/src/lib.rs` | bounded compatibility consumer; `LegacyFrozen` rows, no external caller |
+//!
+//! The one shape that is NOT bounded is the current owner, and it is reached
+//! through the re-export rows below: `eliot_context_contracts::ContextRecipe`
+//! plus the `adapt_*` adapters. There is no third path.
 
 use thiserror::Error;
 
@@ -64,7 +89,7 @@ pub enum FacadeError {
 /// `(item, disposition, owner-or-replacement)`. Legacy rows are frozen
 /// compatibility material with the removal plan from the module docs;
 /// re-export rows resolve by type identity to the current owner.
-pub const FACADE_DISPOSITIONS: [(&str, &str, &str); 62] = [
+pub const FACADE_DISPOSITIONS: [(&str, &str, &str); 64] = [
     ("CONTRACT_NAME", "LegacyFrozen", "frozen wire name"),
     ("CONTRACT_VERSION", "LegacyFrozen", "frozen wire revision"),
     (
@@ -243,6 +268,18 @@ pub const FACADE_DISPOSITIONS: [(&str, &str, &str); 62] = [
         "LegacyFrozen",
         "donor digest helper; no NEW callers since the #1862 rework",
     ),
+    // #1724 A6. This public item had NO row, so the table's own claim that
+    // "every public item has one row" was false and a live product consumer of
+    // the frozen surface was inheriting a silent classification. It has exactly
+    // one production caller, `bins/eliotd/src/campaign_packet.rs`, which imports
+    // it to build the admission-closure floor identity; it re-derives rather than
+    // decides, because it calls `ApprovedRecipeCatalogue::resolve` and
+    // `GoverningContextRequirements::authorize` on the way out.
+    (
+        "campaign_publication::context_safety_floor_identity",
+        "LegacyFrozen",
+        "frozen floor-identity projection over the owner catalogue; no NEW callers",
+    ),
     (
         "CampaignContextCompileError",
         "LegacyFrozen",
@@ -340,6 +377,11 @@ pub const FACADE_DISPOSITIONS: [(&str, &str, &str); 62] = [
     ("adapt_admit_context", "AdapterEntry", "one A-17a call"),
     ("adapt_assemble_view", "AdapterEntry", "one A-18 call"),
     ("FacadeError", "FacadeSurface", "closed refusal vocabulary"),
+    (
+        "facade",
+        "FacadeSurface",
+        "this module; the only owner-adapter surface, and where the table lives",
+    ),
     (
         "FACADE_DISPOSITIONS",
         "FacadeSurface",

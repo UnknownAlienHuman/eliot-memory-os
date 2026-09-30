@@ -13,7 +13,7 @@
 use super::daemon_request_dispatch::{
     DAEMON_STARTUP_EVIDENCE_OPERATION, NOTIFICATION_STATE_MUTATION_OPERATION,
     NOTIFICATION_STATE_READ_OPERATION, USER_AUTOMATION_OPERATOR_OPERATION,
-    USER_AUTOMATION_RUNTIME_OPERATION,
+    USER_AUTOMATION_PREFLIGHT_SELECTOR, USER_AUTOMATION_RUNTIME_OPERATION,
 };
 use super::daemon_request_dispatch::{
     STORAGE_REPLACEMENT_OPERATION, STORAGE_REPLACEMENT_RESUME_OPERATION,
@@ -258,6 +258,7 @@ fn actual_route_name(action: &KernelFrameAction) -> &'static str {
         KernelFrameAction::Doctor { .. } => "doctor_admitted",
         KernelFrameAction::Testd { .. } => "testd_admitted",
         KernelFrameAction::Dreamer { .. } => "dreamer_admitted",
+        KernelFrameAction::Backup { .. } => "backup_restore_admitted",
         KernelFrameAction::Research { .. } => "research_provider_admitted",
         KernelFrameAction::Fence(_) => "fenced_reply",
     }
@@ -912,12 +913,19 @@ impl KernelComposition {
                     payload: route_payload_for_daemon_operation(&operation, payload, identity)?,
                 });
             }
-            if is_user_automation_operator_operation(&operation) {
+            if is_user_automation_operator_operation(&operation)
+                || operation == USER_AUTOMATION_PREFLIGHT_SELECTOR
+            {
                 // The authenticated `UserAutomation` operator selector is not a
                 // daemon-module operation: the closed
                 // create/list/status/history/pause/resume/edit/run-now/remove/
                 // inspect-last-failure vocabulary arrives over the same admitted
-                // front-door transport from the operator surface. Only the
+                // front-door transport from the operator surface. The complete
+                // preflight projection read rides the same transport under its
+                // own selector (`eliot.config.user_automation.v1`): without
+                // this entry the frame falls through every predicate, fails
+                // the generic decode, and fences the session before the owner
+                // arm is ever entered. Only the
                 // selector string selects this route; the typed operation, the
                 // peer-bound principal, and the canonical request hash are
                 // proved by the route owner before any Store IO. `Ready` admits

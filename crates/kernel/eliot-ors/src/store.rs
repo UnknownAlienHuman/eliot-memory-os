@@ -3436,6 +3436,13 @@ const KERNEL_EXECUTION_MANIFESTS: TableDefinition<&str, &str> =
 /// every distinct denied operation keeps its own durable escalation.
 const EFFECT_REPLAY_RECONCILIATIONS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_effect_replay_reconciliations_v1");
+/// Durable manifest-side restart reconciliation intents (issue #1884; I1.9).
+/// Keyed by `{module_id}::{generation}` with the same key the execution
+/// manifest uses, so a refused restart of one generation updates one row
+/// instead of growing the table. A restart is not an effect replay, so these
+/// items name no operation identity and cannot use the effect-replay family.
+const KERNEL_RESTART_RECONCILIATIONS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_kernel_restart_reconciliations_v1");
 const NEXT_GLOBAL_ORDER: &str = "next_global_order";
 const RECOVERY_RESERVATION_REVISION: &str = "ors_recovery_reservations_revision_v1";
 const RECOVERY_OPERATIONAL_CURRENT_REVISION: &str = "ors_recovery_operational_current_revision_v1";
@@ -3661,17 +3668,24 @@ pub trait OperationalRecoveryStore: Send + Sync {
         &self,
         activation: AdmissionReservationActivationRequest,
     ) -> Result<AdmissionReservationSnapshot, OrsError>;
-    /// Marks an inactive reservation as reconciling with exact evidence.
+    /// Marks a staged, reconciling or active reservation as reconciling with
+    /// exact evidence (I14.20:94-96). An `ACTIVE` row moves to `RECONCILING`
+    /// only; it can never be expired here.
     fn reconcile_kernel_admission_reservation(
         &self,
         disposition: AdmissionReservationDisposition,
     ) -> Result<AdmissionReservationSnapshot, OrsError>;
-    /// Releases an inactive reservation with receipt-backed evidence.
+    /// Releases a staged, reconciling or active reservation with receipt-backed
+    /// evidence (I14.20:94-96). This is the path that takes an `ACTIVE`
+    /// reservation to `RELEASED`; expiry is not (I14.20:99).
     fn release_kernel_admission_reservation(
         &self,
         disposition: AdmissionReservationDisposition,
     ) -> Result<AdmissionReservationSnapshot, OrsError>;
-    /// Expires an inactive reservation only after its declared expiry time.
+    /// Expires an inactive (staged or reconciling) reservation only after its
+    /// declared expiry time. An `ACTIVE` row is refused: I14.20:99 — "an active
+    /// reservation attached to a nonterminal attempt cannot be expired as
+    /// cleanup."
     fn expire_kernel_admission_reservation(
         &self,
         disposition: AdmissionReservationDisposition,
@@ -3923,6 +3937,18 @@ pub trait OperationalRecoveryStore: Send + Sync {
         &self,
         item: RecoveryInboxItem,
     ) -> Result<RecoveryInboxReceipt, OrsError>;
+    /// Reads back one imported recovery-inbox obligation by exact item
+    /// identity without interpreting its payload (issue #1694 W2).
+    ///
+    /// This is the owner read-back behind persist-before-ack proof: the
+    /// returned envelope is the durably committed staged bytes, including
+    /// envelopes that live only inside the inbox row and never in the
+    /// envelope table. A missing row reads back as `None`, never as a
+    /// synthesized envelope.
+    fn load_recovery_inbox_envelope(
+        &self,
+        item_id: &crate::OperationIdentity,
+    ) -> Result<Option<RecoveryPayloadEnvelope>, OrsError>;
     fn record_recovery_inbox_disposition(
         &self,
         item_id: crate::OperationIdentity,
@@ -22349,6 +22375,43 @@ impl RedbRecoveryStore {
             .transpose()
     }
 
+    /// Verifies one presented executable-binding digest against the durable
+    /// claim row (issue #2567).
+    ///
+    /// Owner check: the lookup shape is validated with its existing
+    /// [`crate::ProviderCapabilityLookup::validate`], the row is loaded by
+    /// exact claim identity, and the presented digest is compared against
+    /// the retained row through
+    /// [`crate::NativeWorkerClaimRecord::verified_executable_binding_digest`].
+    /// Returns the retained digest on agreement; an unknown identity, a
+    /// foreign attempt/operation, an unadmitted claim, or a digest
+    /// disagreement is a typed refusal, never the caller-claimed value.
+    pub fn verify_native_worker_claim_executable_binding(
+        &self,
+        lookup: &crate::ProviderCapabilityLookup,
+        presented_executable_digest: &str,
+    ) -> Result<String, OrsError> {
+        lookup.validate()?;
+        let claim_id = crate::OperationIdentity::new(lookup.claim_id.as_str())?;
+        let record = self.load_native_worker_claim(&claim_id)?.ok_or_else(|| {
+            OrsError::NativeWorkerClaimIdentityConflict {
+                claim_id: lookup.claim_id.clone(),
+            }
+        })?;
+        if !lookup.matches(&record) {
+            return Err(OrsError::NativeWorkerClaimIdentityConflict {
+                claim_id: lookup.claim_id.clone(),
+            });
+        }
+        record
+            .verified_executable_binding_digest(
+                lookup.attempt_id.as_str(),
+                lookup.operation_id.as_str(),
+                presented_executable_digest,
+            )
+            .map(str::to_owned)
+    }
+
     /// Reverse-resolves one claim identity from its bound attempt and
     /// operation labels (T9-04 supplier core, issue #1108).
     ///
@@ -26236,9 +26299,12 @@ impl RedbRecoveryStore {
     ///
     /// The returned admitted decision carries the sealed immutable manifest,
     /// including its exact digest, launch binding, Job Object/resource limits,
-    /// restart budget, readiness reference, and state-class behavior. This is
-    /// a read-only manifest authorization projection; it does not acquire a
-    /// State Fence, certify a live process/Job lineage, or start a process.
+    /// restart budget, readiness reference, and state-class behavior. A refused
+    /// or shadowed decision persists its reconciliation items into
+    /// `KERNEL_RESTART_RECONCILIATIONS` before this returns, so the refusal is
+    /// preserved evidence and the affected generation stays visibly degraded; a
+    /// clean admission writes nothing. The decision itself acquires no State
+    /// Fence, certifies no live process/Job lineage, and starts no process.
     pub fn load_and_verify_kernel_execution_restart(
         &self,
         request: &crate::KernelExecutionRestartRequest,
@@ -26248,7 +26314,136 @@ impl RedbRecoveryStore {
             request.module_id.as_str(),
             request.generation.value(),
         )?;
-        crate::verify_kernel_execution_restart(manifest.as_ref(), request)
+        let decision = crate::verify_kernel_execution_restart(manifest.as_ref(), request)?;
+        // #1884 W1.5: a missing, stale, incompatible, revoked or receipt-less
+        // manifest, an exhausted restart budget and a shadowed effect-capable
+        // candidate all produce at least one reconciliation item on the
+        // decision, and the item is the affected generation's only preserved
+        // evidence of the refusal. It is persisted here before this returns,
+        // so a refused restart is never discarded and the affected generation
+        // stays visibly degraded instead of restarting into normal-effect
+        // service. A clean admission carries no item and writes nothing.
+        for item in &decision.reconciliation {
+            self.persist_kernel_restart_reconciliation(item)?;
+        }
+        Ok(decision)
+    }
+
+    /// Persists one Governor-admitted execution manifest (issue #1884; I1.9,
+    /// W1.1).
+    ///
+    /// This is the only write path into `KERNEL_EXECUTION_MANIFESTS`. The row
+    /// is built by [`crate::KernelExecutionManifest::admit`], the only
+    /// validating construction path, so the caller passes the Governor-issued
+    /// [`crate::AdmittedModuleGeneration`] and the technical execution
+    /// projection separately and never a prebuilt manifest: a projection that
+    /// carries no accepted Module Catalog revision, no Policy revision or no
+    /// Governor lifecycle/admission receipt is refused by `admit` and never
+    /// reaches durable state. `admit` runs `AdmittedModuleGeneration::validate`,
+    /// which requires both revisions to be non-zero and the receipt to be
+    /// non-blank, then refuses a projection whose effect ceiling exceeds the
+    /// admitted ceiling or whose allowed scopes are not a subset of the
+    /// admitted scopes, and finally binds `manifest_sha256` over the recorded
+    /// admission and projection — so Kernel cannot create, widen or update a
+    /// manifest without a governed Catalog/lifecycle receipt. An exact
+    /// re-persist of the same admission and projection is idempotent.
+    pub fn persist_admitted_kernel_execution_manifest(
+        &self,
+        admission: &crate::AdmittedModuleGeneration,
+        projection: &crate::KernelExecutionProjection,
+    ) -> Result<String, OrsError> {
+        let manifest =
+            crate::KernelExecutionManifest::admit(admission.clone(), projection.clone())?;
+        let key = Self::effect_manifest_key(
+            manifest.admission.module_id.as_str(),
+            manifest.admission.generation.value(),
+        );
+        let payload = encode(&manifest)?;
+        let write = self.database.begin_write().map_err(storage)?;
+        {
+            let mut manifests = write
+                .open_table(KERNEL_EXECUTION_MANIFESTS)
+                .map_err(storage)?;
+            manifests
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(manifest.manifest_sha256)
+    }
+
+    /// Persists one manifest-side restart escalation (issue #1884; I1.9, W1.5).
+    ///
+    /// A missing, stale, incompatible, revoked or receipt-less manifest is
+    /// refused by `verify_kernel_execution_restart` with
+    /// `KernelServiceAdmission::None`, and the reconciliation item it returns is
+    /// the affected generation's only preserved evidence of that refusal. A
+    /// restart is not an effect replay, so that item names no operation
+    /// identity and no lease identity, and `persist_effect_replay_reconciliation`
+    /// refuses such an item; this is its durable home instead. Same item type,
+    /// same `validate()`, same persistence codec, keyed by
+    /// `{module_id}::{generation}` so a repeated refusal of one generation
+    /// updates one row instead of growing the table. An exact re-persist is
+    /// idempotent.
+    pub fn persist_kernel_restart_reconciliation(
+        &self,
+        item: &crate::KernelReconciliationItem,
+    ) -> Result<(), OrsError> {
+        item.validate()?;
+        if item.lease_id.is_some() || item.operation_id.is_some() {
+            return Err(OrsError::InvalidField {
+                field: "kernel_reconciliation_item_operation_id",
+                reason: "a manifest-side restart escalation names no replayed effect or lease",
+            });
+        }
+        let key = Self::effect_manifest_key(item.module_id.as_str(), item.generation.value());
+        let payload = encode(item)?;
+        let write = self.database.begin_write().map_err(storage)?;
+        {
+            let mut intents = write
+                .open_table(KERNEL_RESTART_RECONCILIATIONS)
+                .map_err(storage)?;
+            intents
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)
+    }
+
+    /// Loads the durable manifest-side restart escalation for one generation
+    /// (issue #1884; I1.9, W1.5).
+    ///
+    /// Keyed by `{module_id}::{generation}`. The stored item re-decodes through
+    /// the same persistence codec, so a tampered row fails closed as corruption
+    /// instead of surviving as escalation evidence. Returns `Ok(None)` when no
+    /// restart was ever refused for the generation, which keeps an unrefused
+    /// generation indistinguishable from one whose escalation was never needed.
+    pub fn load_kernel_restart_reconciliation(
+        &self,
+        module_id: &str,
+        generation: u64,
+    ) -> Result<Option<crate::KernelReconciliationItem>, OrsError> {
+        crate::model::validate_text(module_id, "kernel_execution_manifest_module_id")?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let intents = read
+            .open_table(KERNEL_RESTART_RECONCILIATIONS)
+            .map_err(storage)?;
+        let key = Self::effect_manifest_key(module_id, generation);
+        intents
+            .get(key.as_str())
+            .map_err(storage)?
+            .map(|value| {
+                let item: crate::KernelReconciliationItem = decode(value.value())?;
+                if item.module_id != module_id || item.generation.value() != generation {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "kernel_restart_reconciliation",
+                        reason: "restart reconciliation key does not match the recorded identity"
+                            .to_owned(),
+                    });
+                }
+                Ok(item)
+            })
+            .transpose()
     }
 
     /// Persists one effect-replay reconciliation intent (issue #1885; I1.9).
@@ -27067,6 +27262,15 @@ impl RedbRecoveryStore {
         drop(
             write
                 .open_table(EFFECT_REPLAY_RECONCILIATIONS)
+                .map_err(storage)?,
+        );
+        // #1884: the manifest-side restart-reconciliation family is part of the
+        // base family too, materialized empty on every open like every other
+        // base table, so a refused restart escalates into a real table instead
+        // of failing on a missing one. No row is backfilled or inferred here.
+        drop(
+            write
+                .open_table(KERNEL_RESTART_RECONCILIATIONS)
                 .map_err(storage)?,
         );
         // #2571: the logical host-request index is part of the base family,
@@ -31215,7 +31419,9 @@ impl RedbRecoveryStore {
 /// disposition transitions already had, rather than a second scheme.
 #[derive(Clone, Copy)]
 enum AdmissionReservationTransitionSpec<'a> {
-    /// A receipt-backed disposition of an inactive/reconciling reservation.
+    /// A receipt-backed disposition of a staged, reconciling or active
+    /// reservation. `ACTIVE` is a legal source for `Released` and
+    /// `Reconciling` only, never for `Expired` (I14.20:94-96, I14.20:99).
     Disposition {
         /// The caller-supplied disposition with its reason and evidence.
         disposition: &'a AdmissionReservationDisposition,
@@ -31396,6 +31602,35 @@ impl RedbRecoveryStore {
         ))
     }
 
+    /// Whether one admission-reservation state may legally be the source of a
+    /// transition to `target` (I14.20:94-96, #1678 section 8).
+    ///
+    /// `STAGED_INACTIVE` and `RECONCILING` reach every target, which keeps the
+    /// activation path (`-> ACTIVE`) intact. `ACTIVE` reaches exactly `RELEASED` and
+    /// `RECONCILING`, so an active reservation can be disposed of or handed to
+    /// recovery by its owning execution/recovery path. I14.20:99 keeps expiry
+    /// narrower — "an active reservation attached to a nonterminal attempt cannot be
+    /// expired as cleanup" — so `ACTIVE -> EXPIRED` has no arm here and stays
+    /// refused. `RELEASED` and `EXPIRED` are terminal and are never a source.
+    ///
+    /// The match is exhaustive so a future `AdmissionReservationState` variant
+    /// cannot silently default to a legal source.
+    fn legal_admission_reservation_source(
+        state: AdmissionReservationState,
+        target: AdmissionReservationState,
+    ) -> bool {
+        match state {
+            AdmissionReservationState::StagedInactive | AdmissionReservationState::Reconciling => {
+                true
+            }
+            AdmissionReservationState::Active => matches!(
+                target,
+                AdmissionReservationState::Released | AdmissionReservationState::Reconciling
+            ),
+            AdmissionReservationState::Released | AdmissionReservationState::Expired => false,
+        }
+    }
+
     fn prepare_admission_reservation_transition(
         record: &mut AdmissionReservationRecord,
         spec: AdmissionReservationTransitionSpec<'_>,
@@ -31450,11 +31685,15 @@ impl RedbRecoveryStore {
         {
             return Err(OrsError::FenceMismatch);
         }
-        if record.state == target
-            || !matches!(
-                record.state,
-                AdmissionReservationState::StagedInactive | AdmissionReservationState::Reconciling
-            )
+        // I14.20:94-96 — `STAGED_INACTIVE` and `RECONCILING` reach every
+        // target, which keeps the activation path (`-> ACTIVE`) intact, and
+        // `ACTIVE` reaches exactly `RELEASED` and `RECONCILING`, so an active
+        // reservation can be disposed of or handed to recovery by its owning
+        // execution/recovery path. I14.20:99 keeps expiry narrower — "an active
+        // reservation attached to a nonterminal attempt cannot be expired as
+        // cleanup" — so `ACTIVE -> EXPIRED` has no arm here and stays refused.
+        // The match is exhaustive so a future state can never default to legal.
+        if record.state == target || !Self::legal_admission_reservation_source(record.state, target)
         {
             return Err(OrsError::InvalidTransition);
         }
@@ -33334,6 +33573,27 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         item: RecoveryInboxItem,
     ) -> Result<RecoveryInboxReceipt, OrsError> {
         recovery_projection::import_recovery_inbox(self, item)
+    }
+
+    fn load_recovery_inbox_envelope(
+        &self,
+        item_id: &crate::OperationIdentity,
+    ) -> Result<Option<RecoveryPayloadEnvelope>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read.open_table(RECOVERY_INBOX).map_err(storage)?;
+        let value = table.get(item_id.as_str()).map_err(storage)?;
+        value
+            .map(|stored| {
+                let record: DurableInboxRecord = decode_named(stored.value(), "recovery_inbox")?;
+                if record.item.item_id.as_str() != item_id.as_str() {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "recovery_inbox",
+                        reason: "row key differs from its imported item identity".to_owned(),
+                    });
+                }
+                Ok(record.item.envelope)
+            })
+            .transpose()
     }
 
     fn record_recovery_inbox_disposition(

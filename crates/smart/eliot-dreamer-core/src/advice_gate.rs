@@ -15,6 +15,31 @@
 //! mutation-shaped entry point ([`AdviceGate::direct_apply`]) always fails
 //! with [`AdviceRejected::DirectMutationForbidden`] so the prohibition is
 //! executable and testable.
+//!
+//! # D-DRM-NEG-1 — an OPEN, deliberate divergence from the admitted owner
+//!
+//! [`NegativeMemoryEntry`] is a second negative-memory state shape. The
+//! ADMITTED owner of the durable negative-memory rule is cell
+//! `smart.dreamer.failure` (`crates/smart/eliot-dreamer-failure`, whose
+//! `NegativeMemoryFingerprint` is the only current durable record), and it is
+//! strictly stronger on every dimension this type names: a typed exact
+//! trigger predicate, an owner-issued affected scope with a non-empty resource
+//! set, a recomputed record digest, a mandatory reopen condition with a named
+//! verifier, a mandatory discriminating check, and an
+//! owner-admitted `NegativeMemoryActionPolicy`.
+//!
+//! This shape keys negative memory on a free-text hypothesis key —
+//! `<class>:<whitespace-folded lowercased statement>` — with no failed action,
+//! no trigger predicate, no affected scope and no policy. It is KEPT, not
+//! closed, and the divergence is recorded here rather than hidden, because
+//! closing it is not a deletion: the admitted owner admits an exact typed
+//! predicate or refuses, and has no path that accepts a model-authored prose
+//! key, so deleting this type would drop a capability rather than migrate one.
+//! The exact precondition is recorded in
+//! `crates/smart/eliot-dreamer-core/disposition.module.toml`
+//! (`[[work_item_4_negative_memory_owner_reevaluation]]`). It must not be read
+//! as the canonical failure memory of I12.19, and it acquires no
+//! admission, blocking power, authority or Finish role of its own.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -154,6 +179,12 @@ pub enum AdviceRejected {
 /// `candidates` and `candidate` were removed in #1143 work item 4: they had an
 /// empty caller set across the whole workspace, so they were a second way to
 /// observe the same private ledger with no reader, not an owner of it.
+///
+/// Every text value this gate admits or commits is trimmed by the single
+/// private owner `trim_to_owned`, and every discriminator and hypothesis
+/// statement is folded by the single private owner `fold_whitespace`. The two
+/// are deliberately different rules: a committed record keeps its internal
+/// spacing, a hypothesis key folds it.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AdviceGate {
@@ -221,17 +252,18 @@ impl AdviceGate {
         &mut self,
         proposal: &AdviceProposal,
     ) -> Result<AdviceCandidate, AdviceRejected> {
-        if proposal.statement.trim().is_empty() {
-            return Err(AdviceRejected::BlankField("statement"));
-        }
-        if proposal.expected_benefit.trim().is_empty() {
-            return Err(AdviceRejected::BlankField("expected_benefit"));
-        }
-        if proposal.cost_counter_metrics.trim().is_empty() {
-            return Err(AdviceRejected::BlankField("cost_counter_metrics"));
-        }
-        if proposal.owner.trim().is_empty() {
-            return Err(AdviceRejected::BlankField("owner"));
+        for (field, value) in [
+            ("statement", proposal.statement.as_str()),
+            ("expected_benefit", proposal.expected_benefit.as_str()),
+            (
+                "cost_counter_metrics",
+                proposal.cost_counter_metrics.as_str(),
+            ),
+            ("owner", proposal.owner.as_str()),
+        ] {
+            if trim_to_owned(value).is_empty() {
+                return Err(AdviceRejected::BlankField(field));
+            }
         }
         let evidence: Vec<String> = proposal
             .discriminating_evidence
@@ -246,12 +278,12 @@ impl AdviceGate {
         self.check_negative_block(&hypothesis_key, &evidence)?;
         let candidate = AdviceCandidate {
             hypothesis_key,
-            statement: proposal.statement.trim().to_owned(),
+            statement: trim_to_owned(&proposal.statement),
             advice_class: proposal.advice_class,
             discriminating_evidence: evidence,
-            expected_benefit: proposal.expected_benefit.trim().to_owned(),
-            cost_counter_metrics: proposal.cost_counter_metrics.trim().to_owned(),
-            owner: proposal.owner.trim().to_owned(),
+            expected_benefit: trim_to_owned(&proposal.expected_benefit),
+            cost_counter_metrics: trim_to_owned(&proposal.cost_counter_metrics),
+            owner: trim_to_owned(&proposal.owner),
             verifier: None,
             rollback_plan: None,
             state: AdviceState::Proposed,
@@ -279,14 +311,14 @@ impl AdviceGate {
         }
         match decision {
             OwnerDecision::Approve { verifier, rollback } => {
-                if verifier.trim().is_empty() {
+                if trim_to_owned(verifier).is_empty() {
                     return Err(AdviceRejected::MissingVerifier);
                 }
-                if rollback.trim().is_empty() {
+                if trim_to_owned(rollback).is_empty() {
                     return Err(AdviceRejected::MissingRollback);
                 }
-                candidate.verifier = Some(verifier.trim().to_owned());
-                candidate.rollback_plan = Some(rollback.trim().to_owned());
+                candidate.verifier = Some(trim_to_owned(verifier));
+                candidate.rollback_plan = Some(trim_to_owned(rollback));
                 candidate.state = AdviceState::OwnerApproved;
                 self.commit(&candidate);
                 Ok(candidate)
@@ -307,10 +339,11 @@ impl AdviceGate {
         candidate: &AdviceCandidate,
         reason: &str,
     ) -> NegativeMemoryEntry {
-        let reason = if reason.trim().is_empty() {
+        let trimmed = trim_to_owned(reason);
+        let reason = if trimmed.is_empty() {
             "unspecified failure"
         } else {
-            reason.trim()
+            trimmed.as_str()
         };
         let entry = self
             .negative_memory
@@ -374,6 +407,27 @@ impl AdviceGate {
 /// [`AdviceGate::record_failure`] accumulates it verbatim.
 fn fold_whitespace(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The single owner of the committed-text edge trim.
+///
+/// The value a record commits — the proposal's four admitted fields, the
+/// owner's named verifier and rollback condition, and the recorded failure
+/// reason — was trimmed with `value.trim().to_owned()` written out at seven
+/// sites across `AdviceGate::propose`, `AdviceGate::record_owner_decision` and
+/// `AdviceGate::record_failure`, and blank-checked with
+/// `value.trim().is_empty()` at two more. Seven copies of one commit rule can
+/// drift into committing differently-shaped values for the same input, which
+/// is the duplication work item 4 removes. All of them now read this one
+/// private owner.
+///
+/// `trim_to_owned` deliberately stays separate from `fold_whitespace`: a
+/// committed record keeps its internal spacing and only loses its edges, while
+/// the hypothesis key folds internal whitespace and lowercases. Merging them
+/// would silently rewrite committed values, so the two rules stay distinct
+/// owners with distinct jobs.
+fn trim_to_owned(value: &str) -> String {
+    value.trim().to_owned()
 }
 
 fn normalise_statement(statement: &str) -> String {

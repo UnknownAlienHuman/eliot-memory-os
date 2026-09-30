@@ -703,7 +703,12 @@ impl MaintenanceTriggerDeliveryLedger {
     /// Replays the same retained trigger after a crash before decision commit.
     ///
     /// Returns the exact retained record; the caller re-presents it to the
-    /// evaluator instead of minting a new trigger.
+    /// evaluator instead of minting a new trigger. A row that already carries
+    /// a committed decision receipt never replays by trigger: the caller must
+    /// look up the existing receipt through
+    /// [`Self::recover_commit_before_ack`] and acknowledge it without another
+    /// job, recommendation, or wake, so recovery cannot rerun the committed
+    /// external effects blindly.
     pub fn replay_after_crash(
         &self,
         trigger_id: &str,
@@ -712,6 +717,13 @@ impl MaintenanceTriggerDeliveryLedger {
             .rows
             .get(trigger_id)
             .ok_or(MaintenanceTriggerDeliveryError::UnknownTrigger)?;
+        if row.decision_receipt.is_some() {
+            return Err(ProtocolError::InvalidField {
+                field: "maintenance_trigger_delivery.decision_receipt",
+                reason: "a committed decision replays by receipt lookup, not by trigger",
+            }
+            .into());
+        }
         match row.disposition {
             MaintenanceTriggerDisposition::Pending
             | MaintenanceTriggerDisposition::Claimed
@@ -1218,7 +1230,7 @@ fn live_fence(
 /// Admits one retained trigger intake through live Kernel authority.
 ///
 /// Re-validates the session, proves the record's delivery obligation names
-/// a durably staged ORS envelope through the existing ORS owner, then
+/// a durably staged ORS inbox item through the existing ORS owner, then
 /// delegates to [`MaintenanceTriggerDeliveryLedger::admit_intake`]: the
 /// complete opaque input must already be staged, exact identity/hash replay
 /// returns the same staging receipt, and changed content conflicts. Any
@@ -1234,6 +1246,7 @@ pub fn handle_maintenance_trigger_intake(
     session.service_context(service)?;
     prove_maintenance_trigger_staging(
         store,
+        &record.trigger_id,
         &record.payload.envelope_reference,
         &record.payload.payload_hash,
     )?;
@@ -1336,7 +1349,8 @@ pub fn handle_maintenance_trigger_ack(
 /// Re-validates the session, then delegates to
 /// [`MaintenanceTriggerDeliveryLedger::replay_after_crash`]: the caller
 /// re-presents the exact retained record to the evaluator under the same
-/// identity.
+/// identity. A trigger with a committed decision receipt is refused here and
+/// must recover through [`recover_maintenance_trigger_commit`] instead.
 pub fn replay_maintenance_trigger_after_crash(
     service: &KernelService,
     session: &AuthenticatedMaintenanceTriggerSession,
