@@ -3,10 +3,11 @@
 //! Closed backup entry: exactly three operations (`backup.create`,
 //! `backup.verify`, `backup.restore-test`) selected by the operation string,
 //! each validated to its exact payload shape before any owner is named.
-//! `backup.verify` reaches the real capture owner and answers from it; the
-//! other two remain rehearsal-only and perform no capture, no coordination
-//! commit, no store import, and no activation/retirement/cutover. Missing
-//! owners refuse as typed replies (`refused`/`blocked` with
+//! `backup.verify` reaches the real capture owner and answers from it, and
+//! `backup.restore-test` reaches the real isolated-restore owner and answers
+//! from it; `backup.create` remains rehearsal-only and performs no capture, no
+//! coordination commit, no store import, and no activation/retirement/cutover.
+//! Missing owners refuse as typed replies (`refused`/`blocked` with
 //! `code = plan_gap`), never as fake success and never silently.
 //!
 //! Why each refusal is honest rather than a validation gap:
@@ -118,18 +119,27 @@
 //!   (#959)`, OPEN. What it CAN do, and does, is force the owner to re-decide the
 //!   named operation: nothing here invents
 //!   a capability, a receipt type, or an owner value to paper over that.
-//! - `backup.restore-test` rehearses the shape path reachable without
-//!   owner-held state (bounded decode, exact shapes, digest shapes, lineage
-//!   admissibility, provisioning shape, store-level isolation inequality),
-//!   then returns `blocked` naming the three real owners rather than a
-//!   Governor transition type: the Kernel restore coordinator and the
-//!   production call to it (#960), the owner-issued restore evidence - a
-//!   `RestoreJournalAdmission` plus a `DestinationManifestEvidence` - (#962),
-//!   and the front-door connection (#2569), all open. Measured on this tree,
-//!   none of those three exists yet: there is no `restore_transitions` symbol
-//!   and no `CoordinationCommit` type anywhere, and the composition's
-//!   isolated-restore entry has no production caller. Owner-backed gates are
-//!   marked `-deferred` in `gates_passed` and never claimed as proven.
+//! - `backup.restore-test` runs the rehearsal shape path (bounded decode,
+//!   exact shapes, digest shapes, lineage admissibility, provisioning shape,
+//!   store-level isolation inequality) and then EXECUTES the isolated restore
+//!   on the composition-owned durable ORS journal, reaching
+//!   [`KernelComposition::rehearse_isolated_restore`] under the frame's own
+//!   `idempotency_key`. The `RestoreJournalAdmission` is issued by the durable
+//!   ORS owner inside that entry and is never synthesized here; the archive
+//!   the owner restores is the decoded `eliot-backup` bundle, and the
+//!   destination is the target the shape gate bound. It previously answered
+//!   `blocked`/`plan_gap` naming three owners as absent, and that answer was
+//!   itself the defect: `KernelBackupRestore`,
+//!   `KernelComposition::backup_restore_with_ors_journal`,
+//!   `OrsRestoreJournalOwner` and `RestoreJournalAdmission::issue_for_operation`
+//!   all exist, so the refusal asserted an absence that was not there. The
+//!   terminal answers are now the restore owner's own typed refusals and, on
+//!   success, the owner's own receipt, evidence level and phase log — never a
+//!   richer state than the owner proved. `gates_passed` still names the one
+//!   gate that remains deferred (`introductions-deferred`) rather than
+//!   claiming it as proven. Rehearsal still cannot activate, retire or cut
+//!   over: the composition entry fixes `rehearsal` to `true` and takes no
+//!   argument that could change it.
 //!
 //! The dispatch-matrix arm is [`crate::frame_dispatch`]'s closed `backup`
 //! operation gate; this file holds only the route. The arm fences the frame
@@ -144,6 +154,7 @@
 
 use std::num::NonZeroU64;
 
+use eliot_backup::{BackupBundle, RestoreContext};
 use eliot_contracts::{
     EpochId, EpochLineageId, ResourceGeneration, canonical_json_bytes, sha256_hex,
 };
@@ -153,7 +164,7 @@ use eliot_ors::{
     BACKUP_VERIFY_PROFILE_VERSION, BACKUP_VERIFY_RETENTION_WINDOW, BackupVerificationDisposition,
     BackupVerificationResultRecord, BackupVerifyRequestIdentity,
     CONTRACT_VERSION as ORS_CONTRACT_VERSION, LegacyFenceBoundBackupVerificationClass,
-    LegacyUnscopedBackupVerificationClass, OrsError,
+    LegacyUnscopedBackupVerificationClass, OrsError, RestoreJournalArchiveClass,
 };
 use eliot_protocol::backup::BackupClassWire;
 use eliot_protocol::{Frame, FrameKind, MessageType, ProtocolPayload};
@@ -167,8 +178,22 @@ use super::backup_verify_provenance::{OwnerProvenanceEvidence, check_provenance_
 use super::composition_bootstrap::DAEMON_FRONT_DOOR_CAPABILITY;
 use super::{
     CaptureCallerAuth, CaptureReport, CaptureState, KernelCaptureError, KernelComposition,
-    KernelFrameAction, status_frame,
+    KernelFrameAction, KernelRestoreError, KernelRestoreOutcome, OrsRestoreBinding, status_frame,
 };
+
+/// The Kernel writer identity the ORS restore journal binds every durable row
+/// to.
+///
+/// This is a COMPOSITION fact, not owner-issued evidence and not a caller's
+/// text: `OrsRestoreBinding::writer_id` names the writer whose rows this
+/// composition owns, and the ORS owner re-proves it against the durable
+/// stream-binding row it committed from that same binding on every admission
+/// and every journal read (`OrsRestoreJournalOwner::durable_journal_record`
+/// and `OrsRestoreJournal::ensure_bound`). It is therefore a fixed Kernel
+/// label rather than a request field, which is also why a request cannot
+/// select it: a restore naming a different writer cannot reach the same
+/// stream, and the binding check refuses it before any effect.
+const RESTORE_JOURNAL_WRITER_ID: &str = "kernel-ors-restore-writer";
 
 /// Closed backup create operation selector (mirrored by the operator CLI
 /// surface; the string only selects this entry, never authority).
@@ -230,18 +255,25 @@ const BACKUP_VERIFY_REQUEST_ENCODING_VERSION: u16 = 1;
 
 /// Gates reported by the restore-test rehearsal, in pass order.
 ///
-/// Gates without a `-deferred` suffix ran here for real against the frame
-/// bytes; gates with the suffix need owner-held state and are named as
-/// deferred, never claimed as proven. See [`handle_backup_restore_test`].
-const RESTORE_TEST_GATES: [&str; 8] = [
+/// Every gate listed without a `-deferred` suffix ran here for real, against
+/// the frame bytes or against the restore owner's own answers. Exactly one
+/// gate remains deferred and is named as such rather than claimed as proven:
+/// `introductions-deferred` is exact-set verification of the console-presented
+/// capability introductions against a live owner readback, and nothing on this
+/// route performs that comparison.
+///
+/// Two gates that were deferred before #963 are no longer listed, because they
+/// now run for real: live fence currency is checked by the restore owner
+/// against the session fence this handler passes it, and journal production
+/// admission is issued by the durable ORS owner rather than asserted here.
+const RESTORE_TEST_GATES: [&str; 7] = [
     "decode",
     "validate",
     "shape",
     "authorization-shape",
-    "currency-deferred",
     "provisioning",
     "isolation",
-    "admission-deferred",
+    "introductions-deferred",
 ];
 
 /// Field-bound shape failure, rendered as an `invalid` reply by the handlers.
@@ -2911,13 +2943,20 @@ fn answer_failed_stage(
 }
 
 /// Validates the restore target shape and binds the exact authority tuple,
-/// returning the admitted target identity.
+/// returning the admitted isolated destination context.
 ///
 /// `EpochLineageId::new` proves canonical lineage spelling, `NonZeroU64`
 /// plus `EpochId::new` bind the exact `(lineage_id, sequence)` authority
 /// tuple, and `ResourceGeneration::new` proves a nonzero generation; all
 /// three contract imports compile directly against current main.
-fn restore_target_shape(target: &Map<String, Value>) -> Result<String, InvalidShape> {
+///
+/// The bound values are RETURNED, not just proved and dropped. The isolated
+/// restore owner compiles its plan against exactly this tuple
+/// (`RestorePlan::compile` requires the target epoch to advance the archive's
+/// own lineage and the target generation to exceed it), so a context rebuilt
+/// from anything other than these three proved values would not be the
+/// destination the caller asked to restore into.
+fn restore_target_shape(target: &Map<String, Value>) -> Result<RestoreContext, InvalidShape> {
     require_exact_keys(
         target,
         &[
@@ -2965,11 +3004,11 @@ fn restore_target_shape(target: &Map<String, Value>) -> Result<String, InvalidSh
         })?;
     // Binds the exact authority tuple; the constructor is infallible on main
     // but the binding itself is the proof the rehearsal carries.
-    let _authority_epoch = EpochId::new(lineage_id, sequence).map_err(|_| InvalidShape {
+    let target_authority_epoch = EpochId::new(lineage_id, sequence).map_err(|_| InvalidShape {
         field: "restore.target_sequence",
         reason: "target authority epoch is not admissible".to_owned(),
     })?;
-    let _resource_generation =
+    let target_resource_generation =
         ResourceGeneration::new(get_u64(target, "target_generation").map_err(|reason| {
             InvalidShape {
                 field: "restore.target_generation",
@@ -2980,7 +3019,11 @@ fn restore_target_shape(target: &Map<String, Value>) -> Result<String, InvalidSh
             field: "restore.target_generation",
             reason: "target resource generation must be nonzero".to_owned(),
         })?;
-    Ok(target_id)
+    Ok(RestoreContext {
+        target_id,
+        target_authority_epoch,
+        target_resource_generation,
+    })
 }
 
 /// Validates the restore provisioning shape, returning the admitted
@@ -3037,9 +3080,9 @@ fn restore_provisioning_shape(provisioning: &Map<String, Value>) -> Result<Strin
     Ok(dest_store_id)
 }
 
-/// Handles one isolated restore-test frame: rehearses the shape path reachable
-/// without owner-held state, then returns `blocked` naming the exact missing
-/// Governor inputs.
+/// Handles one isolated restore-test frame: runs the rehearsal shape gates for
+/// real, then EXECUTES the restore on the composition-owned durable ORS journal
+/// and answers from what that owner actually proved.
 ///
 /// Gates that run here for real: `decode` (both inline hex bodies admit
 /// bounded even-length lowercase hex and decode non-empty), `validate`
@@ -3050,230 +3093,416 @@ fn restore_provisioning_shape(provisioning: &Map<String, Value>) -> Result<Strin
 /// hex-shaped only — never cryptographic verification), `provisioning`
 /// (provisioning exact shape plus digest shapes), and `isolation`
 /// (target identity differs from the destination store identity at shape
-/// level only). Gates marked `-deferred` need owner-held state:
-/// `currency-deferred` (live fence currency needs the owner-held fence) and
-/// `admission-deferred` (journal production admission, introduction exact-set
-/// verification against live owner readback, and the admission mint need the
-/// owner-held journal). Typed projection decode of introductions likewise
-/// waits for the owner edge; each entry must already be a JSON object so
-/// malformed rows refuse before any owner readback.
+/// level only). Exactly one gate is marked `-deferred` and it is named as
+/// such rather than claimed as proven: `introductions-deferred` (exact-set
+/// verification of the console-presented introductions against a live owner
+/// readback). Typed projection decode of introductions likewise waits for the
+/// owner edge; each entry must already be a JSON object so malformed rows
+/// refuse before any owner readback. See [`RESTORE_TEST_GATES`] for the
+/// authoritative list.
 ///
-/// Execution itself refuses with `plan_gap` naming the real owners rather
-/// than a Governor transition type: the Kernel restore coordinator and the
-/// production call to it (#960), the owner-issued `RestoreJournalAdmission`
-/// and `DestinationManifestEvidence` (#962), and the front-door connection
-/// (#2569), all open. Provisioning the isolated destination, admitting the
-/// durable ORS restore journal and importing restore-class bytes without that
-/// owner evidence would fabricate owner authority, and rehearsal never
-/// activates, retires, or cuts over.
-#[allow(
-    clippy::too_many_lines,
-    reason = "one linear shape-validation sequence per rehearsal gate; splitting it would hide the exact admission order the blocked reply reports"
-)]
-fn handle_backup_restore_test(payload: &Value, idempotency_key: &str) -> Value {
-    let Some(object) = payload.as_object() else {
-        return invalid_reply(
-            BACKUP_RESTORE_TEST_OPERATION,
-            idempotency_key,
-            "backup.restore-test",
-            "payload must be a JSON object",
-        );
-    };
-    if let Err(reason) = require_exact_keys(
-        object,
-        &[
-            "bundle_hex",
-            "destination_authorization_hex",
-            "target",
-            "provisioning",
-            "introductions",
-        ],
-    ) {
-        return invalid_reply(
-            BACKUP_RESTORE_TEST_OPERATION,
-            idempotency_key,
-            "backup.restore-test",
-            &reason,
-        );
-    }
-    let bundle_hex = match get_str(object, "bundle_hex") {
-        Ok(bundle_hex) => bundle_hex,
-        Err(reason) => {
+/// ## The execution is the real owner's, not a claim about it
+///
+/// Once the shape gates hold, this calls
+/// [`KernelComposition::rehearse_isolated_restore`] under the ORIGINAL
+/// `idempotency_key` the frame already carried, so a retry reconciles the same
+/// operation instead of starting a second one. That entry issues the
+/// `RestoreJournalAdmission` from the durable ORS owner and runs the single
+/// phase engine on the composition-owned journal, so the receipt, evidence
+/// level and phase log projected below are the OWNER's values and not a
+/// restatement of what this route hoped happened.
+///
+/// `plan_gap` is no longer the terminal answer of this command. It was a
+/// hand-written refusal asserting that the restore owners did not exist, and
+/// that stopped being true once #960 and #962 landed them; the honest terminal
+/// answers are now the owner's own typed refusals (see
+/// [`restore_owner_reply`]) and, on success, the owner's own receipt.
+impl KernelComposition {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one linear shape-validation sequence per rehearsal gate, then the owner execution and its projection; splitting it would hide the exact admission order"
+    )]
+    fn handle_backup_restore_test(
+        &self,
+        session: &Session,
+        payload: &Value,
+        idempotency_key: &str,
+    ) -> Value {
+        let Some(object) = payload.as_object() else {
+            return invalid_reply(
+                BACKUP_RESTORE_TEST_OPERATION,
+                idempotency_key,
+                "backup.restore-test",
+                "payload must be a JSON object",
+            );
+        };
+        if let Err(reason) = require_exact_keys(
+            object,
+            &[
+                "bundle_hex",
+                "destination_authorization_hex",
+                "target",
+                "provisioning",
+                "introductions",
+            ],
+        ) {
+            return invalid_reply(
+                BACKUP_RESTORE_TEST_OPERATION,
+                idempotency_key,
+                "backup.restore-test",
+                &reason,
+            );
+        }
+        let bundle_hex = match get_str(object, "bundle_hex") {
+            Ok(bundle_hex) => bundle_hex,
+            Err(reason) => {
+                return invalid_reply(
+                    BACKUP_RESTORE_TEST_OPERATION,
+                    idempotency_key,
+                    "backup.bundle_hex",
+                    &reason,
+                );
+            }
+        };
+        let bundle_raw = match hex_bytes(bundle_hex, "backup.bundle_hex", BACKUP_WIRE_BYTES_MAX) {
+            Ok(bundle_raw) => bundle_raw,
+            Err(reason) => {
+                return invalid_reply(
+                    BACKUP_RESTORE_TEST_OPERATION,
+                    idempotency_key,
+                    "backup.bundle_hex",
+                    &reason,
+                );
+            }
+        };
+        if bundle_raw.is_empty() {
             return invalid_reply(
                 BACKUP_RESTORE_TEST_OPERATION,
                 idempotency_key,
                 "backup.bundle_hex",
-                &reason,
+                "bundle bytes must be non-empty",
             );
         }
-    };
-    let bundle_raw = match hex_bytes(bundle_hex, "backup.bundle_hex", BACKUP_WIRE_BYTES_MAX) {
-        Ok(bundle_raw) => bundle_raw,
-        Err(reason) => {
-            return invalid_reply(
-                BACKUP_RESTORE_TEST_OPERATION,
-                idempotency_key,
-                "backup.bundle_hex",
-                &reason,
-            );
-        }
-    };
-    if bundle_raw.is_empty() {
-        return invalid_reply(
-            BACKUP_RESTORE_TEST_OPERATION,
-            idempotency_key,
-            "backup.bundle_hex",
-            "bundle bytes must be non-empty",
-        );
-    }
-    let authorization_hex = match get_str(object, "destination_authorization_hex") {
-        Ok(authorization_hex) => authorization_hex,
-        Err(reason) => {
-            return invalid_reply(
-                BACKUP_RESTORE_TEST_OPERATION,
-                idempotency_key,
-                "backup.destination_authorization_hex",
-                &reason,
-            );
-        }
-    };
-    let authorization_raw = match hex_bytes(
-        authorization_hex,
-        "backup.destination_authorization_hex",
-        BACKUP_AUTH_BYTES_MAX,
-    ) {
-        Ok(authorization_raw) => authorization_raw,
-        Err(reason) => {
-            return invalid_reply(
-                BACKUP_RESTORE_TEST_OPERATION,
-                idempotency_key,
-                "backup.destination_authorization_hex",
-                &reason,
-            );
-        }
-    };
-    if authorization_raw.is_empty() {
-        return invalid_reply(
-            BACKUP_RESTORE_TEST_OPERATION,
-            idempotency_key,
+        let authorization_hex = match get_str(object, "destination_authorization_hex") {
+            Ok(authorization_hex) => authorization_hex,
+            Err(reason) => {
+                return invalid_reply(
+                    BACKUP_RESTORE_TEST_OPERATION,
+                    idempotency_key,
+                    "backup.destination_authorization_hex",
+                    &reason,
+                );
+            }
+        };
+        let authorization_raw = match hex_bytes(
+            authorization_hex,
             "backup.destination_authorization_hex",
-            "destination authorization bytes must be non-empty",
-        );
-    }
-    let target = match get_object(object, "target") {
-        Ok(target) => target,
-        Err(reason) => {
+            BACKUP_AUTH_BYTES_MAX,
+        ) {
+            Ok(authorization_raw) => authorization_raw,
+            Err(reason) => {
+                return invalid_reply(
+                    BACKUP_RESTORE_TEST_OPERATION,
+                    idempotency_key,
+                    "backup.destination_authorization_hex",
+                    &reason,
+                );
+            }
+        };
+        if authorization_raw.is_empty() {
             return invalid_reply(
                 BACKUP_RESTORE_TEST_OPERATION,
                 idempotency_key,
-                "backup.target",
-                &reason,
+                "backup.destination_authorization_hex",
+                "destination authorization bytes must be non-empty",
             );
         }
-    };
-    let target_id = match restore_target_shape(target) {
-        Ok(target_id) => target_id,
-        Err(fault) => {
-            return invalid_reply(
-                BACKUP_RESTORE_TEST_OPERATION,
-                idempotency_key,
-                fault.field,
-                &fault.reason,
-            );
-        }
-    };
-    let provisioning = match get_object(object, "provisioning") {
-        Ok(provisioning) => provisioning,
-        Err(reason) => {
-            return invalid_reply(
-                BACKUP_RESTORE_TEST_OPERATION,
-                idempotency_key,
-                "backup.provisioning",
-                &reason,
-            );
-        }
-    };
-    let dest_store_id = match restore_provisioning_shape(provisioning) {
-        Ok(dest_store_id) => dest_store_id,
-        Err(fault) => {
-            return invalid_reply(
-                BACKUP_RESTORE_TEST_OPERATION,
-                idempotency_key,
-                fault.field,
-                &fault.reason,
-            );
-        }
-    };
-    // Console-presented introductions must be an explicit JSON array of
-    // objects, never defaulted. An explicitly empty array is admitted (a
-    // restore with no capability introductions has nothing to compare);
-    // full source-installation isolation and exact-set verification stay
-    // owner-held.
-    let Some(introductions) = object.get("introductions").and_then(Value::as_array) else {
-        return invalid_reply(
-            BACKUP_RESTORE_TEST_OPERATION,
-            idempotency_key,
-            "backup.introductions",
-            "console-presented introductions must be an explicit JSON array",
-        );
-    };
-    if introductions.len() > BACKUP_INTRODUCTIONS_MAX {
-        return invalid_reply(
-            BACKUP_RESTORE_TEST_OPERATION,
-            idempotency_key,
-            "backup.introductions",
-            "exceeds the bounded console-presented introduction count",
-        );
-    }
-    for (index, entry) in introductions.iter().enumerate() {
-        if !entry.is_object() {
+        let target = match get_object(object, "target") {
+            Ok(target) => target,
+            Err(reason) => {
+                return invalid_reply(
+                    BACKUP_RESTORE_TEST_OPERATION,
+                    idempotency_key,
+                    "backup.target",
+                    &reason,
+                );
+            }
+        };
+        let restore_context = match restore_target_shape(target) {
+            Ok(restore_context) => restore_context,
+            Err(fault) => {
+                return invalid_reply(
+                    BACKUP_RESTORE_TEST_OPERATION,
+                    idempotency_key,
+                    fault.field,
+                    &fault.reason,
+                );
+            }
+        };
+        let target_id = restore_context.target_id.as_str();
+        let provisioning = match get_object(object, "provisioning") {
+            Ok(provisioning) => provisioning,
+            Err(reason) => {
+                return invalid_reply(
+                    BACKUP_RESTORE_TEST_OPERATION,
+                    idempotency_key,
+                    "backup.provisioning",
+                    &reason,
+                );
+            }
+        };
+        let dest_store_id = match restore_provisioning_shape(provisioning) {
+            Ok(dest_store_id) => dest_store_id,
+            Err(fault) => {
+                return invalid_reply(
+                    BACKUP_RESTORE_TEST_OPERATION,
+                    idempotency_key,
+                    fault.field,
+                    &fault.reason,
+                );
+            }
+        };
+        // Console-presented introductions must be an explicit JSON array of
+        // objects, never defaulted. An explicitly empty array is admitted (a
+        // restore with no capability introductions has nothing to compare);
+        // full source-installation isolation and exact-set verification stay
+        // owner-held.
+        let Some(introductions) = object.get("introductions").and_then(Value::as_array) else {
             return invalid_reply(
                 BACKUP_RESTORE_TEST_OPERATION,
                 idempotency_key,
                 "backup.introductions",
-                &format!("introduction {index} must be a JSON object"),
+                "console-presented introductions must be an explicit JSON array",
+            );
+        };
+        if introductions.len() > BACKUP_INTRODUCTIONS_MAX {
+            return invalid_reply(
+                BACKUP_RESTORE_TEST_OPERATION,
+                idempotency_key,
+                "backup.introductions",
+                "exceeds the bounded console-presented introduction count",
             );
         }
-    }
-    if target_id == dest_store_id {
-        return invalid_reply(
-            BACKUP_RESTORE_TEST_OPERATION,
-            idempotency_key,
-            "restore.isolation",
-            "restore destination is not isolated from the source store at shape level",
+        for (index, entry) in introductions.iter().enumerate() {
+            if !entry.is_object() {
+                return invalid_reply(
+                    BACKUP_RESTORE_TEST_OPERATION,
+                    idempotency_key,
+                    "backup.introductions",
+                    &format!("introduction {index} must be a JSON object"),
+                );
+            }
+        }
+        if target_id == dest_store_id {
+            return invalid_reply(
+                BACKUP_RESTORE_TEST_OPERATION,
+                idempotency_key,
+                "restore.isolation",
+                "restore destination is not isolated from the source store at shape level",
+            );
+        }
+        // The archive itself is decoded and validated by the SAME `eliot-backup`
+        // type the restore owner compiles its plan from, so the bytes admitted by
+        // the `decode`/`validate` shape gates above are the exact archive the owner
+        // is about to restore rather than a re-parse of caller text.
+        let bundle = match BackupBundle::decode(&bundle_raw) {
+            Ok(bundle) => bundle,
+            Err(error) => {
+                return invalid_reply(
+                    BACKUP_RESTORE_TEST_OPERATION,
+                    idempotency_key,
+                    "backup.bundle_hex",
+                    &bounded_reason(&error.to_string()),
+                );
+            }
+        };
+        let archive_class = backup_restore_archive_class(bundle.manifest.class);
+        // Every value the ORS journal binds is derived from the DECODED archive and
+        // the ADMITTED target context, never from request text: the source archive
+        // is the manifest's own `backup_id`, the destination is the target the
+        // shape gate bound, and the writer is the fixed Kernel identity. The
+        // installation identity is not an argument at all — `from_composition`
+        // reads it from the live composition cell — so no caller can name one.
+        let identity = match OrsRestoreBinding::from_composition(
+            bundle.manifest.backup_id.clone(),
+            archive_class,
+            target_id.to_owned(),
+            RESTORE_JOURNAL_WRITER_ID.to_owned(),
+        ) {
+            Ok(identity) => identity,
+            Err(error) => return restore_owner_reply(idempotency_key, &error),
+        };
+        // The live session effect fence, exactly as the sibling verify handler
+        // passes it: the owner checks this archive against this fence, so a caller
+        // cannot present a restore against a fence it chose.
+        let outcome = self.rehearse_isolated_restore(
+            &bundle,
+            restore_context,
+            &session.module_generation.state_fence,
+            &identity,
         );
+        match outcome {
+            Ok(outcome) => restore_owner_success_reply(idempotency_key, &outcome),
+            Err(error) => restore_owner_reply(idempotency_key, &error),
+        }
     }
+}
+
+/// Maps one closed backup archive class onto the ORS restore-journal class.
+///
+/// Both vocabularies are closed and one-to-one, so the mapping is total. It is
+/// written as one named conversion rather than a `match` inline in the handler
+/// so the two vocabularies cannot drift apart, and so adding a class to either
+/// enum becomes a compile error here instead of a silently unmapped journal
+/// class.
+const fn backup_restore_archive_class(
+    class: eliot_backup::BackupClass,
+) -> RestoreJournalArchiveClass {
+    match class {
+        eliot_backup::BackupClass::FullRecovery => RestoreJournalArchiveClass::FullRecovery,
+        eliot_backup::BackupClass::CanonicalOnlyDegraded => {
+            RestoreJournalArchiveClass::CanonicalOnlyDegraded
+        }
+        eliot_backup::BackupClass::ScopeExport => RestoreJournalArchiveClass::ScopeExport,
+    }
+}
+
+/// Projects one real isolated-restore outcome onto the restore-test reply.
+///
+/// Every value below is the OWNER's, read off the [`KernelRestoreOutcome`] the
+/// restore owner returned — the receipt identity, the archive digest the owner
+/// compiled against, the evidence level the owner certified, the exact applied
+/// phase log and the admitted journal owner. Nothing is restated from what the
+/// request asked for, and nothing is upgraded: `cutover_performed` and
+/// `operational_recovery_ready` are reported as the owner's receipt carries
+/// them rather than as this route would prefer them, and `rehearsal` is the
+/// owner's own flag.
+///
+/// The evidence level is serialised through the owner's own `serde` derivation
+/// rather than a hand-written string, so the wire spelling cannot drift from
+/// the vocabulary the level is defined in.
+fn restore_owner_success_reply(
+    idempotency_key: &str,
+    outcome: &KernelRestoreOutcome,
+) -> Value {
+    let receipt = &outcome.receipt;
+    let evidence_level = serde_json::to_value(receipt.evidence_level)
+        .unwrap_or_else(|_| Value::String("unreadable".to_owned()));
     backup_reply(
         BACKUP_RESTORE_TEST_OPERATION,
-        "blocked",
+        "ok",
         idempotency_key,
         vec![
-            ("code", Value::String("plan_gap".to_owned())),
             (
-                "missing_owner",
-                Value::String(
-                    "backup-restore-owners (#960 Kernel restore coordinator and its production call; #962 owner-issued RestoreJournalAdmission and DestinationManifestEvidence; #2569 front-door connection)"
-                        .to_owned(),
-                ),
+                "restore_receipt",
+                serde_json::json!({
+                    "receipt_id": receipt.receipt_id,
+                    "plan_id": receipt.plan_id,
+                    "bundle_sha256": receipt.bundle_sha256,
+                    "target_id": receipt.target_id,
+                    "evidence_level": evidence_level,
+                    "canonical_only": receipt.canonical_only,
+                    "operational_recovery_ready": receipt.operational_recovery_ready,
+                    "cutover_performed": receipt.cutover_performed,
+                }),
             ),
             (
-                "reason",
-                Value::String(
-                    "the six rehearsal shape gates ran for real; the isolated destination, the durable ORS journal admission and the restore-class import are owner evidence no production owner supplies, and the composition's isolated-restore entry has no production caller"
-                        .to_owned(),
-                ),
-            ),
-            (
-                "gates_passed",
+                "phase_log",
                 Value::Array(
-                    RESTORE_TEST_GATES
+                    outcome
+                        .phase_log
                         .iter()
-                        .map(|gate| Value::String((*gate).to_owned()))
+                        .map(|phase| Value::String(phase.clone()))
                         .collect(),
                 ),
             ),
+            ("journal_owner", Value::String(outcome.journal_owner.clone())),
+            ("rehearsal", Value::Bool(outcome.rehearsal)),
+            (
+                "destination_root",
+                Value::String(outcome.destination_root.display().to_string()),
+            ),
+            ("gates_passed", restore_test_gates_passed()),
         ],
     )
+}
+
+/// The gates that ran for real before the restore owner was reached.
+///
+/// Reported on BOTH terminal answers — success and refusal — because the gates
+/// are a property of the request validation that precedes the owner call, and
+/// an operator reading a refusal needs to see that the shape gates passed and
+/// the owner is what refused, rather than the reverse.
+fn restore_test_gates_passed() -> Value {
+    Value::Array(
+        RESTORE_TEST_GATES
+            .iter()
+            .map(|gate| Value::String((*gate).to_owned()))
+            .collect(),
+    )
+}
+
+/// Projects one typed restore-owner refusal onto the restore-test reply.
+///
+/// The `code` is the owner's own variant discriminant, so the failure stays
+/// typed across the seam instead of being flattened into a generic refusal, and
+/// the `reason` is the owner's own `Display` text, bounded before it reaches
+/// the operator wire. A caller-shaped fault
+/// ([`KernelRestoreError::InvalidInput`]) is answered `invalid` naming its
+/// field, matching how every other malformed-request answer on this route is
+/// reported; every other refusal is `refused`.
+///
+/// ## The one refusal that must never read as effect-free
+///
+/// [`KernelRestoreError::StagedCleanupIncomplete`] is the case where the engine
+/// failed AND the bounded cleanup of what this execution staged could not
+/// finish. Output may therefore remain in the isolated destination, so it
+/// carries `staged_output_may_remain` and must never be reported as a refusal
+/// that left nothing behind. The cause the owner typed is preserved verbatim in
+/// `reason` and never replaced by the cleanup disposition.
+fn restore_owner_reply(idempotency_key: &str, error: &KernelRestoreError) -> Value {
+    let (status, code) = match error {
+        KernelRestoreError::InvalidInput { .. } => ("invalid", "invalid_input"),
+        KernelRestoreError::JournalIo(_) => ("refused", "restore_journal_io"),
+        KernelRestoreError::JournalNotAdmitted => ("refused", "restore_journal_not_admitted"),
+        KernelRestoreError::JournalCorrupt => ("refused", "restore_journal_corrupt"),
+        KernelRestoreError::JournalBindingConflict => {
+            ("refused", "restore_journal_binding_conflict")
+        }
+        KernelRestoreError::DestinationInvalid(_) => ("refused", "restore_destination_invalid"),
+        KernelRestoreError::FenceMismatch(_) => ("refused", "restore_fence_mismatch"),
+        KernelRestoreError::ArchiveInvalid(_) => ("refused", "restore_archive_invalid"),
+        KernelRestoreError::CapabilityMissing { .. } => ("refused", "restore_capability_missing"),
+        KernelRestoreError::OwnerEvidenceInvalid(_) => ("refused", "restore_owner_evidence_invalid"),
+        KernelRestoreError::CutoverNotAuthorized => ("refused", "restore_cutover_not_authorized"),
+        KernelRestoreError::TargetFailed(_) => ("refused", "restore_target_failed"),
+        KernelRestoreError::StagedCleanupIncomplete { .. } => {
+            ("refused", "restore_staged_cleanup_incomplete")
+        }
+    };
+    let mut fields = vec![
+        ("code", Value::String((*code).to_owned())),
+        (
+            "reason",
+            Value::String(bounded_reason(&error.to_string())),
+        ),
+    ];
+    if let KernelRestoreError::InvalidInput { field, reason } = error {
+        fields.push(("field", Value::String((*field).to_owned())));
+        fields.push(("field_reason", Value::String((*reason).to_owned())));
+    }
+    if let KernelRestoreError::CapabilityMissing { capability } = error {
+        fields.push(("capability", Value::String((*capability).to_owned())));
+    }
+    if let KernelRestoreError::StagedCleanupIncomplete { cleanup, .. } = error {
+        fields.push(("staged_output_may_remain", Value::Bool(true)));
+        fields.push((
+            "cleanup_disposition",
+            Value::String(bounded_reason(&cleanup.to_string())),
+        ));
+    }
+    fields.push(("gates_passed", restore_test_gates_passed()));
+    backup_reply(BACKUP_RESTORE_TEST_OPERATION, status, idempotency_key, fields)
 }
 
 impl KernelComposition {
@@ -3289,12 +3518,18 @@ impl KernelComposition {
     ///
     /// The receiver is the composition, exactly like the sibling `TestD` and
     /// Dreamer route entries: `backup.verify` reaches the real capture owner held at
-    /// [`KernelComposition::backup_capture`], and no second dispatch entry is
-    /// introduced. `backup.create` admits its caller through the same
+    /// [`KernelComposition::backup_capture`], `backup.restore-test` reaches the real
+    /// isolated-restore owner held at
+    /// [`KernelComposition::rehearse_isolated_restore`], and no second dispatch
+    /// entry is introduced. `backup.create` admits its caller through the same
     /// [`admit_backup_caller`] gate and then returns a typed refusal naming the
-    /// exact absent capture-owner behaviour, and `backup.restore-test` still
-    /// refuses naming its missing owners, so binding the receiver changes no
+    /// exact absent capture-owner behaviour, so binding the receiver changes no
     /// other behaviour.
+    ///
+    /// `backup.restore-test` answers with the isolated-restore owner's own
+    /// outcome and receipt, or with that owner's typed refusal. A refusal names
+    /// the missing owner capability rather than reading as a completed
+    /// rehearsal.
     ///
     /// Service-readiness and peer-authentication gates stay with the
     /// `frame_dispatch` backup arm, which owns the exact pre-dispatch binding
@@ -3362,7 +3597,9 @@ impl KernelComposition {
             BACKUP_VERIFY_OPERATION => {
                 self.handle_backup_verify(session, &params, idempotency_key)?
             }
-            BACKUP_RESTORE_TEST_OPERATION => handle_backup_restore_test(&params, idempotency_key),
+            BACKUP_RESTORE_TEST_OPERATION => {
+                self.handle_backup_restore_test(session, &params, idempotency_key)
+            }
             _ => return Err(TransportError::SessionFenced),
         };
         let mut frame = status_frame(session, FrameKind::Response, MessageType::Result, reply)?;

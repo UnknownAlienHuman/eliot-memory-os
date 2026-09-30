@@ -878,21 +878,15 @@ impl KernelComposition {
     /// (`crate::dispatch_contour`); there is no other way to construct one, so
     /// a caller cannot name an installation here.
     ///
-    /// ## Chain status: still no production caller
+    /// ## Chain status: one production caller
     ///
-    /// This entry has no caller in this repository, and that is recorded here
-    /// rather than papered over. The Kernel's only front-door backup dispatch
-    /// (`KernelComposition::dispatch_backup_frame`) routes `backup.create`,
-    /// `backup.verify` and `backup.restore-test`; `backup.verify` is read-only,
-    /// and `backup.restore-test` is a rehearsal that answers `plan_gap` naming
-    /// the missing owner evidence, so neither performs a restore. The other two
-    /// workspace consumers of this package are a native worker and an
-    /// instrument harness, not a restore owner. Calling this from any of them
-    /// would be a caller invented for the sake of one, and calling it from the
-    /// rehearsal path would run restore effects off a rehearsal and would still
-    /// refuse for want of owner-issued `DestinationManifestEvidence`, whose
-    /// producer (AUDIT-7) is also open. No placeholder call stands in for the
-    /// missing transport; #963/#2569 own the front-door connection.
+    /// [`Self::rehearse_isolated_restore`] is the production caller, and it is
+    /// reached from the Kernel's own front-door backup dispatch:
+    /// `dispatch_backup_frame`'s `backup.restore-test` arm calls
+    /// `request_dispatch.rs::KernelComposition::handle_backup_restore_test`,
+    /// which calls it under the original operation `idempotency_key`. So the
+    /// entry is no longer unreachable, and a refusal it returns is the restore
+    /// owner's own typed refusal rather than a hand-written `plan_gap`.
     pub fn backup_restore_with_ors_journal(
         &self,
         bundle: &eliot_backup::BackupBundle,
@@ -902,6 +896,73 @@ impl KernelComposition {
     ) -> Result<KernelRestoreOutcome, KernelRestoreError> {
         self.backup_restore
             .restore_with_ors_journal(&self.p07_ors, bundle, target, ports, identity)
+    }
+
+    /// Runs one isolated restore REHEARSAL on the composition-owned durable ORS
+    /// journal (issue #963).
+    ///
+    /// This is the production caller of [`Self::backup_restore_with_ors_journal`]
+    /// that the front door was missing, and it is what makes that entry reachable
+    /// rather than dead: `backup.restore-test` reaches this method through
+    /// `request_dispatch.rs::KernelComposition::handle_backup_restore_test`.
+    ///
+    /// ## Why the admission is taken here and not from the caller
+    ///
+    /// [`RestorePorts`] carries a `&RestoreJournalAdmission`, so a caller must
+    /// supply a value for that field even though
+    /// [`KernelBackupRestore::restore_with_ors_journal`] replaces it with a
+    /// stronger owner-issued one before any effect. This method therefore issues
+    /// it from the real durable owner first — [`KernelBackupRestore::admit_restore_journal`],
+    /// which reaches `RestoreJournalAdmission::issue_for_operation` through
+    /// `OrsRestoreJournalOwner` — and binds THAT value into the bundle. The
+    /// admission is consequently owner-issued at every point it is read, and no
+    /// `RestoreJournalAdmission` is ever constructed, defaulted or synthesized
+    /// here. Keeping `p07_ors` private to this file is what makes that
+    /// unavoidable: a caller cannot name a different journal than the one this
+    /// composition owns.
+    ///
+    /// ## The rehearsal posture is fixed, not a parameter
+    ///
+    /// `rehearsal` is `true` and there is no argument that could make it
+    /// `false`: this is the isolated rehearsal, no production (non-rehearsal)
+    /// restore front door exists on this tree, and a rehearsal prepares and
+    /// restores into an isolated destination without activating, cutting over
+    /// or retiring anything. The remaining fields are the honest absent values
+    /// rather than stand-ins: `manifest_evidence` is `None`, the documented
+    /// rehearsal-without-Host-admission shape, because the Host-issued manifest
+    /// binding is not observable from the Kernel; and `keys`/`blob_scope` are
+    /// `None`, so a blob-carrying archive refuses typed with
+    /// `CapabilityMissing { capability: "blob_key_material" }` instead of
+    /// staging an import the Kernel holds no key material to verify.
+    ///
+    /// # Errors
+    ///
+    /// Every refusal is the restore owner's own typed
+    /// [`KernelRestoreError`], carried across unchanged. The front door maps it
+    /// to a typed reply and never to a fabricated success.
+    pub fn rehearse_isolated_restore(
+        &self,
+        bundle: &eliot_backup::BackupBundle,
+        target: eliot_backup::RestoreContext,
+        kernel_fence: &StateFence,
+        identity: &OrsRestoreBinding,
+    ) -> Result<KernelRestoreOutcome, KernelRestoreError> {
+        let plan = KernelBackupRestore::compile_plan(bundle, target.clone())?;
+        let admission = self.backup_restore.admit_restore_journal(
+            &self.p07_ors,
+            &plan,
+            kernel_fence,
+            identity,
+        )?;
+        let ports = RestorePorts {
+            journal_admission: &admission,
+            kernel_fence,
+            keys: None,
+            blob_scope: None,
+            manifest_evidence: None,
+            rehearsal: true,
+        };
+        self.backup_restore_with_ors_journal(bundle, target, &ports, identity)
     }
 }
 

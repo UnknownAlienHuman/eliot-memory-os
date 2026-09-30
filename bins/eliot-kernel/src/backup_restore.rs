@@ -953,17 +953,17 @@ impl KernelBackupRestore {
     /// [`KernelRestoreTarget::apply_purge_ledger`] — instead of staging a
     /// ledger whose revision no owner ever issued.
     ///
-    /// The owner route DOES exist: [`restore_with_ors_journal`](Self::restore_with_ors_journal)
+    /// The owner route DOES exist and is live: [`restore_with_ors_journal`](Self::restore_with_ors_journal)
     /// supplies the composition-owned ORS handle, and
-    /// `KernelComposition::backup_restore_with_ors_journal` is the intended
-    /// production caller of it. That composition entry is recorded in
-    /// `lib.rs` as having NO caller in this repository, so the owner route is
-    /// not yet live at runtime and this entry's refusal is not currently
-    /// reachable from production. Stated rather than papered over: #963/#2569
-    /// own the front-door connection, and a guard or refusal that is only
-    /// unreachable by accident is not a guard — the purge phase's own
-    /// rehearsal and absent-owner refusals are enforced at the phase, not
-    /// here, precisely so that wiring the entry does not change them.
+    /// `KernelComposition::backup_restore_with_ors_journal` is its production
+    /// caller. That composition entry is itself reached from the front door —
+    /// `request_dispatch.rs::KernelComposition::handle_backup_restore_test`
+    /// calls `KernelComposition::rehearse_isolated_restore`, which calls it —
+    /// so the owner route is no longer unreachable at runtime and a refusal
+    /// from it is now a typed owner refusal on the wire rather than a
+    /// hand-written `plan_gap`. The purge phase's own rehearsal and
+    /// absent-owner refusals are enforced at the phase, not here, precisely so
+    /// that wiring the entry does not change them.
     pub fn restore<J: RestoreJournalPort>(
         &self,
         bundle: &BackupBundle,
