@@ -30,5 +30,14 @@ thiserror = "2.0.18"
 name = "eliot-verifier-selfchange"
 path = "src/bin/eliot-verifier-selfchange.rs"
 
+# The one production entry a local `verify.ps1` run and a CI run both execute
+# (issue #1914 W2/W4, I18.21). It resolves a closed profile ALIAS through
+# `resolve_verification_route`, runs the admitted stages as real processes under
+# the Kernel dispatch fence, and issues the shared
+# `VerificationProfileReceipt`. No thin invoker names a command list.
+[[bin]]
+name = "eliot-profile-resolver"
+path = "src/bin/eliot-profile-resolver.rs"
+
 [lints]
 workspace = true
