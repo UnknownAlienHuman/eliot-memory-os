@@ -8,6 +8,7 @@ description = "One-shot rust-analyzer/SCIP semantic-navigation and diagnostics b
 
 [dependencies]
 eliot-artifact = { path = "../../instrument/eliot-artifact", version = "0.1.0" }
+eliot-blob-api.workspace = true
 eliot-contracts.workspace = true
 eliot-git-bridge.workspace = true
 eliot-build-test-graph = { path = "../../instrument/eliot-build-test-graph", version = "0.1.0" }
