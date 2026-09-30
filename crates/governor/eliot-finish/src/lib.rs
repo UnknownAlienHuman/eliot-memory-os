@@ -728,8 +728,7 @@ mod tests {
                 verifier_run_refs: vec![],
                 requires_verifier: false,
             }],
-            executed_verifier_run_refs: vec![],
-            stale_verifier_run_refs: vec![],
+            verifier_runs: vec![],
             unresolved_effect_refs: vec![],
         }
     }
@@ -849,7 +848,6 @@ mod tests {
                     verifier_run_refs: vec!["verifier-run-1".to_owned()],
                     requires_verifier: true,
                 }],
-                executed_verifier_run_refs: vec![],
                 ..evidence()
             },
             ..context()

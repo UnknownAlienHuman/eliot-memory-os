@@ -966,7 +966,107 @@ pub struct AcceptanceCoverage {
     #[serde(default)]
     pub verifier_run_refs: Vec<String>,
     /// Whether this item requires an executed verifier.
+    ///
+    /// Carried on the rehydrated coverage row, never on the candidate draft.
+    /// The value is derived by the Governor from the rehydrated current
+    /// `TaskContract` acceptance item, not from anything the submitter stated
+    /// and not from the verifier plan being checked.
     pub requires_verifier: bool,
+}
+
+/// Execution axis of one rehydrated verifier run.
+///
+/// This is the finish gate's closed reading of the instrument execution axis
+/// named by I7.9 (`NOT_EXECUTED`, `SIMULATED`, and the executed case). The
+/// instrument contract owns the raw axis; this is the finish gate's own
+/// projection of it, and the Governor's canonical verifier fact is the single
+/// place that mapping is made, so there is one derivation rather than one per
+/// consumer.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum VerifierExecutionStatus {
+    /// The run was never executed: no started execution is on record for it.
+    NotExecuted,
+    /// The run was not executed by the registered productive verifier, so it
+    /// cannot stand in for a real execution.
+    Simulated,
+    /// The run was executed under the admitted productive profile.
+    Executed,
+}
+
+/// Evaluation axis of one executed verifier run.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum VerifierRunOutcome {
+    /// The declared property was proven in the declared scope.
+    Pass,
+    /// The run executed and did not prove the declared property.
+    Fail,
+    /// The run's outcome could not be established.
+    Unknown,
+}
+
+/// Scope-currency axis of one rehydrated verifier run.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum VerifierRunScope {
+    /// The run covers exactly the current candidate, commit, or quiesced
+    /// worktree with an unchanged source observation.
+    Exact,
+    /// The run's scope, source observation, or coverage is not current.
+    Stale,
+}
+
+/// Artifact-binding axis of one rehydrated verifier run.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum VerifierArtifactBinding {
+    /// The run carries complete, untruncated raw and normalized artifact
+    /// evidence.
+    Complete,
+    /// The run is missing its artifact binding, or carries a truncated one.
+    Absent,
+}
+
+/// One rehydrated verifier run with the four axes I7.9 names as disqualifying.
+///
+/// The two collections this replaces were string sets, so *executed*,
+/// *simulated*, and *executed and failed* were indistinguishable at the gate:
+/// membership decided support, and a set difference recovered a single
+/// boolean. These four axes are the whole of I7.9 line 30, carried per run so
+/// the gate compares THIS run's recorded disposition instead of inferring one
+/// from the absence of another list. A run that is `NOT_EXECUTED`, `SIMULATED`,
+/// `FAIL`/`UNKNOWN`, `STALE`, or has an absent artifact binding never supports
+/// `VERIFIED_COMPLETE`.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifierRunEvidence {
+    /// Handle of the rehydrated verifier run.
+    pub run_ref: String,
+    /// Execution axis of this run.
+    pub execution_status: VerifierExecutionStatus,
+    /// Evaluation axis of this run.
+    pub outcome: VerifierRunOutcome,
+    /// Scope-currency axis of this run.
+    pub scope: VerifierRunScope,
+    /// Artifact-binding axis of this run.
+    pub artifact_binding: VerifierArtifactBinding,
+}
+
+impl VerifierRunEvidence {
+    /// Whether this run is executed, passing, current, and completely
+    /// artifact-bound, and is therefore the only kind that can support
+    /// `VERIFIED_COMPLETE`.
+    ///
+    /// Every clause is a comparison against a recorded axis of this run. No
+    /// clause is satisfied by the run's presence in any collection.
+    #[must_use]
+    pub const fn certifies_completion(&self) -> bool {
+        matches!(self.execution_status, VerifierExecutionStatus::Executed)
+            && matches!(self.outcome, VerifierRunOutcome::Pass)
+            && matches!(self.scope, VerifierRunScope::Exact)
+            && matches!(self.artifact_binding, VerifierArtifactBinding::Complete)
+    }
 }
 
 /// Current evidence rehydrated by the finish service.
@@ -982,12 +1082,16 @@ pub struct FinishEvidence {
     pub artifact_refs: Vec<String>,
     /// Per-acceptance evidence and verifier bindings.
     pub acceptance: Vec<AcceptanceCoverage>,
-    /// Executed verifier handles in the exact current scope.
+    /// Rehydrated verifier runs with their execution, evaluation,
+    /// scope-currency, and artifact-binding axes (issue #325 W3, I7.9).
+    ///
+    /// This replaces the two untyped string collections that stood here. Set
+    /// membership made *executed*, *simulated*, and *executed and failed*
+    /// indistinguishable, so the gate could only recover a single boolean from
+    /// their difference and could not name which axis disqualified a run. Each
+    /// run is now carried with the axes I7.9 names, and the gate compares them.
     #[serde(default)]
-    pub executed_verifier_run_refs: Vec<String>,
-    /// Verifier handles known stale or invalid.
-    #[serde(default)]
-    pub stale_verifier_run_refs: Vec<String>,
+    pub verifier_runs: Vec<VerifierRunEvidence>,
     /// Effects not yet reconciled to a terminal outcome.
     #[serde(default)]
     pub unresolved_effect_refs: Vec<String>,
@@ -1034,26 +1138,41 @@ impl FinishEvidence {
             }
         }
         unique(
-            self.executed_verifier_run_refs.iter(),
-            "finish.evidence.executed_verifier_run_refs",
+            self.verifier_runs.iter().map(|run| run.run_ref.clone()),
+            "finish.evidence.verifier_runs.run_ref",
         )?;
-        unique(
-            self.stale_verifier_run_refs.iter(),
-            "finish.evidence.stale_verifier_run_refs",
-        )?;
+        for run in &self.verifier_runs {
+            text(&run.run_ref, "finish.evidence.verifier_runs.run_ref")?;
+        }
         unique(
             self.unresolved_effect_refs.iter(),
             "finish.evidence.unresolved_effect_refs",
         )?;
         for reference in self
-            .executed_verifier_run_refs
+            .verifier_runs
             .iter()
-            .chain(&self.stale_verifier_run_refs)
+            .map(|run| &run.run_ref)
             .chain(&self.unresolved_effect_refs)
         {
             text(reference, "finish.evidence.reference")?;
         }
         Ok(())
+    }
+
+    /// The rehydrated runs that are executed, passing, current, and completely
+    /// artifact-bound.
+    ///
+    /// Membership in this set is the only thing that can support
+    /// `VERIFIED_COMPLETE`, and it is derived by comparing each run's own
+    /// recorded axes rather than by any list a caller or a coverage row
+    /// assembled.
+    #[must_use]
+    pub fn certifying_verifier_runs(&self) -> BTreeSet<&str> {
+        self.verifier_runs
+            .iter()
+            .filter(|run| run.certifies_completion())
+            .map(|run| run.run_ref.as_str())
+            .collect()
     }
 }
 
@@ -1118,32 +1237,25 @@ pub fn derive_finish_decision(
 
     let mut coverage = Vec::with_capacity(evidence.acceptance.len());
     let mut missing = Vec::new();
-    let executed: BTreeSet<&str> = evidence
-        .executed_verifier_run_refs
+    // Issue #325 W3: `certifying` is the gate's explicit executed-and-passing-
+    // and-current check. Every rehydrated run is carried with the axes I7.9
+    // names (`execution_status`, `outcome`, `scope`, `artifact_binding`), and
+    // only a run whose own recorded axes are `EXECUTED`, `PASS`, `EXACT`, and
+    // `COMPLETE` enters this set. A run that is `NOT_EXECUTED`, `SIMULATED`,
+    // failed, of unknown outcome, of stale scope, or missing its artifact
+    // binding is absent from it, and absence below is a gap — never an
+    // objection-free pass. Presence of a run in any collection never suffices.
+    let certifying: BTreeSet<&str> = evidence.certifying_verifier_runs();
+    let rehydrated: BTreeSet<&str> = evidence
+        .verifier_runs
         .iter()
-        .map(String::as_str)
+        .map(|run| run.run_ref.as_str())
         .collect();
-    let stale: BTreeSet<&str> = evidence
-        .stale_verifier_run_refs
-        .iter()
-        .map(String::as_str)
-        .collect();
-    // Issue #325 W3: `executed_current` is the gate's explicit pass-and-exact
-    // outcome check. The canonical owner (`produce_finish_evidence`) records
-    // every terminal run in `executed_verifier_run_refs` but stale-marks each
-    // run that is not executed, passing, productive, and exactly fresh
-    // (`certifies_completion`: the run's bound invocation profile compared
-    // against the registered productive profile, job, receipt, and run
-    // `Succeeded`, outcome `Pass`, coverage `CompleteForScope`, `Exact*`
-    // freshness, unchanged source, complete artifacts). Only refs surviving
-    // this difference are proven executed/passing/current evidence; set
-    // membership in `executed` alone never suffices below.
-    let executed_current: BTreeSet<&str> = executed.difference(&stale).copied().collect();
     let mut verifier_gap = false;
     let mut artifact_gap = false;
     let mut all_satisfied = true;
     let mut bindings = evidence.artifact_refs.clone();
-    bindings.extend(evidence.executed_verifier_run_refs.iter().cloned());
+    bindings.extend(evidence.verifier_runs.iter().map(|run| run.run_ref.clone()));
     for artifact in &draft.artifact_refs {
         if !evidence.artifact_refs.iter().any(|known| known == artifact) {
             artifact_gap = true;
@@ -1151,16 +1263,12 @@ pub fn derive_finish_decision(
         }
     }
     for verifier in &draft.verifier_run_refs {
-        if !evidence
-            .executed_verifier_run_refs
-            .iter()
-            .any(|known| known == verifier)
-        {
+        if !rehydrated.contains(verifier.as_str()) {
             verifier_gap = true;
         }
     }
     for verifier in &draft.verifier_run_refs {
-        if !executed_current.contains(verifier.as_str()) {
+        if !certifying.contains(verifier.as_str()) {
             verifier_gap = true;
             missing.push(format!("verifier:{verifier}"));
         }
@@ -1173,7 +1281,7 @@ pub fn derive_finish_decision(
         coverage.push(format!("{}={}", item.item_id, item.satisfied));
         for verifier in &item.verifier_run_refs {
             bindings.push(verifier.clone());
-            if item.requires_verifier && !executed_current.contains(verifier.as_str()) {
+            if item.requires_verifier && !certifying.contains(verifier.as_str()) {
                 verifier_gap = true;
                 missing.push(format!("verifier:{verifier}"));
             }
@@ -1192,7 +1300,9 @@ pub fn derive_finish_decision(
     // Issue #325 W3: every verifier-bound obligation must be proven by
     // executed, passing, current evidence — a `satisfied` flag alone never
     // carries a verifier-bound item to `VerifiedComplete`. Items without a
-    // verifier requirement keep their upstream disposition.
+    // verifier requirement keep their upstream disposition. `requires_verifier`
+    // is the Governor's derivation from the rehydrated `TaskContract`
+    // acceptance item; the candidate draft never states it.
     let verifier_items_proven = evidence
         .acceptance
         .iter()
@@ -1202,7 +1312,7 @@ pub fn derive_finish_decision(
                 && item
                     .verifier_run_refs
                     .iter()
-                    .all(|verifier| executed_current.contains(verifier.as_str()))
+                    .all(|verifier| certifying.contains(verifier.as_str()))
         });
     let outcome = match draft.requested_outcome {
         RequestedFinishOutcome::CompleteCandidate

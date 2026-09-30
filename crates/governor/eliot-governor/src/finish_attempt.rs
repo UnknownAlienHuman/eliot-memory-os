@@ -442,7 +442,11 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
                 "canonical verifier execution fact is stale for the current task/plan".to_owned(),
             )));
         }
-        let verifier_run_ref = verifier_fact.verification_run.run_id.to_string();
+        // Issue #325 W3: the run handle comes from the fact's own axis
+        // projection, so the reference the task-disposition join compares and
+        // the reference the rehydrated evidence carries are the same value
+        // from one derivation rather than two independent spellings.
+        let verifier_run_ref = verifier_fact.run_evidence().run_ref;
         Ok((verifier_fact, verifier_run_ref))
     }
 
@@ -546,9 +550,10 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
         let (verifier_fact, verifier_run_ref) =
             self.read_current_verifier_fact(task_id, task, plan, fence)?;
         // This fact has already been rehydrated and validated against the
-        // current task, plan, fence, and durable terminal TestD receipt. A
-        // failed or partial verifier is still an executed run; its outcome is
-        // represented per required test below, not mislabeled as stale.
+        // current task, plan, fence, and durable terminal TestD receipt. It is
+        // still a fact for a failed, partial, simulated, or stale run, and it
+        // stays recorded as one: the run's own axes decide below whether it may
+        // certify completion, rather than the fact's existence deciding it.
 
         let coordination = self.read_current_finish_projection(task_id, fence)?;
 
@@ -594,11 +599,6 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
             plan,
             &verifier_fact,
         )?;
-        let stale_verifier_run_refs = if verifier_fact.certifies_completion() {
-            Vec::new()
-        } else {
-            vec![verifier_run_ref.clone()]
-        };
         let mut artifact_refs = coordination.artifact_refs.clone();
         artifact_refs.extend(frame_refs);
         artifact_refs.extend(observation_refs);
@@ -622,8 +622,14 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
             current_task_revision: task.revision,
             artifact_refs,
             acceptance,
-            executed_verifier_run_refs: vec![verifier_run_ref.clone()],
-            stale_verifier_run_refs,
+            // Issue #325 W3, I7.9: the rehydrated run travels with the axes
+            // that decide whether it may support `VERIFIED_COMPLETE` at all.
+            // `run_evidence` is the single projection of the terminal `TestD`
+            // fact's recorded execution, evaluation, scope, and artifact
+            // state, so a `NOT_EXECUTED`, `SIMULATED`, failed, unknown,
+            // stale, or artifact-less run is carried visibly as such and cannot
+            // read as a certifying one.
+            verifier_runs: vec![verifier_fact.run_evidence()],
             unresolved_effect_refs,
         };
         evidence

@@ -55,7 +55,8 @@ use eliot_authority::{
 use eliot_budget::{BudgetLedger, BudgetLedgerRecoverySnapshot};
 use eliot_canonical::{
     AcceptanceCoverage, CanonicalError, CanonicalWriteEnvelope, FinishAttemptDraft,
-    FinishDecisionOutcome, FinishEvidence,
+    FinishDecisionOutcome, FinishEvidence, VerifierArtifactBinding, VerifierExecutionStatus,
+    VerifierRunEvidence, VerifierRunOutcome, VerifierRunScope,
 };
 use eliot_change_monitor::ChangeMonitor;
 use eliot_config::ConfigPolicySnapshot;
@@ -108,8 +109,8 @@ use eliot_session::{SessionLifecycleOwner, SessionLifecycleSnapshot, SessionStat
 use eliot_skill::{SkillLifecycleView, SkillRegistry};
 use eliot_store_api::{
     CanonicalReadClient, OrderingHeadExpectation, PreparedTransition, ProblemOwnerTransition,
-    RevisionHeadExpectation, ScopeRevisionView, StoreHealth, TaskContractAcceptanceSet,
-    WriteReceipt,
+    RevisionHeadExpectation, ScopeRevisionView, StoreHealth, TaskContractAcceptanceEvidence,
+    TaskContractAcceptanceSet, WriteReceipt,
 };
 use eliot_task::{TaskLifecycleOwner, TaskLifecycleSnapshot, TaskRecord, TaskState};
 use eliot_testd_core::{
@@ -2173,60 +2174,65 @@ impl CanonicalVerifierExecutionFact {
         Ok(())
     }
 
-    /// Whether the bound execution/evaluation is eligible to certify finish.
+    /// Projects this fact's bound execution and evaluation into the four axes
+    /// I7.9 names as disqualifying for `VERIFIED_COMPLETE`.
     ///
-    /// `I7.9` (`docs/architecture/I07-09-strict-finish-input-and-outcomes.md:30`)
-    /// forbids a verifier with execution status `NOT_EXECUTED` or `SIMULATED`,
-    /// stale scope, a missing artifact binding, or an unknown outcome from
-    /// supporting `VERIFIED_COMPLETE`.  Every clause is answered here by
-    /// comparing the *recorded* axis of this fact, never by observing that a
-    /// record exists:
+    /// This is the ONE place the recorded axes of a verifier run become a
+    /// finish-gate disposition. Every clause is answered by comparing a
+    /// *recorded* axis of this fact, never by observing that a record exists:
     ///
-    /// - simulated — the run's own bound invocation profile is compared against
-    ///   the registered productive profile constant.  Equality with the
+    /// - `execution_status` — the run's own bound invocation profile is
+    ///   compared against the registered productive profile constant, so a
+    ///   simulated run is `SIMULATED` rather than `EXECUTED`. Equality with the
     ///   canonical plan's declared profile, already required by
     ///   [`Self::validate`] through `check_fact_invocation_matches_plan`, is an
     ///   identity check between two freely-typed labels and says nothing about
-    ///   whether the run was executed productively.  The productive-profile
-    ///   refusal in `evaluate_testd_verification_current` runs on the
-    ///   publication path; this predicate is what the rehydration path and the
-    ///   persisted evidence read-back in
-    ///   [`CanonicalFinishEvidence::validate`] consult, so a simulated run
-    ///   rehydrated from the canonical owner can be recorded neither as
-    ///   certifying nor as an exact current run.
-    /// - unexecuted and unknown — `ExecutionStatus::Succeeded` is required on
-    ///   both the receipt binding and the run, so an admitted-but-not-started
-    ///   or in-flight execution and an unestablishable outcome both fail; only
-    ///   `VerificationOutcome::Pass` is accepted, so an unknown outcome stays
-    ///   unknown and is never read as success or as absence of objection.
-    /// - stale scope — `Exact*` freshness on the run and on every normalized
-    ///   evidence event, an unchanged source observation, and a recorded
-    ///   finish time.
-    /// - missing artifact binding — non-empty raw artifact bindings, non-empty
-    ///   raw and normalized run evidence, and no truncated artifact.
+    ///   whether the run was executed productively. `ExecutionStatus::Succeeded`
+    ///   is required on the job, the receipt binding, and the run, so an
+    ///   admitted-but-not-started or in-flight execution is `NOT_EXECUTED`.
+    /// - `outcome` — only `VerificationOutcome::Pass` is `PASS`; `Fail` is
+    ///   `FAIL` and an unestablishable outcome stays `UNKNOWN`, so it is never
+    ///   read as success or as absence of objection.
+    /// - `scope` — `Exact*` freshness on the run and on every normalized
+    ///   evidence event, complete-for-scope coverage, an unchanged source
+    ///   observation, and a recorded finish time.
+    /// - `artifact_binding` — non-empty raw artifact bindings, non-empty raw
+    ///   and normalized run evidence, and no truncated artifact.
     #[must_use]
-    pub fn certifies_completion(&self) -> bool {
+    pub fn run_evidence(&self) -> VerifierRunEvidence {
         let fresh = matches!(
             self.verification_run.freshness,
             EvidenceFreshness::ExactCandidate
                 | EvidenceFreshness::ExactCommit
                 | EvidenceFreshness::ExactQuiescedWorktree
         );
-        self.invocation.profile == eliot_testd_core::TESTD_PRODUCTIVE_PROFILE
-            && self.job_state == "succeeded"
+        let executed = self.job_state == "succeeded"
             && self.receipt.execution == ExecutionStatus::Succeeded
-            && self.verification_run.execution == ExecutionStatus::Succeeded
-            && self.verification_run.outcome == VerificationOutcome::Pass
+            && self.verification_run.execution == ExecutionStatus::Succeeded;
+        let execution_status = if self.invocation.profile
+            != eliot_testd_core::TESTD_PRODUCTIVE_PROFILE
+        {
+            VerifierExecutionStatus::Simulated
+        } else if !executed {
+            VerifierExecutionStatus::NotExecuted
+        } else {
+            VerifierExecutionStatus::Executed
+        };
+        let outcome = match self.verification_run.outcome {
+            VerificationOutcome::Pass => VerifierRunOutcome::Pass,
+            VerificationOutcome::Fail => VerifierRunOutcome::Fail,
+            VerificationOutcome::Partial
+            | VerificationOutcome::Unknown
+            | VerificationOutcome::Blocked
+            | VerificationOutcome::Cancelled => VerifierRunOutcome::Unknown,
+        };
+        let scope = if fresh
             && self.verification_run.coverage == EvidenceCoverage::CompleteForScope
             && self.verification_run.finished_at.is_some()
-            && fresh
             && self
                 .source_observation
                 .as_ref()
                 .is_some_and(CanonicalVerifierSourceObservationRange::unchanged)
-            && !self.raw_artifact_bindings.is_empty()
-            && !self.verification_run.raw_evidence.is_empty()
-            && !self.verification_run.evidence.is_empty()
             && self.verification_run.evidence.iter().all(|evidence| {
                 matches!(
                     evidence.freshness,
@@ -2235,10 +2241,45 @@ impl CanonicalVerifierExecutionFact {
                         | EvidenceFreshness::ExactQuiescedWorktree
                 ) && evidence.coverage == EvidenceCoverage::CompleteForScope
             })
+        {
+            VerifierRunScope::Exact
+        } else {
+            VerifierRunScope::Stale
+        };
+        let artifact_binding = if !self.raw_artifact_bindings.is_empty()
+            && !self.verification_run.raw_evidence.is_empty()
+            && !self.verification_run.evidence.is_empty()
             && self
                 .raw_artifact_bindings
                 .iter()
                 .all(|artifact| !artifact.truncated)
+        {
+            VerifierArtifactBinding::Complete
+        } else {
+            VerifierArtifactBinding::Absent
+        };
+        VerifierRunEvidence {
+            run_ref: self.verification_run.run_id.to_string(),
+            execution_status,
+            outcome,
+            scope,
+            artifact_binding,
+        }
+    }
+
+    /// Whether the bound execution/evaluation is eligible to certify finish.
+    ///
+    /// I7.9 (`docs/architecture/I07-09-strict-finish-input-and-outcomes.md:30`)
+    /// forbids a verifier with execution status `NOT_EXECUTED` or `SIMULATED`,
+    /// stale scope, a missing artifact binding, or an unknown outcome from
+    /// supporting `VERIFIED_COMPLETE`. This is exactly the conjunction of the
+    /// four axes [`Self::run_evidence`] projects, so the publication path, the
+    /// rehydration path, and the persisted evidence read-back in
+    /// [`CanonicalFinishEvidence::validate`] consult one derivation rather than
+    /// three.
+    #[must_use]
+    pub fn certifies_completion(&self) -> bool {
+        self.run_evidence().certifies_completion()
     }
 }
 
@@ -2732,17 +2773,17 @@ fn task_acceptance_set_commitment(item_ids: &BTreeSet<String>) -> Result<String,
 ///
 /// This is the denominator of acceptance coverage (issue #325 P1, I7.9). It is
 /// deliberately a distinct value from the canonical plan: a plan may *declare*
-/// which obligations it believes exist, but only the contract owner decides
-/// which obligations exist, and a plan that disagrees is refused rather than
-/// silently shrinking the set the gate is computed over.
+/// which obligations it believes exist and which tests establish them, but only
+/// the contract owner decides which obligations exist and what evidence class
+/// each one requires, and a plan that disagrees is refused rather than silently
+/// shrinking the set the gate is computed over.
 ///
-/// The set reaches the finish decision already bound to the owner by
-/// [`ContractAcceptanceDenominator::admits`], so `item_ids` may only be a plan
-/// enumeration that survives that proof. The construction site
-/// (`produce_finish_evidence`) therefore still reads the ids from the plan
-/// because the enumeration itself has to travel with the plan, and the owner
-/// supplies the commitment that makes the enumeration provable rather than
-/// merely plausible.
+/// `required_evidence` is what makes the per-item `requires_verifier` flag an
+/// owner derivation rather than a plan or submitter claim. The plan's
+/// `acceptance_verifier_map` still owns the acceptance-to-test *join* (which
+/// is many-to-many and never equates a test id with an acceptance id), but it
+/// can no longer declare that a contract obligation needs no verifier simply by
+/// omitting or emptying its entry.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContractAcceptanceDenominator {
     /// Contract identity the acceptance set was rehydrated for.
@@ -2753,6 +2794,11 @@ pub struct ContractAcceptanceDenominator {
     pub acceptance_digest: String,
     /// Every acceptance item the current contract requires.
     pub item_ids: BTreeSet<String>,
+    /// The evidence class the contract owner requires for each of those items.
+    ///
+    /// Its key set is exactly [`Self::item_ids`], so it can neither omit an
+    /// obligation nor add one.
+    pub required_evidence: BTreeMap<String, TaskContractAcceptanceEvidence>,
 }
 
 impl ContractAcceptanceDenominator {
@@ -2778,8 +2824,23 @@ impl ContractAcceptanceDenominator {
     ///
     /// The commitment is recomputed here rather than trusted from the plan
     /// binding, so the plan cannot satisfy this by restating a digest.
+    ///
+    /// The owner's per-item evidence classes must also cover exactly the
+    /// admitted enumeration (issue #325 W3). Without that, a required item
+    /// could arrive with no declared evidence class and the per-item
+    /// `requires_verifier` derivation below would have nothing to compare
+    /// against, so an obligation could be carried without stating whether it
+    /// needs a verifier.
     fn admits(&self, verifier_plan: &CanonicalVerifierPlanBinding) -> bool {
         if self.item_ids.is_empty() || self.item_ids != verifier_plan.required_acceptance_item_ids {
+            return false;
+        }
+        if self.required_evidence.len() != self.item_ids.len()
+            || !self
+                .required_evidence
+                .keys()
+                .all(|item_id| self.item_ids.contains(item_id))
+        {
             return false;
         }
         self.task_acceptance_set_commitment()
@@ -2839,12 +2900,18 @@ impl AcceptanceDenominatorError {
     /// enumeration and returns the denominator the coverage gate is computed
     /// over.
     ///
-    /// The denominator's `item_ids` are the CONTRACT OWNER's enumeration. The
-    /// plan's `required_acceptance_item_ids` are compared against it item by
-    /// item and are never adopted: a plan that declares a strict subset would
-    /// otherwise report a smaller denominator as complete, and a plan that
-    /// declares a strict superset would make the gate carry an obligation the
-    /// contract never required. Neither is silently preferred over the other.
+    /// The denominator's `item_ids` and `required_evidence` are the CONTRACT
+    /// OWNER's. The plan's `required_acceptance_item_ids` are compared against
+    /// that enumeration item by item and are never adopted: a plan that declares
+    /// a strict subset would otherwise report a smaller denominator as
+    /// complete, and a plan that declares a strict superset would make the gate
+    /// carry an obligation the contract never required. Neither is silently
+    /// preferred over the other.
+    ///
+    /// The per-item evidence class travels with the enumeration because it is
+    /// the owner's own statement of whether an obligation needs a verifier
+    /// (issue #325 W3, I7.9). Reading it from the plan instead would let the
+    /// party being checked decide that a contract obligation needs no proof.
     ///
     /// `acceptance_digest` is the owner's OWN recorded value, never recomputed
     /// here and never taken from the caller. The existing
@@ -2891,6 +2958,11 @@ impl AcceptanceDenominatorError {
             task_revision,
             acceptance_digest: owner_set.acceptance_digest.clone(),
             item_ids: owner_item_ids,
+            required_evidence: owner_set
+                .items
+                .iter()
+                .map(|item| (item.item_id.clone(), item.required_evidence))
+                .collect(),
         };
         acceptance
             .validate(task_id, task_revision)
@@ -2921,6 +2993,15 @@ impl AcceptanceDenominatorError {
 /// item is enumerated before any verifier evidence is joined; unmapped items
 /// stay uncovered and can never yield `VERIFIED_COMPLETE` downstream. A
 /// persisted `satisfied` flag is a submitter claim and is never read here.
+///
+/// Issue #325 W3: an item is satisfied only when the one rehydrated run is
+/// executed, passing, of exact current scope, and completely artifact-bound AND
+/// every test the plan joined to that item executed and passed. Whether an
+/// item requires an executed verifier at all is the contract owner's own
+/// `required_evidence` class, rehydrated with the acceptance set, so the plan
+/// being checked cannot declare a contract obligation verifier-free. A
+/// verification-class item with no joined test fails closed here rather than
+/// reaching the gate uncovered.
 pub(crate) fn acceptance_coverage_from_verifier_fact(
     contract: &ContractAcceptanceDenominator,
     plan: &CanonicalPlanBinding,
@@ -2939,13 +3020,13 @@ pub(crate) fn acceptance_coverage_from_verifier_fact(
             "canonical verifier plan acceptance set disagrees with the rehydrated current TaskContract",
         ));
     }
-    let run_ref = fact.verification_run.run_id.to_string();
-    let run_is_current = matches!(
-        fact.verification_run.freshness,
-        EvidenceFreshness::ExactCandidate
-            | EvidenceFreshness::ExactCommit
-            | EvidenceFreshness::ExactQuiescedWorktree
-    );
+    // Issue #325 W3: the per-item execution/outcome/scope/artifact axes of the
+    // one run this fact rehydrates. Satisfaction below is a comparison against
+    // THOSE axes, not against the existence of a run or of a passing test
+    // event inside it.
+    let run = fact.run_evidence();
+    let run_ref = run.run_ref.clone();
+    let run_certifies = run.certifies_completion();
     let mut acceptance = Vec::with_capacity(contract.item_ids.len());
     for item_id in &contract.item_ids {
         // Explicit acceptance-to-test join owned by the canonical plan. A
@@ -2957,6 +3038,16 @@ pub(crate) fn acceptance_coverage_from_verifier_fact(
             .get(item_id)
             .cloned()
             .unwrap_or_default();
+        // Issue #325 W3: whether this obligation needs an executed verifier is
+        // the CONTRACT OWNER's statement, rehydrated with the acceptance set.
+        // The plan cannot grant itself an exemption by omitting or emptying
+        // its own entry for an obligation the contract marks as requiring
+        // verification.
+        let required = contract.required_evidence.get(item_id).ok_or_else(|| {
+            verifier_fact_error(
+                "rehydrated contract acceptance item carries no required-evidence class",
+            )
+        })?;
         let mut evidence_refs = BTreeSet::new();
         let mut mapped_events = 0_usize;
         let mut all_mapped_observed = true;
@@ -3013,24 +3104,32 @@ pub(crate) fn acceptance_coverage_from_verifier_fact(
                     .map(ToString::to_string),
             );
         }
-        // An item is satisfied only for a current run where every bound test
-        // executed and every bound execution passed. Failed, stale,
-        // not-executed, simulated (non-productive, hence non-certifying and
-        // stale-marked upstream), unmapped, and non-test obligations stay
+        // An item is satisfied only for a run that is executed, passing, of
+        // exact current scope, and completely artifact-bound, where every bound
+        // test executed and every bound execution passed. Failed, stale,
+        // not-executed, simulated, unmapped, and non-test obligations stay
         // uncovered here and fail closed in `derive_finish_decision`.
-        let satisfied = run_is_current && !mapped.is_empty() && all_mapped_observed && all_pass;
+        let satisfied = run_certifies
+            && !mapped.is_empty()
+            && all_mapped_observed
+            && all_pass;
         let verifier_run_refs = if mapped_events == 0 {
             Vec::new()
         } else {
             vec![run_ref.clone()]
         };
-        // Only an explicit empty mapping declares a non-test obligation that
-        // does not require a verifier run. A missing mapping stays a
-        // verifier gap so absent coverage fails closed downstream.
-        let requires_verifier = !matches!(
-            verifier_plan.acceptance_verifier_map.get(item_id),
-            Some(tests) if tests.is_empty()
-        );
+        // The contract owner's evidence class decides this. A verification-class
+        // obligation stays a verifier requirement whatever the plan's map says;
+        // an observation-class obligation requires no executed verifier, and its
+        // coverage is carried by the artifact and observation evidence joined
+        // above rather than by a test run.
+        let requires_verifier = *required == TaskContractAcceptanceEvidence::Verification;
+        if requires_verifier && mapped.is_empty() {
+            return Err(verifier_fact_error(
+                "canonical verifier plan joins no test to a contract acceptance item the owner \
+                 requires verification for",
+            ));
+        }
         acceptance.push(AcceptanceCoverage {
             item_id: item_id.clone(),
             satisfied,
@@ -3135,6 +3234,16 @@ pub struct CanonicalContractAcceptance {
     pub acceptance_digest: String,
     /// Every acceptance item the current contract requires.
     pub item_ids: BTreeSet<String>,
+    /// The evidence class the contract owner requires for each of those items
+    /// (issue #325 W3, I7.9).
+    ///
+    /// This is the owner's own per-item statement, retained beside the
+    /// enumeration so the per-item `requires_verifier` flag is derived from the
+    /// rehydrated `TaskContract` rather than from the submitted input or from
+    /// the verifier plan being checked. Its key set must equal
+    /// [`Self::item_ids`]: an obligation cannot be missing its class, and a
+    /// class cannot be recorded for an obligation the contract never required.
+    pub required_evidence: BTreeMap<String, TaskContractAcceptanceEvidence>,
 }
 
 impl CanonicalContractAcceptance {
@@ -3154,6 +3263,18 @@ impl CanonicalContractAcceptance {
         {
             return Err(CompositionError::Recovery(
                 "canonical contract acceptance set is absent, stale, or malformed".to_owned(),
+            ));
+        }
+        if self.required_evidence.len() != self.item_ids.len()
+            || !self
+                .required_evidence
+                .keys()
+                .all(|item_id| self.item_ids.contains(item_id))
+        {
+            return Err(CompositionError::Recovery(
+                "canonical contract acceptance evidence classes do not cover exactly the required \
+                 acceptance items"
+                    .to_owned(),
             ));
         }
         // The retained digest is only the contract's acceptance identity when it
@@ -3176,6 +3297,7 @@ impl CanonicalContractAcceptance {
             task_revision: self.task_revision,
             acceptance_digest: self.acceptance_digest.clone(),
             item_ids: self.item_ids.clone(),
+            required_evidence: self.required_evidence.clone(),
         }
     }
 }
@@ -3310,19 +3432,13 @@ impl CanonicalFinishEvidence {
                     .to_owned(),
             ));
         }
-        let run_ref = fact.verification_run.run_id.to_string();
-        if self.evidence.executed_verifier_run_refs != [run_ref.clone()] {
-            return Err(CompositionError::Recovery(
-                "canonical finish evidence does not name its exact executed verifier run"
-                    .to_owned(),
-            ));
-        }
-        let expected_stale = if fact.certifies_completion() {
-            Vec::new()
-        } else {
-            vec![run_ref]
-        };
-        if self.evidence.stale_verifier_run_refs != expected_stale {
+        // Issue #325 W3: the rehydrated run record must be this fact's own run
+        // with this fact's own axes. Comparing the projected record to a fresh
+        // projection of the same fact is a join against THIS operation, not an
+        // existence check: a record naming another run, or restating a
+        // simulated, failed, stale, or artifact-less run as certifying, is
+        // refused here rather than read back as completion proof.
+        if self.evidence.verifier_runs != [fact.run_evidence()] {
             return Err(CompositionError::Recovery(
                 "canonical verifier execution/outcome disposition is not joined to finish evidence"
                     .to_owned(),
