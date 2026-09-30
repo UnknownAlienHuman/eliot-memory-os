@@ -9,8 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     OperationalMutationReceipt, OperationalPhase, OperationalRecordInput, OrsError,
-    UserBrokerResourceSelection, UserBrokerResourceSelectionReceipt,
-    UserBrokerRegistrationReceipt,
+    UserBrokerRegistrationReceipt, UserBrokerResourceSelection, UserBrokerResourceSelectionReceipt,
 };
 
 /// An opaque heartbeat renewal payload for a User Broker registration.
@@ -134,8 +133,9 @@ impl UserBrokerResourceSelectionSnapshot {
         {
             return Err(OrsError::IntegrityProblem {
                 record_type: "user_broker_resource_selection",
-                reason: "snapshot selection identity, phase, order, or store-issued receipt mismatch"
-                    .to_owned(),
+                reason:
+                    "snapshot selection identity, phase, order, or store-issued receipt mismatch"
+                        .to_owned(),
             });
         }
         Ok(Self {
