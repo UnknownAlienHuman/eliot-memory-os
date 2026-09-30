@@ -4520,6 +4520,10 @@ impl KernelComposition {
     /// durable rows stay untouched. Store read errors fail closed without
     /// discarding the pair or its possible-effect evidence. Local-read pairs
     /// are never served here.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the claim gate keeps order, state, durability-bind, attempt, and prune joins in one audited order"
+    )]
     pub(crate) fn claim_observe_pair(
         &self,
         session: &Session,
