@@ -2966,7 +2966,22 @@ async fn spawn_ready_child(
     );
     let pending_native_worker_claim =
         stage_pending_native_worker_process_start(inputs, &admission, executable_file_identity)?;
-    match gateway.start(&owner, admission, proof, outer_binding).await {
+    let start_result = match kind {
+        DispatchedWorkerKind::NativeWorker => {
+            #[cfg(windows)]
+            {
+                gateway
+                    .start_with_live_stdin(&owner, admission, proof, outer_binding)
+                    .await
+            }
+            #[cfg(not(windows))]
+            {
+                gateway.start(&owner, admission, proof, outer_binding).await
+            }
+        }
+        _ => gateway.start(&owner, admission, proof, outer_binding).await,
+    };
+    match start_result {
         Ok(receipt) => Ok(SpawnOutcome::Started(
             Box::new(receipt),
             executable_file_identity,
