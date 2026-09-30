@@ -8632,6 +8632,16 @@ pub struct NativeWorkerClaimRecord {
     pub binding_digest: String,
     /// Canonical digest over the presenting request envelope.
     pub request_digest: String,
+    /// Owner-verified executable-binding digest retained at stage.
+    ///
+    /// Copied from the Kernel-gated v2 executable join
+    /// (`NativeWorkerExecutableBinding.executable_binding_digest`) when the
+    /// claim stages, never recomputed here: ORS compares it byte-wise and
+    /// never interprets it. A changed executable binding under one claim
+    /// identity is rejected as
+    /// [`OrsError::NativeWorkerClaimIdentityConflict`] and never overwrites
+    /// the durable binding.
+    pub executable_binding_digest: String,
     /// Supported execution-unit schema version.
     pub execution_unit_schema_version: u16,
     /// Predecessor revision this claim continues from; opaque to ORS.
@@ -8689,6 +8699,7 @@ impl NativeWorkerClaimRecord {
             && self.authority_epoch == other.authority_epoch
             && self.binding_digest == other.binding_digest
             && self.request_digest == other.request_digest
+            && self.executable_binding_digest == other.executable_binding_digest
             && self.execution_unit_schema_version == other.execution_unit_schema_version
             && self.predecessor_revision == other.predecessor_revision
             && self.resource_envelope_digest == other.resource_envelope_digest
@@ -8723,6 +8734,10 @@ impl NativeWorkerClaimRecord {
             (&self.fence_digest, "native_worker_claim_fence_digest"),
             (&self.binding_digest, "native_worker_claim_binding_digest"),
             (&self.request_digest, "native_worker_claim_request_digest"),
+            (
+                &self.executable_binding_digest,
+                "native_worker_claim_executable_binding_digest",
+            ),
             (
                 &self.resource_envelope_digest,
                 "native_worker_claim_resource_envelope_digest",
@@ -8787,6 +8802,47 @@ impl NativeWorkerClaimRecord {
             });
         }
         Ok(())
+    }
+
+    /// Returns the retained owner-verified executable-binding digest for one
+    /// presented proof (issue #2567).
+    ///
+    /// The verified lookup: the attempt and operation must equal the retained
+    /// row exactly, the claim must carry its immutable admission receipt (an
+    /// unadmitted intent verifies nothing), and the retained digest itself
+    /// must be well-formed and equal the presented digest. Anything else is
+    /// rejected and never resolved to the caller's value: the returned
+    /// reference always points at the durable row, never at the presentation.
+    pub fn verified_executable_binding_digest(
+        &self,
+        attempt_id: &str,
+        operation_id: &str,
+        presented_digest: &str,
+    ) -> Result<&str, OrsError> {
+        if self.attempt_id.as_str() != attempt_id || self.operation_id.as_str() != operation_id {
+            return Err(OrsError::NativeWorkerClaimIdentityConflict {
+                claim_id: self.claim_id.as_str().to_owned(),
+            });
+        }
+        if self.state == NativeWorkerClaimState::Requested
+            || self.receipt_digest.is_none()
+            || self.admitted_at_unix_ms.is_none()
+        {
+            return Err(OrsError::InvalidField {
+                field: "native_worker_claim_receipt",
+                reason: "an unadmitted claim carries no verifiable executable binding",
+            });
+        }
+        validate_digest(
+            &self.executable_binding_digest,
+            "native_worker_claim_executable_binding_digest",
+        )?;
+        if self.executable_binding_digest != presented_digest {
+            return Err(OrsError::NativeWorkerClaimIdentityConflict {
+                claim_id: self.claim_id.as_str().to_owned(),
+            });
+        }
+        Ok(&self.executable_binding_digest)
     }
 }
 

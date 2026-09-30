@@ -71,8 +71,8 @@ use std::sync::{Arc, Mutex};
 
 use eliot_agent_api::{AttemptId, RouteFingerprint};
 use eliot_agent_coordinator::{
-    AdmissionId, CandidateId, RUNTIME_PROFILE_FILE_NAME, SchedulingProfile, StaffingPlanRequest,
-    load_runtime_scheduling_profile,
+    AdmittedProviderCapability, AdmissionId, CandidateId, RUNTIME_PROFILE_FILE_NAME,
+    SchedulingProfile, StaffingPlanRequest, load_runtime_scheduling_profile,
 };
 use eliot_contracts::{fences_match_exact, sha256_hex};
 use serde::{Deserialize, Serialize};
@@ -971,6 +971,45 @@ fn guard_solo_plan(plan: &StaffingPlanRequest) -> Result<(), FabricError> {
     Ok(())
 }
 
+/// Verifies one solo intake's presented provider binding against the live
+/// owner halves and returns the admitted capability (issue #2567).
+///
+/// Prepare plus owner check with no locks held and no effects: readiness,
+/// intake shape, and solo-slice shape are validated first, then the
+/// capability is resolved through
+/// [`crate::DaemonComposition::agent_fabric_verified_capability`], which
+/// overwrites the caller-supplied session halves with the live authenticated
+/// session values and fails closed on any presented-versus-owner disagreement
+/// (route/capacity revision, authority epoch, resource generation) or owner
+/// rejection. The returned capability grants nothing durable by itself: it is
+/// consumed by [`drive_solo_delegate`] and dropped by the queue pre-check, so
+/// a failed lookup leaves the intake queued and grants nothing. The caller
+/// presented executable digest travels as presented evidence only; equality
+/// against the durable ORS row is enforced Kernel-side per effecting
+/// operation through the authenticated capability wire, which loads the
+/// retained `executable_binding_digest` itself.
+///
+/// # Errors
+///
+/// Returns the readiness, intake, solo-shape, or capability owner rejection
+/// unchanged.
+fn verify_solo_provider_binding(
+    composition: &DaemonComposition,
+    kernel: &Arc<DaemonKernelClient>,
+    intake: &SoloDelegateIntake,
+    material: VerifiedProviderMaterial,
+    now_unix_ms: u64,
+) -> Result<AdmittedProviderCapability, DaemonError> {
+    if composition.readiness() != CompositionReadiness::Ready {
+        return Err(DaemonError::Composition(CompositionError::NotReady));
+    }
+    intake
+        .validate(now_unix_ms)
+        .map_err(DaemonError::ProviderAdmission)?;
+    guard_solo_plan(&intake.plan).map_err(DaemonError::ProviderAdmission)?;
+    composition.agent_fabric_verified_capability(kernel, material)
+}
+
 /// Drives one admitted solo delegate intake to a retained dispatch.
 ///
 /// Test-only record of the previous synchronous fabric flow. Production is
@@ -1018,7 +1057,8 @@ pub fn drive_solo_delegate(
             state.live_operation = None;
         }
     }
-    let capability = composition.agent_fabric_verified_capability(kernel, material)?;
+    let capability =
+        verify_solo_provider_binding(composition, kernel, &intake, material, now_unix_ms)?;
     let config = daemon_coordinator_config()?;
     let receipt = plan_coordinator_staffing(&config, &intake.plan).map_err(|error| {
         DaemonError::ProviderAdmission(FabricError::Contract(error.to_string()))
@@ -1717,9 +1757,14 @@ pub fn solo_enqueue(
 /// Test-only synchronous poll behavior. Production uses the async fail-closed
 /// poll path below.
 ///
-/// Bounded work per tick keeps control and shutdown pollable: an empty
-/// queue idles without owner IO, a busy live slot waits without overlap,
-/// and each drive is atomic with its projection persisted before emit.
+/// Bounded prepare/verify/adopt per tick keeps control and shutdown pollable:
+/// an empty queue idles without owner IO, a busy live slot waits without
+/// overlap, and each drive is atomic with its projection persisted before
+/// emit. Prepare peeks at the queue head under a short borrow without
+/// dequeuing; the owner verification runs with no lock held; adopt dequeues
+/// the verified head and drives it. A failed owner lookup leaves the intake
+/// queued and grants nothing: the error propagates and the runtime tick logs
+/// the refusal without dequeuing.
 #[cfg(test)]
 pub fn solo_poll_queue(
     composition: &DaemonComposition,
@@ -1729,7 +1774,7 @@ pub fn solo_poll_queue(
         return Err(DaemonError::Composition(CompositionError::NotReady));
     }
     let intake = {
-        let mut state = composition.solo_state.lock().map_err(|_| {
+        let state = composition.solo_state.lock().map_err(|_| {
             DaemonError::Composition(CompositionError::Recovery(
                 "solo driver state lock poisoned".to_owned(),
             ))
@@ -1742,12 +1787,36 @@ pub fn solo_poll_queue(
         {
             return Ok(SoloPollOutcome::SlotBusy);
         }
-        let Some(intake) = state.queue.pop_front() else {
-            return Ok(SoloPollOutcome::Idle);
-        };
-        intake
+        head
     };
     let now_unix_ms = crate::unix_ms();
+    verify_solo_provider_binding(
+        composition,
+        kernel,
+        &intake,
+        intake.claimed.material(),
+        now_unix_ms,
+    )?;
+    let intake = {
+        let mut state = composition.solo_state.lock().map_err(|_| {
+            DaemonError::Composition(CompositionError::Recovery(
+                "solo driver state lock poisoned".to_owned(),
+            ))
+        })?;
+        let Some(head) = state.queue.pop_front() else {
+            return Ok(SoloPollOutcome::Idle);
+        };
+        if head.claimed.operation_id != intake.claimed.operation_id {
+            // Unreachable on the synchronous poll: no other writer runs
+            // between the peek and the pop. Fail closed and keep the queue
+            // intact rather than driving a substituted head.
+            state.queue.push_front(head);
+            return Err(DaemonError::ProviderAdmission(FabricError::Contract(
+                "solo queue head changed during owner verification".to_owned(),
+            )));
+        }
+        head
+    };
     let outcome = drive_solo_delegate(composition, kernel, intake, now_unix_ms)?;
     Ok(SoloPollOutcome::Drove {
         operation_id: outcome.operation_id,

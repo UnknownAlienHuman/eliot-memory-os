@@ -1636,6 +1636,18 @@ fn native_worker_claim_staged_record(
         authority_epoch: request.authority_epoch.sequence.get(),
         binding_digest: request.binding_digest.clone(),
         request_digest: request.request_digest.clone(),
+        // The retained executable digest is the presented v2 join digest that
+        // the route's executable gate already verified against the current
+        // owner record: a join-less presentation carries no launch authority
+        // and fails closed here instead of staging an unverifiable row.
+        executable_binding_digest: request
+            .executable_binding
+            .as_ref()
+            .map(|join| join.executable_binding_digest.clone())
+            .ok_or(KernelServiceError::InvalidField {
+                field: "native_worker_claim.executable_binding",
+                reason: "wire v2 executable join is required for executable authority",
+            })?,
         execution_unit_schema_version: request.execution_unit_schema_version,
         predecessor_revision: native_worker_claim_identity(
             OpaqueLabel::new(request.predecessor_revision.as_str()),
@@ -1734,6 +1746,10 @@ fn native_worker_claim_changed_fields(
     note(
         durable.request_digest == staged.request_digest,
         "request_digest",
+    );
+    note(
+        durable.executable_binding_digest == staged.executable_binding_digest,
+        "executable_binding_digest",
     );
     if changed.is_empty() {
         changed.push("binding_digest".to_owned());
@@ -2199,6 +2215,29 @@ impl KernelService {
             return Ok(rejected(
                 NativeWorkerClaimRejectionReason::StaleRegistration,
                 "native_worker_ready.generation",
+            ));
+        }
+        let presented_executable_digest = request
+            .executable_binding
+            .as_ref()
+            .map(|join| join.executable_binding_digest.as_str())
+            .unwrap_or_default();
+        if durable
+            .verified_executable_binding_digest(
+                request.attempt_id.as_str(),
+                request.operation_id.as_str(),
+                presented_executable_digest,
+            )
+            .is_err()
+        {
+            // The presented executable binding is not the retained admitted
+            // binding: the unit cannot become ready on a foreign, missing,
+            // or unadmitted executable. Same typed refusal as any other
+            // inadmissible claim field; the changed-work conflict below stays
+            // the backstop for every other dimension.
+            return Ok(rejected(
+                NativeWorkerClaimRejectionReason::InvalidClaimField,
+                "native_worker_claim.executable_binding",
             ));
         }
         let staged = native_worker_claim_staged_record(request)?;

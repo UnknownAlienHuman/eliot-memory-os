@@ -33,13 +33,14 @@
 //! owner digest by value (`native_worker_claim.rs`) and the T9-03 replay
 //! transport carries its authority by value (`native_worker_replay.rs`).
 //!
-//! Residual: ORS carries no `executable_binding_digest` column on the claim
-//! row (no write migration in this slice), so the executable digest is
-//! presented per call and compared for equality against the durable binding
-//! material loaded from Kernel/ORS — never trusted by value — mirroring the
-//! T9-02 presented-expectation pattern (`revoked` stays false until a
-//! Governor revocation feed exists; withdrawal is observed only as
-//! digest/revision disagreement).
+//! Durable executable binding (issue #2567): ORS retains the owner-verified
+//! `executable_binding_digest` column on the claim row (populated at stage
+//! from the Kernel-gated v2 join), so the executable digest is presented per
+//! call and compared for equality against the loaded durable digest — never
+//! trusted by value — mirroring the T9-02 presented-expectation pattern
+//! (`revoked` stays false until a Governor revocation feed exists;
+//! withdrawal is observed only as digest/revision disagreement). The daemon
+//! composition row resolution stays the later wave's call site (above).
 
 use eliot_contracts::EpochId;
 use schemars::JsonSchema;
