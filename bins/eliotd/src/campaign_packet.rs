@@ -8,8 +8,11 @@
 //! The packet's product is one immutable campaign learning-state view, and
 //! the current owner pipeline decides whether it may be used:
 //! `eliot_learning_state_view::validate_campaign_learning_state_view_current`
-//! owns the load-bearing revision and State Fence checks against a fresh
-//! authenticated owner-read set. The `#40`-frozen
+//! owns the view's own load-bearing revision and State Fence checks against a
+//! fresh authenticated owner-read set, and the current candidate cell
+//! `eliot_context_candidates::check_campaign_learning_state_view` then
+//! independently joins that view to this compilation's request identity and to
+//! the Context recipe revision the Context owner re-derived. The `#40`-frozen
 //! `eliot_context::ContextCompiler` is deliberately not called here: the
 //! frozen donor surface takes no new caller, and no legacy-only helper may
 //! accept a view the current owner refused.
@@ -20,8 +23,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use eliot_context::campaign_publication::{
     ContextCampaignRecipeBody, context_delivery_body_digest, context_recipe_body_digest,
 };
-use eliot_context_candidates::CandidateRequest;
-use eliot_context_contracts::{ContextRecipe, ProjectedCitation, SessionDeliverySnapshot};
+use eliot_context_candidates::{CandidateRequest, check_campaign_learning_state_view};
+use eliot_context_contracts::{
+    ContextError, ContextRecipe, ProjectedCitation, SessionDeliverySnapshot,
+};
 use eliot_contracts::{
     ArtifactId, RequestId, StateFence, TaskId, canonical_json_bytes, sha256_hex,
 };
@@ -120,6 +125,12 @@ pub enum CampaignPacketError {
     /// task, scope and fence.
     #[error("campaign Context recipe does not match the admitted task, scope and fence")]
     UnboundContextRecipe,
+    /// The current candidate cell refused the immutable campaign view for this
+    /// attempt: a State Fence, task/scope/request identity or load-bearing
+    /// Context recipe owner-revision join failed, or the view is invalidated,
+    /// stale, blocked or missing its Context recipe row.
+    #[error("campaign learning-state view is not current for this attempt")]
+    CampaignViewNotCurrent,
 }
 
 struct ResolvedCampaignSources {
@@ -180,6 +191,14 @@ enum CampaignPacketGapCode {
     /// measurement suppliers) still have zero production construction sites
     /// in this tree. The daemon therefore closes over no protected floor,
     /// priority policy, admission rule, or measurement composition profile.
+    ///
+    /// The candidate stage is reached today only as far as
+    /// `eliot_context_candidates::check_campaign_learning_state_view`, which
+    /// owns the campaign view's State Fence, identity and load-bearing Context
+    /// recipe revision joins; `construct_context_candidates` itself is still
+    /// unreachable because the seven role projections have no production
+    /// owner, and the admission and assembly cells are unreachable for the
+    /// same missing-supplier reason.
     ///
     /// Minting any of them here from a constant, a CLI flag, an env var, or a
     /// caller-supplied string would fabricate the exact selection record I12.26
@@ -459,17 +478,36 @@ pub fn validate_campaign_packet_pair(
 /// is the deterministic Kernel operation handle and the idempotency key is
 /// the Kernel-minted boot-unique attempt identity — never a caller selector.
 ///
+/// #1862: the immutable campaign view is then joined to that request by the
+/// current candidate cell itself,
+/// `eliot_context_candidates::check_campaign_learning_state_view`. That cell
+/// owns the State Fence, task/scope/request identity and load-bearing Context
+/// recipe owner-revision joins; it compares the view's recorded binding
+/// against this request and the view's recorded Context recipe content digest
+/// against `context_recipe_body_digest`, which the Context owner re-derived
+/// from the exact body its own publication validator accepted. A stale,
+/// missing, blocked or invalidated view is refused here through a current
+/// owner and takes the typed `CampaignViewNotCurrent` gap; the learning-state
+/// owner has already refused a load-bearing-partial view before this point, and
+/// no legacy compiler DTO decides any of it.
+///
 /// The returned request is the proof artifact the compile edge will consume
 /// once its remaining owner suppliers land (STITCH-2564-PACKET-SUPPLY: seven
 /// roles, candidate policy, admission bundle pieces, quality card, assembly
-/// policy, measurement). Today only its success signal gates the product
-/// path: the value proves the owner recipe binds the admitted packet, and a
-/// failure takes the typed context-recipe gap below.
+/// policy, measurement). Today its success signal gates the product path: the
+/// value proves the owner recipe binds the admitted packet and that the
+/// candidate cell accepted the campaign view, and a failure takes the typed
+/// gap named by the failing join. The request is not yet handed to
+/// `construct_context_candidates` because the seven role projections have no
+/// production owner; that composition is reported as
+/// `AdmissionClosureUnbound` rather than faked.
 fn candidate_request_for_packet(
     envelope: &HostRequestEnvelope,
     attempt: &LocalReadAttempt,
     recipe: &ContextRecipe,
     binding: &CampaignPacketBinding,
+    view: &CampaignLearningStateView,
+    context_recipe_body_digest: &str,
 ) -> Result<CandidateRequest, CampaignPacketError> {
     recipe
         .validate()
@@ -489,6 +527,17 @@ fn candidate_request_for_packet(
     request
         .validate()
         .map_err(|_| CampaignPacketError::InvalidInvocation)?;
+    check_campaign_learning_state_view(&request, recipe, view, context_recipe_body_digest)
+        .map_err(|error| match error {
+            ContextError::MissingField(
+                "campaign_view.context_recipe" | "campaign_view.context_reference",
+            )
+            | ContextError::InvalidField("campaign_view.completeness")
+            | ContextError::InvalidDigest("campaign_view.context_recipe")
+            | ContextError::InvalidFence
+            | ContextError::IdentityConflict => CampaignPacketError::CampaignViewNotCurrent,
+            _ => CampaignPacketError::UnboundContextRecipe,
+        })?;
     Ok(request)
 }
 
@@ -983,10 +1032,25 @@ async fn resolve_compile_and_bind_result(
         || context_delivery_record.is_some_and(|record| {
             record.document.schema != eliot_store_api::CampaignSourceDocumentSchema::ContextDelivery
         });
-    let context_body_digests_match = context_recipe_body_digest(&context_recipe_body)
+    let context_recipe_digest = match context_recipe_body_digest(&context_recipe_body) {
+        Ok(digest) => digest,
+        Err(_) => {
+            return campaign_packet_result_body(
+                envelope,
+                attempt,
+                context_blocked_response(
+                    publication,
+                    CampaignPacketGapCode::ContextRecipeUnavailable,
+                    Some(CampaignSourceRole::ContextRecipe),
+                    &resolved.resolutions,
+                    prior.is_some() && !prior_is_current,
+                ),
+            );
+        }
+    };
+    let context_body_digests_match = canonical_body_digest(&context_recipe_record.document.body)
         .ok()
-        .zip(canonical_body_digest(&context_recipe_record.document.body).ok())
-        .is_some_and(|(typed, stored)| typed == stored)
+        .is_some_and(|stored| stored == context_recipe_digest)
         && match (context_delivery_snapshot.as_ref(), context_delivery_record) {
             (Some(snapshot), Some(record)) => context_delivery_body_digest(snapshot)
                 .ok()
@@ -1040,20 +1104,33 @@ async fn resolve_compile_and_bind_result(
     // request identity before the product path continues. The owner recipe
     // must bind the admitted task, scope and fence exactly; a substituted
     // recipe fails closed through the same context-recipe gap above rather
-    // than supporting a compiled packet. The request itself is consumed by
-    // the future compile edge (STITCH-2564-PACKET-SUPPLY), so only its
-    // success signal gates this path today and the product below is
-    // unchanged.
-    if candidate_request_for_packet(envelope, attempt, &context_recipe_body.recipe, &binding)
-        .is_err()
-    {
+    // than supporting a compiled packet. The candidate cell then owns the
+    // campaign-view join itself and a refusal there takes the typed
+    // `CampaignViewNotCurrent` gap, never a compiled packet.
+    if let Err(refusal) = candidate_request_for_packet(
+        envelope,
+        attempt,
+        &context_recipe_body.recipe,
+        &binding,
+        &publication.view,
+        &context_recipe_digest,
+    ) {
+        let (gap, role) = match refusal {
+            CampaignPacketError::CampaignViewNotCurrent => {
+                (CampaignPacketGapCode::CampaignViewNotCurrent, None)
+            }
+            _ => (
+                CampaignPacketGapCode::ContextRecipeUnavailable,
+                Some(CampaignSourceRole::ContextRecipe),
+            ),
+        };
         return campaign_packet_result_body(
             envelope,
             attempt,
             context_blocked_response(
                 publication,
-                CampaignPacketGapCode::ContextRecipeUnavailable,
-                Some(CampaignSourceRole::ContextRecipe),
+                gap,
+                role,
                 &resolved.resolutions,
                 prior.is_some() && !prior_is_current,
             ),

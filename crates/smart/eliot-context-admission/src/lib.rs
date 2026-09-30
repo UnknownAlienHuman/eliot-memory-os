@@ -266,7 +266,15 @@ fn validate_admission_contract(input: &AdmissionInput) -> Result<(), ContextErro
 ///   `campaign_packet::serve_campaign_packet_pair`) never reaches any context
 ///   admission stage at all: it compiles through the learning-state view owner
 ///   `eliot_learning_state_view::compile_campaign_learning_state_view`, not
-///   through this crate, and `eliot-context` does not depend on this crate. The
+///   through this crate, and `eliot-context` does not depend on this crate.
+///   #1862 routes the immutable campaign view into the *candidate* cell
+///   instead (`eliot_context_candidates::check_campaign_learning_state_view`,
+///   called from `bins/eliotd/src/campaign_packet.rs`), which owns that view's
+///   State Fence, task/scope/request identity and load-bearing Context recipe
+///   owner-revision joins. That join is deliberately not a second copy of this
+///   crate's checks, and it does not make this cell reachable: the four
+///   admission-closure identities named above still have no production
+///   construction site, so `admit_context_traced` remains uncalled. The
 ///   `#40`-frozen
 ///   `eliot_context::ContextCompiler::compile_with_campaign_learning_state`
 ///   named by an earlier revision of this note has NO call site either, so it

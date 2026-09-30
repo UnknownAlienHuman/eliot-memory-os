@@ -106,12 +106,23 @@ reason = "Smart handlers are deterministic/stateless or rebuildable projections 
 # it must use owner contracts and never call the #40-frozen donor algorithm in
 # `eliot-context`. The production call and its `#[allow(deprecated)]` were
 # removed; this remains a no-new-call prohibition, not a live compile edge. The
+# immutable campaign view now enters a current owner cell instead
+# (`eliot-context-candidates::check_campaign_learning_state_view`), and the
 # surviving campaign_publication imports and their #40 removal denominator are
 # recorded separately below.
 [[forbidden_compile_edge]]
 from = "bins/eliotd campaign packet route (eliot.packet)"
 to = "eliot-context legacy ContextCompiler / CampaignCompiledContext"
-reason = "the frozen donor surface takes no new caller; compile_with_campaign_learning_state has zero product callers, so this row is a regression prohibition rather than a current edge. The campaign_publication imports that remain are recorded in legacy_facade_consumer."
+reason = "the frozen donor surface takes no new caller; compile_with_campaign_learning_state has zero product callers, so this row is a regression prohibition rather than a current edge. The campaign view's load-bearing revision and State Fence joins are owned by eliot-context-candidates::check_campaign_learning_state_view, not by this facade. The campaign_publication imports that remain are recorded in legacy_facade_consumer."
+
+# #1862: the campaign view must not reach the current cells as a donor-produced
+# compile DTO. The candidate cell re-derives every join it enforces, so the
+# route carries the immutable view and the Context owner's independently
+# re-derived recipe digest, never a legacy compiler verdict.
+[[forbidden_compile_edge]]
+from = "bins/eliotd campaign packet route (eliot.packet)"
+to = "any donor-produced campaign compile verdict presented to eliot-context-candidates / eliot-context-admission / eliot-context-assembly"
+reason = "the current owner cells own the load-bearing revision and State Fence joins; a caller-carried compile DTO is a second, unverifiable spelling of the same facts and is refused by construction at the candidate cell"
 
 [[legacy_facade_consumer]]
 issue = 1862
@@ -142,7 +153,12 @@ facade_disposition_rows = 62
 campaign_publication_disposition_rows = 10
 compile_with_campaign_learning_state_product_callers = 0
 replacement_owner_chain = ["A-15", "A-16a", "A-17a", "A-18"]
-owner_admission_status = "AUD1_PARTIAL_NO_ADMITTED_OWNER_MINTED_CLOSURE"
+admitted_campaign_view_join = "eliot-context-candidates::check_campaign_learning_state_view"
+admitted_campaign_view_join_caller = "bins/eliotd/src/campaign_packet.rs::candidate_request_for_packet"
+admitted_campaign_view_join_enforces = "view State Fence against the candidate request binding; task/scope/request identity; load-bearing Context recipe owner revision against the Context owner's independently re-derived recipe body digest; refusal of invalidated, STALE, BLOCKED and missing-Context-row views"
+unadmitted_campaign_view_joins = ["eliot-context-candidates::construct_context_candidates", "eliot-context-admission::admit_context_traced", "eliot-context-assembly::assemble_active_view"]
+unadmitted_campaign_view_join_reason = "the seven provider role projections and the owner-minted admission closure (SafetyFloorIdentity, PriorityPolicyIdentity, AdmissionRuleIdentity, MeasurementCompositionProfile, QualityScorecard, AssemblyPolicy, measurement port) have zero production construction sites, so KernelContextReadClient::compile_context_packet has no callable argument set and minting them would fabricate the I12.26 selection record"
+owner_admission_status = "AUD1_PARTIAL_CANDIDATE_CELL_JOIN_ADMITTED_MAPPER_AND_ADMISSION_ASSEMBLY_UNADMITTED"
 removal_condition = "Migrate all three bins/eliotd source modules from the frozen campaign_publication surface to admitted owner contracts, then re-verify zero external Cargo dependents and zero imports before #40 A4 facade retirement. The owner chain is not yet an admitted campaign closure."
 
 # Issue #816 uses consumer -> dependency notation for compile edges.  Runtime
