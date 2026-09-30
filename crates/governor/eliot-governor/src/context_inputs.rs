@@ -70,6 +70,18 @@
 //! envelopes (`{version, <selector>, scope_id, records, provenance}`), not
 //! admitted Cue arrays or qualified capability; binding those envelopes to the
 //! typed cue families and to #1773's capability work is a separate slice.
+//!
+//! Committed Problem readback (issue #1759 I2 readback, I13.9): when — and only
+//! when — the request names an exact `attention_problem_id`, the attention
+//! role's page is decoded into the canonical [`ProblemReadback`] carried on
+//! [`SevenRoleInputs::problem_readback`]. It adds no read, no store operation and
+//! no second Problem model: the record is the `record_json` of committed
+//! `ApplyProblemOwnerState` transitions that same page already returns, decoded
+//! through the store's own `decode_problem_owner_state_mutation` and validated by
+//! the Problem model. It is a read model, not a receipt — it closes nothing,
+//! promotes nothing and grants no repair — and a page that does not decode to one
+//! Problem's ordered committed history is a typed
+//! [`ContextInputsError::AttentionPageUndecodable`], never a partial readback.
 
 use std::collections::BTreeMap;
 
@@ -87,6 +99,8 @@ use eliot_store_api::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+
+use crate::problem_read_site::{ProblemReadback, ProblemReadbackError, read_committed_problem};
 
 /// Role label for the `TaskFrame` slot.
 pub const ROLE_TASK_FRAME: &str = "task_frame";
@@ -130,6 +144,15 @@ pub enum ContextInputsError {
     /// outcome); this is a programming error, never a role disposition.
     #[error("context reconstruction role request was rejected: {0}")]
     RequestRejected(String),
+    /// The `GetAttentionAndProblems` page the attention role returned is not a
+    /// decodable, ordered history of canonical Problem revisions, so no committed
+    /// Problem can be read back from it.
+    ///
+    /// This is neither a per-role disposition nor an empty result: a page that
+    /// does not decode is a defect in what was read, and serving a spliced or
+    /// partial history from it would present a record that was never committed.
+    #[error(transparent)]
+    AttentionPageUndecodable(#[from] ProblemReadbackError),
 }
 
 /// Closed request for one seven-role reconstruction.
@@ -314,6 +337,21 @@ pub struct SevenRoleInputs {
     pub task_frame: RoleAcquisition,
     /// `CriticalAttention`/`Conflict` role (`GetAttentionAndProblems`).
     pub attention: RoleAcquisition,
+    /// The committed canonical Problem read back from the attention role for the
+    /// requested `attention_problem_id` (issue #1759 I2 readback, I13.9).
+    ///
+    /// `None` is an honest outcome, not a missing read: no specific Problem was
+    /// requested, the attention source authoritatively reported nothing committed
+    /// for the requested identity, or the role was not readable enough to hold
+    /// one. A required member rather than a defaulted one, so a reader cannot
+    /// mistake an absent readback for a Problem with nothing to report.
+    ///
+    /// This is a read model over committed history, not authority: it closes
+    /// nothing, promotes nothing and grants no repair. A page that does not
+    /// decode to one Problem's ordered committed history is
+    /// [`ContextInputsError::AttentionPageUndecodable`], never a partial
+    /// readback.
+    pub problem_readback: Option<ProblemReadback>,
     /// `CurrentEpistemicPosition` role (`GetCurrentEpistemicPosition`).
     pub epistemic: RoleAcquisition,
     /// Decoded T11.2 readback when the epistemic role is `Complete`.
@@ -460,26 +498,9 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
                 request.projection_max_records,
             )
             .await?;
-        // Negative memory reuses the cue read only when it deliberately
-        // addresses the SAME exact source snapshot — identical selector and
-        // bound. A different source set is read separately, so the two slots
-        // stay separately identified (inputs.rs:1-13) without one unrelated
-        // result being relabelled into both roles.
-        let negative_memory = if request.negative_memory_selector == request.projection_selector
-            && request.negative_memory_max_records == request.projection_max_records
-        {
-            cue.clone()
-        } else {
-            self.acquire_projection_inputs(
-                ctx,
-                request,
-                &ordering,
-                ROLE_NEGATIVE_MEMORY,
-                &request.negative_memory_selector,
-                request.negative_memory_max_records,
-            )
-            .await?
-        };
+        let negative_memory = self
+            .acquire_negative_memory(ctx, request, &ordering, &cue)
+            .await?;
         let evidence = self.acquire_evidence(ctx, request, &ordering).await?;
         let affordances = self
             .acquire_state(
@@ -498,6 +519,15 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
         if heads_after != heads_before {
             return Err(ContextInputsError::SourceHeadsChanged);
         }
+        // The committed Problem is read back from the attention role this same
+        // reconstruction already read (issue #1759 I2 readback), under the same
+        // coherent closure: it adds no read, no store operation and no second
+        // Problem model. A Problem-scoped read is the only scope in which a
+        // committed record exists; an unscoped attention request names no
+        // Problem, so it produces no readback rather than one about an arbitrary
+        // record.
+        let problem_readback =
+            read_committed_problem(&attention, request.attention_problem_id.as_deref())?;
         Ok(SevenRoleInputs {
             scope_id: request.scope_id.clone(),
             state_fence: ctx.state_fence.clone(),
@@ -506,6 +536,7 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
             heads_after,
             task_frame,
             attention,
+            problem_readback,
             epistemic,
             epistemic_readback,
             cue,
@@ -665,6 +696,37 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
                 identity: None,
             }),
         }
+    }
+
+    /// Acquires the negative-memory role, reusing the cue acquisition only when
+    /// the request deliberately addresses the same exact source snapshot.
+    ///
+    /// Negative memory reuses the cue read only when it deliberately addresses
+    /// the SAME exact source snapshot — identical selector and bound. A
+    /// different source set is read separately, so the two slots stay separately
+    /// identified (inputs.rs:1-13) without one unrelated result being relabelled
+    /// into both roles.
+    async fn acquire_negative_memory(
+        &self,
+        ctx: &RequestMetadata,
+        request: &ContextReconstructionRequest,
+        ordering: &ReadOrderingBinding,
+        cue: &RoleAcquisition,
+    ) -> Result<RoleAcquisition, ContextInputsError> {
+        if request.negative_memory_selector == request.projection_selector
+            && request.negative_memory_max_records == request.projection_max_records
+        {
+            return Ok(cue.clone());
+        }
+        self.acquire_projection_inputs(
+            ctx,
+            request,
+            ordering,
+            ROLE_NEGATIVE_MEMORY,
+            &request.negative_memory_selector,
+            request.negative_memory_max_records,
+        )
+        .await
     }
 
     async fn acquire_epistemic(
@@ -1376,6 +1438,7 @@ mod reconstruction_tests {
             heads_after: test_heads("scope-a")?,
             task_frame: unavailable_role(NamedReadOperation::GetTaskState),
             attention: unavailable_role(NamedReadOperation::GetAttentionAndProblems),
+            problem_readback: None,
             epistemic: RoleAcquisition {
                 operation: NamedReadOperation::GetCurrentEpistemicPosition,
                 state: ProjectionState::KnownEmpty,
