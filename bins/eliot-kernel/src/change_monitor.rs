@@ -37,6 +37,21 @@
 //! stay historically addressable. Resolver projection itself is a
 //! separate lane and is not built here.
 //!
+//! Durability: the ledger persists a versioned JSON sidecar under the
+//! default work root (`.eliot/kernel-change-ledger.v1.json`, beside the
+//! `kernel-ors.redb` precedent) after process-effect mutations, and the
+//! finish-acceptance leg rehydrates it when this process started fresh.
+//! Reads stay fail-closed: a poisoned lock blocks acceptance, tips never
+//! advance past unconfirmed or unreconciled Material, and observation
+//! failures against a previously observed tip leave an explicit
+//! gap-marked unknown that blocks until a proven observation continues
+//! from the same before-state. Crash-window boundary: a mutation recorded
+//! in memory but not yet persisted is re-detected after restart by
+//! comparing the restored tip against fresh reads, which re-emits the
+//! unknown-origin record; the first-ever observation of a path establishes
+//! the baseline silently because no oracle distinguishes pre-existing
+//! bytes from placed ones.
+//!
 //! Evidence rule: the Kernel never invents source bytes. Content checksums
 //! are computed here with [`crate::sha256_hex`] over the exact bytes the
 //! trusted readback caller supplies, and every record is keyed by its own
@@ -44,7 +59,10 @@
 //! one operation is never reused for another.
 
 use std::collections::{BTreeMap, btree_map::Entry};
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+
+use serde::{Deserialize, Serialize};
 
 /// Typed `ChangeMonitor` failures. Every variant is constructed below; there
 /// is no stringly error and no silent drop.
@@ -80,6 +98,10 @@ pub(crate) enum ChangeMonitorError {
     UnknownChange,
     /// Reconciliation evidence does not prove the exact recorded transition.
     TransitionMismatch,
+    /// The durable ledger sidecar cannot be read or written.
+    SidecarUnavailable,
+    /// The durable ledger sidecar failed integrity validation.
+    SidecarCorrupt,
 }
 
 impl std::fmt::Display for ChangeMonitorError {
@@ -96,6 +118,8 @@ impl std::fmt::Display for ChangeMonitorError {
             Self::OperationReuse => "change_monitor_operation_reuse",
             Self::UnknownChange => "change_monitor_unknown_change",
             Self::TransitionMismatch => "change_monitor_transition_mismatch",
+            Self::SidecarUnavailable => "change_monitor_sidecar_unavailable",
+            Self::SidecarCorrupt => "change_monitor_sidecar_corrupt",
         };
         f.write_str(code)
     }
@@ -114,7 +138,7 @@ impl std::error::Error for ChangeMonitorError {}
 /// read-only (see [`GitReadback`]) and performs no porcelain status, so a
 /// filesystem-sourced transition surfaces as an unknown-origin Material
 /// change on real content evidence, never as an invented repository claim.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) enum HintOrigin {
     HostEvent,
     FilesystemNotification,
@@ -127,7 +151,7 @@ pub(crate) enum HintOrigin {
 /// ingests each governed tool operation as a host-event hint;
 /// [`observe_filesystem_notification`] ingests each received OS filesystem
 /// notification as a filesystem hint with real Git-substrate evidence.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct KernelChangeHint {
     pub hint_id: String,
     pub resource: String,
@@ -136,20 +160,141 @@ pub(crate) struct KernelChangeHint {
     pub origin_ref: Option<String>,
 }
 
-/// One direct content read: the exact bytes hashed. Deletion readback has
-/// no in-crate producer yet, so absence is expressed only through a missing
-/// baseline (`None`), never through this type.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// One direct content read: the exact bytes hashed, or the proven absence
+/// of the tracked path. Absence is deletion/creation evidence (both
+/// agreeing reads returned not-found); any other read failure is not
+/// representable here and must stay outside baselines and receipts.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) enum ContentRead {
     Present { sha256: String },
+    Absent,
 }
 
 impl ContentRead {
-    fn digest(&self) -> &str {
+    fn digest(&self) -> Option<&str> {
         match self {
-            Self::Present { sha256 } => sha256,
+            Self::Present { sha256 } => Some(sha256),
+            Self::Absent => None,
         }
     }
+}
+
+/// Repository HEAD state proven by direct `.git/HEAD` file reads for one
+/// tracked path (I10.21 W2 Git leg). No process is launched and no
+/// `git status`/diff output is claimed: this is the repository identity
+/// plus the before/after commits the readback actually opened. Constructed
+/// only by [`read_git_head`]; a path no repository claims yields `None`,
+/// never an invented claim.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct GitHeadRead {
+    pub repository: String,
+    pub head_ref: String,
+    pub head_commit: String,
+}
+
+fn is_git_sha(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn validate_git_head(head: &GitHeadRead) -> Result<(), ChangeMonitorError> {
+    if !text(&head.repository) || !text(&head.head_ref) || !is_git_sha(&head.head_commit) {
+        return Err(ChangeMonitorError::InvalidGitEvidence);
+    }
+    Ok(())
+}
+
+/// Reads the repository HEAD claiming one tracked path using only direct
+/// file reads: walks ancestors for `.git/HEAD` (following a worktree
+/// `gitdir:` pointer file when present), then resolves the `ref:` target
+/// through the loose ref file or `packed-refs`. Returns `None` when no
+/// repository claims the path or the ref cannot be resolved to an exact
+/// commit, so callers attach Git evidence only from proven reads.
+pub(crate) fn read_git_head(path: &Path) -> Option<GitHeadRead> {
+    let start = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent()?.to_path_buf()
+    };
+    let mut current = start.as_path();
+    loop {
+        let dot_git = current.join(".git");
+        if let Some(git_dir) = resolve_git_dir(&dot_git)
+            && let Some(head) = read_head_in(&git_dir)
+        {
+            let candidate = GitHeadRead {
+                repository: current.to_string_lossy().into_owned(),
+                head_ref: head.0,
+                head_commit: head.1,
+            };
+            if validate_git_head(&candidate).is_ok() {
+                return Some(candidate);
+            }
+        }
+        current = current.parent()?;
+    }
+}
+
+fn resolve_git_dir(dot_git: &Path) -> Option<PathBuf> {
+    if dot_git.is_dir() {
+        return Some(dot_git.to_path_buf());
+    }
+    if dot_git.is_file() {
+        let pointer = std::fs::read_to_string(dot_git).ok()?;
+        let target = pointer.strip_prefix("gitdir:")?.trim();
+        if target.is_empty() || target.len() > 1024 {
+            return None;
+        }
+        let resolved = if Path::new(target).is_absolute() {
+            PathBuf::from(target)
+        } else {
+            dot_git.parent()?.join(target)
+        };
+        if resolved.is_dir() {
+            return Some(resolved);
+        }
+    }
+    None
+}
+
+fn read_small_text(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.len() > 4096 {
+        return None;
+    }
+    String::from_utf8(bytes).ok().map(|text| text.trim().to_owned())
+}
+
+fn read_head_in(git_dir: &Path) -> Option<(String, String)> {
+    let head = read_small_text(&git_dir.join("HEAD"))?;
+    if let Some(head_ref) = head.strip_prefix("ref:") {
+        let head_ref = head_ref.trim().to_owned();
+        if head_ref.is_empty() || head_ref.len() > 512 {
+            return None;
+        }
+        if let Some(commit) = read_small_text(&git_dir.join(&head_ref))
+            && is_git_sha(&commit)
+        {
+            return Some((head_ref, commit));
+        }
+        let packed = std::fs::read_to_string(git_dir.join("packed-refs")).ok()?;
+        for line in packed.lines() {
+            if line.starts_with('#') || line.starts_with('^') {
+                continue;
+            }
+            let mut parts = line.split_whitespace();
+            if let (Some(commit), Some(name)) = (parts.next(), parts.next())
+                && name == head_ref
+                && is_git_sha(commit)
+            {
+                return Some((head_ref, commit.to_owned()));
+            }
+        }
+        return None;
+    }
+    if is_git_sha(&head) {
+        return Some(("DETACHED".to_owned(), head));
+    }
+    None
 }
 
 /// Readback evidence bound to the same hinted artifact as the two direct
@@ -160,17 +305,18 @@ impl ContentRead {
 /// [`ChangeMonitorError::InvalidGitEvidence`]. A `Some` value must pass
 /// [`validate_git`]; half-filled repository claims are refused rather than
 /// confirmed. The Kernel observes the Git HEAD substrate read-only and
-/// performs no porcelain status: `status_ref` names the exact
-/// HEAD-substrate receipt the adapter read around the content reads, and
-/// `status_sha256` is the SHA-256 over those exact substrate bytes, so the
-/// head values are bound to real bytes, never invented.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// performs no porcelain status: `status_ref`/`status_sha256` carry the
+/// exact HEAD-substrate receipt the adapter read around the content reads
+/// (SHA-256 over those exact substrate bytes, so the head values are bound
+/// to real bytes, never invented), or are both absent when the confirming
+/// lane observed no substrate; a half-filled pair is refused.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct GitReadback {
     pub repository: String,
     pub head_before: String,
     pub head_after: String,
-    pub status_ref: String,
-    pub status_sha256: String,
+    pub status_ref: Option<String>,
+    pub status_sha256: Option<String>,
     pub before_revision: Option<String>,
     pub after_revision: Option<String>,
     pub diff_handle: Option<String>,
@@ -185,7 +331,7 @@ pub(crate) struct GitReadback {
 /// other outcome is a Material transition, never a self-comparison.
 ///
 /// Caller (I10.21 W2): `crate::process_execution::KernelGovernedProcessEffectPort`.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct HintVerification {
     pub before_digest: Option<String>,
     pub first_read: ContentRead,
@@ -200,20 +346,25 @@ pub(crate) struct HintVerification {
 /// hashes the supplied bytes itself and drops them; only digests are
 /// retained.
 ///
-/// Ingress contract (fail-closed): both content sides must be present so the
-/// ledger hashes real before/after source bytes, and `diff_handle` must be
+/// Ingress contract (fail-closed): at least one content side must be real
+/// bytes the producing lane read back, so the ledger hashes source truth
+/// instead of envelope identity. `before_bytes: None` with `after_bytes:
+/// Some` is a creation, `before_bytes: Some` with `after_bytes: None` is a
+/// deletion; both `None` carries no pair at all and both `Some` with equal
+/// digests carries no transition, so both are refused with
+/// [`ChangeMonitorError::InvalidGovernedChange`]. `diff_handle` must be
 /// the exact transition digest for `(change_id, before, after)` — a copied
-/// unrelated digest does not resolve and is refused with
-/// [`ChangeMonitorError::InvalidGovernedChange`]. The fence fields must be
-/// the joined generation and the invalidation outcome the producing lane
+/// unrelated digest does not resolve and is refused. The fence fields must
+/// be the joined generation and the invalidation outcome the producing lane
 /// actually observed. A lane that observed only its own IPC envelope
 /// (request/result digests, no tracked-source bytes) cannot satisfy this
 /// contract; its record is refused, never stored as source identity.
 ///
 /// Caller (I10.21 A1):
 /// `crate::process_execution::KernelGovernedProcessEffectPort::ingest`,
-/// which feeds the record from real pre-effect/terminal readback bytes.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// which feeds one record per declared target from real pre-effect/terminal
+/// readback bytes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct GovernedToolChange {
     pub change_id: String,
     pub resource: String,
@@ -234,7 +385,7 @@ pub(crate) struct GovernedToolChange {
 
 /// Admission of one hint: accepted for verification, or replayed when the
 /// exact hint was already ingested.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) enum HintAdmission {
     Accepted,
     Replayed,
@@ -243,26 +394,26 @@ pub(crate) enum HintAdmission {
 /// Outcome of confirming one hint: either the re-read proves no Material
 /// transition, or a Material transition was recorded (with whether
 /// matching governed evidence already reconciled it).
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) enum HintConfirmation {
     VerifiedImmaterial,
     MaterialRecorded { change_id: String, reconciled: bool },
 }
 
 /// Admission of one governed-tool record.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) enum GovernedAdmission {
     Accepted,
     Replayed,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct HintEntry {
     hint: KernelChangeHint,
     confirmation: Option<HintConfirmation>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct GovernedChangeRecord {
     resource: String,
     path: String,
@@ -280,28 +431,48 @@ struct GovernedChangeRecord {
     fence_invalidated: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct UnknownOriginRecord {
     resource: String,
     before_digest: Option<String>,
     after_digest: Option<String>,
     transition_digest: String,
     reconciled: bool,
+    /// A readback failure against a previously observed tip left this
+    /// blocking marker instead of a proven transition (`after_digest` is
+    /// unknown, not absent). It closes only when a proven observation for
+    /// the same resource continues from the same before-state.
+    #[serde(default)]
+    unresolved_gap: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct UnknownReconciliation {
     unknown_change_id: String,
     evidence_change_id: String,
 }
 
-#[derive(Default)]
+/// Last confirmed state of one tracked resource: the digest the ledger
+/// last proved (`None` = last proved absent) plus the last confirmed
+/// repository commit. Tips are the effect lane's retained baseline: the
+/// external-transition detector compares fresh reads against them, and
+/// they advance only on verified-immaterial or reconciled-material
+/// confirmations — never past unconfirmed or unreconciled Material.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ResourceTip {
+    pub digest: Option<String>,
+    pub head_commit: Option<String>,
+    pub repository: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct KernelChangeLedger {
     hints: BTreeMap<String, HintEntry>,
     governed: BTreeMap<String, GovernedChangeRecord>,
     governed_by_operation: BTreeMap<String, Vec<String>>,
     unknown: BTreeMap<String, UnknownOriginRecord>,
     reconciliations: Vec<UnknownReconciliation>,
+    tips: BTreeMap<String, ResourceTip>,
 }
 
 static CHANGE_LEDGER: OnceLock<Mutex<KernelChangeLedger>> = OnceLock::new();
@@ -348,13 +519,14 @@ fn validate_hint(hint: &KernelChangeHint) -> Result<(), ChangeMonitorError> {
 }
 
 fn validate_git(git: &GitReadback) -> Result<(), ChangeMonitorError> {
-    if !text(&git.repository)
-        || !text(&git.head_before)
-        || !text(&git.head_after)
-        || !text(&git.status_ref)
-        || !is_sha256_hex(&git.status_sha256)
-    {
+    if !text(&git.repository) || !is_git_sha(&git.head_before) || !is_git_sha(&git.head_after) {
         return Err(ChangeMonitorError::InvalidGitEvidence);
+    }
+    match (&git.status_ref, &git.status_sha256) {
+        (None, None) => {}
+        (Some(status_ref), Some(status_sha256))
+            if text(status_ref) && is_sha256_hex(status_sha256) => {}
+        _ => return Err(ChangeMonitorError::InvalidGitEvidence),
     }
     for revision in [&git.before_revision, &git.after_revision]
         .into_iter()
@@ -379,7 +551,9 @@ fn validate_verification(verification: &HintVerification) -> Result<(), ChangeMo
         return Err(ChangeMonitorError::InvalidGitEvidence);
     }
     for read in [&verification.first_read, &verification.reread] {
-        if !is_sha256_hex(read.digest()) {
+        if let Some(digest) = read.digest()
+            && !is_sha256_hex(digest)
+        {
             return Err(ChangeMonitorError::InvalidGitEvidence);
         }
     }
@@ -462,11 +636,13 @@ pub(crate) fn material_transition_ids(
 
 /// Confirms one hint with trusted content and readback evidence (I10.21
 /// W2, second half). The two content reads must agree or the readback
-/// proves nothing; a Material transition (after digest differs from the
-/// retained baseline) emits an unknown-origin Material change (I10.21 A2),
-/// reconciled immediately only when a recorded governed change already
-/// proves the exact same resource transition (same before and after
-/// digests, not merely the same after bytes).
+/// proves nothing; an `Absent` pair against an absent baseline is
+/// immaterial, while a Material transition (after state differs from the
+/// retained baseline, including creation and deletion) emits an
+/// unknown-origin Material change (I10.21 A2), reconciled immediately only
+/// when a recorded governed change already proves the exact same resource
+/// transition (same before and after digests, not merely the same after
+/// bytes).
 ///
 /// Confirmation is evidence-driven, never sticky: identical evidence
 /// replays the identical outcome, while new evidence under a retried
@@ -478,7 +654,13 @@ pub(crate) fn material_transition_ids(
 /// polling alone. The refusal leaves the hint pending, which keeps governed
 /// acceptance blocked until a Git-backed readback resolves it.
 /// History is still never rewritten: unknown records are keyed by their
-/// exact transition and reconciliation only appends links.
+/// exact transition and reconciliation only appends links. Tips advance
+/// only on verified-immaterial or reconciled-material outcomes, so the
+/// retained baseline never moves past an unreconciled Material mutation:
+/// the next capture re-detects it and re-surfaces the same unknown record
+/// instead of observing it away. A proven observation that continues from
+/// a gap-marked before-state also closes that gap, since the gap's guard
+/// duty is subsumed by the new blocking unknown.
 ///
 /// Caller (I10.21 W2):
 /// `crate::process_execution::KernelGovernedProcessEffectPort`.
@@ -490,12 +672,12 @@ pub(crate) fn confirm_hint(
     if verification.first_read != verification.reread {
         return Err(ChangeMonitorError::UnstableReadback);
     }
-    let after_digest = verification.reread.digest().to_owned();
+    let after_digest = verification.reread.digest().map(str::to_owned);
     let before_digest = verification.before_digest.clone();
     let (change_id, transition_digest) = material_transition_ids(
         hint_id,
         before_digest.as_deref(),
-        Some(after_digest.as_str()),
+        after_digest.as_deref(),
     );
     let mut ledger = ledger()?;
     let (resource, origin) = ledger
@@ -510,12 +692,23 @@ pub(crate) fn confirm_hint(
     if origin == HintOrigin::FilesystemNotification && verification.git.is_none() {
         return Err(ChangeMonitorError::InvalidGitEvidence);
     }
-    if before_digest.as_deref() == Some(after_digest.as_str()) {
+    if before_digest == after_digest {
         let entry = ledger
             .hints
             .get_mut(hint_id)
             .ok_or(ChangeMonitorError::UnknownHint)?;
         entry.confirmation = Some(HintConfirmation::VerifiedImmaterial);
+        ledger.tips.insert(
+            resource,
+            ResourceTip {
+                digest: before_digest,
+                head_commit: verification.git.as_ref().map(|git| git.head_after.clone()),
+                repository: verification
+                    .git
+                    .as_ref()
+                    .map(|git| git.repository.clone()),
+            },
+        );
         return Ok(HintConfirmation::VerifiedImmaterial);
     }
     let evidence_id = ledger
@@ -523,19 +716,20 @@ pub(crate) fn confirm_hint(
         .iter()
         .find(|(_, record)| {
             record.resource == resource
-                && record.before_digest.as_deref() == before_digest.as_deref()
-                && record.after_digest.as_deref() == Some(after_digest.as_str())
+                && record.before_digest == before_digest
+                && record.after_digest == after_digest
         })
         .map(|(evidence_id, _)| evidence_id.clone());
     let reconciled = evidence_id.is_some();
     let newly_reconciled = match ledger.unknown.entry(change_id.clone()) {
         Entry::Vacant(slot) => {
             slot.insert(UnknownOriginRecord {
-                resource,
-                before_digest,
-                after_digest: Some(after_digest),
+                resource: resource.clone(),
+                before_digest: before_digest.clone(),
+                after_digest: after_digest.clone(),
                 transition_digest,
                 reconciled,
+                unresolved_gap: false,
             });
             reconciled
         }
@@ -553,6 +747,20 @@ pub(crate) fn confirm_hint(
             unknown_change_id: change_id.clone(),
             evidence_change_id: evidence_id,
         });
+    }
+    close_gaps_from_proven_before(&mut ledger, &resource, &before_digest, &change_id);
+    if reconciled {
+        ledger.tips.insert(
+            resource,
+            ResourceTip {
+                digest: after_digest,
+                head_commit: verification.git.as_ref().map(|git| git.head_after.clone()),
+                repository: verification
+                    .git
+                    .as_ref()
+                    .map(|git| git.repository.clone()),
+            },
+        );
     }
     let entry = ledger
         .hints
@@ -725,8 +933,8 @@ pub(crate) fn observe_filesystem_notification(
         repository,
         head_before: substrate_before.head,
         head_after: substrate_after.head,
-        status_ref,
-        status_sha256: crate::sha256_hex(&status_bytes),
+        status_ref: Some(status_ref),
+        status_sha256: Some(crate::sha256_hex(&status_bytes)),
         before_revision: None,
         after_revision: None,
         diff_handle: None,
@@ -749,22 +957,62 @@ pub(crate) fn observe_filesystem_notification(
     };
     confirm_hint(&hint_id, &verification)
 }
+/// Closes gap-marked unknowns for one resource once a proven observation
+/// continues from the gap's exact before-state: the new unknown record
+/// (identified by `covering_change_id`) now guards the resource, so the
+/// gap's blocking duty is subsumed by it instead of bricking the resource.
+fn close_gaps_from_proven_before(
+    ledger: &mut KernelChangeLedger,
+    resource: &str,
+    before_digest: &Option<String>,
+    covering_change_id: &str,
+) {
+    let covered: Vec<String> = ledger
+        .unknown
+        .iter()
+        .filter(|(_, unknown)| {
+            unknown.unresolved_gap
+                && !unknown.reconciled
+                && unknown.resource == resource
+                && unknown.before_digest == *before_digest
+        })
+        .map(|(unknown_id, _)| unknown_id.clone())
+        .collect();
+    for unknown_id in covered {
+        if let Some(unknown) = ledger.unknown.get_mut(&unknown_id) {
+            unknown.reconciled = true;
+        }
+        ledger.reconciliations.push(UnknownReconciliation {
+            unknown_change_id: unknown_id,
+            evidence_change_id: covering_change_id.to_owned(),
+        });
+    }
+}
 
 /// Records one governed-tool mutation with exact before/after revisions,
 /// the associated session, fenced-attempt lease, tool operation, and
 /// attempt receipt, the diff handle, and the observed State-Fence
 /// invalidation (I10.21 A1). Content checksums are computed here over the
 /// exact bytes supplied; the bytes are dropped and only digests retained.
-/// A record without both content sides, or whose diff handle does not name
-/// its exact before/after transition, is refused: the ledger stores source
-/// identity, never envelope identity. A recorded governed transition
-/// reconciles the matching unknown-origin change for the exact same
-/// resource transition. History is never rewritten: an exact replay is
-/// reported, a conflicting identity is refused, and a lease/session/
-/// operation owned by another operation is never reused.
+/// A creation carries `before_bytes: None`, a deletion carries
+/// `after_bytes: None`; a record with neither side, or with agreeing
+/// present sides, proves no transition and is refused. The diff handle
+/// must resolve to the exact recorded transition through the ledger's own
+/// transition binder (shared with `confirm_hint` and the finish-leg
+/// reconciliation, never a second resolver). A byte copy of an unrelated
+/// digest names no transition this ledger recorded and is refused. A
+/// recorded governed transition reconciles the matching unknown-origin
+/// change for the exact same resource transition, and closes a gap-marked
+/// unknown that starts from the same before-state. History is never
+/// rewritten: an exact replay is reported, a conflicting identity is
+/// refused, and a lease/session/operation owned by another change is never
+/// reused. Tips are deliberately untouched here: only a confirmed
+/// readback advances the retained baseline, never the record alone.
 ///
 /// Caller (I10.21 A1):
-/// `crate::process_execution::KernelGovernedProcessEffectPort::ingest`.
+/// `crate::process_execution::KernelGovernedProcessEffectPort::ingest`,
+/// which feeds one record per declared target from real
+/// pre-effect/terminal readback bytes.
 pub(crate) fn record_governed_tool_change(
     change: &GovernedToolChange,
 ) -> Result<GovernedAdmission, ChangeMonitorError> {
@@ -794,14 +1042,15 @@ pub(crate) fn record_governed_tool_change(
     }
     let before_digest = change.before_bytes.as_deref().map(crate::sha256_hex);
     let after_digest = change.after_bytes.as_deref().map(crate::sha256_hex);
-    // I10.21 A1: both content sides must be real bytes the producing lane
-    // read back. `None` on either side means no source identity exists for
-    // that side (an envelope/request digest is operation identity, not
+    // I10.21 A1: at least one content side must be real bytes the producing
+    // lane read back. `None` on exactly one side is the creation/deletion
+    // shape; `None` on both sides means no source identity exists for
+    // either side (an envelope/request digest is operation identity, not
     // content), so there is no before/after pair to record.
-    let (Some(before_digest), Some(after_digest)) = (before_digest, after_digest) else {
+    if before_digest.is_none() && after_digest.is_none() {
         return Err(ChangeMonitorError::InvalidGovernedChange);
-    };
-    if before_digest == after_digest {
+    }
+    if before_digest.is_some() && before_digest == after_digest {
         return Err(ChangeMonitorError::InvalidGovernedChange);
     }
     // I10.21 A1: the diff handle must resolve to the exact recorded
@@ -811,8 +1060,8 @@ pub(crate) fn record_governed_tool_change(
     // this ledger recorded and is refused.
     let (_, transition_digest) = material_transition_ids(
         &change.change_id,
-        Some(before_digest.as_str()),
-        Some(after_digest.as_str()),
+        before_digest.as_deref(),
+        after_digest.as_deref(),
     );
     if change.diff_handle != transition_digest {
         return Err(ChangeMonitorError::InvalidGovernedChange);
@@ -822,9 +1071,9 @@ pub(crate) fn record_governed_tool_change(
         path: change.path.clone(),
         before_path: change.before_path.clone(),
         before_revision: change.before_revision.clone(),
-        before_digest: Some(before_digest.clone()),
+        before_digest: before_digest.clone(),
         after_revision: change.after_revision.clone(),
-        after_digest: Some(after_digest.clone()),
+        after_digest: after_digest.clone(),
         session: change.session.clone(),
         action_lease: change.action_lease.clone(),
         operation: change.operation.clone(),
@@ -866,9 +1115,10 @@ pub(crate) fn record_governed_tool_change(
         .iter()
         .filter(|(_, unknown)| {
             !unknown.reconciled
+                && !unknown.unresolved_gap
                 && unknown.resource == change.resource
-                && unknown.before_digest.as_deref() == Some(before_digest.as_str())
-                && unknown.after_digest.as_deref() == Some(after_digest.as_str())
+                && unknown.before_digest == before_digest
+                && unknown.after_digest == after_digest
         })
         .map(|(unknown_id, _)| (unknown_id.clone(), change.change_id.clone()))
         .collect();
@@ -881,6 +1131,12 @@ pub(crate) fn record_governed_tool_change(
             evidence_change_id: evidence_id,
         });
     }
+    close_gaps_from_proven_before(
+        &mut ledger,
+        &change.resource,
+        &before_digest,
+        &change.change_id,
+    );
     Ok(GovernedAdmission::Accepted)
 }
 
@@ -919,6 +1175,247 @@ pub(crate) fn reconcile_unknown_change(
     Ok(())
 }
 
+/// Records a fail-closed blocking marker after an observation failure
+/// against a previously observed tip (I10.21 A2): unreadable or disagreeing
+/// readback where fresh reads were expected. The marker carries the frozen
+/// before-state with an unknown after-state, so it can never be mistaken
+/// for a proven deletion, and it blocks governed acceptance exactly like
+/// an unreconciled unknown. It is idempotent per operation: retrying the
+/// same failed observation replays the same marker. It closes only when a
+/// proven observation for the same resource continues from the same
+/// before-state (see [`confirm_hint`] and [`record_governed_tool_change`]),
+/// so a transient read glitch is recovered by the next capture instead of
+/// bricking the resource, while a real hidden mutation stays blocked
+/// behind the re-detected unknown.
+///
+/// Caller (I10.21 A2/A4):
+/// `crate::process_execution::KernelGovernedProcessEffectPort`, on
+/// capture/readback/ingest failures where [`resource_tip`] proves a prior
+/// observation exists. A failure on a never-observed path records nothing,
+/// since there is no baseline to protect and the first successful read
+/// establishes it.
+pub(crate) fn note_unresolved_transition(
+    resource: &str,
+    operation: &str,
+    before_digest: Option<String>,
+) -> Result<String, ChangeMonitorError> {
+    if !text(resource) || !text(operation) {
+        return Err(ChangeMonitorError::InvalidHint);
+    }
+    if let Some(before) = &before_digest
+        && !is_sha256_hex(before)
+    {
+        return Err(ChangeMonitorError::InvalidHint);
+    }
+    let (change_id, transition_digest) = material_transition_ids(
+        &format!("cmx:{operation}"),
+        before_digest.as_deref(),
+        None,
+    );
+    let mut ledger = ledger()?;
+    match ledger.unknown.entry(change_id.clone()) {
+        Entry::Vacant(slot) => {
+            slot.insert(UnknownOriginRecord {
+                resource: resource.to_owned(),
+                before_digest,
+                after_digest: None,
+                transition_digest,
+                reconciled: false,
+                unresolved_gap: true,
+            });
+        }
+        Entry::Occupied(slot) => {
+            let existing = slot.into_mut();
+            if existing.resource != resource || existing.before_digest != before_digest {
+                return Err(ChangeMonitorError::HintConflict);
+            }
+        }
+    }
+    Ok(change_id)
+}
+
+/// Returns the last confirmed state of one tracked resource: the digest
+/// the ledger last proved (`None` = last proved absent), or `None` when
+/// the resource was never observed. The effect lane compares fresh reads
+/// against this tip to detect external transitions, so both live in the
+/// same ledger instead of a disconnected side map.
+///
+/// Caller: `crate::process_execution::KernelGovernedProcessEffectPort`.
+pub(crate) fn resource_tip(resource: &str) -> Option<ResourceTip> {
+    ledger()
+        .ok()
+        .and_then(|ledger| ledger.tips.get(resource).cloned())
+}
+
+/// Version of the durable ledger sidecar schema.
+const LEDGER_SIDECAR_FORMAT_VERSION: u32 = 1;
+
+/// Durable form of the Kernel ledger: the complete in-memory state plus a
+/// schema version, so the finish-acceptance leg and a future Governor
+/// hydration lane read pending hints and unreconciled unknowns from one
+/// projection instead of two disconnected states.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct LedgerSidecarFile {
+    format_version: u32,
+    ledger: KernelChangeLedger,
+}
+
+/// Locates the durable ledger sidecar: `.eliot/` under the default work
+/// root, beside the `kernel-ors.redb` precedent. The path is stable across
+/// restarts for a deployment (same `ELIOT_WORK_ROOT`/current directory),
+/// which is the property durability needs; composition may additionally
+/// pin `work_root`, but the sidecar contract does not depend on it.
+fn ledger_sidecar_path() -> Option<PathBuf> {
+    crate::default_work_root()
+        .ok()
+        .map(|root| root.join(".eliot").join("kernel-change-ledger.v1.json"))
+}
+
+/// Persists the current ledger to its durable sidecar, atomically
+/// (temporary file plus rename). Best-effort by contract: persistence loss
+/// never fails the observation it just recorded — acceptance stays
+/// correctly blocked in memory — but the caller must surface the outcome
+/// so durability loss stays visible.
+///
+/// Caller: `crate::process_execution::KernelGovernedProcessEffectPort`,
+/// after ledger mutations.
+pub(crate) fn persist_ledger_sidecar() -> Result<(), ChangeMonitorError> {
+    let Some(path) = ledger_sidecar_path() else {
+        return Err(ChangeMonitorError::SidecarUnavailable);
+    };
+    let snapshot = ledger().map(|ledger| LedgerSidecarFile {
+        format_version: LEDGER_SIDECAR_FORMAT_VERSION,
+        ledger: ledger.clone(),
+    })?;
+    let bytes = serde_json::to_vec(&snapshot).map_err(|_| ChangeMonitorError::SidecarUnavailable)?;
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|_| ChangeMonitorError::SidecarUnavailable)?;
+    }
+    let staging = path.with_extension(format!("tmp.{}", std::process::id()));
+    std::fs::write(&staging, &bytes).map_err(|_| ChangeMonitorError::SidecarUnavailable)?;
+    std::fs::rename(&staging, &path).map_err(|_| ChangeMonitorError::SidecarUnavailable)?;
+    Ok(())
+}
+
+/// Rehydrates the ledger from its durable sidecar when this process
+/// started fresh (I10.21 durability: observations are retained across
+/// restart, not transient-only). Refuses to clobber live state: a
+/// non-empty ledger is left untouched. A missing sidecar is a clean boot,
+/// not an error; a corrupt sidecar fails closed so the caller blocks
+/// acceptance instead of trusting a half-read projection.
+///
+/// Caller: `host_request_route::daemon_claim_queue::submit_finish_result`,
+/// before consulting the acceptance gate.
+pub(crate) fn hydrate_ledger_sidecar_if_empty() -> Result<bool, ChangeMonitorError> {
+    let Some(path) = ledger_sidecar_path() else {
+        return Ok(false);
+    };
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(ChangeMonitorError::SidecarUnavailable),
+    };
+    let snapshot: LedgerSidecarFile =
+        serde_json::from_slice(&bytes).map_err(|_| ChangeMonitorError::SidecarCorrupt)?;
+    if snapshot.format_version != LEDGER_SIDECAR_FORMAT_VERSION {
+        return Err(ChangeMonitorError::SidecarCorrupt);
+    }
+    validate_imported_ledger(&snapshot.ledger)?;
+    let mut ledger = ledger()?;
+    if !ledger.hints.is_empty()
+        || !ledger.governed.is_empty()
+        || !ledger.unknown.is_empty()
+        || !ledger.tips.is_empty()
+    {
+        return Ok(false);
+    }
+    *ledger = snapshot.ledger;
+    Ok(true)
+}
+
+fn validate_imported_ledger(ledger: &KernelChangeLedger) -> Result<(), ChangeMonitorError> {
+    for entry in ledger.hints.values() {
+        validate_hint(&entry.hint).map_err(|_| ChangeMonitorError::SidecarCorrupt)?;
+        if let Some(HintConfirmation::MaterialRecorded { change_id, .. }) = &entry.confirmation
+            && !text(change_id)
+        {
+            return Err(ChangeMonitorError::SidecarCorrupt);
+        }
+    }
+    for (change_id, record) in &ledger.governed {
+        if !text(change_id)
+            || !text(&record.resource)
+            || !validate_relative_path(&record.path)
+            || !text(&record.session)
+            || !text(&record.action_lease)
+            || !text(&record.operation)
+            || !text(&record.attempt_receipt)
+            || !text(&record.diff_handle)
+        {
+            return Err(ChangeMonitorError::SidecarCorrupt);
+        }
+        if record.before_digest.is_none() && record.after_digest.is_none() {
+            return Err(ChangeMonitorError::SidecarCorrupt);
+        }
+        for digest in [&record.before_digest, &record.after_digest]
+            .into_iter()
+            .flatten()
+        {
+            if !is_sha256_hex(digest) {
+                return Err(ChangeMonitorError::SidecarCorrupt);
+            }
+        }
+        let (_, transition) = material_transition_ids(
+            change_id,
+            record.before_digest.as_deref(),
+            record.after_digest.as_deref(),
+        );
+        if record.diff_handle != transition {
+            return Err(ChangeMonitorError::SidecarCorrupt);
+        }
+    }
+    for (change_id, unknown) in &ledger.unknown {
+        if !change_id.starts_with("cmu:") || !text(&unknown.resource) {
+            return Err(ChangeMonitorError::SidecarCorrupt);
+        }
+        for digest in [&unknown.before_digest, &unknown.after_digest]
+            .into_iter()
+            .flatten()
+        {
+            if !is_sha256_hex(digest) {
+                return Err(ChangeMonitorError::SidecarCorrupt);
+            }
+        }
+        let (_, transition) = material_transition_ids(
+            "",
+            unknown.before_digest.as_deref(),
+            unknown.after_digest.as_deref(),
+        );
+        if unknown.transition_digest != transition {
+            return Err(ChangeMonitorError::SidecarCorrupt);
+        }
+    }
+    for reconciliation in &ledger.reconciliations {
+        if !text(&reconciliation.unknown_change_id) || !text(&reconciliation.evidence_change_id) {
+            return Err(ChangeMonitorError::SidecarCorrupt);
+        }
+    }
+    for tip in ledger.tips.values() {
+        if tip.digest.as_deref().is_some_and(|digest| !is_sha256_hex(digest))
+            || tip
+                .head_commit
+                .as_deref()
+                .is_some_and(|commit| !is_git_sha(commit))
+            || tip.repository.as_deref().is_some_and(|repository| !text(repository))
+        {
+            return Err(ChangeMonitorError::SidecarCorrupt);
+        }
+    }
+    Ok(())
+}
+
 /// Returns whether governed acceptance is currently blocked: a host-event
 /// hint is still unverified, or an unknown-origin Material change is still
 /// unreconciled (I10.21 A2). A poisoned ledger fails closed. This mirrors
@@ -944,19 +1441,15 @@ pub(crate) fn governed_acceptance_blocked() -> bool {
 ///
 /// Scoping is by the tracked source identity carried on the admitted hint
 /// (`KernelChangeHint::resource`) and preserved on the unknown-origin
-/// record derived from it. Both blocking sets of the global gate above are
-/// covered with the same predicates, so completeness matches the global
-/// gate restricted to one resource: a candidate touching a blocked
-/// resource still waits for explicit reconciliation of that resource, while
-/// an out-of-lane re-pin (or any external mutation) of another resource
-/// cannot wedge its acceptance. A poisoned ledger fails closed. The
-/// unknown-origin event itself is still emitted by [`confirm_hint`]; this
-/// query only scopes the block, never clears it.
-///
-/// Caller (I10.21 A2):
-/// `host_request_route::daemon_claim_queue::submit_finish_result`, which
-/// carries the candidate resource from the admitted finish draft and keeps
-/// the global gate above as fallback while the leg carries no resource.
+/// record derived from it. The live finish leg does NOT scope by this
+/// query today: finish drafts name opaque artifact handles while this
+/// ledger keys tracked-source identity, and no admitted mapping proves a
+/// handle disjoint from a blocked resource, so the leg keeps the sound
+/// global gate above. This query is the per-resource end of the future
+/// Kernel-ledger/Governor-monitor identity bridge (see
+/// `eliot-change-monitor::ChangeMonitor::blocks_acceptance_for`): it
+/// becomes leg-eligible only with an admitted handle-to-source mapping,
+/// never by assuming one. A poisoned ledger fails closed.
 pub(crate) fn governed_acceptance_blocked_for(resource: &str) -> bool {
     let Ok(ledger) = ledger() else {
         return true;
