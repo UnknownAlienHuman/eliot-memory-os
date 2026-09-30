@@ -6001,6 +6001,36 @@ pub struct InquiryGovernance {
     /// already committed when the requests were built, and a record without one
     /// cannot be produced on this path at all.
     pub committed_freeze: crate::synthesis_input::CommittedFreeze,
+    /// The retained original of every source this record committed an admission
+    /// for, keyed by source handle.
+    ///
+    /// The same commitments [`Self::source_admission_requests`] already name,
+    /// carried whole rather than as a digest beside them, because each
+    /// [`FreezeCommitment`](crate::source_admissibility::FreezeCommitment) holds
+    /// the *claim* that an original was persisted — its artifact reference and two
+    /// digests — and not the bytes, so a record carrying only the requests would
+    /// let a reader check that some retention was asserted and never that any
+    /// bytes were retained, much less that they reproduce the admitted
+    /// `content_digest` they are filed under. Carrying the revisions is what makes
+    /// the retained originals on this record re-proveable by a reader:
+    /// `validate_source_admission_requests` re-runs each revision's own
+    /// `verify_integrity` and compares it against the commitment its request
+    /// publishes, so a `retained_revisions` entry swapped for a different revision
+    /// of the same source is refused.
+    ///
+    /// It is populated from [`InquiryObservation::retained_revisions`] **only for
+    /// the handles this record actually committed** — the same eligible-and-retained
+    /// filter [`crate::synthesis_input::CommittedFreeze::commit`] builds its own
+    /// members from — so the map cannot hold a revision whose admission was never
+    /// committed, and every entry has a request beside it on this record. The
+    /// owner is unchanged: the bytes were committed by the governed
+    /// source-admission/persistence owner, this crate has no canonical-store write
+    /// authority (`crates/research/AGENTS.md`), and this is the reference to that
+    /// commit rather than a second store of it. An original that was never
+    /// retained therefore produces no entry and no request, and the synthesis pack
+    /// reports it as a published omission with
+    /// [`crate::synthesis_input::PackLimitation::NoRetainedOriginal`].
+    pub retained_revisions: BTreeMap<String, crate::admitted_excerpt::RetainedSourceRevision>,
     /// The synthesis-input pack resolved from that committed freeze.
     ///
     /// W3: "Build the actual synthesis pack from that freeze. Resolve only its
@@ -6243,7 +6273,7 @@ impl InquiryGovernance {
         // still exists for a pre-freeze proposal, and this record does not use
         // it, because a request that named no freeze is exactly the state W2
         // forbids admitting synthesis from.
-        let source_admission_requests =
+        let (source_admission_requests, retained_revisions) =
             commit_freeze_through_source_admission(&observation, &freeze, &admissibility)?;
         // The committed-freeze proof, re-derived from those same requests through
         // the owner's existing validator. It is not built from the freeze alone:
@@ -6280,6 +6310,7 @@ impl InquiryGovernance {
             run_reference_manifest: observation.reference_manifest.clone(),
             profile_admission_request: profile.admission_request(),
             source_admission_requests,
+            retained_revisions,
             unadmitted_references,
             profile,
             claim_audits: claim_audit.records,
@@ -8820,6 +8851,18 @@ fn evidenced_span(text: &str) -> Option<(usize, String)> {
 
 /// The exact released wording of one material claim.
 ///
+/// `claim_id` is the admitted source handle this run is releasing a material claim
+/// about, and the statement names it, so the wording a reader receives is
+/// self-identifying. It was previously threaded in and dropped, which left the
+/// released sentence the *same bytes for every claim in the run*: a record with
+/// three admitted sources published three audits that judged one indistinguishable
+/// sentence, so a consumer holding the delivered text could not tell which claim it
+/// was, and a post-audit edit to one claim's wording was indistinguishable from an
+/// edit to another's. Naming the artifact also makes the wording match the
+/// evidence it is released with — the handle is the claim's only citation and the
+/// key its retained original is filed under — so the sentence cannot promise a
+/// retained artifact without naming the one that was retained.
+///
 /// One function so the statement [`released_material_claim`] publishes, the
 /// identity frozen for the audit, the statement bound into the resulting
 /// [`ClaimAuditRecord`], and any span derived from it all come from the **same**
@@ -8828,9 +8871,9 @@ fn evidenced_span(text: &str) -> Option<(usize, String)> {
 /// exactly the post-audit-material-edit failure the issue names.
 fn released_material_statement(observation: &InquiryObservation, claim_id: &str) -> String {
     format!(
-        "the retained provider artifact for inquiry {} contains evidence the question `{}` \
+        "the retained provider artifact `{}` for inquiry {} contains evidence the question `{}` \
          could be decided from within the admitted scope `{}`",
-        observation.inquiry_id, observation.question, observation.scope
+        claim_id, observation.inquiry_id, observation.question, observation.scope
     )
 }
 
@@ -9198,11 +9241,20 @@ fn unresolved_contradictions(admissibility: &[SourceAdmissibilityRecord]) -> Vec
 /// names the committed freeze and the retained original and refuses either that
 /// does not re-prove itself.
 ///
-/// A record whose original is missing produces no request for that handle. That
-/// is the honest W2 outcome, not a hole: a source that was admitted without its
-/// bytes persisted cannot have its admission committed, and the run's own freeze
-/// still lists it, so the synthesis pack below reports it as a published
-/// omission with [`crate::synthesis_input::PackLimitation::NoRetainedOriginal`]
+/// It returns the retained originals **as well as** the requests, and that is one
+/// traversal rather than two on purpose: the same commit binds the same revision,
+/// so a second pass over the admissibility records would be a second place where
+/// "which originals were committed" is decided, and the two could disagree without
+/// any check firing. Carrying them beside the requests is what makes the retained
+/// original on [`InquiryGovernance::retained_revisions`] the revision the
+/// commitment was actually built from rather than a map a reader has to take on
+/// trust.
+///
+/// A record whose original is missing produces no request and no retained entry
+/// for that handle. That is the honest W2 outcome, not a hole: a source that was
+/// admitted without its bytes persisted cannot have its admission committed, and
+/// the run's own freeze still lists it, so the synthesis pack below reports it as
+/// a published omission with [`crate::synthesis_input::PackLimitation::NoRetainedOriginal`]
 /// rather than dropping it.
 ///
 /// The eligibility filter is the same one [`evidence_freeze`] uses to build the
@@ -9220,8 +9272,16 @@ fn commit_freeze_through_source_admission(
     observation: &InquiryObservation,
     freeze: &EvidenceFreeze,
     admissibility: &[SourceAdmissibilityRecord],
-) -> Result<Vec<GovernorSourceTransitionRequest>, InquiryError> {
+) -> Result<
+    (
+        Vec<GovernorSourceTransitionRequest>,
+        BTreeMap<String, crate::admitted_excerpt::RetainedSourceRevision>,
+    ),
+    InquiryError,
+> {
     let mut requests = Vec::new();
+    let mut retained_revisions: BTreeMap<String, crate::admitted_excerpt::RetainedSourceRevision> =
+        BTreeMap::new();
     for record in admissibility {
         if record.eligibility != SourceEligibility::Eligible {
             continue;
@@ -9230,8 +9290,9 @@ fn commit_freeze_through_source_admission(
             continue;
         };
         requests.push(record.transition_request_committing_freeze(retained, freeze)?);
+        retained_revisions.insert(record.record.handle.clone(), retained.clone());
     }
-    Ok(requests)
+    Ok((requests, retained_revisions))
 }
 
 /// The admitted source records of one run, keyed by handle.

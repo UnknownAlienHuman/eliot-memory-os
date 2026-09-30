@@ -180,7 +180,9 @@ impl AdmittedExcerpt {
     pub fn offer(params: AdmittedExcerptParams) -> Result<Self, PortfolioError> {
         text(&params.source_handle, "excerpt.source_handle")?;
         if params.excerpt.trim().is_empty() {
-            return Err(PortfolioError::Blank { field: "excerpt.excerpt" });
+            return Err(PortfolioError::Blank {
+                field: "excerpt.excerpt",
+            });
         }
         let mut excerpt = Self {
             source_handle: params.source_handle,
@@ -687,7 +689,14 @@ const UNIT_MARKERS: [&str; 12] = [
 
 /// Population or scope markers, matched case-insensitively.
 const POPULATION_MARKERS: [&str; 8] = [
-    "patients", "participants", "subjects", "users", "samples", "sites", "in", "among",
+    "patients",
+    "participants",
+    "subjects",
+    "users",
+    "samples",
+    "sites",
+    "in",
+    "among",
 ];
 
 /// Time-window and version markers, matched case-insensitively.
@@ -961,11 +970,9 @@ fn finish_check(
     let quote_window = &text[quote_window_start..quote_window_end];
     // The quoted window in its own right: the excerpt plus the context window
     // around it, which is what a careful reader would see of the source.
-    let mut stitched = false;
     let mut context: Vec<ContextFinding> = Vec::new();
-    let (section, is_stitched) = section_finding(window, quote);
-    stitched = is_stitched;
-    if is_stitched {
+    let (section, stitched) = section_finding(window, quote);
+    if stitched {
         failures.push(OccurrenceFailure::StitchedAcrossSections);
     }
     // The cropped-negation arm. A difference between two windows of the SAME
