@@ -38,8 +38,8 @@ use thiserror::Error;
 use crate::{
     AcceptanceDenominatorError, CanonicalAdmissionOwner, CanonicalAdmissionSnapshot,
     CanonicalFinishEvidence, CanonicalPlanBinding, CanonicalVerifierExecutionFact,
-    CompositionError, GovernorOwners, KernelPortError, KernelTransitionPort,
-    RehydratedContractAcceptanceSet, acceptance_coverage_from_verifier_fact,
+    CanonicalVerifierPlanState, CompositionError, GovernorOwners, KernelPortError,
+    KernelTransitionPort, RehydratedContractAcceptanceSet, acceptance_coverage_from_verifier_fact,
     evaluate_testd_verification_current, task_acceptance_set_commitment,
 };
 
@@ -795,6 +795,38 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
                 "task-lifecycle owner record is stale for current plan admission".to_owned(),
             )));
         }
+        let (plan_id, work_scope_id) = self.current_task_plan_identity(task_id, task, &fence)?;
+        let mut plan = CanonicalPlanBinding::new(
+            plan_id,
+            task.revision.to_string(),
+            task_id.clone(),
+            work_scope_id,
+        )
+        .map_err(FinishAttemptError::Composition)?;
+        if let Some(retained) = self.retained_verifier_state(&plan, &fence) {
+            plan.verifier = retained;
+        }
+        Ok(plan)
+    }
+
+    /// Resolves the Task Controller's published plan identity for one task from
+    /// the two owners that hold it: the committed same-fence frame on the task's
+    /// own event range, and the current `WorkScope` binding.
+    ///
+    /// This is the whole of the owner derivation
+    /// [`Self::admit_task_controller_plan`] performs; that method keeps the
+    /// admission preconditions and the verifier-state carry-forward and delegates
+    /// the identity read here, so neither half can grow into the other. Every
+    /// refusal is the same typed one, raised from the same check at the same
+    /// point: an absent task, a record stale for the fence, a zero revision, a
+    /// state outside the plan-bearing set, no committed frame in range, or an
+    /// absent or fence-mismatched `WorkScope` binding.
+    fn current_task_plan_identity(
+        &self,
+        task_id: &TaskId,
+        task: &TaskRecord,
+        fence: &StateFence,
+    ) -> Result<(String, String), FinishAttemptError> {
         // A task holds a plan only while the Task Controller's authority over it
         // is live. This is the same state set `read_unique_agent_activation`
         // admits, so the plan cannot be installed for a task that is already
@@ -810,7 +842,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
             )));
         }
         let plan_id = self
-            .current_task_frame_ref(task_id, task, &fence)
+            .current_task_frame_ref(task_id, task, fence)
             .ok_or_else(|| {
                 FinishAttemptError::Composition(CompositionError::Recovery(format!(
                     "task-lifecycle owner has no committed same-fence acceptance frame for task {} \
@@ -825,45 +857,46 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
                     .to_owned(),
             ))
         })?;
-        let scope = work_scope.read_current(&fence).map_err(|error| {
+        let scope = work_scope.read_current(fence).map_err(|error| {
             FinishAttemptError::Composition(CompositionError::Recovery(format!(
                 "current WorkScope binding read failed; current plan admission is refused: {error}"
             )))
         })?;
-        let work_scope_id = scope.binding.scope.scope_ref.clone();
-        let mut plan = CanonicalPlanBinding::new(
-            plan_id,
-            task.revision.to_string(),
-            task_id.clone(),
-            work_scope_id,
-        )
-        .map_err(FinishAttemptError::Composition)?;
-        // The verifier request contract is a separate dimension of the owner image
-        // that only an owner decision sets, and this derivation must neither
-        // author one nor discard one. When the retained owner plan has the same
-        // identity — the same frame, the same task revision, the same task, the
-        // same bound scope — its recorded verifier state is carried forward
-        // verbatim. That carry-forward is what makes an absent decision
-        // non-terminal: an owner decision that later binds a verifier changes this
-        // value, the caller compares it against the retained image by full
-        // equality, and the change advances the owner revision instead of being
-        // absorbed by the idempotence branch. See
-        // `CanonicalPlanBinding::verifier_binding` for what each state means.
-        //
-        // An unreadable retained plan carries nothing forward. That is not a
-        // silent skip: `read_current_plan` validates the retained owner image
-        // first, and the image this produces is validated again by
-        // `prepare_current_plan` before the envelope is built, so a corrupt
-        // retained plan cannot be overwritten by a derived one.
-        if let Ok(retained) = self.canonical.read_current_plan(&fence)
-            && retained.plan_id == plan.plan_id
+        Ok((plan_id, scope.binding.scope.scope_ref.clone()))
+    }
+
+    /// Returns the verifier state the retained owner image already records for
+    /// this exact plan identity, or `None` when there is nothing to carry.
+    ///
+    /// The verifier request contract is a separate dimension of the owner image
+    /// that only an owner decision sets, and the plan derivation must neither
+    /// author one nor discard one. When the retained owner plan has the same
+    /// identity — the same frame, the same task revision, the same task, the same
+    /// bound scope — its recorded state is carried forward verbatim. That
+    /// carry-forward is what makes an absent decision non-terminal: an owner
+    /// decision that later binds a verifier changes the derived value, the caller
+    /// compares it against the retained image by full equality, and the change
+    /// advances the owner revision instead of being absorbed by the idempotence
+    /// branch. See `CanonicalPlanBinding::verifier_binding` for what each state
+    /// means.
+    ///
+    /// `None` covers both "no plan is retained yet" and "the retained plan is a
+    /// different identity", and it is not a silent skip: `read_current_plan`
+    /// validates the retained owner image first, and the image
+    /// `admit_task_controller_plan` builds is validated again by
+    /// `prepare_current_plan` before the envelope is built, so a corrupt retained
+    /// plan cannot be overwritten by a derived one.
+    fn retained_verifier_state(
+        &self,
+        plan: &CanonicalPlanBinding,
+        fence: &StateFence,
+    ) -> Option<CanonicalVerifierPlanState> {
+        let retained = self.canonical.read_current_plan(fence).ok()?;
+        (retained.plan_id == plan.plan_id
             && retained.plan_revision == plan.plan_revision
             && retained.task_id == plan.task_id
-            && retained.work_scope_id == plan.work_scope_id
-        {
-            plan.verifier = retained.verifier;
-        }
-        Ok(plan)
+            && retained.work_scope_id == plan.work_scope_id)
+            .then_some(retained.verifier)
     }
 
     /// Returns the frame reference the Task Controller last committed for one

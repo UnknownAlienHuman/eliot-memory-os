@@ -1379,6 +1379,15 @@ pub enum CompositionError {
 /// * `Decided` is the exact owner-issued request contract, validated by its own
 ///   existing `validate`.
 ///
+/// `Decided` boxes that contract. The two variants differ in size by more than an
+/// order of magnitude — a `String` against a `PlannedVerifierRef` plus a dozen
+/// contract ids, sets and maps — and inlining the large one into every
+/// `CanonicalPlanBinding` inflates the whole owner image, which is retained and
+/// re-read on every finish candidate. The box changes only where the bytes live:
+/// `serde` and `schemars` treat `Box<T>` exactly as `T`, so the persisted and
+/// generated shapes are byte-identical, and the `Decided` payload is still the
+/// identical `CanonicalVerifierPlanBinding` content.
+///
 /// No consumer may read a verifier out of `Undecided`: every one that needs a
 /// verifier goes through [`CanonicalPlanBinding::verifier_binding`], which
 /// refuses with a typed `CompositionError` naming the state it found. The
@@ -1398,7 +1407,7 @@ pub enum CanonicalVerifierPlanState {
     Undecided { reason_ref: String },
     /// The Task Controller published this exact verifier request contract.
     Decided {
-        binding: CanonicalVerifierPlanBinding,
+        binding: Box<CanonicalVerifierPlanBinding>,
     },
 }
 
@@ -1430,7 +1439,7 @@ impl CanonicalVerifierPlanState {
     /// state it found.
     pub fn binding(&self) -> Result<&CanonicalVerifierPlanBinding, CompositionError> {
         match self {
-            Self::Decided { binding } => Ok(binding),
+            Self::Decided { binding } => Ok(binding.as_ref()),
             Self::Undecided { reason_ref } => Err(CompositionError::Recovery(format!(
                 "canonical plan carries no verifier request contract because the Task Controller \
                  has published none for this plan revision ({reason_ref})"
