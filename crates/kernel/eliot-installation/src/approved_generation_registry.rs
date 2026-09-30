@@ -125,9 +125,9 @@ pub struct ApprovedGeneration {
     pub last_known_good: bool,
     /// Original no-follow current-user selection of this generation's roots.
     ///
-    /// This is present only for `UserMode` and `PortableDev`. Its absence on an
-    /// older projection is reported as migration/recovery when a consumer
-    /// requires retained file-object identity.
+    /// This is present only for `UserMode` and `PortableDev`. A projected
+    /// generation without this receipt requires explicit migration/recovery
+    /// because its original file-object identity cannot be recovered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_selection_receipt: Option<ProfileSelectionReceipt>,
 }
@@ -2565,7 +2565,18 @@ impl ApprovedGeneration {
         self.manifest.validate()?;
         self.approval.validate()?;
         validate_approval_against_manifest(&self.approval, &self.manifest, "approved_generation")?;
-        if let Some(receipt) = self.profile_selection_receipt.as_ref() {
+        let profile_selection_receipt = match self.manifest.runtime_launch.profile {
+            InstallationProfile::UserMode | InstallationProfile::PortableDev => {
+                Some(self.profile_selection_receipt.as_ref().ok_or_else(|| {
+                    InstallationError::MigrationRequired {
+                        reason: "projected UserMode/PortableDev generation has no unambiguous original profile selection receipt"
+                            .to_owned(),
+                    }
+                })?)
+            }
+            InstallationProfile::SystemService => self.profile_selection_receipt.as_ref(),
+        };
+        if let Some(receipt) = profile_selection_receipt {
             self.manifest
                 .runtime_launch
                 .profile_governed_roots
