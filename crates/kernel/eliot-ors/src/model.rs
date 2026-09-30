@@ -230,6 +230,182 @@ struct BridgeEventOwnerNamespacePreimage<'a> {
     resource: &'a BridgeEventOwnerResource,
 }
 
+/// Canonical Session/attempt/continuity-or-grant subject for one bridge event
+/// owner bind (issue #2729, item 1 / AUD1).
+///
+/// Identity value, never authority: every field must come from Kernel-owned
+/// admission state (the Host installation binding, the presenting authority
+/// lineage, the platform-verified principal, the admitted producer) or from an
+/// owner-issued grant the store recorded. No application-Session authority
+/// exists on the bridge-event path — minting one is out of scope — so the live
+/// continuity subject is the admitted transport session occurrence; the
+/// semantic application Session/attempt scope stays on
+/// [`BridgeEventOwnerScope`]. Connection ID and producer generation remain
+/// observation metadata and are deliberately absent from the namespace digest;
+/// the occurrence is stored on the owner row and compared per operation
+/// instead of being key material.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BridgeEventOwnerContinuitySubject {
+    /// The admitted transport session occurrence: connection, launch nonce,
+    /// and monotonic session epoch. The current producer/session grant that
+    /// fresh append requires.
+    TransportSession {
+        connection_id: OpaqueLabel,
+        launch_nonce: OpaqueLabel,
+        session_epoch: u64,
+    },
+    /// An owner-issued recovery grant digest (window key bound to its
+    /// continuation secret). Presented for read/ack continuity, never for
+    /// fresh append.
+    RecoveryGrant { grant_digest: String },
+    /// An explicitly unbound observation scope with no task or Attempt claim.
+    UnboundObservation { observation_scope_id: OpaqueLabel },
+}
+
+/// Canonical continuity record for one bridge event owner bind (issue #2729).
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BridgeEventOwnerContinuity {
+    /// Stable authenticated installation identity from the Host binding.
+    pub installation_id: OpaqueLabel,
+    /// Authority lineage retained by the admission owner.
+    pub authority_lineage: OpaqueLabel,
+    /// Authenticated semantic principal; never an operating-system user name.
+    pub principal: OpaqueLabel,
+    /// Admitted producer identity for this stream or unscoped gap.
+    pub producer_id: OpaqueLabel,
+    /// Session/attempt/continuity-or-grant subject bound to this occurrence.
+    pub subject: BridgeEventOwnerContinuitySubject,
+}
+
+impl BridgeEventOwnerContinuity {
+    /// Builds the transport-session continuity for one admitted bind,
+    /// checking component shape without authenticating the source.
+    pub fn transport_session(
+        installation_id: &str,
+        authority_lineage: &str,
+        principal: &str,
+        producer_id: &str,
+        connection_id: &str,
+        launch_nonce: &str,
+        session_epoch: u64,
+    ) -> Result<Self, OrsError> {
+        if session_epoch == 0 {
+            return Err(OrsError::InvalidField {
+                field: "session_epoch",
+                reason: "bridge owner continuity binds a nonzero session epoch",
+            });
+        }
+        Ok(Self {
+            installation_id: OpaqueLabel::new(installation_id.to_owned()).map_err(|_| {
+                OrsError::InvalidField {
+                    field: "installation_id",
+                    reason: "bridge owner continuity binds a non-blank installation",
+                }
+            })?,
+            authority_lineage: OpaqueLabel::new(authority_lineage.to_owned()).map_err(|_| {
+                OrsError::InvalidField {
+                    field: "authority_lineage",
+                    reason: "bridge owner continuity binds a non-blank authority lineage",
+                }
+            })?,
+            principal: OpaqueLabel::new(principal.to_owned()).map_err(|_| OrsError::InvalidField {
+                field: "principal",
+                reason: "bridge owner continuity binds a non-blank principal",
+            })?,
+            producer_id: OpaqueLabel::new(producer_id.to_owned()).map_err(|_| {
+                OrsError::InvalidField {
+                    field: "producer_id",
+                    reason: "bridge owner continuity binds a non-blank producer",
+                }
+            })?,
+            subject: BridgeEventOwnerContinuitySubject::TransportSession {
+                connection_id: OpaqueLabel::new(connection_id.to_owned()).map_err(|_| {
+                    OrsError::InvalidField {
+                        field: "connection_id",
+                        reason: "bridge owner continuity binds a non-blank connection",
+                    }
+                })?,
+                launch_nonce: OpaqueLabel::new(launch_nonce.to_owned()).map_err(|_| {
+                    OrsError::InvalidField {
+                        field: "launch_nonce",
+                        reason: "bridge owner continuity binds a non-blank launch nonce",
+                    }
+                })?,
+                session_epoch,
+            },
+        })
+    }
+
+    /// Checks the continuity shape without authenticating the source.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        // Installation follows the Host binding's own text rules (no key
+        // separator ban): it is digest-framed by labels, and control
+        // characters — including the `\x1f` separator — stay rejected.
+        validate_text(self.installation_id.as_str(), "installation_id")?;
+        validate_bridge_event_owner_component(&self.authority_lineage, "authority_lineage")?;
+        validate_bridge_event_owner_component(&self.principal, "principal")?;
+        validate_bridge_event_owner_component(&self.producer_id, "producer_id")?;
+        match &self.subject {
+            BridgeEventOwnerContinuitySubject::TransportSession {
+                connection_id,
+                launch_nonce,
+                session_epoch,
+            } => {
+                validate_bridge_event_owner_component(connection_id, "connection_id")?;
+                validate_bridge_event_owner_component(launch_nonce, "launch_nonce")?;
+                if *session_epoch == 0 {
+                    return Err(OrsError::InvalidField {
+                        field: "session_epoch",
+                        reason: "bridge owner continuity binds a nonzero session epoch",
+                    });
+                }
+            }
+            BridgeEventOwnerContinuitySubject::RecoveryGrant { grant_digest } => {
+                validate_digest(grant_digest, "grant_digest")?;
+            }
+            BridgeEventOwnerContinuitySubject::UnboundObservation {
+                observation_scope_id,
+            } => {
+                validate_bridge_event_owner_component(
+                    observation_scope_id,
+                    "observation_scope_id",
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Canonical subject text for row storage and grant comparison (issue
+    /// #2729). Labeled `\x1f`-separated components over validated labels —
+    /// the same unambiguous encoding as the #2571 logical key — so two
+    /// distinct occurrences never render the same subject.
+    pub fn subject_text(&self) -> Result<String, OrsError> {
+        self.validate()?;
+        match &self.subject {
+            BridgeEventOwnerContinuitySubject::TransportSession {
+                connection_id,
+                launch_nonce,
+                session_epoch,
+            } => Ok(format!(
+                "transport-session\x1fconnection={}\x1flaunch-nonce={}\x1fsession-epoch={session_epoch}",
+                connection_id.as_str(),
+                launch_nonce.as_str(),
+            )),
+            BridgeEventOwnerContinuitySubject::RecoveryGrant { grant_digest } => {
+                Ok(format!("recovery-grant\x1fgrant={grant_digest}"))
+            }
+            BridgeEventOwnerContinuitySubject::UnboundObservation {
+                observation_scope_id,
+            } => Ok(format!(
+                "unbound-observation\x1fscope={}",
+                observation_scope_id.as_str()
+            )),
+        }
+    }
+}
+
 fn validate_bridge_event_owner_component(
     label: &OpaqueLabel,
     field: &'static str,
