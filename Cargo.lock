@@ -2373,6 +2373,7 @@ dependencies = [
  "eliot-receipts",
  "eliot-runtime-contracts",
  "eliot-security-contracts",
+ "eliot-store",
  "eliot-store-api",
  "eliot-store-memory",
  "eliot-store-surreal-adapter",
