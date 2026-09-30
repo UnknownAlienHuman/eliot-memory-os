@@ -602,12 +602,8 @@ pub fn gate_terminal_restart_for(
     expected_operation_digest: [u8; TERMINAL_CONTAINMENT_OPERATION_DIGEST_BYTES],
 ) -> TerminalRestartGate {
     match validate_terminal_containment_readback_for(bytes, expected_operation_digest) {
-        TerminalContainmentReadback::Unresolved(reason) => {
-            TerminalRestartGate::Blocked { reason }
-        }
-        TerminalContainmentReadback::Complete(record) => {
-            TerminalRestartGate::Reconciled { record }
-        }
+        TerminalContainmentReadback::Unresolved(reason) => TerminalRestartGate::Blocked { reason },
+        TerminalContainmentReadback::Complete(record) => TerminalRestartGate::Reconciled { record },
     }
 }
 
