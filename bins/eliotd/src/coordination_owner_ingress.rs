@@ -147,7 +147,9 @@ impl CoordinationResultIngress {
             ));
         }
         self.state_fence.validate().map_err(|error| {
-            CompositionError::Owner(format!("coordination ingress state_fence is invalid: {error}"))
+            CompositionError::Owner(format!(
+                "coordination ingress state_fence is invalid: {error}"
+            ))
         })?;
         Ok(AgentResultDraft {
             request_id: self.request_id,

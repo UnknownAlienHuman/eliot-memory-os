@@ -1531,9 +1531,7 @@ impl DaemonComposition {
         // written, so a structural mistake never reaches the compare-and-set
         // read or the owner. The draft it lowers to is still the owner's own
         // type and is still re-checked by the owner on the way in.
-        let draft = ingress
-            .into_draft()
-            .map_err(DaemonError::Composition)?;
+        let draft = ingress.into_draft().map_err(DaemonError::Composition)?;
         // The predecessor revision is read here, from the refresh-consistent
         // named read, rather than inside the owner: a caller-presented integer
         // would be exactly the substituted compare-and-set the fenced CAS
@@ -1614,9 +1612,7 @@ impl DaemonComposition {
             result_id: _,
             observed_clock,
         } = issued;
-        let draft = ingress
-            .into_draft()
-            .map_err(DaemonError::Composition)?;
+        let draft = ingress.into_draft().map_err(DaemonError::Composition)?;
         // The work registration records the registered coordination session as
         // its registrant, so the persisted event names the actor that owns the
         // item rather than a label. Read before `session` is moved into the
