@@ -37,11 +37,11 @@ use eliot_store_api::{
     CanonicalSnapshotPort, CanonicalStoreClient, CanonicalValidationSnapshot, EFFECTS,
     ExactJsonBytes, IsolatedDestination, IsolatedDestinationReceipt, IsolatedRestorePort,
     NamedReadRequest, NamedReadResponse, OperationId, OperationIdentity, OrderingHead,
-    OrderingHeadExpectation, OrderingHeadReadback, OrderingScopeId, PreparedTransition, RequestMeta,
-    ReservedWriteRequest, RestoreValidationReceipt, RevisionHead, RevisionHeadExpectation,
-    RevisionKey, SnapshotBeginRequest, SnapshotCursor, SnapshotEndReceipt, SnapshotHandle,
-    SnapshotPage, StoreBackupStatus, StoreBackupStatusOutcome, StoreError, StoreHealth,
-    WriteReceipt, decode_request_frame_with_authority, generated_operation_manifests,
+    OrderingHeadExpectation, OrderingHeadReadback, OrderingScopeId, PreparedTransition,
+    RequestMeta, ReservedWriteRequest, RestoreValidationReceipt, RevisionHead,
+    RevisionHeadExpectation, RevisionKey, SnapshotBeginRequest, SnapshotCursor, SnapshotEndReceipt,
+    SnapshotHandle, SnapshotPage, StoreBackupStatus, StoreBackupStatusOutcome, StoreError,
+    StoreHealth, WriteReceipt, decode_request_frame_with_authority, generated_operation_manifests,
     genesis_manifest, verify_canonical_request_hash,
 };
 pub use eliot_store_api::{
@@ -393,12 +393,13 @@ impl StoreComposition {
             .unwrap_or_else(default_store_transaction_limit_usize);
         let writer_lanes = NonZeroUsize::new(write_limit)
             .ok_or_else(|| "configured Store writer lanes must be non-zero".to_owned())?;
-        let reserved_write_max_pending = match config.store_write_max_pending {
-            Some(max_pending) => Some(NonZeroUsize::new(max_pending).ok_or_else(|| {
-                "configured Store write max_pending must be non-zero".to_owned()
-            })?),
-            None => None,
-        };
+        let reserved_write_max_pending =
+            match config.store_write_max_pending {
+                Some(max_pending) => Some(NonZeroUsize::new(max_pending).ok_or_else(|| {
+                    "configured Store write max_pending must be non-zero".to_owned()
+                })?),
+                None => None,
+            };
         let write_sessions = u8::try_from(write_limit).map_err(|_| {
             "configured Store writer lanes exceed the bounded client-set profile".to_owned()
         })?;
@@ -577,23 +578,17 @@ impl StoreComposition {
                 "reserved execution requires an observed ready Store schema generation".to_owned(),
             );
         }
-        if state_fence != self.state_fence
-            || kernel_generation != state_fence.resource_generation
-        {
+        if state_fence != self.state_fence || kernel_generation != state_fence.resource_generation {
             return Err(
                 "authenticated Kernel generation and complete fence do not match the Store composition"
                     .to_owned(),
             );
         }
-        let observed_generation = SchemaGeneration::new(
-            readiness
-                .observed_generation
-                .as_deref()
-                .ok_or_else(|| {
-                    "ready Store receipt omitted its observed schema generation".to_owned()
-                })?,
-        )
-        .map_err(|error| format!("invalid observed Store schema generation: {error}"))?;
+        let observed_generation =
+            SchemaGeneration::new(readiness.observed_generation.as_deref().ok_or_else(|| {
+                "ready Store receipt omitted its observed schema generation".to_owned()
+            })?)
+            .map_err(|error| format!("invalid observed Store schema generation: {error}"))?;
         self.store
             .install_concurrent_execution(
                 self.writer_lanes,
@@ -1554,7 +1549,9 @@ impl StoreEbpSession {
         validate_session_peer_binding(self)?;
         let generation = self.module_generation.generation.clone();
         if generation != self.state_fence.resource_generation {
-            return Err("authenticated Kernel generation does not match its full state fence".to_owned());
+            return Err(
+                "authenticated Kernel generation does not match its full state fence".to_owned(),
+            );
         }
         Ok((generation, self.state_fence.clone()))
     }

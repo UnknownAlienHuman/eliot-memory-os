@@ -229,8 +229,6 @@ pub use store_client::{
     StoreClientFault, StoreClientFaultHarness,
 };
 #[cfg(windows)]
-pub use store_gateway::{BorrowedCanonicalStoreClient, KernelStoreGateway};
-#[cfg(windows)]
 pub use store_gateway::NamedReadGatewayError;
 #[cfg(windows)]
 pub use store_gateway::StoreApplyRefusal;
@@ -242,6 +240,8 @@ pub use store_gateway::StoreApplyRefusal;
 // retained at all — instead of rendering one reason string for both.
 #[cfg(windows)]
 pub use store_gateway::UserAutomationHorizonPublicationRefusal;
+#[cfg(windows)]
+pub use store_gateway::{BorrowedCanonicalStoreClient, KernelStoreGateway};
 // Issue #1681 W3: the named-read refusal leaves the Kernel with a typed
 // `StoreError` and nothing else. These two are the missing half the transport
 // edge needs to turn that cause into the complete versioned #1679 directive

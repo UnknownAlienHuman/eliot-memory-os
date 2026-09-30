@@ -76,9 +76,8 @@ use eliot_ors::{
     HostRequestAttemptPhase, HostRequestDeliveryReceipt, HostRequestKind, HostRequestNoSendProof,
     HostRequestOwnerReadbackEvidence, HostRequestRecord, HostRequestResponseSource,
     HostRequestState, HostRequestTransportBoundary, HostRequestTransportObservation, OpaqueLabel,
-    OperationIdentity as OrsOperationIdentity, RedbRecoveryStore, RecoveryPayloadEnvelope,
-    ReservationRecord, UnknownCommitOutcome, UnknownCommitRecord,
-    WriterReservationToken,
+    OperationIdentity as OrsOperationIdentity, RecoveryPayloadEnvelope, RedbRecoveryStore,
+    ReservationRecord, UnknownCommitOutcome, UnknownCommitRecord, WriterReservationToken,
 };
 use eliot_ors::{OrsError, prove_maintenance_trigger_staging};
 use eliot_protocol::dreamer_job::{DurableJobRequest, DurableJobResponse, JobOperation};
@@ -1872,9 +1871,10 @@ impl KernelStoreGateway {
         }
         self.require_active_store_generation()
             .map_err(|error| error.to_string())?;
-        let commit_ors = self.commit_ors.clone().ok_or_else(|| {
-            "staged envelope read requires the composition-bound ORS".to_owned()
-        })?;
+        let commit_ors = self
+            .commit_ors
+            .clone()
+            .ok_or_else(|| "staged envelope read requires the composition-bound ORS".to_owned())?;
         let owner = self.bind_reservation_owner_for_fence(&commit_ors, fence)?;
         owner
             .verify_staged_envelope(operation_id)
