@@ -246,6 +246,17 @@ const BRIDGE_EVENT_ADAPTER_VERSION: &str = "eliot.bridge-event.kernel-ingest.v1"
 /// representation plus its redaction receipt. This is the same closed
 /// vocabulary `eliot-ors` validates (`admitted` | `rejected`).
 const BRIDGE_EVENT_PRIVACY_VERDICT_REJECTED: &str = "rejected";
+/// Withheld scope recorded when the retained session's recipient grant admits
+/// no privacy class at all (issue #1934, I7.23): the session owner admitted
+/// nothing, so raw persistence is withheld on the recipient side. This is the
+/// owner's own out-of-scope label, never a claim about scanned content.
+const BRIDGE_EVENT_WITHHELD_RECIPIENT_GRANT_EMPTY: &str = "recipient_grant_admits_no_class";
+/// Withheld scope recorded when the session grant names admittable classes
+/// but the event proves none of them (issue #1934, I7.23): `EventEnvelope`
+/// carries no source privacy class or provider-restriction field, so no
+/// disclosure class is proven for these exact bytes and no grant membership
+/// can hold. Raw persistence is withheld on the source side.
+const BRIDGE_EVENT_WITHHELD_SOURCE_CLASS_UNADMITTED: &str = "source_class_not_admitted";
 
 /// Bound on queued local-read pairs for the outbound-only eliotd poller.
 ///
@@ -6059,19 +6070,29 @@ impl KernelComposition {
     /// was measured rather than assumed. `EventEnvelope`
     /// (`crates/foundation/eliot-protocol/src/lib.rs`) has no field carrying a
     /// `WorkScope`, a privacy class, a source/recipient class, or a provider
-    /// retention constraint; the retained agent-bridge `Session` negotiates an
-    /// EMPTY privacy-class grant (`eliot-ipc`'s
-    /// `Session::establish_agent_bridge`, which is the only constructor on this
-    /// route), so there is no recipient-class evidence either; and the
-    /// Governor-owned `DisclosureDecision` has no producer, store, or wire leg
-    /// that reaches this entry. There is consequently no owner that can present
-    /// a positive verdict bound to these exact bytes, this scope, and this
-    /// policy revision.
+    /// retention constraint; and the Governor-owned `DisclosureDecision` has no
+    /// producer, store, or wire leg that reaches this entry. There is
+    /// consequently no owner that can present a positive verdict bound to these
+    /// exact bytes, this scope, and this policy revision.
+    ///
+    /// What the transport DOES carry is the recipient side of the admission
+    /// evidence, and the resolution below evaluates it for THIS event instead
+    /// of assuming it: the retained `Session`'s negotiated `privacy_classes`
+    /// grant is the session owner's recipient-class admission evidence
+    /// (`eliot-ipc`'s `Session::establish_agent_bridge`, the only constructor
+    /// on this route, negotiates it empty — but the verdict reads the retained
+    /// session, so a class-bearing session would resolve through its real
+    /// grant rather than this route's usual one). The event's own disclosure
+    /// class is unproven for these exact bytes — the envelope names no source
+    /// class — so no grant membership can hold for it.
     ///
     /// Absent evidence is UNRESOLVED, never permission. The resolution is
-    /// therefore [`BRIDGE_EVENT_PRIVACY_VERDICT_REJECTED`]:
-    /// [`RedbRecoveryStore::bridge_event_privacy_decision`] takes the
-    /// rejection arm, the event stages as the deterministic redacted
+    /// therefore [`BRIDGE_EVENT_PRIVACY_VERDICT_REJECTED`], with the
+    /// `declared_class` naming the withholding the evaluated evidence
+    /// determined: an empty recipient grant withholds on the recipient side,
+    /// while a non-empty grant still withholds because the event proves no
+    /// admittable source class. [`RedbRecoveryStore::bridge_event_privacy_decision`]
+    /// takes the rejection arm, the event stages as the deterministic redacted
     /// representation plus its redaction receipt, and the conservative
     /// seven-token deny scan still runs inside the ORS owner — where it can
     /// only narrow the recorded reason and classes, never grant. Ingestion
@@ -6111,11 +6132,25 @@ impl KernelComposition {
         if policy_revision == 0 {
             return Err(TransportError::SessionFenced);
         }
+        // Resolve the withholding through the actual admission evidence for
+        // THIS event. The session owner's recipient grant admits a class only
+        // by name; the event proves no source class for these exact bytes, so
+        // no membership holds — but WHICH side withholds is read, not
+        // assumed: an empty grant withholds every class on the recipient side,
+        // while a class-bearing grant still withholds this classless event on
+        // the source side. Either way raw persistence is not admitted, and the
+        // recorded class tells the receipt which evidence determined that.
+        let declared_class = if session.privacy_classes.is_empty() {
+            BRIDGE_EVENT_WITHHELD_RECIPIENT_GRANT_EMPTY
+        } else {
+            BRIDGE_EVENT_WITHHELD_SOURCE_CLASS_UNADMITTED
+        };
         Ok(serde_json::json!({
             "verdict": BRIDGE_EVENT_PRIVACY_VERDICT_REJECTED,
             "source_sha256": source_sha256,
             "scope": scope,
             "policy_revision": policy_revision,
+            "declared_class": declared_class,
         }))
     }
 
