@@ -38,10 +38,10 @@ use eliot_mcp::{
 use eliot_protocol::{
     AgentHostRequestFailure, EncodingProfile, FINISH_INVOKE_PAYLOAD_SCHEMA_ID, Frame, FrameKind,
     HARD_STRUCTURED_RESPONSE_BYTES, HOST_REQUEST_PAYLOAD_SCHEMA_ID,
-    HOST_REQUEST_RESULT_BODY_WIRE_ID, HOST_REQUEST_WIRE_ID,
-    HostRequestAdmissionReceipt, HostRequestEnvelope, HostRequestIdentity, HostRequestKind,
-    HostRequestResultBody, HostRequestResultClass, HostRequestResultLineage, MessageType,
-    ProtocolPayload, ProtocolVersion, REACTIVE_RESTORE_CAPABILITY, REACTIVE_RESTORE_OPERATION,
+    HOST_REQUEST_RESULT_BODY_WIRE_ID, HOST_REQUEST_WIRE_ID, HostRequestAdmissionReceipt,
+    HostRequestEnvelope, HostRequestIdentity, HostRequestKind, HostRequestResultBody,
+    HostRequestResultClass, HostRequestResultLineage, MessageType, ProtocolPayload,
+    ProtocolVersion, REACTIVE_RESTORE_CAPABILITY, REACTIVE_RESTORE_OPERATION,
     REACTIVE_RESTORE_PAYLOAD_SCHEMA_ID, ReactiveRestoreQuery, ReactiveRestoreReply,
     RequestIdentity, host_request_operation_id, restore_correlation,
 };
@@ -2102,7 +2102,8 @@ fn revalidate_observe_dispatch(
     let expected_payload = canonical_payload_digest(&request.tool)?;
     if expected_payload != envelope.identity.payload_sha256 {
         return Err(PortFailure::TransportBindingRejected {
-            reason: "observe dispatch payload does not match the admitted payload digest".to_owned(),
+            reason: "observe dispatch payload does not match the admitted payload digest"
+                .to_owned(),
         });
     }
     Ok(())
