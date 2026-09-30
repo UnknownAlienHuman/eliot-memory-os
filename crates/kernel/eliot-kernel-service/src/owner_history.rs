@@ -58,10 +58,20 @@
 //! the completed second phase is projected as its own closed, versioned
 //! daemon-facing payload instead of being folded into a shape other owners
 //! already froze.
+//!
+//! [`serve_grant_closure_receipt`] and [`commit_grant_closure_canonical_link`]
+//! complete that second phase over the front door. The read half answers one
+//! exact target grant from the same bound P-07 owner that committed the first
+//! phase, and the write half records the link against the same durable ORS
+//! first-phase row the read half projects. Neither invents a closure: the read
+//! refuses when the owner holds no committed receipt, and the link refuses when
+//! the store holds no committed first phase, so an unestablished outcome stays
+//! an unestablished outcome instead of an empty or synthesized value.
 
 use eliot_influence::RevocationBounds;
-use eliot_ors::{GrantClosureState, OpaqueLabel, OperationalRecoveryStore};
-use eliot_receipts::ReceiptIdentity;
+use eliot_kernel_core::GrantActivationPort;
+use eliot_ors::{GrantClosureProjection, GrantClosureState, OpaqueLabel, OperationalRecoveryStore};
+use eliot_receipts::{GrantClosureReceipt, ReceiptIdentity};
 use eliot_security_contracts::{
     InfluenceState, REVOCATION_DISPOSITION_COMPLETE, REVOCATION_HISTORY_EVIDENCE_VERSION,
     RevocationClosureDigestBounds, RevocationClosureDigestInput, RevocationReason,
@@ -558,4 +568,177 @@ pub fn grant_closure_canonical_links(
     };
     payload.validate(query.max_records)?;
     Ok(payload)
+}
+
+/// Closed selector for one target grant's committed closure receipt.
+///
+/// `state_fence` is a named field for the same reason
+/// [`GrantClosureCanonicalLinksQuery`] carries one: the selector and the fence
+/// it is served under are one fact about one read, so a caller cannot present a
+/// target under a fence the Kernel does not prove.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrantClosureReceiptQuery {
+    /// The exact fence the read must be served and proved under.
+    pub state_fence: eliot_contracts::StateFence,
+    /// The exact committed closure target grant whose receipt is read.
+    pub target_grant_id: String,
+}
+
+/// Closed selector for the canonical second-phase link of one committed
+/// closure operation.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrantClosureCanonicalLinkRequest {
+    /// The exact fence the link must be committed and proved under.
+    pub state_fence: eliot_contracts::StateFence,
+    /// Immutable first-phase closure operation identity.
+    pub closure_operation_id: String,
+    /// The exact canonical receipt identity to link to that first phase.
+    pub canonical_receipt: ReceiptIdentity,
+}
+
+/// Serves one committed `GrantClosureReceipt` verbatim from the bound P-07
+/// owner that committed it (issue #686).
+///
+/// This is the read half of the canonical closure second phase. The daemon
+/// never reads the Kernel's P-07 owner directly, so without this route the
+/// revocation ingress on the far side of the transport can never learn whether
+/// a first phase committed for the grant it is revoking. The value is resolved
+/// through the owner's own committed closure index
+/// (`eliot_kernel_core::GrantActivationPort::closure_receipt_for_target`),
+/// which restart rehydration repopulates from the durable ORS rows — the same
+/// owner the completed-link projection above reads. It is returned exactly as
+/// committed: no field is defaulted, inferred, or re-derived, and no digest is
+/// recomputed here.
+///
+/// `session_fence` is the live fence owned by the dispatch site: the query
+/// fence must equal it before the owner is consulted at all.
+///
+/// # Errors
+///
+/// Returns [`StoreError::FenceMismatch`] for a query fence that disagrees with
+/// the live session fence, [`StoreError::InvalidField`] for a malformed target
+/// grant identity, [`StoreError::ReceiptNotFound`] when the owner holds no
+/// committed closure for that target — an unestablished outcome, never an empty
+/// closure — [`StoreError::Receipt`] when the owner's committed value fails its
+/// own receipt contract, and [`StoreError::InvalidProjection`] when the
+/// committed receipt does not name the presented target.
+pub fn serve_grant_closure_receipt(
+    owner: &GrantActivationPort,
+    query: &GrantClosureReceiptQuery,
+    session_fence: &eliot_contracts::StateFence,
+) -> Result<GrantClosureReceipt, StoreError> {
+    if query.state_fence != *session_fence {
+        return Err(StoreError::FenceMismatch);
+    }
+    let grant_id = query.target_grant_id.as_str();
+    if grant_id.trim().is_empty()
+        || grant_id.chars().any(char::is_control)
+        || grant_id.len() > 1_024
+    {
+        return Err(StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "target_grant_id must be a bounded non-blank string",
+        });
+    }
+    let receipt = owner
+        .closure_receipt_for_target(grant_id)
+        .ok_or(StoreError::ReceiptNotFound)?;
+    // The ORIGINAL recorded value revalidates under its own receipt contract.
+    receipt.validate().map_err(StoreError::Receipt)?;
+    if receipt.declaration.target_grant_id != grant_id {
+        return Err(StoreError::InvalidProjection);
+    }
+    Ok(receipt)
+}
+
+/// Records the canonical second-phase receipt link for one already committed
+/// closure operation, against the one durable ORS store that owns the
+/// immutable first-phase row (issue #686).
+///
+/// This is the write half of the same saga. It delegates to
+/// `eliot_ors::OperationalRecoveryStore::link_grant_closure_canonical_receipt`
+/// — the owner call `eliot_kernel_core`'s durable owner bootstrap already makes
+/// when it links an owner bundle — and never rewrites the first-phase commit
+/// bytes. The durable read-back then proves the same three facts the far side
+/// re-verifies: the returned projection commits the presented operation
+/// identity, its durable second phase IS the presented canonical receipt, and
+/// the first phase's own optional link never contradicts it. An identical link
+/// is idempotent; a different identity is an immutable refusal.
+///
+/// `session_fence` is the live fence owned by the dispatch site: the request
+/// fence must equal it before the store is touched.
+///
+/// # Errors
+///
+/// Returns [`StoreError::FenceMismatch`] for a request fence that disagrees
+/// with the live session fence, [`StoreError::InvalidField`] for an unusable
+/// closure operation or canonical receipt identity,
+/// [`StoreError::ReceiptNotFound`] when no first phase committed for that
+/// operation, [`StoreError::InvalidProjection`] for an immutable conflict or an
+/// incoherent read-back, [`StoreError::PayloadTooLarge`] for an over-bound
+/// refusal, [`StoreError::Receipt`] when the committed first phase fails its
+/// own receipt contract, and [`StoreError::Unavailable`] for a transient store
+/// failure, which stays unestablished instead of being read as a completed
+/// link.
+pub fn commit_grant_closure_canonical_link(
+    store: &dyn OperationalRecoveryStore,
+    request: &GrantClosureCanonicalLinkRequest,
+    session_fence: &eliot_contracts::StateFence,
+) -> Result<GrantClosureProjection, StoreError> {
+    if request.state_fence != *session_fence {
+        return Err(StoreError::FenceMismatch);
+    }
+    let operation_id =
+        eliot_ors::OperationIdentity::new(&request.closure_operation_id).map_err(|_| {
+            StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "closure_operation_id must be a bounded non-blank string",
+            }
+        })?;
+    if !canonical_receipt_identity_is_usable(&request.canonical_receipt) {
+        return Err(StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "canonical_receipt must carry a bounded receipt id and a lowercase 64-hex canonical digest",
+        });
+    }
+    let projection = OperationalRecoveryStore::link_grant_closure_canonical_receipt(
+        store,
+        &operation_id,
+        &request.canonical_receipt,
+    )
+    .map_err(|error| closure_link_store_error(&error))?;
+    let commit = projection.commit();
+    if commit.operation_id != operation_id.as_str()
+        || projection.second_phase() != Some(&request.canonical_receipt)
+        || commit
+            .canonical_receipt
+            .as_ref()
+            .is_some_and(|first_phase| first_phase != &request.canonical_receipt)
+    {
+        return Err(StoreError::InvalidProjection);
+    }
+    // The ORIGINAL committed first-phase bytes revalidate under their own
+    // receipt contract; nothing here recomputes an integrity digest.
+    commit.validate().map_err(StoreError::Receipt)?;
+    Ok(projection)
+}
+
+/// Maps one ORS refusal on the canonical second-phase link to the typed store
+/// failure, keeping determinate contract conflicts integrity-visible rather
+/// than transient.
+fn closure_link_store_error(error: &eliot_ors::OrsError) -> StoreError {
+    match error {
+        eliot_ors::OrsError::IntegrityProblem { .. }
+        | eliot_ors::OrsError::DuplicateConflict
+        | eliot_ors::OrsError::ReconciliationMismatch
+        | eliot_ors::OrsError::InboxIntegrityMismatch
+        | eliot_ors::OrsError::Contract(_) => StoreError::InvalidProjection,
+        eliot_ors::OrsError::ReservationNotFound => StoreError::ReceiptNotFound,
+        eliot_ors::OrsError::ProjectionLimitExceeded | eliot_ors::OrsError::PayloadTooLarge => {
+            StoreError::PayloadTooLarge
+        }
+        _ => StoreError::Unavailable,
+    }
 }

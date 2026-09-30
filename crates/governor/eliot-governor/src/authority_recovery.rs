@@ -19,8 +19,8 @@ use eliot_authority::{
     GRANT_GRAPH_RECOVERY_SCHEMA, GrantActivationRequest, GrantGraph, GrantGraphRecoverySnapshot,
     GrantRevocationRequest, GrantStatus, IntroductionActivationRequest,
     IntroductionRevocationRequest, IntroductionStatus, LEGACY_GRANT_GRAPH_RECOVERY_VERSION,
-    P07PortError, RevocationHistoryEvidence, RootTransitionActivationReceipt,
-    RootTransitionActivationRequest, SnapshotId, SuppressedGrant,
+    P07PortError, RevocationHistoryEvidence, RevocationOperationIdentity,
+    RootTransitionActivationReceipt, RootTransitionActivationRequest, SnapshotId, SuppressedGrant,
 };
 use eliot_contracts::{EpochId, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_receipts::AuthorityBinding;
@@ -608,10 +608,27 @@ impl AuthorityOwner {
     ///
     /// The legacy [`from_snapshot`](Self::from_snapshot) preserves its
     /// exact prior behavior for previously-admitted callers.
+    ///
+    /// `operation` is the admitted principal, task, work scope, observing
+    /// receipt, and causal transaction position the origin-bound recheck runs
+    /// under. The owner snapshot and the revocation-history evidence carry
+    /// none of those five coordinates: the snapshot is a grant/effect payload
+    /// (schema, version, fence, grant graph, effect authorizer, hydrations,
+    /// legacy migration) and the evidence is a fence, a durable source
+    /// revision, and per-closure owner namespace/digest/bounds records. The
+    /// graph is a pure authority evaluator with no plan, no scope binding, and
+    /// no Store readback, so it can derive no admitted task and no causal
+    /// position, and neither can this restore. `AuthorityOwner` therefore
+    /// refuses to fabricate them: the recovering owner — the durable boundary
+    /// that observed this state — supplies the identity it admitted, already
+    /// refused by `RevocationOperationIdentity::admit` if any coordinate is
+    /// blank, control-bearing, or carries no `transaction_sequence`. A
+    /// recheck under an invented identity is not a recheck.
     pub fn from_snapshot_with_revocation_history(
         snapshot: &AuthorityOwnerSnapshot,
         expected_fence: &StateFence,
         history: Option<&RevocationHistoryEvidence>,
+        operation: &RevocationOperationIdentity,
     ) -> Result<AuthorityRestoreOutcome, CompositionError> {
         let snapshot = AuthorityOwnerSnapshot::canonical_durable_snapshot(snapshot)?;
         snapshot.validate_against(expected_fence)?;
@@ -634,6 +651,7 @@ impl AuthorityOwner {
         let outcome = GrantGraph::from_recovery_snapshot_with_revocation_history(
             &snapshot.grant_graph,
             Some(evidence),
+            operation,
         )
         .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         let mut effects = EffectAuthorizer::from_snapshot(snapshot.effect_authorizer.clone())

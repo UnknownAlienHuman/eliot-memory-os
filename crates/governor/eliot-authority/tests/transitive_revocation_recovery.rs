@@ -23,13 +23,20 @@ use eliot_authority::{
     GrantRevocationRequest, GrantStatus, IntroductionActivationRequest, IntroductionId,
     IntroductionRevocationRequest, LogicalTime, P07AuthorityPort, P07PortError, PrincipalRef,
     REVOCATION_HISTORY_EVIDENCE_VERSION, RevocationEvidenceDisposition, RevocationHistoryError,
-    RevocationHistoryEvidence, SuppressionCause, UnavailableP07AuthorityPort,
+    RevocationHistoryEvidence, RevocationOperationIdentity, SuppressionCause,
+    UnavailableP07AuthorityPort,
 };
-use eliot_contracts::{ContractId, EpochId, EpochLineageId, ResourceGeneration, StateFence};
+use eliot_contracts::{
+    ClockReading, ContractId, EpochId, EpochLineageId, ReceiptId, ResourceGeneration, StateFence,
+    TaskId, TransactionSequence,
+};
 use eliot_receipts::{
     AuthorityBinding, EffectClass, ProofCeiling, SessionBinding, WorkScopeBinding,
 };
-use eliot_security_contracts::{InfluenceState, RevocationReason};
+use eliot_security_contracts::{
+    InfluenceState, REVOCATION_DISPOSITION_COMPLETE, RevocationClosureDigestBounds,
+    RevocationClosureDigestInput, RevocationReason,
+};
 use std::num::NonZeroU64;
 
 const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -79,8 +86,12 @@ fn restore_with_origin_evidence(
         .recovery_snapshot()
         .expect("snapshot");
     let evidence = origin_evidence(fence, denominator);
-    GrantGraph::from_recovery_snapshot_with_revocation_history(&snapshot, Some(&evidence))
-        .expect("current evidence restores")
+    GrantGraph::from_recovery_snapshot_with_revocation_history(
+        &snapshot,
+        Some(&evidence),
+        &operation(),
+    )
+    .expect("current evidence restores")
 }
 
 fn restore_with_mid_evidence(fence: &StateFence, denominator: &Denominator) -> GrantRestoreOutcome {
@@ -104,8 +115,12 @@ fn restore_with_mid_evidence(fence: &StateFence, denominator: &Denominator) -> G
             fence,
         )],
     };
-    GrantGraph::from_recovery_snapshot_with_revocation_history(&snapshot, Some(&evidence))
-        .expect("current evidence restores")
+    GrantGraph::from_recovery_snapshot_with_revocation_history(
+        &snapshot,
+        Some(&evidence),
+        &operation(),
+    )
+    .expect("current evidence restores")
 }
 
 fn assert_full_lineage_retained(restored: &GrantGraphRecoverySnapshot, denominator: &Denominator) {
@@ -157,6 +172,30 @@ fn fence() -> StateFence {
     )
     .expect("epoch");
     StateFence::new(epoch, ResourceGeneration::new(1).expect("generation"))
+}
+
+/// The admitted revocation operation identity every restore below is handed
+/// alongside its evidence. The graph is a pure evaluator with no plan, scope
+/// binding or Store readback of its own, so it derives none of these five
+/// coordinates; a fixture must hand it one that survives
+/// [`RevocationOperationIdentity::admit`] — every text coordinate non-blank and
+/// a causal `transaction_sequence` present. The principal, task, scope and
+/// receipt are the fixture's own namespaced values, and no test asserts
+/// anything about this value.
+fn operation() -> RevocationOperationIdentity {
+    RevocationOperationIdentity::admit(
+        "principal:root",
+        TaskId::new("task:686-alpha-recovery").expect("task id"),
+        "scope:test",
+        ReceiptId::new("receipt:686-alpha-recovery").expect("receipt id"),
+        ClockReading {
+            valid_time_ms: Some(1_000),
+            known_time_ms: Some(1_000),
+            transaction_sequence: Some(TransactionSequence::genesis()),
+            monotonic_ns: None,
+        },
+    )
+    .expect("fixture revocation operation identity is admitted")
 }
 
 fn binding(fence: &StateFence) -> AuthorityBinding {
@@ -290,19 +329,49 @@ fn closure(
     let affected_member_digest =
         AuthorityRevocationClosureEvidence::affected_members_digest(&affected)
             .expect("affected membership is addressable");
+    let evidence_version = REVOCATION_HISTORY_EVIDENCE_VERSION;
+    let bounds = eliot_influence::RevocationBounds::default_bounds();
+    let disposition = RevocationEvidenceDisposition::Complete;
+    let omissions: Vec<String> = Vec::new();
+    let affected_member_count = affected.len() as u64;
+    // The declared digest is computed over the SAME presentation the record
+    // carries, coordinate for coordinate. Recovery recomputes it from the
+    // presented bytes and refuses a disagreement, so a digest taken over any
+    // other set of coordinates would make every fixture refuse for a reason
+    // that has nothing to do with the case under test.
     let canonical_request_digest =
         AuthorityRevocationClosureEvidence::declared_canonical_request_digest(
-            closure_id,
-            root_ref,
-            &dependent_refs,
-            invalidation_reason,
-            InfluenceState::Revoked,
-            fence,
-            revision,
+            &RevocationClosureDigestInput {
+                evidence_version,
+                closure_id,
+                owner_namespace,
+                root_ref,
+                dependent_refs: &dependent_refs,
+                invalidation_reason,
+                current_influence: InfluenceState::Revoked,
+                state_fence: fence,
+                revision,
+                bounds: RevocationClosureDigestBounds {
+                    max_nodes: bounds.max_nodes,
+                    max_edges: bounds.max_edges,
+                    max_depth: bounds.max_depth,
+                    max_result: bounds.max_result,
+                    max_work: bounds.max_work,
+                    max_frontier: bounds.max_frontier,
+                    max_time: bounds.max_time,
+                },
+                // This fixture is always `Complete`, so the canonical
+                // disposition spelling is the crate's exported constant for
+                // it rather than a locally spelled string.
+                disposition: REVOCATION_DISPOSITION_COMPLETE,
+                omissions: &omissions,
+                affected_member_count,
+                affected_member_digest: &affected_member_digest,
+            },
         )
         .expect("closure presentation is addressable");
     AuthorityRevocationClosureEvidence {
-        evidence_version: REVOCATION_HISTORY_EVIDENCE_VERSION,
+        evidence_version,
         closure_id: closure_id.to_owned(),
         owner_namespace: owner_namespace.to_owned(),
         root_ref: root_ref.to_owned(),
@@ -311,10 +380,10 @@ fn closure(
         current_influence: InfluenceState::Revoked,
         state_fence: fence.clone(),
         revision,
-        bounds: eliot_influence::RevocationBounds::default_bounds(),
-        disposition: RevocationEvidenceDisposition::Complete,
-        omissions: Vec::new(),
-        affected_member_count: affected.len() as u64,
+        bounds,
+        disposition,
+        omissions,
+        affected_member_count,
         affected_member_digest,
         canonical_request_digest,
     }
@@ -375,9 +444,12 @@ fn revoke_origin_recovery_suppresses_origin_and_dependents() {
     let graph = chain(&fence, &denominator);
     let snapshot = graph.recovery_snapshot().expect("snapshot");
     let evidence = origin_evidence(&fence, &denominator);
-    let outcome =
-        GrantGraph::from_recovery_snapshot_with_revocation_history(&snapshot, Some(&evidence))
-            .expect("current evidence restores");
+    let outcome = GrantGraph::from_recovery_snapshot_with_revocation_history(
+        &snapshot,
+        Some(&evidence),
+        &operation(),
+    )
+    .expect("current evidence restores");
     let suppressed: BTreeSet<&str> = outcome
         .suppressed
         .iter()
@@ -468,9 +540,12 @@ fn revoke_mid_tree_recovery_reports_transitive_suppression() {
             &fence,
         )],
     };
-    let outcome =
-        GrantGraph::from_recovery_snapshot_with_revocation_history(&snapshot, Some(&evidence))
-            .expect("current evidence restores");
+    let outcome = GrantGraph::from_recovery_snapshot_with_revocation_history(
+        &snapshot,
+        Some(&evidence),
+        &operation(),
+    )
+    .expect("current evidence restores");
     let by_id: std::collections::BTreeMap<&str, &eliot_authority::SuppressedGrant> = outcome
         .suppressed
         .iter()
@@ -506,8 +581,9 @@ fn missing_evidence_refuses_restoration() {
     let snapshot = chain(&fence, &denominator)
         .recovery_snapshot()
         .expect("snapshot");
-    let error = GrantGraph::from_recovery_snapshot_with_revocation_history(&snapshot, None)
-        .expect_err("missing history must refuse");
+    let error =
+        GrantGraph::from_recovery_snapshot_with_revocation_history(&snapshot, None, &operation())
+            .expect_err("missing history must refuse");
     assert_eq!(error, RevocationHistoryError::MissingHistory);
 }
 
@@ -526,8 +602,12 @@ fn stale_evidence_refuses_restoration() {
         closures: Vec::new(),
     };
     assert_eq!(
-        GrantGraph::from_recovery_snapshot_with_revocation_history(&snapshot, Some(&zero))
-            .expect_err("zero revision must refuse"),
+        GrantGraph::from_recovery_snapshot_with_revocation_history(
+            &snapshot,
+            Some(&zero),
+            &operation()
+        )
+        .expect_err("zero revision must refuse"),
         RevocationHistoryError::StaleHistory
     );
     // Closure revision drift against the source revision is stale.
@@ -544,8 +624,12 @@ fn stale_evidence_refuses_restoration() {
         )],
     };
     assert_eq!(
-        GrantGraph::from_recovery_snapshot_with_revocation_history(&snapshot, Some(&drifted))
-            .expect_err("revision drift must refuse"),
+        GrantGraph::from_recovery_snapshot_with_revocation_history(
+            &snapshot,
+            Some(&drifted),
+            &operation()
+        )
+        .expect_err("revision drift must refuse"),
         RevocationHistoryError::StaleHistory
     );
     // A fence from another epoch is stale.
@@ -561,8 +645,12 @@ fn stale_evidence_refuses_restoration() {
         closures: Vec::new(),
     };
     assert_eq!(
-        GrantGraph::from_recovery_snapshot_with_revocation_history(&snapshot, Some(&foreign))
-            .expect_err("foreign fence must refuse"),
+        GrantGraph::from_recovery_snapshot_with_revocation_history(
+            &snapshot,
+            Some(&foreign),
+            &operation()
+        )
+        .expect_err("foreign fence must refuse"),
         RevocationHistoryError::StaleHistory
     );
 }
@@ -594,7 +682,8 @@ fn unknown_evidence_refuses_restoration() {
     assert_eq!(
         GrantGraph::from_recovery_snapshot_with_revocation_history(
             &snapshot,
-            Some(&active_evidence)
+            Some(&active_evidence),
+            &operation()
         )
         .expect_err("non-revoked closure must refuse"),
         RevocationHistoryError::UnknownHistory
@@ -622,8 +711,12 @@ fn unknown_evidence_refuses_restoration() {
         closures: vec![later, earlier],
     };
     assert_eq!(
-        GrantGraph::from_recovery_snapshot_with_revocation_history(&snapshot, Some(&unordered))
-            .expect_err("unordered closures must refuse"),
+        GrantGraph::from_recovery_snapshot_with_revocation_history(
+            &snapshot,
+            Some(&unordered),
+            &operation()
+        )
+        .expect_err("unordered closures must refuse"),
         RevocationHistoryError::UnknownHistory
     );
 }
@@ -642,9 +735,12 @@ fn current_empty_history_restores_unrelated_grants() {
         source_revision: denominator.source_revision,
         closures: Vec::new(),
     };
-    let outcome =
-        GrantGraph::from_recovery_snapshot_with_revocation_history(&snapshot, Some(&empty))
-            .expect("current empty history restores");
+    let outcome = GrantGraph::from_recovery_snapshot_with_revocation_history(
+        &snapshot,
+        Some(&empty),
+        &operation(),
+    )
+    .expect("current empty history restores");
     assert!(outcome.suppressed.is_empty());
     assert_eq!(
         outcome.graph.recovery_snapshot().expect("re-emit"),

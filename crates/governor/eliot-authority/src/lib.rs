@@ -43,9 +43,11 @@ pub use grants::{
     GRANT_GRAPH_RECOVERY_SCHEMA, GRANT_GRAPH_RECOVERY_VERSION, GrantClosureDelegation,
     GrantClosureMemberRef, GrantGraph, GrantGraphRecoverySnapshot, GrantId, GrantRecoveryRecord,
     GrantStatus, IntroductionId, IntroductionStatus, LEGACY_GRANT_GRAPH_RECOVERY_VERSION,
-    LogicalTime, PrincipalRef, QuarantinedCrossRootRecord, QuarantinedCrossRootRelation,
-    QuarantinedFrontierMember, ReceiptObligation, RevocationClosureState, RevocationClosureVerdict,
-    SnapshotId,
+    LogicalTime, PreparedRevocationTransition, PrincipalRef, QuarantinedCrossRootRecord,
+    QuarantinedCrossRootRelation, QuarantinedFrontierMember, REVOCATION_TRANSITION_OPERATION_KIND,
+    ReceiptObligation, RevocationClosureState, RevocationClosureVerdict,
+    RevocationOperationIdentity, RevocationTransitionDisposition, RevocationTransitionRequest,
+    RevocationWriteReceipt, SnapshotId,
 };
 pub use leases::{ActionLease, CapabilityToken, LeaseId, TokenId};
 pub use mechanical_subset::{
@@ -61,7 +63,7 @@ pub use quarantine_evidence::{
 pub use revocation_history::{
     AuthorityRevocationClosureEvidence, GrantRestoreOutcome, REVOCATION_HISTORY_EVIDENCE_VERSION,
     RevocationEvidenceDisposition, RevocationHistoryError, RevocationHistoryEvidence,
-    SuppressedGrant, SuppressionCause, ValidatedRevocationClosure,
+    RevocationOrigin, SuppressedGrant, SuppressionCause, ValidatedRevocationClosure,
 };
 
 use std::{error::Error, fmt};

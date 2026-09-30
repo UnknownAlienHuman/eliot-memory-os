@@ -44,8 +44,9 @@ use crate::{
 use eliot_authority::{
     CrossRootQuarantineEvidence, GrantActivationRequest, GrantId, GrantRevocationRequest,
     GrantStatus, IntroductionActivationRequest, IntroductionId, IntroductionRevocationRequest,
-    IntroductionStatus, P07AuthorityPort, P07PortError, RootTransitionActivationReceipt,
-    RootTransitionActivationRequest,
+    IntroductionStatus, P07AuthorityPort, P07PortError, RevocationOperationIdentity,
+    RevocationOrigin, RevocationTransitionDisposition, RevocationTransitionRequest,
+    RootTransitionActivationReceipt, RootTransitionActivationRequest,
 };
 use eliot_budget::{BudgetLedger, BudgetLedgerRecoverySnapshot};
 use eliot_canonical::{
@@ -70,6 +71,7 @@ use eliot_evaluation_contracts::{TerminalVerifierBinding, VerifierEvidenceRef};
 use eliot_finish::{
     DescendantClosure, FinishDecisionReceipt, FinishLifecycleAction, FinishService,
 };
+use eliot_influence::RevocationBounds;
 use eliot_instrument_api::{
     CaptureProvenance, EvidenceAxes, EvidenceCoverage, EvidenceFreshness, ExecutionStatus,
     InstrumentInvocation, InstrumentKind, NormalizedEvidence, RawEvidence, RawEvidenceSource,
@@ -92,7 +94,7 @@ use eliot_receipts::{GrantClosureReceipt, ReceiptIdentity};
 use eliot_runtime_contracts::{
     AuthorityActivationReceipt, AuthorityRevocationReceipt, AuthorityState, RuntimeLease,
 };
-use eliot_security_contracts::PrivacyClass;
+use eliot_security_contracts::{PrivacyClass, RevocationReason};
 use eliot_session::{SessionLifecycleOwner, SessionLifecycleSnapshot, SessionState};
 use eliot_skill::{SkillLifecycleView, SkillRegistry};
 use eliot_store_api::{
@@ -265,18 +267,87 @@ pub enum KernelPortError {
     NotAdmitted(String),
 }
 
+/// The proved canonical second phase of one grant closure, carried across the
+/// process boundary in transport-neutral types.
+///
+/// The daemon composition root does not depend on `eliot-ors` and must never
+/// gain it (the Kernel owns ORS inside the Kernel process, so the daemon has
+/// to reach the link through the authenticated transport). This record is
+/// therefore the port's return type instead of an in-process ORS projection:
+/// it names exactly the two facts the reconciliation proof reads — the
+/// ORIGINAL committed first-phase closure row and the exact Store-issued
+/// canonical receipt identity durably linked to it — and both are re-served
+/// verbatim from the owner's own committed bytes. No digest is recomputed and
+/// no field is re-derived here or by any implementor.
+///
+/// The link is mandatory, not optional: the durable second phase either exists
+/// and is returned, or the implementor answers `Err`. An absent link is an
+/// unestablished outcome, so a type that could carry "no link" as a success
+/// value would be a fabricated receipt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GrantClosureSecondPhaseLink {
+    /// The ORIGINAL committed first-phase closure row, served verbatim. The
+    /// first-phase bytes are never rewritten by the second phase.
+    closure: GrantClosureReceipt,
+    /// The exact Store-issued canonical receipt identity durably linked to
+    /// `closure` by this call.
+    canonical_receipt: ReceiptIdentity,
+}
+
+impl GrantClosureSecondPhaseLink {
+    /// Binds the ORIGINAL committed first-phase closure to the exact durable
+    /// canonical receipt linked against it.
+    ///
+    /// An implementor MUST pass the owner's verbatim committed closure and the
+    /// owner's verbatim linked receipt identity. It is not a constructor for an
+    /// unrecorded link: a first phase that did not commit, or a link the owner
+    /// does not hold, is a typed [`KernelPortError`], never a value here.
+    pub fn new(closure: GrantClosureReceipt, canonical_receipt: ReceiptIdentity) -> Self {
+        Self {
+            closure,
+            canonical_receipt,
+        }
+    }
+
+    /// Returns the ORIGINAL committed first-phase closure the link was recorded
+    /// against. The caller compares its `operation_id` and `declaration` by
+    /// content against the closure it read back, never by shape.
+    pub const fn closure(&self) -> &GrantClosureReceipt {
+        &self.closure
+    }
+
+    /// Returns the exact durable canonical second-phase receipt link.
+    pub const fn canonical_receipt(&self) -> &ReceiptIdentity {
+        &self.canonical_receipt
+    }
+}
+
 /// Narrow durable boundary for the canonical second phase of a grant
 /// closure. The Kernel-side adapter must delegate this call to
 /// `eliot_ors::OperationalRecoveryStore::link_grant_closure_canonical_receipt`;
 /// Governor never edits the first-phase closure row.
+///
+/// Like [`GrantClosureReceiptPort`], this port is transport-neutral: every type
+/// in its signature is reachable from a daemon-side dependency set that holds
+/// no in-process ORS, so the saga arm that records the canonical second phase
+/// is implementable by the process that owns the decision. `operation_id` is
+/// the ORIGINAL closure operation identity string already recorded in the
+/// first-phase [`GrantClosureReceipt`]; an adapter that needs a typed ORS
+/// operation identity constructs it from these exact bytes at the boundary
+/// that calls the store, which is where that validation belongs.
 pub trait GrantClosureCanonicalLinkPort: Send + Sync {
     /// Links the exact Store-issued `ReceiptIdentity` to the immutable
-    /// first-phase closure operation.
+    /// first-phase closure operation, and returns the proved read-back so the
+    /// caller re-checks it instead of taking the owner's word for it.
+    ///
+    /// Returns a typed [`KernelPortError`] when the first phase has not
+    /// committed for `operation_id`, when the link conflicts with an existing
+    /// one, or when the owner's read-back does not bind the presented receipt.
     fn link_grant_closure_canonical_receipt(
         &self,
-        operation_id: &eliot_ors::OperationIdentity,
+        operation_id: &str,
         canonical_receipt: &ReceiptIdentity,
-    ) -> Result<eliot_ors::GrantClosureProjection, KernelPortError>;
+    ) -> Result<GrantClosureSecondPhaseLink, KernelPortError>;
 }
 
 /// Readback boundary for the durable closure committed by the first P-07
@@ -333,6 +404,20 @@ pub struct PendingCanonicalRevocation {
     pub revocation_id: String,
     /// The canonical phase that has not completed.
     pub phase: CanonicalRevocationPhase,
+}
+
+/// The admitted canonical identity one grant-revocation saga commits under.
+///
+/// The operation identity, the canonical operation id and the canonical
+/// request identity are one indivisible admission: they are composed together
+/// by the caller from admitted ingress and are never derived from the durable
+/// closure. They travel as one value so the prepare step cannot be handed a
+/// mixture of two different operations.
+#[derive(Clone, Copy, Debug)]
+struct CanonicalRevocationCommit<'a> {
+    canonical_operation_id: &'a OperationId,
+    canonical_request_identity: &'a RequestIdentity,
+    operation: &'a RevocationOperationIdentity,
 }
 
 /// Internal carrier for a canonical-phase refusal: which phase failed and the
@@ -4359,9 +4444,10 @@ pub enum AuthorityActionReceipt {
     /// The three durable phases of one reconciled grant revocation. A grant
     /// revocation never reports a single-phase receipt: either the whole saga
     /// committed and proved its read-backs, or it returns `Err`. The record is
-    /// boxed because it carries the whole committed ORS closure projection,
-    /// which is far larger than the other two terminal receipts; the box is a
-    /// representation choice only and changes no field or proof.
+    /// boxed because it carries the whole committed first-phase closure
+    /// together with its second-phase link, which is far larger than the other
+    /// two terminal receipts; the box is a representation choice only and
+    /// changes no field or proof.
     ReconciledGrantRevocation(Box<AuthorityRevocationReconciliation>),
 }
 
@@ -4372,8 +4458,10 @@ pub struct AuthorityRevocationReconciliation {
     pub authority_receipt: AuthorityRevocationReceipt,
     /// Canonical write receipt proving the second phase committed.
     pub canonical_receipt: WriteReceipt,
-    /// ORS projection carrying the exact second-phase link.
-    pub closure_projection: eliot_ors::GrantClosureProjection,
+    /// Proved canonical second phase: the ORIGINAL committed first-phase
+    /// closure together with the exact Store-issued receipt durably linked to
+    /// it, as the neutral [`GrantClosureSecondPhaseLink`] carries it.
+    pub closure_projection: GrantClosureSecondPhaseLink,
 }
 
 /// Agent- and Human-facing projection of one retained terminal cold-start
@@ -7674,23 +7762,40 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     ///
     /// A grant revocation is the only arm with a canonical second phase, so it
     /// is the only arm that reads `canonical_operation_id`,
-    /// `canonical_request_identity`, `durable_link`, and `closure_source`:
-    /// they are forwarded verbatim to [`Self::revoke_grant_and_reconcile`] in
-    /// the order that method mandates — Kernel/ORS fences the exact graph
-    /// revision first, then the durable closure read-back, then the canonical
-    /// envelope commit, then the ORS second-phase link. The other three arms
-    /// never touch them.
+    /// `canonical_request_identity`, `operation`, `durable_link`, and
+    /// `closure_source`: they are forwarded verbatim to
+    /// [`Self::revoke_grant_and_reconcile`] in the order that method mandates
+    /// — Kernel/ORS fences the exact graph revision first, then the durable
+    /// closure read-back and the prepared authority-revocation transition,
+    /// then the canonical envelope commit, then the ORS second-phase link. The
+    /// other three arms never touch them.
+    ///
+    /// `operation` is the admitted revocation operation identity the bounded
+    /// closure and the prepared canonical revocation transition are computed
+    /// under. It is required and never defaulted: the durable closure receipt
+    /// carries a fence, a membership and a digest but none of the identity's
+    /// five coordinates, so preparing under a synthesized identity would make
+    /// the authority graph's own recheck certify itself.
     ///
     /// The canonical operation identity and admitted request identity are
     /// composed by the caller from admitted ingress and are never derived
     /// from the durable closure, so an exact replay of one operation resolves
     /// to the same receipt while the same operation under a changed payload
     /// conflicts at the store instead of reconciling to a different closure.
+    ///
+    /// The grant-revocation arm runs through
+    /// [`Self::apply_admitted_authority_revocation`], which admits the
+    /// presented operation against the live composition generation before
+    /// the saga starts. Live status: production seam for all four authority
+    /// families; the daemon composition root's authority pass is its one
+    /// production caller (BLOCKED-BY authority-transport: that pass does not
+    /// yet build one of these requests from an admitted canonical source).
     pub async fn apply_authority_request<L, C>(
         &mut self,
         request: PresentedAuthorityRequest,
         canonical_operation_id: &OperationId,
         canonical_request_identity: &RequestIdentity,
+        operation: &RevocationOperationIdentity,
         durable_link: &L,
         closure_source: &C,
     ) -> Result<AuthorityActionReceipt, CompositionError>
@@ -7703,10 +7808,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 .activate_grant(&request)
                 .map(AuthorityActionReceipt::Activation),
             PresentedAuthorityRequest::GrantRevocation(request) => self
-                .revoke_grant_and_reconcile(
+                .apply_admitted_authority_revocation(
                     &request,
                     canonical_operation_id,
                     canonical_request_identity,
+                    operation,
                     durable_link,
                     closure_source,
                 )
@@ -7724,6 +7830,119 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 .activate_root_transition(&request)
                 .map(|receipt| AuthorityActionReceipt::RootTransitionActivation(Box::new(receipt))),
         }
+    }
+
+    /// Applies one admitted grant revocation through the complete
+    /// Kernel-first saga under the live composition generation (#686).
+    ///
+    /// This is the production ingress for the revocation half of
+    /// [`Self::apply_authority_request`], and the only entry that reaches
+    /// [`Self::revoke_grant_and_reconcile`] and through it
+    /// [`Self::revoke_grant`], the `GrantGraph` closure revoke, and the
+    /// `RetainedAuthorityRequest` unknown-outcome surface. It admits nothing
+    /// itself: the daemon composition root still builds the
+    /// [`GrantRevocationRequest`] and both canonical identities from its own
+    /// admitted ingress, and both durable boundary ports are still the
+    /// existing owners that hold the ORS first-phase row and the
+    /// Kernel-issued receipt. No second graph, ledger, authority machine or
+    /// Store client is introduced here.
+    ///
+    /// Fail-closed order, all of it ahead of any transport:
+    /// - The composition must be `Ready` and must still retain a live P-07
+    ///   port. A degraded composition issues no right and starts no saga.
+    /// - The presented binding State Fence must equal the live composition
+    ///   State Fence, and the admitted canonical request identity must carry
+    ///   that same fence. An operation compiled against a superseded
+    ///   generation refuses here instead of being presented to the current
+    ///   Kernel owner and retained against a different owner snapshot
+    ///   (A00-03: restoration of revoked influence after recovery is a hard
+    ///   boundary; I6.15 keeps the Governor the owner of the semantic gating
+    ///   around the receipts this port returns).
+    /// - A retained presentation for the same grant must carry the exact
+    ///   same bytes. Changed content under a retained operation identity
+    ///   returns `IdentityConflict` and performs no transition (I5.27), so a
+    ///   lost acknowledgement can never become a second, differently shaped
+    ///   revocation, and a replay of the exact bytes still resolves to the
+    ///   retained receipt rather than minting a new identity.
+    /// - A pending stricter canonical revocation for the same grant must
+    ///   name the same snapshot. Re-presenting that exact operation resumes
+    ///   its unfinished second phase under the same canonical operation
+    ///   identity; presenting different content under an already fenced
+    ///   grant returns `IdentityConflict` instead of a fresh blind retry, and
+    ///   the retained record is never cleared by a refusal.
+    ///
+    /// Everything past admission is the existing saga, unchanged: Kernel
+    /// fences the exact graph revision first, the durable closure is read
+    /// back and validated against this request's snapshot and fence, the
+    /// authority graph's own origin-bound re-derivation is proven to bind
+    /// that closure, the canonical envelope is compiled from that closure and
+    /// committed, and the Store-issued receipt identity is linked to the
+    /// immutable first-phase row and read back. The returned record is only
+    /// ever the evidence those owners supplied.
+    ///
+    /// `operation` is the admitted revocation operation identity the bounded
+    /// closure and the prepared canonical revocation transition are computed
+    /// under, forwarded verbatim to [`Self::revoke_grant_and_reconcile`]. It
+    /// is required, never defaulted.
+    ///
+    /// Live status: production ingress for the revocation half; the daemon
+    /// composition root's polled authority pass is its one production caller
+    /// (BLOCKED-BY authority-revocation-transport: that pass builds no
+    /// revocation request and holds no `GrantClosureReceiptPort` /
+    /// `GrantClosureCanonicalLinkPort` adapter yet).
+    pub async fn apply_admitted_authority_revocation<L, C>(
+        &mut self,
+        request: &GrantRevocationRequest,
+        canonical_operation_id: &OperationId,
+        canonical_request_identity: &RequestIdentity,
+        operation: &RevocationOperationIdentity,
+        durable_link: &L,
+        closure_source: &C,
+    ) -> Result<AuthorityRevocationReconciliation, CompositionError>
+    where
+        L: GrantClosureCanonicalLinkPort + ?Sized,
+        C: GrantClosureReceiptPort + ?Sized,
+    {
+        self.require_ready_for_authority()?;
+        // Resolve the retained port here as well: a diagnosed degradation must
+        // refuse before the saga starts, never half-way through it.
+        self.authority_port()?;
+        let live_fence = self.snapshot.state_fence();
+        if request.binding.state_fence != live_fence {
+            return Err(CompositionError::Recovery(
+                "admitted grant revocation is not bound to the live composition State Fence"
+                    .to_owned(),
+            ));
+        }
+        if canonical_request_identity.request.metadata.state_fence != live_fence {
+            return Err(CompositionError::Provider(
+                "admitted canonical request identity is not bound to the live composition State Fence"
+                    .to_owned(),
+            ));
+        }
+        let presented = PresentedAuthorityRequest::GrantRevocation(request.clone());
+        let ledger_key = presented.ledger_key();
+        if let Some(retained) = self.authority_presentations.get(ledger_key.as_str())
+            && retained.request() != &presented
+        {
+            return Err(CompositionError::Authority(P07PortError::IdentityConflict));
+        }
+        if let Some(pending) = self
+            .pending_canonical_revocations
+            .get(request.grant_id.as_str())
+            && pending.snapshot_id != request.snapshot_id.as_str()
+        {
+            return Err(CompositionError::Authority(P07PortError::IdentityConflict));
+        }
+        self.revoke_grant_and_reconcile(
+            request,
+            canonical_operation_id,
+            canonical_request_identity,
+            operation,
+            durable_link,
+            closure_source,
+        )
+        .await
     }
 
     /// Presents one canonical grant activation to the retained P-07 port and
@@ -7897,9 +8116,16 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// The retained P-07 port first requests the exact graph revision and
     /// durable descendant closure from Kernel/ORS. Only after that receipt is
     /// validated does Governor fence the declared closure in its own
-    /// projection, compile the canonical declaration from the durable
-    /// [`GrantClosureReceipt`] and commit it. The Store-issued canonical
-    /// receipt identity is finally linked to the immutable ORS first-phase row.
+    /// projection, prove that the authority graph's own origin-bound
+    /// re-derivation binds that exact durable closure, compile the canonical
+    /// declaration from the durable [`GrantClosureReceipt`] and commit it. The
+    /// Store-issued canonical receipt identity is finally linked to the
+    /// immutable ORS first-phase row.
+    ///
+    /// `operation` is the admitted revocation operation identity both the
+    /// bounded closure and the prepared canonical revocation transition are
+    /// computed under. It is required, never defaulted, and is forwarded
+    /// verbatim to [`Self::reconcile_canonical_revocation`].
     ///
     /// Every failure after the Kernel first phase retains a
     /// [`PendingCanonicalRevocation`] before returning. The mechanical fence
@@ -7908,6 +8134,12 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// a later activation is refused, and a failed retry never clears it. The
     /// record is removed only when the second-phase link commits, which is the
     /// one outcome that proves canonical reconciliation completed.
+    ///
+    /// Its one production ingress is [`Self::apply_admitted_authority_revocation`],
+    /// which admits the presented operation against the live composition
+    /// generation before the Kernel first phase is struck;
+    /// [`Self::apply_authority_request`] reaches it through the
+    /// `GrantRevocation` arm.
     pub async fn revoke_grant_and_reconcile<
         L: GrantClosureCanonicalLinkPort + ?Sized,
         C: GrantClosureReceiptPort + ?Sized,
@@ -7916,6 +8148,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         request: &GrantRevocationRequest,
         canonical_operation_id: &OperationId,
         canonical_request_identity: &RequestIdentity,
+        operation: &RevocationOperationIdentity,
         durable_link: &L,
         closure_source: &C,
     ) -> Result<AuthorityRevocationReconciliation, CompositionError> {
@@ -7927,8 +8160,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .reconcile_canonical_revocation(
                 request,
                 &authority_receipt,
-                canonical_operation_id,
-                canonical_request_identity,
+                &CanonicalRevocationCommit {
+                    canonical_operation_id,
+                    canonical_request_identity,
+                    operation,
+                },
                 durable_link,
                 closure_source,
             )
@@ -7961,6 +8197,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// This method is reached only after [`Self::revoke_grant`] returned a
     /// validated Kernel revocation receipt, so every refusal here is a refusal
     /// to finish a handoff whose mechanical fence already took effect.
+    ///
+    /// The prepared canonical revocation transition is computed here, before
+    /// this projection fences the declared closure, because it is the
+    /// authority graph's own origin-bound re-derivation at the CURRENT graph
+    /// revision that the durable declaration is then held against.
     async fn reconcile_canonical_revocation<
         L: GrantClosureCanonicalLinkPort + ?Sized,
         C: GrantClosureReceiptPort + ?Sized,
@@ -7968,8 +8209,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         &mut self,
         request: &GrantRevocationRequest,
         authority_receipt: &AuthorityRevocationReceipt,
-        canonical_operation_id: &OperationId,
-        canonical_request_identity: &RequestIdentity,
+        commit: &CanonicalRevocationCommit<'_>,
         durable_link: &L,
         closure_source: &C,
     ) -> Result<AuthorityRevocationReconciliation, PendingCanonicalHandoff> {
@@ -7989,7 +8229,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             || closure.declaration.target_grant_id != request.grant_id.as_str()
             || closure.authority_receipt.snapshot_id != request.snapshot_id.as_str()
             || closure.authority.state_fence != request.binding.state_fence
-            || canonical_request_identity.request.metadata.state_fence
+            || commit
+                .canonical_request_identity
+                .request
+                .metadata
+                .state_fence
                 != closure.authority.state_fence
         {
             return Err(PendingCanonicalHandoff {
@@ -8012,6 +8256,16 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 error: CompositionError::Authority(P07PortError::InvalidBinding),
             });
         }
+        // The declared closure is admitted; before this projection fences it
+        // and advances its own graph revision, the authority graph prepares
+        // the canonical revocation transition over the SAME target and
+        // closure and proves that its own origin-bound re-derivation binds
+        // the durable declaration this saga is about to commit.
+        self.prepare_revocation_transition_for_commit(request, &closure, commit)
+            .map_err(|error| PendingCanonicalHandoff {
+                phase: CanonicalRevocationPhase::ClosureReadback,
+                error,
+            })?;
         // The Kernel already fenced the complete declared closure. Fence the
         // exact same declared members in this projection so an already-issued
         // narrower descendant cannot keep reading an effective right out of the
@@ -8028,8 +8282,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             })?;
         self.owners.authority.invalidate_owner_hydrations();
         let envelope = authority_revocation_envelope_from_closure(
-            canonical_request_identity,
-            canonical_operation_id,
+            commit.canonical_request_identity,
+            commit.canonical_operation_id,
             &closure,
         )
         .map_err(|error| PendingCanonicalHandoff {
@@ -8037,7 +8291,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             error,
         })?;
         let canonical_receipt = self
-            .commit_canonical(canonical_request_identity, envelope)
+            .commit_canonical(commit.canonical_request_identity, envelope)
             .await
             .map_err(|error| PendingCanonicalHandoff {
                 phase: CanonicalRevocationPhase::CanonicalCommit,
@@ -8049,20 +8303,44 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 error,
             }
         })?;
-        let closure_operation_id = eliot_ors::OperationIdentity::new(closure.operation_id.as_str())
-            .map_err(|error| PendingCanonicalHandoff {
-                phase: CanonicalRevocationPhase::SecondPhaseLink,
-                error: CompositionError::Recovery(error.to_string()),
-            })?;
+        // The ORIGINAL recorded first-phase operation identity, not a
+        // re-derived or freshly minted one. `closure.validate()` above already
+        // revalidated this exact field under the closure receipt contract, and
+        // an adapter that needs a typed ORS operation identity rebuilds it from
+        // these same bytes at the boundary that actually calls the store.
+        let closure_projection =
+            Self::link_closure_second_phase(durable_link, &closure, &receipt_identity)?;
+        Ok(AuthorityRevocationReconciliation {
+            authority_receipt: authority_receipt.clone(),
+            canonical_receipt,
+            closure_projection,
+        })
+    }
+
+    /// Links the canonical second phase of one grant revocation through the
+    /// durable boundary and proves the read-back.
+    ///
+    /// The owner-side link is keyed by the ORIGINAL recorded first-phase
+    /// operation identity, never a re-derived or freshly minted one. The
+    /// read-back is compared by CONTENT on the owner's committed bytes, never
+    /// by existence and never by shape: the linked operation identity, the
+    /// whole declared closure membership, and the exact linked canonical
+    /// receipt. A disagreement is the second-phase refusal the saga retains a
+    /// pending stricter revocation for.
+    fn link_closure_second_phase<L: GrantClosureCanonicalLinkPort + ?Sized>(
+        durable_link: &L,
+        closure: &GrantClosureReceipt,
+        receipt_identity: &ReceiptIdentity,
+    ) -> Result<GrantClosureSecondPhaseLink, PendingCanonicalHandoff> {
         let closure_projection = durable_link
-            .link_grant_closure_canonical_receipt(&closure_operation_id, &receipt_identity)
+            .link_grant_closure_canonical_receipt(closure.operation_id.as_str(), receipt_identity)
             .map_err(|error| PendingCanonicalHandoff {
                 phase: CanonicalRevocationPhase::SecondPhaseLink,
                 error: CompositionError::Owner(error.to_string()),
             })?;
-        if closure_projection.commit().operation_id != closure.operation_id
-            || closure_projection.commit().declaration != closure.declaration
-            || closure_projection.second_phase() != Some(&receipt_identity)
+        if closure_projection.closure().operation_id != closure.operation_id
+            || closure_projection.closure().declaration != closure.declaration
+            || closure_projection.canonical_receipt() != receipt_identity
         {
             return Err(PendingCanonicalHandoff {
                 phase: CanonicalRevocationPhase::SecondPhaseLink,
@@ -8072,11 +8350,107 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 ),
             });
         }
-        Ok(AuthorityRevocationReconciliation {
-            authority_receipt: authority_receipt.clone(),
-            canonical_receipt,
-            closure_projection,
-        })
+        Ok(closure_projection)
+    }
+
+    /// Prepares the authority crate's canonical revocation transition over
+    /// THIS composition's own grant graph and proves it binds the exact
+    /// durable closure the Kernel/ORS first phase committed.
+    ///
+    /// [`authority_revocation_envelope_from_closure`] compiles the canonical
+    /// record from the durable `GrantClosureReceipt`: it revalidates that
+    /// receipt with its own `validate()` and digests the membership, revision
+    /// and fence the declaration itself carries. The membership it records is
+    /// therefore the declaration's own word about itself. This step adds the
+    /// independent half the declaration cannot supply: the authority graph
+    /// re-derives the origin-bound affected set itself, at the CURRENT live
+    /// graph revision and under the same State Fence, from the admitted
+    /// operation identity, and the saga refuses unless those two derivations
+    /// agree. `A00-03` names "restoration of revoked influence after recovery"
+    /// a fail-closed boundary, and a declaration whose membership the shipped
+    /// graph cannot reproduce is exactly the case that must not be written.
+    ///
+    /// The comparison is by CONTENT, never by existence or shape: the whole
+    /// re-derived affected set, and the authority epoch every re-derived
+    /// member was proven under. Nothing is recomputed, defaulted or
+    /// manufactured here. The prepared transition's own `graph_revision` is
+    /// deliberately NOT compared with `closure.declaration.grant_graph_revision`:
+    /// those are two owners' counters — the Kernel's enumeration revision and
+    /// this projection's own revision, which `GrantGraph::revoke` and
+    /// `GrantGraph::revoke_declared_closure` have each already advanced past
+    /// that point — so no equality between them would mean anything.
+    ///
+    /// A declaration the authority graph cannot reproduce is refused here
+    /// rather than written. That is the intended direction: the closure's
+    /// `validate()` already refuses a cross-root member, so a durable
+    /// membership this graph re-derives as larger is evidence the recorded
+    /// closure is narrower than the authority's own denominator, and the
+    /// canonical revocation record must not be minted from it.
+    ///
+    /// What is presented is the owner's own material, never a synthesized
+    /// coordinate: the operation identity and idempotency key are the admitted
+    /// canonical ones, the snapshot and State Fence are the ones the durable
+    /// closure records, the bounds are the same default bounds the canonical
+    /// record is committed under, and the reason is the terminal
+    /// `SourceRevoked` state the durable influence closure records. The
+    /// disposition is [`RevocationTransitionDisposition::Prepared`] and no
+    /// write receipt is presented, because at this point nothing has been
+    /// written: the canonical commit is the NEXT step, and no durable receipt
+    /// exists yet to present. A committed presentation is never synthesized
+    /// from a receipt this step has not been given.
+    ///
+    /// `prior` is `None` because this composition retains no prepared
+    /// transition between calls: its durable second-phase progress is the
+    /// [`PendingCanonicalRevocation`] record, and the I5.27 same-operation /
+    /// changed-payload conflict is already enforced on the retained
+    /// presentation bytes at
+    /// [`Self::apply_admitted_authority_revocation`]. The prepared
+    /// transition's own replay gate therefore has nothing to read here, and
+    /// claiming a prior it does not hold would be a fabricated one.
+    fn prepare_revocation_transition_for_commit(
+        &self,
+        request: &GrantRevocationRequest,
+        closure: &GrantClosureReceipt,
+        commit: &CanonicalRevocationCommit<'_>,
+    ) -> Result<(), CompositionError> {
+        let origin = RevocationOrigin::Grant(request.grant_id.clone());
+        let prepared = self
+            .owners
+            .authority
+            .grants
+            .prepare_revocation_transition(
+                &origin,
+                &RevocationTransitionRequest {
+                    operation_id: commit.canonical_operation_id.as_str().to_owned(),
+                    idempotency_key: commit.canonical_request_identity.idempotency_key.clone(),
+                    snapshot_id: request.snapshot_id.clone(),
+                    state_fence: closure.authority.state_fence.clone(),
+                    bounds: RevocationBounds::default_bounds(),
+                    reason: RevocationReason::SourceRevoked,
+                    disposition: RevocationTransitionDisposition::Prepared,
+                    write_receipt: None,
+                    operation: commit.operation.clone(),
+                },
+                None,
+            )
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        // The whole re-derived membership and the authority epoch every member
+        // was proven under. Any disagreement is a reconciliation refusal, not a
+        // widening and not a silent repair.
+        let declared_affected: BTreeSet<String> =
+            closure.declaration.affected_grants().into_iter().collect();
+        if prepared.affected() != &declared_affected
+            || !prepared
+                .authority_epoch()
+                .is_same_authority(&closure.authority_receipt.authority_epoch)
+        {
+            return Err(CompositionError::Recovery(
+                "prepared authority revocation transition does not bind the durable closure \
+                 membership and authority epoch"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     /// Presents one canonical introduction activation to the retained P-07
@@ -8340,12 +8714,22 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// an absent history, or a stale/invalid view refuses before any owner
     /// state is installed: unavailable history is never absence of
     /// revocation.
+    ///
+    /// `operation` is the admitted revocation operation identity this
+    /// restore runs under, supplied by the durable boundary that admitted
+    /// it and forwarded verbatim. It is required, never defaulted: the
+    /// snapshot is a grant/effect payload and the decoded history carries
+    /// only a fence, a durable source revision, and per-closure owner
+    /// namespace/digest/bounds records, so none of the identity's five
+    /// coordinates is derivable here. Restoring under a synthesized
+    /// identity would make the origin-bound recheck certify itself.
     pub async fn restore_authority_with_live_history<R: CanonicalReadClient + ?Sized>(
         reads: &R,
         snapshot: &AuthorityOwnerSnapshot,
         state_fence: &StateFence,
         origin_ref: &str,
         max_records: u32,
+        operation: &RevocationOperationIdentity,
     ) -> Result<AuthorityRestoreOutcome, CompositionError> {
         let request = revocation_history_read_request(state_fence, origin_ref, max_records)?;
         let response = reads
@@ -8357,6 +8741,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             snapshot,
             state_fence,
             Some(&evidence),
+            operation,
         )
     }
 
@@ -8370,6 +8755,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// on provider-revision advance and on recovery; a stale trigger
     /// refuses before any publish, and no owner state installs until
     /// the Kernel readback proves the exact published bytes.
+    ///
+    /// `operation` is the admitted revocation operation identity the
+    /// underlying feed restores under; it is forwarded verbatim to
+    /// [`synchronize_owner_feed`] and is required, never defaulted.
     pub async fn synchronize_kernel_owner<
         R: CanonicalReadClient + ?Sized,
         K: OwnerPublishPort + ?Sized,
@@ -8380,6 +8769,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         origin_refs: &[String],
         max_records: u32,
         expected_revision: u64,
+        operation: RevocationOperationIdentity,
     ) -> Result<u64, CompositionError> {
         let snapshot = self.owners.authority.snapshot()?;
         let state_fence = self.snapshot.state_fence();
@@ -8391,6 +8781,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             origin_refs,
             max_records,
             expected_revision,
+            operation,
         )
         .await
     }
@@ -8399,6 +8790,15 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// read from the durable ORS boundary. The legacy method above remains the
     /// fail-closed empty-link entry point; a production caller that has read
     /// completed links must use this method.
+    ///
+    /// `operation` is the admitted revocation operation identity the
+    /// underlying feed restores under; it is forwarded verbatim to
+    /// [`synchronize_owner_feed_with_canonical_receipts`] and is
+    /// required, never defaulted.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the durable feed boundary keeps read, publish, roots, history, revision, canonical receipt evidence, and the admitted operation identity explicit"
+    )]
     pub async fn synchronize_kernel_owner_with_canonical_receipts<
         R: CanonicalReadClient + ?Sized,
         K: OwnerPublishPort + ?Sized,
@@ -8410,6 +8810,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         max_records: u32,
         expected_revision: u64,
         canonical_receipts: BTreeMap<String, ReceiptIdentity>,
+        operation: RevocationOperationIdentity,
     ) -> Result<u64, CompositionError> {
         let snapshot = self.owners.authority.snapshot()?;
         let state_fence = self.snapshot.state_fence();
@@ -8422,6 +8823,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             max_records,
             expected_revision,
             canonical_receipts,
+            operation,
         )
         .await
     }
@@ -8430,9 +8832,14 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// plus owner quarantine evidence records read from the durable
     /// boundary. Absent evidence leaves the affected omissions explicitly
     /// unresolved; it is never reconstructed here.
+    ///
+    /// `operation` is the admitted revocation operation identity the
+    /// underlying feed restores under; it is forwarded verbatim to
+    /// [`synchronize_owner_feed_with_quarantine_evidence`] and is
+    /// required, never defaulted.
     #[allow(
         clippy::too_many_arguments,
-        reason = "the durable feed boundary keeps read, publish, roots, history, revision, canonical receipt evidence, and quarantine evidence explicit"
+        reason = "the durable feed boundary keeps read, publish, roots, history, revision, canonical receipt evidence, quarantine evidence, and the admitted operation identity explicit"
     )]
     pub async fn synchronize_kernel_owner_with_quarantine_evidence<
         R: CanonicalReadClient + ?Sized,
@@ -8446,6 +8853,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         expected_revision: u64,
         canonical_receipts: BTreeMap<String, ReceiptIdentity>,
         quarantine_evidence: BTreeMap<String, CrossRootQuarantineEvidence>,
+        operation: RevocationOperationIdentity,
     ) -> Result<u64, CompositionError> {
         let snapshot = self.owners.authority.snapshot()?;
         let state_fence = self.snapshot.state_fence();
@@ -8459,6 +8867,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             expected_revision,
             canonical_receipts,
             quarantine_evidence,
+            operation,
         )
         .await
     }

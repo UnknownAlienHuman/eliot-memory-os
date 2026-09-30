@@ -3566,7 +3566,71 @@ async fn run_owner_feed_sync(
             }
         }
     }
+    report_authority_revocation_ingress(kernel, composition, failure_guard).await;
     trigger
+}
+
+/// Reports the durable grant-closure second phases that are still pending
+/// (#686).
+///
+/// This is the production driver for
+/// [`eliotd::authority_revocation_ingress`]. It is deliberately separate from
+/// the owner-feed restore above and runs after it, so the closure read can
+/// never delay, reorder, or fail a restore that is already proven correct: a
+/// degraded ingress pass only emits a bounded diagnostic on this stream's
+/// existing failure guard and the next tick retries it, exactly like the
+/// owner-feed pass itself. The ingress never gates readiness and never fails
+/// the daemon.
+///
+/// Pending second phases are a real durable obligation that nothing in the
+/// shipped daemon can currently finish, so they are reported with the exact
+/// missing owner named rather than left implied by an absence.
+async fn report_authority_revocation_ingress(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: SharedComposition,
+    failure_guard: &mut RepeatedFailureGuard,
+) {
+    let plan = {
+        let guard = composition.lock().await;
+        eliotd::capture_authority_revocation_ingress_plan(&guard)
+    };
+    let report = match plan {
+        Ok(plan) => eliotd::scan_authority_revocation_ingress(plan, kernel).await,
+        Err(error) => Err(error),
+    };
+    match report {
+        Ok(report) => {
+            for pending in report.pending_second_phase() {
+                tracing::warn!(
+                    target: "eliotd::diagnostics",
+                    event = "eliotd.authority_revocation_second_phase_pending",
+                    grant_id = %eliotd::diagnostics::sanitize_identity(&pending.grant_id),
+                    closure_operation_id = %eliotd::diagnostics::sanitize_identity(
+                        &pending.closure_operation_id
+                    ),
+                    authority_receipt_id = %eliotd::diagnostics::sanitize_identity(
+                        &pending.authority_receipt_id
+                    ),
+                    snapshot_id = %eliotd::diagnostics::sanitize_identity(&pending.snapshot_id),
+                    recovered_status = ?pending.recovered_status,
+                    grant_graph_revision = report.revision(),
+                    candidates_examined = report.candidates_examined(),
+                    committed_closures = report.committed_closures(),
+                    resume_blocked = pending.resume_blocked,
+                );
+            }
+        }
+        Err(error) => {
+            if failure_guard.should_emit() {
+                let _ = eliotd::diagnostics::ErrorRecord::of(
+                    eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                    "authority-revocation-ingress",
+                    &error.to_string(),
+                )
+                .emit();
+            }
+        }
+    }
 }
 
 /// The governor-authority driver travels with its in-flight drive step and

@@ -38,6 +38,7 @@ use std::sync::atomic::Ordering;
 
 mod activation_projection;
 pub mod agent_fabric;
+pub mod authority_revocation_ingress;
 pub mod campaign_context_owner;
 pub mod campaign_evaluation_owner;
 pub mod campaign_owner_matrix;
@@ -168,6 +169,12 @@ pub use agent_fabric::{
     prereq_ports,
 };
 use agent_fabric::{FabricOperation, FabricPortId, MissingPortResidual, PortBindingState};
+
+pub use authority_revocation_ingress::{
+    AUTHORITY_REVOCATION_RESUME_BLOCKED, AuthorityRevocationIngressPlan,
+    AuthorityRevocationIngressReport, PendingCanonicalSecondPhase,
+    capture_authority_revocation_ingress_plan, scan_authority_revocation_ingress,
+};
 
 use controlboard_adapters::SharedOperatorReplay;
 

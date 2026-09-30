@@ -1,12 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use eliot_contracts::StateFence;
+use eliot_contracts::{
+    ClockReading, EpochId, ReceiptId, StateFence, TaskId, canonical_json_bytes, sha256_hex,
+};
 use eliot_influence::{
     BoundedRevocationRequest, ClosureCompleteness, InfluenceEdgeDisposition, OmissionCause,
     QualifiedInfluenceEdge, RevocationOmission,
 };
-use eliot_receipts::{AuthorityBinding, EffectClass, SessionBinding, WorkScopeBinding};
+use eliot_receipts::{
+    AuthorityBinding, EffectClass, ReceiptIdentity, SessionBinding, WorkScopeBinding,
+};
 use eliot_security_contracts::{EffectCeiling, RevocationReason};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -20,7 +24,9 @@ use crate::revocation_history::{
 use crate::root_transition::{
     AdmittedRootTransition, AdmittedRootTransitionRecord, RootTransitionDisposition,
 };
-use crate::{AuthorityError, GrantRestoreOutcome, RevocationHistoryError, validate_text};
+use crate::{
+    AuthorityError, GrantRestoreOutcome, RevocationHistoryError, validate_digest, validate_text,
+};
 
 const REVOCATION_PAGE_EDGE_LIMIT: u64 = 256;
 const REVOCATION_PAGE_WORK_LIMIT: u64 = 513;
@@ -1166,6 +1172,611 @@ pub(crate) enum BoundRevocationOrigin {
     Ambiguous,
 }
 
+/// Closed operation kind of the canonical authority-revocation transition this
+/// crate PREPARES. It is part of the canonical request preimage, so this
+/// operation kind can never collide with another canonical operation under one
+/// operation identity (I5.27).
+pub const REVOCATION_TRANSITION_OPERATION_KIND: &str = "authority.revocation.activate";
+
+/// The admitted operation identity ONE bounded revocation traversal runs under.
+///
+/// Every coordinate here is owner-supplied. This crate has no admitted task,
+/// work scope, or observation receipt of its own — the graph is a pure
+/// authority evaluator with no plan, no scope binding, and no Store readback —
+/// so it cannot derive one and must not invent one. The fields are private and
+/// [`Self::admit`] is the only constructor, so a value that exists has already
+/// been refused if any coordinate was blank, control-bearing, or if its time
+/// coordinate carried no causal `transaction_sequence`. `TaskId` and
+/// `ReceiptId` are canonical by construction, so neither has a defaultable
+/// path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RevocationOperationIdentity {
+    principal_ref: String,
+    admitted_task: TaskId,
+    work_scope_ref: String,
+    observing_receipt: ReceiptId,
+    operation_clock: ClockReading,
+}
+
+impl RevocationOperationIdentity {
+    /// Binds the five admitted coordinates of one revocation operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthorityError::InvalidField`] for a blank or
+    /// control-bearing `principal_ref`/`work_scope_ref`, and for an
+    /// `operation_clock` that fails its own ordered-reading check or names no
+    /// `transaction_sequence`. A host wall-clock reading is exactly the
+    /// external timestamp that cannot become causal order, so it refuses here
+    /// rather than reaching the bounded engine. No coordinate is defaulted
+    /// here: an owner that has none cannot construct this value at all.
+    pub fn admit(
+        principal_ref: impl Into<String>,
+        admitted_task: TaskId,
+        work_scope_ref: impl Into<String>,
+        observing_receipt: ReceiptId,
+        operation_clock: ClockReading,
+    ) -> Result<Self, AuthorityError> {
+        let principal_ref = principal_ref.into();
+        let work_scope_ref = work_scope_ref.into();
+        validate_text(&principal_ref, "revocation_operation.principal_ref")?;
+        validate_text(&work_scope_ref, "revocation_operation.work_scope_ref")?;
+        operation_clock
+            .validate()
+            .map_err(|_| AuthorityError::InvalidField("revocation_operation.operation_clock"))?;
+        if operation_clock.transaction_sequence.is_none() {
+            return Err(AuthorityError::InvalidField(
+                "revocation_operation.operation_clock",
+            ));
+        }
+        Ok(Self {
+            principal_ref,
+            admitted_task,
+            work_scope_ref,
+            observing_receipt,
+            operation_clock,
+        })
+    }
+}
+
+/// Disposition of one prepared authority-revocation transition, as reconciled
+/// by the persistence owner that performs the canonical write.
+///
+/// Only [`Committed`](Self::Committed) reports a durable write.
+/// [`Prepared`](Self::Prepared) is the state this crate leaves a transition in
+/// before the owner has answered, and
+/// [`UnknownOutcome`](Self::UnknownOutcome) is the owner saying it cannot tell
+/// whether THIS operation identity committed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RevocationTransitionDisposition {
+    /// Prepared and not yet written; the owner supplied no durable receipt.
+    Prepared,
+    /// The owner proved this exact operation identity committed.
+    Committed,
+    /// The owner cannot tell whether this exact operation identity committed.
+    UnknownOutcome,
+}
+
+/// The existing transition receipt, canonical write receipt, and
+/// reconciliation coordinate the persistence owner actually holds for one
+/// exact prepared operation identity.
+///
+/// This is supplied evidence, never a value this crate composes. The
+/// `recorded_request_digest` is the canonical request hash the durable record
+/// carries for the SAME operation identity; it is compared against the digest
+/// this crate derives, so a receipt for changed content under one identity is
+/// the I5.27 conflict rather than a commit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RevocationWriteReceipt {
+    /// The existing transition/write receipt the owner holds.
+    pub receipt: ReceiptIdentity,
+    /// The owner's own reconciliation coordinate for that receipt.
+    pub reconciliation: ReceiptIdentity,
+    /// Canonical request hash the durable record carries for this exact
+    /// operation identity.
+    pub recorded_request_digest: String,
+}
+
+/// Everything the owner supplies to prepare the canonical revocation
+/// transition for one declared origin.
+///
+/// The affected set is deliberately absent: it is derived from the
+/// origin-bound closure this graph actually computes, never copied from a
+/// caller list.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RevocationTransitionRequest {
+    /// Stable canonical operation identity the persistence owner allocated.
+    pub operation_id: String,
+    /// Idempotency key of that exact operation.
+    pub idempotency_key: String,
+    /// Owner snapshot identity the transition is presented under.
+    pub snapshot_id: SnapshotId,
+    /// Exact State Fence, carrying the authority epoch, the owner presents
+    /// this transition under.
+    pub state_fence: StateFence,
+    /// Exact traversal bounds the completeness claim must be proven under.
+    pub bounds: eliot_influence::RevocationBounds,
+    /// Why the owner is revoking the origin.
+    pub reason: RevocationReason,
+    /// The owner's reconciled disposition for this exact operation identity.
+    pub disposition: RevocationTransitionDisposition,
+    /// The existing transition/write receipt and reconciliation coordinate,
+    /// when the owner holds one. Required by a committed disposition and
+    /// refused for every other disposition.
+    pub write_receipt: Option<RevocationWriteReceipt>,
+    /// The admitted principal, task, work scope, observing receipt, and causal
+    /// position the bounded closure is computed under. The graph holds no
+    /// plan, scope binding, or Store readback of its own, so it can derive
+    /// none of these and never does: they arrive from the owner, already
+    /// refused by [`RevocationOperationIdentity::admit`] if incomplete.
+    pub operation: RevocationOperationIdentity,
+}
+
+/// Canonical preimage of one prepared authority-revocation transition. Private
+/// on purpose: it is the digest input, not a wire contract.
+///
+/// The receipt coordinates and the disposition are deliberately NOT in this
+/// preimage: they are the owner's ANSWER about the transition, not the request
+/// being written, so folding them in would make the digest differ between a
+/// prepared and a committed presentation of one operation identity and break
+/// exact replay.
+#[derive(Serialize)]
+struct RevocationTransitionCanonicalPreimage<'a> {
+    operation_kind: &'static str,
+    operation_id: &'a str,
+    idempotency_key: &'a str,
+    origin: &'a str,
+    owner_namespace: &'a str,
+    affected: &'a BTreeSet<String>,
+    graph_revision: u64,
+    snapshot_id: &'a str,
+    authority_epoch: &'a EpochId,
+    state_fence: &'a StateFence,
+    bounds: &'a eliot_influence::RevocationBounds,
+    reason: RevocationReason,
+    unresolved: &'a BTreeSet<String>,
+    separately_quarantined: &'a [String],
+}
+
+/// The canonical authority-revocation transition this crate is PREPARED to
+/// emit, with every coordinate the replayability requirement names.
+///
+/// This is the prepared-transition DECISION, not the canonical envelope.
+/// `eliot-canonical`'s `CanonicalWriteEnvelope` and `eliot-store-api`'s
+/// `PreparedTransition`/`NamedMutationRequest` are the ONE governed write
+/// path, they live outside this crate, and A12.3 forbids this pure evaluator
+/// from becoming a second writer. What belongs here is the part A12.3 leaves
+/// to the semantic owner: the typed, closed, content-bound decision of WHICH
+/// canonical revocation transition the authority graph is prepared to emit,
+/// which the canonical owner then serializes exactly once.
+///
+/// Every field is private and neither `Serialize` nor `Deserialize` is
+/// derived, so a decoded or caller-authored value can never be a prepared
+/// transition. Its only constructor re-derives the affected set from the
+/// origin-bound closure, rechecks the fence and epoch against every affected
+/// member, and compares any owner-supplied receipt against the canonical
+/// request digest it computed here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedRevocationTransition {
+    operation_id: String,
+    idempotency_key: String,
+    canonical_request_digest: String,
+    origin: String,
+    owner_namespace: String,
+    affected: BTreeSet<String>,
+    graph_revision: u64,
+    snapshot_id: SnapshotId,
+    authority_epoch: EpochId,
+    state_fence: StateFence,
+    bounds: eliot_influence::RevocationBounds,
+    reason: RevocationReason,
+    completeness: RevocationClosureState,
+    disposition: RevocationTransitionDisposition,
+    write_receipt: Option<RevocationWriteReceipt>,
+}
+
+impl PreparedRevocationTransition {
+    /// Stable canonical operation identity this transition is prepared under.
+    #[must_use]
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+
+    /// Idempotency key of that exact operation.
+    #[must_use]
+    pub fn idempotency_key(&self) -> &str {
+        &self.idempotency_key
+    }
+
+    /// Canonical request digest of the exact transition this crate prepared.
+    #[must_use]
+    pub fn canonical_request_digest(&self) -> &str {
+        &self.canonical_request_digest
+    }
+
+    /// The one declared origin every affected grant was derived from.
+    #[must_use]
+    pub fn origin(&self) -> &str {
+        &self.origin
+    }
+
+    /// Authority root the origin belongs to, proven to be one this graph owns.
+    #[must_use]
+    pub fn owner_namespace(&self) -> &str {
+        &self.owner_namespace
+    }
+
+    /// The exact affected set the origin-bound closure derived, in
+    /// grant-identity order. A caller cannot supply or extend it.
+    #[must_use]
+    pub const fn affected(&self) -> &BTreeSet<String> {
+        &self.affected
+    }
+
+    /// Graph revision the affected set was derived at.
+    #[must_use]
+    pub const fn graph_revision(&self) -> u64 {
+        self.graph_revision
+    }
+
+    /// Owner snapshot identity the transition is presented under.
+    #[must_use]
+    pub fn snapshot_id(&self) -> &str {
+        self.snapshot_id.as_str()
+    }
+
+    /// Authority epoch the transition is proven at; it travels inside the
+    /// bound State Fence and is compared against every affected member.
+    #[must_use]
+    pub const fn authority_epoch(&self) -> &EpochId {
+        &self.authority_epoch
+    }
+
+    /// Exact State Fence the closure was proven under.
+    #[must_use]
+    pub const fn state_fence(&self) -> &StateFence {
+        &self.state_fence
+    }
+
+    /// Exact traversal bounds the completeness claim was proven under.
+    #[must_use]
+    pub const fn bounds(&self) -> &eliot_influence::RevocationBounds {
+        &self.bounds
+    }
+
+    /// Why the origin is being revoked, as the owner recorded it.
+    #[must_use]
+    pub const fn reason(&self) -> RevocationReason {
+        self.reason
+    }
+
+    /// Honest completeness of the affected set. Preparation admits only a
+    /// complete closure, so this is never partial.
+    #[must_use]
+    pub const fn completeness(&self) -> &RevocationClosureState {
+        &self.completeness
+    }
+
+    /// The owner's reconciled disposition of this exact operation identity.
+    #[must_use]
+    pub const fn disposition(&self) -> RevocationTransitionDisposition {
+        self.disposition
+    }
+
+    /// Whether this transition is reported as durably committed. True only
+    /// for [`RevocationTransitionDisposition::Committed`], so a possible
+    /// commit is never read as a commit.
+    #[must_use]
+    pub fn is_committed(&self) -> bool {
+        matches!(self.disposition, RevocationTransitionDisposition::Committed)
+    }
+
+    /// The existing transition/write receipt and reconciliation coordinate the
+    /// owner supplied, or the explicit absence while the transition is
+    /// prepared or its outcome is unknown.
+    #[must_use]
+    pub fn write_receipt(&self) -> Option<&RevocationWriteReceipt> {
+        self.write_receipt.as_ref()
+    }
+}
+
+impl GrantGraph {
+    /// Prepares the canonical authority-revocation transition for exactly one
+    /// declared origin, binding every coordinate the replayability
+    /// requirement names and NEVER committing it.
+    ///
+    /// The affected set is the one this graph ACTUALLY derives for that one
+    /// origin under the owner's declared fence and bounds, through
+    /// [`revocation_denominator_for_origin`](Self::revocation_denominator_for_origin).
+    /// No caller-supplied membership is accepted anywhere on this path, so a
+    /// transition can never name a grant the origin-bound closure does not
+    /// reach, and a partial or unknown closure refuses instead of preparing a
+    /// transition that over-claims.
+    ///
+    /// `prior` is the transition the owner already prepared or reconciled for
+    /// the same origin, when it holds one. It is what makes replay and
+    /// conflict real rather than assumed: a second presentation of the SAME
+    /// operation identity with a different canonical request digest is the
+    /// I5.27 conflict and performs no transition, and a prior whose outcome is
+    /// unknown may only be re-presented under its OWN identity, never under a
+    /// fresh one, because a possible commit is not a no-write.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthorityError::InvalidField`] for a blank operation
+    /// identity or idempotency key, [`AuthorityError::FenceMismatch`] and
+    /// [`AuthorityError::EpochMismatch`] when the presented fence or epoch
+    /// disagrees with an affected member's live binding,
+    /// [`AuthorityError::StaleTransitionEvidence`] when a receipt is presented
+    /// under a disposition that does not report a commit, or when a committed
+    /// transition would be walked back to prepared or unknown,
+    /// [`AuthorityError::UnreconciledTransitionEvidence`] when a possible
+    /// commit is re-presented without the owner's resolution,
+    /// [`AuthorityError::IdentityConflict`] for the same operation identity
+    /// with changed content and for a possible commit re-presented under a
+    /// fresh identity, and [`AuthorityError::BoundedRevocation`] carrying the
+    /// engine's own cause for an incomplete closure, invalid bounds, or an
+    /// origin that resolves to no entity of this graph.
+    pub fn prepare_revocation_transition(
+        &self,
+        origin: &RevocationOrigin,
+        request: &RevocationTransitionRequest,
+        prior: Option<&PreparedRevocationTransition>,
+    ) -> Result<PreparedRevocationTransition, AuthorityError> {
+        validate_text(&request.operation_id, "revocation_transition.operation_id")?;
+        validate_text(
+            &request.idempotency_key,
+            "revocation_transition.idempotency_key",
+        )?;
+        request
+            .state_fence
+            .validate()
+            .map_err(|_| AuthorityError::FenceMismatch)?;
+        request
+            .bounds
+            .validate()
+            .map_err(map_bounded_revocation_error)?;
+        if let Some(prior) = prior {
+            require_same_operation(prior, &request.operation_id, &request.idempotency_key)?;
+            require_forward_only_disposition(prior, request.disposition)?;
+        }
+        // The declared origin is re-resolved against THIS graph, so a
+        // reference that names no entity here — or two — refuses instead of
+        // being read as a revocation of something else.
+        let owner_namespace = self.require_bound_origin_namespace(origin)?;
+        let denominator = self.revocation_denominator_for_origin(
+            origin,
+            &request.state_fence,
+            &request.bounds,
+            &request.operation,
+        )?;
+        let RevocationClosureState::Complete {
+            separately_quarantined,
+        } = &denominator.completeness
+        else {
+            return Err(map_bounded_revocation_error(
+                eliot_influence::InfluenceError::IncompleteCoverage(
+                    "revocation_transition.completeness",
+                ),
+            ));
+        };
+        let separately_quarantined: Vec<String> = separately_quarantined
+            .iter()
+            .map(|binding| binding.relation_id().to_owned())
+            .collect();
+        let affected = self.require_members_at_fence(&denominator, &request.state_fence)?;
+        let unresolved = unresolved_references(&denominator.completeness);
+        let canonical_request_digest = sha256_hex(
+            &canonical_json_bytes(&RevocationTransitionCanonicalPreimage {
+                operation_kind: REVOCATION_TRANSITION_OPERATION_KIND,
+                operation_id: &request.operation_id,
+                idempotency_key: &request.idempotency_key,
+                origin: origin.as_str(),
+                owner_namespace: &owner_namespace,
+                affected: &affected,
+                graph_revision: self.revision,
+                snapshot_id: request.snapshot_id.as_str(),
+                authority_epoch: &request.state_fence.authority_epoch,
+                state_fence: &request.state_fence,
+                bounds: &request.bounds,
+                reason: request.reason,
+                unresolved: &unresolved,
+                separately_quarantined: &separately_quarantined,
+            })
+            .map_err(|_| {
+                AuthorityError::InvalidField("revocation_transition.canonical_request_digest")
+            })?,
+        );
+        let write_receipt = admit_write_receipt(request, &canonical_request_digest)?;
+        Ok(PreparedRevocationTransition {
+            operation_id: request.operation_id.clone(),
+            idempotency_key: request.idempotency_key.clone(),
+            canonical_request_digest,
+            origin: origin.as_str().to_owned(),
+            owner_namespace,
+            affected,
+            graph_revision: self.revision,
+            snapshot_id: request.snapshot_id.clone(),
+            authority_epoch: request.state_fence.authority_epoch.clone(),
+            state_fence: request.state_fence.clone(),
+            bounds: request.bounds.clone(),
+            reason: request.reason,
+            completeness: denominator.completeness,
+            disposition: request.disposition,
+            write_receipt,
+        })
+    }
+
+    /// The exact affected membership, rechecked as admitted grants of THIS
+    /// graph bound to the presented fence and the same authority epoch.
+    ///
+    /// The readback is against the live grants, never against a copy of a
+    /// caller list: a closure proven against a fence or an authority epoch the
+    /// graph no longer serves is not this transition, and a member this graph
+    /// cannot resolve is a reconciliation problem to report rather than
+    /// silently dropped from the denominator.
+    fn require_members_at_fence(
+        &self,
+        denominator: &RevocationDenominator,
+        fence: &StateFence,
+    ) -> Result<BTreeSet<String>, AuthorityError> {
+        let mut affected = BTreeSet::new();
+        for member in &denominator.members {
+            let grant_id = GrantId::new(member.as_str())?;
+            let Some(grant) = self.grant(grant_id.as_str()) else {
+                return Err(AuthorityError::MissingParent(grant_id));
+            };
+            if grant.binding.state_fence != *fence {
+                return Err(AuthorityError::FenceMismatch);
+            }
+            if !grant
+                .binding
+                .authority_epoch
+                .is_same_authority(&fence.authority_epoch)
+            {
+                return Err(AuthorityError::EpochMismatch);
+            }
+            affected.insert(member.clone());
+        }
+        if affected.is_empty() {
+            return Err(AuthorityError::InvalidField(
+                "revocation_transition.affected",
+            ));
+        }
+        Ok(affected)
+    }
+
+    /// The authority root the one declared origin belongs to, proven to be an
+    /// authority root THIS graph owns.
+    fn require_bound_origin_namespace(
+        &self,
+        origin: &RevocationOrigin,
+    ) -> Result<String, AuthorityError> {
+        if !matches!(
+            self.resolve_revocation_origin(origin.as_str()),
+            Ok(BoundRevocationOrigin::Bound(bound)) if bound == *origin
+        ) {
+            return Err(map_bounded_revocation_error(
+                eliot_influence::InfluenceError::UnverifiedRecovery("revocation_transition.origin"),
+            ));
+        }
+        let namespace = match origin {
+            RevocationOrigin::Grant(grant_id) => self
+                .grant(grant_id.as_str())
+                .map(|grant| grant.authority_root_ref.clone())
+                .ok_or_else(|| AuthorityError::MissingParent(grant_id.clone()))?,
+            RevocationOrigin::AuthorityRoot(root_ref) => root_ref.as_str().to_owned(),
+        };
+        self.owned_authority_root(namespace.as_str())
+            .map(|owned| owned.as_str().to_owned())
+            .map_err(|_| AuthorityError::InvalidField("revocation_transition.owner_namespace"))
+    }
+}
+
+/// Rejects a second presentation that cannot be reconciled with the prior one
+/// under the SAME operation identity.
+fn require_same_operation(
+    prior: &PreparedRevocationTransition,
+    operation_id: &str,
+    idempotency_key: &str,
+) -> Result<(), AuthorityError> {
+    if prior.operation_id != operation_id {
+        if prior.disposition == RevocationTransitionDisposition::UnknownOutcome {
+            // A possible commit is not a no-write: presenting the same work
+            // under a fresh identity cannot conflict with the first attempt
+            // and can apply it twice.
+            return Err(AuthorityError::IdentityConflict);
+        }
+        return Ok(());
+    }
+    if prior.idempotency_key != idempotency_key {
+        return Err(AuthorityError::IdentityConflict);
+    }
+    Ok(())
+}
+
+/// Rejects a presentation that would walk a concluded transition backwards.
+///
+/// A possible commit advances only to a committed presentation of that SAME
+/// operation identity carrying the owner's own durable evidence; it never
+/// becomes a no-write. A committed transition is the owner's own durable
+/// record and is never re-presented as prepared or unknown, so no later
+/// presentation can retract it.
+fn require_forward_only_disposition(
+    prior: &PreparedRevocationTransition,
+    disposition: RevocationTransitionDisposition,
+) -> Result<(), AuthorityError> {
+    match prior.disposition {
+        RevocationTransitionDisposition::Prepared => Ok(()),
+        RevocationTransitionDisposition::UnknownOutcome
+            if disposition == RevocationTransitionDisposition::Committed =>
+        {
+            Ok(())
+        }
+        RevocationTransitionDisposition::UnknownOutcome => Err(
+            AuthorityError::UnreconciledTransitionEvidence("revocation_transition.outcome_unknown"),
+        ),
+        RevocationTransitionDisposition::Committed => Err(AuthorityError::StaleTransitionEvidence(
+            "revocation_transition.committed_downgrade",
+        )),
+    }
+}
+
+/// Admits the owner's existing transition/write receipt and reconciliation
+/// coordinate for this exact operation identity, or its explicit absence.
+fn admit_write_receipt(
+    request: &RevocationTransitionRequest,
+    canonical_request_digest: &str,
+) -> Result<Option<RevocationWriteReceipt>, AuthorityError> {
+    let Some(receipt) = request.write_receipt.as_ref() else {
+        if request.disposition == RevocationTransitionDisposition::Committed {
+            // A committed claim with no durable receipt from the persistence
+            // owner is a manufactured one. This crate reports no commit it
+            // was not given evidence for.
+            return Err(AuthorityError::StaleTransitionEvidence(
+                "revocation_transition.write_receipt",
+            ));
+        }
+        return Ok(None);
+    };
+    if request.disposition != RevocationTransitionDisposition::Committed {
+        // A receipt under a disposition that does not report a commit is
+        // evidence the owner and this crate disagree about, not a commit.
+        return Err(AuthorityError::StaleTransitionEvidence(
+            "revocation_transition.disposition",
+        ));
+    }
+    validate_text(
+        receipt.receipt.receipt_id.as_str(),
+        "revocation_transition.receipt_id",
+    )?;
+    validate_digest(
+        &receipt.receipt.canonical_sha256,
+        "revocation_transition.canonical_sha256",
+    )?;
+    validate_text(
+        receipt.reconciliation.receipt_id.as_str(),
+        "revocation_transition.reconciliation_id",
+    )?;
+    validate_digest(
+        &receipt.reconciliation.canonical_sha256,
+        "revocation_transition.reconciliation_sha256",
+    )?;
+    // The receipt is bound to THIS operation by CONTENT: the canonical request
+    // hash the durable record carries for that identity must equal the digest
+    // derived here. Existence or shape proves nothing, and a same-identity
+    // write of changed content is the conflict, never a commit.
+    validate_digest(
+        &receipt.recorded_request_digest,
+        "revocation_transition.recorded_request_digest",
+    )?;
+    if receipt.recorded_request_digest != canonical_request_digest {
+        return Err(AuthorityError::IdentityConflict);
+    }
+    Ok(Some(receipt.clone()))
+}
+
 /// `ELIOT_ARCH_OWNER`: ARCH-AUTH-01
 /// Pure grant-lineage evaluator.
 #[derive(Clone, Debug)]
@@ -1462,10 +2073,12 @@ impl GrantGraph {
         origin: &RevocationOrigin,
         fence: &StateFence,
         bounds: &eliot_influence::RevocationBounds,
+        operation: &RevocationOperationIdentity,
     ) -> Result<RevocationDenominator, AuthorityError> {
         match origin {
             RevocationOrigin::Grant(grant_id) => {
-                let verdict = self.revocation_closure_verdict(grant_id, fence, bounds)?;
+                let verdict =
+                    self.revocation_closure_verdict(grant_id, fence, bounds, operation)?;
                 self.denominator_from_verdicts(origin, fence, bounds, [verdict])
             }
             RevocationOrigin::AuthorityRoot(root_ref) => {
@@ -1479,7 +2092,9 @@ impl GrantGraph {
                     .collect();
                 let mut verdicts = Vec::with_capacity(owned.len());
                 for grant_id in owned {
-                    verdicts.push(self.revocation_closure_verdict(&grant_id, fence, bounds)?);
+                    verdicts.push(
+                        self.revocation_closure_verdict(&grant_id, fence, bounds, operation)?,
+                    );
                 }
                 self.denominator_from_verdicts(origin, fence, bounds, verdicts)
             }
@@ -1714,9 +2329,17 @@ impl GrantGraph {
     ///
     /// The legacy [`from_recovery_snapshot`](Self::from_recovery_snapshot)
     /// preserves its exact prior behavior for previously-admitted callers.
+    ///
+    /// `operation` is the admitted principal, task, work scope, observing
+    /// receipt, and causal position the recheck runs under. The graph holds no
+    /// plan, scope binding, or Store readback of its own, so it cannot derive
+    /// one: the recovery owner supplies it, and the bounded engine refuses a
+    /// traversal whose identity omits it. Without it this path cannot recheck
+    /// anything, and "recheck nothing" is not the same as "no revocation".
     pub fn from_recovery_snapshot_with_revocation_history(
         snapshot: &GrantGraphRecoverySnapshot,
         history: Option<&crate::RevocationHistoryEvidence>,
+        operation: &RevocationOperationIdentity,
     ) -> Result<GrantRestoreOutcome, RevocationHistoryError> {
         // Schema identity is decided before any other wire field is validated,
         // so a snapshot persisted under an unsupported revision refuses by
@@ -1767,7 +2390,11 @@ impl GrantGraph {
         // left exactly as the snapshot carried it.
         let mut admitted: Vec<AdmittedRevocationClosure> = Vec::with_capacity(closures.len());
         for closure in &closures {
-            admitted.push(graph.admit_origin_bound_closure(closure, &evidence.state_fence)?);
+            admitted.push(graph.admit_origin_bound_closure(
+                closure,
+                &evidence.state_fence,
+                operation,
+            )?);
         }
         let suppressed = derive_suppressions(&graph, &admitted);
         for entry in &suppressed {
@@ -1845,6 +2472,7 @@ impl GrantGraph {
         &self,
         closure: &ValidatedRevocationClosure,
         fence: &StateFence,
+        operation: &RevocationOperationIdentity,
     ) -> Result<AdmittedRevocationClosure, RevocationHistoryError> {
         // The declared owner namespace is proven against this graph's own
         // admitted grants, never read from the reference's spelling, and the
@@ -1899,7 +2527,7 @@ impl GrantGraph {
             ));
         }
         let denominator = self
-            .revocation_denominator_for_origin(&origin, fence, &bounds)
+            .revocation_denominator_for_origin(&origin, fence, &bounds, operation)
             .map_err(|error| match error {
                 // A crossing this closure depends on was presented twice under
                 // one owner operation identity with different content. That is
@@ -2332,6 +2960,7 @@ impl GrantGraph {
         origin: &GrantId,
         fence: &StateFence,
         bounds: &eliot_influence::RevocationBounds,
+        operation: &RevocationOperationIdentity,
     ) -> Result<eliot_influence::BoundedRevocationOutcome, AuthorityError> {
         if !self.grants.contains_key(origin) {
             return Err(AuthorityError::MissingParent(origin.clone()));
@@ -2340,6 +2969,19 @@ impl GrantGraph {
         let request = BoundedRevocationRequest {
             request_id: format!("transitive-revocation:{}", origin.as_str()),
             root_ref: origin.as_str().to_owned(),
+            // The admitted principal, task, work scope, observing receipt and
+            // causal position are the OWNER's, never this crate's. A12.5 ties
+            // a dependent's ceiling to its source, and I5.27 defines
+            // idempotency over canonical bytes: an operation whose identity
+            // omitted them would yield the same digest for two different
+            // principals, tasks, or observations. They travel with the
+            // request and the engine re-freezes them, so nothing here is
+            // defaulted, derived from the origin, or read from a clock.
+            principal_ref: operation.principal_ref.clone(),
+            admitted_task: operation.admitted_task.clone(),
+            work_scope_ref: operation.work_scope_ref.clone(),
+            observing_receipt: operation.observing_receipt.clone(),
+            operation_clock: operation.operation_clock,
             reason: RevocationReason::SourceRevoked,
             state_fence: fence.clone(),
             edges,
@@ -2710,8 +3352,15 @@ impl GrantGraph {
         origin: &GrantId,
         fence: &StateFence,
         bounds: &eliot_influence::RevocationBounds,
+        operation: &RevocationOperationIdentity,
     ) -> Result<RevocationClosureVerdict, AuthorityError> {
-        self.revocation_closure_verdict_with_quarantine(origin, fence, bounds, &BTreeMap::new())
+        self.revocation_closure_verdict_with_quarantine(
+            origin,
+            fence,
+            bounds,
+            &BTreeMap::new(),
+            operation,
+        )
     }
 
     /// Structural walk of one origin's authorized dependency closure.
@@ -2841,12 +3490,13 @@ impl GrantGraph {
         fence: &StateFence,
         bounds: &eliot_influence::RevocationBounds,
         bindings: &BTreeMap<String, VerifiedQuarantineBinding>,
+        operation: &RevocationOperationIdentity,
     ) -> Result<RevocationClosureVerdict, AuthorityError> {
         let mut traversed: BTreeMap<String, AdmittedRootTransition> = BTreeMap::new();
         let mut unbound: BTreeSet<String> = BTreeSet::new();
         let walk = self.walk_authorized_closure(origin, &mut traversed, &mut unbound)?;
         let quarantined_frontier = self.collect_quarantined_frontier(&walk.reached, bindings);
-        let outcome = self.transitive_revocation_closure(origin, fence, bounds)?;
+        let outcome = self.transitive_revocation_closure(origin, fence, bounds, operation)?;
         let (frontier_refs, bound, forensic, partial) =
             self.reconcile_engine_outcome(&outcome, &walk.reached, unbound, bindings);
         // Read before the omissions move below: this is the bounded engine's
