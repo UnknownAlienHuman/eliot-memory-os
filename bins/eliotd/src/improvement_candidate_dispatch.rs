@@ -112,15 +112,16 @@
 //! function for why the original values are the ones compared and why a refusal
 //! is propagated rather than resolved into a substitute.
 //!
-//! # An unresolved external effect is not committed here, and why
+//! # An unresolved external effect is made durable, and how
 //!
 //! `UnknownRequiresReconciliation { obligation }` names a real external debt:
 //! the exact candidate, experiment, commitment, owner and forward-repair /
 //! invalidation bindings whose effect is unsettled. It is read and named by
 //! `daemon_runtime::report_improvement_candidate_route` through the daemon's
-//! existing diagnostics, so the debt is inspectable rather than silently lost —
-//! but it is NOT made durable on this path, and the reason is measured rather
-//! than assumed:
+//! existing diagnostics, and [`commit_unknown_effect_obligation`] then makes the
+//! named debt durable through the same single seam the rest of the improvement
+//! record family uses, so it outlives the pass that observed it. The constraints
+//! that decide WHERE it lands are measured rather than assumed:
 //!
 //! - The closed [`eliot_store_api::LearningRecordKind`] set has no kind for an
 //!   unresolved external effect. `Candidate` is the only kind that describes a
@@ -129,30 +130,43 @@
 //!   receipt and the archive receipt. `ActivationReceipt` would assert that an
 //!   activation receipt exists; nothing here activated anything, and
 //!   `execution_authorized` is false in every handoff the pipeline builds.
-//! - A `Candidate` row, however, is read back EXHAUSTIVELY by
+//! - A `Candidate` row is read back EXHAUSTIVELY by
 //!   `improvement_dedup_read::read_candidate_scope`, whose `classify_row`
-//!   re-proves exactly three document shapes (the candidate artifact, the
-//!   archive receipt, the lineage-merge receipt) and REFUSES any other row of
-//!   that kind. A fourth `Candidate` document shape would therefore make every
-//!   subsequent pass's deduplication read fail closed and stop the whole
-//!   improvement intake. Teaching that reader a fourth shape is a change to
-//!   `improvement_dedup_read`, outside this change, and guessing at it here
-//!   would trade a named debt for a broken pass.
+//!   re-proves every document shape it accepts and REFUSES any other row of that
+//!   kind. The obligation is therefore the FOURTH shape that reader re-proves
+//!   (`classify_reconciliation_obligation`), in the same `DEDUP_SCOPE` the other
+//!   three land in. Writing it as an untaught fourth shape would have traded a
+//!   named debt for a pass whose deduplication read fails closed.
 //! - Inventing a record kind, or opening a second read or write path for the
 //!   obligation, is exactly the second owner this module does not add.
 //!
-//! So the honest state is: the obligation's exact identity is emitted, the
-//! durable owner for it is undecided, and this module says so rather than
-//! pretending the debt is stored.
+//! So the durable record is the named debt plus the owner's DENYING answer: no
+//! effect outcome, no receipt, no permit and no authority, because this daemon
+//! holds none. The effect OWNER is still the absent half, and that — not a
+//! missing call — is what keeps the debt open.
 //!
 //! # No second owner, store, digest or write path
 //!
 //! This module computes no proposal digest: the Governor pipeline computes
 //! exactly one commitment and carries it into its own result, so a digest
-//! computed here could only disagree with the committed one. It opens no store,
-//! reads no record, starts no flight, and writes nothing. It adds no scheduler,
-//! no maintenance owner and no dependency, and it has no blocking `attach_*`
-//! call. Durability of the artifact it reads stays with the existing
+//! computed here could only disagree with the committed one. It reads no record
+//! and starts no flight. It adds no scheduler, no maintenance owner and no
+//! dependency, and it has no blocking `attach_*` call.
+//!
+//! The ONE write it performs is [`commit_unknown_effect_obligation`], and it
+//! writes through the same single Governor-owned seam every other durable
+//! improvement record uses — [`crate::DaemonComposition::commit_learning_record`]
+//! over the closed `RecordLearningRecord` mutation, in the same Governor scope
+//! and the same closed `candidate` record kind as the candidate artifact, the
+//! archive receipts and the lineage-merge receipts
+//! (`improvement_intake_dispatch`). No store client is opened here and no
+//! operation is invented. It exists because an unresolved external effect is
+//! otherwise a debt that lives only in this pass: the record it writes is the
+//! named debt's durable, reviewable form, and it carries no permit, no outcome,
+//! and no authority — nothing about it promotes, activates, installs,
+//! completes, or issues authority.
+//!
+//! Durability of the artifact the route reads stays with the existing
 //! [`crate::DaemonComposition::commit_learning_record`] seam in
 //! `daemon_runtime::run_improvement_intake`.
 //!
@@ -195,6 +209,29 @@
 //! [`eliot_maintenance::check_handoff_wire_revision`] against the same constant.
 //! That call site is the Kernel owner's to write, and is named here rather than
 //! faked with a consumer in this crate.
+//!
+//! # The external effect is read from its owner and made durable, never settled
+//!
+//! Every dispatched route reads the disposition's external-effect state through
+//! [`read_improvement_effect_state`], which forwards to the Governor owner's own
+//! retry gate and retained-result accessors, and
+//! [`commit_unknown_effect_obligation`] then makes a named unresolved
+//! obligation durable so the debt outlives the pass.
+//!
+//! What this module deliberately does NOT do is attach an owner outcome. The
+//! only writer of the Governor obligation's outcome is
+//! `ImprovementUnknownEffect::with_settled_owner_outcome`, which re-checks that
+//! the outcome is terminal, that a canonical receipt is present, and that both
+//! the authorized effect and that receipt name the obligation's exact operation
+//! id and idempotency key; its input is an `eliot_authority::EffectReceipt`,
+//! and this repository has no producer of a SETTLED one —
+//! `EffectAuthorizer::compile_effectful_action` is the only production
+//! constructor and it itself has no caller, so it is dead along with the
+//! terminal paths behind it. Calling the seam with a receipt this daemon
+//! assembled would be a fabricated effect outcome, which is precisely the
+//! forgery I12.24 and the audit behind AUD2/AUD3 exist to prevent. So the read
+//! stays a read, and the named gap is the missing effect owner, not a missing
+//! call.
 
 #![forbid(unsafe_code)]
 
@@ -212,12 +249,39 @@ use eliot_maintenance::{
     ImprovementPulseOutcome, ImprovementReplayAssessment, ImprovementTerminalDisposition,
     MechanismDeclaration, PipelineError, RollbackContract, TESTD_OWNER, VERIFIER_OWNER_FAMILY,
 };
+use eliot_protocol::RequestIdentity;
+use eliot_receipts::RequestBinding;
+use eliot_store_api::{
+    LearningRecordKind, ScopeId, WriteReceipt, canonical_json_bytes, learning_record_commit_params,
+    learning_record_mutation_request,
+};
 
+use super::DaemonComposition;
 use super::improvement_candidate_route::{
-    ImprovementRouteRequest, assess_improvement_repeat, check_improvement_handoff_identity,
+    ImprovementEffectState, ImprovementRouteRequest, UnknownEffectObligation,
+    assess_improvement_repeat, check_improvement_handoff_identity, read_improvement_effect_state,
     route_improvement_candidate,
 };
-use super::improvement_intake_dispatch::ImprovementArtifact;
+use super::improvement_intake_dispatch::{ImprovementArtifact, ImprovementDispatchError};
+
+/// Closed store scope for the durable unresolved-effect obligation record.
+///
+/// The SAME Governor scope the candidate artifact, the archive receipts and the
+/// lineage-merge receipts are committed under, read from the Governor owner's
+/// own published constant rather than spelled here. The obligation is part of
+/// the same improvement record family, so it lands where the exhaustive
+/// candidate-scope read already looks for it — `improvement_dedup_read` names
+/// this scope as its `DEDUP_SCOPE` — and a second scope would be a second
+/// durability owner.
+const RECONCILIATION_SCOPE: &str = eliot_governor::GOVERNOR_SCOPE_ID;
+
+/// Deadline bounding one durable obligation-commit ingress, in Unix
+/// milliseconds.
+///
+/// The same bound `improvement_intake_dispatch` uses for the candidate and
+/// receipt commits it owns, so this commit is bounded identically rather than
+/// inventing a second timeout for the same seam.
+const RECONCILIATION_COMMIT_DEADLINE_MS: u64 = 30_000;
 
 /// The one bounded route step this daemon performs over one real observation.
 ///
@@ -261,6 +325,8 @@ pub struct ImprovementRouteDispatch<'a> {
 /// [`check_improvement_handoff_identity`] reach the Governor-owned
 /// content-identity check on the handoff's OWN recorded components. It is a
 /// read binding, not a second commitment, a second digest, or a stored record.
+/// `effect` is never absent: the Governor owner answers for every disposition,
+/// and on this workspace the answer is always the denying one.
 #[derive(Clone, Debug)]
 pub struct ImprovementRouteOutcome {
     /// The pipeline's own advisory-only terminal disposition.
@@ -277,6 +343,14 @@ pub struct ImprovementRouteOutcome {
     /// whenever the pass was not admitted, so an unadmitted pass never
     /// accumulates a record to compare against.
     pub retained_next: Option<RetainedImprovementProposal>,
+    /// What the disposition says about the external effect it names, read
+    /// through the Governor owner's own retry gate and retained-result
+    /// accessors.
+    ///
+    /// This is the reconciliation read the pass makes before anything is
+    /// recorded or retried: nothing here attaches an owner outcome, and nothing
+    /// decides a retry this daemon is not already told about.
+    pub effect: ImprovementEffectState,
 }
 
 /// Routes one real maintenance observation through the Governor-owned
@@ -352,11 +426,175 @@ pub fn dispatch_improvement_candidate_route(
         _ => None,
     };
     let retained_next = current.as_ref().map(retained_record_of);
+    // The external-effect read, taken from the Governor owner over the
+    // disposition this very call produced. It is a read and nothing more: the
+    // obligation's owner outcome is private to the Governor module, and this
+    // module neither writes it nor re-decides the retry answer. On this
+    // workspace the answer is the denying one, because no producer of an
+    // owner-settled receipt exists; recording it is what makes that denial
+    // visible on the live pass instead of an unexamined omission.
+    let effect = read_improvement_effect_state(&disposition);
     Ok(ImprovementRouteOutcome {
         disposition,
         experiment,
         repeat,
         retained_next,
+        effect,
+    })
+}
+
+/// Makes one unresolved external-effect obligation durable for its named owner.
+///
+/// # Why the debt needs a durable record
+///
+/// `ImprovementUnknownEffect` is a value. The Governor pipeline builds it from
+/// checked records and hands it back inside
+/// `ImprovementTerminalDisposition::UnknownRequiresReconciliation`, and if this
+/// daemon only logged it the debt would exist for exactly as long as the pass
+/// that observed it. So the obligation is committed through the SAME durable
+/// seam the rest of the improvement record family already uses:
+/// [`DaemonComposition::commit_learning_record`] over the closed
+/// `RecordLearningRecord` mutation, in the same Governor scope and the same
+/// closed `candidate` record kind, under its own record key. `Ok(None)` is the
+/// answer for a disposition that names no unresolved effect — there is nothing
+/// to owe anyone, and inventing a record for a disposition that carries no debt
+/// would be a fabricated obligation.
+///
+/// # What the record contains, and what it does NOT
+///
+/// The document is the obligation's own checked identity — owner, candidate,
+/// experiment, committed operation and idempotency namespace, forward-repair
+/// reference and invalidation set — plus the two answers the Governor owner gave
+/// (`retry_permitted`, `completion_retained`). It contains NO effect outcome, NO
+/// receipt, NO permit and NO authority, because this daemon holds none: the
+/// owner's outcome is private to the Governor module and writable only through
+/// its own re-checked seam, which nothing in this workspace can satisfy. So the
+/// record is a named debt plus the denying answer, never a claim that the effect
+/// was settled, completed, or may be retried.
+///
+/// The commit is idempotent under its own key, so re-committing the same
+/// unresolved obligation on a later pass converges on one durable record instead
+/// of appending duplicates. Proof refs are the candidate's own canonical
+/// evidence lineage — the same refs the candidate artifact commits under, so
+/// this record cites the evidence its own obligation was raised over.
+pub async fn commit_unknown_effect_obligation(
+    composition: &mut DaemonComposition,
+    artifact: &ImprovementArtifact,
+    effect: &ImprovementEffectState,
+    state_fence: &StateFence,
+) -> Result<Option<WriteReceipt>, ImprovementDispatchError> {
+    let Some(obligation) = effect.obligation.as_ref() else {
+        return Ok(None);
+    };
+    let record = serde_json::json!({
+        "unknown_effect_obligation": obligation,
+        "retry_permitted": effect.retry_permitted,
+        "completion_retained": effect.completion_retained,
+    });
+    let record_bytes = canonical_json_bytes(&record)
+        .map_err(|error| ImprovementDispatchError::Contract(error.to_string()))?;
+    let record_json = String::from_utf8(record_bytes)
+        .map_err(|_| ImprovementDispatchError::Contract("record is not utf-8".to_owned()))?;
+    let record_digest = eliot_contracts::sha256_hex(record_json.as_bytes());
+    let scope_digest = eliot_contracts::sha256_hex(RECONCILIATION_SCOPE.as_bytes());
+    let fence_digest = eliot_contracts::sha256_hex(format!("{state_fence:?}").as_bytes());
+    // The key names THIS record, so the obligation's commit is an operation
+    // distinct from the candidate's own commit rather than one key reused for
+    // two different documents, and a replay of the same unresolved obligation
+    // converges on it.
+    let record_key = reconciliation_record_key(obligation);
+    let request = learning_record_mutation_request(learning_record_commit_params(
+        LearningRecordKind::Candidate,
+        record_key.clone(),
+        record_json,
+        record_digest,
+        scope_digest,
+        fence_digest,
+        record_key.clone(),
+    ));
+    let identity = reconciliation_commit_identity(&record_key, state_fence)?;
+    let scope = ScopeId::new(RECONCILIATION_SCOPE)
+        .map_err(|error| ImprovementDispatchError::Contract(error.to_string()))?;
+    let (receipt, _effective) = composition
+        .commit_learning_record(
+            &identity,
+            request,
+            scope,
+            artifact.candidate.evidence_refs.clone(),
+            None,
+            false,
+            false,
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .map_err(|error| {
+            let candidate_id = &obligation.candidate_id;
+            let owner_id = &obligation.owner_id;
+            ImprovementDispatchError::Commit(format!(
+                "the unresolved external effect on candidate {candidate_id} owed by owner \
+                 {owner_id} could not be made durable: {error}"
+            ))
+        })?;
+    Ok(Some(receipt))
+}
+
+/// The closed store handle and idempotency key of one reconciliation record.
+///
+/// Derived from the obligation's own candidate identity, so a repeat of the same
+/// unresolved debt converges on one record instead of appending a duplicate.
+/// The candidate is the only input: the obligation's owner, experiment and
+/// operation are recorded in the document, and folding them into the key would
+/// make two records for one debt whenever the owner re-observed it under a new
+/// pass.
+fn reconciliation_record_key(obligation: &UnknownEffectObligation) -> String {
+    let candidate_id = obligation.candidate_id.trim();
+    format!("improvement-reconciliation:{candidate_id}")
+}
+
+/// Derives the admitted commit ingress for one reconciliation record.
+///
+/// The request metadata is derived from this daemon's own admitted fence and the
+/// idempotency key is the owner-derived record key, so an identical unresolved
+/// obligation replays convergently under the same key. This mirrors
+/// `improvement_intake_dispatch::improvement_commit_identity` field for field
+/// rather than calling it: that helper is private to the intake module, and this
+/// record is a distinct operation with its own key, so sharing the derivation
+/// would couple two commits whose whole point is that they are separate.
+fn reconciliation_commit_identity(
+    record_key: &str,
+    state_fence: &StateFence,
+) -> Result<RequestIdentity, ImprovementDispatchError> {
+    let now = super::unix_ms_i64();
+    let service = super::SERVICE_NAME;
+    let metadata = eliot_contracts::RequestMetadata {
+        request_id: eliot_contracts::RequestId::new(format!("{service}:{record_key}"))
+            .map_err(|error| ImprovementDispatchError::Contract(error.to_string()))?,
+        session_id: None,
+        task_id: None,
+        product_id: eliot_contracts::ProductId::new(service)
+            .map_err(|error| ImprovementDispatchError::Contract(error.to_string()))?,
+        source_id: eliot_contracts::SourceId::new(service)
+            .map_err(|error| ImprovementDispatchError::Contract(error.to_string()))?,
+        state_fence: state_fence.clone(),
+        clock: eliot_contracts::ClockReading {
+            valid_time_ms: Some(now),
+            known_time_ms: Some(now),
+            transaction_sequence: None,
+            monotonic_ns: None,
+        },
+    };
+    metadata
+        .validate()
+        .map_err(|error| ImprovementDispatchError::Contract(error.to_string()))?;
+    Ok(RequestIdentity {
+        request: RequestBinding {
+            metadata,
+            state_fence: state_fence.clone(),
+        },
+        idempotency_key: record_key.to_owned(),
+        deadline_unix_ms: super::unix_ms().saturating_add(RECONCILIATION_COMMIT_DEADLINE_MS),
+        cancellation_id: format!("{record_key}:cancel"),
     })
 }
 

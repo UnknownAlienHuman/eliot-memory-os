@@ -5145,7 +5145,7 @@ fn admit_over_restored_registry(
 /// through the Governor `RecordLearningRecord` seam, and route the committed
 /// artifact through the Governor improvement pipeline.
 ///
-/// Five phases, and the lock is held for three of them:
+/// Six phases, and the lock is held for three of them:
 ///
 /// 1. guarded: evaluate the observation, capture the admitted fence, assemble
 ///    the artifact, read the `G-19` admission policy;
@@ -5159,7 +5159,12 @@ fn admit_over_restored_registry(
 /// 5. UNGUARDED and pure: route the committed artifact through the Governor
 ///    improvement pipeline (`improvement_candidate_dispatch`), which is where
 ///    `ImprovementRouteRequest` is constructed and `route_improvement_candidate`
-///    is called.
+///    is called;
+/// 6. guarded: read the routed disposition's external-effect state back from
+///    the effect owner and, when the disposition names an UNRESOLVED effect,
+///    make that named obligation durable through the same
+///    `commit_learning_record` seam phase 4 used
+///    (`record_unknown_effect_obligation`).
 ///
 /// A refused or unexhausted phase-2 read is this phase's own diagnostic and the
 /// pass STOPS. It is never treated as an empty registry: admitting against
@@ -5304,32 +5309,84 @@ async fn run_improvement_intake(
             .emit();
         }
     }
-    // Phase 5: run the Governor improvement-candidate ROUTE over the same
+    // Phases 5 and 6: run the Governor improvement-candidate ROUTE over the same
     // observation, the same `G-19` policy and the same admitted fence this pass
-    // already holds. This is the leg that makes
-    // `route_improvement_candidate` reachable at all: `ImprovementRouteRequest`
-    // borrows seven Governor-owned records, so until this call nothing in the
-    // repository constructed one.
-    //
-    // It is pure with respect to the Kernel — no exchange, no write — so it
-    // needs no guard and adds no fifth phase of durability. The outcome is read
-    // and recorded by [`report_improvement_candidate_route`], which is where a
-    // canary handoff is checked against this build's identity, where an
-    // unresolved external effect is named instead of dropped, and where the
-    // record the NEXT pass compares against is settled.
+    // already holds, then route the disposition's external effect to the owner
+    // that owes it. Phase 5 is the leg that makes `route_improvement_candidate`
+    // reachable at all: `ImprovementRouteRequest` borrows seven Governor-owned
+    // records, so until this call nothing in the repository constructed one. It
+    // is pure with respect to the Kernel — no exchange, no write — so it needs no
+    // guard. The outcome is read and recorded by
+    // [`report_improvement_candidate_route`], which is where a canary handoff is
+    // checked against this build's identity, where an unresolved external effect
+    // is named instead of dropped, and where the record the NEXT pass compares
+    // against is settled.
+    route_and_reconcile_improvement_candidate(composition, &artifact, &policy, &fence, retained)
+        .await
+}
+
+/// Routes the committed artifact through the Governor pipeline, then routes the
+/// disposition's external effect to the owner that owes it.
+///
+/// The two route phases of one improvement-intake step, split out of
+/// [`run_improvement_intake`] so each reads on its own.
+///
+/// # Phase 5 — the Governor route
+///
+/// This is the leg that makes `route_improvement_candidate` reachable at all:
+/// `ImprovementRouteRequest` borrows seven Governor-owned records, so until this
+/// call nothing in the repository constructed one. It is pure with respect to
+/// the Kernel — no exchange, no write — so it needs no guard.
+///
+/// A typed `PipelineError` is a diagnostic under the same discipline as the
+/// refusal phases of the step that called this, never a loop failure: the
+/// Governor pipeline refusing this candidate is the advisory outcome I12.24:76
+/// requires, because this daemon holds no independent executed evaluation and
+/// sets `ImprovementEvidenceExecution::NotExecuted` rather than claiming one.
+/// Reading what the disposition decided stays with
+/// [`report_improvement_candidate_route`], which this function hands the outcome
+/// to unchanged.
+///
+/// # Phase 6 — the external effect
+///
+/// The disposition's effect state has already been read from the effect owner
+/// through the Governor pipeline's own accessors, so this phase only makes a
+/// NAMED unresolved effect durable, and only when the disposition carries one.
+/// See [`record_unknown_effect_obligation`].
+///
+/// # The returned record
+///
+/// The record the NEXT pass retains for its own repeat assessment, or the one
+/// this pass was handed when the route was refused. A refusal produced no
+/// checked record, so it retains nothing new, and the previously retained record
+/// stays in the flight: a refused pass is not evidence that the last admitted
+/// record stopped existing.
+async fn route_and_reconcile_improvement_candidate(
+    composition: &SharedComposition,
+    artifact: &eliotd::improvement_intake_dispatch::ImprovementArtifact,
+    policy: &eliot_maintenance::ImprovementAdmissionPolicy,
+    fence: &eliot_contracts::StateFence,
+    retained: Option<eliot_maintenance::RetainedImprovementProposal>,
+) -> Option<eliot_maintenance::RetainedImprovementProposal> {
     let routed = eliotd::improvement_candidate_dispatch::dispatch_improvement_candidate_route(
         eliotd::improvement_candidate_dispatch::ImprovementRouteDispatch {
-            artifact: &artifact,
-            policy: &policy,
-            state_fence: &fence,
+            artifact,
+            policy,
+            state_fence: fence,
             retained: retained.as_ref(),
         },
     );
-    report_improvement_candidate_route(
-        &artifact.candidate.candidate_id,
-        routed,
-        retained,
-    )
+    // Phase 6 — the external effect this disposition names, read from the effect
+    // owner and, when the disposition actually carries an unresolved effect,
+    // routed to that owner's durable surface. It runs before the disposition is
+    // read so a named debt outlives the pass that observed it even if the reading
+    // below is the part a reader looks at first. Nothing here attaches an effect
+    // outcome, and nothing on this path promotes, activates, installs,
+    // completes, or issues authority.
+    if let Ok(outcome) = &routed {
+        record_unknown_effect_obligation(composition, artifact, &outcome.effect, fence).await;
+    }
+    report_improvement_candidate_route(&artifact.candidate.candidate_id, routed, retained)
 }
 
 /// Reads one improvement-candidate route outcome and records what it actually
@@ -5357,13 +5414,18 @@ async fn run_improvement_intake(
 /// - An `UnknownRequiresReconciliation` obligation is a named debt, not a weaker
 ///   success and not an absent result. It is named here with its exact identity
 ///   and the retry gate read from the effect owner's own stored value, so the
-///   debt is inspectable instead of dropped with the match arm. It is NOT made
-///   durable on this path: `improvement_candidate_dispatch` records why, with the
-///   measurement — the closed learning-record kind set has no kind for an
-///   unresolved effect, and the one kind that fits (`Candidate`) is re-proved
-///   exhaustively by `improvement_dedup_read::classify_row`, which refuses any
-///   document shape beyond the three it knows, so a fourth `Candidate` document
-///   would stop every later pass.
+///   debt is inspectable instead of dropped with the match arm. It is made
+///   durable one step earlier by phase 6
+///   ([`record_unknown_effect_obligation`]), through the same
+///   `commit_learning_record` seam the rest of the improvement record family
+///   uses and in the same closed `Candidate` kind and Governor scope;
+///   `improvement_candidate_dispatch` records why that shape and no other, with
+///   the measurement — the closed learning-record kind set has no kind for an
+///   unresolved effect, and the one kind that fits is re-proved exhaustively by
+///   `improvement_dedup_read::classify_row`, which refuses any document shape it
+///   has not been taught. The record carries the debt and the owner's DENYING
+///   answer only: no outcome, no receipt, and no authority, because the effect
+///   owner is the half that does not exist yet.
 /// - The `CanaryAdmitted` arm also names the repeat assessment the pipeline
 ///   derived against the retained prior record, so an absent assessment is
 ///   visibly the denial it is rather than a silent omission.
@@ -5454,8 +5516,14 @@ fn report_improvement_candidate_route(
                     owner_id = %obligation.owner_id,
                     forward_repair_ref = %obligation.forward_repair_ref,
                     invalidation_targets = ?obligation.invalidation_set,
-                    // Stated, not implied: this debt is NAMED here, not stored.
-                    durable = false,
+                    // The debt is made durable by phase 6
+                    // (`record_unknown_effect_obligation`) through the same
+                    // `commit_learning_record` seam the rest of the improvement
+                    // record family uses; this line names what was READ, and that
+                    // phase reports whether the commit landed. What the record
+                    // carries is the debt plus the owner's DENYING answer: no
+                    // outcome, no receipt and no authority.
+                    effect = ?outcome.effect,
                 ),
                 disposition => {
                     tracing::info!(
@@ -5465,6 +5533,14 @@ fn report_improvement_candidate_route(
                         // The pipeline's own advisory-only terminal disposition,
                         // recorded verbatim.
                         disposition = ?disposition,
+                        // The repeat assessment, when one was derived, and the
+                        // external-effect state the owner gave for it. Recorded so
+                        // "nobody settled this effect" and "no prior record was
+                        // compared" are visible facts on the live pass instead of
+                        // unexamined omissions: on this workspace the execution
+                        // gate refuses first, so both are absent.
+                        repeat = ?outcome.repeat,
+                        effect = ?outcome.effect,
                     );
                 }
             }
@@ -5552,6 +5628,84 @@ fn improvement_intake_observation(
         ],
         activation_in_flight,
     )
+}
+
+/// Records one routed disposition's unresolved external effect for its owner.
+///
+/// # What this step is
+///
+/// The improvement pipeline's `UnknownRequiresReconciliation` disposition
+/// carries a named debt: a candidate, an experiment, a committed operation and
+/// idempotency namespace, a forward-repair reference, an invalidation set, and
+/// the external owner that owes the reconciliation. `ImprovementRouteOutcome`
+/// has already read all of that back from the effect owner through the
+/// Governor pipeline's own accessors, so this step only makes it DURABLE —
+/// otherwise the debt would exist for exactly as long as the pass that observed
+/// it, and a named external debt that vanishes with a process is the failure
+/// I14.24 records.
+///
+/// Durability goes through the same single seam phase 4 used:
+/// `improvement_candidate_dispatch::commit_unknown_effect_obligation` reaches
+/// [`eliotd::DaemonComposition::commit_learning_record`] in the same Governor
+/// scope and the same closed `candidate` record kind as the candidate artifact,
+/// the archive receipts and the lineage-merge receipts. No store client is
+/// opened, no operation is invented, and the lock is taken only for the commit
+/// itself.
+///
+/// # What this step is NOT
+///
+/// It does not settle the effect, and it cannot. The owner outcome lives behind
+/// a private field whose only writer re-checks that the outcome is terminal,
+/// carries a canonical receipt, and names this obligation's exact operation id
+/// and idempotency key — and this repository has no producer of a SETTLED
+/// `eliot_authority::EffectReceipt` to offer it. So the committed record names
+/// the debt and the denying answer, and a refusal to commit it is this phase's
+/// own diagnostic under the same discipline as phases 1 to 4, never a loop
+/// failure. Nothing here promotes, activates, installs, completes, or issues
+/// authority, and nothing here retries anything: a retry is the Governor gate's
+/// answer to read, never one this step decides.
+async fn record_unknown_effect_obligation(
+    composition: &SharedComposition,
+    artifact: &eliotd::improvement_intake_dispatch::ImprovementArtifact,
+    effect: &eliotd::improvement_candidate_route::ImprovementEffectState,
+    fence: &eliot_contracts::StateFence,
+) {
+    if effect.obligation.is_none() {
+        // No unresolved effect is named, so there is no debt to record. A record
+        // written for a disposition that carries no obligation would be an
+        // invented one.
+        return;
+    }
+    let committed = {
+        let mut guard = composition.lock().await;
+        eliotd::improvement_candidate_dispatch::commit_unknown_effect_obligation(
+            &mut guard, artifact, effect, fence,
+        )
+        .await
+    };
+    match committed {
+        Ok(Some(receipt)) => {
+            tracing::info!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.improvement_effect_reconciliation_recorded",
+                candidate_id = %artifact.candidate.candidate_id,
+                operation_id = %receipt.operation_id,
+                // The owner's own two answers, recorded verbatim so the record
+                // and the daemon's own view cannot drift apart silently.
+                retry_permitted = effect.retry_permitted,
+                completion_retained = effect.completion_retained,
+            );
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let _ = eliotd::diagnostics::ErrorRecord::of(
+                eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                "improvement-reconciliation-commit",
+                &error.to_string(),
+            )
+            .emit();
+        }
+    }
 }
 
 /// Starts one improvement-intake step when its flight is idle. The
