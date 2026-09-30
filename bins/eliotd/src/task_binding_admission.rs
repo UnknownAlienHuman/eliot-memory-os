@@ -641,9 +641,9 @@ impl ColdStartReadinessRecordOwner for KernelColdStartReadinessRecordOwner {
         &self,
         binding_digest: &str,
     ) -> Result<Option<ColdStartReadinessOrsRecord>, OrsError> {
-        match self.request(ColdStartReadinessOwnerRpcAction::ReadinessLoadForBinding {
-            binding_digest,
-        })? {
+        match self
+            .request(ColdStartReadinessOwnerRpcAction::ReadinessLoadForBinding { binding_digest })?
+        {
             ColdStartReadinessOwnerRpcResult::ReadinessRecord { record } => Ok(record),
             _ => Err(OrsError::Contract(
                 "Kernel returned an invalid cold-start readiness binding read result".to_owned(),

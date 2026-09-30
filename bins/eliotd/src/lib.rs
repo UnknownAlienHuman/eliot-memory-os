@@ -3958,9 +3958,7 @@ impl DaemonComposition {
                 "current-task readiness claim is invalid: {error}"
             )))
         })?;
-        let (activation, receipt) = self
-            .governor
-            .current_task_selection_for_claim(now, claim)?;
+        let (activation, receipt) = self.governor.current_task_selection_for_claim(now, claim)?;
         let live_fence = self.governor.kernel_snapshot().state_fence();
         match task_binding_admission::bind_current_task_selection(
             activation.as_ref(),
