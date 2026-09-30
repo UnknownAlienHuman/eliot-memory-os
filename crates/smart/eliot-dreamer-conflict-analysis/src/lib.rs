@@ -5646,7 +5646,7 @@ fn causal_evidence_digest_parts(record: &CausalEvidenceRecord) -> Vec<String> {
         // token, so the revision is passed positionally rather than through the
         // named `{revision}` capture the previous spelling used.
         parts.push(format!(
-            "causal_evidence_envelope:{}:{}:{}:{}:{}:{:?}:{:?}:{:?}:{:?}:{:?}:{}:{}:{:?}",
+            "causal_evidence_envelope:{}:{}:{}:{}:{}:{:?}:{:?}:{:?}:{:?}:{:?}:{}:{revision}:{:?}",
             record.source_handle,
             evidence.evidence_id,
             evidence.owner,
