@@ -70,7 +70,7 @@ use std::sync::Mutex;
 use eliot_contracts::sha256_hex;
 use eliot_watchdog_core::{
     BriefPersistence, ClockDomain, ContextQualityBounds, ContextQualityObservation, CountDelta,
-    CoverageGapExplanation, CoverageRef, EvidenceRef, ExpectedRevision, HealthAnalysisRequest,
+    CoverageManifestProjection, CoverageRef, EvidenceRef, ExpectedRevision, HealthAnalysisRequest,
     HealthDetection, HealthDiagnosticBrief, HealthEvidenceHandles, HealthNoSignalReason,
     HealthObservationPair, HealthOutputFamily, HealthSignalContext, MaintenanceDebtInput,
     MemoryUtilityDeltas, ObservationCoverageInput, ObservedTime, PolicyBound, ProfileRevision,
@@ -78,7 +78,7 @@ use eliot_watchdog_core::{
     RiskRoute, Signal, SignalReferences, SignalTarget, SourceEventRef, StateDeltaPresence,
     TimeUnit, compile_health_brief, evaluate_agent_loop, evaluate_context_quality,
     evaluate_maintenance_debt, evaluate_memory_utility, evaluate_observation_coverage,
-    request_health_analysis,
+    request_health_analysis, validate_observation_coverage_against_manifest,
 };
 
 use crate::PROTOCOL_VERSION;
@@ -241,7 +241,6 @@ struct IntervalObservation {
     evidence_id: String,
     gap_evidence_id: String,
     signature: String,
-    explanation: CoverageGapExplanation,
     blocking_channels: u64,
     non_continuum_channels: u64,
     expected_lineage: u64,
@@ -379,7 +378,6 @@ fn observe_interval(
     let mut expected_lineage = 0_u64;
     let mut blocking_channels = 0_u64;
     let mut non_continuum_channels = 0_u64;
-    let mut any_unclosed = false;
     for capability in &SENSOR_CHANNEL_MAP {
         expected_lineage += capability.supported_classes.len() as u64;
     }
@@ -396,9 +394,9 @@ fn observe_interval(
             signature.push(gap.reason.to_owned());
             gap_fields.push(gap.reason.to_owned());
         }
-        if !record.interval_closed() {
-            any_unclosed = true;
-        }
+        // The interval-close state already rides the signature above; the
+        // coverage verdict itself comes from the owner-issued manifest below,
+        // never from a second derivation here.
         match record.disposition() {
             // A continuous channel is no blocking channel either. A channel
             // the map says has no competent source is a measured structural
@@ -418,23 +416,10 @@ fn observe_interval(
     // appended here so both windows of a pair are encoded the same way.
     signature.push(corpus.newest_payload_class.clone());
     signature.push(corpus.deferred_gap_reasons.to_string());
-    // A report that is not internally consistent, or whose interval no tick
-    // closed, cannot establish what was covered, so it is unknown rather than
-    // either verdict. An interval short of full coverage only through measured
-    // missing adapters reports no blocking channel at all and is therefore
-    // explained; any other short channel is a gap this owner cannot account for.
-    let explanation = if !report.valid() || any_unclosed {
-        CoverageGapExplanation::Unknown
-    } else if blocking_channels == 0 {
-        CoverageGapExplanation::Explained
-    } else {
-        CoverageGapExplanation::Unexplained
-    };
     IntervalObservation {
         evidence_id: sha256_hex(encode_identity(&evidence_fields).as_bytes()),
         gap_evidence_id: sha256_hex(encode_identity(&gap_fields).as_bytes()),
         signature: encode_identity(&signature),
-        explanation,
         blocking_channels,
         non_continuum_channels,
         expected_lineage,
@@ -625,6 +610,12 @@ fn publish(emissions: &[HealthSignalEmission]) {
 /// - this is the first closed interval, so there is no second source event and
 ///   no delta can be proved.
 ///
+/// `manifest` is the same tick's projection of the actual #1755 interval
+/// manifest for `report`, read through the manifest's public claims. The
+/// coverage rule's interval identity, evidence handle, and gap verdict are
+/// taken from it verbatim and validated against it, so the rule can never
+/// contradict the manifest about one interval.
+///
 /// Every rule that stays silent is traced with its own
 /// [`HealthNoSignalReason`], so "no competent source reached this owner" stays
 /// distinguishable from "the source observed no delta".
@@ -635,6 +626,7 @@ fn publish(emissions: &[HealthSignalEmission]) {
 pub fn evaluate_interval_health(
     cell: &HealthProjectionCell,
     report: &IntervalCoverageReport,
+    manifest: &CoverageManifestProjection,
     evidence: Option<&WatchdogHealthEvidence>,
 ) {
     let Some(evidence) = evidence else {
@@ -722,9 +714,14 @@ pub fn evaluate_interval_health(
     if let Some(emission) = open_memory_utility(&previous, pair.clone(), corpus, &mut silent) {
         emissions.push(emission);
     }
-    if let Some(emission) =
-        open_observation_coverage(&previous, pair.clone(), &observation, corpus, &mut silent)
-    {
+    if let Some(emission) = open_observation_coverage(
+        &previous,
+        pair.clone(),
+        &observation,
+        corpus,
+        manifest,
+        &mut silent,
+    ) {
         emissions.push(emission);
     }
     if let Some(emission) =
@@ -1157,21 +1154,26 @@ fn open_memory_utility(
 /// construction — that is the point: the expected set is a declaration, not a
 /// copy of what was read. The activity is the number of retained records the
 /// spool owner actually appended, so an installation that recorded nothing new
-/// produces no delta and opens nothing. The explanation is this owner's own
-/// verdict: only a short channel the map says is wired is unexplained, so the
-/// measured missing adapters can never be read as a bypass.
+/// produces no delta and opens nothing.
+///
+/// The manifest identity, evidence handle, and gap verdict are the actual #1755
+/// manifest's own, carried verbatim from `manifest` — never re-derived here —
+/// and [`validate_observation_coverage_against_manifest`] refuses the input
+/// fail-closed when the supplied values contradict that manifest. The rule and
+/// the manifest therefore agree about one interval by construction, and a
+/// second supplier's restated label, stale interval, or foreign verdict can
+/// never open a gap signal.
 fn open_observation_coverage(
     previous: &IntervalRecord,
     pair: HealthObservationPair,
     observation: &IntervalObservation,
     corpus: &WatchdogHealthCorpus,
+    manifest: &CoverageManifestProjection,
     silent: &mut Vec<(&'static str, HealthNoSignalReason)>,
 ) -> Option<HealthSignalEmission> {
     let input = ObservationCoverageInput {
-        manifest_interval_id: pair_current_event(&pair),
-        manifest_evidence: EvidenceRef {
-            evidence_id: observation.evidence_id.clone(),
-        },
+        manifest_interval_id: manifest.interval_id.clone(),
+        manifest_evidence: manifest.evidence.clone(),
         activity: CountDelta {
             previous: previous.corpus.retained_records,
             current: corpus.retained_records,
@@ -1180,9 +1182,18 @@ fn open_observation_coverage(
             previous: observation.expected_lineage,
             current: observation.expected_lineage,
         },
-        explanation: observation.explanation,
+        explanation: manifest.explanation,
         pair,
     };
+    if let Err(mismatch) = validate_observation_coverage_against_manifest(&input, manifest) {
+        tracing::debug!(
+            event = "watchdog.health_coverage_manifest_refused",
+            observation = "refused",
+            detail = ?mismatch,
+            "I8.18 supplied coverage values contradict the owner-issued #1755 manifest; no signal is opened"
+        );
+        return None;
+    }
     finish(
         OBSERVATION_COVERAGE_RULE,
         evaluate_observation_coverage(input),
@@ -1262,15 +1273,6 @@ fn declared_bound_evidence(name: &str, value: u64) -> EvidenceRef {
             encode_identity(&[format!("watchdog_declared_{name}"), value.to_string()]).as_bytes(),
         ),
     }
-}
-
-/// The manifest interval identity the coverage rule records.
-///
-/// Read back off the pair's current source event, so the record names the exact
-/// interval this owner published rather than a restated label supplied beside
-/// it.
-fn pair_current_event(pair: &HealthObservationPair) -> String {
-    pair.current_event.event_id.clone()
 }
 
 /// Routes one rule result into the emission list or the named silence list.

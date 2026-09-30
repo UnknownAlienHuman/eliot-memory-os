@@ -514,6 +514,7 @@ impl WatchdogComposition {
                             evaluate_interval_health(
                                 health.as_ref(),
                                 &closed,
+                                &manifest,
                                 kernel.health_evidence(now_ms).as_ref(),
                             );
                         }
