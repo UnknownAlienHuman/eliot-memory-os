@@ -903,6 +903,38 @@ fn check_ceiling(
     Ok(())
 }
 
+/// Builds the typed lane's dispatch engine and compiles the exact bounded
+/// buffer on it (item 26 seam, #758).
+///
+/// Two-path status on current main: this locally-configured engine is the
+/// second engine path beside the single provider
+/// (`WasmtimeComponentEngine::new_for_admitted_limits`, used by the
+/// guest-exec child). Both typed lanes (describe and domain)
+/// build through this one seam so the typed configuration exists exactly
+/// once. Full dispatch migration onto the provider-built engine legs needs a
+/// provider-owned leg accessor in `wasmtime_provider.rs` (sibling scope: no
+/// such accessor exists on current main, and the provider file is not this
+/// slice's), so this seam keeps the exact current provider-equivalent
+/// settings (component model, fuel/epoch mode from the admitted policy,
+/// provider stack ceiling) without inventing a third configuration.
+/// `guest_exec` is untouched: the shared provider constructor is neither
+/// called nor modified here.
+fn build_typed_dispatch_component(
+    limits: &InvocationLimits,
+    artifact: &[u8],
+) -> Result<(wasmtime::Engine, wasmtime::component::Component), TypedExecutionError> {
+    let mut config = wasmtime::Config::new();
+    config.wasm_component_model(true);
+    config.consume_fuel(typed_fuel_budget(limits).is_some());
+    config.epoch_interruption(true);
+    config.max_wasm_stack(usize::try_from(PROVIDER_STACK_SIZE).unwrap_or(8192));
+    let engine = wasmtime::Engine::new(&config)
+        .map_err(|_| TypedExecutionError::Engine("config:invalid".to_owned()))?;
+    let component = wasmtime::component::Component::new(&engine, artifact)
+        .map_err(|error| staged(TypedStage::Compile, map_compile_error(&error)))?;
+    Ok((engine, component))
+}
+
 /// Executes the typed `describe` descriptor for one world through the real
 /// Wasmtime component engine under deny-by-default sandbox policy.
 ///
@@ -929,15 +961,7 @@ pub fn execute_describe_experimental(
     // Cache identity revalidation before any engine is built: no bypass.
     let cache_identity = check_cache_identity(world, artifact, &preflight.digest, limits)?;
 
-    let mut config = wasmtime::Config::new();
-    config.wasm_component_model(true);
-    config.consume_fuel(typed_fuel_budget(limits).is_some());
-    config.epoch_interruption(true);
-    config.max_wasm_stack(usize::try_from(PROVIDER_STACK_SIZE).unwrap_or(8192));
-    let engine = wasmtime::Engine::new(&config)
-        .map_err(|_| TypedExecutionError::Engine("config:invalid".to_owned()))?;
-    let component = wasmtime::component::Component::new(&engine, artifact)
-        .map_err(|error| staged(TypedStage::Compile, map_compile_error(&error)))?;
+    let (engine, component) = build_typed_dispatch_component(limits, artifact)?;
 
     // Inspect the exact component type before any instance is created or any
     // guest function is called. Generated bindings provide the expected WIT
@@ -1934,15 +1958,7 @@ pub fn execute_domain_experimental(
     // Cache identity revalidation before any engine is built: no bypass.
     let cache_identity = check_cache_identity(world, artifact, &preflight.digest, limits)?;
 
-    let mut config = wasmtime::Config::new();
-    config.wasm_component_model(true);
-    config.consume_fuel(typed_fuel_budget(limits).is_some());
-    config.epoch_interruption(true);
-    config.max_wasm_stack(usize::try_from(PROVIDER_STACK_SIZE).unwrap_or(8192));
-    let engine = wasmtime::Engine::new(&config)
-        .map_err(|_| TypedExecutionError::Engine("config:invalid".to_owned()))?;
-    let component = wasmtime::component::Component::new(&engine, artifact)
-        .map_err(|error| staged(TypedStage::Compile, map_compile_error(&error)))?;
+    let (engine, component) = build_typed_dispatch_component(limits, artifact)?;
 
     let (imports, exports) = preflight_component_type(world, &engine, &component)?;
 
