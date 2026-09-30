@@ -201,9 +201,11 @@ pub use learning_admission::{
 };
 pub use learning_closure::{
     CanonicalLearningDeltaStore, CanonicalLearningDeltaStoreError, ClosureIdentityInput,
-    LEARNING_DELTA_ORDERING_SCOPE, LEARNING_DELTA_REVISION_KEY, LearningClosureError,
-    LearningClosureOutcome, LearningClosureReceipt, LearningClosureService, close_disposition_for,
-    prior_lineage_delivery, retry_relation_from_prior,
+    DurableObservedClosure, DurableRepeatedVerifierFailure, LEARNING_DELTA_ORDERING_SCOPE,
+    LEARNING_DELTA_REVISION_KEY, LearningClosureError, LearningClosureOutcome,
+    LearningClosureReceipt, LearningClosureService, close_disposition_for,
+    observed_closure_from_durable_rows, prior_lineage_delivery,
+    repeated_verifier_failure_from_durable_rows, retry_relation_from_prior,
 };
 pub use learning_delta_integration::{
     AttemptCloseError, StoredDeltaIdentity, admission_claim_for_delta, attempt_status_for_activity,
@@ -218,7 +220,7 @@ pub use learning_promotion::{
     rollback_promotion,
 };
 pub use learning_record_commit::{
-    commit_learning_record, learning_effective_under_admission,
+    commit_learning_record, learning_delta_record_key, learning_effective_under_admission,
     learning_record_mutation_request_for_delta,
 };
 pub use migration_inventory::{

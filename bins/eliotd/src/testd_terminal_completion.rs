@@ -701,11 +701,81 @@ pub async fn commit_testd_terminal_owner_fact(
     // decision is already durable at this point, so this phase is a pure
     // read of the retained owner images plus one in-process durable commit; it
     // cannot fail the finish and its outcome is a diagnostic, not a receipt.
-    {
+    let closure = {
         let guard = composition.lock().await;
-        close_terminal_attempt_learning(&guard, evidence, &decision);
-    }
+        close_terminal_attempt_learning(&guard, evidence, &decision)
+    };
+    // (10) a second guarded phase with one exchange inside it: publish the record
+    // that closure committed through the existing canonical learning-record
+    // write.
+    //
+    // This leg exists because the closure record used to exist ONLY inside this
+    // process. `CanonicalLearningDeltaStore` is a `Mutex<LearningDeltaImage>` whose
+    // heads were computed for a `CanonicalWriteEnvelope` nobody ever composed —
+    // `git grep revision_expectations` found no consumer in `bins/` — and the
+    // receipt was formatted into a diagnostic string and dropped. Everything the
+    // improvement intake reads from it therefore described one process lifetime:
+    // the brief's safe boundary, and above all a `repeated-verifier-failure:`
+    // marker, which is rare and unrecoverable once lost.
+    //
+    // The guard is RELEASED between the two phases, so the publication is a
+    // separate phase rather than a continuation of the closure commit, and it is
+    // re-taken for the exchange itself — the same contour
+    // `run_improvement_intake` uses for its own `commit_learning_record` phases,
+    // which also await the durable write with the composition guard held. A
+    // refusal is a typed diagnostic, never a loop failure: the finish decision
+    // and the in-process closure are already committed, and publishing is what
+    // makes them outlive this process, so a failed publish is reported rather
+    // than propagated into the finish ceremony.
+    publish_terminal_learning_delta(composition, evidence, closure.as_ref()).await;
     Ok(committed)
+}
+
+/// Publishes one committed learning-closure record durably, when the closure
+/// committed one.
+///
+/// `receipt` is `None` for a closure that crossed no consequential boundary, for
+/// one the owner refused, and for one whose publication already succeeded under
+/// the same deterministic key on an earlier attempt — all three are ordinary and
+/// none becomes a write. The commit, the record key it derives and the heads it
+/// binds are documented on
+/// [`crate::improvement_intake_dispatch::publish_learning_delta_record`], which
+/// is where the durable write lives; this phase is what calls it in the phase
+/// after the guard was released and re-taken.
+///
+/// The job identity in the diagnostic is the terminal row's own, which is
+/// already in hand, rather than anything read out of the committed record: the
+/// record TYPE is not nameable here (`eliotd` has no `eliot-learning-delta`
+/// dependency and takes none for a value used only to render a log line).
+async fn publish_terminal_learning_delta(
+    composition: &SharedTestdOwnerComposition,
+    evidence: &TestdTerminalCompletionEvidence,
+    receipt: Option<&eliot_governor::LearningClosureReceipt>,
+) {
+    let Some(receipt) = receipt else {
+        return;
+    };
+    let detail = {
+        let mut guard = composition.lock().await;
+        match crate::improvement_intake_dispatch::publish_learning_delta_record(&mut guard, receipt)
+            .await
+        {
+            Ok(write_receipt) => format!(
+                "published durable learning delta under operation {}",
+                write_receipt.operation_id
+            ),
+            Err(error) => format!("publication refused: {error}"),
+        }
+    };
+    let _ = crate::diagnostics::ErrorRecord::of(
+        crate::diagnostics::OwningComponent::DaemonRuntime,
+        "learning-closure-publication",
+        &format!(
+            "job {}: {detail}",
+            crate::diagnostics::sanitize_identity(&evidence.job.job_id)
+        ),
+    )
+    .emit();
 }
 
 /// Commits one durable learning-closure edge for a settled terminal attempt.
@@ -733,13 +803,25 @@ pub async fn commit_testd_terminal_owner_fact(
 /// boundary stays visible as a refusal instead of being treated as admissible;
 /// the boundary-content validation itself starts running the moment an owner
 /// publishes one.
+///
+/// # The committed receipt is RETURNED, not consumed by the diagnostic
+///
+/// It used to be formatted into the line below and dropped, which is precisely
+/// why nothing downstream could ever see the record: it existed only in this
+/// process's closure image. The receipt is handed back so the caller's next
+/// phase can publish it through the canonical learning-record write
+/// ([`publish_terminal_learning_delta`]), and `None` — for a non-consequential
+/// closure, an unsettled run, or a refusal — is returned rather than a
+/// synthesized record. The diagnostic is still emitted here, at the phase that
+/// produced the outcome, because a closure that committed but failed to publish
+/// is a distinct fact from one that never committed.
 fn close_terminal_attempt_learning(
     composition: &DaemonComposition,
     evidence: &TestdTerminalCompletionEvidence,
     decision: &eliot_governor::FinishDecisionReceipt,
-) {
+) -> Option<eliot_governor::LearningClosureReceipt> {
     let activity_name = evidence.job.invocation.instrument.as_str();
-    let detail = match composition.close_attempt_learning(
+    let (detail, committed) = match composition.close_attempt_learning(
         evidence,
         decision,
         activity_name,
@@ -767,16 +849,20 @@ fn close_terminal_attempt_learning(
                 Some(reason) => format!("; prior proposal not delivered ({reason:?})"),
                 None => String::new(),
             };
-            if receipt.delivered {
+            let detail = if receipt.delivered {
                 format!("committed; admitted delivery surface is live; {promotion}{prior}")
             } else {
-                format!("committed; unadmitted, behavioural effect withheld; {promotion}{prior}")
-            }
+                format!(
+                    "committed; unadmitted, behavioural effect withheld; {promotion}{prior}"
+                )
+            };
+            (detail, Some(*receipt))
         }
-        Ok(eliot_governor::LearningClosureOutcome::NonConsequential { .. }) => {
-            "no consequential boundary; no record committed".to_owned()
-        }
-        Err(error) => format!("closure refused: {error}"),
+        Ok(eliot_governor::LearningClosureOutcome::NonConsequential { .. }) => (
+            "no consequential boundary; no record committed".to_owned(),
+            None,
+        ),
+        Err(error) => (format!("closure refused: {error}"), None),
     };
     let _ = crate::diagnostics::ErrorRecord::of(
         crate::diagnostics::OwningComponent::DaemonRuntime,
@@ -787,6 +873,7 @@ fn close_terminal_attempt_learning(
         ),
     )
     .emit();
+    committed
 }
 
 /// Queries the Kernel-owned pending verifier dispatches for one bounded drain

@@ -144,6 +144,26 @@ pub fn learning_record_mutation_request_for_delta(
     Ok(request)
 }
 
+/// The record key and idempotency key one learning-delta publication uses.
+///
+/// [`learning_record_mutation_request_for_delta`] takes the idempotency key as
+/// a parameter because the closed `RecordLearningRecord` operation requires the
+/// caller's identity key to equal the named request's key
+/// ([`commit_learning_record`] refuses the pair otherwise), and it cannot derive
+/// one: the key has to name WHICH durable record this is, and the only identity
+/// the owner minted for it is [`StoredLearningDelta::delta_artifact`].
+///
+/// So the key is derived here, in the crate that owns the record, from that
+/// artifact alone and from nothing this process observes. It is namespaced so it
+/// cannot collide with the improvement-candidate keys the daemon derives from a
+/// candidate id (`improvement-candidate:<id>`), and it is deterministic across
+/// retries, so republishing the same record converges on the same row instead of
+/// appending a second one.
+#[must_use]
+pub fn learning_delta_record_key(record: &StoredLearningDelta) -> String {
+    format!("learning-delta:{}", record.delta_artifact.as_str())
+}
+
 /// Report whether a durable learning record is locally effective under a
 /// Governor admission.
 ///

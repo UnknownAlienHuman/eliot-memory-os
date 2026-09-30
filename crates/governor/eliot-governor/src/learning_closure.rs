@@ -9,14 +9,30 @@
 //! conditional-commit contract, a replacement is revalidated before it is
 //! stored, lock poisoning fails closed, and a contended commit is reported as
 //! [`CasOutcome::Contended`] rather than silently overwriting. The store
-//! performs no I/O itself: cross-process durability comes from the daemon
-//! wiring [`CanonicalLearningDeltaStore::revision_expectations`] and
-//! [`CanonicalLearningDeltaStore::ordering_expectations`] into a real
+//! performs no I/O itself, and it is NOT the durable record: it is this
+//! process's image of it.
+//!
+//! Durability is the daemon composing the version-to-head mapping
+//! ([`CanonicalLearningDeltaStore::revision_expectations`],
+//! [`CanonicalLearningDeltaStore::ordering_expectations`]) into a real
 //! `CanonicalWriteEnvelope`, and a violated head surfaces from the canonical
 //! store as a store error that
 //! [`CanonicalLearningDeltaStore::classify_store_error`] reports as
 //! [`CasOutcome::Contended`]. There is no second writer, no raw SQL, and no
 //! remote-database fallback.
+//!
+//! That image was previously the ONLY place a committed closure existed, so a
+//! restart silently emptied it and every consumer of it — including a
+//! repeated-verifier-failure marker, which is rare and therefore unrecoverable
+//! once lost — could only ever answer for one process lifetime. Both halves of
+//! the durable pair now exist: the daemon publishes each committed record through
+//! [`crate::commit_learning_record`] at the closed
+//! [`LearningRecordKind::Delta`] kind with the heads this store's own receipt
+//! carries ([`crate::learning_delta_record_key`] names the record), and
+//! [`observed_closure_from_durable_rows`] /
+//! [`repeated_verifier_failure_from_durable_rows`] read the served rows back,
+//! re-proving each one against its own bytes and the record's own `validate()`.
+//!
 //!
 //! Boundary derivation: [`GovernorComposition::close_attempt_learning`] never
 //! trusts a caller-named boundary. It reads the canonical verifier-execution
@@ -96,9 +112,11 @@ use eliot_learning_delta::{
     StoredLearningDelta, StoredRetryRelation, derive_boundaries,
 };
 use eliot_store_api::{
-    OrderingHeadExpectation, OrderingScopeId, RevisionHeadExpectation, RevisionKey, StoreError,
+    LearningRecordKind, OrderingHeadExpectation, OrderingScopeId, RevisionHeadExpectation,
+    RevisionKey, StoreError,
 };
 use eliot_testd_core::{JobState as TestdJobState, TestdJob, TestdTerminalCompletionEvidence};
+use serde_json::Value;
 use thiserror::Error;
 
 use crate::composition::{
@@ -676,8 +694,8 @@ fn strategy_fingerprint(
     Ok(sha256_hex(&bytes))
 }
 
-/// The verifier identity of a REPEATED verifier failure, when the two
-/// independent owner records together prove one.
+/// The verifier identity of a REPEATED verifier failure, when the recorded
+/// closure projections agree that one happened.
 ///
 /// # Why this comparison and not an assertion
 ///
@@ -692,13 +710,37 @@ fn strategy_fingerprint(
 /// run closes `INVALID_EVIDENCE` here, exactly as a passed one does, because
 /// `derived` is false at this seam) and not the evidence refs.
 ///
-/// So the repeat is compared, not claimed, and the comparison is between two
-/// records this process did not author together:
+/// # What the comparison IS, and what it is NOT
 ///
-/// - the DURABLE terminal job row (`eliot_testd_core::TestJob`), which records
-///   how many physical attempts the job took and how it settled, and
-/// - the CANONICAL verifier-execution fact, whose
-///   [`CanonicalVerifierExecutionFact::verification_run`] is the run itself.
+/// It was previously documented here as a comparison "between two records this
+/// process did not author together" — the durable terminal job row and the
+/// canonical verifier-execution fact — reading as corroboration between two
+/// independent owners. **That was false and is withdrawn.** Both values descend
+/// from ONE owner record:
+///
+/// - `CanonicalVerifierExecutionFact::from_testd(.., job, receipt, run)` embeds
+///   that very `job`, and `run` is not an independent observation of it either:
+///   `composition::evaluate_testd_verification_current(job, receipt, plan)`
+///   DERIVES the run from `job.invocation` and the raw artifacts retained on
+///   `job`'s own `VerificationReceipt`
+///   (`crates/governor/eliot-governor/src/composition.rs:4874-4899`);
+/// - `job.execution` is itself a copy: the terminal transition assigns
+///   `job.execution = Some(execution)` from the same receipt it retains
+///   (`crates/instrument/eliot-testd-core/src/lib.rs:4767`, and `receipt.validate(job)`
+///   refuses a disagreement at `:4756-4758`).
+///
+/// So this is a CONSISTENCY CHECK across two projections of one owner record —
+/// the row's recorded execution status against the execution status the
+/// evaluator derives from the report bytes that same row carries
+/// (`run.execution` is `report.execution_status()`,
+/// `crates/instrument/eliot-verifier/src/lib.rs:830`) — and NOT corroboration
+/// between two owners, and NOT two independent sources. It can catch a row whose
+/// recorded status disagrees with the report its own retained bytes contain; it
+/// cannot and does not attest that two independent authorities saw the failure.
+///
+/// `attempts` and `state` are weaker still: `CanonicalVerifierExecutionFact` has
+/// no attempt-ordinal field at all, so "physically repeated" rests on the job row
+/// alone and the verifier half of the check says only "this run failed".
 ///
 /// A marker is minted only when the job row says the attempt was physically
 /// repeated and failed, the row's own execution projection agrees that it
@@ -706,10 +748,10 @@ fn strategy_fingerprint(
 /// semantic outcome. `None` is the ordinary answer for a first-attempt failure,
 /// a repeated PASS (`SubstantialRecovery`), an unsettled, blocked or cancelled
 /// run, and any row whose execution disagrees with the run — a repeat nobody can
-/// prove is a repeat, and `None` never becomes an invented marker.
+/// show from one owner's record, and `None` never becomes an invented marker.
 ///
 /// The caller still cross-checks `fact.job_id` against the row and the finish
-/// decision against the fact before calling this, so the two records compared
+/// decision against the fact before calling this, so the two projections compared
 /// here are already bound to the same attempt.
 ///
 /// The verifier identity is returned OWNED rather than borrowed out of `fact`.
@@ -738,6 +780,209 @@ fn repeated_verifier_failure_verifier(
         return None;
     }
     Some(run.verifier.as_str().to_owned())
+}
+
+/// One committed closure record re-proved from the DURABLE learning-delta scope,
+/// projected to the values a brief reads.
+///
+/// Owned, not borrowed: the caller of this crate's selectors is a binary that has
+/// no `eliot-learning-delta` edge and therefore cannot name
+/// [`StoredLearningDelta`]. The projection is what crosses that boundary, and
+/// every field on it is the record's own committed value.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DurableObservedClosure {
+    /// `actor_id` the record committed — the principal the safe boundary names.
+    pub actor_id: String,
+    /// `consequential_boundary` the record committed, in its own spelling.
+    pub boundary_ref: String,
+    /// Durable delta artifact handle the record committed.
+    pub lineage_artifact: String,
+    /// Canonical digest of exactly the bytes that handle names.
+    pub lineage_digest: String,
+    /// Attempt identity the record was derived from.
+    pub attempt_id: String,
+    /// Campaign that attempt belonged to.
+    pub campaign_id: String,
+    /// Route the closed attempt ran.
+    pub route_id: String,
+    /// How many evidence refs the record itself retained.
+    pub evidence_ref_count: usize,
+    /// The record's own predicate on whether it proposed a behaviour change.
+    pub carries_behavioural_proposal: bool,
+    /// Whether the record names a prior-attempt lineage to retry against.
+    pub has_retry_lineage: bool,
+}
+
+/// One committed repeated verifier failure re-proved from the DURABLE
+/// learning-delta scope.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DurableRepeatedVerifierFailure {
+    /// Verifier identity the marker retained, read whole so an identity
+    /// containing `:` survives intact.
+    pub verifier_ref: String,
+    /// Attempt whose durable record carries the marker.
+    pub attempt_id: String,
+    /// Campaign that attempt belonged to.
+    pub campaign_id: String,
+    /// Durable delta artifact identity of that same record.
+    pub lineage_artifact: String,
+    /// Canonical digest of exactly the bytes that handle names.
+    pub lineage_digest: String,
+    /// The raw trace, artifact and evaluator references that record retained.
+    pub trace_refs: Vec<String>,
+}
+
+/// Re-proves every served learning-delta row and decodes it, in store order.
+///
+/// # Why this exists at all: the in-process image is not durable
+///
+/// [`CanonicalLearningDeltaStore`] is a `Mutex<LearningDeltaImage>` inside this
+/// process. A daemon restart empties it, so every consumer that read the newest
+/// closure — and every repeated-failure marker on it — was answering only for
+/// this process's lifetime. The durable owner write that publishes these records
+/// is [`crate::commit_learning_record`] at the closed
+/// [`LearningRecordKind::Delta`] kind; this is the read side of that same pair,
+/// and it is the reason the intake can still see a repeat after a restart.
+///
+/// # Completeness and integrity are the caller's, and neither is inferred here
+///
+/// The caller MUST hand an EXHAUSTIVE page set read at one fence; a partial set
+/// is indistinguishable from an absent record, which is exactly the
+/// "looks empty" failure this replaces. This function therefore re-proves each
+/// row on its own content and refuses the whole set on any row it cannot prove:
+///
+/// 1. the `record_kind` is the closed `Delta` spelling;
+/// 2. the presented `record_digest` is the SHA-256 of the exact `record_json`
+///    bytes the store served under it — the digest IS the immutable revision
+///    identity the store keys rows by;
+/// 3. the document decodes to [`StoredLearningDelta`] and passes the record's
+///    OWN `validate()`, which is what makes
+///    [`StoredLearningDelta::repeated_verifier_failure_verifier`] total here: a
+///    restored payload carrying the bare marker prefix is refused rather than
+///    read back as a proven repeat;
+/// 4. the row's `handle` is the `delta_artifact` the decoded record itself
+///    carries, so a row cannot present one document under another's handle.
+///
+/// No row is skipped and none is defaulted past, so a set this function accepts
+/// contains only records an owner committed.
+fn restored_learning_deltas(rows: &[Value]) -> Result<Vec<StoredLearningDelta>, LearningClosureError> {
+    let mut restored = Vec::with_capacity(rows.len());
+    for row in rows {
+        let handle = row.get("handle").and_then(Value::as_str).unwrap_or_default();
+        let refused = |detail: String| {
+            LearningClosureError::Canonical(format!(
+                "durable learning-delta row {handle}: {detail}"
+            ))
+        };
+        let record_kind = row
+            .get("record_kind")
+            .and_then(Value::as_str)
+            .ok_or_else(|| refused("names no record kind".to_owned()))?;
+        if record_kind != LearningRecordKind::Delta.as_str() {
+            return Err(refused("is not a closed learning-delta record".to_owned()));
+        }
+        let record_json = row
+            .get("record_json")
+            .and_then(Value::as_str)
+            .ok_or_else(|| refused("names no record document".to_owned()))?;
+        let record_digest = row
+            .get("record_digest")
+            .and_then(Value::as_str)
+            .ok_or_else(|| refused("names no record digest".to_owned()))?;
+        if sha256_hex(record_json.as_bytes()) != record_digest {
+            return Err(refused(
+                "presented digest does not cover the served record bytes".to_owned(),
+            ));
+        }
+        let record: StoredLearningDelta = serde_json::from_str(record_json)
+            .map_err(|error| refused(format!("record document does not decode: {error}")))?;
+        record
+            .validate()
+            .map_err(|error| refused(format!("record does not validate: {error}")))?;
+        if record.delta_artifact.as_str() != handle {
+            return Err(refused(
+                "presents a handle its own record does not carry".to_owned(),
+            ));
+        }
+        restored.push(record);
+    }
+    Ok(restored)
+}
+
+/// The observed closure the DURABLE learning-delta scope yields for this pass.
+///
+/// # Which record this selects, and why it is not called "the newest"
+///
+/// The learning owner keys rows by `(record_kind, handle, record_digest)` and
+/// publishes no per-row commit sequence, so a range read carries a total order
+/// that is NOT chronological. This returns the LAST row of that enumeration and
+/// does not claim it is the most recent closure: no owner record on this path
+/// records a commit time, and inventing one by parsing `attempt_id` would be a
+/// second spelling of an identity the attempt owner issued. Every committed
+/// closure is a real owner-observed consequential boundary, so any of them
+/// discharges the brief's safe-boundary requirement; the choice is deterministic
+/// and stated rather than presented as recency.
+///
+/// An empty scope is a refusal, never a synthesized record: no consequential
+/// closure has ever been committed durably, and a brief must not reach an owner
+/// as though a boundary had been observed when none was.
+pub fn observed_closure_from_durable_rows(
+    rows: &[Value],
+) -> Result<DurableObservedClosure, LearningClosureError> {
+    let restored = restored_learning_deltas(rows)?;
+    let record = restored.last().ok_or_else(|| {
+        LearningClosureError::Canonical(
+            "the durable learning-delta scope holds no committed closure record".to_owned(),
+        )
+    })?;
+    let (lineage_artifact, lineage_digest) = record.lineage_ref();
+    Ok(DurableObservedClosure {
+        actor_id: record.actor_id.clone(),
+        boundary_ref: record.consequential_boundary.as_str().to_owned(),
+        lineage_artifact: lineage_artifact.to_string(),
+        lineage_digest: lineage_digest.to_owned(),
+        attempt_id: record.attempt_id.as_str().to_owned(),
+        campaign_id: record.campaign_id.as_str().to_owned(),
+        route_id: record.route_id.clone(),
+        evidence_ref_count: record.evidence_refs.len(),
+        carries_behavioural_proposal: record.carries_behavioural_proposal(),
+        has_retry_lineage: record.lineage_for_retry().is_some(),
+    })
+}
+
+/// The repeated verifier failure the DURABLE learning-delta scope proves, when
+/// one of its records proves one.
+///
+/// Scans the enumeration backwards and returns the LAST record that carries a
+/// `repeated-verifier-failure:` marker, for the same reason
+/// [`observed_closure_from_durable_rows`] does not claim recency: the store
+/// publishes `(record_kind, handle, record_digest)` order, not commit order.
+/// `None` is the ordinary answer — no committed record retains a marker, which
+/// is a fact about the durable scope and not a substituted value. Every row was
+/// re-proved first, so a marker read here names a verifier, came from a record
+/// that passed its own validation, and rests on the consistency check documented
+/// on [`repeated_verifier_failure_verifier`] — which is a check across two
+/// projections of ONE owner record, not corroboration between two owners.
+pub fn repeated_verifier_failure_from_durable_rows(
+    rows: &[Value],
+) -> Result<Option<DurableRepeatedVerifierFailure>, LearningClosureError> {
+    let restored = restored_learning_deltas(rows)?;
+    Ok(restored.iter().rev().find_map(|record| {
+        let verifier_ref = record.repeated_verifier_failure_verifier()?;
+        let (lineage_artifact, lineage_digest) = record.lineage_ref();
+        Some(DurableRepeatedVerifierFailure {
+            verifier_ref: verifier_ref.to_owned(),
+            attempt_id: record.attempt_id.as_str().to_owned(),
+            campaign_id: record.campaign_id.as_str().to_owned(),
+            lineage_artifact: lineage_artifact.to_string(),
+            lineage_digest: lineage_digest.to_owned(),
+            trace_refs: record
+                .evidence_refs
+                .iter()
+                .map(|id| id.as_str().to_owned())
+                .collect(),
+        })
+    }))
 }
 
 /// Exact raw trace, artifact, and evaluator references the canonical fact
