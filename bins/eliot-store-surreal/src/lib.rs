@@ -106,7 +106,6 @@ pub use ecxf_export::{EcxfExportArgs, export_ecxf_once};
 mod request_dispatch;
 pub use request_dispatch::StoreDispatchBackend;
 pub use request_dispatch::dispatch;
-pub use request_dispatch::dispatch_admitted_with_log;
 pub use request_dispatch::dispatch_with_log;
 /// Structured bridge diagnostics projection (issue #742). Observability-only:
 /// the module owns vocabulary, redaction, bounded capture, and typed result
@@ -117,7 +116,6 @@ use diagnostics::{
     operation_name, report_events,
 };
 pub mod task_binding_gate;
-pub mod source_artifact_request_context;
 #[cfg(test)]
 use request_dispatch::map_recovery_dispatch_result;
 #[cfg(test)]
@@ -1751,42 +1749,6 @@ pub fn validate_request_frame(
     let outcome = validate_request_frame_with_log(session, frame, &mut events);
     report_events(&events);
     outcome
-}
-
-/// Validates one request and retains its original wire identity, payload
-/// authorities and authenticated session projection for an owner-side typed
-/// operation.
-///
-/// The returned context proves only that this request crossed the Store's
-/// existing transport/session admission boundary. It does not issue a Blob
-/// receipt, Store grant, causal binding or source authority.
-pub fn validate_request_frame_with_context(
-    session: &mut StoreEbpSession,
-    frame: &Frame,
-    events: &mut BoundedEventLog,
-) -> Result<(Request, source_artifact_request_context::AdmittedStoreRequestContext), String> {
-    let request = validate_request_frame_with_log(session, frame, events)?;
-    validate_session_peer_binding(session)?;
-    let authenticated_peer_principal_binding = session
-        .authenticated_peer
-        .as_ref()
-        .map(|peer| peer.principal_binding.clone())
-        .ok_or_else(|| "Store EBP session has no authenticated pipe peer".to_owned())?;
-    let projection = source_artifact_request_context::AdmittedStoreSessionProjection::from_store_session_parts(
-        session.connection_id.clone(),
-        session.protocol_version,
-        session.module_generation.clone(),
-        session.state_fence.clone(),
-        session.session_principal_binding.clone(),
-        authenticated_peer_principal_binding,
-        session.capabilities.clone(),
-    )?;
-    let context = source_artifact_request_context::AdmittedStoreRequestContext::from_validated_parts(
-        frame,
-        &request,
-        projection,
-    )?;
-    Ok((request, context))
 }
 
 /// Validates one request against the admitted session and replay ledger
