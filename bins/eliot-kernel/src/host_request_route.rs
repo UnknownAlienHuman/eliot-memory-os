@@ -8023,10 +8023,24 @@ pub(crate) fn bridge_reconcile_scope_from_payload(
 /// Typed answer for one staged durable event: the store outcome plus the
 /// closed `known`/`accepted` envelope the bridge joins to its sent envelope.
 /// Carries the independently verifiable phase from the persistent owner.
+/// A `retired` disposition (issue #2730, item 2) is a recovery limitation,
+/// not an admission: the request named a position at or below the retained
+/// compacted boundary with no exact evidence left, so nothing was staged by
+/// this call and the answer carries `accepted: false` with the ORS facts
+/// (`disposition`, `compacted_boundary`, cursors, `fresh: false`) untouched
+/// for the #2732 consumer. Every other disposition keeps the caller's
+/// acceptance flag.
 fn bridge_event_forward_response(outcome: &serde_json::Value, accepted: bool) -> serde_json::Value {
+    let retired = outcome
+        .get("disposition")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|disposition| disposition == "retired");
     let mut value = outcome.clone();
     if let Some(object) = value.as_object_mut() {
-        object.insert("accepted".to_owned(), serde_json::Value::Bool(accepted));
+        object.insert(
+            "accepted".to_owned(),
+            serde_json::Value::Bool(accepted && !retired),
+        );
     }
     serde_json::json!({ "status": "known", "value": value })
 }

@@ -1820,12 +1820,16 @@ impl persistence_codec::PersistedValue for BridgeEventGapRow {
 /// reached the handoff and whether reconcile has covered it.
 ///
 /// The reconciled transition stores the presenting stream owner's consumed
-/// frontier and owner revision/incarnation. It is producer-presented
-/// acknowledgement metadata, not proof that a receiving owner durably
-/// accepted this handoff or its remaining application obligation. Nothing in
-/// this row may be reported as evidence of downstream normalization or
-/// application. Until the receiving owner supplies a separately admitted
-/// terminal disposition, a reconciled row remains pending and cannot retire.
+/// frontier and owner revision/incarnation as recorded by the owner-checked
+/// reconcile entry. It is admitted-owner custody for retention, not proof
+/// that a receiving owner durably applied this handoff or its remaining
+/// obligation. Nothing in this row may be reported as evidence of
+/// downstream normalization or application. Retirement additionally
+/// requires the certified compacted boundary gate (see
+/// [`BridgeEventHandoffRow::retirement_eligible`]): a reconciled row
+/// carrying the admitted custody tuple retires only as part of a
+/// contiguous prefix that is certified before the boundary moves, so no
+/// row is deleted without certification.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BridgeEventHandoffRow {
@@ -1931,20 +1935,44 @@ impl BridgeEventHandoffRow {
     }
 
     /// Reports whether the retained owner evidence permits retirement
-    /// (issue #2731). The row's reconcile tuple is producer-presented metadata,
-    /// not proof of receiving-owner durable acceptance or terminal disposition.
-    /// The current row contract has no receiver receipt, so reconciled rows
-    /// remain pending until that evidence is represented by this contract.
-    fn retirement_eligible(&self) -> bool {
+    /// (issue #2730 AUD1; issue #2731). The gate is the certified
+    /// compacted boundary plus the admitted custody tuple: the row must
+    /// sit above `compacted_boundary` (certified history at or below it
+    /// belongs to the position drain and is never re-retired), carry the
+    /// `reconciled` state with a non-empty owner namespace, and carry the
+    /// full custody tuple the owner-checked reconcile entry records — a
+    /// covering consumed frontier (`reconcile_acked_sequence >= sequence`)
+    /// bound to the admitting owner's revision and incarnation. Legacy
+    /// reconciled rows without that tuple stay pending. The tuple is
+    /// admitted-owner custody for retention, not proof of downstream
+    /// normalization or application; the caller still certifies the
+    /// contiguous prefix before the boundary moves, so no row is deleted
+    /// without certification.
+    fn retirement_eligible(
+        &self,
+        compacted_boundary: u64,
+        owner_revision: u64,
+        owner_incarnation: u64,
+    ) -> bool {
         if self.state != BRIDGE_EVENT_HANDOFF_RECONCILED
             || self.owner_namespace.is_empty()
             || self.sequence == 0
+            || self.sequence <= compacted_boundary
         {
             return false;
         }
-        // Row state and identity checks do not prove receiving-owner custody.
-        // No receiver terminal evidence exists in this persisted contract.
-        false
+        // Admitted custody: the owner-checked reconcile entry covered this
+        // sequence with its consumed frontier under the admitting owner's
+        // revision and incarnation. A partial or legacy tuple fails closed.
+        if self.reconcile_acked_sequence < self.sequence
+            || self.reconcile_owner_revision == 0
+            || self.reconcile_owner_incarnation == 0
+            || self.reconcile_owner_revision != owner_revision
+            || self.reconcile_owner_incarnation != owner_incarnation
+        {
+            return false;
+        }
+        true
     }
 }
 
@@ -19280,10 +19308,12 @@ impl RedbRecoveryStore {
     /// Retires eligible handoff rows of one admitted namespace with a finite
     /// work budget and continuation (issue #2731, items 4 and 5).
     ///
-    /// Only rows with an admitted receiving-owner terminal disposition may
-    /// retire. The current row records only the presenting producer's
-    /// reconcile tuple; it has no receiver receipt, so no current row is
-    /// eligible. Existing owner revision/incarnation checks still reject a
+    /// Only rows carrying the admitted custody tuple above the certified
+    /// compacted boundary may retire (see
+    /// [`BridgeEventHandoffRow::retirement_eligible`]). The reconcile
+    /// tuple the owner-checked reconcile entry records is admitted-owner
+    /// custody for retention, not a downstream application receipt.
+    /// Existing owner revision/incarnation checks still reject a
     /// stale writer, but do not substitute for terminal evidence. At most
     /// [`MAX_BRIDGE_HANDOFF_RETIRE_PER_RECOVERY`] positions are scanned per
     /// call; `retirement_continuation` reports whether more positions remain
@@ -19654,10 +19684,11 @@ impl RedbRecoveryStore {
     /// Positions are examined in sequence order from just above the
     /// compacted boundary; the first gap-covered, unknown-handoff,
     /// nonterminal, or missing position stops the range instead of being
-    /// skipped to free space, and torn bindings fail closed. The current
-    /// producer reconcile tuple is not receiver evidence, so no present
-    /// row is eligible. Source/projection joins still run before a row
-    /// could enter a future terminalization path. `gaps` carries this
+    /// skipped to free space, and torn bindings fail closed. A row joins
+    /// the prefix only through
+    /// [`BridgeEventHandoffRow::retirement_eligible`]: reconciled with the
+    /// admitted custody tuple above the certified boundary. Source and
+    /// retained-row joins still run before a row terminalizes. `gaps` carries this
     /// namespace's scoped coverage intervals loaded once by the caller,
     /// so the page never scans the gap table per candidate.
     fn bridge_retire_eligible_in(
@@ -19721,7 +19752,11 @@ impl RedbRecoveryStore {
                         .to_owned(),
                 });
             }
-            if !row.retirement_eligible() {
+            if !row.retirement_eligible(
+                cursor.last_compacted_sequence,
+                owner.revision,
+                owner.incarnation,
+            ) {
                 // A nonterminal event stops the range: later positions
                 // are never terminalized past it.
                 stopped = true;
@@ -19861,9 +19896,10 @@ impl RedbRecoveryStore {
     /// fails closed with an integrity error. Performs no cursor or
     /// position mutation itself; the caller advances the boundary over the
     /// certified prefix in the same transaction. Activation stays gated
-    /// behind [`BridgeEventHandoffRow::retirement_eligible`]: with no
-    /// receiving-owner terminal evidence in the handoff contract the
-    /// eligible prefix is empty and this function is never reached.
+    /// behind [`BridgeEventHandoffRow::retirement_eligible`]: without a
+    /// reconciled custody tuple above the certified boundary the eligible
+    /// prefix is empty and this function is never reached, so no row is
+    /// ever deleted without certification.
     /// Whole-incarnation retirement is not performed here; it stays with
     /// #2729's authenticated owner/successor evidence.
     fn certify_bridge_compacted_range_in(
@@ -20099,12 +20135,14 @@ impl RedbRecoveryStore {
     /// Retires one namespace's handoffs inside the recovery transaction
     /// (issue #2731, items 4 and 5) over a contiguous eligible prefix
     /// (issue #2885, item 6). Eligibility is evaluated per row by
-    /// [`BridgeEventHandoffRow::retirement_eligible`], and the first
+    /// [`BridgeEventHandoffRow::retirement_eligible`] against the
+    /// certified compacted boundary and the admitting owner, and the first
     /// gap-covered, unknown-handoff, nonterminal, or missing position
     /// stops the prefix instead of being skipped to free space. The
-    /// stored reconcile tuple is producer-presented frontier/owner data,
-    /// not a receiving-owner receipt or admitted terminal disposition;
-    /// therefore no current row is eligible. A terminalized prefix is
+    /// stored reconcile tuple is the admitted custody the owner-checked
+    /// reconcile entry recorded — a covering consumed frontier bound to
+    /// the admitting revision and incarnation — not a downstream
+    /// application receipt. A terminalized prefix is
     /// certified as a cumulative compacted range binding owner
     /// namespace/incarnation, interval, predecessor, ack frontier,
     /// segment commitment, schema version, and retention revision (issue
@@ -20224,7 +20262,7 @@ impl RedbRecoveryStore {
                 });
             }
             Self::require_bridge_event_relation_in(write, &record, record_key.as_str())?;
-            if !row.retirement_eligible() {
+            if !row.retirement_eligible(compacted, owner.revision, owner.incarnation) {
                 continue;
             }
             let commitment = Self::bridge_replay_commitment_for(&record, now_ms, acked);
