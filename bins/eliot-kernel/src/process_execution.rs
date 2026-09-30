@@ -442,6 +442,138 @@ impl KernelGovernedProcessEffectPort {
             Some(before_digest),
         )
     }
+
+    /// Checks one retained previous digest against fresh reads through the
+    /// filesystem/Git observation adapter (I10.21 A2): the retained previous
+    /// digest against two fresh agreeing reads is evidence no admission
+    /// explains by itself, so the transition is external and uncorrelated
+    /// until a recorded governed change reconciles it. Sets `observed` when
+    /// the adapter admits the transition and returns `false`; returns `true`
+    /// when the caller must skip the target (the transition stays
+    /// unrecorded and a blocking gap marker pins the retained digest so the
+    /// next capture re-detects it instead of advancing past evidence the
+    /// ledger never admitted). Ledger contention fences the tool instead.
+    fn check_retained_external_transition(
+        workspace_root: &Path,
+        hinted_source: &Path,
+        resource: &str,
+        event_ref: &str,
+        previous: &str,
+        operation: &str,
+        observed: &mut bool,
+    ) -> Result<bool, GovernedProcessEffectPortError> {
+        match Self::observe_external_filesystem_transition(
+            workspace_root,
+            hinted_source,
+            resource,
+            event_ref,
+            previous,
+        ) {
+            Ok(confirmation) => {
+                *observed = true;
+                observe_process(
+                    "kernel.process.effect_external_transition",
+                    match confirmation {
+                        change_monitor::HintConfirmation::VerifiedImmaterial => {
+                            "immaterial"
+                        }
+                        change_monitor::HintConfirmation::MaterialRecorded {
+                            reconciled,
+                            ..
+                        } => {
+                            if reconciled {
+                                "reconciled"
+                            } else {
+                                "material"
+                            }
+                        }
+                    },
+                );
+                Ok(false)
+            }
+            Err(error) => {
+                let outcome =
+                    if error == change_monitor::ChangeMonitorError::UnstableReadback {
+                        "unstable"
+                    } else {
+                        "unobserved"
+                    };
+                // I10.21 AUD4: the retained previous digest proves
+                // a real transition, but the ledger could not
+                // record it. The target leaves the baseline with a
+                // blocking gap marker pinned to the retained digest
+                // instead of advancing past evidence the ledger
+                // never admitted; the next capture re-detects it.
+                match change_monitor::note_unresolved_transition(
+                    resource,
+                    operation,
+                    Some(previous.to_owned()),
+                ) {
+                    Ok(_) => observe_process(
+                        "kernel.process.effect_external_transition",
+                        "unresolved",
+                    ),
+                    Err(change_monitor::ChangeMonitorError::LedgerPoisoned) => {
+                        return Err(GovernedProcessEffectPortError::LedgerPoisoned);
+                    }
+                    Err(_) => observe_process(
+                        "kernel.process.effect_external_transition",
+                        outcome,
+                    ),
+                }
+                Ok(true)
+            }
+        }
+    }
+
+    /// Admits one host-event hint for a declared target (I10.21 A1). A
+    /// conflicting identity under the same hint reuses an operation handle
+    /// for different content: evidence is ambiguous, so nothing is recorded
+    /// or confirmed for it. Ledger failures are typed, never swallowed
+    /// (I10.21 AUD4): a poisoned ledger refuses the observation instead of
+    /// recording it as unobserved, and any other ingest refusal pins a
+    /// blocking gap marker on the retained baseline instead of leaving the
+    /// resource unblocked. Returns the admitted hint identity plus whether
+    /// the caller must skip the target (`true`: the hint was refused and
+    /// the caller must continue ingest for the next target).
+    fn admit_host_event_hint(
+        operation: &str,
+        target_digest: &str,
+        resource: &str,
+        lane_path: &str,
+        owner_module: &str,
+        before_digest: &str,
+    ) -> Result<(String, bool), GovernedProcessEffectPortError> {
+        let hint_id = change_monitor::host_hint_id(operation, target_digest);
+        let hint = change_monitor::KernelChangeHint {
+            hint_id: hint_id.clone(),
+            resource: resource.to_owned(),
+            path: lane_path.to_owned(),
+            origin: change_monitor::HintOrigin::HostEvent,
+            origin_ref: Some(owner_module.to_owned()),
+        };
+        match change_monitor::ingest_hint(hint) {
+            Ok(_) => Ok((hint_id, false)),
+            Err(change_monitor::ChangeMonitorError::LedgerPoisoned) => {
+                Err(GovernedProcessEffectPortError::LedgerPoisoned)
+            }
+            Err(_) => {
+                let outcome = match change_monitor::note_unresolved_transition(
+                    resource,
+                    operation,
+                    Some(before_digest.to_owned()),
+                ) {
+                    Ok(_) => "unresolved",
+                    Err(change_monitor::ChangeMonitorError::LedgerPoisoned) => {
+                        return Err(GovernedProcessEffectPortError::LedgerPoisoned);
+                    }
+                    Err(_) => "unobserved",
+                };
+                observe_process("kernel.process.effect_observed", outcome);
+                Ok((hint_id, true))
+            }
+        }
+    }
 }
 
 /// Resolves one path lexically (`.`/`..` without touching the filesystem).
@@ -641,66 +773,16 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
                 // refusal keeps the retained digest so the next capture
                 // retries instead of advancing past evidence the ledger
                 // never admitted.
-                match Self::observe_external_filesystem_transition(
+                if Self::check_retained_external_transition(
                     &source.working_directory,
                     target_path,
                     &resource,
                     binding.owner.module_id(),
                     &previous,
-                ) {
-                    Ok(confirmation) => {
-                        mutated = true;
-                        observe_process(
-                            "kernel.process.effect_external_transition",
-                            match confirmation {
-                                change_monitor::HintConfirmation::VerifiedImmaterial => {
-                                    "immaterial"
-                                }
-                                change_monitor::HintConfirmation::MaterialRecorded {
-                                    reconciled,
-                                    ..
-                                } => {
-                                    if reconciled {
-                                        "reconciled"
-                                    } else {
-                                        "material"
-                                    }
-                                }
-                            },
-                        );
-                    }
-                    Err(error) => {
-                        let outcome =
-                            if error == change_monitor::ChangeMonitorError::UnstableReadback {
-                                "unstable"
-                            } else {
-                                "unobserved"
-                            };
-                        // I10.21 AUD4: the retained previous digest proves
-                        // a real transition, but the ledger could not
-                        // record it. The target leaves the baseline with a
-                        // blocking gap marker pinned to the retained digest
-                        // instead of advancing past evidence the ledger
-                        // never admitted; the next capture re-detects it.
-                        match change_monitor::note_unresolved_transition(
-                            &resource,
-                            &operation,
-                            Some(previous),
-                        ) {
-                            Ok(_) => observe_process(
-                                "kernel.process.effect_external_transition",
-                                "unresolved",
-                            ),
-                            Err(change_monitor::ChangeMonitorError::LedgerPoisoned) => {
-                                return Err(GovernedProcessEffectPortError::LedgerPoisoned);
-                            }
-                            Err(_) => observe_process(
-                                "kernel.process.effect_external_transition",
-                                outcome,
-                            ),
-                        }
-                        continue;
-                    }
+                    &operation,
+                    &mut mutated,
+                )? {
+                    continue;
                 }
             }
             if let Ok(mut last) = self.last_observed.lock() {
@@ -845,57 +927,18 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
                 continue;
             };
             let target_digest = base.target_digest.as_str();
-            let hint_id = change_monitor::host_hint_id(&operation, target_digest);
-            let hint = change_monitor::KernelChangeHint {
-                hint_id: hint_id.clone(),
-                resource: base.resource.clone(),
-                path: base.lane_path.clone(),
-                origin: change_monitor::HintOrigin::HostEvent,
-                origin_ref: Some(baseline.binding.owner.module_id().to_owned()),
-            };
-            // A conflicting identity under the same hint reuses an operation
-            // handle for different content: evidence is ambiguous, so nothing
-            // is recorded or confirmed for it. Ledger failures are typed,
-            // never swallowed (I10.21 AUD4): a poisoned ledger refuses the
-            // observation instead of recording it as unobserved, and any
-            // other ingest refusal pins a blocking gap marker on the
-            // retained baseline instead of leaving the resource unblocked.
-            match change_monitor::ingest_hint(hint) {
-                Ok(_) => admitted_any = true,
-                Err(change_monitor::ChangeMonitorError::HintConflict) => {
-                    let outcome = match change_monitor::note_unresolved_transition(
-                        &base.resource,
-                        &operation,
-                        Some(base.before_digest.clone()),
-                    ) {
-                        Ok(_) => "unresolved",
-                        Err(change_monitor::ChangeMonitorError::LedgerPoisoned) => {
-                            return Err(GovernedProcessEffectPortError::LedgerPoisoned);
-                        }
-                        Err(_) => "unobserved",
-                    };
-                    observe_process("kernel.process.effect_observed", outcome);
-                    continue;
-                }
-                Err(change_monitor::ChangeMonitorError::LedgerPoisoned) => {
-                    return Err(GovernedProcessEffectPortError::LedgerPoisoned);
-                }
-                Err(_) => {
-                    let outcome = match change_monitor::note_unresolved_transition(
-                        &base.resource,
-                        &operation,
-                        Some(base.before_digest.clone()),
-                    ) {
-                        Ok(_) => "unresolved",
-                        Err(change_monitor::ChangeMonitorError::LedgerPoisoned) => {
-                            return Err(GovernedProcessEffectPortError::LedgerPoisoned);
-                        }
-                        Err(_) => "unobserved",
-                    };
-                    observe_process("kernel.process.effect_observed", outcome);
-                    continue;
-                }
+            let (hint_id, skip_target) = Self::admit_host_event_hint(
+                &operation,
+                target_digest,
+                &base.resource,
+                &base.lane_path,
+                baseline.binding.owner.module_id(),
+                &base.before_digest,
+            )?;
+            if skip_target {
+                continue;
             }
+            admitted_any = true;
             let recorded_transition =
                 record_proven_target_transition(&operation, base, back, &baseline, &receipt);
             // I10.21 AUD5: a proven terminal absence confirms as an

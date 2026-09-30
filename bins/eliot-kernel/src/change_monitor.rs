@@ -183,59 +183,8 @@ impl ContentRead {
     }
 }
 
-/// Repository HEAD state proven by direct `.git/HEAD` file reads for one
-/// tracked path (I10.21 W2 Git leg). No process is launched and no
-/// `git status`/diff output is claimed: this is the repository identity
-/// plus the before/after commits the readback actually opened. Constructed
-/// only by [`read_git_head`]; a path no repository claims yields `None`,
-/// never an invented claim.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) struct GitHeadRead {
-    pub repository: String,
-    pub head_ref: String,
-    pub head_commit: String,
-}
-
 fn is_git_sha(value: &str) -> bool {
     value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
-fn validate_git_head(head: &GitHeadRead) -> Result<(), ChangeMonitorError> {
-    if !text(&head.repository) || !text(&head.head_ref) || !is_git_sha(&head.head_commit) {
-        return Err(ChangeMonitorError::InvalidGitEvidence);
-    }
-    Ok(())
-}
-
-/// Reads the repository HEAD claiming one tracked path using only direct
-/// file reads: walks ancestors for `.git/HEAD` (following a worktree
-/// `gitdir:` pointer file when present), then resolves the `ref:` target
-/// through the loose ref file or `packed-refs`. Returns `None` when no
-/// repository claims the path or the ref cannot be resolved to an exact
-/// commit, so callers attach Git evidence only from proven reads.
-pub(crate) fn read_git_head(path: &Path) -> Option<GitHeadRead> {
-    let start = if path.is_dir() {
-        path.to_path_buf()
-    } else {
-        path.parent()?.to_path_buf()
-    };
-    let mut current = start.as_path();
-    loop {
-        let dot_git = current.join(".git");
-        if let Some(git_dir) = resolve_git_dir(&dot_git)
-            && let Some(head) = read_head_in(&git_dir)
-        {
-            let candidate = GitHeadRead {
-                repository: current.to_string_lossy().into_owned(),
-                head_ref: head.0,
-                head_commit: head.1,
-            };
-            if validate_git_head(&candidate).is_ok() {
-                return Some(candidate);
-            }
-        }
-        current = current.parent()?;
-    }
 }
 
 fn resolve_git_dir(dot_git: &Path) -> Option<PathBuf> {
@@ -258,70 +207,6 @@ fn resolve_git_dir(dot_git: &Path) -> Option<PathBuf> {
         }
     }
     None
-}
-
-fn read_small_text(path: &Path) -> Option<String> {
-    let bytes = std::fs::read(path).ok()?;
-    if bytes.len() > 4096 {
-        return None;
-    }
-    String::from_utf8(bytes)
-        .ok()
-        .map(|text| text.trim().to_owned())
-}
-
-fn read_head_in(git_dir: &Path) -> Option<(String, String)> {
-    let head = read_small_text(&git_dir.join("HEAD"))?;
-    if let Some(head_ref) = head.strip_prefix("ref:") {
-        let head_ref = head_ref.trim().to_owned();
-        if head_ref.is_empty() || head_ref.len() > 512 {
-            return None;
-        }
-        if let Some(commit) = read_small_text(&git_dir.join(&head_ref))
-            && is_git_sha(&commit)
-        {
-            return Some((head_ref, commit));
-        }
-        let packed = std::fs::read_to_string(git_dir.join("packed-refs")).ok()?;
-        for line in packed.lines() {
-            if line.starts_with('#') || line.starts_with('^') {
-                continue;
-            }
-            let mut parts = line.split_whitespace();
-            if let (Some(commit), Some(name)) = (parts.next(), parts.next())
-                && name == head_ref
-                && is_git_sha(commit)
-            {
-                return Some((head_ref, commit.to_owned()));
-            }
-        }
-        return None;
-    }
-    if is_git_sha(&head) {
-        return Some(("DETACHED".to_owned(), head));
-    }
-    None
-}
-
-/// Reports whether the repository claim over one tracked path changed
-/// between two HEAD reads: presence flipped (a repository claimed the path
-/// and now none does, or vice versa) or a different repository claims it.
-/// A bare commit movement under the same repository is not a claim change:
-/// concurrent commits are recorded truthfully in `head_before`/`head_after`
-/// instead of refused. The effect lane fails closed on a claim change for
-/// a previously observed resource instead of confirming past the retained
-/// tip on missing Git evidence (I10.21 W2, audit 5910747803 AUD2).
-///
-/// Caller: `crate::process_execution::KernelGovernedProcessEffectPort::ingest`.
-pub(crate) fn repository_claim_changed(
-    before: Option<&GitHeadRead>,
-    after: Option<&GitHeadRead>,
-) -> bool {
-    match (before, after) {
-        (None, None) => false,
-        (Some(before), Some(after)) => before.repository != after.repository,
-        (None, Some(_)) | (Some(_), None) => true,
-    }
 }
 
 /// Readback evidence bound to the same hinted artifact as the two direct
@@ -778,7 +663,7 @@ pub(crate) fn confirm_hint(
             evidence_change_id: evidence_id,
         });
     }
-    close_gaps_from_proven_before(&mut ledger, &resource, &before_digest, &change_id);
+    close_gaps_from_proven_before(&mut ledger, &resource, before_digest.as_ref(), &change_id);
     if reconciled {
         ledger.tips.insert(
             resource,
@@ -878,7 +763,7 @@ fn read_git_head_substrate(
 /// the packed-refs file), or the detached HEAD commit directly. Returns
 /// `None` when this directory claims no readable substrate, so the caller
 /// keeps walking up instead of inventing repository state. The returned
-/// handle names the claiming ancestor, matching [`read_git_head`].
+/// handle names the claiming ancestor, matching [`read_git_head_substrate`].
 fn read_substrate_in(
     repository_root: &std::path::Path,
     git_dir: &std::path::Path,
@@ -1030,7 +915,7 @@ pub(crate) fn observe_filesystem_notification(
 fn close_gaps_from_proven_before(
     ledger: &mut KernelChangeLedger,
     resource: &str,
-    before_digest: &Option<String>,
+    before_digest: Option<&String>,
     covering_change_id: &str,
 ) {
     let covered: Vec<String> = ledger
@@ -1040,7 +925,7 @@ fn close_gaps_from_proven_before(
             unknown.unresolved_gap
                 && !unknown.reconciled
                 && unknown.resource == resource
-                && unknown.before_digest == *before_digest
+                && unknown.before_digest.as_ref() == before_digest
         })
         .map(|(unknown_id, _)| unknown_id.clone())
         .collect();
@@ -1055,37 +940,15 @@ fn close_gaps_from_proven_before(
     }
 }
 
-/// Records one governed-tool mutation with exact before/after revisions,
-/// the associated session, fenced-attempt lease, tool operation, and
-/// attempt receipt, the diff handle, and the observed State-Fence
-/// invalidation (I10.21 A1). Content checksums are computed here over the
-/// exact bytes supplied; the bytes are dropped and only digests retained.
-/// A creation carries `before_bytes: None`, a deletion carries
-/// `after_bytes: None`; a record with neither side, or with agreeing
-/// present sides, proves no transition and is refused. The recorded
-/// revisions must equal those computed digests (`None` exactly where the
-/// matching bytes are `None`), so the before/after identity is the mutated
-/// tracked source's, never the tool executable image's (audit 5910747803
-/// AUD1). The diff handle
-/// must resolve to the exact recorded transition through the ledger's own
-/// transition binder (shared with `confirm_hint` and the finish-leg
-/// reconciliation, never a second resolver). A byte copy of an unrelated
-/// digest names no transition this ledger recorded and is refused. A
-/// recorded governed transition reconciles the matching unknown-origin
-/// change for the exact same resource transition, and closes a gap-marked
-/// unknown that starts from the same before-state. History is never
-/// rewritten: an exact replay is reported, a conflicting identity is
-/// refused, and a lease/session/operation owned by another change is never
-/// reused. Tips are deliberately untouched here: only a confirmed
-/// readback advances the retained baseline, never the record alone.
-///
-/// Caller (I10.21 A1):
-/// `crate::process_execution::KernelGovernedProcessEffectPort::ingest`,
-/// which feeds one record per declared target from real
-/// pre-effect/terminal readback bytes.
-pub(crate) fn record_governed_tool_change(
+/// Validates one governed-tool mutation record and binds its content
+/// identity (I10.21 A1): shape checks plus the ledger-computed before/after
+/// content digests over the supplied tracked-source bytes. Returns those
+/// digests so the recorded revisions are the mutated tracked source's own
+/// content identity, never an unrelated identity such as the tool
+/// executable image.
+fn validate_governed_tool_transition(
     change: &GovernedToolChange,
-) -> Result<GovernedAdmission, ChangeMonitorError> {
+) -> Result<(Option<String>, Option<String>), ChangeMonitorError> {
     if !text(&change.change_id)
         || !text(&change.resource)
         || !validate_relative_path(&change.path)
@@ -1144,6 +1007,41 @@ pub(crate) fn record_governed_tool_change(
     if change.diff_handle != transition_digest {
         return Err(ChangeMonitorError::InvalidGovernedChange);
     }
+    Ok((before_digest, after_digest))
+}
+
+/// Records one governed-tool mutation with exact before/after revisions,
+/// the associated session, fenced-attempt lease, tool operation, and
+/// attempt receipt, the diff handle, and the observed State-Fence
+/// invalidation (I10.21 A1). Content checksums are computed here over the
+/// exact bytes supplied; the bytes are dropped and only digests retained.
+/// A creation carries `before_bytes: None`, a deletion carries
+/// `after_bytes: None`; a record with neither side, or with agreeing
+/// present sides, proves no transition and is refused. The recorded
+/// revisions must equal those computed digests (`None` exactly where the
+/// matching bytes are `None`), so the before/after identity is the mutated
+/// tracked source's, never the tool executable image's (audit 5910747803
+/// AUD1). The diff handle
+/// must resolve to the exact recorded transition through the ledger's own
+/// transition binder (shared with `confirm_hint` and the finish-leg
+/// reconciliation, never a second resolver). A byte copy of an unrelated
+/// digest names no transition this ledger recorded and is refused. A
+/// recorded governed transition reconciles the matching unknown-origin
+/// change for the exact same resource transition, and closes a gap-marked
+/// unknown that starts from the same before-state. History is never
+/// rewritten: an exact replay is reported, a conflicting identity is
+/// refused, and a lease/session/operation owned by another change is never
+/// reused. Tips are deliberately untouched here: only a confirmed
+/// readback advances the retained baseline, never the record alone.
+///
+/// Caller (I10.21 A1):
+/// `crate::process_execution::KernelGovernedProcessEffectPort::ingest`,
+/// which feeds one record per declared target from real
+/// pre-effect/terminal readback bytes.
+pub(crate) fn record_governed_tool_change(
+    change: &GovernedToolChange,
+) -> Result<GovernedAdmission, ChangeMonitorError> {
+    let (before_digest, after_digest) = validate_governed_tool_transition(change)?;
     let record = GovernedChangeRecord {
         resource: change.resource.clone(),
         path: change.path.clone(),
@@ -1212,7 +1110,7 @@ pub(crate) fn record_governed_tool_change(
     close_gaps_from_proven_before(
         &mut ledger,
         &change.resource,
-        &before_digest,
+        before_digest.as_ref(),
         &change.change_id,
     );
     Ok(GovernedAdmission::Accepted)
