@@ -2300,13 +2300,9 @@ fn verify_intent_roles_and_release_leases(
         )
         .map(|outcome| IntentRoleLeaseVerification::Unknown(Box::new(outcome)));
     }
-    if let Err(error) = verify_resumed_bundle(
-        publication,
-        journal,
-        precommit_files,
-        &manifest,
-        &expected,
-    ) {
+    if let Err(error) =
+        verify_resumed_bundle(publication, journal, precommit_files, &manifest, &expected)
+    {
         return persist_unknown_publication(
             store,
             journal,
