@@ -11,8 +11,10 @@ use eliot_runtime::{
     ChildClass, Runtime, ShutdownOutcome, SupervisionOutcome, SupervisionStrategy, TaskFailure,
 };
 use eliot_watchdog_core::{
-    CoverageGapExplanation, CoverageManifestMismatch, CoverageManifestProjection, EvidenceRef,
-    ObservationCoverageInput, validate_observation_coverage_against_manifest,
+    BriefBuildError, BriefPersistence, CoverageGapExplanation, CoverageManifestMismatch,
+    CoverageManifestProjection, EvidenceRef, HealthAnalysisRequest, ObservationCoverageInput,
+    RiskRoute, Signal, compile_health_brief, request_health_analysis,
+    validate_observation_coverage_against_manifest,
 };
 
 use crate::AdmittedIsolatedDestination;
@@ -216,6 +218,60 @@ pub fn validate_supplied_coverage_against_manifest(
 ) -> Result<(), CoverageManifestMismatch> {
     let actual = project_actual_coverage_manifest(manifest);
     validate_observation_coverage_against_manifest(input, &actual)
+}
+
+/// Compiles persistent/cross-cutting drift into one Diagnostic Brief input and
+/// requests one bounded Dreamer/Watchdog-Agent analysis through #1761 routes.
+///
+/// W3 (#2381): the production caller of [`compile_health_brief`] and
+/// [`request_health_analysis`]. The member signals are the persistent or
+/// cross-cutting drift the caller holds; the [`BriefPersistence`]
+/// classification travels on the brief so the analysis route sees which claim
+/// it is asked about. The [`RiskRoute`] is the caller's #1761 selection —
+/// this owner selects no route and opens no parallel escalation path — and the
+/// core degrades it with the ineffective-analysis history per I09-17's
+/// rollback rule. Exactly one request leaves per call, never a campaign.
+///
+/// The question names the persistence class and every member rule identity, so
+/// the bounded analysis is asked about the drift it actually holds; the stop
+/// condition bounds it to one analysis and denies it any
+/// memory-delete/policy-alter/work-terminate authority. This adapter reads no
+/// store and authorizes no effect: every [`BriefBuildError`] from the
+/// underlying contract — empty or overfull member set, duplicate identity,
+/// unvalidated original, or unusable question/stop text — passes through
+/// unchanged.
+///
+/// # Errors
+///
+/// Returns the exact [`BriefBuildError`] when the member set is empty,
+/// overfull, not an independent set, carries an unvalidated original, or the
+/// derived question/stop text is unusable.
+#[must_use]
+pub fn request_persistent_drift_analysis(
+    signals: Vec<Signal>,
+    persistence: BriefPersistence,
+    route: RiskRoute,
+    prior_ineffective_analyses: u32,
+) -> Result<HealthAnalysisRequest, BriefBuildError> {
+    let mut rules: Vec<&str> = signals
+        .iter()
+        .map(|signal| signal.revision().rule.rule_id.as_str())
+        .collect();
+    rules.sort_unstable();
+    rules.dedup();
+    let brief = compile_health_brief(
+        format!(
+            "health drift classified as {} across {} member signal(s) from rule(s) [{}]: what observed delta persists across the member intervals, and what single bounded observation would discriminate continued drift from recovery?",
+            persistence.as_str(),
+            signals.len(),
+            rules.join(", ")
+        ),
+        "stop after one bounded analysis, or earlier when the next closed interval shows no applicable delta for the member rules; the analysis carries no authority to delete memory, alter policy, or terminate work."
+            .to_owned(),
+        persistence,
+        signals,
+    )?;
+    Ok(request_health_analysis(&brief, route, prior_ineffective_analyses))
 }
 
 /// The actual manifest's own interval identity: the declared owner-clock
