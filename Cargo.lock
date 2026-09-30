@@ -869,6 +869,7 @@ dependencies = [
  "blake3",
  "clap",
  "eliot-agent-bridge-core",
+ "eliot-context-measurement",
  "eliot-engine",
  "eliot-runtime-contracts",
  "eliot-store",
