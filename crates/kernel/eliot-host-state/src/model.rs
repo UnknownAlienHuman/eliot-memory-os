@@ -2214,11 +2214,13 @@ pub enum CutoverIntentState {
 
 /// Closed outcome of one durable backup destination preparation.
 ///
-/// `Pending` is the pre-effect state and the only non-terminal one: the
-/// destination root may be created only after the admission is durable.
-/// `Prepared` is terminal and is written only after the root exists and its OS
-/// identity was pinned, so it is the sole proof that this operation - and no
-/// other - created that exact directory.
+/// `Pending` is the pre-effect state: the destination root may be created only
+/// after the admission is durable. `Prepared` is written only after the root
+/// exists and its OS identity was pinned, so it is the sole proof that this
+/// operation - and no other - created that exact directory. `CleanupPending`
+/// and `Reclaimed` are the owner-authorized reclamation of that same proven
+/// root, in that order: the first is retained before the effect and the second
+/// only after the absence has been observed, and `Reclaimed` is terminal.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum BackupPreparationState {
@@ -2237,6 +2239,26 @@ pub enum BackupPreparationState {
     /// The result is durable: this operation exclusively created the recorded
     /// destination and pinned its OS identity.
     Prepared,
+    /// An owner-authorized reclamation of an already prepared destination is
+    /// durable; its effect has NOT been observed.
+    ///
+    /// Retained BEFORE the reclamation effect, so a crash between here and
+    /// [`BackupPreparationState::Reclaimed`] leaves a durable "may have been
+    /// reclaimed" record rather than a receipt claiming a root is gone when
+    /// nobody looked. The pinned identity is carried forward, so the pending
+    /// reclamation names this exact root: the absence is unproven, which pauses
+    /// this operation for observation instead of authorizing a second attempt
+    /// against a root whose disposition is unknown.
+    CleanupPending,
+    /// The reclamation was attempted and the absence was actually observed.
+    ///
+    /// Written only after somebody looked and the root created by this
+    /// operation was observed gone, and terminal. It proves that statement and
+    /// nothing more: it does not prove the root was empty beforehand, that no
+    /// other owner adopted it, or that no restore or cutover custody existed
+    /// over it. Reclamation is a separate owner decision from preparation, and
+    /// cancellation alone is never that proof.
+    Reclaimed,
 }
 
 /// Durable admission, binding and outcome of one separately authorized isolated
@@ -2276,9 +2298,16 @@ pub enum BackupPreparationState {
 /// `destination_root` is the PROPOSED destination, recorded before any effect.
 /// It is a name, not ownership: on its own it never authorises deleting
 /// anything at that path. `destination_root_identity` is the exclusive-creation
-/// proof, and it is present in exactly one state (`Prepared`) - which is why
+/// proof, and it is present in every state except `Pending` - which is why
 /// cleanup can remove a destination this operation created while a `Pending`
 /// root is preserved as unknown rather than removed by path name.
+///
+/// The identity is carried FORWARD through the cleanup states rather than
+/// dropped when the root goes away. The record still proves the identity THIS
+/// operation created, and that proof is what authorises removal at all, so a
+/// `Reclaimed` frame that could not re-pin it would be a receipt asserting a
+/// deletion this operation never proved it was entitled to perform. See
+/// [`Self::validate`].
 ///
 /// Scope, stated as for every other Host journal record: the record lives in
 /// the log of the Host epoch that wrote it, and a restart re-bases the journal
@@ -2339,8 +2368,8 @@ pub struct BackupPreparationRecord {
     /// Authority Epoch, and the derivation floors the value at 1, so zero is
     /// likewise refused.
     pub destination_epoch: u64,
-    /// OS identity pinned at exclusive creation. Present in exactly one state;
-    /// see [`Self::validate`].
+    /// OS identity pinned at exclusive creation. Absent in exactly one state
+    /// (`Pending`); see [`Self::validate`].
     pub destination_root_identity: Option<PlatformHandle>,
     /// Bounded retained evidence for this outcome. Digests/handles only.
     ///
@@ -2389,13 +2418,27 @@ impl BackupPreparationRecord {
             ));
         }
         // The pinned identity is the exclusive-creation proof, so it exists in
-        // exactly one state. A `Prepared` result without it would assert
-        // ownership of a root whose identity was never captured, and a `Pending`
-        // admission carrying one would claim an effect the record says has not
-        // been recorded.
+        // every state except the one that has not created anything yet. A
+        // `Prepared` result without it would assert ownership of a root whose
+        // identity was never captured, and a `Pending` admission carrying one
+        // would claim an effect the record says has not been recorded.
+        //
+        // The two cleanup states carry it forward rather than dropping it when
+        // the root goes away. The identity proves what THIS operation created,
+        // and that proof is the whole authorisation for the reclamation: a
+        // `Reclaimed` frame cannot re-pin an absent root, and one that no
+        // longer carried the identity would be asserting a deletion nothing
+        // proved this operation was entitled to perform. A cleanup state
+        // missing the identity is therefore refused, not admitted as a
+        // best-effort cleanup.
         match (&self.destination_root_identity, self.state) {
             (None, BackupPreparationState::Pending) => {}
-            (Some(identity), BackupPreparationState::Prepared) => {
+            (
+                Some(identity),
+                BackupPreparationState::Prepared
+                | BackupPreparationState::CleanupPending
+                | BackupPreparationState::Reclaimed,
+            ) => {
                 handle(identity, "backup_preparation.destination_root_identity")?;
             }
             (Some(_), BackupPreparationState::Pending) => {
@@ -2404,9 +2447,15 @@ impl BackupPreparationRecord {
                         .into(),
                 ));
             }
-            (None, BackupPreparationState::Prepared) => {
+            (
+                None,
+                BackupPreparationState::Prepared
+                | BackupPreparationState::CleanupPending
+                | BackupPreparationState::Reclaimed,
+            ) => {
                 return Err(JournalError::Invalid(
-                    "prepared backup preparation requires the pinned destination identity".into(),
+                    "a non-pending backup preparation requires the pinned destination identity"
+                        .into(),
                 ));
             }
         }
@@ -2424,8 +2473,38 @@ impl BackupPreparationRecord {
 /// retained record on the operation identity, the admitted source/archive/class
 /// binding, the admission digest, the proposed destination and every
 /// owner-issued identity, so a changed binding under one operation identity is
-/// an idempotency conflict rather than a re-scoped preparation. `Prepared` is
-/// the only terminal state and nothing moves out of it.
+/// an idempotency conflict rather than a re-scoped preparation.
+///
+/// The state law is exactly one step forward per effect, in this order:
+///
+/// ```text
+/// Pending -> Prepared           the root was created and its identity pinned;
+/// Prepared -> CleanupPending    an owner-authorized reclamation is now durable
+///                               BEFORE its effect;
+/// CleanupPending -> Reclaimed   the effect was attempted and its absence
+///                               observed.
+/// ```
+///
+/// `Reclaimed` is terminal. Every other pairing is refused, and each refusal
+/// has a reason that is not a formality:
+///
+/// * `Pending -> CleanupPending` / `Pending -> Reclaimed` would reclaim a root
+///   whose exclusive creation was never recorded. The pinned identity is the
+///   SOLE proof that this operation created that exact directory; without a
+///   `Prepared` record there is no such proof, and a reclamation frame that
+///   skipped it would delete by path name - exactly the failure the
+///   `Pending` documentation refuses.
+/// * `CleanupPending -> Prepared` would reverse a reclamation whose effect may
+///   already have been applied, resurrecting a destination whose absence may
+///   already be observable. Per A13.9 the intent is recorded and fenced BEFORE
+///   external work and then reconciled under fencing; it is never walked back
+///   because the walk-back is the unobserved half.
+/// * `CleanupPending -> CleanupPending` (a repeat) would re-authorize an effect
+///   this operation has already recorded as authorized and possibly applied.
+///   The repeat must observe the existing `CleanupPending` and resolve it
+///   forward, exactly as a repeated commit replays by receipt (I14.21).
+/// * Any successor out of `Reclaimed` is refused because a terminal record that
+///   says the root was observed gone cannot become authority that it exists.
 ///
 /// `retained_evidence_refs` is deliberately NOT part of the comparison, for the
 /// same reason the cutover intent's evidence list is not: a `Prepared` result
@@ -2460,10 +2539,21 @@ pub(crate) fn backup_preparation_transition(
     {
         return Err(JournalError::IdempotencyConflict);
     }
-    if current.state == BackupPreparationState::Prepared {
-        return Err(illegal("backup_preparation", current.state, next.state));
+    let legal = matches!(
+        (current.state, next.state),
+        (BackupPreparationState::Pending, BackupPreparationState::Prepared) | (
+            BackupPreparationState::Prepared,
+            BackupPreparationState::CleanupPending
+        ) | (
+            BackupPreparationState::CleanupPending,
+            BackupPreparationState::Reclaimed
+        )
+    );
+    if legal {
+        Ok(())
+    } else {
+        Err(illegal("backup_preparation", current.state, next.state))
     }
-    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
