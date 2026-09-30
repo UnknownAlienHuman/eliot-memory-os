@@ -49,10 +49,11 @@ use eliot_protocol::{
     MAINTENANCE_TRIGGER_ACK_WIRE_ID, MAINTENANCE_TRIGGER_ACK_WIRE_VERSION,
     MAINTENANCE_TRIGGER_WIRE_ID, MAINTENANCE_TRIGGER_WIRE_VERSION, MaintenanceTriggerAck,
     MaintenanceTriggerClaim, MaintenanceTriggerContentRef, MaintenanceTriggerDecisionReceipt,
-    MaintenanceTriggerGap, MaintenanceTriggerGapKind, MaintenanceTriggerIntakeReceipt,
-    MaintenanceTriggerPayloadRef, MaintenanceTriggerPendingSummary, MaintenanceTriggerPosition,
-    MaintenanceTriggerRecord, MaintenanceTriggerRevocation, MaintenanceTriggerRouteGrant,
-    MaintenanceTriggerRoutingClass, MaintenanceTriggerSourceEvent, ProtocolError,
+    MaintenanceTriggerDisposition, MaintenanceTriggerGap, MaintenanceTriggerGapKind,
+    MaintenanceTriggerIntakeReceipt, MaintenanceTriggerPayloadRef, MaintenanceTriggerPendingSummary,
+    MaintenanceTriggerPosition, MaintenanceTriggerRecord, MaintenanceTriggerRevocation,
+    MaintenanceTriggerRoute, MaintenanceTriggerRouteGrant, MaintenanceTriggerRoutingClass,
+    MaintenanceTriggerSourceEvent, ProtocolError,
 };
 use thiserror::Error;
 
@@ -1177,6 +1178,219 @@ pub fn collect_pending_maintenance_triggers(
     Ok(walk)
 }
 
+/// Fail-closed refusals of the decision-commit route (I14.22, issue #1694 W4).
+///
+/// Every variant keeps the producer-visible retry identity (trigger identity
+/// plus delivery identity) and the exact typed refusal: a local binding
+/// refusal stays a [`ProtocolError`], while the Kernel delivery owner's
+/// refusal — including its exact canonical Store receipt proof — stays a
+/// [`MaintenanceTriggerDeliveryError`]. No failure records a decision, and no
+/// failure authorizes the delivery acknowledgement.
+#[derive(Debug, Error)]
+pub enum MaintenanceTriggerDecisionCommitError {
+    /// The retained record, the live claim, or the decision receipt does not
+    /// bind this operation: unvalidatable shape, a lapsed or foreign claim,
+    /// or a receipt answering another trigger, hash, scope, or claim revision.
+    #[error("maintenance trigger decision binding refused for trigger {trigger_id}: {source}")]
+    Binding {
+        /// Stable trigger identity the decision must answer.
+        trigger_id: String,
+        /// Stable delivery identity of the live claim.
+        delivery_id: String,
+        /// Exact binding refusal; nothing was submitted.
+        #[source]
+        source: Box<ProtocolError>,
+    },
+    /// The Kernel delivery owner refused the commit, including its exact
+    /// canonical receipt proof: an arbitrary receipt ID or a transport `Ok`
+    /// never completes this transition.
+    #[error("maintenance trigger decision owner refused for trigger {trigger_id}: {source}")]
+    Owner {
+        /// Stable trigger identity the decision must answer.
+        trigger_id: String,
+        /// Stable delivery identity of the live claim.
+        delivery_id: String,
+        /// Exact owner refusal; nothing was recorded.
+        #[source]
+        source: Box<MaintenanceTriggerDeliveryError>,
+    },
+    /// The owner answered without carrying this exact committed receipt, so
+    /// the commit is unproven and the acknowledgement must not proceed.
+    #[error("maintenance trigger decision unproven for trigger {trigger_id}: {source}")]
+    Unproven {
+        /// Stable trigger identity the decision must answer.
+        trigger_id: String,
+        /// Stable delivery identity of the live claim.
+        delivery_id: String,
+        /// Exact content refusal; the returned rows name another outcome.
+        #[source]
+        source: Box<ProtocolError>,
+    },
+}
+
+impl MaintenanceTriggerDecisionCommitError {
+    /// Returns the stable trigger identity the decision must answer.
+    #[must_use]
+    pub fn trigger_id(&self) -> &str {
+        match self {
+            Self::Binding { trigger_id, .. }
+            | Self::Owner { trigger_id, .. }
+            | Self::Unproven { trigger_id, .. } => trigger_id,
+        }
+    }
+
+    /// Returns the stable delivery identity of the live claim.
+    #[must_use]
+    pub fn delivery_id(&self) -> &str {
+        match self {
+            Self::Binding { delivery_id, .. }
+            | Self::Owner { delivery_id, .. }
+            | Self::Unproven { delivery_id, .. } => delivery_id,
+        }
+    }
+}
+
+/// Builds the binding refusal for one decision-commit attempt.
+///
+/// The retained record and the live claim carry the retry identity, so every
+/// shape, fence, and content-binding refusal keeps what the caller retries
+/// under.
+fn commit_binding_error(
+    record: &MaintenanceTriggerRecord,
+    claim: &MaintenanceTriggerClaim,
+    source: ProtocolError,
+) -> MaintenanceTriggerDecisionCommitError {
+    MaintenanceTriggerDecisionCommitError::Binding {
+        trigger_id: record.trigger_id.clone(),
+        delivery_id: claim.delivery_id.clone(),
+        source: Box::new(source),
+    }
+}
+
+/// Builds the owner refusal for one decision-commit attempt.
+fn commit_owner_error(
+    record: &MaintenanceTriggerRecord,
+    claim: &MaintenanceTriggerClaim,
+    source: MaintenanceTriggerDeliveryError,
+) -> MaintenanceTriggerDecisionCommitError {
+    MaintenanceTriggerDecisionCommitError::Owner {
+        trigger_id: record.trigger_id.clone(),
+        delivery_id: claim.delivery_id.clone(),
+        source: Box::new(source),
+    }
+}
+
+/// Builds the unproven-commit refusal for an owner answer that does not carry
+/// this exact committed receipt.
+fn commit_unproven_error(
+    record: &MaintenanceTriggerRecord,
+    claim: &MaintenanceTriggerClaim,
+) -> MaintenanceTriggerDecisionCommitError {
+    MaintenanceTriggerDecisionCommitError::Unproven {
+        trigger_id: record.trigger_id.clone(),
+        delivery_id: claim.delivery_id.clone(),
+        source: Box::new(ProtocolError::InvalidField {
+            field: "maintenance_trigger_delivery.decision_receipt",
+            reason: "returned rows do not carry this committed decision",
+        }),
+    }
+}
+
+/// Records one committed maintenance decision before any delivery
+/// acknowledgement (I14.22, issue #1694 W4).
+///
+/// This is the production front-door decision-commit route: the follow-up
+/// daemon-to-Kernel leg after
+/// `maintenance_trigger_evaluator::DaemonComposition::commit_maintenance_trigger_decision`
+/// resolves the current #1692 policy, reuses the #1688 evaluator, and retains
+/// the durable downstream intent through its existing outbox owner
+/// (Governor `PreparedTransition` -> Kernel -> named Store transaction, I1.8).
+/// That leg proves the canonical Store receipt in hand; this route binds that
+/// exact receipt into the Kernel delivery ledger, which alone may later be
+/// acknowledged. A decision plus a durable downstream intent is distinct from
+/// an executed job or a delivered notification: this route admits no job,
+/// starts nothing, and delivers nothing — it records the commitment the
+/// acknowledgement must echo.
+///
+/// The receipt binds the retained trigger identity and operation hash, the
+/// exact claim revision it was evaluated against, the evaluation and policy
+/// revisions, the affected scope, and at least one durable
+/// job/recommendation/wake intent reference; the owner entry re-reads the
+/// exact canonical Store receipt — `Committed` status, canonical-bytes
+/// digest, live-authority fence — before recording, so an arbitrary receipt
+/// ID or a transport `Ok(())` can never complete this transition. Bound
+/// evidence is content, not receipt-ID existence: the returned durable rows
+/// must carry this exact receipt at `DecisionRecorded`. An identical receipt
+/// replays idempotently through the owner, while a different receipt under a
+/// recorded row conflicts there.
+///
+/// # Errors
+///
+/// Returns [`MaintenanceTriggerDecisionCommitError`]: a local binding
+/// refusal, the exact Kernel owner refusal, or an unproven owner answer that
+/// must not be acknowledged.
+pub async fn record_committed_maintenance_decision(
+    gateway: &KernelStoreGateway,
+    principal_ref: &str,
+    record: &MaintenanceTriggerRecord,
+    claim: &MaintenanceTriggerClaim,
+    decision_receipt: MaintenanceTriggerDecisionReceipt,
+    live_fence: &StateFence,
+    now_unix_ms: u64,
+) -> Result<MaintenanceTriggerDecisionReceipt, MaintenanceTriggerDecisionCommitError> {
+    record
+        .validate()
+        .map_err(|source| commit_binding_error(record, claim, source))?;
+    claim
+        .validate()
+        .map_err(|source| commit_binding_error(record, claim, source))?;
+    decision_receipt
+        .validate()
+        .map_err(|source| commit_binding_error(record, claim, source))?;
+    // The commit authorizes under the live claim only: a stale generation, a
+    // foreign session, or a lapsed deadline fails here before any ledger
+    // transition, and the row keeps its existing disposition.
+    claim
+        .authorize_for(record, live_fence, now_unix_ms)
+        .map_err(|source| commit_binding_error(record, claim, source))?;
+    // The receipt must answer this exact retained trigger: identical
+    // identity, operation hash, and scope. Changed content conflicts; it
+    // never re-binds.
+    decision_receipt
+        .matches_trigger(record)
+        .map_err(|source| commit_binding_error(record, claim, source))?;
+    // ... and the exact claim revision it was evaluated against, matching
+    // the row the owner records under.
+    if decision_receipt.revision != claim.revision {
+        return Err(commit_binding_error(
+            record,
+            claim,
+            ProtocolError::ReplayConflict,
+        ));
+    }
+    // Submit the full receipt content through the Kernel owner, which
+    // re-reads the exact canonical Store receipt before recording.
+    let rows = gateway
+        .record_maintenance_trigger_decision(
+            principal_ref,
+            &record.trigger_id,
+            decision_receipt.clone(),
+        )
+        .await
+        .map_err(|source| commit_owner_error(record, claim, source))?;
+    // Bound evidence is content, not receipt-ID existence: the durable
+    // snapshot must carry this exact receipt at `DecisionRecorded`.
+    let proven = rows.iter().any(|row| {
+        row.record.trigger_id == record.trigger_id
+            && row.disposition == MaintenanceTriggerDisposition::DecisionRecorded
+            && row.decision_receipt.as_ref() == Some(&decision_receipt)
+    });
+    if !proven {
+        return Err(commit_unproven_error(record, claim));
+    }
+    Ok(decision_receipt)
+}
+
 /// Fail-closed refusals of the crash-recovery handoff route (I14.22, issue
 /// #1694 W5).
 ///
@@ -1645,6 +1859,175 @@ pub fn recover_replacement_generation(
         now_unix_ms,
         max_pages,
     )
+}
+
+/// One protected-routing assignment verified for route visibility (I14.24,
+/// issue #1694 W6).
+///
+/// Names the registered safety/recovery route one retained trigger stays
+/// visible to while the evaluator is down. Visibility only: the assignment
+/// authorizes no evaluation, no claim, no acknowledgement, and no
+/// containment — containment still requires the evaluator plus the fenced
+/// claim/commit/ack path, so a duplicated delivery can never authorize
+/// duplicated containment.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProtectedRouteAssignment {
+    /// Stable trigger identity staying visible to its registered route.
+    pub trigger_id: String,
+    /// Operation hash the assignment is bound under.
+    pub operation_hash: String,
+    /// Registered safety/recovery route from the owner-issued grant.
+    pub route: MaintenanceTriggerRoute,
+    /// Owner principal that issued the classification.
+    pub owner_id: String,
+}
+
+/// Fail-closed refusals of the protected-route visibility selector (I14.24,
+/// issue #1694 W6).
+///
+/// Every variant keeps the stable trigger identity and the exact wire refusal
+/// as a [`ProtocolError`]: owner-signature issuance proof stays with the
+/// issuing owner and the Kernel intake path, which already admitted the
+/// record. Nothing is routed and no containment is authorized on any failure.
+#[derive(Debug, Error)]
+pub enum MaintenanceTriggerProtectedRouteError {
+    /// The retained record fails validation, so no route can be read from it.
+    #[error("maintenance trigger route record refused for trigger {trigger_id}: {source}")]
+    Shape {
+        /// Stable trigger identity that could not be routed.
+        trigger_id: String,
+        /// Exact shape refusal; nothing was routed.
+        #[source]
+        source: Box<ProtocolError>,
+    },
+    /// The protected classification is missing, expired, not bound to this
+    /// trigger, or changed content arrives under a known identity.
+    #[error("maintenance trigger route classification refused for trigger {trigger_id}: {source}")]
+    Classification {
+        /// Stable trigger identity that could not be routed.
+        trigger_id: String,
+        /// Operation hash the refused classification arrived under.
+        operation_hash: String,
+        /// Exact classification refusal; no containment was authorized.
+        #[source]
+        source: Box<ProtocolError>,
+    },
+}
+
+impl MaintenanceTriggerProtectedRouteError {
+    /// Returns the stable trigger identity that could not be routed.
+    #[must_use]
+    pub fn trigger_id(&self) -> &str {
+        match self {
+            Self::Shape { trigger_id, .. } | Self::Classification { trigger_id, .. } => {
+                trigger_id
+            }
+        }
+    }
+}
+
+/// Builds the classification refusal for one retained record.
+///
+/// The record carries the retry identity, so every missing, expired,
+/// unbound, or conflicting classification keeps the trigger identity and
+/// operation hash it arrived under.
+fn protected_route_classification_error(
+    record: &MaintenanceTriggerRecord,
+    source: ProtocolError,
+) -> MaintenanceTriggerProtectedRouteError {
+    MaintenanceTriggerProtectedRouteError::Classification {
+        trigger_id: record.trigger_id.clone(),
+        operation_hash: record.operation_hash.clone(),
+        source: Box::new(source),
+    }
+}
+
+/// Selects the protected-routing deliveries visible to their registered route
+/// while the evaluator is down (I14.24, issue #1694 W6).
+///
+/// This is the production front-door protected-visibility selector: it runs
+/// over retained records the replacement already surfaced and replayed, and
+/// assigns each safety/recovery trigger to the registered
+/// Host/Kernel/Watchdog/Doctor route its owner-issued grant opens. The grant
+/// must validate at `now_unix_ms` and bind this exact trigger identity and
+/// operation hash — classification is owner-issued, never caller-asserted,
+/// and expiry withdraws the classification without deleting the retained
+/// trigger. Ordinary records are skipped, never promoted: ordinary pending
+/// debt stays visible through the bounded pending set only, and gains no
+/// protected authority here.
+///
+/// A duplicated delivery assigns once: an exact identity/hash repeat reuses
+/// the first assignment, while changed content under a known identity
+/// conflicts instead of re-routing. The selector performs no evaluation,
+/// admits no job, issues no claim or acknowledgement, and performs no
+/// containment, so a duplicated delivery cannot authorize duplicated
+/// containment; containment still requires the evaluator plus the fenced
+/// claim/commit/ack path. The walk is bounded by its input slice, holds no
+/// lease, keeps no runtime alive, and blocks no unrelated safe work.
+///
+/// # Errors
+///
+/// Returns [`MaintenanceTriggerProtectedRouteError`]: an unvalidatable
+/// retained record, or a protected classification that is missing, expired,
+/// unbound, or conflicting.
+pub fn select_protected_route_deliveries(
+    records: &[MaintenanceTriggerRecord],
+    now_unix_ms: u64,
+) -> Result<Vec<ProtectedRouteAssignment>, MaintenanceTriggerProtectedRouteError> {
+    let mut assignments: Vec<ProtectedRouteAssignment> = Vec::new();
+    for record in records {
+        record.validate().map_err(|source| {
+            MaintenanceTriggerProtectedRouteError::Shape {
+                trigger_id: record.trigger_id.clone(),
+                source: Box::new(source),
+            }
+        })?;
+        if record.routing_class == MaintenanceTriggerRoutingClass::Ordinary {
+            // Ordinary pending debt never gains protected visibility: it
+            // stays on the bounded pending set under its existing policy
+            // owner, and ordinary authority never widens here.
+            continue;
+        }
+        let Some(grant) = record.route_grant.as_ref() else {
+            return Err(protected_route_classification_error(
+                record,
+                ProtocolError::InvalidField {
+                    field: "maintenance_trigger.route_grant",
+                    reason: "protected routing requires an owner-issued grant",
+                },
+            ));
+        };
+        grant
+            .validate_at(now_unix_ms)
+            .map_err(|source| protected_route_classification_error(record, source))?;
+        if !grant.binds(&record.trigger_id, &record.operation_hash) {
+            return Err(protected_route_classification_error(
+                record,
+                ProtocolError::ReplayConflict,
+            ));
+        }
+        if let Some(assigned) = assignments
+            .iter()
+            .find(|assigned| assigned.trigger_id == record.trigger_id)
+        {
+            if assigned.operation_hash == record.operation_hash {
+                // Exact duplicate delivery: already visible under this
+                // assignment, so nothing further is authorized.
+                continue;
+            }
+            return Err(protected_route_classification_error(
+                record,
+                ProtocolError::ReplayConflict,
+            ));
+        }
+        assignments.push(ProtectedRouteAssignment {
+            trigger_id: record.trigger_id.clone(),
+            operation_hash: record.operation_hash.clone(),
+            route: grant.route,
+            owner_id: grant.owner_id.clone(),
+        });
+    }
+    Ok(assignments)
 }
 
 /// Fail-closed refusals of the expiry/damage/retention route (I14.22/I5.2,
