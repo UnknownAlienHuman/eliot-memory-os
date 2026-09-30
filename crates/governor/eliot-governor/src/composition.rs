@@ -18,6 +18,7 @@ use crate::activation_outcome::{
 use crate::canonical_projections::{
     GovernorProjectionError, compose_canonical_projections, emit_canonical_projection_set,
 };
+use crate::captured_lsp_evidence::{CapturedLspEvidenceError, consume_captured_lsp_observations};
 use crate::controlboard_projection::{
     ControlBoardGovernorSnapshot, ControlBoardProjectionParts, compile_controlboard_snapshot,
 };
@@ -30,7 +31,6 @@ use crate::negative_memory_probe::{
     NegativeMemoryProbeExecutor, admit_negative_memory_probe, execute_negative_memory_probe,
 };
 use crate::observation_reconciliation::GovernorObservationReconciliation;
-use crate::captured_lsp_evidence::{CapturedLspEvidenceError, consume_captured_lsp_observations};
 use crate::operator_reconciliation::GovernorOperatorReconciliation;
 use crate::owner_closure_feed::{
     OwnerPublishPort, synchronize_owner_feed, synchronize_owner_feed_with_canonical_receipts,

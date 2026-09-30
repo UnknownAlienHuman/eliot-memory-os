@@ -424,8 +424,7 @@ async fn evidence_pack_read_payload(
     let suppression = read_erasure_suppression(db, config).await?;
     let mut payload = evidence_pack_payload(query, state_fence, &rows, &suppression)
         .map_err(AdapterError::Store)?;
-    let current_causal_binding =
-        read_evidence_pack_causal_binding(db, config, state_fence).await?;
+    let current_causal_binding = read_evidence_pack_causal_binding(db, config, state_fence).await?;
     if current_causal_binding != causal_binding {
         return Err(AdapterError::Store(StoreError::RevisionConflict));
     }
