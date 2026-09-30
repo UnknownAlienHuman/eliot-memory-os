@@ -14,8 +14,8 @@
 //! - classification: `eliot_dreamer_classification::classify_orientation`;
 //! - cue activation: `eliot_cue_activation::evaluate_activation`;
 //! - Current Epistemic Position: `eliot_epistemic::resolve`;
-//! - Active Understanding View:
-//!   `eliot_context_assembly::assemble_active_view`;
+//! - Active Understanding View: original
+//!   `eliot_context_assembly::assemble_active_view` output acquired by the runtime;
 //! - claim grounding:
 //!   `eliot_dreamer_claim_grounding::ground_draft_with_controls`;
 //! - rivals: `eliot_dreamer_rival_model::structure_rival_models`;
@@ -26,8 +26,8 @@
 //! - packet: `crate::build_projection`.
 //!
 //! Fail-closed sequencing (issue #2901): production composes only from the
-//! versioned `ProductionOrientationInputs` runtime carrier
-//! carrier, whose CC-002 outcome and CC-004 projection set are mandatory and
+//! versioned `ProductionOrientationInputs` runtime carrier,
+//! whose CC-002 outcome and CC-004 projection set are mandatory and
 //! validated first (schema, bundle-digest binding, job binding, mutual fence
 //! compatibility, one coherent identity closure). Missing prerequisites yield
 //! a typed blocked result, never a packet. The per-stage owner entries answer
@@ -744,10 +744,9 @@ pub fn run_understanding_stage(
             {
                 return Err(PulseError::Understanding);
             }
-            // The callback has no portable function identity. Retain both its
-            // exact measured bytes and its typed returned result in the
-            // canonical stage output, without asserting a commitment to the
-            // callback implementation itself.
+            // Retain the native assembly's original measured bytes and complete
+            // typed result. This stage validates the acquired owner output;
+            // it does not perform another assembly or issue another receipt.
             let canonical = canonical_bytes(&(
                 &output.view,
                 &output.admitted,

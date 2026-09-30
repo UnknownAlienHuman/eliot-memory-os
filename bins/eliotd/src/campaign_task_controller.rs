@@ -577,13 +577,10 @@ async fn prepare_task_controller_owner_publications(
         &claimed.envelope.state_fence,
     )
     .map_err(|_| "invalid_owner_materials")?;
-    let publications = read_authenticated_owner_publications(
-        reads,
-        recipe,
-        &claimed.envelope.state_fence,
-    )
-    .await
-    .map_err(|_| "owner_read_unavailable")?;
+    let publications =
+        read_authenticated_owner_publications(reads, recipe, &claimed.envelope.state_fence)
+            .await
+            .map_err(|_| "owner_read_unavailable")?;
     if invocation.context_compilation_input.is_some() {
         return publish_context_compiler_suppliers(
             &candidate,

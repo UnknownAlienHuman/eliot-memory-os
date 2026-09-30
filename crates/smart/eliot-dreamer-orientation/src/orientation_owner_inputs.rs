@@ -866,17 +866,17 @@ fn check_classification_binding(
     bundle: &DreamInputBundle,
     model_outcome: &ModelRouteOutcome,
 ) -> Result<(), PulseError> {
-    let context = stage.context;
-    if context.bundle != bundle
-        || context.job.canonical_id() != model_outcome.job_id
-        || context.receipt.job_id != model_outcome.job_id
-        || context.receipt.bundle_digest != model_outcome.bundle_digest
-        || context.grounded.job_id != model_outcome.job_id
-        || context.grounded.draft_digest != context.receipt.draft_digest
-        || stage.input.item.task_id != bundle.task_id
-        || stage.input.item.scope_id != bundle.scope_id
-        || stage.input.item.state_fence != bundle.state_fence
-        || stage.input.item.receipt.bundle_digest != model_outcome.bundle_digest
+    stage
+        .input
+        .validate()
+        .map_err(|_| PulseError::Boundary("classification original profile"))?;
+    let bundle_digest = eliot_dreamer_contracts::bundle_digest_of(bundle)
+        .map_err(|_| PulseError::Boundary("classification original bundle"))?;
+    if stage.input.target.task_id.as_str() != bundle.task_id
+        || stage.input.target.scope_id.as_str() != bundle.scope_id
+        || stage.input.target.state_fence != bundle.state_fence
+        || model_outcome.job_id != bundle.job_id
+        || model_outcome.bundle_digest != bundle_digest
     {
         return Err(PulseError::Boundary("classification admitted binding"));
     }

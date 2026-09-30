@@ -1709,6 +1709,7 @@ dependencies = [
  "eliot-epistemic",
  "eliot-epistemic-contracts",
  "eliot-evidence",
+ "eliot-protocol",
  "schemars",
  "serde",
  "serde_json",

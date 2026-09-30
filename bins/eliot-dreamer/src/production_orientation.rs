@@ -133,6 +133,8 @@ pub(crate) struct ProductionOrientationInputs<'a> {
     pub model_outcome: &'a ModelRouteOutcome,
     /// CC-004 canonical projection set (mandatory boundary).
     pub projections: &'a CanonicalProjectionSet,
+    /// Exact original submitted runtime owner publication, retained whole.
+    pub runtime_owner_input: &'a eliot_protocol::dreamer_job::DurableJobRuntimeOwnerExecutionInput,
     /// Governor-resolved epistemic-position handles for the packet.
     pub cep_handles: &'a [CurrentEpistemicPositionHandle],
     /// All mandatory native owner inputs, retained under this carrier's exact closure.
@@ -163,6 +165,8 @@ pub struct OrientationSupply<'a> {
     pub deadline_unix_ms: u64,
     /// CC-004 canonical projection set emitted by the Governor's own producer.
     pub projections: &'a CanonicalProjectionSet,
+    /// Exact original submitted runtime owner publication, retained whole.
+    pub runtime_owner_input: &'a eliot_protocol::dreamer_job::DurableJobRuntimeOwnerExecutionInput,
     /// Governor-issued Current Epistemic Position handles for the packet.
     pub cep_handles: &'a [CurrentEpistemicPositionHandle],
     /// Owner classification input (classification stage).
@@ -238,6 +242,8 @@ pub(crate) struct ProductionOrientationOwnerInputs<'a> {
     pub model_outcome: &'a ModelRouteOutcome,
     /// CC-004 set returned by the canonical projection owner.
     pub projections: &'a CanonicalProjectionSet,
+    /// Exact original submitted runtime owner publication, retained whole.
+    pub runtime_owner_input: &'a eliot_protocol::dreamer_job::DurableJobRuntimeOwnerExecutionInput,
     /// Governor-resolved epistemic-position handles for the packet.
     pub cep_handles: &'a [CurrentEpistemicPositionHandle],
     /// Classification stage inputs.
@@ -302,6 +308,7 @@ pub(crate) fn borrow_governor_supply<'a>(
         model_request: supply.model_request,
         model_outcome: supply.model_outcome,
         projections: supply.projections,
+        runtime_owner_input: supply.runtime_owner_input,
         cep_handles: supply.cep_handles,
         classification: ClassificationStage {
             input: supply.classification_input,
@@ -403,6 +410,7 @@ pub(crate) fn resolve_production_inputs<'a>(
         model_request: owner.model_request,
         model_outcome: owner.model_outcome,
         projections: owner.projections,
+        runtime_owner_input: owner.runtime_owner_input,
         cep_handles: owner.cep_handles,
         owner_stages: OrientationOwnerInputs {
             classification: owner.classification,
@@ -494,6 +502,7 @@ pub(crate) fn compose_production_result(
         model_request: inputs.model_request,
         model_outcome: inputs.model_outcome,
         projections: inputs.projections,
+        runtime_owner_input: inputs.runtime_owner_input,
         semantics,
     };
     let packet = match build_projection_with_owners(

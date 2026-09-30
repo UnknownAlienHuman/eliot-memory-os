@@ -66,6 +66,7 @@
 //! [`PhysicalRouteObservationReceipt::validate_against`]:
 //!     eliot_agent_api::PhysicalRouteObservationReceipt::validate_against
 
+use eliot_agent_api::WorkUnitId;
 use eliot_agent_api::{
     AdmittedRouteReceipt, AgentResult, AttemptId, ExecutionOutcome, LowercaseSha256,
     ProviderExecutionBinding, ResultDisposition, RouteFingerprint, RouteObservationState,
@@ -75,15 +76,14 @@ use eliot_agent_coordinator::{
     ModelRole, PlanGap, ProviderIdentity, RoleProfileId, StaffingPlanCandidate,
     StaffingPlanRequest,
 };
-use eliot_agent_api::WorkUnitId;
 use eliot_agent_opencode::{OpenCodeClient, OpenCodeRouteAdmission};
-use eliot_read::LocalReadPort;
 use eliot_contracts::{
     ClockReading, ContractIdentity, ContractVersion, ProductId, RequestId, RequestMetadata,
     SourceId, StateFence, canonical_json_bytes, contract_identity,
 };
 use eliot_governor::{CompositionError, CompositionReadiness, RouteScopeFingerprint};
 use eliot_protocol::{ContinuityKind, dreamer_job::ProviderStaffingRuntimeSourcePublication};
+use eliot_read::LocalReadPort;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -156,8 +156,8 @@ pub enum DreamerProviderStaffingRuntimeProfileError {
 
 impl DreamerProviderStaffingRuntimeProfile {
     /// Returns the content-addressed profile contract identity.
-    pub fn contract_identity(
-    ) -> Result<ContractIdentity, DreamerProviderStaffingRuntimeProfileError> {
+    pub fn contract_identity()
+    -> Result<ContractIdentity, DreamerProviderStaffingRuntimeProfileError> {
         let shape = serde_json::json!({
             "schema_version": DREAMER_PROVIDER_STAFFING_RUNTIME_SOURCE_SCHEMA_VERSION,
             "admitted_job_id": "DreamJobAdmission::canonical_id()",
@@ -178,23 +178,26 @@ impl DreamerProviderStaffingRuntimeProfile {
     pub fn from_publication(
         publication: &ProviderStaffingRuntimeSourcePublication,
     ) -> Result<Self, DreamerProviderStaffingRuntimeProfileError> {
-        publication
-            .validate()
-            .map_err(|error| DreamerProviderStaffingRuntimeProfileError::Publication(error.to_string()))?;
+        publication.validate().map_err(|error| {
+            DreamerProviderStaffingRuntimeProfileError::Publication(error.to_string())
+        })?;
         if publication.reference.contract != Self::contract_identity()? {
             return Err(DreamerProviderStaffingRuntimeProfileError::ContractIdentity);
         }
-        let profile: Self = serde_json::from_slice(&publication.canonical_bytes)
-            .map_err(|error| DreamerProviderStaffingRuntimeProfileError::Publication(error.to_string()))?;
+        let profile: Self =
+            serde_json::from_slice(&publication.canonical_bytes).map_err(|error| {
+                DreamerProviderStaffingRuntimeProfileError::Publication(error.to_string())
+            })?;
         if profile.schema_version != DREAMER_PROVIDER_STAFFING_RUNTIME_SOURCE_SCHEMA_VERSION {
             return Err(DreamerProviderStaffingRuntimeProfileError::SchemaVersion);
         }
-        if canonical_json_bytes(&profile)
-            .map_err(|error| DreamerProviderStaffingRuntimeProfileError::Publication(error.to_string()))?
-            != publication.canonical_bytes
+        if canonical_json_bytes(&profile).map_err(|error| {
+            DreamerProviderStaffingRuntimeProfileError::Publication(error.to_string())
+        })? != publication.canonical_bytes
         {
             return Err(DreamerProviderStaffingRuntimeProfileError::Publication(
-                "typed provider staffing profile differs from its original canonical bytes".to_owned(),
+                "typed provider staffing profile differs from its original canonical bytes"
+                    .to_owned(),
             ));
         }
         Ok(profile)

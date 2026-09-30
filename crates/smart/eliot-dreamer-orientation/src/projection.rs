@@ -11,6 +11,7 @@ use eliot_dreamer_contracts::relation::{
 use eliot_dreamer_contracts::{
     BudgetUsage, BundleCompleteness, SourceDisposition, SupportState, ValidatedCandidate,
 };
+use eliot_protocol::dreamer_job::DurableJobRuntimeOwnerExecutionInput;
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -187,6 +188,9 @@ pub struct OrientationOwnerClosure {
     pub model_request: eliot_dreamer_contracts::ModelRouteRequest,
     pub model_outcome: eliot_dreamer_contracts::ModelRouteOutcome,
     pub projections: CanonicalProjectionSet,
+    /// Complete original submitted owner publication, including authenticated
+    /// source reads, request selectors, native compiler inputs and receipts.
+    pub runtime_owner_input: DurableJobRuntimeOwnerExecutionInput,
     pub stage_outputs: Vec<OrientationStageOutput>,
 }
 
@@ -195,6 +199,7 @@ pub struct OrientationOwnerProjection<'a> {
     pub model_request: &'a eliot_dreamer_contracts::ModelRouteRequest,
     pub model_outcome: &'a eliot_dreamer_contracts::ModelRouteOutcome,
     pub projections: &'a CanonicalProjectionSet,
+    pub runtime_owner_input: &'a DurableJobRuntimeOwnerExecutionInput,
     pub semantics: OrientationSemanticView<'a>,
 }
 
@@ -289,6 +294,12 @@ impl OrientationPacketCandidate {
             if closure.denominator != ORIENTATION_PRODUCT_DENOMINATOR {
                 return Err(OrientationError::Binding("product denominator"));
             }
+            validate_runtime_owner_input(
+                &closure.runtime_owner_input,
+                &self.task_id,
+                &self.scope_id,
+                &self.provenance.state_fence,
+            )?;
             validate_native_outputs(
                 &closure.stage_outputs,
                 &closure.model_outcome,
@@ -445,6 +456,7 @@ pub fn build_projection_with_owners(
             owners.model_request,
             owners.model_outcome,
             owners.projections,
+            owners.runtime_owner_input,
             &owners.semantics,
         ))
         .map_err(|_| OrientationError::Encoding("joined owner inputs"))?,
@@ -462,6 +474,7 @@ pub fn build_projection_with_owners(
         model_request: owners.model_request.clone(),
         model_outcome: owners.model_outcome.clone(),
         projections: owners.projections.clone(),
+        runtime_owner_input: owners.runtime_owner_input.clone(),
         stage_outputs: owners.semantics.stage_outputs.to_vec(),
     });
     packet.model_routes_and_cost = OrientationResidue {
@@ -493,6 +506,12 @@ fn validate_owner_projection(
     policy: &OrientationPolicy,
     owners: &OrientationOwnerProjection<'_>,
 ) -> Result<(), OrientationError> {
+    validate_runtime_owner_input(
+        owners.runtime_owner_input,
+        &candidate.job.task_id,
+        &candidate.job.scope_id,
+        &candidate.job.state_fence,
+    )?;
     owners
         .model_request
         .validate_binds_bundle(bundle)
@@ -536,10 +555,29 @@ fn validate_owner_projection(
             owners.model_request,
             owners.model_outcome,
             owners.projections,
+            owners.runtime_owner_input,
             &owners.semantics,
         ),
         policy.max_input_bytes,
     )?;
+    Ok(())
+}
+
+fn validate_runtime_owner_input(
+    input: &DurableJobRuntimeOwnerExecutionInput,
+    task_id: &str,
+    scope_id: &str,
+    state_fence: &eliot_contracts::StateFence,
+) -> Result<(), OrientationError> {
+    input
+        .validate()
+        .map_err(|_| OrientationError::Binding("original runtime owner publication"))?;
+    if input.task_id.as_str() != task_id
+        || input.work_scope.scope_id.as_str() != scope_id
+        || &input.state_fence != state_fence
+    {
+        return Err(OrientationError::Binding("runtime owner identity"));
+    }
     Ok(())
 }
 

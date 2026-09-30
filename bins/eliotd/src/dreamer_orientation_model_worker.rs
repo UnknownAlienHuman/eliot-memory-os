@@ -28,15 +28,13 @@ use serde_json::Value;
 use super::agent_fabric::{
     AdmittedOpenCodeAttemptProjectionError, AgentFabric, daemon_coordinator_config,
 };
-use super::dreamer_materials::{
-    AdmittedSourceClaim, DreamerMaterialsError, resolve_source_claim,
+use super::dreamer_materials::{AdmittedSourceClaim, DreamerMaterialsError, resolve_source_claim};
+use super::dreamer_model_adapter::{
+    DreamerProviderStaffingRuntimeProfile, DreamerProviderStaffingRuntimeProfileError,
 };
 use super::dreamer_orientation_model::{
     DreamerOrientationModelAttempt, DreamerOrientationModelInput,
     admitted_model_route_context_bytes, run_admitted_model_route,
-};
-use super::dreamer_model_adapter::{
-    DreamerProviderStaffingRuntimeProfile, DreamerProviderStaffingRuntimeProfileError,
 };
 
 /// Per-call immutable semantic, admission, route, and runtime owner inputs.
@@ -160,9 +158,8 @@ pub async fn execute_admitted_orientation_model(
     let staffing_publication = input
         .provider_staffing_source
         .ok_or(DreamerOrientationModelWorkerError::ProviderStaffingSourceMissing)?;
-    let staffing_profile = DreamerProviderStaffingRuntimeProfile::from_publication(
-        staffing_publication,
-    )?;
+    let staffing_profile =
+        DreamerProviderStaffingRuntimeProfile::from_publication(staffing_publication)?;
     let coordinator_config = daemon_coordinator_config()
         .map_err(|error| DreamerOrientationModelWorkerError::StaffingPlan(error.to_string()))?;
     let mut coordinator = AgentCoordinator::new(
