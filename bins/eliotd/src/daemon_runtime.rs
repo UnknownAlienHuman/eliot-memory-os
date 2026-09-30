@@ -206,6 +206,44 @@ struct RetainedActivationIdentity {
     result_sha256: String,
 }
 
+/// Typed terminal failure from the run loop so `run()` selects the shutdown
+/// disposition from the dispatch owner's typed decision, never from free
+/// text. `message` keeps the exact existing terminal record. Only a failure
+/// the dispatch path classified as retained/unknown
+/// (`ActivationDispatchError::Unknown`) carries `activation_unknown`, with
+/// the original ticket/result identity verbatim; every other loop failure —
+/// including a `Hard` dispatch failure whose detail mentions an unknown
+/// ticket — carries `None`. Local only; no protocol change.
+struct RunLoopFailure {
+    message: String,
+    activation_unknown: Option<RetainedActivationIdentity>,
+}
+
+impl RunLoopFailure {
+    fn hard(message: String) -> Self {
+        Self {
+            message,
+            activation_unknown: None,
+        }
+    }
+
+    fn activation_unknown(ticket_id: String, result_sha256: String, detail: String) -> Self {
+        Self {
+            message: detail,
+            activation_unknown: Some(RetainedActivationIdentity {
+                ticket_id,
+                result_sha256,
+            }),
+        }
+    }
+}
+
+impl From<String> for RunLoopFailure {
+    fn from(message: String) -> Self {
+        Self::hard(message)
+    }
+}
+
 /// Completion of one in-flight activation step. Claim, resolve-wait and
 /// dispatch share one flight branch so health and shutdown stay pollable
 /// while any of them is outstanding. The resolve wait lives inside this
@@ -917,6 +955,11 @@ pub(super) fn run() -> Result<(), String> {
         .map_err(|error| error.to_string());
     // #740: shutdown disposition record. The terminal-failure reports below
     // keep their exact existing behavior; this only names the disposition.
+    // #740 A10: the disposition is the typed dispatch decision threaded
+    // through `RunLoopFailure`/`RunLoopExit`, never a free-text match. Only
+    // a retained/unknown activation sets the flag; a `Hard` dispatch failure
+    // keeps `WithError` even when its detail mentions an unknown ticket.
+    let mut shutdown_activation_unknown = false;
     let final_result = match (loop_result, shutdown_result) {
         (Ok(RunLoopExit::Shutdown), Ok(())) => Ok(()),
         (
@@ -926,14 +969,19 @@ pub(super) fn run() -> Result<(), String> {
                 detail,
             }),
             Ok(()),
-        ) => Err(report_terminal_failure(
-            &kernel,
-            format!(
-                "daemon shutdown with activation submit unknown ticket {ticket_id} result {result_sha256}: {detail}"
-            ),
-        )),
-        (Ok(RunLoopExit::Shutdown), Err(error)) | (Err(error), Ok(())) => {
-            Err(report_terminal_failure(&kernel, error))
+        ) => {
+            shutdown_activation_unknown = true;
+            Err(report_terminal_failure(
+                &kernel,
+                format!(
+                    "daemon shutdown with activation submit unknown ticket {ticket_id} result {result_sha256}: {detail}"
+                ),
+            ))
+        }
+        (Ok(RunLoopExit::Shutdown), Err(error)) => Err(report_terminal_failure(&kernel, error)),
+        (Err(failure), Ok(())) => {
+            shutdown_activation_unknown = failure.activation_unknown.is_some();
+            Err(report_terminal_failure(&kernel, failure.message))
         }
         (
             Ok(RunLoopExit::ShutdownActivationUnknown {
@@ -942,16 +990,22 @@ pub(super) fn run() -> Result<(), String> {
                 detail,
             }),
             Err(shutdown_error),
-        ) => Err(report_terminal_failure(
-            &kernel,
-            format!(
-                "daemon shutdown with activation submit unknown ticket {ticket_id} result {result_sha256}: {detail}; shutdown: {shutdown_error}"
-            ),
-        )),
-        (Err(error), Err(shutdown_error)) => Err(report_terminal_failure(
-            &kernel,
-            format!("{error}; shutdown: {shutdown_error}"),
-        )),
+        ) => {
+            shutdown_activation_unknown = true;
+            Err(report_terminal_failure(
+                &kernel,
+                format!(
+                    "daemon shutdown with activation submit unknown ticket {ticket_id} result {result_sha256}: {detail}; shutdown: {shutdown_error}"
+                ),
+            ))
+        }
+        (Err(failure), Err(shutdown_error)) => {
+            shutdown_activation_unknown = failure.activation_unknown.is_some();
+            Err(report_terminal_failure(
+                &kernel,
+                format!("{}; shutdown: {shutdown_error}", failure.message),
+            ))
+        }
     };
     match &final_result {
         Ok(()) => {
@@ -961,7 +1015,7 @@ pub(super) fn run() -> Result<(), String> {
             );
         }
         Err(error) => {
-            let outcome = if error.contains("unknown ticket") {
+            let outcome = if shutdown_activation_unknown {
                 eliotd::diagnostics::ShutdownOutcome::WithActivationUnknown
             } else {
                 eliotd::diagnostics::ShutdownOutcome::WithError
@@ -1589,7 +1643,7 @@ async fn run_loop(
     // late completion can never overwrite newer owner observations.
     startup_readiness: StartupReadinessProjection,
     startup_maintenance_observations: [MaintenanceObservation; 2],
-) -> Result<RunLoopExit, String> {
+) -> Result<RunLoopExit, RunLoopFailure> {
     let mut cadence = LoopCadence::production();
     // One projection instance is shared with the heartbeat future. Both
     // heartbeat observation and local-read adoption use short synchronous
@@ -2029,7 +2083,7 @@ fn settle_activation_completion(
     deferred_activity: &mut DeferredSupervisionActivity,
     flight: &mut ActivationFlight,
     completion: ActivationCompletion,
-) -> Result<(), String> {
+) -> Result<(), RunLoopFailure> {
     match completion {
         ActivationCompletion::Claim(claim_outcome) => {
             let claim = claim_outcome?;
@@ -2055,7 +2109,11 @@ fn settle_activation_completion(
             Ok(())
         }
         ActivationCompletion::Resolve(resolve_outcome) => {
+            // Pre-dispatch resolve failure: no dispatch decision exists and no
+            // identity was retained, so it carries typed hard detail and never
+            // the activation-unknown disposition (#740 A10).
             settle_activation_resolve_completion(kernel, flight, resolve_outcome)
+                .map_err(RunLoopFailure::hard)
         }
         ActivationCompletion::Dispatch(dispatch_outcome) => match dispatch_outcome {
             Ok(()) => {
@@ -2074,8 +2132,16 @@ fn settle_activation_completion(
                 *flight = ActivationFlight::Idle;
                 Ok(())
             }
-            Err(ActivationDispatchError::Hard(error)) => Err(error),
-            Err(ActivationDispatchError::Unknown { detail, .. }) => Err(detail),
+            Err(ActivationDispatchError::Hard(error)) => Err(RunLoopFailure::hard(error)),
+            Err(ActivationDispatchError::Unknown {
+                ticket_id,
+                result_sha256,
+                detail,
+            }) => Err(RunLoopFailure::activation_unknown(
+                ticket_id,
+                result_sha256,
+                detail,
+            )),
         },
     }
 }
@@ -3342,7 +3408,7 @@ async fn drain_flights_on_shutdown(
     solo_poll_last_refusal: &mut Option<String>,
     fair_pull_recovery_flight: &mut FairPullRecoveryFlight,
     fair_pull_recovery_last_refusal: &mut Option<String>,
-) -> Result<RunLoopExit, String> {
+) -> Result<RunLoopExit, RunLoopFailure> {
     // #740: drain span. Idle drains and unknown-retention drains emit
     // distinct dispositions with the original identity verbatim.
     let _span = tracing::info_span!("eliotd.activation_drain").entered();
@@ -3375,7 +3441,7 @@ async fn drain_flights_on_shutdown(
                 match completion {
                     ActivationCompletion::Claim(claim_outcome) => {
                         let claim = match claim_outcome {
-                            Err(error) => return Err(error),
+                            Err(error) => return Err(error.into()),
                             Ok(claim) => claim,
                         };
                         match settle_activation_claim(
@@ -3405,7 +3471,9 @@ async fn drain_flights_on_shutdown(
                             // settles as a clean shutdown exactly like an
                             // accepted dispatch, never as an unknown identity.
                             Ok(()) | Err(ActivationDispatchError::Expired) => {}
-                            Err(ActivationDispatchError::Hard(error)) => return Err(error),
+                            Err(ActivationDispatchError::Hard(error)) => {
+                                return Err(RunLoopFailure::hard(error));
+                            }
                             Err(ActivationDispatchError::Unknown {
                                 ticket_id,
                                 result_sha256,
