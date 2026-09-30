@@ -1041,10 +1041,7 @@ impl std::fmt::Display for UserAutomationHorizonPublicationRefusal {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NothingRetained { reason } => formatter.write_str(reason),
-            Self::Retained {
-                obligation,
-                reason,
-            } => write!(
+            Self::Retained { obligation, reason } => write!(
                 formatter,
                 "{reason}; this bounded slice IS durably retained under owner operation identity \
                  {} and must be reported and reconciled under that original identity rather than \
@@ -5871,8 +5868,9 @@ impl KernelStoreGateway {
         // this principal and fence. A revision that a concurrent pause,
         // remove, or superseding edit already moved is not published from a
         // stale commit: that leg owns the wake disposition instead.
-        if let Err((kind, reason)) =
-            self.revalidate_horizon_owner(sealed, revision, publication).await
+        if let Err((kind, reason)) = self
+            .revalidate_horizon_owner(sealed, revision, publication)
+            .await
         {
             return Ok((
                 None,
