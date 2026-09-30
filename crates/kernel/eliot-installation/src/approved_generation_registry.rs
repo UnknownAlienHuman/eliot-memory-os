@@ -2691,7 +2691,7 @@ impl Default for ApprovedGenerationRegistry {
 pub(crate) fn registry_projection_identity(
     registry: &ApprovedGenerationRegistry,
 ) -> Result<PlatformHandle, InstallationError> {
-    let bytes = if let Some((version, source_revision)) = registry
+    let bytes = if let Some((version, _source_revision)) = registry
         .legacy_registry_identity_version
         .filter(|(_, source_revision)| *source_revision == registry.revision)
         .filter(|_| registry.system_service_host_root_receipt.is_none())

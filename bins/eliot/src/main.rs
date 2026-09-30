@@ -4585,8 +4585,9 @@ fn run_installation_effect(
                     .runtime_state_roots
                     .host_state_root
                     .clone();
-                let host_root = match ProtectedRootLease::open_existing(Path::new(&host_state_root))
-                {
+                let host_root = match ProtectedRootLease::open_existing(Path::new(
+                    host_state_root.as_str(),
+                )) {
                     Ok(root) => root,
                     Err(error) => {
                         // E3: the retained Host root cannot be reopened after
@@ -4606,7 +4607,9 @@ fn run_installation_effect(
                 };
                 let recorded = match current.system_service_host_root_receipt() {
                     Some(receipt) => {
-                        if let Err(error) = receipt.validate_against(&host_root, &host_state_root) {
+                        if let Err(error) =
+                            receipt.validate_against(&host_root, host_state_root.as_str())
+                        {
                             write_installation_error(
                                 "INSTALLATION_APPLY_RECOVERY_REQUIRED",
                                 &format!(
@@ -4652,7 +4655,7 @@ fn run_installation_effect(
                     }
                 };
                 if let Err(error) =
-                    recorded_root_receipt.validate_against(&host_root, &host_state_root)
+                    recorded_root_receipt.validate_against(&host_root, host_state_root.as_str())
                 {
                     write_installation_error(
                         "INSTALLATION_APPLY_RECOVERY_REQUIRED",
