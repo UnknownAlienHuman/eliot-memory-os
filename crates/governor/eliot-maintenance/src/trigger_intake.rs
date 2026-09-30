@@ -463,14 +463,13 @@ fn check_intake_shape(intake: &MaintenanceTriggerIntake) -> Result<(), Maintenan
     match &intake.source_position {
         TriggerIntakePosition::Cursor { value } => {
             if *value == 0 {
-                return Err(MaintenanceError::InvalidField("persist.source_position.cursor"));
+                return Err(MaintenanceError::InvalidField(
+                    "persist.source_position.cursor",
+                ));
             }
         }
         TriggerIntakePosition::AcceptedOccurrence { occurrence_id } => {
-            require_text(
-                occurrence_id,
-                "persist.source_position.occurrence_id",
-            )?;
+            require_text(occurrence_id, "persist.source_position.occurrence_id")?;
         }
     }
     require_text(&intake.family_ref, "persist.family.reference")?;
@@ -485,12 +484,11 @@ fn check_intake_shape(intake: &MaintenanceTriggerIntake) -> Result<(), Maintenan
         &intake.privacy_class_reference,
         "persist.privacy_class_reference",
     )?;
-    require_text(
-        &intake.visibility_reference,
-        "persist.visibility_reference",
-    )?;
+    require_text(&intake.visibility_reference, "persist.visibility_reference")?;
     if intake.applicable_until_ms <= intake.created_at_ms {
-        return Err(MaintenanceError::InvalidField("persist.applicable_until_ms"));
+        return Err(MaintenanceError::InvalidField(
+            "persist.applicable_until_ms",
+        ));
     }
     validate_routing(&intake.routing)?;
     validate_payload(&intake.payload)?;
