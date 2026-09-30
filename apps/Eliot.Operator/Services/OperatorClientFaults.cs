@@ -167,7 +167,7 @@ public static class OperatorFaultReason
     /// message never travels.
     public static string ForException(Exception error) => error switch
     {
-        OperatorProtocolException protocol => $"{protocol.Shape}_{protocol.Reason.Replace(':', '_')}",
+        OperatorProtocolException protocol => $"{protocol.Shape}_{FoldGuardSuffix(protocol.Reason)}",
         UnauthorizedAccessException => AccessDenied,
         TimeoutException => ConnectionTimeout,
         OperationCanceledException => RequestTimeout,
@@ -178,4 +178,44 @@ public static class OperatorFaultReason
         InvalidOperationException => ResponseShapeRefused,
         _ => "unexpected_fault"
     };
+
+    /// The reason prefixes that carry a wire-supplied property name after the
+    /// colon. Only these are folded, so one code keeps meaning one condition.
+    private const string UnknownPrefix = "unknown:";
+    private const string DuplicatePrefix = "duplicate:";
+
+    /// Folds ONLY the guard's variable-name suffixes off a published code.
+    ///
+    /// `OperatorJsonGuard` mints `unknown:{name}` and `duplicate:{name}` from a
+    /// wire-supplied property name, so the same root cause published as
+    /// `broker_error_unknown_evilfield` in one run and
+    /// `broker_error_unknown_otherfield` in the next — which is exactly the
+    /// drift this class documents it cannot have. Folding at the first colon
+    /// also absorbs a colon inside the name itself, so `unknown:evil:field`
+    /// still publishes one stable code.
+    ///
+    /// The fold is prefix-scoped, NOT a blanket "truncate at the first colon".
+    /// `BrokerPipeClient` mints `field:{name}` for a DIFFERENT condition (a
+    /// required field absent, wrong-kind, or over its text bound), and every
+    /// one of those names is a call-site literal, so that family is already
+    /// stable and must keep its per-field codes: a blanket fold would merge
+    /// `broker_error_field_code` and `broker_error_field_detail` into one
+    /// authoritative-looking code that means two things. One code that merges
+    /// two conditions is worse than one that drifts, because it looks
+    /// trustworthy. Do not widen this to other prefixes.
+    ///
+    /// The full `Reason` is left intact on the exception, so the harness and
+    /// the discovery latch still see `unknown:{name}` verbatim.
+    private static string FoldGuardSuffix(string reason)
+    {
+        if (reason.StartsWith(UnknownPrefix, StringComparison.Ordinal))
+        {
+            return UnknownPrefix.TrimEnd(':');
+        }
+        if (reason.StartsWith(DuplicatePrefix, StringComparison.Ordinal))
+        {
+            return DuplicatePrefix.TrimEnd(':');
+        }
+        return reason.Replace(':', '_');
+    }
 }
