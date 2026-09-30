@@ -413,11 +413,11 @@ fn unusable_model_reason(disposition: ModelRouteDisposition) -> Option<&'static 
 }
 
 /// Collects one stage outcome into the ledger, recording refusals as blocked.
-fn collect_stage<T>(
+fn collect_stage(
     records: &mut Vec<OrientationStageRecord>,
     refused: &mut Vec<String>,
     id: PulseStageId,
-    outcome: Result<PulseStage<T>, PulseError>,
+    outcome: Result<PulseStage, PulseError>,
 ) {
     if let Ok(stage) = outcome {
         records.push(stage_record(&stage));
@@ -517,7 +517,7 @@ fn refused_stages_blocked(
 }
 
 /// Maps one internal stage outcome onto its public ledger record.
-fn stage_record<T>(stage: &PulseStage<T>) -> OrientationStageRecord {
+fn stage_record(stage: &PulseStage) -> OrientationStageRecord {
     let ceiling = match stage.disposition {
         OrientationStageDisposition::Executed => CEILING_CANDIDATE_ONLY,
         _ => CEILING_BLOCKED,
@@ -542,7 +542,7 @@ fn stage_record<T>(stage: &PulseStage<T>) -> OrientationStageRecord {
 
 /// Builds one blocked ledger record for a member that did not run.
 fn blocked_stage_record(id: PulseStageId, reason: &'static str) -> OrientationStageRecord {
-    stage_record(&PulseStage::<()>::blocked(id, reason))
+    stage_record(&PulseStage::blocked(id, reason))
 }
 
 /// Builds the packet ledger record for a projected packet.

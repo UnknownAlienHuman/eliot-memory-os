@@ -49,38 +49,32 @@
 //! not the resolver output, because the two vocabularies are deliberately
 //! distinct.
 
-use eliot_context_assembly::{ActiveUnderstandingViewResult, AssemblyPolicy, assemble_active_view};
+use eliot_context_assembly::{AssemblyPolicy, assemble_active_view};
 use eliot_context_candidates::{
-    AttentionInput, CandidatePolicy, CandidateRequest, CanonicalProjectionInput,
-    ContextCandidateSetResult, CueInput, EpistemicInput, EvidenceInput, MemberMeasurement,
-    construct_context_candidates_with_canonical,
+    AttentionInput, CandidatePolicy, CandidateRequest, CanonicalProjectionInput, CueInput,
+    EpistemicInput, EvidenceInput, MemberMeasurement, construct_context_candidates_with_canonical,
 };
 use eliot_context_contracts::{
     AdmittedContextSet, CanonicalProjectionSet, ContextError, ContextRecipe, QualityScorecard,
     SerializedContextMeasurement,
 };
 use eliot_contracts::StateFence;
-use eliot_cue_activation::{ActivationProfile, CueActivationEvaluation, evaluate_activation};
+use eliot_cue_activation::{ActivationProfile, evaluate_activation};
 use eliot_cue_contracts::{ActivationRequest, CueSnapshotBuildCandidate};
 use eliot_dreamer_claim_grounding::{GroundingRequest, ground_draft_with_controls};
-use eliot_dreamer_classification::{ClassificationPolicy, ClassificationResult, classify};
+use eliot_dreamer_classification::{ClassificationPolicy, classify};
 use eliot_dreamer_conflict_analysis::{
-    ConflictAnalysisCandidate, ConflictAnalysisPolicy, ConflictSupplements, analyze_conflict,
+    ConflictAnalysisPolicy, ConflictSupplements, analyze_conflict,
 };
-use eliot_dreamer_contracts::grounding::GroundedDreamDraft as GroundedClaimDraft;
 use eliot_dreamer_contracts::{
     ClassificationInput, CurationAcceptanceCtx, DreamInputBundle, GroundedDreamDraft,
     ModelRouteDisposition, ModelRouteOutcome, ValidatedCurationItem, ValidatedDreamDraft,
     ValidatedGroundingCandidate, bundle_digest_of, canonical_bytes, digest_hex,
 };
 use eliot_dreamer_orientation::OrientationError;
-use eliot_dreamer_probe_plan::{ProbePlan, ProbePlanParams, plan_discriminative_probes};
-use eliot_dreamer_rival_model::{
-    RivalModelSet as StructuredRivalModelSet, RivalPolicy, structure_rival_models,
-};
-use eliot_epistemic::{
-    CurrentEpistemicPosition as ResolvedEpistemicPosition, PositionRequest, resolve,
-};
+use eliot_dreamer_probe_plan::{ProbePlanParams, plan_discriminative_probes};
+use eliot_dreamer_rival_model::{RivalPolicy, structure_rival_models};
+use eliot_epistemic::{PositionRequest, resolve};
 use eliot_epistemic_contracts::{ConflictSet, CurrentEpistemicPosition as AdmittedPosition};
 
 use crate::OrientationStageDisposition;
@@ -345,7 +339,13 @@ pub(crate) const CEILING_BLOCKED: &str = "blocked";
 pub(crate) const CONFLICT_OUTPUT_QUALIFIED: bool = false;
 
 /// One pulse stage outcome with typed disposition and commitments.
-pub(crate) struct PulseStage<T> {
+///
+/// The member's owner output is deliberately not retained here: each stage
+/// entry invokes its named owner, digests the exact owner output into
+/// `output_commitment`, and returns the disposition record. The typed output
+/// value itself had no reader — the ledger records the commitment, not the
+/// value — so retaining it duplicated a digest the stage had already proved.
+pub(crate) struct PulseStage {
     /// Denominator member identity.
     pub id: PulseStageId,
     /// Typed member disposition.
@@ -356,19 +356,16 @@ pub(crate) struct PulseStage<T> {
     pub output_commitment: Option<String>,
     /// Static reason naming the missing owner value or refusal.
     pub reason: Option<&'static str>,
-    /// Owner output, present exactly when executed.
-    pub output: Option<T>,
 }
 
-impl<T> PulseStage<T> {
-    fn executed(id: PulseStageId, output: T, output_commitment: Option<String>) -> Self {
+impl PulseStage {
+    fn executed(id: PulseStageId, output_commitment: Option<String>) -> Self {
         Self {
             id,
             disposition: OrientationStageDisposition::Executed,
             input_commitment: Some(id.expected_input().to_owned()),
             output_commitment,
             reason: None,
-            output: Some(output),
         }
     }
 
@@ -383,7 +380,6 @@ impl<T> PulseStage<T> {
             input_commitment: None,
             output_commitment: None,
             reason: Some(reason),
-            output: None,
         }
     }
 
@@ -395,7 +391,6 @@ impl<T> PulseStage<T> {
             input_commitment: None,
             output_commitment: None,
             reason: Some(reason),
-            output: None,
         }
     }
 }
@@ -529,7 +524,7 @@ pub(crate) fn check_projection_boundary(
 
 pub(crate) fn run_classification_stage(
     stage: Option<&ClassificationStage>,
-) -> Result<PulseStage<ClassificationResult>, PulseError> {
+) -> Result<PulseStage, PulseError> {
     stage.map_or_else(
         || Ok(PulseStage::pending(PulseStageId::Classification)),
         |inputs| {
@@ -538,7 +533,6 @@ pub(crate) fn run_classification_stage(
             let commitment = output_digest(&output).ok_or(PulseError::Classification)?;
             Ok(PulseStage::executed(
                 PulseStageId::Classification,
-                output,
                 Some(commitment),
             ))
         },
@@ -547,7 +541,7 @@ pub(crate) fn run_classification_stage(
 
 pub(crate) fn run_cue_stage(
     stage: Option<&CueActivationStage>,
-) -> Result<PulseStage<CueActivationEvaluation>, PulseError> {
+) -> Result<PulseStage, PulseError> {
     stage.map_or_else(
         || Ok(PulseStage::pending(PulseStageId::CueActivation)),
         |inputs| {
@@ -556,7 +550,6 @@ pub(crate) fn run_cue_stage(
             let commitment = output_digest(&output).ok_or(PulseError::CueActivation)?;
             Ok(PulseStage::executed(
                 PulseStageId::CueActivation,
-                output,
                 Some(commitment),
             ))
         },
@@ -565,7 +558,7 @@ pub(crate) fn run_cue_stage(
 
 pub(crate) fn run_epistemic_stage(
     position_request: Option<&PositionRequest>,
-) -> Result<PulseStage<ResolvedEpistemicPosition>, PulseError> {
+) -> Result<PulseStage, PulseError> {
     position_request.map_or_else(
         || Ok(PulseStage::pending(PulseStageId::EpistemicPosition)),
         |inputs| {
@@ -573,7 +566,6 @@ pub(crate) fn run_epistemic_stage(
             let commitment = output_digest(&output).ok_or(PulseError::Epistemic)?;
             Ok(PulseStage::executed(
                 PulseStageId::EpistemicPosition,
-                output,
                 Some(commitment),
             ))
         },
@@ -582,7 +574,7 @@ pub(crate) fn run_epistemic_stage(
 
 pub(crate) fn run_understanding_stage<F>(
     stage: Option<UnderstandingStage<'_, F>>,
-) -> Result<PulseStage<ActiveUnderstandingViewResult>, PulseError>
+) -> Result<PulseStage, PulseError>
 where
     F: FnOnce(&[u8]) -> Result<SerializedContextMeasurement, ContextError>,
 {
@@ -602,7 +594,6 @@ where
             let commitment = digest_hex(&output.serialized_bytes);
             Ok(PulseStage::executed(
                 PulseStageId::Understanding,
-                output,
                 Some(commitment),
             ))
         },
@@ -611,25 +602,21 @@ where
 
 pub(crate) fn run_grounding_stage(
     grounding_request: Option<&GroundingRequest>,
-) -> Result<PulseStage<GroundedClaimDraft>, PulseError> {
+) -> Result<PulseStage, PulseError> {
     grounding_request.map_or_else(
         || Ok(PulseStage::pending(PulseStageId::Grounding)),
         |inputs| {
             let output =
                 ground_draft_with_controls(inputs.clone()).map_err(|_| PulseError::Grounding)?;
             let commitment = output_digest(&output).ok_or(PulseError::Grounding)?;
-            Ok(PulseStage::executed(
-                PulseStageId::Grounding,
-                output,
-                Some(commitment),
-            ))
+            Ok(PulseStage::executed(PulseStageId::Grounding, Some(commitment)))
         },
     )
 }
 
 pub(crate) fn run_rival_stage(
     stage: Option<&RivalStage>,
-) -> Result<PulseStage<StructuredRivalModelSet>, PulseError> {
+) -> Result<PulseStage, PulseError> {
     stage.map_or_else(
         || Ok(PulseStage::pending(PulseStageId::Rivals)),
         |inputs| {
@@ -641,18 +628,14 @@ pub(crate) fn run_rival_stage(
             )
             .map_err(|_| PulseError::Rivals)?;
             let commitment = output_digest(&output).ok_or(PulseError::Rivals)?;
-            Ok(PulseStage::executed(
-                PulseStageId::Rivals,
-                output,
-                Some(commitment),
-            ))
+            Ok(PulseStage::executed(PulseStageId::Rivals, Some(commitment)))
         },
     )
 }
 
 pub(crate) fn run_conflict_stage(
     stage: Option<&ConflictStage>,
-) -> Result<PulseStage<ConflictAnalysisCandidate>, PulseError> {
+) -> Result<PulseStage, PulseError> {
     stage.map_or_else(
         || Ok(PulseStage::pending(PulseStageId::Conflict)),
         |inputs| {
@@ -671,7 +654,6 @@ pub(crate) fn run_conflict_stage(
             let commitment = output.candidate_digest.clone();
             Ok(PulseStage::executed(
                 PulseStageId::Conflict,
-                output,
                 Some(commitment),
             ))
         },
@@ -680,17 +662,13 @@ pub(crate) fn run_conflict_stage(
 
 pub(crate) fn run_probe_stage(
     params: Option<ProbePlanParams<'_>>,
-) -> Result<PulseStage<ProbePlan>, PulseError> {
+) -> Result<PulseStage, PulseError> {
     params.map_or_else(
         || Ok(PulseStage::pending(PulseStageId::Probes)),
         |inputs| {
             let output = plan_discriminative_probes(inputs).map_err(|_| PulseError::Probes)?;
             let commitment = output_digest(&output).ok_or(PulseError::Probes)?;
-            Ok(PulseStage::executed(
-                PulseStageId::Probes,
-                output,
-                Some(commitment),
-            ))
+            Ok(PulseStage::executed(PulseStageId::Probes, Some(commitment)))
         },
     )
 }
@@ -703,7 +681,7 @@ pub(crate) const CANDIDATES_REQUIRE_PROJECTIONS: &str =
 pub(crate) fn run_candidate_stage(
     projections: Option<&CanonicalProjectionSet>,
     stage: Option<&CandidateStage>,
-) -> Result<PulseStage<ContextCandidateSetResult>, PulseError> {
+) -> Result<PulseStage, PulseError> {
     match (projections, stage) {
         (Some(projection_set), Some(inputs)) => {
             let canonical = CanonicalProjectionInput {
@@ -724,7 +702,6 @@ pub(crate) fn run_candidate_stage(
             let commitment = output_digest(&output).ok_or(PulseError::Candidates)?;
             Ok(PulseStage::executed(
                 PulseStageId::Candidates,
-                output,
                 Some(commitment),
             ))
         }
