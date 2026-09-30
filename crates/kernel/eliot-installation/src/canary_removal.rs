@@ -431,7 +431,10 @@ impl CanaryRemovalBuildBinding {
 /// resource identity the accepted registry or the original transaction can
 /// describe has one row, so a closed resource category spans one row per
 /// roster effect that names it, and every row that is not removed carries an
-/// explicit `RETAINED` or `UNSUPPORTED` action.
+/// explicit `RETAINED` or `UNSUPPORTED` action. Owner-derived rows
+/// (`CanaryEvidenceRoot`, `StoreObjects`, `GenerationRegistryRecord`) appear
+/// exactly once per `require_quiesced_owner_effects`, which runs at the
+/// destructive gates rather than inside plan validation.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CanaryRemovalPlan {
@@ -587,9 +590,11 @@ impl CanaryRemovalPlan {
             // frozen graph carries one row per installer effect, so a category
             // spans as many rows as the roster holds effects for it (one
             // `CreateRoot`/`ApplyAcl` per hierarchy root, one
-            // `RegisterService`/`StartService` per service role). Row exactness
-            // is carried by the identity uniqueness above and by
-            // `require_complete_effect_coverage`, never by category uniqueness.
+            // `RegisterService`/`StartService` per service role). Roster-row
+            // exactness is carried by the identity uniqueness above and by
+            // `require_complete_effect_coverage`; owner-derived rows carry
+            // theirs via `require_quiesced_owner_effects` at the destructive
+            // gates. Never by category uniqueness.
             categories.insert(effect.category);
         }
         for effect in &self.effects {
