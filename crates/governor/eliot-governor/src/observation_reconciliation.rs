@@ -1028,7 +1028,8 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
             response_mode,
         )
         .map_err(|error| owner_refused(format!("versioned Observe write admission failed: {error}")))?;
-        if versioned.original_source() != original {
+        let admitted_source = versioned.original_source();
+        if admitted_source != original {
             return Err(owner_refused(
                 "versioned Observe write source changed during canonical admission",
             ));
@@ -1037,7 +1038,7 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
             self.canonical,
             &input.identity,
             versioned.envelope,
-            versioned.original_source(),
+            admitted_source,
         )
         .map_err(|error| match error {
             FinishAttemptError::Composition(error) => error,
