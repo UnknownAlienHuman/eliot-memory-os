@@ -84,7 +84,7 @@ pub(super) use handshake::{is_pre_admission_pending_rejection, validate_server_h
 
 use super::{
     KERNEL_OPERATION_TIMEOUT, KernelLaunchBinding, PRE_ADMISSION_RETRY_DELAY, SERVICE_NAME,
-    unix_ms, unix_ms_i64,
+    governor_observe_serve::OBSERVE_CAPABILITY, unix_ms, unix_ms_i64,
 };
 
 const PROVIDER_CAPABILITY_VERIFY_OPERATION: &str = "native_worker.provider_capability.verify";
@@ -901,7 +901,7 @@ pub fn parse_finish_claimed_pair(
         || tool_name != Some("eliot.finish")
         || operation_id.as_str() != expected_operation
         || attempt.operation_id != expected_operation
-        || attempt.session_id.as_deref() != envelope.identity.session_id.as_deref()
+        || Some(attempt.session_id.as_str()) != envelope.identity.session_id.as_deref()
         || attempt.expires_at_unix_ms != envelope.identity.deadline_unix_ms
         || attempt.authority_epoch != envelope.state_fence.authority_epoch
     {
@@ -1285,10 +1285,6 @@ pub fn parse_observe_claimed_pair(
                     != Some(executable_input.commitment_sha256.as_str())
                 || executable_input.payload_sha256 != envelope.identity.payload_sha256
                 || !attempt_matches_owner
-                || !host_request_fence_matches_semantic(
-                    &envelope.state_fence,
-                    &executable_input.application_binding.state_fence,
-                )
                 || durable_attempt.phase != eliot_ors::HostRequestAttemptPhase::Claimed
                 || attempt.authority_epoch != envelope.state_fence.authority_epoch
                 || attempt.facet_method != OBSERVE_CAPABILITY
