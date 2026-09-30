@@ -18,11 +18,11 @@ use crate::schema;
 use eliot_store_api::{
     CanonicalValidationSnapshot, EVIDENCE_PACK_MAX_RECORDS, ExactJsonBytes,
     FencedProjectionPublication, NamedReadOperation, NamedReadRequest, NamedReadResponse,
-    OperationId, OrderingHead, OrderingHeadReadback, OrderingScopeId,
-    PAYLOAD_AUTHORITY_VERSION, PayloadEncoding, PayloadSource, ProjectionPublicationRecord,
-    RevisionHead, RevisionKey, ScopeId, ScopeRevisionView, StateFence, StoreError,
-    WriteReceipt, WriteReceiptStatus, audit_heads_digest, canonical_json_bytes,
-    generated_operation_manifests, named_mutation_operation_name, sha256_hex,
+    OperationId, OrderingHead, OrderingHeadReadback, OrderingScopeId, PAYLOAD_AUTHORITY_VERSION,
+    PayloadEncoding, PayloadSource, ProjectionPublicationRecord, RevisionHead, RevisionKey,
+    ScopeId, ScopeRevisionView, StateFence, StoreError, WriteReceipt, WriteReceiptStatus,
+    audit_heads_digest, canonical_json_bytes, generated_operation_manifests,
+    named_mutation_operation_name, sha256_hex,
 };
 
 use super::{
