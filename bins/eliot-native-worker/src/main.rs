@@ -584,7 +584,6 @@ mod tests {
         ProviderFailure, WorkerCore, WorkerEventEnvelope, WorkerFrame, WorkerFrameBody,
         WorkerHello, WorkerLifecycle,
     };
-    use eliot_protocol::{Frame, ProtocolPayload};
     use eliot_process::SessionId as ProcessSessionId;
     use eliot_process::{
         ActionLeaseRef, DispatchAuthorityId, DispatchPermitAuthority, DispatchValidationContext,
@@ -594,6 +593,7 @@ mod tests {
         ResourceLimits, SuspendedProcessIdentity, ValidatedDispatch,
     };
     use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
+    use eliot_protocol::{Frame, ProtocolPayload};
 
     use super::{
         ADMITTED_DRIVE_FAILED_EXIT, KERNEL_ADMISSION_EXIT, PROVIDER_RUNTIME_DEFERRED, block_on,

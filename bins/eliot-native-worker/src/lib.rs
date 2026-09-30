@@ -1501,9 +1501,7 @@ impl eliot_native_worker_core::CapabilityAdmissionPort for PresentationEchoAdmis
                 std::sync::atomic::Ordering::Relaxed,
                 |next| next.checked_add(1),
             ) else {
-                return Ok(
-                    self.reject_liveness("Kernel liveness identity sequence is exhausted"),
-                );
+                return Ok(self.reject_liveness("Kernel liveness identity sequence is exhausted"));
             };
             let heartbeat_id = match NativeHeartbeatId::new(format!(
                 "native-worker-heartbeat-{observed_at}-{sequence}"
@@ -1522,9 +1520,7 @@ impl eliot_native_worker_core::CapabilityAdmissionPort for PresentationEchoAdmis
                 )));
             }
         } else {
-            return Ok(
-                self.reject_liveness("authenticated Kernel liveness transport is missing"),
-            );
+            return Ok(self.reject_liveness("authenticated Kernel liveness transport is missing"));
         }
 
         Ok(AdmissionLivenessOutcome::Live(AdmissionLivenessFacts::new(
