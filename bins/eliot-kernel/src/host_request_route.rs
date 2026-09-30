@@ -3938,6 +3938,21 @@ impl KernelComposition {
     /// Kernel-owned dispatch binding ([`check_act_submit_binding`]) is
     /// revalidated before admission, while the material admission verdict
     /// stays the Governor owner's `admit_material_decision` (I01-08).
+    ///
+    /// Replay safety at this seam is record-bound (issue #1745, A6): an exact
+    /// replay of a staged operation returns the durable ORS record unchanged
+    /// and a retained result is served verbatim, so neither duplicate
+    /// execution nor new use evidence is produced; a changed binding under
+    /// the same identity fails as `IdentityConflict` in the admission core.
+    /// Exposure-receipt revisions (`ToolExposureReceiptV2` linked revisions)
+    /// carry no typed slot here — [`HostRequestRecord`] is owned by
+    /// `eliot-ors` under `deny_unknown_fields`, the per-lane queue refs hold
+    /// memory-only tool bytes, and observe kinds are the Governor owner's
+    /// closed set — so persisting them awaits the receipt owner's submission
+    /// contract through this same observation path. No parallel store is
+    /// invented; when that contract arrives, both revisions validate through
+    /// the existing receipt `validate()` (supplied-or-explicitly-unresolved,
+    /// digests checked on the recorded original, unknown never coerced).
     pub(crate) fn admit_and_queue_observe_submit(
         &self,
         envelope: &HostRequestEnvelope,
