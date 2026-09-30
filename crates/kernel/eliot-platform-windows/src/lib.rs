@@ -144,10 +144,11 @@ pub use installer_authority_key::{
     WindowsInstallationAuthorityKeyProvider, WindowsInstallationAuthorityKeyStore,
 };
 pub use installer_root::{
-    InstallerProtectedFileReadback, InstallerRootAbsentSnapshot, InstallerRootCreateAttempt,
-    InstallerRootCreateDisposition, InstallerRootError, InstallerRootObjectSnapshot,
-    InstallerRootPrimitiveCreate, InstallerRootPrimitiveObservation, InstallerRootPrimitiveSpec,
-    InstallerRootProfile, InstallerRootStage, WindowsInstallerRootPrimitive, is_process_elevated,
+    GuardOutcomeContext, InstallerProtectedFileReadback, InstallerRootAbsentSnapshot,
+    InstallerRootCreateAttempt, InstallerRootCreateDisposition, InstallerRootError,
+    InstallerRootObjectSnapshot, InstallerRootPrimitiveCreate, InstallerRootPrimitiveObservation,
+    InstallerRootPrimitiveSpec, InstallerRootProfile, InstallerRootStage,
+    WindowsInstallerRootPrimitive, is_process_elevated, scoped_restore_privilege_outcome,
     windows_path_identity_digest, windows_paths_equal,
 };
 pub use kernel_front_door_expectation::{KernelFrontDoorAclMode, KernelFrontDoorServerExpectation};
@@ -167,7 +168,6 @@ pub(crate) use kernel_front_door_server::{
     validate_kernel_front_door_executable_identity, validate_kernel_front_door_process_identity,
 };
 pub(crate) use named_pipe_peer_auth::PEER_SET_GENERIC_ALL_MAPPED;
-pub use named_pipe_peer_auth::observe_named_pipe_peer_process_in_job;
 #[cfg(test)]
 pub(crate) use named_pipe_peer_auth::{
     admit_named_pipe_peer_process, pipe_dacl_principal_allowed, validate_peer_set_ace_fields,
@@ -177,6 +177,9 @@ pub(crate) use named_pipe_peer_auth::{
 pub use named_pipe_peer_auth::{
     authenticate_named_pipe_client, authenticate_named_pipe_client_with_peer_set,
     authenticate_named_pipe_server, authenticate_named_pipe_server_with_peer_set,
+};
+pub use named_pipe_peer_auth::{
+    impersonation_guard_outcome, observe_named_pipe_peer_process_in_job,
 };
 pub use named_pipe_process_admission::{
     NamedPipePeerEvidence, NamedPipePeerExpectation, NamedPipePeerJobBinding,

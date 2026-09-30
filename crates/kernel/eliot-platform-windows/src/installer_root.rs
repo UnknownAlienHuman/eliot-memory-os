@@ -16,6 +16,13 @@ pub use contract_models::{
 
 use std::path::{Path, PathBuf};
 
+use eliot_contracts::{RequestId, RequestMetadata};
+use eliot_platform::{
+    ContainmentRecord, EffectCertainty, EffectDisposition, FailureRecord, GuardKind,
+    GuardOutcomeError, GuardRevertOutcome, OsErrorCode, PlatformHandle, RequiredNextAction,
+    RestorationAttempt, RestorationRecord, RestorationStage,
+};
+
 use super::{
     FileIdentity, ProtectedPathError, current_user_local_app_data_root, protected_program_data_root,
 };
@@ -1295,6 +1302,169 @@ fn installer_root_stage_name(stage: InstallerRootStage) -> &'static str {
         InstallerRootStage::CreateProtectedFile => "CreateProtectedFile",
         InstallerRootStage::OpenReadback => "OpenReadback",
         InstallerRootStage::Readback => "Readback",
+    }
+}
+
+/// Caller-supplied validated operation context and precomputed bounded
+/// references for one guard-revert composite.
+///
+/// Issue #1148 item A8 shared input for both guard families
+/// (`ScopedRestorePrivilege` and `ImpersonationGuard`): one owner, no second
+/// journal. The caller supplies the same validated operation context it passed
+/// to [`crate::terminal_containment::prepare_terminal_containment`] before the
+/// guarded mutation, plus the bounded [`PlatformHandle`] references it
+/// precomputed while normal allocation was safe. The guard owners never invent
+/// these values: a blank or control-bearing reference, or an unvalidated
+/// operation context, fails the composite's own `validate()` with
+/// [`GuardOutcomeError`] instead of producing a shippable payload. No raw
+/// token, ACL, principal value, or path is representable here.
+pub struct GuardOutcomeContext {
+    /// The parent operation identity and the validated State Fence under which
+    /// the guarded mutation was admitted.
+    pub parent_operation: RequestMetadata,
+    /// The child operation identity of the guarded mutation itself.
+    pub child_operation: RequestId,
+    /// Opaque bounded reference to the protected object. Never a path, token,
+    /// ACL, or principal value.
+    pub protected_object: PlatformHandle,
+    /// Opaque bounded reference to the exact pre-state the guard expected.
+    pub expected_pre_state: PlatformHandle,
+    /// Opaque bounded reference to the exact post-state the guard expected.
+    pub expected_post_state: PlatformHandle,
+    /// Opaque bounded reference to the generation of the protected object.
+    pub generation: PlatformHandle,
+    /// Opaque bounded reference to the retained bounded evidence record.
+    pub evidence_ref: PlatformHandle,
+}
+
+/// Builds the closed provider-neutral composite for one `ScopedRestorePrivilege`
+/// restoration sequence.
+///
+/// Issue #1148 item A8 producer for the token-privilege guard family; the
+/// accepted interface issue #860 consumes. The guard body keeps owning the
+/// physical restoration and the fail-stop decision; this function only projects
+/// the exact observed outcomes into the one
+/// [`GuardRevertOutcome`] payload the installation caller persists through
+/// `InstallationCoordinator::record_guard_revert`. It invents no journal, no
+/// retry, and no cleanup: installation producers keep retaining `None`, and
+/// the sibling installation drive arms retain the carried composite verbatim.
+///
+/// Ownership and lifetime rules: the context moves in by value and none of it
+/// is borrowed, so no reference outlives this call.
+///
+/// Error rules: `construction` carries the exact construction-compensation
+/// failure from `enter` (recorded under
+/// [`RestorationStage::ConstructionCompensation`]), `explicit` carries the
+/// exact `restore_typed` failure (recorded under
+/// [`RestorationStage::Explicit`]), and `primary` carries the guarded
+/// operation's own failure slot, or `None` when the primary succeeded. Each
+/// failed restoration attempt keeps its exact `u32` OS code
+/// ([`OsErrorCode::Exact`]); a non-`Win32` restoration error carries no OS
+/// code and is recorded explicitly as
+/// (`EffectDisposition::Unknown`, `EffectCertainty::Unverified`,
+/// [`OsErrorCode::NotReported`]), never as an invented zero. A failed
+/// restoration is recorded as `Partial`/`Unverified`: the elevation was
+/// applied and its restoration is incomplete, and the residual effect was not
+/// re-observed. Attempts are additive and one-based; the emergency slot stays
+/// empty here because the emergency Drop path never returns a composite.
+///
+/// The returned composite never requests terminal containment and never
+/// observes any: the fail-stop path ([`emit_abort_boundary_evidence`]) does
+/// not return, so only continuation-safe or reconcile-blocked outcomes leave
+/// through this function. `next_action` is derived, never chosen: a composite
+/// whose restoration is proven continuation-safe returns
+/// [`RequiredNextAction::ContinueNormally`]; every other composite returns
+/// [`RequiredNextAction::ReconcileRetainedEvidence`], which keeps the affected
+/// object blocked until the independent owner reconciles the exact retained
+/// evidence. A reconcile-blocked composite does not authorize thread
+/// continuation: when the thread may still be bound to the elevated duplicate
+/// (failed rebind, or a primary failure combined with a failed restoration),
+/// the guard owner must still fail-stop through the bounded terminal writer
+/// before any ordinary persistence, logging, or callback code runs, instead of
+/// returning.
+///
+/// # Errors
+///
+/// Returns the [`GuardOutcomeError`] from the composite's own `validate()`
+/// when the supplied context or references are not bindable, or when a normal
+/// return is demanded without continuation-safe OS state.
+pub fn scoped_restore_privilege_outcome(
+    context: GuardOutcomeContext,
+    primary: Option<FailureRecord>,
+    construction: Option<InstallerRootError>,
+    explicit: Option<InstallerRootError>,
+) -> Result<GuardRevertOutcome, GuardOutcomeError> {
+    let GuardOutcomeContext {
+        parent_operation,
+        child_operation,
+        protected_object,
+        expected_pre_state,
+        expected_post_state,
+        generation,
+        evidence_ref,
+    } = context;
+    let mut restoration = RestorationRecord {
+        explicit: Vec::new(),
+        emergency: Vec::new(),
+    };
+    if let Some(error) = construction {
+        restoration
+            .explicit
+            .push(token_privilege_restoration_attempt(
+                RestorationStage::ConstructionCompensation,
+                error,
+            ));
+    }
+    if let Some(error) = explicit {
+        restoration
+            .explicit
+            .push(token_privilege_restoration_attempt(
+                RestorationStage::Explicit,
+                error,
+            ));
+    }
+    let mut outcome = GuardRevertOutcome {
+        parent_operation,
+        child_operation,
+        guard: GuardKind::TokenPrivilege,
+        protected_object,
+        expected_pre_state,
+        expected_post_state,
+        generation,
+        evidence_ref,
+        primary,
+        restoration,
+        containment: ContainmentRecord::none(),
+        next_action: RequiredNextAction::ReconcileRetainedEvidence,
+    };
+    if outcome.continuation_is_safe() {
+        outcome.next_action = RequiredNextAction::ContinueNormally;
+    }
+    outcome.validate()?;
+    Ok(outcome)
+}
+
+/// Projects one exact token-privilege restoration failure onto its additive
+/// composite attempt without classifying, substituting, or dropping the code.
+fn token_privilege_restoration_attempt(
+    stage: RestorationStage,
+    error: InstallerRootError,
+) -> RestorationAttempt {
+    match error {
+        InstallerRootError::Win32 { code, .. } => RestorationAttempt {
+            stage,
+            attempt: 1,
+            disposition: EffectDisposition::Partial,
+            certainty: EffectCertainty::Unverified,
+            code: OsErrorCode::Exact(code),
+        },
+        _ => RestorationAttempt {
+            stage,
+            attempt: 1,
+            disposition: EffectDisposition::Unknown,
+            certainty: EffectCertainty::Unverified,
+            code: OsErrorCode::NotReported,
+        },
     }
 }
 

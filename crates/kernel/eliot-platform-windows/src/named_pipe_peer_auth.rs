@@ -24,8 +24,14 @@
 //! Normative sources: `docs/ARCHITECTURE_CONTRACT.md` and the canonical
 //! sharded fragments named per anchor above.
 
+use crate::installer_root::GuardOutcomeContext;
 use crate::named_pipe_process_admission::{NamedPipePeerExpectation, NamedPipePeerJobBinding};
 use crate::{ProcessIdentity, WindowsAdapterError, same_process_identity};
+use eliot_platform::{
+    ContainmentRecord, EffectCertainty, EffectDisposition, FailureRecord, GuardKind,
+    GuardOutcomeError, GuardRevertOutcome, OsErrorCode, RequiredNextAction, RestorationAttempt,
+    RestorationRecord, RestorationStage,
+};
 
 #[cfg(windows)]
 use crate::named_pipe_process_admission::{NamedPipePeerEvidence, observe_named_pipe_peer_process};
@@ -762,6 +768,102 @@ impl ImpersonationGuard {
         self.active = false;
         Ok(())
     }
+}
+
+/// Builds the closed provider-neutral composite for one `ImpersonationGuard`
+/// restoration sequence.
+///
+/// Issue #1148 item A8 producer for the thread-impersonation guard family; the
+/// accepted interface issue #860 consumes. The guard body keeps owning the
+/// physical `RevertToSelf` restoration, the first-failure retention, and the
+/// fail-stop decision; this function only projects the exact observed outcomes
+/// into the one [`GuardRevertOutcome`]
+/// payload the installation caller persists through
+/// `InstallationCoordinator::record_guard_revert`. It invents no journal, no
+/// retry, and no cleanup: installation producers keep retaining `None`, and
+/// the sibling installation drive arms retain the carried composite verbatim.
+///
+/// Ownership and lifetime rules: the context moves in by value and none of it
+/// is borrowed, so no reference outlives this call.
+///
+/// Error rules: `explicit_revert_code` carries the exact `u32` the failed
+/// `RevertToSelf` call reported, captured immediately after that call — the
+/// same code [`ImpersonationGuard::revert`] returned and the emergency Drop
+/// attempt records — or `None` when the explicit restoration succeeded. A
+/// failed restoration is recorded as one [`RestorationStage::Explicit`]
+/// attempt with `Partial`/`Unverified` disposition and certainty: impersonation
+/// was applied and its restoration is incomplete, and the residual token state
+/// was not re-observed. The exact code rides [`OsErrorCode::Exact`] unchanged;
+/// no code is classified, substituted, or replaced by an invented zero. The
+/// emergency slot stays empty here because the emergency Drop path never
+/// returns a composite; a successful emergency restoration must never erase
+/// the explicit failure this payload already retained.
+///
+/// The returned composite never requests terminal containment and never
+/// observes any: the fail-stop path
+/// ([`crate::installer_root::emit_abort_boundary_evidence`]) does not return,
+/// so only continuation-safe or reconcile-blocked outcomes leave through this
+/// function. `next_action` is derived, never chosen: a composite whose
+/// restoration is proven continuation-safe returns
+/// [`RequiredNextAction::ContinueNormally`]; every other composite returns
+/// [`RequiredNextAction::ReconcileRetainedEvidence`], which keeps the affected
+/// object blocked until the independent owner reconciles the exact retained
+/// evidence. A reconcile-blocked composite does not authorize thread
+/// continuation: when the thread may still hold the client token, the guard
+/// owner must still fail-stop through the bounded terminal writer before any
+/// ordinary persistence, logging, or callback code runs, instead of returning.
+///
+/// # Errors
+///
+/// Returns the [`GuardOutcomeError`] from the composite's own `validate()`
+/// when the supplied context or references are not bindable, or when a normal
+/// return is demanded without continuation-safe OS state.
+pub fn impersonation_guard_outcome(
+    context: GuardOutcomeContext,
+    primary: Option<FailureRecord>,
+    explicit_revert_code: Option<u32>,
+) -> Result<GuardRevertOutcome, GuardOutcomeError> {
+    let GuardOutcomeContext {
+        parent_operation,
+        child_operation,
+        protected_object,
+        expected_pre_state,
+        expected_post_state,
+        generation,
+        evidence_ref,
+    } = context;
+    let mut restoration = RestorationRecord {
+        explicit: Vec::new(),
+        emergency: Vec::new(),
+    };
+    if let Some(code) = explicit_revert_code {
+        restoration.explicit.push(RestorationAttempt {
+            stage: RestorationStage::Explicit,
+            attempt: 1,
+            disposition: EffectDisposition::Partial,
+            certainty: EffectCertainty::Unverified,
+            code: OsErrorCode::Exact(code),
+        });
+    }
+    let mut outcome = GuardRevertOutcome {
+        parent_operation,
+        child_operation,
+        guard: GuardKind::ThreadImpersonation,
+        protected_object,
+        expected_pre_state,
+        expected_post_state,
+        generation,
+        evidence_ref,
+        primary,
+        restoration,
+        containment: ContainmentRecord::none(),
+        next_action: RequiredNextAction::ReconcileRetainedEvidence,
+    };
+    if outcome.continuation_is_safe() {
+        outcome.next_action = RequiredNextAction::ContinueNormally;
+    }
+    outcome.validate()?;
+    Ok(outcome)
 }
 
 #[cfg(windows)]
