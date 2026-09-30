@@ -57,6 +57,7 @@ mod store_write_reservation;
 mod store_write_reservation_tests;
 mod testd_front_door;
 mod user_automation;
+mod user_automation_compiler;
 mod user_automation_execution;
 mod user_automation_execution_client;
 mod user_automation_failure_history;

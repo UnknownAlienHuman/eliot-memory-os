@@ -56,7 +56,7 @@ public sealed record UserAutomationCreateOperation(
         {
             throw new InvalidOperationException("create requires one typed revision payload.");
         }
-        Revision.Validate();
+        Revision.ValidateForNormalizationSubmission();
     }
 
     public override bool IsEffect() => true;
@@ -123,18 +123,16 @@ public sealed record UserAutomationEditOperation(
             throw new InvalidOperationException("edit requires both typed revision payloads.");
         }
         PreviousRevision.Validate();
-        Revision.Validate();
+        Revision.ValidateForNormalizationSubmission();
         if (!string.Equals(PreviousRevision.AutomationId, Revision.AutomationId, StringComparison.Ordinal)
             || !string.Equals(Revision.Supersedes, PreviousRevision.Revision, StringComparison.Ordinal)
             || string.Equals(PreviousRevision.Revision, Revision.Revision, StringComparison.Ordinal))
         {
             throw new InvalidOperationException("UserAutomation edit must supersede one distinct revision of the same automation.");
         }
-        // Retained operations are validated during exact-identity recovery, so
-        // this remains a structural/local consistency check. Fresh create/edit
-        // admission separately fails closed until the owner result can be bound
-        // to the submitted immutable revision.
-        UserAutomationScheduleMirror.RequireFreshOwnerEvidenceForEdit(
+        // This checks the V3 source/digest relation only. The Store owner still
+        // compiles the submitted schedule and issues its normalization receipt.
+        UserAutomationScheduleMirror.RequireV3SourceDigestConsistencyForEdit(
             PreviousRevision.Schedule,
             Revision.Schedule);
     }
@@ -476,7 +474,11 @@ public sealed record UserAutomationRevision(
     [property: JsonPropertyName("current_execution_refs")] IReadOnlyList<string> CurrentExecutionRefs,
     [property: JsonPropertyName("execution_history_query_ref")] string ExecutionHistoryQueryRef)
 {
-    public void Validate()
+    public void Validate() => Validate(allowReceiptFreeSchedule: false);
+
+    internal void ValidateForNormalizationSubmission() => Validate(allowReceiptFreeSchedule: true);
+
+    private void Validate(bool allowReceiptFreeSchedule)
     {
         // Each nested record below is a required reference-typed member that
         // decodes to null when the member is absent, and every one of them is
@@ -528,7 +530,14 @@ public sealed record UserAutomationRevision(
         UserAutomationContract.RequireOneOf(OverlapPolicy, "overlap_policy", "FORBID_OVERLAP", "QUEUE_ONE", "COALESCE_LATEST");
         if (Supersedes is not null) UserAutomationContract.RequireText(Supersedes, "supersedes");
         WorkScope.Validate();
-        Schedule.Validate();
+        if (allowReceiptFreeSchedule)
+        {
+            Schedule.ValidateForNormalizationSubmission();
+        }
+        else
+        {
+            Schedule.Validate();
+        }
         Task.Validate();
         UserAutomationContract.RequireTextList(PortableSkillPackageRevisionRefs, "portable_skill_package_revision_refs");
         if (!string.Equals(WorkdirRef, WorkScope.WorkdirRef, StringComparison.Ordinal))
@@ -577,7 +586,8 @@ public sealed record UserAutomationNormalizedSchedule(
     [property: JsonPropertyName("end_at")] string? EndAt,
     [property: JsonPropertyName("next_occurrences")] IReadOnlyList<string> NextOccurrences,
     [property: JsonPropertyName("normalization_receipt")]
-        UserAutomationScheduleNormalizationReceipt NormalizationBinding)
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        UserAutomationScheduleNormalizationReceipt? NormalizationBinding)
 {
     /// <summary>
     /// Validates the bounded wire shape and exact supported contract version of
@@ -615,24 +625,14 @@ public sealed record UserAutomationNormalizedSchedule(
     /// "normalized".
     /// </para>
     /// </remarks>
-    public void Validate()
+    public void Validate() => Validate(allowReceiptFreeDraft: false);
+
+    internal void ValidateForNormalizationSubmission() => Validate(allowReceiptFreeDraft: true);
+
+    private void Validate(bool allowReceiptFreeDraft)
     {
-        // `normalization_receipt` is a required reference-typed member and an
-        // absent member decodes to null, so `NormalizationBinding.Validate()`
-        // below is itself the dereference. `UserAutomationRevision.Validate`
-        // refuses a null `schedule`, but the schedule record being present is
-        // not the same claim as its own members being present. A
-        // `NullReferenceException` is not an `InvalidOperationException`, so
-        // the fault would escape every handler written to contain a
-        // closed-shape refusal (`MainViewModel`, the pending journal, the
-        // reconciliation loop) instead of the withheld, still-reconciling
-        // outcome they are written to produce. Refused by name here, one fixed
-        // sentence over the wire member, exactly as `create`, `edit` and
-        // `UserAutomationRevision` refuse their nested records. This adds no
-        // bound, no wire member and no digest input: a previously valid
-        // schedule carried the member, so its retained bytes still validate
-        // and still re-derive the same idempotency key.
-        if (NormalizationBinding is null) throw new InvalidOperationException("schedule.normalization_receipt must be present.");
+        // Draft Create/Edit revisions omit the owner-issued receipt. A retained
+        // or returned revision must include it and is checked below.
         UserAutomationContract.RequireOneOf(Kind, "schedule.kind", "ONE_SHOT", "RECURRING");
         UserAutomationContract.RequireText(Expression, "schedule.expression");
         UserAutomationContract.RequireText(Calendar, "schedule.calendar");
@@ -650,17 +650,28 @@ public sealed record UserAutomationNormalizedSchedule(
         {
             throw new InvalidOperationException("ONE_SHOT schedules require one next occurrence.");
         }
-        NormalizationBinding.Validate();
         var projection = UserAutomationScheduleMirror.ReadScheduleProjection(
             Timezone, DstFold, DstGap, StartAt, EndAt, NextOccurrences);
-        if (!string.Equals(
-                NormalizationBinding.SourceDigest, projection.SourceDigest, StringComparison.Ordinal))
+        if (NormalizationBinding is null)
+        {
+            if (!allowReceiptFreeDraft)
+            {
+                throw new InvalidOperationException(
+                    "schedule.normalization_receipt must be present on an admitted revision.");
+            }
+
+            return;
+        }
+
+        NormalizationBinding.Validate();
+        if (!string.Equals(NormalizationBinding.SourceDigest, projection.SourceDigest, StringComparison.Ordinal))
         {
             throw new UserAutomationScheduleContractException(
                 "Invalid",
                 UserAutomationScheduleMirror.OwnerText("Invalid", "schedule.normalization_receipt.source_digest"),
-                "obtain a new owner normalization for this expression and calendar; preserve the current immutable revision");
+                "obtain a new owner normalization for this schedule source; preserve the current immutable revision");
         }
+
         if (!string.Equals(
                 NormalizationBinding.ZoneDatabaseRevision,
                 projection.PinnedZoneDatabaseRelease,
@@ -690,9 +701,17 @@ public sealed record UserAutomationNormalizedSchedule(
     /// the owner admitted or normalized the revision.
     /// </para>
     /// </remarks>
-    public UserAutomationScheduleProjection ReadLocalProjection()
+    public UserAutomationScheduleProjection ReadLocalProjection(bool allowReceiptFreeDraft = false)
     {
-        Validate();
+        if (allowReceiptFreeDraft)
+        {
+            ValidateForNormalizationSubmission();
+        }
+        else
+        {
+            Validate();
+        }
+
         var projection = UserAutomationScheduleMirror.ReadScheduleProjection(
             Timezone, DstFold, DstGap, StartAt, EndAt, NextOccurrences);
         return projection with { NormalizationReceipt = NormalizationBinding };
@@ -700,17 +719,14 @@ public sealed record UserAutomationNormalizedSchedule(
 }
 
 /// <summary>
-/// The normalization evidence field required by the owner schedule wire
-/// contract. Parsing this caller-supplied DTO does not prove owner issuance.
+/// Owner-issued normalization evidence for an admitted schedule. A Create/Edit
+/// submission may omit it so the Store compiler can issue the receipt; parsing
+/// a caller-supplied value does not prove owner issuance.
 /// </summary>
 /// <remarks>
-/// <para>
-/// The owner side of this record is <c>deny_unknown_fields</c>, so this member
-/// is not optional: without it a 1.2.0 revision cannot round-trip through the
-/// Operator at all. These caller-supplied fields are not verified until Kernel
-/// joins the receipt ID to the exact owner-issued envelope in the authenticated
-/// preflight assembly.
-/// </para>
+/// Persisted/read revisions require this value. For a fresh Create/Edit
+/// revision, null is omitted from the request so the owner can normalize the
+/// schedule and issue the receipt.
 /// <para>
 /// <b>Why the C# member on the schedule is named <c>NormalizationBinding</c>.</b>
 /// The schedule exposes the same JSON member as <c>normalization_receipt</c>;

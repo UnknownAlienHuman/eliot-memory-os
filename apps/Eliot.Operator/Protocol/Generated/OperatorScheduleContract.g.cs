@@ -26,12 +26,12 @@
 //   crates/kernel/eliot-kernel-core/src/module/notification_state.rs
 //   crates/foundation/eliot-receipts/src/lib.rs
 //   crates/kernel/eliot-platform/src/handle_nonce.rs
-// contract_source_sha256: 33d2304da1adb9d72ea994b4649eb1a8628556e7942955ee38dd2910f857a486
-// constants_source_sha256: ea50e5435dd673fd0db560e3dbee5830f8b8382bde9ba9f41061ff5c1666a511
+// contract_source_sha256: 9718d55ca1cb1aff278bc4eb121ff5cad86a82877a4558970252ef7ad2955c46
+// constants_source_sha256: 653507ac2d8e509d78a588cc15bf6f7d621dbab20e4dec032d654a91146568d0
 // dispositions_source_sha256: c4e647fdf7f44d2ad6a194259323bf75c220b4b2bf4f00f40ffbb258cf0c2817
 // refusals_source_sha256: 2f2fd3ce7bbf507d067887e936c06089a7b21fb2576271524c55374010a2ade6
-// grammar_source_sha256: 4e4d28ddd0d419e7f5b7472737432301edcfe572bec49e165367994fa04efc2a
-// user_automation_result_schema_sha256: a33f0f2df3f54d99ac0af98f256bd4766f943552a46be06c98e5f74f4462dc5c
+// grammar_source_sha256: c101eff7f636b3adc2441df5c5a27c140f3b4c833ce1c8b27c4b432e9255923b
+// user_automation_result_schema_sha256: 785065c0d1839a65d8ea7dad8dd0415450470dfee1fab655472a49d0cd0c3a3e
 //
 // Stated boundary of this mirror. The Operator validates the bounded wire
 // shape, the exact supported contract version and the self-consistency of the
@@ -74,7 +74,7 @@ public static class OperatorScheduleContract
         "NORMALIZED_OCCURRENCE_ENCODING\t&str\t\"ELIOT/I11.12/OCCURRENCE/V4\"",
         "LEGACY_NORMALIZED_OCCURRENCE_ENCODING_V3\t&str\t\"ELIOT/I11.12/OCCURRENCE/V3\"",
         "LEGACY_NORMALIZED_OCCURRENCE_ENCODING_V2\t&str\t\"ELIOT/I11.12/OCCURRENCE/V2\"",
-        "SCHEDULE_SOURCE_DIGEST_DOMAIN\t&str\t\"ELIOT/I11.12/USER-AUTOMATION-SCHEDULE-SOURCE/V2\"",
+        "SCHEDULE_SOURCE_DIGEST_DOMAIN\t&str\t\"ELIOT/I11.12/USER-AUTOMATION-SCHEDULE-SOURCE/V3\"",
         "NORMALIZED_OCCURRENCE_FIELD_SEPARATOR\tchar\t'|'",
         "NORMALIZED_OCCURRENCE_FIELD_COUNT\tusize\t10",
         "MAX_OCCURRENCE_KEY_BYTES\tusize\t1024",
@@ -104,8 +104,8 @@ public static class OperatorScheduleContract
     /// </summary>
     public static readonly IReadOnlyList<string> GrammarFunctionDigests =
     [
-        "source_digest\t72e77c33b6c5de08128633a32ad1a2ceeed345a1eeababe5cf10f0f57d7abb82",
-        "normalized_occurrences\ta20e6c6520d6a3a9baed76218e7cd9199afde1cb2a0a87c5ab6be3fb8df6a128",
+        "source_digest\tb302613a715e598e6b013db1bc8e588763ec5c29a1e835374edddbf7aabd4a66",
+        "normalized_occurrences\t8480c4226e8f335a6e8379ad94caf1de6bcefd41e12ab7b6986fb346c83a547f",
         "parse_occurrence\t53ee26d8c5f5363416264b0d56eb527d744dd78129c530eeb6624e95e8349b0f",
         "parse_civil_wall_clock\t5578d2b151cd928f77ced97ed589e5ab4879d7cd11e0be0f1389f973a75a0984",
         "parse_utc_offset\t355b42de90101091999ed58b7faac560e01ba9199b36fe9e1a5026cc9f410de5",
@@ -129,8 +129,8 @@ public static class OperatorScheduleContract
     /// <summary>`LEGACY_NORMALIZED_OCCURRENCE_ENCODING_V2	&str	"ELIOT/I11.12/OCCURRENCE/V2"`</summary>
     public const string LEGACY_NORMALIZED_OCCURRENCE_ENCODING_V2 = "ELIOT/I11.12/OCCURRENCE/V2";
 
-    /// <summary>`SCHEDULE_SOURCE_DIGEST_DOMAIN	&str	"ELIOT/I11.12/USER-AUTOMATION-SCHEDULE-SOURCE/V2"`</summary>
-    public const string SCHEDULE_SOURCE_DIGEST_DOMAIN = "ELIOT/I11.12/USER-AUTOMATION-SCHEDULE-SOURCE/V2";
+    /// <summary>`SCHEDULE_SOURCE_DIGEST_DOMAIN	&str	"ELIOT/I11.12/USER-AUTOMATION-SCHEDULE-SOURCE/V3"`</summary>
+    public const string SCHEDULE_SOURCE_DIGEST_DOMAIN = "ELIOT/I11.12/USER-AUTOMATION-SCHEDULE-SOURCE/V3";
 
     /// <summary>`NORMALIZED_OCCURRENCE_FIELD_SEPARATOR	char	'|'`</summary>
     public const string NORMALIZED_OCCURRENCE_FIELD_SEPARATOR = "|";
@@ -203,7 +203,7 @@ public static class OperatorScheduleContract
     /// The C# decoder source pins this value separately; changing only the
     /// generated artefact cannot widen the decoder.
     /// </summary>
-    public const string USER_AUTOMATION_RESULT_SCHEMA_SHA256 = "a33f0f2df3f54d99ac0af98f256bd4766f943552a46be06c98e5f74f4462dc5c";
+    public const string USER_AUTOMATION_RESULT_SCHEMA_SHA256 = "785065c0d1839a65d8ea7dad8dd0415450470dfee1fab655472a49d0cd0c3a3e";
 
     /// <summary>Generated public members of `UserAutomationOperatorResultEnvelope`.</summary>
     public static readonly string[] USER_AUTOMATION_RESULT_ENVELOPE_MEMBERS =
@@ -415,6 +415,7 @@ public static class OperatorScheduleContract
         "mode",
         "task",
         "portable_skill_package_revision_refs",
+        "trusted_tool_definition_refs",
         "workdir_ref",
         "route_cost_policy",
         "provider_policy",
@@ -533,6 +534,20 @@ public static class OperatorScheduleContract
         "end_at",
         "next_occurrences",
         "normalization_receipt",
+    ];
+
+    /// <summary>Required serialized members of `NormalizedSchedule`.</summary>
+    public static readonly string[] USER_AUTOMATION_NORMALIZED_SCHEDULE_REQUIRED_MEMBERS =
+    [
+        "kind",
+        "expression",
+        "calendar",
+        "timezone",
+        "dst_fold",
+        "dst_gap",
+        "start_at",
+        "end_at",
+        "next_occurrences",
     ];
 
     /// <summary>Generated public members of `AutomationWorkScope`.</summary>
