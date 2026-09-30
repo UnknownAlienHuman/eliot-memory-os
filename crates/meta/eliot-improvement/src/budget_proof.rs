@@ -166,6 +166,14 @@ impl BudgetProof {
     /// caller-set Boolean left to flip: matchedness is the ledger's own
     /// `equivalence` class and conclusiveness is the recorded content of the
     /// six I18.47 delta slots.
+    ///
+    /// The three reference legs are required UNEQUALLY, and this gate does not
+    /// require all four references of I12.24:68/69 to be present: affected
+    /// checks and the delayed-harm window are each refused when missing (see
+    /// [`BudgetProof::validate`]), while the matched-budget live shadow/canary
+    /// leg is satisfied by EITHER one, so a proof carrying only live shadow, or
+    /// only live canary, promotes. All of them are caller-set references,
+    /// checked for presence and agreement and never resolved to an observation.
     pub fn supports_promotion(&self) -> Result<(), ImprovementError> {
         self.validate()?;
         if !matches!(

@@ -313,8 +313,12 @@
 //!   class and the delta's six recorded slots are checked against the original
 //!   record values, and a record whose ledger or delta differs is refused even
 //!   when it reuses the same `ledger_id`. The four evidence legs stay
-//!   caller-set references: the gate requires them to be present and to agree
-//!   with the bound proof, and does not resolve them to an observation. No
+//!   caller-set references, and they are required UNEVENLY: affected checks
+//!   and the delayed-harm window are required individually, while the
+//!   live-evidence leg is satisfied by matched-budget live shadow OR live
+//!   canary (I12.24:68), so a proof carrying only one of the two still
+//!   promotes. Each is required to agree with the bound proof, and none is
+//!   resolved to an observation. No
 //!   ledger or delta is recomputed, re-derived or substituted on either path.
 //! - The lifecycle enums carry the experiment states and enforce the edge
 //!   table: `AcceptedForExperiment` and `Running` exist only as transitions
@@ -996,8 +1000,12 @@ impl ImprovementCandidate {
     /// delta's six recorded slots — so no caller-set name or Boolean decides
     /// them. The four evidence legs (affected checks, live shadow, live canary,
     /// delayed-harm window) are caller-set references that the gate requires to
-    /// be present and to agree with the bound proof; it does not resolve them
-    /// to an observation, and nothing here claims it does. The lifecycle
+    /// agree with the bound proof; it does not resolve them to an observation,
+    /// and nothing here claims it does. They are not all required in the same
+    /// way: affected checks and the delayed-harm window must each be present,
+    /// whereas I12.24:68's matched-budget live shadow/canary leg is satisfied by
+    /// EITHER one, so a record with no live canary reference at all still
+    /// promotes when it carries a live shadow reference. The lifecycle
     /// promotion itself remains [`ImprovementCandidate::promote_lifecycle`].
     pub fn promotion_input(
         &self,
@@ -1044,12 +1052,18 @@ impl ImprovementCandidate {
 ///
 /// The remaining four — affected checks, live shadow, live canary and the
 /// delayed-harm window — stay caller-set REFERENCES, exactly as I12.24:68 and
-/// I12.24:69 leave them. The gate requires each to be present and to agree with
-/// the bound proof; it does not and cannot resolve them to an observation. The
-/// honest summary is therefore: no caller-set name or Boolean decides
+/// I12.24:69 leave them. The gate requires each to agree with the bound proof;
+/// it does not and cannot resolve any of them to an observation. Required is
+/// NOT the same as required ALL FOUR: affected checks and the delayed-harm
+/// window are each required in their own right, while I12.24:68's
+/// matched-budget live shadow/canary is required as shadow OR canary, so one of
+/// the two is enough and a record carrying only live shadow — or only live
+/// canary — promotes. The honest summary is therefore: no caller-set name or
+/// Boolean decides
 /// MATCHEDNESS or CONCLUSIVENESS (the ledger's own `validate()`, its recorded
 /// `equivalence` class and the delta's six recorded slots do), while the four
-/// evidence legs are present-and-consistent references, not attested records.
+/// evidence legs are required-and-consistent references, not attested records,
+/// required unevenly as set out above.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct OutcomeEvidence {
     pub outcome_ref: String,
@@ -1194,8 +1208,11 @@ impl OutcomeEvidence {
 /// `BudgetEquivalenceLedger` value and the recorded `ComplexityEconomicsDelta`
 /// it was judged under. It is here so the two canonical bindings are
 /// re-checkable against a canonical record rather than against the names
-/// `outcome` carries. The four evidence legs of `outcome` remain
-/// present-and-consistent references, not attested records.
+/// `outcome` carries. The four evidence legs of `outcome` remain caller-set
+/// references, not attested records: the gate requires each to agree with the
+/// bound proof, requires affected checks and the delayed-harm window
+/// individually, and accepts matched-budget live shadow OR live canary for the
+/// live leg.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PromotionInput {
     pub input_id: String,
@@ -1243,7 +1260,9 @@ impl PromotionInput {
     /// - the four evidence legs (affected checks, live shadow, live canary,
     ///   delayed-harm window) are NOT re-derived here and this method does not
     ///   claim they are: they are caller-set references that the gate requires
-    ///   to be present and to agree with the bound proof.
+    ///   to agree with the bound proof, and it requires affected checks and the
+    ///   delayed-harm window individually while accepting matched-budget live
+    ///   shadow OR live canary for the live leg (I12.24:68).
     pub fn validate(&self) -> Result<(), ImprovementError> {
         if self.direct_promotion {
             return Err(ImprovementError::SelfPromotionForbidden);
