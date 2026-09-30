@@ -1216,6 +1216,8 @@ dependencies = [
  "eliot-contracts",
  "eliot-evidence",
  "eliot-receipts",
+ "schemars",
+ "serde",
 ]
 
 [[package]]
@@ -1693,9 +1695,18 @@ dependencies = [
 name = "eliot-dreamer-orientation"
 version = "0.1.0"
 dependencies = [
+ "eliot-context-candidates",
  "eliot-context-contracts",
  "eliot-contracts",
+ "eliot-cue-activation",
+ "eliot-cue-contracts",
+ "eliot-dreamer-claim-grounding",
+ "eliot-dreamer-classification",
+ "eliot-dreamer-conflict-analysis",
  "eliot-dreamer-contracts",
+ "eliot-dreamer-probe-plan",
+ "eliot-dreamer-rival-model",
+ "eliot-epistemic",
  "eliot-epistemic-contracts",
  "eliot-evidence",
  "schemars",
@@ -1973,6 +1984,7 @@ dependencies = [
  "eliot-context-contracts",
  "eliot-contracts",
  "eliot-coordination",
+ "eliot-cue-binding",
  "eliot-cue-contracts",
  "eliot-cue-index",
  "eliot-diagnostic",

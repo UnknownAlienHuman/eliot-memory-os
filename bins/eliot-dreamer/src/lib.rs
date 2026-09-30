@@ -26,9 +26,7 @@ mod error;
 mod grounding_stage;
 pub(crate) mod kernel_port;
 mod model_stage;
-mod orientation_owner_inputs;
 mod production_orientation;
-mod pulse;
 mod result_stage;
 mod validation_stage;
 
@@ -44,7 +42,7 @@ pub use curation_screen_stage::{
     CurationProtection, CurationProtectionSet, ProtectionClass, ProtectionDecision,
 };
 pub use error::DreamerError;
-pub use production_orientation::{MeasureFn, OrientationSupply};
+pub use production_orientation::OrientationSupply;
 
 pub const SERVICE_NAME: &str = "eliot-dreamer";
 pub const PROTOCOL_VERSION: &str = "eliot.dreamer.v1";
@@ -932,25 +930,7 @@ pub struct CurationCandidate {
 /// Exact schema version accepted by [`OrientationPulseResult`].
 pub const ORIENTATION_PULSE_RESULT_SCHEMA_VERSION: u32 = 3;
 
-/// Closed per-stage disposition for one Orientation pulse member (issue #2901).
-///
-/// The composer emits `Executed` for a stage whose owner entry ran,
-/// `Pending` for a compatibility-composition member whose owner inputs were
-/// absent, and `Blocked` for a production member that cannot proceed (missing
-/// prerequisite, incoherent closure, or owner refusal). `Stale`, `Unknown`,
-/// and `NotApplicable` are versioned contract states for owner-reported
-/// conditions; no current owner reports them, so the composer never emits
-/// them today.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OrientationStageDisposition {
-    Executed,
-    Pending,
-    Blocked,
-    Stale,
-    Unknown,
-    NotApplicable,
-}
+pub use eliot_dreamer_orientation::OrientationStageDisposition;
 
 /// One pulse-member ledger record: stage/owner identity, disposition, input
 /// and output commitments, proof ceiling, bounded reason, and reopen

@@ -40,7 +40,7 @@ pub fn validate_evidence(
     input: &ClassificationSemantics<'_>,
     policy: &ClassificationPolicy,
 ) -> Result<(), ContractViolation> {
-    for evidence in &input.evidence {
+    for evidence in input.evidence {
         let Some(binding) = policy
             .grade_bindings
             .iter()

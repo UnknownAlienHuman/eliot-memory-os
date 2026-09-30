@@ -7,8 +7,10 @@
 #![forbid(unsafe_code)]
 
 pub mod input;
+pub mod orientation_owner_inputs;
 pub mod policy;
 pub mod projection;
+pub mod pulse;
 pub mod result;
 
 pub use input::{
@@ -23,7 +25,7 @@ pub use projection::{
     OrientationProvenance, OrientationResidue, OrientationSection, OrientationSectionKind,
     OrientationSemanticView, OrientationStageOutput,
 };
-pub use result::{OrientationDisposition, OrientationResult};
+pub use result::{OrientationDisposition, OrientationResult, OrientationStageDisposition};
 
 /// Pure five-input Orientation projector.
 pub fn project_orientation(

@@ -1,11 +1,14 @@
 //! Immutable stage-owner view and retained result set for one production call.
 
-use eliot_context_assembly::ActiveUnderstandingViewResult;
+use crate::{
+    InertProbe, OrientationInterpretation, OrientationResidue, OrientationSemanticView,
+    OrientationStageOutput,
+};
 use eliot_context_candidates::ContextCandidateSetResult;
 use eliot_context_candidates::{EpistemicInput, PROVIDER_EPISTEMIC};
+use eliot_context_contracts::ActiveUnderstandingViewResult;
 use eliot_context_contracts::{
-    AtomAvailability, AtomRepresentation, CanonicalProjectionSet, ContextError, ProviderId,
-    SerializedContextMeasurement,
+    AtomAvailability, AtomRepresentation, CanonicalProjectionSet, ProviderId,
 };
 use eliot_cue_activation::CueActivationEvaluation;
 use eliot_dreamer_claim_grounding::GroundingRequest;
@@ -15,10 +18,6 @@ use eliot_dreamer_contracts::grounding::GroundedDreamDraft as StructuredGrounded
 use eliot_dreamer_contracts::rival::RivalModelSet as ProbeRivalModelSet;
 use eliot_dreamer_contracts::{
     DreamInputBundle, ModelDraft, ModelRouteOutcome, ValidatedGroundingCandidate, canonical_bytes,
-};
-use eliot_dreamer_orientation::{
-    InertProbe, OrientationInterpretation, OrientationResidue, OrientationSemanticView,
-    OrientationStageOutput,
 };
 use eliot_dreamer_probe_plan::{ProbePlan, ProbePlanParams, ProbeProposal};
 use eliot_dreamer_rival_model::RivalModelSet;
@@ -35,11 +34,9 @@ use crate::pulse::{
     run_understanding_stage,
 };
 
-pub(crate) type MeasureFn = fn(&[u8]) -> Result<SerializedContextMeasurement, ContextError>;
-
 /// Borrowed typed owner records assembled from the admitted Kernel payload.
 /// This type holds no defaults and creates no owner input itself.
-pub(crate) struct OrientationOwnerInputs<'a> {
+pub struct OrientationOwnerInputs<'a> {
     pub classification: ClassificationStage<'a>,
     pub cue_activation: CueActivationStage<'a>,
     pub epistemic: &'a PositionRequest,
@@ -47,7 +44,7 @@ pub(crate) struct OrientationOwnerInputs<'a> {
     pub admitted_candidate: &'a EpistemicPositionCandidate,
     /// Original source observation retained by the Governor readback owner.
     pub source_observation: &'a ObservationRecord,
-    pub understanding: UnderstandingStage<'a, MeasureFn>,
+    pub understanding: UnderstandingStage<'a>,
     pub grounding: &'a GroundingRequest,
     pub rivals: RivalStage<'a>,
     pub conflict: ConflictStage<'a>,
@@ -56,7 +53,7 @@ pub(crate) struct OrientationOwnerInputs<'a> {
 }
 
 /// Typed native outputs retained from the exact mandatory owner calls.
-pub(crate) struct StageOutputSet {
+pub struct StageOutputSet {
     boundary_predecessors: Vec<String>,
     pub classification: Option<OrientationClassificationResult>,
     pub cue_activation: Option<CueActivationEvaluation>,
@@ -128,7 +125,7 @@ impl StageOutputSet {
     }
 
     /// Borrows packet semantics only after every mandatory owner has returned.
-    pub(crate) fn projection_view(&self) -> Option<OrientationSemanticView<'_>> {
+    pub fn projection_view(&self) -> Option<OrientationSemanticView<'_>> {
         (self.classification.is_some()
             && self.cue_activation.is_some()
             && self.epistemic_position.is_some()
@@ -433,7 +430,7 @@ fn retain_candidate_omissions(
 
 /// Ordered result of the mandatory run, preserving the executed prefix and
 /// the exact refusal stage for the production ledger.
-pub(crate) struct MandatoryStageRun {
+pub struct MandatoryStageRun {
     pub stages: Vec<PulseStage>,
     pub outputs: StageOutputSet,
     pub failure: Option<PulseError>,
@@ -528,7 +525,7 @@ impl StageAccumulator {
 
 /// Runs each named owner once in denominator order after checking the exact
 /// route and canonical-projection boundaries.
-pub(crate) fn run_mandatory_stages(
+pub fn run_mandatory_stages(
     inputs: &OrientationOwnerInputs<'_>,
     model_draft: &ModelDraft,
     bundle: &DreamInputBundle,
@@ -631,7 +628,7 @@ fn run_initial_stages(
                 recipe: inputs.understanding.recipe,
                 quality: inputs.understanding.quality,
                 policy: inputs.understanding.policy,
-                measure: inputs.understanding.measure,
+                output: inputs.understanding.output,
             }))
         },
     )
@@ -642,7 +639,7 @@ fn run_initial_stages(
 /// output: this only compares its retained whole atom with the existing
 /// candidate-mapper projection of the same typed position.
 fn check_understanding_epistemic_source(
-    stage: &UnderstandingStage<'_, MeasureFn>,
+    stage: &UnderstandingStage<'_>,
     input: &EpistemicInput,
 ) -> Result<(), PulseError> {
     let provider = ProviderId::new(PROVIDER_EPISTEMIC)
@@ -918,7 +915,7 @@ fn check_epistemic_binding(
 }
 
 fn check_understanding_binding(
-    stage: &UnderstandingStage<'_, MeasureFn>,
+    stage: &UnderstandingStage<'_>,
     bundle: &DreamInputBundle,
     projections: &CanonicalProjectionSet,
 ) -> Result<(), PulseError> {

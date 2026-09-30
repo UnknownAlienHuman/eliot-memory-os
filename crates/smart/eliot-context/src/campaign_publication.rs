@@ -63,8 +63,8 @@ pub struct ContextCampaignRecipeBody {
 
 /// Versioned native owner inputs for one campaign Context compilation.
 ///
-/// The exact profile is retained in the original ContextRecipe source and
-/// mirrored by the ContextToolPolicy projection. Their existing named-read
+/// The exact profile is retained in the original `ContextRecipe` source and
+/// mirrored by the `ContextToolPolicy` projection. Their existing named-read
 /// receipts provide source provenance; this value does not create another
 /// receipt or digest scheme.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -206,14 +206,14 @@ impl ContextCompilerSupplierProfileV1 {
     }
 }
 
-/// Typed versioned projection published by the ContextToolPolicy owner when
+/// Typed versioned projection published by the `ContextToolPolicy` owner when
 /// compilation suppliers are present.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ContextToolPolicyProjectionV1 {
     /// Projection schema version, currently exactly `1`.
     pub schema_version: u32,
-    /// Exact recipe mirrored from the ContextRecipe owner read.
+    /// Exact recipe mirrored from the `ContextRecipe` owner read.
     pub recipe: ContextRecipe,
     /// Exact original compiler supplier profile.
     pub compiler_suppliers: ContextCompilerSupplierProfileV1,

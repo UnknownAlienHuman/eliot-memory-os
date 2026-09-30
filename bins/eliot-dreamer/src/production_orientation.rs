@@ -39,14 +39,13 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use eliot_context_assembly::AssemblyPolicy;
 use eliot_context_candidates::{
     AttentionInput, CandidatePolicy, CandidateRequest, CueInput, EpistemicInput, EvidenceInput,
     MemberMeasurement,
 };
+use eliot_context_contracts::{ActiveUnderstandingViewResult, AssemblyPolicy};
 use eliot_context_contracts::{
-    AdmittedContextSet, CanonicalProjectionSet, ContextError, ContextRecipe, QualityScorecard,
-    SerializedContextMeasurement,
+    AdmittedContextSet, CanonicalProjectionSet, ContextRecipe, QualityScorecard,
 };
 use eliot_contracts::StateFence;
 use eliot_cue_activation::ActivationProfile;
@@ -55,9 +54,9 @@ use eliot_dreamer_claim_grounding::GroundingRequest;
 use eliot_dreamer_classification::ClassificationPolicy;
 use eliot_dreamer_conflict_analysis::{ConflictAnalysisPolicy, ConflictSupplements};
 use eliot_dreamer_contracts::{
-    ClassificationInput, CurationAcceptanceCtx, DreamInputBundle, DreamJobAdmission, JobClass,
-    ModelRouteDisposition, ModelRouteOutcome, ModelRouteRequest, ValidatedCandidate,
-    ValidatedCurationItem, ValidatedGroundingCandidate, bundle_digest_of,
+    DreamInputBundle, DreamJobAdmission, JobClass, ModelRouteDisposition, ModelRouteOutcome,
+    ModelRouteRequest, OrientationClassificationProfile, ValidatedCandidate, ValidatedCurationItem,
+    ValidatedGroundingCandidate, bundle_digest_of,
 };
 use eliot_dreamer_orientation::{
     AdmittedOrientationJob, CurrentEpistemicPositionHandle, OrientationDisposition,
@@ -73,17 +72,19 @@ use eliot_epistemic_contracts::{
     ConflictSet, CurrentEpistemicPosition as AdmittedPosition, EpistemicPositionCandidate,
 };
 
-use crate::orientation_owner_inputs::{OrientationOwnerInputs, run_mandatory_stages};
-use crate::pulse::{
-    CEILING_BLOCKED, CEILING_CANDIDATE_ONLY, CONFLICT_OUTPUT_QUALIFIED, CandidateStage,
-    ClassificationStage, ConflictStage, CueActivationStage, MANDATORY_DENOMINATOR, PulseError,
-    PulseStage, PulseStageId, RivalStage, UnderstandingStage, check_projection_boundary,
-    fences_compatible, output_digest,
-};
 use crate::{
     DreamJobInput, KernelJobAdmission, ORIENTATION_PULSE_RESULT_SCHEMA_VERSION,
     OrientationAdmittedPrefix, OrientationBoundaryRecord, OrientationPulseResult,
     OrientationStageDisposition, OrientationStageRecord,
+};
+use eliot_dreamer_orientation::orientation_owner_inputs::{
+    OrientationOwnerInputs, run_mandatory_stages,
+};
+use eliot_dreamer_orientation::pulse::{
+    CEILING_BLOCKED, CEILING_CANDIDATE_ONLY, CONFLICT_OUTPUT_QUALIFIED, CandidateStage,
+    ClassificationStage, ConflictStage, CueActivationStage, MANDATORY_DENOMINATOR, PulseError,
+    PulseStage, PulseStageId, RivalStage, UnderstandingStage, check_projection_boundary,
+    fences_compatible, output_digest,
 };
 
 /// Exact schema version accepted by [`ProductionOrientationInputs`].
@@ -105,13 +106,6 @@ pub(crate) const CONFLICT_UNQUALIFIED: &str = "conflict output unqualified until
 const OWNER_PROJECTIONS: &str = "governor canonical projection owner";
 /// Blocked reason when a caller reports that its owner snapshot is stale.
 pub(crate) const ORIENTATION_SUPPLY_STALE: &str = "governor orientation owner snapshot is stale";
-
-/// Immutable route-measurement function supplied with the understanding record.
-///
-/// A plain `fn` item keeps the carrier non-generic: the Governor channel
-/// supplies the measurement with the admitted set, and the composer invokes it
-/// at most once through the understanding owner entry.
-pub type MeasureFn = fn(&[u8]) -> Result<SerializedContextMeasurement, ContextError>;
 
 /// Versioned runtime-owned production carrier: everything one complete
 /// Orientation pulse must consume, with no optional mandatory member.
@@ -172,9 +166,7 @@ pub struct OrientationSupply<'a> {
     /// Governor-issued Current Epistemic Position handles for the packet.
     pub cep_handles: &'a [CurrentEpistemicPositionHandle],
     /// Owner classification input (classification stage).
-    pub classification_input: &'a ClassificationInput,
-    /// Governor acceptance context the classification selector runs under.
-    pub classification_context: &'a CurationAcceptanceCtx<'a>,
+    pub classification_input: &'a OrientationClassificationProfile,
     /// Execution policy the classification input digest binds.
     pub classification_policy: &'a ClassificationPolicy,
     /// Immutable cue-snapshot build candidate (cue-activation stage).
@@ -197,8 +189,8 @@ pub struct OrientationSupply<'a> {
     pub quality: &'a QualityScorecard,
     /// Caller-owned immutable assembly parameters (understanding stage).
     pub assembly_policy: &'a AssemblyPolicy,
-    /// Route measurement invoked once over the canonical payload bytes.
-    pub measure: MeasureFn,
+    /// Original complete Context assembly output acquired before composition.
+    pub understanding_output: &'a ActiveUnderstandingViewResult,
     /// Owner grounding request (claim-grounding stage).
     pub grounding: &'a GroundingRequest,
     /// Validated grounding candidate carrying the rival declarations.
@@ -259,7 +251,7 @@ pub(crate) struct ProductionOrientationOwnerInputs<'a> {
     /// Original source observation retained by that same owner.
     pub source_observation: &'a ObservationRecord,
     /// Understanding stage inputs with the route measurement.
-    pub understanding: UnderstandingStage<'a, MeasureFn>,
+    pub understanding: UnderstandingStage<'a>,
     /// Claim-grounding request (the owner takes an owned clone).
     pub grounding: &'a GroundingRequest,
     /// Rival-structuring stage inputs.
@@ -313,7 +305,6 @@ pub(crate) fn borrow_governor_supply<'a>(
         cep_handles: supply.cep_handles,
         classification: ClassificationStage {
             input: supply.classification_input,
-            context: supply.classification_context,
             policy: supply.classification_policy,
         },
         cue_activation: CueActivationStage {
@@ -329,7 +320,7 @@ pub(crate) fn borrow_governor_supply<'a>(
             recipe: supply.recipe,
             quality: supply.quality,
             policy: supply.assembly_policy,
-            measure: supply.measure,
+            output: supply.understanding_output,
         },
         grounding: supply.grounding,
         rivals: RivalStage {

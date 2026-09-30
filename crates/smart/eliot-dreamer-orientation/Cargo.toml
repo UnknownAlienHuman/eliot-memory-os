@@ -20,6 +20,15 @@ runtime_bundle = "eliot-dreamer"
 agent_order = 6
 
 [dependencies]
+eliot-context-candidates = { path = "../eliot-context-candidates", version = "0.1.0" }
+eliot-cue-activation = { path = "../eliot-cue-activation", version = "0.1.0" }
+eliot-cue-contracts = { path = "../eliot-cue-contracts", version = "0.1.0" }
+eliot-dreamer-claim-grounding = { path = "../eliot-dreamer-claim-grounding", version = "0.1.0" }
+eliot-dreamer-classification = { path = "../eliot-dreamer-classification", version = "0.1.0" }
+eliot-dreamer-conflict-analysis = { path = "../eliot-dreamer-conflict-analysis", version = "0.1.0" }
+eliot-dreamer-probe-plan = { path = "../eliot-dreamer-probe-plan", version = "0.1.0" }
+eliot-dreamer-rival-model = { path = "../eliot-dreamer-rival-model", version = "0.1.0" }
+eliot-epistemic = { path = "../eliot-epistemic", version = "0.1.0" }
 eliot-contracts.workspace = true
 eliot-context-contracts.workspace = true
 eliot-evidence.workspace = true

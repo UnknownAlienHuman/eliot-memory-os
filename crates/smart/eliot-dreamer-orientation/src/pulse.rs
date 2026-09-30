@@ -23,10 +23,10 @@
 //! - probes: `eliot_dreamer_probe_plan::plan_discriminative_probes`;
 //! - candidates:
 //!   `eliot_context_candidates::construct_context_candidates_with_canonical`;
-//! - packet: `eliot_dreamer_orientation::build_projection`.
+//! - packet: `crate::build_projection`.
 //!
 //! Fail-closed sequencing (issue #2901): production composes only from the
-//! versioned [`ProductionOrientationInputs`](crate::production_orientation::ProductionOrientationInputs)
+//! versioned `ProductionOrientationInputs` runtime carrier
 //! carrier, whose CC-002 outcome and CC-004 projection set are mandatory and
 //! validated first (schema, bundle-digest binding, job binding, mutual fence
 //! compatibility, one coherent identity closure). Missing prerequisites yield
@@ -45,7 +45,7 @@
 //! has a compatible input shape. The resolved epistemic position is resolver policy output,
 //! never a Governor-issued handle, so it is reported as its own stage and the
 //! packet keeps receiving only caller-supplied
-//! [`CurrentEpistemicPositionHandle`](eliot_dreamer_orientation::CurrentEpistemicPositionHandle)
+//! [`CurrentEpistemicPositionHandle`](crate::CurrentEpistemicPositionHandle)
 //! values (G5: locally built envelopes would be self-issued authority). The
 //! rival stage consumes the admitted-contracts position supplied by its owner,
 //! not the resolver output, because the two vocabularies are deliberately
@@ -54,15 +54,15 @@
 //! exact projection; candidate mapping consumes the executed cue result and
 //! exact analyzed conflict set alongside its other admitted source records.
 
-use eliot_context_assembly::{ActiveUnderstandingViewResult, AssemblyPolicy, assemble_active_view};
+use crate::OrientationError;
 use eliot_context_candidates::{
     AttentionInput, CandidatePolicy, CandidateRequest, CanonicalProjectionInput,
     ContextCandidateSetResult, CueInput, EpistemicInput, EvidenceInput, MemberMeasurement,
     construct_context_candidates_with_canonical,
 };
+use eliot_context_contracts::{ActiveUnderstandingViewResult, AssemblyPolicy};
 use eliot_context_contracts::{
-    AdmittedContextSet, CanonicalProjectionSet, ContextError, ContextRecipe, QualityScorecard,
-    SerializedContextMeasurement,
+    AdmittedContextSet, CanonicalProjectionSet, ContextRecipe, QualityScorecard,
 };
 use eliot_contracts::StateFence;
 use eliot_cue_activation::{ActivationProfile, CueActivationEvaluation, evaluate_activation};
@@ -81,7 +81,6 @@ use eliot_dreamer_contracts::{
     ValidatedCurationItem, ValidatedGroundingCandidate, bundle_digest_of, canonical_bytes,
     digest_hex,
 };
-use eliot_dreamer_orientation::OrientationError;
 use eliot_dreamer_probe_plan::{ProbePlan, ProbePlanParams, plan_discriminative_probes};
 use eliot_dreamer_rival_model::{RivalModelSet, RivalPolicy, structure_rival_models};
 use eliot_epistemic::{
@@ -94,7 +93,7 @@ use eliot_epistemic_contracts::{
 use crate::OrientationStageDisposition;
 
 /// Caller-supplied classification stage inputs (owner-built, never inferred).
-pub(crate) struct ClassificationStage<'a> {
+pub struct ClassificationStage<'a> {
     /// Original owner-published Orientation classification profile.
     pub input: &'a OrientationClassificationProfile,
     /// Execution policy the input digest binds.
@@ -102,7 +101,7 @@ pub(crate) struct ClassificationStage<'a> {
 }
 
 /// Caller-supplied cue-activation stage inputs (owner-built, never inferred).
-pub(crate) struct CueActivationStage<'a> {
+pub struct CueActivationStage<'a> {
     /// Immutable cue-snapshot build candidate under evaluation.
     pub candidate: &'a CueSnapshotBuildCandidate,
     /// Bounded activation request.
@@ -112,7 +111,7 @@ pub(crate) struct CueActivationStage<'a> {
 }
 
 /// Original admitted source records joined to one native CEP resolver request.
-pub(crate) struct EpistemicStage<'a> {
+pub struct EpistemicStage<'a> {
     /// Original candidate returned by storage readback.
     pub candidate: &'a EpistemicPositionCandidate,
     /// Original Current view returned beside that candidate.
@@ -124,7 +123,7 @@ pub(crate) struct EpistemicStage<'a> {
 }
 
 /// Caller-supplied understanding stage inputs (owner-built, never inferred).
-pub(crate) struct UnderstandingStage<'a, F> {
+pub struct UnderstandingStage<'a> {
     /// Exact admitted context set to project.
     pub admitted: &'a AdmittedContextSet,
     /// Recipe the admitted set must satisfy.
@@ -133,12 +132,12 @@ pub(crate) struct UnderstandingStage<'a, F> {
     pub quality: &'a QualityScorecard,
     /// Caller-owned immutable assembly parameters.
     pub policy: &'a AssemblyPolicy,
-    /// Route measurement invoked once over the canonical payload bytes.
-    pub measure: F,
+    /// Exact original native assembly output acquired by the runtime owner.
+    pub output: &'a ActiveUnderstandingViewResult,
 }
 
 /// Caller-supplied rival stage inputs (owner-built, never inferred).
-pub(crate) struct RivalStage<'a> {
+pub struct RivalStage<'a> {
     /// Grounded input bundle the rivals bind against.
     pub bundle: &'a DreamInputBundle,
     /// Validated grounding candidate carrying the rival declarations.
@@ -150,7 +149,7 @@ pub(crate) struct RivalStage<'a> {
 }
 
 /// Caller-supplied conflict-analysis stage inputs (owner-built, never inferred).
-pub(crate) struct ConflictStage<'a> {
+pub struct ConflictStage<'a> {
     /// Validated curation item under analysis.
     pub item: &'a ValidatedCurationItem,
     /// Admitted conflict set under analysis.
@@ -166,7 +165,7 @@ pub(crate) struct ConflictStage<'a> {
 /// The CC-004 projection set itself travels on the request boundary, not here:
 /// this stage runs only when both the boundary set and these inputs are
 /// present, so candidates always derive from the validated shared set.
-pub(crate) struct CandidateStage<'a> {
+pub struct CandidateStage<'a> {
     /// Candidate request envelope.
     pub request: &'a CandidateRequest,
     /// Context recipe fixing the denominator.
@@ -195,7 +194,7 @@ pub(crate) struct CandidateStage<'a> {
 /// the packet requires the full joined closure before it may project.
 /// [`PulseStageId::ORDER`] is the deterministic composition order.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PulseStageId {
+pub enum PulseStageId {
     Classification,
     CueActivation,
     EpistemicPosition,
@@ -253,7 +252,7 @@ impl PulseStageId {
             Self::Candidates => {
                 "eliot_context_candidates::construct_context_candidates_with_canonical"
             }
-            Self::Packet => "eliot_dreamer_orientation::build_projection",
+            Self::Packet => "crate::build_projection",
         }
     }
 
@@ -323,16 +322,15 @@ impl PulseStageId {
 }
 
 /// Canonical identity of the mandatory ten-member denominator.
-pub(crate) const PULSE_DENOMINATOR_IDENTITY: &str =
-    eliot_dreamer_orientation::projection::ORIENTATION_PRODUCT_DENOMINATOR;
+pub const PULSE_DENOMINATOR_IDENTITY: &str = crate::projection::ORIENTATION_PRODUCT_DENOMINATOR;
 
 /// Explicit composition denominator: the canonical member set this crate
 /// composes against. Whether CC-002/CC-004 are mandatory is no longer a flag
 /// on the denominator: production carries them as non-optional
-/// [`ProductionOrientationInputs`](crate::production_orientation::ProductionOrientationInputs)
+/// `ProductionOrientationInputs` runtime carrier
 /// members, so the carrier itself is the admission proof and no optional
 /// alternative denominator exists to weaken it.
-pub(crate) struct PulseDenominator {
+pub struct PulseDenominator {
     /// Canonical denominator identity carried by the result.
     pub identity: &'static str,
     /// Expected members in composition order.
@@ -340,15 +338,15 @@ pub(crate) struct PulseDenominator {
 }
 
 /// Mandatory production denominator: all ten members.
-pub(crate) const MANDATORY_DENOMINATOR: PulseDenominator = PulseDenominator {
+pub const MANDATORY_DENOMINATOR: PulseDenominator = PulseDenominator {
     identity: PULSE_DENOMINATOR_IDENTITY,
     members: &PulseStageId::ORDER,
 };
 
 /// Proof ceiling for an executed member: candidate-only, never promoted.
-pub(crate) const CEILING_CANDIDATE_ONLY: &str = "candidate_only";
+pub const CEILING_CANDIDATE_ONLY: &str = "candidate_only";
 /// Proof ceiling for a member that did not execute: nothing proved.
-pub(crate) const CEILING_BLOCKED: &str = "blocked";
+pub const CEILING_BLOCKED: &str = "blocked";
 
 /// Whether conflict owner output qualifies toward a complete pulse.
 ///
@@ -356,7 +354,7 @@ pub(crate) const CEILING_BLOCKED: &str = "blocked";
 /// and #2870 (canonical pair orientation, one-digest invariant) land: an
 /// executed conflict stage stays unqualified and caps the overall pulse at
 /// partial. Owned here, flipped only by that repair wave.
-pub(crate) const CONFLICT_OUTPUT_QUALIFIED: bool = false;
+pub const CONFLICT_OUTPUT_QUALIFIED: bool = false;
 
 /// One pulse stage outcome with typed disposition and commitments.
 ///
@@ -365,7 +363,7 @@ pub(crate) const CONFLICT_OUTPUT_QUALIFIED: bool = false;
 /// `output_commitment`, and returns the disposition record. The typed output
 /// value itself had no reader â€” the ledger records the commitment, not the
 /// value â€” so retaining it duplicated a digest the stage had already proved.
-pub(crate) struct PulseStage {
+pub struct PulseStage {
     /// Denominator member identity.
     pub id: PulseStageId,
     /// Typed member disposition.
@@ -419,7 +417,7 @@ impl PulseStage {
     }
 
     /// Records a production member that cannot proceed.
-    pub(crate) fn blocked(id: PulseStageId, reason: &'static str) -> Self {
+    pub fn blocked(id: PulseStageId, reason: &'static str) -> Self {
         Self {
             id,
             disposition: OrientationStageDisposition::Blocked,
@@ -433,8 +431,8 @@ impl PulseStage {
 }
 
 /// Native result values returned by the mandatory stage owners.
-pub(crate) enum StageOwnerOutput {
-    Classification(Box<ClassificationResult>),
+pub enum StageOwnerOutput {
+    Classification(Box<OrientationClassificationResult>),
     CueActivation(CueActivationEvaluation),
     EpistemicPosition(CurrentEpistemicPosition),
     Understanding(Box<ActiveUnderstandingViewResult>),
@@ -462,13 +460,13 @@ struct GroundingInput<'a> {
 ///
 /// Returns `None` only when canonical serialization fails, which the caller
 /// treats as an owner defect.
-pub(crate) fn output_digest<T: serde::Serialize>(value: &T) -> Option<String> {
+pub fn output_digest<T: serde::Serialize>(value: &T) -> Option<String> {
     canonical_owner_output(value).map(|(digest, _)| digest)
 }
 
 /// Returns the exact canonical output bytes and their existing owner
 /// commitment in one serialization pass.
-pub(crate) fn canonical_owner_output<T: serde::Serialize>(value: &T) -> Option<(String, Vec<u8>)> {
+pub fn canonical_owner_output<T: serde::Serialize>(value: &T) -> Option<(String, Vec<u8>)> {
     canonical_bytes(value)
         .ok()
         .map(|bytes| (digest_hex(&bytes), bytes))
@@ -478,13 +476,13 @@ pub(crate) fn canonical_owner_output<T: serde::Serialize>(value: &T) -> Option<(
 ///
 /// This ledger commitment does not replace or reissue any digest carried by
 /// an input contract.
-pub(crate) fn canonical_input_commitment<T: serde::Serialize>(value: &T) -> Option<String> {
+pub fn canonical_input_commitment<T: serde::Serialize>(value: &T) -> Option<String> {
     canonical_bytes(value).ok().map(|bytes| digest_hex(&bytes))
 }
 
 /// Fail-closed pulse error with bounded static refusal fields.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum PulseError {
+pub enum PulseError {
     /// CC-002/CC-004 boundary validation failed; carries the static field.
     #[error("pulse boundary refused: {0}")]
     Boundary(&'static str),
@@ -529,11 +527,11 @@ pub(crate) enum PulseError {
     Packet(#[from] OrientationError),
 }
 
-pub(crate) fn fences_compatible(left: &StateFence, right: &StateFence) -> bool {
+pub fn fences_compatible(left: &StateFence, right: &StateFence) -> bool {
     left.is_compatible_with(right) && right.is_compatible_with(left)
 }
 
-pub(crate) fn check_model_boundary(
+pub fn check_model_boundary(
     outcome: &ModelRouteOutcome,
     bundle: &DreamInputBundle,
 ) -> Result<(), PulseError> {
@@ -560,7 +558,7 @@ pub(crate) fn check_model_boundary(
     Ok(())
 }
 
-pub(crate) fn check_projection_boundary(
+pub fn check_projection_boundary(
     projections: &CanonicalProjectionSet,
     bundle: &DreamInputBundle,
 ) -> Result<(), PulseError> {
@@ -578,7 +576,7 @@ pub(crate) fn check_projection_boundary(
     Ok(())
 }
 
-pub(crate) fn run_classification_stage(
+pub fn run_classification_stage(
     stage: Option<&ClassificationStage>,
 ) -> Result<PulseStage, PulseError> {
     stage.map_or_else(
@@ -610,7 +608,7 @@ pub(crate) fn run_classification_stage(
     )
 }
 
-pub(crate) fn run_cue_stage(stage: Option<&CueActivationStage>) -> Result<PulseStage, PulseError> {
+pub fn run_cue_stage(stage: Option<&CueActivationStage>) -> Result<PulseStage, PulseError> {
     stage.map_or_else(
         || Ok(PulseStage::pending(PulseStageId::CueActivation)),
         |inputs| {
@@ -635,9 +633,7 @@ pub(crate) fn run_cue_stage(stage: Option<&CueActivationStage>) -> Result<PulseS
     )
 }
 
-pub(crate) fn run_epistemic_stage(
-    stage: Option<&EpistemicStage<'_>>,
-) -> Result<PulseStage, PulseError> {
+pub fn run_epistemic_stage(stage: Option<&EpistemicStage<'_>>) -> Result<PulseStage, PulseError> {
     stage.map_or_else(
         || Ok(PulseStage::pending(PulseStageId::EpistemicPosition)),
         |inputs| {
@@ -678,12 +674,9 @@ pub(crate) fn run_epistemic_stage(
     )
 }
 
-pub(crate) fn run_understanding_stage<F>(
-    stage: Option<UnderstandingStage<'_, F>>,
-) -> Result<PulseStage, PulseError>
-where
-    F: FnOnce(&[u8]) -> Result<SerializedContextMeasurement, ContextError>,
-{
+pub fn run_understanding_stage(
+    stage: Option<UnderstandingStage<'_>>,
+) -> Result<PulseStage, PulseError> {
     stage.map_or_else(
         || Ok(PulseStage::pending(PulseStageId::Understanding)),
         |inputs| {
@@ -718,14 +711,30 @@ where
                 measurement_status: inputs.policy.measurement_status,
             })
             .ok_or(PulseError::Understanding)?;
-            let output = assemble_active_view(
-                inputs.admitted,
-                inputs.recipe,
-                (*inputs.quality).clone(),
-                inputs.policy,
-                inputs.measure,
-            )
-            .map_err(|_| PulseError::Understanding)?;
+            inputs
+                .policy
+                .validate()
+                .map_err(|_| PulseError::Understanding)?;
+            let output = inputs.output;
+            output
+                .view
+                .validate_against(inputs.admitted)
+                .map_err(|_| PulseError::Understanding)?;
+            let measurement = &output.view.measurement;
+            if measurement.serializer_id != inputs.policy.serializer_id
+                || measurement.serializer_version != inputs.policy.serializer_version
+                || measurement.serializer_options_digest != inputs.policy.serializer_options_digest
+                || measurement.route_id != inputs.policy.route_id
+                || measurement.model_id != inputs.policy.model_id
+                || measurement.status != inputs.policy.measurement_status
+                || measurement.rendered_utf8_bytes > inputs.policy.max_serialized_bytes
+                || u64::try_from(output.serialized_bytes.len()).ok()
+                    != Some(measurement.rendered_utf8_bytes)
+                || eliot_contracts::sha256_hex(&output.serialized_bytes)
+                    != output.view.output_digest
+            {
+                return Err(PulseError::Understanding);
+            }
             if output.admitted != *inputs.admitted
                 || output.view.binding != inputs.admitted.binding
                 || output.view.quality != *inputs.quality
@@ -752,14 +761,14 @@ where
                 PulseStageId::Understanding,
                 input_commitment,
                 commitment,
-                StageOwnerOutput::Understanding(Box::new(output)),
+                StageOwnerOutput::Understanding(Box::new(output.clone())),
                 canonical,
             ))
         },
     )
 }
 
-pub(crate) fn run_grounding_stage(
+pub fn run_grounding_stage(
     grounding_request: Option<&GroundingRequest>,
 ) -> Result<PulseStage, PulseError> {
     grounding_request.map_or_else(
@@ -813,7 +822,7 @@ pub(crate) fn run_grounding_stage(
     )
 }
 
-pub(crate) fn run_rival_stage(stage: Option<&RivalStage>) -> Result<PulseStage, PulseError> {
+pub fn run_rival_stage(stage: Option<&RivalStage>) -> Result<PulseStage, PulseError> {
     stage.map_or_else(
         || Ok(PulseStage::pending(PulseStageId::Rivals)),
         |inputs| {
@@ -862,7 +871,7 @@ pub(crate) fn run_rival_stage(stage: Option<&RivalStage>) -> Result<PulseStage, 
     )
 }
 
-pub(crate) fn run_conflict_stage(
+pub fn run_conflict_stage(
     stage: Option<&ConflictStage>,
     candidate: Option<&ValidatedGroundingCandidate>,
 ) -> Result<PulseStage, PulseError> {
@@ -910,9 +919,7 @@ pub(crate) fn run_conflict_stage(
     }
 }
 
-pub(crate) fn run_probe_stage(
-    params: Option<ProbePlanParams<'_>>,
-) -> Result<PulseStage, PulseError> {
+pub fn run_probe_stage(params: Option<ProbePlanParams<'_>>) -> Result<PulseStage, PulseError> {
     params.map_or_else(
         || Ok(PulseStage::pending(PulseStageId::Probes)),
         |inputs| {
@@ -955,10 +962,10 @@ pub(crate) fn run_probe_stage(
 
 /// Pending reason when the candidate stage has owner inputs but the CC-004
 /// projection boundary is absent.
-pub(crate) const CANDIDATES_REQUIRE_PROJECTIONS: &str =
+pub const CANDIDATES_REQUIRE_PROJECTIONS: &str =
     "pulse context candidates require CC-004 projection set";
 
-pub(crate) fn run_candidate_stage(
+pub fn run_candidate_stage(
     projections: Option<&CanonicalProjectionSet>,
     stage: Option<&CandidateStage>,
     cue_activation: Option<&eliot_cue_activation::CueActivationEvaluation>,
