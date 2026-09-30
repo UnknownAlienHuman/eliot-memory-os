@@ -236,14 +236,18 @@ impl MaintenanceTriggerDeliveryLedger {
             match (&row.disposition, &row.claim) {
                 (MaintenanceTriggerDisposition::Claimed, Some(_))
                 | (
-                    MaintenanceTriggerDisposition::Pending
-                    | MaintenanceTriggerDisposition::DecisionRecorded
+                    MaintenanceTriggerDisposition::DecisionRecorded
                     | MaintenanceTriggerDisposition::Acknowledged
                     | MaintenanceTriggerDisposition::Reconciling
                     | MaintenanceTriggerDisposition::Expired
                     | MaintenanceTriggerDisposition::Superseded,
                     _,
                 ) => {}
+                // Awaiting-claim rows never carry a live claim: every ledger
+                // transition that parks a row in `Pending` clears its claim,
+                // so a restored `Pending` row with a claim is damage, not a
+                // guessed-complete entry.
+                (MaintenanceTriggerDisposition::Pending, None) => {}
                 _ => {
                     return Err(ProtocolError::InvalidField {
                         field: "maintenance_trigger_delivery.claim",
