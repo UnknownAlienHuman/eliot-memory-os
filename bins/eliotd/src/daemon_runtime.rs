@@ -4807,10 +4807,6 @@ async fn prepare_observation_capture(
         .map_err(|error| format!("Host Observe identity cannot encode: {error}"))?
         || application.session_ref.as_str()
             != host_identity.session_id.as_deref().unwrap_or_default()
-        || application.task_ref.as_ref().map(|task| task.as_str())
-            != host_identity.task_id.as_deref()
-        || application.scope_ref.as_ref().map(|scope| scope.as_str())
-            != host_identity.work_scope_id.as_deref()
     {
         return Err("Observe application binding differs from its admitted identity".to_owned());
     }
@@ -4825,7 +4821,12 @@ async fn prepare_observation_capture(
             .map_err(|error| format!("Observe current owner binding: {error}"))?;
         if binding.authenticated_principal_ref != principal_ref
             || binding.authenticated_session_ref != host_identity.session_id.as_deref().unwrap_or_default()
-            || binding.authenticated_scope_ref != host_identity.work_scope_id.as_deref().unwrap_or_default()
+            || application.scope_ref.as_ref().map(|scope| scope.as_str())
+                != Some(binding.authenticated_scope_ref.as_str())
+            || host_identity
+                .work_scope_id
+                .as_deref()
+                .is_some_and(|scope| scope != binding.authenticated_scope_ref)
             || binding.authenticated_task_ref.is_some()
             || binding.state_fence != semantic_fence
         {
@@ -4855,10 +4856,7 @@ async fn prepare_observation_capture(
             .session_id
             .as_deref()
             .ok_or_else(|| "task-relative Observe request has no authenticated session".to_owned())?;
-        let scope_ref = host_identity
-            .work_scope_id
-            .as_deref()
-            .ok_or_else(|| "task-relative Observe request has no WorkScope".to_owned())?;
+        let scope_ref = capture_binding.authenticated_scope_ref.as_str();
         let now = unix_ms(SystemTime::now())?;
         let pending = {
             let guard = composition.lock().await;
@@ -4932,6 +4930,7 @@ async fn prepare_observation_capture(
         .map_err(|error| format!("selected Observe task id is invalid: {error}"))?;
     identity.request.metadata.session_id = Some(session_id);
     identity.request.metadata.task_id = task_id;
+    identity.request.metadata.work_scope_id = Some(capture_binding.authenticated_scope_ref.clone());
     identity.request.metadata.state_fence = semantic_fence.clone();
     identity.request.state_fence = semantic_fence.clone();
     identity
@@ -4979,8 +4978,7 @@ async fn prepare_observation_capture(
             .map(eliot_contracts::SessionId::as_str)
             .unwrap_or_default();
         let task_ref = previous.task_ref();
-        let scope_ref = host_identity.work_scope_id.as_deref()
-            .ok_or_else(|| "task-relative Observe request has no WorkScope".to_owned())?;
+        let scope_ref = capture_binding.authenticated_scope_ref.as_str();
         let pending = {
             let guard = composition.lock().await;
             guard
@@ -5062,7 +5060,7 @@ async fn prepare_observation_capture(
         let task_ref = identity.request.metadata.task_id.as_ref()
             .map(eliot_contracts::TaskId::as_str)
             .unwrap_or_default();
-        let scope_ref = host_identity.work_scope_id.as_deref().unwrap_or_default();
+        let scope_ref = capture_binding.authenticated_scope_ref.as_str();
         let port = OwnerSelectionKernelPort::new(
             kernel,
             (&principal_ref, session_ref, task_ref, scope_ref),
