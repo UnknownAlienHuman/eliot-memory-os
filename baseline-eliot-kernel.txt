@@ -1,0 +1,134 @@
+    Checking eliot-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\foundation\eliot-contracts)
+    Checking eliot-conformance-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\foundation\eliot-conformance-contracts)
+    Checking eliot-build-test-graph v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\instrument\eliot-build-test-graph)
+    Checking eliot-windows-ipc v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\eliot-windows-ipc)
+    Checking eliot-source-assurance v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\security\eliot-source-assurance)
+    Checking eliot-receipts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\foundation\eliot-receipts)
+    Checking eliot-evidence v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\foundation\eliot-evidence)
+    Checking eliot-runtime-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\foundation\eliot-runtime-contracts)
+    Checking eliot-instrument-api v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\instrument\eliot-instrument-api)
+    Checking eliot-agent-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\agent\eliot-agent-contracts)
+    Checking eliot-doctor-core v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\meta\eliot-doctor-core)
+    Checking eliot-observability v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\instrument\eliot-observability)
+    Checking eliot-security-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\foundation\eliot-security-contracts)
+    Checking eliot-epistemic-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\smart\eliot-epistemic-contracts)
+    Checking eliot-learning-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\smart\eliot-learning-contracts)
+    Checking eliot-cue-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\smart\eliot-cue-contracts)
+    Checking eliot-influence v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\security\eliot-influence)
+    Checking eliot-epistemic v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\smart\eliot-epistemic)
+    Checking eliot-observation-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\foundation\eliot-observation-contracts)
+    Checking eliot-platform v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\kernel\eliot-platform)
+    Checking eliot-protocol v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\foundation\eliot-protocol)
+    Checking eliot-rules v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\foundation\eliot-rules)
+    Checking eliot-config v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\governor\eliot-config)
+    Checking eliot-authority v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\governor\eliot-authority)
+    Checking eliot-skills v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\surfaces\eliot-skills)
+    Checking eliot-process v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\kernel\eliot-process)
+    Checking eliot-platform-windows v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\kernel\eliot-platform-windows)
+    Checking eliot-blob-api v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\storage\eliot-blob-api)
+    Checking eliot-agent-api v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\agent\eliot-agent-api)
+    Checking eliot-runtime v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\kernel\eliot-runtime)
+    Checking eliot-wasm-runtime v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\modules\eliot-wasm-runtime)
+    Checking eliot-observability-runtime v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\instrument\eliot-observability-runtime)
+    Checking eliot-process-executor v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\instrument\eliot-process-executor)
+    Checking eliot-context-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\smart\eliot-context-contracts)
+    Checking eliot-bootstrap v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\foundation\eliot-bootstrap)
+    Checking eliot-ipc v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\kernel\eliot-ipc)
+    Checking eliot-testd-core v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\instrument\eliot-testd-core)
+    Checking eliot-installation v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\kernel\eliot-installation)
+    Checking eliot-workscope v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\governor\eliot-workscope)
+    Checking eliot-reactive-context-plan v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\smart\eliot-reactive-context-plan)
+    Checking eliot-store-api v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\storage\eliot-store-api)
+    Checking eliot-ors v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\kernel\eliot-ors)
+    Checking eliot-skill v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\governor\eliot-skill)
+    Checking eliot-ecxf v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\storage\eliot-ecxf)
+    Checking eliot-backup v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\storage\eliot-backup)
+    Checking eliot-kernel-core v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\kernel\eliot-kernel-core)
+    Checking eliot-mcp v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\surfaces\eliot-mcp)
+    Checking eliot-kernel-service v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\kernel\eliot-kernel-service)
+    Checking eliot-kernel v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\bins\eliot-kernel)
+error: large future with a size of 16432 bytes
+   --> bins\eliot-kernel\src\control_plane.rs:471:31
+    |
+471 |                   let receipt = self
+    |  _______________________________^
+472 | |                     .rebind_store(handoff.clone(), request.payload_digest.clone())
+    | |__________________________________________________________________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#large_futures
+    = note: `-D clippy::large-futures` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::large_futures)]`
+help: consider `Box::pin` on it
+    |
+471 ~                 let receipt = Box::pin(self
+472 +                     .rebind_store(handoff.clone(), request.payload_digest.clone()))
+    |
+
+error: field name starts with the struct's name
+  --> bins\eliot-kernel\src\testd_terminal_completion_route.rs:72:5
+   |
+72 |     pub request_digest: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#struct_field_names
+   = note: `-D clippy::struct-field-names` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::struct_field_names)]`
+
+error: deref which would be done by auto-deref
+    --> bins\eliot-kernel\src\daemon_request_dispatch.rs:4660:13
+     |
+4660 |             &*gateway,
+     |             ^^^^^^^^^ help: try: `&gateway`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#explicit_auto_deref
+     = note: `-D clippy::explicit-auto-deref` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::explicit_auto_deref)]`
+
+error: deref which would be done by auto-deref
+    --> bins\eliot-kernel\src\daemon_request_dispatch.rs:4776:17
+     |
+4776 |                 &*gateway,
+     |                 ^^^^^^^^^ help: try: `&gateway`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#explicit_auto_deref
+
+error: deref which would be done by auto-deref
+    --> bins\eliot-kernel\src\daemon_request_dispatch.rs:5999:46
+     |
+5999 |         ensure_user_automation_store_receipt(&*gateway, &lookup.state_fence, &request.identity)
+     |                                              ^^^^^^^^^ help: try: `&gateway`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#explicit_auto_deref
+
+error: these match arms have identical bodies
+    --> bins\eliot-kernel\src\daemon_request_dispatch.rs:9273:9
+     |
+9273 |         PeerIdentity::Authenticated { .. } => Err(TransportError::PeerIdentityUnavailable),
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+9274 |         PeerIdentity::Unavailable { .. } => Err(TransportError::PeerIdentityUnavailable),
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: if this is unintentional make the arms return different values
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#match_same_arms
+     = note: `-D clippy::match-same-arms` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::match_same_arms)]`
+help: otherwise merge the patterns into a single arm
+     |
+9273 ~         PeerIdentity::Authenticated { .. } | PeerIdentity::Unavailable { .. } => Err(TransportError::PeerIdentityUnavailable),
+9274 ~         }
+     |
+
+error: this function has too many lines (164/100)
+    --> bins\eliot-kernel\src\dispatch_launch.rs:1719:1
+     |
+1719 | / pub(crate) fn read_testd_terminal_completion(
+1720 | |     service: &KernelService,
+1721 | |     request: &super::testd_terminal_completion_route::Request,
+1722 | | ) -> Result<super::testd_terminal_completion_route::Response, DispatchLaunchError> {
+     | |__________________________________________________________________________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#too_many_lines
+     = note: `-D clippy::too-many-lines` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::too_many_lines)]`
+
+error: could not compile `eliot-kernel` (lib) due to 7 previous errors

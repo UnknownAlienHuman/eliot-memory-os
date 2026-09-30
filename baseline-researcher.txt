@@ -1,0 +1,8 @@
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Checking eliot-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\foundation\eliot-contracts)
+    Checking eliot-research-exchange-api v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\research\eliot-research-exchange-api)
+    Checking eliot-research-exchange v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\research\eliot-research-exchange)
+    Checking eliot-researcher v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\research\eliot-researcher)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 8.09s

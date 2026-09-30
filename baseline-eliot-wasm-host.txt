@@ -1,0 +1,91 @@
+    Blocking waiting for file lock on package cache
+    Checking eliot-conformance-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\foundation\eliot-conformance-contracts)
+    Checking eliot-windows-ipc v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\eliot-windows-ipc)
+    Checking eliot-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\foundation\eliot-contracts)
+    Checking eliot-source-assurance v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\security\eliot-source-assurance)
+    Checking eliot-build-test-graph v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\instrument\eliot-build-test-graph)
+    Checking eliot-integration-coverage v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\governor\eliot-integration-coverage)
+    Checking eliot-receipts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\foundation\eliot-receipts)
+    Checking eliot-evidence v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\foundation\eliot-evidence)
+    Checking eliot-runtime-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\foundation\eliot-runtime-contracts)
+    Checking eliot-instrument-api v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\instrument\eliot-instrument-api)
+    Checking eliot-agent-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\agent\eliot-agent-contracts)
+    Checking eliot-session v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\governor\eliot-session)
+    Checking eliot-task v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\governor\eliot-task)
+    Checking eliot-doctor-core v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\meta\eliot-doctor-core)
+    Checking eliot-diagnostic v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\instrument\eliot-diagnostic)
+    Checking eliot-reports v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\instrument\eliot-reports)
+    Checking eliot-security-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\foundation\eliot-security-contracts)
+    Checking eliot-epistemic-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\smart\eliot-epistemic-contracts)
+    Checking eliot-evaluation-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\foundation\eliot-evaluation-contracts)
+    Checking eliot-memory-projection-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\foundation\eliot-memory-projection-contracts)
+    Checking eliot-learning-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\smart\eliot-learning-contracts)
+    Checking eliot-change-monitor v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\governor\eliot-change-monitor)
+    Checking eliot-coordination v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\governor\eliot-coordination)
+    Checking eliot-cue-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\smart\eliot-cue-contracts)
+    Checking eliot-influence v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\security\eliot-influence)
+    Checking eliot-epistemic v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\smart\eliot-epistemic)
+    Checking eliot-cue-index v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\smart\eliot-cue-index)
+    Checking eliot-learning-delta v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\smart\eliot-learning-delta)
+    Checking eliot-learning-activation-assessment v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\meta\eliot-learning-activation-assessment)
+    Checking eliot-observation-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\foundation\eliot-observation-contracts)
+    Checking eliot-protocol v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\foundation\eliot-protocol)
+    Checking eliot-platform v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\kernel\eliot-platform)
+    Checking eliot-rules v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\foundation\eliot-rules)
+    Checking eliot-authority v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\governor\eliot-authority)
+    Checking eliot-config v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\governor\eliot-config)
+    Checking eliot-module-registry v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\governor\eliot-module-registry)
+    Checking eliot-skills v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\surfaces\eliot-skills)
+    Checking eliot-process v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\kernel\eliot-process)
+    Checking eliot-platform-windows v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\kernel\eliot-platform-windows)
+    Checking eliot-budget v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\governor\eliot-budget)
+    Checking eliot-agent-api v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\agent\eliot-agent-api)
+    Checking eliot-maintenance v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\governor\eliot-maintenance)
+    Checking eliot-observation v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\governor\eliot-observation)
+    Checking eliot-problem v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\governor\eliot-problem)
+    Checking eliot-runtime v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\kernel\eliot-runtime)
+    Checking eliot-instrument-nextest v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\instrument\eliot-instrument-nextest)
+    Checking eliot-wasm-runtime v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\modules\eliot-wasm-runtime)
+    Checking eliot-verifier v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\instrument\eliot-verifier)
+    Checking eliot-process-executor v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\instrument\eliot-process-executor)
+    Checking eliot-context-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\smart\eliot-context-contracts)
+    Checking eliot-bootstrap v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\foundation\eliot-bootstrap)
+    Checking eliot-testd-core v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\instrument\eliot-testd-core)
+    Checking eliot-workscope v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\governor\eliot-workscope)
+    Checking eliot-reactive-context-plan v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\smart\eliot-reactive-context-plan)
+    Checking eliot-dreamer-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\smart\eliot-dreamer-contracts)
+    Checking eliot-context-candidates v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\smart\eliot-context-candidates)
+    Checking eliot-context-measurement v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\smart\eliot-context-measurement)
+    Checking eliot-store-api v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\storage\eliot-store-api)
+    Checking eliot-ors v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\kernel\eliot-ors)
+    Checking eliot-canonical v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\governor\eliot-canonical)
+    Checking eliot-skill v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\governor\eliot-skill)
+    Checking eliot-read v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\governor\eliot-read)
+    Checking eliot-finish v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\governor\eliot-finish)
+    Checking eliot-dreamer-failure v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\smart\eliot-dreamer-failure)
+    Checking eliot-kernel-core v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\kernel\eliot-kernel-core)
+    Checking eliot-mcp v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\surfaces\eliot-mcp)
+    Checking eliot-governor v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\governor\eliot-governor)
+    Checking eliot-improvement v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\meta\eliot-improvement)
+    Checking eliot-context-assembly v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\smart\eliot-context-assembly)
+    Checking eliot-context-admission v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\crates\smart\eliot-context-admission)
+    Checking eliot-wasm-host v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-base-cb2\bins\eliot-wasm-host)
+error: very complex type used. Consider factoring parts into `type` definitions
+   --> bins\eliot-wasm-host\src\dispatch_drive.rs:935:13
+    |
+935 |     screen: Option<&dyn Fn(&[u8]) -> Result<(), DriveError>>,
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#type_complexity
+    = note: `-D clippy::type-complexity` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::type_complexity)]`
+
+error: very complex type used. Consider factoring parts into `type` definitions
+  --> bins\eliot-wasm-host\src\parent_dispatch.rs:29:13
+   |
+29 |     screen: Option<&dyn Fn(&[u8]) -> Result<(), DriveError>>,
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#type_complexity
+
+error: could not compile `eliot-wasm-host` (lib) due to 2 previous errors
