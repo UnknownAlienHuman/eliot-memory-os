@@ -63,7 +63,8 @@ pub use finish_disposition::{
 pub use plan_consumer::{ApplicableInputs, ResolverPlanConsumer};
 pub use work_envelope::{
     BUILD_ROOT_DIRECTORY, BuildMode, CARGO_HOME_ENV, CARGO_TARGET_DIR_ENV, CandidateIdentity,
-    GovernedWorkEnvelope, LaneIdentity, RuntimeEnvironmentLease, WorkEnvelopeError,
+    FIXTURE_NAMESPACE_ENV, FIXTURE_ROOT_DIRECTORY, FIXTURE_ROOT_ENV, GovernedWorkEnvelope,
+    LaneIdentity, RuntimeEnvironmentLease, WorkEnvelopeError,
 };
 
 pub(crate) fn validate_text_shape(value: &str, field: &'static str) -> Result<(), GraphError> {

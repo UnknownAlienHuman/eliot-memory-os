@@ -9,7 +9,8 @@
 
 pub use eliot_build_test_graph::{
     BUILD_ROOT_DIRECTORY, BuildFingerprint, BuildMode, CARGO_HOME_ENV, CARGO_TARGET_DIR_ENV,
-    CandidateIdentity, GovernedWorkEnvelope, LaneIdentity, RuntimeEnvironmentLease,
+    CandidateIdentity, FIXTURE_NAMESPACE_ENV, FIXTURE_ROOT_ENV, GovernedWorkEnvelope,
+    LaneIdentity, RuntimeEnvironmentLease,
 };
 use eliot_contracts::{
     ArtifactId, ClockReading, ContractId, EpochId, RequestId, canonical_json_bytes,
@@ -2427,10 +2428,28 @@ impl TestdProcessToolIntent {
     /// Revalidates the tool observation and closed child environment against
     /// the Kernel-selected target/cache roots, then returns the exact
     /// non-inheriting process environment projection.
+    ///
+    /// This is the ONE environment authority for the productive lane: the
+    /// Kernel-issued `ProcessIntent` and the TestD owner's re-derivation must
+    /// produce the same map, because `ProcessIntent::effect_digest` covers
+    /// `environment` and two gates require the two invocation digests to be
+    /// EQUAL (`present_dispatch_admission` in the TestD owner, and the
+    /// pre-start binding check in `start_claimed_from_store`). A key composed
+    /// on one side only would make those equalities unsatisfiable by
+    /// construction, so the governed fixture pair is emitted HERE, from the
+    /// same retained lane envelope the owner reads on the re-derivation side,
+    /// and never added beside this map by a second composition site.
+    ///
+    /// `lane` is the retained [`GovernedWorkEnvelope`] for this work item, or
+    /// `None` for a job admitted without a lane. `None` yields no fixture
+    /// bindings at all: an unallocated lane has no namespace to isolate one
+    /// with, and inventing one here would restore exactly the inert label the
+    /// envelope exists to replace.
     pub fn validate_for_roots(
         &self,
         target_root: &str,
         cache_root: &str,
+        lane: Option<&GovernedWorkEnvelope>,
     ) -> Result<eliot_process::EnvironmentProjection, TestdError> {
         self.observation.validate()?;
         let nextest = validate_canonical_tool_file(&self.observation.nextest_path)?;
@@ -2500,7 +2519,7 @@ impl TestdProcessToolIntent {
             reason: "observed tool directories cannot be composed into PATH",
         })?;
         let path_value = path_value.to_string_lossy().into_owned();
-        let values = BTreeMap::from([
+        let mut values = BTreeMap::from([
             (
                 "NEXTEST_EXPERIMENTAL_LIBTEST_JSON".to_owned(),
                 "1".to_owned(),
@@ -2531,6 +2550,27 @@ impl TestdProcessToolIntent {
             ("PATH".to_owned(), path_value),
             ("CARGO_TARGET_DIR".to_owned(), target_root.to_owned()),
         ]);
+        // Issue #1897 (AUD8): the governed fixture pair joins THIS map, the
+        // single environment authority, from the one retained lane envelope.
+        // The owner re-derives the same two bindings from the same envelope on
+        // its side, so both maps carry the identical pair and the two
+        // invocation digests can still be equal. The pair is emitted only from
+        // an allocated lane: a job admitted without one receives nothing, and a
+        // pre-bound key of the same name is refused rather than overwritten
+        // (two independent fixture authorities for one process is not a merge).
+        if let Some(lane) = lane {
+            for (key, value) in lane
+                .fixture_environment()
+                .map_err(|error| TestdError::Contract(error.to_string()))?
+            {
+                if values.insert(key.clone(), value).is_some() {
+                    return Err(TestdError::Invalid {
+                        field: "process_tool.environment",
+                        reason: "owner environment already binds a governed fixture key",
+                    });
+                }
+            }
+        }
 
         eliot_process::EnvironmentProjection::new(
             values,

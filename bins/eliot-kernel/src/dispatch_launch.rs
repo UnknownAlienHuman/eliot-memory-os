@@ -1544,9 +1544,35 @@ pub(crate) async fn submit_testd_owner_job(
     .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
     verify_envelope_layout_binding(&target_roots, &target_layout, &lane_envelope)
         .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    // Issue #1897 (AUD8): the lane's governed fixture directory is created here,
+    // beside the governed build root, so the namespace the child is handed
+    // names a real, exclusively-owned directory at the moment the Kernel seals
+    // the intent - not only later, at the owner's re-derivation. Creation stays
+    // confined to this lane's own directory under the admitted local
+    // application-data root, and a root that cannot be created or that does not
+    // canonicalize back to itself refuses the submission instead of falling
+    // back to a shared fixture location.
+    let fixture_root = lane_envelope
+        .derive_fixture_root()
+        .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
+    std::fs::create_dir_all(&fixture_root)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    if std::fs::canonicalize(&fixture_root).ok().as_deref() != Some(fixture_root.as_path()) {
+        return Err(DispatchLaunchError::Gate(
+            "Kernel TestD governed fixture root is not canonical".to_owned(),
+        ));
+    }
+    // The fixture pair is emitted inside `validate_for_roots` - the single
+    // environment authority - from this same retained lane envelope, so the
+    // Kernel-issued intent and the TestD owner's re-derivation carry the
+    // identical map and the two invocation digests can still be equal.
     let environment = request
         .process_tool
-        .validate_for_roots(&target_roots.target_root, &target_roots.cache_root)
+        .validate_for_roots(
+            &target_roots.target_root,
+            &target_roots.cache_root,
+            Some(&lane_envelope),
+        )
         .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
 
     let profile = testd_profile_binding(

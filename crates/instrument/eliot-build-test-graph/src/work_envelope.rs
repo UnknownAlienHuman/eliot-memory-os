@@ -19,7 +19,19 @@
 //!   ([`GovernedWorkEnvelope::derive_target_root`]);
 //! * the fixture namespace, derived from the tuple rather than from the
 //!   worktree, because "a worktree does not isolate runtime resources"
-//!   ([`GovernedWorkEnvelope::fixture_namespace`]);
+//!   ([`GovernedWorkEnvelope::fixture_namespace`]), together with the
+//!   *physical* directory that namespace owns
+//!   ([`GovernedWorkEnvelope::derive_fixture_root`]) and the two child-process
+//!   bindings a fixture owner actually reads
+//!   ([`GovernedWorkEnvelope::fixture_environment`]). The namespace is an
+//!   input to real resource identity, not a recorded label: two lanes holding
+//!   different namespaces cannot touch one directory. That one method is the
+//!   workspace's ONLY composition of the pair — the Kernel-issued process
+//!   environment and the TestD owner's re-derivation of it both read it, which
+//!   is what lets the two invocation digests this lane is gated on stay equal,
+//!   and it refuses a root that is not this lane's own directory under the
+//!   admitted fixture root rather than accepting any path whose last segment
+//!   happens to equal the namespace.
 //! * the declared resource claims, without which execution is refused
 //!   ([`GovernedWorkEnvelope::admit`]).
 //!
@@ -76,6 +88,33 @@ pub const CARGO_TARGET_DIR_ENV: &str = "CARGO_TARGET_DIR";
 /// directory, because an unset `CARGO_HOME` is how a governed invocation reads
 /// the user-global Cargo cache instead of its own lane's root.
 pub const CARGO_HOME_ENV: &str = "CARGO_HOME";
+
+/// Directory name under the local application data root that anchors every
+/// governed fixture lane.
+///
+/// Fixture state is mutable and "a worktree does not isolate runtime
+/// resources", so the governed fixture lanes live beside the governed build
+/// lanes under the *same* admitted local application-data root instead of
+/// inside a checkout, where two agents would collide.
+pub const FIXTURE_ROOT_DIRECTORY: &str = "fixtures";
+
+/// Environment variable a governed child process's fixture namespace is bound
+/// to.
+///
+/// The namespace is derived from the lane tuple and names the fixture state;
+/// carrying it into the child is what lets a fixture, database, port, or
+/// service owner report which lane's state it was handed.
+pub const FIXTURE_NAMESPACE_ENV: &str = "ELIOT_FIXTURE_NAMESPACE";
+
+/// Environment variable a governed child process's *physical* fixture root is
+/// bound to.
+///
+/// This is the directory a fixture owner actually creates, seeds, and tears
+/// down. It is emitted beside [`FIXTURE_NAMESPACE_ENV`] and derived from the
+/// same namespace, so a stored namespace string can no longer be recorded
+/// while two jobs keep touching one directory: the two bindings are the same
+/// value read as identity and as path.
+pub const FIXTURE_ROOT_ENV: &str = "ELIOT_FIXTURE_ROOT";
 
 /// Target and cache mode of one governed work item.
 ///
@@ -253,6 +292,22 @@ pub enum WorkEnvelopeError {
     /// requirement, and neither is any other caller-supplied path.
     #[error("local_app_data must be an existing canonical directory, not {0}")]
     UnresolvedLocalAppData(String),
+    /// The derived fixture root is not this lane's own directory under the
+    /// admitted fixture root.
+    ///
+    /// The namespace identifies fixture state and the root is where that state
+    /// physically lives, so a root outside `%LOCALAPPDATA%\Eliot\fixtures` (or
+    /// one whose final segment is not the carried namespace) is not this lane's
+    /// directory at all: binding it would name an isolated namespace while
+    /// pointing the child somewhere else. The refusal is typed rather than a
+    /// best-effort fallback, because there is no second admitted location.
+    #[error("fixture root {root} is not this lane's own directory under {admitted}")]
+    ForeignFixtureRoot {
+        /// The derived root that was refused.
+        root: String,
+        /// The admitted fixture root it had to sit under.
+        admitted: String,
+    },
     /// A retained lease record names a holder that is not this work item.
     ///
     /// The lease set is written only from an allocator grant, and a grant names
@@ -529,6 +584,94 @@ impl GovernedWorkEnvelope {
             self.build_mode.as_str(),
             self.normalized_fingerprint()?
         ))
+    }
+
+    /// The physical directory this work item's fixture namespace owns.
+    ///
+    /// Exactly
+    /// `%LOCALAPPDATA%\Eliot\fixtures\<fixture namespace>`. The namespace is
+    /// the last path segment, so the two cannot drift: a lane that stores a
+    /// namespace string and a lane that writes fixture bytes resolve to the
+    /// same directory by construction, and two lanes that stored different
+    /// namespaces resolve to two different directories.
+    ///
+    /// Deriving the root here rather than at each fixture owner is what makes
+    /// the namespace an input to real resource identity instead of a recorded
+    /// label. Every fixture, database, port, or service owner that is handed
+    /// [`FIXTURE_ROOT_ENV`] receives this path, so there is one fixture root
+    /// derivation in the workspace and no owner invents a second one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkEnvelopeError`] when the fingerprint or a tuple element
+    /// is invalid.
+    pub fn derive_fixture_root(&self) -> Result<PathBuf, WorkEnvelopeError> {
+        self.validate()?;
+        Ok(self
+            .local_app_data
+            .join("Eliot")
+            .join(FIXTURE_ROOT_DIRECTORY)
+            .join(self.fixture_namespace()?))
+    }
+
+    /// The exact fixture bindings a governed child process of this work item
+    /// runs with.
+    ///
+    /// Emits [`FIXTURE_NAMESPACE_ENV`] and [`FIXTURE_ROOT_ENV`] together,
+    /// both derived from the one retained namespace. A caller may not bind one
+    /// without the other: the namespace identifies the state and the root is
+    /// where that state physically lives, so a child that receives a namespace
+    /// but no root (or a root that is not this namespace's directory) is not
+    /// isolated and is refused at the admission seam.
+    ///
+    /// This is deliberately separate from
+    /// [`GovernedWorkEnvelope::cargo_environment`]: the fixture lane is not a
+    /// Cargo setting, and a work item that runs no Cargo command still needs
+    /// its own fixture directory.
+    ///
+    /// This is the workspace's ONLY composition of the pair. The Kernel-issued
+    /// process environment
+    /// ([`eliot_testd_core::TestdProcessToolIntent::validate_for_roots`]) and
+    /// the TestD owner's re-derivation of that same environment both read it
+    /// from the one retained envelope, so neither side adds these keys to its
+    /// own map and the two invocation digests this lane is gated on stay
+    /// comparable. The root it emits is required to be this lane's own
+    /// directory under the admitted fixture root
+    /// ([`WorkEnvelopeError::ForeignFixtureRoot`]), not merely some absolute
+    /// traversal-free path whose last segment equals the namespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkEnvelopeError`] when the fixture root cannot be derived,
+    /// or [`WorkEnvelopeError::ForeignFixtureRoot`] when the derived root is
+    /// not this lane's own directory under the admitted fixture root.
+    pub fn fixture_environment(&self) -> Result<Vec<(String, String)>, WorkEnvelopeError> {
+        let root = self.derive_fixture_root()?;
+        let namespace = self.fixture_namespace()?;
+        // The root is required to BE this lane's own directory under the
+        // admitted fixture root, not merely some absolute traversal-free path
+        // whose last segment equals the namespace. Without this, a stored
+        // namespace and the directory a child actually writes could name
+        // different locations while still looking like a matched pair, which
+        // is the inert-namespace defect in its weakest form. Deriving both
+        // here makes the check a statement about this envelope's own output
+        // rather than a comparison against a caller-supplied path.
+        let admitted = self
+            .local_app_data
+            .join("Eliot")
+            .join(FIXTURE_ROOT_DIRECTORY);
+        if root.parent() != Some(admitted.as_path())
+            || root.file_name().and_then(|name| name.to_str()) != Some(namespace.as_str())
+        {
+            return Err(WorkEnvelopeError::ForeignFixtureRoot {
+                root: path_text(&root),
+                admitted: path_text(&admitted),
+            });
+        }
+        Ok(vec![
+            (FIXTURE_NAMESPACE_ENV.to_owned(), namespace),
+            (FIXTURE_ROOT_ENV.to_owned(), path_text(&root)),
+        ])
     }
 
     /// The runtime-environment leases this work item holds, in stable order.
