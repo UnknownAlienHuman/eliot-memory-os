@@ -90,7 +90,8 @@ use eliot_learning_contracts::{AgentAttemptId, CampaignId, OverlayId};
 use eliot_learning_delta::{
     AdmissionReceipt, AttemptCloseDisposition, ConsequentialBoundary, DeliveryRefusal,
     LearningDeltaError, LifecycleActivity, REPEATED_VERIFIER_FAILURE_REF_PREFIX, RetryEquivalence,
-    RetryEquivalenceBasis, RetryReason, StoredLearningDelta, StoredRetryRelation, derive_boundaries,
+    RetryEquivalenceBasis, RetryReason, StoredLearningDelta, StoredRetryRelation,
+    derive_boundaries,
 };
 use eliot_store_api::{
     OrderingHeadExpectation, OrderingScopeId, RevisionHeadExpectation, RevisionKey, StoreError,
@@ -708,10 +709,19 @@ fn strategy_fingerprint(
 /// The caller still cross-checks `fact.job_id` against the row and the finish
 /// decision against the fact before calling this, so the two records compared
 /// here are already bound to the same attempt.
+///
+/// The verifier identity is returned OWNED rather than borrowed out of `fact`.
+/// That matches this file's convention — `strategy_fingerprint` returns
+/// `Result<String, _>` and `observed_evidence_refs` returns
+/// `Result<Vec<ArtifactId>, _>`, both owned values derived from the same `fact`
+/// — and it is what a durable stored marker should be: the result is formatted
+/// into a retained evidence reference that outlives this function and is
+/// committed to the canonical image, so it must not hold a borrow into a record
+/// the caller only holds for the length of this closure.
 fn repeated_verifier_failure_verifier(
     job: &TestdJob,
     fact: &CanonicalVerifierExecutionFact,
-) -> Option<&str> {
+) -> Option<String> {
     if job.state != TestdJobState::Failed || job.attempts <= 1 {
         return None;
     }
@@ -725,7 +735,7 @@ fn repeated_verifier_failure_verifier(
     {
         return None;
     }
-    Some(run.verifier.as_str())
+    Some(run.verifier.as_str().to_owned())
 }
 
 /// Exact raw trace, artifact, and evaluator references the canonical fact
