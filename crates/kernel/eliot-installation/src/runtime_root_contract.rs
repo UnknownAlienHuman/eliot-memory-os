@@ -255,7 +255,15 @@ impl RuntimeStateRoots {
     /// Declared as its own constant rather than inlined so the installer
     /// hierarchy, the derivation and any reader agree on the exact name of the
     /// directory, and so it is lexically distinct from the package staging leaf.
-    const ISOLATED_RESTORE_ROOT_DIR: &'static str = "isolated-restore";
+    ///
+    /// The value is the one the Windows profile contour admits, taken from
+    /// `eliot_platform_windows::ISOLATED_RESTORE_ROOT_DIR` rather than
+    /// restated. The contour must admit this exact leaf — it is the leaf this
+    /// contract publishes as a `CreateRoot` effect and the leaf every
+    /// destination preparation proves already exists — so the published effect
+    /// and the admitted contour are one name with one owner, and neither can
+    /// drift into an effect that can never execute.
+    const ISOLATED_RESTORE_ROOT_DIR: &'static str = eliot_platform_windows::ISOLATED_RESTORE_ROOT_DIR;
     const ROOT_SUFFIXES: [(&'static str, &'static str); 7] = [
         ("host_state_root", "host"),
         ("kernel_ors_root", "kernel\\state"),
