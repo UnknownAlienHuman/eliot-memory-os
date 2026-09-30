@@ -1577,6 +1577,17 @@ fn runtime_control_trigger_class(
 /// leaving the trigger implicit in the request handler — lets
 /// [`HostComposition::note_observable_use`] record the real class and its
 /// capability set durably.
+///
+/// A3 projection path: the requester-visible answer travels only on the
+/// existing wire (`HostRuntimeControlResponse`) via `envelope.respond`, whose
+/// `Restarted`/`StoreRecovered` receipts already bind the serving generations
+/// (`old/new_kernel_generation`, `store_fence`, `activation_receipt_digest`,
+/// `ready_receipt_digest`). The generation-bound admission projection of the
+/// same durable snapshot is [`HostComposition::activation_admission`],
+/// reported every service-loop tick by `report_activation_diagnostics`. A
+/// typed admission member on the response itself belongs to the wire owner
+/// (`crates/kernel/eliot-host-service/src/runtime_control.rs`) as STITCH work;
+/// this plane adds no second spelling.
 #[cfg(windows)]
 fn process_runtime_control_requests(
     host: &mut HostComposition,
@@ -1797,12 +1808,33 @@ impl HostIdleDrainSupervisor {
             Ok(DrainWakeOutcome::CancelDrain) => {
                 // A cancellation ends the drain attempt and changes the
                 // obligation set, so the cached census is no longer authority
-                // for the next decision.
-                self.invalidate_census();
-                let _ = writeln!(
-                    io::stderr().lock(),
-                    "eliot-host: observable use cancelled the pre-commit drain; readiness revalidation decides the return to ACTIVE"
-                );
+                // for the next decision. The same trigger then drives the
+                // I1.5 return to ACTIVE: the tick reconcile cannot, because
+                // its Healthy proof requires the Active state being restored.
+                match host.resume_cancelled_drain_on_observable_use() {
+                    Ok(true) => {
+                        self.idle_since = Some(std::time::Instant::now());
+                        self.invalidate_census();
+                        let _ = writeln!(
+                            io::stderr().lock(),
+                            "eliot-host: observable use cancelled the pre-commit drain and returned the same activation generation to ACTIVE after readiness revalidation"
+                        );
+                    }
+                    Ok(false) => {
+                        self.invalidate_census();
+                        let _ = writeln!(
+                            io::stderr().lock(),
+                            "eliot-host: observable use cancelled the pre-commit drain; the same generation did not resume on this trigger"
+                        );
+                    }
+                    Err(error) => {
+                        self.invalidate_census();
+                        let _ = writeln!(
+                            io::stderr().lock(),
+                            "eliot-host: observable use cancelled the pre-commit drain but readiness revalidation failed: {error}"
+                        );
+                    }
+                }
             }
             Ok(DrainWakeOutcome::QueueNextGeneration) => {
                 let _ = writeln!(
@@ -1820,10 +1852,34 @@ impl HostIdleDrainSupervisor {
             }
             Ok(DrainWakeOutcome::Proceed) => {}
             Err(error) => {
-                let _ = writeln!(
-                    io::stderr().lock(),
-                    "eliot-host: observable use was not admitted by the current activation generation: {error}"
-                );
+                // A fresh authenticated trigger the current generation could
+                // not admit (for example, `Draining` with an already
+                // `Cancelled` drain) is still demand: retry the trigger-driven
+                // resume before reporting, so a failed probe never strands the
+                // generation. The resume admits only the `Draining` +
+                // `Cancelled` state and stays shut otherwise.
+                match host.resume_cancelled_drain_on_observable_use() {
+                    Ok(true) => {
+                        self.idle_since = Some(std::time::Instant::now());
+                        self.invalidate_census();
+                        let _ = writeln!(
+                            io::stderr().lock(),
+                            "eliot-host: observable use was not admitted, but the trigger returned the same activation generation to ACTIVE after readiness revalidation"
+                        );
+                    }
+                    Ok(false) => {
+                        let _ = writeln!(
+                            io::stderr().lock(),
+                            "eliot-host: observable use was not admitted by the current activation generation: {error}"
+                        );
+                    }
+                    Err(resume_error) => {
+                        let _ = writeln!(
+                            io::stderr().lock(),
+                            "eliot-host: observable use was not admitted by the current activation generation: {error}; cancelled-drain resume also failed: {resume_error}"
+                        );
+                    }
+                }
             }
         }
     }
@@ -1975,6 +2031,11 @@ impl HostIdleDrainSupervisor {
 /// state and drain disposition through the existing minimal Host operational
 /// diagnostics (F-LOG-HOST-1, I15.4: bounded codes only, no identity, digest or
 /// free-text payload). Process liveness is never part of this projection.
+///
+/// This is the Host-side half of the A3 path: the projected
+/// [`HostComposition::activation_admission`] is the read model of the same
+/// durable snapshot the per-request runtime-control receipts bind (see
+/// `process_runtime_control_requests`).
 #[cfg(windows)]
 fn report_activation_diagnostics(host: &HostComposition, census: &IdleLeaseCensus) {
     let admission = host.activation_admission();

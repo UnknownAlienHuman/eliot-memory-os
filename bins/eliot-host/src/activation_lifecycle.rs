@@ -65,8 +65,7 @@
 //! the current activation generation holds its generation-bound `RuntimeLease`
 //! reference (issued, renewed, and released here from fresh admitting
 //! observations), the idle-drain gate reads exactly those held references
-//! plus the published supervision mirror, and [`project_runtime_lease`]
-//! projects the owner-validated row content for the held identity. A
+//! plus the published supervision mirror. A
 //! `StoppedClean` terminal releases
 //! the held references (`transition_activation_record` clears them once the
 //! `DrainCommitRecord` snapshot carries the obligations, proven by
@@ -85,7 +84,8 @@ use eliot_host_state::{
     ServiceSafetyClass, WakeDisposition, WakeRecord, record_checksum,
 };
 use eliot_platform::PlatformHandle;
-use eliot_runtime_contracts::{LeaseState, RuntimeLease, WakeIntent, WakeIntentState};
+use eliot_runtime_contracts::{WakeIntent, WakeIntentState};
+use serde::Serialize;
 
 use super::watchdog_publication::live_supervision_obligation;
 use super::{
@@ -281,7 +281,15 @@ impl IdleLeaseCensus {
 /// receives an activation result bound to the current Host/Kernel/Watchdog
 /// generations." Every field is a projection of one durable journal snapshot;
 /// nothing here is inferred from a live process, a pipe or a heartbeat.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// Wire projection: every field already carries the owner's `Serialize`
+/// implementation, so this struct derives `Serialize` and can be placed on
+/// the runtime-control wire without a second spelling. STITCH: the
+/// `HostRuntimeControlResponse` member that carries it lives in
+/// `crates/kernel/eliot-host-service/src/runtime_control.rs`, outside this
+/// Host lifecycle file, and the emission point is the `envelope.respond`
+/// call in the runtime-control service loop; both belong to the owning lane.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ActivationAdmission {
     /// Durable activation identity of the joined generation.
     pub activation_id: PlatformHandle,
@@ -344,9 +352,10 @@ impl HostComposition {
     ///
     /// Pre-linearization drain: the trigger appends the terminal
     /// `Drain(Cancelled)` record and returns [`DrainWakeOutcome::CancelDrain`].
-    /// The activation stays `Draining` here on purpose — `ACTIVE` is reached
-    /// only through [`HostComposition::resume_cancelled_drain`], which demands a
-    /// fresh readiness proof.
+    /// The activation stays `Draining` here on purpose — the return to `ACTIVE`
+    /// runs through
+    /// [`HostComposition::resume_cancelled_drain_on_observable_use`], which
+    /// revalidates readiness with a fresh probe before transitioning.
     ///
     /// Post-linearization drain: the trigger queues a durable next-generation
     /// `WakeIntent` and returns [`DrainWakeOutcome::QueueNextGeneration`].
@@ -465,6 +474,18 @@ impl HostComposition {
     /// authenticated [`HostBranchDisposition::Healthy`] leaves the activation
     /// `Draining`: a cancelled drain never re-promotes readiness on its own.
     ///
+    /// Reachability contract: the sole production caller is
+    /// `HostIdleDrainSupervisor::observe_readiness`, which forwards only
+    /// [`HostBranchDisposition::Healthy`], and the sole production producer of
+    /// [`HostBranchDisposition::Healthy`] is the readiness gate behind the
+    /// exact-current-`Active` activation check in
+    /// `HostComposition::reconcile_branch_readiness_at`. A `Draining`
+    /// generation with a `Cancelled` drain therefore never observes that proof
+    /// through the tick reconcile; its I1.5 return to `ACTIVE` runs through
+    /// [`HostComposition::resume_cancelled_drain_on_observable_use`], which
+    /// carries its own fresh probe. This entry stays for reconcile-driven
+    /// dispositions and performs the same owner `Active` transition.
+    ///
     /// # Errors
     ///
     /// Returns an error when the durable state cannot be read or the journal
@@ -496,6 +517,102 @@ impl HostComposition {
             return Ok(false);
         }
         self.transition_activation(ActivationState::Active, "host-drain-cancelled")?;
+        host_lifecycle_observe_drain(BOUNDARY_DRAIN_RESUME_ACTIVE_RESTORED);
+        host_terminal.disarm();
+        Ok(true)
+    }
+
+    /// Returns a `Draining` generation with a cancelled pre-commit drain to
+    /// `ACTIVE` on a fresh observable-use trigger, after readiness
+    /// revalidation.
+    ///
+    /// I1.5: "A new observable-use trigger received before the durable drain
+    /// linearization point cancels drain and returns the same generation to
+    /// `ACTIVE` after readiness revalidation." The cancellation itself is
+    /// [`HostComposition::note_observable_use`]; this is the second half, and
+    /// the supervisor calls it on the trigger that cancelled the drain (and
+    /// retries it on a later trigger the generation could not admit, so a
+    /// failed probe never strands the generation).
+    ///
+    /// The tick reconcile cannot serve this path: its `Healthy` proof requires
+    /// `activation.state == Active` (`HostComposition::reconcile_branch_readiness_at`),
+    /// which is exactly the state being restored. The revalidation here is
+    /// therefore the same fresh proof, not a weaker one, driven by the trigger
+    /// instead of the tick: `HostComposition::persist_process_observations`
+    /// re-observes Watchdog supervision, probes Kernel readiness live, admits
+    /// the observation into the journal and grants the readiness gate —
+    /// answered from this call, never from the pre-drain observation retained
+    /// since activation. The return to `ACTIVE` then commits through
+    /// `HostComposition::transition_activation_with_readiness_evidence`, the
+    /// same owner the production start path uses, carrying the just-appended
+    /// probe evidence (which also re-binds the generation's runtime and
+    /// supervision leases from that fresh evidence). The next tick reconcile
+    /// re-proves the restored generation through its own `Active` gate.
+    ///
+    /// Returns `Ok(false)` when there is no cancelled pre-commit drain to
+    /// resume. Anything else that is not proven fails closed with a typed
+    /// error instead of stranding the generation silently.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the durable state cannot be read, the cancelled
+    /// record carries no trigger evidence, the recorded serving contour is
+    /// gone, no approved active generation exists, the fresh probe is not
+    /// provable, or the journal rejects the transition.
+    #[cfg(windows)]
+    pub fn resume_cancelled_drain_on_observable_use(&mut self) -> Result<bool, HostError> {
+        // F-LOG-HOST-1: readiness revalidation boundary.
+        let mut host_terminal = HostTerminalGuard::armed(BOUNDARY_DRAIN_RESUME_TERMINAL);
+        let state = self.snapshot()?;
+        if state.drain_commit.is_some() {
+            host_terminal.disarm();
+            return Ok(false);
+        }
+        let Some(drain) = state
+            .drain
+            .as_ref()
+            .filter(|drain| drain.state == DrainState::Cancelled)
+        else {
+            host_terminal.disarm();
+            return Ok(false);
+        };
+        let activation = state.activation.clone().ok_or_else(|| {
+            HostError::OwnerLeaseRecovery("activation record is absent".to_owned())
+        })?;
+        if activation.state != ActivationState::Draining {
+            host_terminal.disarm();
+            return Ok(false);
+        }
+        if drain.evidence_refs.is_empty() {
+            return Err(HostError::RecoveryRequired(
+                "cancelled pre-commit drain carries no trigger evidence".to_owned(),
+            ));
+        }
+        if !self.has_process_contour() {
+            // A pre-commit drain stops nothing, so a generation that reached
+            // this state with no recorded serving contour is broken, not
+            // idle: returning it to `ACTIVE` would admit an empty contour.
+            return Err(HostError::RecoveryRequired(
+                "cancelled pre-commit drain has no recorded serving contour".to_owned(),
+            ));
+        }
+        let generation = self
+            .registry
+            .active()
+            .map(|item| item.manifest.generation.clone())
+            .ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "cancelled pre-commit drain has no approved active generation".to_owned(),
+                )
+            })?;
+        // The same fresh proof the tick reconcile uses, driven by this
+        // trigger. A failing probe leaves `Draining` with a `Cancelled`
+        // drain for the next trigger instead of manufacturing readiness.
+        self.persist_process_observations(&generation)?;
+        self.transition_activation_with_readiness_evidence(
+            ActivationState::Active,
+            "host-drain-cancelled",
+        )?;
         host_lifecycle_observe_drain(BOUNDARY_DRAIN_RESUME_ACTIVE_RESTORED);
         host_terminal.disarm();
         Ok(true)
@@ -673,8 +790,11 @@ impl HostComposition {
     /// journal owner.
     ///
     /// Preconditions, all proven here rather than assumed: the activation is
-    /// `ACTIVE` again (only `resume_cancelled_drain` produces that, from an
-    /// owner-backed readiness revalidation); the prior drain is proven
+    /// `ACTIVE` again (the trigger-driven
+    /// [`HostComposition::resume_cancelled_drain_on_observable_use`] produces
+    /// that from a fresh probe committed through the start-path owner; the
+    /// reconcile-driven [`HostComposition::resume_cancelled_drain`] admits the
+    /// same transition for a `Healthy` disposition); the prior drain is proven
     /// `Cancelled` by the caller's arm; and no `DrainCommit` exists — the
     /// caller refuses that case, and the reducer refuses it again through its
     /// own `COMMITTED` transition law, so no unresolved irreversible action is
@@ -818,9 +938,8 @@ impl HostComposition {
     /// instead of vanishing into a live state.
     ///
     /// The durable writer is the journal append the caller performs with this
-    /// revision; the ORS row for the projected [`project_runtime_lease`]
-    /// content is committed by the Kernel writer lane under the same
-    /// generation-bound identity
+    /// revision; the ORS row for the held identity is committed by the Kernel
+    /// writer lane under the same generation-bound identity
     /// (`bins/eliot-kernel/src/control_plane.rs::runtime_lease_id_for_candidate`).
     ///
     /// # Errors
@@ -1114,6 +1233,26 @@ pub const RUNTIME_LEASE_ID_PREFIX: &str = "runtime-lease";
 /// carried, never cached — so a stale predecessor identity can never pass as
 /// this generation's lease.
 ///
+/// Row-leg STITCH (I1.5 Work: issuance, renewal, expiry, revocation,
+/// reconciliation): this file holds lease *references*, never rows, so row
+/// content is never constructed here — rows are committed only by the Kernel
+/// writer lane under this identity
+/// (`bins/eliot-kernel/src/control_plane.rs::runtime_lease_id_for_candidate`:
+/// issuance, the `expire_past_due_runtime_leases`,
+/// `supersede_stale_runtime_leases` and `renew_runtime_leases_for_probe` tick,
+/// and the explicit-command-only `RevokeRuntimeLease` arm, all through the
+/// owner `RuntimeLease::transition_to` legality into
+/// `RedbRecoveryStore::record_runtime_lease_current`) and read back by exact
+/// `state_fence` equality
+/// (`RedbRecoveryStore::load_runtime_leases_by_state_fence` and
+/// `load_runtime_lease_census_by_state_fence`, served over the authenticated
+/// `ReadRuntimeLeaseCensus` wire by
+/// `bins/eliot-kernel/src/idle_lease_census.rs::read_runtime_lease_census`
+/// for `bins/eliot-host/src/lease_drain.rs::require_generation_retirement_barrier`).
+/// The `Active` to `Reconciling` row producer has no call site yet and belongs
+/// beside the existing `Revoked`/`Expired`/`Superseded` arms in that same
+/// Kernel writer lane.
+///
 /// # Errors
 ///
 /// Returns an error when the identity spelling is not a valid handle.
@@ -1149,7 +1288,7 @@ pub(super) fn is_fresh_admitting_observation(
         && !observation.evidence_refs.is_empty()
 }
 
-/// Proves the terminal `RuntimeLease` release of a clean stop.
+/// Proves the terminal `RuntimeLease` reference release of a clean stop.
 ///
 /// `transition_activation_record` clears the held runtime-lease references on
 /// `StoppedClean` because the obligations were snapshotted into the
@@ -1158,6 +1297,11 @@ pub(super) fn is_fresh_admitting_observation(
 /// [`runtime_lease_id_for`] identity: a foreign or stale predecessor reference
 /// must never vanish silently — reconciliation is still owed there, so the
 /// stop fails closed instead of reporting a clean release it did not prove.
+///
+/// This proves the reference release only, never a `Released` row transition:
+/// row-state expiry, revocation and reconciliation move exclusively through
+/// the Kernel writer lane under [`runtime_lease_id_for`] (see its row-leg
+/// note), so no lease-row state is fabricated here.
 ///
 /// # Errors
 ///
@@ -1178,87 +1322,6 @@ pub(super) fn prove_terminal_runtime_release(
         "clean stop would silently release a runtime-lease reference that is not this generation's lease"
             .to_owned(),
     ))
-}
-
-/// Projects the owner-validated ORS `runtime_lease_current` row content for a
-/// held generation lease.
-///
-/// I1.5 assigns the `RuntimeLease` row family to Kernel-owned ORS
-/// (`ors_runtime_lease_current_v1`, record type `runtime_lease_current`). The
-/// Host journal holds the lease *reference*; this projection builds the row
-/// content for the held
-/// [`runtime_lease_id_for`] identity, the row is selected by exact
-/// `state_fence` equality
-/// (`RedbRecoveryStore::load_runtime_leases_by_state_fence`), the scope is the
-/// generation's admitted frozen trigger-class spelling, the authority epoch is
-/// the generation's Kernel epoch, and the owner [`RuntimeLease::validate`]
-/// runs before return. The contour fence is caller-supplied: the writer lane
-/// owns the live contour, so the Host never invents it here.
-///
-/// Committed by the other lane: the durable row commit has landed
-/// (`bins/eliot-kernel/src/control_plane.rs` issuance into
-/// `RedbRecoveryStore::record_runtime_lease_current`, keyed by the
-/// generation-bound [`runtime_lease_id_for`] identity through
-/// `runtime_lease_id_for_candidate`) together with the renewal/expiry/supersede
-/// tick beside it and the explicit-command-only `RevokeRuntimeLease` arm (named
-/// exact-fence row to the `Revoked` terminal through the owner
-/// `transition_to` legality, re-recorded through the ORS owner).
-/// Validity window in milliseconds for a Host-projected runtime lease
-/// (issue #1751 W4; I1.5). Mirrors the Kernel
-/// `RUNTIME_LEASE_VALIDITY_MS` and the supervision renewal policy's
-/// 60-second validity: one window for both halves of the lease census, so
-/// the projected expiry can never outlive the owner's proof.
-const RUNTIME_LEASE_VALIDITY_MS: u64 = 60_000;
-
-/// Readers have landed too: the Kernel `idle_lease_census` runtime leg
-/// (`RedbRecoveryStore::load_runtime_leases_by_state_fence`) and
-/// `read_runtime_lease_census`
-/// (`RedbRecoveryStore::load_runtime_lease_census_by_state_fence`) serve the
-/// authenticated `ReadRuntimeLeaseCensus` wire the Host retirement barrier
-/// (`bins/eliot-host/src/lease_drain.rs`
-/// `require_generation_retirement_barrier`) queries, and the tick beside the
-/// issuance site (`expire_past_due_runtime_leases`,
-/// `supersede_stale_runtime_leases`, `renew_runtime_leases_for_probe`) plus
-/// the explicit-command-only `RevokeRuntimeLease` arm renew, expire,
-/// supersede, and revoke rows through the owner `RuntimeLease::transition_to`
-/// legality. The identity the landed writer keys rows by is the
-/// [`runtime_lease_id_for`] identity built here, derived there from the
-/// validated candidate contour
-/// (`bins/eliot-kernel/src/control_plane.rs::runtime_lease_id_for_candidate`)
-/// — that owner-scope identity decision is what adopted this projection. No
-/// mirror or queued `WakeIntent`
-/// can reactivate a terminal
-/// revision: revision chaining through the owner `transition_to` legality is
-/// the writer lane's own commit rule.
-///
-/// # Errors
-///
-/// Returns an error when the lease identity, scope, or fence is not
-/// owner-valid.
-pub fn project_runtime_lease(
-    activation: &EliotActivationRecord,
-    contour_fence: &StateFence,
-    state: LeaseState,
-) -> Result<RuntimeLease, HostError> {
-    let lease = RuntimeLease {
-        lease_id: runtime_lease_id_for(
-            &activation.activation_id,
-            &activation.fence.activation_generation,
-        )?
-        .as_str()
-        .to_owned(),
-        scope_ref: activation.trigger_class.as_str().to_owned(),
-        authority_epoch: activation.lineage.kernel_epoch.clone(),
-        state_fence: contour_fence.clone(),
-        state,
-        expires_at_ms: unix_millis()?
-            .checked_add(RUNTIME_LEASE_VALIDITY_MS)
-            .ok_or_else(|| HostError::Platform("runtime lease expiry overflowed".to_owned()))?,
-    };
-    lease
-        .validate()
-        .map_err(|error| HostError::Platform(error.to_string()))?;
-    Ok(lease)
 }
 
 fn activation_admission_from(state: &HostState) -> Result<ActivationAdmission, HostError> {
