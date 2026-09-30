@@ -3922,6 +3922,11 @@ pub struct PeerReviewObligation {
     /// retains none (I11.8), so no role-gated filtering may be evaluated
     /// on this read.
     pub reviewer_principal_id: String,
+    /// Reviewed operation identity exactly as the retained record carries it.
+    /// This is the only operation/WorkScope-adjacent fact the owner retains:
+    /// no recipient, role, WorkScope, or task fact is retained on the record,
+    /// so none is reported here and none may be inferred (I11.8).
+    pub operation: String,
     pub target_kind: ReviewTargetKind,
     pub kind: ReviewKind,
     /// Historical anchor selector exactly as submitted.
@@ -3987,6 +3992,7 @@ impl From<&AnchoredReview> for PeerReviewObligation {
             artifact_digest: review.artifact_digest.clone(),
             reviewer_session_id: review.reviewer_session_id.clone(),
             reviewer_principal_id: review.reviewer_principal.clone(),
+            operation: review.operation.clone(),
             target_kind: review.target_kind,
             kind: review.kind,
             anchor_field: review.anchor_field.clone(),
