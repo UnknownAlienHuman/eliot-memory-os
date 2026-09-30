@@ -11,7 +11,8 @@ use std::io::{self, Write};
 use thiserror::Error;
 
 use crate::{
-    ActiveUnderstandingView, AdmittedContextSet, ContextError, QualityDimension, QualityOperation,
+    ActiveUnderstandingView, AdmittedContextSet, ContextError, QualityDimension,
+    QualityDimensionResult, QualityOperation, SerializedContextMeasurement,
 };
 
 /// Maximum canonical bytes retained by one immutable planning input.
@@ -515,6 +516,98 @@ impl ContextPlanningView {
                 unresolved_applicability: refusal.unresolved_applicability,
             })?;
         Ok(())
+    }
+
+    /// Re-observe this retained closure against a freshly admitted context set
+    /// and return the delivery readiness that survives the re-observation.
+    ///
+    /// This is the one site that holds both sides of the grade-invalidation
+    /// comparison: `self` is the retained view, carrying the recorded card and
+    /// the recorded measurement, and `admitted` is the freshly supplied admitted
+    /// set for the same task. A route, governing-instruction, source, task or
+    /// verifier dependency that moved between the two is exactly what the
+    /// recorded grade was taken under and no longer holds, so the retained card
+    /// is re-evaluated before the readiness read rather than after it.
+    ///
+    /// The re-observation is decided by
+    /// [`SerializedContextMeasurement::reevaluate_against`], the measurement
+    /// owner, against that type's own independent
+    /// [`crate::QualityInvalidationReason::INVALIDATION_REASONS`] denominator. A
+    /// caller does not name a reason here and cannot narrow the set. A
+    /// re-observation that agrees on every reason returns `Ok(None)` and the
+    /// retained card is left exactly as it was.
+    ///
+    /// `verifier_rule_revisions` is the verifier identity the observing owner
+    /// resolved for the dimensions it declares. It is the caller's own recorded
+    /// declaration — no revision, digest or counter is synthesised here — and an
+    /// empty list simply means that owner declares no verifier identity, which
+    /// the measurement owner reports as absent rather than guessing at one.
+    ///
+    /// The returned readiness is the same typed refusal a plain
+    /// [`ContextPlanningView::validate`] produces, so an invalidated grade
+    /// blocks the dependent action with its exact dimensions named instead of
+    /// being reported as a current pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReactiveInputError::Context`] when the retained closure, the
+    /// supplied admitted set, or the re-observation fails its owner validation,
+    /// and [`ReactiveInputError::QualityRefused`] when the re-observed card no
+    /// longer carries a current pass for the required dimensions. The retained
+    /// view is never mutated: the re-evaluation runs against a clone, so a
+    /// refused or failing re-observation leaves the retained record intact.
+    pub fn revalidate_against_admitted(
+        &self,
+        admitted: &AdmittedContextSet,
+        verifier_rule_revisions: &[(QualityDimension, eliot_contracts::ArtifactId)],
+    ) -> Result<Option<Vec<QualityDimensionResult>>, ReactiveInputError> {
+        // The retained closure and the freshly supplied admitted set are both
+        // validated by their own owners first, so a re-evaluation never compares
+        // two records that have not passed their own validation.
+        self.validate()?;
+        admitted
+            .validate()
+            .map_err(ReactiveInputError::Context)?;
+        // The current side of the comparison is a measurement carrying the values
+        // this re-observation observes. Every one of them is read from a record:
+        // the route the packet is now served on, the recipe revision the
+        // admitted set was admitted under, the source snapshots it read, and the
+        // task revision on the admitted set's own binding. The retained
+        // measurement's own byte, capacity and serializer fields are carried over
+        // unchanged rather than recomputed, because this re-observation concerns
+        // the recorded owner dependencies and not the rendered bytes.
+        let observed = SerializedContextMeasurement {
+            route_id: self.view.measurement.route_id.clone(),
+            recipe_digest: admitted.economy.recipe_digest.clone(),
+            sources: admitted
+                .records
+                .iter()
+                .map(|record| record.candidate.source.clone())
+                .collect(),
+            context: admitted.binding.clone(),
+            verifier_rule_revisions: verifier_rule_revisions.to_vec(),
+            ..self.view.measurement.clone()
+        };
+        let mut reobserved = self.view.quality.clone();
+        let invalidated =
+            SerializedContextMeasurement::reevaluate_against(&observed, &mut reobserved)?;
+        // The blocking read. A grade the re-observation invalidated is not a
+        // current pass, so it blocks here exactly as a failed dimension does,
+        // and the exact dimensions are named instead of a generic error. The
+        // retained card is the one being read, so the readiness reported is the
+        // readiness of the packet as it now stands.
+        reobserved
+            .suitability(QualityOperation::DependentAction, &[])
+            .map_err(|refusal| ReactiveInputError::QualityRefused {
+                operation: refusal.operation,
+                blocking: refusal
+                    .blocking
+                    .iter()
+                    .map(|result| result.dimension)
+                    .collect(),
+                unresolved_applicability: refusal.unresolved_applicability,
+            })?;
+        Ok(invalidated)
     }
 }
 

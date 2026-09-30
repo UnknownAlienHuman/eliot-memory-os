@@ -303,7 +303,12 @@ impl SerializedContextMeasurement {
             // here through assembly, and comparing digests instead of the source
             // revisions would hide the reason behind a different label.
             QualityInvalidationReason::Source => (
-                card.output.evidence_revisions.join(","),
+                card.output
+                    .evidence_revisions
+                    .iter()
+                    .map(|revision| revision.as_str().to_owned())
+                    .collect::<Vec<_>>()
+                    .join(","),
                 self.sources
                     .iter()
                     .map(|source| format!("{}@{}", source.snapshot_id.as_str(), source.revision))

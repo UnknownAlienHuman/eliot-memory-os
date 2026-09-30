@@ -23,7 +23,7 @@
 
 use eliot_context_contracts::{
     ActiveUnderstandingView, AdmittedContextSet, ContextPlanningView, CriticalAttentionProjection,
-    IntegrationCoverageProfile, ReactiveInputError, SessionDeliverySnapshot,
+    IntegrationCoverageProfile, QualityDimension, ReactiveInputError, SessionDeliverySnapshot,
 };
 use eliot_contracts::ArtifactId;
 use eliot_cue_contracts::{ActivationRequest, ActivationResult};
@@ -40,20 +40,48 @@ use super::input::{ReactiveCueActivation, ReactiveDeliveryPolicy, ReactiveTarget
 /// does not reproduce the view's own canonical digest (and the admitted
 /// payload digest), so caller bytes can never smuggle a foreign view into
 /// the plan.
+///
+/// The recorded card is then re-observed against this exact admitted set
+/// through [`ContextPlanningView::revalidate_against_admitted`], which runs
+/// [`eliot_context_contracts::SerializedContextMeasurement::reevaluate_against`]
+/// and then reads the produced invalidations through the same
+/// `DependentAction` readiness rule. That read is what makes the invalidation
+/// path live rather than vacuous: before it, the card's `invalidation` field
+/// had no producer anywhere in the tree, so `is_current_pass` was vacuously
+/// true for every grade and a route, governing-instruction, source, task or
+/// verifier change could never block an action. A grade that no longer holds
+/// is refused here with its exact dimensions named, before any planner input
+/// is released.
+///
+/// `verifier_rule_revisions` is the observing owner's own recorded verifier
+/// identity per dimension. It is supplied by the caller that re-read the
+/// verifier contracts; nothing is synthesised here, and an empty list means
+/// this owner declares no verifier identity, which the measurement owner
+/// reports as absent rather than guessing at one.
+///
+/// # Errors
+///
+/// Returns the owner's exact [`ReactiveInputError`] when the closure, the
+/// admitted set, or the re-observation is refused, including
+/// [`ReactiveInputError::QualityRefused`] when a recorded grade the
+/// re-observation invalidated blocks the dependent action.
 pub fn produce_planning_view(
     view_id: ArtifactId,
     view: ActiveUnderstandingView,
     admitted: AdmittedContextSet,
     canonical_bytes: Vec<u8>,
     admitted_canonical_bytes: Vec<u8>,
+    verifier_rule_revisions: &[(QualityDimension, ArtifactId)],
 ) -> Result<ContextPlanningView, ReactiveInputError> {
-    ContextPlanningView::new(
+    let view = ContextPlanningView::new(
         view_id,
         view,
-        admitted,
+        admitted.clone(),
         canonical_bytes,
         admitted_canonical_bytes,
-    )
+    )?;
+    view.revalidate_against_admitted(&admitted, verifier_rule_revisions)?;
+    Ok(view)
 }
 
 /// Adopt the cue owner's exact firing pair plus the target-to-atom mapping

@@ -76,7 +76,7 @@ pub use negative_memory_context::{
     NegativeMemoryEvidenceLoss, NegativeMemoryExposureError, NegativeMemoryPermittedNextAction,
     NegativeMemoryRuleExposure, NegativeMemoryRuleInvalidation, NegativeMemoryRuleProjection,
     NegativeMemoryRuleValidity, admitted_rule, apply_negative_memory_coverage,
-    project_negative_memory_rules,
+    invalidate_stale_grade, project_negative_memory_rules,
 };
 pub use negative_memory_gate::{
     NegativeMemoryGateDecision, NegativeMemoryGateInput, NegativeMemoryGateRefusal,

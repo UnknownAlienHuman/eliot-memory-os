@@ -14,7 +14,7 @@
 
 use eliot_context_contracts::{
     ActiveUnderstandingView, AdmittedContextSet, ContextPlanningView, CriticalAttentionProjection,
-    IntegrationCoverageProfile, ReactiveInputError, SessionDeliverySnapshot,
+    IntegrationCoverageProfile, QualityDimension, ReactiveInputError, SessionDeliverySnapshot,
 };
 use eliot_contracts::ArtifactId;
 use eliot_cue_contracts::{ActivationRequest, ActivationResult};
@@ -40,6 +40,13 @@ pub struct PlanningViewSupply {
     /// Admitted canonical bytes travelling with the closure (re-proved,
     /// never trusted).
     pub admitted_canonical_bytes: Vec<u8>,
+    /// Verifier contract revision in force per graded dimension, as this
+    /// owner re-read it. Empty means this owner declares no verifier
+    /// identity, which the measurement owner reports as absent rather than
+    /// guessing at one; it is never defaulted to the card's own recorded
+    /// `rule_revision`, which would make the verifier comparison a value
+    /// with a copy of itself.
+    pub verifier_rule_revisions: Vec<(QualityDimension, ArtifactId)>,
 }
 
 /// Live cue-firing bundle for the cue-activation producer.
@@ -214,6 +221,7 @@ impl ReactiveOwnerSupply {
                     view_supply.admitted,
                     view_supply.canonical_bytes,
                     view_supply.admitted_canonical_bytes,
+                    &view_supply.verifier_rule_revisions,
                 )
                 .map_err(|error| OwnerAssembleError::Refused {
                     owner: "context assembly",
