@@ -6,6 +6,8 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(windows)]
+use eliot_contracts::ResourceGeneration;
 use eliot_contracts::StateFence;
 #[cfg(windows)]
 use eliot_kernel_service::KernelServiceState;
@@ -22,7 +24,8 @@ use eliot_process::{
 use eliot_runtime_contracts::{
     AutomaticRestartDecision, DaemonChannelCursor, DaemonProgressObservation,
     DaemonSupervisionRenewalPolicy, RestartFailureEvidence, RestartIdentityEvidence,
-    RestartOwnerLifecycle, RestartPolicyV1, decide_automatic_restart,
+    RestartOwnerLifecycle, RestartPolicyAdmissionBinding, RestartPolicyError, RestartPolicyV1,
+    decide_automatic_restart,
 };
 use eliot_runtime_contracts::{
     LeaseState, SupervisionGenerationBinding, SupervisionLeaseIncarnationBinding,
@@ -104,6 +107,12 @@ pub(crate) enum DaemonRestartRefusal {
     /// class exists to permit a replacement. This is the fail-closed reading of
     /// an absent declaration, never an unlimited budget.
     PolicyNotAdmitted,
+    /// A declaration was admitted, but its digest is not bound to the
+    /// admitted generation and state fence of the generation being replaced,
+    /// so no class may be read for this identity. This is what keeps the
+    /// binding a binding: a declaration validated and then dropped would let
+    /// any policy justify any generation.
+    PolicyNotBoundToAdmittedGeneration,
     /// The admitted declaration is one the shared contract does not admit, so
     /// no class is read. Assembly already refuses such a value; this arm keeps
     /// the decision fail-closed if one ever reaches the replacement path.
@@ -237,31 +246,115 @@ const fn daemon_restart_decision_reason(decision: AutomaticRestartDecision) -> &
     }
 }
 
+/// One admitted versioned restart policy, bound to the admitted generation and
+/// the exact admitted state fence it was admitted under (I14.10, I08.12,
+/// #1682 W1).
+///
+/// The declaration itself is `eliot_runtime_contracts::RestartPolicyV1`; this
+/// is its admission. The shared contract already owns the whole shape - the
+/// restart class, the group id and strategy, the required/optional/advisory
+/// dependency edges with their exact invalidation triggers, the eight
+/// `RestartIntensityPolicy` numbers, the quarantine/escalation declaration and
+/// the source manifest/profile revision - plus the canonical digest, so this
+/// type adds no field, no number and no rule of its own. I08.12 keeps the exact
+/// values in the approved config and fault profiles: none is declared here.
+///
+/// The digest is produced by the contract's own `bind`, which proves the fence
+/// and requires the admitted generation to be that fence's generation, and the
+/// resulting `RestartPolicyAdmissionBinding` is *retained* here rather than
+/// validated and dropped. That retention is the whole point: a policy that was
+/// only checked at assembly and then discarded cannot distinguish the
+/// declaration admitted for this generation from any other declaration.
+///
+/// Reading it back is not free either. `policy_for_generation` re-proves the
+/// retained binding with the contract's own `validate_for` against the
+/// *original* admitted declaration and the generation/fence the caller
+/// independently observed, so the class is never read from a declaration whose
+/// digest no longer matches the identity it claims to govern.
+#[cfg(windows)]
+pub(crate) struct AdmittedDaemonRestartPolicy {
+    policy: RestartPolicyV1,
+    binding: RestartPolicyAdmissionBinding,
+}
+
+#[cfg(windows)]
+impl AdmittedDaemonRestartPolicy {
+    /// Admits one declared policy under one admitted generation and state
+    /// fence, and retains the resulting binding.
+    ///
+    /// The original declared value is validated by the shared contract, both
+    /// inside `bind` and again through the binding's own `validate_for`; a
+    /// declaration this contract does not admit is refused here rather than
+    /// read under a permissive interpretation.
+    pub(crate) fn admit(
+        policy: RestartPolicyV1,
+        admitted_generation: ResourceGeneration,
+        state_fence: &StateFence,
+    ) -> Result<Self, RestartPolicyError> {
+        let binding = policy.bind(admitted_generation, state_fence.clone())?;
+        binding.validate_for(&policy, &admitted_generation, state_fence)?;
+        Ok(Self { policy, binding })
+    }
+
+    /// Returns the admitted declaration only while it is still bound to the
+    /// exact admitted generation and state fence the caller observed.
+    ///
+    /// The caller supplies the generation and fence from the owner's own
+    /// admission record rather than from this value, so a binding made for one
+    /// generation cannot authorize a replacement of another. The returned
+    /// reference is the retained declaration itself: the class rule reads the
+    /// admitted policy, never a reconstruction of it.
+    pub(crate) fn policy_for_generation(
+        &self,
+        admitted_generation: ResourceGeneration,
+        state_fence: &StateFence,
+    ) -> Result<&RestartPolicyV1, RestartPolicyError> {
+        self.binding
+            .validate_for(&self.policy, &admitted_generation, state_fence)?;
+        Ok(&self.policy)
+    }
+}
+
 /// Applies the declared restart class to one reconciled generation, and returns
 /// the refusal that withholds a replacement, or `None` when the class permits
 /// one.
 ///
 /// `policy` is the admitted declaration for this child, exactly as
-/// `KernelConfig::daemon_restart_policy` injected it. The class rule is not
-/// restated here: the rule body, its refusal order and its owner-neutral inputs
-/// are `eliot_runtime_contracts::restart_policy::decide_automatic_restart`, and
+/// `KernelConfig::daemon_restart_policy` injected it and as the admitted
+/// generation's `RestartPolicyAdmissionBinding` retains it. The class rule is
+/// not restated here: the rule body, its refusal order and its owner-neutral
+/// inputs are
+/// `eliot_runtime_contracts::restart_policy::decide_automatic_restart`, and
 /// this function only supplies the lifecycle and the exit/health evidence that
 /// the rule cannot observe for itself.
+///
+/// `admitted_generation` and `state_fence` are the generation being replaced and
+/// the exact fence admitted for it, so the class is read only under a digest
+/// that is still bound to that identity.
 ///
 /// `None` is returned only for `Eligible`, which is not launch, effect or
 /// budget authority: the owner's own bounded recovery budget and effect
 /// authorization still decide whether a replacement is dispatched.
 #[cfg(windows)]
 pub(crate) fn daemon_class_withholds_replacement(
-    policy: Option<&RestartPolicyV1>,
+    policy: Option<&AdmittedDaemonRestartPolicy>,
+    admitted_generation: ResourceGeneration,
+    state_fence: &StateFence,
     owner_state: KernelServiceState,
     previous_status: &DaemonRuntimeStatus,
     view: &ProcessExecutionView,
 ) -> Option<DaemonRestartRefusal> {
     // An absent declaration has no class to permit anything. It is refused here
     // rather than defaulted to the widest authority.
-    let Some(policy) = policy else {
+    let Some(admitted) = policy else {
         return Some(DaemonRestartRefusal::PolicyNotAdmitted);
+    };
+    // A declaration admitted for a different generation, or whose digest no
+    // longer matches the value it was admitted from, is refused before any
+    // class is read. This is the check that makes the retained binding mean
+    // something at the point the decision is actually taken.
+    let Ok(policy) = admitted.policy_for_generation(admitted_generation, state_fence) else {
+        return Some(DaemonRestartRefusal::PolicyNotBoundToAdmittedGeneration);
     };
     let (identity, failure) = daemon_restart_evidence(previous_status, view);
     let lifecycle = daemon_owner_restart_lifecycle(owner_state);
@@ -284,6 +377,9 @@ pub(crate) const fn daemon_restart_refusal_reason(refusal: &DaemonRestartRefusal
         DaemonRestartRefusal::OwnerLifecycle => "owner_lifecycle_suppressed",
         DaemonRestartRefusal::ExitIdentityNotProved => "exit_identity_not_proved",
         DaemonRestartRefusal::PolicyNotAdmitted => "restart_policy_not_admitted",
+        DaemonRestartRefusal::PolicyNotBoundToAdmittedGeneration => {
+            "restart_policy_not_bound_to_admitted_generation"
+        }
         DaemonRestartRefusal::PolicyRejected => "restart_policy_rejected_by_contract",
         DaemonRestartRefusal::ClassWithholds(reason) => reason,
     }
