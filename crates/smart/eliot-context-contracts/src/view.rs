@@ -267,7 +267,16 @@ impl ActiveUnderstandingView {
         Ok(view)
     }
 
-    /// Validate every rendered field against the exact admitted record.
+    /// Validate every rendered field against the exact admitted record, and the
+    /// grade against the exact admitted set it was read from.
+    ///
+    /// This is the admitted-set-anchored half of the output binding: it joins
+    /// the scorecard's recorded admitted digest, omission handles and
+    /// source/evidence revisions against this admitted set's own values, so a
+    /// card graded against a different admitted set, recipe or source set is
+    /// refused even when both share one task, attempt, scope, decision and
+    /// fence. [`ActiveUnderstandingView::validate`] remains the part a
+    /// deserialized view can check on its own.
     pub fn validate_against(&self, admitted: &AdmittedContextSet) -> Result<(), ContextError> {
         admitted.validate()?;
         self.validate()?;
@@ -312,6 +321,36 @@ impl ActiveUnderstandingView {
             self.selection.omission_evidence.iter().cloned().collect();
         if expected_omissions != actual_omissions {
             return Err(ContextError::SelectionIntegrityMismatch);
+        }
+        // The source/evidence-revision join. The admitted records are the
+        // authority on which source snapshots a grade may be read from, so the
+        // expected set is derived here from `AdmittedContextSet::records` and
+        // not from the scorecard's own list: a card that never observed one of
+        // the admitted sources, or that claims a source this packet does not
+        // carry, is refused instead of passing on unrelated nonempty handles.
+        // The set is the distinct `source.snapshot_id` of every admitted
+        // record, which is exactly the recorded meaning of
+        // `QualityOutputBinding::evidence_revisions`.
+        //
+        // A revision that moved is caught by the checks around this one, not by
+        // this set: every rendered atom's `source_revision` is compared against
+        // its own admitted record below, and `canonical_payload_digest` above
+        // hashes the admitted records themselves, so a changed source revision
+        // changes a recorded digest or a compared field and is rejected.
+        let expected_revisions: BTreeSet<ArtifactId> = admitted
+            .records
+            .iter()
+            .map(|record| record.candidate.source.snapshot_id.clone())
+            .collect();
+        let graded_revisions: BTreeSet<ArtifactId> = self
+            .quality
+            .output
+            .evidence_revisions
+            .iter()
+            .cloned()
+            .collect();
+        if expected_revisions != graded_revisions {
+            return Err(ContextError::QualityIncomplete);
         }
         let expected: Vec<_> = admitted
             .records
@@ -407,6 +446,13 @@ impl ActiveUnderstandingView {
     }
 
     /// Detect any post-assembly mutation or injected non-admitted content.
+    ///
+    /// This is the self-contained half of the grade/output binding: it joins the
+    /// scorecard's recorded recipe, fence, rendered digest, source/evidence
+    /// revisions and omission handles against this view's own values, so a
+    /// deserialized or mutated view cannot carry a grade that belongs to a
+    /// different packet. [`ActiveUnderstandingView::validate_against`] is the
+    /// other half, the join against the admitted set itself.
     pub fn validate(&self) -> Result<(), ContextError> {
         self.binding.validate()?;
         self.selection.validate()?;
@@ -454,6 +500,24 @@ impl ActiveUnderstandingView {
         {
             return Err(ContextError::QualityIncomplete);
         }
+// #1726: the grade is bound to this exact representation's own source
+        // and omission handles, not only to a pre-pruning candidate set.
+        //
+        // This is the self-contained half of that binding, so a deserialized
+        // view with no admitted set in hand still detects the change. The
+        // compared side is the scorecard's recorded `evidence_revisions` and
+        // `omission_handles`; the expected sides are two independent records
+        // this view already carries — its own rendered source snapshots (via
+        // `observed_source_revisions`) and its own selection-proof omission
+        // evidence. A card graded against a different membership, a different
+        // source set or a different omission set records different values here
+        // and is rejected, which is what makes a route, source, task or verifier
+        // change invalidate a grade instead of leaving it silently current.
+        // Nothing is re-hashed as a substitute for validating the recorded
+        // value: the card's recorded values are compared against the view's own
+        // values, and the canonical rendered digest above remains the single
+        // existing owner of the final-representation identity.
+        //
         // The serializer/route half of the output binding, compared against the
         // execution this view was actually produced under. `execution` is the
         // assembly owner's own record of the policy it applied, and
@@ -471,18 +535,25 @@ impl ActiveUnderstandingView {
         {
             return Err(ContextError::QualityIncomplete);
         }
-        // The source-revision half. Every revision the card claims it graded
-        // from must be a revision this packet actually carries. The expected
-        // set is derived from the rendered projection, not from the card, and
-        // `validate_against` already proves each rendered `source_id` equals
-        // its admitted record's `source.snapshot_id`, so a card citing a
-        // foreign or never-observed source revision is refused while a card
-        // citing a genuine one passes. The comparison runs in this direction —
-        // claimed ⊆ observed — because that is the guarantee: it makes a
-        // valid-looking handle without a current observation unable to bind.
-        // It deliberately does not demand the reverse, which would make a
-        // re-sealed packet that legitimately gained a source ungradeable by
-        // the seed card it was legitimately re-graded under.
+        // The source-revision half, against this representation's own source
+        // snapshots. Every revision the card claims it graded from must be a
+        // revision this packet actually carries. The expected set is derived
+        // from the rendered projection, not from the card, and `validate_against`
+        // already proves each rendered `source_id` equals its admitted record's
+        // `source.snapshot_id`, so a card citing a foreign or never-observed
+        // source revision is refused while a card citing a genuine one passes.
+        // The comparison runs in this direction — claimed ⊆ observed — because
+        // that is the guarantee: it makes a valid-looking handle without a
+        // current observation unable to bind. It deliberately does not demand
+        // the reverse, which would make a re-sealed packet that legitimately
+        // gained a source ungradeable by the seed card it was legitimately
+        // re-graded under.
+        //
+        // #1726: this is deliberately ONE-WAY where the rescue's version was
+        // two-way. Demanding the reverse here would refuse a re-sealed packet
+        // that legitimately gained a source, which is the case the comment
+        // above names; the rescue's bidirectional equality is recovered where it
+        // is sound, in `validate_against` against the admitted set itself.
         let observed_revisions = self.observed_source_revisions();
         if self
             .quality
@@ -518,6 +589,18 @@ impl ActiveUnderstandingView {
             {
                 return Err(ContextError::QualityIncomplete);
             }
+// #1726: the omission half of the same binding, which the checks above
+        // do not cover. The card's recorded `omission_handles` are compared
+        // against this representation's own selection-proof omission evidence —
+        // a second record the view carries, written by the selection proof and
+        // not copied from the card. A card graded against a different omission set
+        // records different values here and is refused. The source half of the
+        // rescue's bidirectional equality is deliberately NOT restored here,
+        // because main's one-way `claimed ⊆ observed` comparison above is the
+        // stricter guarantee for a re-sealable packet; this adds only the part
+        // main did not already check.
+        if self.quality.output.omission_handles != self.selection.omission_evidence {
+            return Err(ContextError::QualityIncomplete);
         }
         if self.selection.binding != self.binding
             || self.quality.binding != self.binding
