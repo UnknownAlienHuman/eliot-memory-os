@@ -564,6 +564,17 @@ pub struct MemoryVitalitySignals {
     pub false_activation_count: u64,
     pub negative_transfer_count: u64,
     pub contradiction_count: u64,
+    /// Measured Context cost of this memory, in `MemoryUtilitySignalKind::ContextTokenCost`
+    /// units.
+    ///
+    /// That unit is the #704 conservative Source Token Unit (`stu_estimate.value`,
+    /// `empirical: false`) admitted by the closed `eliot-context-cost/v1` measurement
+    /// adapter, not a count of current route tokens. The field name and the
+    /// `MemoryVitalityScore` field it projects into keep their historical spelling
+    /// because both live outside this file's ownership; the unit is the one recorded
+    /// here. Bytes, characters, KiB and record counts are never admitted into this
+    /// field: a memory with no admitted measurement reports zero units, which is
+    /// "unmeasured", not "cheap enough to keep".
     pub context_cost_tokens: u64,
     pub maintenance_cost_units: u64,
     pub minority_importance_millis: i64,
@@ -572,6 +583,21 @@ pub struct MemoryVitalitySignals {
 }
 
 impl MemoryVitalityService {
+    /// Baseline vitality for a memory whose Context cost was never measured.
+    ///
+    /// `context_cost_tokens` is left at zero rather than seeded with a literal. The
+    /// removed seed asserted 64 units of `MemoryUtilitySignalKind::ContextTokenCost`
+    /// cost with no measurement, no `eliot-context-cost/v1` adapter revision and no
+    /// route/model/tokenizer binding behind it, which presented a non-token basis as
+    /// a Context token cost. Zero units is the honest representation of "not
+    /// measured"; it is not a zero-cost, cheap or preferred claim, and the
+    /// `KeepHandleOnly` disposition still requires a caller to supply a real measured
+    /// value above its existing threshold.
+    ///
+    /// Corrected-evidence note (R4): dropping the unsourced seed lowers this
+    /// baseline's `harm_millis` by `64 / 10` and raises its `utility_millis` by
+    /// `64 / 5`. The decision thresholds, weights and clamp bounds are unchanged and
+    /// nothing here retunes them; only the unevidenced input is removed.
     pub fn score(project_id: ProjectId, memory_ref: &str) -> MemoryVitalityScore {
         Self::score_from_signals(
             project_id,
@@ -581,7 +607,7 @@ impl MemoryVitalityService {
                 verification_success_count: 1,
                 freshness_millis: 750,
                 scope_fit_millis: 750,
-                context_cost_tokens: 64,
+                context_cost_tokens: 0,
                 maintenance_cost_units: 1,
                 ..MemoryVitalitySignals::default()
             },
