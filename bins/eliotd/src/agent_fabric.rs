@@ -73,7 +73,9 @@ use eliot_agent_coordinator::{
 use eliot_agent_coordinator::{OwnerCurrentness, PresentedClaimMaterial};
 use eliot_contracts::{EpochId, StateFence, fences_match_exact};
 use eliot_kernel_service::ProviderCapabilityExpectation;
-use eliot_store_api::{StoreError, SwarmOwnerRevision, WriteReceipt, WriteReceiptStatus};
+use eliot_store_api::{
+    StoreError, SwarmOwnerRevision, SwarmSemanticOwnerKind, WriteReceipt, WriteReceiptStatus,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -1231,6 +1233,20 @@ fn contract_rejection(error: eliot_agent_contracts::ContractError) -> FabricErro
 /// progression are re-checked through [`SwarmOwnerRevision::validate`], the
 /// existing Store contract — never re-derived here.
 ///
+/// #1702 W3/A3: the owner this revision speaks for is also bound here, and
+/// the discriminator is [`SwarmOwnerRevision::owner_kind`] — the Store-owned
+/// stream the canonical transaction committed on — not a label the caller
+/// fills in. `SwarmOwnerRevision::validate` validates the record against
+/// whatever owner kind the revision *declares*, so a definition record
+/// committed on the Governor admission stream would pass that check while
+/// carrying the wrong owner's fields. `expected_owner` names the owner this
+/// particular write boundary is for; a mismatch is refused here, before the
+/// revision enters any in-memory map, which is what stops a stale or foreign
+/// controller or coordinator from writing the other owner's fields under its
+/// own labels. The check is deliberately a closed three-way match, so it has
+/// exactly one way to pass: the declared kind, the committed record shape and
+/// this operation's owner must all be the same owner.
+///
 /// `record` is the semantic record the caller wants published, as its JSON
 /// value. [`SwarmOwnerRevision::validate`] has already established that
 /// `record_json` is the canonical encoding and that `content_digest` binds
@@ -1243,16 +1259,24 @@ fn contract_rejection(error: eliot_agent_contracts::ContractError) -> FabricErro
 ///
 /// Returns [`FabricError::RevisionNotDurable`] carrying the typed
 /// [`StoreError`] when the owner revision is malformed, when it does not carry
-/// `record` verbatim, or when the receipt is absent, non-committed, of another
-/// transition class, or bound to another owner stream or revision.
+/// `record` verbatim, when it was committed on another owner's stream, or when
+/// the receipt is absent, non-committed, of another transition class, or bound
+/// to another owner stream or revision.
 fn require_durable_owner_revision(
     owner_revision: &SwarmOwnerRevision,
     receipt: &WriteReceipt,
     record: &serde_json::Value,
+    expected_owner: SwarmSemanticOwnerKind,
 ) -> Result<(), FabricError> {
     owner_revision
         .validate()
         .map_err(FabricError::RevisionNotDurable)?;
+    if owner_revision.owner_kind != expected_owner {
+        return Err(FabricError::RevisionNotDurable(StoreError::InvalidField {
+            field: "swarm.owner_kind",
+            reason: "committed revision belongs to another semantic owner stream",
+        }));
+    }
     if serde_json::from_str::<serde_json::Value>(&owner_revision.record_json)
         .ok()
         .as_ref()
@@ -2467,7 +2491,12 @@ impl AgentFabric {
         let record = serde_json::to_value(&definition).map_err(|error| {
             FabricError::Contract(format!("semantic definition encode: {error}"))
         })?;
-        require_durable_owner_revision(owner_revision, receipt, &record)?;
+        require_durable_owner_revision(
+            owner_revision,
+            receipt,
+            &record,
+            SwarmSemanticOwnerKind::TaskController,
+        )?;
         if !matches!(
             definition.lifecycle,
             SwarmPlanDefinitionLifecycle::Draft | SwarmPlanDefinitionLifecycle::Frozen
@@ -2547,7 +2576,12 @@ impl AgentFabric {
         let record = serde_json::to_value(&admission).map_err(|error| {
             FabricError::Contract(format!("semantic admission encode: {error}"))
         })?;
-        require_durable_owner_revision(owner_revision, receipt, &record)?;
+        require_durable_owner_revision(
+            owner_revision,
+            receipt,
+            &record,
+            SwarmSemanticOwnerKind::Governor,
+        )?;
         let definition_key = admission.definition_id.as_str().to_owned();
         let definition = self
             .semantic_definitions
@@ -2656,7 +2690,12 @@ impl AgentFabric {
         let record = serde_json::to_value(&admission).map_err(|error| {
             FabricError::Contract(format!("semantic admission encode: {error}"))
         })?;
-        require_durable_owner_revision(owner_revision, receipt, &record)?;
+        require_durable_owner_revision(
+            owner_revision,
+            receipt,
+            &record,
+            SwarmSemanticOwnerKind::Governor,
+        )?;
         self.semantic_admissions.insert(key.clone(), admission);
         // #1702 W2: the disposition is durable before it becomes the current
         // one; a failed write leaves the previous disposition authoritative.
@@ -2710,7 +2749,12 @@ impl AgentFabric {
         let record = serde_json::to_value(&execution).map_err(|error| {
             FabricError::Contract(format!("semantic execution encode: {error}"))
         })?;
-        require_durable_owner_revision(owner_revision, receipt, &record)?;
+        require_durable_owner_revision(
+            owner_revision,
+            receipt,
+            &record,
+            SwarmSemanticOwnerKind::AgentCoordinator,
+        )?;
         if !execution
             .coordinator
             .authorizes(coordinator_holder, coordinator_epoch)
@@ -2820,7 +2864,12 @@ impl AgentFabric {
         let record = serde_json::to_value(&next).map_err(|error| {
             FabricError::Contract(format!("semantic execution encode: {error}"))
         })?;
-        require_durable_owner_revision(owner_revision, receipt, &record)?;
+        require_durable_owner_revision(
+            owner_revision,
+            receipt,
+            &record,
+            SwarmSemanticOwnerKind::AgentCoordinator,
+        )?;
         self.semantic_executions.insert(key.clone(), next);
         // #1702 W2: the rebind is durable before it becomes the current
         // execution owner; a failed write leaves the previous epoch in force.
@@ -2946,7 +2995,12 @@ impl AgentFabric {
         let record = serde_json::to_value(&next).map_err(|error| {
             FabricError::Contract(format!("semantic definition encode: {error}"))
         })?;
-        require_durable_owner_revision(owner_revision, receipt, &record)?;
+        require_durable_owner_revision(
+            owner_revision,
+            receipt,
+            &record,
+            SwarmSemanticOwnerKind::TaskController,
+        )?;
         let link = next.supersedes.clone().ok_or_else(|| {
             FabricError::BrokenOwnershipLink("replacement without supersedes link".to_owned())
         })?;
