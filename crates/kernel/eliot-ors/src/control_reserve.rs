@@ -12,6 +12,15 @@
 //! normal Store write, named read, agent or maintenance admission cannot reach
 //! protected ORS capacity by relabelling its priority or class.
 //!
+//! W4 ORS wave: every [`OrsPermit`] is owner-issued non-clone evidence bound
+//! to capacity class, bottleneck/unit/granted amount, typed operation,
+//! operation identity, owner and the typed [`AuthorityEpoch`] observed at
+//! acquisition, mirroring the front-door ControlPermit evidence grade.
+//! Every denial names the exact bottleneck, shed work and observed epoch. A
+//! stale epoch, changed operation or changed owner fails before consumption
+//! because the evidence no longer matches the current owner state; there is
+//! no epoch-blind permit to replay.
+//!
 //! Exhausted normal durable bytes render as a versioned
 //! [`I14BackpressureResponseV1`] with disposition `STORAGE_BACKPRESSURE`
 //! naming exactly [`ORS_DURABLE_BYTES_BOTTLENECK`] in its byte unit; exhausted
@@ -29,6 +38,10 @@
 //! `join_ors_owner_evidence` composition step. There is no emergency
 //! partition here; recording reserve loss stays with the front-door
 //! last-resort slot until a later wave wires ORS-side loss reporting.
+//! Restart reconciliation (W5) stays with the ORS recovery-journal owner:
+//! permits carry the operation identity, owner and epoch the reconciler
+//! needs, but this module holds no durable permit ledger and never
+//! reconstitutes capacity from a reset counter.
 //! DISCLOSED LIMIT: `profile_revision` on the responses is caller-supplied
 //! metadata echoed into the directive; the `Current` currentness claim refers
 //! to the live-observed saturation at call time, not to a re-read of the
@@ -38,7 +51,7 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use eliot_contracts::{ArtifactId, OperationId};
+use eliot_contracts::{ArtifactId, AuthorityEpoch, OperationId};
 use eliot_runtime_contracts::{
     AffectedOperationClass, BackpressureDisposition, BottleneckAvailability,
     BottleneckCapacityProfile, BottleneckCoverageState, BottleneckObservationV1, CapacityBottleneck,
@@ -77,7 +90,7 @@ pub enum OrsReserveError {
     /// The normal partition cannot satisfy the request; the protected
     /// partition is untouched.
     #[error(
-        "ORS normal capacity exhausted for {bottleneck:?}: work {work_class:?} operation {operation_id} owned by {owner}"
+        "ORS normal capacity exhausted for {bottleneck:?}: work {work_class:?} operation {operation_id} owned by {owner} epoch {epoch:?}"
     )]
     NormalCapacityExhausted {
         /// Bottleneck whose normal partition is saturated.
@@ -88,10 +101,12 @@ pub enum OrsReserveError {
         operation_id: String,
         /// Requesting owner.
         owner: String,
+        /// Authority epoch observed at denial.
+        epoch: AuthorityEpoch,
     },
     /// The protected partition cannot satisfy the request.
     #[error(
-        "ORS protected reserve exhausted for {bottleneck:?}: control operation {operation:?} operation {operation_id} owned by {owner}"
+        "ORS protected reserve exhausted for {bottleneck:?}: control operation {operation:?} operation {operation_id} owned by {owner} epoch {epoch:?}"
     )]
     ProtectedReserveExhausted {
         /// Bottleneck whose protected partition is saturated.
@@ -102,6 +117,8 @@ pub enum OrsReserveError {
         operation_id: String,
         /// Requesting owner.
         owner: String,
+        /// Authority epoch observed at denial.
+        epoch: AuthorityEpoch,
     },
 }
 
@@ -202,9 +219,9 @@ pub struct OrsReserve {
     inner: Arc<OrsReserveInner>,
 }
 
-/// One held ORS capacity permit, bound to dimension, class, operation and
-/// owner. Releasing is automatic on drop and returns exactly the consumed
-/// partition and amount.
+/// One held ORS capacity permit, bound to dimension, class, operation, owner
+/// and Authority Epoch. Releasing is automatic on drop and returns exactly
+/// the consumed partition and amount.
 ///
 /// Permits are deliberately not [`Clone`]: duplicating a permit handle must
 /// never duplicate the underlying capacity.
@@ -217,6 +234,7 @@ pub struct OrsPermit {
     operation: OrsPermitOperation,
     operation_id: String,
     owner: String,
+    epoch: AuthorityEpoch,
 }
 
 impl OrsPermit {
@@ -260,6 +278,12 @@ impl OrsPermit {
     #[must_use]
     pub fn owner(&self) -> &str {
         &self.owner
+    }
+
+    /// Returns the Authority Epoch bound at acquisition.
+    #[must_use]
+    pub const fn epoch(&self) -> AuthorityEpoch {
+        self.epoch
     }
 }
 
@@ -412,19 +436,23 @@ impl OrsReserve {
     /// Attempts to acquire one normal transaction slot without blocking.
     ///
     /// Only [`NormalWorkClass`] operations typecheck here, so protected ORS
-    /// capacity is unreachable through this path by construction.
+    /// capacity is unreachable through this path by construction. The granted
+    /// permit binds `epoch`; a caller presenting it under a different epoch
+    /// holds evidence that no longer matches the current owner state.
     ///
     /// # Errors
     ///
     /// Returns [`OrsReserveError::InvalidField`] for a blank owner/operation
     /// identity, or [`OrsReserveError::NormalCapacityExhausted`] naming the
-    /// transaction bottleneck and shed work when the normal partition is
-    /// saturated. The protected partition is untouched in every case.
+    /// transaction bottleneck, shed work and observed epoch when the normal
+    /// partition is saturated. The protected partition is untouched in every
+    /// case.
     pub fn try_acquire_normal_transaction(
         &self,
         work: NormalWorkClass,
         owner: &str,
         operation_id: &str,
+        epoch: AuthorityEpoch,
     ) -> Result<OrsPermit, OrsReserveError> {
         validate_text(owner, "ors_permit.owner").map_err(|_| OrsReserveError::InvalidField {
             field: "ors_permit.owner",
@@ -446,6 +474,7 @@ impl OrsReserve {
                 work_class: work,
                 operation_id: operation_id.to_owned(),
                 owner: owner.to_owned(),
+                epoch,
             });
         }
         Ok(OrsPermit {
@@ -456,27 +485,31 @@ impl OrsReserve {
             operation: OrsPermitOperation::Normal(work),
             operation_id: operation_id.to_owned(),
             owner: owner.to_owned(),
+            epoch,
         })
     }
 
     /// Attempts to acquire `bytes` normal durable bytes without blocking.
     ///
     /// Only [`NormalWorkClass`] operations typecheck here, so protected ORS
-    /// durable capacity is unreachable through this path by construction.
+    /// durable capacity is unreachable through this path by construction. The
+    /// granted permit binds `epoch`; a caller presenting it under a different
+    /// epoch holds evidence that no longer matches the current owner state.
     ///
     /// # Errors
     ///
     /// Returns [`OrsReserveError::InvalidField`] for a blank owner/operation
     /// identity, or [`OrsReserveError::NormalCapacityExhausted`] naming the
-    /// durable-byte bottleneck and shed work when the normal partition cannot
-    /// satisfy the request. The protected partition is untouched in every
-    /// case.
+    /// durable-byte bottleneck, shed work and observed epoch when the normal
+    /// partition cannot satisfy the request. The protected partition is
+    /// untouched in every case.
     pub fn try_acquire_normal_durable_bytes(
         &self,
         work: NormalWorkClass,
         owner: &str,
         operation_id: &str,
         bytes: NonZeroU64,
+        epoch: AuthorityEpoch,
     ) -> Result<OrsPermit, OrsReserveError> {
         validate_text(owner, "ors_permit.owner").map_err(|_| OrsReserveError::InvalidField {
             field: "ors_permit.owner",
@@ -498,6 +531,7 @@ impl OrsReserve {
                 work_class: work,
                 operation_id: operation_id.to_owned(),
                 owner: owner.to_owned(),
+                epoch,
             });
         }
         Ok(OrsPermit {
@@ -508,6 +542,7 @@ impl OrsReserve {
             operation: OrsPermitOperation::Normal(work),
             operation_id: operation_id.to_owned(),
             owner: owner.to_owned(),
+            epoch,
         })
     }
 
@@ -517,19 +552,22 @@ impl OrsReserve {
     /// Store write, named read, agent admission or module job cannot name a
     /// protected operation and therefore cannot acquire this partition. This
     /// is the path an admitted cancellation/recovery record keeps while
-    /// normal transaction work is saturated.
+    /// normal transaction work is saturated. The granted permit binds `epoch`
+    /// so the recovery record proves it was admitted under the current owner
+    /// state.
     ///
     /// # Errors
     ///
     /// Returns [`OrsReserveError::InvalidField`] for a blank owner/operation
     /// identity, or [`OrsReserveError::ProtectedReserveExhausted`] naming the
-    /// transaction bottleneck, operation, owner and request when the
-    /// protected partition is saturated.
+    /// transaction bottleneck, operation, owner, request and observed epoch
+    /// when the protected partition is saturated.
     pub fn try_acquire_protected_transaction(
         &self,
         operation: ControlOperationClass,
         owner: &str,
         operation_id: &str,
+        epoch: AuthorityEpoch,
     ) -> Result<OrsPermit, OrsReserveError> {
         validate_text(owner, "ors_permit.owner").map_err(|_| OrsReserveError::InvalidField {
             field: "ors_permit.owner",
@@ -551,6 +589,7 @@ impl OrsReserve {
                 operation,
                 operation_id: operation_id.to_owned(),
                 owner: owner.to_owned(),
+                epoch,
             });
         }
         Ok(OrsPermit {
@@ -561,6 +600,7 @@ impl OrsReserve {
             operation: OrsPermitOperation::Protected(operation),
             operation_id: operation_id.to_owned(),
             owner: owner.to_owned(),
+            epoch,
         })
     }
 
@@ -568,20 +608,23 @@ impl OrsReserve {
     ///
     /// Only [`ControlOperationClass`] operations typecheck here. This is the
     /// path an admitted cancellation/recovery record keeps while normal
-    /// durable-byte work reports `STORAGE_BACKPRESSURE`.
+    /// durable-byte work reports `STORAGE_BACKPRESSURE`. The granted permit
+    /// binds `epoch` so the recovery record proves it was admitted under the
+    /// current owner state.
     ///
     /// # Errors
     ///
     /// Returns [`OrsReserveError::InvalidField`] for a blank owner/operation
     /// identity, or [`OrsReserveError::ProtectedReserveExhausted`] naming the
-    /// durable-byte bottleneck, operation, owner and request when the
-    /// protected partition cannot satisfy the request.
+    /// durable-byte bottleneck, operation, owner, request and observed epoch
+    /// when the protected partition cannot satisfy the request.
     pub fn try_acquire_protected_durable_bytes(
         &self,
         operation: ControlOperationClass,
         owner: &str,
         operation_id: &str,
         bytes: NonZeroU64,
+        epoch: AuthorityEpoch,
     ) -> Result<OrsPermit, OrsReserveError> {
         validate_text(owner, "ors_permit.owner").map_err(|_| OrsReserveError::InvalidField {
             field: "ors_permit.owner",
@@ -603,6 +646,7 @@ impl OrsReserve {
                 operation,
                 operation_id: operation_id.to_owned(),
                 owner: owner.to_owned(),
+                epoch,
             });
         }
         Ok(OrsPermit {
@@ -613,6 +657,7 @@ impl OrsReserve {
             operation: OrsPermitOperation::Protected(operation),
             operation_id: operation_id.to_owned(),
             owner: owner.to_owned(),
+            epoch,
         })
     }
 
