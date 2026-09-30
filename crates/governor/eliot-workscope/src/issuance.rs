@@ -19,9 +19,9 @@
 use super::{
     GoverningSourceSet, IdentityEvidence, PrivacyBoundary, PrivacyProfile,
     ResolutionAuthentication, ScopeBinding, ScopeBindingDisposition, ScopeBindingGuard,
-    ScopeFingerprint, WorkScopeAdmissionAuthority, WorkScopeBindingOwner,
-    WorkScopeBindingSnapshot, WorkScopeDescriptor, WorkScopeError, WorkScopeResolutionReceipt,
-    binding_matches_descriptor, text,
+    ScopeFingerprint, WorkScopeAdmissionAuthority, WorkScopeBindingOwner, WorkScopeBindingSnapshot,
+    WorkScopeDescriptor, WorkScopeError, WorkScopeResolutionReceipt, binding_matches_descriptor,
+    text,
 };
 use super::{IdentityLegOutcome, identity_legs};
 use eliot_contracts::StateFence;
