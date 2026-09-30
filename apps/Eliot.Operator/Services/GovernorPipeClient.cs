@@ -132,7 +132,7 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
     // token, a rotated registration or a restarted process can never revive
     // it. It is never written to an envelope, a file, a log or a banner;
     // state-changing sends gate on it, and only on it, before any byte.
-    private RedeemedOperatorBinding? _retainedBinding;
+    private BrokerPipeClient.RedeemedOperatorBinding? _retainedBinding;
 
     /// Refuses new work once the session binding is proven lost. A fresh
     /// broker handoff arrives only with a fresh process, never in-process.
