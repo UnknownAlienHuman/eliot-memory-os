@@ -51,6 +51,100 @@
 //! Concilium have no arm and are annotated as such. None is filled from a
 //! substitute value.
 //!
+//! # A1's SECOND disjunct has no honest producer, and the arm is NOT written
+//!
+//! A1 reads "A real conformance diagnosis **or real repeated verifier
+//! failure** produces a durable deduplicated improvement candidate and a brief
+//! containing the stated evidence, risk, benefit, owner, cost, reversible next
+//! step, and unknowns." The FIRST disjunct is live through
+//! [`conformance_diagnosis_evidence`]. The SECOND has no arm here, deliberately,
+//! and this section records why so the next owner does not re-derive it and
+//! re-introduce a dead one.
+//!
+//! ## The signal exists at the closure seam and is DISCARDED before it persists
+//!
+//! The Governor's learning-closure owner derives the repeated-failure signal
+//! correctly. `observed_activities` emits
+//! `LifecycleActivity::RepeatedFailureSignature` exactly when the durable
+//! terminal job row is `TestdJobState::Failed` AND its physical attempt count
+//! exceeds one (`crates/governor/eliot-governor/src/learning_closure.rs:582-588`),
+//! and `derive_boundaries` refuses an ordinary read and an empty activity set
+//! first (`:483-491`). So the signal is real.
+//!
+//! It is then collapsed, and the collapse is what makes it unreachable here:
+//!
+//! 1. `close_attempt` persists `boundaries[0]`
+//!    (`learning_closure.rs:492-495`) — "The first derived boundary in the closed
+//!    nine-value order names the record". `derive_boundaries` returns
+//!    `ConsequentialBoundary::ALL` order (`crates/smart/eliot-learning-delta/src/
+//!    boundary.rs:233-236`), where `VerifierOutcome` is index 1 and
+//!    `RepeatedFailureSignature` is index 3 (`boundary.rs:49-58`).
+//! 2. `verifier_finished` is ALWAYS true on the production path.
+//!    `observed_activities` is called with
+//!    `fact.verification_run.finished_at.is_some()`
+//!    (`learning_closure.rs:854-859`), the only production construction of a
+//!    canonical `VerificationRun` is `evaluate_testd_verification_current` →
+//!    `eliot_verifier::evaluate_current`, which hardcodes `finished_at: Some(…)`
+//!    (`crates/instrument/eliot-verifier/src/lib.rs:838`), and
+//!    `read_verifier_execution_fact` returns `Err` when the fact is ABSENT
+//!    (`crates/governor/eliot-governor/src/composition.rs:3212-3221`), so
+//!    `close_attempt_learning` errors out rather than committing with a
+//!    `verifier_finished` of `false`.
+//! 3. `observed_activities` never pushes `MaterialImplementationAttempt` (index
+//!    0), so nothing sorts before the always-present `VerifierOutcome`.
+//!
+//! Therefore `boundaries[0] == VerifierOutcome` for EVERY committed record, and
+//! `StoredLearningDelta::consequential_boundary` is always `"verifier_outcome"`.
+//! A TestD job with `attempts = 3`, `state = Failed` and a real nextest receipt
+//! still commits `"verifier_outcome"`. An arm comparing that field against
+//! `"repeated_failure_signature"` can never fire on any production input.
+//!
+//! ## The record also cannot express FAILURE, which is the second half of the gap
+//!
+//! Even a persisted `RepeatedFailureSignature` would not be enough for a
+//! "repeated VERIFIER FAILURE" claim, because the record does not carry the
+//! verifier's verdict. The run's `outcome` is consumed by
+//! `close_disposition_for` (`learning_closure.rs:607-633`) and only its
+//! three-value `AttemptCloseDisposition` reaches `StoredLearningDelta::disposition`
+//! via `as_stored()`; on the production path `derived` is hardcoded `false`
+//! (`learning_closure.rs:866`), so a conclusive run closes as `INVALID_EVIDENCE`
+//! and a non-conclusive one as `INCONCLUSIVE`. Neither distinguishes
+//! `VerificationOutcome::Pass` from `VerificationOutcome::Fail`, which is the same
+//! fact A1's second disjunct names. The record's `evidence_refs` carry the
+//! verifier run id and raw artifacts (`learning_closure.rs:663-676`) but no
+//! verdict, and `strategy_fingerprint` is computed from plan and invocation
+//! binding alone (`:641-659`), so neither can be read as one.
+//!
+//! ## What the fix needs, and why it is not in this file
+//!
+//! Two changes in `crates/governor/eliot-governor/src/learning_closure.rs`,
+//! neither of which this module may make:
+//!
+//! 1. persist the derived boundary SET rather than `boundaries[0]`, so
+//!    `RepeatedFailureSignature` survives onto `StoredLearningDelta`; and
+//! 2. carry the verifier's `Pass`/`Fail` verdict onto the record, so a consumer
+//!    can tell a repeated failure from a repeated success.
+//!
+//! `StoredLearningDelta` has one `consequential_boundary` field
+//! (`crates/smart/eliot-learning-delta/src/stored.rs:214`), so (1) is a contract
+//! change in that crate as well, not a field this dispatch layer can add.
+//!
+//! ## What is deliberately NOT done here
+//!
+//! No arm, no match pattern, and no `EvidenceSource::Attempt` relabelling stands
+//! in for the missing signal. The three available substitutes were each measured
+//! and each rejected: comparing the collapsed boundary is dead on arrival (above);
+//! deriving failure from `disposition` cannot separate `Pass` from `Fail`; and
+//! reading a verdict out of `evidence_refs` would name a verifier the record
+//! never names, which is the misattribution this file exists to remove.
+//!
+//! The correct label once (1) and (2) exist is [`EvidenceSource::EvaluatorVerdict`],
+//! through the existing `eliot_improvement::sourced_evidence_from_repeated_verifier_failure`
+//! (`crates/meta/eliot-improvement/src/evidence_sources.rs:118-142`), which
+//! already exists, is the closed set's own spelling for a verifier verdict, and
+//! currently has no caller. It is not wired speculatively against a record that
+//! cannot yet carry what it needs.
+//!
 //! The decision now also carries its origin —
 //! [`eliot_maintenance::AutomationTriggerDecision::trigger`] is copied verbatim
 //! from the evaluated trigger — so the three suggestion sources are no longer
@@ -747,71 +841,7 @@ pub fn assemble_improvement_artifact(
         &boundary,
     )?;
 
-    // The disposition recorded here is the DAEMON'S OWN, and is named that way.
-    //
-    // It is still the production caller of the bridge's `record_brief_decision`,
-    // which previously had none, and it is still non-mutating: `Investigate` is
-    // one of the two kinds `is_non_mutating` admits, and recording it changes
-    // no surface, which is I12.24:82's "advisory … default; changes nothing
-    // until owner acts" observed rather than asserted.
-    //
-    // What changed is the `owner`. It used to be [`IMPROVEMENT_OWNER`], the
-    // maintenance (`G-19`) admission authority, on the reasoning that this field
-    // names the principal that RECORDED the disposition and the maintenance owner
-    // is that principal because it issued the permit this candidate was assembled
-    // under. That reasoning was wrong, and it is the same error this issue
-    // exists to remove, read from the other side. Issuing a learning-admission
-    // permit is a different act from selecting a disposition over a brief: the
-    // `G-19` owner admitted the CANDIDATE to the bounded backlog, and it never
-    // saw this brief, never read it, and chose nothing about it. Recording its
-    // name against a disposition it did not select is precisely the false
-    // attribution A12.02:3 forbids — "Identity is not a model's self-declared
-    // string" — with the failure running the other way: not a model inventing an
-    // identity, but a real principal's name attached to a decision that principal
-    // never made. A later reader of `improvement_dedup_read` takes that field at
-    // its word, so the false attribution is not harmless; it is a durable claim
-    // about a real owner.
-    //
-    // The owner recorded now is the only principal that genuinely selected this
-    // disposition: the daemon itself, under its own service identity
-    // ([`SERVICE_NAME`]). That identity is not self-declared — A12.02:3 is
-    // "Identity is not a model's self-declared string" — it is the installed
-    // service's own, named by the composition and carried on every request
-    // identity this daemon commits (`improvement_commit_identity` below binds it
-    // as both `product_id` and `source_id`), and the exchange it makes over is
-    // authenticated in the other direction too: the Kernel front door proves
-    // this daemon's peer SID, session identity and artifact digest before the
-    // connection is used (`daemon_kernel_client.rs:1878-1908`). It grants nothing
-    // either way — `is_non_mutating` is what makes the record advisory. A note
-    // that says "the daemon triaged this and no owner has ruled on it" is a
-    // smaller claim than the one it replaces, and it is a TRUE one.
-    //
-    // It is deliberately NOT the brief's `proposed_owner` either. That field
-    // names the principal proposed to DECIDE (the observed boundary's
-    // `actor_id`, read from a committed closure record); this field names the
-    // principal that DID record a disposition. The daemon is not proposed to
-    // decide its own brief, so conflating the two would overwrite the one route
-    // an owner's decision has a named place to arrive through.
-    //
-    // The four dispositions remain unreachable from an owner's selection, and
-    // `OwnerDecisionKind::Reject` in particular is not produced anywhere in
-    // `bins/`. The measurement of every candidate ingress surface, and the exact
-    // route that is missing and where it would attach, are recorded in the
-    // module documentation above under "The recorded disposition is the DAEMON's
-    // own, and no owner ingress exists". Nothing here substitutes a fabricated
-    // caller for it.
-    let decision_record = crate::improvement_intake::record_brief_decision(
-        &brief,
-        SERVICE_NAME,
-        OwnerDecisionKind::Investigate,
-        &format!(
-            "the daemon triaged blocked maintenance family {} at its own initiative; this \
-             disposition selects nothing and no owner has ruled on this brief, because no \
-             owner-issued ingress reaches this process",
-            decision.family
-        ),
-    )
-    .map_err(|error| ImprovementDispatchError::Contract(error.to_string()))?;
+    let decision_record = record_daemon_disposition(&brief, decision.family)?;
 
     // Deduplication and bounded admission are NOT done here. They need the
     // live Governor owner (a real permit whose authority the bound is checked
@@ -823,6 +853,80 @@ pub fn assemble_improvement_artifact(
         brief,
         decision: decision_record,
     })
+}
+
+/// Records the DAEMON'S OWN non-authoritative disposition over the brief it just
+/// assembled, and names it as such.
+///
+/// This is the production caller of the bridge's `record_brief_decision`, which
+/// previously had none, and it is still non-mutating: `Investigate` is one of the
+/// two kinds `is_non_mutating` admits, and recording it changes no surface, which
+/// is I12.24:82's "advisory … default; changes nothing until owner acts" observed
+/// rather than asserted.
+///
+/// # The owner is the daemon, and deliberately NOT `IMPROVEMENT_OWNER`
+///
+/// The `owner` used to be [`IMPROVEMENT_OWNER`], the maintenance (`G-19`)
+/// admission authority, on the reasoning that this field names the principal
+/// that RECORDED the disposition and the maintenance owner is that principal
+/// because it issued the permit this candidate was assembled under. That
+/// reasoning was wrong, and it is the same error this issue exists to remove,
+/// read from the other side. Issuing a learning-admission permit is a different
+/// act from selecting a disposition over a brief: the `G-19` owner admitted the
+/// CANDIDATE to the bounded backlog, and it never saw this brief, never read it,
+/// and chose nothing about it. Recording its name against a disposition it did
+/// not select is precisely the false attribution A12.02:3 forbids — "Identity is
+/// not a model's self-declared string" — with the failure running the other way:
+/// not a model inventing an identity, but a real principal's name attached to a
+/// decision that principal never made. A later reader of
+/// `improvement_dedup_read` takes that field at its word, so the false
+/// attribution is not harmless; it is a durable claim about a real owner.
+///
+/// The owner recorded now is the only principal that genuinely selected this
+/// disposition: the daemon itself, under its own service identity
+/// ([`SERVICE_NAME`]). That identity is not self-declared — A12.02:3 is "Identity
+/// is not a model's self-declared string" — it is the installed service's own,
+/// named by the composition and carried on every request identity this daemon
+/// commits (`improvement_commit_identity` below binds it as both `product_id` and
+/// `source_id`), and the exchange it makes over is authenticated in the other
+/// direction too: the Kernel front door proves this daemon's peer SID, session
+/// identity and artifact digest before the connection is used
+/// (`daemon_kernel_client.rs:1878-1908`). It grants nothing either way —
+/// `is_non_mutating` is what makes the record advisory. A note that says "the
+/// daemon triaged this and no owner has ruled on it" is a smaller claim than the
+/// one it replaces, and it is a TRUE one.
+///
+/// It is deliberately NOT the brief's `proposed_owner` either. That field names
+/// the principal proposed to DECIDE (the observed boundary's `actor_id`, read
+/// from a committed closure record); this field names the principal that DID
+/// record a disposition. The daemon is not proposed to decide its own brief, so
+/// conflating the two would overwrite the one route an owner's decision has a
+/// named place to arrive through.
+///
+/// The four dispositions remain unreachable from an owner's selection, and
+/// `OwnerDecisionKind::Reject` in particular is not produced anywhere in
+/// `bins/`. The measurement of every candidate ingress surface, and the exact
+/// route that is missing and where it would attach, are recorded in the module
+/// documentation above under "The recorded disposition is the DAEMON's own, and
+/// no owner ingress exists". Nothing here substitutes a fabricated caller for it.
+///
+/// `family` is the maintenance family this pass evaluated, and it appears only
+/// in the note text; the disposition it selects does not depend on it.
+fn record_daemon_disposition(
+    brief: &eliot_improvement::ImprovementBrief,
+    family: eliot_maintenance::MaintenanceFamily,
+) -> Result<OwnerDecision, ImprovementDispatchError> {
+    crate::improvement_intake::record_brief_decision(
+        brief,
+        SERVICE_NAME,
+        OwnerDecisionKind::Investigate,
+        &format!(
+            "the daemon triaged blocked maintenance family {family} at its own initiative; this \
+             disposition selects nothing and no owner has ruled on this brief, because no \
+             owner-issued ingress reaches this process"
+        ),
+    )
+    .map_err(|error| ImprovementDispatchError::Contract(error.to_string()))
 }
 
 /// The evidence lineage this observation raises, over the decision's own
