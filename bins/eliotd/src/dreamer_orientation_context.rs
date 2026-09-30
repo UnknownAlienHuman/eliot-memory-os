@@ -7,7 +7,7 @@
 
 use eliot_agent_api::RouteFingerprint;
 use eliot_context::campaign_publication::{ContextPublicationError, context_recipe_body_digest};
-use eliot_context_contracts::OmissionRecord;
+use eliot_context_contracts::{AssemblyError, ContextError, OmissionRecord};
 use eliot_governor::{
     GovernorProjectionSet, OrientationProjectionOwnerInput, OrientationProjectionOwnerOutput,
     RouteScopeFingerprint, WorkScopeBindingSnapshot, bind_orientation_projections,
@@ -153,7 +153,7 @@ pub fn compile_dreamer_orientation_context<'owner, 'source>(
 /// Serializes the complete native owner readback carried by the result-body
 /// transport. Original request, role reads, candidate omissions, admission
 /// result, rank traces, assembly disposition and original owner policies stay
-/// together; only an assembly-stage refusal remains an error result.
+/// together, including a structured refusal from the assembly stage.
 pub(crate) fn compilation_owner_publication(
     compilation: &ContextCompilationOwnerReadback<'_>,
 ) -> Result<serde_json::Value, String> {
@@ -164,7 +164,9 @@ pub(crate) fn compilation_owner_publication(
         ContextCompilationOwnerOutcome::Incomplete(gaps) => {
             serde_json::json!({"incomplete": gaps})
         }
-        ContextCompilationOwnerOutcome::Refused(error) => return Err(error.to_string()),
+        ContextCompilationOwnerOutcome::Refused(error) => {
+            serde_json::json!({"refused": packet_composition_error_publication(error)})
+        }
     };
     serde_json::to_value(serde_json::json!({
         "request": compilation.request,
@@ -180,6 +182,137 @@ pub(crate) fn compilation_owner_publication(
         "outcome": outcome,
     }))
     .map_err(|error| error.to_string())
+}
+
+fn packet_composition_error_publication(error: &PacketCompositionError) -> serde_json::Value {
+    match error {
+        PacketCompositionError::BindingMismatch => serde_json::json!({
+            "variant": "binding_mismatch",
+        }),
+        PacketCompositionError::RoleUnavailable { role } => serde_json::json!({
+            "variant": "role_unavailable",
+            "role": role,
+        }),
+        PacketCompositionError::RoleConversionMissing { role, owner } => serde_json::json!({
+            "variant": "role_conversion_missing",
+            "role": role,
+            "owner": owner,
+        }),
+        PacketCompositionError::Candidates(error) => serde_json::json!({
+            "variant": "candidates",
+            "error": context_error_publication(error),
+        }),
+        PacketCompositionError::Admission(error) => serde_json::json!({
+            "variant": "admission",
+            "error": context_error_publication(error),
+        }),
+        PacketCompositionError::AdmissionIncomplete(gaps) => serde_json::json!({
+            "variant": "admission_incomplete",
+            "gaps": gaps,
+        }),
+        PacketCompositionError::CampaignView(error) => serde_json::json!({
+            "variant": "campaign_view",
+            "error": context_error_publication(error),
+        }),
+        PacketCompositionError::Assembly(error) => serde_json::json!({
+            "variant": "assembly",
+            "error": assembly_error_publication(error),
+        }),
+        PacketCompositionError::QualityIncomplete {
+            attempted_recipe_digest,
+            attempted_binding,
+            quality,
+            refusal,
+        } => serde_json::json!({
+            "variant": "quality_incomplete",
+            "attempted_recipe_digest": attempted_recipe_digest,
+            "attempted_binding": attempted_binding,
+            "quality": quality,
+            "refusal": refusal,
+        }),
+        PacketCompositionError::TraceDelivery(error) => serde_json::json!({
+            "variant": "trace_delivery",
+            "error": context_error_publication(error),
+        }),
+    }
+}
+
+fn context_error_publication(error: &ContextError) -> serde_json::Value {
+    match error {
+        ContextError::MissingField(field) => serde_json::json!({
+            "variant": "missing_field",
+            "field": field,
+        }),
+        ContextError::InvalidField(field) => serde_json::json!({
+            "variant": "invalid_field",
+            "field": field,
+        }),
+        ContextError::Bounds { field } => serde_json::json!({
+            "variant": "bounds",
+            "field": field,
+        }),
+        ContextError::InvalidFence => serde_json::json!({"variant": "invalid_fence"}),
+        ContextError::Duplicate(field) => serde_json::json!({
+            "variant": "duplicate",
+            "field": field,
+        }),
+        ContextError::DenominatorMismatch => {
+            serde_json::json!({"variant": "denominator_mismatch"})
+        }
+        ContextError::IdentityConflict => serde_json::json!({"variant": "identity_conflict"}),
+        ContextError::WholeUnitRequired => {
+            serde_json::json!({"variant": "whole_unit_required"})
+        }
+        ContextError::MissingFloor => serde_json::json!({"variant": "missing_floor"}),
+        ContextError::StaleFloor => serde_json::json!({"variant": "stale_floor"}),
+        ContextError::BlockedFloor => serde_json::json!({"variant": "blocked_floor"}),
+        ContextError::OversizedFloor => serde_json::json!({"variant": "oversized_floor"}),
+        ContextError::Overflow => serde_json::json!({"variant": "overflow"}),
+        ContextError::CapacityExceeded => serde_json::json!({"variant": "capacity_exceeded"}),
+        ContextError::UnknownMeasurement => {
+            serde_json::json!({"variant": "unknown_measurement"})
+        }
+        ContextError::OmissionHandleInvalid => {
+            serde_json::json!({"variant": "omission_handle_invalid"})
+        }
+        ContextError::EconomyMismatch => serde_json::json!({"variant": "economy_mismatch"}),
+        ContextError::QualityIncomplete => {
+            serde_json::json!({"variant": "quality_incomplete"})
+        }
+        ContextError::SelectionIntegrityMismatch => {
+            serde_json::json!({"variant": "selection_integrity_mismatch"})
+        }
+        ContextError::InvalidDigest(field) => serde_json::json!({
+            "variant": "invalid_digest",
+            "field": field,
+        }),
+    }
+}
+
+fn assembly_error_publication(error: &AssemblyError) -> serde_json::Value {
+    match error {
+        AssemblyError::Contract(error) => serde_json::json!({
+            "variant": "contract",
+            "error": context_error_publication(error),
+        }),
+        AssemblyError::Bounds(field) => serde_json::json!({
+            "variant": "bounds",
+            "field": field,
+        }),
+        AssemblyError::MeasurementMismatch(field) => serde_json::json!({
+            "variant": "measurement_mismatch",
+            "field": field,
+        }),
+        AssemblyError::Incomplete(gaps) => serde_json::json!({
+            "variant": "incomplete",
+            "gaps": gaps,
+        }),
+        AssemblyError::QualityIncomplete(quality, refusal) => serde_json::json!({
+            "variant": "quality_incomplete",
+            "quality": quality,
+            "refusal": refusal,
+        }),
+    }
 }
 
 /// Binds the CC-004 projections to the exact Context reconstruction and native
