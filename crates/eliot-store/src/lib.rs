@@ -38,7 +38,8 @@ pub use canonical_store::{
     CanonicalToolObservation, CognitiveProjectionBacklog, CognitiveProjectionFamily,
     CognitiveProjectionFamilyCounts, CognitiveProjectionFamilyState,
     CognitiveProjectionIntentReceipt, CognitiveProjectionLease, CognitiveProjectionProject,
-    CognitiveProjectionProjectPage, CognitiveProjectionPublicationStatus,
+    CognitiveProjectionProjectPage, CognitiveProjectionPublicationStatus, TaskAcceptanceItemRead,
+    TaskAcceptanceItemSet,
 };
 pub use control_reserve::{
     STORE_CONNECTION_BOTTLENECK, STORE_PENDING_WRITE_BOTTLENECK, STORE_TRANSACTION_BOTTLENECK,
