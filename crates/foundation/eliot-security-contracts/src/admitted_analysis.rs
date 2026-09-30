@@ -43,8 +43,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::SecurityContractError;
 use crate::surface_types::{
-    AssessedSourceRevision, DisclosureDecision, DisclosureDecisionKind, DisclosureDependencyClosure,
-    assessment_digest, assessment_refs, assessment_text,
+    AssessedSourceRevision, DisclosureDecision, DisclosureDecisionKind,
+    DisclosureDependencyClosure, assessment_digest, assessment_refs, assessment_text,
 };
 
 /// Why one optional analysis was asked for.
@@ -53,7 +53,11 @@ use crate::surface_types::{
 /// runtime state, so neither a blocked hard gate nor any other waiting
 /// condition can produce a request.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "trigger", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+#[serde(
+    tag = "trigger",
+    rename_all = "SCREAMING_SNAKE_CASE",
+    deny_unknown_fields
+)]
 pub enum AdmittedAnalysisTrigger {
     /// One bounded semantic question about one retained I8.8 indicator
     /// observation.
@@ -256,7 +260,11 @@ pub struct AdmittedAnalysisOutcome {
 /// the admitted handles whose lineage could not be established, so bounded
 /// uncertainty is stated rather than presented as a complete summary.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "lineage", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+#[serde(
+    tag = "lineage",
+    rename_all = "SCREAMING_SNAKE_CASE",
+    deny_unknown_fields
+)]
 pub enum AdmittedAnalysisLineage {
     /// Every claim is attributed to a known lineage root.
     Attributed {
@@ -357,7 +365,10 @@ pub fn admit_analysis(
         "analysis.answered_from_handles",
     )?;
     optional_refs(&outcome.common_lineage_refs, "analysis.common_lineage_refs")?;
-    optional_refs(&outcome.counterevidence_refs, "analysis.counterevidence_refs")?;
+    optional_refs(
+        &outcome.counterevidence_refs,
+        "analysis.counterevidence_refs",
+    )?;
     optional_refs(&outcome.unknowns, "analysis.unknowns")?;
     match &outcome.lineage {
         AdmittedAnalysisLineage::Attributed { lineage_roots } => {
@@ -367,10 +378,7 @@ pub fn admit_analysis(
             unattributed_claims,
             unknown_lineage_handles,
         } => {
-            assessment_refs(
-                unattributed_claims,
-                "analysis.lineage.unattributed_claims",
-            )?;
+            assessment_refs(unattributed_claims, "analysis.lineage.unattributed_claims")?;
             assessment_refs(
                 unknown_lineage_handles,
                 "analysis.lineage.unknown_lineage_handles",
