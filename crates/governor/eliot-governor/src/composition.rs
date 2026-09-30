@@ -1310,6 +1310,10 @@ pub enum CompositionError {
         /// Which retained-identity shape the candidate record has.
         reason: ProblemOwnerAuthorizationRefusal,
     },
+    /// The daemon-owned runtime clock could not produce a timestamp for an
+    /// owner admission read.
+    #[error("runtime clock read failed: {0}")]
+    Clock(String),
     /// Kernel snapshot or transition-port identity was not exact.
     #[error("Kernel provider mismatch: {0}")]
     Provider(String),
@@ -10324,18 +10328,23 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     ///
     /// The returned `WorkScope` snapshot is an independent expected binding for
     /// the caller's Host observation. Coordination's `WorkItem` and `WorkLease`
-    /// records do not contain an operating-system workspace locator.
+    /// records do not contain an operating-system workspace locator. `read_now`
+    /// is the daemon-owned runtime clock read: this method calls it before the
+    /// first owner read and again after the Kernel acceptance read, so the
+    /// second owner projection validates lease and session liveness at the
+    /// time evidence is issued rather than reusing the request-start timestamp.
     pub async fn task_selection_evidence_for_request(
         &self,
-        now: u64,
+        mut read_now: impl FnMut() -> Result<u64, CompositionError>,
         authenticated_principal_ref: &str,
         request_session_ref: &str,
         request_task_ref: &str,
         request_scope_ref: &str,
         request_fence: &StateFence,
     ) -> Result<TaskSelectionAdmissionBinding, CompositionError> {
+        let request_now = read_now()?;
         let pending = self.prepare_task_selection_for_request(
-            now,
+            request_now,
             authenticated_principal_ref,
             request_session_ref,
             request_task_ref,
@@ -10350,7 +10359,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 pending.state_fence(),
             )
             .await?;
-        self.finish_task_selection_for_request(pending, now, acceptance)
+        let completion_now = read_now()?;
+        self.finish_task_selection_for_request(pending, completion_now, acceptance)
     }
 
     /// Captures the validated owner selection before Governor awaits its
