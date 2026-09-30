@@ -418,7 +418,7 @@ fn readiness_supervision_snapshot(
         kernel_front_door_session_id: 0,
         kernel_front_door_artifact_sha256: fixture
             .candidate
-            .kernel_artifact_digest
+            .artifact_hash
             .as_str()
             .to_owned(),
         watchdog_epoch: AuthorityEpoch::new(1)?,
@@ -809,7 +809,7 @@ pub(super) fn liveness_manifest_with_distinct_store_digests()
     let host_path = path(&portable, "eliot-host.exe");
     let user_broker_path = path(&portable, "eliot-user-broker.exe");
     let user_broker_bytes = b"approved-user-broker-fixture";
-    std::fs::write(&user_broker_path, user_broker_bytes)?;
+    std::fs::write(Path::new(user_broker_path.as_str()), user_broker_bytes)?;
     let user_broker_digest = handle(format!("{:x}", Sha256::digest(user_broker_bytes)));
     let profile_governed_roots = eliot_installation::InstallationRoots {
         binding_version: eliot_installation::INSTALLATION_ROOT_BINDING_VERSION,
