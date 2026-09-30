@@ -100,7 +100,7 @@ pub struct OperationOwnerRecord {
     /// Which of the six issue lifecycle operations this row covers.
     /// `stop/cancel` has five rows: the challenge-grant Kill path, the
     /// retained-handle Host termination path, and three owner-binding-only
-    /// grant-less cancel paths (native-worker cancel_observe, wire Cancel
+    /// grant-less cancel paths (native-worker `cancel_observe`, wire Cancel
     /// frames, daemon recovery plus its operation-port adapter).
     pub lifecycle: &'static str,
     /// The challenge operation class, or `None` for rows that carry no
@@ -263,7 +263,7 @@ pub static ATTACH_CREDENTIAL_BLOCKED_ROW: OperationOwnerRecord = OperationOwnerR
     gap: "concrete gap: AttachCredential has packaging (bins/eliotd/src/process_origin.rs::request_origin_control, re-exported by bins/eliotd/src/lib.rs) but zero non-test callers and no admitted dispatch path; binding an actual connection plus retained process identity through the transport/platform mechanism, or an explicit refusal when that proof is unavailable, is implementation work still open",
 };
 
-/// Stop/cancel from the native-worker cancel_observe route, owner binding only.
+/// Stop/cancel from the native-worker `cancel_observe` route, owner binding only.
 ///
 /// The `native_worker.cancel_observe` arm stages a `ProcessExecutionRequest::Cancel`
 /// with no `OriginControlGrant` anywhere on the path (the route file holds
