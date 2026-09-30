@@ -1122,9 +1122,7 @@ impl TargetRootBuildCoordinator {
     /// the same slot.
     fn registry_for(&self, target_root: &Path) -> SingleFlightBuildRegistry {
         let mut live = self.live.borrow_mut();
-        live.entry(target_root.to_path_buf())
-            .or_default()
-            .clone()
+        live.entry(target_root.to_path_buf()).or_default().clone()
     }
 
     /// The single-flight registry for one governed target root, when this
