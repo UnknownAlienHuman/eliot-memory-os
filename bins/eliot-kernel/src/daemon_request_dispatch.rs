@@ -626,6 +626,7 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         LINK_GRANT_CLOSURE_RECEIPT_OPERATION => LINK_GRANT_CLOSURE_RECEIPT_OPERATION,
         "publish_wasm_dispatch_bundle" => "publish_wasm_dispatch_bundle",
         "bind_notify_launch_grant" => "bind_notify_launch_grant",
+        "bind_operator_session_token" => "bind_operator_session_token",
         "agent_host_request_reconcile" => "agent_host_request_reconcile",
         "agent_host_request_rehydrate" => "agent_host_request_rehydrate",
         _ => "untrusted_operation",
@@ -903,6 +904,27 @@ struct NotifyLaunchGrantOperation {
     notification_digest: String,
     executable_path: String,
     artifact_digest: String,
+}
+
+/// Closed Operator session-token request (`#1777` I11.8).
+///
+/// Carries the exact binding evidence the requesting User Broker observed for
+/// one connecting UI process: its live Kernel registration identity, the
+/// one-shot handoff nonce it issued for this binding, the OS-observed Windows
+/// SID/session/process tuple, and the exact requested role and capability set.
+/// Session evidence is threaded from the live authenticated session, never from
+/// the payload. Unknown fields fail closed.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OperatorSessionTokenOperation {
+    registration_digest: String,
+    handoff_nonce: String,
+    windows_sid: String,
+    interactive_session_id: String,
+    client_process_id: String,
+    client_image_path: String,
+    role: String,
+    capabilities: Vec<String>,
 }
 
 /// Checks every admitted binding in the bundle against the authenticated
@@ -4104,6 +4126,9 @@ impl KernelComposition {
             "bind_notify_launch_grant" => {
                 self.notify_launch_grant_operation(session, payload.clone())
                     .await
+            }
+            "bind_operator_session_token" => {
+                self.operator_session_token_operation(session, payload.clone())
             }
             _ => return Err(TransportError::SessionFenced),
         };
@@ -9561,6 +9586,89 @@ impl KernelComposition {
                 "generation": authorization.generation().value(),
                 "authority_epoch": authorization.authority_epoch(),
                 "state_fence": authorization.state_fence(),
+            },
+        }))
+    }
+
+    /// Binds one fresh, short-lived Operator session token on the admitted path
+    /// (`#1777` I11.8): the production caller of
+    /// `eliot_kernel_service::bind_operator_session_token`, the minter of the
+    /// Kernel challenge/session token the `WinUI` client then presents at
+    /// redemption.
+    ///
+    /// The binding evidence arrives as closed payload evidence from the
+    /// requesting User Broker; session evidence is threaded from the live
+    /// authenticated session - connection, exact epoch, exact fence - never
+    /// from the payload, and the binder re-proves it against live Kernel
+    /// admission together with Ready state, unfenced generation, and the exact
+    /// epoch/fence currency. The token and its bounded lease are derived here
+    /// from the observed authority triple, so this composition root never mints
+    /// one itself.
+    ///
+    /// The grant binds and echoes the presented peer tuple; it does not claim
+    /// that a presented process id owns a channel. The connected-peer proof
+    /// belongs to the pipe owner in the broker
+    /// (`bins/eliot-user-broker/src/main.rs::serve_operator_pipe_connection`),
+    /// which compares this echoed evidence with the OS-observed peer before it
+    /// accepts any redemption.
+    pub(crate) fn operator_session_token_operation(
+        &self,
+        session: &Session,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let operation: OperatorSessionTokenOperation =
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
+        validate_store_session_fence(session, &session.module_generation.state_fence)?;
+        self.admit_material_authority_for_governor_issued_fence(
+            &session.module_generation.state_fence,
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        // Session evidence threaded from the live authenticated session, the
+        // same `SessionBinding` projection the notify grant binds with.
+        let session_evidence = serde_json::json!({
+            "session_id": &session.connection_id,
+            "authority_epoch": &session.authority_epoch,
+            "state_fence": &session.module_generation.state_fence,
+        });
+        let session_binding =
+            serde_json::from_value(session_evidence).map_err(|_| TransportError::SessionFenced)?;
+        let inputs = eliot_kernel_service::OperatorSessionTokenInputs {
+            registration_digest: operation.registration_digest,
+            handoff_nonce: operation.handoff_nonce,
+            windows_sid: operation.windows_sid,
+            interactive_session_id: operation.interactive_session_id,
+            client_process_id: operation.client_process_id,
+            client_image_path: operation.client_image_path,
+            role: operation.role,
+            capabilities: operation.capabilities,
+            session: session_binding,
+        };
+        let service = self
+            .service
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let authorization = eliot_kernel_service::bind_operator_session_token(&service, &inputs)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let bound = authorization.inputs();
+        Ok(serde_json::json!({
+            "kind": "operator_session_token",
+            "value": {
+                "operation_id": authorization.operation_id(),
+                "token": authorization.token(),
+                "issued_at_unix_ms": authorization.issued_at_unix_ms(),
+                "expires_at_unix_ms": authorization.expires_at_unix_ms(),
+                "generation": authorization.generation().value(),
+                "authority_epoch": authorization.authority_epoch(),
+                "state_fence": authorization.state_fence(),
+                "registration_digest": &bound.registration_digest,
+                "handoff_nonce": &bound.handoff_nonce,
+                "windows_sid": &bound.windows_sid,
+                "interactive_session_id": &bound.interactive_session_id,
+                "client_process_id": &bound.client_process_id,
+                "client_image_path": &bound.client_image_path,
+                "role": &bound.role,
+                "capabilities": &bound.capabilities,
             },
         }))
     }
