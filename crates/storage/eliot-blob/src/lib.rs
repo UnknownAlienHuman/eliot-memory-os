@@ -5068,7 +5068,7 @@ pub struct BlobStoreService<P, C, K, A, L> {
 /// from the exact bytes it stages.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlobResidencyDomains {
-    /// Lawful WorkScope or source namespace binding.
+    /// Lawful `WorkScope` or source namespace binding.
     pub scope_domain_id: BlobId,
     /// Principal/access binding.
     pub access_domain_id: BlobId,
@@ -5219,7 +5219,7 @@ where
         self.core.reference(request)
     }
 
-    /// Stages exact source bytes through the canonical BlobStoreCore path.
+    /// Stages exact source bytes through the canonical `BlobStoreCore` path.
     /// This owner-only entry point is available to a source-only composition
     /// whose `L` has no live-set implementation; it cannot perform GC or
     /// reachability operations.
@@ -5255,10 +5255,13 @@ where
     }
 
     /// Reads and verifies exact plaintext bytes through the canonical
-    /// BlobStoreCore path. The returned chunk carries the original
+    /// `BlobStoreCore` path. The returned chunk carries the original
     /// independently verifiable Blob read receipt.
-    pub fn read_source(&self, request: BlobReadRequest) -> Result<BlobReadChunk, BlobError> {
-        self.core.read_sync(&request)
+    pub fn read_source(
+        &self,
+        request: &BlobReadRequest,
+    ) -> Result<BlobReadChunk, BlobError> {
+        self.core.read_sync(request)
     }
 
     /// Startup recovery helper; it is not part of the public `BlobStoreClient` contract.
