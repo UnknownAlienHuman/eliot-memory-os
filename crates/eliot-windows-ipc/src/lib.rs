@@ -758,11 +758,33 @@ impl RetirablePinnedFile {
         Ok(Self { file, identity })
     }
 
+    /// Returns the length observed from the retained file handle.
+    ///
+    /// The handle denies concurrent writes and deletes, so this length and
+    /// subsequent reads describe the same immutable file object.
+    pub fn file_len(&self) -> io::Result<u64> {
+        self.file.metadata().map(|metadata| metadata.len())
+    }
+
     /// Reads the pinned object's bytes for comparison with the owner record.
     pub fn read_all(&mut self) -> io::Result<Vec<u8>> {
         self.file.seek(SeekFrom::Start(0))?;
         let mut bytes = Vec::new();
         self.file.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// Reads at most `maximum_bytes` plus one sentinel byte from the retained
+    /// handle, allowing callers to reject oversized files without an
+    /// unbounded allocation.
+    pub fn read_bounded(&mut self, maximum_bytes: u64) -> io::Result<Vec<u8>> {
+        let read_limit = maximum_bytes.checked_add(1).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "bounded read limit overflowed")
+        })?;
+        self.file.seek(SeekFrom::Start(0))?;
+        let mut bytes = Vec::new();
+        let mut bounded_file = (&mut self.file).take(read_limit);
+        bounded_file.read_to_end(&mut bytes)?;
         Ok(bytes)
     }
 

@@ -1497,9 +1497,10 @@ impl eliot_process::ProcessEvidenceSink for BoundedEvidenceSink {
 /// join, executable gate, grant checks, and receipt/proof validation, so
 /// these pre-filters never weaken (and never replace) any existing check.
 pub mod admitted_material {
-    use std::fs;
     use std::path::{Path, PathBuf};
 
+    #[cfg(windows)]
+    use eliot_windows_ipc::RetirablePinnedFile;
     use eliot_contracts::RequestId;
     use eliot_native_worker_core::{
         ActionEnvelopeCarrier, ClaimAdmissionRequest, NativeWorkerClaim, ReadinessSubmission,
@@ -1608,8 +1609,8 @@ pub mod admitted_material {
     /// the binary entry maps each to exit 78 without effect.
     #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
     pub enum AdmittedMaterialError {
-        /// The dispatch file exists but cannot be read.
-        #[error("admitted material unreadable: {0}")]
+        /// The dispatch file cannot be safely opened, read, or retired.
+        #[error("admitted material could not be safely consumed: {0}")]
         Io(String),
         /// The dispatch file exceeds the bounded input limit.
         #[error("admitted material exceeds {maximum} bytes (observed {actual})")]
@@ -1672,53 +1673,66 @@ pub mod admitted_material {
     /// The path parameter exists so tests can stage material without touching
     /// the executable directory; production always passes
     /// [`admitted_material_path`]. Semantics match
-    /// [`read_admitted_material`].
+    /// [`read_admitted_material`]. On Windows, the final path component is
+    /// opened once without following reparse points. Size, bytes, validation,
+    /// and consume-once retirement all use that retained file handle.
     pub fn read_admitted_material_from(
         path: &Path,
     ) -> Result<Option<ValidatedAdmittedMaterial>, AdmittedMaterialError> {
-        if let Some(actual) = bounded_file_len(path)? {
-            return Err(AdmittedMaterialError::TooLarge {
-                maximum: ADMITTED_MATERIAL_LIMIT_BYTES,
-                actual,
-            });
-        }
-        let bytes = match fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(AdmittedMaterialError::Io(error.to_string())),
-        };
-        let actual = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-        if actual > ADMITTED_MATERIAL_LIMIT_BYTES {
-            return Err(AdmittedMaterialError::TooLarge {
-                maximum: ADMITTED_MATERIAL_LIMIT_BYTES,
-                actual,
-            });
-        }
-        match serde_json::from_slice::<AdmittedClaimEnvelope>(&bytes) {
-            Ok(envelope) => {
-                let validated = validate_envelope(envelope)?;
-                consume_material(path);
-                Ok(Some(validated))
+        #[cfg(windows)]
+        {
+            let mut material = match RetirablePinnedFile::open(path) {
+                Ok(material) => material,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(AdmittedMaterialError::Io(error.to_string())),
+            };
+            let file_len = material
+                .file_len()
+                .map_err(|error| AdmittedMaterialError::Io(error.to_string()))?;
+            if file_len > ADMITTED_MATERIAL_LIMIT_BYTES {
+                return Err(AdmittedMaterialError::TooLarge {
+                    maximum: ADMITTED_MATERIAL_LIMIT_BYTES,
+                    actual: file_len,
+                });
             }
-            Err(envelope_error) => {
-                if is_kernel_grant_file(&bytes) {
-                    let validated = validate_kernel_file_bytes(&bytes)?;
-                    consume_material(path);
-                    Ok(Some(validated))
-                } else {
-                    Err(AdmittedMaterialError::Malformed(truncate_detail(
-                        &envelope_error.to_string(),
-                    )))
+            let bytes = material
+                .read_bounded(ADMITTED_MATERIAL_LIMIT_BYTES)
+                .map_err(|error| AdmittedMaterialError::Io(error.to_string()))?;
+            let actual = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            if actual > ADMITTED_MATERIAL_LIMIT_BYTES {
+                return Err(AdmittedMaterialError::TooLarge {
+                    maximum: ADMITTED_MATERIAL_LIMIT_BYTES,
+                    actual,
+                });
+            }
+            if actual != file_len {
+                return Err(AdmittedMaterialError::Io(
+                    "pinned admitted material changed length while being read".to_owned(),
+                ));
+            }
+            let validated = match serde_json::from_slice::<AdmittedClaimEnvelope>(&bytes) {
+                Ok(envelope) => validate_envelope(envelope)?,
+                Err(_) if is_kernel_grant_file(&bytes) => {
+                    validate_kernel_file_bytes(&bytes)?
                 }
-            }
+                Err(envelope_error) => {
+                    return Err(AdmittedMaterialError::Malformed(truncate_detail(
+                        &envelope_error.to_string(),
+                    )));
+                }
+            };
+            material
+                .retire()
+                .map_err(|error| AdmittedMaterialError::Io(error.to_string()))?;
+            Ok(Some(validated))
         }
-    }
-
-    /// Consume-once: a validated presentation must not linger for a later
-    /// invocation to replay. Removal is best-effort; the kernel launch reaps
-    /// the file regardless, and removal failure never fails the run.
-    fn consume_material(path: &Path) {
-        let _ = fs::remove_file(path);
+        #[cfg(not(windows))]
+        {
+            let _ = path;
+            Err(AdmittedMaterialError::Io(
+                "safe admitted-material pinning and retirement require Windows".to_owned(),
+            ))
+        }
     }
 
     /// Peeks whether delivered bytes carry the Kernel launch-grant shape.
@@ -1734,25 +1748,6 @@ pub mod admitted_material {
             .ok()
             .and_then(|value| value.as_object().cloned())
             .is_some_and(|object| object.contains_key("grant"))
-    }
-
-    /// Pre-checks the file length so an unbounded file is refused before it is
-    /// read. Returns `Ok(None)` when the length is within bounds or unknown
-    /// (the post-read check still applies); returns the observed length when it
-    /// already exceeds the bound. A missing file surfaces as `Ok(None)` here so
-    /// the read below can report absence exactly once.
-    fn bounded_file_len(path: &Path) -> Result<Option<u64>, AdmittedMaterialError> {
-        let metadata = match fs::metadata(path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(AdmittedMaterialError::Io(error.to_string())),
-        };
-        let actual = metadata.len();
-        if actual > ADMITTED_MATERIAL_LIMIT_BYTES {
-            Ok(Some(actual))
-        } else {
-            Ok(None)
-        }
     }
 
     /// Validates one parsed envelope through the production gates. Every check

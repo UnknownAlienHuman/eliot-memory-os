@@ -30,6 +30,9 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+eliot-windows-ipc.workspace = true
+
 [dev-dependencies]
 eliot-kernel = { path = "../eliot-kernel", version = "0.1.0" }
 
