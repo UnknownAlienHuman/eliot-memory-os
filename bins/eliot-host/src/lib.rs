@@ -6281,7 +6281,7 @@ impl HostComposition {
         let committed = commit_store.acknowledge_user_mode_task_run(
             &owner_capability,
             commit_registry.revision(),
-            ack.clone(),
+            &ack,
         )?;
         drop(commit_store);
 

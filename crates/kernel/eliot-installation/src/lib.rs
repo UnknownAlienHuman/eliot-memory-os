@@ -171,6 +171,8 @@ pub use approved_generation_registry::{
     ApprovedGeneration, ApprovedGenerationRegistry, CommittedCutoverActivation,
     HostPhaseBPreparedMaterialization, PendingActivation, PendingActivationState,
     PhaseBDigestState, PhaseBLiveBinding, phase_b_digest_state, phase_b_scm_selector,
+    UserModeTaskRunHostAck, UserModeTaskRunHostReadinessEvidence,
+    UserModeTaskRunIntentProjection, UserModeTaskRunRecord, UserModeTaskRunRecordState,
 };
 use approved_generation_registry::{
     ActiveVerifiedReceiptBinding, PendingActivationAbortReceipt, PendingActivationTerminal,
@@ -386,9 +388,10 @@ pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(5, 0, 0);
 /// receipt and unresolved progress. Version 29 adds exact Task `RunEx` intent
 /// and receipt plus the source-publication profile-anchor object identity.
 /// Version 30 binds the original `SystemService` Host-state root object identity
-/// on the transaction wire. Legacy `SystemService` records require recovery;
-/// current-user records retain their prior decode path.
-pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(30, 0, 0);
+/// on the transaction wire. Version 31 retains the exact `UserMode` Task `RunEx`
+/// Host readiness acknowledgement. Legacy `SystemService` records require
+/// recovery; current-user records retain their explicit migration path.
+pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(31, 0, 0);
 
 /// Current durable approved-generation registry wire revision.
 ///
@@ -400,9 +403,10 @@ pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersi
 /// and digest pins and the mandatory retained I3.1 profile-root binding to
 /// each candidate and runtime launch descriptor. Version 18 persists the
 /// original `SystemService` Host-state root object identity for the registry.
-/// Older `SystemService` projections require recovery; current-user projections
-/// retain their prior decode path.
-pub const INSTALLATION_REGISTRY_WIRE_VERSION: ContractVersion = ContractVersion::new(18, 0, 0);
+/// Version 19 retains the exact `UserMode` Task `RunEx` intent and Host readiness
+/// acknowledgement. Older `SystemService` projections require recovery;
+/// current-user projections retain their prior decode path.
+pub const INSTALLATION_REGISTRY_WIRE_VERSION: ContractVersion = ContractVersion::new(19, 0, 0);
 
 /// Bounded wall-clock window in which one committed SCM start intent must
 /// converge to a stable `Running` readback.  The coordinator accepts an
@@ -10354,11 +10358,16 @@ where
     }
 
     /// Issues one current-user `RunEx` call after committing its live-session
-    /// intent. A retained intent without a receipt is never replayed.
-    pub(crate) fn run_current_user_task_once(
+    /// intent and staging the exact operation with the Host registry. A retained
+    /// intent without a receipt is never replayed.
+    pub(crate) fn run_current_user_task_once<F>(
         &mut self,
         transaction_id: &PlatformHandle,
-    ) -> Result<CurrentUserTaskRunReceipt, InstallationError> {
+        before_run: F,
+    ) -> Result<CurrentUserTaskRunReceipt, InstallationError>
+    where
+        F: FnOnce(&CurrentUserTaskReceipt, &CurrentUserTaskRunIntent) -> Result<(), InstallationError>,
+    {
         let mut transaction = self.load_transaction(transaction_id)?;
         transaction.validate()?;
         let task_index = task_effect_index(&transaction)?;
@@ -10403,6 +10412,11 @@ where
             .record_current_user_task_run_intent(live_client.expected_session_id())?;
         self.store.compare_and_save(expected, &transaction)?;
 
+        // The Host must have the same durable operation identity before Task
+        // Scheduler can launch it. A staging failure leaves the one-shot intent
+        // unresolved; recovery must not retry RunEx from this point.
+        before_run(&task_receipt, &intent)?;
+
         let persisted = self.load_transaction(transaction_id)?;
         persisted.validate()?;
         let task_index = task_effect_index(&persisted)?;
@@ -10424,6 +10438,28 @@ where
         completed.record_current_user_task_run_receipt(run_receipt.clone())?;
         self.store.compare_and_save(expected, &completed)?;
         Ok(run_receipt)
+    }
+
+    /// Copies only the exact Host-owned registry acknowledgement into the
+    /// transaction. This query-driven CAS never issues another Task run.
+    pub(crate) fn reconcile_current_user_task_host_ack(
+        &mut self,
+        transaction_id: &PlatformHandle,
+        ack: &UserModeTaskRunHostAck,
+    ) -> Result<(), InstallationError> {
+        let mut transaction = self.load_transaction(transaction_id)?;
+        transaction.validate()?;
+        if transaction.current_user_task_run_host_ack() == Some(ack) {
+            return Ok(());
+        }
+        let expected = TransactionVersion::of(&transaction)?;
+        transaction.record_current_user_task_host_ack(ack.clone())?;
+        self.store.compare_and_save(expected, &transaction)?;
+        let recorded = self.load_transaction(transaction_id)?;
+        if recorded.current_user_task_run_host_ack() != Some(ack) {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(())
     }
 
     fn load_transaction(
@@ -13243,11 +13279,25 @@ where
     /// If the call has already been attempted but its exact receipt was not
     /// durably recorded, this method returns an unresolved observation and
     /// never issues `RunEx` again.
-    pub fn run_current_user_task_once(
+    pub fn run_current_user_task_once<F>(
         &mut self,
         transaction_id: &PlatformHandle,
-    ) -> Result<CurrentUserTaskRunReceipt, InstallationError> {
-        self.inner.run_current_user_task_once(transaction_id)
+        before_run: F,
+    ) -> Result<CurrentUserTaskRunReceipt, InstallationError>
+    where
+        F: FnOnce(&CurrentUserTaskReceipt, &CurrentUserTaskRunIntent) -> Result<(), InstallationError>,
+    {
+        self.inner.run_current_user_task_once(transaction_id, before_run)
+    }
+
+    /// Reconciles the exact Host registry readiness acknowledgment after the
+    /// one-shot Task intent and its durable RunEx acceptance receipt.
+    pub fn reconcile_current_user_task_host_ack(
+        &mut self,
+        transaction_id: &PlatformHandle,
+        ack: &UserModeTaskRunHostAck,
+    ) -> Result<(), InstallationError> {
+        self.inner.reconcile_current_user_task_host_ack(transaction_id, ack)
     }
 
     /// Reconciles an exact Host registry terminal into the sole durable

@@ -3709,77 +3709,49 @@ fn prepare_transaction_envelope_for_current_wire(
             reason: "transaction envelope has an unsupported wire discriminator".to_owned(),
         }
     })?;
-    if version == ContractVersion::new(29, 0, 0) {
-        let profile = value
-            .get("transaction")
-            .and_then(|transaction| transaction.get("profile"))
-            .and_then(serde_json::Value::as_str);
-        match profile {
-            Some("system_service") => {
-                return Err(InstallationError::MigrationRequired {
-                    reason: "v29 SystemService transaction envelope has no original Host-root object identity; explicit recovery is required before reuse"
-                        .to_owned(),
-                });
-            }
-            Some("user_mode" | "portable_dev") => {
-                let transaction_version = value
-                    .get("transaction")
-                    .and_then(|transaction| transaction.get("transaction_wire_version"))
-                    .cloned()
-                    .and_then(|version| serde_json::from_value::<ContractVersion>(version).ok());
-                if transaction_version != Some(ContractVersion::new(29, 0, 0)) {
-                    return Err(InstallationError::MigrationRequired {
-                        reason: "v29 transaction envelope does not contain a matching v29 transaction payload"
-                            .to_owned(),
-                    });
-                }
-                if value
-                    .get("transaction")
-                    .and_then(serde_json::Value::as_object)
-                    .is_some_and(|transaction| {
-                        transaction.contains_key("system_service_host_root_receipt")
-                    })
-                {
-                    return Err(InstallationError::CorruptRegistry {
-                        reason: "v29 transaction envelope contains a field outside its declared wire shape"
-                            .to_owned(),
-                    });
-                }
-                let transaction_wire_version = serde_json::to_value(
-                    INSTALLATION_TRANSACTION_WIRE_VERSION,
-                )
-                .map_err(|error| InstallationError::CorruptRegistry {
-                    reason: error.to_string(),
+    if version == ContractVersion::new(29, 0, 0) || version == ContractVersion::new(30, 0, 0) {
+        let envelope = value
+            .as_object_mut()
+            .ok_or_else(|| InstallationError::CorruptRegistry {
+                reason: "transaction envelope is not an object".to_owned(),
+            })?;
+        let transaction =
+            envelope
+                .get_mut("transaction")
+                .ok_or_else(|| InstallationError::CorruptRegistry {
+                    reason: "transaction envelope payload is missing".to_owned(),
                 })?;
-                let envelope =
-                    value
-                        .as_object_mut()
-                        .ok_or_else(|| InstallationError::CorruptRegistry {
-                            reason: "transaction envelope is not an object".to_owned(),
-                        })?;
-                let transaction = envelope
-                    .get_mut("transaction")
-                    .and_then(serde_json::Value::as_object_mut)
-                    .ok_or_else(|| InstallationError::CorruptRegistry {
-                        reason: "transaction envelope payload is not an object".to_owned(),
-                    })?;
-                transaction.insert(
-                    "transaction_wire_version".to_owned(),
-                    transaction_wire_version.clone(),
-                );
-                transaction.insert(
-                    "system_service_host_root_receipt".to_owned(),
-                    serde_json::Value::Null,
-                );
-                envelope.insert("wire_version".to_owned(), transaction_wire_version);
-            }
-            _ => {
-                return Err(InstallationError::MigrationRequired {
-                    reason: "v29 transaction envelope profile is missing or unsupported; explicit migration is required"
-                        .to_owned(),
-                });
-            }
+        let transaction_version = transaction
+            .get("transaction_wire_version")
+            .cloned()
+            .and_then(|version| serde_json::from_value::<ContractVersion>(version).ok());
+        if transaction_version != Some(version) {
+            return Err(InstallationError::MigrationRequired {
+                reason: format!(
+                    "v{} transaction envelope does not contain a matching transaction payload",
+                    version.major
+                ),
+            });
         }
+        if version == ContractVersion::new(29, 0, 0)
+            && transaction.as_object().is_some_and(|transaction| {
+                transaction.contains_key("system_service_host_root_receipt")
+            })
+        {
+            return Err(InstallationError::CorruptRegistry {
+                reason: "v29 transaction envelope contains a field outside its declared wire shape"
+                    .to_owned(),
+            });
+        }
+        crate::transaction::prepare_transaction_json_for_current_wire(transaction)?;
+        envelope.insert(
+            "wire_version".to_owned(),
+            serde_json::to_value(INSTALLATION_TRANSACTION_WIRE_VERSION).map_err(|error| {
+                InstallationError::CorruptRegistry {
+                    reason: error.to_string(),
+                }
+            })?,
+        );
     } else if version != INSTALLATION_TRANSACTION_WIRE_VERSION {
         return Err(InstallationError::MigrationRequired {
             reason: format!(

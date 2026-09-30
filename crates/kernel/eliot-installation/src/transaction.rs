@@ -809,9 +809,9 @@ pub struct InstallationEffectProgress {
     /// observed by the Host process handshake.
     pub current_user_task_run_receipt: Option<CurrentUserTaskRunReceipt>,
     /// Exact registry-validated Host readiness acknowledgement for the
-    /// retained task receipt and one-shot `RunEx` intent. It can satisfy active
-    /// readiness when the `RunEx` response was lost, but never manufactures an
-    /// engine process ID or claims Task Scheduler acceptance.
+    /// retained task receipt and one-shot `RunEx` intent. It supplies active
+    /// readiness only with the exact persisted Task Scheduler run receipt;
+    /// it never manufactures an engine process ID or claims acceptance.
     pub current_user_task_run_host_ack: Option<UserModeTaskRunHostAck>,
     /// Current durable effect state.
     pub state: InstallationEffectProgressState,
@@ -2372,9 +2372,9 @@ impl InstallationTransaction {
     /// Retains the exact Host readiness acknowledgement for the transaction's
     /// already-committed current-user task and one-shot `RunEx` intent.
     ///
-    /// The acknowledgement may satisfy active readiness when the Task
-    /// Scheduler response was lost. It does not synthesize or replace the
-    /// Task Scheduler engine receipt.
+    /// The acknowledgement supplies active readiness only after the exact
+    /// Task Scheduler acceptance receipt is durable. It does not synthesize
+    /// or replace that receipt.
     pub(crate) fn record_current_user_task_host_ack(
         &mut self,
         ack: UserModeTaskRunHostAck,
@@ -2402,6 +2402,12 @@ impl InstallationTransaction {
                 "Host readiness acknowledgement requires the exact persisted RunEx intent"
                     .to_owned(),
             ))?;
+        if progress.current_user_task_run_receipt.is_none() {
+            return Err(InstallationError::IncompleteObservation(
+                "Host readiness acknowledgement requires the exact persisted RunEx receipt"
+                    .to_owned(),
+            ));
+        }
         ack.validate()?;
         Self::validate_current_user_task_run_intent(task_receipt, run_intent)?;
         if ack.intent.task_receipt != *task_receipt || ack.intent.run_intent != *run_intent {
@@ -3449,10 +3455,13 @@ impl InstallationTransaction {
             if self
                 .effect_progress
                 .get(positions.task)
-                .is_none_or(|progress| progress.current_user_task_run_host_ack.is_none())
+                .is_none_or(|progress| {
+                    progress.current_user_task_run_receipt.is_none()
+                        || progress.current_user_task_run_host_ack.is_none()
+                })
             {
                 return Err(InstallationError::IncompleteObservation(
-                    "ActiveVerified UserMode transaction requires the exact Host readiness acknowledgement"
+                    "ActiveVerified UserMode transaction requires exact Task RunEx and Host readiness receipts"
                         .to_owned(),
                 ));
             }
@@ -3801,6 +3810,12 @@ impl InstallationTransaction {
                             (None, Some(_)) => return Err(InstallationError::IdentityConflict),
                         }
                         if let Some(ack) = host_ack {
+                            if run_receipt.is_none() {
+                                return Err(InstallationError::IncompleteObservation(
+                                    "Host readiness acknowledgement requires its exact RunEx receipt"
+                                        .to_owned(),
+                                ));
+                            }
                             let intent = run_intent.ok_or_else(|| {
                                 InstallationError::IncompleteObservation(
                                     "Host readiness acknowledgement requires its exact RunEx intent"

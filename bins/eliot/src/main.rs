@@ -4056,16 +4056,27 @@ fn finish_user_mode_task_activation(
     leases
         .verify_stable_identity()
         .map_err(|error| InstallationError::Platform(error.to_string()))?;
-    let run_receipt = coordinator.run_current_user_task_once(transaction_id);
+    let run_receipt = coordinator.run_current_user_task_once(transaction_id, |task_receipt, intent| {
+        stage_user_mode_task_run_intent(&registered, task_receipt, intent)
+    });
     leases
         .verify_stable_identity()
         .map_err(|error| InstallationError::Platform(error.to_string()))?;
-    let run_receipt = run_receipt?;
     let durable = coordinator.store().load(transaction_id)?.ok_or_else(|| {
         InstallationError::TransactionNotFound {
             transaction_id: transaction_id.as_str().to_owned(),
         }
     })?;
+    let run_receipt = match run_receipt {
+        Ok(receipt) => receipt,
+        Err(_) if durable.current_user_task_run_intent().is_some() => {
+            // Once the durable intent exists, the scheduler response may have
+            // been lost. Keep the run unresolved; this path never issues
+            // RunEx a second time or adopts Host readiness as run acceptance.
+            return Ok(registration_outcome);
+        }
+        Err(error) => return Err(error),
+    };
     let durable_run_receipt = durable
         .installer_effects
         .iter()
@@ -4098,6 +4109,57 @@ fn finish_user_mode_task_activation(
         ));
     }
     Ok(registration_outcome)
+}
+
+#[cfg(windows)]
+fn stage_user_mode_task_run_intent(
+    transaction: &InstallationTransaction,
+    task_receipt: &eliot_platform_windows::profile_supervision::CurrentUserTaskReceipt,
+    run_intent: &eliot_installation::CurrentUserTaskRunIntent,
+) -> std::result::Result<(), InstallationError> {
+    let projection = inspect_host_activation_registry_for_terminal(transaction)?.ok_or_else(|| {
+        InstallationError::IncompleteObservation(
+            "UserMode Host registry is absent before Task Scheduler RunEx".to_owned(),
+        )
+    })?;
+    projection.read_committed_activation_receipt(
+        &transaction.transaction_id,
+        &transaction.installer_plan_digest,
+        &transaction.candidate_manifest.generation,
+    )?;
+    let host_state_root = Path::new(
+        transaction
+            .candidate_manifest
+            .runtime_launch
+            .runtime_state_roots
+            .host_state_root
+            .as_str(),
+    );
+    let host_root = UserOwnedRootLease::open_existing(host_state_root)
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    let selection = transaction.profile_selection_receipt().ok_or_else(|| {
+        InstallationError::MigrationRequired {
+            reason: "UserMode RunEx requires the original root selection".to_owned(),
+        }
+    })?;
+    let registry = RedbInstallationRegistry::open_existing_user_owned_at(
+        host_root,
+        InstallationProfile::UserMode,
+        selection,
+    )?
+    .ok_or_else(|| {
+        InstallationError::IncompleteObservation(
+            "UserMode Host registry disappeared before Task Scheduler RunEx".to_owned(),
+        )
+    })?;
+    registry.stage_user_mode_task_run_intent(
+        projection.revision(),
+        &eliot_installation::UserModeTaskRunIntentProjection {
+            task_receipt: task_receipt.clone(),
+            run_intent: run_intent.clone(),
+        },
+    )?;
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -4538,7 +4600,9 @@ fn run_installation_effect(
             };
             let user_owned_supervision_pending =
                 uses_user_owned_supervision(transaction.profile)
-                    && matches!(&outcome, InstallationStepOutcome::Applied { .. });
+                    && matches!(&outcome, InstallationStepOutcome::Applied { .. })
+                    && !(transaction.profile == InstallationProfile::UserMode
+                        && transaction.stage() == InstallationStage::ActiveVerified);
             let terminal_status = match &outcome {
                 InstallationStepOutcome::RollbackRequired { .. } => "ROLLBACK_REQUIRED",
                 InstallationStepOutcome::Quarantined { .. } => "QUARANTINED",
@@ -5375,25 +5439,22 @@ fn reconcile_host_activation_terminal(
         Err(InstallationError::IncompleteObservation(_)) => return Ok(None),
         Err(error) => return Err(error),
     };
-    let evidence = vec![
+    let mut evidence = vec![
         receipt.terminal_digest().clone(),
         receipt.candidate_manifest_digest().clone(),
     ];
     let store = RedbInstallationTransactionStore::open_existing_exact_path(store_path)?;
     let mut coordinator = WindowsInstallationCoordinator::new(store);
     if transaction.profile == InstallationProfile::UserMode {
-        let durable = coordinator
+        let mut durable = coordinator
             .store()
             .load(&transaction.transaction_id)?
             .ok_or_else(|| InstallationError::TransactionNotFound {
                 transaction_id: transaction.transaction_id.as_str().to_owned(),
             })?;
-        if !user_mode_task_run_receipt_is_durable(&durable) {
+        if durable.current_user_task_run_intent().is_none() {
             if !complete_user_mode_task {
-                // Recover mode is a read-only terminal query. Keep the exact
-                // Host commit visible as pending while Task receipts remain
-                // incomplete; never convert that live generation into a
-                // rollback attempt.
+                // Recover never creates a Task registration or issues RunEx.
                 return Ok(Some(InstallationStepOutcome::Applied {
                     stage: durable.stage(),
                     evidence_refs: evidence,
@@ -5406,45 +5467,79 @@ fn reconcile_host_activation_terminal(
             if !matches!(&task_outcome, InstallationStepOutcome::Applied { .. }) {
                 return Ok(Some(task_outcome));
             }
+            durable = coordinator
+                .store()
+                .load(&transaction.transaction_id)?
+                .ok_or_else(|| InstallationError::TransactionNotFound {
+                    transaction_id: transaction.transaction_id.as_str().to_owned(),
+                })?;
         }
+        if durable.current_user_task_run_receipt().is_none() {
+            // Host readiness alone cannot prove that Task Scheduler accepted
+            // this operation's one-shot RunEx call.
+            return Ok(Some(InstallationStepOutcome::Applied {
+                stage: durable.stage(),
+                evidence_refs: evidence,
+            }));
+        }
+        let Some(ack) = read_user_mode_task_host_ack(&durable)? else {
+            // A Task Scheduler return value is not Host readiness. Keep the
+            // committed Host activation visible without advancing the stage.
+            return Ok(Some(InstallationStepOutcome::Applied {
+                stage: durable.stage(),
+                evidence_refs: evidence,
+            }));
+        };
+        evidence.extend(ack.evidence.kernel_process_evidence_refs.iter().cloned());
+        evidence.extend(ack.evidence.kernel_ready_evidence_refs.iter().cloned());
+        coordinator.reconcile_current_user_task_host_ack(&transaction.transaction_id, &ack)?;
     }
     coordinator
         .reconcile_active_verified(receipt, evidence)
         .map(Some)
 }
 
-fn user_mode_task_run_receipt_is_durable(transaction: &InstallationTransaction) -> bool {
-    transaction
+fn read_user_mode_task_host_ack(
+    transaction: &InstallationTransaction,
+) -> Result<Option<eliot_installation::UserModeTaskRunHostAck>, InstallationError> {
+    let (task_receipt, run_intent) = transaction
         .installer_effects
         .iter()
         .zip(transaction.effect_progress())
-        .any(|(effect, progress)| {
-            let Some(request) = progress.current_user_task_request.as_ref() else {
-                return false;
-            };
-            let Some(registration) = progress.current_user_task_receipt.as_ref() else {
-                return false;
-            };
-            let Some(run_intent) = progress.current_user_task_run_intent.as_ref() else {
-                return false;
-            };
-            let Some(run) = progress.current_user_task_run_receipt.as_ref() else {
-                return false;
-            };
+        .find_map(|(effect, progress)| {
             matches!(
                 effect,
                 eliot_installation::InstallerEffectPlan::RegisterCurrentUserTask { .. }
-            ) && matches!(
-                progress.state,
-                eliot_installation::InstallationEffectProgressState::Applied { .. }
-            ) && request == &registration.request
-                && run.task_name == registration.task_name
-                && run.sid == registration.sid
-                && run.session_id != 0
-                && run.session_id == run_intent.session_id
-                && run.task_xml_sha256 == registration.task_xml_sha256
-                && run.engine_process_id != 0
+            )
+            .then_some((
+                progress.current_user_task_receipt.as_ref(),
+                progress.current_user_task_run_intent.as_ref(),
+            ))
         })
+        .and_then(|(receipt, intent)| receipt.zip(intent))
+        .ok_or_else(|| {
+            InstallationError::IncompleteObservation(
+                "UserMode Task RunEx has no exact retained registration and intent".to_owned(),
+            )
+        })?;
+    let registry = inspect_host_activation_registry_for_terminal(transaction)?.ok_or_else(|| {
+        InstallationError::IncompleteObservation(
+            "UserMode Host registry is absent after Task Scheduler RunEx".to_owned(),
+        )
+    })?;
+    let record = registry.user_mode_task_run_record().ok_or_else(|| {
+        InstallationError::IncompleteObservation(
+            "UserMode Host registry has no staged Task RunEx intent".to_owned(),
+        )
+    })?;
+    let expected = eliot_installation::UserModeTaskRunIntentProjection {
+        task_receipt: task_receipt.clone(),
+        run_intent: run_intent.clone(),
+    };
+    if record.intent() != &expected {
+        return Err(InstallationError::IdentityConflict);
+    }
+    Ok(record.host_ack().cloned())
 }
 
 fn installation_error_requires_recovery(error: &InstallationError) -> bool {
@@ -5571,6 +5666,16 @@ fn installation_command_status(
             ..
         }
         | InstallationStepOutcome::Quarantined { .. } => "QUARANTINED",
+        InstallationStepOutcome::Applied {
+            stage: InstallationStage::ActiveVerified,
+            ..
+        } if recover && profile == InstallationProfile::UserMode && all_effects_applied => {
+            "ACTIVE_VERIFIED"
+        }
+        InstallationStepOutcome::Applied {
+            stage: InstallationStage::Activating,
+            ..
+        } if recover && profile == InstallationProfile::UserMode => "PENDING_RUNTIME",
         InstallationStepOutcome::Applied { .. } if recover => "ERROR",
         InstallationStepOutcome::Applied {
             stage: InstallationStage::Activating,
@@ -5674,7 +5779,7 @@ fn installation_preflight_staging_reason(
                     .iter()
                     .any(|progress| progress.current_user_task_receipt.is_some()) =>
             {
-                "Task registration readback is durable; its exact RunEx receipt or authenticated Host readiness remains pending"
+                "Task registration readback is durable; exact RunEx acceptance and authenticated Host readiness remain pending"
             }
             InstallationProfile::UserMode => {
                 "UserMode Phase-B is committed, but current-user Task registration or run evidence remains pending"
