@@ -316,7 +316,7 @@ impl DownstreamHeadroomRequest {
         validate_text(self.stage_id.as_str(), "headroom.stage_id")?;
         validate_text(self.route_id.as_str(), "headroom.route_id")?;
         validate_text(self.serializer_id.as_str(), "headroom.serializer_id")?;
-        validate_digest(self.recipe_digest, "headroom.recipe_digest")?;
+        validate_digest(&self.recipe_digest, "headroom.recipe_digest")?;
         self.release.validate()?;
         if self.demands.is_empty() || self.demands.len() > HeadroomDimension::DENOMINATOR.len() {
             return Err(ContextError::Bounds {
@@ -530,7 +530,7 @@ impl DownstreamHeadroomResult {
         if self.schema_version != DOWNSTREAM_HEADROOM_SCHEMA_VERSION {
             return Err(ContextError::InvalidField("headroom_result.schema_version"));
         }
-        validate_digest(self.request_digest, "headroom_result.request_digest")?;
+        validate_digest(&self.request_digest, "headroom_result.request_digest")?;
         if self.request_digest != request.canonical_digest()? {
             return Err(ContextError::IdentityConflict);
         }
@@ -584,6 +584,25 @@ impl DownstreamHeadroomResult {
                     if owner_dimension != dimension {
                         return Err(ContextError::IdentityConflict);
                     }
+                    // `HeadroomQuantity::unit` returns `None` for exactly one
+                    // reason: the quantity is `HeadroomQuantity::Unknown`, i.e.
+                    // the owner could not determine the admitted amount. An
+                    // unstated unit is UNKNOWN, and unknown is neither zero
+                    // nor "equal to whatever the owner's unit happens to be",
+                    // so `None != Some(owner_unit)` refuses it here. That is
+                    // deliberate fail-closed behaviour, not an over-refusal: a
+                    // `Granted` outcome whose admitted amount the owner could
+                    // not determine is a self-contradicting grant, and the
+                    // module rule is that `Unknown` is its own state and never
+                    // reads as satisfied. Do NOT "fix" this to
+                    // `Some(dimension.owner_unit())` or
+                    // `admitted_demand.unit().unwrap_or(...)`; either one turns
+                    // an undetermined admission into an accepted one.
+                    // `known().is_none()` below is deliberately redundant with
+                    // the `None` arm above and is kept as an independent
+                    // statement that a grant must carry a positive amount, so
+                    // widening or changing the unit comparison cannot silently
+                    // drop the amount requirement.
                     if admitted_demand.unit() != dimension.owner_unit()
                         || admitted_demand.known().is_none()
                     {
@@ -864,20 +883,22 @@ impl HeadroomAllocationLedger {
         if seen != expected.iter().copied().collect::<BTreeSet<_>>() {
             return Err(ContextError::DenominatorMismatch);
         }
-        if self
+        // Fail closed on the missing entry rather than asserting: this
+        // validator is reachable from untrusted wire data, so it must return
+        // a refusal, never panic, even on a path the denominator check above
+        // already makes unreachable.
+        let output_share = self
             .purpose(HeadroomPurpose::Output)
-            .expect("denominator complete")
-            .share
-            != self.capacity.output_reserve
-        {
+            .ok_or(ContextError::DenominatorMismatch)?
+            .share;
+        if output_share != self.capacity.output_reserve {
             return Err(ContextError::EconomyMismatch);
         }
-        if self
+        let review_share = self
             .purpose(HeadroomPurpose::ReviewReasoning)
-            .expect("denominator complete")
-            .share
-            != self.capacity.review_reserve
-        {
+            .ok_or(ContextError::DenominatorMismatch)?
+            .share;
+        if review_share != self.capacity.review_reserve {
             return Err(ContextError::EconomyMismatch);
         }
         if self.total()? > self.capacity.route_capacity {
