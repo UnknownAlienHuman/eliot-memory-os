@@ -1848,6 +1848,17 @@ pub struct ResolvedProfile {
     pub scope: WorkScope,
     /// Bound environment.
     pub environment: StageEnvironment,
+    /// Scope classes the admitted profile revision declares.
+    ///
+    /// These are the classes the resolution above was validated against, not
+    /// a caller-supplied copy: the environment check compares the attested
+    /// [`StageEnvironment`] class with [`Self::environment`] against
+    /// `profile.classes.environment`, and this field is that same admitted
+    /// value. Returning it keeps a later receipt or declared-environment
+    /// check bound to the registry's own class instead of text a caller
+    /// repeated back, so a caller can never admit a route against classes the
+    /// registry never admitted.
+    pub classes: ProfileScopeClasses,
     /// Registry generation the resolution was validated against.
     pub registry_generation: u64,
     /// Registry digest the resolution was validated against.
@@ -1956,6 +1967,7 @@ impl<'a> InstrumentProfileResolver<'a> {
             layout,
             scope,
             environment,
+            classes: profile.classes.clone(),
             registry_generation,
             registry_digest,
             resolution_digest,
