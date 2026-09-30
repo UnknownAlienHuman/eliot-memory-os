@@ -431,24 +431,11 @@ pub async fn prepare_task_controller_claim(
     claimed: TaskControllerClaimedInvocation,
 ) -> Result<TaskControllerClaimPreparation, String> {
     let invocation = &claimed.invocation;
-    let recipe: LearningStateViewRecipe =
-        match serde_json::from_value(invocation.learning_state_view_recipe.clone()) {
-            Ok(recipe) => recipe,
-            Err(_) => {
-                return Ok(TaskControllerClaimPreparation::Rejected(Box::new(
-                    task_controller_rejection(&claimed, "invalid_recipe")?,
-                )));
-            }
-        };
-    if recipe.validate().is_err()
-        || recipe.binding.task_id.as_str() != invocation.task_id.as_str()
-        || recipe.binding.scope.as_str() != invocation.work_scope_id
-        || recipe.binding.state_fence != claimed.envelope.state_fence
-    {
+    let Some(recipe) = decode_task_controller_claim_recipe(&claimed) else {
         return Ok(TaskControllerClaimPreparation::Rejected(Box::new(
             task_controller_rejection(&claimed, "invalid_recipe")?,
         )));
-    }
+    };
     let complete_owner_publications = match invocation.campaign_owner_materials.as_ref() {
         Some(materials) => {
             if reject_caller_owner_material(materials).is_err() {
@@ -537,6 +524,22 @@ pub async fn prepare_task_controller_claim(
             action,
         },
     )))
+}
+
+fn decode_task_controller_claim_recipe(
+    claimed: &TaskControllerClaimedInvocation,
+) -> Option<LearningStateViewRecipe> {
+    let invocation = &claimed.invocation;
+    let recipe: LearningStateViewRecipe =
+        serde_json::from_value(invocation.learning_state_view_recipe.clone()).ok()?;
+    if recipe.validate().is_err()
+        || recipe.binding.task_id.as_str() != invocation.task_id.as_str()
+        || recipe.binding.scope.as_str() != invocation.work_scope_id
+        || recipe.binding.state_fence != claimed.envelope.state_fence
+    {
+        return None;
+    }
+    Some(recipe)
 }
 
 async fn task_controller_selection_admission(
@@ -632,11 +635,13 @@ enum TaskControllerSelectionError {
 impl TaskControllerSelectionError {
     fn reason_code(&self) -> Option<&'static str> {
         match self {
-            Self::Required => Some("TASK_SELECTION_REQUIRED"),
-            Self::ScopeIncompatible => Some("TASK_SCOPE_INCOMPATIBLE"),
+            Self::Required | Self::Kernel(KernelPortError::TaskSelectionRequired) => {
+                Some("TASK_SELECTION_REQUIRED")
+            }
+            Self::ScopeIncompatible | Self::Kernel(KernelPortError::TaskScopeIncompatible) => {
+                Some("TASK_SCOPE_INCOMPATIBLE")
+            }
             Self::Composition(error) => task_selection_composition_reason_code(error),
-            Self::Kernel(KernelPortError::TaskSelectionRequired) => Some("TASK_SELECTION_REQUIRED"),
-            Self::Kernel(KernelPortError::TaskScopeIncompatible) => Some("TASK_SCOPE_INCOMPATIBLE"),
             Self::Kernel(_) => None,
             Self::Binding(error) => Some(error.code()),
         }
