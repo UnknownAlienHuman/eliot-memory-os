@@ -116,10 +116,10 @@ use eliot_workscope::{
     GenerationEvidence, GoverningSourceAdmission, GoverningSourceSet, GuardTrigger, GuardVerdict,
     IdentityEvidence, IdentityLegOutcome, LeaseJoin, LooseScanQuarantine, MaterialAdmission,
     MaterialReadinessDirective, MaterialReadinessInputs, ObservedScopeResources, OnboardingLease,
-    OnboardingSingleFlight, PrivacyBoundary, PrivacyProfile, QuarantinedScopeRecord,
-    ReadinessLifecycle, RepositoryLineageIdentity, RequestedEffect, ResolutionAuthentication,
-    ResolutionRequest, ScanDisclosureOwnerBinding, ScanReceiptHandle, ScannerResolverInputs,
-    ScopeBinding, ScopeBindingDisposition, ScopeBindingGuard, ScopeIdentity, ScopeKind,
+    PrivacyBoundary, PrivacyProfile, QuarantinedScopeRecord, ReadinessLifecycle,
+    RepositoryLineageIdentity, RequestedEffect, ResolutionAuthentication, ResolutionRequest,
+    ScanDisclosureOwnerBinding, ScanReceiptHandle, ScannerResolverInputs, ScopeBinding,
+    ScopeBindingDisposition, ScopeBindingGuard, ScopeIdentity, ScopeKind,
     ScopeRelocationOrAttachReceipt, ScopeResolution, SourceAdmissionRequest, TaskBindingInput,
     TaskBindingState, TaskIntakeCandidate, TaskSelectionRequired, TriggerAdmission, TriggerReport,
     WorkScopeBindingOwner, WorkScopeBindingSnapshot, WorkScopeCandidate, WorkScopeCandidateSet,
@@ -3939,15 +3939,8 @@ pub struct GovernorComposition<P: ?Sized> {
     /// stale presentation still shows. An entry is removed only when the
     /// second-phase link commits; a failed retry never clears it.
     pending_canonical_revocations: BTreeMap<String, PendingCanonicalRevocation>,
-    /// Governor-owned cold-start single-flight registry (issue #1790, I4.4.1).
-    ///
-    /// Compatible concurrent attaches join the same [`OnboardingSingleFlight`]
-    /// lease here instead of keeping caller-owned registries: the registry
-    /// holds no filesystem, process, credential or store state, only lease
-    /// keys with their terminal receipts, so every trigger that reaches the
-    /// cold-start legs below coalesces on exact workspace identity, privacy
-    /// boundary and governing-source generation.
-    cold_start: OnboardingSingleFlight,
+    /// Installation-bound durable owner for exact cold-start lease and terminal
+    /// receipt records. Compatible callers join through this owner.
     cold_start_readiness_owner: Option<Arc<dyn ColdStartReadinessRecordOwner>>,
     cold_start_readiness_contour: Option<InstallationScanContour>,
     cold_start_readiness_claims: BTreeMap<String, ColdStartReadinessOwnerClaim>,
@@ -4488,7 +4481,7 @@ pub struct AuthorityRevocationReconciliation {
 /// `OnboardingReadinessReceipt::validate` checks structure and internal
 /// consistency but does not verify a stored payload digest, and `receipt_ref`
 /// is not such a digest. Correct origin and freshness therefore depend on the
-/// retained `OnboardingSingleFlight` owner and #8's authenticated live
+/// durable ORS readiness owner and #8's authenticated live
 /// producer. This projection has no clock input, so it cannot independently
 /// establish that the lease has not expired or been revoked; the live #8
 /// caller must revalidate those facts before using readiness. `readiness` is
@@ -4671,7 +4664,6 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             readiness: CompositionReadiness::Ready,
             authority_presentations: BTreeMap::new(),
             pending_canonical_revocations: BTreeMap::new(),
-            cold_start: OnboardingSingleFlight::new(),
             cold_start_readiness_owner: None,
             cold_start_readiness_contour: None,
             cold_start_readiness_claims: BTreeMap::new(),
@@ -6699,14 +6691,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .validate_for(&candidate.scope, privacy)
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
 
-        let contour = self
-            .cold_start_readiness_contour
-            .as_ref()
-            .ok_or_else(|| {
-                CompositionError::Recovery(
-                    "cold-start readiness owner has no admitted installation contour".to_owned(),
-                )
-            })?;
+        let contour = self.cold_start_readiness_contour.as_ref().ok_or_else(|| {
+            CompositionError::Recovery(
+                "cold-start readiness owner has no admitted installation contour".to_owned(),
+            )
+        })?;
         if contour != scan_store.contour()
             || scan_binding.installation_id != contour.installation_id()
             || candidate.scope.lineage_ref.as_deref()
@@ -6734,18 +6723,13 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         let fence_bytes = canonical_json_bytes(&live_fence)
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-        if scan_binding.state_fence_ref.as_deref()
-            != Some(sha256_hex(&fence_bytes).as_str())
-        {
+        if scan_binding.state_fence_ref.as_deref() != Some(sha256_hex(&fence_bytes).as_str()) {
             return Err(CompositionError::ActivationStaleFence);
         }
 
-        let replayed = eliot_workscope::ScanDisclosureStore::readback(
-            scan_store,
-            scan_receipt,
-            scan_binding,
-        )
-        .map_err(CompositionError::ScanDisclosure)?;
+        let replayed =
+            eliot_workscope::ScanDisclosureStore::readback(scan_store, scan_receipt, scan_binding)
+                .map_err(CompositionError::ScanDisclosure)?;
         if replayed.scan_ref != scan_receipt.receipt_ref {
             return Err(CompositionError::ScanDisclosure(
                 WorkScopeError::ScanReceiptReplaced,
@@ -6762,9 +6746,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         let key = ColdStartReadinessOwnerKey {
             installation_id: contour.installation_id().to_owned(),
             lineage_candidate_ref: proposed.lineage_candidate_ref.clone(),
-            workspace_instance_candidate_ref: proposed
-                .workspace_instance_candidate_ref
-                .clone(),
+            workspace_instance_candidate_ref: proposed.workspace_instance_candidate_ref.clone(),
             filesystem_identity_ref: candidate.instance.root_identity.clone(),
             vcs_identity_ref: candidate.instance.vcs_identity_ref.clone(),
             privacy_boundary_ref: scan_binding.privacy_boundary_ref.clone(),
@@ -6810,8 +6792,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             || lease.workspace_instance_candidate_ref
                 != record.claim.key.workspace_instance_candidate_ref
             || lease.privacy_class != record.claim.key.privacy_class
-            || lease.governing_source_generation
-                != record.claim.key.governing_source_generation
+            || lease.governing_source_generation != record.claim.key.governing_source_generation
         {
             return Err(CompositionError::ActivationStaleFence);
         }
@@ -6848,10 +6829,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         }
     }
 
-    /// Joins one I4.4.1 trigger to the retained cold-start single-flight
+    /// Joins one I4.4.1 trigger to the durable cold-start single-flight
     /// lease (issue #1790, single-flight join production caller).
     ///
-    /// The join runs against the retained [`OnboardingSingleFlight`] registry,
+    /// The join runs against the installation-bound ORS readiness owner,
     /// so compatible concurrent attaches coalesce on exact workspace
     /// filesystem/VCS identity plus privacy boundary plus governing-source
     /// generation, and a changed governing-source digest or dirty-base summary
@@ -6902,14 +6883,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             scan_binding,
             scan_receipt,
         )?;
-        let owner = self
-            .cold_start_readiness_owner
-            .as_ref()
-            .ok_or_else(|| {
-                CompositionError::Recovery(
-                    "cold-start readiness ORS owner is not bound".to_owned(),
-                )
-            })?;
+        let owner = self.cold_start_readiness_owner.as_ref().ok_or_else(|| {
+            CompositionError::Recovery("cold-start readiness ORS owner is not bound".to_owned())
+        })?;
         let outcome = owner
             .claim_cold_start_readiness(&claim, now)
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
@@ -7041,14 +7017,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         {
             return Err(CompositionError::ActivationStaleFence);
         }
-        let owner = self
-            .cold_start_readiness_owner
-            .as_ref()
-            .ok_or_else(|| {
-                CompositionError::Recovery(
-                    "cold-start readiness ORS owner is not bound".to_owned(),
-                )
-            })?;
+        let owner = self.cold_start_readiness_owner.as_ref().ok_or_else(|| {
+            CompositionError::Recovery("cold-start readiness ORS owner is not bound".to_owned())
+        })?;
         let record = owner
             .load_cold_start_readiness(&owned.record_key)
             .map_err(|error| CompositionError::Recovery(error.to_string()))?
@@ -7068,11 +7039,13 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         }
         if record.terminal.is_some() {
             let joined = Self::readiness_join_from_record(&record, now, false)?;
-            self.cold_start_readiness_claims.remove(&claim.binding_digest);
+            self.cold_start_readiness_claims
+                .remove(&claim.binding_digest);
             return Ok(joined);
         }
         if now > record.claim.lease_deadline {
-            self.cold_start_readiness_claims.remove(&claim.binding_digest);
+            self.cold_start_readiness_claims
+                .remove(&claim.binding_digest);
             return Err(CompositionError::ActivationStaleFence);
         }
         let lease: OnboardingLease = serde_json::from_str(&record.claim.lease_bytes)
@@ -7151,7 +7124,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         terminal_record
             .validate()
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-        self.cold_start_readiness_claims.remove(&claim.binding_digest);
+        self.cold_start_readiness_claims
+            .remove(&claim.binding_digest);
         Self::readiness_join_from_record(&terminal_record, now, false)
     }
 
@@ -7200,7 +7174,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
 
     /// Reads the exact retained terminal lease and surface from ORS after
     /// restart. A partial identity cannot name the full binding digest, and
-    /// the in-memory `OnboardingSingleFlight` registry is never a fallback.
+    /// the process-local claim map is never a fallback.
     pub fn cold_start_owner_readback_for_claim(
         &self,
         claim: &ColdStartReadinessClaim,
@@ -7223,14 +7197,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         claim
             .validate()
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-        let contour = self
-            .cold_start_readiness_contour
-            .as_ref()
-            .ok_or_else(|| {
-                CompositionError::Recovery(
-                    "cold-start readiness owner has no admitted installation contour".to_owned(),
-                )
-            })?;
+        let contour = self.cold_start_readiness_contour.as_ref().ok_or_else(|| {
+            CompositionError::Recovery(
+                "cold-start readiness owner has no admitted installation contour".to_owned(),
+            )
+        })?;
         if claim.key.installation_id != contour.installation_id() {
             return Err(CompositionError::ActivationStaleFence);
         }
@@ -7238,14 +7209,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         if !fences_match_exact(&claim.key.state_fence, &live_fence) {
             return Err(CompositionError::ActivationStaleFence);
         }
-        let owner = self
-            .cold_start_readiness_owner
-            .as_ref()
-            .ok_or_else(|| {
-                CompositionError::Recovery(
-                    "cold-start readiness ORS owner is not bound".to_owned(),
-                )
-            })?;
+        let owner = self.cold_start_readiness_owner.as_ref().ok_or_else(|| {
+            CompositionError::Recovery("cold-start readiness ORS owner is not bound".to_owned())
+        })?;
         let record = owner
             .load_cold_start_readiness_for_binding(&claim.binding_digest)
             .map_err(|error| CompositionError::Recovery(error.to_string()))?
@@ -7282,8 +7248,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         if lease.lease_ref != record.claim.lease_ref
             || lease.deadline != record.claim.lease_deadline
             || lease.lineage_candidate_ref != claim.key.lineage_candidate_ref
-            || lease.workspace_instance_candidate_ref
-                != claim.key.workspace_instance_candidate_ref
+            || lease.workspace_instance_candidate_ref != claim.key.workspace_instance_candidate_ref
             || lease.privacy_class != claim.key.privacy_class
             || lease.governing_source_generation != claim.key.governing_source_generation
             || receipt.lease_ref != lease.lease_ref

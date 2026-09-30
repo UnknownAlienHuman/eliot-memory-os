@@ -199,8 +199,7 @@ impl ColdStartReadinessRecordOwner for InstallationColdStartReadinessOwner {
             || existing.claim.lease_ref != lease_ref
         {
             return Err(OrsError::Contract(
-                "cold-start readiness publication disagrees with the retained lease row"
-                    .to_owned(),
+                "cold-start readiness publication disagrees with the retained lease row".to_owned(),
             ));
         }
         let record = self.owner.publish_cold_start_readiness(

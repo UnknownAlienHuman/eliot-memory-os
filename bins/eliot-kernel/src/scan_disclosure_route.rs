@@ -81,9 +81,7 @@ pub(crate) enum ScanDisclosureOwnerAction {
         limit: u16,
     },
     /// Atomically claim or join one exact durable cold-start lease key.
-    ReadinessClaim {
-        claim: Box<ColdStartReadinessClaim>,
-    },
+    ReadinessClaim { claim: Box<ColdStartReadinessClaim> },
     /// Publish one immutable terminal readiness receipt revision.
     ReadinessPublish {
         record_key: String,
@@ -393,8 +391,7 @@ impl KernelComposition {
             .map_err(|_| TransportError::SessionFenced)?
             .ok_or(TransportError::IdentityConflict)?;
         Self::validate_cold_start_readiness_record(current, &existing)?;
-        if existing.claim.binding_digest != binding_digest
-            || existing.claim.lease_ref != lease_ref
+        if existing.claim.binding_digest != binding_digest || existing.claim.lease_ref != lease_ref
         {
             return Err(TransportError::IdentityConflict);
         }
@@ -473,7 +470,9 @@ impl KernelComposition {
         current: &CurrentScanDisclosureActivation,
         record: &ColdStartReadinessOrsRecord,
     ) -> Result<(), TransportError> {
-        record.validate().map_err(|_| TransportError::SessionFenced)?;
+        record
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
         Self::validate_cold_start_readiness_key(current, &record.claim.key)?;
         if super::unix_ms() > record.claim.lease_deadline {
             return Err(TransportError::SessionFenced);
