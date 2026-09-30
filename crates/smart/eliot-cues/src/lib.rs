@@ -530,6 +530,37 @@ pub fn preserve_v1_snapshot_conversion(
     Ok(snapshot)
 }
 
+/// The single owner of the v1 row-payload identity binding.
+///
+/// The retained-bytes/row binding — parse the supplied bytes against the
+/// supplied row id and refuse when the parsed row is not byte-equal to the row
+/// the caller passed in — was written out twice in this crate, in the same
+/// order, once in [`reject_v1_row_conversion`] and once in
+/// [`convert_v1_row`](legacy_adapter::convert_v1_row). Two copies of one
+/// identity rule are two owners that can drift into accepting different bytes.
+/// Both now read this one owner.
+///
+/// Order is preserved exactly: the payload is bound before the legacy identity
+/// is validated, so the first refusal a caller sees is unchanged, and the
+/// single stable pointer [`FacadeError::ResponseIdentityMismatch`] with
+/// `what = "migration.row_payload"` is the one every caller already receives.
+/// The two different field paths that follow the binding
+/// (`legacy_identity` vs `legacy_row_id`) deliberately stay at their own call
+/// sites, because each names its own input.
+pub(crate) fn bind_v1_row_payload(
+    legacy_row_id: &str,
+    row: &LegacyEliotCuesV1Row,
+    legacy_bytes: &[u8],
+) -> Result<(), FacadeError> {
+    let parsed = legacy_adapter::parse_bound_v1_row(legacy_bytes, legacy_row_id)?;
+    if &parsed != row {
+        return Err(FacadeError::ResponseIdentityMismatch {
+            what: "migration.row_payload",
+        });
+    }
+    Ok(())
+}
+
 /// Records a precise v1-to-v2 rejection while retaining the original row
 /// bytes and identity. The result is candidate-only and never an admission.
 pub fn reject_v1_row_conversion(
@@ -539,12 +570,7 @@ pub fn reject_v1_row_conversion(
     reason: V1MigrationRejection,
 ) -> Result<V1RowMigration, FacadeError> {
     row.validate_for_conversion()?;
-    let parsed = legacy_adapter::parse_bound_v1_row(legacy_bytes, legacy_row_id)?;
-    if &parsed != row {
-        return Err(FacadeError::ResponseIdentityMismatch {
-            what: "migration.row_payload",
-        });
-    }
+    bind_v1_row_payload(legacy_row_id, row, legacy_bytes)?;
     validate_legacy_identity(legacy_row_id)?;
     if legacy_bytes.is_empty() {
         return Err(FacadeError::EnvelopeInvalid {
