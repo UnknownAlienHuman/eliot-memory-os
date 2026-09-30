@@ -172,10 +172,9 @@ impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
             KernelActivationState::HandoffPrepared,
             "kernel-handoff-prepared",
             |next| {
-                if let Some(evidence) = evidence {
-                    if !next.disposition_evidence.contains(&evidence) {
-                        next.disposition_evidence.push(evidence);
-                    }
+                if let Some(evidence) = evidence.filter(|e| !next.disposition_evidence.contains(e))
+                {
+                    next.disposition_evidence.push(evidence);
                 }
                 Ok(())
             },
