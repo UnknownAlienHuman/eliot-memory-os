@@ -164,7 +164,7 @@ impl DaemonComposition {
     /// terminal, and unknown/reconciling ORS rows return explicit pending,
     /// revoked, or unknown outcomes without applying active-binding
     /// currentness rules. Admitted/live rows are revalidated against the
-    /// retained Governor fence, plan, task, session, WorkScope, protected
+    /// retained Governor fence, plan, task, session, `WorkScope`, protected
     /// config, Module Catalog, and Kernel-observed time, then return a typed
     /// provider-revisions-unavailable result because no live provider
     /// route/capacity revision owner is wired into this daemon composition.
@@ -185,19 +185,63 @@ impl DaemonComposition {
         task_id: &str,
         outcome: super::daemon_kernel_client::NativeWorkerExecutableBindingReadbackOutcome,
     ) -> Result<NativeWorkerBindingObservation, DaemonError> {
+        let composition_session = self.readback_owner_session(kernel)?;
+
+        match outcome {
+            super::daemon_kernel_client::NativeWorkerExecutableBindingReadbackOutcome::Pending {
+                claim_id: observed_claim_id,
+                attempt_id: observed_attempt_id,
+                operation_id: observed_operation_id,
+                task_id: observed_task_id,
+                observed_at_unix_ms,
+            } => Self::adopt_pending_binding_readback(
+                (claim_id, attempt_id, operation_id, task_id),
+                (
+                    observed_claim_id,
+                    observed_attempt_id,
+                    observed_operation_id,
+                    observed_task_id,
+                    observed_at_unix_ms,
+                ),
+            ),
+            super::daemon_kernel_client::NativeWorkerExecutableBindingReadbackOutcome::Found(
+                readback,
+            ) => self.adopt_found_binding_readback(
+                kernel,
+                &composition_session,
+                (claim_id, attempt_id, operation_id, task_id),
+                &readback,
+            ),
+        }
+    }
+
+    /// Checks composition readiness and that the daemon and the client retain
+    /// the same validated Kernel session for one binding readback.
+    ///
+    /// Returns the owned composition session binding the caller rechecks
+    /// after Governor validation, so a session rotation mid-validation
+    /// cannot be mistaken for owner evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed daemon/Composition error for a non-ready
+    /// composition, missing session state on either side, or a
+    /// composition/client session mismatch.
+    fn readback_owner_session(&self, kernel: &DaemonKernelClient) -> Result<String, DaemonError> {
         if self.readiness() != CompositionReadiness::Ready {
             return Err(DaemonError::Composition(CompositionError::NotReady));
         }
         let composition_session = self
             .owner_session
             .as_ref()
-            .map(|facts| facts.session_binding())
+            .map(super::daemon_kernel_client::OwnerSessionFacts::session_binding)
             .ok_or_else(|| {
                 DaemonError::Kernel(
                     "daemon has no validated Kernel owner session for native binding readback"
                         .to_owned(),
                 )
-            })?;
+            })?
+            .to_owned();
         let client_session = kernel
             .owner_session_facts()
             .ok_or_else(|| {
@@ -214,154 +258,216 @@ impl DaemonComposition {
                     .to_owned(),
             ));
         }
+        Ok(composition_session)
+    }
 
-        match outcome {
-            super::daemon_kernel_client::NativeWorkerExecutableBindingReadbackOutcome::Pending {
-                claim_id: observed_claim_id,
-                attempt_id: observed_attempt_id,
-                operation_id: observed_operation_id,
-                task_id: observed_task_id,
-                observed_at_unix_ms,
-            } => {
-                if observed_claim_id != claim_id
-                    || observed_attempt_id != attempt_id
-                    || observed_operation_id != operation_id
-                    || observed_task_id != task_id
-                    || observed_at_unix_ms == 0
-                {
-                    return Err(DaemonError::Kernel(
-                        "pending native binding readback does not match the exact request tuple"
-                            .to_owned(),
-                    ));
-                }
+    /// Adopts one pending binding readback after rechecking the exact
+    /// request tuple.
+    ///
+    /// Requested, terminal, and unknown/reconciling ORS rows never reach
+    /// here; this is the pending-publication shape only.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed daemon error when the observed tuple or timestamp
+    /// does not match the exact request.
+    fn adopt_pending_binding_readback(
+        expected: (&str, &str, &str, &str),
+        observed: (String, String, String, String, u64),
+    ) -> Result<NativeWorkerBindingObservation, DaemonError> {
+        let (claim_id, attempt_id, operation_id, task_id) = expected;
+        let (
+            observed_claim_id,
+            observed_attempt_id,
+            observed_operation_id,
+            observed_task_id,
+            observed_at_unix_ms,
+        ) = observed;
+        if observed_claim_id != claim_id
+            || observed_attempt_id != attempt_id
+            || observed_operation_id != operation_id
+            || observed_task_id != task_id
+            || observed_at_unix_ms == 0
+        {
+            return Err(DaemonError::Kernel(
+                "pending native binding readback does not match the exact request tuple".to_owned(),
+            ));
+        }
+        Ok(NativeWorkerBindingObservation::Pending {
+            claim_id: observed_claim_id,
+            attempt_id: observed_attempt_id,
+            operation_id: observed_operation_id,
+            task_id: observed_task_id,
+            claim_state: None,
+            observed_at_unix_ms,
+        })
+    }
+
+    /// Adopts one found binding readback: exact tuple/owner-digest match,
+    /// claim-state classification, session recheck, then disposition.
+    ///
+    /// Requested and terminal rows return explicit pending or revoked
+    /// outcomes, unknown/reconciling rows return the unknown outcome, and
+    /// admitted/live rows continue into Governor currentness through
+    /// [`Self::adopt_governor_current_binding`]. Nothing here mints a
+    /// Coordinator capability or effect permission.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed daemon error for a tuple or owner-digest mismatch,
+    /// an unrecognized claim state, a rotated owner session, or stale
+    /// Governor-owned currentness.
+    fn adopt_found_binding_readback(
+        &self,
+        kernel: &DaemonKernelClient,
+        composition_session: &str,
+        expected: (&str, &str, &str, &str),
+        readback: &super::daemon_kernel_client::NativeWorkerExecutableBindingReadback,
+    ) -> Result<NativeWorkerBindingObservation, DaemonError> {
+        let (claim_id, attempt_id, operation_id, task_id) = expected;
+        let binding = readback.binding();
+        let observed_at_unix_ms = readback.observed_at_unix_ms();
+        if readback.claim_id() != claim_id
+            || readback.attempt_id() != attempt_id
+            || readback.operation_id() != operation_id
+            || readback.task_id() != task_id
+            || binding.claim_id != claim_id
+            || binding.operation_id != operation_id
+            || binding.task_id != task_id
+            || readback.executable_binding_digest() != binding.binding_digest
+            || observed_at_unix_ms == 0
+        {
+            return Err(DaemonError::Kernel(
+                "native binding readback does not match the exact request tuple or owner digest"
+                    .to_owned(),
+            ));
+        }
+
+        let (claim_state, disposition) =
+            NativeWorkerBindingObservation::classify_claim_state(readback.claim_state())
+                .map_err(DaemonError::Kernel)?;
+        Self::recheck_readback_session(kernel, composition_session)?;
+
+        match disposition {
+            NativeWorkerBindingClaimDisposition::Requested => {
                 Ok(NativeWorkerBindingObservation::Pending {
-                    claim_id: observed_claim_id,
-                    attempt_id: observed_attempt_id,
-                    operation_id: observed_operation_id,
-                    task_id: observed_task_id,
-                    claim_state: None,
+                    claim_id: readback.claim_id().to_owned(),
+                    attempt_id: readback.attempt_id().to_owned(),
+                    operation_id: readback.operation_id().to_owned(),
+                    task_id: readback.task_id().to_owned(),
+                    claim_state: Some(claim_state),
                     observed_at_unix_ms,
                 })
             }
-            super::daemon_kernel_client::NativeWorkerExecutableBindingReadbackOutcome::Found(
-                readback,
-            ) => {
-                let binding = readback.binding();
-                let observed_at_unix_ms = readback.observed_at_unix_ms();
-                if readback.claim_id() != claim_id
-                    || readback.attempt_id() != attempt_id
-                    || readback.operation_id() != operation_id
-                    || readback.task_id() != task_id
-                    || binding.claim_id != claim_id
-                    || binding.operation_id != operation_id
-                    || binding.task_id != task_id
-                    || readback.executable_binding_digest() != binding.binding_digest
-                    || observed_at_unix_ms == 0
-                {
-                    return Err(DaemonError::Kernel(
-                        "native binding readback does not match the exact request tuple or owner digest"
-                            .to_owned(),
-                    ));
-                }
-
-                let (claim_state, disposition) =
-                    NativeWorkerBindingObservation::classify_claim_state(readback.claim_state())
-                        .map_err(DaemonError::Kernel)?;
-                let client_session_after = kernel
-                    .owner_session_facts()
-                    .ok_or_else(|| {
-                        DaemonError::Kernel(
-                            "Kernel owner session disappeared during native binding validation"
-                                .to_owned(),
-                        )
-                    })?
-                    .session_binding()
-                    .to_owned();
-                if client_session_after != composition_session {
-                    return Err(DaemonError::Kernel(
-                        "Kernel owner session changed during native binding validation"
-                            .to_owned(),
-                    ));
-                }
-
-                let claim_id = readback.claim_id().to_owned();
-                let attempt_id = readback.attempt_id().to_owned();
-                let operation_id = readback.operation_id().to_owned();
-                let task_id = readback.task_id().to_owned();
-                let binding = binding.clone();
-                let executable_binding_digest = readback
-                    .executable_binding_digest()
-                    .to_owned();
-
-                match disposition {
-                    NativeWorkerBindingClaimDisposition::Requested => {
-                        Ok(NativeWorkerBindingObservation::Pending {
-                            claim_id,
-                            attempt_id,
-                            operation_id,
-                            task_id,
-                            claim_state: Some(claim_state),
-                            observed_at_unix_ms,
-                        })
-                    }
-                    NativeWorkerBindingClaimDisposition::Terminal => {
-                        Ok(NativeWorkerBindingObservation::Revoked {
-                            claim_id,
-                            attempt_id,
-                            operation_id,
-                            task_id,
-                            binding,
-                            executable_binding_digest,
-                            claim_state,
-                            observed_at_unix_ms,
-                        })
-                    }
-                    NativeWorkerBindingClaimDisposition::UnknownOutcome => {
-                        Ok(NativeWorkerBindingObservation::UnknownOutcome {
-                            claim_id,
-                            attempt_id,
-                            operation_id,
-                            task_id,
-                            binding,
-                            executable_binding_digest,
-                            claim_state,
-                            observed_at_unix_ms,
-                        })
-                    }
-                    NativeWorkerBindingClaimDisposition::GovernorCurrentnessRequired => {
-                        let kernel_fence = kernel.kernel_fence();
-                        if binding.state_fence != kernel_fence {
-                            return Err(DaemonError::Kernel(
-                                "active native binding readback is not current at the Kernel fence"
-                                    .to_owned(),
-                            ));
-                        }
-                        self.governor.validate_native_worker_binding_current(
-                            &binding,
-                            observed_at_unix_ms,
-                        )?;
-                        if kernel.kernel_fence() != kernel_fence {
-                            return Err(DaemonError::Kernel(
-                                "Kernel fence moved while Governor revalidated the native binding"
-                                    .to_owned(),
-                            ));
-                        }
-                        Ok(
-                            NativeWorkerBindingObservation::GovernorCurrentButProviderRevisionsUnavailable {
-                                claim_id,
-                                attempt_id,
-                                operation_id,
-                                task_id,
-                                binding,
-                                executable_binding_digest,
-                                claim_state,
-                                observed_at_unix_ms,
-                            },
-                        )
-                    }
-                }
+            NativeWorkerBindingClaimDisposition::Terminal => {
+                Ok(NativeWorkerBindingObservation::Revoked {
+                    claim_id: readback.claim_id().to_owned(),
+                    attempt_id: readback.attempt_id().to_owned(),
+                    operation_id: readback.operation_id().to_owned(),
+                    task_id: readback.task_id().to_owned(),
+                    binding: binding.clone(),
+                    executable_binding_digest: readback.executable_binding_digest().to_owned(),
+                    claim_state,
+                    observed_at_unix_ms,
+                })
+            }
+            NativeWorkerBindingClaimDisposition::UnknownOutcome => {
+                Ok(NativeWorkerBindingObservation::UnknownOutcome {
+                    claim_id: readback.claim_id().to_owned(),
+                    attempt_id: readback.attempt_id().to_owned(),
+                    operation_id: readback.operation_id().to_owned(),
+                    task_id: readback.task_id().to_owned(),
+                    binding: binding.clone(),
+                    executable_binding_digest: readback.executable_binding_digest().to_owned(),
+                    claim_state,
+                    observed_at_unix_ms,
+                })
+            }
+            NativeWorkerBindingClaimDisposition::GovernorCurrentnessRequired => {
+                self.adopt_governor_current_binding(kernel, readback)
             }
         }
+    }
+
+    /// Rechecks that the Kernel owner session still matches the composition
+    /// session after claim-state classification.
+    ///
+    /// A rotation between the readback and Governor validation must refuse
+    /// rather than validate owner evidence under a replaced session.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed daemon error when the owner session disappeared or
+    /// no longer matches the composition session.
+    fn recheck_readback_session(
+        kernel: &DaemonKernelClient,
+        composition_session: &str,
+    ) -> Result<(), DaemonError> {
+        let client_session_after = kernel
+            .owner_session_facts()
+            .ok_or_else(|| {
+                DaemonError::Kernel(
+                    "Kernel owner session disappeared during native binding validation".to_owned(),
+                )
+            })?
+            .session_binding()
+            .to_owned();
+        if client_session_after != composition_session {
+            return Err(DaemonError::Kernel(
+                "Kernel owner session changed during native binding validation".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Revalidates one admitted/live binding against the retained Governor
+    /// fence and owner projections.
+    ///
+    /// Returns the typed provider-revisions-unavailable observation because
+    /// no live provider route/capacity revision owner is wired into this
+    /// daemon composition. It never turns the binding readback into a
+    /// Coordinator capability or effect permission.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed daemon error for an active binding's stale Kernel
+    /// fence, a moved fence during Governor revalidation, or stale
+    /// Governor-owned currentness.
+    fn adopt_governor_current_binding(
+        &self,
+        kernel: &DaemonKernelClient,
+        readback: &super::daemon_kernel_client::NativeWorkerExecutableBindingReadback,
+    ) -> Result<NativeWorkerBindingObservation, DaemonError> {
+        let binding = readback.binding();
+        let observed_at_unix_ms = readback.observed_at_unix_ms();
+        let kernel_fence = kernel.kernel_fence();
+        if binding.state_fence != kernel_fence {
+            return Err(DaemonError::Kernel(
+                "active native binding readback is not current at the Kernel fence".to_owned(),
+            ));
+        }
+        self.governor
+            .validate_native_worker_binding_current(binding, observed_at_unix_ms)?;
+        if kernel.kernel_fence() != kernel_fence {
+            return Err(DaemonError::Kernel(
+                "Kernel fence moved while Governor revalidated the native binding".to_owned(),
+            ));
+        }
+        let (claim_state, _) =
+            NativeWorkerBindingObservation::classify_claim_state(readback.claim_state())
+                .map_err(DaemonError::Kernel)?;
+        Ok(
+            NativeWorkerBindingObservation::GovernorCurrentButProviderRevisionsUnavailable {
+                claim_id: readback.claim_id().to_owned(),
+                attempt_id: readback.attempt_id().to_owned(),
+                operation_id: readback.operation_id().to_owned(),
+                task_id: readback.task_id().to_owned(),
+                binding: binding.clone(),
+                executable_binding_digest: readback.executable_binding_digest().to_owned(),
+                claim_state,
+                observed_at_unix_ms,
+            },
+        )
     }
 }
 

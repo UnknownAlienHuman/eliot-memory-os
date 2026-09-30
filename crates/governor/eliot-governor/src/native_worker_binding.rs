@@ -320,7 +320,7 @@ impl NativeWorkerExecutableBinding {
 /// Typed result of re-reading the owner-persisted executable binding for one
 /// exact native-worker claim tuple (issue #1108 W1/A1).
 ///
-/// GovernorCurrentButProviderRevisionsUnavailable means the authenticated
+/// `GovernorCurrentButProviderRevisionsUnavailable` means the authenticated
 /// Kernel/ORS readback and retained Governor owners agree on the complete M1
 /// binding, its tuple, fence, plan, task, session, config, catalog, and time
 /// window. It is deliberately not an admitted provider capability: the live

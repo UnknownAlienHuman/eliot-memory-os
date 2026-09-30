@@ -1242,7 +1242,10 @@ pub async fn drive_solo_delegate_async(
     })?;
 
     kernel
-        .verify_provider_binding_async(&intake.claimed.material())
+        .verify_provider_binding_async(
+            &intake.claimed.material(),
+            intake.plan.launch.task_id.as_str(),
+        )
         .await
         .map_err(|error| DaemonError::Kernel(error.to_string()))?;
 
@@ -1658,48 +1661,17 @@ pub async fn solo_poll_queue_async(
         .await
         .map_err(|error| DaemonError::Kernel(error.to_string()))?;
 
-    let observation = {
-        let composition = composition.lock().await;
-        if composition.readiness() != CompositionReadiness::Ready {
-            return Err(DaemonError::Composition(CompositionError::NotReady));
-        }
-        let state = composition.solo_state.lock().map_err(|_| {
-            DaemonError::Composition(CompositionError::Recovery(
-                "solo driver state lock poisoned".to_owned(),
-            ))
-        })?;
-        let Some(head) = state.queue.front() else {
-            return Ok(SoloPollOutcome::SlotBusy);
-        };
-        if head.claimed.claim_id != intake.claimed.claim_id
-            || head.claimed.attempt_id != intake.claimed.attempt_id
-            || head.claimed.operation_id != intake.claimed.operation_id
-            || head.plan.launch.task_id != intake.plan.launch.task_id
-        {
-            return Ok(SoloPollOutcome::SlotBusy);
-        }
-        drop(state);
-        let observation = composition.validate_solo_native_worker_binding_readback(
-            kernel,
-            &intake.claimed.claim_id,
-            &intake.claimed.attempt_id,
-            &intake.claimed.operation_id,
-            task_id,
-            readback,
-        )?;
-        let historical_non_effect = matches!(
-            &observation,
-            eliot_governor::NativeWorkerBindingObservation::Revoked { .. }
-                | eliot_governor::NativeWorkerBindingObservation::UnknownOutcome { .. }
-        );
-        if !historical_non_effect
-            && !fences_match_exact(&expected_kernel_fence, &kernel.kernel_fence())
-        {
-            return Err(DaemonError::ProviderAdmission(FabricError::StaleFence(
-                "Kernel fence changed while the solo binding readback was in flight".to_owned(),
-            )));
-        }
-        observation
+    let observation = validate_solo_poll_readback(
+        composition,
+        kernel,
+        &intake,
+        task_id,
+        expected_kernel_fence,
+        readback,
+    )
+    .await?;
+    let Some(observation) = observation else {
+        return Ok(SoloPollOutcome::SlotBusy);
     };
 
     // The owner validator confirms Governor currentness using Kernel's
@@ -1707,6 +1679,76 @@ pub async fn solo_poll_queue_async(
     // capacity revision, so admitted rows remain before capability
     // construction. Historical terminal/unknown states are surfaced as
     // typed observations; the exact queue head remains present in all cases.
+    Ok(map_binding_observation_to_poll(observation))
+}
+
+/// Revalidates one solo poll readback under a short composition borrow.
+///
+/// Confirms the composition is still ready, the exact queue head is still
+/// first, and the head tuple still matches the intake the readback was
+/// issued for; then adopts the readback through the owner validator and
+/// refuses a fence move observed mid-flight for non-historical outcomes.
+/// Returns `None` when the queue no longer holds the intake, so the caller
+/// reports the slot busy without dequeuing.
+async fn validate_solo_poll_readback(
+    composition: &tokio::sync::Mutex<DaemonComposition>,
+    kernel: &Arc<DaemonKernelClient>,
+    intake: &SoloDelegateIntake,
+    task_id: &str,
+    expected_kernel_fence: eliot_contracts::StateFence,
+    readback: crate::daemon_kernel_client::NativeWorkerExecutableBindingReadbackOutcome,
+) -> Result<Option<eliot_governor::NativeWorkerBindingObservation>, DaemonError> {
+    let composition = composition.lock().await;
+    if composition.readiness() != CompositionReadiness::Ready {
+        return Err(DaemonError::Composition(CompositionError::NotReady));
+    }
+    let state = composition.solo_state.lock().map_err(|_| {
+        DaemonError::Composition(CompositionError::Recovery(
+            "solo driver state lock poisoned".to_owned(),
+        ))
+    })?;
+    let Some(head) = state.queue.front() else {
+        return Ok(None);
+    };
+    if head.claimed.claim_id != intake.claimed.claim_id
+        || head.claimed.attempt_id != intake.claimed.attempt_id
+        || head.claimed.operation_id != intake.claimed.operation_id
+        || head.plan.launch.task_id != intake.plan.launch.task_id
+    {
+        return Ok(None);
+    }
+    drop(state);
+    let observation = composition.validate_solo_native_worker_binding_readback(
+        kernel,
+        &intake.claimed.claim_id,
+        &intake.claimed.attempt_id,
+        &intake.claimed.operation_id,
+        task_id,
+        readback,
+    )?;
+    let historical_non_effect = matches!(
+        &observation,
+        eliot_governor::NativeWorkerBindingObservation::Revoked { .. }
+            | eliot_governor::NativeWorkerBindingObservation::UnknownOutcome { .. }
+    );
+    if !historical_non_effect
+        && !fences_match_exact(&expected_kernel_fence, &kernel.kernel_fence())
+    {
+        return Err(DaemonError::ProviderAdmission(FabricError::StaleFence(
+            "Kernel fence changed while the solo binding readback was in flight".to_owned(),
+        )));
+    }
+    Ok(Some(observation))
+}
+
+/// Maps one adopted binding observation onto the solo poll outcome.
+///
+/// Pending, terminal, unknown, and provider-revision states all keep the
+/// exact queue head queued; only their typed reports differ. Dispatch never
+/// happens here.
+fn map_binding_observation_to_poll(
+    observation: eliot_governor::NativeWorkerBindingObservation,
+) -> SoloPollOutcome {
     match observation {
         eliot_governor::NativeWorkerBindingObservation::Pending {
             claim_id,

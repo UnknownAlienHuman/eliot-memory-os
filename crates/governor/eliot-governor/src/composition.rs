@@ -6477,7 +6477,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     }
 
     /// Revalidates a retained executable binding against the current
-    /// Governor-owned plan, task, session, WorkScope, config, and Module
+    /// Governor-owned plan, task, session, `WorkScope`, config, and Module
     /// Catalog projections (issue #1108 W1/A1).
     ///
     /// This is the read-side counterpart to
@@ -6489,7 +6489,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// owners and refuses any fence, plan, task, session, route, scope, config,
     /// or catalog drift. It does not resolve provider route/capacity revisions
     /// or mint provider admission; those remain separate required owner inputs.
-    /// now_unix_ms must be the fresh time observation carried by the
+    /// `now_unix_ms` must be the fresh time observation carried by the
     /// authenticated owner readback, not an intake timestamp. The binding is
     /// usable only before both its execution deadline and its expiry.
     ///

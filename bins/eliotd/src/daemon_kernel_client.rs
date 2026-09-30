@@ -20,6 +20,7 @@ use eliot_contracts::{
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_governor::{
     GovernorLaunchConfig, KernelGenerationSnapshot, KernelPortError,
+    NativeWorkerBindingClaimDisposition, NativeWorkerBindingObservation,
     NativeWorkerExecutableBinding as GovernorNativeWorkerExecutableBinding,
 };
 use eliot_learning_contracts::LearningStateViewRecipe;
@@ -159,7 +160,7 @@ pub(super) enum NativeWorkerExecutableBindingReadbackOutcome {
         task_id: String,
         observed_at_unix_ms: u64,
     },
-    Found(NativeWorkerExecutableBindingReadback),
+    Found(Box<NativeWorkerExecutableBindingReadback>),
 }
 
 #[derive(Deserialize)]
@@ -179,9 +180,9 @@ enum NativeWorkerExecutableBindingReadbackReplyWire {
         attempt_id: String,
         operation_id: String,
         task_id: String,
-        binding: GovernorNativeWorkerExecutableBinding,
+        binding: Box<GovernorNativeWorkerExecutableBinding>,
         executable_binding_digest: String,
-        executable_binding_projection: NativeWorkerExecutableBindingProjectionReadback,
+        executable_binding_projection: Box<NativeWorkerExecutableBindingProjectionReadback>,
         claim_state: String,
         observed_at_unix_ms: u64,
     },
@@ -243,6 +244,126 @@ fn native_worker_binding_projection_matches(
         && projection.expires_at_unix_ms == binding.expires_at_unix_ms
         && projection.executable_wire_version == binding.wire_version
         && projection.executable_binding_digest == binding.binding_digest
+}
+
+/// Adopts one pending executable-binding readback after rechecking the
+/// exact lookup tuple.
+///
+/// The lookup tuple is only a selector; a pending reply that echoes a
+/// different tuple, kind, or a zero timestamp is refused rather than
+/// mistaken for the requested claim.
+fn adopt_pending_binding_readback(
+    expected: (&str, &str, &str, &str),
+    kind: &str,
+    observed: (String, String, String, String),
+    observed_at_unix_ms: u64,
+) -> Result<NativeWorkerExecutableBindingReadbackOutcome, KernelClientError> {
+    let (claim_id, attempt_id, operation_id, task_id) = expected;
+    let (observed_claim_id, observed_attempt_id, observed_operation_id, observed_task_id) =
+        observed;
+    if kind != NATIVE_WORKER_EXECUTABLE_BINDING_READBACK_KIND
+        || observed_claim_id != claim_id
+        || observed_attempt_id != attempt_id
+        || observed_operation_id != operation_id
+        || observed_task_id != task_id
+        || observed_at_unix_ms == 0
+    {
+        return Err(KernelClientError::Unknown(
+            "Kernel pending executable binding readback does not match the lookup tuple"
+                .to_owned(),
+        ));
+    }
+    Ok(NativeWorkerExecutableBindingReadbackOutcome::Pending {
+        claim_id: observed_claim_id,
+        attempt_id: observed_attempt_id,
+        operation_id: observed_operation_id,
+        task_id: observed_task_id,
+        observed_at_unix_ms,
+    })
+}
+
+/// Re-proves one found executable-binding record at the daemon read edge.
+///
+/// Validates the Governor record shape, then binds it to its own digest,
+/// the same-row Kernel projection, and a known claim state. Tuple
+/// echo checks stay with the caller; a record that fails here can never
+/// become readback state.
+fn check_found_binding_record(
+    binding: &GovernorNativeWorkerExecutableBinding,
+    executable_binding_digest: &str,
+    projection: &NativeWorkerExecutableBindingProjectionReadback,
+    claim_state: &str,
+) -> Result<(), KernelClientError> {
+    binding.validate().map_err(KernelClientError::Contract)?;
+    if binding.binding_digest != executable_binding_digest
+        || !valid_native_worker_claim_state(claim_state)
+        || !native_worker_binding_projection_matches(binding, projection)
+    {
+        return Err(KernelClientError::Unknown(
+            "Kernel executable binding readback does not match its Governor record and claim tuple"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Adopts one found executable-binding readback into owned readback state.
+///
+/// Re-proves the record, then rechecks the exact lookup tuple and every
+/// shared tuple field against the owner binding and its digest. A reply
+/// that echoes another claim, a substituted binding, or a zero timestamp
+/// is refused rather than adopted.
+fn adopt_found_binding_readback(
+    expected: (&str, &str, &str, &str),
+    kind: &str,
+    observed: (String, String, String, String),
+    record: (
+        Box<GovernorNativeWorkerExecutableBinding>,
+        String,
+        Box<NativeWorkerExecutableBindingProjectionReadback>,
+        String,
+    ),
+    observed_at_unix_ms: u64,
+) -> Result<NativeWorkerExecutableBindingReadbackOutcome, KernelClientError> {
+    let (claim_id, attempt_id, operation_id, task_id) = expected;
+    let (observed_claim_id, observed_attempt_id, observed_operation_id, observed_task_id) =
+        observed;
+    let (binding, executable_binding_digest, executable_binding_projection, claim_state) =
+        record;
+    check_found_binding_record(
+        &binding,
+        &executable_binding_digest,
+        &executable_binding_projection,
+        &claim_state,
+    )?;
+    if kind != NATIVE_WORKER_EXECUTABLE_BINDING_READBACK_KIND
+        || observed_claim_id != claim_id
+        || observed_attempt_id != attempt_id
+        || observed_operation_id != operation_id
+        || observed_task_id != task_id
+        || binding.claim_id != observed_claim_id
+        || binding.operation_id != observed_operation_id
+        || binding.task_id != observed_task_id
+        || binding.binding_digest != executable_binding_digest
+        || observed_at_unix_ms == 0
+    {
+        return Err(KernelClientError::Unknown(
+            "Kernel executable binding readback does not match its Governor record and claim tuple"
+                .to_owned(),
+        ));
+    }
+    Ok(NativeWorkerExecutableBindingReadbackOutcome::Found(
+        Box::new(NativeWorkerExecutableBindingReadback {
+            claim_id: observed_claim_id,
+            attempt_id: observed_attempt_id,
+            operation_id: observed_operation_id,
+            task_id: observed_task_id,
+            claim_state,
+            observed_at_unix_ms,
+            executable_binding_digest,
+            binding: *binding,
+        }),
+    ))
 }
 
 /// #791 (W4/W17): the typed detail reported when the daemon's shutdown request
@@ -1672,27 +1793,17 @@ impl DaemonKernelClient {
                 operation_id: observed_operation_id,
                 task_id: observed_task_id,
                 observed_at_unix_ms,
-            } => {
-                if kind != NATIVE_WORKER_EXECUTABLE_BINDING_READBACK_KIND
-                    || observed_claim_id != claim_id
-                    || observed_attempt_id != attempt_id
-                    || observed_operation_id != operation_id
-                    || observed_task_id != task_id
-                    || observed_at_unix_ms == 0
-                {
-                    return Err(KernelClientError::Unknown(
-                        "Kernel pending executable binding readback does not match the lookup tuple"
-                            .to_owned(),
-                    ));
-                }
-                Ok(NativeWorkerExecutableBindingReadbackOutcome::Pending {
-                    claim_id: observed_claim_id,
-                    attempt_id: observed_attempt_id,
-                    operation_id: observed_operation_id,
-                    task_id: observed_task_id,
-                    observed_at_unix_ms,
-                })
-            }
+            } => adopt_pending_binding_readback(
+                (claim_id, attempt_id, operation_id, task_id),
+                &kind,
+                (
+                    observed_claim_id,
+                    observed_attempt_id,
+                    observed_operation_id,
+                    observed_task_id,
+                ),
+                observed_at_unix_ms,
+            ),
             NativeWorkerExecutableBindingReadbackReplyWire::Found {
                 kind,
                 claim_id: observed_claim_id,
@@ -1704,57 +1815,87 @@ impl DaemonKernelClient {
                 executable_binding_projection,
                 claim_state,
                 observed_at_unix_ms,
-            } => {
-                binding.validate().map_err(KernelClientError::Contract)?;
-                if kind != NATIVE_WORKER_EXECUTABLE_BINDING_READBACK_KIND
-                    || observed_claim_id != claim_id
-                    || observed_attempt_id != attempt_id
-                    || observed_operation_id != operation_id
-                    || observed_task_id != task_id
-                    || binding.claim_id != observed_claim_id
-                    || binding.operation_id != observed_operation_id
-                    || binding.task_id != observed_task_id
-                    || binding.binding_digest != executable_binding_digest
-                    || observed_at_unix_ms == 0
-                    || !valid_native_worker_claim_state(&claim_state)
-                    || !native_worker_binding_projection_matches(
-                        &binding,
-                        &executable_binding_projection,
-                    )
-                {
-                    return Err(KernelClientError::Unknown(
-                        "Kernel executable binding readback does not match its Governor record and claim tuple"
-                            .to_owned(),
-                    ));
-                }
-                Ok(NativeWorkerExecutableBindingReadbackOutcome::Found(
-                    NativeWorkerExecutableBindingReadback {
-                        claim_id: observed_claim_id,
-                        attempt_id: observed_attempt_id,
-                        operation_id: observed_operation_id,
-                        task_id: observed_task_id,
-                        claim_state,
-                        observed_at_unix_ms,
-                        executable_binding_digest,
-                        binding,
-                    },
-                ))
-            }
+            } => adopt_found_binding_readback(
+                (claim_id, attempt_id, operation_id, task_id),
+                &kind,
+                (
+                    observed_claim_id,
+                    observed_attempt_id,
+                    observed_operation_id,
+                    observed_task_id,
+                ),
+                (
+                    binding,
+                    executable_binding_digest,
+                    executable_binding_projection,
+                    claim_state,
+                ),
+                observed_at_unix_ms,
+            ),
         }
     }
 
-    /// Rejects the presentation-only legacy call. Expected executable
-    /// digest, route revision, and capacity revision must come from separate
-    /// Governor/Kernel owner observations; fields inside `material` are only
-    /// claim presentation and cannot supply their own expectations.
+    /// Verifies one presented provider claim binding against the
+    /// authenticated Kernel/ORS owner readback (issue #1108 W2).
+    ///
+    /// Runs the same authenticated readback the solo poll path uses, then
+    /// corroborates the operation-presented digests against the
+    /// owner-persisted binding and classifies the owner claim state through
+    /// the single Governor classifier. Pending, requested, terminal, and
+    /// unknown rows refuse with typed errors; only an owner-corroborated
+    /// live claim verifies.
+    ///
+    /// Success is claim corroboration only, never admission: the presented
+    /// route/capacity revisions are not live Governor observations, and no
+    /// admitted provider capability is constructed here.
     pub(super) async fn verify_provider_binding_async(
         &self,
-        _material: &super::agent_fabric::VerifiedProviderMaterial,
+        material: &super::agent_fabric::VerifiedProviderMaterial,
+        task_id: &str,
     ) -> Result<(), KernelClientError> {
-        Err(KernelClientError::Contract(
-            "provider binding verification requires authenticated Governor binding readback and independent route/capacity currentness"
-                .to_owned(),
-        ))
+        let outcome = self
+            .read_native_worker_executable_binding_async(
+                &material.claim_id,
+                &material.attempt_id,
+                &material.operation_id,
+                task_id,
+            )
+            .await?;
+        let readback = match outcome {
+            NativeWorkerExecutableBindingReadbackOutcome::Pending { .. } => {
+                return Err(KernelClientError::Contract(
+                    "provider binding has no owner-published executable binding yet"
+                        .to_owned(),
+                ));
+            }
+            NativeWorkerExecutableBindingReadbackOutcome::Found(readback) => readback,
+        };
+        if readback.binding().binding_digest != material.binding_digest
+            || readback.executable_binding_digest() != material.executable_digest
+        {
+            return Err(KernelClientError::Contract(
+                "presented provider binding digests do not match the owner-persisted binding"
+                    .to_owned(),
+            ));
+        }
+        let (_, disposition) =
+            NativeWorkerBindingObservation::classify_claim_state(readback.claim_state())
+                .map_err(KernelClientError::Unknown)?;
+        match disposition {
+            NativeWorkerBindingClaimDisposition::Requested => Err(KernelClientError::Contract(
+                "provider binding claim is still requested and cannot verify".to_owned(),
+            )),
+            NativeWorkerBindingClaimDisposition::Terminal => Err(KernelClientError::Contract(
+                "provider binding claim is terminal and cannot verify".to_owned(),
+            )),
+            NativeWorkerBindingClaimDisposition::UnknownOutcome => {
+                Err(KernelClientError::Unknown(
+                    "provider binding claim outcome is unknown; reconcile the original operation"
+                        .to_owned(),
+                ))
+            }
+            NativeWorkerBindingClaimDisposition::GovernorCurrentnessRequired => Ok(()),
+        }
     }
 
     /// Clones the retained validated binding string, if any. A poisoned slot

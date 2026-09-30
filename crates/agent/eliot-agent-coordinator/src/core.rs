@@ -61,7 +61,7 @@ pub(crate) enum ProviderProofKind {
 /// Sealed inside this crate so callers cannot implement an "always verified"
 /// provider. The production adapter keeps a typed G11 gap until original
 /// per-operation owner receipts can be checked. The plan-only constructor
-/// installs a typed PLAN_GAP verifier.
+/// installs a typed `PLAN_GAP` verifier.
 pub(crate) trait ProviderVerifier: Send + Sync {
     fn binding(&self) -> ProviderBindingSnapshot;
     fn minimum_event_sequence(&self) -> u64;
@@ -2738,7 +2738,7 @@ impl AgentCoordinator {
     /// The snapshot's stored binding must match the supplied verifier
     /// binding. The production verifier currently keeps a typed G11 gap
     /// until original per-operation owner receipts are available, so a
-    /// serialized Verified label cannot restore effect authority.
+    /// serialized `Verified` label cannot restore effect authority.
     pub fn restore_with_admitted_provider(
         snapshot: CoordinatorSnapshot,
         live_config: CoordinatorConfig,
@@ -2801,7 +2801,7 @@ impl AgentCoordinator {
     /// [`Self::decode_snapshot_wire`], so pre-candidate-only wires and
     /// misdirected result wires fail with structured errors before any replay.
     /// Replay uses the same fail-closed provider verifier as
-    /// restore_with_admitted_provider.
+    /// `restore_with_admitted_provider`.
     /// STITCH (#370 W24/W25/W26/A2/A28): the daemon JSON-restore path
     /// stitches its real persisted-snapshot ingress here; BLOCKED-BY the
     /// durable fabric-restore driver (#1108 lane). Forbidden: serializing
