@@ -546,6 +546,86 @@ impl TaskControllerOrientationPrepareInputV1 {
             .validate("task_controller_invocation.orientation_prepare.provider_staffing_source")?;
         Ok(())
     }
+
+    fn validate_runtime_owner_bindings(
+        &self,
+        invocation: &TaskControllerInvocation,
+    ) -> Result<(), ProtocolError> {
+        let runtime_owner: Value = serde_json::from_slice(
+            &self.runtime_owner_execution_input.canonical_bytes,
+        )
+        .map_err(|_| ProtocolError::InvalidField {
+            field: "task_controller_invocation.orientation_prepare.runtime_owner_execution_input",
+            reason: "must decode as its original canonical object",
+        })?;
+        for (field, expected) in [
+            ("task_id", serde_json::json!(invocation.task_id)),
+            ("attempt_id", serde_json::json!(self.job_attempt_id)),
+            ("work_scope", serde_json::json!(self.work_scope)),
+            ("context_input", invocation.context_input.clone()),
+            (
+                "context_campaign_recipe",
+                invocation.context_campaign_recipe.clone(),
+            ),
+            (
+                "context_campaign_recipe_policy",
+                invocation.context_campaign_recipe_policy.clone(),
+            ),
+            (
+                "context_reconstruction_result",
+                serde_json::json!(self.context_reconstruction_result),
+            ),
+            (
+                "context_compilation_input",
+                self.context_compilation_input.clone(),
+            ),
+            (
+                "orientation_classification_source_readback",
+                self.orientation_classification_source_readback.clone(),
+            ),
+            ("semantic_source", serde_json::json!(self.semantic_source)),
+            ("output_contract", serde_json::json!(self.output_contract)),
+            (
+                "output_schema_recipe",
+                serde_json::json!(self.output_schema_recipe),
+            ),
+            ("schema_source", serde_json::json!(self.schema_source)),
+            ("materials", serde_json::json!(self.materials)),
+            ("budget", serde_json::json!(self.budget)),
+            (
+                "job_admission_ref",
+                serde_json::json!(Some(&self.job_admission_ref)),
+            ),
+            (
+                "job_admission_bytes",
+                serde_json::json!(Some(&self.job_admission_bytes)),
+            ),
+            (
+                "input_bundle_ref",
+                serde_json::json!(Some(&self.input_bundle_ref)),
+            ),
+            (
+                "input_bundle_bytes",
+                serde_json::json!(Some(&self.input_bundle_bytes)),
+            ),
+            (
+                "provider_staffing_source",
+                serde_json::json!(Some(&self.provider_staffing_source)),
+            ),
+            (
+                "admitted_orientation_job",
+                serde_json::json!(Some(&self.admitted_orientation_job)),
+            ),
+        ] {
+            if runtime_owner.get(field) != Some(&expected) {
+                return Err(ProtocolError::InvalidField {
+                    field: "task_controller_invocation.orientation_prepare.runtime_owner_execution_input",
+                    reason: "must preserve the exact original owner values and source pairs",
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 fn validate_original_canonical_object(
@@ -974,6 +1054,7 @@ impl TaskControllerInvocation {
                 reason: "must preserve the exact admitted Task Controller scope",
             });
         }
+        input.validate_runtime_owner_bindings(self)?;
         Ok(())
     }
 
