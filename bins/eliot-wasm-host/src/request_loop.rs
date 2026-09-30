@@ -88,13 +88,18 @@
 //! reclaim are four more states kept apart (issue #2787, external audit
 //! comment 5868395275). The loop's claim-bound [`ObservedResultRetention`]
 //! writes the exact bounded sequence to the existing #2786 result record
-//! *before* any of it reaches stdout, so a publication that fails, or a
-//! cleanup that fails after a successful one, still leaves the observed guest
-//! result on disk. A restart reads that record back through the real per-frame
-//! and stream validators over the original recorded bytes, and only a
-//! complete sequence is republished through this same owner on the new
+//! *before* any of it reaches stdout, and it does so only behind the real
+//! [`validate_frame`] (and, for a complete sequence, [`validate_result_stream`])
+//! validators, so a frame that cannot prove itself is never written durably and
+//! never published either; the retained sequence itself is bounded by
+//! [`MAX_RESULT_SEQUENCE`] at the point each observation joins it, and an
+//! observation past that bound is an explicit typed capacity failure rather
+//! than a dropped prefix. A restart reads that record back through the real
+//! per-frame and stream validators over the original recorded bytes, and only
+//! a complete sequence is republished through this same owner on the new
 //! transport — without admitting a request, issuing a permit, spawning a
-//! worker, or deleting anything. The loop's own handoff ([`RequestLoopReport`])
+//! worker, or deleting anything, and gated on the same retention as every
+//! other emission. The loop's own handoff ([`RequestLoopReport`])
 //! carries the retained sequence next to the disposition that ended the loop,
 //! so a failure never travels alone and an observation is never discarded
 //! because something later failed.
@@ -225,7 +230,12 @@ pub const ACK_PHASE_ENQUEUED: &str = "enqueued";
 /// (#2787). The follow-up taxonomy admits at most one initial observation
 /// plus one follow-up observation per operation, so two events is the
 /// structural maximum; the bound leaves headroom for future bounded phases
-/// without permitting unbounded growth, and emission fails closed past it.
+/// without permitting unbounded growth. It is enforced twice on purpose: at
+/// the point an observation joins the retained sequence, and again over the
+/// whole aggregate before it is serialized, so the in-memory sequence can
+/// never exceed it and the record can never be built from more than it. Past
+/// it, retention and emission both fail closed as an explicit typed capacity
+/// failure — never a dropped prefix, truncation, or eviction.
 pub const MAX_RESULT_SEQUENCE: u64 = 8;
 
 /// Bounded result-byte budget: the largest result frame the loop publishes.
@@ -3453,7 +3463,11 @@ pub struct BoundedRequestLoop {
     /// digest (#2787 step 3). Each observation appends; history is never
     /// rewritten, so an initial `Unknown` and its later control outcome
     /// both survive, and an exact replay republishes the same bounded
-    /// sequence without executing again. Bounded by [`MAX_RESULT_SEQUENCE`].
+    /// sequence without executing again. Bounded by [`MAX_RESULT_SEQUENCE`]
+    /// at the point an event joins the sequence itself
+    /// ([`Self::retain_slot_available`]), not only in the later aggregate
+    /// builder: an observation that would exceed the bound is an explicit
+    /// typed capacity failure, never a dropped prefix.
     retained: BTreeMap<String, Vec<WasmHostResultFrame>>,
     /// The claim-bound durable owner of the observed result sequence
     /// (#2787 audit defect 3). Every observed event is written through it
@@ -3589,13 +3603,43 @@ impl BoundedRequestLoop {
     /// owner, before any of it can be exposed on stdout (#2787 audit
     /// defect 3).
     ///
+    /// The order is validate, then retain, then publish: the REAL existing
+    /// validators run over the exact observation BEFORE the durable write,
+    /// so a frame that cannot prove itself never reaches the result record.
+    /// Until now only the later emitter validated, which meant an invalid
+    /// frame was written to disk first and rejected only at publication.
+    ///
+    /// `validate_frame` is the same per-event validator
+    /// [`DeliverySetChannel::publish`] runs, not a second or weaker rule. It
+    /// is applied to the newest observation — the event that just joined the
+    /// sequence — so the earlier retained events were each proved by the same
+    /// call on their own turn. Once the stream is complete (its last event is
+    /// the terminal one) the existing `validate_result_stream` additionally
+    /// proves the whole sequence's shape — gapless `sequence` values from 0,
+    /// one closing terminal, one parent identity — so a record that would be
+    /// sealed as a complete stream is checked as one. An incomplete prefix is
+    /// explicitly allowed here: the audit's bounded prefix is retained, and a
+    /// sequence with no terminal yet is exactly that.
+    ///
     /// The write always carries the WHOLE sequence observed so far, so a
     /// later observation still lands the earlier ones that a transient
-    /// failure kept off disk. A failure is a typed capacity failure or the
-    /// retention failure itself; the caller keeps the original claim
-    /// uncertain, reclaims nothing, and never re-executes the guest.
+    /// failure kept off disk. A failure is a validation refusal, a typed
+    /// capacity failure, or the retention failure itself; the caller keeps the
+    /// original claim uncertain, publishes nothing, reclaims nothing, and
+    /// never re-executes the guest.
     fn retain_observed(&self) -> Result<(), LoopError> {
-        self.retention.retain(&self.retained_sequence())
+        let events = self.retained_sequence();
+        // A complete sequence (one that ends in its terminal event) must also
+        // prove its stream shape; an explicit prefix has no terminal to close
+        // it yet and is validated event by event only.
+        let complete = events.last().is_some_and(|event| event.terminal);
+        if let Some(latest) = events.last() {
+            validate_frame(latest)?;
+        }
+        if complete {
+            validate_result_stream(&events)?;
+        }
+        self.retention.retain(&events)
     }
 
     /// Returns the terminal denial, when the loop refused before executing.
@@ -3849,6 +3893,13 @@ impl BoundedRequestLoop {
     /// handover correlation of the command that produced it and the exact
     /// owner delivery it answers — never a value inferred from arrival, and
     /// never a delivery identity the command did not come from.
+    ///
+    /// `None` means this observation produced no publishable event: either it
+    /// was a `Shutdown` outcome, which projects no worker-command frame, or
+    /// the retained sequence is already at [`MAX_RESULT_SEQUENCE`] and this
+    /// observation became the loop's first bounded residual instead. In the
+    /// capacity case nothing is retained and nothing is published, so the
+    /// claim stays uncertain and the guest is not re-executed.
     fn on_outcome(
         &mut self,
         outcome: WorkerOutcome,
@@ -3909,8 +3960,19 @@ impl BoundedRequestLoop {
             frame.delivery_ack = delivery;
         }
         frame = enforce_frame_budget(frame, self.binding.max_output_bytes);
-        self.next_sequence = self.next_sequence.saturating_add(1);
         self.admission.one_shot_spent = true;
+        // The retained sequence is bounded WHERE the frame joins it, not only
+        // in the later aggregate builder (#2787). The bound is consulted before
+        // the event is copied into the aggregate, so a ninth observation is
+        // never allocated into the in-memory sequence and never becomes
+        // `self.published`; an over-bound event is an explicit typed capacity
+        // failure recorded as this loop's first bounded residual, and no
+        // earlier observation is dropped, truncated, or evicted to make room.
+        if !self.retain_slot_available(&frame.request_digest) {
+            self.record_residual(LoopError::ResultTooLarge);
+            return None;
+        }
+        self.next_sequence = self.next_sequence.saturating_add(1);
         if frame.disposition == UNCERTAIN_DISPOSITION {
             self.settle_uncertain(&mut frame);
         } else {
@@ -3922,6 +3984,20 @@ impl BoundedRequestLoop {
             .or_default()
             .push(frame.clone());
         Some(frame)
+    }
+
+    /// Whether one more observation may join `digest`'s retained sequence
+    /// under [`MAX_RESULT_SEQUENCE`].
+    ///
+    /// The bound is a real accumulation bound, so it is asked of the sequence
+    /// itself, at the append, rather than discovered afterwards while a
+    /// larger aggregate is being serialized. The count is derived from the
+    /// retained entries themselves, so it cannot disagree with what the
+    /// sequence actually holds and therefore cannot let a frame's
+    /// `observation_predecessors` name an event the sequence does not retain.
+    fn retain_slot_available(&self, digest: &str) -> bool {
+        let held = self.retained.get(digest).map_or(0, |events| events.len());
+        u64::try_from(held).is_ok_and(|count| count < MAX_RESULT_SEQUENCE)
     }
 
     /// Chooses the single bounded next step for an uncertain outcome:
@@ -4054,7 +4130,10 @@ impl BoundedRequestLoop {
     /// returns afterwards, so a publication failure here never masks the lost
     /// response. Runs once: a published terminal or a recorded denial
     /// suppresses any later loss projection, and nothing is projected without
-    /// an accepted command to observe.
+    /// an accepted command to observe. A retained sequence already at
+    /// [`MAX_RESULT_SEQUENCE`] suppresses it too: the projection becomes the
+    /// loop's first bounded residual instead, and the loss is neither
+    /// truncated into the sequence nor published from outside it.
     fn publish_lost_response(
         &mut self,
         channel: &mut dyn WasmHostRequestChannel,
@@ -4109,6 +4188,18 @@ impl BoundedRequestLoop {
             frame.delivery_ack = delivery;
         }
         frame = enforce_frame_budget(frame, self.binding.max_output_bytes);
+        // The error-path observation is bounded exactly like any other, at the
+        // point it would join the retained sequence (#2787). Past
+        // [`MAX_RESULT_SEQUENCE`] it is not a prefix to trim and not an earlier
+        // observation to evict: it becomes this loop's first bounded residual,
+        // an explicit typed capacity failure, and is neither retained nor
+        // exposed. The claim therefore stays uncertain, nothing is reclaimed,
+        // the guest is not re-executed, and the retained sequence still holds
+        // every observation it held before.
+        if !self.retain_slot_available(&frame.request_digest) {
+            self.record_residual(LoopError::ResultTooLarge);
+            return;
+        }
         frame.terminal = true;
         self.next_sequence = self.next_sequence.saturating_add(1);
         self.published = Some(frame.clone());
@@ -4325,13 +4416,14 @@ impl RequestLoopReport {
 /// process-level containment path — runs all three steps, so no path can
 /// leave a live join handle unreported.
 ///
-/// Every observed result event is written through `retention` — the existing
-/// claim-bound result owner — before it is published on stdout, and the whole
-/// observed sequence travels back with the loop's disposition, so an
-/// observation is never lost to a later failure. The loop's own failure is a
-/// [`LoopCompletion::Failed`] disposition beside that sequence rather than a
-/// `Result` error, because an error arm returning only the failure would
-/// throw away the only copy of an observed guest result.
+/// Every observed result event is proved by the real per-frame validator and,
+/// once the stream is complete, by the real stream validator, then written
+/// through `retention` — the existing claim-bound result owner — before it is
+/// published on stdout, and the whole observed sequence travels back with the
+/// loop's disposition, so an observation is never lost to a later failure. The
+/// loop's own failure is a [`LoopCompletion::Failed`] disposition beside that
+/// sequence rather than a `Result` error, because an error arm returning only
+/// the failure would throw away the only copy of an observed guest result.
 pub fn run_request_loop(
     runtime: AdmittedRuntime,
     material: &ValidatedDispatchMaterial,
@@ -5065,6 +5157,17 @@ fn drive_loop(
             // retained event. The retained sequence is consumed here, so it
             // proves its stream shape first: a corrupted retained sequence
             // fails closed instead of republishing.
+            //
+            // This is the one state in which "published but not durable" was
+            // reachable, so it is gated on the same claim-bound retention
+            // every other emission path has (`publish_lost_response`,
+            // `consume_worker_outcome`, `observe_residual_outcome`): the
+            // sequence is retained durably, through the existing result owner
+            // and behind the same real validators, before any of it reaches
+            // the new transport. A retention refusal publishes nothing and
+            // leaves the claim uncertain — the bytes are already durable, so
+            // nothing is lost, and the guest is not re-executed.
+            state.retain_observed()?;
             state.published = Some(channel.publish_retained_sequence(&replay)?);
             state.close_admission();
             break;
@@ -5185,12 +5288,14 @@ fn consume_worker_outcome(
     if let Some(frame) = frame.as_ref() {
         // Order of the four states, and the reason for it (#2787 audit
         // defect 3): the outcome is observed, then that exact observation is
-        // retained through the claim-bound result owner, then the local
-        // stdout write happens, and the owner acknowledgement follows what
-        // the worker actually did. Retention comes first because a stdout
-        // write that succeeds and a later cleanup that fails must still
-        // leave the observed result on disk; where it cannot, the claim
-        // stays uncertain and the guest is never re-executed.
+        // proved by the real validators and retained through the claim-bound
+        // result owner, then the local stdout write happens, and the owner
+        // acknowledgement follows what the worker actually did. Retention
+        // comes first because a stdout write that succeeds and a later
+        // cleanup that fails must still leave the observed result on disk;
+        // where it cannot, the claim stays uncertain and the guest is never
+        // re-executed. A frame that fails its own validation is never
+        // written to the record at all.
         state.retain_observed()?;
         // The exact outcome is observed here: complete the accepted
         // control before publishing, so the ack is durable ahead of
