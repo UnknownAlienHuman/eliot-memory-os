@@ -482,24 +482,40 @@ def _read_inventory_artifact(
     return header, rows, worksets, str(artifact["inventory_digest"]), raw
 
 
+def _declared_universe(rows: list[dict[str, Any]]) -> tuple[tuple[str, str, str, str], ...]:
+    """The scan universe the *stored artifact itself* declares.
+
+    Each inventory row carries the exact ``(case_ref, owner, path, signal)``
+    identity #866 measured. Reconstructing that tuple set is how the oracle
+    asks the producer to re-discover the very same universe -- it is the
+    artifact's own declaration, never a list hard-coded here, so a row the
+    producer added and a row the producer dropped both change the question the
+    producer is asked and both are visible as drift.
+    """
+    return tuple(
+        (str(r["case_ref"]), str(r["owner"]), str(r["path"]), str(r["signal"])) for r in rows
+    )
+
+
 def _producer_candidates(
-    root: Path, producer: Any
+    root: Path, producer: Any, declared: tuple[tuple[str, str, str, str], ...]
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Obtain the producer's own file records and candidates through the
     accepted #866 read-only API.
 
     This is the *sole* candidate accounting for the oracle. It calls the
-    producer's own :func:`discover_context_measurements` over the producer's own
-    ``DENOMINATOR_CASES`` -- the declared scan universe and needle vocabulary --
-    so an added estimator is seen because the producer saw it. It does not call
-    the producer's ``sync``, does not emit or write anything, and does not
-    re-implement discovery, classification or the denominator.
+    producer's own :func:`discover_context_measurements` over ``declared`` --
+    the artifact's own universe and needle vocabulary -- so a candidate is
+    located, classified and measured by #866 and never by a second scanner
+    written here. It does not call the producer's ``sync``, does not emit or
+    write anything, and does not re-implement discovery, classification or the
+    denominator.
 
     A read, masking or classification failure raises a typed
     :class:`OracleError` rather than escaping as a traceback.
     """
     try:
-        return producer.discover_context_measurements(root, producer.DENOMINATOR_CASES)
+        return producer.discover_context_measurements(root, declared)
     except producer.InventoryError as exc:
         raise OracleError(
             "PRODUCER_CHECK_FAILED",
@@ -508,20 +524,20 @@ def _producer_candidates(
 
 
 def _producer_check(
-    root: Path, producer: Any, raw: bytes
+    root: Path, producer: Any, raw: bytes, declared: tuple[tuple[str, str, str, str], ...]
 ) -> tuple[str, str]:
     """Decide the producer's freshness verdict and validate its declared
     source/rule/owner-map input digests against the live tree.
 
     The stored artifact's *raw* bytes are exactly the bytes the producer's
-    re-emission is compared to, and exactly the bytes a consumer of this
-    result reasons about; they are used here so freshness is decided by the
-    producer's own re-emission rather than by trusting a recorded digest or a
-    commit SHA. Separately, the *recorded* ``source_sha``/``rule_digest``/
-    ``owner_digest``/``owner_map_digest`` header values are validated against
-    the values the producer itself derives from the live tree, so a relevant
-    source/rule/allocation change is caught even when the re-emission happens
-    to be compared separately.
+    re-emission is compared to, and exactly the bytes a digest is computed
+    over; they are used here so freshness is decided by the producer's own
+    re-emission rather than by trusting a recorded digest or a commit SHA.
+    Separately, the *recorded* ``source_sha``/``rule_digest``/``owner_digest``/
+    ``owner_map_digest`` header values are validated against the values the
+    producer itself derives from the live tree, so a relevant source/rule/
+    allocation/owner-map change is caught and named.
+
 
     Returns ``(status, detail)``; ``status`` is ``"ok"`` or a typed non-ok
     token (``"stale"``, ``"blocked"``, ``"error"``, ``"digest-mismatch"``).
@@ -557,13 +573,12 @@ def _producer_check(
         )
 
     # Validate the recorded source/rule/owner digests against the live tree,
-    # using the producer's own derivation of each.
+    # using the producer's own derivation of each over the artifact's OWN
+    # declared universe. A recorded value is validated, never trusted.
     try:
         measured_rule_digest = producer._rule_digest()
-        measured_owner_digest = producer._owner_digest(producer.DENOMINATOR_CASES)
-        file_records, _candidates = producer.discover_context_measurements(
-            root, producer.DENOMINATOR_CASES
-        )
+        measured_owner_digest = producer._owner_digest(declared)
+        file_records, _candidates = producer.discover_context_measurements(root, declared)
         source_pairs = sorted(f"{r['path']}:{r['sha256']}" for r in file_records)
         measured_source_sha = _sha256("\n".join(source_pairs).encode("utf-8"))
         owner_map = producer.load_owner_map(root)
@@ -590,11 +605,11 @@ def _producer_check(
     # move (which changes no scan input) NOT stale the artifact, while any
     # change to a scan root, rule, or owner allocation does.
     try:
-        mapping, map_status, _map_digest = producer.load_owner_map(root)
+        mapping, map_status, map_digest = producer.load_owner_map(root)
         fresh = producer.build_inventory(
-            root, producer.DENOMINATOR_CASES,
+            root, declared,
             str(header.get("generation_command", "")),
-            (mapping, map_status, owner_map[2]),
+            (mapping, map_status, map_digest),
         )
         fresh_raw = producer._emit_toml(fresh)
     except producer.InventoryError as exc:
@@ -615,7 +630,11 @@ def _producer_check(
 
 
 def _unaccounted_candidates(
-    root: Path, producer: Any, rows: list[dict[str, Any]], candidates: list[dict[str, Any]]
+    root: Path,
+    producer: Any,
+    rows: list[dict[str, Any]],
+    candidates: list[dict[str, Any]],
+    header: dict[str, Any],
 ) -> list[dict[str, Any]]:
     """Detect an added, moved or removed unaccounted estimator through #866.
 
@@ -709,7 +728,64 @@ def _unaccounted_candidates(
             )
 
     # (b) Declared-exclusion integrity, measured by the producer.
-    exclusion_paths = sorted({str(rel) for _r, rel, _n, _x in producer.EXCLUSION_CASES})
+    #
+    # The exclusion set under audit is the one *this artifact declares* (its
+    # own ``exclusions`` header), not the producer's process-wide default: a
+    # bounded declared universe legitimately records none. Each recorded
+    # evidence string names ``case_ref|path:span|digest|reason|class``; the
+    # needle is recovered from the producer's own declared exclusion table, so
+    # the oracle still contributes no needle vocabulary of its own. A
+    # declaration that names an exclusion the producer does not declare is
+    # itself an overbroad/invented exception.
+    recorded_exclusions = header.get("exclusions") or []
+    declared_exclusions: list[tuple[str, str, str, str]] = []
+    if recorded_exclusions:
+        by_ref = {str(case[0]): case for case in producer.EXCLUSION_CASES}
+        for entry in recorded_exclusions:
+            parts = str(entry).split("|")
+            if len(parts) < 3 or not parts[0]:
+                findings.append(
+                    {
+                        "code": "OVERBROAD_EXCEPTION",
+                        "path": "",
+                        "span_start": 0,
+                        "span_end": 0,
+                        "signal": "",
+                        "case_ref": parts[0] if parts else "",
+                        "label": "UNDECLARED_EXCLUSION_EVIDENCE",
+                        "evidence": (
+                            f"the artifact records malformed exclusion evidence {entry!r}; an "
+                            f"exception must name its exact case, span and digest"
+                        ),
+                    }
+                )
+                continue
+            case_ref = parts[0]
+            if case_ref not in by_ref:
+                findings.append(
+                    {
+                        "code": "OVERBROAD_EXCEPTION",
+                        "path": parts[1].split(":", 1)[0] if ":" in parts[1] else parts[1],
+                        "span_start": 0,
+                        "span_end": 0,
+                        "signal": "",
+                        "case_ref": case_ref,
+                        "label": "UNDECLARED_EXCLUSION",
+                        "evidence": (
+                            f"the artifact claims exclusion {case_ref} but the "
+                            f"#{PRODUCER_ISSUE} producer declares no such exclusion; an "
+                            f"exception is never invented by the artifact"
+                        ),
+                    }
+                )
+                continue
+            _c, rel, needle, _reason = by_ref[case_ref]
+            # The producer's OWN declared reason is carried, never one written
+            # here: an exception's justification belongs to the producer that
+            # declares the exception, and an oracle that supplied its own would
+            # be inventing the very thing it is meant to audit.
+            declared_exclusions.append((case_ref, str(rel), str(needle), str(_reason)))
+    exclusion_paths = sorted({rel for _c, rel, _n, _r in declared_exclusions})
     if exclusion_paths:
         try:
             exclusion_cache = producer._load_files(root, tuple(exclusion_paths))
@@ -933,8 +1009,12 @@ def evaluate(root: Path) -> OwnershipResult:
             owner_sites=[],
         )
 
+    # The scan universe is the artifact's own declared case set: #866's own
+    # row identities, never a list fixed here.
+    declared = _declared_universe(rows)
+
     # --- Producer freshness verdict (read-only, once). ---------------------
-    check_status, check_detail = _producer_check(root, producer, raw)
+    check_status, check_detail = _producer_check(root, producer, raw, declared)
     if check_status not in ("ok",):
         if check_status == "blocked":
             add(
@@ -966,7 +1046,7 @@ def evaluate(root: Path) -> OwnershipResult:
 
     # --- Producer's own candidate accounting (the sole producer). ---------
     try:
-        _file_records, candidates = _producer_candidates(root, producer)
+        _file_records, candidates = _producer_candidates(root, producer, declared)
     except OracleError as exc:
         add(exc.code, exc.detail, rule="candidate-accounting")
         candidates = []
@@ -1073,7 +1153,7 @@ def evaluate(root: Path) -> OwnershipResult:
         )
 
     # --- Unaccounted estimator detection, through the producer. -----------
-    unaccounted = _unaccounted_candidates(root, producer, rows, candidates)
+    unaccounted = _unaccounted_candidates(root, producer, rows, candidates, header)
     for item in unaccounted:
         add(
             str(item["code"]),
