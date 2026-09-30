@@ -54,7 +54,10 @@ use eliot_protocol::{
     host_request_operation_id,
 };
 #[cfg(windows)]
-use eliot_protocol::{MaintenanceTriggerIntakeReceipt, MaintenanceTriggerRecord, ProtocolError};
+use eliot_protocol::{
+    MaintenanceTriggerDecisionReceipt, MaintenanceTriggerIntakeReceipt, MaintenanceTriggerRecord,
+    ProtocolError,
+};
 use eliot_runtime_contracts::GenerationCutoverState;
 #[cfg(windows)]
 use eliot_runtime_contracts::{
@@ -315,6 +318,32 @@ pub(crate) const STORAGE_REPLACEMENT_ROLLBACK_OPERATION: &str =
 /// unreachable from the front door until
 /// `frame_dispatch::is_daemon_operation` lists it.
 pub(crate) const MAINTENANCE_TRIGGER_INTAKE_OPERATION: &str = "maintenance_trigger_intake";
+
+/// Authenticated daemon operation that records one committed maintenance
+/// trigger decision before any delivery acknowledgement (issue #1694 W4).
+///
+/// Commit before ack: the arm records the daemon's bound decision receipt
+/// through the existing gateway owner entry
+/// (`KernelStoreGateway::record_maintenance_trigger_decision`), which
+/// re-reads the exact canonical Store receipt of the Governor
+/// `PreparedTransition` → Kernel → named Store transaction, requires
+/// `Committed` status, re-proves the bound receipt digest, and requires the
+/// receipt fence to match live service authority — before the ledger row
+/// moves to `DecisionRecorded`. The receipt must content-match the retained
+/// trigger (identity, hash, scope) and bind its revision plus
+/// evaluation/policy revisions and a durable downstream intent; replaying
+/// the identical receipt reuses it, while a different receipt while one is
+/// recorded is a competing decision and is refused. Any failure is answered
+/// with the decision's own stable refusal code and never with an
+/// acknowledgement, so the trigger stays retained and the daemon reconciles
+/// by receipt lookup instead of repeating the downstream effect. No new
+/// owner, database, or poller; no Governor types in ORS.
+///
+/// It carries the same front-door caveat as
+/// [`MAINTENANCE_TRIGGER_INTAKE_OPERATION`]: it is recognized here and
+/// unreachable from the front door until
+/// `frame_dispatch::is_daemon_operation` lists it.
+pub(crate) const MAINTENANCE_TRIGGER_DECISION_OPERATION: &str = "maintenance_trigger_decision";
 
 const STARTUP_EVIDENCE_FIELDS: [&str; 8] = [
     "transport_binding",
@@ -622,6 +651,7 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         STORAGE_REPLACEMENT_RESUME_OPERATION => STORAGE_REPLACEMENT_RESUME_OPERATION,
         STORAGE_REPLACEMENT_ROLLBACK_OPERATION => STORAGE_REPLACEMENT_ROLLBACK_OPERATION,
         MAINTENANCE_TRIGGER_INTAKE_OPERATION => MAINTENANCE_TRIGGER_INTAKE_OPERATION,
+        MAINTENANCE_TRIGGER_DECISION_OPERATION => MAINTENANCE_TRIGGER_DECISION_OPERATION,
         DAEMON_STARTUP_EVIDENCE_OPERATION => DAEMON_STARTUP_EVIDENCE_OPERATION,
         USER_AUTOMATION_RUNTIME_OPERATION => USER_AUTOMATION_RUNTIME_OPERATION,
         "health" => "health",
@@ -2803,6 +2833,176 @@ fn maintenance_trigger_intake_refusal_answer(
     }
 }
 
+/// Exact request payload for [`MAINTENANCE_TRIGGER_DECISION_OPERATION`].
+///
+/// The caller presents the retained trigger identity, the bound decision
+/// receipt the daemon committed through its `PreparedTransition`, and the
+/// exact admitted session fence. The receipt carries the trigger
+/// identity/hash, evaluation/policy revisions, affected scope, and
+/// job/recommendation/wake intent references plus the canonical Store
+/// receipt binding; the arm re-proves all of it through the gateway owner
+/// before recording. The caller never supplies authority or a delivery
+/// identity: those stay owner-issued, never asserted.
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MaintenanceTriggerDecisionRequest {
+    /// Version of the authenticated decision request.
+    version: u8,
+    /// Exact State Fence carried by the admitted daemon session.
+    state_fence: StateFence,
+    /// Stable trigger identity the decision answers.
+    trigger_id: String,
+    /// Bound durable decision receipt to record.
+    receipt: MaintenanceTriggerDecisionReceipt,
+}
+
+/// Closed decision failure for one maintenance-trigger decision record
+/// (issue #1694 W4).
+///
+/// Variants name the failure kind only: exact source errors stay with their
+/// owners (receipt re-lookup under the same identity re-observes them) and
+/// never enter logs or responses, so a refusal carries its stable code and
+/// nothing privacy-sensitive. A protocol or changed-content conflict, an
+/// unknown trigger, a fenced generation, and a live-authority refusal stay
+/// distinguishable and never collapse into an acknowledgement. Any failure
+/// records nothing and acknowledges nothing: the trigger stays retained
+/// and the daemon reconciles by receipt lookup instead of repeating the
+/// downstream effect.
+#[cfg(windows)]
+enum MaintenanceTriggerDecisionFailure {
+    /// The presented receipt failed protocol validation, changed content
+    /// under the same identity conflicted (`ReplayConflict`), or a
+    /// different receipt competed with the recorded commitment.
+    Protocol(ProtocolError),
+    /// No retained trigger exists under the requested identity.
+    UnknownTrigger,
+    /// The live generation is fenced for this decision record.
+    FencedGeneration,
+    /// Live Kernel authority refused session or admission; fails closed.
+    LiveAuthority,
+    /// The Kernel owner could not reach its service or ledger state.
+    OwnerUnavailable,
+    /// The canonical Store refused the backing receipt read.
+    Store,
+    /// A ledger-level refusal owned by another transition (claim/ack/page
+    /// paths) or a staging proof the decision path never performs. It is
+    /// preserved exactly and fails closed here rather than becoming an
+    /// acknowledgement.
+    UnexpectedLedgerRefusal,
+}
+
+#[cfg(windows)]
+impl From<MaintenanceTriggerDeliveryError> for MaintenanceTriggerDecisionFailure {
+    /// Classifies one owner-side decision outcome into the closed decision
+    /// failure.
+    ///
+    /// Exact source errors are preserved in their variant; only the stable
+    /// code reads the classification. The ledger-level refusals owned by
+    /// the claim/ack/page transitions — plus the ORS staging proof the
+    /// decision path never performs — can never be produced by decision
+    /// recording and fail closed as ledger refusals, never as
+    /// acknowledgements. The match stays exhaustive with no wildcard arm,
+    /// so a new owner variant breaks here loudly instead of being absorbed.
+    fn from(error: MaintenanceTriggerDeliveryError) -> Self {
+        match error {
+            MaintenanceTriggerDeliveryError::Protocol(error) => Self::Protocol(error),
+            MaintenanceTriggerDeliveryError::UnknownTrigger => Self::UnknownTrigger,
+            MaintenanceTriggerDeliveryError::Service(KernelServiceError::GenerationFenced) => {
+                Self::FencedGeneration
+            }
+            MaintenanceTriggerDeliveryError::Service(_) => Self::LiveAuthority,
+            MaintenanceTriggerDeliveryError::OwnerUnavailable(_) => Self::OwnerUnavailable,
+            MaintenanceTriggerDeliveryError::Store(_) => Self::Store,
+            MaintenanceTriggerDeliveryError::StagingProof(_)
+            | MaintenanceTriggerDeliveryError::ClaimConflict
+            | MaintenanceTriggerDeliveryError::RevokedConsumer
+            | MaintenanceTriggerDeliveryError::ExpiredEligibility
+            | MaintenanceTriggerDeliveryError::MirrorRecoveryRequired => {
+                Self::UnexpectedLedgerRefusal
+            }
+        }
+    }
+}
+
+/// Maps one decision failure to its stable diagnostic code.
+///
+/// Only the variant is emitted; the `String` payloads and the source
+/// errors' own fields are never logged. An unknown trigger stays
+/// distinguishable from a competing decision, a fenced generation stays
+/// distinguishable from a live-authority refusal, and a Store receipt
+/// refusal stays distinguishable from an owner outage, so none of them
+/// collapses into an effect-free success. The match stays exhaustive with
+/// no wildcard: a new failure variant breaks here loudly.
+#[cfg(windows)]
+fn maintenance_trigger_decision_terminal_code(
+    failure: &MaintenanceTriggerDecisionFailure,
+) -> &'static str {
+    match failure {
+        MaintenanceTriggerDecisionFailure::Protocol(error) => {
+            if *error == ProtocolError::ReplayConflict {
+                "DECISION_REPLAY_CONFLICT"
+            } else {
+                "DECISION_PROTOCOL_REJECTED"
+            }
+        }
+        MaintenanceTriggerDecisionFailure::UnknownTrigger => "DECISION_UNKNOWN_TRIGGER",
+        MaintenanceTriggerDecisionFailure::FencedGeneration => "DECISION_GENERATION_FENCED",
+        MaintenanceTriggerDecisionFailure::LiveAuthority => "DECISION_LIVE_AUTHORITY_REFUSED",
+        MaintenanceTriggerDecisionFailure::OwnerUnavailable => "DECISION_OWNER_UNAVAILABLE",
+        MaintenanceTriggerDecisionFailure::Store => "DECISION_STORE_REFUSED",
+        MaintenanceTriggerDecisionFailure::UnexpectedLedgerRefusal => "DECISION_LEDGER_REFUSED",
+    }
+}
+
+/// Closed outcome of one recorded maintenance-trigger decision.
+///
+/// `terminal_code` is the ONE stable diagnostic code for a refused decision
+/// and is `None` only when the gateway owner actually recorded the bound
+/// receipt against its committed Store transaction. `trigger_id` echoes the
+/// recorded identity and is present only then, so "requested", "refused",
+/// and "recorded" never collapse into one answer.
+#[cfg(windows)]
+#[derive(Serialize)]
+struct MaintenanceTriggerDecisionAnswer {
+    /// Version of the authenticated decision answer.
+    version: u8,
+    /// Terminal diagnostic code of the refused decision, `None` when recorded.
+    terminal_code: Option<&'static str>,
+    /// The recorded trigger identity, present only when recorded.
+    trigger_id: Option<String>,
+}
+
+/// The admitted-reply envelope, identical to every other arm on this channel.
+#[cfg(windows)]
+fn maintenance_trigger_decision_response(
+    answer: &MaintenanceTriggerDecisionAnswer,
+) -> serde_json::Value {
+    serde_json::json!({
+        "status": "known",
+        "value": answer,
+        "recovery": null,
+    })
+}
+
+/// The outcome of a decision the owner refused before it could record.
+///
+/// Every position field is empty on purpose: a decision that never reached
+/// the ledger recorded nothing and owns no new obligation. Reporting the
+/// refusal code alone is the honest shape — a refused decision is not a
+/// recorded commitment that made no progress, and the trigger stays
+/// retained for receipt-lookup reconciliation.
+#[cfg(windows)]
+fn maintenance_trigger_decision_refusal_answer(
+    terminal_code: &'static str,
+) -> MaintenanceTriggerDecisionAnswer {
+    MaintenanceTriggerDecisionAnswer {
+        version: 1,
+        terminal_code: Some(terminal_code),
+        trigger_id: None,
+    }
+}
+
 #[cfg(windows)]
 impl KernelComposition {
     /// Admits one ORS-staged maintenance trigger before acknowledging intake.
@@ -2864,6 +3064,85 @@ impl KernelComposition {
     /// **exact** admitted session fence. A request failing any of them is
     /// fenced at the transport, before the gateway is touched.
     fn validate_maintenance_trigger_intake_fence(
+        session: &Session,
+        version: u8,
+        state_fence: &StateFence,
+    ) -> Result<(), TransportError> {
+        state_fence
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if version != 1 || state_fence != &session.module_generation.state_fence {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(())
+    }
+
+    /// Records one committed maintenance trigger decision before any
+    /// delivery acknowledgement.
+    ///
+    /// The operation selector only picks this entry. The closed request
+    /// carries the retained trigger identity, the bound decision receipt,
+    /// and the exact admitted session fence; the principal comes from the
+    /// authenticated session module binding, never from the request DTO. A
+    /// malformed request or a fence that is not the exact admitted session
+    /// fence is fenced at the transport, before the gateway is touched.
+    ///
+    /// Recording itself is the existing gateway owner entry
+    /// (`KernelStoreGateway::record_maintenance_trigger_decision`), which
+    /// re-reads the exact canonical Store receipt, requires `Committed`
+    /// status, re-proves the bound digest, and requires the receipt fence
+    /// to match live service authority before the ledger row moves to
+    /// `DecisionRecorded`. Any failure is answered with the decision's own
+    /// stable refusal code and never with an acknowledgement, so the
+    /// trigger stays retained and the daemon reconciles by receipt lookup
+    /// instead of repeating the downstream effect.
+    async fn maintenance_trigger_decision_operation(
+        &self,
+        session: &Session,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let request: MaintenanceTriggerDecisionRequest =
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
+        Self::validate_maintenance_trigger_decision_fence(
+            session,
+            request.version,
+            &request.state_fence,
+        )?;
+        let gateway = self.retained_store_gateway()?;
+        match gateway
+            .record_maintenance_trigger_decision(
+                session.module_generation.module_id.as_str(),
+                &request.trigger_id,
+                request.receipt,
+            )
+            .await
+        {
+            Ok(_) => Ok(maintenance_trigger_decision_response(
+                &MaintenanceTriggerDecisionAnswer {
+                    version: 1,
+                    terminal_code: None,
+                    trigger_id: Some(request.trigger_id),
+                },
+            )),
+            Err(error) => Ok(maintenance_trigger_decision_response(
+                &maintenance_trigger_decision_refusal_answer(
+                    maintenance_trigger_decision_terminal_code(
+                        &MaintenanceTriggerDecisionFailure::from(error),
+                    ),
+                ),
+            )),
+        }
+    }
+
+    /// The one admission gate every maintenance-trigger decision request passes.
+    ///
+    /// The same three checks the intake ingress applies: the request's own
+    /// State Fence must be well formed, the version must be the one this
+    /// arm speaks, and the presented fence must be the **exact** admitted
+    /// session fence. A request failing any of them is fenced at the
+    /// transport, before the gateway is touched.
+    fn validate_maintenance_trigger_decision_fence(
         session: &Session,
         version: u8,
         state_fence: &StateFence,
@@ -3229,6 +3508,18 @@ impl KernelComposition {
             #[cfg(windows)]
             MAINTENANCE_TRIGGER_INTAKE_OPERATION => {
                 self.maintenance_trigger_intake_operation(session, payload.clone())
+            }
+            // Issue #1694 W4: the commit-before-ack maintenance-trigger
+            // decision. The arm records the daemon's bound decision receipt
+            // through the existing gateway owner entry — which re-proves the
+            // exact canonical Store receipt before the ledger row moves to
+            // `DecisionRecorded` — before any delivery acknowledgement;
+            // every refusal carries the decision's own stable code, never an
+            // acknowledgement.
+            #[cfg(windows)]
+            MAINTENANCE_TRIGGER_DECISION_OPERATION => {
+                self.maintenance_trigger_decision_operation(session, payload.clone())
+                    .await
             }
             DAEMON_STARTUP_EVIDENCE_OPERATION => {
                 self.daemon_startup_evidence_operation(session, &request_id, payload)
