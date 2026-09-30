@@ -1148,11 +1148,46 @@ impl<'a> AxisBuilder<'a> {
                 .map_err(|_| QualityEvidenceError::Owner("negative_memory"))?;
         }
 
-        // The delivered packet IS the admitted set, in both directions. The
-        // expected set is the admission owner's own record list; the delivered
-        // set is what the assembly handed on. Comparing them in one direction
-        // only would be a count that can go down, which is not accounting.
-        let mut delivered: Vec<(&'a RenderedAtom, &'a AdmittedAtom)> =
+        // The delivered packet IS the admitted set, in both directions, and the
+        // omission set is reconciled against it, before any axis is graded.
+        let delivered = Self::reconcile(admitted, evidence)?;
+
+        let lineage_complete = evidence
+            .lineage
+            .validate_for_phase(DecisionLineagePhase::BeforeEffect)
+            .map_err(|_| QualityEvidenceError::Owner("lineage"))?
+            == DecisionLineageCompleteness::Complete;
+
+        Ok(Self {
+            admitted,
+            measurement: evidence.measurement,
+            lineage: evidence.lineage,
+            negative_memory: evidence.negative_memory,
+            binding: admitted.binding.clone(),
+            route_id: scorecard.output.route_id.clone(),
+            lineage_complete,
+            delivered,
+        })
+    }
+
+    /// Accounts the delivered packet against the admitted set, in BOTH
+    /// directions, before any axis is graded.
+    ///
+    /// The expected set is the admission owner's own record list; the delivered
+    /// set is what the assembly handed on. A dropped member fails because it has
+    /// no admission record, and an invented member fails the count, so the
+    /// comparison can only go in one direction neither way: a count that can
+    /// only go down is not accounting. Each delivered field is compared against
+    /// the exact admitted record, so the CONTENT of a delivered member is
+    /// checked and not only its identity. The assembly owner's own delivery
+    /// record is reconciled the same way, and the economy receipt's
+    /// authorised-omission set must equal its own omission records and be
+    /// disjoint from what was delivered.
+    fn reconcile<'evidence>(
+        admitted: &'evidence AdmittedContextSet,
+        evidence: &QualityCompilationEvidence<'evidence>,
+    ) -> Result<Vec<(&'evidence RenderedAtom, &'evidence AdmittedAtom)>, QualityEvidenceError> {
+        let mut delivered: Vec<(&'evidence RenderedAtom, &'evidence AdmittedAtom)> =
             Vec::with_capacity(evidence.rendered.len());
         for atom in evidence.rendered {
             let Some(record) = admitted
@@ -1162,9 +1197,6 @@ impl<'a> AxisBuilder<'a> {
             else {
                 return Err(QualityEvidenceError::Unaccounted("rendered.admitted"));
             };
-            // Each delivered field is compared against the exact admitted
-            // record, so the CONTENT of the delivered member is checked and not
-            // only its identity.
             if atom.role != record.candidate.provider_role.role
                 || atom.source_id != record.candidate.source.snapshot_id
                 || atom.source_identity != record.candidate.source.source_id
@@ -1202,10 +1234,9 @@ impl<'a> AxisBuilder<'a> {
             return Err(QualityEvidenceError::Unaccounted("delivered.membership"));
         }
 
-        // Omission and expansion accounting, in both directions, before any
-        // axis is graded. The expected set is the economy receipt's own
-        // authorised-omission set; the omission records are the compilation's own
-        // account of each one.
+        // Omission and expansion accounting, in both directions. The expected
+        // set is the economy receipt's own authorised-omission set; the omission
+        // records are the compilation's own account of each one.
         let displaced: BTreeSet<ArtifactId> = admitted.economy.displaced.iter().cloned().collect();
         let omissions: BTreeSet<ArtifactId> = admitted
             .economy
@@ -1220,23 +1251,7 @@ impl<'a> AxisBuilder<'a> {
         {
             return Err(QualityEvidenceError::Unaccounted("economy.omissions"));
         }
-
-        let lineage_complete = evidence
-            .lineage
-            .validate_for_phase(DecisionLineagePhase::BeforeEffect)
-            .map_err(|_| QualityEvidenceError::Owner("lineage"))?
-            == DecisionLineageCompleteness::Complete;
-
-        Ok(Self {
-            admitted,
-            measurement: evidence.measurement,
-            lineage: evidence.lineage,
-            negative_memory: evidence.negative_memory,
-            binding: admitted.binding.clone(),
-            route_id: scorecard.output.route_id.clone(),
-            lineage_complete,
-            delivered,
-        })
+        Ok(delivered)
     }
 
     /// Every axis, in the contract owner's canonical order.
@@ -1281,9 +1296,15 @@ impl<'a> AxisBuilder<'a> {
     // -----------------------------------------------------------------------
 
     /// One evidence handle naming an exact owner-issued fact.
+    ///
+    /// The handle is namespaced by the owning axis as well as the domain, so a
+    /// handle that names one required member can never be mistaken for the same
+    /// member's handle on a different axis. `domain` is a `'static` label — the
+    /// same fixed vocabulary the [`QualityEvidenceError::Evidence`] variant
+    /// carries — because it is always a literal, never caller-derived text.
+    /// It needs nothing from the builder, so it is an associated function.
     fn handle(
-        &self,
-        domain: &str,
+        domain: &'static str,
         dimension: QualityDimension,
         value: &str,
     ) -> Result<ArtifactId, QualityEvidenceError> {
@@ -1293,19 +1314,19 @@ impl<'a> AxisBuilder<'a> {
         if value.len() > MAX_AXIS_EVIDENCE {
             return Err(QualityEvidenceError::Evidence(domain));
         }
-        ArtifactId::new(std::format!("quality:{domain}:{value}"))
+        ArtifactId::new(std::format!("quality:{dimension:?}:{domain}:{value}"))
             .map_err(|_| QualityEvidenceError::Evidence(domain))
     }
 
     /// A requirement whose observation is a delivered member's own text.
     fn text_requirement(
         &self,
-        domain: &str,
+        domain: &'static str,
         dimension: QualityDimension,
         token: &str,
         text: &str,
     ) -> Result<Requirement, QualityEvidenceError> {
-        let handle = self.handle(domain, dimension, token)?;
+        let handle = Self::handle(domain, dimension, token)?;
         let observed = self
             .delivered
             .iter()
@@ -1320,14 +1341,13 @@ impl<'a> AxisBuilder<'a> {
 
     /// A requirement whose observation is the record comparison beside it.
     fn record_requirement(
-        &self,
-        domain: &str,
+        domain: &'static str,
         dimension: QualityDimension,
         token: &str,
         observed: bool,
     ) -> Result<Requirement, QualityEvidenceError> {
         Ok(Requirement {
-            handle: self.handle(domain, dimension, token)?,
+            handle: Self::handle(domain, dimension, token)?,
             text: None,
             observed,
         })
@@ -1349,7 +1369,7 @@ impl<'a> AxisBuilder<'a> {
         &self,
         dimension: QualityDimension,
     ) -> Result<ArtifactId, QualityEvidenceError> {
-        self.handle("rule-revision", dimension, &self.fence_digest()?)
+        Self::handle("rule-revision", dimension, &self.fence_digest()?)
     }
 
     /// The readable text one delivered member preserves, or `None`.
@@ -1378,7 +1398,7 @@ impl<'a> AxisBuilder<'a> {
     fn owner_requirements(
         &self,
         dimension: QualityDimension,
-        domain: &str,
+        domain: &'static str,
         scalars: &[(&DecisionLineageSlot<DecisionLineageRef>, &str)],
         vectors: &[(&DecisionLineageSlot<Vec<DecisionLineageRef>>, &[&str])],
     ) -> Result<Vec<Requirement>, QualityEvidenceError> {
@@ -1395,7 +1415,7 @@ impl<'a> AxisBuilder<'a> {
                 | DecisionLineageSlot::Unknown { .. } => {
                     // The owner did not present this relation. It is a named
                     // missing member, never a default and never substituted.
-                    requirements.push(self.record_requirement(
+                    requirements.push(Self::record_requirement(
                         domain,
                         dimension,
                         &std::format!("not-present:{wire_kind}"),
@@ -1408,7 +1428,7 @@ impl<'a> AxisBuilder<'a> {
             match slot {
                 DecisionLineageSlot::Present { value } => {
                     if value.is_empty() {
-                        requirements.push(self.record_requirement(
+                        requirements.push(Self::record_requirement(
                             domain,
                             dimension,
                             "present-empty:an owner-presented slot carried no member",
@@ -1417,25 +1437,29 @@ impl<'a> AxisBuilder<'a> {
                     }
                     for reference in value {
                         // The category filter is the lineage contract's own wire
-                        // name, compared on the value, so a member of a
-                        // different category is not counted as this one.
-                        if !kinds.contains(&reference.kind.as_str()) {
+                        // name, carried on the reference itself and compared on
+                        // the value, so a member of a different category is not
+                        // counted as this one. It is the same name
+                        // `DecisionLineageRef::validate` proves against the
+                        // closed kind enum, so it is the owner's category and not
+                        // a label restated here.
+                        if !kinds.contains(&reference.reference.kind.as_str()) {
                             continue;
                         }
                         let token = std::format!(
                             "present:{}:{}@{}",
-                            reference.kind,
-                            reference.id.as_str(),
-                            reference.revision.as_str()
+                            reference.reference.kind,
+                            reference.reference.id.as_str(),
+                            reference.reference.revision.as_str()
                         );
-                        let text = reference.id.as_str().to_owned();
+                        let text = reference.reference.id.as_str().to_owned();
                         requirements.push(self.text_requirement(domain, dimension, &token, &text)?);
                     }
                 }
                 DecisionLineageSlot::NotApplicable { .. }
                 | DecisionLineageSlot::NotYetProduced { .. }
                 | DecisionLineageSlot::Unknown { .. } => {
-                    requirements.push(self.record_requirement(
+                    requirements.push(Self::record_requirement(
                         domain,
                         dimension,
                         "not-present:an owner relation in this category",
@@ -1461,9 +1485,9 @@ impl<'a> AxisBuilder<'a> {
     fn place(
         &self,
         dimension: QualityDimension,
-        mut required: Vec<Requirement>,
+        required: &[Requirement],
         mut observed: Vec<ArtifactId>,
-        mut measurements: Vec<MeasurementRef>,
+        measurements: Vec<MeasurementRef>,
         rule_revision: ArtifactId,
     ) -> QualityDimensionResult {
         let missing: Vec<ArtifactId> = required
@@ -1556,15 +1580,13 @@ impl<'a> AxisBuilder<'a> {
         let mut required = self.owner_requirements(
             dimension,
             "causal",
-            &[(&self.lineage.goal, "goal")],
             &[
-                (&self.lineage.rationale, &["rationale"][..]),
-                (&self.lineage.why_now, &["why_now"][..]),
-                (
-                    &self.lineage.epistemic_position,
-                    &["epistemic_position"][..],
-                ),
+                (&self.lineage.goal, "goal"),
+                (&self.lineage.rationale, "rationale"),
+                (&self.lineage.why_now, "why_now"),
+                (&self.lineage.epistemic_position, "epistemic_position"),
             ],
+            &[],
         )?;
         for dependency in &self.admitted.floor.interpretation_dependencies {
             required.push(self.text_requirement(
@@ -1601,7 +1623,7 @@ impl<'a> AxisBuilder<'a> {
                 && atom.source_revision == source.revision
                 && atom.source_digest == source.content_sha256
                 && atom.source_owner == source.owner;
-            let requirement = self.record_requirement(
+            let requirement = Self::record_requirement(
                 "anchor",
                 dimension,
                 &std::format!(
@@ -1623,7 +1645,7 @@ impl<'a> AxisBuilder<'a> {
             // reads as exact, and it never becomes a required member the
             // provider did not claim.
             if let Some(range) = &record.candidate.source_range {
-                let range_requirement = self.record_requirement(
+                let range_requirement = Self::record_requirement(
                     "anchor-range",
                     dimension,
                     &std::format!(
@@ -1658,7 +1680,7 @@ impl<'a> AxisBuilder<'a> {
         required.extend(owner);
         Ok(self.place(
             dimension,
-            required,
+            &required,
             observed,
             measurements,
             self.fence_rule_revision(dimension)?,
@@ -1690,7 +1712,7 @@ impl<'a> AxisBuilder<'a> {
                         | EpistemicStatus::Rejected
                         | EpistemicStatus::Unknown
                 );
-            let requirement = self.record_requirement(
+            let requirement = Self::record_requirement(
                 "freshness",
                 dimension,
                 &std::format!(
@@ -1712,7 +1734,7 @@ impl<'a> AxisBuilder<'a> {
         let packet_fence = self.fence_digest()?;
         let owner_fence = canonical_fence_digest(&self.lineage.epoch.state_fence)
             .map_err(|_| QualityEvidenceError::Owner("lineage.epoch"))?;
-        let fence_requirement = self.record_requirement(
+        let fence_requirement = Self::record_requirement(
             "state-fence",
             dimension,
             &owner_fence,
@@ -1723,7 +1745,7 @@ impl<'a> AxisBuilder<'a> {
             observed.push(fence_requirement.handle.clone());
         }
         required.push(fence_requirement);
-        let completeness = self.record_requirement(
+        let completeness = Self::record_requirement(
             "lineage-completeness",
             dimension,
             "the decision owner's own lineage is not complete for this phase",
@@ -1735,7 +1757,7 @@ impl<'a> AxisBuilder<'a> {
         required.push(completeness);
         Ok(self.place(
             dimension,
-            required,
+            &required,
             observed,
             measurements,
             self.fence_rule_revision(dimension)?,
@@ -1779,7 +1801,7 @@ impl<'a> AxisBuilder<'a> {
             DecisionLineageSlot::NotApplicable { .. }
             | DecisionLineageSlot::NotYetProduced { .. }
             | DecisionLineageSlot::Unknown { .. } => {
-                required.push(self.record_requirement(
+                required.push(Self::record_requirement(
                     "rival-member",
                     dimension,
                     "not-present:the decision owner presented no rival set",
@@ -1803,20 +1825,20 @@ impl<'a> AxisBuilder<'a> {
     fn negative_memory_axis(&self) -> Result<QualityDimensionResult, QualityEvidenceError> {
         let dimension = QualityDimension::NegativeMemoryInvariantCoverage;
         let Some(projection) = self.negative_memory else {
-            let missing = self.record_requirement(
+            let missing = Self::record_requirement(
                 "negative-memory",
                 dimension,
                 "no-negative-memory-read-was-taken-for-this-dispatch",
                 false,
             )?;
             let handle = missing.handle.clone();
-            return Ok(self.place(dimension, vec![missing], Vec::new(), Vec::new(), handle));
+            return Ok(self.place(dimension, &[missing], Vec::new(), Vec::new(), handle));
         };
         let mut required = Vec::new();
         let mut observed = Vec::new();
         for rule in &projection.rules {
             let governing = matches!(rule.exposure, NegativeMemoryRuleExposure::Governing { .. });
-            let requirement = self.record_requirement(
+            let requirement = Self::record_requirement(
                 "negative-memory-rule",
                 dimension,
                 &std::format!(
@@ -1835,7 +1857,7 @@ impl<'a> AxisBuilder<'a> {
         // The matcher's own retained limitations decide degradation, because
         // only the matcher knows the compared rule set was not established
         // completely.
-        let rule_revision = self.handle(
+        let rule_revision = Self::handle(
             "negative-memory-rule-set",
             dimension,
             &std::format!(
@@ -1847,7 +1869,7 @@ impl<'a> AxisBuilder<'a> {
                     + projection.evidence.compared_scope_field_count
             ),
         )?;
-        let mut result = self.place(dimension, required, observed, Vec::new(), rule_revision);
+        let mut result = self.place(dimension, &required, observed, Vec::new(), rule_revision);
         if !projection.losses.is_empty() || !projection.evidence.limitation_refs.is_empty() {
             result.state = QualityDimensionState::Degraded {
                 reason: std::format!(
@@ -1874,7 +1896,7 @@ impl<'a> AxisBuilder<'a> {
         match &self.lineage.verifiers {
             DecisionLineageSlot::Present { value: verifiers } => {
                 if verifiers.is_empty() {
-                    required.push(self.record_requirement(
+                    required.push(Self::record_requirement(
                         "verifier",
                         dimension,
                         "present-empty:the decision owner issued an empty verifier set",
@@ -1899,7 +1921,7 @@ impl<'a> AxisBuilder<'a> {
             DecisionLineageSlot::NotApplicable { .. }
             | DecisionLineageSlot::NotYetProduced { .. }
             | DecisionLineageSlot::Unknown { .. } => {
-                required.push(self.record_requirement(
+                required.push(Self::record_requirement(
                     "verifier",
                     dimension,
                     "not-present:the decision owner issued no verifier set for this action",
@@ -1923,7 +1945,7 @@ impl<'a> AxisBuilder<'a> {
             DecisionLineageSlot::NotApplicable { .. }
             | DecisionLineageSlot::NotYetProduced { .. }
             | DecisionLineageSlot::Unknown { .. } => {
-                required.push(self.record_requirement(
+                required.push(Self::record_requirement(
                     "action-contract",
                     dimension,
                     "not-present:the decision owner issued no action contract",
@@ -1960,7 +1982,7 @@ impl<'a> AxisBuilder<'a> {
         let mut measurements = Vec::new();
         // The floor owner's capacity and the economy receipt's own allocation of
         // it are independent records of the same route, compared by value.
-        let capacity_requirement = self.record_requirement(
+        let capacity_requirement = Self::record_requirement(
             "route-capacity",
             dimension,
             &std::format!("route:{}:capacity:{capacity}", self.route_id),
@@ -1974,13 +1996,25 @@ impl<'a> AxisBuilder<'a> {
         // The measurement owner's own verdict on these bytes. `proves_fit`
         // returns `Err` for a cost that was never measured, and an unmeasured
         // cost is not a fit.
-        let fit_requirement = self.record_requirement(
+        let fit_requirement = Self::record_requirement(
             "route-fit",
             dimension,
             &std::format!("route:{}:cost:{capacity}", self.route_id),
             matches!(self.measurement.proves_fit(capacity), Ok(true)),
         )?;
-        measurements.push(self.measurement.clone());
+        // The whole-packet `SerializedContextMeasurement` is NOT a
+        // `MeasurementRef` and is not fabricated into one: it carries an
+        // envelope digest and a serializer identity, not the digest/serializer
+        // pair a `MeasurementRef` names, and inventing that pair would mint a
+        // measurement handle the measurement owner never recorded. Its fit
+        // verdict is carried BY VALUE in the `route-fit` handle above, and the
+        // per-atom measurement handles of the delivered set are what the
+        // `measurements` list carries.
+        measurements.extend(
+            self.delivered
+                .iter()
+                .map(|(atom, _)| atom.measurement.clone()),
+        );
         if fit_requirement.observed {
             observed.push(fit_requirement.handle.clone());
         }
@@ -2002,7 +2036,7 @@ impl<'a> AxisBuilder<'a> {
             else {
                 continue;
             };
-            let whole_unit = self.record_requirement(
+            let whole_unit = Self::record_requirement(
                 "whole-unit",
                 dimension,
                 &std::format!(
@@ -2020,7 +2054,7 @@ impl<'a> AxisBuilder<'a> {
         }
         Ok(self.place(
             dimension,
-            required,
+            &required,
             observed,
             measurements,
             self.fence_rule_revision(dimension)?,
@@ -2041,8 +2075,8 @@ impl<'a> AxisBuilder<'a> {
         let mut required = self.owner_requirements(
             dimension,
             "instruction",
+            &[(&self.lineage.rationale, "rationale")],
             &[],
-            &[(&self.lineage.rationale, &["rationale"][..])],
         )?;
         for (atom, record) in &self.delivered {
             if !matches!(
@@ -2052,7 +2086,7 @@ impl<'a> AxisBuilder<'a> {
                 continue;
             }
             let carries = Self::preserved_text(atom).is_some_and(|text| !text.trim().is_empty());
-            let requirement = self.record_requirement(
+            let requirement = Self::record_requirement(
                 "directive-member",
                 dimension,
                 &std::format!(
@@ -2083,7 +2117,7 @@ impl<'a> AxisBuilder<'a> {
         let mut observed = Vec::new();
         let mut measurements = Vec::new();
         for (atom, _) in &self.delivered {
-            let member = self.record_requirement(
+            let member = Self::record_requirement(
                 "reconstruction",
                 dimension,
                 &std::format!(
@@ -2102,7 +2136,7 @@ impl<'a> AxisBuilder<'a> {
             }
             required.push(member);
         }
-        let bytes = self.record_requirement(
+        let bytes = Self::record_requirement(
             "payload-bytes",
             dimension,
             &std::format!(
@@ -2123,12 +2157,18 @@ impl<'a> AxisBuilder<'a> {
         )?;
         if bytes.observed {
             observed.push(bytes.handle.clone());
-            measurements.push(self.measurement.clone());
+            // The packet's own byte count is NOT a `MeasurementRef`: the
+            // measurement owner recorded an envelope digest and a serializer
+            // identity for the whole packet, not the digest/serializer pair a
+            // `MeasurementRef` names. Its status, byte count and measured cost
+            // are compared BY VALUE in the `payload-bytes` handle above, which
+            // is observed only when the owner qualified the count as exact, so
+            // nothing is lost by not fabricating a handle from it here.
         }
         required.push(bytes);
         Ok(self.place(
             dimension,
-            required,
+            &required,
             observed,
             measurements,
             self.fence_rule_revision(dimension)?,
@@ -2160,7 +2200,7 @@ impl<'a> AxisBuilder<'a> {
                 (None, Some(reason)) => std::format!("non-recoverable:{reason:?}"),
                 _ => "none".to_owned(),
             };
-            let omission = self.record_requirement(
+            let omission = Self::record_requirement(
                 "omission",
                 dimension,
                 &std::format!(
@@ -2182,7 +2222,7 @@ impl<'a> AxisBuilder<'a> {
             // and displaced counts are the observation, so the axis reports a
             // measured absence instead of an empty requirement that passes
             // vacuously.
-            let none = self.record_requirement(
+            let none = Self::record_requirement(
                 "omission",
                 dimension,
                 &std::format!(
@@ -2195,7 +2235,7 @@ impl<'a> AxisBuilder<'a> {
             observed.push(none.handle.clone());
             required.push(none);
         }
-        let rule_revision = self.handle(
+        let rule_revision = Self::handle(
             "omission-rule",
             dimension,
             &std::format!(
@@ -2205,7 +2245,7 @@ impl<'a> AxisBuilder<'a> {
                 economy.displaced.len()
             ),
         )?;
-        Ok(self.place(dimension, required, observed, Vec::new(), rule_revision))
+        Ok(self.place(dimension, &required, observed, Vec::new(), rule_revision))
     }
 
     /// Telemetry, measurement cost and coverage.
@@ -2274,13 +2314,19 @@ impl<'a> AxisBuilder<'a> {
                         == self.admitted.floor.capacity.review_reserve,
             ),
         ] {
-            let requirement = self.record_requirement(domain, dimension, &token, satisfied)?;
+            let requirement = Self::record_requirement(domain, dimension, &token, satisfied)?;
             if requirement.observed {
                 observed.push(requirement.handle.clone());
             }
             required.push(requirement);
         }
-        let mut measurements = vec![self.measurement.clone()];
+        // The `measurements` list carries the measurement handles the delivered
+        // members themselves recorded. The assembly owner's whole-packet
+        // `SerializedContextMeasurement` is a different record and is not a
+        // `MeasurementRef`, so it is never fabricated into one; its envelope
+        // digest, status and measured cost are compared BY VALUE in the
+        // `telemetry-cost` and `telemetry-reserve` handles above.
+        let mut measurements: Vec<MeasurementRef> = Vec::new();
         measurements.extend(
             self.delivered
                 .iter()
@@ -2288,7 +2334,7 @@ impl<'a> AxisBuilder<'a> {
         );
         Ok(self.place(
             dimension,
-            required,
+            &required,
             observed,
             measurements,
             self.fence_rule_revision(dimension)?,
@@ -2318,7 +2364,7 @@ impl<'a> AxisBuilder<'a> {
                         Self::preserved_text(atom).is_some_and(|held| held.contains(text))
                     })
             });
-            required.push(self.record_requirement(
+            required.push(Self::record_requirement(
                 "role-member",
                 dimension,
                 &std::format!(
@@ -2334,7 +2380,7 @@ impl<'a> AxisBuilder<'a> {
         let (observed, measurements) = self.observe(&required);
         Ok(self.place(
             dimension,
-            required,
+            &required,
             observed,
             measurements,
             self.fence_rule_revision(dimension)?,
