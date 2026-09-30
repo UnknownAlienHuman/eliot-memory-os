@@ -3,6 +3,12 @@
 //! The canonical wire contract remains owned by `eliot-host-service`; this
 //! cell owns only the bounded authenticated endpoint and its in-process queue.
 //!
+//! A backup control request on this pipe is admitted only against
+//! [`BackupAuthenticatedPeer`], an authenticated context minted from the
+//! transport's own observation of the connected handle. The closed accepted
+//! method table decides which owner operations exist; it never authenticates
+//! the requester, and no caller can build the context.
+//!
 //! Transport exclusion (I7.5): this admin surface — Kernel restart, store
 //! recovery, and authenticated UserAutomation execution — is named-pipe-only
 //! and is excluded from the agent-facing loopback HTTP transport profile by
@@ -41,7 +47,7 @@ pub use eliot_host_service::{
     user_automation_host_execution_response_frame,
 };
 use eliot_host_service::{UserAutomationHostExecutionSession, UserAutomationHostOwnerBinding};
-use eliot_ipc::{NamedPipeServer, TransportLimits};
+use eliot_ipc::{NamedPipeServer, PeerIdentity, TransportLimits};
 use tokio::sync::oneshot;
 
 pub mod backup;
@@ -201,6 +207,105 @@ fn response_matches_private_correlation(
 ) -> bool {
     Arc::ptr_eq(&expected.0, &reply.correlation.0)
         && response_matches_request(request, &reply.response)
+}
+
+/// The authenticated context of one received backup control request.
+///
+/// The context exists because a closed method table cannot authenticate
+/// itself. [`HostRuntimeControl::handle_backup_operation`] decides which owner
+/// operations exist; it cannot decide who is asking, and a decoded `role`,
+/// `source` or `destination` string is a claim about the request, never a
+/// proof of who sent it. This value carries the one fact the transport
+/// observed and the payload cannot supply: the peer the pipe itself sealed
+/// for the connected handle.
+///
+/// It is minted only by [`HostRuntimeControl::serve_one`], from
+/// [`NamedPipeServer::peer_identity`] on the server the transport has already
+/// run [`NamedPipeServer::wait_for_authenticated_client`] against. Every field
+/// is private, the sole constructor takes that connected server and is itself
+/// private, and the value is neither deserializable, defaulted nor built from a
+/// payload field, so no requester on the wire and no caller of this endpoint
+/// can construct one or substitute a peer of its own. A context that cannot
+/// be minted is an absent observation, and an absent observation is unknown,
+/// not zero: the request is refused, never admitted on trust.
+///
+/// The context grants no authority beyond the observation it was minted from.
+/// It is not a cutover receipt, it is not a backup capability, and a permitted
+/// administrator connection is therefore not by itself approval for one exact
+/// cutover: the separate cutover admission stays with the registered owner
+/// operation and its own admission, and every payload `role`, `capability`,
+/// `source` and `destination` string stays a claim that authorizes nothing on
+/// its own here.
+pub struct BackupAuthenticatedPeer {
+    /// The provider proof the transport sealed for the connected handle.
+    ///
+    /// The handle-bound process binding, SID and session inside it are private
+    /// to the IPC crate, so this field holds an observation of the live peer
+    /// and never a caller-supplied identity.
+    peer: PeerIdentity,
+}
+
+impl BackupAuthenticatedPeer {
+    /// Mints the authenticated context from the transport's own peer
+    /// observation of the connected server.
+    ///
+    /// This is the only constructor, and it takes the connected
+    /// [`NamedPipeServer`] itself rather than an identity, so the peer can
+    /// only ever come from the transport's own platform proof for a live
+    /// connection.
+    fn observe_transport_peer(server: &NamedPipeServer) -> Self {
+        Self {
+            peer: server.peer_identity().clone(),
+        }
+    }
+
+    /// Admits one decoded backup control request against this authenticated
+    /// context, before any owner effect.
+    ///
+    /// Two facts are required and neither is a payload claim: the transport
+    /// sealed a live peer proof for this connection — an unauthenticated or
+    /// unproven transport is `PeerIdentity::Unavailable`, which is refused
+    /// rather than read as an administrator — and the request still carries
+    /// the complete canonical commitment its own carrier defines. The second
+    /// check is the existing envelope validator used as it stands, and this is
+    /// the admission boundary where the wire identity, operation, principal,
+    /// role/capability, nonce, generation, fence and body commitment of this
+    /// request must all hold together before any owner is reached. No digest
+    /// is recomputed here and no evidence is inferred from the existence or
+    /// the shape of a value.
+    ///
+    /// # Errors
+    ///
+    /// Returns this operation's typed pre-effect [`BackupDispatchRefusal`]
+    /// when the connection carried no transport-proved peer, when that peer's
+    /// own proof does not validate, or when the request does not carry its own
+    /// canonical identity.
+    pub fn admit_request(
+        &self,
+        request: &BackupRuntimeControlRequest,
+    ) -> Result<(), BackupDispatchRefusal> {
+        let operation = request.operation;
+        let refusal = BackupDispatchRefusal::new;
+        if matches!(self.peer, PeerIdentity::Unavailable { .. }) {
+            return Err(refusal(
+                operation,
+                "backup control request carries no transport-proved peer",
+            ));
+        }
+        if self.peer.validate().is_err() {
+            return Err(refusal(
+                operation,
+                "backup control transport peer proof does not validate",
+            ));
+        }
+        if request.validate().is_err() {
+            return Err(refusal(
+                operation,
+                "backup control request lacks its own canonical identity",
+            ));
+        }
+        Ok(())
+    }
 }
 
 pub struct HostRuntimeControl {
@@ -415,6 +520,7 @@ impl HostRuntimeControl {
     /// registered owner operation (#962).
     ///
     /// The order is fail-closed and every gate runs before any owner effect:
+    /// the authenticated context the transport derived for this connection,
     /// the closed Host-accepted method table, the payload-to-authenticated
     /// operation binding, the separate cutover admission, the registered
     /// dispatch row, the owner itself, and finally the exact request/response
@@ -422,6 +528,13 @@ impl HostRuntimeControl {
     /// carry the authenticated operation's own wire identity, and a cutover
     /// without its separate installation-authority admission are all refused
     /// here, so none of them can be reported as a no-op/zero/default success.
+    ///
+    /// The authenticated context ([`BackupAuthenticatedPeer`]) and the closed
+    /// table are separate invariants and neither replaces the other: a
+    /// consistent table row never authenticates a requester, and an
+    /// authenticated connection never admits an operation the table does not
+    /// carry. The context also grants no cutover authority, so a permitted
+    /// administrator peer is not by itself approval for one exact cutover.
     ///
     /// The answer is the owner's own typed outcome, bound to the exact
     /// admitted request by [`BackupRuntimeControlResponse::backup_response_for`]
@@ -446,9 +559,19 @@ impl HostRuntimeControl {
     fn handle_backup_operation(
         &self,
         request: &BackupRuntimeControlRequest,
+        peer: &BackupAuthenticatedPeer,
     ) -> Result<BackupRuntimeControlResponse, BackupDispatchRefusal> {
         let operation = request.operation;
         let refusal = BackupDispatchRefusal::new;
+        // 0. The authenticated context. This request is admitted only against
+        //    the peer the transport itself proved for this connection and
+        //    against the complete canonical commitment the carrier already
+        //    defines for it. The context is derived from the transport's own
+        //    observation, so a payload `role`, `source` or `destination`
+        //    string cannot become authority here however self-consistent it
+        //    is, and a connection the transport could not prove refuses
+        //    before the closed table below is even consulted.
+        peer.admit_request(request)?;
         // 1. Closed Host-accepted method table. Unsupported and absent
         //    methods fail before effects, never as a default success.
         if !backup::is_supported(operation) {
@@ -489,6 +612,12 @@ impl HostRuntimeControl {
         // authority. A prepare-domain role cannot present a cutover
         // admission, and a rehearsal completion is not an accepted method at
         // all, so rehearsal can never select cutover.
+        //
+        // This decoded role claim is still not this admission by itself, and
+        // the authenticated context above is deliberately not a substitute for
+        // it: a proved administrator peer never approves one exact cutover,
+        // and the registered owner operation below performs its own separate
+        // cutover admission before it can effect anything.
         if needs_cutover_admission && !request.role.permits(BackupOperationKind::AdmitCutover) {
             return Err(refusal(
                 operation,
@@ -596,6 +725,13 @@ impl HostRuntimeControl {
                 // that is not admitted fails with its typed refusal here, so
                 // no unsupported method can reach an owner effect.
                 if let Ok(backup_request) = decode_backup_request_frame(&frame) {
+                    // The authenticated context is minted here, from the
+                    // transport's own observation of the connected peer, and
+                    // travels into the backup handler. It cannot be supplied
+                    // by the requester: the constructor takes the connected
+                    // server the transport just authenticated and has private
+                    // fields, so no frame can carry or name one.
+                    //
                     // The typed refusal is rendered to text exactly once,
                     // here, at the endpoint's pre-existing `Result<(), String>`
                     // boundary. No backup request is answered with a frame
@@ -603,8 +739,9 @@ impl HostRuntimeControl {
                     // returned its own outcome; the frame states that outcome,
                     // so a pending or possibly-effected operation stays
                     // visible as such instead of collapsing into a refusal.
+                    let peer = BackupAuthenticatedPeer::observe_transport_peer(&server);
                     let backup_response = self
-                        .handle_backup_operation(&backup_request)
+                        .handle_backup_operation(&backup_request, &peer)
                         .map_err(|refused| refused.to_string())?;
                     backup_response_frame(connection_id, &backup_response)?
                 } else {
