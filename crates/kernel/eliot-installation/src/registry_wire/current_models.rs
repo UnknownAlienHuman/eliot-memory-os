@@ -23,8 +23,8 @@ use super::super::{
     HostPhaseBMaterializationIntent, HostPhaseBMaterializationReceipt,
     HostPhaseBPreparedMaterialization, HostPhaseBPreparedReceipt, InstallationActivationApproval,
     InstallerServiceRegistrationApproval, PendingActivation, PendingActivationAbortReceipt,
-    PendingActivationState, PlatformHandle, PreparedDestinationAdmission, ResourceGeneration,
-    StateFence,
+    PendingActivationState, PlatformHandle, PreparedDestinationAdmission,
+    PreparedDestinationMaterialisation, ResourceGeneration, StateFence,
 };
 
 use super::{PendingActivationTerminal, PendingActivationTerminalDisposition};
@@ -218,6 +218,14 @@ pub(super) struct RegistryWireV11 {
     /// written before this member byte-identical.
     #[serde(default)]
     prepared_isolated_destinations: Vec<PreparedDestinationAdmission>,
+    /// Destination installations whose root this authority actually CREATED
+    /// (#958, A2). A registry written before this member has no such rows and
+    /// decodes as empty, for the same reason `prepared_isolated_destinations` is
+    /// optional: an absent collection is a valid earlier state, not a schema
+    /// migration, and `skip_serializing_if` on the projection keeps the identity
+    /// of every registry written before this member byte-identical.
+    #[serde(default)]
+    prepared_destination_materialisations: Vec<PreparedDestinationMaterialisation>,
 }
 
 /// An optional wire member whose presence is mandatory.  Explicit `null` is
@@ -265,6 +273,7 @@ impl RegistryWireV11 {
                 .map(ActivePhaseBRebindWireV11::into_rebind),
             committed_cutover_activation: self.committed_cutover_activation,
             prepared_isolated_destinations: self.prepared_isolated_destinations,
+            prepared_destination_materialisations: self.prepared_destination_materialisations,
         }
     }
 }

@@ -65,8 +65,9 @@ use crate::{
     ApprovedGenerationRegistry, CommittedCutoverActivation, HostPhaseBMaterializationIntent,
     HostPhaseBMaterializationReceipt, HostPhaseBPreparedMaterialization, HostPhaseBPreparedReceipt,
     InstallationActivationApproval, InstallationError, PendingActivation,
-    PendingActivationAbortReceipt, PreparedDestinationAdmission, WindowsPathIdentity,
-    activation_terminal_digest, candidate_manifest_digest, valid_installation_key,
+    PendingActivationAbortReceipt, PreparedDestinationAdmission, PreparedDestinationMaterialisation,
+    WindowsPathIdentity, activation_terminal_digest, candidate_manifest_digest,
+    valid_installation_key,
 };
 
 pub(super) const REGISTRY_TABLE: TableDefinition<&str, &[u8]> =
@@ -920,13 +921,78 @@ impl RedbInstallationRegistry {
     }
 
     /// Atomically records one PREPARED, UNACTIVATED isolated destination
-    /// installation (#958, A2).
+    /// installation together with the proof that its root was actually CREATED
+    /// (#958, A2).
+    ///
+    /// The admission and its materialisation are one fact and are written in one
+    /// compare-and-swap, so this authority can never retain a created root
+    /// without the admission that admitted it, or an admission whose
+    /// `admission_digest` the created root does not carry. The live exclusive
+    /// [`HostOwnerEpochCapability`] and the CAS revision fence are required for
+    /// exactly the same reason every sibling mutation requires them.
+    ///
+    /// A repeat of the same pair is idempotent and returns the stored
+    /// materialisation, so a repeated or lost-response request resolves the same
+    /// verified destination instead of allocating a second one. A changed
+    /// same-operation record, or a second operation naming a destination another
+    /// operation already holds, is
+    /// [`InstallationError::IdentityConflict`].
+    ///
+    /// # Errors
+    ///
+    /// [`InstallationError::CompareAndSaveConflict`] when `expected_revision` no
+    /// longer matches, [`InstallationError::IdentityConflict`] for a changed or
+    /// contended record, [`InstallationError::Duplicate`] when the destination
+    /// is this authority's active or already-approved installation, and
+    /// [`InstallationError::InvalidField`] when the materialisation does not
+    /// realise the admission it was given.
+    pub fn record_prepared_isolated_destination_creation(
+        &self,
+        host: &HostOwnerEpochCapability,
+        expected_revision: u64,
+        admission: &PreparedDestinationAdmission,
+        materialisation: &PreparedDestinationMaterialisation,
+    ) -> Result<PreparedDestinationMaterialisation, InstallationError> {
+        let _guard = host
+            .live_guard()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        self.validate_host_owner_capability(host)?;
+        admission
+            .validate()
+            .map_err(|error| InstallationError::InvalidField {
+                field: "prepared_isolated_destination".to_owned(),
+                reason: error.to_string(),
+            })?;
+        materialisation
+            .validate()
+            .map_err(|error| InstallationError::InvalidField {
+                field: "prepared_destination_materialisation".to_owned(),
+                reason: error.to_string(),
+            })?;
+        let admission = admission.clone();
+        let materialisation = materialisation.clone();
+        self.mutate_atomic(expected_revision, |registry| {
+            registry.record_prepared_isolated_destination_creation_unchecked(
+                &admission,
+                &materialisation,
+            )
+        })
+    }
+
+    /// Atomically records one PREPARED, UNACTIVATED isolated destination
+    /// installation, with no filesystem effect (#958, A2).
     ///
     /// The destination is allocated and admitted, never approved and never
     /// active: it carries no generation, no activation approval, no epoch and no
     /// SCM grant, so this call activates nothing and stops nothing. It is also
     /// the only way such a destination enters the projection, so an isolated
     /// destination that no call made is by construction not an installation.
+    ///
+    /// A retained admission says the destination was ADMITTED; it does not say a
+    /// root was created. Use
+    /// [`Self::record_prepared_isolated_destination_creation`] when the caller
+    /// has actually created the root through the installation authority, so the
+    /// created object and the admission are recorded as one fact.
     ///
     /// The caller's live exclusive [`HostOwnerEpochCapability`] is required for
     /// the same reason every sibling seam requires it: this is a mutation of the
@@ -1004,12 +1070,130 @@ impl RedbInstallationRegistry {
             })
     }
 
+    /// Reads back the ADMISSION and the MATERIALISATION of one isolated
+    /// destination, as the pair this authority recorded.
+    ///
+    /// This is the read an import-side consumer uses to learn which root was
+    /// created for its operation. It is a pure read of a durable projection: it
+    /// grants no mutation authority, and both records are re-validated on the way
+    /// out, so a consumer learns the created root only together with the
+    /// admission digest that root was recorded against.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallationError::IncompleteObservation`] when this authority
+    /// retains no admission, or no materialisation, for that operation, and
+    /// [`InstallationError::InvalidField`] when the retained pair is not
+    /// self-consistent — which the durable projection already refuses, so a
+    /// failure here means the bytes on disk changed under a reader.
+    pub fn read_prepared_isolated_destination_creation(
+        &self,
+        host: &HostOwnerEpochCapability,
+        operation_id: &PlatformHandle,
+    ) -> Result<
+        (
+            PreparedDestinationAdmission,
+            PreparedDestinationMaterialisation,
+        ),
+        InstallationError,
+    > {
+        let (admission, materialisation) = {
+            let _guard = host
+                .live_guard()
+                .map_err(|error| InstallationError::Platform(error.to_string()))?;
+            self.validate_host_owner_capability(host)?;
+            let registry = self.load()?;
+            let admission = registry
+                .prepared_isolated_destination(operation_id)
+                .cloned()
+                .ok_or_else(|| {
+                    InstallationError::IncompleteObservation(
+                        "this authority retains no prepared isolated destination for that operation"
+                            .to_owned(),
+                    )
+                })?;
+            let materialisation = registry
+                .prepared_destination_materialisation(operation_id)
+                .cloned()
+                .ok_or_else(|| {
+                    InstallationError::IncompleteObservation(
+                        "this authority retains no materialised isolated destination for that \
+                         operation"
+                            .to_owned(),
+                    )
+                })?;
+            (admission, materialisation)
+        };
+        admission
+            .validate()
+            .map_err(|error| InstallationError::InvalidField {
+                field: "prepared_isolated_destination".to_owned(),
+                reason: error.to_string(),
+            })?;
+        materialisation
+            .validate()
+            .map_err(|error| InstallationError::InvalidField {
+                field: "prepared_destination_materialisation".to_owned(),
+                reason: error.to_string(),
+            })?;
+        if materialisation.admission_digest != admission.admission_digest
+            || materialisation.destination_installation != admission.destination_installation
+        {
+            return Err(InstallationError::InvalidField {
+                field: "prepared_destination_materialisation".to_owned(),
+                reason: "the retained materialisation does not realise the retained admission"
+                    .to_owned(),
+            });
+        }
+        Ok((admission, materialisation))
+    }
+
     /// Forgets one explicitly owned, never-activated destination during cleanup.
     ///
     /// An operation whose destination has since been activated is refused rather
     /// than forgotten, so cleanup can never orphan an installation this authority
     /// now treats as real. An admission this authority does not hold is refused
     /// for the same reason: cleanup removes only what it owns.
+    ///
+    /// The filesystem is NOT touched by this call. A destination whose root was
+    /// materialised is removed through the installation authority's own
+    /// handle-bound publication teardown, never by path name, and only after this
+    /// record has been forgotten — a root this authority cannot prove it owns is
+    /// preserved.
+    pub fn forget_prepared_isolated_destination_creation(
+        &self,
+        host: &HostOwnerEpochCapability,
+        expected_revision: u64,
+        admission: &PreparedDestinationAdmission,
+        materialisation: &PreparedDestinationMaterialisation,
+    ) -> Result<(), InstallationError> {
+        let _guard = host
+            .live_guard()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        self.validate_host_owner_capability(host)?;
+        admission
+            .validate()
+            .map_err(|error| InstallationError::InvalidField {
+                field: "prepared_isolated_destination".to_owned(),
+                reason: error.to_string(),
+            })?;
+        materialisation
+            .validate()
+            .map_err(|error| InstallationError::InvalidField {
+                field: "prepared_destination_materialisation".to_owned(),
+                reason: error.to_string(),
+            })?;
+        let admission = admission.clone();
+        let materialisation = materialisation.clone();
+        self.mutate_atomic(expected_revision, |registry| {
+            registry.forget_prepared_isolated_destination_creation_unchecked(
+                &admission,
+                &materialisation,
+            )
+        })
+    }
+
+    /// Forgets one explicitly owned, never-activated destination during cleanup.
     pub fn forget_prepared_isolated_destination(
         &self,
         host: &HostOwnerEpochCapability,

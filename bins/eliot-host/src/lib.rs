@@ -6632,14 +6632,17 @@ impl HostComposition {
             // the rest of the arm unchanged.
             BackupDispatchTarget::Prepare => match self.admit_owner_isolated_destination(request) {
                 Err(reason) => Err(BackupDispatchRefusal::new(operation, reason)),
-                // The installation authority admitted and durably retained a
-                // new distinct isolated destination for this operation, and the
-                // downstream refusal below still stands unchanged: admitting a
-                // destination does not name it across the frozen #954 seam, and
-                // the owner-issued caller credential is still absent.
+                // The installation authority admitted a new distinct isolated
+                // destination, CREATED its root through its own owned-directory
+                // publication under the retained protected-root lease, and
+                // durably retained the admission together with the created root's
+                // own observed file identity. The downstream refusal below still
+                // stands unchanged: materialising a destination does not name it
+                // across the frozen #954 seam, and the owner-issued caller
+                // credential is still absent.
                 Ok(()) => Err(BackupDispatchRefusal::new(
                     operation,
-                    "the installation authority admitted a new distinct isolated destination and retained it, but preparation is still refused up to its caller credential: what is still absent is an owner-issued caller credential, and how a prepared destination may be named across this seam is a frozen #954 interface decision",
+                    "the installation authority admitted a new distinct isolated destination, created it through its own protected-root publication and retained it, but preparation is still refused up to its caller credential: what is still absent is an owner-issued caller credential, and how a prepared destination may be named across this seam is a frozen #954 interface decision",
                 )),
             },
             // Named owner refusal, also PRE-EFFECT: it refuses before
@@ -6695,12 +6698,14 @@ impl HostComposition {
     ///   isolated restore area, which the installation authority resolves and
     ///   re-verifies.
     ///
-    /// On success the admitted record is written into the installation registry
-    /// through the authority's own compare-and-swap, so the destination becomes a
-    /// real PREPARED, UNACTIVATED installation this authority retains -- and the
-    /// downstream refusal for the missing owner-issued caller credential is left
-    /// exactly as it was, because admitting a destination does not name it across
-    /// the frozen `#954` seam.
+    /// On success the admitted record AND the proof that its root was created
+    /// are written into the installation registry through the authority's own
+    /// compare-and-swap, so the destination becomes a real PREPARED, UNACTIVATED
+    /// installation this authority retains, with the created object's own
+    /// observed file identity recorded beside it -- and the downstream refusal
+    /// for the missing owner-issued caller credential is left exactly as it was,
+    /// because materialising a destination does not name it across the frozen
+    /// `#954` seam.
     ///
     /// # Errors
     ///
@@ -6729,6 +6734,44 @@ impl HostComposition {
         };
         let facts = PreparedDestinationFacts::issue_for_admitted_identity(&body.identity)
             .map_err(Self::isolated_destination_reason)?;
+
+        // A repeated request — including one whose response was lost after the
+        // destination was already created — resolves the SAME verified
+        // destination this authority already retains, and conflicts when the
+        // bound inputs changed. It never admits a second installation and never
+        // re-creates a root it already created. The readback compares the
+        // retained records' CONTENT against the owner-issued request: the
+        // operation identity, the bound archive, the class, the target schema
+        // and the destination installation all have to be the ones this request
+        // names, so a changed same-operation input is a conflict rather than a
+        // second allocation.
+        let store = self.open_registry_store().map_err(|_| {
+            "the installation registry could not be opened to admit the isolated destination"
+                .to_owned()
+        })?;
+        let capability = self.owner_lease.activation_capability();
+        if let Ok((retained, materialisation)) = store
+            .read_prepared_isolated_destination_creation(&capability, &facts.operation_id)
+        {
+            if retained.archive_id != facts.archive_id
+                || retained.archive_digest != facts.archive_digest
+                || retained.archive_class != facts.archive_class
+                || retained.target_schema_digest != facts.target_schema_digest
+                || retained.source_installation != facts.source_installation
+                || retained.destination_installation != facts.destination_installation
+                || materialisation.destination_installation != retained.destination_installation
+                || materialisation.destination_installation_root
+                    != retained.isolation.destination_installation_root
+            {
+                return Err(
+                    "a different isolated destination was already admitted for this operation, so \
+                     the request conflicts instead of allocating a second installation"
+                        .to_owned(),
+                );
+            }
+            return Ok(());
+        }
+
         let evidence = crate::backup_preparation::OwnerEvidence::inspect(&self.registry_host_root)
             .map_err(|_| {
                 "the source installation owner evidence could not be inspected, so no isolated \
@@ -6770,20 +6813,34 @@ impl HostComposition {
         )
         .map_err(Self::isolated_destination_reason)?;
 
-        // The admission is durable: this authority retains a PREPARED, UNACTIVATED
-        // destination installation for the operation, with the registry CAS
-        // revision fence and the live exclusive Host owner capability the
-        // authority requires of every mutation of its own projection.
-        let store = self.open_registry_store().map_err(|_| {
-            "the installation registry could not be opened to admit the isolated destination"
-                .to_owned()
-        })?;
-        let capability = self.owner_lease.activation_capability();
+        // The destination is now actually CREATED, through the installation
+        // authority's own create-new owned-directory publication, under the very
+        // retained protected-root lease the admission was proved against. The
+        // created object's own observed file identity and the admission digest it
+        // was created under come back together, so the recorded admission and the
+        // created root are the SAME fact rather than two facts a reader has to
+        // correlate. A refusal here is still PRE-EFFECT for the destination
+        // record: nothing is retained, and a publication that committed without a
+        // readable identity leaves the created root preserved, never removed by
+        // path name.
+        let materialisation =
+            eliot_installation::materialise_prepared_isolated_destination(
+                &allocation.admission,
+                &area_lease,
+            )
+            .map_err(Self::isolated_destination_reason)?;
+
+        // One compare-and-swap writes the admission and its materialisation
+        // together, under the registry CAS revision fence and the live exclusive
+        // Host owner capability the authority requires of every mutation of its
+        // own projection. Repeating the request with the same pair is idempotent
+        // and resolves the same verified destination.
         store
-            .record_prepared_isolated_destination(
+            .record_prepared_isolated_destination_creation(
                 &capability,
                 evidence.revision(),
                 &allocation.admission,
+                &materialisation,
             )
             .map(|_| ())
             .map_err(|_| {
@@ -6820,10 +6877,11 @@ impl HostComposition {
                  is not a new distinct isolated installation"
                     .to_owned()
             }
-            IsolatedDestinationError::Refused(IsolatedDestinationRefusal::UnapprovedTarget) => {
-                "the approved target build or profile could not be proved before allocation"
-                    .to_owned()
-            }
+            IsolatedDestinationError::Refused(
+                IsolatedDestinationRefusal::ForeignInstallationOwner,
+            ) => "the destination is inside a foreign installation's own contour, so this \
+                    operation does not own it"
+                .to_owned(),
             IsolatedDestinationError::Refused(IsolatedDestinationRefusal::ClassNotRestorable) => {
                 "the declared archive class is not an installation-backup class and cannot name an \
                  isolated restore destination"
@@ -6848,7 +6906,7 @@ impl HostComposition {
                 "an owner-issued backup record bound to this operation did not validate".to_owned()
             }
             IsolatedDestinationError::Installation(_) => {
-                "the installation authority could not produce the isolated destination allocation"
+                "the installation authority could not admit and materialise the isolated destination"
                     .to_owned()
             }
         }
