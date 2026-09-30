@@ -86,7 +86,6 @@ pub struct LiveLspCaptureInvocation<'a, G, C> {
     pub candidate_identity_after_run: Option<&'a eliot_lsp_bridge::CandidateIdentity>,
     pub build_fingerprint_after_run: Option<&'a eliot_lsp_bridge::BuildFingerprint>,
     pub after_run_source_proof: Option<eliot_lsp_bridge::LspSourceArtifactProof>,
-    pub invoked_at_unix_ms: u64,
     /// Owner completion wait. The daemon passes the exact operation ID after
     /// it has been accepted by the original process owner. Its evidence is
     /// only a scheduling barrier: the bridge performs a fresh original-owner
@@ -2226,7 +2225,6 @@ impl DaemonComposition {
             candidate_identity_after_run,
             build_fingerprint_after_run,
             after_run_source_proof,
-            invoked_at_unix_ms,
             await_terminal,
         } = invocation;
         let task_id = identity
@@ -2322,7 +2320,6 @@ impl DaemonComposition {
                 source_scope_after_run,
                 candidate_identity_after_run,
                 build_fingerprint_after_run,
-                invoked_at_unix_ms,
                 source_root,
                 after_run_source_proof,
                 &publisher,
