@@ -3481,11 +3481,30 @@ impl AgentFabric {
     /// Controller acknowledgement after a crash records no duplicate
     /// revision); any other reuse of the replacement identity conflicts.
     ///
+    /// #1702 W5: proposing the replacement also FREEZES the old wave's new
+    /// dispatch, for every disposition. A new execution identity under the
+    /// prior definition is refused from the moment this returns — under
+    /// `CANCEL` and `SUPERSEDE` that was already true through
+    /// [`AgentFabric::record_semantic_execution`], but under `DRAIN` it was
+    /// not, so a drain could admit unbounded fresh overlapping work under the
+    /// very definition it was draining. The freeze is the "new overlapping
+    /// work cannot start until old ownership and possible effects are
+    /// dispositioned" rule made reachable: only the held wave's EXISTING
+    /// executions keep their recorded state, and a drain keeps admitting
+    /// mechanical progress on them through
+    /// [`AgentFabric::check_semantic_execution_update`] while `CANCEL` and
+    /// `SUPERSEDE` stop it outright. Each held identity is named in the
+    /// ledger as `semantic_execution_new_dispatch_frozen`, so the hold is
+    /// visible without re-deriving the join.
+    ///
     /// The replacement revision and its supersession link are published as
     /// current only after the canonical Store transaction that durably persists
     /// them committed; see [`AgentFabric::register_semantic_definition`] for
     /// the ordering this preserves. The prior frozen record stays verbatim, so
-    /// the durable history and the published history are the same bytes.
+    /// the durable history and the published history are the same bytes. If
+    /// admission of the replacement later fails, the prior records and the link
+    /// are still exactly what they were: the old wave is held, not resurrected,
+    /// and nothing here revives it.
     ///
     /// # Errors
     ///
@@ -3543,6 +3562,25 @@ impl AgentFabric {
                 "replacement semantic definition {next_key} already registered"
             )));
         }
+        // #1702 W5: item 5 requires the old execution's NEW dispatch to be
+        // frozen the moment the replacement is proposed, for EVERY
+        // disposition — not only for `CANCEL` and `SUPERSEDE`. `DRAIN` keeps
+        // the old wave's mechanical progress admissible, but a new execution
+        // identity under the prior definition is overlapping work starting
+        // before the old ownership and its possible effects are dispositioned,
+        // which item 5 forbids outright. Freezing it here is what makes the
+        // disposition a real hold rather than a label: without this a drain
+        // could admit unlimited fresh waves under the definition it is
+        // draining, and each of those would be a new launch the replacement
+        // was supposed to account for. The frozen executions themselves are
+        // retained verbatim, so a drain's in-flight work, partial results and
+        // unknown effects all survive and are still reconciled.
+        let held: Vec<String> = self
+            .semantic_executions
+            .iter()
+            .filter(|(_, execution)| execution.definition_id.as_str() == prior_key.as_str())
+            .map(|(key, _)| key.clone())
+            .collect();
         self.semantic_definitions.insert(next_key.clone(), next);
         self.semantic_supersessions.insert(next_key.clone(), link);
         // #1702 W2: the replacement and its old-wave disposition are two
@@ -3557,6 +3595,12 @@ impl AgentFabric {
             return Err(error);
         }
         self.record("semantic_definition_superseded", &next_key);
+        // The ledger names what the disposition now holds, so a reader can see
+        // which old waves stopped taking new identities without having to
+        // re-derive it from the join.
+        for key in held {
+            self.record("semantic_execution_new_dispatch_frozen", &key);
+        }
         Ok(())
     }
 
