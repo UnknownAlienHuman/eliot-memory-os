@@ -11,7 +11,7 @@ pub enum CapturedLspEvidenceError {
     /// The live Governor owner is not ready for semantic evidence adoption.
     #[error("Governor composition is not ready")]
     GovernorNotReady,
-    /// CodeCortex rejected the exact captured envelope/chunk/task/causal join.
+    /// `CodeCortex` rejected the exact captured envelope/chunk/task/causal join.
     #[error("CodeCortex refused captured LSP evidence: {0}")]
     CodeCortex(#[from] CodeCortexError),
 }

@@ -2018,7 +2018,7 @@ impl DaemonComposition {
                 payload_ref: reference.clone(),
                 now: context.now,
             };
-            let admission = self.governor.admit_source_artifact_read(request)?;
+            let admission = self.governor.admit_source_artifact_read(&request)?;
             if admission.causal() != &context.causal_binding {
                 return Err(CapturedLspAdoptionError::CurrentCausalChanged);
             }
