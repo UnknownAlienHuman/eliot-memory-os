@@ -30,7 +30,9 @@ use eliot_installation::InstallationProfile;
 #[cfg(windows)]
 use eliot_kernel_core::user_automation::{UserAutomationTrigger, UserAutomationTriggerOrigin};
 #[cfg(windows)]
-use eliot_kernel_service::{UserAutomationHostExecutionOperation, UserAutomationHostExecutionRequest};
+use eliot_kernel_service::{
+    UserAutomationHostExecutionOperation, UserAutomationHostExecutionRequest,
+};
 #[cfg(windows)]
 use eliot_platform::PlatformHandle;
 #[cfg(windows)]
@@ -1928,11 +1930,14 @@ fn process_user_automation_request(
 ///
 /// The runtime-control and execution-pipe planes carry no authenticated
 /// caller/principal field and no Watchdog-origin discriminator, so this loop
-/// cannot attribute a carrier to `CliRequest`, `UiRequest`, or
-/// `WatchdogRegisteredActivity`. Those producers belong to the endpoint and
-/// contract owners: the endpoint must propagate the authenticated peer
-/// identity onto the envelope, and the Watchdog carrier owner must attest
-/// the watchdog origin (or demand-start Host through a real caller).
+/// cannot attribute a carrier to `UiRequest` or `WatchdogRegisteredActivity`,
+/// and it never mints `CliRequest`: the local CLI trigger is produced only
+/// where the CLI actually arrives, the console/stdin plane
+/// (`admit_console_trigger`). The two remaining producers belong to the
+/// endpoint and contract owners: the endpoint must propagate the
+/// authenticated peer identity onto the envelope, and the Watchdog carrier
+/// owner must attest the watchdog origin (or demand-start Host through a
+/// real caller).
 #[cfg(windows)]
 fn process_user_automation_owner_requests(
     host: &mut HostComposition,
@@ -1972,7 +1977,10 @@ fn process_user_automation_owner_requests(
         triggers
     };
     for (trigger, evidence) in &triggers {
-        if idle_drain.note_observable_use(host, *trigger, evidence).is_err() {
+        if idle_drain
+            .note_observable_use(host, *trigger, evidence)
+            .is_err()
+        {
             let _ = writeln!(
                 io::stderr().lock(),
                 "eliot-host: UserAutomation owner queue drain skipped: the observable-use admission failed and the envelopes stay queued"
@@ -2076,7 +2084,10 @@ fn execution_proves_scheduled_wake(execution: &UserAutomationHostExecutionReques
     match &execution.operation {
         UserAutomationHostExecutionOperation::AdmitOccurrence { request } => {
             request.invocation.trigger_origin == UserAutomationTriggerOrigin::ScheduledWake
-                && matches!(request.invocation.trigger, UserAutomationTrigger::Scheduled { .. })
+                && matches!(
+                    request.invocation.trigger,
+                    UserAutomationTrigger::Scheduled { .. }
+                )
                 && request.invocation.child_depth == 0
         }
         _ => false,

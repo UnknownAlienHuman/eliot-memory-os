@@ -233,6 +233,10 @@ pub enum ActivationTriggerClass {
     /// `eliot` CLI request from an authenticated user session.
     CliRequest,
     /// Native UI request over the role-filtered ControlBoard/Operator contract.
+    /// No UI ingress reaches Host in-tree, so this class has no producer here:
+    /// STITCH caller is the ControlBoard/Operator contract owner
+    /// (`crates/agent`, `crates/governor`), which must propagate the
+    /// authenticated UI identity onto a Host-visible envelope.
     UiRequest,
     /// Agent bridge / MCP attach or tool call.
     AgentBridgeAttach,
@@ -244,6 +248,12 @@ pub enum ActivationTriggerClass {
     ProtectedExternalEffect,
     /// Watchdog observation of a registered agent/bridge event requiring
     /// reconciliation.
+    /// No Watchdog observation ingress reaches Host in-tree (Watchdog demand-starts
+    /// Host only via a persisted signed `WakeIntent` plus SCM start, which this
+    /// process consumes as `ScheduledWake`), so this class has no producer here:
+    /// STITCH caller is the Watchdog carrier owner, which must attest the
+    /// watchdog origin on a Host-visible envelope, or the Governor-owned spool
+    /// journal path.
     WatchdogRegisteredActivity,
     /// Task Scheduler wake created by an admitted `WakeIntent`.
     ScheduledWake,
@@ -1227,10 +1237,11 @@ impl HostComposition {
     /// next-generation demand. The cross-process arm itself — the
     /// installer-admitted Task Scheduler Host-wake registration firing
     /// `StartService(eliot-host)`, consumed on startup as `ScheduledWake` —
-    /// is STITCH work outside this path scope: no general Host-wake
-    /// scheduler publisher exists in-tree (the only Task Scheduler route is
-    /// the fixed watchdog-fallback task, which cannot be reused for Host
-    /// wake), and this module creates no second scheduler or authority.
+    /// is STITCH work outside this path scope: no Host-wake scheduler
+    /// publisher exists in-tree (the in-tree Task Scheduler routes — the
+    /// per-user launcher supervision and the signed notify fallback — belong
+    /// to other lifecycles and cannot be reused for Host wake), and this
+    /// module creates no second scheduler or authority.
     ///
     /// # Errors
     ///
