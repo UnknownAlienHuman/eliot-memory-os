@@ -1230,7 +1230,7 @@ fn live_fence(
 /// Admits one retained trigger intake through live Kernel authority.
 ///
 /// Re-validates the session, proves the record's delivery obligation names
-/// a durably staged ORS envelope through the existing ORS owner, then
+/// a durably staged ORS inbox item through the existing ORS owner, then
 /// delegates to [`MaintenanceTriggerDeliveryLedger::admit_intake`]: the
 /// complete opaque input must already be staged, exact identity/hash replay
 /// returns the same staging receipt, and changed content conflicts. Any
@@ -1246,6 +1246,7 @@ pub fn handle_maintenance_trigger_intake(
     session.service_context(service)?;
     prove_maintenance_trigger_staging(
         store,
+        &record.trigger_id,
         &record.payload.envelope_reference,
         &record.payload.payload_hash,
     )?;
