@@ -3544,6 +3544,52 @@ fn map_parent_cancellation_disposition(
     }
 }
 
+/// Builds the dispatch frame for one prepared invoke envelope.
+///
+/// Extracted verbatim from `invoke` (issue #77 W8): the settled-marking wraps
+/// added lines to an already-long dispatch entry, so the frame match lives
+/// here to keep the entry under the length lint. Behavior unchanged: every
+/// arm returns the same frame or the same typed failure.
+fn invoke_request_frame(
+    request: &HostInvocationRequest,
+    envelope: &HostRequestEnvelope,
+    facts: &TransportFacts,
+) -> Result<Frame, PortFailure> {
+    Ok(match canonical_dispatch_entry(&request.tool) {
+        CanonicalDispatchEntry::InvokeRead => {
+            host_request_invoke_read_frame(request, envelope, facts)?
+        }
+        CanonicalDispatchEntry::SubmitAdmitOnly { .. } => host_request_frame_for_envelope(
+            AGENT_HOST_REQUEST_SUBMIT_OPERATION,
+            envelope,
+            facts,
+        )?,
+        CanonicalDispatchEntry::SubmitActGated { .. } => {
+            revalidate_act_dispatch(request, envelope, facts)?;
+            host_request_frame_for_envelope(
+                AGENT_HOST_REQUEST_SUBMIT_OPERATION,
+                envelope,
+                facts,
+            )?
+        }
+        CanonicalDispatchEntry::SubmitCoordinateGated { .. } => {
+            revalidate_coordinate_dispatch(request, envelope, facts)?;
+            host_request_frame_for_envelope(
+                AGENT_HOST_REQUEST_SUBMIT_OPERATION,
+                envelope,
+                facts,
+            )?
+        }
+        CanonicalDispatchEntry::SubmitCarryingBytes => {
+            host_request_user_automation_frame(request, envelope, facts)?
+        }
+        CanonicalDispatchEntry::SubmitObservePair => {
+            revalidate_observe_dispatch(request, envelope, facts)?;
+            host_request_observe_submit_frame(request, envelope, facts)?
+        }
+    })
+}
+
 impl KernelHostRequestPort for KernelHostRequestClient {
     #[expect(
         clippy::too_many_lines,
@@ -3608,47 +3654,7 @@ impl KernelHostRequestPort for KernelHostRequestClient {
             let outcome = self.probe_settles_invocation(&facts, &session, &envelope, now_ms);
             return self.record_settled(correlation.as_str(), outcome);
         }
-        let frame = match canonical_dispatch_entry(&request.tool) {
-            CanonicalDispatchEntry::InvokeRead => {
-                host_request_invoke_read_frame(request, &envelope, &facts)?
-            }
-            CanonicalDispatchEntry::SubmitAdmitOnly { .. } => host_request_frame_for_envelope(
-                AGENT_HOST_REQUEST_SUBMIT_OPERATION,
-                &envelope,
-                &facts,
-            )?,
-            CanonicalDispatchEntry::SubmitActGated { .. } => {
-                revalidate_act_dispatch(request, &envelope, &facts)?;
-                host_request_frame_for_envelope(
-                    AGENT_HOST_REQUEST_SUBMIT_OPERATION,
-                    &envelope,
-                    &facts,
-                )?
-            }
-            CanonicalDispatchEntry::SubmitCoordinateGated { .. } => {
-                revalidate_coordinate_dispatch(request, &envelope, &facts)?;
-                host_request_frame_for_envelope(
-                    AGENT_HOST_REQUEST_SUBMIT_OPERATION,
-                    &envelope,
-                    &facts,
-                )?
-            }
-            CanonicalDispatchEntry::SubmitStateGated { .. } => {
-                revalidate_state_dispatch(request, &envelope, &facts)?;
-                host_request_frame_for_envelope(
-                    AGENT_HOST_REQUEST_SUBMIT_OPERATION,
-                    &envelope,
-                    &facts,
-                )?
-            }
-            CanonicalDispatchEntry::SubmitCarryingBytes => {
-                host_request_user_automation_frame(request, &envelope, &facts)?
-            }
-            CanonicalDispatchEntry::SubmitObservePair => {
-                revalidate_observe_dispatch(request, &envelope, &facts)?;
-                host_request_observe_submit_frame(request, &envelope, &facts)?
-            }
-        };
+        let frame = invoke_request_frame(request, &envelope, &facts)?;
         let reply = match self.exchange(&frame) {
             Ok(reply) => reply,
             Err(error @ PortFailure::AgentResponse { .. }) => return Err(error),
