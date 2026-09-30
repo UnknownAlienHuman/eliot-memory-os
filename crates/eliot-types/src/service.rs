@@ -183,11 +183,24 @@ pub enum IpcHandshakeReason {
 
 /// One IPC frame envelope.
 ///
-/// `payload_inline` is explicitly bounded inert data: it is a caller-supplied
-/// transport body addressed by `payload_ref`/`payload_hash` and size-bounded by
-/// `IpcConfig::max_frame_bytes` at the owning server. It carries no authority,
-/// lifecycle, or health meaning, so it is not a protected typed payload. The
-/// envelope fields themselves are closed.
+/// `payload_inline` is explicitly bounded inert data, not a protected typed
+/// payload, and stays an untyped `Value` on purpose. Its shape belongs to the
+/// producer and the named reader of each frame kind, not to this envelope: the
+/// three production writers of a `payload_inline` body emit three mutually
+/// incompatible shapes — the accepted acknowledgement from
+/// `NamedPipeIpcServer::handle_frame`, the error body from its `error_frame`
+/// reply, and the health body built by the `ipc smoke` command — so no single
+/// owning record type exists here, and `IpcFrameKind` does not determine the
+/// body. Re-typing the field would invent a payload union no owner specified
+/// and would break every one of those writers.
+///
+/// The bound that does apply is the envelope's own: `payload_hash` is computed
+/// by the producer over the body it emitted, and the serialized frame is
+/// size-bounded by `IpcConfig::max_frame_bytes` at the owning server. The
+/// envelope fields are closed, and no production byte ingress decodes this type
+/// today — the shipped IPC contours decode their own handshake and request
+/// types — so an attacker-supplied body cannot reach a trusted state through
+/// this envelope.
 ///
 /// `protocol_version` on this envelope is not decode-pinned, unlike the
 /// `StartupHealthReport` version in `health.rs`. Two owners write it and they do
