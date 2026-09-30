@@ -351,6 +351,45 @@ impl<'a> AuthenticatedKernelJobPort<'a> {
         &self.admission
     }
 
+    /// Decodes the production semantic input from the Kernel-staged inline bytes.
+    ///
+    /// The claim port already proved these bytes: the staged envelope check
+    /// digest-verified `semantic_input_bytes` against the owner
+    /// `semantic_input` reference at claim time, so this performs no second
+    /// digest check and no transport. It only interprets the verified bytes
+    /// as the closed owner [`DreamJobInput`] shape: `deny_unknown_fields`
+    /// rejects any foreign encoding (including `UserAutomation` content, which
+    /// is never a Dreamer orientation payload), the owner
+    /// `DreamJobInput::validate` bounds run through the existing denial
+    /// mapping, and the decoded job is bound to this exact claim (`job_id`,
+    /// `scope_id`, and `state_fence` must match the staged material, mirroring
+    /// [`KernelSupervisedComposition::submit`]).
+    ///
+    /// Returns `Ok(None)` when the Kernel staged no inline bytes: a worker
+    /// launched without a job still reports its proved disposition through
+    /// `status` rather than inventing one. Every other absence is a typed
+    /// fail-closed refusal, never a fabricated value: undecodable bytes,
+    /// owner-invalid bounds, or a foreign identity refuse instead of
+    /// defaulting a single field.
+    pub fn staged_job_input(&self) -> Result<Option<DreamJobInput>, DreamerError> {
+        let Some(bytes) = self.material.semantic_input_bytes.as_ref() else {
+            return Ok(None);
+        };
+        let job: DreamJobInput = serde_json::from_slice(bytes).map_err(|_| {
+            DreamerError::InvalidAdmission("staged semantic input is not a closed dream job input")
+        })?;
+        job.validate().map_err(|error| job_denied(&error))?;
+        if job.job_id != self.material.job_id
+            || job.scope_id != self.material.scope_id
+            || job.state_fence != self.material.fence
+        {
+            return Err(DreamerError::KernelAdmissionRequired(
+                "staged semantic input is not bound to the claimed dreamer job".to_owned(),
+            ));
+        }
+        Ok(Some(job))
+    }
+
     /// Refuses any admission that is not the claimed dreamer job.
     fn check_claimed(&self, admission: &KernelJobAdmission) -> Result<(), DreamerError> {
         admission.validate()?;
