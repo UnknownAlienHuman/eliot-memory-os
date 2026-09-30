@@ -51,8 +51,7 @@ use eliot_platform_windows::{NamedPipePeerExpectation, observe_named_pipe_peer_p
 use eliot_platform_windows::ProtectedSecret;
 #[cfg(windows)]
 use eliot_ors::{
-    OperationalRecoveryStore, RecoveryCursor, RecoveryPayload, ReservationState,
-    StateFenceSnapshot,
+    RecoveryPayload, ReservationState, StateFenceSnapshot,
 };
 #[cfg(windows)]
 use std::fmt;
@@ -488,20 +487,33 @@ impl KernelComposition {
     /// Resumes only new, exact full-operation Observe reservations after the
     /// existing Store and ORS recovery pass has established their denominator.
     /// Legacy transition-only records and uncertain send states stay on the
-    /// receipt-only path; they are never reconstructed from current heads.
+    /// receipt-only path. Complete original operations are decoded only from
+    /// their protected reservation payload and are never reconstructed from
+    /// current heads.
     #[cfg(windows)]
     pub(crate) async fn resume_staged_observe_reservations(
         &self,
         gateway: &Arc<KernelStoreGateway>,
+        inventory: &eliot_kernel_service::StagedWriteRecovery,
     ) -> Result<(), String> {
-        let cursor = RecoveryCursor::new(0, eliot_ors::MAX_RECOVERY_PAGE)
-            .map_err(|error| error.to_string())?;
-        let page = self
-            .generation_gateway
-            .ors
-            .recover_page(cursor)
-            .map_err(|error| error.to_string())?;
-        for reservation in page.records {
+        for staged in &inventory.envelopes {
+            let operation_identity =
+                eliot_ors::OperationIdentity::new(staged.operation_id.as_str())
+                    .map_err(|error| error.to_string())?;
+            let Some(reservation) = self
+                .generation_gateway
+                .ors
+                .load_write_reservation_by_operation(&operation_identity)
+                .map_err(|error| error.to_string())?
+            else {
+                continue;
+            };
+            if reservation.token.operation_id != operation_identity
+                || reservation.token.reservation_order != staged.reservation_order
+                || reservation.state != staged.state
+            {
+                continue;
+            }
             if matches!(
                 reservation.state,
                 ReservationState::Reserved
@@ -556,8 +568,8 @@ impl KernelComposition {
         let staged_access = envelope.privacy_and_visibility_class.clone();
         let ciphertext = match envelope.payload {
             RecoveryPayload::Encrypted { key, ciphertext }
-                if key.provider.as_str() == "kernel-reservation-key"
-                    && key.key.as_str() == "store-write-reservation-v1" =>
+                if key.provider.as_str() == "dpapi"
+                    && key.key.as_str() == "current-user" =>
             {
                 ciphertext
             }
@@ -572,7 +584,9 @@ impl KernelComposition {
         let operation: super::daemon_request_dispatch::StoreApplyOperation =
             serde_json::from_slice(&original_bytes).map_err(|error| error.to_string())?;
         if canonical_json_bytes(&operation).map_err(|error| error.to_string())? != original_bytes
-            || eliot_contracts::sha256_hex(&original_bytes) != token.prepared_transition_sha256
+            || eliot_store_api::prepared_transition_digest(&operation.transition)
+                .map_err(|error| error.to_string())?
+                != token.prepared_transition_sha256
             || operation.context.state_fence != state_fence
             || operation.transition.identity.operation_id.as_str() != token.operation_id.as_str()
         {
