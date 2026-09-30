@@ -261,7 +261,9 @@ fn read_small_text(path: &Path) -> Option<String> {
     if bytes.len() > 4096 {
         return None;
     }
-    String::from_utf8(bytes).ok().map(|text| text.trim().to_owned())
+    String::from_utf8(bytes)
+        .ok()
+        .map(|text| text.trim().to_owned())
 }
 
 fn read_head_in(git_dir: &Path) -> Option<(String, String)> {
@@ -674,11 +676,8 @@ pub(crate) fn confirm_hint(
     }
     let after_digest = verification.reread.digest().map(str::to_owned);
     let before_digest = verification.before_digest.clone();
-    let (change_id, transition_digest) = material_transition_ids(
-        hint_id,
-        before_digest.as_deref(),
-        after_digest.as_deref(),
-    );
+    let (change_id, transition_digest) =
+        material_transition_ids(hint_id, before_digest.as_deref(), after_digest.as_deref());
     let mut ledger = ledger()?;
     let (resource, origin) = ledger
         .hints
@@ -703,10 +702,7 @@ pub(crate) fn confirm_hint(
             ResourceTip {
                 digest: before_digest,
                 head_commit: verification.git.as_ref().map(|git| git.head_after.clone()),
-                repository: verification
-                    .git
-                    .as_ref()
-                    .map(|git| git.repository.clone()),
+                repository: verification.git.as_ref().map(|git| git.repository.clone()),
             },
         );
         return Ok(HintConfirmation::VerifiedImmaterial);
@@ -755,10 +751,7 @@ pub(crate) fn confirm_hint(
             ResourceTip {
                 digest: after_digest,
                 head_commit: verification.git.as_ref().map(|git| git.head_after.clone()),
-                repository: verification
-                    .git
-                    .as_ref()
-                    .map(|git| git.repository.clone()),
+                repository: verification.git.as_ref().map(|git| git.repository.clone()),
             },
         );
     }
@@ -1207,11 +1200,8 @@ pub(crate) fn note_unresolved_transition(
     {
         return Err(ChangeMonitorError::InvalidHint);
     }
-    let (change_id, transition_digest) = material_transition_ids(
-        &format!("cmx:{operation}"),
-        before_digest.as_deref(),
-        None,
-    );
+    let (change_id, transition_digest) =
+        material_transition_ids(&format!("cmx:{operation}"), before_digest.as_deref(), None);
     let mut ledger = ledger()?;
     match ledger.unknown.entry(change_id.clone()) {
         Entry::Vacant(slot) => {
@@ -1287,7 +1277,8 @@ pub(crate) fn persist_ledger_sidecar() -> Result<(), ChangeMonitorError> {
         format_version: LEDGER_SIDECAR_FORMAT_VERSION,
         ledger: ledger.clone(),
     })?;
-    let bytes = serde_json::to_vec(&snapshot).map_err(|_| ChangeMonitorError::SidecarUnavailable)?;
+    let bytes =
+        serde_json::to_vec(&snapshot).map_err(|_| ChangeMonitorError::SidecarUnavailable)?;
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -1403,12 +1394,18 @@ fn validate_imported_ledger(ledger: &KernelChangeLedger) -> Result<(), ChangeMon
         }
     }
     for tip in ledger.tips.values() {
-        if tip.digest.as_deref().is_some_and(|digest| !is_sha256_hex(digest))
+        if tip
+            .digest
+            .as_deref()
+            .is_some_and(|digest| !is_sha256_hex(digest))
             || tip
                 .head_commit
                 .as_deref()
                 .is_some_and(|commit| !is_git_sha(commit))
-            || tip.repository.as_deref().is_some_and(|repository| !text(repository))
+            || tip
+                .repository
+                .as_deref()
+                .is_some_and(|repository| !text(repository))
         {
             return Err(ChangeMonitorError::SidecarCorrupt);
         }
