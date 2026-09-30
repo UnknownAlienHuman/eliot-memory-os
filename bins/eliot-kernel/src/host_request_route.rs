@@ -2729,6 +2729,19 @@ impl KernelComposition {
         }
         // Issue #1837: durable audit evidence for queue admission.
         self.audit_observe(AuditEventDraft::queue_local_read_enqueued(envelope, queued));
+        // Issue #1745 R7 persistence tail: the freshly staged pair's
+        // dispatch-owned exposure evidence (eligible/selected from the
+        // admission owner above; every other stage explicitly unresolved)
+        // persists through the existing observation path under the
+        // operation:digest idempotency lineage. Replays never reach this
+        // arm — `AlreadyStaged` returns early above and conflicting
+        // identities fail — so a replay reconciles the recorded original
+        // without new evidence. Best-effort like every observation: a
+        // populate failure is terminal-visible but never changes the staged
+        // admission.
+        super::tool_exposure::observe_dispatch_exposure(envelope, tool, &admission, |draft| {
+            self.audit_observe(draft);
+        });
         // I16.5 (issue #1841): the queue gauges are read from the owner's own
         // live index at admission, so a sample measures the current contour
         // rather than a total carried forward.
