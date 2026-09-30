@@ -56,6 +56,7 @@ mod blob_store_controller;
 mod canonical_store_runtime;
 mod composition_bootstrap;
 mod control_plane;
+mod module_build_provenance_owner;
 /// Kernel problem-diagnostic projection (issue #1844; I16.7): the bounded
 /// `LogWindowRef`/`DiagnosticBrief` compiler over the canonical audit chain
 /// and the captured operational log windows. It emits references, gaps, and
@@ -308,6 +309,7 @@ use daemon_supervision::{
     daemon_restart_refusal_reason,
 };
 use generation_recovery::OrsGenerationCoordinator;
+use module_build_provenance_owner::ModuleBuildProvenanceOwner;
 #[cfg(test)]
 use generation_recovery::update_handshake_policy;
 #[cfg(windows)]
@@ -390,6 +392,7 @@ use eliot_kernel_service::{
     HostStartupEvidence, HostStoreBootstrapRequirement, KERNEL_CONTROL_PIPE,
     KernelActivationPermit, KernelActivationReceipt, KernelControlCommand, KernelControlRequest,
     KernelControlResponse, KernelReadyReceipt, KernelService, KernelServiceError,
+    ModuleBuildProvenanceRecord,
     KernelServiceState, ProcessAuthorityHandoffDescriptor, ProcessExecutionRequest,
     ProcessExecutionResponse, ProcessObservation, StoreBootstrapHandoff,
     USER_AUTOMATION_KERNEL_CAPABILITY, USER_AUTOMATION_KERNEL_MODULE_ID,
@@ -636,6 +639,9 @@ pub struct KernelComposition {
     generations: Mutex<GenerationRouter>,
     generation_poison: Mutex<Option<String>>,
     front_door_policy: Mutex<ServerHandshakePolicy>,
+    /// Complete Host journal rows retained only for the exact authenticated
+    /// installation, candidate, generation, and state fence that admitted them.
+    module_build_provenance: Mutex<ModuleBuildProvenanceOwner>,
     process_gateway: Option<Arc<ProcessExecutionGateway>>,
     store_bootstrap: Option<HostStoreBootstrapRequirement>,
     daemon_launch: Option<EliotdLaunchDescriptor>,

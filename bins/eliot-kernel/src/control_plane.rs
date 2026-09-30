@@ -327,7 +327,16 @@ impl KernelComposition {
         };
         #[cfg(windows)]
         self.validate_store_rebind_admission(&request)?;
-        {
+        let host_evidence_report =
+            if let KernelControlCommand::ReportHostStartupEvidence(evidence) = &request.command {
+                evidence
+                    .validate(&request.candidate, request.generation)
+                    .map_err(|_| TransportError::SessionFenced)?;
+                Some(evidence)
+            } else {
+                None
+            };
+        let active_state_fence = {
             let mut policy = self
                 .front_door_policy
                 .lock()
@@ -367,7 +376,44 @@ impl KernelComposition {
                 policy.module_generation.state_fence =
                     StateFence::new(request.candidate.kernel_epoch.clone(), request.generation);
             }
-        }
+            let active_state_fence = policy.module_generation.state_fence.clone();
+            let mut provenance_owner = self
+                .module_build_provenance
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            if let Some(evidence) = host_evidence_report {
+                if evidence.startup_evidence.state_fence != active_state_fence {
+                    return Err(TransportError::SessionFenced.into());
+                }
+                if let Some(rows) = evidence.module_build_provenance.as_deref() {
+                    provenance_owner
+                        .admit_rows(
+                            &request.candidate,
+                            request.generation,
+                            &active_state_fence,
+                            rows,
+                        )
+                        .map_err(|_| TransportError::SessionFenced)?;
+                } else {
+                    provenance_owner
+                        .observe_scope(
+                            &request.candidate,
+                            request.generation,
+                            &active_state_fence,
+                        )
+                        .map_err(|_| TransportError::SessionFenced)?;
+                }
+            } else {
+                provenance_owner
+                    .observe_scope(
+                        &request.candidate,
+                        request.generation,
+                        &active_state_fence,
+                    )
+                    .map_err(|_| TransportError::SessionFenced)?;
+            }
+            active_state_fence
+        };
         // I1.5 (#1750): a new candidate activation contour invalidates the
         // recorded independent-supervision evidence. The previous observation
         // belonged to the previous activation generation, host epoch, and
@@ -383,9 +429,6 @@ impl KernelComposition {
                 .map_err(|_| TransportError::SessionFenced)?;
         }
         if let KernelControlCommand::ReportHostStartupEvidence(evidence) = &request.command {
-            evidence
-                .validate(&request.candidate, request.generation)
-                .map_err(|_| TransportError::SessionFenced)?;
             // I1.5/A8.1: this carrier is the one owner-correct route by which a
             // Host-observed Watchdog branch reaches Kernel. Host just
             // revalidated the live SCM Watchdog incarnation (bound PID/start
@@ -396,8 +439,7 @@ impl KernelComposition {
             // Material/Critical admission.
             #[cfg(windows)]
             {
-                let target =
-                    StateFence::new(request.candidate.kernel_epoch.clone(), request.generation);
+                let target = active_state_fence.clone();
                 self.admit_host_observed_watchdog_branch(
                     &evidence.startup_evidence,
                     &request.candidate,
@@ -405,10 +447,20 @@ impl KernelComposition {
                 )
                 .map_err(|_| TransportError::SessionFenced)?;
             }
-            // Typed provenance rows are validated as transport input above.
-            // They are not an I1.11 probe and have no Kernel candidate
-            // admission/readback owner yet, so this path does not turn them
-            // into startup or generation authority.
+            if let Some(rows) = evidence.module_build_provenance.as_deref() {
+                for row in rows {
+                    let retained = self
+                        .readback_host_module_build_provenance(
+                            &request.candidate,
+                            request.generation,
+                            row.module_id.as_str(),
+                        )?
+                        .ok_or(TransportError::SessionFenced)?;
+                    if retained.as_ref() != Some(row) {
+                        return Err(TransportError::SessionFenced.into());
+                    }
+                }
+            }
             self.consume_host_startup_evidence(&evidence.startup_evidence)?;
         }
         if let Some(handoff) = bootstrap {
@@ -1446,6 +1498,37 @@ impl KernelComposition {
                 .map_err(|_| TransportError::SessionFenced)?;
         }
         Ok(())
+    }
+
+    /// Reads one complete Host journal row back from the composition-local
+    /// owner while the active Kernel fence remains locked and current.
+    fn readback_host_module_build_provenance(
+        &self,
+        candidate: &HostKernelCandidateBinding,
+        generation: ResourceGeneration,
+        module_id: &str,
+    ) -> Result<Option<ModuleBuildProvenanceRecord>, TransportError> {
+        let policy = self
+            .front_door_policy
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if policy.module_generation.generation != generation
+            || policy.module_generation.state_fence.resource_generation != generation
+            || !candidate
+                .kernel_epoch
+                .is_same_authority(&policy.module_generation.state_fence.authority_epoch)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let state_fence = policy.module_generation.state_fence.clone();
+        let mut owner = self
+            .module_build_provenance
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        owner.revoke_if_fence_moved(generation, &state_fence);
+        owner
+            .readback(candidate, generation, &state_fence, module_id)
+            .map_err(|_| TransportError::SessionFenced)
     }
 
     /// Returns the runtime's protected-control capacity.

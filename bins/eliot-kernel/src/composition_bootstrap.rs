@@ -1629,6 +1629,7 @@ impl KernelComposition {
             generations: Mutex::new(generations),
             generation_poison: Mutex::new(None),
             front_door_policy: Mutex::new(policy),
+            module_build_provenance: Mutex::new(ModuleBuildProvenanceOwner::default()),
             process_gateway,
             store_bootstrap,
             daemon_active_launch: Mutex::new(daemon_launch.clone()),

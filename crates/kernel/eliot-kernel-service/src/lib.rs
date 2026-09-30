@@ -16,6 +16,8 @@
 use std::future::Future;
 use std::pin::Pin;
 
+pub use eliot_host_state::ModuleBuildProvenanceRecord;
+
 #[cfg(windows)]
 mod commit_recovery;
 #[cfg(windows)]
