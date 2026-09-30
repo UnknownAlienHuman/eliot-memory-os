@@ -1359,6 +1359,94 @@ pub enum CompositionError {
     Kernel(#[from] KernelPortError),
 }
 
+/// The Task Controller's verifier decision for one current plan revision.
+///
+/// The previous representation was `Option<CanonicalVerifierPlanBinding>`, which
+/// cannot say *which* of two different situations it is reporting: a Task
+/// Controller that has not yet decided a verifier request contract for this plan
+/// revision, or a plan whose recorded decision has been lost. Issue #1741 made
+/// that distinction load-bearing — with a bare `None` the finish path could not
+/// tell a pending decision from a dead task, and the idempotence check in
+/// `prepare_current_plan_admission` would absorb a later owner decision and leave
+/// the task permanently unable to produce verifier-bound evidence.
+///
+/// A closed, two-member state makes the distinction explicit and keeps both
+/// refusals:
+///
+/// * `Undecided` is the honest owner state before any decision. It carries an
+///   explicit reason reference, so a consumer's refusal names the missing owner
+///   decision instead of reporting a corrupt or absent binding.
+/// * `Decided` is the exact owner-issued request contract, validated by its own
+///   existing `validate`.
+///
+/// No consumer may read a verifier out of `Undecided`: every one that needs a
+/// verifier goes through [`CanonicalPlanBinding::verifier_binding`], which
+/// refuses with a typed `CompositionError` naming the state it found. The
+/// requirement itself is unchanged; only the reason it is refused is now
+/// nameable.
+///
+/// Nothing in this crate authors a `Decided` value. The state is reachable from
+/// persisted owner bytes, exactly as `CanonicalVerifierPlanBinding` itself is, and
+/// `GovernorFinishAttempt::admit_task_controller_plan` carries a retained
+/// decision forward verbatim rather than authoring or discarding one.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case", tag = "verifier_state")]
+pub enum CanonicalVerifierPlanState {
+    /// The Task Controller has published no verifier request contract for this
+    /// plan revision. `reason_ref` is the owner-side reference explaining that,
+    /// not a synthesized label.
+    Undecided { reason_ref: String },
+    /// The Task Controller published this exact verifier request contract.
+    Decided {
+        binding: CanonicalVerifierPlanBinding,
+    },
+}
+
+impl CanonicalVerifierPlanState {
+    /// The owner-side reference recorded when no verifier decision exists.
+    ///
+    /// This is the only value [`Self::default`] produces, and it names the
+    /// absent owner decision rather than standing in for one.
+    pub const NO_VERIFIER_DECISION_REF: &'static str =
+        "task-controller-published-no-verifier-request-contract";
+
+    /// Validates the state and, when decided, the exact owner-issued contract.
+    pub fn validate(&self) -> Result<(), CompositionError> {
+        match self {
+            Self::Undecided { reason_ref } => {
+                if reason_ref.trim().is_empty() || reason_ref.chars().any(char::is_control) {
+                    return Err(CompositionError::Recovery(
+                        "canonical plan verifier state has an empty or malformed decision reference"
+                            .to_owned(),
+                    ));
+                }
+                Ok(())
+            }
+            Self::Decided { binding } => binding.validate(),
+        }
+    }
+
+    /// The exact owner-issued request contract, or a typed refusal that names the
+    /// state it found.
+    pub fn binding(&self) -> Result<&CanonicalVerifierPlanBinding, CompositionError> {
+        match self {
+            Self::Decided { binding } => Ok(binding),
+            Self::Undecided { reason_ref } => Err(CompositionError::Recovery(format!(
+                "canonical plan carries no verifier request contract because the Task Controller \
+                 has published none for this plan revision ({reason_ref})"
+            ))),
+        }
+    }
+}
+
+impl Default for CanonicalVerifierPlanState {
+    fn default() -> Self {
+        Self::Undecided {
+            reason_ref: Self::NO_VERIFIER_DECISION_REF.to_owned(),
+        }
+    }
+}
+
 /// Exact current Canonical plan identity retained by the Governor owner.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1367,15 +1455,23 @@ pub struct CanonicalPlanBinding {
     pub plan_revision: String,
     pub task_id: TaskId,
     pub work_scope_id: String,
-    /// Verifier request contract selected by this canonical plan. Older
-    /// plans may omit it, but the verifier fact producer refuses such a plan
-    /// because profile/config/scope/artifact currentness cannot be proved.
+    /// The Task Controller's verifier decision for this plan revision.
+    ///
+    /// Explicitly typed so an absent decision is distinguishable from a lost one;
+    /// see [`CanonicalVerifierPlanState`]. A plan that has not been given a
+    /// verifier request contract still validates, and every consumer that needs
+    /// one refuses through [`Self::verifier_binding`].
     #[serde(default)]
-    pub verifier: Option<CanonicalVerifierPlanBinding>,
+    pub verifier: CanonicalVerifierPlanState,
 }
 
 impl CanonicalPlanBinding {
     /// Constructs a bounded current-plan identity.
+    ///
+    /// The verifier dimension starts as [`CanonicalVerifierPlanState::Undecided`]:
+    /// a plan identity is not an authority to pick a verifier, so this admits
+    /// none. An owner decision binds one by changing this dimension, which is a
+    /// different owner revision.
     pub fn new(
         plan_id: impl Into<String>,
         plan_revision: impl Into<String>,
@@ -1387,10 +1483,16 @@ impl CanonicalPlanBinding {
             plan_revision: plan_revision.into(),
             task_id,
             work_scope_id: work_scope_id.into(),
-            verifier: None,
+            verifier: CanonicalVerifierPlanState::default(),
         };
         binding.validate()?;
         Ok(binding)
+    }
+
+    /// The exact owner-issued verifier request contract for this plan, or a typed
+    /// refusal that names whether the owner has simply not decided one yet.
+    pub fn verifier_binding(&self) -> Result<&CanonicalVerifierPlanBinding, CompositionError> {
+        self.verifier.binding()
     }
 
     /// Validates the bounded plan identity without consulting evidence.
@@ -1412,9 +1514,11 @@ impl CanonicalPlanBinding {
                 "canonical work scope id is blank or contains control characters".to_owned(),
             ));
         }
-        if let Some(verifier) = &self.verifier {
-            verifier.validate()?;
-        }
+        // The verifier dimension is validated as the closed state it now is, not
+        // skipped when absent: an `Undecided` must still carry a well-formed
+        // owner-side reason reference, so "no decision yet" is always a stated
+        // fact and never an unexplained hole.
+        self.verifier.validate()?;
         Ok(())
     }
 }
@@ -2292,8 +2396,10 @@ fn admitted_testd_verifier_plan<'a>(
         ));
     }
     plan.validate()?;
-    let verifier_plan = plan.verifier.as_ref().ok_or_else(|| {
-        verifier_fact_error("canonical plan has no verifier profile/config/scope/artifact binding")
+    let verifier_plan = plan.verifier_binding().map_err(|error| {
+        verifier_fact_error(format!(
+            "canonical plan has no verifier profile/config/scope/artifact binding: {error}"
+        ))
     })?;
     if job.invocation.request.task_id.as_ref() != Some(task_id) {
         return Err(verifier_fact_error(
@@ -2488,8 +2594,10 @@ fn checked_fact_identity_and_plan<'a>(
             "canonical verifier fact plan is task-mismatched",
         ));
     }
-    let verifier_plan = fact.plan.verifier.as_ref().ok_or_else(|| {
-        verifier_fact_error("persisted verifier fact has no canonical verifier plan binding")
+    let verifier_plan = fact.plan.verifier_binding().map_err(|error| {
+        verifier_fact_error(format!(
+            "persisted verifier fact has no canonical verifier plan binding: {error}"
+        ))
     })?;
     fact.invocation.validate()?;
     Ok(verifier_plan)
@@ -3018,8 +3126,10 @@ pub(crate) fn acceptance_coverage_from_verifier_fact(
             "canonical verifier fact plan drifted from the current canonical owner plan",
         ));
     }
-    let verifier_plan = plan.verifier.as_ref().ok_or_else(|| {
-        verifier_fact_error("canonical finish plan has no verifier item bindings")
+    let verifier_plan = plan.verifier_binding().map_err(|error| {
+        verifier_fact_error(format!(
+            "canonical finish plan has no verifier item bindings: {error}"
+        ))
     })?;
     if !contract.admits(verifier_plan) {
         return Err(verifier_fact_error(
@@ -5715,13 +5825,15 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// Rehydrates one verifier execution fact from the current Governor task,
     /// plan, and the current durable TestD owner row. The caller supplies only
     /// the durable job identity; it cannot pass a held `TestJob` image or a
-    /// verifier verdict. The store read, task/plan join, persisted receipt,
-    /// execution run, artifact lineage, and canonical fence are checked by
-    /// the one fact constructor.
+    /// verifier verdict, and it cannot pass a task revision either — the current
+    /// revision is the task-lifecycle owner record's own value, because
+    /// `StateFence::task_revision` is structurally `None` on every production
+    /// Kernel-generation fence. The store read, task/plan join, persisted
+    /// receipt, execution run, artifact lineage, and canonical fence are checked
+    /// by the one fact constructor.
     pub fn rehydrate_testd_verifier_execution_fact(
         &self,
         task_id: &TaskId,
-        task_revision: u64,
         job_id: &str,
         testd: &TestdStore,
     ) -> Result<CanonicalVerifierExecutionFact, CompositionError> {
@@ -5732,11 +5844,14 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         let task = self.owners.task.task(task_id).ok_or_else(|| {
             CompositionError::Recovery(format!("canonical task {} is absent", task_id.as_str()))
         })?;
-        if task.task_id != *task_id || task.revision != task_revision || task.state_fence != fence {
+        if task.task_id != *task_id || task.revision == 0 || task.state_fence != fence {
             return Err(CompositionError::Recovery(
                 "canonical task owner is stale for verifier rehydration".to_owned(),
             ));
         }
+        // The task revision the fact is bound to is the owner record's own
+        // current value, proved non-zero and fence-bound above.
+        let task_revision = task.revision;
         let plan = self.owners.canonical.read_current_plan(&fence)?;
         if plan.task_id != *task_id {
             return Err(CompositionError::Recovery(
@@ -5751,10 +5866,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .ok_or_else(|| {
                 CompositionError::Recovery(format!("durable TestD job {job_id} is absent"))
             })?;
-        let verifier_plan = plan.verifier.as_ref().ok_or_else(|| {
-            CompositionError::Recovery(
-                "canonical plan has no verifier profile/config/scope/artifact binding".to_owned(),
-            )
+        let verifier_plan = plan.verifier_binding().map_err(|error| {
+            CompositionError::Recovery(format!(
+                "canonical plan has no verifier profile/config/scope/artifact binding: {error}"
+            ))
         })?;
         let receipt = job.verification_receipt.as_ref().ok_or_else(|| {
             CompositionError::Recovery(
@@ -5779,12 +5894,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     pub fn prepare_testd_verifier_execution_fact(
         &self,
         task_id: &TaskId,
-        task_revision: u64,
         job_id: &str,
         testd: &TestdStore,
     ) -> Result<CanonicalAdmissionSnapshot, CompositionError> {
-        let fact =
-            self.rehydrate_testd_verifier_execution_fact(task_id, task_revision, job_id, testd)?;
+        let fact = self.rehydrate_testd_verifier_execution_fact(task_id, job_id, testd)?;
         self.owners.canonical.prepare_verifier_execution_fact(fact)
     }
 
@@ -6363,7 +6476,6 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         identity: &RequestIdentity,
         operation_id: &OperationId,
         task_id: &TaskId,
-        task_revision: u64,
         job_id: &str,
         testd: &TestdStore,
     ) -> Result<Option<WriteReceipt>, FinishAttemptError> {
@@ -6371,14 +6483,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             return Err(FinishAttemptError::Composition(CompositionError::NotReady));
         }
         self.finish_attempt_service()
-            .publish_testd_verifier_execution_fact(
-                identity,
-                operation_id,
-                task_id,
-                task_revision,
-                job_id,
-                testd,
-            )
+            .publish_testd_verifier_execution_fact(identity, operation_id, task_id, job_id, testd)
             .await
     }
 
@@ -11422,7 +11527,7 @@ mod tests {
                 plan_revision: "1".to_owned(),
                 task_id: TaskId::new("task-1").expect("task id"),
                 work_scope_id: "scope:work".to_owned(),
-                verifier: None,
+                verifier: CanonicalVerifierPlanState::default(),
             }),
             verifier_execution_fact: None,
             finish_evidence: None,
@@ -12320,7 +12425,7 @@ mod tests {
                 plan_revision: "1".to_owned(),
                 task_id: TaskId::new("task-other").expect("task id"),
                 work_scope_id: "scope:work".to_owned(),
-                verifier: None,
+                verifier: CanonicalVerifierPlanState::default(),
             }),
             verifier_execution_fact: None,
             finish_evidence: None,

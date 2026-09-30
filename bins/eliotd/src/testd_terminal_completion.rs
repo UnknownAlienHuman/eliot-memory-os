@@ -63,27 +63,24 @@ impl DaemonComposition {
     /// Captures the current canonical verifier plan with its admitted owner
     /// identity. Call this before inserting/dispatching the productive `TestD`
     /// job; the returned binding is persisted in the durable `TestD` row.
+    ///
+    /// The task revision is not a parameter: it is the task-lifecycle owner
+    /// record's own current revision, because
+    /// `StateFence::task_revision` is structurally `None` on every production
+    /// Kernel-generation fence and could therefore only ever refuse. A presented
+    /// fence that does restate a revision is still compared against the owner
+    /// value, so a disagreement is refused rather than silently adopted.
     pub fn testd_verifier_dispatch_binding(
         &self,
         identity: &RequestIdentity,
         operation_id: &OperationId,
         task_id: &TaskId,
-        task_revision: u64,
         invocation: &InstrumentInvocation,
     ) -> Result<TestdVerifierDispatchBinding, DaemonError> {
         identity.validate().map_err(completion_error)?;
-        if identity.request.metadata.task_id.as_ref() != Some(task_id)
-            || identity
-                .request
-                .state_fence
-                .task_revision
-                .as_ref()
-                .map(|revision| revision.value())
-                != Some(task_revision)
-            || task_revision == 0
-        {
+        if identity.request.metadata.task_id.as_ref() != Some(task_id) {
             return Err(completion_error(
-                "admitted identity does not bind the requested task revision",
+                "admitted identity does not name the requested task",
             ));
         }
         if invocation.request != identity.request.metadata
@@ -101,8 +98,15 @@ impl DaemonComposition {
             .task
             .task(task_id)
             .ok_or_else(|| completion_error("canonical task owner is absent"))?;
-        if current_task.revision != task_revision
+        if current_task.revision == 0
             || current_task.state_fence != identity.request.state_fence
+            || identity
+                .request
+                .state_fence
+                .task_revision
+                .as_ref()
+                .map(|revision| revision.value())
+                .is_some_and(|presented| presented != current_task.revision)
         {
             return Err(completion_error(
                 "TestD invocation does not bind the current canonical task revision",
@@ -113,8 +117,10 @@ impl DaemonComposition {
             .read_current_plan(&identity.request.state_fence)
             .map_err(completion_error)?;
         plan.validate().map_err(completion_error)?;
-        let verifier = plan.verifier.as_ref().ok_or_else(|| {
-            completion_error("current canonical plan is missing the task-bound verifier request")
+        let verifier = plan.verifier_binding().map_err(|error| {
+            completion_error(format!(
+                "current canonical plan is missing the task-bound verifier request: {error}"
+            ))
         })?;
         if plan.task_id != *task_id
             || verifier.instrument != invocation.instrument
@@ -164,20 +170,12 @@ impl DaemonComposition {
             .task_id
             .as_ref()
             .ok_or_else(|| completion_error("admitted request has no task id"))?;
-        let task_revision = identity
-            .request
-            .state_fence
-            .task_revision
-            .as_ref()
-            .map(|revision| revision.value())
-            .ok_or_else(|| completion_error("admitted request has no task revision"))?;
         let operation_id =
             OperationId::new(job.process.operation_id.clone()).map_err(completion_error)?;
         let binding = self.testd_verifier_dispatch_binding(
             identity,
             &operation_id,
             task_id,
-            task_revision,
             &job.invocation,
         )?;
         testd
@@ -245,14 +243,11 @@ impl DaemonComposition {
             .task_id
             .clone()
             .ok_or_else(|| no_task_material_denial("TestD terminal publication"))?;
-        let task_revision = binding
-            .request_identity
-            .request
-            .state_fence
-            .task_revision
-            .as_ref()
-            .map(|revision| revision.value())
-            .ok_or_else(|| completion_error("admitted request has no task revision"))?;
+        // The current task revision is resolved by the Governor finish owner from
+        // its live task-lifecycle record, not from the admitted identity's
+        // `StateFence::task_revision`: that field is structurally `None` on every
+        // production Kernel-generation fence, so this leg could otherwise only
+        // ever refuse. This lane therefore supplies no revision at all.
         let operation_id =
             OperationId::new(binding.operation_id.clone()).map_err(completion_error)?;
         if let Some(receipt_json) = &publication.committed_receipt_json {
@@ -266,7 +261,6 @@ impl DaemonComposition {
             &binding.request_identity,
             &operation_id,
             &task_id,
-            task_revision,
             &job.job_id,
             testd,
         ))
@@ -330,22 +324,9 @@ impl DaemonComposition {
             .task_id
             .clone()
             .ok_or_else(|| completion_error("pending dispatch has no admitted task id"))?;
-        let task_revision = identity
-            .request
-            .state_fence
-            .task_revision
-            .as_ref()
-            .map(|revision| revision.value())
-            .ok_or_else(|| completion_error("pending dispatch has no task revision fence"))?;
         let operation_id =
             OperationId::new(job.process.operation_id.clone()).map_err(completion_error)?;
-        self.testd_verifier_dispatch_binding(
-            identity,
-            &operation_id,
-            &task_id,
-            task_revision,
-            &job.invocation,
-        )
+        self.testd_verifier_dispatch_binding(identity, &operation_id, &task_id, &job.invocation)
     }
 
     /// Plans the first-phase Governor-owned canonical legs for one terminal evidence
@@ -374,13 +355,37 @@ impl DaemonComposition {
     ) -> Result<TestdTerminalOwnerPlan, DaemonError> {
         let identity = &evidence.request_identity;
         let job = &evidence.job;
-        // Issue #1789 A1: both legs below publish canonical Material effects,
-        // so a missing admitted task denies the whole completion here with
-        // the readiness gate's typed directive before either leg launches.
-        if identity.request.metadata.task_id.is_none() {
-            return Err(no_task_material_denial("TestD terminal completion"));
-        }
-        let draft = finish_draft_from_testd_terminal_evidence(job, identity)?;
+        // Issue #1789 A1: both legs below publish canonical Material effects, so
+        // the readiness gate's typed directive is the very refusal that also
+        // yields the task id — the denial stays ahead of both legs exactly as
+        // before, and it is not restated as a second check.
+        let task_id = identity
+            .request
+            .metadata
+            .task_id
+            .clone()
+            .ok_or_else(|| no_task_material_denial("TestD terminal completion"))?;
+        // The candidate's stale-write guard is the task-lifecycle owner record's
+        // own current revision, read here from the same owner the Governor
+        // resolves it from again inside the fact leg. The admitted identity's
+        // `StateFence::task_revision` is not consulted: it is structurally `None`
+        // on every production Kernel-generation fence. Only presence and
+        // non-zero are checked here; fence identity, the zero revision, and the
+        // comparison against this exact value are re-proved by
+        // `rehydrate_task_revision`, `validate_task` and the draft's
+        // `expected_task_revision` check, so this lane adds no second gate.
+        let expected_task_revision = self
+            .governor
+            .owners()
+            .task
+            .task(&task_id)
+            .map(|record| record.revision)
+            .filter(|revision| *revision != 0)
+            .ok_or_else(|| {
+                completion_error("terminal evidence names a task with no current owner record")
+            })?;
+        let draft =
+            finish_draft_from_testd_terminal_evidence(job, identity, expected_task_revision)?;
         let operation_id = testd_terminal_finish_operation_id(&job.job_id)?;
         let verifier_fact = self
             .governor
@@ -576,18 +581,18 @@ pub async fn commit_testd_terminal_owner_fact(
     composition: &SharedTestdOwnerComposition,
     evidence: &TestdTerminalCompletionEvidence,
 ) -> Result<WriteReceipt, DaemonError> {
-    // (0) guard held, no exchange: deny a task-free row, then admit the Task
-    // Controller's current plan for this row's task and publish it.
+    // (0) guard held, no exchange: deny a task-free row and derive the Task
+    // Controller's current plan for this row's task.
     //
     // Issue #1741, I7.9: the current `TaskContract`'s plan revision is an owner
     // fact, and the fact leg below reads it from the canonical owner image. That
-    // image carried no plan at all until the `eliot.finish` claim lane admitted
-    // one, so a row recovered after a restart — the whole point of this drain —
-    // refused at `read_current_plan` before the executed verifier run, exact
-    // artifacts or effect outcomes could be rehydrated. The plan is derived
-    // inside the Governor from the Task-selection and task-lifecycle owners; this
-    // lane supplies only the admitted identity, the row's operation identity and
-    // the task id, so it cannot hand the canonical owner a plan of its own.
+    // image carried no plan at all until this leg existed, so a row recovered
+    // after a restart — the whole point of this drain — refused at
+    // `read_current_plan` before the executed verifier run, exact artifacts or
+    // effect outcomes could be rehydrated. The plan is derived inside the
+    // Governor from the task-lifecycle and `WorkScope` owners; this lane
+    // supplies only the admitted identity, the row's operation identity and the
+    // task id, so it cannot hand the canonical owner a plan of its own.
     //
     // The task-binding denial stays ahead of every leg exactly as phase (1)
     // places it: a missing admitted task denies the whole completion with the
@@ -614,7 +619,11 @@ pub async fn commit_testd_terminal_owner_fact(
     }
     .map_err(DaemonError::Finish)?;
     if let Some(prepared) = current_plan.as_ref() {
+        // (0b) no guard: publish the plan owner image over the Kernel port.
         let _receipt = exchange_testd_owner_finish_leg(kernel, prepared).await?;
+        // (0c) guard held, no exchange: revalidate the plan leg's pre-commit
+        // fence, then refresh so the image phase (1) reads is the one phase (0b)
+        // committed and not the pre-publish snapshot.
         let mut guard = composition.lock().await;
         guard.accept_testd_terminal_owner_fact(prepared)?;
         guard.refresh_testd_terminal_owner()?;
@@ -877,9 +886,18 @@ pub struct TestdOwnerDrainOutcome {
 /// worker success into a Task outcome — the Governor rehydrates canonical
 /// evidence and derives the decision, and a candidate never asserts a
 /// verifier run.
+///
+/// `expected_task_revision` is the task-lifecycle owner record's own current
+/// revision, resolved by the caller. It is not read from the admitted identity's
+/// `StateFence::task_revision` — that field is structurally `None` on every
+/// production Kernel-generation fence, so the candidate could otherwise never be
+/// built — and it is not an independent claim: `prepare_finish_evidence` and
+/// `prepare_finish_decision` compare it against the same owner value again and
+/// refuse a stale candidate.
 fn finish_draft_from_testd_terminal_evidence(
     job: &TestJob,
     identity: &RequestIdentity,
+    expected_task_revision: u64,
 ) -> Result<eliot_governor::FinishAttemptDraft, DaemonError> {
     let task_id = identity
         .request
@@ -887,13 +905,11 @@ fn finish_draft_from_testd_terminal_evidence(
         .task_id
         .clone()
         .ok_or_else(|| completion_error("terminal evidence has no admitted task id"))?;
-    let expected_task_revision = identity
-        .request
-        .state_fence
-        .task_revision
-        .as_ref()
-        .map(|revision| revision.value())
-        .ok_or_else(|| completion_error("terminal evidence has no task revision fence"))?;
+    if expected_task_revision == 0 {
+        return Err(completion_error(
+            "terminal evidence resolves to a zero current task revision",
+        ));
+    }
     let requested_outcome = match job.state {
         TestdJobState::Succeeded => eliot_governor::RequestedFinishOutcome::CompleteCandidate,
         TestdJobState::Failed => eliot_governor::RequestedFinishOutcome::FailedVerification,

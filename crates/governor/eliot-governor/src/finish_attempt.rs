@@ -99,6 +99,11 @@ impl FinishAttemptError {
 /// Governor adapter over the single task, canonical, and finish owners.
 pub struct GovernorFinishAttempt<'a, P: ?Sized> {
     task: &'a TaskLifecycleOwner,
+    /// The current `WorkScope` binding owner, the declared owner of scope
+    /// identity. `None` while the Kernel has not installed one, which is an
+    /// explicit refusal for every consumer that needs a bound scope, never a
+    /// default scope.
+    work_scope: Option<&'a eliot_workscope::WorkScopeBindingOwner>,
     canonical: &'a CanonicalAdmissionOwner,
     coordination: &'a CoordinationOwner,
     observation: &'a ObservationJournal,
@@ -117,6 +122,7 @@ impl<'a, P: ?Sized> GovernorFinishAttempt<'a, P> {
     ) -> Self {
         Self {
             task: &owners.task,
+            work_scope: owners.work_scope.as_ref(),
             canonical,
             coordination: &owners.coordination,
             observation: &owners.observation,
@@ -361,15 +367,24 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
     ///
     /// The acceptance identity carried on those receipts is NOT the finish
     /// denominator: the denominator is the contract owner's own enumeration,
-    /// rehydrated through [`Self::rehydrate_task_contract_acceptance`]. The
-    /// receipt digest is a second, independent owner of the same fact, and
-    /// this walk returns it so the caller can require it to commit to the
-    /// enumerated set. Before the owner-enumeration change that commitment was
-    /// forced implicitly, because the receipt digest *was* the denominator's
+    /// rehydrated through [`Self::rehydrate_task_contract_acceptance`]. What
+    /// this walk returns is `TaskSelectionEvidence::acceptance_digest`, and that
+    /// field is **caller-stated at intake** — the intake path can supply an
+    /// arbitrary 64-hex value, and the exploratory `eliot-workscope` branch
+    /// computes it as `sha256_hex` over the task goal rather than over the
+    /// contract's obligation set. It is not an independent owner of the same
+    /// fact and it proves nothing on its own; it is only a cross-check that the
+    /// task-selection evidence agrees with the contract owner's enumeration.
+    ///
+    /// That is why the conjunct is an *addition* to
+    /// [`crate::AcceptanceDenominatorError::bind`] and never a replacement for
+    /// it: `bind` is the enforcement, and this one is a consistency check over a
+    /// caller-stated value. Before the owner-enumeration change the commitment
+    /// was forced implicitly, because the receipt digest *was* the denominator's
     /// digest and `ContractAcceptanceDenominator::admits` recomputed the
-    /// commitment over the enumeration retained beside it. Keeping the
-    /// commitment as an explicit additional conjunct preserves that refusal
-    /// instead of leaving the receipt digest agreeing only with other receipts.
+    /// commitment over the enumeration retained beside it. Restating it as an
+    /// explicit conjunct keeps that refusal while leaving the receipt digest the
+    /// weak, caller-stated value it always was.
     fn rehydrate_task_bound_observation_refs(
         &self,
         task_id: &TaskId,
@@ -561,9 +576,9 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
         // The task-and-plan-bound observation receipts are joined here so their
         // record ids enter the artifact evidence. They are not the acceptance
         // denominator: the denominator is rehydrated from the contract owner
-        // instead. The digest they jointly record is still a second owner of
-        // the same fact, so it is returned and required below to commit to the
-        // enumerated set.
+        // instead. The digest they carry is a caller-stated value, not a second
+        // owner of the fact, so it is returned only as a cross-check that the
+        // task-selection evidence agrees with the contract owner's enumeration.
         let selection_acceptance_digest = self.rehydrate_task_bound_observation_refs(
             task_id,
             task,
@@ -571,10 +586,15 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
             fence,
             &mut observation_refs,
         )?;
-        let verifier_plan = plan.verifier.as_ref().ok_or_else(|| {
-            FinishAttemptError::Composition(CompositionError::Recovery(
-                "canonical plan has no verifier binding".to_owned(),
-            ))
+        // The verifier requirement is unchanged: a plan the Task Controller has
+        // not yet given a verifier request contract cannot support a verifier-
+        // backed completion. What changed is that the refusal now names the
+        // typed state and the owner's own reason reference instead of reporting
+        // an indistinguishable absent binding.
+        let verifier_plan = plan.verifier_binding().map_err(|error| {
+            FinishAttemptError::Composition(CompositionError::Recovery(format!(
+                "canonical plan has no verifier binding: {error}"
+            )))
         })?;
         // Issue #1741, I7.9: the denominator is the CONTRACT OWNER's
         // enumeration, rehydrated at this exact task id and task revision through
@@ -721,22 +741,44 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
     ///
     /// This is the read half of current-plan admission, and the only place the
     /// plan identity is assembled. It reads the live task-lifecycle record and
-    /// the Task-selection owner's accepted receipts; it takes no plan, no
-    /// revision, and no scope from a caller, so no caller can hand the canonical
-    /// owner a plan of its own choosing.
+    /// the current `WorkScope` binding; it takes no plan, no revision, and no
+    /// scope from a caller, so no caller can hand the canonical owner a plan of
+    /// its own choosing.
     ///
-    /// The plan identity comes from the `ObservationPlanBinding` the accepted
-    /// receipt already carries, matched to this exact fence and this exact
-    /// owner-resolved task revision. That is deliberate: the finish path's own
-    /// `matches_plan` join requires the retained observation receipts to bind the
-    /// same plan, so deriving the plan from those receipts is what makes the
-    /// owner and its evidence provably about the same plan revision rather than
-    /// two independently asserted facts.
+    /// # Why the task-lifecycle owner, not an observation receipt
     ///
-    /// A receipt whose selection is contaminated is skipped: a quarantined
-    /// selection does not establish a usable current plan. Two accepted receipts
-    /// that disagree about the plan identity are ambiguous owner state, not a
-    /// majority vote, so this refuses instead of picking one.
+    /// A10.4:22 places the current plan revision of one task under the active
+    /// Authority Epoch with exactly one Task Controller, and A2.2:22 keeps it
+    /// from the Main Agent and from workers. The task-lifecycle owner *is* that
+    /// Task Controller's durable record: it holds the current `TaskRecord`
+    /// (identity, revision, state, fence) and the committed event range the
+    /// controller framed the task in. The `WorkScope` binding owner is the
+    /// declared owner of scope identity (`StateFence::I45_KEY_OMISSIONS` assigns
+    /// the scope dimension to it and forbids a fence-wide counter).
+    ///
+    /// The previous derivation read `ObservationPlanBinding` off the
+    /// Task-selection owner's accepted receipts. That field is `None` at every
+    /// production construction site — `ObservationSubmission.plan` is `None` in
+    /// `observation_reconciliation.rs` at all five, and `task_selection: Some(..)`
+    /// has no production constructor at all — so that derivation refused on every
+    /// live daemon and moved the W3 refusal from `read_current_plan` to
+    /// `admit_task_controller_plan` without making the rehydration reachable.
+    /// A receipt field nobody sets is not an owner read, so the plan is re-derived
+    /// here from the two owners that do hold it.
+    ///
+    /// `plan_id` is the frame reference the Task Controller itself committed on
+    /// the task's own event range, at this exact fence, inside the task's last
+    /// sequence — the same range and the same filter
+    /// [`Self::scan_task_frame_and_authority`] reads for artifact evidence, so
+    /// the plan identity and the artifact evidence cannot be two different
+    /// statements about the same framing. `plan_revision` is the owner record's
+    /// own current revision. `work_scope_id` is the current `WorkScope` binding's
+    /// own scope reference.
+    ///
+    /// Fails closed, without synthesizing anything: an absent task, a record
+    /// stale for the fence, a zero revision, a state outside the plan-bearing set,
+    /// no committed frame in range, an absent or fence-mismatched `WorkScope`
+    /// binding, or a derived image that does not validate.
     pub fn admit_task_controller_plan(
         &self,
         task_id: &TaskId,
@@ -767,59 +809,92 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
                 "task is not in a plan-bearing state; current plan admission is refused".to_owned(),
             )));
         }
-        let mut plan_identity: Option<(String, String, String)> = None;
-        for entry in self.observation.snapshot() {
-            let receipt = match &entry.result {
-                ObservationAdmissionResult::Accepted { receipt }
-                | ObservationAdmissionResult::Replayed { receipt } => receipt,
-                ObservationAdmissionResult::Rejected { .. } => continue,
-            };
-            let Some(selection) = receipt.task_selection.as_ref().filter(|selection| {
-                receipt.state_fence == fence
-                    && selection.task_ref == task_id.as_str()
-                    && selection.task_revision == task.revision
-                    && !selection.is_contaminated()
-            }) else {
-                continue;
-            };
-            let Some(plan) = receipt
-                .plan
-                .as_ref()
-                .filter(|plan| plan.state_fence == fence && plan.validate().is_ok())
-            else {
-                continue;
-            };
-            let observed = (
-                plan.plan_id.clone(),
-                plan.plan_revision.clone(),
-                selection.work_scope_ref.clone(),
-            );
-            if plan_identity.as_ref().is_some_and(|seen| *seen != observed) {
-                return Err(FinishAttemptError::Composition(CompositionError::Recovery(
-                    "task-selection owner evidence disagrees about the current plan identity"
-                        .to_owned(),
-                )));
-            }
-            plan_identity = Some(observed);
-        }
-        let (plan_id, plan_revision, work_scope_id) = plan_identity.ok_or_else(|| {
+        let plan_id = self
+            .current_task_frame_ref(task_id, task, &fence)
+            .ok_or_else(|| {
+                FinishAttemptError::Composition(CompositionError::Recovery(format!(
+                    "task-lifecycle owner has no committed same-fence acceptance frame for task {} \
+                     at revision {}; current plan admission is refused",
+                    task_id.as_str(),
+                    task.revision
+                )))
+            })?;
+        let work_scope = self.work_scope.ok_or_else(|| {
             FinishAttemptError::Composition(CompositionError::Recovery(
-                "task-selection owner has no same-fence, task-bound, plan-bearing accepted receipt; \
-                 current plan admission is refused"
+                "no current WorkScope binding owner is installed; current plan admission is refused"
                     .to_owned(),
             ))
         })?;
-        // The verifier request contract is left exactly as the owner does not yet
-        // hold one. `CanonicalVerifierPlanBinding` has no producer anywhere in the
-        // tree — not even a test constructs one, so it is reachable only by
-        // deserialization — and synthesising an instrument/profile/target/test-id
-        // contract here would be a second, fabricated plan authority. A plan
-        // without it is the honest owner state: `CanonicalPlanBinding::validate`
-        // already admits an absent verifier for exactly this reason, and every
-        // consumer that needs one refuses on its own pre-existing typed check
-        // rather than reading a stand-in.
-        CanonicalPlanBinding::new(plan_id, plan_revision, task_id.clone(), work_scope_id)
-            .map_err(FinishAttemptError::Composition)
+        let scope = work_scope.read_current(&fence).map_err(|error| {
+            FinishAttemptError::Composition(CompositionError::Recovery(format!(
+                "current WorkScope binding read failed; current plan admission is refused: {error}"
+            )))
+        })?;
+        let work_scope_id = scope.binding.scope.scope_ref.clone();
+        let mut plan = CanonicalPlanBinding::new(
+            plan_id,
+            task.revision.to_string(),
+            task_id.clone(),
+            work_scope_id,
+        )
+        .map_err(FinishAttemptError::Composition)?;
+        // The verifier request contract is a separate dimension of the owner image
+        // that only an owner decision sets, and this derivation must neither
+        // author one nor discard one. When the retained owner plan has the same
+        // identity — the same frame, the same task revision, the same task, the
+        // same bound scope — its recorded verifier state is carried forward
+        // verbatim. That carry-forward is what makes an absent decision
+        // non-terminal: an owner decision that later binds a verifier changes this
+        // value, the caller compares it against the retained image by full
+        // equality, and the change advances the owner revision instead of being
+        // absorbed by the idempotence branch. See
+        // `CanonicalPlanBinding::verifier_binding` for what each state means.
+        //
+        // An unreadable retained plan carries nothing forward. That is not a
+        // silent skip: `read_current_plan` validates the retained owner image
+        // first, and the image this produces is validated again by
+        // `prepare_current_plan` before the envelope is built, so a corrupt
+        // retained plan cannot be overwritten by a derived one.
+        if let Ok(retained) = self.canonical.read_current_plan(&fence)
+            && retained.plan_id == plan.plan_id
+            && retained.plan_revision == plan.plan_revision
+            && retained.task_id == plan.task_id
+            && retained.work_scope_id == plan.work_scope_id
+        {
+            plan.verifier = retained.verifier;
+        }
+        Ok(plan)
+    }
+
+    /// Returns the frame reference the Task Controller last committed for one
+    /// task inside its own committed event range at this exact fence.
+    ///
+    /// The filter is the one [`Self::scan_task_frame_and_authority`] uses, so the
+    /// plan identity and the artifact evidence are the same owner value read
+    /// twice, never two statements about the same framing. The LAST frame in
+    /// range is returned, matching the task owner's own projection order: a task
+    /// may be re-framed, and only the current framing is the current plan.
+    fn current_task_frame_ref(
+        &self,
+        task_id: &TaskId,
+        task: &TaskRecord,
+        fence: &StateFence,
+    ) -> Option<String> {
+        self.task
+            .events()
+            .iter()
+            .filter(|event| {
+                event.task_id == *task_id
+                    && event.state_fence == *fence
+                    && event.authority_epoch == fence.authority_epoch
+                    && event.sequence > 0
+                    && event.sequence <= task.last_sequence
+            })
+            .filter_map(|event| match &event.command {
+                Some(TaskCommand::Frame { frame_ref }) => Some(frame_ref.clone()),
+                _ => None,
+            })
+            .next_back()
     }
 
     /// Wraps the current-plan owner transition in the exact prepared exchange
@@ -917,10 +992,61 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
         Ok(RehydratedContractAcceptanceSet::admit_owner_read(set))
     }
 
+    /// Resolves the current task revision for one task-bound owner leg from the
+    /// live task-lifecycle owner record (issue #1741, I7.9).
+    ///
+    /// This is the same treatment
+    /// [`Self::rehydrate_task_contract_acceptance`] already applies to the
+    /// acceptance denominator, applied here so the two owner legs cannot disagree
+    /// about which revision they are admitted against. The value is the owner
+    /// record's own `TaskRecord.revision`: never a caller-supplied revision, and
+    /// never `StateFence::task_revision`.
+    ///
+    /// `StateFence::task_revision` is `None` on every production
+    /// Kernel-generation fence by construction (`StateFence::new` sets
+    /// `task_revision: None`, and `git grep 'task_revision: Some('` finds only a
+    /// bridge dry-run projection and tests), so requiring it here could only ever
+    /// refuse. `StateFence::I45_KEY_OMISSIONS` assigns the task-revision
+    /// dimension to the operation's own owner record instead of the transport
+    /// fence, and the task-lifecycle owner already holds the current
+    /// `TaskRecord.revision`, which is the durable task-bound write precondition
+    /// I5.5 requires.
+    ///
+    /// A presented fence that *does* carry a task revision is still checked, so
+    /// the owner's own value is compared against any restatement of it: a
+    /// disagreement is the typed `StaleTaskRevision` refusal, never a widened
+    /// revision. Fails closed on an absent task, a record stale for this fence, or
+    /// a zero owner revision.
+    fn rehydrate_task_revision(
+        &self,
+        task_id: &TaskId,
+        fence: &StateFence,
+    ) -> Result<u64, FinishAttemptError> {
+        let task = self.task.task(task_id).ok_or_else(|| {
+            FinishAttemptError::Composition(CompositionError::Recovery(format!(
+                "canonical task {} is absent",
+                task_id.as_str()
+            )))
+        })?;
+        validate_task(task, fence)?;
+        if let Some(presented) = fence
+            .task_revision
+            .as_ref()
+            .map(|revision| revision.value())
+            && presented != task.revision
+        {
+            return Err(
+                FinishError::Canonical(eliot_canonical::CanonicalError::StaleTaskRevision).into(),
+            );
+        }
+        Ok(task.revision)
+    }
+
     /// Rehydrates and publishes the verifier-execution owner from the
     /// current durable TestD row. `job_id` is the only TestD input crossing
     /// this boundary: the row, receipt, run, canonical task, current plan,
-    /// and fence are all read and joined here. A caller-held `TestJob` or
+    /// and fence are all read and joined here, and the current task revision is
+    /// resolved from the task-lifecycle owner. A caller-held `TestJob` or
     /// verdict cannot become canonical proof.
     ///
     /// This is the composed form of the same three phases
@@ -935,7 +1061,6 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
         identity: &RequestIdentity,
         operation_id: &OperationId,
         task_id: &TaskId,
-        task_revision: u64,
         job_id: &str,
         testd: &TestdStore,
     ) -> Result<Option<WriteReceipt>, FinishAttemptError> {
@@ -943,7 +1068,6 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
             identity,
             operation_id,
             task_id,
-            task_revision,
             job_id,
             testd,
         )?;
@@ -965,7 +1089,6 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
         identity: &RequestIdentity,
         operation_id: &OperationId,
         task_id: &TaskId,
-        task_revision: u64,
         job_id: &str,
         testd: &TestdStore,
     ) -> Result<Option<PreparedKernelExchange>, FinishAttemptError> {
@@ -980,31 +1103,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
             )
             .into());
         }
-        let expected_revision = fence
-            .task_revision
-            .as_ref()
-            .map(|revision| revision.value())
-            .ok_or_else(|| {
-                FinishAttemptError::Serialization(
-                    "verifier fact request is missing its task revision fence".to_owned(),
-                )
-            })?;
-        if expected_revision != task_revision {
-            return Err(
-                FinishError::Canonical(eliot_canonical::CanonicalError::StaleTaskRevision).into(),
-            );
-        }
-        let task = self.task.task(task_id).ok_or_else(|| {
-            FinishAttemptError::Composition(CompositionError::Recovery(format!(
-                "canonical task {} is absent",
-                task_id.as_str()
-            )))
-        })?;
-        if task.revision != task_revision || task.state_fence != fence {
-            return Err(FinishAttemptError::Composition(CompositionError::Recovery(
-                "canonical task owner is stale for verifier fact publication".to_owned(),
-            )));
-        }
+        let task_revision = self.rehydrate_task_revision(task_id, &fence)?;
         let plan = self.canonical.read_current_plan(&fence)?;
         if plan.task_id != *task_id {
             return Err(FinishAttemptError::Composition(CompositionError::Recovery(
@@ -1028,10 +1127,10 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
                 "durable TestD job has no full verification receipt".to_owned(),
             ))
         })?;
-        let verifier_plan = plan.verifier.as_ref().ok_or_else(|| {
-            FinishAttemptError::Composition(CompositionError::Recovery(
-                "canonical plan has no verifier binding".to_owned(),
-            ))
+        let verifier_plan = plan.verifier_binding().map_err(|error| {
+            FinishAttemptError::Composition(CompositionError::Recovery(format!(
+                "canonical plan has no verifier binding: {error}"
+            )))
         })?;
         let run = evaluate_testd_verification_current(&job, receipt, verifier_plan)?;
         let fact = CanonicalVerifierExecutionFact::from_testd(
@@ -1080,7 +1179,17 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
         if self.canonical.state_fence() != &fence {
             return Err(FinishError::FenceMismatch.into());
         }
-        let (task_id, task_revision) = evidence_task_binding(identity)?;
+        let task_id = identity.request.metadata.task_id.clone().ok_or_else(|| {
+            FinishAttemptError::Composition(CompositionError::Recovery(
+                "verifier fact evidence carries no admitted task id".to_owned(),
+            ))
+        })?;
+        // The current task revision is the task-lifecycle owner record's own
+        // value, resolved by the same owner read the acceptance denominator
+        // uses. It is not taken from `StateFence::task_revision`, which is
+        // structurally `None` on every production Kernel-generation fence and
+        // therefore refused this leg on every row, and it is not a caller claim.
+        let task_revision = self.rehydrate_task_revision(&task_id, &fence)?;
         if !matches!(
             job.state,
             TestdJobState::Succeeded | TestdJobState::Failed | TestdJobState::Cancelled
@@ -1115,27 +1224,16 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
                 "verifier fact evidence receipt is undecodable: {error}"
             )))
         })?;
-        let task = self.task.task(&task_id).ok_or_else(|| {
-            FinishAttemptError::Composition(CompositionError::Recovery(format!(
-                "canonical task {} is absent",
-                task_id.as_str()
-            )))
-        })?;
-        if task.revision != task_revision || task.state_fence != fence {
-            return Err(FinishAttemptError::Composition(CompositionError::Recovery(
-                "canonical task owner is stale for verifier fact publication".to_owned(),
-            )));
-        }
         let plan = self.canonical.read_current_plan(&fence)?;
         if plan.task_id != task_id {
             return Err(FinishAttemptError::Composition(CompositionError::Recovery(
                 "canonical verifier plan is task-mismatched".to_owned(),
             )));
         }
-        let verifier_plan = plan.verifier.as_ref().ok_or_else(|| {
-            FinishAttemptError::Composition(CompositionError::Recovery(
-                "canonical plan has no verifier binding".to_owned(),
-            ))
+        let verifier_plan = plan.verifier_binding().map_err(|error| {
+            FinishAttemptError::Composition(CompositionError::Recovery(format!(
+                "canonical plan has no verifier binding: {error}"
+            )))
         })?;
         let run = evaluate_testd_verification_current(job, receipt, verifier_plan)?;
         let fact = CanonicalVerifierExecutionFact::from_testd(
@@ -1423,28 +1521,6 @@ fn validate_identity(identity: &RequestIdentity) -> Result<(), FinishAttemptErro
         return Err(FinishError::FenceMismatch.into());
     }
     Ok(())
-}
-
-/// Extracts the admitted task binding carried by terminal evidence: the
-/// task id from request metadata and the revision from the state fence.
-fn evidence_task_binding(identity: &RequestIdentity) -> Result<(TaskId, u64), FinishAttemptError> {
-    let task_id = identity.request.metadata.task_id.clone().ok_or_else(|| {
-        FinishAttemptError::Serialization(
-            "verifier fact evidence carries no admitted task id".to_owned(),
-        )
-    })?;
-    let task_revision = identity
-        .request
-        .state_fence
-        .task_revision
-        .as_ref()
-        .map(|revision| revision.value())
-        .ok_or_else(|| {
-            FinishAttemptError::Serialization(
-                "verifier fact evidence is missing its task revision fence".to_owned(),
-            )
-        })?;
-    Ok((task_id, task_revision))
 }
 
 /// Proves the live task-lifecycle record belongs to this exact fence and holds
