@@ -333,7 +333,9 @@ pub(super) fn ensure_store_endpoint_available(
 /// Checks a pre-recovery endpoint while the retained, independently verified
 /// old Store child may still own its listener. The caller must prove the old
 /// child's Job membership and committed predecessor binding before passing
-/// its PID; this observation grants no ownership to any other listener.
+/// its PID; this observation grants no ownership to any other listener. A
+/// degenerate retained claim (PID 0) and a corrupt owner observation (PID 0)
+/// each fail closed before any admission or directive.
 ///
 /// A preflight port check is not sufficient on its own: the occupant can
 /// change between this read and the real connection. This function therefore
@@ -365,7 +367,32 @@ pub(super) fn ensure_store_endpoint_available_or_owned(
         AdmittedCollisionOperation::FreshDependencyStart
     };
 
+    // Issue #1775 (A-stale): a degenerate retained claim fails before any
+    // observation is admitted or directed. PID 0 is never a real child
+    // process, so a caller projecting its exact-identity proof to PID 0
+    // proves no retained child; admitting it on a free endpoint would let an
+    // unproven caller proceed toward termination and relaunch. The production
+    // reconnect caller refuses a zero PID before calling, so this fires only
+    // on caller error, never on a genuine owned reconnect.
+    if retained_old_child_pid == Some(0) {
+        host_launch_observe("host.launch retained child identity degenerate");
+        return Err(HostError::ProcessContour(
+            "retained owned child has no observable process identity".to_owned(),
+        ));
+    }
+
     match store_endpoint_foreign_occupant(endpoint) {
+        // Issue #1775 (A-stale): PID 0 can never own a socket, so an owner
+        // observation of PID 0 is corrupt rather than an occupant. It is
+        // refused as an untrustworthy read instead of being recorded into a
+        // directive or admitted against the retained child; a corrupt read is
+        // not absence, so the start/reconnect defers.
+        StoreEndpointObservation::Occupied { owner_process_id: 0 } => {
+            host_launch_observe("host.launch store endpoint owner unobservable");
+            Err(HostError::StoreEndpointOwnerUnreadable(format!(
+                "planned Store endpoint {endpoint} owner observation is not a real process; a corrupt read is not absence, so the start/reconnect defers until exact installation ownership is observable"
+            )))
+        }
         StoreEndpointObservation::Occupied { owner_process_id }
             if Some(owner_process_id) == retained_old_child_pid =>
         {
