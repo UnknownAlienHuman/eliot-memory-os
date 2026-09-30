@@ -58,10 +58,15 @@
 //!
 //! # Pollability and durability
 //!
-//! The production queue poll snapshots its head under a short composition
-//! lock, then performs authenticated Kernel verification with owned inputs
-//! and no composition guard across the await. Until the Kernel owner retains
-//! the executable-binding digest, that check fails closed before admission,
+//! The runtime queue poll snapshots its head under a short composition
+//! lock, then drives the verified async seam with the composition guard
+//! held across the await: `agent_fabric_new_verified_async` resolves the
+//! session halves and verifies through the Kernel provider-admission
+//! verifier on `&DaemonComposition`, so the guard cannot drop before the
+//! fabric exists. The poll flight stays single-flighted, so ticks never
+//! overlap a drive. Until the owner ports bind (B-MOD #694 for the route,
+//! the native-worker executable-binding digest for execution), the drive
+//! fails closed with the typed owner residual before admission,
 //! activation, or dispatch. The test-only historical dispatch projection is
 //! persisted under the daemon state root before `emit`; uncertain ownership
 //! is never released without an observed terminal disposition.
@@ -677,7 +682,10 @@ fn solo_dispatch_identity(attempt_id: &str, admission_id: &str) -> String {
 }
 
 /// Derives the deterministic solo cancellation identity.
-#[cfg(test)]
+///
+/// Non-test: the verified async drive binds the same `<operation>-cancel`
+/// identity as the test-only sync drive, so both paths address one
+/// cancellation per operation.
 fn solo_cancellation_identity(operation_id: &str) -> String {
     format!("{operation_id}-cancel")
 }
@@ -1150,6 +1158,18 @@ pub fn drive_solo_delegate(
 /// intake without crossing into local admission, activation, or dispatch
 /// substitutes.
 ///
+/// This is the direct-entry probe behind
+/// [`DaemonComposition::solo_drive_once_async`]: it validates the
+/// plan-only staffing receipt and verifies the remaining exact owner tuple
+/// through the Kernel verifier, then returns the typed fail-closed residual
+/// before any capability or fabric effect is created. The runtime queue
+/// poll does not use this probe: [`solo_poll_queue_async`] drives through
+/// [`drive_solo_delegate_verified_async`] into
+/// [`DaemonComposition::agent_fabric_new_verified_async`] instead, so the
+/// verified-construct seam has its production caller on the poll path while
+/// the direct entry stays a probe until its `lib.rs` wrapper threads the
+/// composition through (one-line follow-up outside this module).
+///
 /// Kernel currently has no independently owner-backed executable-binding
 /// digest on its durable provider claim row. Its accepted verifier therefore
 /// cannot yet authorize construction of an `AdmittedProviderCapability` for
@@ -1189,9 +1209,194 @@ pub async fn drive_solo_delegate_async(
     )))
 }
 
-/// The synchronous solo path is retained only for unit tests. Production must
-/// use [`drive_solo_delegate_async`] so Kernel verification never blocks the
-/// current-thread daemon runtime.
+/// Drives one admitted solo delegate intake through the verified async
+/// seam to a retained dispatch (issue #1108 W4/A2).
+///
+/// This is the runtime poll's construct path into
+/// [`DaemonComposition::agent_fabric_new_verified_async`]: the driver's own
+/// claimed halves (`intake.claimed`, operation-presented) travel as the
+/// per-operation `claimed` argument while the same halves' material travels
+/// as the resolution input, and the fabric is built over
+/// [`DaemonComposition::production_fabric_ports`] — never over the
+/// test-only solo ports. Session halves are overwritten with the live
+/// authenticated session values and the binding is verified through the
+/// Kernel provider-admission verifier inside the seam before any admitted
+/// capability exists, so this path mints no authority of its own.
+///
+/// Fail-closed order mirrors the test-only sync drive: readiness, intake
+/// shape, solo recipe, single live slot, plan-only staffing receipt, then
+/// the seam, then the admitted-route gate and the fabric chain
+/// (`define_and_plan` -> `stage_reservation` -> `commit_admission` ->
+/// `activate` -> `dispatch` -> persist -> `emit`). Until the owner ports
+/// bind, the drive refuses at the gate with the typed missing-prerequisite
+/// residual: B-MOD #694 for the route, the Governor swarm-admission owner
+/// for staging, B-ACTIVATION-PROJECTION #839 for activation, the
+/// executor-daemon bind (#874) for emission. The projection is persisted
+/// before `emit` exactly as in the sync drive, so a restart reads back the
+/// same digest-bound attempt.
+///
+/// The caller holds the composition guard across the seam await (see
+/// [`solo_poll_queue_async`]); this function takes `&DaemonComposition`
+/// like the sync drive and performs no locking of its own.
+#[allow(clippy::too_many_lines)]
+#[allow(clippy::needless_pass_by_value)]
+async fn drive_solo_delegate_verified_async(
+    composition: &DaemonComposition,
+    kernel: &Arc<DaemonKernelClient>,
+    intake: SoloDelegateIntake,
+    now_unix_ms: u64,
+) -> Result<SoloDriveOutcome, DaemonError> {
+    if composition.readiness() != CompositionReadiness::Ready {
+        return Err(DaemonError::Composition(CompositionError::NotReady));
+    }
+    intake
+        .validate(now_unix_ms)
+        .map_err(DaemonError::ProviderAdmission)?;
+    guard_solo_plan(&intake.plan).map_err(DaemonError::ProviderAdmission)?;
+    let material = intake.claimed.material();
+    let operation_id = material.operation_id.clone();
+    let attempt_id = AttemptId::new(material.attempt_id.clone())
+        .map_err(|error| DaemonError::ProviderAdmission(contract(error)))?;
+    // Single live slot: a second drive while the slot holds an unsettled
+    // attempt refuses instead of overlapping ownership. A settled slot
+    // clears so the next admitted operation may proceed.
+    {
+        let mut state = composition.solo_state.lock().map_err(|_| {
+            DaemonError::Composition(CompositionError::Recovery(
+                "solo driver state lock poisoned".to_owned(),
+            ))
+        })?;
+        if let Some(live) = state.live_operation.clone()
+            && live != operation_id
+        {
+            let settled = load_projection(composition.state_root(), &live)
+                .is_ok_and(|projection| projection_settled(&projection));
+            if !settled {
+                return Err(DaemonError::ProviderAdmission(FabricError::Contract(
+                    format!("solo slice holds live attempt {live}; settle or cancel it first"),
+                )));
+            }
+            state.live_operation = None;
+        }
+    }
+    let config = daemon_coordinator_config()?;
+    let receipt = plan_coordinator_staffing(&config, &intake.plan).map_err(|error| {
+        DaemonError::ProviderAdmission(FabricError::Contract(error.to_string()))
+    })?;
+    verify_receipt_digest(&receipt).map_err(|error| {
+        DaemonError::ProviderAdmission(FabricError::Contract(error.to_string()))
+    })?;
+    let staffed = receipt.lanes.first().ok_or_else(|| {
+        DaemonError::ProviderAdmission(FabricError::NoRoute(
+            "solo staffing receipt staffed no lane".to_owned(),
+        ))
+    })?;
+    // Issue #1108 W4/A2: the verified-construct site. Production ports plus
+    // the driver's claimed halves enter the async seam; the seam resolves
+    // the session halves over the live authenticated session, verifies the
+    // binding through the Kernel provider-admission verifier, and builds
+    // the sealed capability through the closed admission port before the
+    // coordinator is constructed.
+    let ports = composition.production_fabric_ports()?;
+    let mut fabric = composition
+        .agent_fabric_new_verified_async(kernel, ports, material, &intake.claimed)
+        .await?;
+    // Issue #1702 W2: the drive runs against the daemon state root, so every
+    // owner-separated revision published on this fabric is committed and
+    // verified durably before anything reports it current. Attaching the store
+    // before the first semantic write is what makes the ordering property
+    // reachable from the production path instead of a separate test seam.
+    fabric.attach_semantic_revision_store(composition.state_root());
+    let evidence = composition.capability_admission()?;
+    let route = fabric.require_model_route(
+        &intake.requirements,
+        evidence,
+        &intake.observed_scope,
+        now_unix_ms,
+    )?;
+    let (definition, _) = fabric.define_and_plan(intake.plan.clone())?;
+    let reservation = fabric.stage_reservation(&definition.definition_id)?;
+    let admission = fabric.commit_admission(&reservation.reservation_id)?;
+    let _evidence = fabric.activate(&admission.admission_id, &attempt_id)?;
+    let dispatch_id = solo_dispatch_identity(attempt_id.as_str(), admission.admission_id.as_str());
+    let intent = fabric.dispatch(&admission.admission_id, &attempt_id, &dispatch_id)?;
+    let dispatch = SoloDispatchRecord {
+        dispatch_id: dispatch_id.clone(),
+        claim_id: intake.claimed.claim_id.clone(),
+        attempt_id: attempt_id.as_str().to_owned(),
+        operation_id: operation_id.clone(),
+        task_id: intake.plan.launch.task_id.as_str().to_owned(),
+        route: route.clone(),
+        route_class: staffed.route_class.clone(),
+        worker_generation: intake.claimed.worker_generation,
+        binding_digest: intake.claimed.binding_digest.clone(),
+        executable_digest: intake.claimed.executable_digest.clone(),
+        expected_result_schema: intake.delegate.expected_result.clone(),
+        deadline_unix_ms: intake.deadline_unix_ms,
+        cancellation_id: solo_cancellation_identity(&operation_id),
+        fence: intent.fence.clone(),
+        epoch: intent.epoch.clone(),
+        worker_completed_fields: vec![
+            "registration_id".to_owned(),
+            "executable_binding".to_owned(),
+            "decision_id".to_owned(),
+            "parent_job_id".to_owned(),
+            "work_scope_id".to_owned(),
+            "expected_result_schema_version".to_owned(),
+        ],
+    };
+    let snapshot = fabric.snapshot()?;
+    let projection = SoloPersistedAttempt {
+        operation_id: operation_id.clone(),
+        attempt_id: attempt_id.as_str().to_owned(),
+        delegate_digest: intake.delegate.source_digest.clone(),
+        plan_digest: definition.definition_digest.clone(),
+        requirements: intake.requirements.clone(),
+        observed_scope: intake.observed_scope.clone(),
+        claimed: intake.claimed.clone(),
+        receipt: receipt.clone(),
+        snapshot,
+        dispatch: Some(dispatch.clone()),
+        emitted: false,
+        result_digest: None,
+        cancellation_evidence: None,
+    };
+    persist_projection(composition.state_root(), &projection)?;
+    let ack = fabric.emit(&dispatch_id)?;
+    if !ack.retained || ack.dispatch_id != dispatch_id {
+        return Err(DaemonError::ProviderAdmission(FabricError::Contract(
+            "solo egress acknowledgement does not retain the intent".to_owned(),
+        )));
+    }
+    let mut projection = projection;
+    projection.emitted = true;
+    projection.snapshot = fabric.snapshot()?;
+    persist_projection(composition.state_root(), &projection)?;
+    {
+        let mut state = composition.solo_state.lock().map_err(|_| {
+            DaemonError::Composition(CompositionError::Recovery(
+                "solo driver state lock poisoned".to_owned(),
+            ))
+        })?;
+        state.live_operation = Some(operation_id.clone());
+    }
+    Ok(SoloDriveOutcome {
+        operation_id,
+        attempt_id: attempt_id.as_str().to_owned(),
+        dispatch_id,
+        admission_id: admission.admission_id.as_str().to_owned(),
+        route,
+        retained: ack.retained,
+        dispatch,
+    })
+}
+
+/// The synchronous solo path is retained only for unit tests. Production
+/// drives through the async verified seam: the runtime poll uses
+/// [`drive_solo_delegate_verified_async`], while direct production calls
+/// stay on the [`drive_solo_delegate_async`] probe; both refuse this
+/// synchronous path because authenticated Kernel verification requires an
+/// async call.
 #[cfg(not(test))]
 pub fn drive_solo_delegate(
     _composition: &DaemonComposition,
@@ -1206,7 +1411,10 @@ pub fn drive_solo_delegate(
 }
 
 /// Returns true when the persisted projection needs no further drive.
-#[cfg(test)]
+///
+/// Non-test: the verified async drive clears a settled live slot under the
+/// same rule as the test-only sync drive, so one settled attempt never
+/// pins the slot against the next admitted operation.
 fn projection_settled(projection: &SoloPersistedAttempt) -> bool {
     if projection.result_digest.is_some() || projection.cancellation_evidence.is_some() {
         return true;
@@ -1314,6 +1522,33 @@ fn restore_solo_fabric(
 }
 
 #[cfg(not(test))]
+/// STITCH(#1108-W4/A2-restore): the production restore side of the async
+/// seam ([`DaemonComposition::agent_fabric_restore_verified_async`]) is
+/// constructed and signature-ready, but no driver context can call it yet,
+/// so production restore stays fail-closed here instead of half-wired:
+///
+/// 1. Every restore caller in this module except [`solo_fair_pull_recovery`]
+///    is synchronous (`solo_request_cancel`, `solo_reconcile_cancel`,
+///    `solo_ingest_result`, `solo_restore`); awaiting the async restore
+///    from any of them would convert sync to async, which this stitch
+///    explicitly does not do.
+/// 2. A solo restore must rebind the persisted solo context (definition
+///    digest, fence, epoch, attempt, receipt lanes) through solo-context
+///    ports, and no non-test solo-context ports exist in this module:
+///    `solo_fabric_ports` and `SoloModelRegistryPort` are `cfg(test)`,
+///    while the production registry port is private to `lib.rs`. The async
+///    restore seam requires caller-supplied `ports` plus the driven
+///    `&SoloClaimedHalves`, so the ports to hand it are not assemblable
+///    from this module on a non-test build.
+/// 3. The remaining async restorer, [`solo_fair_pull_recovery`], therefore
+///    stays on the synchronous verified seam as well: restoring with the
+///    wrong (context-free) ports would silently drop the frozen-plan and
+///    fence bindings the seam exists to enforce.
+///
+/// Wiring the async restore belongs with the W1-ports lane that binds the
+/// non-test solo-context (or accepted production) ports; until then the
+/// stub below refuses typed and no production build resumes effecting
+/// operations from a snapshot.
 fn restore_solo_fabric(
     _composition: &DaemonComposition,
     _kernel: &Arc<DaemonKernelClient>,
@@ -1391,15 +1626,17 @@ fn load_scheduling_profile(
 /// re-resolves live owner evidence over the closed production ports, and
 /// reconciles an emitted-but-unresulted dispatch to unknown instead of
 /// relaunching; missing, stale, or revoked evidence refuses typed before any
-/// effect. New production work stays one documented fail-closed hop short of
-/// live admission, and that hop is not this issue's:
-/// `drive_solo_delegate_async` refuses before any fabric effect until the
-/// native-worker owner persists the executable-binding digest, so no
-/// production build yet creates an admitted coordinator projection to pull
-/// over. That residual is the Kernel native-worker owner (issue #1678). The
-/// join is placed on the release path because that is where I14.8 says the
-/// wake happens, not on a site that would be reachable only by pulling over
-/// an empty plan-only coordinator.
+/// effect. New production work now constructs through the async seam on the
+/// runtime queue-poll path
+/// ([`drive_solo_delegate_verified_async`] over
+/// [`DaemonComposition::agent_fabric_new_verified_async`] with the driver's
+/// claimed halves) and fails closed one hop later: the admitted-route gate
+/// refuses with the typed missing-prerequisite residual until B-MOD #694
+/// binds an accepted registry revision, and execution still waits on the
+/// native-worker executable-binding owner (issue #1678). The join is placed
+/// on the release path because that is where I14.8 says the wake happens,
+/// not on a site that would be reachable only by pulling over an empty
+/// plan-only coordinator.
 fn drive_fair_pull_after_release(
     composition: &DaemonComposition,
     fabric: &mut AgentFabric,
@@ -1475,10 +1712,10 @@ pub enum FairPullRecovery {
 /// poll restores through the verified seam (issue #1108): missing, stale, or
 /// revoked evidence reports its typed refusal and stays blocked, and an
 /// emitted-but-unresulted dispatch reconciles to unknown instead of
-/// relaunching. No new production projection is created here — that residual
-/// (the Kernel native-worker executable-binding owner, #1678) still refuses
-/// at `drive_solo_delegate_async` — so the poll only ever drives a previously
-/// admitted projection.
+/// relaunching. New projections construct through the async seam on the
+/// queue-poll path ([`drive_solo_delegate_verified_async`]) but refuse at
+/// the admitted-route gate until B-MOD #694 binds — so the poll only ever
+/// drives a previously admitted projection, never a fresh one.
 ///
 /// The Kernel handle is used only for the restore's live owner-evidence
 /// re-resolution that [`restore_solo_fabric`] already performs; this poll
@@ -1762,9 +1999,19 @@ pub fn solo_poll_queue(
     })
 }
 
-/// Async runtime poll hook. It leaves the head item queued when Kernel refuses
-/// or the executable-binding owner evidence is absent, preserving the exact
-/// operation for a later fresh evaluation.
+/// Async runtime poll hook. It leaves the head item queued when the verified
+/// drive refuses, preserving the exact operation for a later fresh
+/// evaluation.
+///
+/// The head intake drives through [`drive_solo_delegate_verified_async`]:
+/// the composition guard is held across the seam await because
+/// [`DaemonComposition::agent_fabric_new_verified_async`] resolves the
+/// session halves and verifies through the Kernel provider-admission
+/// verifier on `&DaemonComposition`. The poll flight stays single-flighted
+/// (see `daemon_runtime`), so ticks never overlap a drive. Until the owner
+/// ports bind, the drive refuses with the typed missing-prerequisite
+/// residual and the head stays queued; a refusal is a refusal, never a
+/// degraded drive.
 pub async fn solo_poll_queue_async(
     composition: &tokio::sync::Mutex<DaemonComposition>,
     kernel: &Arc<DaemonKernelClient>,
@@ -1791,9 +2038,17 @@ pub async fn solo_poll_queue_async(
         }
         head
     };
-    // The async owner call operates only on owned intake and Kernel handles.
-    // The Tokio composition guard above is out of scope across this await.
-    let outcome = drive_solo_delegate_async(kernel, intake, crate::unix_ms()).await?;
+    // Issue #1108 W4/A2: the runtime drive chain
+    // (`run_loop` -> `solo_poll_queue_async` -> verified drive) enters the
+    // async seam here with the driver's claimed halves. The composition
+    // guard is held across this await: the seam needs `&DaemonComposition`
+    // for the production ports, the session-half resolution, and the
+    // capability construction, and the single live slot it mutates must not
+    // move underneath the drive.
+    let outcome = {
+        let composition = composition.lock().await;
+        drive_solo_delegate_verified_async(&composition, kernel, intake, crate::unix_ms()).await?
+    };
     {
         let composition = composition.lock().await;
         let mut state = composition.solo_state.lock().map_err(|_| {
