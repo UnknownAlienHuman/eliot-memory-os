@@ -1439,16 +1439,43 @@ impl PacketAdmissionBundle {
         measurement_profile
             .validate()
             .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
-        if floor.decision.decision_id != binding.decision_id
-            || priority.decision.decision_id != binding.decision_id
-            || rule.decision.decision_id != binding.decision_id
+        let bundle = Self {
+            floor,
+            priority,
+            rule,
+            measurement_profile,
+            supplied_omissions,
+            measurements,
+        };
+        bundle.binds(recipe, binding)?;
+        Ok(bundle)
+    }
+
+    /// Proves this bundle closes over one compilation (#2564 I3).
+    ///
+    /// The floor, priority and rule decisions name the compilation decision,
+    /// the recipe binds the same task/attempt/scope/fence decision, every
+    /// recipe mandatory role is covered by the floor, the floor reserves
+    /// reconcile, and every omission and measurement binds the same context.
+    /// [`PacketAdmissionBundle::build`] runs this after mint-time validation;
+    /// [`KernelContextReadClient::compile_context_packet`] runs it again over
+    /// the presented bundle, so a bundle minted for another compilation fails
+    /// here as a typed composition error, never as an admitted foreign closure.
+    pub fn binds(
+        &self,
+        recipe: &ContextRecipe,
+        binding: &ContextBinding,
+    ) -> Result<(), PacketCompositionError> {
+        if self.floor.decision.decision_id != binding.decision_id
+            || self.priority.decision.decision_id != binding.decision_id
+            || self.rule.decision.decision_id != binding.decision_id
         {
             return Err(PacketCompositionError::BindingMismatch);
         }
         if recipe.binding != *binding {
             return Err(PacketCompositionError::BindingMismatch);
         }
-        let floor_roles: BTreeSet<_> = floor.floor.mandatory_roles.iter().collect();
+        let floor_roles: BTreeSet<_> = self.floor.floor.mandatory_roles.iter().collect();
         if !recipe
             .mandatory_roles
             .iter()
@@ -1456,17 +1483,17 @@ impl PacketAdmissionBundle {
         {
             return Err(PacketCompositionError::BindingMismatch);
         }
-        floor
+        self.floor
             .floor
             .capacity
             .validate()
             .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
-        for omission in &supplied_omissions {
+        for omission in &self.supplied_omissions {
             omission
                 .validate(binding)
                 .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
         }
-        for measurement in &measurements {
+        for measurement in &self.measurements {
             measurement
                 .validate()
                 .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
@@ -1474,14 +1501,7 @@ impl PacketAdmissionBundle {
                 return Err(PacketCompositionError::BindingMismatch);
             }
         }
-        Ok(Self {
-            floor,
-            priority,
-            rule,
-            measurement_profile,
-            supplied_omissions,
-            measurements,
-        })
+        Ok(())
     }
 }
 
@@ -1515,14 +1535,12 @@ impl KernelContextReadClient {
     ///   owner: generic authority rows are not automatically admitted
     ///   Cue/negative-memory/capability inputs.
     ///
-    /// The admission closure pieces (`floor`, `priority`, `rule`,
-    /// `measurement_profile`, omissions, measurements), the `quality`
-    /// scorecard, the assembly `policy`, and the `measure` callback all arrive
-    /// from their owners: a protected floor, reservations, and scorecard
-    /// evidence are never assembled here merely to satisfy the renderer. The
-    /// pieces are closed into the one admission bundle by
-    /// [`PacketAdmissionBundle::build`], so an unvalidated or foreign piece
-    /// fails before any candidate is admitted. An explicit admission gap fails as
+    /// The admission closure arrives built, never loose: the one validated
+    /// [`PacketAdmissionBundle`] the owner suppliers closed through
+    /// [`PacketAdmissionBundle::build`]. The pieces are re-proved against this
+    /// compilation by [`PacketAdmissionBundle::binds`], so an unvalidated or
+    /// foreign bundle fails before any candidate is admitted. An explicit
+    /// admission gap fails as
     /// [`PacketCompositionError::AdmissionIncomplete`] with the owner's gaps,
     /// never as a silently cut view. The packet dispatch invokes this edge with
     /// the admitted pair's binding, recipe, and owner evidence; large output
@@ -1535,20 +1553,18 @@ impl KernelContextReadClient {
     /// which holds the admitted binding and the owner recipe today and still
     /// lacks the remaining owner suppliers (seven-role converters, candidate
     /// policy, admission identities, quality card, assembly policy,
-    /// measurement). Until those suppliers call this edge with owner-minted
-    /// pieces, the packet keeps its unbound-closure gap.
-    #[allow(clippy::too_many_arguments)]
+    /// measurement). Until those suppliers call this edge with an owner-built
+    /// bundle, the packet keeps its unbound-closure gap.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the bundle arrives built; the rest are the compilation's distinct owner inputs"
+    )]
     pub fn compile_context_packet(
         seven: &SevenRoleInputs,
         request: &CandidateRequest,
         recipe: &ContextRecipe,
         policy: &CandidatePolicy,
-        floor: SafetyFloorIdentity,
-        priority: PriorityPolicyIdentity,
-        rule: AdmissionRuleIdentity,
-        measurement_profile: MeasurementCompositionProfile,
-        supplied_omissions: Vec<SuppliedOmissionBinding>,
-        measurements: Vec<AdmissionMeasurement>,
+        admission: &PacketAdmissionBundle,
         quality: QualityScorecard,
         assembly: &AssemblyPolicy,
         measure: impl FnOnce(&[u8]) -> Result<SerializedContextMeasurement, ContextError>,
@@ -1568,18 +1584,7 @@ impl KernelContextReadClient {
         policy
             .validate()
             .map_err(|error| PacketCompositionError::Candidates(Box::new(error)))?;
-        let admission = PacketAdmissionBundle::build(
-            PacketAdmissionParts {
-                floor,
-                priority,
-                rule,
-                measurement_profile,
-                supplied_omissions,
-                measurements,
-            },
-            recipe,
-            &request.binding,
-        )?;
+        admission.binds(recipe, &request.binding)?;
         let scope_revision = observed_scope_revision(seven)?;
         let task_frame = required_projection(
             &seven.task_frame,
