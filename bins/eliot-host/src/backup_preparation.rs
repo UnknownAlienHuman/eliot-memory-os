@@ -1392,8 +1392,10 @@ impl PreparationJournal for HostStatePreparationJournal<'_> {
         // The result must describe the very root and identity the durable
         // admission proposed, or it is not this operation's result. Every
         // comparison is against the RETAINED value, never a recomputation.
-        if !windows_paths_equal(&destination.root, Path::new(retained.destination_root.as_str()))
-            || destination.destination_id != retained.destination_id.as_str()
+        if !windows_paths_equal(
+            &destination.root,
+            Path::new(retained.destination_root.as_str()),
+        ) || destination.destination_id != retained.destination_id.as_str()
             || destination.admission_digest != retained.admission_digest.as_str()
             || destination.config_projection_digest != retained.config_projection_digest.as_str()
             || destination.destination_epoch != retained.destination_epoch
@@ -1405,12 +1407,28 @@ impl PreparationJournal for HostStatePreparationJournal<'_> {
         // A cleanup state carries the identity forward from the record it
         // succeeds; a frame that names a different one is not this operation's
         // reclamation.
-        if let Some(retained_identity) = retained.destination_root_identity.as_ref() {
-            if retained_identity.as_str() != pinned {
-                return Err(PreparationError::ConflictField {
-                    field: "destination_root_identity",
-                });
-            }
+        // A retained record that pinned no identity cannot be advanced into a
+        // cleanup state: the pinned identity is the SOLE proof that this
+        // operation created that exact root, and a cleanup frame that carried
+        // none would authorise a deletion nothing proved. The owner's own
+        // record validation refuses such a frame too; refusing here names the
+        // operation instead of surfacing it as a journal fault.
+        if retained
+            .destination_root_identity
+            .as_ref()
+            .is_some_and(|retained_identity| retained_identity.as_str() != pinned)
+        {
+            return Err(PreparationError::ConflictField {
+                field: "destination_root_identity",
+            });
+        }
+        if retained.destination_root_identity.is_none() {
+            return Err(PreparationError::UnknownState {
+                operation: operation_id.to_owned(),
+                reason: "the retained record pinned no destination identity, so this operation \
+                         cannot prove it created the root it would reclaim"
+                    .to_owned(),
+            });
         }
         let record = BackupPreparationRecord {
             fence: retained.fence.clone(),
@@ -1489,7 +1507,10 @@ impl PreparationJournal for HostStatePreparationJournal<'_> {
             })?
             .to_path_buf();
         check_persistable_path(&canonical_parent, "canonical_parent")?;
-        check_persistable_path(Path::new(record.destination_root.as_str()), "destination_root")?;
+        check_persistable_path(
+            Path::new(record.destination_root.as_str()),
+            "destination_root",
+        )?;
         let intent = serde_json::json!({
             "version": PREPARATION_VERSION,
             "operation_id": operation_id,
@@ -1801,12 +1822,14 @@ fn persistable_path_text<'a>(
     path: &'a Path,
     field: &'static str,
 ) -> Result<&'a str, PreparationError> {
-    path.to_str().ok_or_else(|| PreparationError::InvalidRequest {
-        field,
-        reason: "path has no lossless text form on this platform; refusing before any intent or \
+    path.to_str()
+        .ok_or_else(|| PreparationError::InvalidRequest {
+            field,
+            reason:
+                "path has no lossless text form on this platform; refusing before any intent or \
                  effect rather than recording replacement characters"
-            .to_owned(),
-    })
+                    .to_owned(),
+        })
 }
 
 /// Shape-only wrapper over [`persistable_path_text`] for the places that only
@@ -2533,9 +2556,7 @@ impl PreparationLifecycle {
     pub fn usable_destination(&self) -> Option<&PreparedDestination> {
         match self {
             Self::Prepared(destination) => Some(destination),
-            Self::Cancelled { .. }
-            | Self::CleanupPending { .. }
-            | Self::Reclaimed { .. } => None,
+            Self::Cancelled { .. } | Self::CleanupPending { .. } | Self::Reclaimed { .. } => None,
         }
     }
 
@@ -2666,9 +2687,10 @@ fn decode_preparation_record(
     {
         return Err(PreparationError::UnknownState {
             operation: operation_id.to_owned(),
-            reason: "recorded record carries a version this decoder does not implement; preserved, \
+            reason:
+                "recorded record carries a version this decoder does not implement; preserved, \
                      never re-interpreted"
-                .to_owned(),
+                    .to_owned(),
         });
     }
     // The stored operation identity is the record's own. A frame naming a
@@ -2713,17 +2735,27 @@ fn decode_preparation_record(
                     operation: operation_id.to_owned(),
                     reason: "cleanup transition block declares no state; preserved".to_owned(),
                 })?;
-            if transition.get("version").and_then(serde_json::Value::as_u64)
+            if transition
+                .get("version")
+                .and_then(serde_json::Value::as_u64)
                 != Some(u64::from(CLEANUP_TRANSITION_VERSION))
                 || state.spelling() != transition_state
                 || !state_is_cleanup(state)
-                || transition.get("operation_id").and_then(serde_json::Value::as_str)
+                || transition
+                    .get("operation_id")
+                    .and_then(serde_json::Value::as_str)
                     != Some(operation_id)
-                || transition.get("destination_id").and_then(serde_json::Value::as_str)
+                || transition
+                    .get("destination_id")
+                    .and_then(serde_json::Value::as_str)
                     != Some(receipt.destination_id.as_str())
-                || transition.get("destination_epoch").and_then(serde_json::Value::as_u64)
+                || transition
+                    .get("destination_epoch")
+                    .and_then(serde_json::Value::as_u64)
                     != Some(receipt.destination_epoch)
-                || transition.get("admission_digest").and_then(serde_json::Value::as_str)
+                || transition
+                    .get("admission_digest")
+                    .and_then(serde_json::Value::as_str)
                     != Some(receipt.admission_digest.as_str())
                 || transition
                     .get("root_identity")
@@ -2956,12 +2988,13 @@ fn validate_recorded_binding(
                 .to_owned(),
         });
     };
-    let admission_frame = intent
-        .get("admission")
-        .ok_or_else(|| PreparationError::UnknownState {
-            operation: operation_id.to_owned(),
-            reason: "recorded intent carries no admission".to_owned(),
-        })?;
+    let admission_frame =
+        intent
+            .get("admission")
+            .ok_or_else(|| PreparationError::UnknownState {
+                operation: operation_id.to_owned(),
+                reason: "recorded intent carries no admission".to_owned(),
+            })?;
     let owner_evidence = match binding {
         RecordedAdmissionBinding::Complete => {
             let admission = recorded_complete_admission(admission_frame, operation_id)?;
@@ -2993,11 +3026,7 @@ fn validate_recorded_binding(
             field: "config_projection_digest",
         });
     }
-    let canonical_parent = PathBuf::from(recorded_text(
-        intent,
-        "canonical_parent",
-        operation_id,
-    )?);
+    let canonical_parent = PathBuf::from(recorded_text(intent, "canonical_parent", operation_id)?);
     check_persistable_path(&canonical_parent, "canonical_parent")?;
     if intent.get("root").and_then(serde_json::Value::as_str)
         != Some(persistable_path_text(&receipt.root, "root")?)
@@ -3182,7 +3211,9 @@ pub fn prepare_isolated_destination<J: PreparationJournal>(
             // both replay paths now re-open the recorded root through the owner
             // that containment-checks and pins it.
             let lease = reverify_recorded_destination(&admission.operation_id, destination)
-                .map_err(|error| note_prepare_error(OP_PREPARE, "replay_check", error, generation))?;
+                .map_err(|error| {
+                    note_prepare_error(OP_PREPARE, "replay_check", error, generation)
+                })?;
             // Observed replay, not a second effect: the recorded destination is
             // re-verified and reused unchanged. The retained lease is dropped on
             // purpose — deciding a destination is reusable is not a reason to hold
@@ -3368,23 +3399,20 @@ pub fn reconcile_preparation<J: PreparationJournal>(
         });
     };
     // The SAME decoder and the SAME record-intent join the prepare replay uses.
-// Reconciliation previously decoded the result with a field-name reader and did
-// not join it to its intent at all, so a record whose result named a root, an
-// identity and a destination identity the recorded admission never admitted
-// reconciled as `Current`.
-    let lifecycle = match validate_recorded_binding(operation_id, &intent, &result) {
-        Ok(lifecycle) => lifecycle,
-        Err(_) => {
-            observe_prepare_progress(OP_RECONCILE, "outcome", "uncertain", 0, 0);
-            return Ok(ReconcileDisposition::Uncertain {
-                // The specific refusal is deliberately not echoed: it names
-                // recorded paths and digests. What matters to a reader is that
-                // the outcome is unestablished and preserved.
-                reason: "recorded result does not join its own recorded intent; preserved for \
-                         inspection"
+    // Reconciliation previously decoded the result with a field-name reader and
+    // did not join it to its intent at all, so a record whose result named a
+    // root, an identity and a destination identity the recorded admission never
+    // admitted reconciled as `Current`.
+    let Ok(lifecycle) = validate_recorded_binding(operation_id, &intent, &result) else {
+        observe_prepare_progress(OP_RECONCILE, "outcome", "uncertain", 0, 0);
+        return Ok(ReconcileDisposition::Uncertain {
+            // The specific refusal is deliberately not echoed: it names
+            // recorded paths and digests. What matters to a reader is that
+            // the outcome is unestablished and preserved.
+            reason:
+                "recorded result does not join its own recorded intent; preserved for inspection"
                     .to_owned(),
-            });
-        }
+        });
     };
     // Only a `Prepared` record may reconcile into a usable destination. A
     // cancelled, cleanup-pending or reclaimed record is terminal or unsettled,
@@ -3486,14 +3514,10 @@ pub fn cancel_preparation<J: PreparationJournal>(
             // disk is still the object this operation created.
             reverify_recorded_destination(operation_id, &destination)
                 .map_err(|error| note_prepare_error(OP_CANCEL, "reconcile", error, 0))?;
-            let prior_receipt =
-                result_json(&destination, PreparationLifecycleState::Prepared).map_err(|error| {
-                    note_prepare_error(OP_CANCEL, "record_result", error, 0)
-                })?;
-            let mut envelope =
-                result_json(&destination, PreparationLifecycleState::Cancelled).map_err(|error| {
-                    note_prepare_error(OP_CANCEL, "record_result", error, 0)
-                })?;
+            let prior_receipt = result_json(&destination, PreparationLifecycleState::Prepared)
+                .map_err(|error| note_prepare_error(OP_CANCEL, "record_result", error, 0))?;
+            let mut envelope = result_json(&destination, PreparationLifecycleState::Cancelled)
+                .map_err(|error| note_prepare_error(OP_CANCEL, "record_result", error, 0))?;
             envelope["prior_receipt"] = prior_receipt;
             journal
                 .record_result(operation_id, &envelope)
@@ -3513,9 +3537,10 @@ pub fn cancel_preparation<J: PreparationJournal>(
             "outcome",
             PreparationError::UnknownState {
                 operation: operation_id.to_owned(),
-                reason: "an authorized reclamation is already pending and its effect is unobserved; \
+                reason:
+                    "an authorized reclamation is already pending and its effect is unobserved; \
                           cancellation is a different transition and cannot reverse it"
-                    .to_owned(),
+                        .to_owned(),
             },
             0,
         )),
@@ -3685,7 +3710,7 @@ pub fn cleanup_preparations<J: PreparationJournal>(
             return Ok(report);
         }
         // The sweep classifies through the SAME decoder every other read path uses,
-// through [`validate_recorded_binding`] rather than through
+        // through [`validate_recorded_binding`] rather than through
         // [`reconcile_preparation`]'s disposition: a cancelled record reconciles as
         // a preserved terminal disposition, yet its root is still an owned
         // unactivated preparation this sweep may reclaim once it clears the same
@@ -3702,8 +3727,7 @@ pub fn cleanup_preparations<J: PreparationJournal>(
                 // call stay in the report and the unprocessed remainder is
                 // preserved with it, so no post-effect failure can discard the
                 // evidence of an irreversible effect.
-                let reason =
-                    note_prepare_error(OP_CLEANUP, "reconcile", error, 0).to_string();
+                let reason = note_prepare_error(OP_CLEANUP, "reconcile", error, 0).to_string();
                 record_sweep_stop(&mut report, &swept[index..], &reason);
                 return Ok(report);
             }
@@ -3767,13 +3791,7 @@ pub fn cleanup_preparations<J: PreparationJournal>(
             // not re-authorize: the transition is already durable, so this goes
             // straight to the same removal proof with no second transition write.
             PreparationLifecycle::CleanupPending { .. } => {
-                remove_reverified_destination(
-                    journal,
-                    operation_id,
-                    &receipt,
-                    false,
-                    &mut report,
-                );
+                remove_reverified_destination(journal, operation_id, &receipt, false, &mut report);
             }
             // `Prepared` and `Cancelled` are both reclamation candidates. A
             // cancellation withdrew the operation, not the root; what authorizes
