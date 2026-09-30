@@ -210,6 +210,31 @@ struct InlineProcessEvidenceIdentity<'a> {
 /// same `persistence_codec`; it is not a second journal or table owner.
 const PROCESS_STREAM_RECOVERY: TableDefinition<&str, &str> =
     TableDefinition::new("ors_process_stream_recovery_v1");
+
+/// Writer admission for the process-stream recovery family's one durable write
+/// body (issue #269).
+///
+/// `Observation` is the ordinary sink/observation writer: it may advance
+/// availability and nothing else. `TerminalPlacement` is admitted to place a
+/// terminal row, and exactly two call sites carry it — retirement, which
+/// proves terminal disposition and a recorded handoff, and the restore, which
+/// re-preserves already-proven terminal evidence. `HandoffRecord` is admitted
+/// to record a proven handoff, and exactly one call site carries it
+/// ([`RedbRecoveryStore::record_process_stream_recovery_handoff`]), which
+/// proves terminal disposition, the terminal receipt and a fresh Blob readback
+/// against the durable row immediately before the write and binds the recorded
+/// digest to that readback. No admission is a licence: the two hoisted
+/// reconciliation rules still apply to every arm of the write body.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StreamRecoveryWriteAdmission {
+    /// Ordinary observation writer: availability advances only.
+    Observation,
+    /// Retirement and restore: the only writers that may place a terminal row.
+    TerminalPlacement,
+    /// Owning operation contract: the only writer that may move a durable
+    /// reconciliation into `Reconciled`.
+    HandoffRecord,
+}
 const SUPERVISION_LEASE_STAGED: TableDefinition<&str, &str> =
     TableDefinition::new("ors_supervision_lease_staged_v1");
 const SUPERVISION_LEASE_CURRENT: TableDefinition<&str, &str> =
@@ -24072,21 +24097,22 @@ impl RedbRecoveryStore {
     /// backup/restore.
     ///
     /// This path never RECORDS a handoff either, and that is the property the
-    /// retirement gate leans on. It passes the placement token as `false`, so
+    /// retirement gate leans on. It carries the `Observation` admission, so
     /// the write body refuses ANY change to a durable row's `reconciliation`
     /// here — in the merge arm and in the transition arm alike, in either
     /// direction and onto any owner, state or digest — and refuses an empty-key
     /// insert that carries a handoff digest. An observation therefore advances
     /// `availability`, and only `availability`. The digest that
     /// [`Self::retire_process_stream_recovery`] later compares cannot be
-    /// authored here; the one remaining author is a restore into an EMPTY
-    /// `(operation, stream)` key, which is disclosed at
+    /// authored here; its authors are the handoff recorder
+    /// ([`Self::record_process_stream_recovery_handoff`]) and a restore into
+    /// an EMPTY `(operation, stream)` key, which is disclosed at
     /// [`Self::import_process_stream_recovery_suspended`].
     pub fn put_process_stream_recovery(
         &self,
         projection: &ProcessStreamRecoveryProjection,
     ) -> Result<ProcessStreamRecoveryWriteOutcome, OrsError> {
-        self.write_process_stream_recovery(projection, false)
+        self.write_process_stream_recovery(projection, StreamRecoveryWriteAdmission::Observation)
     }
 
     /// The one refusal a writer without the placement token gets, shared by both
@@ -24110,11 +24136,14 @@ impl RedbRecoveryStore {
     /// separate message from [`Self::HANDOFF_AUTHORSHIP_REFUSED`] on purpose:
     /// that one says no writer outside the operation contract's own write may
     /// record a handoff, and this one says that once a DURABLE row carries
-    /// one, nothing may move it, re-point it or erase it — not the owning
-    /// operation contract, and not the admitted restore either.
+    /// one, nothing may move it, re-point it or erase it — not the admitted
+    /// restore either. The move INTO `Reconciled` has exactly one admitted
+    /// author, the handoff recorder, and this refusal is what every other
+    /// writer gets for attempting it.
     const HANDOFF_WRITE_ONCE_REFUSED: &str = "a durable reconciled handoff is write-once and immutable: a \
-         recovery reconciliation is never moved into Reconciled by a later write, never moved out of it, \
-         and a row that is already Reconciled keeps its owner and its handoff digest byte for byte";
+         recovery reconciliation is moved into Reconciled only by the owning operation contract's proven \
+         handoff write, never moved out of it, and a row that is already Reconciled keeps its owner and \
+         its handoff digest byte for byte";
 
     /// THE RULE, stated once and applied ABOVE the whole match: a writer that
     /// is not admitted for terminal placement may not change a durable row's
@@ -24143,9 +24172,10 @@ impl RedbRecoveryStore {
     ///
     /// `evidence_axes_sha256` cannot see any of this: it excludes
     /// `reconciliation` by design, which is exactly why the rule is here. What
-    /// the two admitted writers do instead is in
+    /// the admitted writers do instead is in
     /// [`Self::write_process_stream_recovery`]: retirement writes the row it
     /// read back, so the reconciliation is byte-identical and no rule fires,
+    /// the handoff recorder carries the one admitted `Reconciled` transition,
     /// and the restore is re-presenting an archived row and is held by the
     /// SECOND rule below, [`Self::refuse_handoff_rewrite`], which speaks to
     /// every writer.
@@ -24190,7 +24220,9 @@ impl RedbRecoveryStore {
     /// `reconciliation.owner` (`mod:source` against `mod:local`) and is still
     /// allowed to present it, so a byte-identical-reconciliation rule would
     /// have refused every ordinary W7 restore. Three clauses instead:
-    /// - a reconciliation that is not `Reconciled` is never moved INTO it;
+    /// - a reconciliation that is not `Reconciled` is never moved INTO it,
+    ///   except by the handoff recorder, which proves terminal disposition,
+    ///   the terminal receipt and a fresh readback first;
     /// - a `Reconciled` one is never moved OUT of it;
     /// - a row already `Reconciled` keeps its `owner` and its `handoff_sha256`
     ///   byte for byte.
@@ -24206,6 +24238,7 @@ impl RedbRecoveryStore {
     /// a disclosed pre-existing residual, at
     /// [`Self::import_process_stream_recovery_suspended`].
     fn refuse_handoff_rewrite(
+        admission: StreamRecoveryWriteAdmission,
         projection: &ProcessStreamRecoveryProjection,
         existing: Option<&ProcessStreamRecoveryProjection>,
     ) -> Result<(), OrsError> {
@@ -24217,10 +24250,15 @@ impl RedbRecoveryStore {
             existing.reconciliation.state == reconciled,
             projection.reconciliation.state == reconciled,
         ) {
-            // Clause one (not `Reconciled` -> `Reconciled`) and clause two
-            // (`Reconciled` -> anything else) are the same refusal: the handoff
-            // is never moved across that state boundary in either direction.
-            (false, true) | (true, false) => true,
+            // Clause one (not `Reconciled` -> `Reconciled`) is refused for
+            // every writer except the one admitted to record a proven handoff
+            // ([`Self::record_process_stream_recovery_handoff`]), which proves
+            // terminal disposition, the terminal receipt and a fresh readback
+            // before the write and binds the digest to that readback. Clause
+            // two (`Reconciled` -> anything else) is refused for every writer:
+            // the handoff is never moved out once recorded.
+            (false, true) => admission != StreamRecoveryWriteAdmission::HandoffRecord,
+            (true, false) => true,
             // Clause three: an already `Reconciled` row keeps its owner and its
             // digest. Its handoff digest is `Some` by
             // `StreamRecoveryReconciliation::validate`, so comparing the
@@ -24301,8 +24339,8 @@ impl RedbRecoveryStore {
     /// The family's one durable write body, shared by the gated public writer,
     /// by retirement and by the restore's terminal re-presentation.
     ///
-    /// `terminal_placement_admitted` is `true` on exactly two call sites, and
-    /// they are admitted for DIFFERENT reasons:
+    /// `admission` is `TerminalPlacement` on exactly two call sites, and they
+    /// are admitted for DIFFERENT reasons:
     /// - [`Self::retire_process_stream_recovery`], which proves terminal
     ///   disposition, the terminal receipt and the evidence handoff against the
     ///   durable row immediately before this write, and writes that row back
@@ -24312,11 +24350,18 @@ impl RedbRecoveryStore {
     ///   owning operation contract already proved and durably archived, which is
     ///   why an archived `Retired` row stays `Retired`.
     ///
-    /// Every other caller passes `false`, and the flag is an admission token
-    /// rather than a licence: no path creates terminality out of nothing, and an
-    /// empty `(operation, stream)` key is no exemption, so the insert arm
-    /// refuses a `Retired` projection exactly as the transition arm does. A
-    /// write that changes a live row's activation to `Retired` is accepted only
+    /// `admission` is `HandoffRecord` on exactly one call site,
+    /// [`Self::record_process_stream_recovery_handoff`], which proves terminal
+    /// disposition, the terminal receipt and a fresh Blob readback against the
+    /// durable row immediately before this write and records the readback-bound
+    /// handoff digest the retirement gate later compares. Every other caller
+    /// carries `Observation`.
+    ///
+    /// The admission is a token rather than a licence: no path creates
+    /// terminality out of nothing, and an empty `(operation, stream)` key is no
+    /// exemption, so the insert arm refuses a `Retired` projection exactly as
+    /// the transition arm does. A write that changes a live row's activation
+    /// to `Retired` is accepted only
     /// when the projection equals that row, as read by THIS transaction, in
     /// every field except the activation, and is refused with
     /// [`OrsError::ReconciliationMismatch`] otherwise: the exact shape
@@ -24337,9 +24382,12 @@ impl RedbRecoveryStore {
     /// first one is silent about an admitted one and the admitted restore
     /// reaches the transition arm, which writes the incoming projection
     /// verbatim. [`Self::refuse_handoff_rewrite`] makes a `Reconciled` handoff
-    /// on a durable row write-once for EVERY writer: never moved into
-    /// `Reconciled`, never moved out of it, and a row already `Reconciled`
-    /// keeps its owner and its digest byte for byte. An `Unreconciled` ->
+    /// on a durable row write-once: never moved out of `Reconciled`, and a row
+    /// already `Reconciled` keeps its owner and its digest byte for byte, for
+    /// EVERY writer. The move INTO `Reconciled` has exactly one admitted
+    /// author, the handoff recorder
+    /// ([`Self::record_process_stream_recovery_handoff`]); every other writer,
+    /// the admitted restore included, is refused it. An `Unreconciled` ->
     /// `Unreconciled` owner change stays allowed, because that is what a
     /// legitimate cross-installation restore does and it carries no proof.
     /// `evidence_axes_sha256` cannot see any of this — it excludes
@@ -24358,7 +24406,7 @@ impl RedbRecoveryStore {
     /// fresh store" or inventing an archive signature, and this item names
     /// neither.
     ///
-    /// The two admitted shapes are unaffected, and neither is a licence to
+    /// The two terminal-placement shapes are unaffected, and neither is a licence to
     /// rewrite proven history. The retirement writes the row it read back with
     /// only its activation changed, so its reconciliation is byte-identical to
     /// the durable row and no reconciliation rule fires at all. The restore
@@ -24398,7 +24446,7 @@ impl RedbRecoveryStore {
     fn write_process_stream_recovery(
         &self,
         projection: &ProcessStreamRecoveryProjection,
-        terminal_placement_admitted: bool,
+        admission: StreamRecoveryWriteAdmission,
     ) -> Result<ProcessStreamRecoveryWriteOutcome, OrsError> {
         projection.validate()?;
         let key = projection.record_key()?;
@@ -24419,9 +24467,9 @@ impl RedbRecoveryStore {
             // second keys on the value and speaks to every writer, which is why
             // the admitted restore cannot author a `Reconciled` handoff on a
             // durable row either.
-            let unadmitted = !terminal_placement_admitted;
+            let unadmitted = admission == StreamRecoveryWriteAdmission::Observation;
             Self::refuse_unadmitted_handoff(unadmitted, projection, existing.as_ref())?;
-            Self::refuse_handoff_rewrite(projection, existing.as_ref())?;
+            Self::refuse_handoff_rewrite(admission, projection, existing.as_ref())?;
             match existing {
                 Some(existing) if existing == *projection => {
                     ProcessStreamRecoveryWriteOutcome::Unchanged
@@ -24619,6 +24667,109 @@ impl RedbRecoveryStore {
         Ok(outcomes)
     }
 
+    /// Revalidates every durable stream projection after a Kernel restart and
+    /// persists only the resulting availability observations.
+    ///
+    /// A single fence cannot cover a restart: stdout and stderr carry
+    /// independent immutable locators, so one fence's locator identity matches
+    /// at most one of the two streams and the other always fails closed as a
+    /// locator mismatch. `fence_for` therefore builds the current fence per
+    /// row — the caller supplies the current generation, authority epoch,
+    /// policy revision and stream-contract revision and binds the row's own
+    /// locator — and every other stale dimension still fails closed per row.
+    /// The locator dimension itself is enforced by the resolver, which must
+    /// return a binding for exactly the row's locator.
+    ///
+    /// This path never writes transport, persistence or gaps: a failed
+    /// revalidation records a typed availability fault and preserves the prior
+    /// typed state exactly — an `UNKNOWN_OUTCOME` transport stays
+    /// `UNKNOWN_OUTCOME`, `PARTIAL_SOURCE` stays `PARTIAL_SOURCE` and
+    /// `SOURCE_UNAVAILABLE` stays `SOURCE_UNAVAILABLE` — and no outcome can
+    /// promote partial or unavailable evidence to `COMPLETE_SOURCE`. Missing
+    /// Blob bytes and a mismatched receipt land as typed `Unavailable` faults,
+    /// and only a full locator/receipt/digest/count/coverage agreement lands
+    /// as `Revalidated`, which is also what the status view requires before it
+    /// reports complete evidence.
+    ///
+    /// Rows are visited in durable key order in bounded pages, so a restart
+    /// never holds an unbounded decoded set. A codec-version mismatch and an
+    /// interrupted or unreadable row abort the sweep with the same explicit
+    /// dispositions as [`Self::load_process_stream_recovery`]; neither is
+    /// silently repaired, upgraded or dropped.
+    pub fn revalidate_all_process_stream_recovery(
+        &self,
+        fence_for: &dyn Fn(&ProcessStreamRecoveryProjection) -> ProcessStreamRecoveryFence,
+        resolver: &dyn ProcessStreamSourceResolver,
+    ) -> Result<Vec<ProcessStreamRecoveryRevalidation>, ProcessStreamRecoveryLoadError> {
+        let mut outcomes = Vec::new();
+        let mut after_key = String::new();
+        loop {
+            let page = self.load_process_stream_recovery_page(&after_key)?;
+            if page.is_empty() {
+                return Ok(outcomes);
+            }
+            for projection in &page {
+                after_key = projection
+                    .record_key()
+                    .map_err(Self::stream_recovery_load_error)?;
+                let outcome = projection.revalidate(&fence_for(projection), resolver);
+                if let Some(availability) = outcome.availability() {
+                    let observed = projection
+                        .with_availability(availability)
+                        .map_err(Self::stream_recovery_load_error)?;
+                    self.put_process_stream_recovery(&observed)
+                        .map_err(Self::stream_recovery_load_error)?;
+                }
+                outcomes.push(outcome);
+            }
+        }
+    }
+
+    /// Reads one bounded page of durable stream projections after `after_key`.
+    ///
+    /// Same codec, same canonical-key check and same explicit dispositions as
+    /// [`Self::load_process_stream_recovery`], in durable key order.
+    fn load_process_stream_recovery_page(
+        &self,
+        after_key: &str,
+    ) -> Result<Vec<ProcessStreamRecoveryProjection>, ProcessStreamRecoveryLoadError> {
+        let read = self
+            .database
+            .begin_read()
+            .map_err(|error| Self::stream_recovery_read_error(&storage(error)))?;
+        let table = read
+            .open_table(PROCESS_STREAM_RECOVERY)
+            .map_err(|error| Self::stream_recovery_read_error(&storage(error)))?;
+        let rows = table
+            .iter()
+            .map_err(|error| Self::stream_recovery_read_error(&storage(error)))?;
+        let mut page = Vec::new();
+        for row in rows {
+            let (key, value) =
+                row.map_err(|error| Self::stream_recovery_read_error(&storage(error)))?;
+            let key_text = key.value().to_owned();
+            if key_text.as_str() <= after_key {
+                continue;
+            }
+            let projection: ProcessStreamRecoveryProjection =
+                decode(value.value()).map_err(Self::stream_recovery_load_error)?;
+            let canonical = projection
+                .record_key()
+                .map_err(Self::stream_recovery_load_error)?;
+            if canonical != key_text {
+                return Err(ProcessStreamRecoveryLoadError::InterruptedRead {
+                    reason: "durable row does not match its canonical operation/stream key"
+                        .to_owned(),
+                });
+            }
+            page.push(projection);
+            if page.len() == usize::from(crate::MAX_RECOVERY_PAGE) {
+                break;
+            }
+        }
+        Ok(page)
+    }
+
     /// Projects the available stream recovery state for one operation into the
     /// ORS status/recovery view.
     ///
@@ -24655,10 +24806,10 @@ impl RedbRecoveryStore {
     /// property of one arm. The family's write body applies TWO checks above
     /// the merge and transition arms alike: a non-admitted writer may not
     /// change a durable row's `reconciliation` at all
-    /// ([`Self::refuse_unadmitted_handoff`]), and for EVERY writer, admitted
-    /// ones included, a `Reconciled` handoff on a durable row is write-once —
-    /// never moved into `Reconciled`, never moved out of it, and a row already
-    /// `Reconciled` keeps its owner and its digest byte for byte
+    /// ([`Self::refuse_unadmitted_handoff`]), and a `Reconciled` handoff on a
+    /// durable row is write-once — moved into `Reconciled` only by the owning
+    /// operation contract's proven handoff write, never moved out of it, and
+    /// a row already `Reconciled` keeps its owner and its digest byte for byte
     /// ([`Self::refuse_handoff_rewrite`]). The second rule is what stops the
     /// other admitted writer, the restore, from authoring the handoff: an
     /// archived `Reconciled` row cannot be moved onto a live destination row
@@ -24667,9 +24818,10 @@ impl RedbRecoveryStore {
     /// `Reconciled`.
     ///
     /// So a digest on a DURABLE row can only have been recorded by the owning
-    /// operation contract's own write — and there is no owner-facing API for
-    /// that write yet, so the handoff half of this gate is enforced rather
-    /// than satisfiable today. ONE residual is disclosed rather than closed: a
+    /// operation contract's own write
+    /// ([`Self::record_process_stream_recovery_handoff`]), which proves
+    /// terminal disposition, the terminal receipt and a fresh readback before
+    /// recording. ONE residual is disclosed rather than closed: a
     /// restore into an EMPTY `(operation, stream)` key has no durable row for
     /// either rule to compare, so an archived `Reconciled` row lands there
     /// carrying its digest. That is pre-existing (before any of this the
@@ -24794,7 +24946,121 @@ impl RedbRecoveryStore {
         // compare against the durable row can be smuggled in through the
         // caller's copy.
         let retired = stored.with_activation(StreamRecoveryActivation::Retired)?;
-        self.write_process_stream_recovery(&retired, true)
+        self.write_process_stream_recovery(
+            &retired,
+            StreamRecoveryWriteAdmission::TerminalPlacement,
+        )
+    }
+
+    /// Records a proven evidence handoff/readback for one recovery projection.
+    ///
+    /// This is the owning operation contract's own write: the one writer
+    /// admitted to move a durable reconciliation into `Reconciled`. It proves,
+    /// in order, exactly what retirement later compares — the terminal
+    /// disposition and terminal receipt of the owning reservation, the named
+    /// recovery owner, and a fresh Blob readback of the row's own locator —
+    /// and it records nothing else: the row's typed transport, persistence,
+    /// gaps, coverage and activation are carried through byte-identical, so a
+    /// handoff can never promote `PARTIAL_SOURCE` or `SOURCE_UNAVAILABLE` and
+    /// can never retire the row. Retirement stays a separate proven step
+    /// ([`Self::retire_process_stream_recovery`]).
+    ///
+    /// The recorded digest is bound to the readback observed by THIS call: it
+    /// must equal the SHA-256 of the canonical readback the resolver just
+    /// returned, so a digest the owning contract did not just prove cannot be
+    /// recorded. The write goes through the family's one write body with the
+    /// handoff admission; an already `Retired` row keeps its retained history
+    /// and is refused, and a row that moved between the proof reads and the
+    /// write is refused by the body's proved-row comparison instead of being
+    /// overwritten with a stale copy. There is no empty-key author here: the
+    /// row must already be durable.
+    pub fn record_process_stream_recovery_handoff(
+        &self,
+        projection: &ProcessStreamRecoveryProjection,
+        proof: &ProcessStreamRetirementProof,
+        fence: &ProcessStreamRecoveryFence,
+        resolver: &dyn ProcessStreamSourceResolver,
+    ) -> Result<ProcessStreamRecoveryWriteOutcome, OrsError> {
+        projection.validate()?;
+        proof.validate()?;
+        let key = projection.record_key()?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let stored = {
+            let table = read.open_table(PROCESS_STREAM_RECOVERY).map_err(storage)?;
+            table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode::<ProcessStreamRecoveryProjection>(value.value()))
+                .transpose()?
+                .ok_or(OrsError::IntegrityProblem {
+                    record_type: "process_stream_recovery",
+                    reason: "the named recovery projection row is not durable".to_owned(),
+                })?
+        };
+        if stored.evidence_axes_sha256()? != projection.evidence_axes_sha256()? {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "process_stream_recovery",
+                reason: "handoff target does not match the durable evidence axes".to_owned(),
+            });
+        }
+        if stored.activation == StreamRecoveryActivation::Retired {
+            return Err(OrsError::InvalidField {
+                field: "stream_recovery_activation",
+                reason: "the reconciliation of an already retired recovery projection is \
+                         retained history and is not rewritten",
+            });
+        }
+        let reservation_id = {
+            let operations = read.open_table(OPERATIONS).map_err(storage)?;
+            operations
+                .get(projection.operation_id.as_str())
+                .map_err(storage)?
+                .map(|value| value.value().to_owned())
+                .ok_or(OrsError::ReservationNotFound)?
+        };
+        if reservation_id != proof.reservation_id.as_str() {
+            return Err(OrsError::ReconciliationMismatch);
+        }
+        let reservation = {
+            let reservations = read.open_table(RESERVATIONS).map_err(storage)?;
+            let value = reservations
+                .get(reservation_id.as_str())
+                .map_err(storage)?
+                .ok_or(OrsError::ReservationNotFound)?;
+            decode::<ReservationRecord>(value.value())?
+        };
+        if reservation.token.recovery_owner != proof.recovery_owner
+            || stored.reconciliation.owner != proof.recovery_owner
+        {
+            return Err(OrsError::RecoveryOwnerMismatch);
+        }
+        if !reservation.state.is_terminal() {
+            return Err(OrsError::UnsafeExpiry);
+        }
+        if reservation.terminal_receipt_id.as_ref() != Some(&proof.terminal_receipt_id) {
+            return Err(OrsError::ReconciliationMismatch);
+        }
+        let readback = match stored.revalidate(fence, resolver) {
+            ProcessStreamRecoveryRevalidation::Revalidated { readback, .. } => readback,
+            ProcessStreamRecoveryRevalidation::SourceUnavailable { .. }
+            | ProcessStreamRecoveryRevalidation::Refused(_)
+            | ProcessStreamRecoveryRevalidation::NoDurableSource => {
+                return Err(OrsError::ReconciliationMismatch);
+            }
+        };
+        let observed =
+            serde_json::to_vec(&readback).map_err(|error| OrsError::Encoding(error.to_string()))?;
+        if proof.handoff_sha256 != crate::model::sha256_hex(&observed) {
+            return Err(OrsError::ReconciliationMismatch);
+        }
+        drop(read);
+        let mut recorded = stored.clone();
+        recorded.reconciliation = crate::StreamRecoveryReconciliation {
+            owner: proof.recovery_owner.clone(),
+            state: StreamRecoveryReconciliationState::Reconciled,
+            handoff_sha256: Some(proof.handoff_sha256.clone()),
+        };
+        self.write_process_stream_recovery(&recorded, StreamRecoveryWriteAdmission::HandoffRecord)
     }
 
     /// Imports a recovery projection from backup/restore as suspended evidence.
@@ -24846,13 +25112,15 @@ impl RedbRecoveryStore {
     /// even when neither side is `Reconciled`, by the merge arm's own
     /// retained-history check.
     ///
-    /// DISCLOSED RESIDUAL, THE ONE REMAINING AUTHOR OF A `RECONCILED` HANDOFF.
+    /// DISCLOSED RESIDUAL, THE OTHER AUTHOR OF A `RECONCILED` HANDOFF.
     /// Both rules compare against a DURABLE row, so neither can fire when the
     /// `(operation, stream)` key is EMPTY, and this path is admitted. An
     /// archived `Reconciled` row therefore lands on a fresh key carrying its
-    /// digest — which is also the one way the handoff half of
-    /// [`Self::retire_process_stream_recovery`] is reachable at all. It is
-    /// disclosed, not closed: it is pre-existing behaviour (before any of this
+    /// digest — which used to be the only way the handoff half of
+    /// [`Self::retire_process_stream_recovery`] was reachable at all; the
+    /// owning operation contract's own write
+    /// ([`Self::record_process_stream_recovery_handoff`]) is now the proven
+    /// one. It is disclosed, not closed: it is pre-existing behaviour (before any of this
     /// the restore went through [`Self::put_process_stream_recovery`] and could
     /// do the same), and closing it would mean either refusing the legitimate
     /// "restore proven terminal evidence into a fresh store" path or inventing an
@@ -24887,7 +25155,10 @@ impl RedbRecoveryStore {
         // still refuses a rewrite of a terminal row's retained reconciliation.
         // An EMPTY key is the disclosed residual above: no durable row exists
         // for any of those rules to compare, so the archived row lands.
-        self.write_process_stream_recovery(&imported, true)
+        self.write_process_stream_recovery(
+            &imported,
+            StreamRecoveryWriteAdmission::TerminalPlacement,
+        )
     }
 
     /// Maps a codec failure onto its explicit recovery disposition.
