@@ -27,10 +27,13 @@
 //!    issuer's own key material, which is the issuer's responsibility.
 //!
 //! A delayed expiry for an already-renewed lease cannot unassign its successor:
-//! the loss event carries the exact [`LeaseIdentity`] it observed dead, and
-//! [`Ownership::record_loss`] refuses when the record's retained identity has
+//! the loss event carries the exact [`LeaseIdentity`] it observed dead, and each
+//! record's `record_owner_loss` refuses when the record's retained identity has
 //! moved on. Loss never implies resolution — [`Ownership::Unassigned`] is a
-//! live obligation, not a terminal state.
+//! live obligation, not a terminal state: the obligation is discharged by
+//! admitting an eligible successor under a strictly greater ownership epoch, and
+//! [`Ownership::retained_epoch`] is what lets that successor clear the fenced
+//! epoch instead of being refused because the record currently has no owner.
 
 use eliot_contracts::{EpochId, StateFence, canonical_json_bytes, sha256_hex};
 use schemars::JsonSchema;
@@ -424,6 +427,26 @@ impl Ownership {
     #[must_use]
     pub const fn is_assigned(&self) -> bool {
         matches!(self, Self::Assigned(_))
+    }
+
+    /// The ownership epoch this record currently holds, assigned or not.
+    ///
+    /// Both variants retain the epoch: an assigned record holds the epoch of
+    /// its live lease, and an unassigned one holds the epoch that was fenced
+    /// when ownership was lost. Reading it from either variant is what lets a
+    /// successor be admitted to a record that has lost its owner — the epoch
+    /// still advances past the fenced one instead of restarting from nothing.
+    ///
+    /// This is deliberately *not* [`Self::assigned`]: that one is the fencing
+    /// check and must keep refusing an unassigned record, because it is what
+    /// stops a lost owner from writing. Only the epoch comparison a successor
+    /// has to clear reads the unassigned epoch.
+    #[must_use]
+    pub const fn retained_epoch(&self) -> u64 {
+        match self {
+            Self::Assigned(assigned) => assigned.ownership_epoch,
+            Self::Unassigned(unassigned) => unassigned.ownership_epoch,
+        }
     }
 }
 
