@@ -248,9 +248,7 @@ impl CanarySourceBundleReceipt {
             })?;
         let canonical_path = PlatformHandle::new(self.selected_profile_anchor_path.clone())
             .map_err(|error| {
-                MaterializeError::Contract(format!(
-                    "selected profile anchor path: {error}"
-                ))
+                MaterializeError::Contract(format!("selected profile anchor path: {error}"))
             })?;
         Ok(SourceBundlePublicationBinding {
             source_identity: self.source_identity,
@@ -440,7 +438,7 @@ impl<'a> SelectedProfileAnchor<'a> {
             ));
         }
         let current_path = canonical_windows_path(&self.canonical_path)
-        .map_err(|error| MaterializeError::Platform(error.to_string()))?;
+            .map_err(|error| MaterializeError::Platform(error.to_string()))?;
         if !eliot_platform_windows::windows_paths_equal(&self.canonical_path, &current_path) {
             return Err(MaterializeError::Invalid(
                 "selected profile anchor path changed during materialization".to_owned(),
@@ -883,189 +881,418 @@ fn build_typed_bundle(
     build_typed_bundle_with_selection(input, executables, &selection)
 }
 
-fn build_typed_bundle_with_selection(
-    input: &CanarySourceBundleMaterializeInput,
-    executables: &[ValidatedExecutable],
-    selection: &ProfileSelectionResolution,
-) -> Result<TypedBundle, MaterializeError> {
-    let roots = selection.roots.runtime_state_roots.clone();
-    let profile = selection.governance.profile;
-    let immutable_generation_root = Path::new(&selection.roots.immutable_binaries);
-    let role_path = |role: &str| {
-        handle_path(
-            &immutable_generation_root.join(role),
-            "profile-governed immutable destination",
-        )
-    };
-    let host_path = role_path("eliot-host.exe")?;
-    let watchdog_path = role_path("eliot-watchdog.exe")?;
-    let store_bridge_path = role_path("eliot-store-surreal.exe")?;
-    let canonical_store_path = role_path("surreal.exe")?;
-    let eliotd_path = role_path("eliotd.exe")?;
-    let doctor_path = role_path("eliot-doctor.exe")?;
-    let testd_path = role_path("eliot-testd.exe")?;
-    let native_worker_path = role_path("eliot-native-worker.exe")?;
-    let wasm_host_path = role_path("eliot-wasm-host.exe")?;
-    let config_path = role_path("generation.json")?;
-    let governor_path = role_path("eliotd-governor.json")?;
-    let descriptor_path = role_path("eliotd.json")?;
-    let authority_path = role_path("authority.json")?;
-    let store_bootstrap_path = role_path("store-bootstrap.json")?;
+struct GovernedBundlePaths {
+    host: PlatformHandle,
+    watchdog: PlatformHandle,
+    store_bridge: PlatformHandle,
+    canonical_store: PlatformHandle,
+    eliotd: PlatformHandle,
+    doctor: PlatformHandle,
+    testd: PlatformHandle,
+    native_worker: PlatformHandle,
+    wasm_host: PlatformHandle,
+    store_config: PlatformHandle,
+    governor_config: PlatformHandle,
+    eliotd_descriptor: PlatformHandle,
+    authority_descriptor: PlatformHandle,
+    store_bootstrap: PlatformHandle,
+}
 
-    let by_name = |name: &str| {
-        executables
-            .iter()
-            .find(|item| item.name == name)
-            .ok_or_else(|| MaterializeError::Invalid(format!("missing executable {name}")))
-    };
-    let kernel = by_name("eliot-kernel.exe")?;
-    let host = by_name("eliot-host.exe")?;
-    let watchdog = by_name("eliot-watchdog.exe")?;
-    let store_bridge = by_name("eliot-store-surreal.exe")?;
-    let canonical_store = by_name("surreal.exe")?;
-    let eliotd = by_name("eliotd.exe")?;
-    let doctor = by_name("eliot-doctor.exe")?;
-    let testd = by_name("eliot-testd.exe")?;
-    let native_worker = by_name("eliot-native-worker.exe")?;
-    let wasm_host = by_name("eliot-wasm-host.exe")?;
-    let governor = governor_bytes(&input.generation, &input.installation_epoch, &kernel.sha256)?;
-    let protected_snapshot_digest = protected_snapshot_digest_from_governor_bytes(&governor)?;
-    bridge_source_plan(input, &kernel.sha256, protected_snapshot_digest.as_str())?;
-    let governor_sha256 = sha256_hex(&governor);
-    let template_facts = vec![
-        package_digest("eliot-host.exe", host.size, &host.sha256)?,
-        package_digest("eliot-watchdog.exe", watchdog.size, &watchdog.sha256)?,
-        package_digest("eliot-kernel.exe", kernel.size, &kernel.sha256)?,
-        package_digest(
-            "eliot-store-surreal.exe",
-            store_bridge.size,
-            &store_bridge.sha256,
-        )?,
-        package_digest("surreal.exe", canonical_store.size, &canonical_store.sha256)?,
-        package_digest("eliotd.exe", eliotd.size, &eliotd.sha256)?,
-        package_digest("eliot-doctor.exe", doctor.size, &doctor.sha256)?,
-        package_digest("eliot-testd.exe", testd.size, &testd.sha256)?,
-        package_digest(
-            "eliot-native-worker.exe",
-            native_worker.size,
-            &native_worker.sha256,
-        )?,
-        package_digest("eliot-wasm-host.exe", wasm_host.size, &wasm_host.sha256)?,
-        package_digest(
-            "eliotd-governor.json",
-            governor.len() as u64,
-            &governor_sha256,
-        )?,
-    ];
-    let template_digest =
-        GenerationPackagePlanner::phase_a_template_content_digest(&template_facts)
-            .map_err(|error| MaterializeError::Contract(error.to_string()))?;
-    let nonce_seed = format!(
-        "eliotd:phase-a-template:{}:{}:{}:{}",
-        input.transaction_id.as_str(),
-        input.installation_epoch.installation.as_str(),
-        input.generation.as_str(),
-        template_digest.as_str()
-    );
-    let eliotd_launch_nonce = make_digest(
-        format!("eliotd:{}", sha256_hex(nonce_seed.as_bytes())),
-        "eliotd launch nonce",
-    )?;
-    let credential_token = sha256_hex(
-        format!(
-            "eliot-store-credential:phase-a-template:{}:{}:{}",
+impl GovernedBundlePaths {
+    fn resolve(selection: &ProfileSelectionResolution) -> Result<Self, MaterializeError> {
+        let immutable_generation_root = Path::new(&selection.roots.immutable_binaries);
+        let role_path = |role: &str| {
+            handle_path(
+                &immutable_generation_root.join(role),
+                "profile-governed immutable destination",
+            )
+        };
+        let host = role_path("eliot-host.exe")?;
+        let watchdog = role_path("eliot-watchdog.exe")?;
+        let store_bridge = role_path("eliot-store-surreal.exe")?;
+        let canonical_store = role_path("surreal.exe")?;
+        let eliotd = role_path("eliotd.exe")?;
+        let doctor = role_path("eliot-doctor.exe")?;
+        let testd = role_path("eliot-testd.exe")?;
+        let native_worker = role_path("eliot-native-worker.exe")?;
+        let wasm_host = role_path("eliot-wasm-host.exe")?;
+        let store_config = role_path("generation.json")?;
+        let governor_config = role_path("eliotd-governor.json")?;
+        let eliotd_descriptor = role_path("eliotd.json")?;
+        let authority_descriptor = role_path("authority.json")?;
+        let store_bootstrap = role_path("store-bootstrap.json")?;
+        Ok(Self {
+            host,
+            watchdog,
+            store_bridge,
+            canonical_store,
+            eliotd,
+            doctor,
+            testd,
+            native_worker,
+            wasm_host,
+            store_config,
+            governor_config,
+            eliotd_descriptor,
+            authority_descriptor,
+            store_bootstrap,
+        })
+    }
+}
+
+struct BundleExecutables<'a> {
+    kernel: &'a ValidatedExecutable,
+    host: &'a ValidatedExecutable,
+    watchdog: &'a ValidatedExecutable,
+    store_bridge: &'a ValidatedExecutable,
+    canonical_store: &'a ValidatedExecutable,
+    eliotd: &'a ValidatedExecutable,
+    doctor: &'a ValidatedExecutable,
+    testd: &'a ValidatedExecutable,
+    native_worker: &'a ValidatedExecutable,
+    wasm_host: &'a ValidatedExecutable,
+}
+
+impl<'a> BundleExecutables<'a> {
+    fn resolve(executables: &'a [ValidatedExecutable]) -> Result<Self, MaterializeError> {
+        let by_name = |name: &str| {
+            executables
+                .iter()
+                .find(|item| item.name == name)
+                .ok_or_else(|| MaterializeError::Invalid(format!("missing executable {name}")))
+        };
+        let kernel = by_name("eliot-kernel.exe")?;
+        let host = by_name("eliot-host.exe")?;
+        let watchdog = by_name("eliot-watchdog.exe")?;
+        let store_bridge = by_name("eliot-store-surreal.exe")?;
+        let canonical_store = by_name("surreal.exe")?;
+        let eliotd = by_name("eliotd.exe")?;
+        let doctor = by_name("eliot-doctor.exe")?;
+        let testd = by_name("eliot-testd.exe")?;
+        let native_worker = by_name("eliot-native-worker.exe")?;
+        let wasm_host = by_name("eliot-wasm-host.exe")?;
+        Ok(Self {
+            kernel,
+            host,
+            watchdog,
+            store_bridge,
+            canonical_store,
+            eliotd,
+            doctor,
+            testd,
+            native_worker,
+            wasm_host,
+        })
+    }
+}
+
+fn executable_by_name<'a>(
+    executables: &'a [ValidatedExecutable],
+    name: &str,
+) -> Result<&'a ValidatedExecutable, MaterializeError> {
+    executables
+        .iter()
+        .find(|item| item.name == name)
+        .ok_or_else(|| MaterializeError::Invalid(format!("missing executable {name}")))
+}
+
+struct BundleTemplateIdentity {
+    governor_bytes: Vec<u8>,
+    protected_snapshot_digest: PlatformHandle,
+    governor_sha256: String,
+    launch_nonce: PlatformHandle,
+    credential_token: String,
+    store_credential_target: PlatformHandle,
+    authority_generation: ResourceGeneration,
+    authority_epoch: EpochId,
+    authority_state_fence: StateFence,
+}
+
+impl BundleTemplateIdentity {
+    fn derive(
+        input: &CanarySourceBundleMaterializeInput,
+        executables: &BundleExecutables<'_>,
+    ) -> Result<Self, MaterializeError> {
+        let governor_bytes = governor_bytes(
+            &input.generation,
+            &input.installation_epoch,
+            &executables.kernel.sha256,
+        )?;
+        let protected_snapshot_digest =
+            protected_snapshot_digest_from_governor_bytes(&governor_bytes)?;
+        bridge_source_plan(
+            input,
+            &executables.kernel.sha256,
+            protected_snapshot_digest.as_str(),
+        )?;
+        let governor_sha256 = sha256_hex(&governor_bytes);
+        let template_facts =
+            phase_a_template_facts(executables, governor_bytes.len(), &governor_sha256)?;
+        let template_digest =
+            GenerationPackagePlanner::phase_a_template_content_digest(&template_facts)
+                .map_err(|error| MaterializeError::Contract(error.to_string()))?;
+        let nonce_seed = format!(
+            "eliotd:phase-a-template:{}:{}:{}:{}",
+            input.transaction_id.as_str(),
             input.installation_epoch.installation.as_str(),
             input.generation.as_str(),
             template_digest.as_str()
-        )
-        .as_bytes(),
-    );
-    let store_credential_target = make_digest(
-        format!("eliot/store/v1/{}", &credential_token[..32]),
-        "Store credential target",
-    )?;
-    let authority_generation = ResourceGeneration::new(1)
-        .map_err(|error| MaterializeError::Contract(error.to_string()))?;
-    let authority_epoch = materializer_genesis_epoch()?;
-    let authority_state_fence = StateFence::new(authority_epoch.clone(), authority_generation);
-    let kernel_arguments = make_args([
-        "--work-root".to_owned(),
-        roots.kernel_work_root.as_str().to_owned(),
-        "--store-bootstrap".to_owned(),
-        store_bootstrap_path.as_str().to_owned(),
-        "--store-bootstrap-sha256".to_owned(),
-        PHASE_B_PENDING_MARKER.to_owned(),
-        "--authority-descriptor".to_owned(),
-        authority_path.as_str().to_owned(),
-        "--authority-descriptor-sha256".to_owned(),
-        PHASE_B_PENDING_MARKER.to_owned(),
-        "--kernel-artifact-sha256".to_owned(),
-        kernel.sha256.clone(),
-        "--doctor-artifact-sha256".to_owned(),
-        doctor.sha256.clone(),
-        "--testd-artifact-sha256".to_owned(),
-        testd.sha256.clone(),
-        "--native-worker-artifact-sha256".to_owned(),
-        native_worker.sha256.clone(),
-        "--eliotd-descriptor".to_owned(),
-        descriptor_path.as_str().to_owned(),
-        "--eliotd-descriptor-sha256".to_owned(),
-        "0".repeat(64),
-    ])?;
-    let store_bridge_arguments = match profile {
-        InstallationProfile::PortableDev => make_args([
-            "--portable-dev-root".to_owned(),
-            input
-                .profile_selection
-                .profile_anchor_root
-                .as_str()
-                .to_owned(),
-            "--config".to_owned(),
-            config_path.as_str().to_owned(),
-        ])?,
-        InstallationProfile::SystemService | InstallationProfile::UserMode => {
-            make_args(["--config".to_owned(), config_path.as_str().to_owned()])?
-        }
-    };
-    let canonical_store_arguments = make_args([
-        "start".to_owned(),
-        "--no-banner".to_owned(),
-        "--bind".to_owned(),
-        "127.0.0.1:8000".to_owned(),
-        "--temporary-directory".to_owned(),
-        roots.store_temp_root.as_str().to_owned(),
-        "--log-file-enabled".to_owned(),
-        "--log-file-path".to_owned(),
-        roots.store_work_root.as_str().to_owned(),
-        "--log-file-name".to_owned(),
-        "surrealdb.log".to_owned(),
-        format!(
-            "surrealkv://{}",
-            roots.store_data_root.as_str().replace('\\', "/")
-        ),
-    ])?;
+        );
+        let launch_nonce = make_digest(
+            format!("eliotd:{}", sha256_hex(nonce_seed.as_bytes())),
+            "eliotd launch nonce",
+        )?;
+        let credential_token = sha256_hex(
+            format!(
+                "eliot-store-credential:phase-a-template:{}:{}:{}",
+                input.installation_epoch.installation.as_str(),
+                input.generation.as_str(),
+                template_digest.as_str()
+            )
+            .as_bytes(),
+        );
+        let store_credential_target = make_digest(
+            format!("eliot/store/v1/{}", &credential_token[..32]),
+            "Store credential target",
+        )?;
+        let authority_generation = ResourceGeneration::new(1)
+            .map_err(|error| MaterializeError::Contract(error.to_string()))?;
+        let authority_epoch = materializer_genesis_epoch()?;
+        let authority_state_fence = StateFence::new(authority_epoch.clone(), authority_generation);
+        Ok(Self {
+            governor_bytes,
+            protected_snapshot_digest,
+            governor_sha256,
+            launch_nonce,
+            credential_token,
+            store_credential_target,
+            authority_generation,
+            authority_epoch,
+            authority_state_fence,
+        })
+    }
+}
+
+fn phase_a_template_facts(
+    executables: &BundleExecutables<'_>,
+    governor_size: usize,
+    governor_sha256: &str,
+) -> Result<Vec<PackageArtifactDigest>, MaterializeError> {
+    Ok(vec![
+        package_digest(
+            "eliot-host.exe",
+            executables.host.size,
+            &executables.host.sha256,
+        )?,
+        package_digest(
+            "eliot-watchdog.exe",
+            executables.watchdog.size,
+            &executables.watchdog.sha256,
+        )?,
+        package_digest(
+            "eliot-kernel.exe",
+            executables.kernel.size,
+            &executables.kernel.sha256,
+        )?,
+        package_digest(
+            "eliot-store-surreal.exe",
+            executables.store_bridge.size,
+            &executables.store_bridge.sha256,
+        )?,
+        package_digest(
+            "surreal.exe",
+            executables.canonical_store.size,
+            &executables.canonical_store.sha256,
+        )?,
+        package_digest(
+            "eliotd.exe",
+            executables.eliotd.size,
+            &executables.eliotd.sha256,
+        )?,
+        package_digest(
+            "eliot-doctor.exe",
+            executables.doctor.size,
+            &executables.doctor.sha256,
+        )?,
+        package_digest(
+            "eliot-testd.exe",
+            executables.testd.size,
+            &executables.testd.sha256,
+        )?,
+        package_digest(
+            "eliot-native-worker.exe",
+            executables.native_worker.size,
+            &executables.native_worker.sha256,
+        )?,
+        package_digest(
+            "eliot-wasm-host.exe",
+            executables.wasm_host.size,
+            &executables.wasm_host.sha256,
+        )?,
+        package_digest(
+            "eliotd-governor.json",
+            governor_size as u64,
+            governor_sha256,
+        )?,
+    ])
+}
+
+struct TypedBundleBuildContext<'a> {
+    input: &'a CanarySourceBundleMaterializeInput,
+    executables: &'a [ValidatedExecutable],
+    selection: &'a ProfileSelectionResolution,
+    paths: GovernedBundlePaths,
+    named_executables: BundleExecutables<'a>,
+    template: BundleTemplateIdentity,
+}
+
+impl<'a> TypedBundleBuildContext<'a> {
+    fn new(
+        input: &'a CanarySourceBundleMaterializeInput,
+        executables: &'a [ValidatedExecutable],
+        selection: &'a ProfileSelectionResolution,
+    ) -> Result<Self, MaterializeError> {
+        let paths = GovernedBundlePaths::resolve(selection)?;
+        let named_executables = BundleExecutables::resolve(executables)?;
+        let template = BundleTemplateIdentity::derive(input, &named_executables)?;
+        Ok(Self {
+            input,
+            executables,
+            selection,
+            paths,
+            named_executables,
+            template,
+        })
+    }
+}
+
+struct RuntimeLaunchArguments {
+    kernel: Vec<PlatformHandle>,
+    store_bridge: Vec<PlatformHandle>,
+    canonical_store: Vec<PlatformHandle>,
+}
+
+impl RuntimeLaunchArguments {
+    fn build(context: &TypedBundleBuildContext<'_>) -> Result<Self, MaterializeError> {
+        let roots = &context.selection.roots.runtime_state_roots;
+        let profile = context.selection.governance.profile;
+        let kernel = &context.named_executables.kernel;
+        let doctor = &context.named_executables.doctor;
+        let testd = &context.named_executables.testd;
+        let native_worker = &context.named_executables.native_worker;
+        let kernel_arguments = make_args([
+            "--work-root".to_owned(),
+            roots.kernel_work_root.as_str().to_owned(),
+            "--store-bootstrap".to_owned(),
+            context.paths.store_bootstrap.as_str().to_owned(),
+            "--store-bootstrap-sha256".to_owned(),
+            PHASE_B_PENDING_MARKER.to_owned(),
+            "--authority-descriptor".to_owned(),
+            context.paths.authority_descriptor.as_str().to_owned(),
+            "--authority-descriptor-sha256".to_owned(),
+            PHASE_B_PENDING_MARKER.to_owned(),
+            "--kernel-artifact-sha256".to_owned(),
+            kernel.sha256.clone(),
+            "--doctor-artifact-sha256".to_owned(),
+            doctor.sha256.clone(),
+            "--testd-artifact-sha256".to_owned(),
+            testd.sha256.clone(),
+            "--native-worker-artifact-sha256".to_owned(),
+            native_worker.sha256.clone(),
+            "--eliotd-descriptor".to_owned(),
+            context.paths.eliotd_descriptor.as_str().to_owned(),
+            "--eliotd-descriptor-sha256".to_owned(),
+            "0".repeat(64),
+        ])?;
+        let store_bridge_arguments = match profile {
+            InstallationProfile::PortableDev => make_args([
+                "--portable-dev-root".to_owned(),
+                context
+                    .input
+                    .profile_selection
+                    .profile_anchor_root
+                    .as_str()
+                    .to_owned(),
+                "--config".to_owned(),
+                context.paths.store_config.as_str().to_owned(),
+            ])?,
+            InstallationProfile::SystemService | InstallationProfile::UserMode => make_args([
+                "--config".to_owned(),
+                context.paths.store_config.as_str().to_owned(),
+            ])?,
+        };
+        let canonical_store_arguments = make_args([
+            "start".to_owned(),
+            "--no-banner".to_owned(),
+            "--bind".to_owned(),
+            "127.0.0.1:8000".to_owned(),
+            "--temporary-directory".to_owned(),
+            roots.store_temp_root.as_str().to_owned(),
+            "--log-file-enabled".to_owned(),
+            "--log-file-path".to_owned(),
+            roots.store_work_root.as_str().to_owned(),
+            "--log-file-name".to_owned(),
+            "surrealdb.log".to_owned(),
+            format!(
+                "surrealkv://{}",
+                roots.store_data_root.as_str().replace('\\', "/")
+            ),
+        ])?;
+        Ok(Self {
+            kernel: kernel_arguments,
+            store_bridge: store_bridge_arguments,
+            canonical_store: canonical_store_arguments,
+        })
+    }
+
+    fn bind_descriptor_digest(mut self, descriptor_sha256: &str) -> Result<Self, MaterializeError> {
+        self.kernel = self
+            .kernel
+            .into_iter()
+            .map(|argument| {
+                if argument.as_str() == "0".repeat(64) {
+                    PlatformHandle::new(descriptor_sha256.to_owned()).map_err(|error| {
+                        MaterializeError::Contract(format!("kernel descriptor digest: {error}"))
+                    })
+                } else {
+                    Ok(argument)
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(self)
+    }
+}
+
+fn eliotd_descriptor_binding(
+    context: &TypedBundleBuildContext<'_>,
+) -> Result<(Vec<u8>, String), MaterializeError> {
+    let roots = &context.selection.roots.runtime_state_roots;
     let descriptor = EliotdLaunchDescriptor {
         wire_id: ELIOTD_LAUNCH_DESCRIPTOR_WIRE_ID.to_owned(),
         wire_version: EliotdLaunchDescriptor::CONTRACT_VERSION,
-        executable: eliotd_path.clone(),
-        executable_sha256: eliotd.sha256.clone(),
+        executable: context.paths.eliotd.clone(),
+        executable_sha256: context.named_executables.eliotd.sha256.clone(),
         arguments: make_args([
             "--config-descriptor".to_owned(),
-            governor_path.as_str().to_owned(),
+            context.paths.governor_config.as_str().to_owned(),
             "--config-descriptor-sha256".to_owned(),
-            governor_sha256.clone(),
+            context.template.governor_sha256.clone(),
             "--launch-nonce".to_owned(),
-            eliotd_launch_nonce.as_str().to_owned(),
+            context.template.launch_nonce.as_str().to_owned(),
             "--executable-sha256".to_owned(),
-            eliotd.sha256.clone(),
+            context.named_executables.eliotd.sha256.clone(),
         ])?,
         working_directory: roots.kernel_work_root.clone(),
-        config_descriptor: governor_path.clone(),
-        config_descriptor_sha256: governor_sha256.clone(),
-        protected_snapshot_digest: protected_snapshot_digest.as_str().to_owned(),
-        launch_nonce: eliotd_launch_nonce.clone(),
-        authority_epoch,
-        generation: authority_generation,
+        config_descriptor: context.paths.governor_config.clone(),
+        config_descriptor_sha256: context.template.governor_sha256.clone(),
+        protected_snapshot_digest: context
+            .template
+            .protected_snapshot_digest
+            .as_str()
+            .to_owned(),
+        launch_nonce: context.template.launch_nonce.clone(),
+        authority_epoch: context.template.authority_epoch.clone(),
+        generation: context.template.authority_generation,
         descriptor_sha256: String::new(),
     }
     .with_computed_digest()
@@ -1077,92 +1304,106 @@ fn build_typed_bundle_with_selection(
         MaterializeError::Contract(format!("serialize eliotd descriptor: {error}"))
     })?;
     let descriptor_sha256 = sha256_hex(&descriptor_bytes);
-    let kernel_arguments = kernel_arguments
-        .into_iter()
-        .map(|argument| {
-            if argument.as_str() == "0".repeat(64) {
-                PlatformHandle::new(descriptor_sha256.clone()).map_err(|error| {
-                    MaterializeError::Contract(format!("kernel descriptor digest: {error}"))
-                })
-            } else {
-                Ok(argument)
-            }
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    Ok((descriptor_bytes, descriptor_sha256))
+}
+
+fn runtime_launch_descriptor(
+    context: &TypedBundleBuildContext<'_>,
+    arguments: RuntimeLaunchArguments,
+    descriptor_sha256: &str,
+) -> Result<RuntimeLaunchDescriptor, MaterializeError> {
+    let input = context.input;
+    let paths = &context.paths;
+    let executables = &context.named_executables;
+    let template = &context.template;
+    let roots = context.selection.roots.runtime_state_roots.clone();
+    let profile = context.selection.governance.profile;
     let supervision_lease_scope_id = PlatformHandle::new(format!(
         "eliot-supervision-scope:v1:{}:{}",
         input.installation_epoch.installation, input.generation
     ))
     .map_err(|error| MaterializeError::Contract(format!("supervision scope id: {error}")))?;
-    let runtime_launch = RuntimeLaunchDescriptor {
+    RuntimeLaunchDescriptor {
         profile,
         profile_component: PlatformHandle::new(input.profile_selection.component.clone())
             .map_err(|error| MaterializeError::Contract(error.to_string()))?,
         profile_version: PlatformHandle::new(input.profile_selection.version.clone())
             .map_err(|error| MaterializeError::Contract(error.to_string()))?,
         profile_installation_key: input.profile_selection.installation_key.clone(),
-        profile_governed_roots: selection.roots.clone(),
+        profile_governed_roots: context.selection.roots.clone(),
         portable_root: (profile == InstallationProfile::PortableDev)
             .then(|| input.profile_selection.profile_anchor_root.clone()),
         installation_epoch: input.installation_epoch.clone(),
         generation: input.generation.clone(),
-        authority_generation,
-        authority_state_fence,
+        authority_generation: template.authority_generation,
+        authority_state_fence: template.authority_state_fence.clone(),
         supervision_authority: SupervisionAuthorityBinding::Pending {
             supervision_lease_scope_id,
         },
-        authority_descriptor_path: authority_path,
+        authority_descriptor_path: paths.authority_descriptor.clone(),
         authority_descriptor_digest: PlatformHandle::new(PHASE_B_PENDING_MARKER)
             .map_err(|error| MaterializeError::Contract(error.to_string()))?,
         runtime_state_roots: roots.clone(),
         kernel_work_root: roots.kernel_work_root.clone(),
-        kernel_artifact_digest: make_digest(kernel.sha256.clone(), "kernel digest")?,
-        eliotd_executable_path: eliotd_path,
-        eliotd_artifact_digest: make_digest(eliotd.sha256.clone(), "eliotd digest")?,
-        eliotd_config_path: governor_path,
-        eliotd_config_digest: make_digest(governor_sha256.clone(), "governor digest")?,
-        protected_snapshot_digest: protected_snapshot_digest.clone(),
-        eliotd_descriptor_path: descriptor_path,
-        eliotd_descriptor_digest: make_digest(descriptor_sha256.clone(), "descriptor digest")?,
-        eliotd_launch_nonce: eliotd_launch_nonce.clone(),
-        store_config_path: config_path.clone(),
-        store_credential_target: store_credential_target.clone(),
-        store_bridge_executable_path: store_bridge_path,
+        kernel_artifact_digest: make_digest(executables.kernel.sha256.clone(), "kernel digest")?,
+        eliotd_executable_path: paths.eliotd.clone(),
+        eliotd_artifact_digest: make_digest(executables.eliotd.sha256.clone(), "eliotd digest")?,
+        eliotd_config_path: paths.governor_config.clone(),
+        eliotd_config_digest: make_digest(template.governor_sha256.clone(), "governor digest")?,
+        protected_snapshot_digest: template.protected_snapshot_digest.as_str().to_owned(),
+        eliotd_descriptor_path: paths.eliotd_descriptor.clone(),
+        eliotd_descriptor_digest: make_digest(descriptor_sha256.to_owned(), "descriptor digest")?,
+        eliotd_launch_nonce: template.launch_nonce.clone(),
+        store_config_path: paths.store_config.clone(),
+        store_credential_target: template.store_credential_target.clone(),
+        store_bridge_executable_path: paths.store_bridge.clone(),
         store_bridge_artifact_digest: make_digest(
-            store_bridge.sha256.clone(),
+            executables.store_bridge.sha256.clone(),
             "Store bridge digest",
         )?,
-        store_bootstrap_descriptor_path: store_bootstrap_path,
+        store_bootstrap_descriptor_path: paths.store_bootstrap.clone(),
         store_bootstrap_descriptor_digest: PlatformHandle::new(PHASE_B_PENDING_MARKER)
             .map_err(|error| MaterializeError::Contract(error.to_string()))?,
-        canonical_store_executable_path: canonical_store_path,
+        canonical_store_executable_path: paths.canonical_store.clone(),
         canonical_store_artifact_digest: make_digest(
-            canonical_store.sha256.clone(),
+            executables.canonical_store.sha256.clone(),
             "Surreal digest",
         )?,
-        kernel_arguments,
-        store_bridge_arguments,
-        canonical_store_arguments,
-        host_executable_path: host_path,
-        host_artifact_digest: make_digest(host.sha256.clone(), "Host digest")?,
-        watchdog_executable_path: watchdog_path,
-        watchdog_artifact_digest: make_digest(watchdog.sha256.clone(), "Watchdog digest")?,
-        doctor_artifact_digest: make_digest(doctor.sha256.clone(), "Doctor digest")?,
-        testd_artifact_digest: make_digest(testd.sha256.clone(), "Testd digest")?,
+        kernel_arguments: arguments.kernel,
+        store_bridge_arguments: arguments.store_bridge,
+        canonical_store_arguments: arguments.canonical_store,
+        host_executable_path: paths.host.clone(),
+        host_artifact_digest: make_digest(executables.host.sha256.clone(), "Host digest")?,
+        watchdog_executable_path: paths.watchdog.clone(),
+        watchdog_artifact_digest: make_digest(
+            executables.watchdog.sha256.clone(),
+            "Watchdog digest",
+        )?,
+        doctor_artifact_digest: make_digest(executables.doctor.sha256.clone(), "Doctor digest")?,
+        testd_artifact_digest: make_digest(executables.testd.sha256.clone(), "Testd digest")?,
         native_worker_artifact_digest: make_digest(
-            native_worker.sha256.clone(),
+            executables.native_worker.sha256.clone(),
             "Native worker digest",
         )?,
-        wasm_host_artifact_digest: make_digest(wasm_host.sha256.clone(), "WASM host digest")?,
-        doctor_executable_path: doctor_path,
-        testd_executable_path: testd_path,
-        native_worker_executable_path: native_worker_path,
-        wasm_host_executable_path: wasm_host_path,
+        wasm_host_artifact_digest: make_digest(
+            executables.wasm_host.sha256.clone(),
+            "WASM host digest",
+        )?,
+        doctor_executable_path: paths.doctor.clone(),
+        testd_executable_path: paths.testd.clone(),
+        native_worker_executable_path: paths.native_worker.clone(),
+        wasm_host_executable_path: paths.wasm_host.clone(),
         descriptor_digest: PlatformHandle::new("0".repeat(64))
             .map_err(|error| MaterializeError::Contract(error.to_string()))?,
     }
     .with_computed_digest()
-    .map_err(|error| MaterializeError::Contract(format!("runtime launch: {error}")))?;
+    .map_err(|error| MaterializeError::Contract(format!("runtime launch: {error}")))
+}
+
+fn store_config_bytes(
+    context: &TypedBundleBuildContext<'_>,
+    runtime_launch: &RuntimeLaunchDescriptor,
+) -> Result<Vec<u8>, MaterializeError> {
     let admitted_store_target = &runtime_launch.store_credential_target;
     let credential_ref = admitted_store_target.as_str().to_owned();
     // I15.4 requires the provider bootstrap/admin credential to be a separate,
@@ -1178,11 +1419,14 @@ fn build_typed_bundle_with_selection(
             .as_str()
             .to_owned();
     let mut store_config = StoreLaunchConfig {
-        store_pipe: format!(r"\\.\pipe\eliot\store-{credential_token}"),
-        launch_nonce: format!("store:{credential_token}"),
+        store_pipe: format!(
+            r"\\.\pipe\eliot\store-{}",
+            context.template.credential_token
+        ),
+        launch_nonce: format!("store:{}", context.template.credential_token),
         expected_client_sid: LOCAL_SERVICE_SID.to_owned(),
         expected_client_session_id: 0,
-        approved_artifact_hash: store_bridge.sha256.clone(),
+        approved_artifact_hash: context.named_executables.store_bridge.sha256.clone(),
         approved_config_hash: String::new(),
         endpoint: RUNTIME_LIVE_STORE_ENDPOINT.to_owned(),
         provider_bind_address: RUNTIME_LIVE_STORE_BIND.to_owned(),
@@ -1195,11 +1439,18 @@ fn build_typed_bundle_with_selection(
         // bridge knob defaults to the I5.7 desktop default; behavior unchanged.
         store_transaction_limit: None,
         schema_generation: "1.0.0".to_owned(),
-        blob_root: Path::new(roots.store_data_root.as_str())
-            .join("blob")
-            .to_string_lossy()
-            .into_owned(),
-        instance_id: format!("store-{}", input.generation.as_str()),
+        blob_root: Path::new(
+            context
+                .selection
+                .roots
+                .runtime_state_roots
+                .store_data_root
+                .as_str(),
+        )
+        .join("blob")
+        .to_string_lossy()
+        .into_owned(),
+        instance_id: format!("store-{}", context.input.generation.as_str()),
         credential_ref,
         provider_bootstrap_credential_ref,
         provider_bootstrap_username: "provider-bootstrap".to_owned(),
@@ -1212,25 +1463,18 @@ fn build_typed_bundle_with_selection(
         .map_err(|error| MaterializeError::Contract(format!("Store config: {error}")))?;
     let generation_bytes = serde_json::to_vec(&store_config)
         .map_err(|error| MaterializeError::Contract(format!("serialize Store config: {error}")))?;
-    validate_store_config_bytes(&generation_bytes, &runtime_launch)?;
-    let json_roles = vec![
-        JsonRole {
-            name: "generation.json",
-            bytes: generation_bytes.clone(),
-        },
-        JsonRole {
-            name: "eliotd-governor.json",
-            bytes: governor.clone(),
-        },
-        JsonRole {
-            name: "eliotd.json",
-            bytes: descriptor_bytes.clone(),
-        },
-    ];
+    validate_store_config_bytes(&generation_bytes, runtime_launch)?;
+    Ok(generation_bytes)
+}
+
+fn package_inventory(
+    context: &TypedBundleBuildContext<'_>,
+    json_roles: &[JsonRole],
+) -> Result<(Vec<PackageArtifactDigest>, PackageManifest, PlatformHandle), MaterializeError> {
     let mut expected = Vec::with_capacity(REQUIRED_ROLES.len());
     for (role, executable) in REQUIRED_ROLES {
         let (size, digest) = if executable {
-            let executable = by_name(role)?;
+            let executable = executable_by_name(context.executables, role)?;
             (executable.size, executable.sha256.clone())
         } else {
             let json = json_roles
@@ -1254,11 +1498,40 @@ fn build_typed_bundle_with_selection(
                 .map_err(|error| MaterializeError::Contract(error.to_string()))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let manifest = PackageManifest::new(input.generation.as_str(), specs)
+    let manifest = PackageManifest::new(context.input.generation.as_str(), specs)
         .map_err(|error| MaterializeError::Contract(error.to_string()))?;
     let evidence_digest =
         GenerationPackagePlanner::artifact_set_evidence_digest(&manifest, &expected)
             .map_err(|error| MaterializeError::Contract(error.to_string()))?;
+    Ok((expected, manifest, evidence_digest))
+}
+
+fn build_typed_bundle_with_selection(
+    input: &CanarySourceBundleMaterializeInput,
+    executables: &[ValidatedExecutable],
+    selection: &ProfileSelectionResolution,
+) -> Result<TypedBundle, MaterializeError> {
+    let context = TypedBundleBuildContext::new(input, executables, selection)?;
+    let arguments = RuntimeLaunchArguments::build(&context)?;
+    let (descriptor_bytes, descriptor_sha256) = eliotd_descriptor_binding(&context)?;
+    let arguments = arguments.bind_descriptor_digest(&descriptor_sha256)?;
+    let runtime_launch = runtime_launch_descriptor(&context, arguments, &descriptor_sha256)?;
+    let generation_bytes = store_config_bytes(&context, &runtime_launch)?;
+    let json_roles = vec![
+        JsonRole {
+            name: "generation.json",
+            bytes: generation_bytes,
+        },
+        JsonRole {
+            name: "eliotd-governor.json",
+            bytes: context.template.governor_bytes.clone(),
+        },
+        JsonRole {
+            name: "eliotd.json",
+            bytes: descriptor_bytes,
+        },
+    ];
+    let (expected, manifest, evidence_digest) = package_inventory(&context, &json_roles)?;
     Ok(TypedBundle {
         json_roles,
         expected,
@@ -1780,6 +2053,80 @@ fn resume_intent_publication(
     }
 }
 
+fn reconcile_existing_journal_destination(
+    store: &RedbInstallationTransactionStore,
+    journal: &SourceBundlePublicationJournal,
+    precommit_files: Vec<MaterializedRolePrecommitReceipt>,
+    selected_profile_anchor: &SelectedProfileAnchor<'_>,
+) -> Result<CanarySourceBundleMaterializeOutcome, MaterializeError> {
+    match reconcile_journal_destination(journal, selected_profile_anchor) {
+        Ok(Some(receipt)) => {
+            let updated = SourceBundlePublicationJournal {
+                state: SourceBundlePublicationJournalState::Published,
+                destination_identity: Some(receipt.directory_publication.destination_identity),
+                directory_receipt: Some(receipt.directory_publication.clone()),
+                diagnostic: None,
+                ..journal.clone()
+            };
+            selected_profile_anchor.revalidate()?;
+            let recorded = match store.record_source_bundle_publication(&updated) {
+                Ok(recorded) => recorded,
+                Err(error) if journal.state == SourceBundlePublicationJournalState::Intent => {
+                    return persist_unknown_publication(
+                        store,
+                        journal,
+                        precommit_files,
+                        format!(
+                            "reconciled destination failed durable authority verification: {error}"
+                        ),
+                        selected_profile_anchor,
+                    );
+                }
+                Err(error) => {
+                    return Ok(journal_unknown_outcome(
+                        journal,
+                        precommit_files,
+                        format!(
+                            "unknown destination failed durable authority verification: {error}"
+                        ),
+                        selected_profile_anchor,
+                    ));
+                }
+            };
+            let receipt = load_verified_published_receipt(
+                store,
+                &recorded.operation_id,
+                selected_profile_anchor,
+            )?;
+            Ok(CanarySourceBundleMaterializeOutcome::Published(receipt))
+        }
+        Ok(None) if journal.state == SourceBundlePublicationJournalState::Intent => {
+            resume_intent_publication(store, journal, precommit_files, selected_profile_anchor)
+        }
+        Ok(None) => Ok(journal_unknown_outcome(
+            journal,
+            precommit_files,
+            "durable publication journal exists but its destination is absent".to_owned(),
+            selected_profile_anchor,
+        )),
+        Err(error) if journal.state == SourceBundlePublicationJournalState::Intent => {
+            persist_unknown_publication(
+                store,
+                journal,
+                precommit_files,
+                format!("durable publication reconciliation rejected: {error}"),
+                selected_profile_anchor,
+            )
+        }
+        Err(error) => Ok(journal_unknown_outcome(
+            journal,
+            precommit_files,
+            format!("durable publication reconciliation rejected: {error}"),
+            selected_profile_anchor,
+        )),
+    }
+}
+
 fn reconcile_existing_publication(
     input: &CanarySourceBundleMaterializeInput,
     selection: &ProfileSelectionResolution,
@@ -1836,73 +2183,12 @@ fn reconcile_existing_publication(
             load_verified_published_receipt(&store, &operation_id, selected_profile_anchor)?,
         )));
     }
-    match reconcile_journal_destination(&journal, selected_profile_anchor) {
-        Ok(Some(receipt)) => {
-            let updated = SourceBundlePublicationJournal {
-                state: SourceBundlePublicationJournalState::Published,
-                destination_identity: Some(receipt.directory_publication.destination_identity),
-                directory_receipt: Some(receipt.directory_publication.clone()),
-                diagnostic: None,
-                ..journal.clone()
-            };
-            selected_profile_anchor.revalidate()?;
-            let recorded = match store.record_source_bundle_publication(&updated) {
-                Ok(recorded) => recorded,
-                Err(error) if journal.state == SourceBundlePublicationJournalState::Intent => {
-                    return Ok(Some(persist_unknown_publication(
-                        &store,
-                        &journal,
-                        precommit_files,
-                        format!(
-                            "reconciled destination failed durable authority verification: {error}"
-                        ),
-                        selected_profile_anchor,
-                    )?));
-                }
-                Err(error) => {
-                    return Ok(Some(journal_unknown_outcome(
-                        &journal,
-                        precommit_files,
-                        format!(
-                            "unknown destination failed durable authority verification: {error}"
-                        ),
-                        selected_profile_anchor,
-                    )));
-                }
-            };
-            Ok(Some(CanarySourceBundleMaterializeOutcome::Published(
-                load_verified_published_receipt(
-                    &store,
-                    &recorded.operation_id,
-                    selected_profile_anchor,
-                )?,
-            )))
-        }
-        Ok(None) if journal.state == SourceBundlePublicationJournalState::Intent => Ok(Some(
-            resume_intent_publication(&store, &journal, precommit_files, selected_profile_anchor)?,
-        )),
-        Ok(None) => Ok(Some(journal_unknown_outcome(
-            &journal,
-            precommit_files,
-            "durable publication journal exists but its destination is absent".to_owned(),
-            selected_profile_anchor,
-        ))),
-        Err(error) if journal.state == SourceBundlePublicationJournalState::Intent => {
-            Ok(Some(persist_unknown_publication(
-                &store,
-                &journal,
-                precommit_files,
-                format!("durable publication reconciliation rejected: {error}"),
-                selected_profile_anchor,
-            )?))
-        }
-        Err(error) => Ok(Some(journal_unknown_outcome(
-            &journal,
-            precommit_files,
-            format!("durable publication reconciliation rejected: {error}"),
-            selected_profile_anchor,
-        ))),
-    }
+    Ok(Some(reconcile_existing_journal_destination(
+        &store,
+        &journal,
+        precommit_files,
+        selected_profile_anchor,
+    )?))
 }
 
 #[allow(
@@ -1921,12 +2207,8 @@ fn materialize_with_executables(
         input.profile_selection.profile_anchor_root.as_str(),
     ))
     .map_err(|error| MaterializeError::Platform(error.to_string()))?;
-    let selected_profile_anchor = SelectedProfileAnchor::retain(
-        input,
-        &selection,
-        &anchor_handle,
-        anchor_identity,
-    )?;
+    let selected_profile_anchor =
+        SelectedProfileAnchor::retain(input, &selection, &anchor_handle, anchor_identity)?;
     materialize_with_resolved_selection(
         input,
         executables,
@@ -2116,12 +2398,10 @@ fn materialize_with_resolved_selection(
         parent_identity: publication.parent_identity(),
         generation: input.generation.clone(),
         profile_governed_roots: typed.profile_governed_roots.clone(),
-        selected_profile_anchor_path: PlatformHandle::new(
-            selected_profile_anchor.path_string(),
-        )
-        .map_err(|error| {
-            MaterializeError::Contract(format!("selected profile anchor path: {error}"))
-        })?,
+        selected_profile_anchor_path: PlatformHandle::new(selected_profile_anchor.path_string())
+            .map_err(|error| {
+                MaterializeError::Contract(format!("selected profile anchor path: {error}"))
+            })?,
         selected_profile_anchor_identity: selected_profile_anchor.identity,
         manifest_digest: PlatformHandle::new(typed.manifest.canonical_digest())
             .map_err(|error| MaterializeError::Contract(error.to_string()))?,
@@ -2156,14 +2436,12 @@ fn materialize_with_resolved_selection(
     let store = RedbInstallationTransactionStore::open_existing_exact_path(&input.store_path)
         .map_err(|error| MaterializeError::Contract(error.to_string()))?;
     match existing_journal.state {
-        SourceBundlePublicationJournalState::Intent => {
-            resume_intent_publication(
-                &store,
-                &existing_journal,
-                precommit_files,
-                selected_profile_anchor,
-            )
-        }
+        SourceBundlePublicationJournalState::Intent => resume_intent_publication(
+            &store,
+            &existing_journal,
+            precommit_files,
+            selected_profile_anchor,
+        ),
         SourceBundlePublicationJournalState::Published => {
             let receipt = load_verified_published_receipt(
                 &store,
