@@ -6,9 +6,9 @@
 
 #![forbid(unsafe_code)]
 
-use eliot_contracts::StateFence;
 #[cfg(windows)]
 use eliot_contracts::ResourceGeneration;
+use eliot_contracts::StateFence;
 #[cfg(windows)]
 use eliot_kernel_service::KernelServiceState;
 use eliot_kernel_service::{KernelActivationReceipt, KernelServiceError};

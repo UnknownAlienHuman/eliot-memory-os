@@ -15,6 +15,11 @@
 //!
 //! Public construction semantics remain on `KernelComposition`; this ordinary
 //! module only houses their implementation.
+#[cfg(windows)]
+use super::{
+    AdmittedDaemonRestartPolicy, DaemonSupervisionProgressState, SupervisionLeaseAuthorityConfig,
+    dispatch_key, load_agent_bridge_declaration, observed_session_principal_binding,
+};
 use super::{
     ArtifactId, AuditEventDraft, AuthorityDescriptorContour, AuthorityHandoffBegin,
     AuthorityHandoffRecord, AuthorityHandoffState, AuthorityPreparationError,
@@ -35,12 +40,6 @@ use super::{
 };
 #[cfg(test)]
 use super::{CanonicalEvidenceProvider, DispatchValidationPort};
-#[cfg(windows)]
-use super::{
-    AdmittedDaemonRestartPolicy, DaemonSupervisionProgressState,
-    SupervisionLeaseAuthorityConfig, dispatch_key, load_agent_bridge_declaration,
-    observed_session_principal_binding,
-};
 #[cfg(not(windows))]
 use super::{
     SupervisionLeaseAuthorityConfig, dispatch_key, load_agent_bridge_declaration,

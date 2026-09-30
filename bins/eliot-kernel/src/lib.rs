@@ -300,14 +300,13 @@ mod wasm_runtime_port_grant;
 use daemon_session_guard::caller_binding;
 #[cfg(all(windows, test))]
 use daemon_supervision::EliotdSupervisionSuccessorEvidence;
-use daemon_supervision::{DaemonRuntimeState, DaemonRuntimeStatus, daemon_status_proves_ready};
 #[cfg(windows)]
 use daemon_supervision::{
     AdmittedDaemonRestartPolicy, DaemonSupervisionContour, DaemonSupervisionProgressState,
     EliotdLiveReceiptDisposition, classify_eliotd_live_receipt_transition,
-    daemon_class_withholds_replacement, daemon_refuses_replacement,
-    daemon_restart_refusal_reason,
+    daemon_class_withholds_replacement, daemon_refuses_replacement, daemon_restart_refusal_reason,
 };
+use daemon_supervision::{DaemonRuntimeState, DaemonRuntimeStatus, daemon_status_proves_ready};
 use generation_recovery::OrsGenerationCoordinator;
 #[cfg(test)]
 use generation_recovery::update_handshake_policy;
