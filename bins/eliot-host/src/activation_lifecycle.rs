@@ -33,16 +33,32 @@
 //! Census honesty: the `RuntimeLease` row family I1.5 assigns to the Kernel's ORS
 //! now exists as durable state (`ors_runtime_lease_current_v1`, record type
 //! `runtime_lease_current`, selected by exact `StateFence` equality through
-//! `RedbRecoveryStore::load_runtime_leases_by_state_fence`), but the ORS row
-//! writer and the Kernel renewal/expiry tick are still the crates/Kernel
-//! lane's work (STITCH, out of contour). The Host half below is durable and
-//! complete on its own side: the current activation generation holds its
-//! generation-bound `RuntimeLease` reference (issued, renewed, and released
-//! here from fresh admitting observations), the idle-drain gate reads exactly
-//! those held references plus the published supervision mirror, and
-//! [`project_runtime_lease`] projects the owner-validated row
-//! content the writer lane persists under the same key/fence scheme — never a
-//! sidecar, never beside the ORS family. A `StoppedClean` terminal releases
+//! `RedbRecoveryStore::load_runtime_leases_by_state_fence`) with a landed
+//! writer: `bins/eliot-kernel/src/control_plane.rs` issues one `Active` row
+//! per granted activation into `RedbRecoveryStore::record_runtime_lease_current`
+//! (I18.53 ACT-1), and the Kernel census
+//! (`bins/eliot-kernel/src/idle_lease_census.rs` `runtime_lease_leg` and
+//! `read_runtime_lease_census`) plus the Host retirement barrier
+//! (`bins/eliot-host/src/lease_drain.rs`
+//! `require_generation_retirement_barrier` over `ReadRuntimeLeaseCensus`)
+//! read it back. The Kernel tick beside the issuance site has landed too:
+//! `expire_past_due_runtime_leases` and `supersede_stale_runtime_leases` at
+//! grant time plus `renew_runtime_leases_for_probe` on the probe path move
+//! rows through the owner `RuntimeLease::transition_to` legality — past-due
+//! rows reach the `Expired` terminal, stale same-scope identities reach
+//! `Superseded`, and live rows held by the probed activation renew from that
+//! probe's fresh evidence (renewed supervision head plus live receipt inside
+//! `RUNTIME_LEASE_EVIDENCE_FRESHNESS_MS`). Still STITCH, out of contour:
+//! explicit revocation (no `RevokeRuntimeLease` production path exists).
+//! The Host half below is durable and complete on its own side:
+//! the current activation generation holds its generation-bound `RuntimeLease`
+//! reference (issued, renewed, and released here from fresh admitting
+//! observations), the idle-drain gate reads exactly those held references
+//! plus the published supervision mirror, and [`project_runtime_lease`]
+//! projects the owner-validated row content for the held identity — but the
+//! landed writer keys rows by `receipt.operation_id`, not by that identity,
+//! so the two schemes still need the owner-scope identity decision (STITCH,
+//! never a sidecar, never beside the ORS family). A `StoppedClean` terminal releases
 //! the held references (`transition_activation_record` clears them once the
 //! `DrainCommitRecord` snapshot carries the obligations, proven by
 //! [`prove_terminal_runtime_release`]); recovery terminals
@@ -1154,13 +1170,13 @@ pub(super) fn prove_terminal_runtime_release(
     ))
 }
 
-/// Projects the exact canonical ORS `runtime_lease_current` row content for a
+/// Projects the owner-validated ORS `runtime_lease_current` row content for a
 /// held generation lease.
 ///
 /// I1.5 assigns the `RuntimeLease` row family to Kernel-owned ORS
 /// (`ors_runtime_lease_current_v1`, record type `runtime_lease_current`). The
-/// Host journal holds the lease *reference*; this projection is the row
-/// content the crates-side writer persists under it: the key is the held
+/// Host journal holds the lease *reference*; this projection builds the row
+/// content for the held
 /// [`runtime_lease_id_for`] identity, the row is selected by exact
 /// `state_fence` equality
 /// (`RedbRecoveryStore::load_runtime_leases_by_state_fence`), the scope is the
@@ -1169,9 +1185,12 @@ pub(super) fn prove_terminal_runtime_release(
 /// runs before return. The contour fence is caller-supplied: the writer lane
 /// owns the live contour, so the Host never invents it here.
 ///
-/// STITCH, out of contour (other lane): the durable row commit and the Kernel
-/// renewal/expiry tick. Named adopters are the `ors_runtime_lease_current_v1`
-/// commit path beside
+/// STITCH, out of contour (other lane): the durable row commit has landed
+/// (`bins/eliot-kernel/src/control_plane.rs` issuance into
+/// `RedbRecoveryStore::record_runtime_lease_current`, keyed by
+/// `receipt.operation_id`) together with the renewal/expiry/supersede tick
+/// beside it; the explicit revoke arm and the owner-scope identity decision
+/// are still STITCH there, through the ORS owner.
 /// Validity window in milliseconds for a Host-projected runtime lease
 /// (issue #1751 W4; I1.5). Mirrors the Kernel
 /// `RUNTIME_LEASE_VALIDITY_MS` and the supervision renewal policy's
@@ -1179,15 +1198,24 @@ pub(super) fn prove_terminal_runtime_release(
 /// the projected expiry can never outlive the owner's proof.
 const RUNTIME_LEASE_VALIDITY_MS: u64 = 60_000;
 
-/// `RedbRecoveryStore::{load_runtime_leases_by_state_fence,
-/// load_runtime_lease_census_by_state_fence}`, consumed by the Kernel
-/// `idle_lease_census` runtime leg over the authenticated
-/// `ReadRuntimeLeaseCensus` wire. Until that commit lands, an empty ORS table
-/// reads as "no durable rows" — exactly like the supervision-status
-/// `has_table` precedent — never as a caller-supplied default. No mirror or
-/// queued `WakeIntent` can reactivate a terminal revision this projection once
-/// closed: revision chaining through the owner `transition_to` legality is the
-/// writer lane's own commit rule.
+/// Readers have landed too: the Kernel `idle_lease_census` runtime leg
+/// (`RedbRecoveryStore::load_runtime_leases_by_state_fence`) and
+/// `read_runtime_lease_census`
+/// (`RedbRecoveryStore::load_runtime_lease_census_by_state_fence`) serve the
+/// authenticated `ReadRuntimeLeaseCensus` wire the Host retirement barrier
+/// (`bins/eliot-host/src/lease_drain.rs`
+/// `require_generation_retirement_barrier`) queries, and the tick beside the
+/// issuance site (`expire_past_due_runtime_leases`,
+/// `supersede_stale_runtime_leases`, `renew_runtime_leases_for_probe`)
+/// renews, expires, and reconciles rows through the owner
+/// `RuntimeLease::transition_to` legality. What keeps this projection
+/// unadopted is identity, not plumbing: the landed writer keys rows by
+/// `receipt.operation_id`, not by the [`runtime_lease_id_for`] identity
+/// built here, and no production path revokes a row — that identity
+/// decision and the explicit revoke arm belong beside the issuance site
+/// (STITCH). No mirror or queued `WakeIntent` can reactivate a terminal
+/// revision: revision chaining through the owner `transition_to` legality is
+/// the writer lane's own commit rule.
 ///
 /// # Errors
 ///
