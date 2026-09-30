@@ -162,6 +162,7 @@ pub struct PreparedKernelExchange {
     operation_id: OperationId,
     idempotency_key: String,
     transition: Option<PreparedTransition>,
+    expected_transition_class: TransitionClass,
     expected_revision_heads: Vec<RevisionHeadExpectation>,
     expected_ordering_heads: Vec<OrderingHeadExpectation>,
     pre_commit_fence: StateFence,
@@ -208,7 +209,7 @@ impl PreparedKernelExchange {
         let committed = match port
             .apply_prepared(
                 &self.identity,
-                transition,
+                transition.clone(),
                 self.expected_revision_heads.clone(),
                 self.expected_ordering_heads.clone(),
             )
@@ -218,12 +219,7 @@ impl PreparedKernelExchange {
             Err(KernelPortError::Unknown(_)) => return self.reconcile_receipt(port).await,
             Err(error) => return Err(error.into()),
         };
-        check_finish_receipt(
-            &committed,
-            &self.operation_id,
-            &self.pre_commit_fence,
-            &self.idempotency_key,
-        )?;
+        self.validate_receipt(&committed)?;
         Ok(committed)
     }
 
@@ -245,13 +241,26 @@ impl PreparedKernelExchange {
                     self.operation_id.as_str()
                 )))
             })?;
+        self.validate_receipt(&committed)?;
+        Ok(committed)
+    }
+
+    /// Revalidates a returned receipt against this exact prepared plan.
+    ///
+    /// The owner calls this again while accepting a completed Observe so a
+    /// caller cannot substitute a receipt after the exchange has settled.
+    pub(crate) fn validate_receipt(
+        &self,
+        receipt: &WriteReceipt,
+    ) -> Result<(), FinishAttemptError> {
         check_finish_receipt(
-            &committed,
+            receipt,
             &self.operation_id,
             &self.pre_commit_fence,
             &self.idempotency_key,
-        )?;
-        Ok(committed)
+            self.expected_transition_class,
+            self.transition.as_ref(),
+        )
     }
 }
 
@@ -323,6 +332,7 @@ pub(crate) fn prepare_exchange(
         operation_id: envelope.operation_id,
         idempotency_key: identity.idempotency_key.clone(),
         pre_commit_fence: canonical.state_fence().clone(),
+        expected_transition_class: transition.transition_class,
         identity: identity.clone(),
         transition: Some(transition),
         expected_revision_heads: envelope.expected_revision_heads,
@@ -337,12 +347,14 @@ fn prepare_receipt_readback(
     canonical: &CanonicalAdmissionOwner,
     operation_id: OperationId,
     identity: &RequestIdentity,
+    transition_class: TransitionClass,
 ) -> PreparedKernelExchange {
     PreparedKernelExchange {
         identity: identity.clone(),
         operation_id,
         idempotency_key: identity.idempotency_key.clone(),
         transition: None,
+        expected_transition_class: transition_class,
         expected_revision_heads: Vec::new(),
         expected_ordering_heads: Vec::new(),
         pre_commit_fence: canonical.state_fence().clone(),
@@ -1035,6 +1047,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
                 self.canonical,
                 fact_operation,
                 fact_identity,
+                TransitionClass::RecoverySchema,
             )));
         }
         let snapshot = self
@@ -1496,6 +1509,8 @@ fn check_finish_receipt(
     operation_id: &OperationId,
     fence: &StateFence,
     idempotency_key: &str,
+    expected_transition_class: TransitionClass,
+    expected_transition: Option<&PreparedTransition>,
 ) -> Result<(), FinishAttemptError> {
     receipt
         .validate()
@@ -1508,10 +1523,25 @@ fn check_finish_receipt(
             "committed receipt does not bind the finish identity".to_owned(),
         ));
     }
-    if receipt.transition_class != TransitionClass::RecoverySchema {
+    if receipt.transition_class != expected_transition_class {
         return Err(FinishAttemptError::Store(
-            "finish receipt has the wrong transition class".to_owned(),
+            "prepared receipt has the wrong transition class".to_owned(),
         ));
+    }
+    if let Some(transition) = expected_transition {
+        if receipt.canonical_request_hash != transition.identity.canonical_request_hash
+            || receipt.transition_class != transition.transition_class
+            || receipt.operation_manifest_digest != transition.operation_manifest_digest
+            || receipt.admission_digest != transition.admission_digest
+            || receipt.mutation_plan_digest != transition.mutation_plan_digest
+            || receipt.semantic_source_revisions != transition.semantic_source_revisions
+            || receipt.policy_config_schema_versions
+                != eliot_store_api::PolicyConfigSchemaVersions::bound_to(transition)
+        {
+            return Err(FinishAttemptError::Store(
+                "committed receipt does not match the original prepared transition".to_owned(),
+            ));
+        }
     }
     if receipt.status != WriteReceiptStatus::Committed {
         return Err(FinishAttemptError::Store(format!(
