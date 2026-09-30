@@ -2544,6 +2544,35 @@ impl DaemonKernelClient {
         payload: serde_json::Value,
         identity: RequestIdentity,
     ) -> Result<serde_json::Value, KernelClientError> {
+        match self
+            .transact_async_with_identity_outcome(operation, payload, identity)
+            .await?
+        {
+            WireOutcome::Known { value, recovery } => {
+                let _ = recovery;
+                Ok(value)
+            }
+            WireOutcome::Error { code, reason } => {
+                Err(KernelClientError::Contract(format!("{code}: {reason}")))
+            }
+            WireOutcome::Partial { reason, value } => {
+                let _ = value;
+                Err(KernelClientError::Unknown(reason))
+            }
+            WireOutcome::Unknown { reason } => Err(KernelClientError::Unknown(reason)),
+            WireOutcome::AcceptedPending { .. } => Err(KernelClientError::Unknown(
+                "Kernel returned ACCEPTED_PENDING to a receipt-only caller".to_owned(),
+            )),
+        }
+    }
+
+    #[cfg(windows)]
+    pub(super) async fn transact_async_with_identity_outcome(
+        &self,
+        operation: &str,
+        payload: serde_json::Value,
+        identity: RequestIdentity,
+    ) -> Result<WireOutcome, KernelClientError> {
         let (mut transport, limits) = self.connect_transport().await?;
         let request_id = identity.request.metadata.request_id.clone();
         let frame = Frame {
@@ -2587,22 +2616,8 @@ impl DaemonKernelClient {
                 "Kernel response is not JSON".to_owned(),
             ));
         };
-        match serde_json::from_value::<WireOutcome>(value)
-            .map_err(|error| KernelClientError::Unknown(error.to_string()))?
-        {
-            WireOutcome::Known { value, recovery } => {
-                let _ = recovery;
-                Ok(value)
-            }
-            WireOutcome::Error { code, reason } => {
-                Err(KernelClientError::Contract(format!("{code}: {reason}")))
-            }
-            WireOutcome::Partial { reason, value } => {
-                let _ = value;
-                Err(KernelClientError::Unknown(reason))
-            }
-            WireOutcome::Unknown { reason } => Err(KernelClientError::Unknown(reason)),
-        }
+        serde_json::from_value::<WireOutcome>(value)
+            .map_err(|error| KernelClientError::Unknown(error.to_string()))
     }
 
     #[cfg(not(windows))]
@@ -2621,6 +2636,16 @@ impl DaemonKernelClient {
         _payload: serde_json::Value,
         _identity: RequestIdentity,
     ) -> Result<serde_json::Value, KernelClientError> {
+        Err(KernelClientError::Unsupported)
+    }
+
+    #[cfg(not(windows))]
+    pub(super) async fn transact_async_with_identity_outcome(
+        &self,
+        _operation: &str,
+        _payload: serde_json::Value,
+        _identity: RequestIdentity,
+    ) -> Result<WireOutcome, KernelClientError> {
         Err(KernelClientError::Unsupported)
     }
 
