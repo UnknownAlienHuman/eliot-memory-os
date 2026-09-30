@@ -9134,6 +9134,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 task_ref,
                 task_revision,
                 acceptance_digest,
+                selection_source_ref,
+                evidence_ref,
             } => {
                 let (evidence, _) = self
                     .issue_task_selection_evidence_for_binding(
@@ -9144,6 +9146,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                         (&task_ref, task_revision, Some(&acceptance_digest)),
                     )
                     .await?;
+                if evidence.selection_source_ref != selection_source_ref
+                    || evidence.evidence_ref != evidence_ref
+                {
+                    return Err(CompositionError::ActivationStaleFence);
+                }
                 TaskBindingInput::Selected(evidence)
             }
             TaskBindingInput::Selected(supplied) => {
