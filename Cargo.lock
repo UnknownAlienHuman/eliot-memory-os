@@ -1062,9 +1062,12 @@ dependencies = [
 name = "eliot-code-cortex"
 version = "0.1.0"
 dependencies = [
+ "eliot-blob-api",
  "eliot-graph-api",
  "eliot-instrument-api",
  "eliot-lsp-bridge",
+ "eliot-receipts",
+ "eliot-store-api",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -1974,6 +1977,7 @@ dependencies = [
  "eliot-budget",
  "eliot-canonical",
  "eliot-change-monitor",
+ "eliot-code-cortex",
  "eliot-config",
  "eliot-context-candidates",
  "eliot-context-contracts",
@@ -2494,6 +2498,7 @@ name = "eliot-lsp-bridge"
 version = "0.1.0"
 dependencies = [
  "eliot-artifact",
+ "eliot-blob-api",
  "eliot-build-test-graph",
  "eliot-contracts",
  "eliot-evidence",
