@@ -37,7 +37,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::route_receipts::CommittedRouteEvidenceRelation;
+use crate::route_receipts::{COMMITTED_ROUTE_EVIDENCE_SCHEMA_VERSION, CommittedRouteEvidenceRelation};
 use crate::{
     CancelReason, CancellationState, ContractError, EventCursor, EventId, ExecutionUnit,
     ProviderExecutionBinding, ProviderObservationLineage, UsageReceipt,
@@ -1285,6 +1285,36 @@ pub fn validate_legacy_carry(
     Ok(normalized)
 }
 
+/// Route-binding disposition of one committed journal record's retained
+/// route evidence (issue #2645 W6).
+///
+/// Rows admitted under the pre-fix staging predicate carry no versioned
+/// relation, or a relation stamped with a non-current schema version. They
+/// keep their retained requested/actual columns as forensic evidence with
+/// the explicit [`CommittedRouteBindingDisposition::UnverifiedLegacy`]
+/// disposition until the original owner material (binding, admission,
+/// applicable physical observation) establishes the binding through the
+/// existing owner checks. No recomputed self-hash, no matching column, and
+/// no absence of an error upgrades them: only a current-version relation
+/// resolved from the owners reads
+/// [`CommittedRouteBindingDisposition::Verified`]. Dependent use stays
+/// restricted under the existing owner policy — a route-claim consumer
+/// requires `Verified` — and session-only lineage carries no route authority
+/// at all (`None` disposition alongside the `None` relation, never a
+/// fabricated attempt binding).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CommittedRouteBindingDisposition {
+    /// Current-version relation resolved from the governing owners and bound
+    /// to the retained columns.
+    Verified,
+    /// Pre-fix row: the relation is absent or stamped with a legacy
+    /// (non-current) schema version. The retained columns are forensic
+    /// evidence, never verified binding, and grant no
+    /// execution/promotion authority.
+    UnverifiedLegacy,
+}
+
 /// Durable-to-intake conversion view for one committed journal record (issues
 /// #371 W7/A27).
 ///
@@ -1340,20 +1370,37 @@ pub struct CommittedHostEventIntake {
     /// route evidence identities are this relation's digests, resolved
     /// through their receipt owners at staging.
     pub route_evidence: Option<CommittedRouteEvidenceRelation>,
+    /// Explicit route-binding disposition (issue #2645 W6): `None` exactly
+    /// for session-only lineage, which carries no route authority;
+    /// `Some(Verified)` exactly for execution-unit lineage carrying a
+    /// current-version relation bound to the retained columns;
+    /// `Some(UnverifiedLegacy)` exactly for pre-fix execution-unit rows
+    /// whose relation is absent or legacy-versioned. The disposition is
+    /// re-verified (see [`Self::verify`]) before the view is handed out: a
+    /// view whose disposition disagrees with its lineage/relation shape
+    /// fails closed, and nothing but the original owner material upgrades a
+    /// legacy row. A route-claim consumer requires `Verified`; legacy
+    /// columns stay forensic evidence with restricted dependent use.
+    #[serde(default)]
+    pub route_binding_disposition: Option<CommittedRouteBindingDisposition>,
 }
 
 impl CommittedHostEventIntake {
     /// Builds the intake view for one envelope known committed by the durable
     /// journal, carrying the journal's retained versioned route-evidence
-    /// relation (issue #2645 W5). Rejects a receipt that is not the
+    /// relation (issue #2645 W5) and routing it to its explicit readback
+    /// disposition (issue #2645 W6). Rejects a receipt that is not the
     /// envelope's sealed receipt and an output digest that does not
     /// recompute; extracts every preserved fact from the envelope instead of
     /// re-deriving it. The carried relation is the journal-readback-validated
     /// [`CommittedRouteEvidenceRelation`] for this record (`Some` exactly for
-    /// execution-unit lineage, `None` exactly for session-only lineage); the
-    /// finished view is re-verified (see [`Self::verify`]) before it is
-    /// handed out, so a relation that drifted from the envelope-carried
-    /// admission reference fails closed here.
+    /// execution-unit lineage carrying a current-version relation, `None`
+    /// exactly for session-only lineage and for pre-fix execution-unit rows
+    /// whose relation is absent or legacy-versioned); the finished view is
+    /// re-verified (see [`Self::verify`]) before it is handed out, so a
+    /// relation that drifted from the envelope-carried admission reference,
+    /// or a disposition that disagrees with the lineage/relation shape,
+    /// fails closed here.
     pub fn from_envelope(
         envelope: &NormalizedHostEventEnvelope,
         acked: bool,
@@ -1381,6 +1428,8 @@ impl CommittedHostEventIntake {
             &envelope.payload,
             &envelope.raw_source.digest,
         )?;
+        let route_binding_disposition =
+            Self::readback_disposition(&envelope.lineage, route_evidence.as_ref());
         let intake = Self {
             event_id: envelope.event_id.clone(),
             cursor: envelope.cursor.clone(),
@@ -1395,18 +1444,47 @@ impl CommittedHostEventIntake {
             envelope: envelope.clone(),
             receipt,
             route_evidence,
+            route_binding_disposition,
         };
         intake.verify()?;
         Ok(intake)
+    }
+
+    /// Routes the retained relation to its explicit readback disposition
+    /// (issue #2645 W6): session-only lineage carries no route authority
+    /// (`None`, alongside the `None` relation); execution-unit lineage with
+    /// a current-version relation reads `Verified`; execution-unit lineage
+    /// with an absent or legacy-versioned relation reads `UnverifiedLegacy`
+    /// — the retained columns stay forensic evidence and no column
+    /// comparison upgrades them. The finished view is re-verified (see
+    /// [`Self::verify`]) before it is handed out, so a smuggled session
+    /// relation or a claimed `Verified` over a legacy row still fails
+    /// closed there.
+    fn readback_disposition(
+        lineage: &ProviderObservationLineage,
+        route_evidence: Option<&CommittedRouteEvidenceRelation>,
+    ) -> Option<CommittedRouteBindingDisposition> {
+        match (lineage, route_evidence) {
+            (ProviderObservationLineage::SessionObservation(_), _) => None,
+            (
+                ProviderObservationLineage::ExecutionUnitObservation(_),
+                Some(relation),
+            ) if relation.schema_version == COMMITTED_ROUTE_EVIDENCE_SCHEMA_VERSION => {
+                Some(CommittedRouteBindingDisposition::Verified)
+            }
+            (ProviderObservationLineage::ExecutionUnitObservation(_), _) => {
+                Some(CommittedRouteBindingDisposition::UnverifiedLegacy)
+            }
+        }
     }
 
     /// Re-verifies the preserved facts against the carried envelope: receipt
     /// equality, recomputed output digest, identity/sequence/cursor agreement,
     /// predecessor/delivery/payload-kind agreement, generation/fence presence
     /// agreement with the lineage, stable-identity recomputation, and the
-    /// carried route-evidence relation agreement (issue #2645 W5). The
-    /// coordinator intake calls this before observing; a view that drifted
-    /// from its envelope fails closed here.
+    /// carried route-evidence relation and disposition agreement (issues
+    /// #2645 W5/W6). The coordinator intake calls this before observing; a
+    /// view that drifted from its envelope fails closed here.
     pub fn verify(&self) -> Result<(), ContractError> {
         if self.receipt != self.envelope.normalization {
             return Err(ContractError::DigestMismatch);
@@ -1451,21 +1529,48 @@ impl CommittedHostEventIntake {
         self.verify_route_evidence()
     }
 
-    /// Readback-validates the carried route-evidence relation against the
-    /// carried envelope (issue #2645 W5): session-only lineage carries no
-    /// relation and no route authority; execution-unit lineage carries
-    /// exactly one relation whose schema shape holds and whose admission
-    /// reference equals the envelope-carried admission reference. A stripped,
-    /// smuggled, or re-pointed relation fails with a typed error instead of
-    /// reaching a route-claim consumer; the relation's role-qualified columns
+    /// Readback-validates the carried route-evidence relation and its explicit
+    /// disposition against the carried envelope (issues #2645 W5/W6):
+    /// session-only lineage carries neither relation nor disposition and no
+    /// route authority; execution-unit lineage with a current-version
+    /// relation carries `Verified` exactly when the relation shape holds and
+    /// its admission reference equals the envelope-carried admission
+    /// reference; execution-unit lineage with an absent or legacy-versioned
+    /// relation carries `UnverifiedLegacy` with the retained columns
+    /// preserved as forensic evidence — no column match promotes them, and
+    /// only the original owner material establishes the binding. A stripped,
+    /// smuggled, re-pointed, disposition-disagreeing, or `Verified`-claimed
+    /// legacy view fails with a typed error instead of reaching a
+    /// route-claim consumer; the verified relation's role-qualified columns
     /// were already bound to the retained record columns journal-side before
     /// conversion, and are not re-derived here.
     fn verify_route_evidence(&self) -> Result<(), ContractError> {
         match (&self.envelope.lineage, &self.route_evidence) {
-            (ProviderObservationLineage::SessionObservation(_), None) => Ok(()),
-            (ProviderObservationLineage::ExecutionUnitObservation(_), Some(relation)) => {
+            (ProviderObservationLineage::SessionObservation(_), None) => {
+                if self.route_binding_disposition.is_some() {
+                    return Err(ContractError::BindingMismatch);
+                }
+                Ok(())
+            }
+            (
+                ProviderObservationLineage::ExecutionUnitObservation(_),
+                Some(relation),
+            ) if relation.schema_version == COMMITTED_ROUTE_EVIDENCE_SCHEMA_VERSION => {
+                if self.route_binding_disposition
+                    != Some(CommittedRouteBindingDisposition::Verified)
+                {
+                    return Err(ContractError::BindingMismatch);
+                }
                 relation.validate()?;
                 if self.envelope.admitted_route_digest.as_ref() != Some(&relation.admission_digest)
+                {
+                    return Err(ContractError::BindingMismatch);
+                }
+                Ok(())
+            }
+            (ProviderObservationLineage::ExecutionUnitObservation(_), _) => {
+                if self.route_binding_disposition
+                    != Some(CommittedRouteBindingDisposition::UnverifiedLegacy)
                 {
                     return Err(ContractError::BindingMismatch);
                 }

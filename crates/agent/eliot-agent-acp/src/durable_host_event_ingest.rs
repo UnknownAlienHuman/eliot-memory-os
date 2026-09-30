@@ -43,7 +43,9 @@
 
 use std::collections::BTreeMap;
 
-use eliot_agent_api::route_receipts::CommittedRouteEvidenceRelation;
+use eliot_agent_api::route_receipts::{
+    COMMITTED_ROUTE_EVIDENCE_SCHEMA_VERSION, CommittedRouteEvidenceRelation,
+};
 use eliot_agent_api::{
     AdmittedRouteReceipt, CommittedHostEventIntake, ContractError, EventCursor, EventId,
     HOST_EVENT_CONTRACT_VERSION, HOST_EVENT_DIGEST_ALGORITHM, HostEventDeliveryDisposition,
@@ -1043,20 +1045,24 @@ impl DurableHostEventJournal {
     /// plus the stable identity derived from the normalized input. The
     /// coordinator intake re-verifies every fact before observing.
     ///
-    /// Route-relation contract (issue #2645 W5): commit implies the record's
-    /// requested/actual route columns already passed owner-qualified staging
-    /// validation (admission fingerprint for requested, validated physical
-    /// observation for actual, explicit absence otherwise), and this
+    /// Route-relation contract (issues #2645 W5/W6): commit implies the
+    /// record's requested/actual route columns already passed owner-qualified
+    /// staging validation (admission fingerprint for requested, validated
+    /// physical observation for actual, explicit absence otherwise), and this
     /// projection readback-validates the retained versioned
     /// [`CommittedRouteEvidenceRelation`] before converting: the relation's
     /// owner references must bind the envelope-carried admission reference
     /// and the relation's role-qualified columns must equal the retained
-    /// record columns, or conversion fails closed. A consumer that uses route
-    /// claims receives the validated relation in this view (same relation is
-    /// also available through [`Self::committed_route_evidence`]); the
-    /// envelope's `admitted_route_digest` travels in this view as the exact
-    /// owner-resolvable admission reference. No unused column is declared
-    /// proof of coordinator validation here.
+    /// record columns, or conversion fails closed. A pre-fix execution-unit
+    /// row (relation absent or legacy-versioned) converts with the explicit
+    /// unverified legacy disposition instead: its retained columns travel as
+    /// forensic evidence, never as verified binding, and dependent use stays
+    /// restricted. A consumer that uses route claims receives the validated
+    /// relation in this view (same relation is also available through
+    /// [`Self::committed_route_evidence`]) and requires its `Verified`
+    /// disposition; the envelope's `admitted_route_digest` travels in this
+    /// view as the exact owner-resolvable admission reference. No unused
+    /// column is declared proof of coordinator validation here.
     pub fn to_coordinator_intake(
         &self,
         key: &EventKey,
@@ -1078,15 +1084,21 @@ impl DurableHostEventJournal {
     }
 
     /// Returns the retained versioned route-evidence relation for one
-    /// committed record (issue #2645 W5): `Some` exactly for execution-unit
-    /// lineage, carrying the role-qualified requested/actual digests plus the
-    /// exact owner-resolvable admission and observation references; `None`
-    /// exactly for session-only lineage, which carries no route authority.
+    /// committed record (issues #2645 W5/W6): `Some` exactly for
+    /// execution-unit lineage carrying a current-version relation — the
+    /// role-qualified requested/actual digests plus the exact
+    /// owner-resolvable admission and observation references; `None` exactly
+    /// for session-only lineage, which carries no route authority, and for
+    /// pre-fix execution-unit rows, whose absent or legacy-versioned relation
+    /// reads as the explicit unverified legacy disposition on the converted
+    /// intake view instead. A route-claim consumer requires that view's
+    /// `Verified` disposition: `None` here never authorizes route use.
     ///
     /// The retained relation is readback-validated before it is handed out
-    /// (see [`Self::check_retained_route_evidence`]): a relation that drifted
-    /// from the envelope-carried admission reference or the retained record
-    /// columns fails closed here instead of reaching a route-claim consumer.
+    /// (see [`Self::check_retained_route_evidence`]): a current-version
+    /// relation that drifted from the envelope-carried admission reference
+    /// or the retained record columns fails closed here instead of reaching
+    /// a route-claim consumer.
     /// A staged-but-uncommitted record reports [`IngestError::NotCommitted`].
     pub fn committed_route_evidence(
         &self,
@@ -1104,14 +1116,20 @@ impl DurableHostEventJournal {
     }
 
     /// Readback-validates the retained route-evidence relation of one record
-    /// (issue #2645 W5) without the owner receipts at hand: session-only
+    /// (issues #2645 W5/W6) without the owner receipts at hand: session-only
     /// lineage must retain no relation and no route columns (it carries no
-    /// route authority); execution-unit lineage must retain a relation whose
-    /// admission reference equals the envelope-carried admission reference
-    /// and whose role-qualified columns equal the retained record columns
-    /// (see [`CommittedRouteEvidenceRelation::verify_retained`]). Any drift
-    /// fails closed with a typed error before the intake converts or the
-    /// relation reaches a consumer.
+    /// route authority); execution-unit lineage with a current-version
+    /// relation must bind the envelope-carried admission reference with
+    /// role-qualified columns equal to the retained record columns (see
+    /// [`CommittedRouteEvidenceRelation::verify_retained`]); execution-unit
+    /// lineage with an absent or legacy-versioned relation is a pre-fix row
+    /// and is preserved as-is — its retained columns stay forensic evidence
+    /// under the explicit unverified legacy disposition surfaced through the
+    /// intake view, never upgraded by column agreement, never deleted, with
+    /// no receipt mutated. Any other drift (smuggled session relation,
+    /// re-pointed admission, column mismatch on a versioned row) fails
+    /// closed with a typed error before the intake converts or the relation
+    /// reaches a consumer.
     fn check_retained_route_evidence(record: &DurableHostEventRecord) -> Result<(), IngestError> {
         match &record.envelope.lineage {
             ProviderObservationLineage::SessionObservation(_) => {
@@ -1124,10 +1142,12 @@ impl DurableHostEventJournal {
                 Ok(())
             }
             ProviderObservationLineage::ExecutionUnitObservation(_) => {
-                let evidence = record
-                    .route_evidence
-                    .as_ref()
-                    .ok_or(IngestError::Contract(ContractError::BindingMismatch))?;
+                let Some(evidence) = record.route_evidence.as_ref() else {
+                    return Ok(());
+                };
+                if evidence.schema_version != COMMITTED_ROUTE_EVIDENCE_SCHEMA_VERSION {
+                    return Ok(());
+                }
                 evidence
                     .verify_retained(
                         record.envelope.admitted_route_digest.as_ref(),
