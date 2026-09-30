@@ -178,6 +178,12 @@ use eliot_workscope::{
     issue_discovery_lease, task_selection_required,
 };
 
+#[path = "cold_start_authority_inputs.rs"]
+mod cold_start_authority_inputs;
+pub use cold_start_authority_inputs::{
+    ColdStartAuthorityInputGap, ColdStartAuthorityInputJoin, ColdStartAuthorityInputReadiness,
+};
+
 /// Authenticated activation's bounded filesystem/VCS observation and its
 /// scanner inputs. The ticket binds the explicit selector to the admitted
 /// Bridge request and peer receipt; all identity/evidence fields below are
