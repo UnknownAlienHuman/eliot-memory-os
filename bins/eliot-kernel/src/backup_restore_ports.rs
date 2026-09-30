@@ -311,9 +311,17 @@ pub enum StagedCleanupRefusal {
     /// [`Self::RemovalFailed`] or [`Self::BudgetReached`]: those say a removal
     /// could not happen, while this says the bytes were correctly NOT removed
     /// because a durable journal row and a retained receipt still account for
-    /// them. A caller deciding whether the destination is empty, or whether to
-    /// retry, is deciding on different facts in the two cases and must be able
-    /// to tell them apart (`ARCH-RES-03`, A13.7; #960 W13/A18).
+    /// them. "Account for them" is a claim about a receipt that is bound to
+    /// the transaction that wrote it, not about a receipt that merely exists:
+    /// destination roots are keyed by `target_id` and reused across executions,
+    /// and receipts are never cleaned up, so presence alone would let a prior
+    /// execution's receipt preserve this execution's staging. The owner
+    /// therefore proves the binding (transaction, phase and input digest) from
+    /// the receipt's own recorded values before it reports this reason
+    /// (`backup_restore.rs`). A caller deciding whether the destination is
+    /// empty, or whether to retry, is deciding on different facts in the two
+    /// cases and must be able to tell them apart (`ARCH-RES-03`, A13.7; #960
+    /// W13/A18).
     AttestedPhaseMaterialPreserved,
 }
 
@@ -379,9 +387,13 @@ pub enum KernelRestoreError {
     /// [`TargetFailed`](Self::TargetFailed) carries it, in `primary`; this
     /// variant only adds the typed cleanup disposition, so the cleanup
     /// outcome is never a formatted string and never replaces the cause. A
-    /// cleanup that removes everything, or that had nothing to remove, stays
-    /// plain [`TargetFailed`](Self::TargetFailed): there is no second fact to
-    /// report and the absence of a change is the whole truth.
+    /// cleanup that removes everything, or that had nothing to remove on a
+    /// destination it owns, stays plain [`TargetFailed`](Self::TargetFailed):
+    /// there is no second fact to report and the absence of a change is the
+    /// whole truth. A destination the cleanup could not attribute is the
+    /// exception and always reports itself, even with nothing removable,
+    /// because "this destination is not provably mine" is itself the second
+    /// fact a caller needs.
     StagedCleanupIncomplete {
         /// The engine's typed failure, unchanged.
         primary: BackupError,

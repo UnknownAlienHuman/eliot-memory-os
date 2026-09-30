@@ -1601,6 +1601,22 @@ struct KernelRestoreTarget<'a> {
     /// Exact paths this execution wrote, in write order, each under the
     /// destination root. Nothing else is ever a cleanup candidate.
     staged: Vec<PathBuf>,
+    /// The exact intents under which THIS execution persisted a phase
+    /// receipt, in persistence order.
+    ///
+    /// A destination root is keyed by `target_id` and is REUSED across
+    /// executions (`KernelIsolatedDestination::open` marks an existing
+    /// directory `Resumed`), and phase receipts are never cleaned up, so a
+    /// receipt left behind by a PRIOR transaction can name a phase this
+    /// execution is running with different bytes. Presence of a receipt
+    /// proves nothing about which transaction wrote it; only the intent a
+    /// phase of THIS transaction persisted under does.
+    ///
+    /// Stored, never derived. The engine is the only source of these
+    /// values, they are recorded verbatim as it handed them to
+    /// [`Self::persist_applied`], and the input digest is the recorded one —
+    /// it is never recomputed, re-derived or inferred here.
+    receipt_intents: Vec<RestoreIntent>,
 }
 
 impl<'a> KernelRestoreTarget<'a> {
@@ -1631,6 +1647,7 @@ impl<'a> KernelRestoreTarget<'a> {
             staged_members: 0,
             staged_bytes: 0,
             staged: Vec::new(),
+            receipt_intents: Vec::new(),
         })
     }
 
@@ -1914,25 +1931,36 @@ impl<'a> KernelRestoreTarget<'a> {
             .map_err(|_| BackupError::RestoreJournalCorrupt)?
             .to_string_lossy()
             .into_owned();
-        self.write_file(&relative, &bytes)
+        self.write_file(&relative, &bytes)?;
+        // The receipt is on disk only now, so the intent that produced it is
+        // recorded only now: this is the exact transaction/phase/input-digest
+        // triple a later cleanup matches a staged path against, and it is the
+        // one this execution was handed by the engine. A receipt whose write
+        // failed leaves no record here, so it attests nothing.
+        self.receipt_intents.push(intent.clone());
+        Ok(())
     }
 
     /// Turns an engine failure plus the cleanup disposition into the refusal
     /// this owner returns.
     ///
     /// The engine's typed failure is the cause and is never replaced. When the
-    /// cleanup removed everything, or had nothing removable to remove, the
-    /// refusal stays plain [`KernelRestoreError::TargetFailed`] — in both of
-    /// those cases the bounded cleanup did exactly what it exists to do, so
-    /// there is no second fact to report and nothing about the primary cause is
-    /// lost. When the cleanup preserved something — either what it could not
-    /// attribute, or published phase material a still-present phase receipt
-    /// attests — that exact typed reason travels with the SAME primary failure,
-    /// so nothing is lost and nothing is stringified. The two preservation
-    /// causes are distinct typed reasons and never collapse into one, because
-    /// "we could not prove this was ours to remove" and "these bytes are
-    /// applied history the journal still accounts for" are different facts a
-    /// caller needs separately (#960 W13/A18).
+    /// cleanup removed everything, or had nothing removable to remove on a
+    /// destination it owns, the refusal stays plain
+    /// [`KernelRestoreError::TargetFailed`] — in both of those cases the
+    /// bounded cleanup did exactly what it exists to do, so there is no second
+    /// fact to report and nothing about the primary cause is lost. A
+    /// destination the cleanup could not attribute always reports itself (see
+    /// [`Self::cleanup_staged_output`]), because "this destination is not
+    /// provably mine" is itself a second fact. When the cleanup preserved
+    /// something — either what it could not attribute, or published phase
+    /// material a still-present phase receipt attests — that exact typed
+    /// reason travels with the SAME primary failure, so nothing is lost and
+    /// nothing is stringified. The two preservation causes are distinct typed
+    /// reasons and never collapse into one, because "we could not prove this
+    /// was ours to remove" and "these bytes are applied history the journal
+    /// still accounts for" are different facts a caller needs separately
+    /// (#960 W13/A18).
     fn refuse_with_staged_cleanup(
         &self,
         destination: &KernelIsolatedDestination,
@@ -1964,8 +1992,9 @@ impl<'a> KernelRestoreTarget<'a> {
     ///    ([`Self::staged`]) minus the preserved observation classes, so a
     ///    prior execution's staging, a pinned admission, and the reconcileable
     ///    phase receipts are never candidates at all;
-    /// 2. a staged path whose publishing phase still has its phase receipt on
-    ///    disk is not a candidate either
+    /// 2. a staged path whose publishing phase has a phase receipt on disk that
+    ///    is bound to THIS transaction, THIS phase and THIS input digest is
+    ///    not a candidate either
     ///    ([`Self::is_attested_phase_material`]): that receipt is the durable
     ///    observation the ORS restore journal committed `ReceiptPersisted`
     ///    against, so the bytes it digests are applied history a resume will
@@ -1983,12 +2012,32 @@ impl<'a> KernelRestoreTarget<'a> {
     ///    `<work_root>/.eliot/restore-isolated/<label>`, so a swapped or
     ///    re-pointed destination cannot redirect a removal.
     ///
+    /// ## Ordering of the ownership refusals against the candidate set
+    ///
+    /// The candidate set is built first, as above, but it is not allowed to
+    /// conclude anything on its own: claims 3 and 4 are facts about the
+    /// DESTINATION, and they are proved before the set is allowed to end the
+    /// pass. Returning as soon as `candidates` empties used to report
+    /// `AttestedPhaseMaterialPreserved` for a resumed or foreign destination
+    /// without ever surfacing the resume/foreign fact — the caller then could
+    /// not tell that the destination it was told had been preserved was not
+    /// provably this execution's, which is exactly the fact an operator needs
+    /// when a run ends with material on disk. A destination this pass cannot
+    /// attribute now refuses with its own typed reason whatever the candidate
+    /// set turns out to be, and that refusal still removes nothing.
+    ///
+    /// No removal path is widened by this: the candidate set itself is
+    /// unchanged — still exactly the [`Self::staged`] paths, still gated by
+    /// the same byte and member ceilings inside the removal loop, and the
+    /// primary engine failure is still carried unchanged by
+    /// [`Self::refuse_with_staged_cleanup`].
+    ///
     /// Bounded work, in four dimensions: the walk is over a known path set,
     /// so there is no unbounded directory recursion; the set is at most
     /// [`StagedOutputBudget::members`] because those are the same writes the
     /// budget admitted; the aggregate unlinked bytes stop at
     /// [`StagedOutputBudget::bytes`], the same ceiling that admitted them; and
-    /// the attestation probe is one bounded `Path::exists` per staged path
+    /// the attestation probe is one bounded `load_applied` read per staged path
     /// over the same set, never a directory walk. Empty directories left behind
     /// are reclaimed with [`std::fs::remove_dir`], which cannot remove a
     /// non-empty directory, so a directory this pass did not empty always
@@ -2009,13 +2058,10 @@ impl<'a> KernelRestoreTarget<'a> {
                 candidates.push(path);
             }
         }
-        if candidates.is_empty() {
-            return if preserved_attested {
-                StagedCleanup::AttestedPhaseMaterialPreserved
-            } else {
-                StagedCleanup::NothingStaged
-            };
-        }
+        // The destination's own provenance is proved before the candidate set
+        // is allowed to conclude anything, so a run that ends with material
+        // preserved still says whether the destination was provably this
+        // execution's. Nothing is removed on either of these branches.
         if destination.is_resumed() {
             return StagedCleanup::Refused(StagedCleanupRefusal::AdmittedResume);
         }
@@ -2029,6 +2075,13 @@ impl<'a> KernelRestoreTarget<'a> {
         .is_err()
         {
             return StagedCleanup::Refused(StagedCleanupRefusal::ForeignAdmission);
+        }
+        if candidates.is_empty() {
+            return if preserved_attested {
+                StagedCleanup::AttestedPhaseMaterialPreserved
+            } else {
+                StagedCleanup::NothingStaged
+            };
         }
         let isolated = self.work_root.join(".eliot").join(RESTORE_ISOLATED_AREA);
         let area = match std::fs::canonicalize(isolated.join(&self.label)) {
@@ -2134,8 +2187,8 @@ impl<'a> KernelRestoreTarget<'a> {
     }
 
     /// Whether a staged path is published phase material whose phase receipt
-    /// is STILL on disk, and is therefore attested applied history rather than
-    /// abandoned staging.
+    /// is STILL on disk, is bound to a phase of THIS transaction, and is
+    /// therefore attested applied history rather than abandoned staging.
     ///
     /// Each phase publishes its material first and persists
     /// `phase-receipts/<phase-digest>.json` second, whose `evidence_sha256` is
@@ -2147,7 +2200,32 @@ impl<'a> KernelRestoreTarget<'a> {
     /// destination verifier (`apply_rebuild`'s `count_dir`) is itself a phase
     /// behind that head.
     ///
-    /// Unlinking such bytes leaves a durable journal and retained receipts
+    /// ## Why the attestation is transaction-bound
+    ///
+    /// Receipt PRESENCE alone proves nothing here. A destination root is keyed
+    /// by `target_id` and is reused across executions ([`KernelIsolatedDestination::open`]
+    /// marks an existing directory `Resumed`), and receipts are never cleaned
+    /// up, so a PRIOR transaction's receipt for the same phase sits at the same
+    /// path. A bare `Path::exists` there lets an unrelated execution's receipt
+    /// attest this execution's freshly staged bytes with no journal row behind
+    /// them, and the disposition's stated reason for preserving them ("a
+    /// durable journal row and a retained receipt still account for them") is
+    /// then not established. The direction of that error is over-preservation
+    /// rather than loss, but a preservation nobody can justify is a
+    /// preservation nobody can reason about later.
+    ///
+    /// So the binding is exactly the one [`Self::load_applied`] already applies
+    /// to the same bytes on the resume path, and it is that one function, not a
+    /// second copy of the rule: the receipt found on disk must be the applied
+    /// effect for the exact `transaction_id`, `phase` and `input_digest` this
+    /// transaction recorded in [`Self::receipt_intents`] when it persisted it.
+    /// The intent is compared as recorded — no digest is recomputed, re-derived
+    /// or inferred — and a receipt that fails to parse, or that does not match
+    /// this transaction, is not this transaction's attestation, so those bytes
+    /// stay ordinary removable staging exactly as they were before any
+    /// attestation existed.
+    ///
+    /// Unlinking attested bytes leaves a durable journal and retained receipts
     /// attesting restored canonical history that does not exist, which
     /// `ARCH-RES-03` (A13.7) forbids. So they are not cleanup candidates at
     /// all: they are preserved, and the disposition reports that something
@@ -2163,17 +2241,45 @@ impl<'a> KernelRestoreTarget<'a> {
         let Some(phase) = Self::publishing_phase(relative) else {
             return false;
         };
-        self.phase_receipt_path(&phase)
-            .is_ok_and(|receipt| receipt.exists())
+        // Only an intent this transaction actually persisted a receipt under
+        // can attest what this transaction staged. A receipt at that path with
+        // no such intent behind it belongs to another execution.
+        for recorded in &self.receipt_intents {
+            if recorded.phase == phase {
+                return matches!(self.load_applied(recorded), Ok(ObservedEffect::Applied(_)));
+            }
+        }
+        false
     }
 
     /// Maps one staged path back to the single phase that publishes it.
     ///
-    /// The mapping is the inverse of the `write_file` relative path each phase
-    /// uses, so the receipt named here is the very receipt that phase
-    /// persisted for exactly these bytes. A path no phase publishes — or a
-    /// path whose shape does not match one of these phases — has no phase to
-    /// attest it and is `None`.
+    /// The mapping is the exact inverse of the `write_file` relative path each
+    /// phase uses, driven by the segments the staged path actually has — not
+    /// by an assumption that a bundle-supplied identifier is one segment. That
+    /// assumption is false: [`CanonicalRecord::new`](eliot_backup::CanonicalRecord::new)
+    /// validates `record_id` only as non-blank text, and
+    /// [`Self::contained_member_path`] accepts several plain segments, so
+    /// `record_id = "a/b"` really does stage `events/a/b.json`. A blob
+    /// `locator.hash` and a `receipt.operation_id` are the same case. Only the
+    /// FIRST separator is a boundary here — the directory — and everything
+    /// after it, however many segments it spans, is the identifier, which is
+    /// what `format!` put there.
+    ///
+    /// ## What `None` means
+    ///
+    /// `None` means "no phase publishes this shape", NOT "this shape cannot be
+    /// mapped and must be treated with suspicion". The candidate set is exactly
+    /// the paths THIS execution's phases wrote through
+    /// [`Self::write_file`], each of which uses one of the documented relative
+    /// forms above, so a path in that set either is its publishing phase's
+    /// material or was never phase material at all. Because the mapping is
+    /// total over the forms a phase can publish, there is no in-between shape
+    /// left to guess about, and refusing to map cannot silently skip a receipt
+    /// that exists. Making `None` preserve instead would disable the bounded
+    /// cleanup for every path this owner does not currently recognise, and a
+    /// blanket preservation with no receipt behind it is the same unjustified
+    /// preservation this function exists to prevent.
     fn publishing_phase(relative: &Path) -> Option<RestorePhase> {
         let staged = relative.to_str()?;
         let phase = match staged {
@@ -2183,11 +2289,6 @@ impl<'a> KernelRestoreTarget<'a> {
             "verify.json" => RestorePhase::VerifyReceiptEventChain,
             _ => {
                 let (directory, member) = staged.split_once('/')?;
-                // A member is one path segment: a nested staged path belongs to
-                // no phase and is never attested.
-                if member.is_empty() || member.contains('/') {
-                    return None;
-                }
                 match directory {
                     // A blob is staged under its own content hash, with no
                     // extension; every other member is staged as `<id>.json`.
