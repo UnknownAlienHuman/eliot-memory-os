@@ -19,9 +19,10 @@
 //!
 //! A third denominator completes the work-item W1 object classes that decide
 //! whether a path *outside* this module can select or execute one of those
-//! roots: [`SELECTION_PATHS`] — every migration executor, configuration path,
-//! package/release consumer and restore dependency that can reach a migration
-//! statement, each recorded with the exact repository `path::symbol` it names.
+//! roots: [`SELECTION_PATHS`] — every migration constructor or executor,
+//! configuration path, package/release consumer and restore dependency that can
+//! reach a migration statement, each recorded with the exact repository
+//! `path::symbol` it names.
 //! Without it the two denominators above answer "which body and which root does
 //! the current owner hold?" while staying silent about the callers that could
 //! reach past them.
@@ -311,8 +312,9 @@ pub(crate) static NON_EXECUTABLE_MIGRATION_ROOTS: [NonExecutableRoot; 3] = [
 /// identity was unknown.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SelectionPathClass {
-    /// A migration constructor or executor that can send migration statements
-    /// to a provider without passing this owner's admission gate.
+    /// A migration constructor that builds the value an outside executor sends,
+    /// or such an executor itself: either reaches a provider without passing
+    /// this owner's admission gate.
     MigrationExecutor,
     /// A configuration field or key that can name a migration root directory.
     ConfigPath,
@@ -366,7 +368,7 @@ const OWNER_GENERATION_DEPENDENCY: &str = "depends on the current owner's schema
 /// to exist in the tree; [`validate_selection_path_closure`] additionally
 /// requires each `selects` root to be one this owner already declares
 /// non-executable, so this table cannot name a root nobody has dispositioned.
-pub(crate) static SELECTION_PATHS: [SelectionPath; 13] = [
+pub(crate) static SELECTION_PATHS: [SelectionPath; 15] = [
     // -- Migration executors ------------------------------------------------
     //
     // The current owner's own executor is deliberately absent: it is
@@ -380,6 +382,13 @@ pub(crate) static SELECTION_PATHS: [SelectionPath; 13] = [
         symbol: "MigrationRunner::run_all",
         selects: None,
         rationale: "a migration executor outside the current owner: run_all hands each caller-constructed CompiledMigration straight to SurrealStore::apply_migration as (migration_id, sql), so its statements are arbitrary caller text that never reaches this owner's gate and its only digest is the legacy blake3 checksum rather than the published SHA-256. No in-tree caller constructs a MigrationRunner, which is why the executor is recorded here with its owner rather than deleted from under it",
+    },
+    SelectionPath {
+        class: SelectionPathClass::MigrationExecutor,
+        path: "crates/eliot-store/src/migration.rs",
+        symbol: "CompiledMigration::new",
+        selects: None,
+        rationale: "the constructor that makes the executor above reachable: it accepts any caller's sql as impl Into<String>, digests it with the legacy blake3 hash rather than the published SHA-256, and produces exactly the value MigrationRunner::run_all forwards to SurrealStore::apply_migration. A migration constructor is a distinct object class from a migration executor and it is named in work item W1, so recording only the executor would leave the class unfilled while the closure check still passed; this owner admits migrations through its own CompiledMigration in readiness.rs, which is deliberately absent from this table as the owner's own path",
     },
     SelectionPath {
         class: SelectionPathClass::MigrationExecutor,
@@ -471,6 +480,13 @@ pub(crate) static SELECTION_PATHS: [SelectionPath; 13] = [
         symbol: "validate_restore_batch",
         selects: None,
         rationale: OWNER_GENERATION_DEPENDENCY,
+    },
+    SelectionPath {
+        class: SelectionPathClass::RestoreDependency,
+        path: "crates/storage/eliot-store-surreal-adapter/src/client/backup_restore.rs",
+        symbol: "fixed_restore_statement",
+        selects: None,
+        rationale: "the closed registry binding each restore operation name to its fixed interned statement, the exact structural mirror of fixed_snapshot_statement in the sibling client/backup_snapshot.rs: it selects only from the module's own prepare, fence, purge-ledger, archive-member, carrier-publish, canonical-read, apply, validate and reconcile constants and refuses any other operation name. It applies no DDL of its own and takes no caller SQL, but its operations write the restore and purge tables of the generation this owner publishes, and A13.7 requires restore to verify schema and format compatibility against exactly that generation",
     },
 ];
 
