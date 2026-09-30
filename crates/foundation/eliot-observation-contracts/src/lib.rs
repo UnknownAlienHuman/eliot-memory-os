@@ -955,7 +955,35 @@ impl MaintenanceMetricEvaluationV1 {
         Ok(())
     }
 
+    /// Whether this one metric's evidence supports a benefit direction, given
+    /// whether it is the cost metric and so which value bases are admissible.
     fn supports_benefit_claim(&self, is_cost: bool) -> bool {
+        self.has_sufficient_measured_evidence(is_cost)
+            && matches!(
+                self.directional_assessment,
+                MaintenanceMetricAssessment::SupportsBenefit
+                    | MaintenanceMetricAssessment::NoMaterialChange
+            )
+    }
+
+    /// Whether this metric asserts a direction at all.
+    ///
+    /// `UNRESOLVED` is the absence of a claim, not a neutral claim: the
+    /// validator already refuses a directional assessment on a metric that
+    /// carries no measured value, so this is false exactly when the metric
+    /// stated no direction.
+    fn claims_direction(&self) -> bool {
+        self.directional_assessment != MaintenanceMetricAssessment::Unresolved
+    }
+
+    /// The evidence floor a directional conclusion requires of one metric.
+    ///
+    /// A measured value, both admitted observation references, complete
+    /// unblinded coverage, and a value basis that is not an estimate or an
+    /// inference. This is the single definition both directional claims share,
+    /// so a metric can never satisfy one and silently fail the other for
+    /// different reasons.
+    fn has_sufficient_measured_evidence(&self, is_cost: bool) -> bool {
         let MaintenanceMetricResult::Value { basis, .. } = &self.result else {
             return false;
         };
@@ -968,11 +996,6 @@ impl MaintenanceMetricEvaluationV1 {
             && self.follow_up_observation_ref.is_some()
             && self.coverage.disposition == CoverageDisposition::Complete
             && self.coverage.blind_intervals.is_empty()
-            && matches!(
-                self.directional_assessment,
-                MaintenanceMetricAssessment::SupportsBenefit
-                    | MaintenanceMetricAssessment::NoMaterialChange
-            )
             && basis_is_sufficient
     }
 }
@@ -1002,7 +1025,13 @@ impl MaintenanceUtilityEvidenceV1 {
         self.operator_burden.validate(false)
     }
 
-    fn supports_benefit_claim(&self) -> bool {
+    /// Whether the measured evidence supports a `BENEFICIAL` conclusion.
+    ///
+    /// Public so the maintenance evaluator reaches this predicate instead of
+    /// restating it: a second implementation of the basis, coverage, blind
+    /// interval and direction rules would be a second scoring vocabulary that
+    /// could disagree with the one `MaintenanceResultV1::validate` enforces.
+    pub fn supports_benefit_claim(&self) -> bool {
         let metrics = [
             (&self.recurrence, false),
             (&self.product_recovery_delta, false),
@@ -1015,6 +1044,50 @@ impl MaintenanceUtilityEvidenceV1 {
             .all(|(metric, is_cost)| metric.supports_benefit_claim(*is_cost))
             && metrics.iter().any(|(metric, _)| {
                 metric.directional_assessment == MaintenanceMetricAssessment::SupportsBenefit
+            })
+    }
+
+    /// Whether the measured evidence supports a `HARMFUL` conclusion.
+    ///
+    /// A measured harm is reportable from the metrics that were actually
+    /// measured. Three rules, each load-bearing:
+    ///
+    /// * Every metric that claims a direction must do so on the same measured,
+    ///   complete, unblinded, directly observed evidence [`Self::supports_benefit_claim`]
+    ///   requires — a direction asserted on a partial or blinded comparison
+    ///   proves nothing in either direction.
+    /// * At least one metric must claim harm. Without one there is no harm to
+    ///   report.
+    /// * No metric may claim benefit. Evidence pointing both ways is not a
+    ///   directional conclusion at all, in either direction.
+    ///
+    /// A metric that is explicitly `UNKNOWN` claims no direction and so does
+    /// not block this. That is deliberate and it is the whole asymmetry with
+    /// [`Self::supports_benefit_claim`]: claiming improvement requires every
+    /// required metric measured, because an unmeasured metric cannot be shown
+    /// not to have got worse. Claiming harm requires only the harm to be
+    /// measured, because "this recurred more" stays true while "the cost fell"
+    /// stays unknown. The contract validator enforces both, so this predicate
+    /// is the only place the asymmetry is decided.
+    pub fn supports_harm_claim(&self) -> bool {
+        let metrics = [
+            (&self.recurrence, false),
+            (&self.product_recovery_delta, false),
+            (&self.false_changes, false),
+            (&self.cost, true),
+            (&self.operator_burden, false),
+        ];
+        metrics
+            .iter()
+            .all(|(metric, is_cost)| {
+                !metric.claims_direction()
+                    || metric.has_sufficient_measured_evidence(*is_cost)
+            })
+            && metrics.iter().any(|(metric, _)| {
+                metric.directional_assessment == MaintenanceMetricAssessment::SupportsHarm
+            })
+            && metrics.iter().all(|(metric, _)| {
+                metric.directional_assessment != MaintenanceMetricAssessment::SupportsBenefit
             })
     }
 }
@@ -1273,6 +1346,18 @@ impl MaintenanceResultV1 {
             return Err(ObservationError::InvalidField {
                 field: "maintenance_result.utility_verdict",
                 reason: "a no-attempt decision cannot claim maintenance benefit",
+            });
+        }
+        // A harm conclusion is the mirror guarantee: it is the other direction
+        // a caller could assert from work performed rather than from measured
+        // evidence, so it answers to the same measured/unblinded floor through
+        // the shared predicate rather than being unvalidated.
+        if self.utility_verdict == MaintenanceUtilityVerdict::Harmful
+            && !self.utility.supports_harm_claim()
+        {
+            return Err(ObservationError::InvalidField {
+                field: "maintenance_result.utility_verdict",
+                reason: "HARMFUL requires a measured harm direction on complete unblinded evidence and no metric claiming benefit",
             });
         }
         Ok(())

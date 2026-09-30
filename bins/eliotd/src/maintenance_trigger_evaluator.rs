@@ -345,6 +345,14 @@ pub enum MaintenanceResultPublication {
     Reconciled {
         /// The exact store receipt the canonical owner returned.
         receipt: eliot_store_api::WriteReceipt,
+        /// The instant the admitted observation record itself carries.
+        ///
+        /// This is the record's own observed time, read from the record this
+        /// publication built rather than from a second clock reading. It is
+        /// what bounds a later delayed comparison's window from below, so the
+        /// window is anchored to an admitted observation instead of to when the
+        /// evaluator happened to run.
+        observed_at_unix_ms: u64,
     },
 }
 
@@ -526,7 +534,10 @@ impl DaemonComposition {
                 status: receipt.status,
             });
         }
-        Ok(MaintenanceResultPublication::Reconciled { receipt })
+        Ok(MaintenanceResultPublication::Reconciled {
+            receipt,
+            observed_at_unix_ms,
+        })
     }
 
     /// Admits the canonical receipt for one published maintenance result onto
@@ -564,6 +575,45 @@ impl DaemonComposition {
         }
         self.governor
             .admit_maintenance_observation_receipt(job_id, publication_id, observation_receipt_ref)
+            .map_err(|error| MaintenanceResultPublishError::Daemon(DaemonError::Composition(error)))
+    }
+
+    /// Appends one delayed utility evaluation for a retained maintenance job.
+    ///
+    /// This is the production call that turns work performed plus measured
+    /// evidence into a delayed utility conclusion (I14.22, issue #1695 W4).
+    /// The maintenance owner reads its own retained obligation chain, binds the
+    /// caller's measurements to obligations that chain really holds, and appends
+    /// the resulting evaluation revision on the same Kernel durable-job ledger
+    /// its transitions already write through. The evaluation then reaches the
+    /// observation path through the existing
+    /// [`Self::publish_maintenance_result`] route like any other source result.
+    ///
+    /// No verdict is asserted here. `evidence` carries only comparisons this
+    /// daemon genuinely observed, and every required metric the comparison did
+    /// not observe stays explicitly unknown, so a completed job with no
+    /// measured follow-up appends an evaluation that reads `PENDING`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MaintenanceResultPublishError::Daemon`] with
+    /// [`DaemonError::Composition`] when the composition is not ready or the
+    /// retained-job write is refused. The maintenance owner's own refusal
+    /// travels unchanged inside that variant, so a malformed comparison stays
+    /// distinguishable from a transport failure.
+    pub fn evaluate_maintenance_utility(
+        &mut self,
+        job_id: &str,
+        evaluation_window: eliot_observation_contracts::CoverageInterval,
+        evidence: &eliot_maintenance::UtilityEvaluationEvidence,
+    ) -> Result<eliot_maintenance::MaintenanceJob, MaintenanceResultPublishError> {
+        if self.readiness() != eliot_governor::CompositionReadiness::Ready {
+            return Err(MaintenanceResultPublishError::Daemon(
+                DaemonError::Composition(CompositionError::NotReady),
+            ));
+        }
+        self.governor
+            .evaluate_maintenance_utility(job_id, evaluation_window, evidence)
             .map_err(|error| MaintenanceResultPublishError::Daemon(DaemonError::Composition(error)))
     }
 

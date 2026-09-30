@@ -2496,6 +2496,11 @@ async fn publish_maintenance_source_results(
     // route actually returned. A publication identity, the job's own
     // `outcome_ref`, and the fact that a job completed settle nothing here.
     let mut admitted: Vec<eliot_maintenance::AdmittedObservationReceipt> = Vec::new();
+    // Each admitted observation's own recorded instant, kept beside the exact
+    // receipt that admitted it. This is the only clock reading this function
+    // uses, and it comes from an admitted record rather than from a second
+    // reading of the wall clock.
+    let mut observation_instants: Vec<(String, u64)> = Vec::new();
     for obligation in &obligations {
         let publication = {
             let guard = composition.lock().await;
@@ -2507,8 +2512,16 @@ async fn publish_maintenance_source_results(
             Ok(
                 eliotd::maintenance_trigger_evaluator::MaintenanceResultPublication::Reconciled {
                     receipt,
+                    observed_at_unix_ms,
                 },
             ) => {
+                // The instant the admitted observation record itself carries, so
+                // a later delayed comparison is bounded below by an admitted
+                // observation rather than by when the evaluator runs.
+                observation_instants.push((
+                    obligation.publication_id.clone(),
+                    observed_at_unix_ms,
+                ));
                 // Only a job-side obligation can be settled durably. The
                 // decision's own non-execution result has no retained job
                 // revision to admit onto, and inventing one would be a second
@@ -2693,6 +2706,173 @@ async fn publish_maintenance_source_results(
                     &error.to_string(),
                 )
                 .emit();
+            }
+        }
+    }
+    // Delayed utility evaluation, after the coverage census rather than inside
+    // it. Coverage says which results owe an observation; this says whether the
+    // work improved the maintained subsystem, which is a different fact needing
+    // its own evidence. It runs only for a result whose observation the store
+    // actually admitted, because a comparison anchored to a publication the
+    // store never accepted measures nothing.
+    evaluate_admitted_maintenance_results(
+        composition,
+        &jobs,
+        &admitted,
+        &observation_instants,
+        failure_guard,
+    )
+    .await;
+}
+
+/// Appends one delayed utility evaluation per admitted maintenance result.
+///
+/// This is the production binding of delayed evaluation to the maintenance
+/// owner (I14.22, issue #1695 W4). For each declared job it reads the owner's
+/// own retained obligation chain through the existing durable-job route, and for
+/// the chain's latest result asks whether the canonical route admitted that
+/// result's observation. Only an admitted result is evaluated, and only the
+/// measurement set this daemon genuinely observed is presented.
+///
+/// What this function deliberately does **not** do is invent a comparison. This
+/// daemon observes no product pulse, no billed cost and no operator-time
+/// measurement, so it presents none: every required metric the comparison did
+/// not observe is appended as explicitly `UNKNOWN` over a preserved blind
+/// interval, and the verdict the maintenance owner records is `PENDING`. That
+/// is the honest state and it is the reason a completed job can never read as
+/// beneficial — the contract's own benefit predicate requires all five of its
+/// required metrics measured, and no daemon-side observation satisfies the cost
+/// one. A `BENEFICIAL` verdict becomes reachable only when a real measurement
+/// owner supplies the missing comparisons, which is a new evidence owner rather
+/// than a new verdict path.
+///
+/// The appended revision publishes through the existing
+/// [`publish_maintenance_source_results`] route on the next pass, because it is
+/// an ordinary entry in the same append-only obligation chain.
+///
+/// This function reaches no trigger, admits no job and appends no lifecycle
+/// transition. It is a pure read plus one durable append per admissible result,
+/// so a repeated unchanged result is refused by the owner rather than looping.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the admission gate, the window derivation and the durable append stay in one order so an unadmitted result is never evaluated"
+)]
+async fn evaluate_admitted_maintenance_results(
+    composition: &SharedComposition,
+    jobs: &[eliot_maintenance::MaintenanceJob],
+    admitted: &[eliot_maintenance::AdmittedObservationReceipt],
+    observation_instants: &[(String, u64)],
+    failure_guard: &mut RepeatedFailureGuard,
+) {
+    for declared in jobs {
+        // The revision read above publication still carries `Pending` delivery,
+        // because a publication identity settles nothing on its own. The
+        // admission is settled on the durable revision, so the chain is re-read
+        // through the same authenticated durable-job route rather than trusted
+        // from the local snapshot.
+        let job = {
+            let guard = composition.lock().await;
+            guard.retained_maintenance_job(&declared.job_id)
+        };
+        let job = match job {
+            Ok(Some(job)) => job,
+            Ok(None) => continue,
+            Err(error) => {
+                if failure_guard.should_emit() {
+                    let _ = eliotd::diagnostics::ErrorRecord::of(
+                        eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                        "maintenance-utility-evaluation",
+                        &error.to_string(),
+                    )
+                    .emit();
+                }
+                continue;
+            }
+        };
+        let Some(source) = job.result_obligations.last() else {
+            continue;
+        };
+        // A chain whose tail is already an appended evaluation revision owes no
+        // further comparison: that result was evaluated, and re-evaluating it
+        // would be the autonomous loop the owner refuses. Later comparisons
+        // arrive through later source results, not by revisiting this one.
+        if source.utility_evaluation.is_some() {
+            continue;
+        }
+        let evaluable = match eliot_maintenance::result_is_evaluable(source, admitted) {
+            Ok(evaluable) => evaluable,
+            Err(error) => {
+                if failure_guard.should_emit() {
+                    let _ = eliotd::diagnostics::ErrorRecord::of(
+                        eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                        "maintenance-utility-evaluation",
+                        &error.to_string(),
+                    )
+                    .emit();
+                }
+                continue;
+            }
+        };
+        if !evaluable {
+            // The result's own observation is not admitted, so there is no
+            // admitted anchor for a comparison. Its verdict stays `PENDING`
+            // until the observation is admitted, which is not a failure here.
+            continue;
+        }
+        // The comparison window runs from the instant the admitted source
+        // observation itself carries to this evaluation. Both bounds come from
+        // admitted records, not from an assumed window length.
+        let Some(start) = observation_instants
+            .iter()
+            .find(|(publication_id, _)| publication_id == &source.publication_id)
+            .map(|(_, instant)| *instant)
+        else {
+            // An admitted result always has the instant its admitted record
+            // carries. Without one there is no admitted lower bound, so the
+            // comparison is not attempted rather than bounded by a guess.
+            continue;
+        };
+        let evaluated_at = observation_instants
+            .iter()
+            .map(|(_, instant)| *instant)
+            .max()
+            .unwrap_or(start);
+        let window =
+            match eliot_observation_contracts::CoverageInterval::new(start, evaluated_at) {
+                Ok(window) => window,
+                Err(_) => continue,
+            };
+        // No comparison was observed in this pass, so none is presented. The
+        // owner records the explicit unknown with the reason it is unknown.
+        let evidence = eliot_maintenance::UtilityEvaluationEvidence::default();
+        let appended = {
+            let mut guard = composition.lock().await;
+            guard.evaluate_maintenance_utility(&job.job_id, window, &evidence)
+        };
+        match appended {
+            Ok(appended) => {
+                let evaluation = appended
+                    .result_obligations
+                    .last()
+                    .and_then(|obligation| obligation.utility_evaluation.as_ref());
+                tracing::info!(
+                    target: "eliotd::diagnostics",
+                    event = "eliotd.maintenance_utility_evaluated",
+                    job = %eliotd::diagnostics::sanitize_identity(&appended.job_id),
+                    source_publication_id =
+                        %eliotd::diagnostics::sanitize_identity(&source.publication_id),
+                    verdict = ?evaluation.map(|evaluation| evaluation.utility_verdict),
+                );
+            }
+            Err(error) => {
+                if failure_guard.should_emit() {
+                    let _ = eliotd::diagnostics::ErrorRecord::of(
+                        eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                        "maintenance-utility-evaluation",
+                        &error.to_string(),
+                    )
+                    .emit();
+                }
             }
         }
     }
