@@ -48,11 +48,6 @@ public sealed class MainViewModel : INotifyPropertyChanged
     /// from an unknown outcome.
     public const string StaleFenceReasonCode = "STALE_STATE_FENCE";
 
-    private static readonly JsonSerializerOptions UserAutomationRevisionReader = new(OperatorJson.Reader)
-    {
-        PropertyNameCaseInsensitive = false
-    };
-
     private readonly IGovernorClient _client;
     private readonly OperatorPendingOperationJournal? _pendingJournal;
     private OperatorTaskContext? _taskContext;
@@ -917,9 +912,11 @@ public sealed class MainViewModel : INotifyPropertyChanged
     {
         // This is operator-typed JSON, so apply its independent structural caps
         // and duplicate-key rejection before allocating the typed revision. The
-        // shared closed reader then rejects unknown fields at every schema level.
+        // shared closed reader then rejects unknown fields at every schema level
+        // and matches member names exactly; that is stated once, on
+        // `OperatorJson.Reader`, and is not restated as a local copy here.
         OperatorResponseGuard.ValidateLocalParameter(value, "user_automation_revision");
-        var revision = JsonSerializer.Deserialize<UserAutomationRevision>(value, UserAutomationRevisionReader)
+        var revision = JsonSerializer.Deserialize<UserAutomationRevision>(value, OperatorJson.Reader)
             ?? throw new InvalidOperationException("UserAutomation schedule revision JSON is required.");
         revision.Validate();
         return revision;
@@ -1732,11 +1729,15 @@ public sealed class MainViewModel : INotifyPropertyChanged
     /// request.
     ///
     /// A refusal raised by this application's own closed UserAutomation
-    /// contract keeps its message: every such message is a fixed sentence over
-    /// locally authored field names, so it names the rule that refused the
-    /// request and carries no value. A framework exception message is never
-    /// shown — a serializer message can carry a JSON path, a line/byte offset
-    /// and a character lifted from the refused bytes — so only its closed
+    /// contract keeps its message. Every such message is assembled only from
+    /// locally authored field names, the generated owner refusal table and
+    /// pinned contract constants — the
+    /// <see cref="UserAutomationScheduleContractException"/> shape is the
+    /// generated owner Display sentence joined to a locally authored action —
+    /// so it names the rule that refused the request and carries no value from
+    /// the refused bytes. A framework exception message is never shown — a
+    /// serializer message can carry a JSON path, a line/byte offset and a
+    /// character lifted from the refused bytes — so only its closed
     /// [`OperatorFaultReason`] code is displayed, exactly as the transport
     /// paths do.
     private static string BoundedRefusalReason(Exception error) =>
