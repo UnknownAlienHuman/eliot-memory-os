@@ -415,6 +415,17 @@ impl KernelTransitionPort for DaemonKernelClient {
     /// response that substitutes the task, the revision, or the fence is
     /// refused here as well as in the neutral decoder, so no implementor can
     /// widen the denominator the finish gate is computed over.
+    ///
+    /// "The store remains the only owner of the durable enumeration" names the
+    /// intended owner, not one this leg can currently reach. The request travels
+    /// as `GetTaskContractAcceptanceSet`, which has no activated entry in the
+    /// store operation catalogue, so the admission refuses it with
+    /// `StoreError::UnknownOperation` before any handler runs and this method
+    /// never returns an owner set. What would change it is activating that
+    /// catalogue row with a proven store-owned handler over the
+    /// `eliot-store` `TaskContract.acceptance_items` enumeration. Nothing here
+    /// synthesizes the set in the meantime, and no caller falls back to the
+    /// plan's declared list.
     fn task_contract_acceptance_set(
         &self,
         task_id: &TaskId,

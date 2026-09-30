@@ -75,12 +75,19 @@ fn finish_rejection_cause(error: &FinishAttemptError) -> (AgentResponseDispositi
         FinishAttemptError::Kernel(_) | FinishAttemptError::Store(_) => {
             (AgentResponseDisposition::Failed, "RUNTIME_FAILED")
         }
-        // Issue #1741, I7.9: the contract owner's acceptance denominator could
-        // not be rehydrated or disagrees with the plan's declared set. The
-        // decision context is incomplete, so this is the same
-        // `DECISION_CONTEXT_INCOMPLETE` refusal as a rehydrated owner state that
-        // does not validate — never a degraded success and never the plan's own
-        // list.
+        // Issue #1741, I7.9: the contract owner's acceptance denominator was
+        // rehydrated but disagrees with the plan's declared set, or the set
+        // arrived substituted, stale, fence-foreign or malformed. The decision
+        // context is incomplete, so this is the same `DECISION_CONTEXT_INCOMPLETE`
+        // refusal as a rehydrated owner state that does not validate — never a
+        // degraded success and never the plan's own list.
+        //
+        // Reachability: this arm is compiled in a non-test build, but the
+        // `GetTaskContractAcceptanceSet` read it guards has no activated
+        // catalogue entry, so in the current tree the read is refused before a
+        // set exists and the claim settles as `RUNTIME_FAILED` via the
+        // `Kernel(_)` arm above. This arm becomes reachable when that catalogue
+        // row is activated with a proven store-owned handler.
         FinishAttemptError::AcceptanceDenominator(_)
         | FinishAttemptError::Finish(_)
         | FinishAttemptError::Serialization(_) => (
@@ -253,6 +260,19 @@ pub async fn serve_finish_claim(
     // before. A refusal here is a typed rejection body: the plan's own
     // `required_acceptance_item_ids` are never used as the denominator, so a
     // candidate whose plan narrows the contract's obligations cannot proceed.
+    //
+    // Which refusal, precisely: a join disagreement, a substituted task, a
+    // stale revision, a foreign fence or a malformed payload is an
+    // `AcceptanceDenominator`, mapped to `DECISION_CONTEXT_INCOMPLETE` below.
+    // A refusal of the read itself is not — the neutral
+    // `GetTaskContractAcceptanceSet` operation has no activated catalogue
+    // entry, so the admission refuses it with `StoreError::UnknownOperation`
+    // before any handler runs, that arrives as `FinishAttemptError::Kernel`,
+    // and this claim maps to `RUNTIME_FAILED`. So on the current tree this
+    // read always refuses and every finish claim through this leg settles as
+    // `RUNTIME_FAILED`, never reaching the denominator join at all. That is the
+    // honest state: the gate is closed, not bypassed, and the plan's list is
+    // still never substituted for it.
     let task_id = eliot_contracts::TaskId::new(draft.task_id.clone())
         .map_err(|error| format!("admitted finish draft names an invalid task: {error}"))?;
     let contract_acceptance = {

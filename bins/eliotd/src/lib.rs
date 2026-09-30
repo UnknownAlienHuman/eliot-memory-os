@@ -1545,8 +1545,22 @@ impl DaemonComposition {
     /// same shape as the synchronous `refresh_from_kernel` the decision leg
     /// already performs under the lock; the write legs still run unlocked.
     ///
-    /// A refusal is a typed `AcceptanceDenominatorError`. There is no fallback to
-    /// the canonical plan's declared list.
+    /// There is no fallback to the canonical plan's declared list, on any arm.
+    ///
+    /// On the refusal *kind*: a join disagreement, a substituted task, a stale
+    /// revision, a foreign fence and a malformed payload are a typed
+    /// `AcceptanceDenominatorError`. A refusal of the read itself is not. The
+    /// read travels as `GetTaskContractAcceptanceSet`, which has no activated
+    /// entry in the store operation catalogue
+    /// (`crates/storage/eliot-store-api/src/operation_catalogue.rs` lists 22
+    /// activated reads and this is not among them), so every admission path
+    /// refuses it with `StoreError::UnknownOperation` before any handler runs.
+    /// That refusal arrives here as a `KernelPortError`, so it becomes
+    /// `FinishAttemptError::Kernel`, not `AcceptanceDenominator`. The same holds
+    /// for any `KernelTransitionPort` that does not override
+    /// `task_contract_acceptance_set`: the trait's default arm returns
+    /// `KernelPortError::NotAdmitted`. What would change this is activating the
+    /// catalogue row with a proven store-owned handler; nothing else does.
     pub async fn rehydrate_task_contract_acceptance(
         &self,
         task_id: &eliot_contracts::TaskId,

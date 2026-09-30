@@ -1039,6 +1039,18 @@ impl ToolExposureReceiptV2 {
         Ok(self)
     }
 
+    /// Reachability, for this transition and for the sibling
+    /// [`Self::record_observable_use`] added alongside it: both are `pub` on a
+    /// foundation crate with many dependents, but in this tree each has exactly
+    /// one non-test call site, and both sit inside
+    /// `advance_tool_exposure_receipt_for_persisted_result` in
+    /// `bins/eliot-kernel/src/host_request_route.rs`. That function reaches the
+    /// use transition only on the campaign-packet lane and only when the
+    /// response carries a non-null `campaign_learning_state_view`; the local-read
+    /// and skill lanes record no observable use. The terminal outcome is
+    /// attempted on every lane that gets that far, and the observe,
+    /// task-controller and finish submit legs never reach either transition.
+    ///
     /// Records the terminal task or product outcome reference.
     ///
     /// The reference is carried verbatim; only its presence is observed here.

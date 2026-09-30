@@ -462,9 +462,9 @@ const HOST_REQUESTS: TableDefinition<&str, &str> = TableDefinition::new("ors_hos
 /// Durable evaluated tool-exposure receipts, one per completed host-request
 /// operation (issue #1945, I7.24).
 ///
-/// One row per evaluated completion, keyed exactly like its host-request row
-/// (`operation_id::request_digest`), holding the completed
-/// [`eliot_receipts::ToolExposureReceiptV2`] the Kernel measured for that
+/// Keyed exactly like its host-request row
+/// (`operation_id::request_digest`), holding a completed
+/// [`eliot_receipts::ToolExposureReceiptV2`] the Kernel measured for a
 /// completion. The receipt evidences the persisted result, so it is recorded
 /// after the result it observes — never before it, and never for an operation
 /// that carries no result. The first retained receipt stands: a replay can
@@ -472,6 +472,20 @@ const HOST_REQUESTS: TableDefinition<&str, &str> = TableDefinition::new("ors_hos
 /// table family, owned by the same `RedbRecoveryStore` and written through
 /// the same `persistence_codec`; it is not a second receipt store or a second
 /// table owner.
+///
+/// "One row per evaluated completion" would overstate the denominator: a row
+/// appears only for a completion whose measured receipt actually reached this
+/// attach. The sole non-test caller is
+/// `advance_tool_exposure_receipt_for_persisted_result` in
+/// `bins/eliot-kernel/src/host_request_route.rs`, and that function returns
+/// `None` — no row at all — whenever the queue owner no longer retains the
+/// envelope or tool for the operation, the admission or request construction
+/// fails, the persisted row carries no result digest or body, the produced
+/// digest does not bind the delivered bytes, or the terminal-outcome
+/// transition fails. The caller discards this attach's `Result`, so an unknown
+/// operation and an identity/digest/transition refusal both drop the receipt
+/// without a row. Completions on the observe, task-controller and finish legs
+/// never reach it.
 const HOST_REQUEST_TOOL_EXPOSURE_RECEIPTS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_host_request_tool_exposure_receipts_v1");
 /// Durable versioned-artifact registry rows (issue #1971; I1.6, I1.12, I14.14).

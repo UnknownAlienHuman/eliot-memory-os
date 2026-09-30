@@ -4713,9 +4713,21 @@ impl HostRequestResultLineage {
     /// The retained readback path carries the lineage, the result digest and
     /// the result bytes as three separate fields of one owner record, so
     /// nothing inside the lineage proves it describes THOSE bytes. This is the
-    /// single shared entry that closes that gap for every consumer: it
-    /// compares the ORIGINALLY RECORDED `output_digest` with the ORIGINALLY
-    /// RECORDED `result_digest` and then applies [`Self::validate_class`].
+    /// shared entry for that join: it compares the ORIGINALLY RECORDED
+    /// `output_digest` with the ORIGINALLY RECORDED `result_digest` and then
+    /// applies [`Self::validate_class`].
+    ///
+    /// It is not the only place the retained pair is joined, so "every
+    /// consumer" would overstate it. `git grep` finds three call sites in this
+    /// tree, all in `bins/`: the Bridge resource-source resolve and the
+    /// Bridge record decode in `eliot-agent-bridge`'s
+    /// `kernel_host_request_client.rs`, and the daemon local-read admission in
+    /// `eliotd`'s `daemon_kernel_client.rs`. Two other retained-lineage
+    /// consumers join the same pair without calling this entry, on their own
+    /// types: the ORS mirror `HostRequestRetainedLineage::validate` and the
+    /// Kernel replay leg `local_read_replay_response`, which both compare the
+    /// recorded digests and the canonical-class/receipt relationship locally.
+    /// Those are separate rules on separate types, not delegates to this one.
     ///
     /// Nothing is recomputed over the bytes a reader happens to be holding. A
     /// fresh checksum would replace the recorded proof with a new one instead

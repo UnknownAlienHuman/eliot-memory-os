@@ -3731,12 +3731,16 @@ impl KernelComposition {
             self.clear_pending_result_binding(&body.operation_id);
         }
         // I7.24 (#1945): advance the evaluated exposure receipt through its
-        // measured stages for this persisted completion, and retain the
-        // completed receipt on the durable operation row it evidences —
-        // never dropped. Observational only: every missing input, failed
-        // transition, or failed attach inside the two calls leaves the
-        // submit disposition and the durability contract unchanged, so they
-        // never gain a receipt-shaped failure mode.
+        // measured stages for this persisted completion, and hand the completed
+        // receipt to the durable operation row it evidences. Observational only:
+        // every missing input, failed transition, or failed attach inside the two
+        // calls leaves the submit disposition and the durability contract
+        // unchanged, so they never gain a receipt-shaped failure mode. The
+        // attach's own `Result` is discarded (`let _ =`), so an `Ok(None)` for an
+        // unknown operation and an `Err` from the identity, digest or transition
+        // checks all drop this receipt with no signal to the submit leg; the
+        // receipt is therefore retained only when the attach succeeds, not
+        // unconditionally.
         if let Some(receipt) = advance_tool_exposure_receipt_for_persisted_result(
             queue,
             queued_envelope.as_ref(),

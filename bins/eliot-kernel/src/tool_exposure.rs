@@ -180,11 +180,21 @@ pub(crate) fn authorize_pre_dispatch(
 
 /// Records the per-evaluation receipt skeleton for one authorized request.
 ///
-/// This is the production recording call at the orchestration boundary: it
-/// runs the real pre-dispatch gate ([`authorize_pre_dispatch`]) and, only on
+/// It runs the real pre-dispatch gate ([`authorize_pre_dispatch`]) and, only on
 /// success, stages the [`eliot_receipts::ToolExposureReceiptV2`] admission
 /// skeleton from the request's own admission-derived identities (tool
-/// definition, route fingerprint). Eligibility and selection hold because the
+/// definition, route fingerprint).
+///
+/// On reachability: this is not itself the orchestration boundary call. It has
+/// one call site, [`observe_persisted_delivery`] in this module, which is in
+/// turn called once, from
+/// `advance_tool_exposure_receipt_for_persisted_result` in
+/// `bins/eliot-kernel/src/host_request_route.rs`. That submit-leg function is
+/// the boundary; this is its admission step, reached only when the delivery
+/// measurement succeeds far enough to ask for a skeleton. Both are compiled in
+/// a non-test build and are called from `submit_claimed_result`.
+///
+/// Eligibility and selection hold because the
 /// gated request was presented for dispatch and admitted; every unobserved
 /// stage stays `None`, delivery stays `MISSING`, and no representation
 /// evidence is attached. Measurement owners populate the rest through the
@@ -211,12 +221,18 @@ pub(crate) fn observe_authorized_admission(
 /// Measures the exact delivered representation for one persisted result and
 /// advances its evaluated receipt to a complete delivery.
 ///
-/// This is the delivery owner's transition driver: it re-establishes the
+/// It re-establishes the
 /// admission skeleton from the request's own admission-derived identities
 /// ([`observe_authorized_admission`]), measures the delivered bytes itself
 /// with [`canonical_json_bytes`], and refuses a produced digest that does
 /// not bind those exact bytes. Digest and byte count are never copied from
 /// caller values; a mismatch fails typed instead of recording.
+///
+/// It has one call site,
+/// `advance_tool_exposure_receipt_for_persisted_result` in
+/// `bins/eliot-kernel/src/host_request_route.rs`, on the local-read and
+/// campaign-packet submit legs of `submit_claimed_result`. It is not called on
+/// the observe, task-controller or finish submit legs.
 ///
 /// Byte-completeness holds by construction on this path: the protocol bounds
 /// the response ceiling and rejects an oversize body instead of cutting it,
