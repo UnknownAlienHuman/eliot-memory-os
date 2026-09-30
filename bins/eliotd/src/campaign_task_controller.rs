@@ -419,6 +419,11 @@ fn validate_orientation_task_binding(
     if input.request.role != JobRole::Requester {
         return Err("invalid_orientation_request");
     }
+    if claimed.native_worker_claim_id.as_deref()
+        != Some(input.native_worker_claim_id.as_str())
+    {
+        return Err("orientation_native_worker_claim_mismatch");
+    }
     let request_identity = &input.request.request_identity;
     if request_identity.request.metadata.task_id.as_ref() != Some(&invocation.task_id) {
         return Err("orientation_task_mismatch");
