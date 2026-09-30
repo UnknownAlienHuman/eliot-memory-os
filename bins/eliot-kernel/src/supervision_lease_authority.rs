@@ -111,11 +111,28 @@ fn record_supervision_ticket_context(
 ) {
     use crate::kernel_diagnostics::bound_field;
 
+    // A shared caller span can cross more than one lease phase. Clear the
+    // previous phase's discriminator before validating the next ticket so an
+    // invalid ticket cannot inherit stale diagnostic meaning.
+    let unavailable_operation = bound_field("unavailable");
+    context.record("lease_operation", unavailable_operation.text());
+
     // Keep invalid ticket references unavailable even when the caller shares
     // a broader operation span with this authority boundary.
     if ticket.validate().is_err() {
         return;
     }
+
+    let operation_label = match ticket.operation {
+        SupervisionLeaseOperation::Commit => "commit",
+        SupervisionLeaseOperation::Renew => "renew",
+        SupervisionLeaseOperation::Revoke => "revoke",
+        SupervisionLeaseOperation::Expire => "expire",
+        SupervisionLeaseOperation::Supersede => "supersede",
+        SupervisionLeaseOperation::Close => "close",
+    };
+    let lease_operation = bound_field(operation_label);
+    context.record("lease_operation", lease_operation.text());
 
     let lease = bound_field(ticket.lease_id.as_str());
     context.record("lease", lease.text());
