@@ -325,7 +325,7 @@ pub(crate) fn issue_source_artifact_admission(
         &input.contract,
         input.operation.clone(),
         input.operation_name,
-        input.resource_ref,
+        input.resource_ref.clone(),
         input.executor_boundary,
         &mut action_lease,
         &input.work_scope,
