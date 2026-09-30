@@ -7418,18 +7418,34 @@ fn audit_claim_with_retained(
         claim.material && !claim_identity_verified && !outside_citation && !revoked_citation;
     // The measured occurrence-and-context result for every exact excerpt the
     // claim offers, computed **before** the terminal outcome so the outcome can
-    // read it. `admitted_handles` is this audit's own `evidence_map`, not a
-    // caller-supplied roster: a completeness rule that compared two copies of
-    // the same caller list would prove nothing, and the map here is the set of
-    // handles that survived the citation loop above.
-    let admitted_handles: BTreeSet<String> = evidence_map.iter().cloned().collect();
+    // read it.
+    //
+    // `admitted_content` is this audit's own admitted set, and each value is the
+    // `SourceRecord::content_digest` read off the portfolio record the citation
+    // loop above admitted. That second half is what makes the check able to
+    // refuse a FOREIGN SOURCE REVISION: a retained revision re-proves its own
+    // digest, which shows it is internally consistent, and the only independent
+    // statement of which revision it should be is the admitted record's own
+    // content digest. Deriving the value from `evidence_map` alone would compare
+    // the retained bytes with a restatement of the same list and prove nothing;
+    // taking it from the portfolio record is a different input from a different
+    // owner.
+    let admitted_content: BTreeMap<String, String> = evidence_map
+        .iter()
+        .filter_map(|handle| {
+            portfolio
+                .records
+                .get(handle)
+                .map(|record| (handle.clone(), record.content_digest.clone()))
+        })
+        .collect();
     let excerpt_checks: Vec<crate::admitted_excerpt::OccurrenceCheck> = claim
         .excerpts
         .iter()
         .map(|excerpt| {
             crate::admitted_excerpt::verify_excerpt_occurrence(
                 excerpt,
-                &admitted_handles,
+                &admitted_content,
                 retained.get(&excerpt.source_handle),
             )
         })
