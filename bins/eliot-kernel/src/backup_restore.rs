@@ -2861,22 +2861,102 @@ impl<'a> KernelRestoreTarget<'a> {
         }
     }
 
-    /// Reads the persisted phase-receipt digest for one obligation group.
+    /// What one phase's re-read may claim about the material that phase's
+    /// receipt names, as the narrowest binding the readback actually proved.
+    ///
+    /// The three answers come from [`Self::phase_material`], which is the same
+    /// mirror of the `apply_*` methods the resume path reads, so the finalize
+    /// denominators are labelled from the phase's own published member and not
+    /// from anything the receipt says about itself.
+    fn material_binding(material: &PhaseMaterial) -> &'static str {
+        if material.receipt_digests_member {
+            "digested-member"
+        } else if material.member.is_some() {
+            // The receipt digests an observation document this target never
+            // persists, so the re-read proves the member is present and
+            // NOTHING about its content. Naming that is the honest alternative
+            // to minting a digest binding the receipt does not carry.
+            "presence-only-member"
+        } else {
+            // The phase publishes no member under this execution's authority,
+            // so there is no material of its own to re-read at all.
+            "no-published-member"
+        }
+    }
+
+    /// Re-reads every phase's material and digests it into one obligation
+    /// group denominator.
     ///
     /// Every phase the coordinator journaled as receipt-persisted left its
     /// observed applied record under the destination; a journaled effect
-    /// without its observation is corruption, never success.
+    /// without its observation is corruption, never success. That alone is not
+    /// enough here, because finalize publishes the obligation DENOMINATORS and
+    /// a phase receipt is a description of an effect rather than the effect: a
+    /// receipt whose material a power loss removed, or that now names bytes
+    /// other than the ones on disk, still digests cleanly and would be
+    /// published as an attested completeness the destination does not have.
+    /// Validating a receipt's own digests against themselves is not a weaker
+    /// form of that readback, it is the substitution.
+    ///
+    /// So each phase is read back through exactly the mechanism the resume path
+    /// already applies to a recovered receipt — [`Self::check_attested_material`],
+    /// reached there from [`Self::load_applied`] — with the SAME members
+    /// [`Self::phase_material`] names and the same refusal vocabulary. The
+    /// ORIGINAL recorded `evidence_sha256` is the value compared against the
+    /// bytes on disk; nothing is recomputed to make a check pass, and no second
+    /// verification rule is written here, so the two paths cannot drift apart.
+    /// A receipt that is not this phase's receipt is a
+    /// [`BackupError::RestoreJournalMismatch`], and a missing or unreadable one
+    /// is a [`BackupError::RestoreJournalCorrupt`]: missing material is a
+    /// typed refusal, never a zero that still produces a denominator.
+    ///
+    /// The denominator is assembled from those per-phase re-reads, and each
+    /// contribution is labelled by [`Self::material_binding`]. A group
+    /// containing a phase whose receipt digests an observation that was never
+    /// persisted therefore publishes a reference whose PREFIX names the
+    /// presence-only binding, instead of a well-formed digest implying a
+    /// content completeness nobody re-read. The weakest binding names the
+    /// group, because a group reference is only as strong as its weakest
+    /// member.
+    ///
+    /// The one thing still unobservable from here is each earlier phase's
+    /// `input_digest`: this target is handed only the FINALIZE intent, so the
+    /// transaction/input binding [`Self::load_applied`] checks is checked for
+    /// whichever phase is being reconciled and not re-derived for the ones
+    /// finalize merely summarizes. That limit is named here rather than papered
+    /// over, because the material is what this denominator claims to attest.
     fn group_ref(&self, phases: &[RestorePhase]) -> Result<String, BackupError> {
-        let mut digests = Vec::with_capacity(phases.len());
+        let mut contributions = Vec::with_capacity(phases.len());
+        let mut fully_digested = true;
         for phase in phases {
             let path = self.phase_receipt_path(phase)?;
             let bytes = std::fs::read(&path).map_err(|_| BackupError::RestoreJournalCorrupt)?;
-            digests.push(sha256_hex(&bytes));
+            let applied: RestoreAppliedEffect =
+                serde_json::from_slice(&bytes).map_err(|_| BackupError::RestoreJournalCorrupt)?;
+            if applied.receipt.phase != *phase {
+                return Err(BackupError::RestoreJournalMismatch);
+            }
+            let material = self.phase_material(phase)?;
+            Self::check_attested_material(&material, &applied.receipt.evidence_sha256)?;
+            let binding = Self::material_binding(&material);
+            fully_digested &= material.receipt_digests_member;
+            // The recorded digest when it is a digest of the re-read member's
+            // own bytes, and the receipt's own digest otherwise — never a fresh
+            // digest computed here to stand in for either.
+            let observed = if material.receipt_digests_member {
+                applied.receipt.evidence_sha256.clone()
+            } else {
+                sha256_hex(&bytes)
+            };
+            contributions.push(format!("{binding}:{observed}"));
         }
-        Ok(format!(
-            "kernel-restore-phase-receipt:{}",
-            sha256_hex(digests.join(",").as_bytes())
-        ))
+        let prefix = if fully_digested {
+            "kernel-restore-phase-receipt"
+        } else {
+            "kernel-restore-phase-material-presence-only"
+        };
+        let denominator = sha256_hex(contributions.join(",").as_bytes());
+        Ok(format!("{prefix}:{denominator}"))
     }
 
     fn canonical_phases(bundle: &BackupBundle) -> Vec<RestorePhase> {
