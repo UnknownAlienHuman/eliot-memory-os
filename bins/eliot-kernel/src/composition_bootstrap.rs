@@ -374,36 +374,8 @@ impl KernelComposition {
         })
         .map_err(&terminal)?;
         #[cfg(windows)]
-        if config.require_descriptor_supervision_authority {
-            let descriptor_authority = SupervisionLeaseAuthorityConfig {
-                authority: prepared.descriptor.supervision_authority.clone(),
-            };
-            match &config.supervision_lease_authority {
-                Some(configured) if configured != &descriptor_authority => {
-                    observe_entrypoint_with_detail(
-                        EntrypointStage::SupervisionAuthority,
-                        "kernel.composition.supervision_authority_mismatch",
-                    );
-                    return Err(terminal(KernelBuildError::Service(
-                        "configured supervision authority does not match the protected handoff descriptor"
-                            .to_owned(),
-                    )));
-                }
-                Some(_) => {
-                    observe_entrypoint_with_detail(
-                        EntrypointStage::SupervisionAuthority,
-                        "kernel.composition.supervision_authority_matched",
-                    );
-                }
-                None => {
-                    config.supervision_lease_authority = Some(descriptor_authority);
-                    observe_entrypoint_with_detail(
-                        EntrypointStage::SupervisionAuthority,
-                        "kernel.composition.supervision_authority_adopted",
-                    );
-                }
-            }
-        }
+        Self::install_descriptor_supervision_authority(&mut config, &prepared.descriptor)
+            .map_err(&terminal)?;
         let snapshot_binding = AuthoritySnapshotBinding::from_wire(
             prepared.descriptor.snapshot_binding.clone(),
             &prepared.descriptor.authority_id,
@@ -439,6 +411,46 @@ impl KernelComposition {
             canonical_store_evidence,
         )
         .map_err(&terminal)
+    }
+
+    #[cfg(windows)]
+    fn install_descriptor_supervision_authority(
+        config: &mut KernelConfig,
+        descriptor: &ProcessAuthorityHandoffDescriptor,
+    ) -> Result<(), KernelBuildError> {
+        if !config.require_descriptor_supervision_authority {
+            return Ok(());
+        }
+        let descriptor_authority = SupervisionLeaseAuthorityConfig {
+            authority: descriptor.supervision_authority.clone(),
+        };
+        match &config.supervision_lease_authority {
+            Some(configured) if configured != &descriptor_authority => {
+                observe_entrypoint_with_detail(
+                    EntrypointStage::SupervisionAuthority,
+                    "kernel.composition.supervision_authority_mismatch",
+                );
+                Err(KernelBuildError::Service(
+                    "configured supervision authority does not match the protected handoff descriptor"
+                        .to_owned(),
+                ))
+            }
+            Some(_) => {
+                observe_entrypoint_with_detail(
+                    EntrypointStage::SupervisionAuthority,
+                    "kernel.composition.supervision_authority_matched",
+                );
+                Ok(())
+            }
+            None => {
+                config.supervision_lease_authority = Some(descriptor_authority);
+                observe_entrypoint_with_detail(
+                    EntrypointStage::SupervisionAuthority,
+                    "kernel.composition.supervision_authority_adopted",
+                );
+                Ok(())
+            }
+        }
     }
 
     /// Builds a production composition with an externally supplied process
@@ -1154,8 +1166,11 @@ impl KernelComposition {
         ors_object_path: PathBuf,
         process_gateway: Option<Arc<ProcessExecutionGateway>>,
         platform: Arc<WindowsPlatform>,
-        _canonical_store_evidence: Option<Arc<CanonicalStoreEvidence>>,
+        canonical_store_evidence: Option<Arc<CanonicalStoreEvidence>>,
     ) -> Result<Self, KernelBuildError> {
+        #[cfg(not(windows))]
+        let _ = canonical_store_evidence;
+
         // F-LOG-KERNEL-2 (#899): assembly phases only; the public
         // constructors own the single terminal per failed build. Only fixed
         // phase labels plus numeric epoch/generation are emitted, never raw
@@ -1795,7 +1810,7 @@ impl KernelComposition {
             backup_capture,
             backup_owner_clients,
             #[cfg(windows)]
-            canonical_store_evidence: _canonical_store_evidence,
+            canonical_store_evidence,
             #[cfg(windows)]
             canonical_store_gateway: Mutex::new(None),
             #[cfg(windows)]
