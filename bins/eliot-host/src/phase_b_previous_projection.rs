@@ -385,12 +385,12 @@ fn phase_b_previous_projection_file(
     };
     if !observation.is_current
         && !observation.is_template(input.template_digest)
-        && !input
+        && input
             .durable_digest
-            .is_some_and(|expected| observation.digest == *expected)
-        && !input
+            .is_none_or(|expected| observation.digest != *expected)
+        && input
             .prepared_digest
-            .is_some_and(|expected| observation.digest == *expected)
+            .is_none_or(|expected| observation.digest != *expected)
     {
         phase_b_previous_projection_observe("host.phase-b prior-projection mismatch retained");
         return Err(HostError::RecoveryRequired(format!(
@@ -597,8 +597,8 @@ fn phase_b_previous_store_bootstrap_from_files(
         return Ok(None);
     }
     let Some(binding) = phase_b_previous_projection_digest_binding(
-        &config,
-        &bootstrap,
+        config,
+        bootstrap,
         input.durable,
         input.prepared,
     ) else {
@@ -622,12 +622,12 @@ fn phase_b_previous_store_bootstrap_from_files(
             "prior Store projection has no exact previous Host binding".to_owned(),
         )
     })?;
-    let requirement = phase_b_previous_store_bootstrap_requirement(&bootstrap, &binding, previous)?;
+    let requirement = phase_b_previous_store_bootstrap_requirement(bootstrap, &binding, previous)?;
     let (expected_peer_sid, expected_peer_session_id) =
-        phase_b_previous_peer_identity(&config, &binding, requirement.as_ref())?;
+        phase_b_previous_peer_identity(config, &binding, requirement.as_ref())?;
     Ok(Some(PhaseBPreviousStoreBootstrap {
         digest: (bootstrap.digest == binding.store_bootstrap_descriptor_digest)
-            .then_some(bootstrap.digest),
+            .then_some(bootstrap.digest.clone()),
         requirement,
         expected_peer_sid,
         expected_peer_session_id,
