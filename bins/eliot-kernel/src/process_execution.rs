@@ -3123,10 +3123,7 @@ impl KernelComposition {
         session_binding: &ProcessSessionBinding,
         request: &ProcessExecutionRequest,
         source_binding: Option<(&eliot_protocol::RequestIdentity, &eliot_contracts::TaskId)>,
-    ) -> Result<
-        ProcessOwnerBinding,
-        eliot_kernel_service::ProcessExecutionRejection,
-    > {
+    ) -> Result<ProcessOwnerBinding, eliot_kernel_service::ProcessExecutionRejection> {
         if let Some((identity, admitted_task_id)) = source_binding
             && let Err(rejection) = lsp_admission::validate_current_source_request(
                 identity,
@@ -3139,15 +3136,13 @@ impl KernelComposition {
             return Err(rejection);
         }
 
-        let (owner, expected_session_binding) =
-            super::caller_binding(session).map_err(|_| {
-                observe_process("kernel.process.request_rejected", "caller_unavailable");
-                eliot_kernel_service::ProcessExecutionRejection {
-                    code: "AUTHENTICATED_CALLER_REQUIRED".to_owned(),
-                    detail: "the established authenticated session binding is unavailable"
-                        .to_owned(),
-                }
-            })?;
+        let (owner, expected_session_binding) = super::caller_binding(session).map_err(|_| {
+            observe_process("kernel.process.request_rejected", "caller_unavailable");
+            eliot_kernel_service::ProcessExecutionRejection {
+                code: "AUTHENTICATED_CALLER_REQUIRED".to_owned(),
+                detail: "the established authenticated session binding is unavailable".to_owned(),
+            }
+        })?;
         if eliot_process::validate_process_transport_binding(
             session_binding,
             &expected_session_binding,
@@ -3164,13 +3159,15 @@ impl KernelComposition {
         // Issue #79: validate the intent against the server-derived admitted
         // owner/session binding, never against the presenting pipe.
         if let ProcessExecutionRequest::Start(admission) = request {
-            let caller = self.admitted_process_caller_session(session).map_err(|error| {
-                observe_process("kernel.process.request_rejected", "caller_session");
-                eliot_kernel_service::ProcessExecutionRejection {
-                    code: "ADMITTED_CALLER_SESSION_REQUIRED".to_owned(),
-                    detail: error.to_string().chars().take(512).collect(),
-                }
-            })?;
+            let caller = self
+                .admitted_process_caller_session(session)
+                .map_err(|error| {
+                    observe_process("kernel.process.request_rejected", "caller_session");
+                    eliot_kernel_service::ProcessExecutionRejection {
+                        code: "ADMITTED_CALLER_SESSION_REQUIRED".to_owned(),
+                        detail: error.to_string().chars().take(512).collect(),
+                    }
+                })?;
             if let Err(error) = eliot_process::validate_process_intent_session(
                 admission.intent(),
                 &caller,
