@@ -2165,7 +2165,7 @@ impl AgentFabric {
                 let _ = crate::diagnostics::AdmissionRecord::of(
                     crate::diagnostics::disposition_of_admission(admission),
                     &admission.reservation_id,
-                    admission.admission_id.as_str(),
+                    admission.definition_digest.as_str(),
                 )
                 .emit();
             }
