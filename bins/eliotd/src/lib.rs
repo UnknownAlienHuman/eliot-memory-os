@@ -129,6 +129,8 @@ pub mod notification_state_emit;
 mod observation_adapters;
 mod owner_feed;
 mod process_origin;
+mod provider_admission;
+mod provider_capability;
 pub mod provider_transport_policy;
 mod reactive_feed;
 mod route_execution_identity;
