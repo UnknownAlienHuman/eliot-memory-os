@@ -8,6 +8,11 @@ on:
         required: false
         default: false
         type: boolean
+      operator_linker_probe:
+        description: Branch-only native toolchain and Operator UI diagnostics
+        required: false
+        default: false
+        type: boolean
       require_live_windows_scenarios:
         description: Require the live Windows scenario harness
         required: false
@@ -18,7 +23,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}${{ inputs.operator_linker_probe && '-linker-probe' || '' }}
   cancel-in-progress: false
 
 env:
@@ -28,7 +33,7 @@ env:
 
 jobs:
   source-candidate-gate:
-    if: ${{ !inputs.operator_audit_diagnostic }}
+    if: ${{ !inputs.operator_audit_diagnostic && !inputs.operator_linker_probe }}
     runs-on: windows-latest
     timeout-minutes: 180
 
@@ -390,7 +395,7 @@ jobs:
   # Explicit user-authorized temporary audit mode. Never a Review, MergeCompile,
   # release, installed-runtime or Product acceptance receipt. Normal job unchanged.
   operator-audit-diagnostic:
-    if: ${{ inputs.operator_audit_diagnostic && github.ref == 'refs/heads/Operator_tests' }}
+    if: ${{ inputs.operator_audit_diagnostic && !inputs.operator_linker_probe && github.ref == 'refs/heads/Operator_tests' }}
     runs-on: windows-latest
     timeout-minutes: 180
     env:
@@ -421,12 +426,60 @@ jobs:
           retention-days: 14
 
   operator-audit-ref-guard:
-    if: ${{ inputs.operator_audit_diagnostic && github.ref != 'refs/heads/Operator_tests' }}
+    if: ${{ ((inputs.operator_audit_diagnostic || inputs.operator_linker_probe) && github.ref != 'refs/heads/Operator_tests') || (inputs.operator_audit_diagnostic && inputs.operator_linker_probe) || (inputs.operator_linker_probe && inputs.require_live_windows_scenarios) }}
     runs-on: windows-latest
     timeout-minutes: 2
     steps:
       - name: Reject diagnostics outside the explicitly authorized branch
         shell: pwsh
         run: |
-          Write-Error 'Operator audit diagnostics are restricted to Operator_tests.'
+          Write-Error 'Operator diagnostics require Operator_tests, one diagnostic mode, and no live-scenario override.'
           exit 1
+
+
+  operator-linker-probe:
+    if: ${{ inputs.operator_linker_probe && !inputs.operator_audit_diagnostic && !inputs.require_live_windows_scenarios && github.ref == 'refs/heads/Operator_tests' }}
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Synthetic native linker environment comparison (diagnostic only)
+        shell: pwsh
+        run: |
+          python scripts/operator-linker-probe.py --output "$env:RUNNER_TEMP\operator-linker-probe-evidence"
+          exit $LASTEXITCODE
+      - name: Retain bounded diagnostic outcomes and logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: operator-linker-probe-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/operator-linker-probe-evidence/
+          if-no-files-found: error
+          retention-days: 14
+
+
+  operator-ui-diagnostic:
+    if: ${{ inputs.operator_linker_probe && !inputs.operator_audit_diagnostic && !inputs.require_live_windows_scenarios && github.ref == 'refs/heads/Operator_tests' }}
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Locked Operator build and headless harness (diagnostic only)
+        shell: pwsh
+        run: |
+          python scripts/operator-ui-diagnostic.py --output "$env:RUNNER_TEMP\operator-ui-diagnostic-evidence"
+          exit $LASTEXITCODE
+      - name: Retain bounded diagnostic outcomes and logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: operator-ui-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/operator-ui-diagnostic-evidence/
+          if-no-files-found: error
+          retention-days: 14
