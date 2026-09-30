@@ -572,7 +572,7 @@ impl CodeCortexService {
         }
         Ok(Self {
             index,
-            current_task_binding: None,
+            current_task_binding: Some(current_read_task_binding),
         })
     }
 
