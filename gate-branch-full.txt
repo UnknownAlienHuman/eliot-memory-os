@@ -1,0 +1,21 @@
+bins\eliot-testd\src\kernel_client.rs:74:61: error: item in documentation is missing backticks
+bins\eliot-testd\src\kernel_client.rs:77:20: error: item in documentation is missing backticks
+bins\eliot-testd\src\kernel_client.rs:101:12: error: item in documentation is missing backticks
+bins\eliot-testd\src\kernel_client.rs:170:1: error: large size difference between variants: the entire enum is at least 2424 bytes
+bins\eliot-testd\src\kernel_client.rs:656:19: error: item in documentation is missing backticks
+bins\eliot-testd\src\kernel_client.rs:750:17: error: wildcard matches only a single variant and will also match any future added variants: help: try: `TestdTerminalCompletionResponse::Pending { .. }`
+bins\eliot-testd\src\worker.rs:177:65: error: item in documentation is missing backticks
+bins\eliot-testd\src\worker.rs:380:5: error: item in documentation is missing backticks
+bins\eliot-testd\src\worker.rs:593:17: error: assigning the result of `ToOwned::to_owned()` may be inefficient: help: use `clone_into()`: `observation_reason(&view).clone_into(&mut reason)`
+bins\eliot-testd\src\worker.rs:612:21: error: assigning the result of `ToOwned::to_owned()` may be inefficient: help: use `clone_into()`: `"bounded terminal supervision expired after cancellation; reconcile by exact identity".clone_into(&mut reason)`
+bins\eliot-testd\src\worker.rs:974:15: error: casting `u64` to `i64` may wrap around the value: help: if this is intentional, use `cast_signed()` instead: `now.min(i64::MAX as u64).cast_signed()`
+bins\eliot-testd\src\lib.rs:1154:62: error: item in documentation is missing backticks
+bins\eliot-testd\src\lib.rs:1576:25: error: redundant closure: help: replace the closure with the method itself: `std::fs::FileType::is_dir`
+bins\eliot-testd\src\lib.rs:1612:24: error: case-sensitive file extension comparison
+bins\eliot-testd\src\lib.rs:1727:1: error: this function has too many lines (107/100)
+bins\eliot-testd\src\lib.rs:1765:17: error: used `expect()` on an `Option` value
+bins\eliot-testd\src\lib.rs:1766:17: error: used `expect()` on an `Option` value
+bins\eliot-testd\src\lib.rs:1932:15: error: unnecessary closure used to substitute value for `Option::None`
+bins\eliot-testd\src\lib.rs:2149:19: error: item in documentation is missing backticks
+bins\eliot-testd\src\lib.rs:2098:1: error: unused `async` for function with no await statements
+crates\kernel\eliot-process\src\dispatch_permit.rs:66:5: error: missing `#[must_use]` attribute on a method returning `Self`

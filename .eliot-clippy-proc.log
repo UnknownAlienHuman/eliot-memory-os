@@ -1,0 +1,3 @@
+    Checking eliot-process v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140\crates\kernel\eliot-process)
+crates\kernel\eliot-process\src\dispatch_permit.rs:66:5: error: missing `#[must_use]` attribute on a method returning `Self`
+error: could not compile `eliot-process` (lib) due to 1 previous error

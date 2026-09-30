@@ -1,0 +1,14 @@
+eliot-testd-core : findings=0
+eliot-testd : findings=25
+   bins\eliot-testd\src\kernel_client.rs:74:61: error: item in documentation is missing backticks
+   bins\eliot-testd\src\kernel_client.rs:77:20: error: item in documentation is missing backticks
+   bins\eliot-testd\src\kernel_client.rs:101:12: error: item in documentation is missing backticks
+   bins\eliot-testd\src\kernel_client.rs:170:1: error: large size difference between variants: the entire enum is at least 2424 bytes
+   bins\eliot-testd\src\kernel_client.rs:656:19: error: item in documentation is missing backticks
+   bins\eliot-testd\src\kernel_client.rs:750:17: error: wildcard matches only a single variant and will also match any future added variants: help: try: `TestdTerminalCompletionResponse::Pending { .. }`
+   bins\eliot-testd\src\worker.rs:177:65: error: item in documentation is missing backticks
+   bins\eliot-testd\src\worker.rs:253:1: error: this function has too many lines (102/100)
+   bins\eliot-testd\src\worker.rs:382:5: error: item in documentation is missing backticks
+   bins\eliot-testd\src\worker.rs:448:1: error: this function has too many arguments (9/7)
+eliot-process : findings=1
+   crates\kernel\eliot-process\src\dispatch_permit.rs:66:5: error: missing `#[must_use]` attribute on a method returning `Self`
