@@ -29,8 +29,7 @@ use std::num::NonZeroU64;
 
 use eliot_contracts::ArtifactId;
 use eliot_runtime_contracts::{
-    CapacityBottleneck, CapacityPermitBinding, CapacityReleaseEvidence, CapacityRequest,
-    CapacityUnit,
+    CapacityBottleneck, CapacityPermitBinding, CapacityRequest, CapacityUnit,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -709,6 +708,12 @@ impl std::fmt::Display for HeadroomAttempt {
 /// cancellation and downstream completion. This is the instruction; the
 /// non-clone permit handle stays with the issuing owner, so this record is
 /// evidence of the intended terminal state and never itself a release.
+///
+/// The terminal check is the owner's own
+/// [`eliot_runtime_contracts::CapacityReleaseEvidence::matches_binding`], not a
+/// Context-side restatement of it: Context holds no permit handle and therefore
+/// has no release authority to exercise, so it never re-decides whether a
+/// release closed the permit it names.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HeadroomReleaseInstruction {
@@ -718,32 +723,6 @@ pub struct HeadroomReleaseInstruction {
     pub operation_id: String,
     /// The condition under which the owner terminates the reservation.
     pub condition: HeadroomReleaseCondition,
-}
-
-/// The owner's terminal record for one released or reconciled reservation.
-///
-/// This wraps the existing owner-issued [`CapacityReleaseEvidence`] rather than
-/// restating it. `matches_binding` is the owner's own exact-match rule, so a
-/// release that changes the unit, quantity, owner generation, epoch or profile
-/// never closes the permit it names.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct HeadroomRelease {
-    /// The owner-issued release record.
-    pub evidence: CapacityReleaseEvidence,
-}
-
-impl HeadroomRelease {
-    /// Prove this release closes exactly the permit it names.
-    pub fn validate_for(&self, reservation: &CapacityPermitBinding) -> Result<(), ContextError> {
-        self.evidence
-            .validate()
-            .map_err(|_| ContextError::InvalidField("headroom_release.evidence"))?;
-        if !self.evidence.matches_binding(reservation) {
-            return Err(ContextError::IdentityConflict);
-        }
-        Ok(())
-    }
 }
 
 /// One independent purpose a Context packet must keep explicit.

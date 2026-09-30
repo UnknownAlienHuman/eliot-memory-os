@@ -59,7 +59,7 @@ pub use eliot_context_contracts::{
     ActiveUnderstandingView, AdmittedContextSet, BoundaryMetadataSet, ContextError, ContextOutcome,
     DownstreamHeadroomRequest, DownstreamHeadroomResult, HeadroomAllocationLedger, HeadroomAttempt,
     HeadroomConsumer, HeadroomDecision, HeadroomDemand, HeadroomDimension, HeadroomOutcome,
-    HeadroomPurpose, HeadroomQuantity, HeadroomRefusal, HeadroomRelease, HeadroomReleaseCondition,
+    HeadroomPurpose, HeadroomQuantity, HeadroomRefusal, HeadroomReleaseCondition,
     HeadroomReleaseInstruction, IndexPreview, PreviewAuthority, ProjectedCitation,
     QualityScorecard, ReadbackRefusal, ReadbackRefusalKind, ReadbackRequest, RenderedAtom,
     SelectionIntegrityProof, SerializedContextMeasurement,
