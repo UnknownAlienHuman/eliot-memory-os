@@ -570,6 +570,13 @@ fn run_console() -> (bool, Option<HostLaunchOptions>) {
             return (false, Some(launch_options));
         }
     };
+    // AUD6: a retained post-commit demand makes this start the demand-start
+    // owner's firing; consume it before `Ready` so the served intent joins
+    // the activation ahead of the first console query.
+    #[cfg(windows)]
+    let mut startup_drain = HostIdleDrainSupervisor::new();
+    #[cfg(windows)]
+    consume_startup_wake_demand(&mut host, &mut startup_drain);
     if !write_response(&Response::Ready {
         service: SERVICE_NAME,
         protocol: PROTOCOL_VERSION,
@@ -862,6 +869,134 @@ fn observe_malformed_sighted(options: &HostLaunchOptions) {
     );
 }
 
+/// Admits one served Host console request as an observable-use trigger.
+///
+/// I1.5 (AUD5): the stdin/stdout operator protocol is Host's local CLI
+/// channel, so each served `Status`/`Stop` is a `CliRequest` trigger.
+/// Classification and durable admission run ahead of serving — the trigger
+/// joins the activation, restarts the idle grace, and may cancel a
+/// pre-linearization drain before the state projection is read or the stop
+/// effect runs — so a failed admission refuses the console query instead of
+/// answering from a generation that refused the trigger.
+///
+/// Cancel/queue handling mirrors `HostIdleDrainSupervisor::note_observable_use`
+/// for the arms a console loop can meet. This loop owns no census and runs no
+/// readiness tick, so there is nothing to invalidate and no tick resume: a
+/// cancelled drain attempts the same trigger-driven resume with its own fresh
+/// probe, and a post-commit trigger is verified against the durable handoff
+/// instead of reporting a queued generation nothing can fire.
+///
+/// The evidence is a process-unique serving correlation (`console-status` or
+/// `console-stop` plus the serving sequence). The console wire carries no
+/// request digest and the raw line is user content, so neither can serve as
+/// durable evidence; the correlation still keeps two console requests
+/// distinct for the drain replay rule.
+#[cfg(windows)]
+fn admit_console_trigger(
+    host: &mut HostComposition,
+    trigger: ActivationTriggerClass,
+    request: &'static str,
+) -> Result<DrainWakeOutcome, HostError> {
+    let sequence = CONSOLE_TRIGGER_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let evidence = PlatformHandle::new(format!("{request}:{sequence}"))
+        .map_err(|error| HostError::Platform(error.to_string()))?;
+    match host.note_observable_use(trigger, &evidence) {
+        Ok(DrainWakeOutcome::CancelDrain) => {
+            match host.resume_cancelled_drain_on_observable_use() {
+                Ok(true) => {
+                    let _ = writeln!(
+                        io::stderr().lock(),
+                        "eliot-host: console use cancelled the pre-commit drain and returned the same activation generation to ACTIVE after readiness revalidation"
+                    );
+                }
+                Ok(false) => {
+                    let _ = writeln!(
+                        io::stderr().lock(),
+                        "eliot-host: console use cancelled the pre-commit drain; the same generation did not resume on this trigger"
+                    );
+                }
+                Err(error) => {
+                    let _ = writeln!(
+                        io::stderr().lock(),
+                        "eliot-host: console use cancelled the pre-commit drain but readiness revalidation failed: {error}"
+                    );
+                    return Err(error);
+                }
+            }
+            Ok(DrainWakeOutcome::CancelDrain)
+        }
+        Ok(DrainWakeOutcome::QueueNextGeneration) => {
+            match host.next_generation_wake_handoff() {
+                Ok(Some(_)) => {
+                    let _ = writeln!(
+                        io::stderr().lock(),
+                        "eliot-host: console use arrived after DrainCommitRecord and was queued as the next activation generation"
+                    );
+                    Ok(DrainWakeOutcome::QueueNextGeneration)
+                }
+                Ok(None) => Err(HostError::OwnerLeaseRecovery(
+                    "queued next-generation wake demand is absent from the durable journal; the demand-start owner has nothing to fire"
+                        .to_owned(),
+                )),
+                Err(error) => Err(error),
+            }
+        }
+        outcome => outcome,
+    }
+}
+
+/// Consumes the stopped-installation demand-start owner's firing on process start.
+///
+/// AUD6: when the durable journal retains an actionable post-commit
+/// next-generation demand (see `HostComposition::startup_wake_demand`), this
+/// start is the demand being served — the admitted demand-start owner fired
+/// for exactly this intent — so the start joins the activation as
+/// `ScheduledWake` with the intent's durable `wake_id` as evidence instead
+/// of leaving the intent unowned. A start with no retained demand records no
+/// trigger.
+///
+/// A refused admission never fails the start: the process must enter its
+/// service loop for any later trigger to revalidate the intent, so the
+/// refusal is reported loudly and the demand stays `Pending`. Claiming and
+/// satisfaction of the served intent then run through the normal paths
+/// (`revalidate_pending_wakes` on this trigger, `satisfy_claimed_wakes` on
+/// the first authenticated readiness proof).
+#[cfg(windows)]
+fn consume_startup_wake_demand(
+    host: &mut HostComposition,
+    idle_drain: &mut HostIdleDrainSupervisor,
+) {
+    let demand = match host.startup_wake_demand() {
+        Ok(demand) => demand,
+        Err(error) => {
+            let _ = writeln!(
+                io::stderr().lock(),
+                "eliot-host: startup wake demand is unreadable, starting without a wake trigger: {error}"
+            );
+            return;
+        }
+    };
+    let Some((trigger, evidence)) = demand else {
+        return;
+    };
+    match idle_drain.note_observable_use(host, trigger, &evidence) {
+        Ok(outcome) => {
+            let _ = writeln!(
+                io::stderr().lock(),
+                "eliot-host: startup serves the retained next-generation wake demand as {}: {}",
+                trigger.as_str(),
+                outcome.as_str(),
+            );
+        }
+        Err(error) => {
+            let _ = writeln!(
+                io::stderr().lock(),
+                "eliot-host: startup wake demand was not admitted, starting anyway; the demand stays pending: {error}"
+            );
+        }
+    }
+}
+
 fn dispatch(
     host: &mut HostComposition,
     line: &str,
@@ -869,6 +1004,23 @@ fn dispatch(
 ) -> (Response, bool, Option<HostConsoleRequest>) {
     match serde_json::from_str::<Request>(line) {
         Ok(Request::Status) => {
+            // I1.5 (AUD5): admission ahead of serving. The served console
+            // request is a `CliRequest` trigger (see `admit_console_trigger`),
+            // so a refused trigger refuses the query with the `Error` frame
+            // plus stay-in-loop below instead of answering state from a
+            // generation that refused the trigger.
+            #[cfg(windows)]
+            if let Err(error) =
+                admit_console_trigger(host, ActivationTriggerClass::CliRequest, "console-status")
+            {
+                return (
+                    Response::Error {
+                        error: error.to_string(),
+                    },
+                    false,
+                    Some(HostConsoleRequest::Status),
+                );
+            }
             let outcome = host.snapshot();
             observe_status_served(options, &outcome);
             let response = match outcome {
@@ -896,72 +1048,92 @@ fn dispatch(
             };
             (response, false, Some(HostConsoleRequest::Status))
         }
-        Ok(Request::Stop) => (
-            match host.stop() {
-                Ok(()) => {
-                    // F-LOG-HOST-7 B9: accepted stop still terminates the loop;
-                    // the Stopped frame below keeps owning completion.
-                    eliot_host::host_diagnostics::observe_entrypoint_with_detail(
-                        eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
-                        "stop_accepted",
-                    );
-                    // #889 projection: the stop effect committed durably.
-                    observe_host_request(
-                        &HostRequestProjection::durable_committed(
-                            eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
-                        )
-                        .with_request(HostConsoleRequest::Stop)
-                        .with_operation(AdmittedEvent::ServiceStop)
-                        .with_launch_options(options),
-                    );
-                    Response::Stopped
-                }
-                Err(error @ HostError::Stopped) => {
-                    // F-LOG-HOST-7 B9: already-stopped stop keeps the exact
-                    // Error response plus terminate; cancellation with
-                    // proven no-effect stays distinct from failure.
-                    eliot_host::host_diagnostics::observe_entrypoint_with_detail(
-                        eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
-                        "stop_failed",
-                    );
-                    // #889 projection: admitted stop effected nothing.
-                    observe_host_request(
-                        &HostRequestProjection::cancelled(
-                            eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
-                        )
-                        .with_request(HostConsoleRequest::Stop)
-                        .with_operation(AdmittedEvent::ServiceStop)
-                        .with_launch_options(options),
-                    );
+        Ok(Request::Stop) => {
+            // Same admission-ahead rule as `Status` above: the operator stop
+            // joins as a `CliRequest` trigger before the shutdown sequence
+            // runs, so a pre-commit drain sees the cancellation first. A
+            // refused admission refuses the stop and the loop stays up for
+            // the operator to retry; the SCM stop path never depends on this
+            // admission.
+            #[cfg(windows)]
+            if let Err(error) =
+                admit_console_trigger(host, ActivationTriggerClass::CliRequest, "console-stop")
+            {
+                return (
                     Response::Error {
                         error: error.to_string(),
-                    }
-                }
-                Err(error) => {
-                    // F-LOG-HOST-7 B9: stop failure correlates only; a
-                    // lib-terminal child failure is not re-emitted here.
-                    eliot_host::host_diagnostics::observe_entrypoint_with_detail(
-                        eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
-                        "stop_failed",
-                    );
-                    // #889 projection: the stop failed with a typed reason.
-                    observe_host_request(
-                        &HostRequestProjection::failed(
+                    },
+                    false,
+                    Some(HostConsoleRequest::Stop),
+                );
+            }
+            (
+                match host.stop() {
+                    Ok(()) => {
+                        // F-LOG-HOST-7 B9: accepted stop still terminates the loop;
+                        // the Stopped frame below keeps owning completion.
+                        eliot_host::host_diagnostics::observe_entrypoint_with_detail(
                             eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
-                            &error,
-                        )
-                        .with_request(HostConsoleRequest::Stop)
-                        .with_operation(AdmittedEvent::ServiceStop)
-                        .with_launch_options(options),
-                    );
-                    Response::Error {
-                        error: error.to_string(),
+                            "stop_accepted",
+                        );
+                        // #889 projection: the stop effect committed durably.
+                        observe_host_request(
+                            &HostRequestProjection::durable_committed(
+                                eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
+                            )
+                            .with_request(HostConsoleRequest::Stop)
+                            .with_operation(AdmittedEvent::ServiceStop)
+                            .with_launch_options(options),
+                        );
+                        Response::Stopped
                     }
-                }
-            },
-            true,
-            Some(HostConsoleRequest::Stop),
-        ),
+                    Err(error @ HostError::Stopped) => {
+                        // F-LOG-HOST-7 B9: already-stopped stop keeps the exact
+                        // Error response plus terminate; cancellation with
+                        // proven no-effect stays distinct from failure.
+                        eliot_host::host_diagnostics::observe_entrypoint_with_detail(
+                            eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
+                            "stop_failed",
+                        );
+                        // #889 projection: admitted stop effected nothing.
+                        observe_host_request(
+                            &HostRequestProjection::cancelled(
+                                eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
+                            )
+                            .with_request(HostConsoleRequest::Stop)
+                            .with_operation(AdmittedEvent::ServiceStop)
+                            .with_launch_options(options),
+                        );
+                        Response::Error {
+                            error: error.to_string(),
+                        }
+                    }
+                    Err(error) => {
+                        // F-LOG-HOST-7 B9: stop failure correlates only; a
+                        // lib-terminal child failure is not re-emitted here.
+                        eliot_host::host_diagnostics::observe_entrypoint_with_detail(
+                            eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
+                            "stop_failed",
+                        );
+                        // #889 projection: the stop failed with a typed reason.
+                        observe_host_request(
+                            &HostRequestProjection::failed(
+                                eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
+                                &error,
+                            )
+                            .with_request(HostConsoleRequest::Stop)
+                            .with_operation(AdmittedEvent::ServiceStop)
+                            .with_launch_options(options),
+                        );
+                        Response::Error {
+                            error: error.to_string(),
+                        }
+                    }
+                },
+                true,
+                Some(HostConsoleRequest::Stop),
+            )
+        }
         Err(error) => {
             // F-LOG-HOST-7 B9: malformed input keeps Error plus stay-in-loop;
             // the raw line is never logged (user content, I15.4/I07.20).
@@ -1067,6 +1239,17 @@ fn finish_console_shutdown(
 
 #[cfg(windows)]
 static STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Serving sequence for Host console trigger evidence (AUD5).
+///
+/// The stdin/stdout operator protocol carries no wire digest and the raw line
+/// is user content, so each served console request mints a process-unique
+/// correlation instead. The value names only the serving observation, which
+/// keeps two console requests distinct for the drain replay rule without
+/// logging anything the operator typed.
+#[cfg(windows)]
+static CONSOLE_TRIGGER_SEQ: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(windows)]
 fn run_as_scm_service() -> Result<bool, u32> {
@@ -1382,6 +1565,11 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
     report.check_point = 0;
     let _ = report_service_status(&handle, &report);
     let mut idle_drain = HostIdleDrainSupervisor::new();
+    // AUD6: a retained post-commit demand makes this start the demand-start
+    // owner's firing; consume it before the service loop so the served intent
+    // is claimed by the generation it was queued for instead of lingering
+    // unowned.
+    consume_startup_wake_demand(&mut host, &mut idle_drain);
     while !STOP_REQUESTED.load(Ordering::Acquire) && host.running() {
         let durable_fence = match host.has_durable_branch_fence() {
             Ok(fenced) => fenced,

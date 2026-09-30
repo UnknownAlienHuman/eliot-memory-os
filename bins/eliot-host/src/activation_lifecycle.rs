@@ -81,8 +81,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use eliot_contracts::{ResourceGeneration, StateFence};
 use eliot_host_service::runtime_control::HostActivationAdmission;
 use eliot_host_state::{
-    ActivationState, DrainRecord, DrainState, EliotActivationRecord, EpochIdentity,
-    EpochTransition, HostState, HostStateRecord, KernelReadinessObservationRecord,
+    ActivationState, DrainCommitRecord, DrainRecord, DrainState, EliotActivationRecord,
+    EpochIdentity, EpochTransition, HostState, HostStateRecord, KernelReadinessObservationRecord,
     ServiceSafetyClass, WakeDisposition, WakeRecord, record_checksum,
 };
 use eliot_platform::PlatformHandle;
@@ -1244,6 +1244,48 @@ impl HostComposition {
         }))
     }
 
+    /// Returns the stopped-installation demand this process start serves, if any.
+    ///
+    /// This is the Host-side consumption point of the post-commit
+    /// next-generation demand: the admitted stopped-installation
+    /// demand-start owner fires `StartService(eliot-host)` for a `Pending`
+    /// intent this journal retains, and the start joins the activation as
+    /// [`ActivationTriggerClass::ScheduledWake`] with the intent's durable
+    /// `wake_id` as trigger evidence, so the intent is claimed by the
+    /// generation it was queued for instead of lingering unowned.
+    ///
+    /// Only an actionable owner-family intent qualifies: `Pending`, carrying
+    /// this owner's maintenance family, with a `Due` or `Expired` schedule. A
+    /// not-yet-due intent is not this start's firing and stays `Pending` for
+    /// the trigger whose time has come; any other wake family keeps its own
+    /// policy untouched. When the journal holds no such intent this start
+    /// carries no wake demand and no trigger is recorded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the durable Host state or the wall clock cannot
+    /// be read.
+    pub fn startup_wake_demand(
+        &self,
+    ) -> Result<Option<(ActivationTriggerClass, PlatformHandle)>, HostError> {
+        let state = self.snapshot()?;
+        let now_ms = unix_millis()?;
+        Ok(state.wakes.iter().find_map(|wake| {
+            if wake.intent.state != WakeIntentState::Pending
+                || wake.maintenance_family.as_str() != NEXT_GENERATION_WAKE_MAINTENANCE_FAMILY
+            {
+                return None;
+            }
+            match next_generation_wake_schedule_state(wake, now_ms) {
+                NextGenerationWakeSchedule::Due | NextGenerationWakeSchedule::Expired => {
+                    Some((ActivationTriggerClass::ScheduledWake, wake.wake_id.clone()))
+                }
+                NextGenerationWakeSchedule::NoOwnerPolicy
+                | NextGenerationWakeSchedule::NotDue => None,
+            }
+        }))
+    }
+
     /// Returns the capability set this activation generation durably requires.
     ///
     /// I1.5 "start only the remaining capabilities required by the admitted
@@ -1280,6 +1322,17 @@ impl HostComposition {
     /// of claimed or cancelled, and a not-yet-due intent is left `PENDING`
     /// with no row written. Wakes outside this owner's maintenance family
     /// keep their existing claim rule untouched.
+    ///
+    /// A `Due` owner-family intent presented by a `ScheduledWake` trigger —
+    /// the demand-start owner's firing for the generation it was queued for —
+    /// is additionally claimed by the direct-child generation once the
+    /// parent's `DrainCommitRecord` proves the old authority fenced, with the
+    /// generation's own durable requirement as the capability gate. The new
+    /// generation can never share the old authority (fencing it is the point
+    /// of the commit), so same-authority can never prove this claim; the
+    /// commit record naming the wake's generation is the proof instead. An
+    /// unserviceable demand is still `CANCELLED` rather than executed because
+    /// it was once queued.
     ///
     /// # Errors
     ///
@@ -1349,15 +1402,52 @@ impl HostComposition {
                 .required_capabilities
                 .iter()
                 .all(|capability| requested.iter().any(|value| value == capability.as_str()));
+            // AUD6: the demand-start owner's firing serves the demand queued
+            // for exactly this generation. The conditions are deliberately
+            // narrow: only a `ScheduledWake` trigger may claim across the
+            // generation boundary, only for a `Due` intent of this owner's
+            // maintenance family, only by the direct-child generation of the
+            // wake's own generation, and only when the durable
+            // `DrainCommitRecord` names that parent generation — the
+            // linearization proof I1.5 requires before the next generation
+            // may start. The capability gate reads the generation's own
+            // durable requirement, never the trigger's class set, because the
+            // firing serves the queued demand rather than stating new demand.
+            let next_generation_claim = trigger == ActivationTriggerClass::ScheduledWake
+                && wake.maintenance_family.as_str() == NEXT_GENERATION_WAKE_MAINTENANCE_FAMILY
+                && matches!(
+                    next_generation_wake_schedule_state(&wake, now_ms),
+                    NextGenerationWakeSchedule::Due
+                )
+                && activation
+                    .fence
+                    .activation_generation
+                    .current
+                    .is_direct_child_of(&wake.fence.activation_generation.current)
+                && state.drain_commit.as_ref().is_some_and(|commit: &DrainCommitRecord| {
+                    commit
+                        .drain_generation
+                        .current
+                        .is_same_authority(&wake.fence.activation_generation.current)
+                })
+                && wake.required_capabilities.iter().all(|capability| {
+                    activation
+                        .requested_capabilities
+                        .iter()
+                        .any(|required| required.as_str() == capability.as_str())
+                });
             let mut next = wake.clone();
             next.operation = operation("host-wake-revalidation")?;
             next.reason_evidence_refs.push(evidence.clone());
-            next.intent.state = if same_generation && same_authority && capabilities_covered {
-                claimed += 1;
-                WakeIntentState::Claimed
-            } else {
-                WakeIntentState::Cancelled
-            };
+            next.intent.state =
+                if (same_generation && same_authority && capabilities_covered)
+                    || next_generation_claim
+                {
+                    claimed += 1;
+                    WakeIntentState::Claimed
+                } else {
+                    WakeIntentState::Cancelled
+                };
             self.append_record(HostStateRecord::Wake(next))?;
         }
         host_lifecycle_observe_scm(BOUNDARY_WAKE_REVALIDATION_OBSERVED);
