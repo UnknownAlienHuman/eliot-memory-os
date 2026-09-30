@@ -2395,7 +2395,7 @@ async fn publish_maintenance_source_results(
                 // revision to admit onto, and inventing one would be a second
                 // store rather than a receipt.
                 if let Some(job_ref) = &obligation.job_ref
-                    && jobs.iter().any(|job| &job.job_id == job_ref)
+                    && jobs.iter().any(|job| job.job_id == job_ref.as_str())
                 {
                     let admitted_receipt = eliot_maintenance::AdmittedObservationReceipt {
                         publication_id: obligation.publication_id.clone(),

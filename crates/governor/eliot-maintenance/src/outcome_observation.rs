@@ -260,7 +260,7 @@ pub fn outcome_observation_disposition(
     // nothing.
     match admitted
         .iter()
-        .find(|receipt| receipt.publication_id == publication_id)
+        .find(|receipt| receipt.publication_id == publication_id.as_str())
     {
         Some(receipt) => Ok(MaintenanceOutcomeDisposition::ResultObserved {
             publication_id,
