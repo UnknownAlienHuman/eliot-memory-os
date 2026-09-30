@@ -78,12 +78,7 @@ eliot-context-contracts.workspace = true
 eliot-config.workspace = true
 eliot-controlboard.workspace = true
 eliot-doctor-core.workspace = true
-eliot-dreamer-bundle = { path = "../../crates/smart/eliot-dreamer-bundle", version = "0.1.0" }
 eliot-dreamer-failure = { path = "../../crates/smart/eliot-dreamer-failure", version = "0.1.0" }
-eliot-dreamer-candidate-validation = { path = "../../crates/smart/eliot-dreamer-candidate-validation", version = "0.1.0" }
-eliot-dreamer-claim-grounding = { path = "../../crates/smart/eliot-dreamer-claim-grounding", version = "0.1.0" }
-eliot-dreamer-probe-plan = { path = "../../crates/smart/eliot-dreamer-probe-plan", version = "0.1.0" }
-eliot-dreamer-rival-model = { path = "../../crates/smart/eliot-dreamer-rival-model", version = "0.1.0" }
 eliot-dreamer-contracts.workspace = true
 eliot-dreamer-memory-revision = { path = "../../crates/smart/eliot-dreamer-memory-revision", version = "0.1.0" }
 eliot-evaluation-contracts.workspace = true
