@@ -10,7 +10,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use eliot_contracts::{
@@ -207,7 +206,6 @@ pub struct DaemonKernelClient {
     pub(super) kernel_binding: KernelLaunchBinding,
     pub(super) connection_id: String,
     pub(super) snapshot: KernelGenerationSnapshot,
-    request_counter: Arc<AtomicU64>,
     /// Literal Kernel-issued `sid=..;session=..` binding string retained only
     /// after a successful [`validate_server_hello`](handshake::validate_server_hello)
     /// in this process (AUD-C02-B, Implements #1187). Never the whole
@@ -346,6 +344,71 @@ pub enum TaskControllerSubmitOutcome {
     Expired,
     /// The attempt was replaced, revoked or otherwise stale.
     StaleAttempt,
+}
+
+/// Version of the canonical Kernel request identity encoding this module
+/// mints. I5.27 requires the canonical encoding to be deterministic AND
+/// versioned; the version is bound into the digest input so a future encoding
+/// change cannot silently re-key a receipt already admitted under this one.
+const KERNEL_REQUEST_IDENTITY_ENCODING_VERSION: u16 = 1;
+
+/// Domain separator for the canonical Kernel request identity digest. Keeps
+/// this digest disjoint from every other digest in the system, so a request
+/// identity can never be reproduced from an unrelated material.
+const KERNEL_REQUEST_IDENTITY_DOMAIN: &str = "eliot.kernel_request_identity";
+
+/// The caller-admitted inputs one Kernel request identity is derived from.
+///
+/// I5.27's `CanonicalOperationIdentity`: the semantic command kind, the
+/// principal and operation scope, and the canonical request bytes. Every field
+/// here is supplied by the caller as operation content or as the admitted
+/// scope; none of them is an attempt counter, nonce, clock or ambient state.
+/// Two byte-identical presentations of one operation therefore bind to the
+/// same identity, and a changed payload binds to a different one.
+///
+/// This is the ONLY place the operation name and the scope are declared for a
+/// transport identity, so the digest input and the emitted key labels cannot
+/// be given different values.
+struct CanonicalKernelRequest<'a> {
+    /// The semantic command kind. Not caller spelling of a retry: it is the
+    /// closed operation this request actually executes.
+    operation: &'a str,
+    /// The admitted principal and operation scope: the installation,
+    /// generation and authority epoch this connection is bound to. A different
+    /// installation or generation really is a different operation scope, so
+    /// this belongs in the identity; it is not an attempt discriminator.
+    scope: &'a str,
+    /// The exact canonical request bytes this transport is about to send.
+    request: &'a serde_json::Value,
+}
+
+/// Computes the canonical request digest for one Kernel request.
+///
+/// Reuses the repository's single canonicalization and digest owner
+/// (`eliot_contracts::canonical_json_bytes`, which sorts every object key
+/// recursively, and `eliot_contracts::sha256_hex`). This introduces no second
+/// hash or canonicalization scheme, and the domain separator plus encoding
+/// version follow the same shape as the existing `testd_owner_*_request_digest`
+/// helpers in this module.
+fn canonical_kernel_request_digest(
+    request: &CanonicalKernelRequest<'_>,
+) -> Result<String, serde_json::Error> {
+    #[derive(Serialize)]
+    struct Canonical<'a> {
+        domain_separator: &'a str,
+        canonical_encoding_version: u16,
+        semantic_command_kind: &'a str,
+        principal_and_scope: &'a str,
+        canonical_request: &'a serde_json::Value,
+    }
+    let bytes = canonical_json_bytes(&Canonical {
+        domain_separator: KERNEL_REQUEST_IDENTITY_DOMAIN,
+        canonical_encoding_version: KERNEL_REQUEST_IDENTITY_ENCODING_VERSION,
+        semantic_command_kind: request.operation,
+        principal_and_scope: request.scope,
+        canonical_request: request.request,
+    })?;
+    Ok(sha256_hex(&bytes))
 }
 
 fn derive_task_controller_request_identity(
@@ -1293,7 +1356,6 @@ impl DaemonKernelClient {
             ),
             snapshot: expected_snapshot(&config.launch)?,
             kernel_binding: config.kernel_binding.clone(),
-            request_counter: Arc::new(AtomicU64::new(1)),
             validated_session_binding: Mutex::new(None),
             shutdown_tx,
             shutdown_rx,
@@ -1578,9 +1640,29 @@ impl DaemonKernelClient {
     /// for this exact publish (same contour as `daemon_ready`) and
     /// correlated by [`Self::send_startup_evidence`]; the producer never
     /// mints identities.
+    ///
+    /// The publish's own canonical bytes cannot be the digest input here:
+    /// `EliotdStartupEvidence` carries this very binding inside its
+    /// `transport_binding` field, so
+    /// digesting it here would be self-referential. The retained Kernel
+    /// generation snapshot is the admitted publish scope instead — service,
+    /// protocol, generation, authority epoch, artifact digest, protected
+    /// snapshot digest and principal — and it is exactly what the Kernel
+    /// re-checks against this publish in
+    /// `validate_server_hello`/`daemon_startup_evidence_operation`. The
+    /// resulting binding is therefore a deterministic function of retained
+    /// content, so a byte-identical republish presents the same identity
+    /// rather than a fresh one, and a publish under a different admitted
+    /// snapshot binds to a different identity.
     pub fn mint_startup_evidence_identity(&self) -> Result<RequestIdentity, super::DaemonError> {
-        self.next_identity(super::startup_evidence_producer::DAEMON_STARTUP_EVIDENCE_OPERATION)
-            .map_err(|error| super::DaemonError::Kernel(error.to_string()))
+        let scope = serde_json::to_value(&self.snapshot)
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        self.next_identity(&CanonicalKernelRequest {
+            operation: super::startup_evidence_producer::DAEMON_STARTUP_EVIDENCE_OPERATION,
+            scope: &self.connection_id,
+            request: &scope,
+        })
+        .map_err(|error| super::DaemonError::Kernel(error.to_string()))
     }
 
     /// Publishes one validated Governor startup evidence payload on the
@@ -1779,7 +1861,11 @@ impl DaemonKernelClient {
         operation: &str,
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, KernelClientError> {
-        let identity = self.next_identity(operation)?;
+        let identity = self.next_identity(&CanonicalKernelRequest {
+            operation,
+            scope: &self.connection_id,
+            request: &payload,
+        })?;
         self.transact_async_with_identity(operation, payload, identity)
             .await
     }
@@ -1938,11 +2024,34 @@ impl DaemonKernelClient {
         Ok((transport, limits))
     }
 
-    fn next_identity(&self, operation: &str) -> Result<RequestIdentity, KernelClientError> {
-        let sequence = self.request_counter.fetch_add(1, Ordering::Relaxed);
-        let request_id =
-            RequestId::new(format!("{}:{}:{}", self.connection_id, operation, sequence))
-                .map_err(|error| KernelClientError::Contract(error.to_string()))?;
+    /// Mints the transport operation binding for one Kernel request from the
+    /// canonical request bytes plus the caller-admitted identity inputs.
+    ///
+    /// I5.27 requires idempotency to be defined over canonical bytes, never
+    /// over a per-attempt discriminator. The binding below is therefore a
+    /// pure function of `canonical_request` and `scope`: two byte-identical
+    /// presentations of one operation derive the same `request_id`, the same
+    /// `idempotency_key` and the same `cancellation_id`, so the Kernel binds
+    /// both attempts to the one admitted operation and a retry resolves to the
+    /// first attempt's receipt instead of opening a second operation. A
+    /// changed payload derives a different binding, so it is never mistaken
+    /// for a replay of the original.
+    ///
+    /// The operation name and scope are read from `canonical_request` alone,
+    /// so the digest input and the emitted key labels can never disagree. No
+    /// counter, nonce, salt, clock or hidden state participates.
+    fn next_identity(
+        &self,
+        canonical_request: &CanonicalKernelRequest<'_>,
+    ) -> Result<RequestIdentity, KernelClientError> {
+        let operation = canonical_request.operation;
+        let digest = canonical_kernel_request_digest(canonical_request)
+            .map_err(|error| KernelClientError::Contract(error.to_string()))?;
+        let request_id = RequestId::new(format!(
+            "{}:{}:{}",
+            self.connection_id, operation, digest
+        ))
+        .map_err(|error| KernelClientError::Contract(error.to_string()))?;
         let fence = self.snapshot.state_fence();
         let metadata = RequestMetadata {
             request_id: request_id.clone(),
@@ -1965,9 +2074,14 @@ impl DaemonKernelClient {
                 metadata,
                 state_fence: fence,
             },
-            idempotency_key: format!("{SERVICE_NAME}:{operation}:{sequence}"),
+            idempotency_key: format!("{SERVICE_NAME}:{operation}:{digest}"),
             deadline_unix_ms: unix_ms().saturating_add(30_000),
-            cancellation_id: format!("{SERVICE_NAME}:{operation}:{sequence}:cancel"),
+            // A cancellation handle addresses the admitted operation, not one
+            // transport attempt, so it is derived from the same canonical
+            // bytes. Deriving it from a counter would make a cancelled attempt
+            // unreachable by the next attempt's cancel, which is exactly the
+            // per-attempt identity I5.27 forbids.
+            cancellation_id: format!("{SERVICE_NAME}:{operation}:{digest}:cancel"),
         })
     }
 
@@ -2664,7 +2778,6 @@ impl DaemonKernelClient {
             kernel_binding: self.kernel_binding.clone(),
             connection_id: self.connection_id.clone(),
             snapshot: self.snapshot.clone(),
-            request_counter: Arc::clone(&self.request_counter),
             validated_session_binding: Mutex::new(self.validated_session_binding()),
             // #791 (W4/W17): the clone shares the same shutdown broadcast, so
             // a request published on the owning client is observed by a
@@ -3141,7 +3254,6 @@ mod tests {
                 protected_snapshot_digest: "b".repeat(64),
                 principal: "test-principal".to_owned(),
             },
-            request_counter: Arc::new(AtomicU64::new(1)),
             validated_session_binding: Mutex::new(None),
             shutdown_tx: shutdown_tx.clone(),
             shutdown_rx: shutdown_rx.clone(),
