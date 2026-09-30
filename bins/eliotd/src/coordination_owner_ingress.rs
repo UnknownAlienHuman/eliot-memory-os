@@ -1,11 +1,10 @@
 //! Typed coordination result ingress for the coordination owner's write route.
 //!
-//! This module defines the exact shape a session/work-item driver must present
-//! to [`DaemonComposition::commit_coordination_candidate_result`](crate::DaemonComposition::commit_coordination_candidate_result).
-//! It exists so the missing material is named and typed rather than described
-//! in prose: every field below is one the coordination owner re-checks against
-//! the image it already holds, and every one of them must come from an admitted
-//! owner, never from this daemon.
+//! This module is the *only* way to reach
+//! [`DaemonComposition::commit_coordination_candidate_result`](crate::DaemonComposition::commit_coordination_candidate_result):
+//! that entry takes a [`CoordinationResultIngress`] and lowers it here, so a
+//! caller cannot present a raw draft that skipped the closed-shape check, and
+//! this type is not a sibling shape that production never constructs.
 //!
 //! Nothing here mints, defaults, or derives coordination identity. The ingress
 //! validates the closed shape and refuses a blank or control-bearing field, so
@@ -23,17 +22,42 @@
 //! | `lease_id` | the coordination owner, via `acquire_work` | the fenced claim on that item |
 //! | `result_id` | the submitting attempt | this one candidate result reference |
 //!
+//! Every one of those is a *presented* handle that the coordination owner
+//! re-checks against the image it already holds; none of them is derived here.
 //! `result_ref` is the candidate artifact handle. It is a reference, never a
 //! verifier outcome, an acceptance claim, or a finish input: the coordination
 //! owner stamps the admitted receipt at `CandidateArtifact` and this ingress
 //! cannot express anything stronger, because the ceiling has exactly one
 //! representable variant.
+//!
+//! # Not yet produced in production (issue #370 R1)
+//!
+//! This ingress is now the live, total shape on the durable route, but nothing
+//! constructs it in production yet, and the blocker is upstream of the route,
+//! measured on this tree rather than inferred:
+//!
+//! - `CoordinationOwner::register_session`, `register_work`, `acquire_work`, and
+//!   `acquire_work_with_issuance` have no non-test caller anywhere in the
+//!   workspace, so the persisted `owner/coordination` image holds no session, no
+//!   work item, and no lease;
+//! - the only production consumers of that image, including
+//!   `GovernorComposition::read_unique_agent_activation`, therefore observe an
+//!   empty coordination owner and can never admit anything;
+//! - no owner in the workspace issues a coordination `work_item_id` or
+//!   `lease_id`. The Kernel-issued `TaskControllerAttempt` and
+//!   `NativeWorkerClaim` carry a session, task, scope, fence, epoch, attempt,
+//!   and operation identity but no work-item or lease identity, and the Kernel's
+//!   own `AdmissionReservation` work-item projection is a different ORS record in
+//!   a different process.
+//!
+//! Deriving a `work_item_id` or `lease_id` here would fabricate exactly the
+//! coordination authority the owner validates on the way in, so it was not
+//! done. The legitimate issuer is the missing session/work-item driver, and
+//! producing it requires an owner decision this issue does not own.
 
 use eliot_contracts::{EpochId, StateFence};
-use eliot_governor::{AgentResultDraft, ResultAdmissionCeiling};
+use eliot_governor::{AgentResultDraft, CompositionError, ResultAdmissionCeiling};
 use serde::{Deserialize, Serialize};
-
-use crate::DaemonError;
 
 /// Maximum bounded length of one coordination ingress text field.
 ///
@@ -47,8 +71,8 @@ const MAX_FIELD_LEN: usize = 1024;
 ///
 /// Every field is required and every field is validated here before the
 /// coordination owner sees it, so a structural mistake is a typed
-/// [`DaemonError::ProviderAdmission`] at the ingress rather than an owner
-/// failure discovered mid-commit.
+/// [`CompositionError`] at the ingress rather than an owner failure discovered
+/// mid-commit.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CoordinationResultIngress {
@@ -66,6 +90,10 @@ pub struct CoordinationResultIngress {
     pub lease_id: String,
     /// Authority epoch under which the result was admitted.
     pub authority_epoch: EpochId,
+    /// Fence the submission is admitted under. The coordination owner re-checks
+    /// it against the fence its own lease record carries, so this is the fence
+    /// the submitting attempt observed, never a fence of its own choosing.
+    pub state_fence: StateFence,
     /// Candidate artifact handle. A reference only, never proof.
     pub result_ref: String,
     /// Observation time of this submission, as the coordination owner requires
@@ -73,14 +101,17 @@ pub struct CoordinationResultIngress {
     pub now: u64,
 }
 
-fn require_field(value: &str, field: &'static str) -> Result<(), DaemonError> {
-    if value.trim().is_empty()
-        || value.chars().any(char::is_control)
-        || value.len() > MAX_FIELD_LEN
-    {
-        return Err(DaemonError::ProviderAdmission(
-            eliot_agent_coordinator::CoordinatorError::InvalidField(field),
-        ));
+/// Refuses one structurally unusable ingress field by name.
+///
+/// This is a shape failure in the request this daemon was handed, not a refusal
+/// by the coordination owner, so it is classified as a typed composition
+/// `Owner` error and never dressed as an owner verdict or a provider admission.
+fn require_field(value: &str, field: &'static str) -> Result<(), CompositionError> {
+    if value.trim().is_empty() || value.chars().any(char::is_control) || value.len() > MAX_FIELD_LEN
+>    {
+        return Err(CompositionError::Owner(format!(
+            "coordination ingress field {field} is blank, control-bearing, or longer than {MAX_FIELD_LEN} bytes"
+        )));
     }
     Ok(())
 }
@@ -93,22 +124,34 @@ impl CoordinationResultIngress {
     /// because that is the only representable ceiling on the owner's wire; a
     /// caller cannot express a finish, completion, or closure ceiling here
     /// because the enum admits no such variant.
-    pub fn into_draft(self, state_fence: StateFence) -> Result<AgentResultDraft, DaemonError> {
+    pub fn into_draft(self) -> Result<AgentResultDraft, CompositionError> {
         for (value, field) in [
-            (&self.request_id, "coordination_ingress.request_id"),
-            (&self.result_id, "coordination_ingress.result_id"),
-            (&self.session_id, "coordination_ingress.session_id"),
-            (&self.work_item_id, "coordination_ingress.work_item_id"),
-            (&self.lease_id, "coordination_ingress.lease_id"),
-            (&self.result_ref, "coordination_ingress.result_ref"),
+            (&self.request_id, "request_id"),
+            (&self.result_id, "result_id"),
+            (&self.session_id, "session_id"),
+            (&self.work_item_id, "work_item_id"),
+            (&self.lease_id, "lease_id"),
+            (&self.result_ref, "result_ref"),
         ] {
             require_field(value, field)?;
         }
         if self.now == 0 {
-            return Err(DaemonError::ProviderAdmission(
-                eliot_agent_coordinator::CoordinatorError::InvalidField("coordination_ingress.now"),
+            return Err(CompositionError::Owner(
+                "coordination ingress field now must be greater than zero".to_owned(),
             ));
         }
+        // The epoch and the fence are two owner-validated views of one
+        // admission, so an ingress that disagrees with itself is refused here
+        // rather than at the owner. The owner still re-checks both against the
+        // lease record it holds; this is not a second copy of that check.
+        if self.state_fence.authority_epoch != self.authority_epoch {
+            return Err(CompositionError::Owner(
+                "coordination ingress authority_epoch does not match its state_fence".to_owned(),
+            ));
+        }
+        self.state_fence.validate().map_err(|error| {
+            CompositionError::Owner(format!("coordination ingress state_fence is invalid: {error}"))
+        })?;
         Ok(AgentResultDraft {
             request_id: self.request_id,
             result_id: self.result_id,
@@ -116,7 +159,7 @@ impl CoordinationResultIngress {
             session_id: self.session_id,
             work_item_id: self.work_item_id,
             authority_epoch: self.authority_epoch,
-            state_fence,
+            state_fence: self.state_fence,
             result_ref: self.result_ref,
             ceiling: ResultAdmissionCeiling::CandidateArtifact,
             now: self.now,
