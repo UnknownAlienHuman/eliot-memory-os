@@ -146,6 +146,35 @@ impl OwnerLoadedClaimRow {
         }
         Ok(())
     }
+
+    /// Returns the loaded attempt identity this row was read under.
+    ///
+    /// Crate-internal: the sealed verifier reads the witnessed row back
+    /// through these accessors on every proof, so the loaded legs never alias
+    /// the presented half once the factory witnessed them.
+    pub(crate) fn attempt_id(&self) -> &str {
+        &self.attempt_id
+    }
+
+    /// Returns the loaded operation identity this row was read under.
+    pub(crate) fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+
+    /// Returns the loaded claim binding digest.
+    pub(crate) fn binding_digest(&self) -> &str {
+        &self.binding_digest
+    }
+
+    /// Returns the loaded executable binding digest.
+    pub(crate) fn executable_digest(&self) -> &str {
+        &self.executable_digest
+    }
+
+    /// Returns the loaded claiming-worker generation.
+    pub(crate) fn worker_generation(&self) -> u64 {
+        self.worker_generation
+    }
 }
 
 /// Closed admitted-provider factory bound to one loaded owner row (issue
@@ -244,12 +273,17 @@ impl AdmittedProviderFactory {
             presented_fence,
         )?;
         let currentness = OwnerCurrentness::new(expectation, live_fence)?;
-        AdmittedProviderCapability::new(
+        // The witnessed row travels into the capability with the halves it
+        // just agreed with, so every later proof re-proves presented values
+        // against this retained durable evidence instead of aliasing the
+        // presented half.
+        AdmittedProviderCapability::new_with_witnessed_row(
             identity,
             presented,
             currentness,
             health,
             minimum_event_sequence,
+            self.loaded.clone(),
         )
     }
 }

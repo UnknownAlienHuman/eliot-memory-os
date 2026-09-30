@@ -33,16 +33,22 @@
 //! coordinator never mistakes its stored presented values for loaded owner
 //! evidence.
 //!
-//! Residual STITCH (issue #1108 A5): the loaded legs passed to the pure owner
-//! verifier in [`KernelProviderVerifier::verify`] alias the presented half
-//! (attempt, operation, digests, generation); only the fence leg rides
-//! owner-observed evidence (the live-fence digest) while attempt/operation
-//! mismatch is caught receipt-side from the ORIGINAL bytes. Binding the
-//! digest legs against the durable row per effecting operation demands the
-//! factory-witnessed row retained in this capability (producer:
-//! [`AdmittedProviderFactory::admit`]) plus a daemon row source that no seam
-//! returns today. Until both land, the owner digest/generation gates re-prove
-//! construction-time coherence, not a fresh row read.
+//! Residual (issue #1108 A5): the loaded legs passed to the pure owner
+//! verifier in [`KernelProviderVerifier::verify`] come from the
+//! factory-witnessed durable row retained in the capability when it was
+//! admitted through
+//! [`AdmittedProviderFactory::admit`](crate::admitted_provider::AdmittedProviderFactory::admit).
+//! A capability built directly through [`AdmittedProviderCapability::new`]
+//! carries no witnessed row and still aliases the presented half for those
+//! legs; only the fence leg rides owner-observed evidence (the live-fence
+//! digest) in both cases, while attempt/operation mismatch is caught
+//! receipt-side from the ORIGINAL bytes. Witnessing a genuine row for
+//! production capabilities demands a row-returning daemon seam that no
+//! `DaemonKernelClient` method offers today
+//! (`verify_provider_binding_async` returns `Result<(), _>` by contract and
+//! must not be taught to fabricate one), so the daemon production
+//! constructors cannot witness yet and the owner digest/generation gates
+//! re-prove construction-time coherence there, not a fresh row read.
 //!
 //! Catalogue, quota, and liveness observations (issue #265) ride only as
 //! [`ProviderSelectionHealth`]: selection/health input, never admission. The
@@ -64,6 +70,7 @@ use eliot_kernel_service::{
     ProviderProofKind as KernelProofKind, verify_provider_capability,
 };
 
+use crate::admitted_provider::OwnerLoadedClaimRow;
 use crate::core::{ProviderProofKind, ProviderVerifier};
 use crate::model::{
     CoordinatorError, PlanGap, ProviderAdmissionReceipt, ProviderBindingSnapshot,
@@ -304,6 +311,16 @@ pub struct AdmittedProviderCapability {
     currentness: OwnerCurrentness,
     health: Option<ProviderSelectionHealth>,
     minimum_event_sequence: u64,
+    /// Factory-witnessed durable owner row, if any (issue #1108 A5).
+    ///
+    /// Set only by the closed factory admission, which proved the halves it
+    /// carries equal to this row before any existing validator observed
+    /// them. Every `verify` reads the loaded legs back from this retained
+    /// row instead of aliasing the presented half, so one admission binds
+    /// every later proof to the same durable evidence. Direct construction
+    /// carries none: the row must be witnessed, never rebuilt from presented
+    /// halves, and no row-returning daemon seam exists yet.
+    witnessed: Option<OwnerLoadedClaimRow>,
 }
 
 impl AdmittedProviderCapability {
@@ -342,7 +359,44 @@ impl AdmittedProviderCapability {
             currentness,
             health,
             minimum_event_sequence,
+            witnessed: None,
         })
+    }
+
+    /// Builds the admitted capability with its factory-witnessed owner row.
+    ///
+    /// Crate-internal: only
+    /// [`AdmittedProviderFactory::admit`](crate::admitted_provider::AdmittedProviderFactory::admit)
+    /// calls this, after proving the halves equal the row field for field.
+    /// Shape validation is identical to [`new`](Self::new); the row is
+    /// retained so every later `verify` binds to the same durable evidence.
+    pub(crate) fn new_with_witnessed_row(
+        identity: ProviderIdentity,
+        presented: PresentedClaimMaterial,
+        currentness: OwnerCurrentness,
+        health: Option<ProviderSelectionHealth>,
+        minimum_event_sequence: u64,
+        witnessed: OwnerLoadedClaimRow,
+    ) -> Result<Self, CoordinatorError> {
+        identity.validate()?;
+        Ok(Self {
+            identity,
+            presented,
+            currentness,
+            health,
+            minimum_event_sequence,
+            witnessed: Some(witnessed),
+        })
+    }
+
+    /// Borrows the factory-witnessed durable owner row, if one was retained.
+    ///
+    /// Crate-internal: the sealed verifier reads the loaded legs back from
+    /// this row on every proof. `None` for directly constructed
+    /// capabilities, which alias the presented half for those legs until a
+    /// row-returning daemon seam lets production construction witness.
+    pub(crate) fn witnessed_row(&self) -> Option<&OwnerLoadedClaimRow> {
+        self.witnessed.as_ref()
     }
 
     /// Returns the input-only selection/health observation, if any.
@@ -494,8 +548,10 @@ impl ProviderVerifier for KernelProviderVerifier {
         // above; its per-kind attempt/operation identity is read from the
         // ORIGINAL canonical bytes (typed per-kind receipt schemas, never an
         // opaque string path and never a recomputed stand-in) and carried as
-        // the owner request, while the admitted claim rides as the loaded
-        // durable row. A receipt naming an attempt or operation the claim
+        // the owner request, while the factory-witnessed row retained in the
+        // capability rides as the loaded durable row (a directly constructed
+        // capability carries no witnessed row and still aliases the
+        // presented half there). A receipt naming an attempt or operation the claim
         // never covered fails closed through the owner as `ForeignAttempt` /
         // `ForeignOperation` (typed `StaleProviderBinding`, the same typed
         // error a revoked or mismatched binding yields); only cancellation
@@ -525,6 +581,37 @@ impl ProviderVerifier for KernelProviderVerifier {
             receipt_proof_identity(kind, canonical_payload, &presented.operation_id)?;
         let fence_digest = presented.fence_digest()?;
         let live_fence_digest = currentness.live_fence_digest()?;
+        // Loaded legs come from the factory-witnessed durable row when the
+        // capability was admitted through the closed factory, so the owner
+        // re-proves presented values against retained durable evidence on
+        // every call. A directly constructed capability carries no witnessed
+        // row and still aliases the presented half here (residual: no
+        // row-returning daemon seam exists yet); the fence leg rides the
+        // live-fence digest in both cases, never a presented echo.
+        let witnessed = self.capability.witnessed_row();
+        let loaded = match witnessed {
+            Some(row) => (
+                row.attempt_id(),
+                row.operation_id(),
+                row.binding_digest(),
+                row.executable_digest(),
+                row.worker_generation(),
+            ),
+            None => (
+                presented.attempt_id.as_str(),
+                presented.operation_id.as_str(),
+                presented.binding_digest.as_str(),
+                presented.executable_digest.as_str(),
+                presented.worker_generation,
+            ),
+        };
+        let (
+            loaded_attempt_id,
+            loaded_operation_id,
+            loaded_binding_digest,
+            loaded_executable_digest,
+            loaded_worker_generation,
+        ) = loaded;
         let request = ProviderCapabilityRequest {
             claim_id: presented.claim_id.clone(),
             attempt_id: receipt_attempt_id,
@@ -548,11 +635,11 @@ impl ProviderVerifier for KernelProviderVerifier {
         verify_provider_capability(
             &request,
             &currentness.expectation,
-            &presented.attempt_id,
-            &presented.operation_id,
-            &presented.binding_digest,
-            &presented.executable_digest,
-            presented.worker_generation,
+            loaded_attempt_id,
+            loaded_operation_id,
+            loaded_binding_digest,
+            loaded_executable_digest,
+            loaded_worker_generation,
             &live_fence_digest,
             &currentness.live_epoch(),
         )

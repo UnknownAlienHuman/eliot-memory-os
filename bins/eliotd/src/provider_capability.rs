@@ -30,18 +30,23 @@
 //! diagnostics. Issue #265 catalogue/quota/liveness observations ride only in
 //! the health half: selection/health input, never admission.
 //!
-//! Residual STITCH (issue #1108 A4): this adapter still builds the sealed
+//! Residual (issue #1108 A4/A5): this adapter still builds the sealed
 //! capability through `AdmittedProviderCapability::new` directly from
-//! operation-presented halves, so the agreement gate in
-//! `AdmittedProviderFactory::admit` never observes production material. The
-//! migration demands one input that no daemon seam returns today: the durable
-//! row as `OwnerLoadedClaimRow` from a Kernel/ORS claim read under the exact
-//! `claim_id`. `DaemonKernelClient::verify_provider_binding_async` returns no row
-//! (its receipt echoes presented values), and the ORS claim row carries no
-//! executable-digest column, so the row must not be rebuilt here from
-//! presented halves: that would make the factory gate tautological. Until the
-//! row-returning read lands, production Verified rests on the
-//! construction-time Binding probe plus the per-proof receipt/payload checks,
+//! operation-presented halves, so the resulting capability carries no
+//! factory-witnessed row and its owner digest/generation gates re-prove
+//! construction-time coherence, not a fresh row read. Migrating this call
+//! site to `AdmittedProviderFactory::admit` demands one input that no daemon
+//! seam returns today: the durable row as `OwnerLoadedClaimRow` from a
+//! Kernel/ORS claim read under the exact `claim_id`.
+//! `DaemonKernelClient::verify_provider_binding_async` returns no row (its
+//! receipt echoes presented values) by contract, and the row must not be
+//! rebuilt here from presented halves: that would make the factory agreement
+//! gate tautological. The missing pieces live outside this slice's files:
+//! a row-returning owner read on `DaemonKernelClient`, threading through
+//! `DaemonComposition::build_production_provider_capability`, and migration
+//! of the restore-time builder in `solo_agent_driver.rs`. Until they land,
+//! production Verified rests on the construction-time Binding probe plus the
+//! per-proof receipt/payload checks and the Kernel-side per-call row reads,
 //! not on factory agreement.
 
 use eliot_agent_coordinator::{

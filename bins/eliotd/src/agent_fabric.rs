@@ -71,7 +71,7 @@ use eliot_agent_coordinator::{
     StaffingPlanRequest, SwarmDefinitionAdmissionPrep, WorkClass,
 };
 #[cfg(test)]
-use eliot_agent_coordinator::{OwnerCurrentness, PresentedClaimMaterial};
+use eliot_agent_coordinator::{AdmittedProviderFactory, OwnerLoadedClaimRow};
 use eliot_contracts::{EpochId, StateFence, fences_match_exact};
 use eliot_kernel_service::ProviderCapabilityExpectation;
 use eliot_store_api::{StoreError, SwarmOwnerRevision, WriteReceipt, WriteReceiptStatus};
@@ -699,25 +699,40 @@ pub struct VerifiedProviderMaterial {
 /// values before calling this builder. External callers therefore cannot
 /// bypass the session-half overwrite with coherent caller-built halves.
 ///
-/// Wiring plus coherence: forwards the daemon-resolved
-/// [`VerifiedProviderMaterial`] halves into the presented/owner capability
-/// boundary, which fails closed on any presented-versus-owner disagreement
-/// (route/capacity revision, authority epoch, resource generation) or owner
-/// rejection (revoked, malformed, stale). The caller must supply a freshly
-/// re-queried live fence and the validated session binding per call: a
-/// blank binding (no live session) or a stale fence fails here, never at
-/// first effect. Currency is re-checked on every coordinator `verify` call,
-/// never cached.
+/// Closed factory path even under `cfg(test)`: the daemon-resolved
+/// [`VerifiedProviderMaterial`] halves travel through the coordinator's
+/// owner-witnessed
+/// [`AdmittedProviderFactory`](eliot_agent_coordinator::AdmittedProviderFactory),
+/// never through the half constructors directly. The mirrored owner row
+/// repeats the resolved material exactly as the daemon's ORS read projection
+/// would return it, so the agreement gate observes fixture values, never a
+/// second authority; the coherence gates downstream still judge the halves.
 ///
 /// # Errors
 ///
-/// Returns the coordinator owner rejection unchanged (shape, coherence, or
+/// Returns the coordinator owner rejection unchanged (shape, agreement, or
 /// stale/revoked binding).
 #[cfg(test)]
 pub(crate) fn build_admitted_provider_capability(
     material: VerifiedProviderMaterial,
 ) -> Result<AdmittedProviderCapability, FabricError> {
-    let presented = PresentedClaimMaterial::new(
+    let presented_fence_digest = eliot_contracts::sha256_hex(
+        &eliot_contracts::canonical_json_bytes(&material.presented_fence).map_err(|error| {
+            FabricError::Contract(format!("provider presented fence: {error}"))
+        })?,
+    );
+    let loaded = OwnerLoadedClaimRow::new(
+        material.claim_id.clone(),
+        material.attempt_id.clone(),
+        material.operation_id.clone(),
+        material.binding_digest.clone(),
+        material.executable_digest.clone(),
+        material.worker_generation,
+        presented_fence_digest,
+    )?;
+    let factory = AdmittedProviderFactory::new(loaded);
+    Ok(factory.admit(
+        material.identity,
         material.claim_id,
         material.attempt_id,
         material.operation_id,
@@ -727,12 +742,8 @@ pub(crate) fn build_admitted_provider_capability(
         material.capacity_revision,
         material.worker_generation,
         material.presented_fence,
-    )?;
-    let currentness = OwnerCurrentness::new(material.expectation, material.live_fence)?;
-    Ok(AdmittedProviderCapability::new(
-        material.identity,
-        presented,
-        currentness,
+        material.expectation,
+        material.live_fence,
         material.health,
         material.minimum_event_sequence,
     )?)
