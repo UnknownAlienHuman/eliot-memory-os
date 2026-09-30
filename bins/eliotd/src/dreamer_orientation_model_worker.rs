@@ -20,7 +20,8 @@ use eliot_dreamer_contracts::{
     PROVIDER_OUTPUT_SCHEMA_VERSION, RecipeInput, provider_output_schema_v2,
 };
 use eliot_protocol::dreamer_job::{
-    DurableJobError, DurableJobRuntimeOwnerExecutionInput, OpaqueContentRef,
+    DurableJobError, DurableJobRequest, DurableJobResponse, DurableJobRuntimeOwnerExecutionInput,
+    JobOperation, JobState, OpaqueContentRef,
 };
 use eliot_read::LocalReadPort;
 use eliot_receipts::WorkScopeBinding;
@@ -60,6 +61,14 @@ pub struct DreamerOrientationModelWorkerInput<'a, R: LocalReadPort> {
     pub runtime_owner_input_ref: &'a OpaqueContentRef,
     /// Exact original canonical bytes named by `runtime_owner_input_ref`.
     pub runtime_owner_input_bytes: &'a [u8],
+    /// Original K0 `LeaseNext` request which selected this worker's job.
+    pub durable_lease_request: &'a DurableJobRequest,
+    /// Original K0 response retaining the selected job and owner lease.
+    pub durable_lease_response: &'a DurableJobResponse,
+    /// Authenticated K0 `Start` request for the selected original lease.
+    pub durable_start_request: &'a DurableJobRequest,
+    /// Original Kernel K0 response acknowledging that start.
+    pub durable_start_response: &'a DurableJobResponse,
     pub catalogue: &'a ModelCatalogueSnapshot,
     pub policy: &'a HumanModelPreferencePolicy,
     pub now_unix_ms: u64,
@@ -115,6 +124,8 @@ pub enum DreamerOrientationModelWorkerError {
     RuntimeOwnerReference(DurableJobError),
     #[error("original admission or bundle content reference is invalid: {0}")]
     RuntimeOwnerSourceReference(DurableJobError),
+    #[error("original K0 claimed-job request/response does not retain this model input: {0}")]
+    DurableClaim(DurableJobError),
     #[error("original provider admission is absent from the runtime owner input")]
     ProviderAdmissionMissing,
     #[error(transparent)]
@@ -167,6 +178,7 @@ pub async fn execute_admitted_orientation_model(
     route_admission: &OpenCodeRouteAdmission,
     input: DreamerOrientationModelWorkerInput<'_, impl LocalReadPort>,
 ) -> Result<DreamerOrientationModelAttempt, DreamerOrientationModelWorkerError> {
+    validate_durable_claim(&input)?;
     validate_runtime_owner_publication(
         input.runtime_owner_input,
         input.runtime_owner_input_ref,
@@ -412,6 +424,78 @@ fn validate_runtime_owner_publication(
     runtime
         .validate()
         .map_err(DreamerOrientationModelWorkerError::SemanticReference)
+}
+
+fn validate_durable_claim<R: LocalReadPort>(
+    input: &DreamerOrientationModelWorkerInput<'_, R>,
+) -> Result<(), DreamerOrientationModelWorkerError> {
+    let lease_request = input.durable_lease_request;
+    let lease_response = input.durable_lease_response;
+    lease_response
+        .validate_for(lease_request)
+        .map_err(DreamerOrientationModelWorkerError::DurableClaim)?;
+    let selector = match &lease_request.operation {
+        JobOperation::LeaseNext { selector } => selector,
+        _ => {
+            return Err(DreamerOrientationModelWorkerError::RuntimeOwnerSourceBindingMismatch);
+        }
+    };
+    let selected_lease = lease_response
+        .lease
+        .as_ref()
+        .ok_or(DreamerOrientationModelWorkerError::RuntimeOwnerSourceBindingMismatch)?;
+    let runtime = input.runtime_owner_input;
+    if lease_request.role != eliot_protocol::dreamer_job::JobRole::Worker
+        || lease_response.state != JobState::Leased
+        || selector.worker_artifact_id != selected_lease.owner_artifact_id
+        || selector.expected_fence != *input.current_fence
+        || lease_response.scope != *input.work_scope
+        || lease_response.job_id != runtime.job_id
+        || lease_response.attempt_id != runtime.attempt_id
+        || lease_request.request_identity.request.request.metadata.session_id.as_deref()
+            != Some(input.work_lease_request.session_id.as_str())
+    {
+        return Err(DreamerOrientationModelWorkerError::RuntimeOwnerSourceBindingMismatch);
+    }
+
+    let request = input.durable_start_request;
+    let response = input.durable_start_response;
+    response
+        .validate_for(request)
+        .map_err(DreamerOrientationModelWorkerError::DurableClaim)?;
+    let (start_lease, started_at_unix_ms) = match &request.operation {
+        JobOperation::Start {
+            lease,
+            now_unix_ms,
+        } => (lease, now_unix_ms),
+        _ => {
+            return Err(DreamerOrientationModelWorkerError::RuntimeOwnerSourceBindingMismatch);
+        }
+    };
+    if *started_at_unix_ms != input.now_unix_ms
+        || start_lease.validate_active_at(input.now_unix_ms).is_err()
+        || response.state != JobState::Running
+        || response.lease.as_ref() != Some(start_lease)
+        || start_lease != selected_lease
+        || &start_lease.state_fence != input.current_fence
+        || &start_lease.resource_generation != &input.work_scope.resource_generation
+        || request.role != eliot_protocol::dreamer_job::JobRole::Worker
+        || response.runtime_owner_execution_input.as_ref() != Some(input.runtime_owner_input_ref)
+        || response.runtime_owner_execution_input_bytes.as_deref()
+            != Some(input.runtime_owner_input_bytes)
+        || response.semantic_input.as_ref() != Some(input.semantic_input_ref)
+        || response.semantic_input_bytes.as_deref() != Some(input.semantic_input_bytes)
+        || response.output_contract.as_ref() != Some(input.output_contract_ref)
+        || &response.scope != input.work_scope
+        || input.source_read_context.state_fence != response.scope.state_fence
+        || input.source_scope.as_str() != response.scope.scope_id.as_str()
+        || &response.request_identity != &request.request_identity
+        || request.request_identity.request.request.metadata.session_id.as_deref()
+            != Some(input.work_lease_request.session_id.as_str())
+    {
+        return Err(DreamerOrientationModelWorkerError::RuntimeOwnerSourceBindingMismatch);
+    }
+    Ok(())
 }
 
 fn decode_original_typed_publication<T>(
