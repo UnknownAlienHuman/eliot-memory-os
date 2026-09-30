@@ -629,6 +629,39 @@ pub fn compare_operation_with_store_read_model(
     compare_operation_in_catalogue(operation, &generated_manifests()?)
 }
 
+/// Resolves the validated binding of one local read port method.
+///
+/// This is the single resolution path a [`LocalReadPort`](crate::LocalReadPort)
+/// method uses to learn which operation, intent, consistency mode and Store
+/// selector names it dispatches. It is the narrow form of
+/// [`read_owner_inventory`]: it resolves the same declared row and checks it
+/// against the same Store declaration table and the same owner intent gate, but
+/// it does not build the aggregate inventory, so the read path does not pay for
+/// rows it never reads.
+///
+/// The port methods build their requests from the row this returns. They used to
+/// write the same operation, intent and consistency mode again as literals at the
+/// call site, which left two places stating the same decision: this table, which
+/// is checked against the Store catalogue, and a literal that was not. The
+/// literals are gone; the declared row is the only statement of them.
+///
+/// The resolution is a pure function of crate constants and the Store
+/// declaration tables. It holds no state, is never cached, and creates no
+/// freshness: a caller that cannot describe its own port does not answer.
+pub fn local_read_port_binding(
+    method: LocalReadPortMethod,
+) -> Result<LocalReadPortBinding, ReadError> {
+    let declaration = PORT_DECLARATIONS
+        .iter()
+        .find(|declaration| declaration.method == method)
+        .ok_or_else(|| ReadError::InvalidField {
+            field: "local_read_port.declaration".to_owned(),
+            reason: format!("no declared binding for port method {method:?}"),
+        })?;
+    let comparison = compare_operation_with_store_read_model(declaration.operation)?;
+    resolve_port_binding(declaration, std::slice::from_ref(&comparison))
+}
+
 /// Compares one named read against an already generated Store catalogue.
 fn compare_operation_in_catalogue(
     operation: NamedReadOperation,
@@ -697,10 +730,10 @@ struct PortDeclaration {
 ///
 /// This is the only hand-typed binding table in the package, and the read path
 /// consults it: each port method builds its request from the row it resolves
-/// rather than from a literal intent written at the call site. Every row is then
-/// checked against the Store declaration table and against this owner's own
-/// intent gate, so a declaration that stops matching its source is a typed
-/// error rather than a silently wrong request.
+/// through [`local_read_port_binding`] rather than from a literal intent written
+/// at the call site. Every row is then checked against the Store declaration
+/// table and against this owner's own intent gate, so a declaration that stops
+/// matching its source is a typed error rather than a silently wrong request.
 const PORT_DECLARATIONS: [PortDeclaration; 2] = [
     PortDeclaration {
         method: LocalReadPortMethod::EvidenceQuery,
@@ -883,6 +916,11 @@ const PUBLIC_ITEM_DECLARATIONS: &[PublicTypeDeclaration] = &[
     },
     PublicTypeDeclaration {
         name: "compare_operation_with_store_read_model",
+        kind: PublicApiKind::ContractFunction,
+        witness: None,
+    },
+    PublicTypeDeclaration {
+        name: "local_read_port_binding",
         kind: PublicApiKind::ContractFunction,
         witness: None,
     },
