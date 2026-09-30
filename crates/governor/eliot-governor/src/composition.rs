@@ -9738,7 +9738,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .execute_named(request)
             .await
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-        let evidence = decode_revocation_history_evidence(&response, state_fence)?;
+        let evidence = decode_revocation_history_evidence(&response, state_fence, origin_ref)?;
         AuthorityOwner::from_snapshot_with_revocation_history(
             snapshot,
             state_fence,

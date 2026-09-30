@@ -627,9 +627,22 @@ pub fn revocation_history_read_request(
 /// field-for-field: filling a newer evidence shape from these rows would
 /// fail to compile, never silently upgrade. A v1 payload carries no
 /// producer coordinates and is refused at parse, never reinterpreted.
+///
+/// `expected_origin_ref` is the exact `origin_ref` selector the read was
+/// issued for (see [`revocation_history_read_request`]), and the served
+/// payload must echo it back. The echoed selector is the ONLY thing that
+/// names the origin of an EMPTY closure set, and an empty set at a nonzero
+/// `source_revision` is a positive attestation of zero recorded
+/// revocations; without this comparison a view served for another origin
+/// decodes as this origin's attestation and reads as proof that nothing was
+/// revoked. Per-closure `root_ref`/`owner_namespace` comparisons cannot
+/// cover that case, because a wrong-origin empty view carries no closure
+/// to compare. The selector is therefore bound here, at the one adapter
+/// that materializes the view, rather than at each downstream consumer.
 pub fn decode_revocation_history_evidence(
     response: &NamedReadResponse,
     expected_fence: &eliot_contracts::StateFence,
+    expected_origin_ref: &str,
 ) -> Result<RevocationHistoryEvidence, CompositionError> {
     if response.operation != NamedReadOperation::GetAuthorityRevocationHistory {
         return Err(owner_refused(
@@ -647,6 +660,11 @@ pub fn decode_revocation_history_evidence(
     let payload = parse_revocation_history_payload(&response.payload).map_err(|error| {
         owner_refused(format!("revocation history payload is malformed: {error}"))
     })?;
+    if payload.origin_ref != expected_origin_ref {
+        return Err(identity_refused(
+            "revocation history view was served for a different origin".to_owned(),
+        ));
+    }
     let mut closures = Vec::with_capacity(payload.closures.len());
     for row in payload.closures {
         // The admitted bounds are the bounds the evidence declared: mapped
@@ -1275,7 +1293,8 @@ mod authority_revocation_tests {
     fn decode_history_then_restore_suppresses_origin_and_child() {
         let fence = fence();
         let evidence =
-            decode_revocation_history_evidence(&history_response(&fence), &fence).expect("decode");
+            decode_revocation_history_evidence(&history_response(&fence), &fence, "root:alpha")
+                .expect("decode");
         assert_eq!(evidence.source_revision, 9);
         assert_eq!(evidence.closures.len(), 1);
         let snapshot = owner_snapshot(&fence);
@@ -1304,7 +1323,9 @@ mod authority_revocation_tests {
         let fence = fence();
         let mut wrong_operation = history_response(&fence);
         wrong_operation.operation = NamedReadOperation::GetEvidencePack;
-        assert!(decode_revocation_history_evidence(&wrong_operation, &fence).is_err());
+        assert!(
+            decode_revocation_history_evidence(&wrong_operation, &fence, "root:alpha").is_err()
+        );
         let other_fence = StateFence::new(
             EpochId::new(
                 EpochLineageId::new(TEST_LINEAGE_A).expect("lineage"),
@@ -1314,11 +1335,16 @@ mod authority_revocation_tests {
             ResourceGeneration::new(1).expect("generation"),
         );
         assert!(
-            decode_revocation_history_evidence(&history_response(&fence), &other_fence).is_err()
+            decode_revocation_history_evidence(
+                &history_response(&fence),
+                &other_fence,
+                "root:alpha"
+            )
+            .is_err()
         );
         let mut bad_version = history_response(&fence);
         bad_version.payload["version"] = serde_json::json!(999);
-        assert!(decode_revocation_history_evidence(&bad_version, &fence).is_err());
+        assert!(decode_revocation_history_evidence(&bad_version, &fence, "root:alpha").is_err());
     }
 
     #[test]
@@ -1336,7 +1362,8 @@ mod authority_revocation_tests {
             "missing history blocks restoration"
         );
         let evidence =
-            decode_revocation_history_evidence(&history_response(&fence), &fence).expect("decode");
+            decode_revocation_history_evidence(&history_response(&fence), &fence, "root:alpha")
+                .expect("decode");
         let other_fence = StateFence::new(
             EpochId::new(
                 EpochLineageId::new(TEST_LINEAGE_A).expect("lineage"),
