@@ -67,9 +67,14 @@
 //!   W4/A2): [`admit_canonical_write`] preceded by
 //!   [`bind_current_task_selection`], so a structurally valid receipt that
 //!   disagrees with the live activation fails closed before any admission.
-//!   Designated caller
-//!   [`DaemonComposition::commit_canonical_and_refresh`](super::DaemonComposition);
-//!   STITCH until the activation lane retains the snapshot to pass.
+//!   Live caller
+//!   [`DaemonComposition::commit_canonical_and_refresh`](super::DaemonComposition),
+//!   for task-relative envelopes only (see [`envelope_is_task_relative`]): the
+//!   snapshot is resolved from the presented readiness lease through the
+//!   Governor owner (`GovernorComposition::current_task_selection`), never
+//!   from the request. Captures and non-task-relative writes stay on the
+//!   receipt-only [`admit_canonical_write`] leg so permitted raw capture
+//!   remains cold without a retained terminal.
 //! - [`require_material_bootstrap_for_task_bound`] — the W5/A4 join
 //!   (issue #1746): a sealed [`DispatchedBinding`] proceeds toward the #1742
 //!   Material gate only on a `Material` [`BootstrapAdmission`] naming the
@@ -92,6 +97,14 @@
 //!   [`DaemonComposition::commit_canonical_and_refresh`](super::DaemonComposition).
 //!   An earlier revision of this file recorded *zero* call sites for it; that
 //!   was false and is corrected here.
+//! - [`admit_canonical_write_with_activation`] has **one** caller: the same
+//!   [`DaemonComposition::commit_canonical_and_refresh`](super::DaemonComposition),
+//!   on its task-relative leg only (see [`envelope_is_task_relative`]). The
+//!   snapshot it passes is resolved from the presented readiness lease through
+//!   the Governor owner (`GovernorComposition::current_task_selection`), never
+//!   from the request; captures and non-task-relative writes stay on the
+//!   receipt-only [`admit_canonical_write`] leg, so the cold path never needs
+//!   a retained terminal.
 //! - `DaemonComposition::commit_canonical_and_refresh` itself has **zero**
 //!   production call sites — its only in-tree mentions are documentation and a
 //!   source-string assertion in `bins/eliotd/tests/agent_fabric_wiring.rs`. It
@@ -859,6 +872,29 @@ pub fn requirement_for_named_mutation(
         }
         _ => CanonicalOperationRequirement::DiscoveryReadOnly,
     }
+}
+
+/// Whether one canonical write envelope is task-relative (issue #1746, W4).
+///
+/// Single definition of the capture/task-relative split predicate behind
+/// [`admit_canonical_write`]: a write that names a task, or that carries a
+/// task-relative/effectful named mutation
+/// ([`requirement_for_named_mutation`]), needs the live activation recheck
+/// ([`admit_canonical_write_with_activation`]); anything else stays on the
+/// receipt-only cold/non-task-relative legs, so permitted raw capture remains
+/// cold without a retained terminal. Consulted by [`admit_canonical_write`]
+/// and by the dispatch effect gate in
+/// [`DaemonComposition::commit_canonical_and_refresh`](super::DaemonComposition).
+#[must_use]
+pub fn envelope_is_task_relative(envelope: &CanonicalWriteEnvelope) -> bool {
+    envelope.task_id.is_some()
+        || envelope
+            .semantic_commands
+            .iter()
+            .any(|command| {
+                requirement_for_named_mutation(command.operation)
+                    == CanonicalOperationRequirement::TaskRelativeEffectful
+            })
 }
 
 /// Daemon dispatch entrypoint presenting one admission attempt
@@ -2291,8 +2327,9 @@ pub fn admit_canonical_write(
             .any(|command| requirement_for_named_mutation(command.operation) == requirement)
     };
     let captures = carries_requirement(CanonicalOperationRequirement::SafeRawCapture);
-    let task_relative = envelope.task_id.is_some()
-        || carries_requirement(CanonicalOperationRequirement::TaskRelativeEffectful);
+    // Issue #1746, W4: the same frozen split the dispatch effect gate consults
+    // through `envelope_is_task_relative`, so gating cannot drift from it.
+    let task_relative = envelope_is_task_relative(envelope);
     // Issue #1746, W4: Absent stays absent and Ambiguous keeps its bounded
     // eligible handles through the single typed response constructor.
     // A task-free capture remains cold and unrelated non-task writes need
@@ -2454,13 +2491,14 @@ pub fn admit_canonical_write(
 /// alone. No task is created to remove an absence, none is chosen from
 /// ambiguity, and no cold capture is retroactively attached.
 ///
-/// Designated caller (STITCH, daemon composition lane):
+/// Live caller (daemon composition lane):
 /// [`DaemonComposition::commit_canonical_and_refresh`](super::DaemonComposition),
-/// passing the activation snapshot the activation lane resolved for this
-/// session at the write fence. Until that lane retains the snapshot, no live
-/// caller supplies `activation` and this entry stays wired but unreached; the
-/// fence-leg revalidation behind it ([`revalidate_task_bound_for_effect`]) is
-/// the live leg.
+/// for task-relative envelopes (see [`envelope_is_task_relative`]): it
+/// resolves the snapshot from the presented readiness lease through
+/// `GovernorComposition::current_task_selection` and passes it here at the
+/// write fence. Captures and non-task-relative writes stay on the
+/// receipt-only [`admit_canonical_write`] leg, so the cold path never needs a
+/// retained terminal.
 pub fn admit_canonical_write_with_activation(
     candidate_id: String,
     context: &RequestMetadata,

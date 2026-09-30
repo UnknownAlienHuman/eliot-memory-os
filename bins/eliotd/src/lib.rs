@@ -1137,13 +1137,51 @@ impl DaemonComposition {
             eliot_workscope::RequestedEffect::CanonicalWrite,
         )
         .map_err(|error| DaemonError::Composition(CompositionError::Recovery(error.to_string())))?;
-        let admission = crate::task_binding_admission::admit_canonical_write(
-            envelope.operation_id.as_str().to_owned(),
-            &identity.request.metadata,
-            &envelope,
-            readiness.receipt,
-            readiness.fence,
-        )?;
+        let admission = if crate::task_binding_admission::envelope_is_task_relative(&envelope)
+        {
+            // Issue #1746 (W4/A2): a task-relative write is admitted only
+            // against the live Governor-resolved activation, never on the
+            // caller-presented receipt alone. The lease key terms come from
+            // the presented readiness lease, but the snapshot comes from the
+            // Governor owner (`current_task_selection` reads the RETAINED
+            // terminal for that key and joins it to the unique live
+            // activation: principal, session, task, revision, and `WorkScope`
+            // at the live fence), so a structurally valid receipt naming
+            // another task, a moved revision/digest, another scope, or
+            // another fence fails closed with `TASK_SCOPE_INCOMPATIBLE`
+            // before any admission runs. Absent/ambiguous/exploratory/stale
+            // selections fall through to the cold candidate, the bounded
+            // intake answer, or the typed error inside; no task is created,
+            // none is chosen, and no cold capture is retroactively attached.
+            // A write with no retained terminal for its lease key fails
+            // closed here: re-resolve through the owner onboarding route.
+            // Captures and non-task-relative writes stay on the receipt-only
+            // leg below so permitted raw capture remains cold (issue #1746,
+            // A3) without a retained terminal.
+            let (activation, _) = self.governor.current_task_selection(
+                readiness.now,
+                readiness.lease.lineage_candidate_ref.as_str(),
+                readiness.lease.workspace_instance_candidate_ref.as_str(),
+                readiness.lease.privacy_class.clone(),
+                readiness.lease.governing_source_generation,
+            )?;
+            crate::task_binding_admission::admit_canonical_write_with_activation(
+                envelope.operation_id.as_str().to_owned(),
+                &identity.request.metadata,
+                &envelope,
+                readiness.receipt,
+                readiness.fence,
+                activation.as_ref(),
+            )?
+        } else {
+            crate::task_binding_admission::admit_canonical_write(
+                envelope.operation_id.as_str().to_owned(),
+                &identity.request.metadata,
+                &envelope,
+                readiness.receipt,
+                readiness.fence,
+            )?
+        };
         // Issue #1929: the durable retention of a cold unbound capture is NOT
         // this log line, and not this daemon. `ColdUnbound` here records only
         // the admission decision. The retention owner is the store, which
