@@ -243,7 +243,7 @@ pub struct AdmittedAttemptOutcome {
     pub route: SealedRouteDisposition,
 }
 
-/// Error from projecting one retained admitted OpenCode outcome into the
+/// Error from projecting one retained admitted `OpenCode` outcome into the
 /// provider-neutral candidate intake contract. Receipt-free route outcomes
 /// remain typed here so callers can retain and report the original candidate
 /// and its raw provider evidence without collapsing it into a generic failure.
@@ -252,13 +252,15 @@ pub enum AdmittedOutcomeProjectionError {
     #[error(transparent)]
     Owner(#[from] AdmittedAttemptError),
     #[error("sealed route disposition has no validated physical receipt")]
-    RouteDispositionUnavailable { disposition: SealedRouteDisposition },
+    RouteDispositionUnavailable {
+        disposition: Box<SealedRouteDisposition>,
+    },
 }
 
 impl AdmittedAttemptOutcome {
-    /// Projects the already sealed OpenCode observation into the provider-neutral
+    /// Projects the already sealed `OpenCode` observation into the provider-neutral
     /// candidate intake contract. The original outcome remains the canonical
-    /// OpenCode artifact; this projection carries only its validated route and
+    /// `OpenCode` artifact; this projection carries only its validated route and
     /// usage receipt plus a digest reference to the exact candidate.
     ///
     /// The owner admission, execution binding, live fence/generation, sealed
@@ -281,7 +283,7 @@ impl AdmittedAttemptOutcome {
 
         let actual_route = self.route.receipt().ok_or_else(|| {
             AdmittedOutcomeProjectionError::RouteDispositionUnavailable {
-                disposition: self.route.clone(),
+                disposition: Box::new(self.route.clone()),
             }
         })?;
         let disposition = if self.route.is_observed() {
@@ -289,16 +291,21 @@ impl AdmittedAttemptOutcome {
         } else {
             ResultDisposition::UnknownOutcome
         };
-        let unknown_reason = (disposition == ResultDisposition::UnknownOutcome).then(|| {
-            format!("OpenCode route disposition is {}", self.route.cause_code())
-        });
+        let unknown_reason = (disposition == ResultDisposition::UnknownOutcome)
+            .then(|| format!("OpenCode route disposition is {}", self.route.cause_code()));
         let result = AgentResult {
             attempt_id: admitted.binding().attempt_id.clone(),
             disposition,
             artifacts: Vec::new(),
             evidence_refs: vec![
-                format!("opencode-candidate:{}", self.candidate.result_digest.as_str()),
-                format!("opencode-route-receipt:{}", actual_route.self_digest.as_str()),
+                format!(
+                    "opencode-candidate:{}",
+                    self.candidate.result_digest.as_str()
+                ),
+                format!(
+                    "opencode-route-receipt:{}",
+                    actual_route.self_digest.as_str()
+                ),
             ],
             proposed_effects: Vec::new(),
             unresolved_questions: Vec::new(),
