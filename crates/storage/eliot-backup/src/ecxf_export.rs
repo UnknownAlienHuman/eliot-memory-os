@@ -106,11 +106,11 @@ use std::path::{Path, PathBuf};
 
 use eliot_blob_api::BlobReadyReceipt;
 use eliot_security_contracts::PurgeLedgerEntry;
-pub use eliot_store_api::{EcxfExportReport, EcxfExportRequest};
 use eliot_store_api::{
     CanonicalEvent, OrderingHead, OrderingScopeId, RevisionHead, RevisionKey, ScopeId,
     ScopeRevisionView, SnapshotCompleteness, WriteReceipt,
 };
+pub use eliot_store_api::{EcxfExportReport, EcxfExportRequest};
 use serde::{Deserialize, Serialize};
 
 use super::{BackupError, CanonicalRecord, EventRange, bytes_sha256, digest, text};
