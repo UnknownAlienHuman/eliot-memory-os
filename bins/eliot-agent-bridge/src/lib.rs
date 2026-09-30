@@ -5812,9 +5812,7 @@ impl BridgeRunner {
     ) -> Result<ToolExposureHistoryEntry, BridgeError> {
         entry
             .record_transport_completed(delivered, source_ref)
-            .map_err(|error| {
-                Self::map_exposure_history_error(error, "history.transport_completed")
-            })
+            .map_err(|error| Self::map_exposure_history_error(error, "history.transport_completed"))
     }
     /// Populates the `result_delivery` stage of an exposure-history entry from
     /// this bridge's delivery-projection owner (I7.24).
