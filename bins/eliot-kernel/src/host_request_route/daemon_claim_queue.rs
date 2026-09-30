@@ -463,6 +463,84 @@ impl KernelComposition {
         Ok(None)
     }
 
+    /// Reads the exact live Task Controller owner record for a previously
+    /// claimed attempt without claiming, refreshing, or advancing it. The
+    /// presented attempt is only a selector; it must equal the capability
+    /// reconstructed from the current Kernel queue row and remain owned by
+    /// this authenticated session.
+    pub(crate) fn task_controller_attempt_owner(
+        &self,
+        session: &Session,
+        presented: &TaskControllerAttempt,
+    ) -> Result<Option<(HostRequestEnvelope, TaskControllerInvocation)>, TransportError> {
+        presented
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let _transition = self.agent_bridge_transition_read()?;
+        let admission_owner = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let index = self
+            .host_request_connection_index
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let now = unix_ms();
+        for candidate in index.values().flatten() {
+            let (Some(envelope), Some(tool)) = (
+                candidate.task_controller_envelope.as_ref(),
+                candidate.task_controller_tool.as_ref(),
+            ) else {
+                continue;
+            };
+            if activation_deadline_expired(now, envelope.identity.deadline_unix_ms)
+                || !candidate.task_controller_attempt.is_owned_by(session)
+                || !self.application_binding_live_for_claim(envelope, &admission_owner, true)?
+            {
+                continue;
+            }
+            let task_id = envelope
+                .identity
+                .task_id
+                .as_deref()
+                .and_then(|value| value.parse().ok())
+                .ok_or(TransportError::SessionFenced)?;
+            let scope_id = envelope
+                .identity
+                .work_scope_id
+                .as_deref()
+                .ok_or(TransportError::SessionFenced)?;
+            let session_id = envelope
+                .identity
+                .session_id
+                .as_deref()
+                .ok_or(TransportError::SessionFenced)?;
+            let current = TaskControllerAttempt {
+                wire_id: eliot_protocol::TASK_CONTROLLER_ATTEMPT_WIRE_ID.to_owned(),
+                wire_version: eliot_protocol::TASK_CONTROLLER_ATTEMPT_WIRE_VERSION,
+                operation_id: candidate.operation_id.clone(),
+                attempt_id: candidate.task_controller_attempt.attempt_id.clone(),
+                fencing_generation: candidate.task_controller_attempt.generation,
+                session_id: session_id.to_owned(),
+                authority_epoch: envelope.state_fence.authority_epoch.clone(),
+                scope_id: scope_id.to_owned(),
+                expires_at_unix_ms: envelope.identity.deadline_unix_ms,
+                use_budget: 1,
+                task_id,
+                state_fence: envelope.state_fence.clone(),
+            };
+            if &current != presented {
+                continue;
+            }
+            current
+                .validate()
+                .map_err(|_| TransportError::SessionFenced)?;
+            let invocation = task_controller_admission(envelope, tool)?;
+            return Ok(Some((envelope.clone(), invocation)));
+        }
+        Ok(None)
+    }
+
     pub(super) fn enqueue_finish_pair_under_transition(
         &self,
         envelope: &HostRequestEnvelope,

@@ -633,6 +633,9 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "campaign_packet_result" => "campaign_packet_result",
         "task_controller_claim" => "task_controller_claim",
         "task_controller_result" => "task_controller_result",
+        super::native_worker_execution_admission_read::NATIVE_WORKER_EXECUTION_ADMISSION_READ_OPERATION => {
+            super::native_worker_execution_admission_read::NATIVE_WORKER_EXECUTION_ADMISSION_READ_OPERATION
+        }
         "finish_claim" => "finish_claim",
         "finish_result" => "finish_result",
         "agent_host_request_submit" => "agent_host_request_submit",
@@ -3702,9 +3705,15 @@ impl KernelComposition {
                     if payload.as_object().is_none_or(|object| object.len() != 1) {
                         return Err(TransportError::SessionFenced);
                     }
-                    self.claim_task_controller_pair(session)
-                        .map(|pair| match pair {
-                            Some((envelope, tool, invocation, attempt)) => serde_json::json!({
+                    match self.claim_task_controller_pair(session)? {
+                        Some((envelope, tool, invocation, attempt)) => {
+                            let native_worker_claim_id = self
+                                .verified_native_worker_claim_id_for_task_controller_claim(
+                                    session,
+                                    &invocation,
+                                    &attempt,
+                                )?;
+                            Ok(serde_json::json!({
                                 "status": "known",
                                 "value": {
                                     "pair": {
@@ -3713,16 +3722,38 @@ impl KernelComposition {
                                         "tool": tool,
                                         "operation_id": attempt.operation_id,
                                         "attempt": attempt,
+                                        "native_worker_claim_id": native_worker_claim_id,
                                     }
                                 },
                                 "recovery": null,
-                            }),
-                            None => serde_json::json!({
-                                "status": "known",
-                                "value": { "pair": null },
-                                "recovery": null,
-                            }),
-                        })
+                            }))
+                        }
+                        None => Ok(serde_json::json!({
+                            "status": "known",
+                            "value": { "pair": null },
+                            "recovery": null,
+                        })),
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            super::native_worker_execution_admission_read::NATIVE_WORKER_EXECUTION_ADMISSION_READ_OPERATION => {
+                #[cfg(windows)]
+                {
+                    let request: eliot_kernel_service::NativeWorkerExecutionAdmissionReadRequest =
+                        serde_json::from_value(without_daemon_routing_key(payload.clone())?)
+                            .map_err(|_| TransportError::SessionFenced)?;
+                    let response =
+                        self.read_native_worker_execution_admission(session, &request)?;
+                    Ok(serde_json::json!({
+                        "status": "known",
+                        "value": response,
+                        "recovery": null,
+                    }))
                 }
                 #[cfg(not(windows))]
                 {
