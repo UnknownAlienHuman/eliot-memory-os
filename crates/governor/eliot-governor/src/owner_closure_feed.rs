@@ -301,7 +301,7 @@ pub async fn synchronize_owner_feed_with_quarantine_evidence<
             .execute_named(request)
             .await
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-        let evidence = decode_revocation_history_evidence(&response, state_fence)?;
+        let evidence = decode_revocation_history_evidence(&response, state_fence, origin_ref)?;
         if evidence.source_revision != expected_revision {
             return Err(CompositionError::Recovery(format!(
                 "owner feed observed revision {} disagrees with expected {expected_revision}; trigger is stale",
