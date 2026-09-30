@@ -34,9 +34,14 @@
 //!
 //! Carriers only: nothing here changes wire payloads, canonical write
 //! semantics, finish semantics, or host UI expectations. Structured events
-//! carry identifiers, digests, stages, counts, and outcome classes; they never
-//! carry tool payloads, host secrets, or private conversation content, per
-//! `docs/integrations/claude/CLAUDE_INTEGRATION_SECURITY.md`.
+//! carry identifiers, digests, stages, counts, closed reason codes and bounded
+//! closed class names; they never carry tool arguments, response bodies,
+//! conversation content, credentials, host secrets, or free-form prose on
+//! either ELIOT or host side, per issue #2899 item 12 and
+//! `docs/integrations/claude/CLAUDE_INTEGRATION_SECURITY.md`. A recovery order
+//! is therefore a TYPED, BOUNDED value ([`RecoveryDirective`]) rather than a
+//! formatted sentence, and a degradation names its correlation by digest
+//! rather than by interpolated caller text.
 
 use serde::{Deserialize, Serialize};
 
@@ -836,9 +841,24 @@ impl CanonicalDisposition {
         }
     }
 
-    /// Whether read-only status/reconciliation must precede any replay.
-    pub const fn needs_reconciliation_first(&self) -> bool {
-        matches!(self, Self::PossibleCommit | Self::Unknown)
+    /// The closed canonical recovery class this disposition always derives.
+    ///
+    /// A total function of the disposition alone, so the canonical half of a
+    /// recovery order is fixed by canonical evidence before any host or route
+    /// cause is read, and the five dispositions named by issue #2899 A7 each
+    /// receive a distinct class. Host completion never moves this value and a
+    /// route fault never does either: it is derived once, from the owner's own
+    /// canonical references, and is only ever read afterwards.
+    pub const fn recovery_class(&self) -> CanonicalRecoveryClass {
+        match self {
+            Self::ReadOnly => CanonicalRecoveryClass::NoMutation,
+            Self::FailedBeforeStage => CanonicalRecoveryClass::NoMutatingStageStaged,
+            Self::PossibleCommit | Self::Unknown => {
+                CanonicalRecoveryClass::ReconcileBeforeReplay
+            }
+            Self::CommittedWithReadback => CanonicalRecoveryClass::SettledDoNotReplay,
+            Self::RolledBack => CanonicalRecoveryClass::ReplayUnderSameIdentity,
+        }
     }
 
     /// Derives the disposition provable from facade evidence alone.
@@ -960,13 +980,22 @@ impl CorrelationAssessmentState {
 /// "emitted-but-unobserved" code: a healthy emission with absent host
 /// telemetry is pending coverage, not degradation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RouteDegradation {
     /// Machine-readable degradation class.
     pub code: RouteDegradationCode,
     /// Latest ELIOT-side stage actually reached.
     pub last_observed_stage: CorrelationStage,
-    /// Human-readable detail bound to the correlation record, not a verdict.
-    pub detail: String,
+    /// Digest of the correlation this degradation was derived for.
+    ///
+    /// The record identifies its correlation by digest rather than by a
+    /// formatted sentence. The previous free-text detail interpolated the
+    /// caller-supplied MCP request id into a prose string, which put unbounded
+    /// caller-controlled text inside a structured correlation record; issue
+    /// #2899 W12.2 admits only identifiers, digests, stages, counts and closed
+    /// reason codes, and the digest is the exact join key the owner already
+    /// records.
+    pub correlation_digest: String,
 }
 
 /// Machine-readable route degradation classes.
@@ -992,19 +1021,198 @@ impl RouteDegradationCode {
     }
 }
 
+/// Maximum actions one derived recovery order may carry.
+///
+/// The order is bounded by construction and by type: it is the concatenation of
+/// at most one canonical-segment action, at most one route-segment action and
+/// the terminal bounded escalation, so no emission can grow a list. The bound
+/// is also re-proved on every deserialized order, which fails closed rather
+/// than truncating a historical record.
+pub const MAX_RECOVERY_ACTIONS: usize = 3;
+
+/// Bounded, ordered recovery sequence: canonical segment first, then route
+/// segment, then bounded escalation (issue #2899 W10.8).
+///
+/// It is deliberately not an open list. A per-emission common list is exactly
+/// the shape W10.8 rejects: it cannot say which disposition produced the
+/// sequence, and nothing stops it from growing without limit. Here the order
+/// carries the two closed typed segments it was derived from plus a fixed
+/// ceiling on its length, and the sequence is a total function of those two
+/// values.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct RecoveryActions(Vec<RecoveryAction>);
+
+impl RecoveryActions {
+    /// Builds the bounded sequence, failing closed past the stated ceiling.
+    fn bounded(actions: Vec<RecoveryAction>) -> Result<Self, RecoveryOrderError> {
+        if actions.len() > MAX_RECOVERY_ACTIONS {
+            return Err(RecoveryOrderError::OrderTooLong {
+                offered: actions.len(),
+                bound: MAX_RECOVERY_ACTIONS,
+            });
+        }
+        Ok(Self(actions))
+    }
+
+    /// The ordered actions, canonical segment first.
+    pub fn as_slice(&self) -> &[RecoveryAction] {
+        &self.0
+    }
+}
+
+/// Why a recovery order was refused.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoveryOrderError {
+    /// More actions were offered than [`MAX_RECOVERY_ACTIONS`] permits.
+    OrderTooLong {
+        /// Actions the derivation offered.
+        offered: usize,
+        /// Stated bound the order may not exceed.
+        bound: usize,
+    },
+}
+
+impl std::fmt::Display for RecoveryOrderError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OrderTooLong { offered, bound } => write!(
+                formatter,
+                "recovery order carries {offered} actions; the bound is {bound}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RecoveryOrderError {}
+
+impl<'de> Deserialize<'de> for RecoveryActions {
+    /// Re-proves the bound on the way IN, exactly as it is proved on the way
+    /// out. An over-long historical order is refused rather than silently
+    /// shortened, so a record is never edited by being read.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let offered = Vec::<RecoveryAction>::deserialize(deserializer)?;
+        Self::bounded(offered).map_err(<D::Error as serde::de::Error>::custom)
+    }
+}
+
+/// Closed typed canonical segment of one recovery order (issue #2899 A7).
+///
+/// A total function of [`CanonicalDisposition`] alone, so the canonical half of
+/// the sequence is fixed by canonical evidence before any host or route cause
+/// is consulted. I14.21:
+/// ```text
+/// if committed  -> reconcile ORS;
+/// if known rollback -> retry under same identity;
+/// if unknown    -> pause, preserve the operation, open Problem State;
+///                  no blind duplicate effect.
+/// ```
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CanonicalRecoveryClass {
+    /// The request performs no mutation: nothing to reconcile and nothing to
+    /// replay. Distinct from [`Self::NoMutatingStageStaged`] because a read and
+    /// a mutation that never started are different facts about the operation.
+    NoMutation,
+    /// No mutating stage ever executed: the invocation failed before the
+    /// operation could begin, so no mutation reconciliation applies.
+    NoMutatingStageStaged,
+    /// A mutation may have committed with an unresolved result: read-only
+    /// reconciliation must precede any replay.
+    ReconcileBeforeReplay,
+    /// Canonical truth is settled by a current receipt plus exact readback, so
+    /// replay would duplicate a committed effect.
+    SettledDoNotReplay,
+    /// The operation provably rolled back, so same-identity replay is lawful —
+    /// and only under an owner-minted binding.
+    ReplayUnderSameIdentity,
+}
+
+impl CanonicalRecoveryClass {
+    /// Stable wire name for structured events.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoMutation => "no_mutation",
+            Self::NoMutatingStageStaged => "no_mutating_stage_staged",
+            Self::ReconcileBeforeReplay => "reconcile_before_replay",
+            Self::SettledDoNotReplay => "settled_do_not_replay",
+            Self::ReplayUnderSameIdentity => "replay_under_same_identity",
+        }
+    }
+}
+
+/// Closed typed route segment of one recovery order.
+///
+/// Chosen by the observed CAUSE alone and independent of the canonical
+/// disposition, so a route fault can never be read as a canonical statement and
+/// a canonical statement can never be read as a route fault (issue #2899
+/// item 11).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteRecoveryClass {
+    /// The cause prescribes no host-facing route action: the invocation is
+    /// healthy, coverage is pending, or the failure is an ELIOT-side local fact.
+    NoRouteAction,
+    /// Transport loss was proven after the frame reached the pipe, so the route
+    /// process itself may be re-established.
+    ReestablishRoute,
+    /// A complete observed interval passed the admitted deadline with no host
+    /// terminal state.
+    RefreshAfterDeadline,
+    /// The host completed the invocation while the Desktop view is confirmed
+    /// stale.
+    RefreshStaleDesktopView,
+}
+
+impl RouteRecoveryClass {
+    /// Stable wire name for structured events.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoRouteAction => "no_route_action",
+            Self::ReestablishRoute => "reestablish_route",
+            Self::RefreshAfterDeadline => "refresh_after_deadline",
+            Self::RefreshStaleDesktopView => "refresh_stale_desktop_view",
+        }
+    }
+}
+
 /// Usable recovery directive accompanying a route assessment.
+///
+/// It is a TYPED, BOUNDED order rather than a common list: the two closed
+/// segments it was derived from are carried on the record, and the action
+/// sequence is their bounded concatenation. The canonical segment is a total
+/// function of the canonical disposition, so `ReadOnly`,
+/// `FailedBeforeStage`, `PossibleCommit`, `CommittedWithReadback` and
+/// `RolledBack` each receive a distinct canonical class instead of collapsing
+/// into one shared list (issue #2899 W10.8, A7).
+///
+/// Nothing on this record is prose: it carries two closed classes, a bounded
+/// list of closed action codes, and the correlation identity digest. It carries
+/// no tool argument, no response body, no conversation content, no credential
+/// and no host-controlled text (issue #2899 W12.2).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecoveryDirective {
-    /// Ordered recovery actions; later actions apply if earlier ones fail.
-    pub actions: Vec<RecoveryAction>,
-    /// Which correlation evidence to attach when escalating.
-    pub evidence_hint: String,
+    /// Canonical segment: fixed by canonical evidence alone.
+    pub canonical: CanonicalRecoveryClass,
+    /// Route segment: fixed by the observed cause alone.
+    pub route: RouteRecoveryClass,
+    /// Correlation identity digest this order is bound to.
+    pub identity_digest: String,
+    /// Bounded ordered actions; the canonical segment always leads, and later
+    /// actions apply only if earlier ones fail.
+    pub actions: RecoveryActions,
 }
 
 impl RecoveryDirective {
     /// Comma-joined stable action names for structured events.
+    #[must_use]
     pub fn action_names(&self) -> String {
         self.actions
+            .as_slice()
             .iter()
             .map(|action| action.as_str())
             .collect::<Vec<_>>()
@@ -1016,7 +1224,13 @@ impl RecoveryDirective {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryAction {
-    /// Restart the stdio route process and replay by operation identity.
+    /// Re-establish the stdio route process after proven transport loss.
+    ///
+    /// Reconnecting is NOT replaying: it issues no new invocation effect and
+    /// mints no identity. Same-operation replay is a separate action that only
+    /// the canonical segment can contribute, and only for a provable rollback
+    /// under an owner-minted binding — so this action can never carry a
+    /// duplicate effect (I14.21: "no blind duplicate effect").
     ReconnectStdioRoute,
     /// Refresh the Desktop view; ELIOT-side state is already terminal.
     RefreshDesktopView,
@@ -1238,7 +1452,10 @@ fn assess_host_error(inputs: &AssessmentInputs<'_>, evidence: AssessmentEvidence
 /// Builds the degradation record for a competent fault state.
 ///
 /// Called only with fault codes proven by host evidence; there is no
-/// emitted-but-unobserved code to construct.
+/// emitted-but-unobserved code to construct. The record names its correlation
+/// by digest, never by a formatted sentence: a prose field here would put
+/// caller-controlled text inside a structured correlation record (issue #2899
+/// W12.2).
 fn degradation_for(
     emission: &EliotEmissionObservation,
     code: RouteDegradationCode,
@@ -1246,54 +1463,49 @@ fn degradation_for(
     RouteDegradation {
         code,
         last_observed_stage: emission.stage,
-        detail: format!(
-            "request {} code {} stage {}",
-            emission.identity.mcp_request_id,
-            code.as_str(),
-            emission.stage.as_str(),
-        ),
+        correlation_digest: emission.identity.identity_digest.clone(),
     }
 }
 
 /// Derives typed, bounded recovery from state plus dispositions.
 ///
-/// Recovery order is per-cause, never a common list: healthy completion
-/// recovers nothing; pending states recover nothing; a directly observed local
-/// emission failure is a local fact and recovers nothing host-facing; possible
-/// or unknown canonical outcomes reconcile read-only first; same-operation
-/// replay appears only from an owner-validated binding whose approved options
-/// include resubmission in a lawful retry state. Every evidenced route-fault
-/// recovery terminates in bounded escalation with the correlation record
-/// attached.
+/// The result is a TYPED, BOUNDED ORDER and never a common list applied to every
+/// emission (issue #2899 W10.8). It is the bounded concatenation of two closed
+/// segments — the canonical segment first, the route segment second, bounded
+/// escalation last — and each segment is a total function of exactly one kind
+/// of evidence:
 ///
-/// #2899 A7 — the CANONICAL segment is a total function of the canonical
-/// disposition alone, and the bound is stated rather than implied (I14.21:
+/// * the **canonical** segment is fixed by [`CanonicalDisposition`] alone, so
+///   the five dispositions named by issue #2899 A7 receive five distinct
+///   canonical classes instead of collapsing into one shared list;
+/// * the **route** segment is fixed by the observed CAUSE alone, so a route
+///   fault never reads as a canonical statement and a canonical statement
+///   never reads as a route fault (issue #2899 item 11).
 ///
-/// ```text
-/// if committed  -> reconcile ORS;
-/// if known rollback -> retry under same identity;
-/// if unknown    -> pause, preserve the operation, open Problem State;
-///                  no blind duplicate effect.
-/// ```
+/// | disposition             | canonical class           | canonical action                  |
+/// |-------------------------|---------------------------|----------------------------------|
+/// | `ReadOnly`              | `NoMutation`              | none — no mutation exists         |
+/// | `FailedBeforeStage`     | `NoMutatingStageStaged`   | none — no mutating stage executed  |
+/// | `PossibleCommit`        | `ReconcileBeforeReplay`   | `QueryStatusTool`                 |
+/// | `Unknown`               | `ReconcileBeforeReplay`   | `QueryStatusTool` — same floor    |
+/// | `CommittedWithReadback` | `SettledDoNotReplay`      | none — replay would duplicate it  |
+/// | `RolledBack`            | `ReplayUnderSameIdentity` | `ResubmitSameOperationIdentity`, owner binding only |
 ///
-/// | disposition            | canonical segment                                  |
-/// |------------------------|---------------------------------------------------|
-/// | `ReadOnly`             | none — no mutation exists to reconcile or replay  |
-/// | `FailedBeforeStage`    | none — no mutating stage ever executed           |
-/// | `PossibleCommit`       | `QueryStatusTool` first — reconcile before replay |
-/// | `Unknown`              | `QueryStatusTool` first — the same lawful floor  |
-/// | `CommittedWithReadback`| none — canonical truth is settled; replay would duplicate it |
-/// | `RolledBack`           | `ResubmitSameOperationIdentity`, owner binding only |
+/// Same-operation replay is therefore doubly gated: the canonical class must
+/// already be the lawful retry state AND the owner must have approved
+/// resubmission for this exact operation. A possible commit, an unknown
+/// outcome, a read, a pre-stage failure and a committed effect all refuse it
+/// (I14.21: "if unknown → pause Ordering Scope, preserve the operation and
+/// open Problem State; Human/Doctor chooses evidence-backed reconciliation; no
+/// blind duplicate effect").
 ///
-/// The route segment (reconnect, refresh, escalation) is chosen by the observed
-/// CAUSE and is identical across dispositions; only the canonical segment above
-/// varies. `ReadOnly`, `FailedBeforeStage` and `CommittedWithReadback` therefore
-/// share one sequence, and that is the honest limit of the closed
-/// [`RecoveryAction`] vocabulary: no action in it separates "the mutation never
-/// started" from "this request is a read" from "the mutation is committed and
-/// read back", because all three are canonically settled and admit only
-/// route-level recovery. Inventing an action to separate them would be a
-/// prescription the documentation does not authorize.
+/// The canonical segment LEADS the order, so an operation whose outcome is not
+/// settled is reconciled before anything that could re-open the route, and a
+/// provable rollback replays under the same identity before any route work.
+/// Every evidenced fault and every confirmed stale view terminates in bounded
+/// escalation with the correlation record attached; a pending state, a healthy
+/// completion without a confirmed stale view, and a local emission failure
+/// recover nothing.
 pub fn derive_recovery(
     identity_digest: &str,
     state: CorrelationAssessmentState,
@@ -1301,65 +1513,83 @@ pub fn derive_recovery(
     canonical: &CanonicalDisposition,
     ui_confirmed_stale: bool,
 ) -> Option<RecoveryDirective> {
-    let resubmit_allowed = operation_binding
-        .is_some_and(|binding| binding.allows(RecoveryAction::ResubmitSameOperationIdentity));
-    let mut actions = match state {
+    let canonical_class = canonical.recovery_class();
+    let resubmit_allowed = operation_binding.is_some_and(|binding| {
+        // Retry authority is doubly gated: the canonical class must already be
+        // the lawful retry state AND the owner must have approved resubmission
+        // for this exact operation. A binding alone never authorizes a replay.
+        canonical_class == CanonicalRecoveryClass::ReplayUnderSameIdentity
+            && binding.allows(RecoveryAction::ResubmitSameOperationIdentity)
+    });
+    let (route_class, route_action) = match state {
+        // A healthy completion with no confirmed stale Desktop view is not a
+        // fault: the closed action vocabulary prescribes nothing for it, so no
+        // order exists at all.
         CorrelationAssessmentState::HostCompleted => {
-            if ui_confirmed_stale {
-                vec![RecoveryAction::RefreshDesktopView]
-            } else {
+            if !ui_confirmed_stale {
                 return None;
             }
+            (
+                RouteRecoveryClass::RefreshStaleDesktopView,
+                Some(RecoveryAction::RefreshDesktopView),
+            )
         }
+        // A consistent host error, pending coverage, a gapped or unattributable
+        // denominator, and an ELIOT-side emission failure are not route faults
+        // and prescribe no host-facing recovery.
         CorrelationAssessmentState::HostReportedInvocationError
         | CorrelationAssessmentState::EmissionSucceededAwaitingHostObservation
         | CorrelationAssessmentState::HostObservationUnavailableOrGapped
         | CorrelationAssessmentState::TransportOutcomeUnknown
         | CorrelationAssessmentState::EliotEmissionFailed => return None,
         CorrelationAssessmentState::ResponseMisclassifiedByHost => {
-            misclassified_recovery(canonical, resubmit_allowed)
+            (RouteRecoveryClass::NoRouteAction, None)
         }
-        CorrelationAssessmentState::TransportLostAfterFlush => {
-            let mut actions = vec![RecoveryAction::ReconnectStdioRoute];
-            if matches!(canonical, CanonicalDisposition::RolledBack) && resubmit_allowed {
-                actions.push(RecoveryAction::ResubmitSameOperationIdentity);
-            } else if canonical.needs_reconciliation_first() {
-                actions.push(RecoveryAction::QueryStatusTool);
-            }
-            actions
-        }
-        CorrelationAssessmentState::HostRespondingStuckAfterDeadline => {
-            let mut actions = Vec::new();
-            if canonical.needs_reconciliation_first() {
-                actions.push(RecoveryAction::QueryStatusTool);
-            }
-            actions.push(RecoveryAction::RefreshDesktopView);
-            actions
-        }
+        CorrelationAssessmentState::TransportLostAfterFlush => (
+            RouteRecoveryClass::ReestablishRoute,
+            Some(RecoveryAction::ReconnectStdioRoute),
+        ),
+        CorrelationAssessmentState::HostRespondingStuckAfterDeadline => (
+            RouteRecoveryClass::RefreshAfterDeadline,
+            Some(RecoveryAction::RefreshDesktopView),
+        ),
     };
+    let mut actions = Vec::with_capacity(MAX_RECOVERY_ACTIONS);
+    match canonical_class {
+        // The operation may have committed and nothing has proved otherwise:
+        // read-only reconciliation is the first lawful step for EVERY observed
+        // cause, so re-establishing the route can never precede it.
+        CanonicalRecoveryClass::ReconcileBeforeReplay => {
+            actions.push(RecoveryAction::QueryStatusTool);
+        }
+        // A provable rollback under an owner-minted binding is the only state in
+        // which same-operation replay is lawful at all.
+        CanonicalRecoveryClass::ReplayUnderSameIdentity if resubmit_allowed => {
+            actions.push(RecoveryAction::ResubmitSameOperationIdentity);
+        }
+        // A read, a mutation that never started, a settled commit, and a
+        // rollback with no owner binding admit no canonical action: there is
+        // nothing to reconcile, and replay is not authorized.
+        CanonicalRecoveryClass::NoMutation
+        | CanonicalRecoveryClass::NoMutatingStageStaged
+        | CanonicalRecoveryClass::SettledDoNotReplay
+        | CanonicalRecoveryClass::ReplayUnderSameIdentity => {}
+    }
+    actions.extend(route_action);
     // Every arm above is an evidenced fault state or a stale completion: each
     // terminates in bounded escalation, so a proven fault never prescribes
     // nothing. A pending state and a local emission failure reach no arm and
     // recover nothing.
     actions.push(RecoveryAction::EscalateWithCorrelationEvidence);
     Some(RecoveryDirective {
-        actions,
-        evidence_hint: format!("attach {CORRELATION_SCHEMA_ID} record {identity_digest}"),
+        canonical: canonical_class,
+        route: route_class,
+        identity_digest: identity_digest.to_owned(),
+        // The bound is re-proved here rather than assumed. The concatenation
+        // above can only ever reach `MAX_RECOVERY_ACTIONS`; if it somehow did
+        // not, the order is refused instead of truncated.
+        actions: RecoveryActions::bounded(actions).ok()?,
     })
-}
-
-/// Recovery for a host error on a proven success envelope.
-fn misclassified_recovery(
-    canonical: &CanonicalDisposition,
-    resubmit_allowed: bool,
-) -> Vec<RecoveryAction> {
-    if matches!(canonical, CanonicalDisposition::RolledBack) && resubmit_allowed {
-        vec![RecoveryAction::ResubmitSameOperationIdentity]
-    } else if canonical.needs_reconciliation_first() {
-        vec![RecoveryAction::QueryStatusTool]
-    } else {
-        Vec::new()
-    }
 }
 
 /// One append-only assessment revision under a logical correlation.

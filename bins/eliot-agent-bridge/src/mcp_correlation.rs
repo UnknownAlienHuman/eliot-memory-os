@@ -49,14 +49,15 @@
 use eliot_agent_bridge_core::host_event::ToolOutcomeClass;
 use eliot_agent_bridge_core::mcp_correlation::RecoveryDirective;
 use eliot_agent_bridge_core::{
-    AgentBridgeCore, Assessment, AssessmentLog, AssessmentSummary, BridgeError,
-    CanonicalDisposition, CommitEvidence, CorrelationAssessmentState, CorrelationIdentity,
+    AgentBridgeCore, Assessment, AssessmentLog, AssessmentLogError, AssessmentSummary, BridgeError,
+    CanonicalDisposition, CorrelationAssessmentState, CorrelationIdentity,
     CorrelationIdentityParts, CorrelationStage, CoverageProof, DeadlineSweepRequest,
     EliotEmissionObservation, EmissionCause, FaultEdgeSubmission, HandlerOutcome,
     HostEventEnvelope, HostEventJoinKeys, HostEventReplay, NormalizedHostEventPayload,
     OperationIdentity, OwnerValidatedOperationBinding, ReconcileError, ReplayConflict,
-    StdioEmissionReceipt, TerminalReconcileRequest, check_event_replay, reconcile_deadline_sweep,
-    reconcile_terminal_event, submit_derived_fault,
+    StdioEmissionReceipt, TerminalReconcileRequest, check_event_replay,
+    read_canonical_commit_evidence, reconcile_deadline_sweep, reconcile_terminal_event,
+    submit_derived_fault,
 };
 use eliot_contracts::{ResourceGeneration, StateFence};
 use eliot_protocol::{DeliveryClass, EventEnvelope, EventPayload, ProtocolPayload};
@@ -155,8 +156,10 @@ pub struct CorrelationVerdict {
     /// Canonical operation disposition the current verdict was derived under.
     pub canonical_disposition: CanonicalDisposition,
     /// Bounded, typed recovery order for this verdict and disposition, when a
-    /// lawful recovery exists. `None` means none is lawful.
-    pub recovery: Option<String>,
+    /// lawful recovery exists. `None` means none is lawful. It is the typed
+    /// order itself rather than a joined string, so the two closed segments it
+    /// was derived from stay readable instead of being flattened into prose.
+    pub recovery: Option<RecoveryDirective>,
 }
 
 impl CorrelationVerdict {
@@ -207,7 +210,11 @@ pub enum ReconcileFailure {
     OwnerUnavailable,
     /// The event joined a correlation but the owner's own log refused the
     /// resulting revision, so no current assessment exists.
-    RevisionRefused(String),
+    ///
+    /// The owner's typed refusal travels as itself. Stringifying it here would
+    /// collapse a typed failure into prose at the layer boundary and force the
+    /// caller to parse the sentence back into a reason.
+    RevisionRefused(AssessmentLogError),
     /// More than one retained correlation accepted the same candidate event.
     ///
     /// Attribution is decided by the host event's own invocation scope, so this
@@ -233,8 +240,8 @@ impl std::fmt::Display for ReconcileFailure {
             Self::OwnerUnavailable => {
                 formatter.write_str("event owner unattached; nothing verified against it")
             }
-            Self::RevisionRefused(detail) => {
-                write!(formatter, "owner's log refused the revision: {detail}")
+            Self::RevisionRefused(reason) => {
+                write!(formatter, "owner's log refused the revision: {reason}")
             }
             Self::AmbiguousAttribution(event_id) => write!(
                 formatter,
@@ -380,16 +387,15 @@ fn coverage_of(assessment: &Assessment) -> CoverageProof {
         .unwrap_or(CoverageProof::NoEventYet)
 }
 
-/// The bounded typed recovery order one assessment derived, as stable names.
+/// The bounded typed recovery order one assessment derived.
 ///
 /// `None` means no recovery is lawful for this state and disposition — a
 /// healthy completion, a pending state and a local emission failure all recover
-/// nothing. Only identifiers and closed action names cross this boundary.
-fn recovery_of(assessment: &Assessment) -> Option<String> {
-    assessment
-        .recovery
-        .as_ref()
-        .map(RecoveryDirective::action_names)
+/// nothing. The value is the owner's own typed order: two closed segments, a
+/// bounded action list and the correlation digest, with no prose and no
+/// caller-controlled text crossing this boundary.
+fn recovery_of(assessment: &Assessment) -> Option<RecoveryDirective> {
+    assessment.recovery.clone()
 }
 
 /// Whether a resolved state attests healthy host completion, or a host error
@@ -519,13 +525,13 @@ impl StdioOwnerEmissionEvidence {
 /// record with an explicit `PartialUnknown` denominator, and only a later
 /// admitted host event can resolve the correlation.
 ///
-/// The canonical disposition is derived from the owner evidence the caller
-/// read back plus the facade's own pre-stage fact, never from the caller's
-/// hints: an admitted operation handle is a possible commit (reconciliation
-/// still required), a pre-stage failure is a provable failed-before-stage, a
-/// facade-owned protocol method is a read, and everything else is unknown. The
-/// caller `write_id`/`idempotency_key` strings stay diagnostic and can never
-/// authorize resubmission.
+/// The canonical disposition is derived INSIDE the owner, from the owner's own
+/// canonical write references and the facade's pre-stage fact, never from the
+/// caller's hints and never from a host observation: an owner-issued operation
+/// handle is a possible commit (reconciliation still required), a pre-stage
+/// failure is a provable failed-before-stage, a facade-owned protocol method is
+/// a read, and everything else is unknown. The caller `write_id`/`idempotency_key`
+/// strings stay diagnostic and can never authorize resubmission.
 pub fn observe_mcp_emission(
     runner: &mut BridgeRunner,
     request: &Value,
@@ -580,16 +586,6 @@ pub fn observe_mcp_emission(
         Some(outcome.bytes),
         Some(receipt),
     );
-    let canonical = CanonicalDisposition::from_facade_evidence(
-        method,
-        evidence.failed_before_handler,
-        &CommitEvidence {
-            canonical_receipt_write_id: evidence.owner_operation_receipt.clone(),
-            // No exact readback exists at this boundary, so this is never
-            // `Some(true)`: a committed disposition stays underivable here.
-            exact_readback_match: None,
-        },
-    );
     // The caller-supplied hints are diagnostic only and are never allowed to
     // authorize resubmission: no operation binding is passed, so the owner's
     // recovery derivation cannot offer same-operation replay from this path.
@@ -601,14 +597,14 @@ pub fn observe_mcp_emission(
         operation_hint_present = !operation.is_empty(),
         idempotency_key_present = operation.idempotency_key.is_some(),
         owner_operation_bound = false,
-        canonical_disposition = canonical.as_str(),
+        owner_operation_receipt_present = evidence.owner_operation_receipt.is_some(),
         admitted_deadline_present = deadline_unix_ms.is_some(),
         stage = stage.as_str(),
         response_bytes = outcome.bytes,
         emitted_exactly_once = emission.emitted_exactly_once(),
         "mcp emission observation submitted to the event owner"
     );
-    runner.submit_emission_observation(&emission, canonical, None, deadline_unix_ms)
+    runner.submit_emission_observation(&emission, evidence, None, deadline_unix_ms)
 }
 
 /// Milliseconds since the Unix epoch, or `None` when the host clock is
@@ -658,10 +654,21 @@ impl BridgeRunner {
     /// emission produces a record whose assessment is pending; only a later
     /// admitted host event can resolve it, and only through
     /// [`Self::reconcile_terminal_host_event`].
+    ///
+    /// The canonical disposition is derived HERE, inside the owner, and is
+    /// never a parameter. The owner is the only holder of its canonical write
+    /// references, so a caller-computed disposition could assert a commit the
+    /// owner never recorded. `CommittedWithReadback` therefore requires the
+    /// owner's own CURRENT receipt plus its own exact readback, content-compared
+    /// against the operation handle this correlation was admitted under
+    /// (issue #2899 W11.3), and the resulting value is then frozen on the
+    /// record: a later host completion, host error or Desktop UI timeout can
+    /// only READ it, so a possible commit stays reconciling whatever the host
+    /// or the UI reported.
     pub fn submit_emission_observation(
         &mut self,
         emission: &EliotEmissionObservation,
-        canonical: CanonicalDisposition,
+        owner_evidence: &StdioOwnerEmissionEvidence,
         binding: Option<OwnerValidatedOperationBinding>,
         deadline_unix_ms: Option<u64>,
     ) -> Result<CorrelationTrackOutcome, Box<BridgeError>> {
@@ -716,6 +723,28 @@ impl BridgeRunner {
         // whatever the journal head happens to be by then, which is the only
         // form of the comparison that can be both strict and satisfiable.
         let required_seq = owner_observed_sequence(&self.core);
+        // The canonical disposition comes from the owner's OWN canonical write
+        // references, never from the facade and never from a host fact: a
+        // committed claim needs the owner's current receipt whose content names
+        // this operation plus the owner's exact readback, and anything short of
+        // that stays at possible commit or below (issue #2899 W11.3).
+        let commit = read_canonical_commit_evidence(
+            &self.core,
+            owner_evidence.owner_operation_receipt.as_deref(),
+        );
+        let canonical = CanonicalDisposition::from_facade_evidence(
+            emission.identity.method.as_str(),
+            owner_evidence.failed_before_handler,
+            &commit,
+        );
+        tracing::info!(
+            identity_digest = %emission.identity.identity_digest,
+            canonical_disposition = canonical.as_str(),
+            canonical_recovery_class = canonical.recovery_class().as_str(),
+            owner_canonical_receipt_bound = commit.canonical_receipt_write_id.is_some(),
+            owner_exact_readback_present = matches!(commit.exact_readback_match, Some(true)),
+            "mcp emission canonical disposition derived from owner canonical references",
+        );
         Ok(self.correlations.track(TrackedCorrelation {
             emission: emission.clone(),
             assessments: AssessmentLog::default(),
@@ -936,7 +965,7 @@ impl BridgeRunner {
         record
             .assessments
             .append(&digest, assessment)
-            .map_err(|error| ReconcileFailure::RevisionRefused(error.to_string()))?;
+            .map_err(ReconcileFailure::RevisionRefused)?;
         // The appended revision is cloned out of the correlations store before
         // the bridge core is borrowed mutably: the two fields are disjoint, but a
         // live `&mut` into `self.correlations` across `&mut self.core` is a

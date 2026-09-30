@@ -3092,13 +3092,15 @@ fn run_mcp_front_door(
 /// Every line here is identifiers, closed reason codes and bounded counts: the
 /// correlation digest, the current state, whether the coverage it rested on is
 /// a complete interval or partial, the canonical disposition it was derived
-/// under, and the bounded typed recovery order. No tool argument, response body
-/// or host prose is reported.
+/// under, and the two closed typed segments plus the bounded action order of
+/// its recovery. No tool argument, response body or host prose is reported.
 fn sweep_mcp_correlations(runner: &mut BridgeRunner) {
     let now_unix_ms = eliot_agent_bridge::mcp_correlation::owner_now_unix_ms().unwrap_or(0);
     let report = runner.sweep_correlation_deadlines(now_unix_ms);
     let summary = runner.correlation_verdict_summary();
     for verdict in &report.verdicts {
+        let recovery = verdict.recovery.as_ref();
+        let recovery_actions = recovery.map_or_else(String::new, |order| order.action_names());
         tracing::info!(
             correlation_digest = %verdict.correlation_digest,
             assessment_state = verdict.state.as_str(),
@@ -3107,7 +3109,9 @@ fn sweep_mcp_correlations(runner: &mut BridgeRunner) {
             coverage = verdict.coverage.as_str(),
             coverage_complete = verdict.coverage_is_complete(),
             canonical_disposition = verdict.canonical_disposition.as_str(),
-            recovery = verdict.recovery.as_deref().unwrap_or(""),
+            canonical_recovery = recovery.map_or("", |order| order.canonical.as_str()),
+            route_recovery = recovery.map_or("", |order| order.route.as_str()),
+            recovery = %recovery_actions,
             "mcp correlation deadline sweep"
         );
     }

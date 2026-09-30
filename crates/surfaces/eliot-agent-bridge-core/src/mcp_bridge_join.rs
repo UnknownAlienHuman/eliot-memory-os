@@ -70,9 +70,9 @@
 
 use crate::mcp_correlation::{
     Assessment, AssessmentInputs, AssessmentLog, AssessmentRevision, CanonicalDisposition,
-    CoverageIndeterminacy, CoverageProof, EliotEmissionObservation, HostTerminalObservation,
-    ObservationWindow, OwnerValidatedOperationBinding, PartialObservation, assess_correlation,
-    sha256_hex,
+    CommitEvidence, CoverageIndeterminacy, CoverageProof, EliotEmissionObservation,
+    HostTerminalObservation, ObservationWindow, OwnerValidatedOperationBinding, PartialObservation,
+    assess_correlation, sha256_hex,
 };
 use crate::mcp_host_observation::{
     HostEventJoinKeys, HostObservationReject, HostOwnerBinding, RecordedInvocation, ReplayConflict,
@@ -150,6 +150,51 @@ pub fn submit_derived_fault(
         return FaultEdgeSubmission::NoEdgeForState;
     }
     FaultEdgeSubmission::Submitted
+}
+
+/// Reads the owner's OWN canonical evidence for one exact operation.
+///
+/// `CommittedWithReadback` is the strongest canonical claim this module can
+/// make, so it is gated on the owner's existing records rather than on anything
+/// a caller asserts (issue #2899 W11.3: "Committed requires the existing
+/// current receipt plus exact readback"):
+///
+/// * the **candidate reference** is the owner-issued operation handle the
+///   trusted port admitted for THIS correlation. It is a candidate, so it
+///   establishes a possible commit and nothing more;
+/// * the **current receipt** is the one the owner itself retains in its
+///   canonical write references. It counts for this operation only when its
+///   CONTENT equals that handle: a receipt the owner retains for a different
+///   operation is another operation's record and is never reused here, exactly
+///   as a directory or lease is only reusable by the operation that owns it;
+/// * the **exact readback** is the owner's own independent readback reference,
+///   recorded beside that receipt. `CanonicalWriteRefs::record_slot` refuses to
+///   replace a slot with a different identity, so the retained readback is the
+///   current one for the retained receipt.
+///
+/// The readback is never reported as matching on its own: with no receipt
+/// content-comparable to this operation the result is `None`, which keeps the
+/// disposition at possible commit. A Desktop UI timeout, a host error or a
+/// transport fault cannot reach this function at all — the host half of an
+/// assessment never produces canonical evidence — so a possible commit stays
+/// reconciling no matter what the host or the UI did.
+pub fn read_canonical_commit_evidence(
+    bridge: &AgentBridgeCore,
+    owner_operation_handle: Option<&str>,
+) -> CommitEvidence {
+    let Some(operation) = owner_operation_handle else {
+        return CommitEvidence::default();
+    };
+    let owned = bridge.terminal_reduction_inputs().is_some_and(|inputs| {
+        inputs.canonical().receipt_ref() == Some(operation)
+            && inputs.canonical().readback_ref().is_some()
+    });
+    CommitEvidence {
+        canonical_receipt_write_id: Some(operation.to_owned()),
+        // `None` means the exact readback was never proved for this operation,
+        // which is indeterminacy and never a mismatch claim.
+        exact_readback_match: owned.then_some(true),
+    }
 }
 
 /// Host-event coverage projected from the live owner journal.
