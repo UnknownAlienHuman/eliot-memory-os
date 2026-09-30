@@ -114,8 +114,15 @@ impl BlobFileStore {
     /// Pins one existing absolute, non-reparse Blob root.
     pub fn new(root: impl Into<PathBuf>) -> Result<Self, BlobFileStoreError> {
         let platform = WindowsPlatform::new(root).map_err(map_port)?;
-        let root_handle = platform.root_pin.try_clone().map_err(|error| map_io(&error))?;
-        if !root_handle.metadata().map_err(|error| map_io(&error))?.is_dir() {
+        let root_handle = platform
+            .root_pin
+            .try_clone()
+            .map_err(|error| map_io(&error))?;
+        if !root_handle
+            .metadata()
+            .map_err(|error| map_io(&error))?
+            .is_dir()
+        {
             return Err(BlobFileStoreError::InvalidPath);
         }
         let root_identity =
@@ -159,7 +166,9 @@ impl BlobFileStore {
                 probe.sync_all().map_err(|error| map_io(&error))?;
                 crate::directory_publication::sync_directory_handle(&parent)
                     .map_err(map_directory)?;
-                probe.seek(SeekFrom::Start(0)).map_err(|error| map_io(&error))?;
+                probe
+                    .seek(SeekFrom::Start(0))
+                    .map_err(|error| map_io(&error))?;
                 let mut observed = Vec::with_capacity(sample.len());
                 (&mut probe)
                     .take(sample.len() as u64 + 1)
@@ -752,7 +761,11 @@ impl BlobFileStore {
                 Err(error) => return Err(error),
             };
             ensure_not_reparse(&directory)?;
-            if !directory.metadata().map_err(|error| map_io(&error))?.is_dir() {
+            if !directory
+                .metadata()
+                .map_err(|error| map_io(&error))?
+                .is_dir()
+            {
                 return Err(BlobFileStoreError::InvalidPath);
             }
             walk_regular_files_handle(prefix, &directory, &mut values)?;
@@ -830,7 +843,11 @@ impl BlobFileStore {
 
     #[cfg(windows)]
     fn pinned_root_directory(&self) -> Result<File, BlobFileStoreError> {
-        let handle = self.platform.root_pin.try_clone().map_err(|error| map_io(&error))?;
+        let handle = self
+            .platform
+            .root_pin
+            .try_clone()
+            .map_err(|error| map_io(&error))?;
         if !handle.metadata().map_err(|error| map_io(&error))?.is_dir()
             || crate::file_identity_for_open_handle(&handle).map_err(map_protected)?
                 != self.root_identity
@@ -1288,21 +1305,18 @@ fn decode_regular_file_records(
             .chunks_exact(2)
             .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
             .collect::<Vec<_>>();
-        let name =
-            String::from_utf16(&name_units).map_err(|_| BlobFileStoreError::InvalidPath)?;
+        let name = String::from_utf16(&name_units).map_err(|_| BlobFileStoreError::InvalidPath)?;
         if name != "." && name != ".." {
             validate_leaf(&name)?;
             if information.file_attributes & BLOB_FILE_ATTRIBUTE_REPARSE_POINT != 0 {
                 return Err(BlobFileStoreError::ReparsePoint);
             }
-            let relative =
-                WorkScopePath::new(format!("{}/{name}", prefix.normalized_identity()))
-                    .map_err(|_| BlobFileStoreError::InvalidPath)?;
+            let relative = WorkScopePath::new(format!("{}/{name}", prefix.normalized_identity()))
+                .map_err(|_| BlobFileStoreError::InvalidPath)?;
             if information.file_attributes & BLOB_FILE_ATTRIBUTE_DIRECTORY != 0 {
-                let child = crate::directory_publication::open_owned_directory_relative(
-                    directory, &name,
-                )
-                .map_err(map_directory)?;
+                let child =
+                    crate::directory_publication::open_owned_directory_relative(directory, &name)
+                        .map_err(map_directory)?;
                 walk_regular_files_handle(&relative, &child, output)?;
             } else {
                 let child = open_file_relative(
@@ -1449,7 +1463,8 @@ fn digest_open_file(file: &mut File) -> Result<String, BlobFileStoreError> {
 
     let identity_before = crate::file_identity_for_open_handle(file).map_err(map_protected)?;
     let length_before = file.metadata().map_err(|error| map_io(&error))?.len();
-    file.seek(SeekFrom::Start(0)).map_err(|error| map_io(&error))?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| map_io(&error))?;
     let mut digest = Sha256::new();
     let mut buffer = vec![0_u8; 64 * 1024];
     let mut read_total = 0_u64;
