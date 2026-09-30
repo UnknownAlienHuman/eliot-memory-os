@@ -1547,6 +1547,19 @@ fn is_daemon_operation(operation: &str) -> bool {
             // generic `ProcessExecutionRequest` decode.
             | "finish_claim"
             | "finish_result"
+            // Issue #1867 (I12.24:65): the owner-decision claim is a separate
+            // admitted operation with its own declared queue, its own capacity
+            // ledger and its own typed entry, so a queued decision can never be
+            // read by or attributed to any other lane. The marker is the one
+            // string `hot_path_runtime.rs` declares and registers, and it was
+            // absent here, so the frame would have fallen through every
+            // predicate, failed the `ProcessExecutionRequest` decode, and fenced
+            // the session before the claim arm was ever entered. This entry only
+            // lets the frame reach that arm: the arm still proves the module
+            // binding, the peer principal and the exact session State Fence,
+            // and the claim still returns only an entry whose fence and
+            // authority epoch that session may serve.
+            | "improvement_decision_claim"
     )
 }
 
