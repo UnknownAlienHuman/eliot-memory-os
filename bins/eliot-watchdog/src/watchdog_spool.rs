@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use eliot_contracts::sha256_hex;
-use eliot_platform_windows::ProtectedRuntimePathLease;
+use eliot_platform_windows::{ProtectedRuntimePathLease, windows_paths_equal};
 use eliot_watchdog_core::{
     WatchdogSpoolAcknowledgement, WatchdogSpoolCursor, WatchdogSpoolExportBatch,
     WatchdogSpoolExportEntry, WatchdogSpoolPayloadKind, WatchdogSpoolReconciliationError,
@@ -461,13 +461,38 @@ impl WatchdogSpool {
     /// database out of scope entirely: the destination spool is opened here
     /// from the admitted binding alone.
     ///
-    /// With a destination admitted, the destination triple is gated through
-    /// [`backup::validate_isolated_destination`] against the destination's OWN
-    /// owner-issued identity (`AdmittedIsolatedDestination::installation`) — the
-    /// destination identity is never a caller string — and the chain through
-    /// [`backup::validate_restore_chain`], rooted at the admitted preparation
-    /// digest carried as the first step's predecessor. The destination's own
-    /// spool is opened once through
+    /// The active installation is `active: &WatchdogRuntimeBinding`, NOT a
+    /// caller string, and that is the second half of the signature. The
+    /// ACTIVE side of the isolation check is read out of the owner's own
+    /// retained admission — the digest-verified, root-leased binding the live
+    /// spool itself was opened from — never from the request. A caller can
+    /// therefore not present a convenient "active" identity and make the
+    /// comparison a tautology: the only active installation this owner knows
+    /// is the one whose approved manifest and retained root leases it holds.
+    /// This is the same owner-issued fact the backup port is constructed from.
+    ///
+    /// Isolation is proved on BOTH owner-issued axes, not one:
+    ///
+    /// - identity: the destination's OWNER-ISSUED installation identity
+    ///   ([`AdmittedIsolatedDestination::installation`], read from the
+    ///   destination's own registry-selected approved manifest) must differ
+    ///   from the source and from the active installation's OWNER-ISSUED
+    ///   identity (the active binding's own selected manifest), through
+    ///   [`backup::validate_isolated_destination`]; and
+    /// - storage: the destination's OWNER-ISSUED Watchdog state root must not be
+    ///   the active installation's OWNER-ISSUED state root, compared with the
+    ///   same `windows_paths_equal` owner the admission uses.
+    ///
+    /// The second comparison is strictly stronger than the first and is the
+    /// one that makes "an import never targets the active installation"
+    /// structural: two distinct installation identities that nevertheless
+    /// resolve to ONE state root would satisfy the identity check alone, and
+    /// would make the import write into the live installation's own
+    /// `watchdog.redb`. That is refused here.
+    ///
+    /// The chain is gated through [`backup::validate_restore_chain`], rooted at
+    /// the admitted preparation digest carried as the first step's predecessor.
+    /// The destination's own spool is opened once through
     /// [`Self::open_isolated_destination`], and every retained-evidence read and
     /// every accepted append goes through THAT spool. Each accepted step is
     /// appended through the existing [`append`](Self::append) path as a
@@ -486,19 +511,35 @@ impl WatchdogSpool {
     /// records, not from this owner's: repeated import is a statement about
     /// what the destination already holds.
     ///
+    /// The returned disposition never reports a known-zero over an unresolved
+    /// signal. If the destination already retains a coverage-invalidating
+    /// record that is not this operation's own quarantine — a `Gap`, an
+    /// unreconciled problem/incident intent, or a `Recovery` from another
+    /// source — classified through the same [`backup::SpoolFenceEntryKind`]
+    /// owner the capture path uses, the disposition is
+    /// [`backup::SpoolRestoreDisposition::Unknown`] even when every presented
+    /// step was applied or was a duplicate. `Unknown` is what
+    /// `backup::acceptance_allowed` refuses, so recovery acceptance stays
+    /// blocked while a critical signal is unresolved instead of defaulting to
+    /// zero. Those records are never dropped, reordered, or downgraded to make
+    /// the import look clean, and this operation's own historical evidence is
+    /// excluded from the test so a repeated import still observes its own
+    /// disposition.
+    ///
     /// # Errors
     ///
     /// Returns [`SpoolError::InvalidLease`] when no externally admitted
     /// destination installation binding was supplied — the absent admission is
     /// refused, never substituted. Returns [`SpoolError`] when the destination
-    /// is not isolated from the source and active installations, its spool
+    /// is not isolated from the source and active installations on either the
+    /// owner-issued identity axis or the owner-issued state-root axis, its spool
     /// cannot be opened, the step chain is empty, malformed, non-consecutive, or
     /// unlinked, the bounded step count is exceeded, or any step conflicts with
     /// already quarantined evidence.
     pub fn import_backup_isolated(
         source_installation: &str,
         destination: Option<&AdmittedIsolatedDestination>,
-        active_installation: &str,
+        active: &WatchdogRuntimeBinding,
         steps: &[backup::SpoolRestoreStep],
     ) -> Result<backup::SpoolRestoreDisposition, SpoolError> {
         let Some(destination) = destination else {
@@ -506,21 +547,17 @@ impl WatchdogSpool {
                 "watchdog spool backup import refuses to run: no externally admitted isolated destination installation binding was supplied, and an import targets only that admitted destination".to_owned(),
             ));
         };
+        let active_installation = owner_issued_active_installation(active);
         backup::validate_isolated_destination(
             source_installation,
             destination.installation(),
             active_installation,
         )?;
-        let step_count = u64::try_from(steps.len()).map_err(|_| {
-            SpoolError::Corrupt(
-                "watchdog spool backup import exceeds the bounded step counter".to_owned(),
-            )
-        })?;
-        if step_count > backup::BACKUP_MAX_WORK_UNITS {
-            return Err(SpoolError::Corrupt(
-                "watchdog spool backup import exceeds the bounded work ceiling".to_owned(),
-            ));
-        }
+        // The identity axis above does not by itself prove a different store;
+        // the second, independent owner-issued axis is the Watchdog state root,
+        // refused by `reject_shared_active_state_root`.
+        reject_shared_active_state_root(destination, active)?;
+        validate_import_step_budget(steps)?;
         let prepare_digest = steps
             .first()
             .map_or("", |step| step.predecessor_digest.as_str());
@@ -530,18 +567,14 @@ impl WatchdogSpool {
         // own spool is not even reachable from here: there is no `self`.
         let destination_spool = WatchdogSpool::open_isolated_destination(destination)?;
         let retained = destination_spool.readback()?;
-        let mut quarantined: Vec<(String, String)> = Vec::new();
-        for entry in &retained {
-            if let WatchdogSpoolPayload::Recovery {
-                reason,
-                corrupt_digest,
-                ..
-            } = &entry.payload
-                && reason.starts_with(BACKUP_IMPORT_REASON_MARKER)
-            {
-                quarantined.push((reason.clone(), corrupt_digest.clone()));
-            }
-        }
+        // Unreconciled critical signal/intent identities already retained by the
+        // destination installation, read by `has_unresolved_critical` through the
+        // same single owner (`SpoolFenceEntryKind`) the capture path uses.
+        let unresolved_critical = has_unresolved_critical(&retained);
+        // The destination's own previously written quarantine records, replayed
+        // against the presented steps below so a repeated import still observes
+        // its own `Duplicate` disposition.
+        let mut quarantined = retained_import_quarantine(&retained);
         let observed_at_ms = current_unix_ms()?.max(1);
         let mut ledger = backup::SpoolImportReplayLedger::new();
         let mut disposition = backup::SpoolRestoreDisposition::Duplicate;
@@ -587,6 +620,19 @@ impl WatchdogSpool {
             )?;
             quarantined.push((reason, step.step_digest.clone()));
             disposition = backup::SpoolRestoreDisposition::Accepted;
+        }
+        // An unreconciled critical signal/intent already retained by the
+        // destination means its historical coverage is NOT closed. Reporting
+        // `Accepted` or `Duplicate` there would be the known-zero default this
+        // path must never produce: it would let recovery acceptance proceed
+        // over an unresolved signal. `Unknown` is the honest disposition and
+        // `acceptance_allowed` fails closed on it, keeping the signal visible
+        // until it is actually reconciled. The records themselves are never
+        // dropped, reordered, or downgraded. Steps already appended stay
+        // appended: this narrows the reported disposition, it never undoes an
+        // accepted, bounded, quarantined append.
+        if unresolved_critical {
+            disposition = backup::SpoolRestoreDisposition::Unknown;
         }
         Ok(disposition)
     }
@@ -2201,6 +2247,130 @@ fn unbound_export_cursor() -> WatchdogSpoolCursor {
         installation_id: String::new(),
         sink_id: String::new(),
     }
+}
+
+/// Reads the active installation identity out of the owner's own retained
+/// runtime admission.
+///
+/// This is the single reader for the active side of every isolation fact, and it
+/// is module-level `pub` only so the backup port in
+/// [`crate::watchdog_composition`] compares against the same owner-issued read
+/// instead of re-walking the manifest; the enclosing `watchdog_spool` module is
+/// private to this crate, so no new public API leaves the binary. The value is
+/// never received from a caller string:
+/// `WatchdogSpool::open_runtime_binding` opens the live spool from exactly this
+/// binding's Watchdog state root, so this is the same owner-issued fact that
+/// decides where the live database is.
+#[must_use]
+pub fn owner_issued_active_installation(binding: &WatchdogRuntimeBinding) -> &str {
+    binding
+        .selected_manifest
+        .runtime_launch
+        .installation_epoch
+        .installation
+        .as_str()
+}
+
+/// Refuses a destination that names the active installation's own Watchdog state
+/// root.
+///
+/// Identity inequality alone does not prove a different store. Two distinct
+/// admitted identities can name one state root, and then an import would append
+/// quarantined evidence into the active installation's own `watchdog.redb` —
+/// overwriting live supervision history and reusing the active installation's
+/// storage as a recovery target. Both roots below are owner-issued (the
+/// destination's own approved manifest, and the active binding's own approved
+/// manifest), so this comparison cannot be satisfied by presenting a convenient
+/// string. The roots are compared with the same `windows_paths_equal` the
+/// destination admission itself uses.
+///
+/// # Errors
+///
+/// Returns [`SpoolError::InvalidLease`] when the destination and the active
+/// installation are one owner-issued state root.
+fn reject_shared_active_state_root(
+    destination: &AdmittedIsolatedDestination,
+    active: &WatchdogRuntimeBinding,
+) -> Result<(), SpoolError> {
+    if windows_paths_equal(
+        destination.watchdog_state_root(),
+        active.watchdog_state_root(),
+    ) {
+        return Err(SpoolError::InvalidLease(
+            "watchdog spool backup import refuses to run: the admitted isolated destination shares the active installation's Watchdog state root, so it is not a separate recovery target".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// True when the destination installation still retains an unresolved
+/// coverage-invalidating signal or intent.
+///
+/// Classification goes through the one owner the capture path uses
+/// ([`backup::SpoolFenceEntryKind`]), so an import cannot disagree with a
+/// snapshot about which records invalidate coverage. This import's own
+/// `BACKUP_IMPORT_REASON_MARKER` quarantine records are excluded, and only
+/// because they are the operation's own historical evidence: a repeated import
+/// must still be able to observe its own `Duplicate` disposition rather than
+/// blocking on what it wrote last time. Every other coverage-invalidating record
+/// — a `Gap`, an unreconciled problem/incident intent, or a `Recovery` this
+/// owner did not write — is an unresolved critical signal and blocks. The
+/// records themselves are never dropped, reordered, or downgraded.
+#[must_use]
+fn has_unresolved_critical(retained: &[WatchdogSpoolEntry]) -> bool {
+    retained.iter().any(|entry| {
+        let is_own_quarantine = matches!(
+            &entry.payload,
+            WatchdogSpoolPayload::Recovery { reason, .. }
+                if reason.starts_with(BACKUP_IMPORT_REASON_MARKER)
+        );
+        !is_own_quarantine
+            && backup::SpoolFenceEntryKind::classify(&entry.payload).marks_incomplete()
+    })
+}
+
+/// Collects the destination installation's own already-quarantined import
+/// evidence as `(reason, corrupt_digest)` pairs.
+///
+/// These are the records an earlier import of this same owner wrote into the
+/// destination spool; they are the destination's retained idempotency evidence
+/// and are never dropped, reordered, or rewritten.
+fn retained_import_quarantine(retained: &[WatchdogSpoolEntry]) -> Vec<(String, String)> {
+    let mut quarantined: Vec<(String, String)> = Vec::new();
+    for entry in retained {
+        if let WatchdogSpoolPayload::Recovery {
+            reason,
+            corrupt_digest,
+            ..
+        } = &entry.payload
+            && reason.starts_with(BACKUP_IMPORT_REASON_MARKER)
+        {
+            quarantined.push((reason.clone(), corrupt_digest.clone()));
+        }
+    }
+    quarantined
+}
+
+/// Refuses a presented step chain that cannot be counted or is over the
+/// bounded work ceiling.
+///
+/// # Errors
+///
+/// Returns [`SpoolError::Corrupt`] when the chain length is not representable as
+/// the bounded step counter, or exceeds
+/// [`backup::BACKUP_MAX_WORK_UNITS`].
+fn validate_import_step_budget(steps: &[backup::SpoolRestoreStep]) -> Result<(), SpoolError> {
+    let step_count = u64::try_from(steps.len()).map_err(|_| {
+        SpoolError::Corrupt(
+            "watchdog spool backup import exceeds the bounded step counter".to_owned(),
+        )
+    })?;
+    if step_count > backup::BACKUP_MAX_WORK_UNITS {
+        return Err(SpoolError::Corrupt(
+            "watchdog spool backup import exceeds the bounded work ceiling".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// True while the stored cursor binds no sink identity yet.

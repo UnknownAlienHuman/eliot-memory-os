@@ -21,6 +21,7 @@ use crate::SERVICE_NAME;
 use crate::SpoolError;
 use crate::WatchdogAdmissionSource;
 use crate::WatchdogConfig;
+use crate::WatchdogRuntimeBinding;
 use crate::admission_gap_reason;
 use crate::backup_control::BackupControlRegistration;
 use crate::current_unix_ms;
@@ -36,6 +37,7 @@ use crate::watchdog_spool::backup::{
     CaptureFenceParams, SpoolRestoreDisposition, SpoolRestoreStep, WatchdogSpoolBackupLimits,
     WatchdogSpoolFence, WatchdogSpoolSnapshotPage,
 };
+use crate::watchdog_spool::owner_issued_active_installation;
 
 mod authority_state;
 
@@ -1086,20 +1088,32 @@ impl WatchdogBackupPort {
     /// Imports bounded restore steps INTO THE ADMITTED ISOLATED DESTINATION and
     /// reports whether recovery is accepted.
     ///
-    /// Thin delegation to `WatchdogSpool::import_backup_isolated`, with the
-    /// request's `active` installation bound against the owner-held identity so
-    /// an import can never be presented as isolated from the wrong live
-    /// installation. The destination is not a string: it is the externally
-    /// admitted installation binding, and the admitted destination's own
-    /// owner-issued identity is what the isolation gate compares — so the
-    /// destination must differ from both `source` and that active identity by
-    /// owner-issued fact, not by presentation. Old signed observations stay
-    /// historical evidence under their exact source identity and grant no
-    /// active supervision, heartbeat, lease, or epoch authority. A repeated
-    /// byte-identical import appends nothing to the destination; the observed
-    /// disposition is then passed through `acceptance_allowed`, so an
-    /// unresolved reconciliation blocks recovery acceptance instead of
-    /// returning zero by default.
+    /// Thin delegation to `WatchdogSpool::import_backup_isolated`. The `active`
+    /// argument is this OWNER'S OWN RETAINED RUNTIME BINDING, not a caller
+    /// string, and that is what makes the isolation gate mean anything: the
+    /// owner reads the active installation identity and the active Watchdog
+    /// state root out of its own digest-verified, root-leased admission — the
+    /// same admission its live spool was opened from — and compares the
+    /// destination's own owner-issued identity and state root against them. A
+    /// caller cannot present a convenient "active" installation to make the
+    /// comparison a comparison of its own claim with itself, and a destination
+    /// that shares the active state root is refused even when its installation
+    /// identity differs, because then it is the same store.
+    ///
+    /// The port still refuses a request whose `active` binding is not THIS
+    /// owner's own retained admission, so a foreign active installation fails
+    /// closed with its own exact reason before the owner path runs.
+    ///
+    /// The destination is not a string: it is the externally admitted
+    /// installation binding, and the admitted destination's own owner-issued
+    /// identity is what the isolation gate compares — so the destination must
+    /// differ from both `source` and the active identity by owner-issued fact,
+    /// not by presentation. Old signed observations stay historical evidence
+    /// under their exact source identity and grant no active supervision,
+    /// heartbeat, lease, or epoch authority. A repeated byte-identical import
+    /// appends nothing to the destination; the observed disposition is then
+    /// passed through `acceptance_allowed`, so an unresolved reconciliation
+    /// blocks recovery acceptance instead of returning zero by default.
     ///
     /// `destination: None` is refused by the owner with
     /// [`SpoolError::InvalidLease`]; this port never substitutes the active
@@ -1109,18 +1123,23 @@ impl WatchdogBackupPort {
     ///
     /// Returns [`SpoolError`] when the active identity is not the owner's, no
     /// externally admitted destination was supplied, the destination is not
-    /// isolated, its spool cannot be opened, the step chain breaks, content
-    /// conflicts, or reconciliation is unknown.
+    /// isolated on either the identity or the state-root axis, its spool cannot
+    /// be opened, the step chain breaks, content conflicts, or reconciliation
+    /// is unknown.
     pub fn import_isolated(
         &self,
         source: &str,
         destination: Option<&AdmittedIsolatedDestination>,
-        active: &str,
+        active: &WatchdogRuntimeBinding,
         steps: &[SpoolRestoreStep],
     ) -> Result<SpoolRestoreDisposition, SpoolError> {
-        if active != self.source_installation {
+        // The active identity is read out of the owner's own retained runtime
+        // admission by the same owner-issued reader the spool import uses, not
+        // from a caller string, so this port and the owner cannot disagree
+        // about which installation is live.
+        if owner_issued_active_installation(active) != self.source_installation {
             return Err(SpoolError::Corrupt(
-                "watchdog backup port refuses an import that does not name this owner as the active installation"
+                "watchdog backup port refuses an import bound to an active installation that is not this owner's retained admission"
                     .to_owned(),
             ));
         }
