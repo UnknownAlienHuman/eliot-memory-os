@@ -27,24 +27,33 @@
 //!   cannot be removed by generic TTL cleanup." Expiry therefore takes the
 //!   attempt's disposition as an explicit typed input
 //!   ([`AdmissionReservationAttemptDisposition`]) and refuses anything that is
-//!   not a proven terminal/no-attempt disposition *before* any store access. The
-//!   typed owner's own transition table then refuses every `ACTIVE` row as a
-//!   disposition source, so release, expiry and cancellation act on an
-//!   `INACTIVE` reservation only and an active one keeps excluding overlapping
-//!   work until its owning recovery path resolves it.
+//!   not a proven terminal/no-attempt disposition *before* any store access, and
+//!   it then refuses an `ACTIVE` durable row on its own authority.
+//! - **I14.20:94-96** — `ACTIVE → RELEASED | RECONCILING` are required edges, so
+//!   the typed owner's transition table accepts an `ACTIVE` row as the source of
+//!   a release or a reconciliation. [`release_admission_reservation`] is
+//!   therefore the path that takes an active reservation to `RELEASED`, and
+//!   [`reconcile_admission_reservation`] the one that hands it to recovery. I14.20:99
+//!   keeps expiry narrower than both, and that asymmetry is enforced twice: the
+//!   owner's table has no `ACTIVE → EXPIRED` edge, and
+//!   [`expire_admission_reservation`] refuses an `ACTIVE` row before the write.
 //! - **#1678 section 8** — "Cancellation before canonical commit, after
 //!   canonical commit but before activation, and after activation are different
 //!   cuts with different evidence. Do not flatten them into one delete
 //!   operation." [`cancel_admission_reservation`] derives the cut from the
 //!   durable row, refuses a caller-claimed cut the row does not prove, retains
 //!   the owner-declared reason for that exact cut, and refuses the
-//!   after-activation cut outright. There is no second state machine and no
-//!   second delete path.
+//!   after-activation cut — which is a release the owning execution/recovery
+//!   path must make through [`release_admission_reservation`], not a saga
+//!   cancellation. There is no second state machine and no second delete path.
 //! - **#1678 section 8** — "Release active claims only after the owning
 //!   execution/recovery path proves the applicable terminal/cleanup
 //!   disposition. Unknown process/provider effect, live descendants, uncertain
 //!   cleanup or lost terminal receipt keeps the reservation active/reconciling
-//!   and continues to exclude overlapping work."
+//!   and continues to exclude overlapping work." That is why the two edges out
+//!   of `ACTIVE` are not self-service: a release keeps the terminal/recovery
+//!   evidence on the row, and a reconcile keeps excluding overlapping work
+//!   while it is `RECONCILING`.
 //! - **#1678 A10** — the transition retains the exact terminal or recovery
 //!   evidence and charges/releases capacity once. The cross-check below
 //!   compares the echoed row BY VALUE against the durable row this call read, so
@@ -81,10 +90,13 @@ use crate::{
 /// `ACTIVE` reservation is attached to (#1678 W7, REQ8, A9/A10).
 ///
 /// This is an explicit typed INPUT to
-/// [`expire_admission_reservation`] and is never inferred by this owner. I14.20
+/// [`expire_admission_reservation`] and is never inferred by this owner. I14.20:99
 /// fixes the rule it encodes: "an active reservation attached to a nonterminal
 /// attempt cannot be expired as cleanup", and #1678 section 8 extends it to an
-/// "unknown-effect attempt".
+/// "unknown-effect attempt". It is necessary but NOT sufficient: an `ACTIVE`
+/// durable row is refused by expiry on its own authority as well, so no
+/// disposition here — including [`Self::NotAttached`] — can expire an activated
+/// reservation. Disposing of one is [`release_admission_reservation`]'s path.
 ///
 /// ORS reads no attempt execution state, because the reservation row holds
 /// none: the durable evidence for the disposition travels as the disposition's
@@ -95,7 +107,9 @@ use crate::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AdmissionReservationAttemptDisposition {
     /// No attempt was ever activated against this reservation, so no effect
-    /// exists that a cleanup could disturb.
+    /// exists that a cleanup could disturb. The durable row decides whether
+    /// that is true: an `ACTIVE` row proves an attempt WAS attached, whatever
+    /// this input claims.
     NotAttached,
     /// The owning execution/recovery path proved the attempt's terminal
     /// disposition and completed its cleanup. That proof is the disposition's
@@ -132,7 +146,11 @@ pub enum AdmissionReservationCancellationCut {
     /// retained on the row, but this reservation never activated.
     AfterCanonicalCommitBeforeActivation,
     /// The reservation activated, so its attempt may be live and its claims
-    /// may still be in use.
+    /// may still be in use. This cut is distinct precisely because it is NOT a
+    /// saga cancellation: I14.20:96 routes an activated reservation to
+    /// `RELEASED` or `RECONCILING` through the owning execution/recovery path
+    /// (see [`release_admission_reservation`]), never through this owner, and it
+    /// is never expired at all (I14.20:99).
     AfterActivation,
 }
 
@@ -200,8 +218,8 @@ impl DispositionTarget {
 /// Spec: #1678 section 8 — "A staged inactive reservation may expire or release
 /// only through one exact owner transition with disposition evidence." I14.20 —
 /// "Release, expiry and recovery reuse the same reservation identity and
-/// produce a receipt." I14.6 — "release/expiry is receipted and cannot cancel a
-/// running attempt silently."
+/// produce a receipt." I14.20:96 — `ACTIVE → RELEASED`. I14.6 — "release/expiry
+/// is receipted and cannot cancel a running attempt silently."
 ///
 /// This is one exact owner transition to `RELEASED` through
 /// [`OperationalRecoveryStore::release_kernel_admission_reservation`]. It
@@ -209,22 +227,28 @@ impl DispositionTarget {
 /// the store's echoed row BY VALUE against both, and reads the same reservation
 /// identity back out of the owner before returning it.
 ///
+/// An `ACTIVE` row is a legal source here: this is the path that takes an
+/// active reservation to `RELEASED`, so the owning execution/recovery path can
+/// discharge its claims once it has proven the applicable terminal/cleanup
+/// disposition and retained that evidence on the row. I14.6's "cannot cancel a
+/// running attempt silently" still holds — the transition is receipted, the
+/// reason and evidence travel with it, and I14.20:99 keeps it out of the expiry
+/// path entirely, so no generic TTL cleanup can reach an active reservation
+/// through this call either.
+///
 /// Claims, the retained canonical commit and both owner receipts are carried
 /// through unchanged, so the released row still holds the exact terminal or
 /// recovery evidence (A10) and the capacity this reservation charged is released
 /// exactly once. Nothing is provisioned, launched or deleted here.
-///
-/// The typed owner's transition table accepts only a `STAGED_INACTIVE` or
-/// `RECONCILING` row as the source of a disposition, so an `ACTIVE` row is
-/// refused with [`OrsError::InvalidTransition`] and keeps excluding overlapping
-/// work rather than being removed by a release call.
 ///
 /// # Errors
 ///
 /// Returns [`OrsError::InvalidField`] when the request is incomplete, invalid or
 /// names a blank identity; [`OrsError::ReservationNotFound`] when no reservation
 /// exists under the named identity; [`OrsError::InvalidTransition`] when the
-/// durable row is `ACTIVE`, or is in no legal source state for a disposition;
+/// durable row is already released or expired, i.e. in no legal source state
+/// (I14.20:94-96 gives `STAGED_INACTIVE`, `RECONCILING` and `ACTIVE` — never
+/// `RELEASED` or `EXPIRED` — as a disposition source);
 /// [`OrsError::IntegrityProblem`] when the store's echoed row or the readback
 /// does not carry the facts this call validated; and the store's own typed
 /// errors otherwise — [`OrsError::DuplicateConflict`] for a stale expected ORS
@@ -244,8 +268,8 @@ pub fn release_admission_reservation<S: OperationalRecoveryStore + ?Sized>(
 /// Spec: #1678 section 8 — "A staged inactive reservation may expire or release
 /// only through one exact owner transition with disposition evidence" and "An
 /// active reservation attached to a nonterminal or unknown-effect attempt cannot
-/// be removed by generic TTL cleanup." I14.20 — "an active reservation attached
-/// to a nonterminal attempt cannot be expired as cleanup."
+/// be removed by generic TTL cleanup." I14.20:99 — "an active reservation
+/// attached to a nonterminal attempt cannot be expired as cleanup."
 ///
 /// This is one exact owner transition to `EXPIRED` through
 /// [`OperationalRecoveryStore::expire_kernel_admission_reservation`], reached
@@ -253,10 +277,15 @@ pub fn release_admission_reservation<S: OperationalRecoveryStore + ?Sized>(
 /// claims ([`AdmissionReservationAttemptDisposition::permits_expiry`]). A
 /// nonterminal or unknown-effect attempt is refused with
 /// [`OrsError::UnsafeExpiry`] before any store access at all, so no generic
-/// cleanup loop can reach the write. The typed owner's transition table then
-/// refuses every `ACTIVE` row, so an active reservation keeps excluding
-/// overlapping work until its owning recovery path disposes of it through
-/// [`release_admission_reservation`].
+/// cleanup loop can reach the write. An `ACTIVE` durable row is then refused on
+/// its own authority, also with [`OrsError::UnsafeExpiry`]: a caller cannot reach
+/// expiry by asserting [`AdmissionReservationAttemptDisposition::NotAttached`]
+/// against a row that already holds an activation receipt. That refusal is
+/// enforced a third time, at the typed owner's own transition table, which has no
+/// `ACTIVE → EXPIRED` edge (I14.20:94-96). An active reservation is therefore
+/// only ever disposed of through [`release_admission_reservation`], or parked at
+/// `RECONCILING` through [`reconcile_admission_reservation`], and keeps
+/// excluding overlapping work until then.
 ///
 /// The declared expiry boundary is re-checked against the durable row before
 /// the write, and the terminal/cleanup evidence travels as the disposition's
@@ -267,23 +296,31 @@ pub fn release_admission_reservation<S: OperationalRecoveryStore + ?Sized>(
 ///
 /// Returns [`OrsError::UnsafeExpiry`] when the attempt is
 /// [`AdmissionReservationAttemptDisposition::Nonterminal`] or
-/// [`AdmissionReservationAttemptDisposition::UnknownEffect`];
-/// [`OrsError::InvalidField`] when the request is incomplete or invalid;
-/// [`OrsError::ReservationNotFound`] when no reservation exists under the named
-/// identity; [`OrsError::InvalidExpiry`] when the observed time has not reached
-/// the durable row's `expires_at_ms`; [`OrsError::InvalidTransition`] when the
-/// durable row is `ACTIVE` or is in no legal source state;
-/// [`OrsError::IntegrityProblem`] when the echoed row or readback does not carry
-/// the validated facts; and the store's own typed errors otherwise.
+/// [`AdmissionReservationAttemptDisposition::UnknownEffect`], and when the
+/// durable row is `ACTIVE` (I14.20:99); [`OrsError::InvalidField`] when the
+/// request is incomplete or invalid; [`OrsError::ReservationNotFound`] when no
+/// reservation exists under the named identity; [`OrsError::InvalidExpiry`] when
+/// the observed time has not reached the durable row's `expires_at_ms`;
+/// [`OrsError::InvalidTransition`] when the durable row is in no legal source
+/// state; [`OrsError::IntegrityProblem`] when the echoed row or readback does not
+/// carry the validated facts; and the store's own typed errors otherwise.
 pub fn expire_admission_reservation<S: OperationalRecoveryStore + ?Sized>(
     store: &S,
     attempt: AdmissionReservationAttemptDisposition,
     disposition: &AdmissionReservationDisposition,
 ) -> Result<AdmissionReservationSnapshot, OrsError> {
-    // The refusal is taken from the caller's own typed statement, before any
-    // store read or write: a TTL sweep cannot present a terminal disposition it
-    // does not hold, and it cannot reach the expiry write for a live attempt.
+    // Two independent refusals, both before the expiry write: the caller's own
+    // typed statement, and the durable row itself. A TTL sweep cannot present a
+    // terminal disposition it does not hold, and — because I14.20:99 forbids
+    // expiring an active reservation as cleanup — it cannot reach the expiry
+    // write for a live attempt even by asserting `NotAttached`.
     if !attempt.permits_expiry() {
+        return Err(OrsError::UnsafeExpiry);
+    }
+    let current = store
+        .load_kernel_admission_reservation(&disposition.reservation_id)?
+        .ok_or(OrsError::ReservationNotFound)?;
+    if current.record().state == AdmissionReservationState::Active {
         return Err(OrsError::UnsafeExpiry);
     }
     apply_receipt_backed_disposition(store, disposition, DispositionTarget::Expired)
@@ -295,15 +332,20 @@ pub fn expire_admission_reservation<S: OperationalRecoveryStore + ?Sized>(
 /// Spec: I14.21 — "if unknown → pause Ordering Scope, preserve operation and
 /// open Problem State; Human/Doctor chooses evidence-backed reconciliation; no
 /// blind duplicate effect." I14.20 — "`RECONCILING` cannot create a new effect."
-/// #1678 section 5 — a missing, unavailable, inconclusive or conflicting
-/// outcome keeps the reservation inactive/reconciling and blocks launch.
+/// I14.20:96 — `ACTIVE → RECONCILING`, which is what an unknown effect on an
+/// activated reservation must reach. #1678 section 5 — a missing, unavailable,
+/// inconclusive or conflicting outcome keeps the reservation
+/// inactive/reconciling and blocks launch.
 ///
 /// This is the durable move used after a possible canonical commit, once the
-/// owner's receipt readback has classified the outcome as unknown. It is one
-/// exact transition to `RECONCILING` through
+/// owner's receipt readback has classified the outcome as unknown, and after an
+/// unknown effect on an activation. It is one exact transition to `RECONCILING`
+/// through
 /// [`OperationalRecoveryStore::reconcile_kernel_admission_reservation`], it
 /// retains the evidence it is given, and it neither releases capacity nor
-/// admits, activates, provisions or launches anything.
+/// admits, activates, provisions or launches anything. Because the row is
+/// `RECONCILING` afterwards, it keeps excluding overlapping work while it waits
+/// for the evidence-backed decision.
 ///
 /// # Errors
 ///
@@ -334,11 +376,16 @@ pub fn reconcile_admission_reservation<S: OperationalRecoveryStore + ?Sized>(
 ///   requires the retained canonical `ADMITTED` commit to be on the row and no
 ///   activation receipt, so the commit is preserved as evidence on the released
 ///   row instead of being flattened away;
-/// - [`AdmissionReservationCancellationCut::AfterActivation`] is REFUSED. An
-///   activated reservation's attempt may be live, so cancelling it here would be
-///   exactly the silent cancellation I14.6 forbids; its claims stay reserved
-///   until the owning execution/recovery path proves a terminal disposition and
-///   calls [`release_admission_reservation`].
+/// - [`AdmissionReservationCancellationCut::AfterActivation`] is REFUSED, and
+///   the durable row — not this owner — is what proves it: an `ACTIVE` row
+///   carries an activation receipt. The cut is distinct from the two above
+///   because an activated reservation is not a saga to unwind, and I14.20:96
+///   gives it a different, narrower exit than "cancel": it can only be
+///   `RELEASED` by the owning execution/recovery path through
+///   [`release_admission_reservation`], or parked at `RECONCILING` through
+///   [`reconcile_admission_reservation`], and never `EXPIRED` (I14.20:99). Its
+///   claims stay reserved until that path proves a terminal disposition, so
+///   nothing here can cancel a live attempt silently (I14.6).
 ///
 /// `disposition.reason` must be the owner-declared reason for `cut`
 /// ([`AdmissionReservationCancellationCut::disposition_reason`]), so the
@@ -400,9 +447,12 @@ pub fn cancel_admission_reservation<S: OperationalRecoveryStore + ?Sized>(
     } else {
         AdmissionReservationCancellationCut::BeforeCanonicalCommit
     };
-    // The after-activation cut is refused whichever cut the caller claimed: an
-    // activated reservation's attempt may be live, so its claims stay reserved
-    // until the owning execution/recovery path proves a terminal disposition.
+    // The after-activation cut is refused whichever cut the caller claimed. The
+    // durable row proves it — an activated row carries an activation receipt,
+    // and `ACTIVE` is durably only ever moved by the owning
+    // execution/recovery path (I14.20:96) — so an activated reservation's
+    // attempt may still be live and its claims stay reserved until that path
+    // proves a terminal disposition and releases it.
     if proven == AdmissionReservationCancellationCut::AfterActivation {
         return Err(OrsError::InvalidTransition);
     }
@@ -574,13 +624,15 @@ fn apply_receipt_backed_disposition<S: OperationalRecoveryStore + ?Sized>(
     // A row already at the target is left to the typed owner, which compares the
     // whole persisted request and so distinguishes an exact replay from a
     // same-identity changed-content request. Only a row in no legal source
-    // state at all is refused here, before the write.
-    if observed.state != target.state()
-        && !matches!(
-            observed.state,
-            AdmissionReservationState::StagedInactive | AdmissionReservationState::Reconciling
-        )
-    {
+    // state at all is refused here, before the write, and the set is exactly the
+    // store's own: `ACTIVE` is a legal source for `RELEASED` and `RECONCILING`
+    // (I14.20:96) and never for `EXPIRED` (I14.20:99).
+    let legal_source = matches!(
+        observed.state,
+        AdmissionReservationState::StagedInactive | AdmissionReservationState::Reconciling
+    ) || (observed.state == AdmissionReservationState::Active
+        && target != DispositionTarget::Expired);
+    if observed.state != target.state() && !legal_source {
         return Err(OrsError::InvalidTransition);
     }
     // The declared expiry boundary is re-checked against the durable row, so an
