@@ -359,7 +359,10 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
         // The lane-stable artifact path derives from the admitted image
         // identity (never a bare constant), so distinct images never share
         // one artifact record.
-        let lane_path = format!("process-image/{}", super::sha256_hex(source.image_id.as_bytes()));
+        let lane_path = format!(
+            "process-image/{}",
+            super::sha256_hex(source.image_id.as_bytes())
+        );
         let resource = source.executable.to_string_lossy().into_owned();
         let unobserved = || GovernedProcessEffectBaseline {
             binding: binding.clone(),
