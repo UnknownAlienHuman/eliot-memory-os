@@ -6891,7 +6891,57 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     pub fn current_observation_ingress_policy_at_retained_fence(
         &self,
     ) -> Result<crate::ObservationIngressPolicyBinding, CompositionError> {
-        self.observation_reconciliation().current_ingress_policy()
+        self.try_current_observation_ingress_policy_at_retained_fence()?
+            .ok_or_else(|| {
+                CompositionError::Recovery(
+                    "current Policy owner has no admitted Observation ingress policy setting"
+                        .to_owned(),
+                )
+            })
+    }
+
+    /// Reads explicit Observation capture policy if configured. A valid Policy
+    /// snapshot without that optional setting yields `None`; owner/read
+    /// corruption and stale projections remain errors.
+    pub fn try_current_observation_ingress_policy_at_retained_fence(
+        &self,
+    ) -> Result<Option<crate::ObservationIngressPolicyBinding>, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        let policy_owner = self.owners.policy.as_ref().ok_or_else(|| {
+            CompositionError::Recovery(
+                "current Policy owner is unavailable for Observe capture".to_owned(),
+            )
+        })?;
+        let policy_read = self.recovery.policy_read.as_ref().ok_or_else(|| {
+            CompositionError::Recovery(
+                "current Policy named read is unavailable for Observe capture".to_owned(),
+            )
+        })?;
+        if policy_read.state_fence != self.snapshot.state_fence()
+            || policy_read.revision != policy_owner.revision()
+            || policy_read.value_digest != policy_owner.canonical_digest()
+        {
+            return Err(CompositionError::Recovery(
+                "Policy named-read source changed after its recovered projection".to_owned(),
+            ));
+        }
+        let Some(policy) = self
+            .observation_reconciliation()
+            .try_current_ingress_policy()?
+        else {
+            return Ok(None);
+        };
+        if policy_read.state_fence != self.snapshot.state_fence()
+            || policy_read.revision != policy.policy_revision
+            || policy_read.value_digest != policy.canonical_read_digest
+        {
+            return Err(CompositionError::Recovery(
+                "Policy named-read source changed after its recovered projection".to_owned(),
+            ));
+        }
+        Ok(Some(policy))
     }
 
     /// Reads the exact `Policy` and `WorkScope` named-read projections needed by
@@ -7028,6 +7078,25 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         self.observation_capture_owner_binding_for_activation_inner(activation, None)
     }
 
+    /// Optionally projects capture policy alongside ordinary activation
+    /// readback. Missing explicit capture policy is not permission and does
+    /// not block unrelated activation; malformed or stale owner state remains
+    /// an error. Capture preparation must continue using the strict API.
+    pub fn try_observation_capture_owner_binding_for_activation(
+        &self,
+        activation: &GovernorActivationSnapshot,
+    ) -> Result<Option<crate::ObservationCaptureOwnerBinding>, CompositionError> {
+        self.validate_observation_activation_fence(activation)?;
+        if self
+            .try_current_observation_ingress_policy_at_retained_fence()?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        self.observation_capture_owner_binding_for_activation_inner(activation, None)
+            .map(Some)
+    }
+
     /// Reads the current Observation policy and `WorkScope` for an authenticated
     /// cold capture identified by its original principal, semantic Session,
     /// and `StateFence`. No `RequestIdentity` or task identity is synthesized;
@@ -7104,11 +7173,41 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         )
     }
 
-    fn observation_capture_owner_binding_for_activation_inner(
+    /// Optionally projects capture policy for a negative Host activation
+    /// result. Absence of the explicit policy omits the supplemental readback;
+    /// it never grants capture permission or masks other owner failures.
+    pub fn try_observation_capture_owner_binding_for_host_origin(
+        &self,
+        peer_admission_receipt: &eliot_protocol::AgentBridgePeerAdmissionReceipt,
+    ) -> Result<Option<crate::ObservationCaptureOwnerBinding>, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        peer_admission_receipt
+            .validate()
+            .map_err(|error| CompositionError::Provider(error.to_string()))?;
+        let request_fence = &peer_admission_receipt.state_fence;
+        if request_fence != &self.snapshot.state_fence()
+            || request_fence != &self.recovery.state_fence
+        {
+            return Err(CompositionError::Provider(
+                "Host Observe owner read is not at the exact retained receipt fence".to_owned(),
+            ));
+        }
+        if self
+            .try_current_observation_ingress_policy_at_retained_fence()?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        self.observation_capture_owner_binding_for_host_origin(peer_admission_receipt)
+            .map(Some)
+    }
+
+    fn validate_observation_activation_fence(
         &self,
         activation: &GovernorActivationSnapshot,
-        task_selection: Option<&TaskSelectionAdmissionBinding>,
-    ) -> Result<crate::ObservationCaptureOwnerBinding, CompositionError> {
+    ) -> Result<(), CompositionError> {
         if self.readiness != CompositionReadiness::Ready {
             return Err(CompositionError::NotReady);
         }
@@ -7126,6 +7225,16 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 "activated Observe owner binding is invalid or stale".to_owned(),
             ));
         }
+        Ok(())
+    }
+
+    fn observation_capture_owner_binding_for_activation_inner(
+        &self,
+        activation: &GovernorActivationSnapshot,
+        task_selection: Option<&TaskSelectionAdmissionBinding>,
+    ) -> Result<crate::ObservationCaptureOwnerBinding, CompositionError> {
+        self.validate_observation_activation_fence(activation)?;
+        let fence = &activation.state_fence;
         let session_id = SessionId::new(activation.session_id.clone()).map_err(|error| {
             CompositionError::Provider(format!("activated Observe session is invalid: {error}"))
         })?;
