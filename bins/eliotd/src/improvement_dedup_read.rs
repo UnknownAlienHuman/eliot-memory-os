@@ -690,11 +690,13 @@ fn classify_row(row: &Value) -> Result<Row, ImprovementDedupReadError> {
     // CANDIDATE's own authority and never this field, and the record's own
     // digest already covers this string, so it cannot be altered inside the
     // record without changing the revision identity the store keys the row by.
-    eliot_authority::PrincipalRef::new(artifact.owner_decision.owner.as_str()).map_err(|error| {
-        refused(format!(
-            "recorded decision owner is not a principal: {error}"
-        ))
-    })?;
+    eliot_authority::PrincipalRef::new(artifact.owner_decision.owner.as_str()).map_err(
+        |error| {
+            refused(format!(
+                "recorded decision owner is not a principal: {error}"
+            ))
+        },
+    )?;
     if artifact.governed_admission_digest.trim().is_empty() {
         return Err(refused(
             "record carries no owner-issued governed admission digest".to_owned(),
