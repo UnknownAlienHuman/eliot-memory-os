@@ -3261,12 +3261,11 @@ impl AdmittedAttemptCandidate {
             });
         }
 
-        let terminal_value = result
-            .extra
-            .get("admitted_terminal_observation")
-            .ok_or(AdmittedAttemptError::SealRejected {
+        let terminal_value = result.extra.get("admitted_terminal_observation").ok_or(
+            AdmittedAttemptError::SealRejected {
                 reason: "sealed run has no terminal observation",
-            })?;
+            },
+        )?;
         let mut original_preimage = result.clone();
         original_preimage
             .extra
