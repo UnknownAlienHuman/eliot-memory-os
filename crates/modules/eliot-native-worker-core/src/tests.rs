@@ -852,16 +852,12 @@ fn v1_string_authority_wire_is_rejected_before_admission() {
     assert!(serde_json::from_value::<WorkerHello>(value).is_err());
 
     let mut value = serde_json::to_value(
-        frame(
-            "request-1",
-            WorkerFrameBody::Execute(execute_call(None)),
-        )
-        .to_ebp_frame()
-        .expect("canonical EBP frame"),
+        frame("request-1", WorkerFrameBody::Execute(execute_call(None)))
+            .to_ebp_frame()
+            .expect("canonical EBP frame"),
     )
     .expect("fixture");
-    value["payload"]["native_protocol_version"] =
-        serde_json::json!("eliot-native-worker/v1");
+    value["payload"]["native_protocol_version"] = serde_json::json!("eliot-native-worker/v1");
     value["payload"]["authority_epoch"] = serde_json::json!("1");
     value["payload"]["state_fence"] = serde_json::json!("legacy-fence");
     assert!(serde_json::from_value::<eliot_protocol::Frame>(value).is_err());
@@ -1478,12 +1474,9 @@ fn native_case_17_typed_v2_roundtrips_and_sealed_provider_output_matches() {
     );
 
     let original_frame = frame("request-17", WorkerFrameBody::Execute(execute_call(None)));
-    let frame_wire = serde_json::to_value(
-        original_frame
-            .to_ebp_frame()
-            .expect("canonical EBP frame"),
-    )
-    .expect("frame wire");
+    let frame_wire =
+        serde_json::to_value(original_frame.to_ebp_frame().expect("canonical EBP frame"))
+            .expect("frame wire");
     assert_eq!(frame_wire["payload"]["authority_epoch"], epoch_wire());
     assert!(frame_wire["payload"]["state_fence"].is_object());
     assert_eq!(
@@ -1584,12 +1577,9 @@ fn native_case_19_protocol_label_and_field_shape_must_match_v2() {
     hello_wire["authority_epoch"] = serde_json::json!("1");
     assert!(serde_json::from_value::<WorkerHello>(hello_wire).is_err());
     let mut frame_wire = serde_json::to_value(
-        frame(
-            "request-19",
-            WorkerFrameBody::Execute(execute_call(None)),
-        )
-        .to_ebp_frame()
-        .expect("canonical EBP frame"),
+        frame("request-19", WorkerFrameBody::Execute(execute_call(None)))
+            .to_ebp_frame()
+            .expect("canonical EBP frame"),
     )
     .expect("frame wire");
     frame_wire["payload"]["state_fence"] = serde_json::json!("legacy-fence");

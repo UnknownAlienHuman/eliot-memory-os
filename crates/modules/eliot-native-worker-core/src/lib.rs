@@ -29,12 +29,12 @@ pub use eliot_agent_api::{
 };
 use eliot_agent_api::{AuthorizedEffect, ProposedEffect};
 use eliot_contracts::RequestId;
-use eliot_protocol::Frame;
 use eliot_process::{
     CancellationStatus, EvidenceSinkError, FencingToken, OperationId,
     PROCESS_CONTRACT_SCHEMA_VERSION, ProcessEvidence, ProcessEvidenceSink, ProcessExecutionError,
     ProcessExecutionView, ProcessExecutor, ProcessLifecycle, ProcessRequest, ProcessStartReceipt,
 };
+use eliot_protocol::Frame;
 use eliot_receipts::{ProofCeiling, ReceiptDisposition};
 pub use generated::{
     NativeWorkerExecuteEbpCallV1, NativeWorkerFacetStubError, compile_native_worker_execute_call_v1,
