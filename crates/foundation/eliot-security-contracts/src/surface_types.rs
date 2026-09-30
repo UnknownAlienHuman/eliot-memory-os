@@ -238,7 +238,10 @@ pub struct ModelProposedInterpretation {
     pub coverage: AssessmentCoverage,
 }
 
-fn assessment_text(value: &str, field: &'static str) -> Result<(), crate::SecurityContractError> {
+pub(crate) fn assessment_text(
+    value: &str,
+    field: &'static str,
+) -> Result<(), crate::SecurityContractError> {
     if value.trim().is_empty() || value.chars().any(char::is_control) {
         return Err(crate::SecurityContractError::InvalidText { field });
     }
@@ -258,7 +261,7 @@ fn assessment_digest(value: &str) -> Result<(), crate::SecurityContractError> {
     Ok(())
 }
 
-fn assessment_refs(
+pub(crate) fn assessment_refs(
     values: &[String],
     field: &'static str,
 ) -> Result<(), crate::SecurityContractError> {
@@ -321,6 +324,28 @@ pub struct SourceUseAuthority {
     pub instruction_taint: InstructionTaint,
     /// Fence this narrowing is bound to for the current operation.
     pub state_fence: StateFence,
+}
+
+impl SourceUseAuthority {
+    /// Intersects this narrowing with a second one over the same source.
+    ///
+    /// Both records describe the same assessed source revision, so the
+    /// intersection is the only use that both admit. Instruction taint takes
+    /// the stronger of the two, so intersecting can never clear taint, and the
+    /// fence of the receiver is kept.
+    #[must_use]
+    pub fn narrowed_with(&self, other: &SourceUseAuthority) -> SourceUseAuthority {
+        SourceUseAuthority {
+            assessed_source: self.assessed_source.clone(),
+            permitted_uses: assessment_intersection(&self.permitted_uses, &other.permitted_uses),
+            permitted_effects: assessment_intersection(
+                &self.permitted_effects,
+                &other.permitted_effects,
+            ),
+            instruction_taint: self.instruction_taint.max(other.instruction_taint),
+            state_fence: self.state_fence.clone(),
+        }
+    }
 }
 
 fn assessment_intersection<T: Copy + PartialEq>(left: &[T], right: &[T]) -> Vec<T> {
@@ -460,6 +485,49 @@ impl SourceSecurityAssessment {
             });
         }
         Ok(())
+    }
+
+    /// Resolves one I8.8 indicator for this assessment's exact source revision
+    /// and returns the use authority that survives it.
+    ///
+    /// The finite indicator-to-source map is consulted with this assessment's
+    /// own [`AssessedSourceRevision`], so an indicator is always scoped to the
+    /// revision it was assessed against. A candidate-only resolution changes
+    /// nothing: it returns exactly what [`Self::resolve_source_use`] returns.
+    /// A bounded restriction is intersected on top of that, so it can only
+    /// remove permitted uses and effects and can never widen them. Instruction
+    /// taint always comes from the assurance in force, so a summary, a second
+    /// model or a re-diagnosis cannot clear it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the assessment shape is malformed, when the
+    /// indicator map refuses the class/evidence/observation combination, or
+    /// when the fence or source in force is no longer the assessed one.
+    pub fn resolve_indicator_use(
+        &self,
+        indicator: crate::IndicatorClass,
+        evidence: &crate::IndicatorEvidence,
+        observation: &crate::IndicatorObservation,
+        current_assurance: &SourceAssurance,
+        state_fence: &StateFence,
+        release_condition: Option<&str>,
+    ) -> Result<SourceUseAuthority, crate::SecurityContractError> {
+        let base = self.resolve_source_use(current_assurance, state_fence)?;
+        let resolution = crate::IndicatorSourceMap::resolve(
+            indicator,
+            evidence,
+            observation,
+            &self.source,
+            state_fence,
+            release_condition,
+        )?;
+        match resolution.restriction() {
+            Some(restriction) => Ok(restriction
+                .resolve_use(current_assurance, state_fence)?
+                .narrowed_with(&base)),
+            None => Ok(base),
+        }
     }
 
     /// Resolves what one action may take from this assessed source right now.

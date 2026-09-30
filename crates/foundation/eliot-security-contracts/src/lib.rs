@@ -6,12 +6,21 @@
 
 #![forbid(unsafe_code)]
 
+mod injection_indicators;
 mod native_resource_lease;
 mod native_resource_selection;
 mod revocation_digest;
 mod surface_types;
 mod validation;
 
+pub use injection_indicators::{
+    BroadExtractionEvidence, DroppedEvidenceKind, DroppedEvidenceRecord, ExternalContentRole,
+    ExtractionScope, INDICATOR_CLASS_COUNT, IndicatorClass, IndicatorCoverage, IndicatorEvidence,
+    IndicatorObservation, IndicatorResolution, IndicatorResponse, IndicatorSourceMap,
+    PersistenceRequest, ProposedSourceRestriction, RepeatedLineageEvidence,
+    RetainedExternalEvidence, SummaryAuthorityEvidence, ToolDefinitionChangeEvidence,
+    ToolDefinitionDelta, UndeclaredEffectEvidence,
+};
 pub use native_resource_lease::{
     NATIVE_RESOURCE_LEASE_VERSION, NativeResourceLease, NativeResourceLeaseBinding,
     NativeResourceLeaseBindingField, NativeResourceLeaseConsumptionReceipt,
