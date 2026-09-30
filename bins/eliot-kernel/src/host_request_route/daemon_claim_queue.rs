@@ -377,6 +377,7 @@ impl KernelComposition {
             serde_json::Value,
             TaskControllerInvocation,
             TaskControllerAttempt,
+            String,
         )>,
         TransportError,
     > {
@@ -405,6 +406,23 @@ impl KernelComposition {
                 if !self.application_binding_live_for_claim(envelope, &admission_owner, true)? {
                     continue;
                 }
+                // The requester principal belongs to the retained application
+                // activation, independently of the daemon transport peer.
+                // The transition guard keeps this verified binding unchanged
+                // through claim publication.
+                let authenticated_principal = self
+                    .agent_bridge_connections
+                    .lock()
+                    .map_err(|_| TransportError::SessionFenced)?
+                    .get(&envelope.connection_id)
+                    .and_then(|connection| connection.activated_binding.as_ref())
+                    .map(|binding| binding.principal_id.clone())
+                    .filter(|principal| {
+                        !principal.trim().is_empty()
+                            && principal.trim() == principal
+                            && !principal.chars().any(char::is_control)
+                    })
+                    .ok_or(TransportError::SessionFenced)?;
                 if !candidate.task_controller_attempt.is_owned_by(session) {
                     let generation = candidate
                         .task_controller_attempt
@@ -457,7 +475,13 @@ impl KernelComposition {
                 attempt
                     .validate()
                     .map_err(|_| TransportError::SessionFenced)?;
-                return Ok(Some((envelope.clone(), tool.clone(), invocation, attempt)));
+                return Ok(Some((
+                    envelope.clone(),
+                    tool.clone(),
+                    invocation,
+                    attempt,
+                    authenticated_principal,
+                )));
             }
         }
         Ok(None)
