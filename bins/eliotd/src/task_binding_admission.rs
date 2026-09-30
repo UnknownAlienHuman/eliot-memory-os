@@ -58,21 +58,32 @@
 //! - [`bind_current_task_selection`] — the applicability recheck admission
 //!   needs (issue #1746, W4). It refuses a current task until the readiness
 //!   receipt carries owner-proven selection source/evidence. The owner
-//!   producer is `GovernorComposition::current_task_selection` and the
-//!   composition caller is `DaemonComposition::resolve_current_task_selection`
-//!   (itself STITCH-called: no live dispatch ingress supplies the lease key
-//!   terms yet). Structural validation of request-supplied
-//!   `TaskSelectionEvidence` is never sufficient.
+//!   producer is `GovernorComposition::current_task_selection_for_claim`
+//!   (retained terminal plus unique live activation, never request-supplied
+//!   evidence); its full-claim composition caller is
+//!   `DaemonComposition::resolve_current_task_selection` (STITCH: no live
+//!   dispatch ingress holds the full claim yet). The dispatch entry
+//!   (`DaemonComposition::commit_canonical_and_refresh`) instead supplies
+//!   partial lease-key terms to the partial-key
+//!   `GovernorComposition::current_task_selection`, which fail-closes by
+//!   owner decision (#1790), so task-relative admission withholds until the
+//!   full-claim route supplies the snapshot. Structural validation of
+//!   request-supplied `TaskSelectionEvidence` is never sufficient.
 //! - [`admit_canonical_write_with_activation`] — the W4 join (issue #1746,
 //!   W4/A2): [`admit_canonical_write`] preceded by
 //!   [`bind_current_task_selection`], so a structurally valid receipt that
 //!   disagrees with the live activation fails closed before any admission.
-//!   Live caller
+//!   The snapshot arrives through the full-claim owner route
+//!   (`GovernorComposition::current_task_selection_for_claim`), never
+//!   from the request; the partial-key lookup fail-closes by owner decision
+//!   (#1790), so the positive path withholds until the full claim is
+//!   supplied. Live caller
 //!   [`DaemonComposition::commit_canonical_and_refresh`](super::DaemonComposition),
 //!   for task-relative envelopes only (see [`envelope_is_task_relative`]): the
-//!   snapshot is resolved from the presented readiness lease through the
-//!   Governor owner (`GovernorComposition::current_task_selection`), never
-//!   from the request. Captures and non-task-relative writes stay on the
+//!   caller passes the presented readiness lease terms to the Governor owner
+//!   (`GovernorComposition::current_task_selection`), never the request, and
+//!   that partial-key lookup withholds per the paragraph above. Captures and
+//!   non-task-relative writes stay on the
 //!   receipt-only [`admit_canonical_write`] leg so permitted raw capture
 //!   remains cold without a retained terminal.
 //! - [`require_material_bootstrap_for_task_bound`] — the W5/A4 join
@@ -1674,9 +1685,13 @@ pub fn admit_task_bound_with_observed_scope(
 /// owner on this exact receipt), never an unbounded caller set. An invalid
 /// receipt fails closed with `TASK_SCOPE_INCOMPATIBLE` and resolves nothing.
 ///
-/// A current binding lacks owner-proven selection source/evidence in the
-/// receipt, so this function returns `TASK_SELECTION_REQUIRED` rather than
-/// fabricating [`TaskSelectionEvidence`]. The governance profile and receipt
+/// A current binding resolves only from the owner-proven selection
+/// source/evidence refs the promoting owner admitted into the receipt
+/// (`TaskIntakeCandidate::promote`): the evidence is structurally validated
+/// here, never fabricated, and admission additionally requires the live
+/// applicability recheck in [`bind_current_task_selection`] — a `Current`
+/// receipt with no owner-validated activation snapshot never admits
+/// task-bound work. The governance profile and receipt
 /// handle are unrelated to task selection and are not used as provenance.
 /// Every non-current binding state keeps its typed meaning:
 ///
@@ -1690,11 +1705,11 @@ pub fn admit_task_bound_with_observed_scope(
 ///   disposition stays non-material.
 ///
 /// There is deliberately no latest-task, open-task, or resolver-guess leg here:
-/// ambiguity is reported, never resolved. The task-intake owner producer is
-/// present (`eliot_workscope::task_selection_required`, consumed by
-/// [`selection_response_for_receipt`]); what is still absent is owner-proven
-/// selection source/evidence on `CurrentTaskContract` receipts, so the current
-/// arm keeps refusing (see [`bind_current_task_selection`]).
+/// ambiguity is reported, never resolved. The task-intake owner shape is
+/// produced by `eliot_workscope::task_selection_required` and consumed by
+/// [`selection_response_for_receipt`]; the owner-proven selection
+/// source/evidence refs arrive through the promoting owner above, never
+/// through a request.
 pub fn resolve_task_selection(
     receipt: &OnboardingReadinessReceipt,
 ) -> Result<TaskSelectionDisposition, TaskBindingError> {
@@ -1753,10 +1768,10 @@ pub fn resolve_task_selection(
 /// Rechecks one Governor-resolved task selection against the current
 /// applicability and fence before any admission (I5.6 step 4, issue #1746 W4).
 ///
-/// [`resolve_task_selection`] refuses `CurrentTaskContract` today because the
-/// readiness receipt has no owner-proven selection source/evidence. If that
-/// owner producer is added, this entry is the applicability leg required by
-/// the issue: the ORIGINAL owner evidence is validated as compiled
+/// [`resolve_task_selection`] resolves `CurrentTaskContract` from the
+/// receipt's owner-proven selection source/evidence refs; this entry is the
+/// applicability leg required by the issue: the ORIGINAL owner evidence is
+/// validated as compiled
 /// (non-zero `TaskContract` revision, acceptance-digest shape, `WorkScope`,
 /// selection source and evidence handles), then every selection field is
 /// rechecked at this exact fence — revision and `WorkScope` against what the

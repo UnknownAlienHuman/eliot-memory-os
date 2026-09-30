@@ -6847,31 +6847,26 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         Ok(report)
     }
 
-    /// Resolves the Governor's retained task binding for admission (issue
+    /// Partial-key task-selection lookup that always fail-closes (issue
     /// #1746, W4).
     ///
-    /// The exact task binding and acceptance digest come from Governor's
-    /// retained cold-start terminal, never from a request-supplied
-    /// `TaskSelectionEvidence`. The receipt carries the owner-proven selection
-    /// source/evidence refs the promoting owner admitted
-    /// (`TaskIntakeCandidate::promote` via [`Self::promote_task_intake`): the
-    /// admitting decision owner or delegating binding, and the exact intake
-    /// handle. This method validates the retained receipt and exact lease key
-    /// against the live Governor fence and freshly matched `WorkScope` without
-    /// synthesizing any reference. A current task
-    /// contract is additionally joined to the unique live activation,
-    /// including principal, session, task id and revision.
-    ///
-    /// Valid no-task, exploratory, stale-selection and ambiguous dispositions
-    /// return `None` with the original receipt so the caller can retain the
-    /// typed intake response and bounded owner-issued handles. Active-work
-    /// ambiguity stays a separate activation outcome. This entry never
-    /// prefers the latest or most similar task, and it never creates one.
+    /// Partial lease-key terms cannot authorize durable task selection
+    /// (#1790): this entry never resolves a snapshot from them and never
+    /// synthesizes selection source/evidence, so a task-relative dispatch leg
+    /// that reaches it withholds instead of admitting on a partial identity.
+    /// Callers holding the full readiness claim use
+    /// [`Self::current_task_selection_for_claim`], which validates the
+    /// retained receipt (with its owner-proven selection source/evidence refs
+    /// from `TaskIntakeCandidate::promote` via [`Self::promote_task_intake`])
+    /// against the live Governor fence and freshly matched `WorkScope` and
+    /// joins a current task contract to the unique live activation. This
+    /// entry never prefers the latest or most similar task, and it never
+    /// creates one.
     ///
     /// # Errors
     ///
-    /// Returns `Some(activation)` only for one current task contract. Invalid
-    /// or stale owner state is refused before the caller can admit a binding.
+    /// Always returns `CompositionError::Recovery` directing the caller to
+    /// supply the full readiness claim.
     pub fn current_task_selection(
         &self,
         now: u64,
