@@ -30,6 +30,17 @@
 //! Every failure is a typed [`MaintenanceError`]; the producer keeps its
 //! retry identity (trigger identity, operation hash, source cursor) on all of
 //! them, and no acknowledgement may be emitted from an error.
+//!
+//! The persist entry is [`MaintenanceTriggerIntake::persist_before_ack`]:
+//! it re-checks the derived statement, invokes the durability owner's staging
+//! seam exactly once, and returns the bound [`TriggerIntakePersistReceipt`]
+//! that alone may advance the producer cursor. The seam performs the
+//! owner-side durable write the Governor must not perform itself — reusing a
+//! retained canonical source event where one exists and storing its delivery
+//! obligation, otherwise staging the complete opaque input through the ORS
+//! owner — and binds the owner-issued envelope reference and payload digest
+//! through [`MaintenanceTriggerIntake::bind_staging_proof`], so unbound owner
+//! output can never become a receipt.
 
 use eliot_contracts::sha256_hex;
 
@@ -285,6 +296,209 @@ pub fn derive_trigger_intake(
         payload: request.payload.clone(),
         payload_binding,
     })
+}
+
+/// Durable persist-before-ack receipt for one retained trigger intake.
+///
+/// Issued only after the complete opaque input is committed through the ORS
+/// owner. An exact identity/hash replay returns the same receipt; changed
+/// content under the same identity never reaches one. The receipt proves
+/// staging only: it is not a decision, an execution, or a delivery
+/// acknowledgement. The producer cursor advances only on this receipt; every
+/// error leaves the retry identity (trigger identity, operation hash, source
+/// cursor or occurrence) with the producer and the cursor unmoved.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TriggerIntakePersistReceipt {
+    /// Stable trigger identity that was staged; echoed from the intake
+    /// statement by construction, never re-derived or re-attested.
+    pub trigger_id: String,
+    /// Lowercase SHA-256 of the exact producer operation bytes; echoed from
+    /// the intake statement by construction.
+    pub operation_hash: String,
+    /// Owner-issued reference to the staged envelope: the delivery
+    /// obligation the Kernel intake path re-proves before acknowledging.
+    pub envelope_reference: String,
+    /// Owner-issued digest of the exact staged envelope payload bytes, bound
+    /// to the presented durable payload by
+    /// [`MaintenanceTriggerIntake::bind_staging_proof`].
+    pub payload_hash: String,
+}
+
+impl MaintenanceTriggerIntake {
+    /// Persists this derived intake through the durability owner before any
+    /// acknowledgement.
+    ///
+    /// Re-checks the statement shape and content binding, then invokes the
+    /// staging seam exactly once. The seam is the production intake path's
+    /// durable write: it reuses a retained canonical source event where one
+    /// exists and stores its delivery obligation, otherwise it stages the
+    /// complete opaque input through the ORS owner, and it binds the
+    /// owner-issued envelope reference and payload digest through
+    /// [`MaintenanceTriggerIntake::bind_staging_proof`]. The returned
+    /// [`TriggerIntakePersistReceipt`] is the only value that may advance the
+    /// producer cursor. In-memory pointers, ephemeral files, and inaccessible
+    /// source references cannot reach the seam: they are unrepresentable in
+    /// the statement, whose shape check refuses them before any write.
+    ///
+    /// Replay and conflict behaviour is deterministic end to end. Derivation
+    /// is pure, so an exact identity/hash replay addresses the same durable
+    /// row and returns the same receipt, while changed content under the same
+    /// identity conflicts instead of replaying. The Governor side of that
+    /// contract is enforced here and in
+    /// [`MaintenanceTriggerIntake::bind_staging_proof`]; row identity, the
+    /// envelope-to-obligation binding, and ledger admission stay with the ORS
+    /// owner and the Kernel delivery ledger, which re-prove staging before
+    /// any intake acknowledgement is issued.
+    ///
+    /// The seam keeps every owner failure typed: capacity, key, integrity,
+    /// and durable-write failures arrive as [`MaintenanceError::Store`] with
+    /// the owner's detail preserved, and changed content under the same
+    /// identity arrives as [`MaintenanceError::IdentityConflict`]. Any error
+    /// means nothing was acknowledged: the producer keeps its retry identity
+    /// and its cursor must not advance.
+    ///
+    /// Production caller (STITCH, issue #1694): the authenticated daemon
+    /// intake-staging path in `bins/eliotd` (sibling to
+    /// `commit_maintenance_trigger_decision`), which copies this statement
+    /// verbatim onto the provider-neutral wire record and the ORS staging
+    /// request and sends the intake operation over the authenticated daemon
+    /// transport through the existing Kernel intake ports. No production
+    /// caller exists yet and none is faked here; the `lib.rs` re-export of
+    /// [`TriggerIntakePersistReceipt`] rides with that stitch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MaintenanceError::InvalidField`] for a malformed statement,
+    /// [`MaintenanceError::IdentityConflict`] when the statement's content
+    /// binding no longer matches its payload, or the seam's typed owner
+    /// failure. Every error acknowledges nothing.
+    pub fn persist_before_ack(
+        &self,
+        stage: &mut impl FnMut(
+            &MaintenanceTriggerIntake,
+        ) -> Result<TriggerIntakePersistReceipt, MaintenanceError>,
+    ) -> Result<TriggerIntakePersistReceipt, MaintenanceError> {
+        check_intake_shape(self)?;
+        stage(self)
+    }
+
+    /// Binds owner-issued staging output into the persist receipt.
+    ///
+    /// The seam calls this with the envelope reference and payload digest
+    /// the durable write actually committed; only this binding can produce a
+    /// [`TriggerIntakePersistReceipt`], so unbound owner output — a predicted
+    /// reference, a guessed digest, or bytes staged beside the obligation —
+    /// can never become one. The trigger identity and operation hash echo the
+    /// intake statement by construction. For a complete opaque input the
+    /// owner digest must equal the digest of the presented bytes; for a
+    /// retained canonical source it must be a staged envelope digest, never
+    /// the derivation-local payload binding, which is replay evidence only
+    /// and must not be copied into the staged record. A mismatch is changed
+    /// content under this identity and conflicts instead of replaying.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MaintenanceError::InvalidField`] for a blank reference or a
+    /// malformed digest, [`MaintenanceError::IdentityConflict`] when the
+    /// owner digest does not bind the presented durable payload. Every error
+    /// acknowledges nothing.
+    pub fn bind_staging_proof(
+        &self,
+        envelope_reference: &str,
+        payload_hash: &str,
+    ) -> Result<TriggerIntakePersistReceipt, MaintenanceError> {
+        require_text(envelope_reference, "persist.envelope_reference")?;
+        require_digest(payload_hash, "persist.payload_hash")?;
+        match &self.payload {
+            TriggerIntakePayload::CompleteOpaqueInput { payload_bytes } => {
+                if sha256_hex(payload_bytes) != payload_hash {
+                    return Err(MaintenanceError::IdentityConflict);
+                }
+            }
+            TriggerIntakePayload::RetainedCanonicalSource { .. } => {
+                if payload_hash == self.payload_binding {
+                    return Err(MaintenanceError::IdentityConflict);
+                }
+            }
+        }
+        Ok(TriggerIntakePersistReceipt {
+            trigger_id: self.trigger_id.clone(),
+            operation_hash: self.operation_hash.clone(),
+            envelope_reference: envelope_reference.to_owned(),
+            payload_hash: payload_hash.to_owned(),
+        })
+    }
+}
+
+/// Re-checks one derived intake statement before it may reach the seam.
+///
+/// Statements normally arrive from [`derive_trigger_intake`], which already
+/// validated every dimension; the fields stay public, so a hand-built
+/// statement must prove the same shape here before any durable write. The
+/// content binding is recomputed from the payload and compared, so bytes
+/// changed after derivation conflict instead of replaying. Expiry against the
+/// live clock stays with the delivery ledger, which refuses stale
+/// eligibility at admission with the time it owns.
+fn check_intake_shape(intake: &MaintenanceTriggerIntake) -> Result<(), MaintenanceError> {
+    require_text(&intake.trigger_id, "persist.trigger_id")?;
+    require_digest(&intake.operation_hash, "persist.operation_hash")?;
+    require_text(&intake.operation_label, "persist.operation")?;
+    require_text(
+        &intake.source_event.producer_id,
+        "persist.source_event.producer_id",
+    )?;
+    if intake.source_event.producer_generation == 0 {
+        return Err(MaintenanceError::InvalidField(
+            "persist.source_event.producer_generation",
+        ));
+    }
+    require_text(
+        &intake.source_event.stream_id,
+        "persist.source_event.stream_id",
+    )?;
+    require_text(
+        &intake.source_event.event_id,
+        "persist.source_event.event_id",
+    )?;
+    match &intake.source_position {
+        TriggerIntakePosition::Cursor { value } => {
+            if *value == 0 {
+                return Err(MaintenanceError::InvalidField("persist.source_position.cursor"));
+            }
+        }
+        TriggerIntakePosition::AcceptedOccurrence { occurrence_id } => {
+            require_text(
+                occurrence_id,
+                "persist.source_position.occurrence_id",
+            )?;
+        }
+    }
+    require_text(&intake.family_ref, "persist.family.reference")?;
+    require_text(&intake.scope_ref, "persist.scope.reference")?;
+    if intake.evidence_locators.is_empty() {
+        return Err(MaintenanceError::InvalidField("persist.evidence_locators"));
+    }
+    for locator in &intake.evidence_locators {
+        require_text(locator, "persist.evidence_locators")?;
+    }
+    require_text(
+        &intake.privacy_class_reference,
+        "persist.privacy_class_reference",
+    )?;
+    require_text(
+        &intake.visibility_reference,
+        "persist.visibility_reference",
+    )?;
+    if intake.applicable_until_ms <= intake.created_at_ms {
+        return Err(MaintenanceError::InvalidField("persist.applicable_until_ms"));
+    }
+    validate_routing(&intake.routing)?;
+    validate_payload(&intake.payload)?;
+    require_digest(&intake.payload_binding, "persist.payload_binding")?;
+    if payload_binding(&intake.payload) != intake.payload_binding {
+        return Err(MaintenanceError::IdentityConflict);
+    }
+    Ok(())
 }
 
 fn validate_operation(operation: &TriggerIntakeOperation) -> Result<(), MaintenanceError> {
