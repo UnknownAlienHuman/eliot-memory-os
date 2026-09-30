@@ -661,6 +661,7 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "semantic_observe_claim" => "semantic_observe_claim",
         "semantic_observe_result" => "semantic_observe_result",
         "semantic_observe_deferred" => "semantic_observe_deferred",
+        "watchdog_export_claim" => "watchdog_export_claim",
         "campaign_packet_claim" => "campaign_packet_claim",
         "campaign_packet_result" => "campaign_packet_result",
         "task_controller_claim" => "task_controller_claim",
@@ -3735,6 +3736,41 @@ impl KernelComposition {
                             "recovery": null,
                         }),
                     })
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            "watchdog_export_claim" => {
+                // Outbound-only eliotd spool-drain poller (#2899): claims the
+                // next Watchdog spool export window this Kernel admitted through
+                // the authenticated `watchdog_export_submit` front-door route,
+                // so the daemon can admit it through the Governor. It mirrors
+                // `semantic_observe_claim`: same dispatcher-head session/auth/
+                // ready/fence gates, same single-`operation`-key payload shape,
+                // same null poll (not error) when empty. The claimed window
+                // carries the exact submitted bytes and every entry was
+                // re-proved against its own durable ORS row, so the daemon never
+                // admits a window the durable owner cannot prove.
+                #[cfg(windows)]
+                {
+                    if payload.as_object().is_none_or(|object| object.len() != 1) {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    match self.claim_watchdog_export_batch(session)? {
+                        Some(batch) => serde_json::json!({
+                            "status": "known",
+                            "value": { "batch": batch },
+                            "recovery": null,
+                        }),
+                        None => serde_json::json!({
+                            "status": "known",
+                            "value": { "batch": null },
+                            "recovery": null,
+                        }),
+                    }
                 }
                 #[cfg(not(windows))]
                 {

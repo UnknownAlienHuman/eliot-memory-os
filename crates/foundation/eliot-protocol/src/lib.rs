@@ -5590,6 +5590,388 @@ impl WatchdogSpoolIntentBatchPayload {
     }
 }
 
+/// Stable wire identity for a Watchdog spool export-batch payload.
+pub const WATCHDOG_SPOOL_EXPORT_BATCH_WIRE_ID: &str = "eliot.protocol.watchdog-spool-export-batch";
+/// Current Watchdog spool export-batch payload wire version.
+pub const WATCHDOG_SPOOL_EXPORT_BATCH_WIRE_VERSION: u16 = 1;
+/// Exact admitted Kernel route that carries one Watchdog spool export batch.
+///
+/// This is a distinct closed route identity from
+/// [`WATCHDOG_SPOOL_BATCH_ROUTE`], which carries spool *intents*. The two
+/// payloads are never interchangeable: an export batch is a bounded drain
+/// window of retained spool observations, while an intent batch is the
+/// owner-ruled escalation subset of that spool.
+pub const WATCHDOG_SPOOL_EXPORT_ROUTE: &str = "watchdog-spool-export-v1";
+/// Bounded number of export entries carried by one payload.
+///
+/// 256 is the Watchdog owner's own default export item ceiling
+/// (`EXPORT_MAX_ITEMS`), so one payload can always carry a whole owner
+/// generated export window and never a larger one.
+pub const MAX_WATCHDOG_SPOOL_EXPORT_ENTRIES: usize = 256;
+/// Domain prefix of the Watchdog export reconciliation idempotency key.
+///
+/// Keeping the prefix here (rather than in either consumer) is what makes the
+/// derivation single-owner: the Kernel mints and re-derives the key, and no
+/// consumer may substitute its own scheme.
+const WATCHDOG_EXPORT_RECONCILE_KEY_DOMAIN: &str = "watchdog-spool-export-reconcile-v1";
+
+/// Owner-neutral Watchdog spool payload class on the wire.
+///
+/// This mirrors the owner-neutral core's `WatchdogSpoolPayloadKind` without
+/// depending on that crate, exactly as the spool codec's three payload classes
+/// (Heartbeat, Gap, Recovery) are mirrored everywhere else. It is an
+/// observation label only: no canonical Problem, Incident, health, or
+/// coverage claim can be expressed by this type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum WatchdogSpoolEntryKind {
+    /// Ordinary liveness/lease observation.
+    Heartbeat,
+    /// Pressure, wrap, or coverage-gap marker.
+    Gap,
+    /// Repair or recovery record.
+    Recovery,
+}
+
+impl WatchdogSpoolEntryKind {
+    /// Returns the stable wire code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Heartbeat => "HEARTBEAT",
+            Self::Gap => "GAP",
+            Self::Recovery => "RECOVERY",
+        }
+    }
+}
+
+/// Derives the exactly-once reconciliation key for one Watchdog spool export
+/// entry.
+///
+/// The key is the single owner-side derivation used by the Kernel export
+/// mutation: it binds the owning installation, the retained spool record
+/// sequence, and the retained record digest under a fixed domain prefix. A
+/// lost-acknowledgement retry presents byte-identical material, so the derived
+/// key is identical and the durable admission ledger resolves it to the same
+/// submission; any change to installation, sequence, or record bytes derives a
+/// different key and can never reuse a prior submission.
+#[must_use]
+pub fn watchdog_export_reconciliation_idempotency_key(
+    installation_id: &str,
+    sequence: u64,
+    record_digest: &str,
+) -> String {
+    let material = format!(
+        "{WATCHDOG_EXPORT_RECONCILE_KEY_DOMAIN}\0{installation_id}\0{sequence}\0{record_digest}"
+    );
+    eliot_contracts::sha256_hex(material.as_bytes())
+}
+
+/// One Watchdog spool export entry inside a fenced export batch.
+///
+/// It carries the owner-neutral export view field for field: the retained
+/// sequence, the record revision, the observation timestamp, the payload class,
+/// and the two owner-computed digests. The digests are the transport unit
+/// because they already bind the canonical retained record bytes, so no
+/// consumer parses raw spool records on this path.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WatchdogSpoolExportSubmission {
+    /// Retained spool sequence of the exported record.
+    pub sequence: u64,
+    /// Watchdog spool record revision; one window carries exactly one.
+    pub schema_version: u16,
+    /// Watchdog observation timestamp of the exported record.
+    pub observed_at_ms: u64,
+    /// Owner-neutral payload class of the exported record.
+    pub entry_kind: WatchdogSpoolEntryKind,
+    /// Digest over the canonical record bytes.
+    pub payload_digest: String,
+    /// Digest over the full record bytes.
+    pub record_digest: String,
+    /// Exactly-once reconciliation key; the Kernel re-derives it and fences on
+    /// any presented value it cannot reproduce.
+    pub idempotency_key: String,
+}
+
+impl WatchdogSpoolExportSubmission {
+    /// Validates the closed submission shape and its digest bindings.
+    ///
+    /// `installation_id` is the batch-level owning installation; the derivation
+    /// it feeds is re-checked here so a forged key fails closed before the
+    /// export entry reaches the durable admission ledger.
+    pub fn validate(&self, installation_id: &str) -> Result<(), ProtocolError> {
+        if self.sequence == 0 {
+            return Err(ProtocolError::InvalidField {
+                field: "watchdog_spool_export_submission.sequence",
+                reason: "retained spool sequence must be positive",
+            });
+        }
+        if self.schema_version == 0 {
+            return Err(ProtocolError::InvalidField {
+                field: "watchdog_spool_export_submission.schema_version",
+                reason: "spool record revision must be positive",
+            });
+        }
+        if self.observed_at_ms == 0 {
+            return Err(ProtocolError::InvalidField {
+                field: "watchdog_spool_export_submission.observed_at_ms",
+                reason: "observation timestamp must be greater than zero",
+            });
+        }
+        lowercase_sha256(
+            &self.payload_digest,
+            "watchdog_spool_export_submission.payload_digest",
+        )?;
+        lowercase_sha256(
+            &self.record_digest,
+            "watchdog_spool_export_submission.record_digest",
+        )?;
+        lowercase_sha256(
+            &self.idempotency_key,
+            "watchdog_spool_export_submission.idempotency_key",
+        )?;
+        if self.idempotency_key
+            != watchdog_export_reconciliation_idempotency_key(
+                installation_id,
+                self.sequence,
+                &self.record_digest,
+            )
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "watchdog_spool_export_submission.idempotency_key",
+                reason: "must be the derived reconciliation key for this installation, sequence, and record digest",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Versioned Watchdog spool export-batch payload carried by the fenced Kernel
+/// route.
+///
+/// This payload is the *only* EBP shape the Kernel admits for a Watchdog spool
+/// export. It binds one owner-generated export window identity, the exact
+/// retained entries covered in that window, and the Watchdog's own supervision
+/// lineage. Admitting it records a durable *pending export projection* only:
+/// the canonical observation commit, the Problem/Incident decision, and every
+/// other semantic decision remain owned by the Governor, and this payload has
+/// no field in which such a decision could be expressed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WatchdogSpoolExportBatchPayload {
+    /// Payload wire identity.
+    pub wire_id: String,
+    /// Payload wire version.
+    pub wire_version: u16,
+    /// Closed admitted route identity; must equal
+    /// [`WATCHDOG_SPOOL_EXPORT_ROUTE`].
+    pub route: String,
+    /// Owning installation echoed from the export predecessor cursor.
+    pub installation_id: String,
+    /// Watchdog spool record revision this whole window carries.
+    ///
+    /// One export window is one spool revision, so every entry must answer it.
+    pub schema_version: u16,
+    /// Watchdog generation echoed from the export predecessor cursor.
+    pub watchdog_generation: u64,
+    /// Watchdog epoch echoed from the export predecessor cursor.
+    pub watchdog_epoch: u64,
+    /// Watchdog-owned epoch lineage identity of this export window.
+    ///
+    /// The durable export projection is stamped with the Watchdog's own epoch
+    /// lineage rather than the presenting Kernel fence, so the record binding
+    /// is byte-stable across a retry that follows an epoch rotation. The
+    /// Kernel's live fence is still checked mechanically at admission, so a
+    /// stale submission is fenced; it simply never *becomes* part of the durable
+    /// identity, which would otherwise turn an exactly-once replay into an
+    /// identity conflict after a rotation.
+    pub watchdog_epoch_lineage_id: String,
+    /// Exact supervision lease identity under which the Watchdog was admitted.
+    ///
+    /// The Kernel resolves this against its own retained supervision-lease
+    /// authority, so the declared Watchdog generation and epoch are checked
+    /// against the lease the Kernel actually holds rather than against the
+    /// presenting transport session. A submission naming a lease the Kernel does
+    /// not currently hold, or a generation/epoch that lease does not admit, is
+    /// fenced before any durable write.
+    pub supervision_lease_id: String,
+    /// Responding sink identity echoed from the export predecessor cursor.
+    pub sink_id: String,
+    /// Predecessor acknowledged sequence the batch continues.
+    pub predecessor_sequence: u64,
+    /// First sequence covered by the export window.
+    pub first_sequence: u64,
+    /// Last sequence covered by the export window.
+    pub last_sequence: u64,
+    /// Spool high-water observed at export time.
+    pub high_water_sequence: u64,
+    /// Export timestamp in milliseconds; must precede `expires_at_ms`.
+    pub created_at_ms: u64,
+    /// Acknowledgement deadline in milliseconds.
+    pub expires_at_ms: u64,
+    /// Batch identity echoed from the export window.
+    pub batch_id: String,
+    /// Batch digest echoed from the export window.
+    pub batch_digest: String,
+    /// Owner-computed count of retained entry bytes this window covers.
+    ///
+    /// It is the Watchdog's own recorded export byte size, carried so a
+    /// consumer can rebuild the exact owner-generated window instead of
+    /// inventing a size of its own.
+    pub byte_size: u64,
+    /// Retained entries covered by this window, in strictly ascending sequence
+    /// order and consecutive from `first_sequence`.
+    pub entries: Vec<WatchdogSpoolExportSubmission>,
+    /// Lowercase SHA-256 over every payload field except this field.
+    pub payload_sha256: String,
+}
+
+impl WatchdogSpoolExportBatchPayload {
+    /// Current payload contract version.
+    pub const CONTRACT_VERSION: u16 = WATCHDOG_SPOOL_EXPORT_BATCH_WIRE_VERSION;
+
+    /// Returns canonical bytes covered by `payload_sha256`.
+    pub fn canonical_unsigned_bytes(&self) -> Result<Vec<u8>, ProtocolError> {
+        let mut unsigned = self.clone();
+        unsigned.payload_sha256.clear();
+        canonical_json_bytes(&unsigned).map_err(|error| ProtocolError::Json(error.to_string()))
+    }
+
+    /// Computes the canonical payload digest.
+    pub fn compute_digest(&self) -> Result<String, ProtocolError> {
+        Ok(eliot_contracts::sha256_hex(
+            &self.canonical_unsigned_bytes()?,
+        ))
+    }
+
+    /// Populates the canonical payload digest.
+    pub fn with_computed_digest(mut self) -> Result<Self, ProtocolError> {
+        self.payload_sha256 = self.compute_digest()?;
+        Ok(self)
+    }
+
+    /// Validates the closed payload shape, the window identity, and every
+    /// covered export entry.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.wire_id != WATCHDOG_SPOOL_EXPORT_BATCH_WIRE_ID
+            || self.wire_version != Self::CONTRACT_VERSION
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "watchdog_spool_export_batch.wire",
+                reason: "unsupported watchdog spool export batch payload",
+            });
+        }
+        if self.route != WATCHDOG_SPOOL_EXPORT_ROUTE {
+            return Err(ProtocolError::InvalidField {
+                field: "watchdog_spool_export_batch.route",
+                reason: "must be the admitted watchdog spool export route",
+            });
+        }
+        bounded_text(
+            &self.installation_id,
+            "watchdog_spool_export_batch.installation_id",
+            MAX_HOST_REQUEST_TEXT_BYTES,
+        )?;
+        bounded_text(
+            &self.sink_id,
+            "watchdog_spool_export_batch.sink_id",
+            MAX_HOST_REQUEST_TEXT_BYTES,
+        )?;
+        if self.watchdog_generation == 0 {
+            return Err(ProtocolError::InvalidField {
+                field: "watchdog_spool_export_batch.watchdog_generation",
+                reason: "watchdog generation must be positive",
+            });
+        }
+        bounded_text(
+            &self.watchdog_epoch_lineage_id,
+            "watchdog_spool_export_batch.watchdog_epoch_lineage_id",
+            MAX_HOST_REQUEST_TEXT_BYTES,
+        )?;
+        bounded_text(
+            &self.supervision_lease_id,
+            "watchdog_spool_export_batch.supervision_lease_id",
+            MAX_HOST_REQUEST_TEXT_BYTES,
+        )?;
+        bounded_text(
+            &self.batch_id,
+            "watchdog_spool_export_batch.batch_id",
+            MAX_HOST_REQUEST_TEXT_BYTES,
+        )?;
+        lowercase_sha256(
+            &self.batch_digest,
+            "watchdog_spool_export_batch.batch_digest",
+        )?;
+        if self.created_at_ms == 0 || self.created_at_ms >= self.expires_at_ms {
+            return Err(ProtocolError::InvalidField {
+                field: "watchdog_spool_export_batch.expires_at_ms",
+                reason: "acknowledgement window must be a positive forward interval",
+            });
+        }
+        if self.entries.is_empty() || self.entries.len() > MAX_WATCHDOG_SPOOL_EXPORT_ENTRIES {
+            return Err(ProtocolError::InvalidField {
+                field: "watchdog_spool_export_batch.entries",
+                reason: "must carry a bounded non-empty export entry list",
+            });
+        }
+        if self.schema_version == 0 {
+            return Err(ProtocolError::InvalidField {
+                field: "watchdog_spool_export_batch.schema_version",
+                reason: "spool record revision must be positive",
+            });
+        }
+        if self.byte_size == 0 {
+            return Err(ProtocolError::InvalidField {
+                field: "watchdog_spool_export_batch.byte_size",
+                reason: "owner-computed export byte size must be positive",
+            });
+        }
+        let mut previous: Option<u64> = None;
+        for entry in &self.entries {
+            entry.validate(&self.installation_id)?;
+            if entry.schema_version != self.schema_version {
+                return Err(ProtocolError::InvalidField {
+                    field: "watchdog_spool_export_batch.entries",
+                    reason: "every export entry must answer the window spool revision",
+                });
+            }
+            match previous {
+                Some(sequence) => {
+                    if sequence.checked_add(1) != Some(entry.sequence) {
+                        return Err(ProtocolError::InvalidField {
+                            field: "watchdog_spool_export_batch.entries",
+                            reason: "export entries must be strictly consecutive by sequence",
+                        });
+                    }
+                }
+                None => {
+                    if self.predecessor_sequence.checked_add(1) != Some(entry.sequence) {
+                        return Err(ProtocolError::InvalidField {
+                            field: "watchdog_spool_export_batch.entries",
+                            reason: "the first export entry must continue the predecessor cursor",
+                        });
+                    }
+                }
+            }
+            previous = Some(entry.sequence);
+        }
+        if previous != Some(self.last_sequence) || self.first_sequence == 0 {
+            return Err(ProtocolError::InvalidField {
+                field: "watchdog_spool_export_batch.last_sequence",
+                reason: "the covered range must answer the submitted window boundaries",
+            });
+        }
+        if self.payload_sha256 != self.compute_digest()? {
+            return Err(ProtocolError::InvalidField {
+                field: "watchdog_spool_export_batch.payload_sha256",
+                reason: "payload digest mismatch",
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Stable typed denial codes for host-request admission control.
 ///
 /// Codes are control values, never human prose: no error text drives routing.
