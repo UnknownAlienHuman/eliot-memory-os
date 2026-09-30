@@ -41,6 +41,14 @@ impl UserBrokerSessionBinding {
         }
     }
 
+    pub(crate) fn connection_id(&self) -> &str {
+        &self.connection_id
+    }
+
+    pub(crate) const fn session_epoch(&self) -> u64 {
+        self.session_epoch
+    }
+
     /// Returns whether a dispatch still belongs to the exact captured
     /// authenticated session.
     pub(crate) fn matches(&self, session: &Session) -> bool {

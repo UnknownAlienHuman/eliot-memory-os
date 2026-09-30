@@ -142,7 +142,7 @@ fn ors_epoch_lineage(
             .map_err(|_| TransportError::SessionFenced)?,
         epoch: epoch.sequence.get(),
     };
-    let predecessor = previous.filter(|prior| prior != &current).cloned();
+    let predecessor = previous.filter(|prior| *prior != &current).cloned();
     let lineage = EpochLineage {
         current,
         predecessor,
@@ -432,15 +432,16 @@ impl KernelComposition {
         let payload_bytes = serde_json::to_vec(&(
             "user-broker-session-fenced-v1",
             &registration.receipt.registration_digest,
-            &registration.session.connection_id,
-            registration.session.session_epoch,
+            registration.session.connection_id(),
+            registration.session.session_epoch(),
         ))
         .map_err(|_| TransportError::SessionFenced)?;
         let payload_length =
             u64::try_from(payload_bytes.len()).map_err(|_| TransportError::SessionFenced)?;
         let record_id = OperationIdentity::new(format!(
             "user-broker-fence:{}:{}",
-            registration.receipt.registration_digest, registration.session.session_epoch
+            registration.receipt.registration_digest,
+            registration.session.session_epoch()
         ))
         .map_err(|_| TransportError::SessionFenced)?;
         let epoch_lineage = ors_epoch_lineage(&registration.authority_epoch, None)?;
