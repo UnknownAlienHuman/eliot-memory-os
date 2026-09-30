@@ -1,7 +1,7 @@
 //! Experience runtime driver: terminal observation/quality invocation over
 //! the real bridge client (#223 B-consumer lane).
 //!
-//! Daemon-side production edge for the experience lane, mirroring
+//! Daemon-side driver for the experience lane, mirroring
 //! [`governor_local_read`](super::governor_local_read): a per-call factory
 //! over [`DaemonComposition::context_read_client`], so the composition
 //! retains no client and no thread and a Governor refresh surfaces as an
@@ -30,6 +30,28 @@
 //! edge (O1 registration hunk): this driver invents none of them. No
 //! policy, admission, or semantic rule lives here; fence agreement and
 //! response identity fail closed before any shaping.
+//!
+//! # Live status: NO production caller
+//!
+//! Nothing in the repository calls this module. Every entry point below is
+//! reachable only by naming it: the only external mentions of these symbols
+//! are the `pub use` re-exports in `bins/eliotd/src/lib.rs`, which are not
+//! calls, plus one `owned_by!` catalogue string in
+//! `bins/eliotd/src/maintenance_family_catalog.rs`, which is a recorded
+//! human-facing label rather than a call. A source implementation is not
+//! evidence of a live edge, so the earlier "Daemon-side production edge" and
+//! "production caller" claims for this module were false and have been
+//! removed.
+//!
+//! Two dependency edges exist because of this module and nothing else in the
+//! tree: `eliot-dreamer-contracts` (the `AcceptedSourceProjection` source
+//! binding carried by the event input structs) and
+//! `eliot-dreamer-memory-revision` (the [`propose`] call in
+//! [`propose_memory_extinction_candidate`]). Whether these drivers are wired
+//! to a real trigger edge, retired, or the `[[runtime_root]]` row in
+//! `config/architecture-boundaries.toml` is narrowed is the #18 owner's
+//! decision. Nothing is deleted or invented here: no caller was added, no
+//! `pub` entry was removed, and the boundary row is unchanged.
 
 #![forbid(unsafe_code)]
 
@@ -181,17 +203,30 @@ impl From<RevisionError> for ExperienceDriverError {
 /// Dreamer memory-revision consumer invocation: propose one advisory
 /// extinction candidate over admitted intake.
 ///
-/// Calls the released [`propose`](eliot_dreamer_memory_revision::propose)
-/// consumer with the edge-supplied owner intake (owner-neutral failure
-/// observation, revision evidence refs, admitted task/safety
-/// projections, frozen self-query/accepted-source refs, pose digest,
-/// candidate id). Intake contract violations fail closed as
+/// Thin wrapper over the released
+/// [`propose`](eliot_dreamer_memory_revision::propose) owner, passing the
+/// edge-supplied owner intake (owner-neutral failure observation, revision
+/// evidence refs, admitted task/safety projections, frozen
+/// self-query/accepted-source refs, pose digest, candidate id) straight
+/// through. Intake contract violations fail closed as
 /// [`ExperienceDriverError::Governor`]; valid intake with insufficient
 /// evidence yields `Ok` with state `Inconclusive` or `Unsupported`
 /// naming the exact missing evidence. No automatic trigger lives here:
 /// the caller passes intake only when the trigger edge already holds
 /// every admitted member; nothing is synthesized from the quality
 /// event's bank/feedback envelopes.
+///
+/// # Live status: no production caller
+///
+/// This is the only call to `eliot_dreamer_memory_revision::propose` in the
+/// repository, and the only thing that makes `eliotd` depend on
+/// `eliot-dreamer-memory-revision`. Its own callers are
+/// [`run_experience_quality_event_with_revision`] and the `map` in that same
+/// function; both are uncalled outside this file and the `pub use` re-exports
+/// in `bins/eliotd/src/lib.rs`. No advisory extinction candidate is proposed
+/// today. The earlier claim that this "Calls the released consumer" as a
+/// production edge was false and is withdrawn; what remains true is only that
+/// the call site exists in source.
 pub fn propose_memory_extinction_candidate(
     intake: &RevisionIntake<'_>,
 ) -> Result<NegativeMemoryExtinctionCandidate, ExperienceDriverError> {
@@ -768,10 +803,18 @@ pub async fn run_experience_quality_event(
 /// trigger edge (the O1-owned daemon trigger assembles it from
 /// owner-issued members); this entry never synthesizes intake from
 /// the quality event's bank/feedback envelopes and owns no automatic
-/// trigger. `None` skips the revision lane entirely. This entry calls
-/// [`run_experience_quality_event`] and then the propose wrapper,
-/// so both symbols have a production caller in this file; the
+/// trigger. `None` skips the revision lane entirely. The
 /// read-only base path is unaffected.
+///
+/// # Live status: no production caller
+///
+/// This entry is what gives [`run_experience_quality_event`] and
+/// [`propose_memory_extinction_candidate`] a caller, but the earlier claim
+/// that this made both "have a production caller" was false and has been
+/// removed: an intra-file call is not a production edge. This entry is itself
+/// re-exported by `bins/eliotd/src/lib.rs` and called by nothing, so neither
+/// callee runs on any live path. The trigger edge named above does not exist
+/// yet.
 pub async fn run_experience_quality_event_with_revision(
     composition: &DaemonComposition,
     kernel: &Arc<DaemonKernelClient>,

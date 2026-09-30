@@ -353,6 +353,20 @@ pub struct MaintenanceEligibility {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaintenanceExecutionOwner {
     /// A real first-party execution owner exists at this exact symbol.
+    ///
+    /// # `Owned` asserts the symbol exists, not that it is called
+    ///
+    /// This is a recorded name, never a lookup. Nothing in the tree resolves
+    /// the string, parses it, or dispatches through it; it is rendered by
+    /// [`MaintenanceFamilyEntry::execution_or_dependency`] into the catalog
+    /// row, so it is a claim a reader can open and check by hand. A symbol may
+    /// therefore be `Owned` and still have no caller anywhere in the tree, and
+    /// one such case is recorded honestly today:
+    /// [`MaintenanceFamily::SelfQualityDebt`] names
+    /// `bins/eliotd/src/experience_runtime.rs::run_experience_quality_event`,
+    /// which is a real symbol with no production caller. The name is retained
+    /// because it is the intended owner and the family must not be silently
+    /// re-pointed, but the row is not evidence that the work runs.
     Owned {
         /// `path::symbol` of the owner.
         symbol: &'static str,
@@ -898,7 +912,7 @@ impl MaintenanceFamilyEntry {
                 "the closure pass runs in-line from the daemon's polled owner feed through bins/eliotd/src/owner_feed.rs::maintain_owner_feed rather than from a maintenance Durable Job request, and no single file may be both the owner and the Durable Job request path"
             }
             MaintenanceFamily::SelfQualityDebt => {
-                "the quality event runs in-line from the daemon's experience path through bins/eliotd/src/experience_runtime.rs::run_experience_quality_event rather than from a maintenance Durable Job request"
+                "no maintenance Durable Job request is the route for this family, and there is currently no in-line route either: bins/eliotd/src/experience_runtime.rs::run_experience_quality_event is the intended in-line leg and has no production caller, so this family has no admitted execution route at all"
             }
             MaintenanceFamily::ResearchExchangeCleanup => {
                 "eliotd holds no durable job route to crates/research/eliot-research-exchange::GovernedExchange; the exchange is driven by bins/eliot-mod-research::submit in a separate composition root and eliotd publishes no operation that reaches it"

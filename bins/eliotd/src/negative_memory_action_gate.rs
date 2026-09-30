@@ -1,15 +1,43 @@
-//! Daemon-held negative-memory action gate: the production caller of the
-//! Governor's gated canonical write (issue #1731 W4/W5/W6/W7).
+//! Daemon-held negative-memory action gate: an implemented but unwired
+//! negative-memory action sequence (issue #1731 W4/W5/W6/W7).
 //!
-//! # Why this module exists
+//! # Live status: NO production caller
 //!
-//! Every negative-memory owner on the Governor side was, before this module, a
-//! definition without a production caller. This module is the missing caller:
-//! it performs the one bounded, exact-fence named read that resolves the
+//! Nothing in the repository calls this module. Every entry point below is
+//! reachable only by naming it: the only external mentions of these symbols
+//! are the `pub use` re-exports in `bins/eliotd/src/lib.rs`, which are not
+//! calls, and one doc cross-reference in
+//! `crates/governor/eliot-governor/src/composition.rs`. A source
+//! implementation is not evidence of a live edge, so the earlier claim that
+//! this module *is* "the missing caller" of the Governor's gated canonical
+//! write was false and has been removed.
+//!
+//! This also means the `eliot-dreamer-failure` dependency edge this module
+//! creates is the only workspace reference to that crate outside its own
+//! `pub use`: `match_negative_memory` is called here and here alone, while
+//! Governor's own `crates/governor/eliot-governor/src/negative_memory_gate.rs`
+//! holds the same bounded rule read, the same probe admission and the same
+//! matcher inside a crate that is not a runtime root. That is the nearest
+//! real thing, and it is not a daemon edge: nothing in `eliotd` calls it
+//! either.
+//!
+//! Whether this module is wired to a real daemon trigger, retired, or the
+//! `[[runtime_root]]` row in `config/architecture-boundaries.toml` that
+//! currently forbids the `eliot-dreamer*` prefix for `eliotd` is narrowed,
+//! is an owner decision (#18). It is deliberately not pre-empted here: no
+//! caller was invented, no entry was deleted, and the boundary row is
+//! unchanged, because removing a `pub` entry from the daemon surface or
+//! moving this sequence into a wired arrangement is an API/architecture
+//! decision, not a documentation fix.
+//!
+//! # What this module does
+//!
+//! It performs the one bounded, exact-fence named read that resolves the
 //! current rule set, hands the **store-observed** result to the pure gate,
 //! dispatches through
 //! [`commit_canonical_gated_by_negative_memory`], and appends the matched
-//! outcome to the existing observation path.
+//! outcome to the existing observation path. All of that is implemented, and
+//! none of it runs today.
 //!
 //! # What it deliberately does not do
 //!
@@ -103,6 +131,11 @@ const GATE_HORIZON_DOMAIN_OWNER: &str = "eliotd";
 /// Fail-closed errors from the daemon negative-memory action gate.
 ///
 /// Every variant stops the effect. None of them is "no rule applies".
+///
+/// # Live status: no production caller
+///
+/// The only mention outside this file is the `pub use` re-export in
+/// `bins/eliotd/src/lib.rs`, so no effect is currently stopped by this type.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum NegativeMemoryActionError {
     /// The closed bounded rule read could not be planned.
@@ -162,6 +195,11 @@ pub enum NegativeMemoryActionError {
 /// Every field is read from the action the daemon is about to commit or from
 /// the daemon's own retained Kernel snapshot. None is invented here, and none
 /// is a display name: the matcher compares these identities exactly.
+///
+/// # Live status: no production caller
+///
+/// Only the `pub use` re-export in `bins/eliotd/src/lib.rs` names this type
+/// outside this file, so no daemon action is currently described by it.
 #[derive(Clone, Debug)]
 pub struct NegativeMemoryPendingAction {
     /// The pending action's own operation identity.
@@ -219,6 +257,11 @@ pub struct NegativeMemoryPendingAction {
 /// The decision, the receipt and the Context projection travel together so the
 /// caller's action response references the same rule revision the effect was
 /// decided under, instead of restating it.
+///
+/// # Live status: no production caller
+///
+/// Only the `pub use` re-export in `bins/eliotd/src/lib.rs` names this type
+/// outside this file, so no action response currently carries it.
 #[derive(Clone, Debug)]
 pub struct NegativeMemoryActionOutcome {
     /// The canonical receipt of the committed effect.
@@ -234,11 +277,18 @@ pub struct NegativeMemoryActionOutcome {
 /// Resolves the current rule set for one action through the authenticated
 /// bounded read.
 ///
-/// This is the production caller of
+/// This is the only caller of
 /// [`plan_negative_memory_rule_read`] and
-/// [`resolve_negative_memory_rule_read`]. The read is issued `ExactFence` on
-/// the action's own admitted fence, so the fence the returned set carries is the
-/// one the store reported, not one this module chose.
+/// [`resolve_negative_memory_rule_read`] in `eliotd`. The read is issued
+/// `ExactFence` on the action's own admitted fence, so the fence the returned
+/// set carries is the one the store reported, not one this module chose.
+///
+/// # Live status: no production caller
+///
+/// [`commit_gated_action`] is the only in-file caller, and
+/// `commit_gated_action` itself has no caller outside this file and the
+/// `pub use` re-export in `bins/eliotd/src/lib.rs`. No daemon request is
+/// resolved against a rule set today.
 ///
 /// # Errors
 ///
@@ -272,6 +322,13 @@ pub async fn resolve_rule_set(
 /// resource-kind vocabulary is the recorded one
 /// (`NegativeMemoryResourceKind`), so a subject cannot introduce a resource
 /// class the record vocabulary does not contain.
+///
+/// # Live status: no production caller
+///
+/// This is `pub` but not re-exported by `bins/eliotd/src/lib.rs`; the only
+/// callers are [`project_action_response`] and [`commit_gated_action`] in this
+/// same file, and neither is called from outside it. The matching subject is
+/// therefore not built for any live effect.
 ///
 /// # Errors
 ///
@@ -352,6 +409,13 @@ pub fn observed_horizon(
 }
 
 /// The closed enumeration bound the synchronous gate runs under.
+///
+/// # Live status: no production caller
+///
+/// This is `pub` but not re-exported by `bins/eliotd/src/lib.rs`; the only
+/// callers are [`project_action_response`] and [`commit_gated_action`] in this
+/// same file, and neither is called from outside it. No matcher run is bounded
+/// by these values today.
 #[must_use]
 pub const fn gate_bound() -> NegativeMemoryMatchBound {
     NegativeMemoryMatchBound {
@@ -364,11 +428,18 @@ pub const fn gate_bound() -> NegativeMemoryMatchBound {
 /// Projects the same admitted-rule truth the gate decided on for the action
 /// response, and grades the caller's packet scorecard from it when one is held.
 ///
-/// This is the production caller of
-/// [`project_negative_memory_rules`] and [`apply_negative_memory_coverage`].
-/// The match is recomputed from the same subject, horizon and rule set the gate
-/// used, so the projection cannot describe a different rule revision than the
-/// one the effect was decided under.
+/// This is the only caller of
+/// [`project_negative_memory_rules`] and [`apply_negative_memory_coverage`] in
+/// `eliotd`. The match is recomputed from the same subject, horizon and rule
+/// set the gate used, so the projection cannot describe a different rule
+/// revision than the one the effect was decided under.
+///
+/// # Live status: no production caller
+///
+/// The only caller is [`commit_gated_action`] in this same file, which is
+/// itself uncalled outside this file and the `pub use` re-export in
+/// `bins/eliotd/src/lib.rs`. No action response is projected from a rule
+/// revision today, and no packet scorecard is graded on this axis.
 ///
 /// # Errors
 ///
@@ -404,10 +475,16 @@ pub fn project_action_response(
 
 /// Builds the typed probe proposal for a `RequireCheck` decision.
 ///
-/// This is the production caller of
-/// [`admit_negative_memory_probe`]. A decision that is not an exact admitted
-/// `RequireCheck` yields `None`, so no probe is ever proposed for a near match,
-/// an advisory disposition, or an undecidable lookup.
+/// This is the only caller of
+/// [`admit_negative_memory_probe`] in `eliotd`. A decision that is not an
+/// exact admitted `RequireCheck` yields `None`, so no probe is ever proposed
+/// for a near match, an advisory disposition, or an undecidable lookup.
+///
+/// # Live status: no production caller
+///
+/// This is `pub` but not re-exported by `bins/eliotd/src/lib.rs`; the only
+/// caller is [`commit_gated_action`] in this same file, which is itself
+/// uncalled outside it. No probe proposal is built today.
 ///
 /// # Errors
 ///
@@ -434,6 +511,11 @@ pub fn probe_for(
 /// `store_named_async` route `skill_evidence_read` uses, so the probe adds no
 /// second read path - and a transport that answered with a substitute response
 /// instead of refusing would not satisfy the executor's contract.
+///
+/// # Live status: no production caller
+///
+/// The only caller is [`commit_gated_action`], which is uncalled outside this
+/// file, so no probe read is issued on any live path.
 fn kernel_probe_executor(kernel: &DaemonKernelClient) -> NamedReadProbeExecutor<'_> {
     NamedReadProbeExecutor::new(
         plan_probe_read,
@@ -482,11 +564,18 @@ fn plan_probe_read(
 
 /// Appends one matched gate outcome to the existing observation path.
 ///
-/// This is the production caller of
-/// [`admit_negative_memory_gate_observation`](eliot_governor::GovernorObservationReconciliation::admit_negative_memory_gate_observation).
-/// The rule identity and rule-set revision are taken from the resolved rule
-/// set, not from the caller, so the appended observation cannot name a rule
-/// revision the decision was not taken over.
+/// This is the only caller of
+/// [`admit_negative_memory_gate_observation`](eliot_governor::GovernorObservationReconciliation::admit_negative_memory_gate_observation)
+/// in `eliotd`. The rule identity and rule-set revision are taken from the
+/// resolved rule set, not from the caller, so the appended observation cannot
+/// name a rule revision the decision was not taken over.
+///
+/// # Live status: no production caller
+///
+/// This is `pub` but not re-exported by `bins/eliotd/src/lib.rs`; the only
+/// caller is [`commit_gated_action`] in this same file, which is itself
+/// uncalled outside it. No matched gate outcome reaches the observation path
+/// today.
 ///
 /// # Errors
 ///
@@ -649,12 +738,23 @@ fn require_effect_ready(
 
 /// Commits one canonical action under the negative-memory gate.
 ///
-/// This is the production caller of
+/// This is the only caller of
 /// [`commit_canonical_gated_by_negative_memory`]. The order is fixed and
 /// fail-closed: resolve the rule set through the authenticated bounded read,
 /// re-read the scope revision head for the dispatch revalidation, evaluate the
 /// gate, append the matched outcome, and only then commit. A refusing decision
 /// is appended as a refusal and never dispatches.
+///
+/// # Live status: no production caller
+///
+/// This is the one entry point `bins/eliotd/src/lib.rs` re-exports, and that
+/// `pub use` is the only mention of it anywhere in the repository: no daemon
+/// operation, poll step, composition method or test calls it. It is therefore
+/// the sole in-tree reference to `GovernorComposition::commit_canonical_gated_by_negative_memory`,
+/// and no canonical action is committed under the negative-memory gate today.
+/// Wiring it to a real commit path, retiring it, or narrowing the boundary row
+/// that admits its `eliot-dreamer-failure` dependency is the #18 owner's
+/// decision, not a documentation one.
 ///
 /// # W5/A1: the scorecard's own verdict is read before the effect
 ///

@@ -8167,10 +8167,16 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// `store_named_async` read-only route through a
     /// `NamedReadProbeExecutor`, and then commits through
     /// [`Self::commit_canonical_gated_by_negative_memory`] rather than through
-    /// this entry. The demanded check therefore does run on the live path; this
-    /// governor entry is the unwired duplicate of that sequence, and the two
-    /// can be reconciled only by making one of them the arrangement the daemon
-    /// uses.
+    /// this entry.
+    ///
+    /// That correction is itself now only partly true, and the rest is
+    /// recorded here rather than left standing: `commit_gated_action` itself
+    /// has **no production caller** anywhere in the tree. Its only external
+    /// mention is the `pub use` re-export in `bins/eliotd/src/lib.rs`. So
+    /// neither arrangement runs today — the demanded check does *not* execute
+    /// on any live path, and both this entry and the daemon gate are unwired
+    /// duplicates of the same two-phase sequence. The two can be reconciled
+    /// only by making one of them the arrangement the daemon actually uses.
     ///
     /// Whether this entry is wired to that dispatch or retired is an owner
     /// decision, not a documentation one. It is retained here unchanged because
