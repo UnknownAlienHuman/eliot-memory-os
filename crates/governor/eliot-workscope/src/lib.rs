@@ -1369,6 +1369,7 @@ impl OnboardingReadinessReceipt {
             task_ref,
             task_revision,
             acceptance_digest,
+            ..
         } = &self.task_binding
         else {
             return Ok(None);
