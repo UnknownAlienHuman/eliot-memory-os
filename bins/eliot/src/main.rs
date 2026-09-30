@@ -476,6 +476,10 @@ enum InstallationCommand {
         transaction_id: String,
         #[arg(long, value_parser = absolute_path)]
         staging_root: PathBuf,
+        /// Explicit reserved-write scheduler queue bound. Omission preserves
+        /// legacy ordinary-write behavior and does not enable reserved writes.
+        #[arg(long)]
+        store_write_max_pending: Option<usize>,
         #[arg(long)]
         minimum_store_available_bytes: u64,
         #[arg(long)]
@@ -2296,6 +2300,7 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             sequence,
             transaction_id,
             staging_root,
+            store_write_max_pending,
             minimum_store_available_bytes,
             recovery_command,
             profile,
@@ -2325,6 +2330,7 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             sequence,
             transaction_id,
             staging_root,
+            store_write_max_pending,
             minimum_store_available_bytes,
             recovery_command,
             profile,
@@ -2814,6 +2820,7 @@ fn run_installation_materialize_source_bundle(
     sequence: u64,
     transaction_id: String,
     staging_root: PathBuf,
+    store_write_max_pending: Option<usize>,
     minimum_store_available_bytes: u64,
     recovery_command: String,
     profile: InstallationProfile,
@@ -2860,6 +2867,7 @@ fn run_installation_materialize_source_bundle(
         // The materializer seam restates the selection's own staging root; it
         // is the same admitted object, not a second independently-proved one.
         staging_root: profile_selection.staging_root.clone(),
+        store_write_max_pending,
     };
     let receipt =
         match source_bundle_materializer::materialize_canary_source_bundle(&materialize_input) {
