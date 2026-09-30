@@ -2726,6 +2726,23 @@ pub fn reject_list_cursor(params: &Value, method: &'static str) -> Result<(), Wi
     Ok(())
 }
 
+/// Owner-observed I7.24 delivery disposition carried by one admitted MCP result.
+///
+/// Mirrors the delivery owner's `FULL | PARTIAL | TRUNCATED | MISSING`
+/// vocabulary exactly. The surface owns the projection but must not depend on
+/// the bridge crates that own the projecting type, so the spelling is mirrored
+/// here and compared against the measured envelope instead of trusted: a frame
+/// that withholds bytes behind a handle is truncated delivery by measurement,
+/// never by owner prose alone.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum HotDeliveryDisposition {
+    Full,
+    Partial,
+    Truncated,
+    Missing,
+}
+
 /// Bounded evidence fields recorded with an admitted MCP result.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2735,9 +2752,18 @@ struct HotEvidenceEnvelope {
     preview: String,
     total_bytes: u64,
     truncated: bool,
+    /// Owner-observed delivery disposition for this frame, measured from the
+    /// recorded view's truncation flag, never estimated.
+    delivery: HotDeliveryDisposition,
 }
 
 /// Validates the bridge's bounded evidence envelope and returns its wire views.
+///
+/// The owner-observed delivery disposition must agree with the measured
+/// truncation: this seam carries a withheld remainder (`total_bytes` beyond
+/// the bounded preview) behind an immutable handle, so only `TRUNCATED` is
+/// coherent here. Anything else fails closed instead of projecting withheld
+/// bytes as complete evidence.
 fn evidence_wire_projection(evidence: &Value) -> Result<(Value, Value), WireRejection> {
     let envelope: HotEvidenceEnvelope = serde_json::from_value(evidence.clone()).map_err(|_| {
         WireRejection::new(
@@ -2762,6 +2788,11 @@ fn evidence_wire_projection(evidence: &Value) -> Result<(Value, Value), WireReje
         || resource_id != envelope.digest
         || envelope.preview.len() > 1024
         || envelope.total_bytes <= preview_bytes
+        // A completed call with truncated delivery stays distinct from fully
+        // delivered evidence: withheld bytes behind a handle are never
+        // projected as complete, so a non-truncated owner disposition for
+        // this frame fails closed.
+        || envelope.delivery != HotDeliveryDisposition::Truncated
     {
         return Err(WireRejection::new(
             WIRE_INTERNAL_ERROR,
