@@ -136,6 +136,7 @@ mod setup_binding;
 mod signed_activation;
 mod survey;
 mod transaction;
+mod user_broker_profile;
 
 pub use guard_containment::RetainedGuardRevert;
 pub use installation_registry::RedbInstallationRegistry;
@@ -273,6 +274,11 @@ pub use transaction::{
     InstallationSecretProvisionDisposition, InstallationSecretReference, InstallationSecretScope,
     InstallationStage, InstallationTransaction, StoreFreeSpaceObservation,
     parse_installation_transaction_id, validate_installation_transaction_json,
+};
+pub use user_broker_profile::{
+    USER_BROKER_INSTALLATION_PROFILE_WIRE_ID, USER_BROKER_INSTALLATION_PROFILE_WIRE_VERSION,
+    USER_BROKER_MAX_FRAME_BYTES, UserBrokerInstallationProfile, UserBrokerProtectedPaths,
+    derive_user_broker_protected_paths,
 };
 
 /// Stable wire name for the installation contract.
