@@ -75,8 +75,8 @@ use eliot_protocol::{
 };
 use eliot_store_api::{
     CampaignSourceDocumentSchema, CampaignSourceReadStatus, CampaignSourceRevisionLookup,
-    CampaignSourceRevisionRead, CanonicalReadClient, EVIDENCE_PACK_MAX_RECORDS,
-    NamedReadOperation, NamedReadRequest, ReadConsistency, RevisionKey, ScopeId,
+    CampaignSourceRevisionRead, CanonicalReadClient, EVIDENCE_PACK_MAX_RECORDS, NamedReadOperation,
+    NamedReadRequest, ReadConsistency, RevisionKey, ScopeId,
 };
 use serde_json::{Value, json};
 use thiserror::Error;
