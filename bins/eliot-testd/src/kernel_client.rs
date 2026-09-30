@@ -1168,12 +1168,12 @@ fn check_drive_closed_argv(
     invocation: &InstrumentInvocation,
     process: &ProcessRequest,
 ) -> Result<(), TestdIpcError> {
-    let slot_suffix: &[String] =
-        if eliot_testd_core::is_slotted_testd_profile(&invocation.profile) {
-            &invocation.arguments
-        } else {
-            &[]
-        };
+    let slot_suffix: &[String] = if eliot_testd_core::is_slotted_testd_profile(&invocation.profile)
+    {
+        &invocation.arguments
+    } else {
+        &[]
+    };
     let binding = eliot_testd_core::testd_profile_binding_with_slots(
         &invocation.profile,
         process.executable_sha256(),
