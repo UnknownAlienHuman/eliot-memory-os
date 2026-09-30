@@ -45,6 +45,7 @@ mod invalidation;
 mod lineage;
 mod normalization;
 mod observation;
+mod orientation_source;
 mod relation;
 mod snapshot;
 mod version;
@@ -74,6 +75,9 @@ pub use normalization::{
     NormalizationProfile, NormalizedCue, TransformationStep,
 };
 pub use observation::{ObservedCue, SourceHandle};
+pub use orientation_source::{
+    ORIENTATION_CUE_ADMISSION_OPERATION_KIND, OrientationCueBindingsSource,
+};
 pub use relation::RelationEdge;
 pub use snapshot::{CueSnapshot, RebuildIdentity, SnapshotMember};
 pub use version::{

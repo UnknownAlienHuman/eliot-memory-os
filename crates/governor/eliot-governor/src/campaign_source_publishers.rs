@@ -110,6 +110,22 @@ pub fn orientation_admission_source_registration(
     })
 }
 
+/// Registration for the independently-read native Orientation cue-binding
+/// source. It stays outside the fixed 26-role learning-view denominator.
+#[must_use]
+pub fn orientation_cue_bindings_source_registration(
+) -> Option<CampaignOwnerSourceRegistration> {
+    let role = CampaignSourceRole::OrientationCueBindings;
+    Some(CampaignOwnerSourceRegistration {
+        role,
+        publisher: CampaignSourcePublisher::for_role(role)?,
+        owner_id: OwnerId::from_artifact(
+            ArtifactId::new(campaign_source_owner_id(role).to_owned()).ok()?,
+        ),
+        schema: campaign_source_schema_for_role(role),
+    })
+}
+
 fn campaign_owner_source_registration(
     role: CampaignSourceRole,
 ) -> Option<CampaignOwnerSourceRegistration> {
@@ -123,6 +139,9 @@ fn campaign_owner_source_registration(
                 }
                 CampaignSourceRole::OrientationAdmission => {
                     orientation_admission_source_registration()
+                }
+                CampaignSourceRole::OrientationCueBindings => {
+                    orientation_cue_bindings_source_registration()
                 }
                 _ => None,
             }
