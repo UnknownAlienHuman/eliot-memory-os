@@ -676,17 +676,21 @@ impl ProfileRootLeaseSet {
         &self.selection
     }
 
-    /// Rechecks every retained file-object identity before a production use.
+    /// Rechecks every retained root before a production use.
+    ///
+    /// Each lease must still bind its declared path to its retained object.
+    /// The handle check alone proves only that the opened object survived: a
+    /// root that is renamed away and replaced by a new directory at the same
+    /// path keeps a valid handle while every later use of the declared path
+    /// resolves to the substitute. Both properties are therefore required, and
+    /// the path check is the owner's existing
+    /// [`UserOwnedRootLease::verify_path_identity`].
     ///
     /// # Errors
-    /// Returns `IdentityMismatch` when any pinned object changed or became
-    /// unreadable.
+    /// Returns `IdentityMismatch` when any pinned object changed, its declared
+    /// path no longer names it, or either became unreadable.
     pub fn verify_stable_identity(&self) -> Result<(), WindowsAdapterError> {
-        for lease in &self.leases {
-            lease
-                .verify_stable_identity()
-                .map_err(|_| WindowsAdapterError::IdentityMismatch)?;
-        }
+        verify_retained_root_leases(&self.leases)?;
         if let Some(anchor) = &self.local_app_data {
             anchor
                 .verify_stable_identity()
@@ -717,11 +721,7 @@ struct RetainedProfileRoots {
 
 impl RetainedProfileRoots {
     fn verify_stable_identity(&self) -> Result<(), WindowsAdapterError> {
-        for lease in &self.leases {
-            lease
-                .verify_stable_identity()
-                .map_err(|_| WindowsAdapterError::IdentityMismatch)?;
-        }
+        verify_retained_root_leases(&self.leases)?;
         if let Some(anchor) = &self.local_app_data {
             anchor
                 .verify_stable_identity()
@@ -729,6 +729,24 @@ impl RetainedProfileRoots {
         }
         Ok(())
     }
+}
+
+/// Rechecks that every retained root lease still binds its declared path to
+/// the object it was acquired for.
+///
+/// Both checks are required and neither substitutes for the other. The handle
+/// check proves the opened object survived; the path check proves the declared
+/// path still names that same object rather than a substitute installed after
+/// the lease was taken. The re-verification contract uses the owner's existing
+/// [`UserOwnedRootLease`] validators and adds no second ownership scheme.
+fn verify_retained_root_leases(leases: &[UserOwnedRootLease]) -> Result<(), WindowsAdapterError> {
+    for lease in leases {
+        lease
+            .verify_stable_identity()
+            .and_then(|()| lease.verify_path_identity())
+            .map_err(|_| WindowsAdapterError::IdentityMismatch)?;
+    }
+    Ok(())
 }
 
 fn retain_profile_roots(
@@ -939,11 +957,7 @@ fn finish_profile_selection(
     if observations.len() != 13 || !validate_role_paths(&observations) {
         return Err(WindowsAdapterError::IdentityMismatch);
     }
-    for lease in &leases {
-        lease
-            .verify_stable_identity()
-            .map_err(|_| WindowsAdapterError::IdentityMismatch)?;
-    }
+    verify_retained_root_leases(&leases)?;
     let current = crate::current_process_named_pipe_expectation()?;
     if owner_sid
         .as_deref()
