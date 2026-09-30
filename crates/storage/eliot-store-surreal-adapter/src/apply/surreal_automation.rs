@@ -1314,6 +1314,21 @@ pub(crate) async fn prepare_automation_writes(
     Ok(writes)
 }
 
+/// The revision-leg payload the create and edit arms commit together.
+///
+/// Grouped as one field group rather than five positionals because the two arms
+/// that write a revision row take exactly these five values and differ only in
+/// whether the pointer is created or moved off a lineage base: `Edit` adds
+/// `previous_revision` and `Create` does not. The memory adapter groups the
+/// same five values under the same name for the same reason.
+struct AutomationRevisionLeg {
+    automation_id: String,
+    revision: String,
+    revision_json: String,
+    configuration_state: String,
+    normalization_receipt_json: Option<Value>,
+}
+
 /// Pre-transaction compute context shared by the automation leg helpers.
 struct PrepareContext<'a> {
     db: &'a RpcTransport,
@@ -1362,11 +1377,13 @@ impl PrepareContext<'_> {
             } => {
                 self.apply_create(
                     writes,
-                    automation_id,
-                    revision,
-                    revision_json,
-                    configuration_state,
-                    normalization_receipt_json,
+                    AutomationRevisionLeg {
+                        automation_id,
+                        revision,
+                        revision_json,
+                        configuration_state,
+                        normalization_receipt_json,
+                    },
                 )
                 .await
             }
@@ -1380,12 +1397,14 @@ impl PrepareContext<'_> {
             } => {
                 self.apply_edit(
                     writes,
-                    automation_id,
                     previous_revision,
-                    revision,
-                    revision_json,
-                    configuration_state,
-                    normalization_receipt_json,
+                    AutomationRevisionLeg {
+                        automation_id,
+                        revision,
+                        revision_json,
+                        configuration_state,
+                        normalization_receipt_json,
+                    },
                 )
                 .await
             }
@@ -1446,12 +1465,15 @@ impl PrepareContext<'_> {
     async fn apply_create(
         &self,
         writes: &mut AutomationWrites,
-        automation_id: String,
-        revision: String,
-        revision_json: String,
-        configuration_state: String,
-        normalization_receipt_json: Option<Value>,
+        leg: AutomationRevisionLeg,
     ) -> Result<(), AdapterError> {
+        let AutomationRevisionLeg {
+            automation_id,
+            revision,
+            revision_json,
+            configuration_state,
+            normalization_receipt_json,
+        } = leg;
         let normalization_receipt_json =
             validate_automation_normalization_envelope(normalization_receipt_json)?;
         require_absent_revision(self.db, self.config, &automation_id, &revision).await?;
@@ -1482,13 +1504,16 @@ impl PrepareContext<'_> {
     async fn apply_edit(
         &self,
         writes: &mut AutomationWrites,
-        automation_id: String,
         previous_revision: String,
-        revision: String,
-        revision_json: String,
-        configuration_state: String,
-        normalization_receipt_json: Option<Value>,
+        leg: AutomationRevisionLeg,
     ) -> Result<(), AdapterError> {
+        let AutomationRevisionLeg {
+            automation_id,
+            revision,
+            revision_json,
+            configuration_state,
+            normalization_receipt_json,
+        } = leg;
         let normalization_receipt_json =
             validate_automation_normalization_envelope(normalization_receipt_json)?;
         let current =

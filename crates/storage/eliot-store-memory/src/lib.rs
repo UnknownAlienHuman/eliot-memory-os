@@ -1191,7 +1191,7 @@ fn apply_automation_leg(
         } => apply_automation_edit(
             state,
             transition,
-            previous_revision,
+            &previous_revision,
             AutomationRevisionLeg {
                 automation_id,
                 revision,
@@ -1220,10 +1220,10 @@ fn apply_automation_leg(
         } => apply_automation_run_now(
             state,
             transition,
-            automation_id,
-            revision,
-            occurrence_id,
-            invocation_json,
+            &automation_id,
+            &revision,
+            &occurrence_id,
+            &invocation_json,
         ),
         DecodedAutomationMutation::Failure {
             automation_id,
@@ -1235,10 +1235,10 @@ fn apply_automation_leg(
             state,
             transition,
             automation_id,
-            revision,
-            occurrence_id,
-            failure,
-            failure_json,
+            &revision,
+            &occurrence_id,
+            &failure,
+            &failure_json,
         ),
     }
 }
@@ -1296,7 +1296,7 @@ fn apply_automation_create(
 fn apply_automation_edit(
     state: &mut MemoryState,
     transition: &PreparedTransition,
-    previous_revision: String,
+    previous_revision: &str,
     leg: AutomationRevisionLeg,
 ) -> Result<Value, StoreError> {
     let AutomationRevisionLeg {
@@ -1307,7 +1307,7 @@ fn apply_automation_edit(
         normalization_receipt_json,
     } = leg;
     let envelope = validate_automation_normalization_envelope(normalization_receipt_json)?;
-    require_current_automation_revision(state, &automation_id, &previous_revision, transition)?;
+    require_current_automation_revision(state, &automation_id, previous_revision, transition)?;
     retain_automation_revision(
         state,
         transition,
@@ -1361,24 +1361,24 @@ fn apply_automation_state_transition(
 fn apply_automation_run_now(
     state: &mut MemoryState,
     transition: &PreparedTransition,
-    automation_id: String,
-    revision: String,
-    occurrence_id: String,
-    invocation_json: String,
+    automation_id: &str,
+    revision: &str,
+    occurrence_id: &str,
+    invocation_json: &str,
 ) -> Result<Value, StoreError> {
-    require_retained_automation_revision(state, &automation_id, &revision)?;
-    match state.automation_invocations.get(&occurrence_id) {
+    require_retained_automation_revision(state, automation_id, revision)?;
+    match state.automation_invocations.get(occurrence_id) {
         Some(existing) if existing.invocation_json != invocation_json => {
             return Err(StoreError::IdentityConflict);
         }
         Some(_) => {}
         None => {
             state.automation_invocations.insert(
-                occurrence_id.clone(),
+                occurrence_id.to_owned(),
                 AutomationInvocationRow {
-                    occurrence_id,
-                    automation_id: automation_id.clone(),
-                    invocation_json: invocation_json.clone(),
+                    occurrence_id: occurrence_id.to_owned(),
+                    automation_id: automation_id.to_owned(),
+                    invocation_json: invocation_json.to_owned(),
                     state_fence: transition.state_fence.clone(),
                     scope_id: transition.scope_id.to_string(),
                     task_id: transition.task_id.clone(),
@@ -1386,7 +1386,7 @@ fn apply_automation_run_now(
             );
         }
     }
-    serde_json::to_value(&invocation_json)
+    serde_json::to_value(invocation_json)
         .map_err(|error| StoreError::Serialization(error.to_string()))
 }
 
@@ -1395,18 +1395,15 @@ fn apply_automation_failure(
     state: &mut MemoryState,
     transition: &PreparedTransition,
     automation_id: String,
-    revision: String,
-    occurrence_id: String,
-    failure: eliot_store_api::AutomationFailureDocument,
-    failure_json: String,
+    revision: &str,
+    occurrence_id: &str,
+    failure: &eliot_store_api::AutomationFailureDocument,
+    failure_json: &str,
 ) -> Result<Value, StoreError> {
-    require_retained_automation_revision(state, &automation_id, &revision)?;
+    require_retained_automation_revision(state, &automation_id, revision)?;
     let operation_key = transition.identity.operation_id.to_string();
-    let failure_key = eliot_store_api::automation_failure_key(
-        &automation_id,
-        &revision,
-        &failure.fingerprint,
-    );
+    let failure_key =
+        eliot_store_api::automation_failure_key(&automation_id, revision, &failure.fingerprint);
     match state.automation_failures.get(&failure_key) {
         Some(existing) if existing.failure_json != failure_json => {
             return Err(StoreError::IdentityConflict);
@@ -1417,10 +1414,10 @@ fn apply_automation_failure(
                 failure_key.clone(),
                 AutomationFailureRow {
                     automation_id: automation_id.clone(),
-                    revision: revision.clone(),
-                    occurrence_id: occurrence_id.clone(),
+                    revision: revision.to_owned(),
+                    occurrence_id: occurrence_id.to_owned(),
                     fingerprint: failure.fingerprint.clone(),
-                    failure_json: failure_json.clone(),
+                    failure_json: failure_json.to_owned(),
                     source_operation_id: operation_key,
                     state_fence: transition.state_fence.clone(),
                     scope_id: transition.scope_id.to_string(),
@@ -1432,8 +1429,7 @@ fn apply_automation_failure(
     state
         .automation_last_failure
         .insert(automation_id, failure_key);
-    serde_json::to_value(&failure_json)
-        .map_err(|error| StoreError::Serialization(error.to_string()))
+    serde_json::to_value(failure_json).map_err(|error| StoreError::Serialization(error.to_string()))
 }
 
 /// Writes one immutable revision row, or fails closed when the row already
@@ -1457,7 +1453,7 @@ fn retain_automation_revision(
             if existing.revision_json != revision_json
                 || existing.normalization_receipt_json != normalization_receipt_json =>
         {
-            return Err(StoreError::IdentityConflict);
+            Err(StoreError::IdentityConflict)
         }
         Some(_) => Ok(()),
         None => {
