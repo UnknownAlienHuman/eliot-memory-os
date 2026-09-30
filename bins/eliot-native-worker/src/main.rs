@@ -189,7 +189,7 @@ fn run() -> i32 {
     // port it injects, so the terminal coverage-gap checkpoint frame binds the
     // granted epoch/fence/lease/revision the core sealed its live grant from
     // instead of a re-derived guess.
-    let admission = PresentationEchoAdmission::new();
+    let admission = PresentationEchoAdmission::with_kernel_liveness(shared.clone());
     let mut worker = NativeWorker::new(WorkerCore::new(
         Some(executor),
         Some(admission.clone()),
@@ -566,8 +566,8 @@ mod tests {
     };
     use eliot_native_worker::{
         AdmittedLifecycle, BoundedEvidenceSink, KernelReplayPort, KernelReplayTransport,
-        NativeWorker, NativeWorkerDispatchAuthority, NativeWorkerError, PresentationEchoAdmission,
-        ValidatedDispatchGrant, derive_admitted_intent, drive_admitted_claimed,
+        NativeWorker, NativeWorkerDispatchAuthority, NativeWorkerError, ValidatedDispatchGrant,
+        derive_admitted_intent, drive_admitted_claimed,
         governed_action::ActionEnvelope, require_launch_grant, select_factory_for_admitted,
     };
     use eliot_native_worker_core::{
@@ -2231,7 +2231,9 @@ mod tests {
         let sink = Arc::new(BoundedEvidenceSink::new());
         let core = WorkerCore::new(
             Some(WindowsProcessExecutor::new(Arc::new(drive_authority))),
-            Some(PresentationEchoAdmission::new()),
+            Some(TestAdmission {
+                admissions: Arc::new(Mutex::new(0_usize)),
+            }),
             Some(replay),
             Some(TestCheckpoint),
             Some(sink.clone()),
@@ -2432,7 +2434,9 @@ mod tests {
         ));
         let core = WorkerCore::new(
             Some(WindowsProcessExecutor::new(Arc::new(authority))),
-            Some(PresentationEchoAdmission::new()),
+            Some(TestAdmission {
+                admissions: Arc::new(Mutex::new(0_usize)),
+            }),
             Some(replay),
             Some(TestCheckpoint),
             Some(Arc::new(BoundedEvidenceSink::new())),

@@ -462,6 +462,16 @@ impl KernelNativeWorkerClient {
         require_echo(&reply, "kind", "native_worker_liveness")?;
         require_echo(&reply, "heartbeat_id", envelope.heartbeat_id.as_str())?;
         require_echo(&reply, "claim_id", envelope.binding.claim_id.as_str())?;
+        require_generation_echo(&reply, envelope.binding.worker_generation)?;
+        if reply
+            .get("observed_at_unix_ms")
+            .and_then(serde_json::Value::as_u64)
+            != Some(envelope.observed_at_unix_ms)
+        {
+            return Err(NativeWorkerError::KernelAdmissionRequired(
+                "Kernel liveness receipt did not echo its observation time".to_owned(),
+            ));
+        }
         Ok(reply)
     }
 
@@ -1395,6 +1405,19 @@ impl SharedKernelTransport {
         self.inner.lock().map_err(|_| {
             NativeWorkerError::KernelAdmissionRequired("Kernel transport lock poisoned".to_owned())
         })
+    }
+
+    /// Queries currentness for one exact Ready-bound worker claim.
+    ///
+    /// The Kernel rechecks the authenticated peer, retained process start,
+    /// owner cell and live activation before returning its non-authority
+    /// liveness receipt. A refusal or transport error must stop the caller's
+    /// grant; this receipt does not create or renew authority.
+    pub fn submit_heartbeat(
+        &self,
+        envelope: &NativeHeartbeatEnvelope,
+    ) -> Result<serde_json::Value, NativeWorkerError> {
+        self.lock()?.submit_heartbeat(envelope)
     }
 }
 
