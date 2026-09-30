@@ -27,16 +27,18 @@ use std::sync::Arc;
 
 use eliot_contracts::{ModuleRuntimeClass, sha256_hex};
 use eliot_instrument_api::{
-    BuildClass, ExecutionStatus, InstrumentAdmissionGrant, InstrumentInvocation, InstrumentKind,
-    TARGET_LAYOUT_REVISION,
+    BuildClass, ExecutionStatus, InstrumentAdmissionGrant, InstrumentAdmissionRequest,
+    InstrumentInvocation, InstrumentKind, TARGET_LAYOUT_REVISION,
 };
 use eliot_process::{ExitDisposition, ProcessEvidenceSink, ProcessExecutor, ProcessRequest};
 use eliot_process_executor::ExecutableObservation;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::profile::{AdmissionError, AdmittedProfile, AdmittedStage};
-use crate::registry::{RegistryEntry, RegistryError};
+use crate::profile::{AdmissionError, AdmittedProfile, AdmittedStage, InstrumentRegistry};
+use crate::registry::{
+    RegistryEntry, RegistryError, ResolvedExecutableIdentity, SupplyChainReceipt,
+};
 use crate::testd_port::{TestdAdmission, TestdAdmissionPort, TestdPortError, testd_dispatchable};
 use crate::{
     InstrumentBinding, InstrumentRequestPort, InstrumentRunner, InstrumentStartReceipt,
@@ -235,6 +237,10 @@ pub struct StagePlan {
     pub profile: String,
     /// Exact admitted revision.
     pub revision: u64,
+    /// Registry generation the plan was compiled against.
+    pub registry_generation: u64,
+    /// Registry digest the plan was compiled against.
+    pub registry_digest: String,
     /// Profile definition digest.
     pub profile_digest: String,
     /// Stage DAG digest.
@@ -910,6 +916,8 @@ impl StageOrchestrator {
         StagePlan {
             profile: admitted.name.clone(),
             revision: admitted.revision,
+            registry_generation: admitted.registry_generation,
+            registry_digest: admitted.registry_digest.clone(),
             profile_digest: admitted.profile_digest.clone(),
             dag_digest: admitted.dag_digest.clone(),
             candidate_identity: None,
@@ -926,6 +934,51 @@ impl StageOrchestrator {
     /// ordering slot while a tool runs.
     pub async fn launch_plan<E: ProcessExecutor + 'static>(
         runner: &InstrumentRunner<E>,
+        plan: &StagePlan,
+        launcher: &dyn StageLauncher,
+    ) -> Vec<InstrumentRun> {
+        Self::launch_all(runner, None, plan, launcher).await
+    }
+
+    /// Launches every planned stage with new admission checked against the
+    /// live registry.
+    ///
+    /// The plan must have been compiled against exactly this registry
+    /// generation: a plan from a replaced generation records every stage as
+    /// missing instead of launching under revoked admission. Each stage then
+    /// admits through [`AdmittedStage::admit_live`], so a spec, parser,
+    /// supply-chain receipt, or route replaced after compilation fails closed
+    /// here without rewriting historical run evidence.
+    pub async fn launch_plan_live<E: ProcessExecutor + 'static>(
+        runner: &InstrumentRunner<E>,
+        registry: &InstrumentRegistry,
+        plan: &StagePlan,
+        launcher: &dyn StageLauncher,
+    ) -> Vec<InstrumentRun> {
+        if plan.registry_generation != registry.generation()
+            || plan.registry_digest != registry.digest()
+        {
+            return plan
+                .stages
+                .iter()
+                .map(|planned| {
+                    let mut run = InstrumentRun::missing(
+                        &planned.route,
+                        "stage plan was compiled against a different registry generation",
+                    );
+                    run.candidate_identity.clone_from(&plan.candidate_identity);
+                    run
+                })
+                .collect();
+        }
+        Self::launch_all(runner, Some(registry), plan, launcher).await
+    }
+
+    /// Walks one plan in topological order, with the live registry when the
+    /// composition root still holds it.
+    async fn launch_all<E: ProcessExecutor + 'static>(
+        runner: &InstrumentRunner<E>,
+        live: Option<&InstrumentRegistry>,
         plan: &StagePlan,
         launcher: &dyn StageLauncher,
     ) -> Vec<InstrumentRun> {
@@ -948,7 +1001,7 @@ impl StageOrchestrator {
                 unlaunched.insert(route.stage().stage_id.clone());
                 continue;
             }
-            let mut run = Self::launch_one(runner, plan, planned, launcher).await;
+            let mut run = Self::launch_one(runner, live, plan, planned, launcher).await;
             run.candidate_identity.clone_from(&plan.candidate_identity);
             if run.evidence.is_missing() {
                 unlaunched.insert(route.stage().stage_id.clone());
@@ -969,6 +1022,17 @@ impl StageOrchestrator {
         stage: &AdmittedStage,
         invocation: &InstrumentInvocation,
     ) -> Option<&'static str> {
+        if invocation.instrument.as_str() != stage.spec.as_str() {
+            return Some(
+                "stage admission refused: invocation instrument differs from admitted stage",
+            );
+        }
+        if invocation.kind != stage.kind {
+            return Some("stage admission refused: invocation kind differs from admitted stage");
+        }
+        if invocation.profile.as_str() != route.stage().profile.as_str() {
+            return Some("stage admission refused: invocation profile differs from admitted stage");
+        }
         if route.stage().profile_revision != stage.profile_revision {
             return Some(
                 "stage admission refused: route revision differs from admitted stage revision",
@@ -985,33 +1049,88 @@ impl StageOrchestrator {
     /// Refuses a sealed grant/request pair that skews from the admitted stage.
     ///
     /// Revalidates the minted grant against the admitted route and stage at
-    /// use, and binds the sealed process request's executable identity to the
-    /// grant's content digest, so neither the grant nor the request can drift
-    /// after admission.
+    /// use, carries the observed canonical path, content digest, and supply
+    /// receipt into the dispatch permit, and revalidates that same object at
+    /// use: the sealed request must name the exact file the owner hashed,
+    /// never an unrelated `PATH` resolution that happens to share a name.
     fn grant_at_use_skew_reason(
         route: &TestExecutionPlaneRoute,
         stage: &AdmittedStage,
         grant: &InstrumentAdmissionGrant,
+        observed: &ResolvedExecutableIdentity,
         process_request: &ProcessRequest,
-    ) -> Option<&'static str> {
+    ) -> Option<String> {
         if grant.profile != route.stage().profile
             || grant.profile_revision != route.stage().profile_revision
         {
-            return Some("stage admission refused: grant profile differs from the admitted route");
+            return Some(
+                "stage admission refused: grant profile differs from the admitted route".to_owned(),
+            );
         }
         if grant.spec_digest != stage.spec_digest
             || grant.parser.as_str() != stage.parser.as_str()
             || grant.parser_generation != stage.parser_generation
             || grant.arguments != stage.argument_template
         {
-            return Some("stage admission refused: grant differs from the admitted stage");
+            return Some(
+                "stage admission refused: grant differs from the admitted stage".to_owned(),
+            );
+        }
+        let admitted_supply = stage
+            .supply_receipt
+            .as_ref()
+            .map(SupplyChainReceipt::digest)
+            .unwrap_or_default();
+        if grant.supply_digest != admitted_supply {
+            return Some(
+                "stage admission refused: grant supply receipt differs from the admitted stage"
+                    .to_owned(),
+            );
+        }
+        if grant.executable_path != observed.canonical_path
+            || grant.content_digest != observed.content_digest
+        {
+            return Some(
+                "stage admission refused: grant carries a different executable object than observed"
+                    .to_owned(),
+            );
         }
         if process_request.executable_sha256() != grant.content_digest.as_str() {
             return Some(
-                "stage admission refused: sealed request carries a different executable identity than the grant",
+                "stage admission refused: sealed request carries a different executable identity than the grant"
+                    .to_owned(),
             );
         }
-        None
+        match std::fs::canonicalize(process_request.intent().executable()) {
+            Ok(canonical) if canonical.to_string_lossy().as_ref() == observed.canonical_path => {
+                None
+            }
+            _ => Some(
+                "stage admission refused: sealed request names a different executable object than the observed identity"
+                    .to_owned(),
+            ),
+        }
+    }
+
+    /// Admits one planned stage against the live registry when the composition
+    /// root still holds it, else against the compiled admission alone.
+    fn admit_planned_stage(
+        planned: &PlannedStage,
+        live: Option<&InstrumentRegistry>,
+        admission: &InstrumentAdmissionRequest,
+        identity: &ResolvedExecutableIdentity,
+        profile_revision: u64,
+    ) -> Result<InstrumentAdmissionGrant, AdmissionError> {
+        match live {
+            Some(registry) => {
+                planned
+                    .stage
+                    .admit_live(registry, admission, Some(identity), profile_revision)
+            }
+            None => planned
+                .stage
+                .admit(admission, Some(identity), profile_revision),
+        }
     }
 
     /// Binds and launches one stage through the existing runner primitives.
@@ -1023,8 +1142,13 @@ impl StageOrchestrator {
     /// authority), the executable hash/file identity resolves from the
     /// machine against the intent-sealed digest, the shared admission gate
     /// checks the fixed argument template and executable identity into a
-    /// sealed grant, the grant is revalidated against the planned stage and
-    /// the sealed request at use, and only then does the runner launch. A
+    /// sealed grant (against the live registry through
+    /// [`AdmittedStage::admit_live`] when the composition root still holds
+    /// it, so a replaced spec, parser, receipt, or route fails closed), the
+    /// grant is revalidated against the planned stage, the observed identity,
+    /// and the sealed request at use — including that the sealed request
+    /// names the same canonical object the owner hashed — and only then does
+    /// the runner launch under [`InstrumentRunner::launch_admitted`]. A
     /// changed executable, an unknown identity, or an off-template argument
     /// combination becomes an explicit missing run here instead of a child
     /// process. The tool version stays unobserved (`None`): no version is
@@ -1032,6 +1156,7 @@ impl StageOrchestrator {
     /// version still gates inside admission.
     async fn launch_one<E: ProcessExecutor + 'static>(
         runner: &InstrumentRunner<E>,
+        live: Option<&InstrumentRegistry>,
         plan: &StagePlan,
         planned: &PlannedStage,
         launcher: &dyn StageLauncher,
@@ -1049,24 +1174,6 @@ impl StageOrchestrator {
                 );
             }
         };
-        if invocation.instrument.as_str() != planned.stage.spec.as_str() {
-            return InstrumentRun::missing(
-                route,
-                "stage admission refused: invocation instrument differs from admitted stage",
-            );
-        }
-        if invocation.kind != planned.stage.kind {
-            return InstrumentRun::missing(
-                route,
-                "stage admission refused: invocation kind differs from admitted stage",
-            );
-        }
-        if invocation.profile.as_str() != route.stage().profile.as_str() {
-            return InstrumentRun::missing(
-                route,
-                "stage admission refused: invocation profile differs from admitted stage",
-            );
-        }
         if let Some(reason) = Self::invocation_skew_reason(route, &planned.stage, &invocation) {
             return InstrumentRun::missing(route, reason);
         }
@@ -1100,22 +1207,25 @@ impl StageOrchestrator {
         let admission = planned
             .stage
             .admission_request(&invocation, Some(&identity));
-        let grant =
-            match planned
-                .stage
-                .admit(&admission, Some(&identity), route.stage().profile_revision)
-            {
-                Ok(grant) => grant,
-                Err(error) => {
-                    return InstrumentRun::missing(
-                        route,
-                        format!("stage admission refused: {error}"),
-                    );
-                }
-            };
-        if let Some(reason) =
-            Self::grant_at_use_skew_reason(route, &planned.stage, &grant, &process_request)
-        {
+        let grant = match Self::admit_planned_stage(
+            planned,
+            live,
+            &admission,
+            &identity,
+            route.stage().profile_revision,
+        ) {
+            Ok(grant) => grant,
+            Err(error) => {
+                return InstrumentRun::missing(route, format!("stage admission refused: {error}"));
+            }
+        };
+        if let Some(reason) = Self::grant_at_use_skew_reason(
+            route,
+            &planned.stage,
+            &grant,
+            &identity,
+            &process_request,
+        ) {
             return InstrumentRun::missing(route, reason);
         }
         let mut binding = match InstrumentBinding::from_request(invocation, process_request) {
@@ -1124,7 +1234,10 @@ impl StageOrchestrator {
                 return InstrumentRun::missing(route, format!("stage admission refused: {error}"));
             }
         };
-        match runner.launch(&mut binding, launcher.sink(planned)).await {
+        match runner
+            .launch_admitted(&mut binding, &grant, launcher.sink(planned))
+            .await
+        {
             Ok(receipt) => {
                 let operation = receipt.process.operation_id().as_str().to_owned();
                 let target_layout = StageTargetLayout::sealed(planned, &receipt);
