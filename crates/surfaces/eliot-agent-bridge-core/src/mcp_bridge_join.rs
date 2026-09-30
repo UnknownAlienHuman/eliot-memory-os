@@ -46,9 +46,14 @@
 //! invocation, so a proven interval is never coverage until it is bounded to
 //! the correlation being assessed. [`reconcile_terminal_event`] requires the
 //! proven interval to reach the candidate's own journaled sequence, and
-//! [`reconcile_deadline_sweep`] requires it to continue one sequence past the
-//! owner's highest, both read from the owner rather than from the request. A
-//! long-contiguous run of *other* invocations' events therefore leaves the
+//! [`reconcile_deadline_sweep`] requires it to continue past
+//! [`DeadlineSweepRequest::required_seq`]: the owner sequence the owning
+//! process recorded for that correlation when it emitted it. Both floors are
+//! read from the owner rather than from the request, and the sweep floor is a
+//! RECORDED value rather than one recomputed at sweep time: a floor derived
+//! from the journal head at sweep time is one past the head, so the interval
+//! could never reach it and the gate would be unsatisfiable rather than strict.
+//! A long-contiguous run of *other* invocations' events therefore leaves the
 //! outcome unknown instead of reading as an owner-proven clean interval
 //! (issue #2899 item 7; I7.23 "missing host coverage is `TAINTED/UNKNOWN`,
 //! never a self-reported PASS").
@@ -70,7 +75,7 @@ use crate::mcp_correlation::{
     sha256_hex,
 };
 use crate::mcp_host_observation::{
-    HostEventJoinKeys, HostObservationReject, HostOwnerBinding, RecordedInvocation,
+    HostEventJoinKeys, HostObservationReject, HostOwnerBinding, RecordedInvocation, ReplayConflict,
     check_event_replay, normalize_terminal_observation,
 };
 use crate::{
@@ -263,10 +268,12 @@ pub enum ReconcileError {
     },
     /// The same event identity was already accepted for this correlation with
     /// different content, generation, route, or cursor.
-    PriorEvidenceConflict {
-        /// Conflicting event identity.
-        event_id: String,
-    },
+    ///
+    /// The conflict carries the exact prior and candidate content digests so
+    /// the refusal stays a typed, bounded reason instead of a silent
+    /// last-write-wins: nothing is appended, no prior revision is touched, and
+    /// the accepted observation stands exactly as it was recorded.
+    PriorEvidenceConflict(ReplayConflict),
     /// The candidate failed host-observation normalization.
     HostRejected(HostObservationReject),
 }
@@ -291,10 +298,11 @@ impl std::fmt::Display for ReconcileError {
                 formatter,
                 "owner journal holds different content for host event {event_id}"
             ),
-            Self::PriorEvidenceConflict { event_id } => write!(
+            Self::PriorEvidenceConflict(conflict) => write!(
                 formatter,
                 "host event {event_id} was already accepted for this correlation with \
-                 different content"
+                 different content",
+                event_id = conflict.event_id
             ),
             Self::HostRejected(reason) => {
                 write!(formatter, "host event rejected for correlation: {reason}")
@@ -307,12 +315,12 @@ impl std::error::Error for ReconcileError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::HostRejected(reason) => Some(reason),
+            Self::PriorEvidenceConflict(conflict) => Some(conflict),
             Self::OwnerUnattached
             | Self::OwnerRouteUnproven
             | Self::NominatedEventNotJournaled { .. }
             | Self::OutOfDeclaredOrder { .. }
-            | Self::JournalContentConflict { .. }
-            | Self::PriorEvidenceConflict { .. } => None,
+            | Self::JournalContentConflict { .. } => None,
         }
     }
 }
@@ -406,15 +414,15 @@ pub fn reconcile_terminal_event(
     // different event identity is a new observation of the same correlation.
     // Neither rewrites a prior revision by itself. Only the same identity with
     // changed content — a different generation, route, cursor, or digest — is
-    // refused. The expected set is this correlation's own retained record, not
-    // anything the joining caller presents.
+    // refused, and it is refused as a typed conflict carrying both digests, so
+    // the refusal is never collapsed into an ordinary non-attribution. The
+    // expected set is this correlation's own retained record, not anything the
+    // joining caller presents.
     if let (Some(prior), HostTerminalObservation::Observed { evidence, .. }) =
         (request.assessments.latest_host_evidence(), &host)
-        && check_event_replay(prior, evidence.as_ref()).is_err()
+        && let Err(conflict) = check_event_replay(prior, evidence.as_ref())
     {
-        return Err(ReconcileError::PriorEvidenceConflict {
-            event_id: journaled.event_id.as_str().to_owned(),
-        });
+        return Err(ReconcileError::PriorEvidenceConflict(conflict));
     }
     let coverage = read_host_coverage(bridge);
     let window = ObservationWindow {
@@ -523,6 +531,23 @@ pub struct DeadlineSweepRequest<'a> {
     pub emission: &'a EliotEmissionObservation,
     /// Applicable observation deadline admitted by the owner, when one exists.
     pub deadline_unix_ms: Option<u64>,
+    /// Owner host-event sequence this correlation must itself reach before a
+    /// proven interval says anything about it.
+    ///
+    /// A RECORDED value, read by the owning process out of the owner journal at
+    /// the moment the emission was admitted: the correlation was emitted when
+    /// the owner had observed up to this sequence, so contiguity proves
+    /// coverage only once the journal later continued past it. It is
+    /// deliberately not recomputed here from the journal head — a head-derived
+    /// floor is one past the head, so the proven interval could never reach it
+    /// and the stuck gate would be unsatisfiable instead of strict.
+    ///
+    /// `None` means the owner admitted no sequence binding for this
+    /// correlation. That is indeterminacy, never coverage: a sweep with no
+    /// recorded floor stays pending (issue #2899 item 7; I7.23
+    /// "missing host coverage is `TAINTED/UNKNOWN`, never a self-reported
+    /// PASS").
+    pub required_seq: Option<u64>,
     /// Owner-validated operation binding, when a tool owner minted one.
     pub operation_binding: Option<&'a OwnerValidatedOperationBinding>,
     /// Canonical disposition from canonical evidence only.
@@ -538,12 +563,13 @@ pub struct DeadlineSweepRequest<'a> {
 /// pending or unknown. Never files edges and never invents host completion.
 ///
 /// The sweep names no candidate event, so the sequence its coverage must reach
-/// is derived from the owner's own journal rather than from the request: the
-/// terminal event for a still-pending correlation would be the next one the
-/// owner admits, so contiguity proves coverage only once the journal actually
-/// continued past it. A journal that stopped short — including a long-contiguous
-/// one covering only *earlier, unrelated* invocations — leaves the outcome
-/// `UNKNOWN`, never stuck (issue #2899 item 7; I7.23).
+/// is the one this correlation recorded when it was emitted
+/// ([`DeadlineSweepRequest::required_seq`]): the terminal event for a
+/// still-pending correlation would be the next one the owner admits, so
+/// contiguity proves coverage only once the journal actually continued past
+/// that recorded point. A journal that stopped short — including a
+/// long-contiguous one covering only *earlier, unrelated* invocations — leaves
+/// the outcome `UNKNOWN`, never stuck (issue #2899 item 7; I7.23).
 pub fn reconcile_deadline_sweep(
     bridge: &AgentBridgeCore,
     request: &DeadlineSweepRequest<'_>,
@@ -553,7 +579,7 @@ pub fn reconcile_deadline_sweep(
         deadline_unix_ms: request.deadline_unix_ms,
         now_unix_ms: request.now_unix_ms,
         coverage: coverage.coverage,
-        required_seq: pending_required_seq(bridge),
+        required_seq: request.required_seq,
     };
     let host = HostTerminalObservation::PartialUnknown(PartialObservation::stdio_boundary());
     let assessment_inputs = AssessmentInputs {
@@ -566,18 +592,4 @@ pub fn reconcile_deadline_sweep(
         ui_confirmed_stale: false,
     };
     assess_correlation(&assessment_inputs)
-}
-
-/// Host-event sequence a still-pending correlation must reach before a
-/// proven interval says anything about it.
-///
-/// Read from the owner's live journal, never from the requesting caller: a
-/// caller-supplied floor could be set arbitrarily low and would then let a
-/// short interval cover an unrelated invocation. With no journal at all the
-/// owner has admitted no sequence binding, which is indeterminacy and leaves
-/// the correlation pending.
-fn pending_required_seq(bridge: &AgentBridgeCore) -> Option<u64> {
-    let inputs = bridge.terminal_reduction_inputs()?;
-    let highest = inputs.history().last()?.sequence;
-    Some(highest.saturating_add(1))
 }

@@ -3715,6 +3715,29 @@ impl KernelHostRequestClient {
         Ok(())
     }
 
+    /// Reads back the exact absolute deadline the owner submitted for one
+    /// already-dispatched correlation.
+    ///
+    /// The deadline is not invented here and not recomputed from a fresh clock:
+    /// it is read out of the retained envelope this transport actually
+    /// submitted for that exact correlation, and it is the value the Kernel
+    /// enforces expiry against at admission. `None` means this correlation has
+    /// no submitted invocation envelope in the retained transport — the call
+    /// never reached one (rejected before building an envelope, or resolved to
+    /// an already-durable winner) — so no settlement deadline exists and no
+    /// deadline-bound conclusion may be drawn for it.
+    ///
+    /// Borrowed from the single retained transport owner, so this is a read of
+    /// the owner's own record and never a second store.
+    pub fn submitted_deadline_unix_ms(&self, correlation_id: &str) -> Option<u64> {
+        self.shared
+            .try_borrow()
+            .ok()?
+            .replay_cache
+            .get(correlation_id)
+            .map(|entry| entry.envelope.identity.deadline_unix_ms)
+    }
+
     /// Asks the kernel preview entry to validate one invocation dry run
     /// (issue #1939, I7.17).
     ///

@@ -23,15 +23,15 @@ use eliot_contracts::{
 };
 use eliot_mcp::{
     HostCancellationOutcome, HostCancellationRequest, HostCancellationResult,
-    HostCorrelationReceipt, HostGatewayError, HostInvocationOutcome, HostInvocationRequest,
-    HostInvocationResult, HostOperationHandle, HostRequestGateway, JsonRpcId,
-    KernelHostRequestPort, NegotiatedWireVersion, PortFailure, ToolRequest, WIRE_INTERNAL_ERROR,
-    WIRE_INVALID_PARAMS, WIRE_INVALID_REQUEST, WIRE_METHOD_NOT_FOUND, WIRE_REQUEST_CANCELLED,
-    build_host_cancellation, build_host_invocation, decode_cancel_notification,
-    decode_initialize_version, decode_resource_uri, decode_tools_call, decode_wire_request,
-    gateway_error_to_wire, initialize_result, negotiate_wire_version, render_accepted_result,
-    render_error, render_rejected_result, render_rejection, render_responded_result, render_result,
-    tools_list_result,
+    HostCompletionOutcome, HostCorrelationReceipt, HostGatewayError, HostInvocationOutcome,
+    HostInvocationRequest, HostInvocationResult, HostOperationHandle, HostRequestGateway,
+    JsonRpcId, KernelHostRequestPort, NegotiatedWireVersion, PortFailure, ToolRequest,
+    WIRE_INTERNAL_ERROR, WIRE_INVALID_PARAMS, WIRE_INVALID_REQUEST, WIRE_METHOD_NOT_FOUND,
+    WIRE_REQUEST_CANCELLED, build_host_cancellation, build_host_invocation,
+    decode_cancel_notification, decode_initialize_version, decode_resource_uri, decode_tools_call,
+    decode_wire_request, gateway_error_to_wire, initialize_result, negotiate_wire_version,
+    render_accepted_result, render_error, render_rejected_result, render_rejection,
+    render_responded_result, render_result, tools_list_result,
 };
 #[cfg(test)]
 use eliot_mcp::{HostCancellationPortOutcome, HostInvocationPortOutcome};
@@ -2973,6 +2973,13 @@ impl McpFrontDoor {
 struct McpFrameOutcome {
     response: Option<Value>,
     dispatched: bool,
+    /// Owner-held facts this frame produced, read back from the owners that
+    /// issued them.
+    ///
+    /// Empty for every frame that admitted nothing, which is the honest
+    /// default: no admitted operation means no canonical reference and no
+    /// settlement deadline, so the correlation can carry neither.
+    owner_evidence: eliot_agent_bridge::mcp_correlation::StdioOwnerEmissionEvidence,
 }
 
 /// Serves the MCP front door on stdio until EOF or a fail-closed break.
@@ -3033,6 +3040,14 @@ fn run_mcp_front_door(
             // admitted route. This declares no host terminal fact: it records
             // only that ELIOT emitted, and a later admitted host event is what
             // can resolve the correlation.
+            //
+            // The canonical disposition and the settlement deadline come from
+            // the owners that issued them — the owner's completion receipt and
+            // the envelope the owner submitted — never from the wire and never
+            // from optimism. A frame that never reached a handler is a provable
+            // pre-stage failure, which is exactly what `dispatched` records.
+            let mut evidence = outcome.owner_evidence;
+            evidence.failed_before_handler = !outcome.dispatched;
             let receipt = write_mcp_frame(&response);
             if let Ok(request) = serde_json::from_str::<Value>(&text) {
                 let observed = eliot_agent_bridge::mcp_correlation::StdioEmissionOutcome {
@@ -3046,7 +3061,7 @@ fn run_mcp_front_door(
                     request.get("method").and_then(Value::as_str).unwrap_or(""),
                     None,
                     observed,
-                    None,
+                    &evidence,
                 ) {
                     emit_error("MCP_EMISSION_OBSERVATION_REFUSED", &error.to_string());
                 }
@@ -3055,12 +3070,62 @@ fn run_mcp_front_door(
                 break;
             }
         }
+        // #2899 A3: one bounded deadline sweep per frame boundary. It is a
+        // poll, not a timer: a stuck conclusion needs the owner's clock, the
+        // owner's admitted deadline and an owner-proven contiguous interval
+        // reaching past the sequence this correlation recorded at emission.
+        // Anything short of all three stays pending or unknown, and a
+        // correlation a host terminal already closed, or one from a superseded
+        // generation, is not touched at all.
+        sweep_mcp_correlations(runner);
     }
     if provider_failure {
         PROVIDER_PORT_EXIT
     } else {
         0
     }
+}
+
+/// Sweeps pending MCP correlations against their admitted deadlines and reports
+/// the typed verdicts plus the bounded CURRENT counts.
+///
+/// Every line here is identifiers, closed reason codes and bounded counts: the
+/// correlation digest, the current state, whether the coverage it rested on is
+/// a complete interval or partial, the canonical disposition it was derived
+/// under, and the bounded typed recovery order. No tool argument, response body
+/// or host prose is reported.
+fn sweep_mcp_correlations(runner: &mut BridgeRunner) {
+    let now_unix_ms = eliot_agent_bridge::mcp_correlation::owner_now_unix_ms().unwrap_or(0);
+    let report = runner.sweep_correlation_deadlines(now_unix_ms);
+    let summary = runner.correlation_verdict_summary();
+    for verdict in &report.verdicts {
+        tracing::info!(
+            correlation_digest = %verdict.correlation_digest,
+            assessment_state = verdict.state.as_str(),
+            revision = verdict.revision,
+            supersedes = verdict.supersedes.map_or(0, |revision| revision.saturating_add(1)),
+            coverage = verdict.coverage.as_str(),
+            coverage_complete = verdict.coverage_is_complete(),
+            canonical_disposition = verdict.canonical_disposition.as_str(),
+            recovery = verdict.recovery.as_deref().unwrap_or(""),
+            "mcp correlation deadline sweep"
+        );
+    }
+    // The counts are reported when the sweep established or refused something.
+    // A correlation a host terminal already closed is counted every time, so
+    // reporting on that alone would repeat an unchanged line per frame.
+    if report.verdicts.is_empty() && report.stale_generation == 0 {
+        return;
+    }
+    tracing::info!(
+        swept = report.verdicts.len(),
+        stale_generation_refused = report.stale_generation,
+        already_closed_untouched = report.already_closed,
+        current_pending = summary.pending,
+        current_completed = summary.completed,
+        current_degraded = summary.degraded,
+        "mcp correlation current verdict summary"
+    );
 }
 
 /// Bounded header bytes accepted for one loopback HTTP request.
@@ -3600,6 +3665,7 @@ fn handle_mcp_frame(
     let valid = |response: Option<Value>| McpFrameOutcome {
         response,
         dispatched: true,
+        owner_evidence: eliot_agent_bridge::mcp_correlation::StdioOwnerEmissionEvidence::none(),
     };
     let request = match decode_wire_request(text) {
         Ok(request) => request,
@@ -3607,6 +3673,8 @@ fn handle_mcp_frame(
             return McpFrameOutcome {
                 response: Some(error.render()),
                 dispatched: false,
+                owner_evidence:
+                    eliot_agent_bridge::mcp_correlation::StdioOwnerEmissionEvidence::none(),
             };
         }
     };
@@ -3625,6 +3693,7 @@ fn handle_mcp_frame(
                 Value::Null,
             )),
             dispatched: false,
+            owner_evidence: eliot_agent_bridge::mcp_correlation::StdioOwnerEmissionEvidence::none(),
         },
         (Some(id), "initialize") => valid(Some(handle_mcp_initialize(
             runner,
@@ -3642,14 +3711,19 @@ fn handle_mcp_frame(
             Value::Null,
         ))),
         (Some(id), "tools/list") => valid(Some(handle_mcp_tools_list(&id, &request.params))),
-        (Some(id), "tools/call") => valid(Some(handle_mcp_tools_call(
-            gateway,
-            port,
-            runner,
-            state,
-            &id,
-            &request.params,
-        ))),
+        (Some(id), "tools/call") => {
+            // #2899: the only frame that reaches the trusted owner, so it is
+            // the only one that can carry an admitted operation reference and
+            // the owner's own submitted settlement deadline. Both are read back
+            // from the owner's receipt and envelope, never from the wire.
+            let (response, owner_evidence) =
+                handle_mcp_tools_call(gateway, port, runner, state, &id, &request.params);
+            McpFrameOutcome {
+                response: Some(response),
+                dispatched: true,
+                owner_evidence,
+            }
+        }
         (Some(id), "resources/list") => {
             valid(Some(handle_mcp_resources_list(state, &id, &request.params)))
         }
@@ -3755,6 +3829,14 @@ fn handle_mcp_tools_list(id: &JsonRpcId, params: &Value) -> Value {
 /// under its type-qualified correlation for the host request, handle lookup,
 /// and cancellation marks; response envelopes echo the original wire identity
 /// unchanged.
+///
+/// #2899: it also returns the owner-held facts about THIS call, so the emitted
+/// correlation is not left asserting an unknown canonical outcome when the owner
+/// has already spoken. The admitted operation reference comes from the owner's
+/// own completion receipt and the settlement deadline from the envelope this
+/// transport actually submitted for this exact correlation. Both are absent
+/// when the owner admitted nothing, which is the honest result and not a
+/// failure.
 fn handle_mcp_tools_call(
     gateway: HostRequestGateway,
     port: &mut KernelHostRequestClient,
@@ -3762,36 +3844,78 @@ fn handle_mcp_tools_call(
     state: &mut McpFrontDoor,
     id: &JsonRpcId,
     params: &Value,
-) -> Value {
+) -> (
+    Value,
+    eliot_agent_bridge::mcp_correlation::StdioOwnerEmissionEvidence,
+) {
     let correlation = id.correlation_text(eliot_contracts::HostCorrelationDomain::Request);
     if state.is_cancelled(&correlation) {
-        return render_error(
-            Some(id),
-            WIRE_REQUEST_CANCELLED,
-            "request was cancelled before dispatch; no kernel effect was issued",
-            Value::Null,
+        return (
+            render_error(
+                Some(id),
+                WIRE_REQUEST_CANCELLED,
+                "request was cancelled before dispatch; no kernel effect was issued",
+                Value::Null,
+            ),
+            eliot_agent_bridge::mcp_correlation::StdioOwnerEmissionEvidence::none(),
         );
     }
     let (name, arguments) = match decode_tools_call(params) {
         Ok(call) => call,
-        Err(rejection) => return render_rejection(Some(id), &rejection),
+        Err(rejection) => {
+            return (
+                render_rejection(Some(id), &rejection),
+                eliot_agent_bridge::mcp_correlation::StdioOwnerEmissionEvidence::none(),
+            );
+        }
     };
     let request = match build_host_invocation(state.version, id, name, arguments) {
         Ok(request) => request,
-        Err(rejection) => return render_rejection(Some(id), &rejection),
+        Err(rejection) => {
+            return (
+                render_rejection(Some(id), &rejection),
+                eliot_agent_bridge::mcp_correlation::StdioOwnerEmissionEvidence::none(),
+            );
+        }
     };
     match gateway.invoke_with_receipt(port, &request) {
         Ok((result, receipt)) => {
-            render_mcp_invocation(port, runner, state, id, &correlation, &result, &receipt)
+            // Read the owner's own statement of what it did with this
+            // correlation. An admitted or inline-responded operation carries the
+            // exact Kernel-issued handle; every owner-reported rejection carries
+            // none, so no canonical reference is claimed for it.
+            let owner_operation_receipt = match receipt.outcome() {
+                HostCompletionOutcome::Admitted { operation_handle }
+                | HostCompletionOutcome::RespondedInline {
+                    operation_handle, ..
+                } => Some(operation_handle.as_str().to_owned()),
+                HostCompletionOutcome::OwnerDeadlineExceeded
+                | HostCompletionOutcome::OwnerCancelled
+                | HostCompletionOutcome::OwnerRejected { .. } => None,
+            };
+            let deadline_unix_ms = port.submitted_deadline_unix_ms(request.correlation_id.as_str());
+            let response =
+                render_mcp_invocation(port, runner, state, id, &correlation, &result, &receipt);
+            (
+                response,
+                eliot_agent_bridge::mcp_correlation::StdioOwnerEmissionEvidence {
+                    failed_before_handler: false,
+                    owner_operation_receipt,
+                    deadline_unix_ms,
+                },
+            )
         }
         Err(error) => {
             let (code, message) = gateway_error_to_wire(&error);
             emit_error("MCP_CALL_GATEWAY_REJECTED", &error.to_string());
-            render_error(
-                Some(id),
-                code,
-                message,
-                serde_json::json!({ "detail": error.to_string() }),
+            (
+                render_error(
+                    Some(id),
+                    code,
+                    message,
+                    serde_json::json!({ "detail": error.to_string() }),
+                ),
+                eliot_agent_bridge::mcp_correlation::StdioOwnerEmissionEvidence::none(),
             )
         }
     }

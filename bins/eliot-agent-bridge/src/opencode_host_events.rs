@@ -670,6 +670,7 @@ impl BridgeHostEventAdmission<'_> {
                 correlation_digest,
                 state,
                 edge_filed,
+                ..
             }) => (
                 correlation_digest,
                 state.as_str(),

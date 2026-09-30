@@ -547,6 +547,19 @@ impl CoverageProof {
             Self::Indeterminate { .. } => "indeterminate",
         }
     }
+
+    /// Whether the owner proved a CONTIGUOUS observed interval.
+    ///
+    /// This is the complete/partial statement about coverage itself. Whether
+    /// that interval covers *this* correlation is a second, separate question
+    /// ([`ObservationWindow::covers_this_correlation`]): a contiguous run of
+    /// other invocations' events is a complete interval and still says nothing
+    /// here. Reporting only this predicate would claim coverage the correlation
+    /// never had, so a fault verdict must rest on the window predicate and this
+    /// one is reported beside it (issue #2899 item 7; I7.23).
+    pub const fn is_complete_interval(&self) -> bool {
+        matches!(self, Self::CompleteInterval { .. })
+    }
 }
 
 /// Why host-event coverage is unprovable.
@@ -1252,6 +1265,35 @@ fn degradation_for(
 /// include resubmission in a lawful retry state. Every evidenced route-fault
 /// recovery terminates in bounded escalation with the correlation record
 /// attached.
+///
+/// #2899 A7 — the CANONICAL segment is a total function of the canonical
+/// disposition alone, and the bound is stated rather than implied (I14.21:
+///
+/// ```text
+/// if committed  -> reconcile ORS;
+/// if known rollback -> retry under same identity;
+/// if unknown    -> pause, preserve the operation, open Problem State;
+///                  no blind duplicate effect.
+/// ```
+///
+/// | disposition            | canonical segment                                  |
+/// |------------------------|---------------------------------------------------|
+/// | `ReadOnly`             | none — no mutation exists to reconcile or replay  |
+/// | `FailedBeforeStage`    | none — no mutating stage ever executed           |
+/// | `PossibleCommit`       | `QueryStatusTool` first — reconcile before replay |
+/// | `Unknown`              | `QueryStatusTool` first — the same lawful floor  |
+/// | `CommittedWithReadback`| none — canonical truth is settled; replay would duplicate it |
+/// | `RolledBack`           | `ResubmitSameOperationIdentity`, owner binding only |
+///
+/// The route segment (reconnect, refresh, escalation) is chosen by the observed
+/// CAUSE and is identical across dispositions; only the canonical segment above
+/// varies. `ReadOnly`, `FailedBeforeStage` and `CommittedWithReadback` therefore
+/// share one sequence, and that is the honest limit of the closed
+/// [`RecoveryAction`] vocabulary: no action in it separates "the mutation never
+/// started" from "this request is a read" from "the mutation is committed and
+/// read back", because all three are canonically settled and admit only
+/// route-level recovery. Inventing an action to separate them would be a
+/// prescription the documentation does not authorize.
 pub fn derive_recovery(
     identity_digest: &str,
     state: CorrelationAssessmentState,
@@ -1462,6 +1504,26 @@ impl AssessmentSummary {
             }
         }
         summary
+    }
+
+    /// Summarizes the CURRENT verdict of each correlation, not its history.
+    ///
+    /// The caller passes each correlation's own latest revision, so a
+    /// correlation that was first assessed as a degradation and later resolved
+    /// by a competent host completion is counted ONCE, as completed. Counting
+    /// every revision would keep reporting the superseded false degradation
+    /// beside the healthy completion, which is exactly the state item 9
+    /// forbids; the earlier revision stays immutable in the log and is simply
+    /// no longer current.
+    ///
+    /// A correlation with no revision yet has no verdict and is not counted.
+    /// That is honest, not an omission: nothing has been established about it,
+    /// and its emission record is durable in the owner regardless.
+    pub fn summarize_current<'a>(
+        currents: impl IntoIterator<Item = &'a AssessmentRevision>,
+    ) -> Self {
+        let revisions = currents.into_iter().cloned().collect::<Vec<_>>();
+        Self::summarize(&revisions)
     }
 }
 
