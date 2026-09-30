@@ -438,6 +438,62 @@ fn declared_target_paths(argv: &[String], working_directory: &Path) -> Vec<PathB
     targets
 }
 
+// I10.21 A1: only a proven transition with real bytes on both
+// sides becomes a governed record. The ledger hashes the supplied
+// bytes itself and the diff handle is the ledger's own transition
+// binder, so the handle resolves to the recorded transition by
+// construction. The record is written before confirmation so the
+// confirmation can reconcile against this exact evidence. The
+// change identity scopes the record to this operation's exact
+// target, so one operation's targets never share one record.
+fn record_proven_target_transition(
+    operation: &str,
+    base: &EffectTargetBaseline,
+    back: &EffectTargetReceipt,
+    baseline: &GovernedProcessEffectBaseline,
+    receipt: &GovernedProcessChangeReceipt,
+) -> Option<String> {
+    let mut recorded_transition: Option<String> = None;
+    if back.after_first_digest == back.after_reread_digest
+        && back.after_first_digest != base.before_digest
+    {
+        let target_digest = base.target_digest.as_str();
+        let change_id = format!("{operation}:{target_digest}");
+        let (_, transition) = change_monitor::material_transition_ids(
+            &change_id,
+            Some(base.before_digest.as_str()),
+            Some(back.after_first_digest.as_str()),
+        );
+        let change = change_monitor::GovernedToolChange {
+            change_id,
+            resource: base.resource.clone(),
+            path: base.lane_path.clone(),
+            before_path: None,
+            before_revision: Some(base.before_digest.clone()),
+            before_bytes: Some(base.before_bytes.clone()),
+            after_revision: Some(back.after_first_digest.clone()),
+            after_bytes: Some(back.after_bytes.clone()),
+            session: baseline.binding.session_id.as_str().to_owned(),
+            action_lease: baseline.binding.action_lease_ref.as_str().to_owned(),
+            operation: operation.to_owned(),
+            attempt_receipt: baseline.effect_digest.clone(),
+            diff_handle: transition.clone(),
+            fence_generation: receipt.terminal_fence.generation().get(),
+            fence_invalidated: receipt.terminal_fence != baseline.capture_fence,
+        };
+        match change_monitor::record_governed_tool_change(&change) {
+            Ok(_) => {
+                recorded_transition = Some(transition);
+                observe_process("kernel.process.effect_observed", "recorded");
+            }
+            Err(_) => {
+                observe_process("kernel.process.effect_observed", "refused");
+            }
+        }
+    }
+    recorded_transition
+}
+
 impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
     fn capture_before(
         &self,
@@ -646,51 +702,8 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
                 observe_process("kernel.process.effect_observed", "unobserved");
                 continue;
             }
-            // I10.21 A1: only a proven transition with real bytes on both
-            // sides becomes a governed record. The ledger hashes the supplied
-            // bytes itself and the diff handle is the ledger's own transition
-            // binder, so the handle resolves to the recorded transition by
-            // construction. The record is written before confirmation so the
-            // confirmation can reconcile against this exact evidence. The
-            // change identity scopes the record to this operation's exact
-            // target, so one operation's targets never share one record.
-            let mut recorded_transition: Option<String> = None;
-            if back.after_first_digest == back.after_reread_digest
-                && back.after_first_digest != base.before_digest
-            {
-                let change_id = format!("{operation}:{target_digest}");
-                let (_, transition) = change_monitor::material_transition_ids(
-                    &change_id,
-                    Some(base.before_digest.as_str()),
-                    Some(back.after_first_digest.as_str()),
-                );
-                let change = change_monitor::GovernedToolChange {
-                    change_id,
-                    resource: base.resource.clone(),
-                    path: base.lane_path.clone(),
-                    before_path: None,
-                    before_revision: Some(base.before_digest.clone()),
-                    before_bytes: Some(base.before_bytes.clone()),
-                    after_revision: Some(back.after_first_digest.clone()),
-                    after_bytes: Some(back.after_bytes.clone()),
-                    session: baseline.binding.session_id.as_str().to_owned(),
-                    action_lease: baseline.binding.action_lease_ref.as_str().to_owned(),
-                    operation: operation.clone(),
-                    attempt_receipt: baseline.effect_digest.clone(),
-                    diff_handle: transition.clone(),
-                    fence_generation: receipt.terminal_fence.generation().get(),
-                    fence_invalidated: receipt.terminal_fence != baseline.capture_fence,
-                };
-                match change_monitor::record_governed_tool_change(&change) {
-                    Ok(_) => {
-                        recorded_transition = Some(transition);
-                        observe_process("kernel.process.effect_observed", "recorded");
-                    }
-                    Err(_) => {
-                        observe_process("kernel.process.effect_observed", "refused");
-                    }
-                }
-            }
+            let recorded_transition =
+                record_proven_target_transition(&operation, base, back, &baseline, &receipt);
             let verification = change_monitor::HintVerification {
                 before_digest: Some(base.before_digest.clone()),
                 first_read: change_monitor::ContentRead::Present {
