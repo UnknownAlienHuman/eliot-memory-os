@@ -11,7 +11,9 @@ use crate::{
     UsageTelemetry, bound_session_identity, committed_message_id, wire_receipt_evidence,
     wire_route_locator,
 };
-use eliot_agent_api::{EventCursor, ExecutionOutcome};
+use eliot_agent_api::{
+    AgentResult, EffectCeiling, EventCursor, ExecutionOutcome, ResultDisposition,
+};
 use eliot_contracts::{ClockReading, ResourceGeneration, StateFence};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -239,6 +241,76 @@ pub struct AdmittedAttemptOutcome {
     pub run: NoAuthorityRunResult,
     pub candidate: AdmittedAttemptCandidate,
     pub route: SealedRouteDisposition,
+}
+
+/// Error from projecting one retained admitted OpenCode outcome into the
+/// provider-neutral candidate intake contract. Receipt-free route outcomes
+/// remain typed here so callers can retain and report the original candidate
+/// and its raw provider evidence without collapsing it into a generic failure.
+#[derive(Debug, thiserror::Error)]
+pub enum AdmittedOutcomeProjectionError {
+    #[error(transparent)]
+    Owner(#[from] AdmittedAttemptError),
+    #[error("sealed route disposition has no validated physical receipt")]
+    RouteDispositionUnavailable { disposition: SealedRouteDisposition },
+}
+
+impl AdmittedAttemptOutcome {
+    /// Projects the already sealed OpenCode observation into the provider-neutral
+    /// candidate intake contract. The original outcome remains the canonical
+    /// OpenCode artifact; this projection carries only its validated route and
+    /// usage receipt plus a digest reference to the exact candidate.
+    ///
+    /// The owner admission, execution binding, live fence/generation, sealed
+    /// run digest, route-disposition summary, and terminal observation are
+    /// revalidated before the projection is returned. Receipt-free route
+    /// dispositions stay typed on the error and must be handled together with
+    /// this original outcome; they are never upgraded to a fabricated physical
+    /// receipt.
+    pub fn to_agent_result(
+        &self,
+        admitted: &AdmittedOpenCodeAttempt,
+        current_fence: &StateFence,
+        runtime_generation: ResourceGeneration,
+        ceiling: &EffectCeiling,
+    ) -> Result<AgentResult, AdmittedOutcomeProjectionError> {
+        admitted.verify(current_fence, runtime_generation)?;
+
+        self.candidate
+            .validate_for_run(admitted, &self.run, &self.route)?;
+
+        let actual_route = self.route.receipt().ok_or_else(|| {
+            AdmittedOutcomeProjectionError::RouteDispositionUnavailable {
+                disposition: self.route.clone(),
+            }
+        })?;
+        let disposition = if self.route.is_observed() {
+            ResultDisposition::CandidateSucceeded
+        } else {
+            ResultDisposition::UnknownOutcome
+        };
+        let unknown_reason = (disposition == ResultDisposition::UnknownOutcome).then(|| {
+            format!("OpenCode route disposition is {}", self.route.cause_code())
+        });
+        let result = AgentResult {
+            attempt_id: admitted.binding().attempt_id.clone(),
+            disposition,
+            artifacts: Vec::new(),
+            evidence_refs: vec![
+                format!("opencode-candidate:{}", self.candidate.result_digest.as_str()),
+                format!("opencode-route-receipt:{}", actual_route.self_digest.as_str()),
+            ],
+            proposed_effects: Vec::new(),
+            unresolved_questions: Vec::new(),
+            usage: self.run.usage.to_usage_receipt(),
+            actual_route: actual_route.clone(),
+            unknown_reason,
+        };
+        result
+            .validate_for_binding(admitted.binding(), admitted.admission(), ceiling)
+            .map_err(AdmittedAttemptError::BindingRejected)?;
+        Ok(result)
+    }
 }
 
 /// Classifies the route disposition carried by one sealed candidate artifact
