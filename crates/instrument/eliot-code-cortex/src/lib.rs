@@ -17,8 +17,9 @@ use eliot_instrument_api::{EvidenceAxes, EvidenceCoverage, EvidenceFreshness, No
 use eliot_receipts::{CausalBinding, TaskBinding};
 use eliot_store_api::CapturedBlobPayloadRefV1;
 use eliot_lsp_bridge::{
-    Coverage as LspCoverage, DiagnosticSeverity, FailureDisposition, Freshness as LspFreshness,
-    LspAdoptionProjection, LspRawOutputKind, NormalizedResult, RetainedLspObservationV1,
+    BridgeError as LspBridgeError, Coverage as LspCoverage, DiagnosticSeverity,
+    FailureDisposition, Freshness as LspFreshness, LspAdoptionProjection, LspRawOutputKind,
+    NormalizedResult, RetainedLspObservationV1,
     SemanticOperation, adopt_captured_observation_from_blob_readback,
     adopt_retained_observation,
 };
@@ -32,7 +33,7 @@ pub const CONTRACT_VERSION: &str = "1.0.0";
 /// Stable normalized-evidence kind for a historically adopted LSP observation.
 pub const LSP_NORMALIZED_EVIDENCE_KIND: &str = "eliot.lsp.normalized-observation.v1";
 
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[derive(Debug, Error)]
 pub enum CodeCortexError {
     #[error("task and scope must be non-blank")]
     InvalidScope,
@@ -42,6 +43,12 @@ pub enum CodeCortexError {
     InvalidGraph(String),
     #[error("evidence is invalid: {0}")]
     InvalidEvidence(String),
+    #[error("captured LSP payload reference is invalid: {0}")]
+    CapturedLspPayloadReference(#[from] eliot_store_api::StoreError),
+    #[error("captured LSP observation adoption failed: {0}")]
+    CapturedLspAdoption(#[from] LspBridgeError),
+    #[error("captured LSP pointer and owner receipts do not join")]
+    CapturedLspBindingMismatch,
     #[error("captured LSP evidence is bound to another task")]
     TaskBindingMismatch,
     #[error("index revision overflow")]
@@ -77,9 +84,7 @@ fn validate_current_read_binding(
     causal_binding: &CausalBinding,
 ) -> Result<(), CodeCortexError> {
     if task_binding.state_fence != causal_binding.state_fence {
-        return Err(CodeCortexError::InvalidEvidence(
-            "current Store read task and causal fences disagree".to_owned(),
-        ));
+        return Err(CodeCortexError::CapturedLspBindingMismatch);
     }
     Ok(())
 }
@@ -87,13 +92,9 @@ fn validate_current_read_binding(
 fn validate_captured_lsp_payload_reference(
     reference: &CapturedBlobPayloadRefV1,
 ) -> Result<(), CodeCortexError> {
-    reference
-        .validate()
-        .map_err(|error| CodeCortexError::InvalidEvidence(error.to_string()))?;
+    reference.validate()?;
     if reference.receipt_kind != eliot_lsp_bridge::LSP_TOOL_OBSERVATION_RECEIPT_KIND {
-        return Err(CodeCortexError::InvalidEvidence(
-            "captured Blob reference is not an LSP observation payload".to_owned(),
-        ));
+        return Err(CodeCortexError::CapturedLspBindingMismatch);
     }
     Ok(())
 }
@@ -104,11 +105,7 @@ fn validate_captured_lsp_task_join(
     current_read_task_binding: &TaskBinding,
     current_read_causal_binding: &CausalBinding,
 ) -> Result<(), CodeCortexError> {
-    let invalid = || {
-        CodeCortexError::InvalidEvidence(
-            "captured LSP payload does not join its Store and Blob owner bindings".to_owned(),
-        )
-    };
+    let invalid = || CodeCortexError::CapturedLspBindingMismatch;
     let readback = &captured.readback;
     let ready = readback.ready_receipt();
     let ready_receipt = ready.receipt();
@@ -610,10 +607,8 @@ impl CodeCortexService {
         let mut index = SemanticIndex::new();
         for observation in observations {
             validate_captured_lsp_payload_reference(&observation.reference)?;
-            let (record, result) = adopt_captured_observation_from_blob_readback(
-                &observation.readback,
-            )
-            .map_err(|error| CodeCortexError::InvalidEvidence(error.to_string()))?;
+            let (record, result) =
+                adopt_captured_observation_from_blob_readback(&observation.readback)?;
             validate_captured_lsp_task_join(
                 &observation,
                 &record,
