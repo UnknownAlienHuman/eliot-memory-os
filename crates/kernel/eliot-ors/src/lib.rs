@@ -144,8 +144,9 @@ pub use status_projection::{
     SupervisionStatusReason,
 };
 pub use store::{
-    CanonicalEvidenceProvider, ColdStartReadinessRecordOwner, OperationalRecoveryStore,
-    OrsCoordinator, OrsStoreIdentity, RedbRecoveryStore, RuntimeLeaseCensusRows,
+    CanonicalEvidenceProvider, ColdStartReadinessRecordOwner, HostRequestObserveResult,
+    OperationalRecoveryStore, OrsCoordinator, OrsStoreIdentity, RedbRecoveryStore,
+    RuntimeLeaseCensusRows,
     ScanDisclosureRecordOwner, StoreStopObligationCensus, StoreStopObligationCounts,
 };
 pub use store_route_ownership::CanonicalStoreRouteOwnership;
