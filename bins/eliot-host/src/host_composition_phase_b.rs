@@ -231,6 +231,106 @@ fn phase_b_observe_bound(observation: &PhaseBObservation) {
 }
 
 impl HostComposition {
+    /// Reopens the selected user-owned launch root for this Phase-B operation
+    /// and binds that live handle to the original Host-retained root object.
+    /// The descriptor supplies the role path; the retained selection receipt
+    /// supplies the expected file identity.
+    #[cfg(windows)]
+    fn phase_b_user_owned_launch_root(
+        &self,
+        launch: &RuntimeLaunchDescriptor,
+    ) -> Result<Option<UserOwnedRootLease>, HostError> {
+        let (root_path, expected_role) = match launch.profile {
+            InstallationProfile::UserMode => {
+                (
+                    launch.profile_governed_roots.immutable_binaries.as_str(),
+                    "immutable_binaries",
+                )
+            }
+            InstallationProfile::PortableDev => (
+                launch
+                    .portable_root
+                    .as_ref()
+                    .ok_or_else(|| {
+                        HostError::RecoveryRequired(
+                            "Phase-B portable root binding is missing".to_owned(),
+                        )
+                    })?
+                    .as_str(),
+                "runtime_state_roots.profile_anchor_root",
+            ),
+            InstallationProfile::SystemService => return Ok(None),
+        };
+        let root = UserOwnedRootLease::open_existing(Path::new(root_path))
+            .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+        #[cfg(test)]
+        let _ = expected_role;
+        root.verify_stable_identity()
+            .and_then(|()| root.verify_path_identity())
+            .map_err(|error| {
+                HostError::RecoveryRequired(format!(
+                    "Phase-B user-owned launch root changed: {error}"
+                ))
+            })?;
+
+        #[cfg(not(test))]
+        {
+            let retained = self.profile_root_leases.as_ref().ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "Phase-B current-user profile roots are not retained by Host".to_owned(),
+                )
+            })?;
+            retained.verify_stable_identity().map_err(|_| {
+                HostError::RecoveryRequired(
+                    "Phase-B current-user profile root identity changed".to_owned(),
+                )
+            })?;
+            let selection = retained.selection();
+            let selected_root = selection
+                .roots
+                .iter()
+                .find(|observation| observation.role == expected_role)
+                .ok_or_else(|| {
+                    HostError::RecoveryRequired(format!(
+                        "Host's retained profile selection has no {expected_role} root"
+                    ))
+                })?;
+            let canonical_path = root
+                .canonical_path()
+                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+            if selected_root.identity != root.identity()
+                || selection.owner_sid != root.current_user_sid()
+                || !eliot_platform_windows::windows_paths_equal(
+                    &selected_root.canonical_path,
+                    &canonical_path,
+                )
+                || !eliot_platform_windows::windows_paths_equal(
+                    &canonical_path,
+                    Path::new(root_path),
+                )
+            {
+                return Err(HostError::RecoveryRequired(
+                    "Phase-B launch root differs from Host's retained profile selection"
+                        .to_owned(),
+                ));
+            }
+            retained.verify_stable_identity().map_err(|_| {
+                HostError::RecoveryRequired(
+                    "Phase-B current-user profile root identity changed".to_owned(),
+                )
+            })?;
+        }
+
+        root.verify_stable_identity()
+            .and_then(|()| root.verify_path_identity())
+            .map_err(|error| {
+                HostError::RecoveryRequired(format!(
+                    "Phase-B user-owned launch root changed: {error}"
+                ))
+            })?;
+        Ok(Some(root))
+    }
+
     #[cfg(windows)]
     fn phase_b_store_peer_identity(
         &self,
@@ -484,32 +584,7 @@ impl HostComposition {
                 "supervision authority is foreign to the approved Phase-A launch".to_owned(),
             ));
         }
-        let user_owned_launch_root = match launch_template.profile {
-            InstallationProfile::UserMode => Some(
-                UserOwnedRootLease::open_existing(Path::new(
-                    launch_template
-                        .profile_governed_roots
-                        .immutable_binaries
-                        .as_str(),
-                ))
-                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?,
-            ),
-            InstallationProfile::PortableDev => Some(
-                UserOwnedRootLease::open_existing(Path::new(
-                    launch_template
-                        .portable_root
-                        .as_ref()
-                        .ok_or_else(|| {
-                            HostError::RecoveryRequired(
-                                "Phase-B portable root binding is missing".to_owned(),
-                            )
-                        })?
-                        .as_str(),
-                ))
-                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?,
-            ),
-            InstallationProfile::SystemService => None,
-        };
+        let user_owned_launch_root = self.phase_b_user_owned_launch_root(launch_template)?;
         verify_user_broker_artifact(manifest, user_owned_launch_root.as_ref())?;
         let profile = launch_template.profile;
         let authority_path = approved_phase_b_destination_locator(
@@ -1690,34 +1765,8 @@ impl HostComposition {
             ));
         }
         let profile = manifest.runtime_launch.profile;
-        let user_owned_launch_root = match profile {
-            InstallationProfile::UserMode => Some(
-                UserOwnedRootLease::open_existing(Path::new(
-                    manifest
-                        .runtime_launch
-                        .profile_governed_roots
-                        .immutable_binaries
-                        .as_str(),
-                ))
-                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?,
-            ),
-            InstallationProfile::PortableDev => Some(
-                UserOwnedRootLease::open_existing(Path::new(
-                    manifest
-                        .runtime_launch
-                        .portable_root
-                        .as_ref()
-                        .ok_or_else(|| {
-                            HostError::RecoveryRequired(
-                                "Phase-B prepared portable root binding is missing".to_owned(),
-                            )
-                        })?
-                        .as_str(),
-                ))
-                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?,
-            ),
-            InstallationProfile::SystemService => None,
-        };
+        let user_owned_launch_root =
+            self.phase_b_user_owned_launch_root(&manifest.runtime_launch)?;
         verify_user_broker_artifact(manifest, user_owned_launch_root.as_ref())?;
         let readback = |path: &Path,
                         expected: &PlatformHandle,
@@ -1965,36 +2014,8 @@ impl HostComposition {
             ));
         }
         let profile = pending.manifest.runtime_launch.profile;
-        let user_owned_launch_root = match profile {
-            InstallationProfile::UserMode => Some(
-                UserOwnedRootLease::open_existing(Path::new(
-                    pending
-                        .manifest
-                        .runtime_launch
-                        .profile_governed_roots
-                        .immutable_binaries
-                        .as_str(),
-                ))
-                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?,
-            ),
-            InstallationProfile::PortableDev => Some(
-                UserOwnedRootLease::open_existing(Path::new(
-                    pending
-                        .manifest
-                        .runtime_launch
-                        .portable_root
-                        .as_ref()
-                        .ok_or_else(|| {
-                            HostError::RecoveryRequired(
-                                "Phase-B rollback portable root binding is missing".to_owned(),
-                            )
-                        })?
-                        .as_str(),
-                ))
-                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?,
-            ),
-            InstallationProfile::SystemService => None,
-        };
+        let user_owned_launch_root =
+            self.phase_b_user_owned_launch_root(&pending.manifest.runtime_launch)?;
         let authority_path = approved_locator(
             Path::new(
                 pending
