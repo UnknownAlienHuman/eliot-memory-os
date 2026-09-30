@@ -61,10 +61,10 @@
 //! The production queue poll snapshots its head under a short composition
 //! lock, reads the full Governor binding and same-row ORS projection through
 //! the authenticated Kernel path without holding that lock across the await,
-//! then revalidates the row with Governor. Route/capacity currentness is not
-//! available from the M1 owner record, so the poll returns typed pending,
-//! terminal/unknown, or provider-revision outcomes before capability
-//! construction, activation, or dispatch. The
+//! then revalidates the row with Governor. A Governor-current binding drives
+//! the verified composition seam once; every owner refusal returns a typed
+//! pending, terminal/unknown, or provider-revision outcome with the exact
+//! head queued, before activation, dispatch, or emission. The
 //! test-only historical dispatch projection is persisted under the daemon
 //! state root before `emit`; uncertain ownership is never released without an
 //! observed terminal disposition.
@@ -111,6 +111,18 @@ pub const SOLO_PROJECTION_MAX_BYTES: u64 = 1_048_576;
 pub const SOLO_QUEUE_MAX_LEN: usize = 16;
 /// Wire version of the persisted solo projection envelope.
 pub const SOLO_PROJECTION_WIRE_VERSION: u32 = 1;
+/// Worker-completed binding fields every solo dispatch record carries.
+///
+/// The daemon records exactly the claim-shape fields the admitted worker must
+/// complete; anything else refuses downstream as an unverified completion.
+const SOLO_WORKER_COMPLETED_FIELDS: [&str; 6] = [
+    "registration_id",
+    "executable_binding",
+    "decision_id",
+    "parent_job_id",
+    "work_scope_id",
+    "expected_result_schema_version",
+];
 
 fn require_text(value: &str, field: &'static str) -> Result<(), FabricError> {
     if value.trim().is_empty() || value.chars().any(char::is_control) {
@@ -809,7 +821,9 @@ pub enum SoloPollOutcome {
     },
     /// Governor confirmed the retained binding, but current provider route
     /// and capacity revisions are not available from an independent owner.
-    /// The exact queue head remains blocked before capability construction.
+    /// The verified composition seam is bound once per Governor-current
+    /// observation; every owner refusal keeps the exact queue head queued
+    /// before any activation, dispatch, or emission.
     ProviderRevisionsUnavailable {
         /// Claim identity selected by the retained queue head.
         claim_id: String,
@@ -1255,6 +1269,261 @@ pub async fn drive_solo_delegate_async(
     )))
 }
 
+/// Constructs the verified solo fabric through the production seam.
+///
+/// Binds the production fabric ports and the verified provider composition
+/// (`agent_fabric_new_verified` plus the admitted-route gate) for one
+/// Governor-current intake. Presented halves travel for the downstream owner
+/// gates to judge; session halves are overwritten by the composition from
+/// the live authenticated session. No reservation, admission, activation,
+/// dispatch, or emit happens here.
+///
+/// # Errors
+///
+/// Returns the readiness, port, verified-construction, or route-gate
+/// rejection unchanged.
+fn construct_verified_solo_fabric(
+    composition: &mut DaemonComposition,
+    kernel: &Arc<DaemonKernelClient>,
+    intake: &SoloDelegateIntake,
+    now_unix_ms: u64,
+) -> Result<(AgentFabric, RouteFingerprint, StaffingPlanReceipt), DaemonError> {
+    if composition.readiness() != CompositionReadiness::Ready {
+        return Err(DaemonError::Composition(CompositionError::NotReady));
+    }
+    intake
+        .validate(now_unix_ms)
+        .map_err(DaemonError::ProviderAdmission)?;
+    guard_solo_plan(&intake.plan).map_err(DaemonError::ProviderAdmission)?;
+    let config = daemon_coordinator_config()?;
+    let receipt = plan_coordinator_staffing(&config, &intake.plan).map_err(|error| {
+        DaemonError::ProviderAdmission(FabricError::Contract(error.to_string()))
+    })?;
+    verify_receipt_digest(&receipt).map_err(|error| {
+        DaemonError::ProviderAdmission(FabricError::Contract(error.to_string()))
+    })?;
+    let ports = composition.production_fabric_ports()?;
+    let mut fabric =
+        composition.agent_fabric_new_verified(kernel, ports, intake.claimed.material())?;
+    let route = composition.require_admitted_model_route(
+        &mut fabric,
+        &intake.requirements,
+        &intake.observed_scope,
+        now_unix_ms,
+    )?;
+    Ok((fabric, route, receipt))
+}
+
+/// Emits one persisted solo dispatch and re-persists the acknowledgement.
+///
+/// The projection is persisted before `emit`; a retained acknowledgement is
+/// verified and re-persisted exactly once. A non-retained acknowledgement
+/// refuses without marking the projection emitted.
+///
+/// # Errors
+///
+/// Returns the emit, acknowledgement, or re-persist rejection unchanged.
+fn emit_verified_solo_dispatch(
+    composition: &DaemonComposition,
+    fabric: &mut AgentFabric,
+    dispatch_id: &str,
+    projection: SoloPersistedAttempt,
+) -> Result<(SoloPersistedAttempt, bool), DaemonError> {
+    persist_projection(composition.state_root(), &projection)?;
+    let ack = fabric.emit(dispatch_id)?;
+    if !ack.retained || ack.dispatch_id != dispatch_id {
+        return Err(DaemonError::ProviderAdmission(FabricError::Contract(
+            "solo egress acknowledgement does not retain the intent".to_owned(),
+        )));
+    }
+    let mut projection = projection;
+    projection.emitted = true;
+    projection.snapshot = fabric.snapshot()?;
+    persist_projection(composition.state_root(), &projection)?;
+    Ok((projection, ack.retained))
+}
+
+/// Dispatches one verified solo fabric through intent and projection.
+///
+/// # Errors
+///
+/// Returns the fabric-chain or projection rejection unchanged.
+fn dispatch_verified_solo_fabric(
+    composition: &DaemonComposition,
+    fabric: &mut AgentFabric,
+    route: RouteFingerprint,
+    intake: &SoloDelegateIntake,
+    receipt: &StaffingPlanReceipt,
+) -> Result<SoloDriveOutcome, DaemonError> {
+    let operation_id = intake.claimed.operation_id.clone();
+    let attempt_id = AttemptId::new(intake.claimed.attempt_id.clone())
+        .map_err(|error| DaemonError::ProviderAdmission(contract(error)))?;
+    let staffed = receipt.lanes.first().ok_or_else(|| {
+        DaemonError::ProviderAdmission(FabricError::NoRoute(
+            "solo staffing receipt staffed no lane".to_owned(),
+        ))
+    })?;
+    let (definition, _) = fabric.define_and_plan(intake.plan.clone())?;
+    let reservation = fabric.stage_reservation(&definition.definition_id)?;
+    let admission = fabric.commit_admission(&reservation.reservation_id)?;
+    let _evidence = fabric.activate(&admission.admission_id, &attempt_id)?;
+    let dispatch_id = solo_dispatch_identity(attempt_id.as_str(), admission.admission_id.as_str());
+    let intent = fabric.dispatch(&admission.admission_id, &attempt_id, &dispatch_id)?;
+    let dispatch = SoloDispatchRecord {
+        dispatch_id: dispatch_id.clone(),
+        claim_id: intake.claimed.claim_id.clone(),
+        attempt_id: attempt_id.as_str().to_owned(),
+        operation_id: operation_id.clone(),
+        task_id: intake.plan.launch.task_id.as_str().to_owned(),
+        route: route.clone(),
+        route_class: staffed.route_class.clone(),
+        worker_generation: intake.claimed.worker_generation,
+        binding_digest: intake.claimed.binding_digest.clone(),
+        executable_digest: intake.claimed.executable_digest.clone(),
+        expected_result_schema: intake.delegate.expected_result.clone(),
+        deadline_unix_ms: intake.deadline_unix_ms,
+        cancellation_id: solo_cancellation_identity(&operation_id),
+        fence: intent.fence.clone(),
+        epoch: intent.epoch.clone(),
+        worker_completed_fields: SOLO_WORKER_COMPLETED_FIELDS
+            .iter()
+            .map(|field| (*field).to_owned())
+            .collect(),
+    };
+    let projection = SoloPersistedAttempt {
+        operation_id: operation_id.clone(),
+        attempt_id: attempt_id.as_str().to_owned(),
+        delegate_digest: intake.delegate.source_digest.clone(),
+        plan_digest: definition.definition_digest.clone(),
+        requirements: intake.requirements.clone(),
+        observed_scope: intake.observed_scope.clone(),
+        claimed: intake.claimed.clone(),
+        receipt: receipt.clone(),
+        snapshot: fabric.snapshot()?,
+        dispatch: Some(dispatch.clone()),
+        emitted: false,
+        result_digest: None,
+        cancellation_evidence: None,
+    };
+    let (projection, retained) =
+        emit_verified_solo_dispatch(composition, fabric, &dispatch_id, projection)?;
+    {
+        let mut state = composition.solo_state.lock().map_err(|_| {
+            DaemonError::Composition(CompositionError::Recovery(
+                "solo driver state lock poisoned".to_owned(),
+            ))
+        })?;
+        state.live_operation = Some(operation_id.clone());
+    }
+    Ok(SoloDriveOutcome {
+        operation_id,
+        attempt_id: attempt_id.as_str().to_owned(),
+        dispatch_id,
+        admission_id: admission.admission_id.as_str().to_owned(),
+        route,
+        retained,
+        dispatch,
+    })
+}
+
+/// Requeues one popped solo head at the queue front after a refused drive.
+///
+/// The queue is memory-only admission offers, so a refusal before any effect
+/// restores the exact head for a later tick instead of dropping the offer.
+///
+/// # Errors
+///
+/// Returns the state-lock recovery error when the driver state is poisoned.
+fn requeue_solo_head(
+    composition: &DaemonComposition,
+    intake: SoloDelegateIntake,
+) -> Result<(), DaemonError> {
+    let mut state = composition.solo_state.lock().map_err(|_| {
+        DaemonError::Composition(CompositionError::Recovery(
+            "solo driver state lock poisoned".to_owned(),
+        ))
+    })?;
+    state.queue.push_front(intake);
+    Ok(())
+}
+
+/// Drives one Governor-current solo intake through the verified composition.
+///
+/// Pops the matching queue head, binds the production seam, and runs the
+/// fabric chain to a retained dispatch with the composition guard held and
+/// no await inside. Admission-domain refusals requeue the head and report
+/// `ProviderRevisionsUnavailable`; transport or composition failures requeue
+/// and return the error unchanged. A retained acknowledgement sets the live
+/// slot and reports `Drove`.
+///
+/// # Errors
+///
+/// Returns the queue-lock, readiness, Kernel, or composition failure
+/// unchanged; admission-domain refusals become typed poll outcomes.
+async fn drive_verified_solo_operation_async(
+    composition: &tokio::sync::Mutex<DaemonComposition>,
+    kernel: &Arc<DaemonKernelClient>,
+    intake: &SoloDelegateIntake,
+    now_unix_ms: u64,
+    observed_at_unix_ms: u64,
+) -> Result<SoloPollOutcome, DaemonError> {
+    let mut guard = composition.lock().await;
+    if guard.readiness() != CompositionReadiness::Ready {
+        return Err(DaemonError::Composition(CompositionError::NotReady));
+    }
+    let head = {
+        let mut state = guard.solo_state.lock().map_err(|_| {
+            DaemonError::Composition(CompositionError::Recovery(
+                "solo driver state lock poisoned".to_owned(),
+            ))
+        })?;
+        if let Some(live) = state.live_operation.as_ref()
+            && live != &intake.claimed.operation_id
+        {
+            return Ok(SoloPollOutcome::SlotBusy);
+        }
+        let front_matches = state.queue.front().is_some_and(|head| {
+            head.claimed.claim_id == intake.claimed.claim_id
+                && head.claimed.attempt_id == intake.claimed.attempt_id
+                && head.claimed.operation_id == intake.claimed.operation_id
+        });
+        if !front_matches {
+            return Ok(SoloPollOutcome::SlotBusy);
+        }
+        state.queue.pop_front()
+    };
+    let Some(head) = head else {
+        return Ok(SoloPollOutcome::SlotBusy);
+    };
+    let outcome = match construct_verified_solo_fabric(&mut guard, kernel, &head, now_unix_ms) {
+        Ok((mut fabric, route, receipt)) => {
+            dispatch_verified_solo_fabric(&guard, &mut fabric, route, &head, &receipt)
+        }
+        Err(error) => Err(error),
+    };
+    match outcome {
+        Ok(drive) => Ok(SoloPollOutcome::Drove {
+            operation_id: drive.operation_id,
+            dispatch_id: drive.dispatch_id,
+        }),
+        Err(DaemonError::ProviderAdmission(_)) => {
+            let stalled = SoloPollOutcome::ProviderRevisionsUnavailable {
+                claim_id: head.claimed.claim_id.clone(),
+                attempt_id: head.claimed.attempt_id.clone(),
+                operation_id: head.claimed.operation_id.clone(),
+                task_id: head.plan.launch.task_id.as_str().to_owned(),
+                observed_at_unix_ms,
+            };
+            requeue_solo_head(&guard, head)?;
+            Ok(stalled)
+        }
+        Err(error) => {
+            requeue_solo_head(&guard, head)?;
+            Err(error)
+        }
+    }
+}
+
 /// The synchronous solo path is retained only for unit tests. Production must
 /// use [`drive_solo_delegate_async`] so Kernel verification never blocks the
 /// current-thread daemon runtime.
@@ -1613,8 +1882,9 @@ pub fn solo_poll_queue(
 
 /// Async runtime poll hook. It reads the authenticated Kernel owner record
 /// without a composition guard, revalidates it with Governor under a short
-/// synchronous borrow, then leaves the exact head queued whenever provider
-/// route/capacity currentness is unavailable or an outcome needs reconciliation.
+/// synchronous borrow, then drives one Governor-current head through the
+/// verified composition or leaves the exact head queued with its typed
+/// report whenever owners refuse or an outcome needs reconciliation.
 pub async fn solo_poll_queue_async(
     composition: &tokio::sync::Mutex<DaemonComposition>,
     kernel: &Arc<DaemonKernelClient>,
@@ -1673,13 +1943,26 @@ pub async fn solo_poll_queue_async(
     let Some(observation) = observation else {
         return Ok(SoloPollOutcome::SlotBusy);
     };
-
-    // The owner validator confirms Governor currentness using Kernel's
-    // observed timestamp. M1 binding has no independently current route or
-    // capacity revision, so admitted rows remain before capability
-    // construction. Historical terminal/unknown states are surfaced as
-    // typed observations; the exact queue head remains present in all cases.
-    Ok(map_binding_observation_to_poll(observation))
+    let now_unix_ms = crate::unix_ms();
+    // A Governor-current binding owns the one verified drive attempt per
+    // observation. Every other adopted outcome keeps the exact queue head
+    // queued with its typed report; dispatch never happens below.
+    match observation {
+        eliot_governor::NativeWorkerBindingObservation::GovernorCurrentButProviderRevisionsUnavailable {
+            observed_at_unix_ms,
+            ..
+        } => {
+            drive_verified_solo_operation_async(
+                composition,
+                kernel,
+                &intake,
+                now_unix_ms,
+                observed_at_unix_ms,
+            )
+            .await
+        },
+        other => Ok(map_binding_observation_to_poll(other)),
+    }
 }
 
 /// Revalidates one solo poll readback under a short composition borrow.
