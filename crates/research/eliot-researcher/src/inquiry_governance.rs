@@ -8977,9 +8977,8 @@ fn released_material_statement_for_release(
     scope: &str,
 ) -> String {
     format!(
-        "the retained provider artifact `{}` for inquiry {} contains evidence the question `{}` \
-         could be decided from within the admitted scope `{}`",
-        claim_id, inquiry_id, question, scope
+        "the retained provider artifact `{claim_id}` for inquiry {inquiry_id} contains evidence the \
+         question `{question}` could be decided from within the admitted scope `{scope}`"
     )
 }
 
