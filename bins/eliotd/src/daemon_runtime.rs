@@ -4618,19 +4618,31 @@ async fn submit_local_read_result_idempotent(
     }
 }
 
+/// Submits the exact retained committed Observe receipt body. A retry reuses
+/// the same receipt reference, response bytes and claimed attempt; it cannot
+/// rerun capture or turn an unknown effect into a deferral.
+async fn submit_observe_result_idempotent(
+    kernel: &DaemonKernelClient,
+    body: &eliot_protocol::HostRequestResultBody,
+) -> Result<eliotd::ObserveSubmitOutcome, String> {
+    match kernel.submit_observe_result_async(body).await {
+        Ok(outcome) => Ok(outcome),
+        Err(first_error) => kernel
+            .submit_observe_result_async(body)
+            .await
+            .map_err(|error| {
+                format!("Kernel Observe result submit: {first_error}; exact retry: {error}")
+            }),
+    }
+}
+
 /// What one settled observe poll step produced (issue #2565).
 ///
-/// `Deferred` is the honest steady state while the Governor observation
-/// owner has no connected admission: the pair retired, the durable record
-/// `Routed`, no effect produced. `Settled` means the record already closed.
-/// `Expired` is the expected claim/defer race; `StaleAttempt` quarantines a
-/// superseded capability (the next claim mints the current generation anew).
-/// Every outcome idles until the next tick; only a step failure fails the
-/// daemon closed.
+/// Capture completion and exact submitted-attempt reconciliation outcomes.
+/// A published Observe pair cannot be projected as a safe no-effect deferral.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ObservePollOutcome {
     IdleBackoff,
-    Deferred,
     Settled,
     Expired,
     StaleAttempt,
@@ -4754,7 +4766,6 @@ fn settle_observe_completion(
 fn observe_outcome_name(outcome: &ObservePollOutcome) -> &'static str {
     match outcome {
         ObservePollOutcome::IdleBackoff => "idle_backoff",
-        ObservePollOutcome::Deferred => "deferred",
         ObservePollOutcome::Settled => "settled",
         ObservePollOutcome::Expired => "expired",
         ObservePollOutcome::StaleAttempt => "stale_attempt",
@@ -4764,13 +4775,10 @@ fn observe_outcome_name(outcome: &ObservePollOutcome) -> &'static str {
 
 /// Runs one observe poll step: `semantic_observe_claim` (pair plus fenced
 /// attempt capability, or null meaning backoff), then
-/// [`serve_admitted_observe`] for the admitted pair under that attempt, then
-/// `semantic_observe_deferred` with the served deferral (deferred, settled,
-/// the expected expiry race, or the stale-attempt quarantine). Exact
-/// replays stay idempotent by Kernel contract. Any step failure fails the
-/// daemon closed — a claimed pair that cannot serve or defer is never
-/// silently discarded. A stale capability is never retried: the step settles
-/// and the next tick claims the current generation anew.
+/// [`serve_admitted_observe`] for the admitted pair under that attempt. Capture
+/// exchanges a prepared canonical transition and submits its checked receipt;
+/// non-capture deferrals mark the already-published pair Unknown and require
+/// reconciliation. A claimed pair is never relabeled as no-effect or requeued.
 async fn run_observe_poll(
     kernel: &DaemonKernelClient,
     composition: &SharedComposition,
@@ -4815,17 +4823,13 @@ async fn run_observe_poll(
         };
         return Ok(step(outcome));
     }
-    let outcome =
-        match defer_observe_pair_idempotent(kernel, &operation_id, &request_digest, attempt).await?
-        {
-            ObserveDeferOutcome::Deferred => ObservePollOutcome::Deferred,
-            ObserveDeferOutcome::Settled => ObservePollOutcome::Settled,
-            ObserveDeferOutcome::Expired => ObservePollOutcome::Expired,
-            ObserveDeferOutcome::StaleAttempt => ObservePollOutcome::StaleAttempt,
-            ObserveDeferOutcome::ReconciliationRequired => {
-                ObservePollOutcome::ReconciliationRequired
-            }
-        };
+    let outcome = match kernel
+        .defer_observe_claim_async(&operation_id, &request_digest, attempt)
+        .await
+        .map_err(|error| format!("Kernel Observe defer reconciliation: {error}"))?
+    {
+        ObserveDeferOutcome::ReconciliationRequired => ObservePollOutcome::ReconciliationRequired,
+    };
     Ok(step(outcome))
 }
 
@@ -5341,32 +5345,6 @@ fn observe_result_body(
     body.validate()
         .map_err(|error| format!("Observe result body is invalid: {error}"))?;
     Ok(body)
-}
-
-/// Defers one served observe pair, retrying once with byte-identical
-/// arguments when the first defer fails.
-///
-/// The retry is safe because the Kernel defer leg is idempotent — an
-/// identical defer under the same live attempt retires once and replays
-/// (`Routed` stays `Routed`), never duplicates. Only transport failures
-/// retry: `Expired`, `Settled`, and `StaleAttempt` are settled outcomes, so
-/// a quarantined capability is never resubmitted.
-async fn defer_observe_pair_idempotent(
-    kernel: &DaemonKernelClient,
-    operation_id: &str,
-    request_digest: &str,
-    attempt: &eliot_protocol::LocalReadAttempt,
-) -> Result<ObserveDeferOutcome, String> {
-    match kernel
-        .defer_observe_claim_async(operation_id, request_digest, attempt)
-        .await
-    {
-        Ok(outcome) => Ok(outcome),
-        Err(first_error) => kernel
-            .defer_observe_claim_async(operation_id, request_digest, attempt)
-            .await
-            .map_err(|error| format!("Kernel observe defer: {first_error}; retry: {error}")),
-    }
 }
 
 /// Starts one campaign-packet claim/compile/result step. The packet route is
