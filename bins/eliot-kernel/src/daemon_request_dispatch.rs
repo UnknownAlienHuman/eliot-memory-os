@@ -8007,13 +8007,31 @@ impl KernelComposition {
         // Same-fence read-back: the receipt alone is not the record. A commit
         // whose record is not readable at the admitted fence is not a
         // successful canonical write and never reports one.
-        let page = self
+        let page = match self
             .read_notification_page(&NotificationPageQuery::addressed_record(
                 &state_fence,
                 dedup_key,
                 notification_id,
             ))
-            .await?;
+            .await?
+        {
+            Ok(page) => page,
+            // The record could not be READ. Reporting the committed receipt
+            // over an unreadable record would present a write this seam never
+            // proved, and substituting an empty page would present a read the
+            // Store never made. The answer is the typed unavailable disposition
+            // with the shared directive, under the same fence the read asked
+            // for, and this read owns no admitted handle of its own to
+            // preserve.
+            Err(error) => {
+                return Ok(Self::store_read_failure_response(
+                    NOTIFICATION_STATE_RESPONSE_KIND,
+                    &state_fence,
+                    None,
+                    &error,
+                ));
+            }
+        };
         if page
             .get(eliot_store_api::NOTIFY_PAGE_RECORDS)
             .and_then(serde_json::Value::as_array)
@@ -8155,9 +8173,24 @@ impl KernelComposition {
             serde_json::from_value(without_daemon_routing_key(payload)?)
                 .map_err(|_| TransportError::SessionFenced)?;
         validate_store_session_fence(session, &operation.state_fence)?;
-        let page = self
+        let page = match self
             .read_notification_page(&NotificationPageQuery::from_read_operation(&operation))
-            .await?;
+            .await?
+        {
+            Ok(page) => page,
+            // The inbox read has no answer: the Store did not make it. The
+            // disposition names the cause and the fence the read was bound to
+            // and carries the shared directive; it never yields an empty page
+            // that reads as a successful inbox with nothing in it.
+            Err(error) => {
+                return Ok(Self::store_read_failure_response(
+                    NOTIFICATION_STATE_PAGE_RESPONSE_KIND,
+                    &operation.state_fence,
+                    None,
+                    &error,
+                ));
+            }
+        };
         Ok(serde_json::json!({
             "status": "known",
             "value": { "kind": NOTIFICATION_STATE_PAGE_RESPONSE_KIND, "value": page },
@@ -8183,25 +8216,40 @@ impl KernelComposition {
     /// call, so none of them can observe a different projection shape. The
     /// selectors and the fence arrive as one [`NotificationPageQuery`], so the
     /// echoed fence is proved against the same fence the query was built for.
+    ///
+    /// The canonical Store's own typed refusal is handed back to the caller
+    /// instead of being collapsed into a fence (issue #1681 W3, I14.11). An
+    /// unreachable Store produces no page, and this read carries no admitted
+    /// Kernel-issued operation handle of its own, so the caller cannot be told
+    /// a current answer — only the closed `DB_UNAVAILABLE` disposition with the
+    /// shared directive, which names the cause and the fence it was observed
+    /// against. Reporting the outage as a fencing refusal instead would name
+    /// neither, and would let an owner outage be read as proof the generation
+    /// had moved.
+    ///
+    /// `Ok(Err(..))` is "the Store could not answer this read";
+    /// `Err(..)` remains the session/route fence refusal that is not an owner
+    /// answer at all. Neither arm ever yields a page, so a read the Store did
+    /// not make cannot leave here as a page that looks successfully empty.
     #[cfg(windows)]
     async fn read_notification_page(
         &self,
         query: &NotificationPageQuery,
-    ) -> Result<serde_json::Value, TransportError> {
+    ) -> Result<Result<serde_json::Value, NamedReadGatewayError>, TransportError> {
         let request = query
             .read_request()
             .map_err(|_| TransportError::SessionFenced)?;
         let gateway = self.retained_store_gateway()?;
-        let response = gateway
-            .execute_named(request)
-            .await
-            .map_err(|_| TransportError::SessionFenced)?;
+        let response = match gateway.execute_named_with_error(request).await {
+            Ok(response) => response,
+            Err(error) => return Ok(Err(error)),
+        };
         if response.operation != eliot_store_api::NamedReadOperation::GetNotificationState
             || response.state_fence != query.state_fence
         {
             return Err(TransportError::SessionFenced);
         }
-        Ok(response.payload)
+        Ok(Ok(response.payload))
     }
 
     #[cfg(windows)]
@@ -9470,7 +9518,8 @@ impl KernelComposition {
                 None,
                 Some(notification_id.to_owned()),
             ))
-            .await?;
+            .await?
+            .map_err(|_| TransportError::SessionFenced)?;
         let records = page
             .get(eliot_store_api::NOTIFY_PAGE_RECORDS)
             .and_then(serde_json::Value::as_array)
