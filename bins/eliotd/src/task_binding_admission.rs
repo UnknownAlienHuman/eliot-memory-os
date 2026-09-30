@@ -2224,15 +2224,14 @@ fn material_effect_guard_detail(report: &eliot_workscope::TriggerReport) -> Stri
     let receipt = report
         .receipt
         .as_ref()
-        .map(|receipt| match receipt.disposition {
+        .map_or("", |receipt| match receipt.disposition {
             ScopeBindingDisposition::Matched => ", receipt MATCHED",
             ScopeBindingDisposition::DifferentInstance => ", receipt DIFFERENT_INSTANCE",
             ScopeBindingDisposition::Ambiguous => ", receipt AMBIGUOUS",
             ScopeBindingDisposition::StaleBinding => ", receipt STALE_BINDING",
             ScopeBindingDisposition::ProvisionalRebind => ", receipt PROVISIONAL_REBIND",
             ScopeBindingDisposition::Conflicted => ", receipt CONFLICTED",
-        })
-        .unwrap_or("");
+        });
     format!(
         "scope guard at material effect is not MATCHED: identity {identity}, verdict {verdict}{receipt}; rebind under a new operation, no rewrite"
     )
