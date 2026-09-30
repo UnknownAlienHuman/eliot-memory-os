@@ -21,17 +21,37 @@
 //! those owner-held values or against the `#954` owner's own tables — never
 //! against a value carried in the presented request.
 //!
-//! Supported subset (closed): the methods the `#954` owner table attributes to
-//! a backup owner role this process actually holds. `READ_SNAPSHOT_PAGE` is the
-//! one executable method: it reaches the `#955` spool capture owner
+//! Supported subset (closed, four operations, explicitly reviewed here):
+//! `READ_SNAPSHOT_PAGE`, `VERIFY_ARCHIVE`, `RESTORE_STATUS` and
+//! `RECONCILE_RESTORE`. That narrowing is THIS endpoint's own reviewed request
+//! shape and dispatch policy. It is deliberately not derived from the `#954`
+//! role and attester matrix: that matrix is a necessary authority check, applied
+//! separately to each admitted request, and it never generates concrete endpoint
+//! membership.
+//!
+//! Two of the four are executable owner contours, over the owners this process
+//! actually holds. `READ_SNAPSHOT_PAGE` reaches the `#955` spool capture owner
 //! ([`WatchdogBackupPort::snapshot`]) and then reads the requested page from the
-//! fence that owner retained. `RESTORE_STEP`, `RECONCILE_RESTORE`,
+//! fence that owner retained. `RECONCILE_RESTORE` reaches the isolated-restore
+//! owner ([`WatchdogBackupPort::import_isolated`]) against an externally
+//! admitted isolated destination, with every presented step bound to this
+//! operation's own stable mutation identity.
+//!
 //! `VERIFY_ARCHIVE` and `RESTORE_STATUS` are recognized so an absent method
 //! fails with an explicit typed refusal instead of vanishing, and are refused
-//! before any owner effect. `ADMIT_CUTOVER` and `PREPARE_ISOLATED_RESTORE` are
-//! never accepted here: preparation and cutover are the Host owner's
+//! before any owner effect: Watchdog owns no archive verifier and no
+//! restore-status projection. `RESTORE_STEP`, `REQUEST_CAPTURE`,
+//! `PREPARE_ISOLATED_RESTORE`, `COMPLETE_REHEARSAL` and `ADMIT_CUTOVER` are
+//! never registered here: preparation and cutover are the Host owner's
 //! separately admitted operations, and rehearsal completion never maps to
 //! cutover.
+//!
+//! Typed ingress: each of those four operations has its own typed request on
+//! this endpoint's closed ingress surface (`WatchdogBackupRequest`), each
+//! carrying its own canonical `#954` request type and validated by that type's
+//! own contract check. No operation is reachable by re-typing another
+//! operation's request shape, and a new canonical operation forces a reviewed
+//! arm in the executable-policy match instead of silently widening this set.
 //!
 //! Capture and preparation are therefore two separately admitted operations
 //! reaching two different owners, and are never merged into one admission.
@@ -84,13 +104,15 @@ use std::sync::{Mutex, MutexGuard};
 use thiserror::Error;
 
 use eliot_protocol::backup::{
-    BackupError, BackupRole, BackupSnapshotPageRead, BackupStage, attesting_roles,
+    BackupArchiveVerification, BackupError, BackupRequestIdentity, BackupRestoreReconcile,
+    BackupRestoreStatus, BackupRole, BackupSnapshotPageRead, BackupStage, attesting_roles,
     operation_for_phase,
 };
 
 use crate::{
-    CaptureFenceParams, CompositionError, PROTOCOL_VERSION, SERVICE_NAME, SpoolError,
-    WatchdogBackupPort, WatchdogComposition, WatchdogSpoolBackupLimits, WatchdogSpoolFence,
+    AdmittedIsolatedDestination, CaptureFenceParams, CompositionError, PROTOCOL_VERSION,
+    SERVICE_NAME, SpoolError, SpoolRestoreDisposition, SpoolRestoreStep, WatchdogBackupPort,
+    WatchdogComposition, WatchdogRuntimeBinding, WatchdogSpoolBackupLimits, WatchdogSpoolFence,
     WatchdogSpoolSnapshotPage,
 };
 
@@ -382,10 +404,13 @@ pub use eliot_protocol::backup::BackupOperationKind;
 /// The closed backup lifecycle stage vocabulary.
 ///
 /// This is a domain enumeration, not a policy table: it exists only to invert
-/// the owner function [`operation_for_phase`]. Every accept/reject decision
-/// below is taken from the owner's own [`operation_for_phase`] and
-/// [`attesting_roles`] functions, so a new canonical stage or a change to the
-/// owner's role matrix reaches this module without any edit here.
+/// the owner function [`operation_for_phase`] and, through it, to read the
+/// owner's own [`attesting_roles`] authority check and to draw the canonical
+/// operation family that registration completeness is measured against. No
+/// accept/reject decision is generated from it: the registered set and the
+/// executable set are this endpoint's own explicit, reviewed narrowing, so a
+/// change to the owner's role matrix can only REFUSE an already registered
+/// operation — it can never add an ingress method here.
 const BACKUP_STAGES: [BackupStage; 8] = [
     BackupStage::Requested,
     BackupStage::Captured,
@@ -404,7 +429,9 @@ const BACKUP_STAGES: [BackupStage; 8] = [
 /// spool owner for the isolated restore it imports. Which OPERATIONS those
 /// roles may attest is not decided here — it is read from the `#954` owner's
 /// own [`attesting_roles`] table, so this list can never widen the Watchdog's
-/// accepted operations on its own.
+/// registered or accepted operations on its own. It is an ADDITIONAL authority
+/// check applied per admitted request, on top of this endpoint's own explicit
+/// registered subset.
 const WATCHDOG_OWNER_ROLES: [BackupRole; 2] = [BackupRole::CaptureOwner, BackupRole::SpoolOwner];
 
 /// Returns the lifecycle stage the `#954` owner maps `operation` to.
@@ -460,22 +487,25 @@ impl AcceptedWatchdogBackupMethod {
 
 /// Closed Watchdog-registered backup method table.
 ///
-/// Membership is the registration, and it is complete against the `#954`
-/// owner's own table: every operation that owner's `attesting_roles` matrix
-/// attributes to a role this process holds has exactly one row here, and no
-/// operation outside that set does. `verify_registration_is_complete` re-derives
-/// that expected set from the owner on every call, so the check compares
-/// against an independent source rather than against this same list.
+/// Membership is the registration, and it is an explicit, reviewed narrowing of
+/// the canonical operation vocabulary rather than a projection of the `#954`
+/// role and attester matrix: that matrix is a necessary authority check applied
+/// per admitted request, never the generator of this concrete endpoint's
+/// membership. The expected set that completeness is checked against is
+/// derived independently by `verify_registration_is_complete` from
+/// `registers_watchdog_operation`, not from this same list.
 ///
-/// Only [`BackupOperationKind::ReadSnapshotPage`] is executable on this owner;
-/// the remaining rows exist so an absent method fails with an explicit typed
-/// refusal instead of vanishing from the closed table.
-static ACCEPTED_WATCHDOG_BACKUP_METHODS: [AcceptedWatchdogBackupMethod; 5] = [
+/// [`BackupOperationKind::ReadSnapshotPage`] and
+/// [`BackupOperationKind::ReconcileRestore`] are the executable owner contours;
+/// [`BackupOperationKind::VerifyArchive`] and
+/// [`BackupOperationKind::RestoreStatus`] are registered so an absent method
+/// fails with an explicit typed refusal instead of vanishing from the closed
+/// table.
+static ACCEPTED_WATCHDOG_BACKUP_METHODS: [AcceptedWatchdogBackupMethod; 4] = [
     AcceptedWatchdogBackupMethod::new(BackupOperationKind::ReadSnapshotPage),
-    AcceptedWatchdogBackupMethod::new(BackupOperationKind::RestoreStep),
-    AcceptedWatchdogBackupMethod::new(BackupOperationKind::ReconcileRestore),
     AcceptedWatchdogBackupMethod::new(BackupOperationKind::VerifyArchive),
     AcceptedWatchdogBackupMethod::new(BackupOperationKind::RestoreStatus),
+    AcceptedWatchdogBackupMethod::new(BackupOperationKind::ReconcileRestore),
 ];
 
 /// Returns the closed Watchdog-registered backup method table.
@@ -484,43 +514,66 @@ pub fn accepted_watchdog_backup_methods() -> &'static [AcceptedWatchdogBackupMet
     &ACCEPTED_WATCHDOG_BACKUP_METHODS
 }
 
-/// The operations the `#954` owner's own role matrix attributes to a backup
-/// owner role this Watchdog process holds.
+/// Returns whether this endpoint registers `operation` as an accepted method.
 ///
-/// Derived by inverting the owner's own [`operation_for_phase`] and consulting
-/// its own [`attesting_roles`]; it is never a list a caller supplies, so
-/// comparing the registered table against it proves completeness against the
-/// owner rather than against a second copy of itself.
-fn owner_table_operations() -> Vec<BackupOperationKind> {
+/// This is the endpoint's own reviewed narrowing of the canonical vocabulary,
+/// matched exhaustively over every variant so a new canonical operation is a
+/// compile error here until its request shape and disposition are reviewed,
+/// instead of silently widening the registered set. It reads no role or
+/// attester matrix: [`watchdog_attesting_role`] is the separate authority check
+/// applied to each admitted request, and it can neither add nor remove a row
+/// here.
+const fn registers_watchdog_operation(operation: BackupOperationKind) -> bool {
+    match operation {
+        BackupOperationKind::ReadSnapshotPage
+        | BackupOperationKind::VerifyArchive
+        | BackupOperationKind::RestoreStatus
+        | BackupOperationKind::ReconcileRestore => true,
+        BackupOperationKind::RequestCapture
+        | BackupOperationKind::RestoreStep
+        | BackupOperationKind::PrepareIsolatedRestore
+        | BackupOperationKind::CompleteRehearsal
+        | BackupOperationKind::AdmitCutover => false,
+    }
+}
+
+/// Returns every canonical backup operation, as the independent denominator the
+/// registered table is checked against.
+///
+/// Derived by inverting the `#954` owner's own [`operation_for_phase`] over the
+/// closed stage vocabulary, plus the one canonical operation that establishes
+/// no lifecycle stage, so completeness is compared against the owner's own
+/// operation family rather than against a second copy of the registered list.
+fn canonical_backup_operations() -> Vec<BackupOperationKind> {
     BACKUP_STAGES
         .into_iter()
-        .filter(|stage| {
-            attesting_roles(*stage)
-                .iter()
-                .any(|role| WATCHDOG_OWNER_ROLES.contains(role))
-        })
         .map(operation_for_phase)
+        .chain(std::iter::once(BackupOperationKind::RestoreStatus))
         .collect()
 }
 
-/// Returns whether the registered table covers the owner's complete accepted
-/// method set for the roles this owner holds, and covers nothing else.
+/// Returns whether the registered table is exactly this endpoint's reviewed
+/// registered subset, and covers nothing else.
 ///
-/// Two independent comparisons, both against the owner: every operation the
-/// owner attributes to a held role must have a registered row, and every
-/// registered row must be an operation the owner attributes to a held role.
-/// A missing row is an incomplete registration; an extra row is an operation
-/// this owner never claimed.
+/// The expected set comes from `registers_watchdog_operation`, an independent
+/// explicit narrowing, and every operation is drawn from the canonical family
+/// itself: an operation this endpoint reviews as registered but has no row for
+/// is an incomplete registration, and a row for an operation this endpoint does
+/// not register is a method this owner never claimed.
 #[must_use]
 pub fn verify_registration_is_complete() -> bool {
-    let expected = owner_table_operations();
     let registered = accepted_watchdog_backup_methods();
-    expected
-        .iter()
-        .all(|op| registered.iter().any(|method| method.op == *op))
+    canonical_backup_operations()
+        .into_iter()
+        .all(|op| {
+            registered
+                .iter()
+                .any(|method| method.op == op)
+                == registers_watchdog_operation(op)
+        })
         && registered
             .iter()
-            .all(|method| expected.contains(&method.op))
+            .all(|method| registers_watchdog_operation(method.op))
 }
 
 /// Resolves a wire id to its registered method before any owner effect runs.
@@ -557,17 +610,13 @@ pub fn resolve_accepted_method(
 /// reason, which is what keeps preparation and cutover unreachable here: they
 /// are the Host owner's separately admitted operations, and a rehearsal
 /// completion never resolves to cutover.
+///
+/// Matched exhaustively over the canonical vocabulary, so a new canonical
+/// operation is a compile error here until its owner contour or its explicit
+/// refusal has been reviewed; it never inherits a default.
 fn executable_owner_method(operation: BackupOperationKind) -> Result<(), SpoolError> {
     match operation {
-        BackupOperationKind::ReadSnapshotPage => Ok(()),
-        BackupOperationKind::RestoreStep => Err(SpoolError::Corrupt(
-            "watchdog backup control recognizes RESTORE_STEP but holds no restore-step owner method; it is advertised as unavailable rather than supported"
-                .to_owned(),
-        )),
-        BackupOperationKind::ReconcileRestore => Err(SpoolError::Corrupt(
-            "watchdog backup control recognizes RECONCILE_RESTORE but the canonical reconcile request carries no source, destination, active-installation or step body this owner could consume; it is advertised as unavailable rather than supported"
-                .to_owned(),
-        )),
+        BackupOperationKind::ReadSnapshotPage | BackupOperationKind::ReconcileRestore => Ok(()),
         BackupOperationKind::VerifyArchive => Err(SpoolError::Corrupt(
             "watchdog backup control refuses VERIFY_ARCHIVE; this owner holds no archive verifier and never interprets archive bytes, and a transport acknowledgement never establishes success"
                 .to_owned(),
@@ -577,6 +626,7 @@ fn executable_owner_method(operation: BackupOperationKind) -> Result<(), SpoolEr
                 .to_owned(),
         )),
         BackupOperationKind::RequestCapture
+        | BackupOperationKind::RestoreStep
         | BackupOperationKind::PrepareIsolatedRestore
         | BackupOperationKind::CompleteRehearsal
         | BackupOperationKind::AdmitCutover => Err(SpoolError::Corrupt(format!(
@@ -662,6 +712,119 @@ impl WatchdogBackupAdmission {
     }
 }
 
+/// One typed request on this endpoint's closed backup ingress surface.
+///
+/// A closed enum over exactly the four canonical `#954` request shapes this
+/// endpoint registers, so every registered operation has a real typed
+/// admission path and none of them is reachable only by re-typing another
+/// operation's DTO. Each variant carries its own canonical request type, which
+/// validates its own wire identity, operation, bindings, bounds and digest; no
+/// variant is coerced through [`BackupSnapshotPageRead`].
+///
+/// The reconcile variant additionally carries the owner-side inputs the
+/// isolated-restore owner consumes and the canonical reconcile request does
+/// not: the externally admitted isolated destination and this owner's own
+/// retained runtime admission (the ACTIVE installation the import must not
+/// reuse). Neither is a string a request may choose freely — the destination is
+/// owner-issued by [`crate::admit_isolated_destination`] and proved isolated by
+/// the owner at import — and both are compared with the canonical request's own
+/// `dest_installation` before the owner is entered.
+#[derive(Clone, Copy)]
+pub enum WatchdogBackupRequest<'a> {
+    /// Bounded page read of an owner snapshot.
+    SnapshotPageRead(&'a BackupSnapshotPageRead),
+    /// Archive verification of an immutable archive handle.
+    ///
+    /// Present so the registered `VERIFY_ARCHIVE` row has a real typed request
+    /// and an explicit refusal, not a silent drop: this owner holds no archive
+    /// verifier, so the request never reaches an owner.
+    ArchiveVerification(&'a BackupArchiveVerification),
+    /// Read-only restore-status query.
+    ///
+    /// Present so the registered `RESTORE_STATUS` row has a real typed request
+    /// and an explicit refusal: this owner holds no restore-status projection,
+    /// so the request never reaches an owner.
+    RestoreStatus(&'a BackupRestoreStatus),
+    /// Bounded restore reconciliation toward an admitted isolated destination.
+    RestoreReconcile {
+        /// Canonical reconcile request: the only authority-bearing payload.
+        request: &'a BackupRestoreReconcile,
+        /// Externally admitted isolated destination installation.
+        destination: &'a AdmittedIsolatedDestination,
+        /// This owner's own retained runtime admission, read from the owner.
+        active: &'a WatchdogRuntimeBinding,
+        /// Bounded, operation-bound restore step chain to reconcile.
+        steps: &'a [SpoolRestoreStep],
+    },
+}
+
+impl std::fmt::Debug for WatchdogBackupRequest<'_> {
+    /// Renders only the closed variant and its canonical operation, never
+    /// request, identity, lease, or installation material.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("WatchdogBackupRequest")
+            .field(&self.operation())
+            .finish()
+    }
+}
+
+impl<'a> WatchdogBackupRequest<'a> {
+    /// Returns the canonical operation this variant is typed for.
+    ///
+    /// Matched exhaustively over this closed surface, so a new variant is a
+    /// compile error here until its operation, validation, and dispatch are
+    /// supplied for it.
+    pub const fn operation(self) -> BackupOperationKind {
+        match self {
+            Self::SnapshotPageRead(_) => BackupOperationKind::ReadSnapshotPage,
+            Self::ArchiveVerification(_) => BackupOperationKind::VerifyArchive,
+            Self::RestoreStatus(_) => BackupOperationKind::RestoreStatus,
+            Self::RestoreReconcile { .. } => BackupOperationKind::ReconcileRestore,
+        }
+    }
+
+    /// Returns the bound request identity every admission gate compares against.
+    ///
+    /// Shared by all four canonical request types, so no gate has to reach into
+    /// a variant to read the one identity the operation is bound to. The borrow
+    /// is the variant's own `'a` borrow, not a borrow of this `Copy` value, so
+    /// the identity outlives the call.
+    const fn identity(self) -> &'a BackupRequestIdentity {
+        match self {
+            Self::SnapshotPageRead(page_read) => &page_read.identity,
+            Self::ArchiveVerification(verification) => &verification.identity,
+            Self::RestoreStatus(status) => &status.identity,
+            Self::RestoreReconcile {
+                request: reconcile,
+                ..
+            } => &reconcile.identity,
+        }
+    }
+
+    /// Runs the canonical contract's own validation for THIS variant's own
+    /// request type.
+    ///
+    /// # Errors
+    ///
+    /// Returns the `#954` contract's own typed [`BackupError`] unchanged, so a
+    /// wire-identity, operation, binding, bound, or digest rejection stays
+    /// distinguishable from every other refusal on this path.
+    fn validate(self) -> Result<(), BackupError> {
+        match self {
+            Self::SnapshotPageRead(page_read) => BackupSnapshotPageRead::validate(page_read),
+            Self::ArchiveVerification(verification) => {
+                BackupArchiveVerification::validate(verification)
+            }
+            Self::RestoreStatus(status) => BackupRestoreStatus::validate(status),
+            Self::RestoreReconcile {
+                request: reconcile,
+                ..
+            } => BackupRestoreReconcile::validate(reconcile),
+        }
+    }
+}
+
 /// One request this owner admitted, resolved to its exact method.
 ///
 /// Its fields are private and the only constructor is
@@ -670,9 +833,9 @@ impl WatchdogBackupAdmission {
 /// the owner operation, and the owner operation is never what grants the
 /// payload authority.
 #[derive(Clone, Debug)]
-pub struct AdmittedWatchdogBackupRequest {
+pub struct AdmittedWatchdogBackupRequest<'a> {
     method: &'static AcceptedWatchdogBackupMethod,
-    request: BackupSnapshotPageRead,
+    request: WatchdogBackupRequest<'a>,
 }
 
 /// The owner's own retained result for one admitted operation.
@@ -689,6 +852,9 @@ pub enum WatchdogBackupChannelOutcome {
         /// The bounded page read from that retained fence.
         page: WatchdogSpoolSnapshotPage,
     },
+    /// The isolated-restore owner's own disposition for the bounded step chain
+    /// of this exact operation.
+    Restore(SpoolRestoreDisposition),
 }
 
 /// Bounded failure of one admitted backup request, or of one backup-control
@@ -928,14 +1094,18 @@ impl BackupControlHandle {
 
     /// Admits exactly one backup request against the authenticated context.
     ///
+    /// Accepts one closed typed request ([`WatchdogBackupRequest`]), so every
+    /// registered operation reaches admission through its own canonical request
+    /// type rather than through one operation's DTO.
+    ///
     /// Every gate below runs before the owner is entered, so a refused request
     /// has provably taken no effect. None of them compares the request against
     /// itself, and none of them reads an owner or a policy out of the payload:
     ///
     /// 1. the handle is started and still holds its bounded registration slot;
-    /// 2. the `#954` contract validates the presented request, which re-derives
-    ///    its own digests, bounds, fence exactness and role/capability matrix
-    ///    through the owner's own [`BackupSnapshotPageRead::validate`];
+    /// 2. the `#954` contract validates the presented request through that
+    ///    variant's OWN canonical validator, which re-derives its own digests,
+    ///    bounds, fence exactness and operation binding;
     /// 3. the request's operation resolves to a row of this owner's closed
     ///    registered table, and the row's own operation must equal the
     ///    operation the request typed — a self-consistent payload can never
@@ -950,55 +1120,73 @@ impl BackupControlHandle {
     ///    owner port is bound to;
     /// 7. the `#954` owner table must attribute this operation to a role this
     ///    owner actually holds, so a request naming an operation this owner has
-    ///    no authority over is refused.
+    ///    no authority over is refused;
+    /// 8. a reconcile request's destination must be the installation its own
+    ///    bound identity names, and the destination is the owner-issued admitted
+    ///    isolated installation rather than a requester-chosen string.
+    ///
+    /// The role matrix is an ADDITIONAL authority check here, never the source
+    /// of the registered set: an operation this owner has no authority to
+    /// attest is refused even though a narrower registered row may exist for it.
     ///
     /// # Errors
     ///
     /// Returns [`BackupControlError::Rejected`] for a handle that cannot
     /// dispatch, an operation this owner has no registered row for, a request
-    /// whose operation and registered row disagree, or any gate 4 to 7
+    /// whose operation and registered row disagree, or any gate 4 to 8
     /// failure. Returns [`BackupControlError::Contract`] when the `#954`
     /// contract refuses the presented request.
-    pub fn admit(
+    pub fn admit<'a>(
         &self,
-        request: &BackupSnapshotPageRead,
-    ) -> Result<AdmittedWatchdogBackupRequest, BackupControlError> {
+        request: WatchdogBackupRequest<'a>,
+    ) -> Result<AdmittedWatchdogBackupRequest<'a>, BackupControlError> {
         self.require_dispatchable()?;
         request.validate().map_err(BackupControlError::Contract)?;
-        let method = resolve_accepted_method(request.operation.wire_id())?;
-        if method.op != request.operation {
+        let identity = request.identity();
+        let operation = request.operation();
+        let method = resolve_accepted_method(operation.wire_id())?;
+        if method.op != operation {
             return Err(BackupControlError::Rejected(format!(
-                "watchdog backup control rejects a {} request dispatched as {}",
-                request.operation, method.op
+                "watchdog backup control rejects a {operation} request dispatched as {}",
+                method.op
             )));
         }
-        if request.identity.principal.session_id != self.admission.session_id {
+        if identity.principal.session_id != self.admission.session_id {
             return Err(BackupControlError::Rejected(
                 "watchdog backup control rejects a request for a foreign admitted session"
                     .to_owned(),
             ));
         }
-        if request.identity.fence.resource_generation.value() != self.admission.owner_generation {
+        if identity.fence.resource_generation.value() != self.admission.owner_generation {
             return Err(BackupControlError::Rejected(
                 "watchdog backup control rejects a request for a stale generation fence".to_owned(),
             ));
         }
-        if request.identity.source_installation != self.admission.owner_installation {
+        if identity.source_installation != self.admission.owner_installation {
             return Err(BackupControlError::Rejected(
                 "watchdog backup control rejects a request for a foreign source installation"
                     .to_owned(),
             ));
         }
-        if watchdog_attesting_role(request.operation).is_none() {
+        if let WatchdogBackupRequest::RestoreReconcile {
+            request,
+            destination,
+            ..
+        } = request
+            && destination.installation() != request.identity.dest_installation.as_str()
+        {
             return Err(BackupControlError::Rejected(format!(
-                "watchdog backup control rejects {}; no backup owner role this process holds attests it",
-                request.operation
+                "watchdog backup control rejects a reconcile request for {} against an admitted destination {}",
+                request.identity.dest_installation,
+                destination.installation()
             )));
         }
-        Ok(AdmittedWatchdogBackupRequest {
-            method,
-            request: request.clone(),
-        })
+        if watchdog_attesting_role(operation).is_none() {
+            return Err(BackupControlError::Rejected(format!(
+                "watchdog backup control rejects {operation}; no backup owner role this process holds attests it"
+            )));
+        }
+        Ok(AdmittedWatchdogBackupRequest { method, request })
     }
 
     /// Runs one admitted request against the exact owner operation it resolved
@@ -1042,7 +1230,7 @@ impl BackupControlHandle {
     /// reason when the owner rejects the bounded request.
     pub fn execute(
         &self,
-        admitted: &AdmittedWatchdogBackupRequest,
+        admitted: &AdmittedWatchdogBackupRequest<'_>,
     ) -> Result<WatchdogBackupChannelOutcome, BackupControlError> {
         self.require_dispatchable()?;
         // A method this owner registers but cannot execute is refused BEFORE
@@ -1053,7 +1241,7 @@ impl BackupControlHandle {
         if let Err(refusal) = executable_owner_method(admitted.method.op) {
             return Err(BackupControlError::OwnerRefused(refusal));
         }
-        let identity = &admitted.request.identity;
+        let identity = admitted.request.identity();
         let binding = identity.mutation.canonical_request_hash.as_str();
         let digest = identity
             .compute_digest()
@@ -1093,20 +1281,29 @@ impl BackupControlHandle {
 
     /// Runs the one owner method this operation resolved to.
     ///
-    /// The executable set is decided by [`executable_owner_method`], which runs
-    /// before the operation is claimed, so this match has exactly one reachable
-    /// owner call and every other arm is the same pre-effect refusal.
+    /// The executable set is decided by `executable_owner_method`, which runs
+    /// before the operation is claimed, so this match has exactly the two
+    /// reachable owner calls and every other arm is the same pre-effect
+    /// refusal.
     ///
     /// # Errors
     ///
     /// Returns [`SpoolError`] when this owner has no executable method for the
-    /// admitted operation, or when the owner itself refuses the bounded read.
+    /// admitted operation, when the admitted request's shape is not the one its
+    /// own operation registered, when a presented reconcile step is not bound to
+    /// this operation, or when the owner itself refuses the bounded request.
     fn run_owner_operation(
         &self,
-        admitted: &AdmittedWatchdogBackupRequest,
+        admitted: &AdmittedWatchdogBackupRequest<'_>,
     ) -> Result<WatchdogBackupChannelOutcome, SpoolError> {
         match admitted.method.op {
             BackupOperationKind::ReadSnapshotPage => {
+                let WatchdogBackupRequest::SnapshotPageRead(request) = admitted.request else {
+                    return Err(SpoolError::Corrupt(
+                        "watchdog backup control reached READ_SNAPSHOT_PAGE with a request shape it does not own"
+                            .to_owned(),
+                    ));
+                };
                 // The `#955` capture owner is reached here: the fence is
                 // produced by the owner itself from the admitted operation's
                 // own bindings, and the page is then read from that retained
@@ -1117,23 +1314,74 @@ impl BackupControlHandle {
                 // cannot infer a global transaction from a message, so the
                 // capture declares no canonical or ORS reference and no
                 // fence-protocol equality rather than asserting one.
-                let identity = &admitted.request.identity;
                 let fence = self.port.snapshot(
                     CaptureFenceParams {
-                        source_installation: identity.source_installation.clone(),
+                        source_installation: request.identity.source_installation.clone(),
                         watchdog_generation: self.admission.owner_generation,
-                        requester_principal: identity.principal.principal.clone(),
-                        snapshot_operation_id: identity.mutation.canonical_request_hash.clone(),
+                        requester_principal: request.identity.principal.principal.clone(),
+                        snapshot_operation_id: request
+                            .identity
+                            .mutation
+                            .canonical_request_hash
+                            .clone(),
                         canonical_ref: None,
                         ors_ref: None,
                         coherence_fence_equal: false,
                     },
                     WatchdogSpoolBackupLimits::default(),
                 )?;
-                let page = self
-                    .port
-                    .read_page(&fence, admitted.request.page.page_index)?;
+                let page = self.port.read_page(&fence, request.page.page_index)?;
                 Ok(WatchdogBackupChannelOutcome::Capture { fence, page })
+            }
+            BackupOperationKind::ReconcileRestore => {
+                let WatchdogBackupRequest::RestoreReconcile {
+                    request,
+                    destination,
+                    active,
+                    steps,
+                } = admitted.request
+                else {
+                    return Err(SpoolError::Corrupt(
+                        "watchdog backup control reached RECONCILE_RESTORE with a request shape it does not own"
+                            .to_owned(),
+                    ));
+                };
+                // The isolated-restore owner is reached here. Every step must be
+                // bound to THIS operation's own stable mutation identity: a step
+                // carried under another operation's identity would reconcile
+                // another operation's retained evidence under this one, and
+                // existence of a well-formed chain proves nothing about whose it
+                // is. The requester's believed digest must be the retained digest
+                // the chain ends at, which is what makes the query's
+                // distinguishing field load-bearing instead of decorative.
+                let operation_id = request
+                    .identity
+                    .mutation
+                    .canonical_request_hash
+                    .as_str();
+                for step in steps {
+                    if step.operation_id.as_str() != operation_id {
+                        return Err(SpoolError::Corrupt(
+                            "watchdog backup control refuses a reconcile step bound to another operation"
+                                .to_owned(),
+                        ));
+                    }
+                }
+                if steps.last().map(|step| step.step_digest.as_str())
+                    != Some(request.believed_digest.as_str())
+                {
+                    return Err(SpoolError::Corrupt(
+                        "watchdog backup control refuses a reconcile request whose believed digest is not the retained digest this operation's chain ends at"
+                            .to_owned(),
+                    ));
+                }
+                let disposition = self.port.import_isolated(
+                    &request.identity.source_installation,
+                    Some(destination),
+                    active,
+                    steps,
+                )?;
+                Ok(WatchdogBackupChannelOutcome::Restore(disposition))
             }
             _ => match executable_owner_method(admitted.method.op) {
                 Ok(()) => Err(SpoolError::Corrupt(
@@ -1153,18 +1401,39 @@ impl BackupControlHandle {
     /// installation, generation, operation, or page can never be delivered as
     /// this operation's answer.
     ///
+    /// The restore contour's owner contract returns a disposition rather than an
+    /// evidence handle, so its per-operation binding is established before the
+    /// owner is entered — source installation, admitted destination, and every
+    /// step bound to this operation's own mutation identity — and the guard here
+    /// refuses to deliver an unresolved disposition as this operation's answer.
+    ///
     /// # Errors
     ///
     /// Returns [`BackupControlError::Rejected`] when any compared value
     /// diverges from the admitted operation or from the authenticated context.
     fn check_outcome_matches_operation(
         &self,
-        admitted: &AdmittedWatchdogBackupRequest,
+        admitted: &AdmittedWatchdogBackupRequest<'_>,
         outcome: &WatchdogBackupChannelOutcome,
     ) -> Result<(), BackupControlError> {
-        let identity = &admitted.request.identity;
+        let identity = admitted.request.identity();
         let (fence, page) = match outcome {
             WatchdogBackupChannelOutcome::Capture { fence, page } => (fence, page),
+            WatchdogBackupChannelOutcome::Restore(disposition) => {
+                if *disposition == SpoolRestoreDisposition::Unknown {
+                    return Err(BackupControlError::Rejected(format!(
+                        "watchdog backup control refuses the unresolved {} disposition as this operation's answer",
+                        admitted.method.op
+                    )));
+                }
+                return Ok(());
+            }
+        };
+        let WatchdogBackupRequest::SnapshotPageRead(request) = admitted.request else {
+            return Err(BackupControlError::Rejected(format!(
+                "watchdog backup control received a {} outcome for a request shape it does not own",
+                admitted.method.op
+            )));
         };
         if fence.source_installation != self.admission.owner_installation
             || fence.watchdog_generation != self.admission.owner_generation
@@ -1186,7 +1455,7 @@ impl BackupControlHandle {
                     .to_owned(),
             ));
         }
-        if page.page_index != admitted.request.page.page_index {
+        if page.page_index != request.page.page_index {
             return Err(BackupControlError::Rejected(
                 "watchdog backup control refuses an owner result for another page of this operation"
                     .to_owned(),
@@ -1246,11 +1515,12 @@ pub fn register_backup_control(
                 .to_owned(),
         ))
     })?;
-    // The registration must cover the complete method set the `#954` owner
-    // attributes to a role this process holds. The expected set is re-derived
-    // from the owner's own role matrix here, so a table that dropped a method
-    // or added one this owner never claimed refuses instead of serving a
-    // partial or over-broad registration.
+    // The registration must cover exactly this endpoint's reviewed registered
+    // subset. The expected set is re-derived here from the endpoint's own
+    // explicit narrowing and from the canonical operation family, not from the
+    // role matrix and not from the registered list itself, so a table that
+    // dropped a method or added one this owner never claimed refuses instead of
+    // serving a partial or over-broad registration.
     if !verify_registration_is_complete() {
         return Err(BackupControlError::Composition(
             CompositionError::InvalidConfiguration(
