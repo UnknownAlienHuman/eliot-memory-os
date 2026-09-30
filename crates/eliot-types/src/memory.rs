@@ -3245,6 +3245,12 @@ pub struct CandidateDiff {
     pub work_item_id: WorkItemId,
     pub base_commit: String,
     pub worktree_head: Option<String>,
+    /// Exact Git tree object measured by the candidate snapshot capture owner.
+    /// Older canonical rows omit this value and therefore have unknown source
+    /// tree identity; consumers must not infer it from `worktree_head` or the
+    /// human-readable diff reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_snapshot: Option<CandidateSourceSnapshotV1>,
     pub diff_hash: String,
     pub diff_ref: String,
     pub changed_files: Vec<PathRef>,
@@ -3257,6 +3263,50 @@ pub struct CandidateDiff {
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     pub write_receipt: Option<WriteReceiptRef>,
+}
+
+pub const CANDIDATE_SOURCE_SNAPSHOT_SCHEMA_VERSION: u16 = 1;
+
+/// Versioned source-tree identity measured while the candidate diff owner
+/// creates the immutable Git tree used for changed-file enumeration and diff
+/// extraction. This value is part of the existing canonical `CandidateDiff`
+/// record and is covered by that record's normal write receipt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateSourceSnapshotV1 {
+    /// Source snapshot schema revision.
+    pub schema_version: u16,
+    /// Git tree object id from the exact `git write-tree` invocation.
+    pub tree_oid: String,
+}
+
+impl CandidateSourceSnapshotV1 {
+    /// Returns whether this versioned tree identity has a supported schema and
+    /// canonical Git object id shape.
+    #[must_use]
+    pub fn is_well_formed(&self) -> bool {
+        self.schema_version == CANDIDATE_SOURCE_SNAPSHOT_SCHEMA_VERSION
+            && matches!(self.tree_oid.len(), 40 | 64)
+            && self
+                .tree_oid
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    }
+}
+
+impl CandidateDiff {
+    /// Returns the recorded tree OID only for the supported owner snapshot
+    /// revision. An absent legacy field or unsupported/malformed revision is
+    /// unknown and must not be reconstructed from other CandidateDiff fields.
+    /// This accessor does not validate the canonical write receipt or join an
+    /// immutable source artifact; those checks belong to the record reader.
+    #[must_use]
+    pub fn recorded_source_tree_oid(&self) -> Option<&str> {
+        self.source_snapshot
+            .as_ref()
+            .filter(|snapshot| snapshot.is_well_formed())
+            .map(|snapshot| snapshot.tree_oid.as_str())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
