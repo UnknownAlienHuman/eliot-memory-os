@@ -26,8 +26,17 @@ use thiserror::Error;
 mod end_of_activity;
 mod improvement_admission;
 pub mod improvement_pipeline;
+mod outcome_observation;
 pub mod result_obligation;
 mod trigger_intake;
+
+pub use outcome_observation::{
+    AdmittedObservationReceipt, ExpectedOutcomeObservation, MaintenanceOutcomeDisposition,
+    OUTCOME_OBSERVATION_OWNER, OUTCOME_OBSERVATION_RESOLUTION, ObservedOutcomeObservation,
+    OutcomeObservationCoverage, OutstandingOutcome, OutstandingOutcomeObligation,
+    admit_observation_delivery, outcome_observation_coverage,
+    outcome_observation_disposition,
+};
 
 pub use result_obligation::{
     FOLLOW_UP_PENDING_REASON, MAINTENANCE_OBLIGATION_CONTRACT_VERSION, MAX_RESULT_OBLIGATIONS,

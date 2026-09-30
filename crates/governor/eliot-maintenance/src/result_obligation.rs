@@ -263,7 +263,9 @@ impl MaintenanceResultObligation {
 /// a source result for it means. Deliberately not total in the other direction:
 /// `Admitted`, `Running` and `Deferred` are not results, so they produce no
 /// obligation at all rather than a fabricated outcome.
-const fn result_outcome(state: MaintenanceJobState) -> Option<MaintenanceExecutionOutcome> {
+pub(crate) const fn result_outcome(
+    state: MaintenanceJobState,
+) -> Option<MaintenanceExecutionOutcome> {
     match state {
         MaintenanceJobState::Checkpointed => Some(MaintenanceExecutionOutcome::Partial),
         MaintenanceJobState::Completed => Some(MaintenanceExecutionOutcome::Completed),
@@ -283,7 +285,7 @@ const fn result_outcome(state: MaintenanceJobState) -> Option<MaintenanceExecuti
 /// A pure function of the source event and its revisions: the job identity, the
 /// lifecycle state and the attempt ordinal. Retry time is deliberately absent, so
 /// republishing the same source result republishes the same identity.
-fn publication_id_for(job_id: &str, state: MaintenanceJobState, attempts: u32) -> String {
+pub(crate) fn publication_id_for(job_id: &str, state: MaintenanceJobState, attempts: u32) -> String {
     format!("maintenance-result:{job_id}:{state}:{attempts}")
 }
 
