@@ -13,12 +13,15 @@
 //! [`KernelContextReadClient::reconstruct_context_inputs`] — the existing
 //! Governor composition edge that instantiates
 //! [`eliot_governor::GovernorContextInputs`] over the Governor `ReadService`
-//! and calls `reconstruct`.
+//! and calls `reconstruct`. After that read closure returns, this route admits
+//! each captured LSP Blob under the Store causal readback, reads the exact
+//! bytes through the daemon Blob owner, and sends authenticated chunks through
+//! Governor's CodeCortex consumer as historical evidence.
 //!
 //! Nothing here reimplements the six-read algorithm, the before/after
 //! source-head closure, or the seven role slots: those stay with
-//! `eliot_governor::context_inputs`. The daemon only resolves identities and
-//! shapes the result body.
+//! `eliot_governor::context_inputs`. Captured instrument observations remain
+//! historically stale and retain their CodeCortex freshness and coverage.
 //!
 //! # Identity discipline
 //!
@@ -71,9 +74,9 @@
 //! The result is a reconstructed INPUT closure, never an admitted
 //! `ActiveUnderstandingView`, never admitted Cue arrays, never capability
 //! qualification and never action authority. The result body therefore
-//! declares the candidate result class with no semantic receipt, exactly as the
-//! campaign-packet body does for content this daemon compiled from owner reads.
-//! The degraded body is weaker still: it declares no result content at all.
+//! declares the candidate result class with no semantic receipt; instrument
+//! observations are task-relative historical evidence in a separate bounded
+//! response field. The degraded body declares no result content at all.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -147,7 +150,7 @@ impl SelectorMember {
 ///
 /// Every variant names the exact missing or unbound owner identity. None of
 /// them carries a substitute value, and none is reachable after a read starts.
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[derive(Debug, Error)]
 pub enum ReconstructionPrerequisite {
     /// The claimed pair is not the admitted `eliot.query` `ContextReconstruction`
     /// shape.
@@ -191,6 +194,21 @@ pub enum ReconstructionPrerequisite {
         /// Number of declared members.
         declared: usize,
     },
+    /// Captured source bytes or bridge adoption failed owner validation.
+    #[error("captured LSP evidence could not be adopted: {0}")]
+    CapturedEvidenceRefused(String),
+    /// A malformed captured Blob pointer failed the closed Store contract.
+    #[error("captured Blob reference is invalid: {0}")]
+    CapturedBlobReference(#[source] eliot_store_api::StoreError),
+    /// A task or causal binding failed typed row decoding.
+    #[error("captured Store evidence binding is invalid: {0}")]
+    CapturedBindingSerialization(#[from] serde_json::Error),
+    /// A captured binding carries an invalid state fence.
+    #[error("captured Store evidence state fence is invalid: {0}")]
+    CapturedBindingFence(#[from] eliot_contracts::ContractError),
+    /// Source-read admission, Blob authentication, or semantic adoption failed.
+    #[error("captured LSP source read or adoption failed: {0}")]
+    CapturedLspAdoption(#[from] crate::CapturedLspAdoptionError),
     /// The Governor reconstruction owner refused the closure.
     #[error("governor reconstruction owner refused the closure: {0}")]
     ReconstructionRefused(String),
@@ -230,6 +248,7 @@ pub fn is_context_reconstruction_query(envelope: &HostRequestEnvelope, tool: &Va
 /// the local-read poller.
 pub async fn serve_context_reconstruction(
     kernel: &Arc<DaemonKernelClient>,
+    composition: &Arc<tokio::sync::Mutex<crate::DaemonComposition>>,
     envelope: &HostRequestEnvelope,
     tool: &Value,
     attempt: &LocalReadAttempt,
@@ -338,7 +357,75 @@ pub async fn serve_context_reconstruction(
             ));
         }
     };
-    context_reconstruction_result_body(envelope, attempt, &scope, task_id, &seven)
+    let captured =
+        captured_lsp_payloads(seven.evidence.payload.as_ref(), task_id, &retained_fence)?;
+    let instrument_evidence = adopt_captured_lsp_evidence(
+        composition,
+        envelope,
+        attempt,
+        ctx,
+        &owner_session,
+        &seven,
+        captured,
+    )
+    .await?;
+    context_reconstruction_result_body(
+        envelope,
+        attempt,
+        &scope,
+        task_id,
+        &seven,
+        &instrument_evidence,
+    )
+}
+
+/// Adopts captured LSP observations against the exact successful seven-role
+/// read and its Store causal binding before projecting instrument evidence.
+async fn adopt_captured_lsp_evidence(
+    composition: &Arc<tokio::sync::Mutex<crate::DaemonComposition>>,
+    envelope: &HostRequestEnvelope,
+    attempt: &LocalReadAttempt,
+    request_metadata: RequestMetadata,
+    owner_session: &OwnerSessionFacts,
+    seven: &SevenRoleInputs,
+    captured: Vec<CapturedLspPayload>,
+) -> Result<Vec<eliot_instrument_api::NormalizedEvidence>, ReconstructionPrerequisite> {
+    if captured.is_empty() {
+        return Ok(Vec::new());
+    }
+    let task_frame_readback = seven.task_frame.identity.clone().ok_or_else(|| {
+        ReconstructionPrerequisite::CapturedEvidenceRefused(
+            "current task-frame read has no retained ReadIdentity".to_owned(),
+        )
+    })?;
+    let first_causal = captured[0].read_causal_binding.clone();
+    if captured
+        .iter()
+        .any(|payload| payload.read_causal_binding != first_causal)
+    {
+        return Err(ReconstructionPrerequisite::CapturedEvidenceRefused(
+            "captured LSP rows disagree on the Store read causal binding".to_owned(),
+        ));
+    }
+    let holder = eliot_authority::PrincipalRef::new(owner_session.kernel_principal.clone())
+        .map_err(crate::CapturedLspAdoptionError::from)?;
+    let mut composition = composition.lock().await;
+    let read_context = crate::CapturedLspReadContext {
+        envelope: envelope.clone(),
+        attempt: attempt.clone(),
+        request_metadata,
+        holder,
+        task_frame_readback,
+        causal_binding: first_causal,
+        now: eliot_authority::LogicalTime::new(crate::unix_ms()),
+    };
+    Ok(composition.consume_captured_lsp_payloads(
+        &read_context,
+        captured
+            .into_iter()
+            .map(|payload| (payload.reference, payload.task_binding))
+            .collect(),
+    )?)
 }
 
 /// Settles one claimed reconstruction pair whose read closure was DEGRADED.
@@ -946,6 +1033,104 @@ fn reconstruction_context(
     Ok(context)
 }
 
+/// One exact LSP Blob pointer echoed by the canonical `GetEvidencePack` row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CapturedLspPayload {
+    reference: eliot_store_api::CapturedBlobPayloadRefV1,
+    task_binding: eliot_store_api::TaskBinding,
+    read_causal_binding: eliot_store_api::CausalBinding,
+}
+
+/// Extracts task-bound LSP Blob pointers from the already admitted evidence-pack
+/// payload. The Blob owner still authenticates each pointer before its bytes are
+/// exposed; this function only preserves and cross-checks the store row binding.
+fn captured_lsp_payloads(
+    payload: Option<&Value>,
+    expected_task_id: &str,
+    expected_fence: &StateFence,
+) -> Result<Vec<CapturedLspPayload>, ReconstructionPrerequisite> {
+    const LSP_RECEIPT_KIND: &str = "instrument.lsp_observation.v1";
+    let Some(records) = payload
+        .and_then(|payload| payload.get("records"))
+        .and_then(Value::as_array)
+    else {
+        return Ok(Vec::new());
+    };
+    let mut captured = Vec::new();
+    for record in records {
+        if record.get("operation").and_then(Value::as_str) != Some("CaptureObservation") {
+            continue;
+        }
+        let Some(parameters) = record.get("parameters").and_then(Value::as_object) else {
+            continue;
+        };
+        let parameters = parameters
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let reference = match eliot_store_api::decode_captured_blob_payload_ref(&parameters) {
+            Ok(Some(reference)) => reference,
+            Ok(None) => continue,
+            Err(error) => return Err(ReconstructionPrerequisite::CapturedBlobReference(error)),
+        };
+        if reference.receipt_kind != LSP_RECEIPT_KIND {
+            continue;
+        }
+        let causal_binding = payload
+            .and_then(|payload| payload.get("causal_binding"))
+            .cloned()
+            .ok_or_else(|| {
+                ReconstructionPrerequisite::CapturedEvidenceRefused(
+                    "LSP evidence pack has no Store causal readback".to_owned(),
+                )
+            })
+            .and_then(|value| {
+                serde_json::from_value::<eliot_store_api::CausalBinding>(value)
+                    .map_err(ReconstructionPrerequisite::from)
+            })?;
+        causal_binding
+            .state_fence
+            .validate()
+            .map_err(ReconstructionPrerequisite::CapturedBindingFence)?;
+        if causal_binding.state_fence != *expected_fence {
+            return Err(ReconstructionPrerequisite::CapturedEvidenceRefused(
+                "LSP evidence-pack causal readback belongs to another state fence".to_owned(),
+            ));
+        }
+        let task_binding = record
+            .get("task_binding")
+            .cloned()
+            .ok_or_else(|| {
+                ReconstructionPrerequisite::CapturedEvidenceRefused(
+                    "LSP capture row has no original task binding".to_owned(),
+                )
+            })
+            .and_then(|value| {
+                serde_json::from_value::<eliot_store_api::TaskBinding>(value)
+                    .map_err(ReconstructionPrerequisite::from)
+            })?;
+        task_binding
+            .state_fence
+            .validate()
+            .map_err(ReconstructionPrerequisite::CapturedBindingFence)?;
+        if task_binding.task_id.as_str() != expected_task_id {
+            return Err(ReconstructionPrerequisite::CapturedEvidenceRefused(
+                "LSP capture row does not bind the admitted task".to_owned(),
+            ));
+        }
+        if captured.len() >= EVIDENCE_PACK_MAX_RECORDS as usize {
+            return Err(ReconstructionPrerequisite::CapturedEvidenceRefused(
+                "captured LSP payload count exceeds the store evidence-pack bound".to_owned(),
+            ));
+        }
+        captured.push(CapturedLspPayload {
+            reference,
+            task_binding,
+            read_causal_binding: causal_binding,
+        });
+    }
+    Ok(captured)
+}
 /// Projects the reconstructed closure into the host-request result body.
 ///
 /// The response carries the exact `SevenRoleInputs` value plus the identity it
@@ -959,14 +1144,18 @@ fn context_reconstruction_result_body(
     scope: &ScopeId,
     task_id: &str,
     seven: &SevenRoleInputs,
+    instrument_evidence: &[eliot_instrument_api::NormalizedEvidence],
 ) -> Result<HostRequestResultBody, ReconstructionPrerequisite> {
     let closure = serde_json::to_value(seven)
         .map_err(|error| ReconstructionPrerequisite::ReconstructionRefused(error.to_string()))?;
+    let instrument_evidence = serde_json::to_value(instrument_evidence)
+        .map_err(|error| ReconstructionPrerequisite::CapturedEvidenceRefused(error.to_string()))?;
     let response = json!({
         "operation": CONTEXT_RECONSTRUCTION_MODE,
         "task_id": task_id,
         "scope_id": scope.as_str(),
         "context_reconstruction": closure,
+        "instrument_evidence": instrument_evidence,
     });
     let bytes = canonical_json_bytes(&response)
         .map_err(|error| ReconstructionPrerequisite::ReconstructionRefused(error.to_string()))?;

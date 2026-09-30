@@ -22,7 +22,8 @@ use eliot_process::{
 
 use crate::{
     ProcessExecutionClient, ProcessExecutionFuture, ProcessExecutionRejection,
-    ProcessExecutionRequest, ProcessExecutionResponse,
+    ProcessExecutionRequest, ProcessExecutionResponse, ProcessStreamReadChunk,
+    ProcessStreamReadRequest,
 };
 
 /// Boxed `Send` future for one closed admission through the caller's authority.
@@ -61,6 +62,12 @@ pub trait ProcessOperationPort: Send + Sync {
 
     /// Reconciles one operation after an unknown delivery/result boundary.
     fn reconcile(&self, operation_id: OperationId) -> ProcessOperationFuture<'_, ProcessEvidence>;
+
+    /// Reads one bounded chunk from a complete original captured stream.
+    fn read_stream_chunk(
+        &self,
+        request: ProcessStreamReadRequest,
+    ) -> ProcessOperationFuture<'_, ProcessStreamReadChunk>;
 }
 
 /// Mechanics-only front-door client composing a starter with an operation port.
@@ -119,6 +126,14 @@ impl ProcessExecutionClient for KernelProcessExecutionClient {
                 ProcessExecutionRequest::Reconcile { operation_id } => {
                     match operations.reconcile(operation_id).await {
                         Ok(evidence) => ProcessExecutionResponse::Reconciled(evidence),
+                        Err(error) => ProcessExecutionResponse::Rejected(
+                            ProcessExecutionRejection::from_error(&error),
+                        ),
+                    }
+                }
+                ProcessExecutionRequest::ReadStream { request } => {
+                    match operations.read_stream_chunk(request).await {
+                        Ok(chunk) => ProcessExecutionResponse::StreamChunk(chunk),
                         Err(error) => ProcessExecutionResponse::Rejected(
                             ProcessExecutionRejection::from_error(&error),
                         ),

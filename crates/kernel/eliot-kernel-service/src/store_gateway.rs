@@ -57,13 +57,14 @@ use eliot_runtime_contracts::{
 };
 use eliot_store_api::{
     CanonicalRequestView, CanonicalRestoreBatch, CanonicalStoreClient, CanonicalValidationSnapshot,
-    NamedReadRequest, NamedReadResponse, OperationIdentity, OrderingHead, OrderingHeadExpectation,
-    OrderingScopeId, PreparedTransition, RecoveryRecord, RecoveryRecordKey, RequestMeta,
-    ReservedWriteRequest, RestoreValidationReceipt, RevisionHead, RevisionHeadExpectation,
-    RevisionKey, ScopeId, ScopeRevisionView, StoreError, StoreGenesisRequest, StoreHealth,
-    StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, WriteReceiptStatus, WriteSubmission,
-    admit_write_submission, canonical_request_hash, dreamer_job_queue_key,
-    generated_operation_manifests, operation_manifest_set_digest, verify_canonical_request_hash,
+    CausalWriteReceipt, NamedReadRequest, NamedReadResponse, OperationIdentity, OrderingHead,
+    OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RecoveryRecord,
+    RecoveryRecordKey, RequestMeta, ReservedWriteRequest, RestoreValidationReceipt, RevisionHead,
+    RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, StoreError,
+    StoreGenesisRequest, StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt,
+    WriteReceiptStatus, WriteSubmission, admit_write_submission, canonical_request_hash,
+    dreamer_job_queue_key, generated_operation_manifests, operation_manifest_set_digest,
+    verify_canonical_request_hash,
 };
 use serde::{Deserialize, Serialize};
 
@@ -877,9 +878,26 @@ impl CanonicalStoreClient for BorrowedCanonicalStoreClient<'_> {
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
     ) -> Result<WriteReceipt, StoreError> {
         self.require_active_generation()?;
+        Box::pin(self.gateway.store.apply_prepared(
+            ctx,
+            transition,
+            expected_revision_heads,
+            expected_ordering_heads,
+        ))
+        .await
+    }
+
+    async fn apply_prepared_with_causal(
+        &self,
+        ctx: &RequestMeta,
+        transition: PreparedTransition,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+    ) -> Result<CausalWriteReceipt, StoreError> {
+        self.require_active_generation()?;
         self.gateway
             .store
-            .apply_prepared(
+            .apply_prepared_with_causal(
                 ctx,
                 transition,
                 expected_revision_heads,
@@ -891,6 +909,14 @@ impl CanonicalStoreClient for BorrowedCanonicalStoreClient<'_> {
     async fn receipt(&self, operation_id: OperationId) -> Result<Option<WriteReceipt>, StoreError> {
         self.require_active_generation()?;
         self.gateway.store.receipt(operation_id).await
+    }
+
+    async fn receipt_with_causal(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<Option<CausalWriteReceipt>, StoreError> {
+        self.require_active_generation()?;
+        self.gateway.store.receipt_with_causal(operation_id).await
     }
 
     async fn revision_heads(
@@ -1205,6 +1231,48 @@ impl KernelStoreGateway {
         .map_err(|error| StoreApplyRefusal::GatewayRefusal(error.to_string()));
         drop(lease);
         result
+    }
+
+    /// Applies one already admitted transition and then obtains the causal
+    /// projection from the same authenticated Store owner's exact-operation
+    /// read path. The causal binding is never reconstructed from the receipt
+    /// envelope; a changed or missing stored receipt refuses the response.
+    pub async fn apply_with_causal(
+        &self,
+        context: &RequestMetadata,
+        transition: PreparedTransition,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+    ) -> Result<CausalWriteReceipt, StoreApplyRefusal> {
+        let expected = transition.identity.clone();
+        let receipt = self
+            .apply(
+                context,
+                transition,
+                expected_revision_heads,
+                expected_ordering_heads,
+            )
+            .await?;
+        let pair = self
+            .receipt_with_causal(&receipt.state_fence, expected.operation_id.clone())
+            .await
+            .map_err(StoreApplyRefusal::GatewayRefusal)?
+            .ok_or_else(|| {
+                StoreApplyRefusal::GatewayRefusal(
+                    "committed Store receipt omitted its causal projection".to_owned(),
+                )
+            })?;
+        if pair.receipt != receipt
+            || pair.receipt.idempotency_key != expected.idempotency_key
+            || pair.receipt.canonical_request_hash != expected.canonical_request_hash
+        {
+            return Err(StoreApplyRefusal::GatewayRefusal(
+                "Store causal readback does not match the exact applied receipt".to_owned(),
+            ));
+        }
+        pair.validate()
+            .map_err(|error| StoreApplyRefusal::GatewayRefusal(error.to_string()))?;
+        Ok(pair)
     }
 
     /// Lists the currently paused ordering scopes with the idempotency key
@@ -2187,6 +2255,16 @@ impl KernelStoreGateway {
         operation_id: OperationId,
     ) -> Result<Option<WriteReceipt>, String> {
         store_receipt_gateway::receipt(self, state_fence, operation_id).await
+    }
+
+    /// Reads one exact Store receipt and its independent canonical causal
+    /// projection through the active Kernel generation route.
+    pub async fn receipt_with_causal(
+        &self,
+        state_fence: &StateFence,
+        operation_id: OperationId,
+    ) -> Result<Option<CausalWriteReceipt>, String> {
+        store_receipt_gateway::receipt_with_causal(self, state_fence, operation_id).await
     }
 
     /// Executes one closed named read through the active Kernel generation

@@ -10,10 +10,11 @@ use crate::SurrealStoreAdapter;
 use crate::config::{SchemaGeneration, SurrealAdapterConfig};
 use crate::error::AdapterError;
 use crate::plan::{
-    self, build_receipt_with_expected_heads, validate_receipt_identity_with_expected_heads,
-    validate_revision_heads,
+    self, build_receipt_with_expected_heads_and_causal,
+    validate_receipt_identity_with_expected_heads_and_causal, validate_revision_heads,
 };
 use crate::readiness::{CompiledMigration, MigrationReceipt, SemanticReadiness};
+use crate::source_artifact_context::CanonicalCausalProjection;
 use crate::write_execution::{
     AttemptOutcome, ExclusiveOpKind, ExecutableAttempt, OpExecution, ProviderGate,
     ReconcileOutcome, ReservedAttemptTransport, current_time_ms,
@@ -100,6 +101,7 @@ pub(crate) use read_boundary::{
     read_validation_snapshot,
 };
 pub(crate) use receipt_reconciliation::read_receipt;
+pub(crate) use receipt_reconciliation::read_receipt_with_causal;
 use receipt_reconciliation::{read_fence, read_idempotency, read_receipt_by_operation};
 use recovery::{
     RecoverySnapshotInput, build_recovery_bindings, build_recovery_snapshot, build_recovery_sql,
@@ -1167,6 +1169,7 @@ async fn rendezvous_before_transaction(adapter: &SurrealStoreAdapter) -> Result<
 /// the line-count lint without changing the read/verify order.
 struct VerifiedAttemptState {
     fence: Option<FenceRecord>,
+    causal: CanonicalCausalProjection,
     current_revisions: Vec<RevisionHead>,
     current_orderings: Vec<OrderingHead>,
     /// Per-scope prior link hashes for the canonical event's chain links
@@ -1232,12 +1235,18 @@ async fn reuse_idempotent_receipt(
     .await?
     {
         Idempotency::Replay(receipt) => {
-            validate_receipt_identity_with_expected_heads(
+            let causal = receipt_reconciliation::read_causal_replay(
+                db,
+                &adapter.config,
+                &receipt.operation_id,
+                &receipt,
+            )
+            .await?;
+            plan::validate_receipt_identity_with_causal(
                 &receipt,
                 ctx,
                 transition,
-                expected_revision_heads,
-                expected_ordering_heads,
+                causal.binding(),
             )?;
             Ok(Some(receipt))
         }
@@ -1258,7 +1267,12 @@ async fn load_verified_attempt_state(
     expected_revision_heads: &[eliot_store_api::RevisionHeadExpectation],
     expected_ordering_heads: &[eliot_store_api::OrderingHeadExpectation],
 ) -> Result<VerifiedAttemptState, AdapterError> {
-    let fence = read_fence(db, &adapter.config).await?;
+    let (fence, causal) = receipt_reconciliation::read_causal_allocation(
+        db,
+        &adapter.config,
+        &transition.state_fence,
+    )
+    .await?;
     if let Some(fence) = &fence
         && fence.state_fence != transition.state_fence
     {
@@ -1292,6 +1306,7 @@ async fn load_verified_attempt_state(
     )?;
     Ok(VerifiedAttemptState {
         fence,
+        causal,
         current_revisions,
         current_orderings,
         current_chain_tips,
@@ -1467,12 +1482,13 @@ async fn apply_with_retry(
         // hash (verified against the supplied claim), never a blind copy,
         // so Governor output, Kernel staging, store commit and WriteReceipt
         // carry the identical digest.
-        let receipt = build_receipt_with_expected_heads(
+        let receipt = build_receipt_with_expected_heads_and_causal(
             ctx,
             &transition,
             &plan,
             &expected_revision_heads,
             &expected_ordering_heads,
+            verified.causal.binding(),
         )?;
 
         // S-CONC-TX production-path rendezvous (issue #989): first attempt
@@ -1489,6 +1505,7 @@ async fn apply_with_retry(
             &transition,
             &plan,
             &receipt,
+            &verified.causal,
             verified.fence.is_none(),
             verified
                 .fence
@@ -1510,12 +1527,13 @@ async fn apply_with_retry(
         .await
         {
             Ok(()) => {
-                validate_receipt_identity_with_expected_heads(
+                validate_receipt_identity_with_expected_heads_and_causal(
                     &receipt,
                     ctx,
                     &transition,
                     &expected_revision_heads,
                     &expected_ordering_heads,
+                    verified.causal.binding(),
                 )?;
                 validate_committed_canonical_transition(&plan, &receipt)?;
                 validate_committed_projection_publications(&plan, &receipt)?;

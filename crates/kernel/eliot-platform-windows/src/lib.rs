@@ -91,6 +91,7 @@ thread_local! {
     };
 }
 
+pub mod blob_file_store;
 mod directory_publication;
 mod event_log;
 mod installer_authority_key;
@@ -2840,7 +2841,7 @@ impl Drop for OwnedSecurityDescriptor {
 pub struct WindowsPlatform {
     root: PathBuf,
     #[cfg(windows)]
-    _root_pin: std::fs::File,
+    root_pin: std::fs::File,
 }
 
 impl WindowsPlatform {
@@ -2858,7 +2859,7 @@ impl WindowsPlatform {
         Ok(Self {
             root,
             #[cfg(windows)]
-            _root_pin: root_pin,
+            root_pin,
         })
     }
 

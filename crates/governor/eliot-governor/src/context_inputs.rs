@@ -783,6 +783,8 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
             &request.scope_id,
             &request.evidence_subject,
         );
+        let state =
+            classify_evidence_payload_for_task(state, &response.view.payload, &request.task_id);
         Ok(RoleAcquisition {
             operation: response.view.operation,
             state,
@@ -1242,7 +1244,11 @@ fn classify_evidence_payload(payload: &Value, scope: &ScopeId, subject: &str) ->
     let unavailable = |detail: &str| ProjectionState::Unavailable {
         reason: bounded_reason("evidence payload fails its contract", detail),
     };
-    if payload.get("version").and_then(Value::as_u64) != Some(1) {
+    // Version 2 adds the exact Store-owned causal readback used by the live
+    // captured-Blob consumer. Version 1 remains structurally readable, while
+    // the source-read route separately requires that causal field before it
+    // can issue a current read admission.
+    if !matches!(payload.get("version").and_then(Value::as_u64), Some(1 | 2)) {
         return unavailable("unsupported evidence pack version");
     }
     if payload.get("subject").and_then(Value::as_str) != Some(subject) {
@@ -1263,6 +1269,71 @@ fn classify_evidence_payload(payload: &Value, scope: &ScopeId, subject: &str) ->
         RolePage::Undescribed => ProjectionState::Unknown {
             reason: "evidence provenance does not authoritatively describe the records".to_owned(),
         },
+    }
+}
+
+/// Keeps task-bound bridge capture references visible but non-authoritative
+/// until the original Blob bytes and process-owner readback reach the current
+/// compositor. The task binding comes from the canonical write receipt echoed
+/// by `GetEvidencePack`, not from the capture subject or retained payload.
+fn classify_evidence_payload_for_task(
+    base: ProjectionState,
+    payload: &Value,
+    expected_task_id: &str,
+) -> ProjectionState {
+    const LSP_RECEIPT_KIND: &str = "instrument.lsp_observation.v1";
+    let Some(records) = payload.get("records").and_then(Value::as_array) else {
+        return base;
+    };
+    let mut has_lsp_capture = false;
+    for record in records {
+        let Some(parameters) = record.get("parameters").and_then(Value::as_object) else {
+            continue;
+        };
+        let parameters = parameters
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let payload_ref = match eliot_store_api::decode_captured_blob_payload_ref(&parameters) {
+            Ok(Some(reference)) => reference,
+            Ok(None) => continue,
+            Err(error) => {
+                return ProjectionState::Unavailable {
+                    reason: bounded_reason("captured Blob reference is invalid", error),
+                };
+            }
+        };
+        if payload_ref.receipt_kind != LSP_RECEIPT_KIND {
+            continue;
+        }
+        has_lsp_capture = true;
+        let task_binding = record
+            .get("task_binding")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<eliot_store_api::TaskBinding>(value).ok());
+        if task_binding
+            .as_ref()
+            .is_none_or(|binding| binding.task_id.as_str() != expected_task_id)
+        {
+            return ProjectionState::Unavailable {
+                reason: "retained LSP capture has no matching original task binding".to_owned(),
+            };
+        }
+    }
+    if !has_lsp_capture {
+        return base;
+    }
+    match base {
+        ProjectionState::Complete => ProjectionState::Unknown {
+            reason: "task-bound LSP Blob is retained, but its original bytes and process-owner readback have not been adopted by the semantic compositor".to_owned(),
+        },
+        ProjectionState::Partial { reason } => ProjectionState::Partial {
+            reason: bounded_reason(
+                "evidence pack is partial and its LSP Blob is not adopted",
+                reason,
+            ),
+        },
+        other => other,
     }
 }
 

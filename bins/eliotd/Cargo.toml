@@ -65,6 +65,7 @@ eliot-agent-api.workspace = true
 eliot-agent-bridge-core.workspace = true
 eliot-agent-contracts.workspace = true
 eliot-agent-coordinator.workspace = true
+eliot-artifact = { path = "../../crates/instrument/eliot-artifact", version = "0.1.0" }
 eliot-authority.workspace = true
 eliot-bootstrap.workspace = true
 eliot-cognitive-quality = { path = "../../crates/smart/eliot-cognitive-quality", version = "0.1.0" }
@@ -85,6 +86,9 @@ eliot-evaluation-contracts.workspace = true
 eliot-epistemic-contracts.workspace = true
 eliot-experience-provider = { path = "../../crates/smart/eliot-experience-provider", version = "0.1.0" }
 eliot-governor.workspace = true
+eliot-blob.workspace = true
+eliot-blob-api.workspace = true
+eliot-git-bridge.workspace = true
 eliot-improvement = { path = "../../crates/meta/eliot-improvement", version = "0.1.0" }
 eliot-self-quality = { path = "../../crates/meta/eliot-self-quality", version = "0.1.0" }
 eliot-conformance-contracts.workspace = true
@@ -97,6 +101,7 @@ eliot-kernel-service.workspace = true
 eliot-ors.workspace = true
 eliot-learning-contracts.workspace = true
 eliot-learning-state-view.workspace = true
+eliot-lsp-bridge = { path = "../../crates/bridges/eliot-lsp-bridge", version = "0.1.0" }
 eliot-maintenance.workspace = true
 eliot-memory-quality = { path = "../../crates/smart/eliot-memory-quality", version = "0.1.0" }
 eliot-observability = { path = "../../crates/instrument/eliot-observability", version = "0.1.0" }

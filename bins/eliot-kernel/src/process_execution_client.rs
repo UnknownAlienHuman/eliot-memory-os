@@ -12,7 +12,8 @@ use std::sync::Arc;
 use eliot_ipc::Session;
 use eliot_kernel_service::{
     KernelProcessExecutionClient, ProcessExecutionRejection, ProcessOperationFuture,
-    ProcessOperationPort, ProcessStarter, ProcessStarterFuture,
+    ProcessOperationPort, ProcessStarter, ProcessStarterFuture, ProcessStreamReadChunk,
+    ProcessStreamReadRequest,
 };
 use eliot_process::{
     CancellationReceipt, OperationId, ProcessEvidence, ProcessExecutionAdmissionRequest,
@@ -52,6 +53,15 @@ impl ProcessOperationPort for GatewayOperationPort {
         let gateway = Arc::clone(&self.gateway);
         let owner = self.owner.clone();
         Box::pin(async move { gateway.reconcile(&owner, operation_id).await })
+    }
+
+    fn read_stream_chunk(
+        &self,
+        request: ProcessStreamReadRequest,
+    ) -> ProcessOperationFuture<'_, ProcessStreamReadChunk> {
+        let gateway = Arc::clone(&self.gateway);
+        let owner = self.owner.clone();
+        Box::pin(async move { gateway.read_stream_chunk(&owner, request).await })
     }
 }
 

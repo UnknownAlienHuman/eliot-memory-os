@@ -11,22 +11,149 @@ use crate::client;
 use crate::config::SurrealAdapterConfig;
 use crate::error::AdapterError;
 use crate::schema;
+use crate::source_artifact_context::{CanonicalCausalProjection, StoredReceiptHead};
 use eliot_store_api::{
     CanonicalRequestView, OperationId, OrderingHeadExpectation, RevisionHeadExpectation,
-    WriteReceipt, canonical_request_hash, validate_store_receipt_envelope,
+    StateFence, StoreError, WriteReceipt, canonical_request_hash, committed_receipt_sequence,
     verify_canonical_request_hash, verify_ordering_scope_binding,
 };
 
-use super::{FenceRecord, Idempotency, take_optional, take_vec};
+use super::{
+    FenceRecord, Idempotency, schema_contract::validate_fence_record, take_optional, take_vec,
+};
+
+/// Reads the canonical allocation cursor and its predecessor in one database
+/// read transaction, then derives the only causal projection the next apply
+/// may bind.
+pub(super) async fn read_causal_allocation(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    expected_state_fence: &StateFence,
+) -> Result<(Option<FenceRecord>, CanonicalCausalProjection), AdapterError> {
+    let mut response = client::query(
+        db,
+        config,
+        "read.canonical_causal_allocation",
+        schema::READ_CAUSAL_ALLOCATION,
+        Map::new(),
+    )
+    .await?;
+    let errors = response.take_errors();
+    if !errors.is_empty() {
+        if errors.iter().all(|error| client::is_absent_table(error)) {
+            let projection =
+                CanonicalCausalProjection::from_store_readback(expected_state_fence, 1, None)?;
+            return Ok((None, projection));
+        }
+        return Err(AdapterError::PartialOutcome);
+    }
+
+    // The transaction opener occupies result zero, so the fence and receipt
+    // rows are the next two bounded statements.
+    let fence = take_optional::<FenceRecord>(&mut response, 1)?;
+    if let Some(fence) = &fence {
+        validate_fence_record(fence)?;
+        if fence.state_fence != *expected_state_fence {
+            return Err(AdapterError::Store(StoreError::FenceMismatch));
+        }
+    }
+    let heads = take_vec::<StoredReceiptHead>(&mut response, 2)?;
+    let next_sequence = fence
+        .as_ref()
+        .map_or(1, |record| record.next_commit_sequence);
+    let predecessor = causal_predecessor(next_sequence, &heads)?;
+    let projection = CanonicalCausalProjection::from_store_readback(
+        expected_state_fence,
+        next_sequence,
+        predecessor,
+    )?;
+    Ok((fence, projection))
+}
+
+/// Re-reads a committed receipt and its sequence-selected predecessor in one
+/// database transaction. The expected envelope's causal fields are never used
+/// to choose or validate the predecessor.
+pub(super) async fn read_causal_replay(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    operation_id: &OperationId,
+    expected_receipt: &WriteReceipt,
+) -> Result<CanonicalCausalProjection, AdapterError> {
+    let mut bindings = Map::new();
+    bindings.insert("operation_id".to_owned(), json!(operation_id.to_string()));
+    let mut response = client::query(
+        db,
+        config,
+        "read.canonical_causal_replay",
+        schema::READ_CAUSAL_REPLAY_BY_OPERATION,
+        bindings,
+    )
+    .await?;
+    if !response.take_errors().is_empty() {
+        return Err(AdapterError::PartialOutcome);
+    }
+    let target = take_vec::<StoredReceiptHead>(&mut response, 1)?;
+    let predecessors = take_vec::<StoredReceiptHead>(&mut response, 2)?;
+    if target.len() != 1
+        || target[0].receipt != *expected_receipt
+        || target[0].receipt.operation_id != *operation_id
+    {
+        return Err(AdapterError::Store(StoreError::InvalidReceipt));
+    }
+    let committed = &target[0];
+    committed.receipt.validate()?;
+    if committed_receipt_sequence(&committed.receipt)? != committed.commit_sequence {
+        return Err(AdapterError::Store(StoreError::InvalidReceipt));
+    }
+    let predecessor = causal_predecessor(committed.commit_sequence, &predecessors)?;
+    CanonicalCausalProjection::from_store_readback(
+        &committed.receipt.state_fence,
+        committed.commit_sequence,
+        predecessor,
+    )
+}
+
+fn causal_predecessor(
+    commit_sequence: u64,
+    rows: &[StoredReceiptHead],
+) -> Result<Option<&StoredReceiptHead>, AdapterError> {
+    if commit_sequence == 1 {
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        return Err(AdapterError::Store(StoreError::InvalidReceipt));
+    }
+    let expected = commit_sequence - 1;
+    let Some(head) = rows.first() else {
+        return Err(AdapterError::Store(StoreError::InvalidReceipt));
+    };
+    if head.commit_sequence != expected
+        || rows
+            .get(1)
+            .is_some_and(|next| next.commit_sequence == expected)
+    {
+        return Err(AdapterError::Store(StoreError::InvalidReceipt));
+    }
+    Ok(Some(head))
+}
 
 /// Resolves a durable receipt by operation identity; the reconciliation read.
 pub(crate) async fn read_receipt(
     adapter: &SurrealStoreAdapter,
     operation_id: OperationId,
 ) -> Result<Option<WriteReceipt>, AdapterError> {
+    Ok(read_receipt_with_causal(adapter, operation_id)
+        .await?
+        .map(|(receipt, _)| receipt))
+}
+
+pub(crate) async fn read_receipt_with_causal(
+    adapter: &SurrealStoreAdapter,
+    operation_id: OperationId,
+) -> Result<Option<(WriteReceipt, eliot_store_api::CausalBinding)>, AdapterError> {
     let db = super::client(adapter).await?;
     super::ensure_ready(adapter, db).await?;
-    read_receipt_by_operation(db, &adapter.config, &operation_id).await
+    read_receipt_with_causal_by_operation(db, &adapter.config, &operation_id).await
 }
 
 pub(super) async fn read_receipt_by_operation(
@@ -34,6 +161,18 @@ pub(super) async fn read_receipt_by_operation(
     config: &SurrealAdapterConfig,
     operation_id: &OperationId,
 ) -> Result<Option<WriteReceipt>, AdapterError> {
+    Ok(
+        read_receipt_with_causal_by_operation(db, config, operation_id)
+            .await?
+            .map(|(receipt, _)| receipt),
+    )
+}
+
+pub(super) async fn read_receipt_with_causal_by_operation(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    operation_id: &OperationId,
+) -> Result<Option<(WriteReceipt, eliot_store_api::CausalBinding)>, AdapterError> {
     let mut bindings = Map::new();
     bindings.insert("table".to_owned(), json!(schema::table::WRITE_RECEIPT));
     bindings.insert("key".to_owned(), json!(operation_id.to_string()));
@@ -49,8 +188,13 @@ pub(super) async fn read_receipt_by_operation(
     if let Some(receipt) = &receipt {
         receipt.validate()?;
         receipt.require_reconciliation_envelope()?;
+        let causal = read_causal_replay(db, config, operation_id, receipt).await?;
+        if receipt.require_reconciliation_envelope()?.core.causal != *causal.binding() {
+            return Err(AdapterError::Store(StoreError::InvalidReceipt));
+        }
+        return Ok(Some((receipt.clone(), causal.binding().clone())));
     }
-    Ok(receipt)
+    Ok(None)
 }
 
 /// Resolves durable idempotency state for one exact admitted transition
@@ -125,12 +269,10 @@ pub(super) async fn read_idempotency(
 /// recomputed) stays `IdentityConflict` with no transaction — including a
 /// retry that differs only in bound semantic source revisions, which are
 /// hash-bound set-like input through the shared view, so the forked digest
-/// reaches the `Conflict` arm instead of the replay-candidate envelope
-/// check. Exact triple with a valid envelope replays the byte-identical
-/// receipt (no re-effect); any other identity divergence is a conflict;
-/// absence means no prior attempt. A triple match with a broken envelope
-/// fails closed with the envelope error instead of replaying or
-/// conflicting.
+/// reaches the `Conflict` arm instead of the replay-candidate check. An exact
+/// triple becomes only a replay candidate here; its sequence and predecessor
+/// are independently reread before the envelope can validate. Any other
+/// identity divergence is a conflict; absence means no prior attempt.
 ///
 /// From the recompute on, supplied == recomputed, so stored-vs-supplied and
 /// stored-vs-recomputed coincide; the comparisons below name the recomputed
@@ -160,7 +302,6 @@ pub(super) fn classify_idempotency_with_expected_heads(
         return if receipt.idempotency_key == transition.identity.idempotency_key
             && receipt.canonical_request_hash == recomputed
         {
-            validate_store_receipt_envelope(ctx, transition, &receipt)?;
             Ok(Idempotency::Replay(receipt))
         } else {
             Ok(Idempotency::Conflict)
@@ -171,7 +312,6 @@ pub(super) fn classify_idempotency_with_expected_heads(
         return if receipt.canonical_request_hash == recomputed
             && receipt.operation_id == transition.identity.operation_id
         {
-            validate_store_receipt_envelope(ctx, transition, &receipt)?;
             Ok(Idempotency::Replay(receipt))
         } else {
             Ok(Idempotency::Conflict)
