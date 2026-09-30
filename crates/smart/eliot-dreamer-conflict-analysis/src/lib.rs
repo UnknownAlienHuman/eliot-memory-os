@@ -5526,6 +5526,14 @@ fn owner_record_digest_parts(records: &OwnerRecords) -> Vec<String> {
 }
 
 /// Builds the digest parts committing one owner-issued causal evidence record.
+///
+/// The returned parts are UNSORTED. `owner_record_digest_parts` sorts the whole
+/// vector before it is serialised, which is what makes every list this function
+/// emits — the rival denominator's three member lists included — order
+/// independent: two owners that declared the same members in a different order
+/// spell the same parts and therefore the same identity. That ordering is a
+/// property of the caller, so this function must not sort locally as well; a
+/// second sort here would be a second canonicalisation of the same value.
 fn causal_evidence_digest_parts(record: &CausalEvidenceRecord) -> Vec<String> {
     let mut parts: Vec<String> = vec![format!(
         "causal_evidence:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
@@ -5552,6 +5560,45 @@ fn causal_evidence_digest_parts(record: &CausalEvidenceRecord) -> Vec<String> {
         "causal_intervention:{}:{intervention}",
         record.source_handle
     ));
+    // The COMPLETE retained rival denominator enters the preimage, not one member
+    // list of it. `omitted` alone used to be serialised, so two owner records that
+    // declared different expected or observed denominators — one owner expecting
+    // one rival and another expecting two — produced byte-identical preimages and
+    // therefore one candidate identity, and the emitted records published only the
+    // derived coverage, so nothing downstream could tell them apart.
+    //
+    // The members are read from the retained lists themselves, not from a copy of
+    // them made for this function, so these parts cannot disagree with what
+    // admission and `derived_coverage` read. The denominator's own DECLARED
+    // coverage cell is committed separately from the derived one: admission reads
+    // it (a `CompleteForScope` claim is refused unless every expected member was
+    // observed, and cannot coexist with an omission), so two records declaring
+    // different coverage are two different retained records even when the
+    // coverage they DERIVE happens to coincide.
+    //
+    // Committing these cells is an IDENTITY change and deliberately not an
+    // ADMISSIBILITY change. An `expected` member that no retained envelope backs
+    // stays admissible and stays a named gap: `expected` is the owner's declared
+    // denominator, `observed` is the observation, and it is `observed` alone that
+    // `RivalDenominator::validate` joins to `evidence_ids`. Requiring an evidence
+    // join for `expected` as well would make `PartialForScope` and the
+    // `observed.is_empty()` `Unknown` arm unreachable, so no denominator could
+    // ever be anything but complete or refused — the coverage ceiling this
+    // package exists to preserve. Such a record still blocks every qualified
+    // causal state through the rival leg in `blocking_causal_leg`; what it can no
+    // longer do is share a candidate identity with a record that declared a
+    // different denominator.
+    parts.push(format!(
+        "rival_declared_coverage:{}:{}",
+        record.source_handle,
+        coverage_spelling(record.rivals.coverage)
+    ));
+    for handle in &record.rivals.expected {
+        parts.push(format!("rival_expected:{}:{handle}", record.source_handle));
+    }
+    for handle in &record.rivals.observed {
+        parts.push(format!("rival_observed:{}:{handle}", record.source_handle));
+    }
     for handle in &record.rivals.omitted {
         parts.push(format!("rival_omitted:{}:{handle}", record.source_handle));
     }
