@@ -2369,6 +2369,7 @@ impl ProcessExecutionGateway {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn run_process_start<P: ProcessStartPorts>(
     ports: &P,
     owner: &ProcessOwnerBinding,
