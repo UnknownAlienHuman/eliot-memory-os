@@ -780,13 +780,8 @@ fn bind_task_selection_to_envelope(
     record: &TaskRecord,
     selection: &TaskSelectionAdmissionBinding,
 ) -> Result<(), TaskLifecycleError> {
-    bind_task_selection_evidence_to_envelope(
-        envelope,
-        identity,
-        record.task_id.as_str(),
-        selection,
-    )
-    .map_err(TaskLifecycleError::Composition)
+    bind_task_selection_evidence_to_envelope(envelope, identity, record.task_id.as_str(), selection)
+        .map_err(TaskLifecycleError::Composition)
 }
 
 /// Adds the existing task-selection evidence contract to a canonical
@@ -799,9 +794,7 @@ pub(crate) fn bind_task_selection_evidence_to_envelope(
     selection: &TaskSelectionAdmissionBinding,
 ) -> Result<(), CompositionError> {
     let evidence = selection.evidence();
-    evidence
-        .validate()
-        .map_err(CompositionError::from)?;
+    evidence.validate().map_err(CompositionError::from)?;
     let fence = &identity.request.state_fence;
     if identity
         .request
