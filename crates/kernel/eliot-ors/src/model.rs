@@ -7781,6 +7781,10 @@ pub struct HostRequestApplicationBinding {
     /// Exact original authenticated host-peer receipt, independently retained
     /// from the semantic application origin selected by Governor.
     pub host_peer_admission_receipt: Value,
+    /// Exact original Kernel activation ticket, retained so consumers can
+    /// join the inert workspace selector and request identity to the peer
+    /// receipt without reconstructing them.
+    pub source_activation_ticket: Value,
     /// Exact retained activation result digest.
     pub activation_result_sha256: Option<String>,
     /// P07 owner revision captured by the admission owner.
@@ -7847,6 +7851,7 @@ impl HostRequestApplicationBinding {
                 reason: "the exact original host-peer receipt must be retained as an object",
             });
         }
+        self.validate_source_activation_ticket()?;
         if let Some(digest) = &self.activation_result_sha256 {
             validate_digest(digest, "host_request_activation_result_sha256")?;
         }
@@ -7860,6 +7865,55 @@ impl HostRequestApplicationBinding {
             validate_text(session_ref.as_str(), "host_request_resolved_session_ref")?;
         }
         self.validate_activation_projection()?;
+        Ok(())
+    }
+
+    fn validate_source_activation_ticket(&self) -> Result<(), OrsError> {
+        let Some(ticket_object) = self.source_activation_ticket.as_object() else {
+            return Err(OrsError::InvalidField {
+                field: "host_request_source_activation_ticket",
+                reason: "the exact original activation ticket must be retained as an object",
+            });
+        };
+        let ticket_digest = ticket_object
+            .get("ticket_sha256")
+            .and_then(Value::as_str)
+            .ok_or(OrsError::InvalidField {
+                field: "host_request_source_activation_ticket_digest",
+                reason: "the original ticket digest is required",
+            })?;
+        validate_digest(ticket_digest, "host_request_source_activation_ticket_digest")?;
+        let mut unsigned_ticket = self.source_activation_ticket.clone();
+        let unsigned_object = unsigned_ticket
+            .as_object_mut()
+            .ok_or(OrsError::PayloadIntegrityMismatch)?;
+        unsigned_object.insert("ticket_sha256".to_owned(), Value::String(String::new()));
+        let bytes = canonical_json_bytes(&unsigned_ticket)
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        if sha256_hex(&bytes) != ticket_digest
+            || ticket_object
+                .get("peer_admission_receipt")
+                != Some(&self.host_peer_admission_receipt)
+            || ticket_object
+                .get("peer_admission_receipt_sha256")
+                .and_then(Value::as_str)
+                != self
+                    .host_peer_admission_receipt
+                    .get("receipt_sha256")
+                    .and_then(Value::as_str)
+            || ticket_object.get("connection_id").and_then(Value::as_str)
+                != self
+                    .host_peer_admission_receipt
+                    .get("connection_id")
+                    .and_then(Value::as_str)
+            || ticket_object.get("state_fence")
+                != Some(
+                    &serde_json::to_value(&self.state_fence)
+                        .map_err(|error| OrsError::Encoding(error.to_string()))?,
+                )
+        {
+            return Err(OrsError::FenceMismatch);
+        }
         Ok(())
     }
 
