@@ -50,10 +50,10 @@ use eliot_protocol::{
     MAINTENANCE_TRIGGER_WIRE_ID, MAINTENANCE_TRIGGER_WIRE_VERSION, MaintenanceTriggerAck,
     MaintenanceTriggerClaim, MaintenanceTriggerContentRef, MaintenanceTriggerDecisionReceipt,
     MaintenanceTriggerDisposition, MaintenanceTriggerGap, MaintenanceTriggerGapKind,
-    MaintenanceTriggerIntakeReceipt, MaintenanceTriggerPayloadRef, MaintenanceTriggerPendingSummary,
-    MaintenanceTriggerPosition, MaintenanceTriggerRecord, MaintenanceTriggerRevocation,
-    MaintenanceTriggerRoute, MaintenanceTriggerRouteGrant, MaintenanceTriggerRoutingClass,
-    MaintenanceTriggerSourceEvent, ProtocolError,
+    MaintenanceTriggerIntakeReceipt, MaintenanceTriggerPayloadRef,
+    MaintenanceTriggerPendingSummary, MaintenanceTriggerPosition, MaintenanceTriggerRecord,
+    MaintenanceTriggerRevocation, MaintenanceTriggerRoute, MaintenanceTriggerRouteGrant,
+    MaintenanceTriggerRoutingClass, MaintenanceTriggerSourceEvent, ProtocolError,
 };
 use thiserror::Error;
 
@@ -1919,9 +1919,7 @@ impl MaintenanceTriggerProtectedRouteError {
     #[must_use]
     pub fn trigger_id(&self) -> &str {
         match self {
-            Self::Shape { trigger_id, .. } | Self::Classification { trigger_id, .. } => {
-                trigger_id
-            }
+            Self::Shape { trigger_id, .. } | Self::Classification { trigger_id, .. } => trigger_id,
         }
     }
 }
@@ -1976,12 +1974,12 @@ pub fn select_protected_route_deliveries(
 ) -> Result<Vec<ProtectedRouteAssignment>, MaintenanceTriggerProtectedRouteError> {
     let mut assignments: Vec<ProtectedRouteAssignment> = Vec::new();
     for record in records {
-        record.validate().map_err(|source| {
-            MaintenanceTriggerProtectedRouteError::Shape {
+        record
+            .validate()
+            .map_err(|source| MaintenanceTriggerProtectedRouteError::Shape {
                 trigger_id: record.trigger_id.clone(),
                 source: Box::new(source),
-            }
-        })?;
+            })?;
         if record.routing_class == MaintenanceTriggerRoutingClass::Ordinary {
             // Ordinary pending debt never gains protected visibility: it
             // stays on the bounded pending set under its existing policy
