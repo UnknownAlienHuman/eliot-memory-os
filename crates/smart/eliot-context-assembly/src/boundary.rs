@@ -12,7 +12,10 @@
 //! order. The role/provider/atom sort applied later during rendering is
 //! presentation order and is deliberately not recorded as source order.
 
-use std::collections::BTreeMap;
+pub use eliot_context_contracts::{
+    assembly_boundary_limits, boundary_binding_digest, read_back_boundaries,
+    verify_boundary_binding,
+};
 
 use eliot_context_contracts::{
     AdmissionDisposition, AdmittedAtom, AdmittedContextSet, AtomRepresentation,
@@ -20,32 +23,16 @@ use eliot_context_contracts::{
     BoundaryDisposition, BoundaryDispositionRecord, BoundaryMember, BoundaryMemberCoverage,
     BoundaryMemberOrigin, BoundaryMemberReference, BoundaryMemberRelation, BoundaryMemberRole,
     BoundaryMetadataEnvelope, BoundaryMetadataSet, BoundaryPrecision, BoundaryRecovery,
-    BoundaryTransformRelation, BoundaryTransformerRevision, BoundaryUnitKind,
-    BoundaryValidationLimits, ContextBinding, ContextError, ContextRecipe, RenderedAtom,
+    BoundaryTransformRelation, BoundaryTransformerRevision, BoundaryUnitKind, ContextBinding,
+    ContextError, ContextRecipe,
 };
-use eliot_contracts::{ArtifactId, ContractVersion, canonical_json_bytes, sha256_hex};
-use serde::Serialize;
+use eliot_contracts::{ArtifactId, ContractVersion, sha256_hex};
 
 /// Stable transformer identity for the A-18 admission-to-render projection.
 pub const BOUNDARY_ASSEMBLY_TRANSFORMER_ID: &str = "context.assembly.render";
 
 /// Contract revision of the A-18 boundary projection.
 pub const BOUNDARY_ASSEMBLY_TRANSFORMER_REVISION: ContractVersion = ContractVersion::new(1, 0, 0);
-
-/// Deterministic caller-supplied resource bounds for one boundary projection.
-///
-/// Assembly owns these values because it is the projection site; the contract still
-/// enforces them, and rejects zero limits itself rather than trusting this site.
-pub fn assembly_boundary_limits() -> BoundaryValidationLimits {
-    BoundaryValidationLimits {
-        max_units: 4096,
-        max_depth: 32,
-        max_members_per_unit: 1024,
-        max_total_members: 262_144,
-        max_references_per_unit: 256,
-        max_metadata_bytes: 8 * 1024 * 1024,
-    }
-}
 
 /// Project one admitted set into a validated, digest-bound boundary metadata set.
 ///
@@ -247,154 +234,6 @@ fn batch_envelope(
         transformer: Some(transformer_revision(recipe)),
     }
 }
-
-/// Reassemble a packed boundary set and prove it still describes this view.
-///
-/// Three independent sides meet here, and no two of them come from the same
-/// producer: the packed bytes, the binding value recorded before transport
-/// (which incorporates the upstream admission receipt digest), and this crate's
-/// own reconstruction from the rendered atoms it holds. A substituted envelope, a
-/// reordered member, a duplicated unit, or a lost unit therefore fails on the
-/// side that did not produce it. Lengths are compared as well as memberships,
-/// because two copies of one identity collapse in a set and a duplicate would
-/// otherwise go unnoticed.
-pub fn read_back_boundaries(
-    packed: &[u8],
-    recorded_binding: &str,
-    admitted_receipt_digest: &str,
-    output_digest: &str,
-    rendered: &[RenderedAtom],
-) -> Result<BoundaryMetadataSet, ContextError> {
-    let reconstructed = BoundaryMetadataSet::unpack(packed, &assembly_boundary_limits())?;
-    verify_boundary_binding(
-        recorded_binding,
-        admitted_receipt_digest,
-        output_digest,
-        &reconstructed,
-    )?;
-    verify_against_rendered(&reconstructed, rendered)?;
-    Ok(reconstructed)
-}
-
-/// Check that a reassembled set describes exactly the rendered units.
-fn verify_against_rendered(
-    boundaries: &BoundaryMetadataSet,
-    rendered: &[RenderedAtom],
-) -> Result<(), ContextError> {
-    let mut expected: BTreeMap<&ArtifactId, &RenderedAtom> = BTreeMap::new();
-    for atom in rendered {
-        if expected.insert(&atom.atom_id, atom).is_some() {
-            return Err(ContextError::Duplicate("boundary.readback.rendered_ids"));
-        }
-    }
-    if expected.is_empty() {
-        return if boundaries.units.is_empty() {
-            Ok(())
-        } else {
-            Err(ContextError::SelectionIntegrityMismatch)
-        };
-    }
-
-    let mut seen: BTreeMap<&ArtifactId, &BoundaryMetadataEnvelope> = BTreeMap::new();
-    for unit in &boundaries.units {
-        if unit.unit_kind != BoundaryUnitKind::Unit {
-            continue;
-        }
-        if seen.insert(&unit.unit_id, unit).is_some() {
-            return Err(ContextError::Duplicate("boundary.readback.unit_ids"));
-        }
-    }
-    if seen.len() != expected.len() {
-        return Err(ContextError::SelectionIntegrityMismatch);
-    }
-
-    let mut orders: Vec<u64> = Vec::with_capacity(seen.len());
-    for (unit_id, atom) in &expected {
-        let unit = seen
-            .get(unit_id)
-            .ok_or(ContextError::SelectionIntegrityMismatch)?;
-        let source = unit
-            .source
-            .as_ref()
-            .ok_or(ContextError::MissingField("boundary.readback.source"))?;
-        if source.snapshot_id != atom.source_id
-            || source.revision != atom.source_revision
-            || source.content_sha256 != atom.source_digest
-        {
-            return Err(ContextError::IdentityConflict);
-        }
-        let order = unit
-            .source_order
-            .ok_or(ContextError::MissingField("boundary.readback.source_order"))?;
-        orders.push(order);
-    }
-    orders.sort_unstable();
-    orders.dedup();
-    if orders.len() != expected.len() || orders.first() != Some(&0) {
-        return Err(ContextError::SelectionIntegrityMismatch);
-    }
-    Ok(())
-}
-
-/// Bind boundary metadata into one output identity checked against the admission
-/// receipt, the rendered output identity, and the boundary set's own recorded
-/// digest.
-///
-/// The three inputs are produced by different owners: the admission receipt is
-/// sealed upstream, the output digest is computed over the rendered atoms, and the
-/// boundary digest is recorded over the envelopes and ordered member relations.
-/// This binding is what makes altered boundary metadata change the bound output
-/// identity instead of being invisible to it.
-pub fn boundary_binding_digest(
-    admitted_receipt_digest: &str,
-    output_digest: &str,
-    boundaries: &BoundaryMetadataSet,
-) -> Result<String, ContextError> {
-    if boundaries.boundary_digest.is_empty() {
-        return Err(ContextError::MissingField("boundary.boundary_digest"));
-    }
-    if boundaries.canonical_digest()? != boundaries.boundary_digest {
-        return Err(ContextError::SelectionIntegrityMismatch);
-    }
-    let mut unsigned = boundaries.clone();
-    unsigned.boundary_digest = String::new();
-    let bytes = canonical_json_bytes(&BoundaryBindingPayload {
-        schema_version: BOUNDARY_METADATA_SCHEMA_REVISION,
-        admitted_receipt_digest,
-        output_digest,
-        boundaries: &unsigned,
-    })
-    .map_err(|_| ContextError::InvalidField("boundary.binding_payload"))?;
-    Ok(sha256_hex(&bytes))
-}
-
-/// Reject a binding digest that does not match what this assembly actually holds.
-///
-/// The digest is recomputed from the current admitted receipt, output identity and
-/// boundary payload, so an altered envelope, a reordered member, or substituted
-/// source revision fails here rather than passing a self-consistent but wrong
-/// value.
-pub fn verify_boundary_binding(
-    expected_digest: &str,
-    admitted_receipt_digest: &str,
-    output_digest: &str,
-    boundaries: &BoundaryMetadataSet,
-) -> Result<(), ContextError> {
-    let derived = boundary_binding_digest(admitted_receipt_digest, output_digest, boundaries)?;
-    if derived != expected_digest {
-        return Err(ContextError::SelectionIntegrityMismatch);
-    }
-    Ok(())
-}
-
-#[derive(Serialize)]
-struct BoundaryBindingPayload<'a> {
-    schema_version: ContractVersion,
-    admitted_receipt_digest: &'a str,
-    output_digest: &'a str,
-    boundaries: &'a BoundaryMetadataSet,
-}
-
 /// The exact input-to-output member relation this one transform emitted.
 fn batch_transform(
     recipe: &ContextRecipe,

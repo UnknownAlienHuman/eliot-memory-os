@@ -1,78 +1,15 @@
 //! Public assembly operation and its explicit phases.
 
 use eliot_context_contracts::{
-    ActiveUnderstandingView, AdmittedContextSet, ContextError, ContextRecipe, MeasurementStatus,
-    QualityOperation, QualityRefusal, QualityRefusalKind, QualityScorecard,
-    SerializedContextMeasurement,
+    ActiveUnderstandingView, ActiveUnderstandingViewResult, AdmittedContextSet, AssemblyPolicy,
+    ContextError, ContextRecipe, QualityOperation, QualityRefusal, QualityRefusalKind,
+    QualityScorecard, SerializedContextMeasurement,
 };
 
 use crate::{AssemblyError, boundary, bounds, measurement, render};
 
 /// Stable local ordering revision for the A-15 canonical rendered payload.
 pub const ASSEMBLY_ORDERING_REVISION: &str = "a18.role-provider-atom.v1";
-
-/// Caller-owned immutable parameters for one A-18 projection.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AssemblyPolicy {
-    /// Digest of the state fence used by the admission decision.
-    pub fence_digest: String,
-    /// Maximum canonical rendered payload bytes accepted by this route.
-    pub max_serialized_bytes: u64,
-    /// Required serializer identity for the injected measurement.
-    pub serializer_id: String,
-    /// Required serializer revision for the injected measurement.
-    pub serializer_version: String,
-    /// Required serializer-options digest.
-    pub serializer_options_digest: String,
-    /// Required route identity.
-    pub route_id: String,
-    /// Required model/tokenizer route identity.
-    pub model_id: String,
-    /// Measurement status qualified for this route; this prototype supports
-    /// only exact UTF-8 bytes, while tokenizer/STU observations remain data.
-    pub measurement_status: MeasurementStatus,
-}
-
-impl AssemblyPolicy {
-    fn validate(&self) -> Result<(), AssemblyError> {
-        validate_digest(&self.fence_digest, "assembly.fence_digest")?;
-        if self.max_serialized_bytes == 0 {
-            return Err(AssemblyError::Bounds("assembly.max_serialized_bytes"));
-        }
-        for (value, field) in [
-            (&self.serializer_id, "assembly.serializer_id"),
-            (&self.serializer_version, "assembly.serializer_version"),
-            (&self.route_id, "assembly.route_id"),
-            (&self.model_id, "assembly.model_id"),
-        ] {
-            if value.len() > bounds::MAX_TEXT_BYTES {
-                return Err(AssemblyError::Bounds(field));
-            }
-            if value.trim().is_empty() || value.chars().any(char::is_control) {
-                return Err(AssemblyError::Contract(ContextError::InvalidField(field)));
-            }
-        }
-        validate_digest(
-            &self.serializer_options_digest,
-            "assembly.serializer_options_digest",
-        )?;
-        if self.measurement_status != MeasurementStatus::ExactUtf8 {
-            return Err(AssemblyError::Contract(ContextError::UnknownMeasurement));
-        }
-        Ok(())
-    }
-}
-
-fn validate_digest(value: &str, field: &'static str) -> Result<(), AssemblyError> {
-    if value.len() != 64
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
-        return Err(AssemblyError::Contract(ContextError::InvalidDigest(field)));
-    }
-    Ok(())
-}
 
 /// Builds and self-validates the selection proof for one assembled view.
 ///
@@ -338,69 +275,4 @@ fn validate_recipe_membership(
         }
     }
     Ok(())
-}
-
-/// Complete projection result retaining the exact A-15 accounting evidence
-/// that the compact view schema represents only through omission identities.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ActiveUnderstandingViewResult {
-    /// Canonical rendered candidate view.
-    pub view: ActiveUnderstandingView,
-    /// Exact admitted records, admissions, floor and economy retained for reconstruction.
-    pub admitted: AdmittedContextSet,
-    /// Exact bytes handed to the measurement callback.
-    pub serialized_bytes: Vec<u8>,
-    /// Boundary metadata for every rendered unit, plus the exact member relation.
-    ///
-    /// This is the round-trip half of the assembly result: readback can compare the
-    /// declared source identities, per-unit scope/fence and admitted source order
-    /// against what it reconstructed, instead of trusting a concatenated string.
-    /// Its recorded digest is validated against the payload held, and
-    /// `boundary_binding` binds it into the output identity together with the
-    /// upstream admission receipt digest.
-    pub boundaries: eliot_context_contracts::BoundaryMetadataSet,
-    /// Exact digest binding the admission receipt, the rendered output identity,
-    /// and the boundary metadata into one output identity.
-    ///
-    /// A consumer re-checks it with `ActiveUnderstandingViewResult::verify_boundaries`
-    /// rather than trusting the field: it is recomputed from what the consumer holds.
-    pub boundary_binding: String,
-}
-
-impl ActiveUnderstandingViewResult {
-    /// Re-check this result's boundary binding against the values it holds.
-    ///
-    /// The digest is recomputed from the retained admission receipt, the rendered
-    /// output identity, and the boundary payload held here, so a substituted
-    /// envelope, a reordered member, or a foreign source revision fails even when
-    /// each object would still validate on its own.
-    pub fn verify_boundaries(&self) -> Result<(), AssemblyError> {
-        boundary::verify_boundary_binding(
-            &self.boundary_binding,
-            &self.admitted.economy.receipt_digest,
-            &self.view.output_digest,
-            &self.boundaries,
-        )?;
-        self.boundaries
-            .validate(&boundary::assembly_boundary_limits())?;
-        self.round_trip_boundary_bytes()
-    }
-
-    /// Round-trips the packed bytes against the binding recorded at production.
-    ///
-    /// `boundary_binding` was recorded before any transport and is bound to the
-    /// upstream admission receipt, so the comparison is against the value the
-    /// owner admitted - not against a digest derived from the bytes being read
-    /// back, which would agree with itself.
-    fn round_trip_boundary_bytes(&self) -> Result<(), AssemblyError> {
-        boundary::read_back_boundaries(
-            &self.boundaries.pack()?,
-            &self.boundary_binding,
-            &self.admitted.economy.receipt_digest,
-            &self.view.output_digest,
-            &self.view.rendered,
-        )
-        .map(|_| ())
-        .map_err(AssemblyError::Contract)
-    }
 }

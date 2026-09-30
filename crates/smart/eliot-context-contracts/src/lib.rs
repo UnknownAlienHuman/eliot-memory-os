@@ -9,6 +9,7 @@
 
 mod admission;
 mod admission_input;
+mod assembly_output;
 mod atom;
 mod boundary;
 mod canonical_projections;
@@ -26,6 +27,11 @@ mod reactive_input;
 mod reactive_session;
 mod readback;
 mod view;
+
+pub use assembly_output::{
+    ActiveUnderstandingViewResult, AssemblyError, AssemblyPolicy, assembly_boundary_limits,
+    boundary_binding_digest, read_back_boundaries, verify_boundary_binding,
+};
 
 pub use admission::{
     AdmissionRecord, AdmittedContextSet, ContextCandidateSet, DecisionSafetyFloor,
