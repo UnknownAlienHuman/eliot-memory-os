@@ -1386,7 +1386,12 @@ impl KernelBackupRestore {
         receipt
             .validate()
             .map_err(KernelRestoreError::TargetFailed)?;
-        let suspended = historical_authority(bundle)?;
+        // The caller's own classification is preserved: this site has always
+        // reported a bad ORS suspension as `ArchiveInvalid`, so the read of the
+        // archive's two mandatory fences keeps that class rather than widening
+        // to the generic target failure.
+        let suspended = historical_authority(bundle)
+            .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
         let evidence = target_impl
             .final_evidence
             .clone()
@@ -1675,16 +1680,6 @@ fn require_operational_validation(evidence: &RestoreEvidence) -> Result<(), Kern
     Ok(())
 }
 
-fn suspended_entries(
-    bundle: &BackupBundle,
-) -> Result<Vec<RestoreHistoricalAuthority>, KernelRestoreError> {
-    match &bundle.ors_snapshot {
-        Some(snapshot) => suspended_recovery_entries(snapshot)
-            .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string())),
-        None => Ok(Vec::new()),
-    }
-}
-
 /// Reads BOTH mandatory recovery fences of the archive into the evidence's
 /// historical authority list.
 ///
@@ -1719,13 +1714,17 @@ fn suspended_entries(
 /// read is preservation and reconciliation is the owner's.
 fn historical_authority(
     bundle: &BackupBundle,
-) -> Result<Vec<RestoreHistoricalAuthority>, KernelRestoreError> {
-    let mut entries = suspended_entries(bundle)?;
+) -> Result<Vec<RestoreHistoricalAuthority>, BackupError> {
+    // The ORS half is the archive's own `suspended_recovery_entries` read, the
+    // one this site performed inline before the Watchdog half was added; the
+    // `BackupError` is what that call site already raised, so its typed
+    // classification is unchanged here.
+    let mut entries = match &bundle.ors_snapshot {
+        Some(snapshot) => suspended_recovery_entries(snapshot)?,
+        None => Vec::new(),
+    };
     if let Some(fence) = bundle.watchdog_spool.as_ref() {
-        entries.extend(
-            suspended_watchdog_signal_entries(fence)
-                .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?,
-        );
+        entries.extend(suspended_watchdog_signal_entries(fence)?);
     }
     Ok(entries)
 }
@@ -3448,7 +3447,7 @@ impl<'a> KernelRestoreTarget<'a> {
             owner_epoch: None,
             reconciliation_denominator: None,
             operational_validation: None,
-            historical_authority: historical_authority(bundle).map_err(kernel_to_backup)?,
+            historical_authority: historical_authority(bundle)?,
             archive_disposition: RestoreArchiveDisposition {
                 disposition: RestoreArchiveDispositionKind::Current,
                 compatibility_ref: "ecxf-1-current".to_owned(),
