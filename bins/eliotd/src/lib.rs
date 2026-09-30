@@ -4205,7 +4205,7 @@ impl DaemonComposition {
     /// reconstruct it from the admitted scan or readiness evidence.
     /// Governor re-reads the durable lease and terminal receipt and checks the
     /// installation, binding digest, current fence, expiry, and retained
-    /// WorkScope before projecting the surface. The returned view carries the
+    /// `WorkScope` before projecting the surface. The returned view carries the
     /// terminal readiness state and its smallest missing question for the live
     /// Agent/Human activation response. No readiness value is inferred from the
     /// activation ticket, directory name, or question text.
