@@ -436,6 +436,7 @@ fn mutation_failure_context(request: &Request) -> Option<StoreFailureIdentityCon
         | Request::Receipt { .. }
         | Request::RevisionHeads { .. }
         | Request::OrderingHeads { .. }
+        | Request::OrderingHeadReadbacks { .. }
         | Request::ValidationSnapshot
         | Request::Recovery { .. } => None,
     }
@@ -693,6 +694,12 @@ impl StoreDispatchBackend for StoreComposition {
                 Ok(heads) => Response::OrderingHeads { heads },
                 Err(error) => map_store_error(error, StoreFailureIdentityContext::default()),
             },
+            Request::OrderingHeadReadbacks { scopes } => {
+                match self.ordering_head_readbacks(scopes).await {
+                    Ok(heads) => Response::OrderingHeadReadbacks { heads },
+                    Err(error) => map_store_error(error, StoreFailureIdentityContext::default()),
+                }
+            }
             Request::ValidationSnapshot => match self.validation_snapshot().await {
                 Ok(snapshot) => Response::ValidationSnapshot { snapshot },
                 Err(error) => map_store_error(error, StoreFailureIdentityContext::default()),

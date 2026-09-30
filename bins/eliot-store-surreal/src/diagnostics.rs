@@ -687,6 +687,7 @@ impl BridgeIdentity {
             | Request::Recovery { .. }
             | Request::RevisionHeads { .. }
             | Request::OrderingHeads { .. }
+            | Request::OrderingHeadReadbacks { .. }
             | Request::ValidationSnapshot => Self::new(),
         }
     }
@@ -722,6 +723,7 @@ impl BridgeIdentity {
             | Response::Named { .. }
             | Response::RevisionHeads { .. }
             | Response::OrderingHeads { .. }
+            | Response::OrderingHeadReadbacks { .. }
             | Response::ValidationSnapshot { .. }
             | Response::Recovery { .. }
             | Response::DreamerJob { .. }
@@ -998,6 +1000,7 @@ pub fn classify_response(response: &Response) -> RequestOutcome {
         | Response::Named { .. }
         | Response::RevisionHeads { .. }
         | Response::OrderingHeads { .. }
+        | Response::OrderingHeadReadbacks { .. }
         | Response::ValidationSnapshot { .. }
         | Response::Recovery { .. }
         | Response::DreamerJob { .. } => RequestOutcome::ReadCompleted,
@@ -1195,6 +1198,7 @@ pub fn emit_dispatch_outcome(
         | Response::Named { .. }
         | Response::RevisionHeads { .. }
         | Response::OrderingHeads { .. }
+        | Response::OrderingHeadReadbacks { .. }
         | Response::ValidationSnapshot { .. }
         | Response::Recovery { .. }
         | Response::DreamerJob { .. }
@@ -1259,6 +1263,7 @@ pub fn operation_name(request: &Request) -> &'static str {
         Request::Backup { .. } => "backup",
         Request::RevisionHeads { .. } => "revision_heads",
         Request::OrderingHeads { .. } => "ordering_heads",
+        Request::OrderingHeadReadbacks { .. } => "ordering_head_readbacks",
         Request::ValidationSnapshot => "validation_snapshot",
         Request::Recovery { .. } => "recovery",
         Request::InitializeGenesis { .. } => "initialize_genesis",
@@ -1288,6 +1293,7 @@ pub fn dispatch_boundary(request: &Request) -> BridgeBoundary {
         | Request::Named { .. }
         | Request::RevisionHeads { .. }
         | Request::OrderingHeads { .. }
+        | Request::OrderingHeadReadbacks { .. }
         | Request::ValidationSnapshot => BridgeBoundary::Dispatch,
     }
 }
