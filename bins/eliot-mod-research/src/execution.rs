@@ -302,18 +302,68 @@ impl ProviderBridge {
         &self.executor
     }
 
+    /// Re-proves that a stored operation is still the admitted provider process
+    /// before this runner observes, cancels, or reconciles it.
+    ///
+    /// The lifecycle operations below act on a **physical** process tree, so the
+    /// operation identity alone is not authority to touch one: a stale
+    /// generation, a retargeted request, or a record that has been replaced
+    /// under the same operation name would all still answer to that name. This
+    /// therefore compares the executor's own stored record against the sealed
+    /// binding of this attempt and against the admission's live epoch and
+    /// generation, and additionally requires the observed process identity to
+    /// still be the one the admitted artifact digest named — the executor's
+    /// `executable_sha256` is measured from the running image, so a replaced
+    /// binary at the same path is caught here even though its path is
+    /// unchanged. An observation with no identity at all is refused rather than
+    /// treated as a match.
+    ///
+    /// `expected_digest` is the invocation digest the caller sealed for this
+    /// attempt before the executor handoff. Nothing is recomputed and nothing
+    /// defaults: a missing or mismatching field is a refusal.
+    fn prove_operation_ownership(
+        &self,
+        admission: &ProviderAdmission,
+        operation: &OperationId,
+        expected_digest: &str,
+        view: &eliot_process::ProcessExecutionView,
+    ) -> Result<(), BridgeError> {
+        let Some(identity) = view.identity() else {
+            return Err(BridgeError::NotAdmitted {
+                reason: "stored operation carries no observed process identity to own",
+            });
+        };
+        if view.operation_id() != operation
+            || operation != admission.operation_id()
+            || view.request_digest() != expected_digest
+            || view.fence().generation() != admission.process_generation()
+            || !view
+                .fence()
+                .authority_epoch()
+                .is_same_authority(admission.epoch())
+            || identity.executable_sha256() != admission.bridge().executable_sha256()
+        {
+            return Err(BridgeError::NotAdmitted {
+                reason: "stored operation no longer matches the admitted identity or artifact",
+            });
+        }
+        Ok(())
+    }
+
     /// Executes one admitted request through the shared governed contour.
     ///
     /// Order (all fail-closed): request/admission binding, submit-binding
     /// projection, port minting, minted-request re-validation (artifact,
-    /// operation, generation, epoch, no ambient environment inheritance,
-    /// delivered submit binding, and the delivered binding's own admitted
-    /// identities re-proved against the admission), executor start with receipt
-    /// checks, terminal wait with deadline, stream readback with immutable
-    /// evidence materialization, typed ack decode. A provider terminal state
-    /// that cannot be classified returns [`ProviderOutcome::Unknown`] with the
-    /// evidence preserved, and must be reconciled by operation identity before
-    /// any retry.
+    /// operation, generation, epoch, no ambient environment inheritance, no
+    /// credential attachment, delivered submit binding, and the delivered
+    /// binding's own admitted identities re-proved against the admission),
+    /// executor start with receipt checks including the executor-observed
+    /// process identity, terminal wait with an ownership proof on every
+    /// observation, deadline cancellation only on an owned operation, stream
+    /// readback with immutable evidence materialization, typed ack decode. A
+    /// provider terminal state that cannot be classified returns
+    /// [`ProviderOutcome::Unknown`] with the evidence preserved, and must be
+    /// reconciled by operation identity before any retry.
     pub fn execute(
         &self,
         admission: &ProviderAdmission,
@@ -331,7 +381,7 @@ impl ProviderBridge {
             &submit_binding_sha256,
             process_request,
         )?;
-        let view = self.await_terminal(&bound, self.admitted_wait_bound(admission))?;
+        let view = self.await_terminal(admission, &bound, self.admitted_wait_bound(admission))?;
         self.finish_terminal(bound, &view)
     }
 
@@ -436,9 +486,18 @@ impl ProviderBridge {
                 source: Box::new(source),
             },
         )?;
+        // The receipt proves a *request* was accepted; it does not by itself
+        // prove which process now runs. Two measured facts close that gap and
+        // are compared by value against this admission: the executable digest
+        // the executor measured from the resumed image, and the image identity
+        // the admitted artifact digest named. A replaced binary at the same
+        // approved path, or a child that answers under a foreign image cell, is
+        // refused here rather than treated as this operation's provider.
         if receipt.operation_id() != &operation
             || receipt.request_digest() != digest
             || receipt.accepted_generation() != generation
+            || receipt.identity().executable_sha256() != admission.bridge().executable_sha256()
+            || receipt.identity().image_id().as_str() != admission.module_id().as_str()
         {
             // The operation may already exist despite a missing or mismatched
             // receipt. The same context identifies it for reconciliation; it
@@ -493,6 +552,7 @@ impl ProviderBridge {
     /// event and never as the loss of what was already observed.
     fn await_terminal(
         &self,
+        admission: &ProviderAdmission,
         bound: &BoundOperation,
         wait_bound: Duration,
     ) -> Result<eliot_process::ProcessExecutionView, BridgeError> {
@@ -505,6 +565,10 @@ impl ProviderBridge {
                     reason: "executor observation does not preserve the bound request",
                 });
             }
+            // The deadline arm below cancels a live process tree, so ownership is
+            // re-proven on the observation the kill would act on rather than
+            // inherited from start time.
+            self.prove_operation_ownership(admission, &bound.operation, &bound.digest, &view)?;
             if view.lifecycle().is_terminal() {
                 return Ok(view);
             }
@@ -514,7 +578,7 @@ impl ProviderBridge {
                 // erase the deadline, and neither may erase a receipt the other
                 // already obtained.
                 let mut undischarged = Vec::new();
-                let cancellation = match block_on(self.executor.cancel(bound.operation.clone())) {
+                let cancellation = match self.cancel_bound_operation(bound) {
                     Ok(receipt) => CancellationOutcome::Confirmed(Box::new(
                         CancellationEvidence::from_receipt(&receipt),
                     )),
@@ -676,50 +740,74 @@ impl ProviderBridge {
         })
     }
 
-    /// Observes the stored operation record for the bound operation identity.
+    /// Cancels the operation this wait already proved it owns.
     ///
-    /// Used before a cancellation so ownership is proven at cancel time, not
-    /// only at start time: a stored operation that no longer answers to the
-    /// admitted identity or Authority Epoch is refused rather than cancelled.
-    pub fn observe_bound_operation(
+    /// The deadline arm has just compared the observation it acts on against the
+    /// sealed binding and the live admission, so this reaches the executor only
+    /// on an owned operation.
+    fn cancel_bound_operation(
         &self,
-    ) -> Result<eliot_process::ProcessExecutionView, BridgeError> {
-        let operation = self
-            .bound_identity
-            .lock()
-            .map_err(|_| BridgeError::EvidenceIncomplete {
-                reason: "bound operation identity lock poisoned",
-            })?
-            .clone()
-            .ok_or(BridgeError::NotAdmitted {
-                reason: "no started operation is bound to this bridge",
-            })?;
-        self.observe_operation(&operation)
+        bound: &BoundOperation,
+    ) -> Result<CancellationReceipt, BridgeError> {
+        block_on(self.executor.cancel(bound.operation.clone())).map_err(BridgeError::Process)
     }
 
-    /// Observes an exact `ProcessExecutor` operation identity supplied by its
-    /// admitted attempt owner. This also covers a start-response loss, where
-    /// runner binding fields correctly remain uninstalled.
+    /// Observes an exact `ProcessExecutor` operation identity **after** proving
+    /// this attempt owns the stored process behind it.
+    ///
+    /// `expected_digest` is the invocation digest this attempt sealed before the
+    /// executor handoff, taken from its own retained attempt owner. It covers a
+    /// start-response loss too, where the runner's bound fields correctly remain
+    /// uninstalled but the operation may exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BridgeError::NotAdmitted`] when the stored record no longer
+    /// answers to the admitted operation identity, request digest, process
+    /// generation, Authority Epoch, or artifact digest, or when it carries no
+    /// observed process identity to compare at all.
     pub fn observe_operation(
         &self,
+        admission: &ProviderAdmission,
         operation: &OperationId,
+        expected_digest: &str,
     ) -> Result<eliot_process::ProcessExecutionView, BridgeError> {
-        block_on(self.executor.inspect(operation.clone())).map_err(BridgeError::Process)
+        let view = block_on(self.executor.inspect(operation.clone()))
+            .map_err(BridgeError::Process)?;
+        self.prove_operation_ownership(admission, operation, expected_digest, &view)?;
+        Ok(view)
     }
 
-    /// Requests cancellation of the bound operation through the executor.
+    /// Requests cancellation of the admitted operation, proving ownership first.
+    ///
+    /// Cancellation stops a live process tree, so it is refused unless the
+    /// executor's own stored record still answers to this attempt's sealed
+    /// binding, the admitted generation and epoch, and the admitted artifact
+    /// digest. This is the single cancel entry point: there is no path that
+    /// reaches the executor's `cancel` on an unproven operation.
     pub fn cancel_operation(
         &self,
-        operation: &eliot_process::OperationId,
+        admission: &ProviderAdmission,
+        operation: &OperationId,
+        expected_digest: &str,
     ) -> Result<CancellationReceipt, BridgeError> {
+        self.observe_operation(admission, operation, expected_digest)?;
         block_on(self.executor.cancel(operation.clone())).map_err(BridgeError::Process)
     }
 
-    /// Reconciles the bound operation's unknown external result.
+    /// Reconciles the admitted operation's unknown external result, proving
+    /// ownership first.
+    ///
+    /// Reconciliation adopts whatever the executor still holds for this
+    /// operation as the outcome of *this* attempt, so it carries the same
+    /// ownership proof as a cancel rather than trusting the operation name.
     pub fn reconcile_operation(
         &self,
-        operation: &eliot_process::OperationId,
+        admission: &ProviderAdmission,
+        operation: &OperationId,
+        expected_digest: &str,
     ) -> Result<ProcessEvidence, BridgeError> {
+        self.observe_operation(admission, operation, expected_digest)?;
         block_on(self.executor.reconcile(operation.clone())).map_err(BridgeError::Process)
     }
 }
@@ -794,8 +882,8 @@ pub fn build_submit_binding(
         executable_sha256: admission.bridge().executable_sha256().to_owned(),
         config_digest: admission.config_digest().to_owned(),
         protocol_digest: admission.protocol_digest().to_owned(),
-        module_id: admission.module_id().to_owned(),
-        module_generation_id: admission.module_generation_id().to_owned(),
+        module_id: admission.module_id().as_str().to_owned(),
+        module_generation_id: admission.module_generation_id().as_str().to_owned(),
         process_generation: admission.process_generation().get(),
         authority_epoch: admission.epoch().clone(),
         state_fence: admission.fence().clone(),
@@ -898,6 +986,16 @@ fn check_minted_request(
     if request.environment().inheritance() != EnvironmentInheritance::None {
         return Err(BridgeError::NotAdmitted {
             reason: "minted process request does not restrict environment inheritance",
+        });
+    }
+    // Credential attachment is refused here, before the executor is contacted,
+    // on the same evidence as the rest of the admission: a minted request
+    // carrying secret references is not this operation's admitted
+    // environment, and admitting it here would let a provider process receive a
+    // credential the admission never bound.
+    if !request.environment().secret_refs().is_empty() {
+        return Err(BridgeError::NotAdmitted {
+            reason: "minted process request attaches credentials this admission does not carry",
         });
     }
     if !carries_submit_binding(request, submit_binding_sha256) {

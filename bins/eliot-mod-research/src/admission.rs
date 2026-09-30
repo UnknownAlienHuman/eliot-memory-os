@@ -25,7 +25,9 @@
 //! Without it the delivered digest would be identical for two operations that
 //! differ in exactly those identities.
 
-use eliot_contracts::{ContractVersion, EpochId, StateFence, fences_match_exact};
+use eliot_contracts::{
+    CapabilityCellId, ContractVersion, EpochId, RuntimeBundleId, StateFence, fences_match_exact,
+};
 use eliot_kernel_service::{ResearchProviderDispatch, ResearchProviderDispatchReceipt};
 use eliot_process::{Generation, OperationId};
 use eliot_research_exchange_api::{DisclosureClass, ResearchQueryRequest};
@@ -68,13 +70,15 @@ impl AdmissionRefusal {
 ///   artifact/config/protocol digest triple next to the bridge executable
 ///   digest they accompany; they bind exact bytes, never a mutable tag.
 /// - `module_id` / `module_generation_id` are Module/Capability Registry
-///   evidence *references* (cf. `EliotdLiveSupervisionEvidence`): they
+///   evidence references (cf. `EliotdLiveSupervisionEvidence`), carried as the
+///   #13 registry's own [`CapabilityCellId`] and [`RuntimeBundleId`]: they
 ///   correlate the operation with a catalogued generation without granting
-///   authority or re-issuing admission. They are compared by value against the
-///   Kernel's own attested dispatch content, which is what makes them
-///   trustworthy as references; they are **not** yet resolved through a
-///   `CapabilityCellRegistry` record, because none naming the research-provider
-///   cell exists. See the ASSUMPTION note on [`ProviderAdmission::module_id`].
+///   authority or re-issuing admission, and they are the exact identities a
+///   generated `CapabilityCellRecord` and its proof-surface readback are keyed
+///   by. They are compared by value against the Kernel's own attested dispatch
+///   content, which is what makes them trustworthy as references. The generated
+///   research-provider cell *record* is still #13's to produce; see the note on
+///   [`ProviderAdmission::module_id`].
 /// - `inquiry_digest` / `denominator_digest` bind the frozen Researcher
 ///   inquiry and its exact source-role portfolio / coverage denominator. A
 ///   coverage or absence claim must name its scope, revision, and the method
@@ -94,8 +98,8 @@ pub struct ProviderAdmission {
     bridge: BridgeIdentity,
     config_digest: String,
     protocol_digest: String,
-    module_id: String,
-    module_generation_id: String,
+    module_id: CapabilityCellId,
+    module_generation_id: RuntimeBundleId,
     process_generation: Generation,
     epoch: EpochId,
     fence: StateFence,
@@ -149,15 +153,26 @@ impl ProviderAdmission {
         {
             return Err(AdmissionRefusal::MalformedDigest);
         }
-        let module_id = module_id.into();
-        let module_generation_id = module_generation_id.into();
+        // The two Module/Capability Registry references are carried as the #13
+        // registry's own typed identities — `CapabilityCellId` for the cell and
+        // `RuntimeBundleId` for the generation that executes it — not as free
+        // text. Their constructors are the registry's own fail-closed
+        // validators, so a blank or control-bearing reference is refused by the
+        // owner instead of by a second local shape check. This binds the process
+        // cell to the #13 proof surface: the admitted reference is exactly the
+        // spelling a generated `CapabilityCellRecord` and its
+        // `resolve_generation_via_registry` readback are keyed by, so the same
+        // identity that will be resolved for a proof entrypoint is the one
+        // sealed here.
+        let module_id =
+            CapabilityCellId::new(module_id).map_err(|_| AdmissionRefusal::MalformedText)?;
+        let module_generation_id = RuntimeBundleId::new(module_generation_id)
+            .map_err(|_| AdmissionRefusal::MalformedText)?;
         let required_schema = required_schema.into();
         let bridge_generation = bridge_generation.into();
         let cancellation_id = cancellation_id.into();
         let coverage_goal = coverage_goal.into();
         for value in [
-            &module_id,
-            &module_generation_id,
             &required_schema,
             &bridge_generation,
             &cancellation_id,
@@ -214,39 +229,32 @@ impl ProviderAdmission {
         &self.protocol_digest
     }
 
-    /// Returns the Module Registry evidence reference.
+    /// Returns the Module/Capability Registry cell reference.
     ///
-    /// ASSUMPTION (named gap, W2): this is a Kernel-issued **reference** whose
-    /// content is re-proved against the live authority, but it is not yet
-    /// resolved through a Module/Capability Registry. The `CapabilityCellRegistry`
-    /// type and its fail-closed validator exist in `eliot-contracts`, and
-    /// `eliot-runtime-status` has the `resolve_generation_via_registry`
-    /// readback, but **no generated registry record names the research-provider
-    /// cell**: the only registry record compiled into the tree is the generated
-    /// native-worker cell in `bins/eliot-kernel/src/composition_bootstrap.rs`,
-    /// and `workstreams/core-daemons/capability-cell-registry.contract.toml`
-    /// lists `research_provider` only as an `[[inventory_family]]` (a process
-    /// name and its source paths) while the same file's `[confirmed_gap]`
-    /// states the executable registry is still missing. `git grep
-    /// capability_cell -- bins/eliot-mod-research` returns nothing.
-    ///
-    /// The owner that must supply it is #13 (the generated current-pair
-    /// `CapabilityCellRegistry` and its research-provider cell record). Binding
-    /// this field to a registry that does not exist would mean inventing the
-    /// authority it is supposed to prove, so the reference stays exactly as
-    /// strong as the evidence behind it and no stronger.
+    /// The reference is carried as #13's own [`CapabilityCellId`], the exact
+    /// identity a generated `CapabilityCellRecord` declares and
+    /// `resolve_generation_via_registry` resolves against, and its content is
+    /// re-proved by value against the live authority in
+    /// [`ProviderAdmission::bind_admitted_dispatch`]. The named gap that remains
+    /// is the *record* side, not the identity side: no generated
+    /// research-provider cell record is compiled into the tree yet (only the
+    /// native-worker cell in `bins/eliot-kernel/src/composition_bootstrap.rs`),
+    /// and #13 owns producing it. When that record lands, the same
+    /// `CapabilityCellId` this field holds is the key it is looked up by, so the
+    /// proof surface binds without a rename or a second identity scheme.
     #[must_use]
-    pub fn module_id(&self) -> &str {
+    pub const fn module_id(&self) -> &CapabilityCellId {
         &self.module_id
     }
 
     /// Returns the Module generation evidence reference.
     ///
-    /// Carries the same named gap as [`ProviderAdmission::module_id`]: bound by
-    /// value against the Kernel's own attested dispatch content, not yet
-    /// resolved through a Module/Capability Registry record.
+    /// Carried as #13's [`RuntimeBundleId`], the field
+    /// `resolve_generation_via_registry` matches an installed generation
+    /// against, so the admitted generation is the same identity the readback
+    /// resolves. Same named record gap as [`ProviderAdmission::module_id`].
     #[must_use]
-    pub fn module_generation_id(&self) -> &str {
+    pub const fn module_generation_id(&self) -> &RuntimeBundleId {
         &self.module_generation_id
     }
 
@@ -413,8 +421,8 @@ impl ProviderAdmission {
             || binding.executable_sha256 != self.bridge.executable_sha256()
             || binding.config_digest != self.config_digest
             || binding.protocol_digest != self.protocol_digest
-            || binding.module_id != self.module_id
-            || binding.module_generation_id != self.module_generation_id
+            || binding.module_id != self.module_id.as_str()
+            || binding.module_generation_id != self.module_generation_id.as_str()
             || binding.process_generation != self.process_generation.get()
             || !binding.authority_epoch.is_same_authority(&self.epoch)
             || !fences_match_exact(&binding.state_fence, &self.fence)
@@ -485,8 +493,8 @@ impl ProviderAdmission {
             || self.bridge.executable_sha256() != dispatch.executable_sha256.as_str()
             || self.config_digest != dispatch.config_digest
             || self.protocol_digest != dispatch.protocol_digest
-            || self.module_id != dispatch.module_id
-            || self.module_generation_id != dispatch.module_generation_id
+            || self.module_id.as_str() != dispatch.module_id
+            || self.module_generation_id.as_str() != dispatch.module_generation_id
             || self.process_generation.get() != dispatch.process_generation
             || self.process_generation.get() != receipt.admitted_generation
             || !self.epoch.is_same_authority(&dispatch.authority_epoch)
@@ -535,8 +543,11 @@ mod tests {
         assert_eq!(admission.bridge(), &test_identity());
         assert_eq!(admission.config_digest(), DIGEST_B);
         assert_eq!(admission.protocol_digest(), DIGEST_C);
-        assert_eq!(admission.module_id(), "mod-research-provider");
-        assert_eq!(admission.module_generation_id(), "gen-mod-24-a");
+        assert_eq!(admission.module_id().as_str(), "mod-research-provider");
+        assert_eq!(
+            admission.module_generation_id().as_str(),
+            "gen-mod-24-a"
+        );
         assert_eq!(
             admission.process_generation(),
             Generation::new(3).expect("gen")
