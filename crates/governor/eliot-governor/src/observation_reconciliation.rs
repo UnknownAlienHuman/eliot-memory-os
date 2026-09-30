@@ -506,6 +506,9 @@ impl ObservationIngressPolicyBinding {
     /// current Kernel named-read projection.
     pub(crate) fn from_policy_owner(owner: &PolicyOwner) -> Result<Self, CompositionError> {
         let snapshot = owner.snapshot();
+        snapshot.validate().map_err(|error| {
+            CompositionError::Recovery(format!("current Policy snapshot is invalid: {error}"))
+        })?;
         let setting = snapshot
             .settings
             .iter()
@@ -568,6 +571,44 @@ impl ObservationIngressPolicyBinding {
             canonical_read_digest: owner.canonical_digest().to_owned(),
             snapshot_digest: owner.snapshot_digest().to_owned(),
         })
+    }
+
+    /// Reads an explicitly configured capture policy when present. A valid
+    /// current Policy snapshot without this optional setting has no capture
+    /// permission, but remains valid for unrelated activation work.
+    pub(crate) fn try_from_policy_owner(
+        owner: &PolicyOwner,
+    ) -> Result<Option<Self>, CompositionError> {
+        let snapshot = owner.snapshot();
+        snapshot.validate().map_err(|error| {
+            CompositionError::Recovery(format!("current Policy snapshot is invalid: {error}"))
+        })?;
+        if let Some(privacy) = snapshot
+            .settings
+            .iter()
+            .find(|setting| setting.key == eliot_config::PRIVACY_MODE_KEY)
+        {
+            if privacy.owner_ref != snapshot.policy_owner.owner_ref {
+                return Err(CompositionError::Recovery(
+                    "Observation privacy choice has a foreign original owner".to_owned(),
+                ));
+            }
+            let value = privacy.value_ref.strip_prefix("literal:").ok_or_else(|| {
+                CompositionError::Recovery(
+                    "current privacy choice is not an admitted literal setting".to_owned(),
+                )
+            })?;
+            eliot_config::PrivacyChoice::parse(value)
+                .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        }
+        if !snapshot
+            .settings
+            .iter()
+            .any(|setting| setting.key == eliot_config::OBSERVATION_INGRESS_POLICY_KEY)
+        {
+            return Ok(None);
+        }
+        Self::from_policy_owner(owner).map(Some)
     }
 
     /// Stable reference to the actual owner setting record.
@@ -923,6 +964,23 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
             )
         })?;
         ObservationIngressPolicyBinding::from_policy_owner(owner)
+    }
+
+    /// Returns an explicit capture policy when configured. Absence from a
+    /// valid current Policy snapshot means capture is not enabled; malformed
+    /// owner state and unavailable reads remain errors.
+    pub fn try_current_ingress_policy(
+        &self,
+    ) -> Result<Option<ObservationIngressPolicyBinding>, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        let owner = self.policy.ok_or_else(|| {
+            CompositionError::Recovery(
+                "current Policy owner is unavailable for Observation capture".to_owned(),
+            )
+        })?;
+        ObservationIngressPolicyBinding::try_from_policy_owner(owner)
     }
 
     /// Normalizes one complete MCP `ObservationContent` value and prepares its
