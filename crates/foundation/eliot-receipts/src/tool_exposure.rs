@@ -1644,6 +1644,34 @@ impl ToolExposureHistoryEntry {
         self.validate()?;
         Ok(self)
     }
+
+    /// Derives the content-bound persistence key for this recorded revision.
+    ///
+    /// The key is the existing foundation hash over the canonical bytes of
+    /// the recorded entry — every supplied-or-unresolved stage, identity,
+    /// and source reference as recorded, compared with this operation. The
+    /// owning observation/receipt/outbox seam keys its write on this value:
+    /// an identical redelivery (lost acknowledgement, replayed publication)
+    /// yields the identical key and reconciles the original event instead of
+    /// executing again, while any recorded difference yields a different key
+    /// instead of a false dedupe. Unknown coverage keys as recorded unknown,
+    /// never coerced to false. Like the receipt envelope's idempotency
+    /// identity, this is a dedupe locator only: it authorizes no replay and
+    /// mutates no store. The persistence seam is the STITCH caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the entry is inconsistent or its recorded
+    /// content cannot be canonically serialized for keying.
+    pub fn persistence_idempotency_key(&self) -> Result<String, ToolExposureError> {
+        self.validate()?;
+        let bytes =
+            crate::canonical_json_bytes(self).map_err(|_| ToolExposureError::InvalidField {
+                field: "history.revision.idempotency_key",
+                reason: "recorded exposure history cannot be canonically keyed for persistence",
+            })?;
+        Ok(crate::sha256_hex(&bytes))
+    }
 }
 
 /// Replay disposition for one exposure-history revision against the recorded prior.
@@ -1791,13 +1819,12 @@ pub fn persist_exposure_history_revision(
 }
 
 /// Canonical digest of one history entry's recorded bytes.
+///
+/// Delegates to [`ToolExposureHistoryEntry::persistence_idempotency_key`]:
+/// one content-bound key implementation serves both the public seam and the
+/// packaged revision.
 fn digest_history_entry(entry: &ToolExposureHistoryEntry) -> Result<String, ToolExposureError> {
-    let bytes =
-        crate::canonical_json_bytes(entry).map_err(|_| ToolExposureError::InvalidField {
-            field: "history.revision",
-            reason: "exposure history entry is not canonically serializable",
-        })?;
-    Ok(crate::sha256_hex(&bytes))
+    entry.persistence_idempotency_key()
 }
 
 /// Canonical digest of one history entry's revision lineage.
