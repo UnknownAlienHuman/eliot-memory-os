@@ -1657,6 +1657,19 @@ impl ChangeMonitor {
             .observations
             .get(evidence_change_id)
             .ok_or(ChangeMonitorError::InvalidReconciliation)?;
+        // Reconciliation is explicitly per-resource: cross-resource evidence
+        // can never clear another resource's blocker, and an observation can
+        // never reconcile itself. Deleted transitions stay addressable via
+        // their before-state identity through `resource_ref`.
+        if unknown_change_id == evidence_change_id {
+            return Err(ChangeMonitorError::InvalidReconciliation);
+        }
+        let unknown_resource = unknown.observation.resource_ref();
+        if unknown_resource.is_empty()
+            || evidence.observation.resource_ref() != unknown_resource
+        {
+            return Err(ChangeMonitorError::InvalidReconciliation);
+        }
         if !unknown.observation.unknown_origin
             || !is_material_mutation(unknown.observation.kind)
             || !is_material_mutation(evidence.observation.kind)
