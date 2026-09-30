@@ -33,7 +33,10 @@ use eliot_contracts::{
 use eliot_receipts::{
     AuthorityBinding, EffectClass, ProofCeiling, SessionBinding, WorkScopeBinding,
 };
-use eliot_security_contracts::{InfluenceState, RevocationReason};
+use eliot_security_contracts::{
+    InfluenceState, REVOCATION_DISPOSITION_COMPLETE, RevocationClosureDigestBounds,
+    RevocationClosureDigestInput, RevocationReason,
+};
 use std::num::NonZeroU64;
 
 const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -326,19 +329,49 @@ fn closure(
     let affected_member_digest =
         AuthorityRevocationClosureEvidence::affected_members_digest(&affected)
             .expect("affected membership is addressable");
+    let evidence_version = REVOCATION_HISTORY_EVIDENCE_VERSION;
+    let bounds = eliot_influence::RevocationBounds::default_bounds();
+    let disposition = RevocationEvidenceDisposition::Complete;
+    let omissions: Vec<String> = Vec::new();
+    let affected_member_count = affected.len() as u64;
+    // The declared digest is computed over the SAME presentation the record
+    // carries, coordinate for coordinate. Recovery recomputes it from the
+    // presented bytes and refuses a disagreement, so a digest taken over any
+    // other set of coordinates would make every fixture refuse for a reason
+    // that has nothing to do with the case under test.
     let canonical_request_digest =
         AuthorityRevocationClosureEvidence::declared_canonical_request_digest(
-            closure_id,
-            root_ref,
-            &dependent_refs,
-            invalidation_reason,
-            InfluenceState::Revoked,
-            fence,
-            revision,
+            &RevocationClosureDigestInput {
+                evidence_version,
+                closure_id,
+                owner_namespace,
+                root_ref,
+                dependent_refs: &dependent_refs,
+                invalidation_reason,
+                current_influence: InfluenceState::Revoked,
+                state_fence: fence,
+                revision,
+                bounds: RevocationClosureDigestBounds {
+                    max_nodes: bounds.max_nodes,
+                    max_edges: bounds.max_edges,
+                    max_depth: bounds.max_depth,
+                    max_result: bounds.max_result,
+                    max_work: bounds.max_work,
+                    max_frontier: bounds.max_frontier,
+                    max_time: bounds.max_time,
+                },
+                // This fixture is always `Complete`, so the canonical
+                // disposition spelling is the crate's exported constant for
+                // it rather than a locally spelled string.
+                disposition: REVOCATION_DISPOSITION_COMPLETE,
+                omissions: &omissions,
+                affected_member_count,
+                affected_member_digest: &affected_member_digest,
+            },
         )
         .expect("closure presentation is addressable");
     AuthorityRevocationClosureEvidence {
-        evidence_version: REVOCATION_HISTORY_EVIDENCE_VERSION,
+        evidence_version,
         closure_id: closure_id.to_owned(),
         owner_namespace: owner_namespace.to_owned(),
         root_ref: root_ref.to_owned(),
@@ -347,10 +380,10 @@ fn closure(
         current_influence: InfluenceState::Revoked,
         state_fence: fence.clone(),
         revision,
-        bounds: eliot_influence::RevocationBounds::default_bounds(),
-        disposition: RevocationEvidenceDisposition::Complete,
-        omissions: Vec::new(),
-        affected_member_count: affected.len() as u64,
+        bounds,
+        disposition,
+        omissions,
+        affected_member_count,
         affected_member_digest,
         canonical_request_digest,
     }
