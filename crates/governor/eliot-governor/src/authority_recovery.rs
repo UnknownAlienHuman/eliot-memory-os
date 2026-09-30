@@ -569,6 +569,11 @@ pub struct AuthorityOwner {
     /// generation are owner-retained until the durable owner write path
     /// persists them.
     effect_obligations: BTreeMap<String, RetainedEffectObligation>,
+    /// True once [`AuthorityOwner::rebuild_effect_obligations`] has derived
+    /// obligations from the restored ledger in this generation. Until then the
+    /// same-scope fence stays closed: an empty obligation map before rebuild
+    /// is missing state, never proof that no dependent work is outstanding.
+    effect_obligations_rebuilt: bool,
     /// Durable revocation-history source revision applied by the latest
     /// history-bound restore (`None` when restored without CURRENT history
     /// evidence). Read back via
@@ -609,6 +614,7 @@ impl AuthorityOwner {
             grants,
             owner_hydrations: snapshot.owner_hydrations.clone(),
             effect_obligations: BTreeMap::new(),
+            effect_obligations_rebuilt: false,
             last_revocation_source_revision: None,
         })
     }
@@ -715,6 +721,7 @@ impl AuthorityOwner {
                 grants: outcome.graph,
                 owner_hydrations: snapshot.owner_hydrations.clone(),
                 effect_obligations: BTreeMap::new(),
+                effect_obligations_rebuilt: false,
                 last_revocation_source_revision: Some(evidence.source_revision),
             },
             suppressed: outcome.suppressed,
@@ -1423,6 +1430,7 @@ impl AuthorityOwner {
                 created += 1;
             }
         }
+        self.effect_obligations_rebuilt = true;
         Ok(created)
     }
 
@@ -1697,8 +1705,18 @@ impl AuthorityOwner {
     /// scope blocked. Terminal reconciliation releases the scope, and scopes
     /// with no retained obligation stay eligible, so independent work
     /// proceeds while dependent work waits.
+    ///
+    /// Fail-closed before rebuild: until
+    /// [`AuthorityOwner::rebuild_effect_obligations`] has derived obligations
+    /// from the restored ledger in this generation, every scope reports
+    /// blocked. An empty obligation map before rebuild is missing state —
+    /// never proof that no dependent work is outstanding — so restart keeps
+    /// dependent dispatch fenced until the rebuild completes.
     #[must_use]
     pub fn dependent_scope_blocked(&self, resource_ref: &str) -> bool {
+        if !self.effect_obligations_rebuilt {
+            return true;
+        }
         self.effect_obligations.values().any(|obligation| {
             !obligation.progress.is_terminal() && obligation.resource_ref == resource_ref
         })
