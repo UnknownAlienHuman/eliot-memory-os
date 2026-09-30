@@ -1584,6 +1584,9 @@ fn installer_plan_parts(
                 InstallerEffectPlan::ProvisionStoreCredential { provision, .. } => {
                     provision.target.clone()
                 }
+                InstallerEffectPlan::ProvisionUserModeSupervisionAuthority {
+                    provision, ..
+                } => provision.target.clone(),
                 InstallerEffectPlan::MaterializePhaseB {
                     static_template, ..
                 } => static_template.authority_id.clone(),
@@ -2017,9 +2020,14 @@ fn system_registration_transaction() -> InstallationTransaction {
             InstallerEffectPlan::MaterializePhaseB { provision, .. } => {
                 provision.as_mut().expected_host_executable = manifest.host_executable_path.clone();
             }
+            // The `UserMode` supervision plan carries no manifest-derived Host
+            // image, and this `SystemService` fixture never plans the effect
+            // (the planner admits it for `UserMode` only), so it has nothing
+            // to rebind here.
             InstallerEffectPlan::CreateRoot { .. }
             | InstallerEffectPlan::ApplyAcl { .. }
-            | InstallerEffectPlan::StagePackage { .. } => {}
+            | InstallerEffectPlan::StagePackage { .. }
+            | InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. } => {}
         }
     }
     let mut ordered_effects = installer_effects
@@ -2360,8 +2368,13 @@ fn fully_applied_system_registration_transaction() -> InstallationTransaction {
                         postcondition_digest: test_handle(format!("{index:064x}")),
                     };
             }
+            // A `SystemService` transaction never plans the current-user
+            // supervision authority effect (the planner emits it for `UserMode`
+            // only and `validate_effect_profile` rejects it here), so this
+            // fully-applied `SystemService` fixture has no receipt to bind.
             InstallerEffectPlan::RegisterService { .. }
-            | InstallerEffectPlan::StagePackage { .. } => {}
+            | InstallerEffectPlan::StagePackage { .. }
+            | InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. } => {}
             InstallerEffectPlan::MaterializePhaseB { .. } => {
                 let change = transaction
                     .planned_changes
@@ -3951,6 +3964,10 @@ fn service_context_binds_same_host_root_for_host_and_watchdog_argv() {
             ownership_secret: None,
             store_credential: None,
             staging_receipt: None,
+            // A `RegisterService` effect has no current-user supervision key
+            // write, so it carries no pre-write `UserMode` key receipt; the
+            // request validator admits `None` for every non-authority plan.
+            user_mode_authority_receipt: None,
             action: InstallationEffectAction::Apply,
             expected_external_identity: None,
             service_bootstrap: Some(InstallationServiceBootstrap {
@@ -9557,6 +9574,9 @@ fn package_precondition_snapshot_is_required_for_post_intent_stage_package() {
         ownership_secret: None,
         store_credential: None,
         staging_receipt: None,
+        // A `StagePackage` effect is not the current-user supervision authority
+        // effect, so no pre-write `UserMode` key receipt exists for it.
+        user_mode_authority_receipt: None,
         action: InstallationEffectAction::Apply,
         expected_external_identity: None,
         service_bootstrap: None,
@@ -9618,6 +9638,18 @@ fn package_binding_validates_candidate_and_package_digests_independently() {
         generation: transaction.candidate_manifest.generation.clone(),
         manifest: package_manifest.clone(),
         staging_root: transaction.staging_root.clone(),
+        // The production planner always seals the candidate's selected
+        // immutable-binaries root here; the binding validator rejects the
+        // effect when a present destination differs from it, and this
+        // regression asserts the unmutated effect is admitted.
+        destination_root: Some(test_handle(
+            transaction
+                .candidate_manifest
+                .runtime_launch
+                .profile_governed_roots
+                .immutable_binaries
+                .clone(),
+        )),
         expected_file_digests: Vec::new(),
         candidate_manifest_digest: must(candidate_manifest_digest(&transaction.candidate_manifest)),
         package_manifest_digest: must(PlatformHandle::new(package_manifest.canonical_digest())),
