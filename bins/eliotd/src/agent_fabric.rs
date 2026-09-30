@@ -3180,6 +3180,14 @@ impl AgentFabric {
     /// an absent document is the loader's own typed refusal rather than a
     /// defaulted profile.
     ///
+    /// `recovery_poll` names which arm of the I14.8 progress loop this is
+    /// (issue #1683 W5), and is passed through to the coordinator verbatim: it
+    /// is evidence in the returned outcome, never a gate. `true` is the
+    /// always-armed bounded recovery poll that survives a lost notification;
+    /// `false` is the response to an observed release/reconciliation event. Both
+    /// drive the identical selector over the identical projection, so the fabric
+    /// re-decides nothing here and records the caller's own classification.
+    ///
     /// Production residual, unchanged here and not worked around: no issuer of
     /// the provider-verified `ProviderAdmissionReceipt` that
     /// `AgentCoordinator::admit` requires exists in the tree today (issue
@@ -3195,11 +3203,12 @@ impl AgentFabric {
     pub fn drive_fair_pull(
         &mut self,
         profile: &SchedulingProfile,
+        recovery_poll: bool,
     ) -> Result<FairPullOutcome, FabricError> {
         // #1683: bounded fair-pull span over the release path. The recorded
         // decision is the coordinator's; the fabric never re-decides it.
         let _span = tracing::info_span!("eliotd.fabric_fair_pull").entered();
-        Ok(self.coordinator.drive_fair_pull(profile)?)
+        Ok(self.coordinator.drive_fair_pull(profile, recovery_poll)?)
     }
 
     /// Asserts that an unknown outcome cannot satisfy Finish.

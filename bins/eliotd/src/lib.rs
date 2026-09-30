@@ -961,6 +961,25 @@ pub async fn solo_poll_queue_async(
     solo_agent_driver::solo_poll_queue_async(composition, kernel).await
 }
 
+/// The always-armed bounded recovery poll of the I14.8 progress loop (issue
+/// #1683 W5).
+///
+/// This is the arm that makes progress correct under a lost notification, and
+/// the event-driven release path is only the optimisation. The daemon runtime
+/// calls it on its existing bounded activation cadence without consulting any
+/// wake state, so a dropped, coalesced or pre-registered wake costs one cadence
+/// of latency instead of stranding work that is already eligible.
+///
+/// Thin wrapper over
+/// [`solo_agent_driver::solo_fair_pull_recovery`](crate::solo_agent_driver::solo_fair_pull_recovery):
+/// it names no interval, retry, cap or timeout of its own.
+pub async fn solo_fair_pull_recovery(
+    composition: &Arc<tokio::sync::Mutex<DaemonComposition>>,
+    kernel: &Arc<DaemonKernelClient>,
+) -> Result<solo_agent_driver::FairPullRecovery, DaemonError> {
+    solo_agent_driver::solo_fair_pull_recovery(composition, kernel).await
+}
+
 impl DaemonComposition {
     /// Composes the daemon only from a Host-approved authenticated Kernel port.
     ///
