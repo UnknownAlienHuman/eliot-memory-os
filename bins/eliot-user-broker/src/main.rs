@@ -10,15 +10,18 @@ use eliot_user_broker::{
     BrokerComposition, BrokerConfig, CompositionError, HumanStateAuthority, NotifyAcknowledge,
     NotifyDeliver, OperatorClientBinding, canonical_root, request_names_notify_image,
 };
+// There is exactly one operator pipe name. The minted `OperatorEndpoint` and
+// the pipe the broker serves are the same name, owned by the handoff contract
+// crate that also validates it; a second literal here would mint endpoints
+// naming a pipe nobody serves.
 use eliot_user_broker_core::{
-    CutoverReceipt, LaunchRequest, OPERATOR_HANDOFF_TTL_MS, OperatorEndpoint,
+    CutoverReceipt, LaunchRequest, OPERATOR_HANDOFF_TTL_MS, OPERATOR_PIPE_NAME, OperatorEndpoint,
     OperatorHandoffRequest, OperatorNativeResourceSelectionInput,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const PROVIDER_REJECTED_EXIT: i32 = 69;
-const OPERATOR_PIPE_NAME: &str = r"\\.\pipe\eliot\user-broker\operator";
 const OPERATOR_PIPE_PREFACE: &str = "ELIOT-BROKER-1\n";
 const MAX_OPERATOR_PIPE_LINE_BYTES: usize = eliot_protocol::HARD_STRUCTURED_RESPONSE_BYTES;
 // The authenticated registration lease is refreshed while the broker is
