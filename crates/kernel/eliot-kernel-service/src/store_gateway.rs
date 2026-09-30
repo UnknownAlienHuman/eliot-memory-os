@@ -56,14 +56,14 @@ use eliot_runtime_contracts::{
     I14WorkOutcome, NormalWorkClass, RecoveryCommitStatus, StatePreservationStatus, WakeIntent,
 };
 use eliot_store_api::{
-    CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, NamedReadRequest,
-    NamedReadResponse, OperationIdentity, OrderingHead, OrderingHeadExpectation, OrderingScopeId,
-    PreparedTransition, RecoveryRecord, RecoveryRecordKey, RequestMeta, ReservedWriteRequest,
-    RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, StoreError,
-    StoreGenesisRequest, StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt,
-    WriteReceiptStatus, WriteSubmission, admit_write_submission, canonical_request_hash,
-    dreamer_job_queue_key, generated_operation_manifests, operation_manifest_set_digest,
-    verify_canonical_request_hash,
+    CanonicalRequestView, CanonicalRestoreBatch, CanonicalStoreClient, CanonicalValidationSnapshot,
+    NamedReadRequest, NamedReadResponse, OperationIdentity, OrderingHead, OrderingHeadExpectation,
+    OrderingScopeId, PreparedTransition, RecoveryRecord, RecoveryRecordKey, RequestMeta,
+    ReservedWriteRequest, RestoreValidationReceipt, RevisionHead, RevisionHeadExpectation,
+    RevisionKey, ScopeId, ScopeRevisionView, StoreError, StoreGenesisRequest, StoreHealth,
+    StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, WriteReceiptStatus, WriteSubmission,
+    admit_write_submission, canonical_request_hash, dreamer_job_queue_key,
+    generated_operation_manifests, operation_manifest_set_digest, verify_canonical_request_hash,
 };
 use serde::{Deserialize, Serialize};
 
@@ -7345,6 +7345,53 @@ impl KernelStoreGateway {
             .map_err(|error| error.to_string())?;
         health.validate().map_err(|error| error.to_string())?;
         Ok(health)
+    }
+
+    /// Restores one bounded canonical batch into its admitted isolated
+    /// destination through this gateway's own Store client (issue #952).
+    ///
+    /// This is the missing Kernel hop, not a second route: it sends over the
+    /// `store` client composed once by [`Self::new`] and retained by the
+    /// composition, so the destination Store process, its credentials and its
+    /// `store_backup_client` binding are the ones the gateway already owns. No
+    /// `NamedPipeTransport` is constructed here and there is no caller endpoint
+    /// override, so a fresh connection — which would duplicate the owner and
+    /// escape the generation-route gate, the drain/fence accounting and the
+    /// `I14.21` unknown-commit recovery — is not representable on this path.
+    ///
+    /// The batch is forwarded as given. Nothing is assembled, defaulted,
+    /// filtered, reordered or reinterpreted: the admitted `CanonicalRestoreBatch`
+    /// this entry hands to the Store is the caller's own batch, byte for byte,
+    /// because the archive/artifact owner resolved its payloads, its purge
+    /// obligations and its per-member dispositions before this hop and the
+    /// destination transaction is where those owner facts are committed.
+    ///
+    /// The gate and the accounting are the same ones every other mutating route
+    /// runs: the flight slot is taken first so `fence_and_drain` still owns this
+    /// connection, and the active-generation check still refuses a generation
+    /// the durable `canonical_store` route no longer names. Neither is relaxed
+    /// to make the entry reachable.
+    ///
+    /// The refusal is the typed [`StoreApplyRefusal`] of this module's
+    /// mutating routes, for the same reason [`Self::apply`] uses it: an I5.19
+    /// admission decision and a pre-existing gateway refusal are different
+    /// facts and must not be flattened into one prose string. A restore that
+    /// cannot be admitted is refused without a send, exactly as an apply is.
+    pub async fn backup_restore_batch(
+        &self,
+        ctx: &RequestMeta,
+        batch: CanonicalRestoreBatch,
+    ) -> Result<RestoreValidationReceipt, StoreApplyRefusal> {
+        let _flight = self
+            .flight
+            .enter()
+            .map_err(StoreApplyRefusal::GatewayRefusal)?;
+        self.require_active_store_generation()
+            .map_err(|error| StoreApplyRefusal::GatewayRefusal(error.to_string()))?;
+        self.store
+            .backup_restore_batch(ctx, batch)
+            .await
+            .map_err(|error| StoreApplyRefusal::GatewayRefusal(error.to_string()))
     }
 }
 
