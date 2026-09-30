@@ -275,6 +275,54 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
             operationId: operationId).ConfigureAwait(false);
     }
 
+    /// The UI-side route label for presenting the retained Human authority
+    /// for one broker-owned operation cancellation. It is not a Governor
+    /// tool: it never reaches `CallToolAsync` or `IsAdmittedTool`, so the
+    /// compatibility adapter gains no sixth route. It names the operation in
+    /// typed faults only.
+    private const string BrokerCancelRoute = "broker_cancel";
+
+    /// Cancels one broker-owned operation under the broker-redeemed Human
+    /// binding of THIS connection, presenting the one `HumanStateAuthority`.
+    ///
+    /// I11.3 admits this as the delegated-Operator "stop": the retained
+    /// `human_operator` grant carries `operator.command`, and the broker's
+    /// operator-pipe `cancel` arm admits the authority and then runs the
+    /// existing gated `cancel`, so the request succeeds only through the
+    /// typed Kernel path. Every authority field comes from the retained
+    /// binding: the principal from the broker-echoed principal (never a
+    /// self-declared string), the session from the broker-echoed session,
+    /// the role and capabilities from the granted binding as the exact
+    /// admitted set, the Kernel session token from the broker-issued token,
+    /// and the approval hash from whatever exact Kernel-canonicalized hash
+    /// was legitimately given alongside the binding.
+    ///
+    /// No such hash reaches the UI, so the request is refused here, at
+    /// admission, before any application byte: there is no Critical-action
+    /// producer anywhere in the repository, the broker challenge and
+    /// redemption echo carry no hash, and the Store's `canonical_request_hash`
+    /// in user-automation receipts is that other operation's content hash —
+    /// a shape-only correlator, not a Critical-action approval for this one.
+    /// Presenting any UI-chosen 64-hex value instead would pass the broker's
+    /// shape check and bind a false approval to the operation key, which the
+    /// broker then keeps against conflicting hashes; that refusal is the
+    /// correct outcome, not a failure of this path. It is reported as
+    /// `access_denied` at admission because the exact broker code has no
+    /// UI-side member and this client holds no approval to present. The send
+    /// is enabled only when a legitimate hash producer reaches the UI; the
+    /// retained-binding gate below already proves everything else the broker
+    /// will compare.
+    public Task CancelBrokerOperationAsync(
+        string operationId,
+        CancellationToken cancellationToken = default)
+    {
+        OperatorIdentityFields.RequireText(operationId, "operation_id");
+        RequireLiveBinding();
+        RequireRetainedHumanBinding(operationId, BrokerCancelRoute, OperatorCapabilityNames.OperatorCommand);
+        throw new OperatorNotAttemptedException(
+            operationId, BrokerCancelRoute, OperatorFaultReason.AccessDenied, OperatorExchangeStages.Admission);
+    }
+
     public async Task<JsonElement> UserAutomationAsync(
         UserAutomationOperatorRequest request,
         CancellationToken cancellationToken = default)

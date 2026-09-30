@@ -208,6 +208,19 @@ enum OperatorPipeRequest {
         endpoint: OperatorEndpoint,
         client: OperatorClientBinding,
     },
+    /// Cancellation of one broker-owned operation on the same
+    /// already-authenticated connection that redeemed it. The authority is
+    /// the one `HumanStateAuthority`: it is admitted by
+    /// `BrokerComposition::admit_human_state_change` against the OS-observed
+    /// pipe peer before `BrokerComposition::cancel` runs, so a missing
+    /// principal, stale token, cross-session identity, ungranted capability,
+    /// or missing approval hash is refused before any state change, exactly
+    /// as on stdin. I11.3 admits this as the delegated-Operator "stop".
+    Cancel {
+        operation_id: OperationId,
+        #[serde(default)]
+        authority: Option<HumanStateAuthority>,
+    },
 }
 
 #[derive(Serialize)]
@@ -228,6 +241,9 @@ enum OperatorPipeMessage {
         role: String,
         capabilities: Vec<String>,
     },
+    /// Cancellation receipt for the broker-owned operation the admitted
+    /// `Cancel` request named. It carries the same receipt stdin renders.
+    Cancelled { receipt: Value },
     Error {
         code: &'static str,
         detail: String,
@@ -657,6 +673,19 @@ fn dispatch_operator_pipe(
                     capabilities: endpoint.capabilities,
                 },
             ),
+        OperatorPipeRequest::Cancel { operation_id, authority } => {
+            match composition.admit_human_state_change(authority.as_ref(), operation_id.as_str()) {
+                Err(error) => operator_pipe_rejection(&error),
+                Ok(()) => composition.cancel(&operation_id).map_or_else(
+                    |error| operator_pipe_rejection(&error),
+                    |receipt| OperatorPipeMessage::Cancelled {
+                        receipt: serde_json::to_value(receipt).unwrap_or_else(
+                            |error| serde_json::json!({"error": error.to_string()}),
+                        ),
+                    },
+                ),
+            }
+        }
     }
 }
 
@@ -992,7 +1021,49 @@ async fn serve_operator_pipe_connection(
         return Ok(());
     }
     let second_response = dispatch_operator_pipe_to_owner(sender, second_request, &peer).await;
-    write_operator_pipe_message(&mut writer, &second_response).await
+    let redeemed = matches!(&second_response, OperatorPipeMessage::Redeemed { .. });
+    write_operator_pipe_message(&mut writer, &second_response).await?;
+    if !redeemed {
+        return Ok(());
+    }
+
+    // The connection stays authenticated after redemption, so the redeemed
+    // client may present its admitted authority once more on this same
+    // connection. Only the state-changing cancel rides here: a further
+    // challenge or redemption would replay the consumed handoff, and anything
+    // else is a sequence violation. The same OS-observed peer evidence goes
+    // down again, so the state change is admitted against the connected
+    // process, never against a presented tuple.
+    let Some(third_line) = read_operator_pipe_line(&mut reader).await? else {
+        return Ok(());
+    };
+    let third_request = match serde_json::from_str::<OperatorPipeRequest>(&third_line) {
+        Ok(request) => request,
+        Err(error) => {
+            write_operator_pipe_message(
+                &mut writer,
+                &OperatorPipeMessage::Error {
+                    code: "REQUEST_INVALID",
+                    detail: error.to_string(),
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    if !matches!(&third_request, OperatorPipeRequest::Cancel { .. }) {
+        write_operator_pipe_message(
+            &mut writer,
+            &OperatorPipeMessage::Error {
+                code: "BROKER_PROTOCOL_SEQUENCE_REJECTED",
+                detail: "the third Operator pipe request must be cancel".to_owned(),
+            },
+        )
+        .await?;
+        return Ok(());
+    }
+    let third_response = dispatch_operator_pipe_to_owner(sender, third_request, &peer).await;
+    write_operator_pipe_message(&mut writer, &third_response).await
 }
 
 #[cfg(windows)]
