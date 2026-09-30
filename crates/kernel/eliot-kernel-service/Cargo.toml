@@ -43,6 +43,12 @@ eliot-runtime-contracts.workspace = true
 eliot-protocol.workspace = true
 eliot-security-contracts.workspace = true
 eliot-store-api.workspace = true
+# Issue #1679 item A6: the Store reservation path binds per-scope permits
+# through the Store bridge generation's existing control-reserve owner
+# (`eliot-store/src/control_reserve.rs`, read-only here). No Store I/O enters
+# through this edge: only the atomic partition acquisition/release and the
+# typed permit/evidence rows.
+eliot-store.workspace = true
 schemars.workspace = true
 sha2.workspace = true
 serde.workspace = true

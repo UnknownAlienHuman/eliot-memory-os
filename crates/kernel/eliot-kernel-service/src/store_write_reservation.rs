@@ -21,6 +21,10 @@
 //!                                    and reconciliation inside ORS
 //! Store (`CanonicalStoreClient`)     committed heads and `WriteReceipt`s with
 //!                                    the reconciliation envelope (#991)
+//! Store (`StoreReserve`)             disjoint normal/protected connection,
+//!                                    transaction, and pending-write-memory
+//!                                    partitions; reservation permits held per
+//!                                    scope, protected keyed per scope (#1679)
 //! #990 projection                    byte-exact reservation binding carried
 //!                                    across the authenticated boundary
 //! This module                         composition of the three above: no new
@@ -133,11 +137,66 @@
 //! releases only `Reserved`/`Eligible` tokens; once `Executing`/`Reconciling`,
 //! release is rejected and identity is preserved until exact receipt
 //! reconciliation.
+//!
+//! ## Store control-reserve binding (issue #1679, item A6)
+//!
+//! The reservation path binds every admitted Store write to the Store bridge
+//! generation's existing control reserve ([`eliot_store::StoreReserve`], owned
+//! by the sibling Store wave; this module constructs no capacity, sizes no
+//! partition, and never edits that owner):
+//!
+//! ```text
+//! normal reservation   -> owner normal partitions (one connection slot, one
+//!                         transaction slot, staged-payload bytes of
+//!                         pending-write memory), held for the reservation
+//!                         lifetime
+//! control reservation  -> owner protected partitions, keyed per ordering
+//!                         scope: one scope holds at most one protected
+//!                         reservation at a time
+//! ```
+//!
+//! Saturating one scope's normal reservations exhausts only the owner's normal
+//! partitions, so another scope's protected control path (cancellation,
+//! fencing, recovery, unknown-outcome reconciliation) keeps its full
+//! protected capacity; a scope whose protected path is already held fails
+//! with a typed refusal that names the exact scope and holder instead of
+//! consuming another scope. Normal work can never name a protected operation:
+//! [`reserve_for_transition`] always claims
+//! [`NormalWorkClass::CanonicalWrite`][eliot_runtime_contracts::NormalWorkClass],
+//! and only [`reserve_for_control_transition`] typechecks against the
+//! protected acquisition paths with an explicit
+//! [`ControlOperationClass`][eliot_runtime_contracts::ControlOperationClass].
+//!
+//! Acquisition order is deterministic: Store permits first, then the single
+//! ORS `stage_and_reserve` write. A Store refusal therefore happens before any
+//! ORS mutation, and an ORS failure drops the already-acquired permits (still
+//! caller-local) back to the exact owner partitions, so no partial hidden
+//! ownership survives either failure. Permits ride in [`SealedReservation`]
+//! and release exactly on drop; the per-scope protected registration is
+//! removed under the same drop, so a closed reservation never wedges its
+//! scopes.
+//!
+//! The permits are generation-scoped in-memory holdings, exactly like the
+//! coordinator's one-in-flight-per-scope execution permits: a restart discards
+//! them with the process while the durable ORS reservation survives for the
+//! startup reconciliation path, which never mints Store permits. Restart
+//! therefore cannot revive held capacity.
+//!
+//! STITCH: [`CompositionReservation::bind`] carries no Store reserve, so the
+//! current production caller
+//! (`KernelStoreGateway::apply_reserved` in `store_gateway.rs`, which calls
+//! [`reserve_for_transition`]) behaves exactly as before. The gateway turn
+//! supplies the composition-bound reserve through
+//! [`CompositionReservation::bind_with_store_reserve`] and routes admitted
+//! control operations through [`reserve_for_control_transition`]; that caller
+//! lives in `store_gateway.rs` and is owned by a sibling turn, never faked
+//! here.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
+use std::num::NonZeroU64;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use eliot_contracts::{EpochId, RequestMetadata, StateFence};
 use eliot_ors::{
@@ -150,7 +209,9 @@ use eliot_ors::{
 };
 use eliot_platform::SecretReference;
 use eliot_receipts::ReceiptDispositionKind;
+use eliot_runtime_contracts::{ControlOperationClass, NormalWorkClass};
 use eliot_security_contracts::{InstructionTaint, PrivacyClass};
+use eliot_store::{StorePermit, StoreReserve, StoreReserveError};
 use eliot_store_api::{
     CAPABILITY_RESERVED_WRITE, CanonicalRequestView, OperationId, OrderingHeadExpectation,
     OrderingScopeId, PreparedTransition, ReceiptEnvelope, ReservedScopeBinding,
@@ -296,6 +357,52 @@ pub enum ReservationWriteError {
     Store(#[from] eliot_store_api::StoreError),
 }
 
+/// Typed failure for Store-bound reservation staging (issue #1679, item A6).
+///
+/// [`ReservationWriteError`] is frozen by the `992/2` negative-path decision
+/// surface (its test helper matches every variant with no wildcard), so the
+/// Store partition failures below ride on this dedicated type instead of
+/// widening that enum. No variant carries payload bytes, digests, or secret
+/// material.
+#[derive(Debug, thiserror::Error)]
+pub enum ScopeStoreReservationError {
+    /// Shared reservation-core refusal (admission, binding, ORS lifecycle,
+    /// Store contract), preserved verbatim.
+    #[error(transparent)]
+    Reservation(#[from] ReservationWriteError),
+    /// The Store control reserve refused a partition acquisition. The owner
+    /// error passes through unchanged so backpressure callers match the exact
+    /// bottleneck, class, and operation the owner named.
+    #[error(transparent)]
+    StoreReserve(#[from] StoreReserveError),
+    /// One ordering scope already holds its protected Store path for another
+    /// control reservation. The refused control reservation consumes nothing:
+    /// neither its own scopes' remaining capacity nor any other scope's
+    /// protected path. The caller retries after the holder closes instead of
+    /// queueing behind it.
+    #[error(
+        "ordering scope {scope} already holds the protected Store path for operation {holder_operation_id}; control reservation for operation {operation_id} refused without consuming another scope"
+    )]
+    ScopeProtectedHeld {
+        /// Ordering scope whose protected path is already held.
+        scope: String,
+        /// Operation holding that scope's protected path.
+        holder_operation_id: String,
+        /// Admitted control operation the refusal preserves.
+        operation_id: String,
+    },
+    /// The owner carries no composition-bound Store reserve, so there is no
+    /// protected partition to draw from. Explicit unsupported behavior, never
+    /// a silent normal-partition fallback.
+    #[error("reserved control write unsupported for operation {operation_id}: {detail}")]
+    ReserveRequired {
+        /// Admitted control operation the refusal preserves.
+        operation_id: String,
+        /// Exact missing binding.
+        detail: String,
+    },
+}
+
 /// Composition-bound reservation owner: the one owned ORS handle plus the
 /// active writer epoch from trusted Kernel composition.
 ///
@@ -303,9 +410,16 @@ pub enum ReservationWriteError {
 /// second ORS handle, or a claimed epoch: the evidence provider stays bound
 /// inside the ORS handle, and the writer epoch must be the composition-active
 /// one or every lifecycle call fails with the owner error.
+///
+/// The Store control-reserve binding is optional and defaults to absent: plain
+/// [`CompositionReservation::bind`] reserves exactly as before, with no Store
+/// partition contact. The gateway turn supplies the composition-bound
+/// [`ScopeStoreReserve`] through [`CompositionReservation::bind_with_store_reserve`];
+/// this module never constructs one from caller text.
 pub struct CompositionReservation {
     ors: Arc<RedbRecoveryStore>,
     writer_epoch: EpochLineage,
+    store_scopes: Option<Arc<ScopeStoreReserve>>,
 }
 
 impl CompositionReservation {
@@ -313,7 +427,8 @@ impl CompositionReservation {
     ///
     /// The epoch lineage edge is validated without granting epoch authority;
     /// currency against the live fence is re-checked at every transition
-    /// boundary, never once here.
+    /// boundary, never once here. No Store reserve is bound: reservations run
+    /// without Store partition permits, exactly as before issue #1679 A6.
     pub fn bind(
         ors: Arc<RedbRecoveryStore>,
         writer_epoch: EpochLineage,
@@ -321,7 +436,34 @@ impl CompositionReservation {
         writer_epoch
             .validate()
             .map_err(ReservationWriteError::Ors)?;
-        Ok(Self { ors, writer_epoch })
+        Ok(Self {
+            ors,
+            writer_epoch,
+            store_scopes: None,
+        })
+    }
+
+    /// Binds the composition-owned ORS handle, active writer epoch, and the
+    /// composition-bound Store control-reserve scope binding.
+    ///
+    /// The reserve is the Store bridge generation's own partition owner,
+    /// constructed with its real capacities by Store/composition and shared
+    /// here; this constructor manufactures no capacity and accepts no
+    /// partition sizes. Reservations made through the returned owner acquire
+    /// Store permits per the A6 binding before any ORS mutation.
+    pub fn bind_with_store_reserve(
+        ors: Arc<RedbRecoveryStore>,
+        writer_epoch: EpochLineage,
+        store_scopes: Arc<ScopeStoreReserve>,
+    ) -> Result<Self, ReservationWriteError> {
+        writer_epoch
+            .validate()
+            .map_err(ReservationWriteError::Ors)?;
+        Ok(Self {
+            ors,
+            writer_epoch,
+            store_scopes: Some(store_scopes),
+        })
     }
 
     /// Returns the bound active writer epoch.
@@ -329,10 +471,283 @@ impl CompositionReservation {
         &self.writer_epoch
     }
 
+    /// Returns the bound Store control-reserve scope binding, if the gateway
+    /// turn supplied one.
+    pub fn store_scopes(&self) -> Option<&ScopeStoreReserve> {
+        self.store_scopes.as_deref()
+    }
+
     /// Returns the exact current writer identity checked at every lifecycle step.
     fn writer_identity(&self) -> &EpochIdentity {
         &self.writer_epoch.current
     }
+}
+
+/// Composition-side binding of Store reservations to the Store bridge
+/// generation's control-reserve partitions, keyed per ordering scope
+/// (issue #1679, item A6).
+///
+/// This type owns no capacity: the single [`StoreReserve`] it wraps is the
+/// existing Store owner, constructed with its real normal/protected partition
+/// sizes by Store/composition. Every slot and byte a reservation holds comes
+/// from that owner's atomic partitions through its typed acquisition paths;
+/// this layer only routes each reservation to the exact class partition and
+/// keys protected holdings per ordering scope, so one scope's saturation
+/// never consumes another scope's protected control path. There is no second
+/// partition scheme, no priority ordering, and no shared scalar utilization
+/// metric here.
+///
+/// The per-scope ledger records only protected holdings (scope identity to
+/// holder operation identity) to enforce the one-protected-reservation-per-scope
+/// rule. Normal holdings need no ledger: the owner's normal partitions bound
+/// them globally, and each held [`StorePermit`] already carries its operation
+/// identity while the ORS token carries the reservation's scope set, so a
+/// normal holding stays attributable by joining the two without a second
+/// counter that could diverge on drop.
+#[derive(Debug)]
+pub struct ScopeStoreReserve {
+    reserve: Arc<StoreReserve>,
+    protected_held: Mutex<BTreeMap<String, String>>,
+}
+
+impl ScopeStoreReserve {
+    /// Wraps the existing Store reserve owner for per-scope reservation
+    /// binding.
+    ///
+    /// The reserve stays the sole capacity enforcement; this binding adds
+    /// only scope keying on top of its partitions.
+    pub fn bind(reserve: Arc<StoreReserve>) -> Self {
+        Self {
+            reserve,
+            protected_held: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// Returns the wrapped Store reserve owner for evidence reads.
+    #[must_use]
+    pub fn reserve(&self) -> &StoreReserve {
+        &self.reserve
+    }
+
+    /// Returns the operation holding one scope's protected Store path, if any.
+    ///
+    /// Bounded observation only; it gates nothing by itself.
+    #[must_use]
+    pub fn protected_holder(&self, scope: &str) -> Option<String> {
+        self.ledger().get(scope).cloned()
+    }
+
+    /// Locks the protected-holdings ledger.
+    ///
+    /// A poisoned lock is recovered rather than refused: every ledger entry
+    /// is inserted only after a successful owner acquisition and removed on
+    /// reservation drop, so the map cannot half-record a hold, and failing
+    /// closed here would wedge live scopes on a stale panic elsewhere.
+    fn ledger(&self) -> MutexGuard<'_, BTreeMap<String, String>> {
+        self.protected_held
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// One reservation's protected-scope registration.
+///
+/// Held inside [`SealedReservation`] and removed on drop, so a closed
+/// reservation never wedges its scopes. Removal is holder-checked: a drop
+/// never unregisters another operation's hold.
+#[derive(Debug)]
+struct ProtectedScopeHold {
+    scopes: Arc<ScopeStoreReserve>,
+    held_scopes: Vec<String>,
+    operation_id: String,
+}
+
+impl ProtectedScopeHold {
+    /// Removes this reservation's scope registrations without touching any
+    /// other operation's hold.
+    fn release(self) {
+        let mut ledger = self.scopes.ledger();
+        for scope in &self.held_scopes {
+            let held_by_self = ledger
+                .get(scope)
+                .is_some_and(|holder| holder == &self.operation_id);
+            if held_by_self {
+                ledger.remove(scope);
+            }
+        }
+    }
+}
+
+/// Which Store capacity class one reservation draws from.
+///
+/// `Unbound` is today's path: the owner carries no Store reserve and no
+/// partition is contacted. `Normal` stages ordinary canonical-write workload
+/// against the owner's normal partitions. `Protected` stages one admitted
+/// control operation against the owner's protected partitions under its exact
+/// [`ControlOperationClass`].
+enum StoreCapacityClaim {
+    Unbound,
+    Normal { scopes: Arc<ScopeStoreReserve> },
+    Protected {
+        scopes: Arc<ScopeStoreReserve>,
+        operation: ControlOperationClass,
+    },
+}
+
+/// One reservation's acquired Store permits plus its protected-scope
+/// registration, if any.
+///
+/// Permits are caller-local: dropping them returns exactly the consumed
+/// partition and amount to the owner, so any acquisition failure after a
+/// partial acquire still releases everything with no explicit rollback.
+struct ScopeStoreAcquisition {
+    permits: Vec<StorePermit>,
+    hold: Option<ProtectedScopeHold>,
+}
+
+impl ScopeStoreAcquisition {
+    /// Empty acquisition for the unbound claim: no Store contact happened.
+    fn empty() -> Self {
+        Self {
+            permits: Vec::new(),
+            hold: None,
+        }
+    }
+}
+
+impl StoreCapacityClaim {
+    /// Acquires this reservation's Store footprint from the owner before any
+    /// ORS mutation.
+    ///
+    /// The footprint is fixed: one connection slot, one transaction slot, and
+    /// the staged payload bytes of pending-write memory. A refusal names the
+    /// exact owner bottleneck and leaves no permit behind.
+    fn acquire(
+        &self,
+        seed: &ReservationSeed,
+        operation_id: &str,
+    ) -> Result<ScopeStoreAcquisition, ScopeStoreReservationError> {
+        match self {
+            Self::Unbound => Ok(ScopeStoreAcquisition::empty()),
+            Self::Normal { scopes } => {
+                let permits = acquire_normal_store_permits(scopes, seed, operation_id)?;
+                Ok(ScopeStoreAcquisition { permits, hold: None })
+            }
+            Self::Protected { scopes, operation } => {
+                acquire_protected_store_permits(scopes, *operation, seed, operation_id)
+            }
+        }
+    }
+}
+
+/// Sorted admitted scope identities for one reservation.
+///
+/// The seed validation already proved the head set non-empty and duplicate-free;
+/// sorting keeps every generation's acquisition order identical.
+fn reservation_scopes(seed: &ReservationSeed) -> Vec<String> {
+    let mut scopes: Vec<String> = seed.heads.iter().map(|head| head.scope.clone()).collect();
+    scopes.sort();
+    scopes
+}
+
+/// Staged-payload byte amount for one reservation's pending-write footprint.
+///
+/// The seed validation already refused empty payloads; the conversion below
+/// still fails closed instead of asserting.
+fn staged_payload_bytes(
+    seed: &ReservationSeed,
+    operation_id: &str,
+) -> Result<NonZeroU64, ScopeStoreReservationError> {
+    let length = u64::try_from(seed.payload_bytes.len()).map_err(|_| {
+        ScopeStoreReservationError::Reservation(ReservationWriteError::Admission {
+            operation_id: operation_id.to_owned(),
+            detail: "reservation seed payload length is not representable".to_owned(),
+        })
+    })?;
+    NonZeroU64::new(length).ok_or(ScopeStoreReservationError::Reservation(
+        ReservationWriteError::Admission {
+            operation_id: operation_id.to_owned(),
+            detail: "reservation seed payload must be non-empty opaque bytes".to_owned(),
+        },
+    ))
+}
+
+/// Acquires one normal reservation's Store footprint from the owner's normal
+/// partitions under [`NormalWorkClass::CanonicalWrite`].
+///
+/// Only the normal acquisition paths typecheck here, so protected Store
+/// capacity is unreachable through this path by construction. A saturated
+/// normal partition fails with the owner's typed exhaustion before any ORS
+/// mutation; permits acquired before the failure drop back to their exact
+/// partitions with no explicit rollback.
+fn acquire_normal_store_permits(
+    scopes: &Arc<ScopeStoreReserve>,
+    seed: &ReservationSeed,
+    operation_id: &str,
+) -> Result<Vec<StorePermit>, ScopeStoreReservationError> {
+    let owner = seed.recovery_owner.as_str();
+    let bytes = staged_payload_bytes(seed, operation_id)?;
+    let reserve = scopes.reserve();
+    let connection =
+        reserve.try_acquire_normal_connection(NormalWorkClass::CanonicalWrite, owner, operation_id)?;
+    let transaction =
+        reserve.try_acquire_normal_transaction(NormalWorkClass::CanonicalWrite, owner, operation_id)?;
+    let pending = reserve.try_acquire_normal_pending_write_bytes(
+        NormalWorkClass::CanonicalWrite,
+        owner,
+        operation_id,
+        bytes,
+    )?;
+    Ok(vec![connection, transaction, pending])
+}
+
+/// Acquires one control reservation's Store footprint from the owner's
+/// protected partitions and registers its scopes.
+///
+/// Only [`ControlOperationClass`] operations typecheck here: ordinary work
+/// cannot name a protected operation and therefore cannot reach this path.
+/// Registration and acquisition happen under one ledger lock in sorted scope
+/// order, so two concurrent control reservations for the same scope cannot
+/// both pass the check: the second fails with
+/// [`ScopeStoreReservationError::ScopeProtectedHeld`] holding nothing, and a
+/// saturated protected partition fails with the owner's typed exhaustion
+/// before any ORS mutation or ledger insert.
+fn acquire_protected_store_permits(
+    scopes: &Arc<ScopeStoreReserve>,
+    operation: ControlOperationClass,
+    seed: &ReservationSeed,
+    operation_id: &str,
+) -> Result<ScopeStoreAcquisition, ScopeStoreReservationError> {
+    let wanted = reservation_scopes(seed);
+    let mut ledger = scopes.ledger();
+    for scope in &wanted {
+        if let Some(holder) = ledger.get(scope) {
+            return Err(ScopeStoreReservationError::ScopeProtectedHeld {
+                scope: scope.clone(),
+                holder_operation_id: holder.clone(),
+                operation_id: operation_id.to_owned(),
+            });
+        }
+    }
+    let owner = seed.recovery_owner.as_str();
+    let bytes = staged_payload_bytes(seed, operation_id)?;
+    let reserve = scopes.reserve();
+    let connection = reserve.try_acquire_protected_connection(operation, owner, operation_id)?;
+    let transaction = reserve.try_acquire_protected_transaction(operation, owner, operation_id)?;
+    let pending =
+        reserve.try_acquire_protected_pending_write_bytes(operation, owner, operation_id, bytes)?;
+    for scope in &wanted {
+        ledger.insert(scope.clone(), operation_id.to_owned());
+    }
+    drop(ledger);
+    Ok(ScopeStoreAcquisition {
+        permits: vec![connection, transaction, pending],
+        hold: Some(ProtectedScopeHold {
+            scopes: Arc::clone(scopes),
+            held_scopes: wanted,
+            operation_id: operation_id.to_owned(),
+        }),
+    })
 }
 
 /// Caller-observed canonical head evidence for one ordering scope.
@@ -519,12 +934,36 @@ impl ReservationSeed {
 /// The token alone does not carry creation time, so reservation returns this
 /// bundle: projection takes it back instead of a re-supplied timestamp that
 /// could fork the token digest.
+///
+/// The bundle also carries the reservation's Store permits for their whole
+/// lifetime: dropping the bundle returns exactly the consumed owner
+/// partitions and unregisters the per-scope protected hold, so a closed
+/// reservation never wedges its scopes.
 #[derive(Debug)]
 pub struct SealedReservation {
     /// Immutable ORS-issued token checked at every lifecycle step.
     pub token: WriterReservationToken,
     /// Owner creation time sealed into the projection.
     pub created_at_ms: i64,
+    /// Store permits held from reservation until this bundle drops. Empty
+    /// when the owner carries no Store reserve.
+    store_permits: Vec<StorePermit>,
+    /// Per-scope protected registration, removed on drop. `None` for normal
+    /// reservations and for owners without a Store reserve.
+    protected_hold: Option<ProtectedScopeHold>,
+}
+
+impl Drop for SealedReservation {
+    /// Releases the reservation's Store footprint: the protected-scope
+    /// registration is removed first (holder-checked, never another
+    /// operation's hold), then the permits drop back to their exact owner
+    /// partitions. Both steps are local and infallible; an unbound
+    /// reservation drops as a no-op.
+    fn drop(&mut self) {
+        if let Some(hold) = self.protected_hold.take() {
+            hold.release();
+        }
+    }
 }
 
 /// Validates the exact admitted transition, scope set, and expected heads
@@ -728,8 +1167,130 @@ fn admitted_instruction_taint(transition: &PreparedTransition) -> InstructionTai
 /// composition's fixed staging floor, not a per-transition admitted class —
 /// [`eliot_security_contracts::PrivacyClass`] declares no severity order, so no
 /// reduction over the admitted per-source classes is derivable here.
+///
+/// Store capacity: this is the normal-workload entry point. When the owner
+/// carries the composition-bound Store reserve, the reservation first acquires
+/// its footprint (one connection slot, one transaction slot, staged-payload
+/// bytes) from the owner's normal partitions under
+/// [`NormalWorkClass::CanonicalWrite`][eliot_runtime_contracts::NormalWorkClass];
+/// a saturated normal partition refuses here, before any ORS mutation, as an
+/// admission refusal carrying the owner's exact exhaustion text (this entry
+/// point's [`ReservationWriteError`] surface is frozen by the `992/2`
+/// negative-path decision surface, so the typed owner error rides in the
+/// detail exactly as [`gateway_seed`] already carries a typed platform error
+/// in an `Unsupported` detail). The permits ride in the returned
+/// [`SealedReservation`] until it drops. When the owner carries no reserve,
+/// this behaves exactly as before: no Store partition is contacted. Control
+/// operations never enter here; they use [`reserve_for_control_transition`].
 pub fn reserve_for_transition(
     owner: &CompositionReservation,
+    seed: &ReservationSeed,
+    context: &RequestMetadata,
+    transition: &PreparedTransition,
+    expected_revision_heads: &[RevisionHeadExpectation],
+    expected_ordering_heads: &[OrderingHeadExpectation],
+) -> Result<SealedReservation, ReservationWriteError> {
+    let operation_id = transition.identity.operation_id.as_str();
+    let claim = match owner.store_scopes.clone() {
+        Some(scopes) => StoreCapacityClaim::Normal { scopes },
+        None => StoreCapacityClaim::Unbound,
+    };
+    let acquisition = claim
+        .acquire(seed, operation_id)
+        .map_err(|error| scope_store_error_to_reservation(error, operation_id))?;
+    reserve_inner(
+        owner,
+        acquisition,
+        seed,
+        context,
+        transition,
+        expected_revision_heads,
+        expected_ordering_heads,
+    )
+}
+
+/// Maps a Store-acquisition failure onto the frozen [`ReservationWriteError`]
+/// surface for the signature-frozen normal entry point.
+///
+/// Reservation-core failures pass through unchanged. Store partition failures
+/// become admission refusals carrying the exact owner text: the refusal
+/// happens before any ORS or Store mutation with the operation identity
+/// preserved, exactly what the variant documents. The fully typed error stays
+/// available on [`reserve_for_control_transition`]'s own surface.
+fn scope_store_error_to_reservation(
+    error: ScopeStoreReservationError,
+    operation_id: &str,
+) -> ReservationWriteError {
+    match error {
+        ScopeStoreReservationError::Reservation(inner) => inner,
+        other => ReservationWriteError::Admission {
+            operation_id: operation_id.to_owned(),
+            detail: other.to_string(),
+        },
+    }
+}
+
+/// Atomically reserves every admitted scope for one admitted control
+/// operation, or none.
+///
+/// Same durable path as [`reserve_for_transition`] (single ORS
+/// `stage_and_reserve`, same admission/binding/plaintext gates), but the
+/// Store footprint comes from the owner's protected partitions under the
+/// exact [`ControlOperationClass`] the caller names, and the reservation's
+/// scopes are registered in the per-scope protected ledger: one scope holds
+/// at most one protected reservation at a time, so this reservation can never
+/// consume another scope's protected control path.
+///
+/// The owner must carry the composition-bound Store reserve: without it there
+/// is no protected partition to draw from, and the reservation is refused
+/// with [`ScopeStoreReservationError::ReserveRequired`] instead of falling
+/// back to the normal partitions. Every failure here is fully typed: the
+/// owner exhaustion passes through unchanged and a held scope names its exact
+/// holder. STITCH: no production caller yet; the gateway turn routes
+/// admitted cancellation/recovery/unknown-reconciliation staging here
+/// (`store_gateway.rs`, owned by a sibling turn).
+pub fn reserve_for_control_transition(
+    owner: &CompositionReservation,
+    operation: ControlOperationClass,
+    seed: &ReservationSeed,
+    context: &RequestMetadata,
+    transition: &PreparedTransition,
+    expected_revision_heads: &[RevisionHeadExpectation],
+    expected_ordering_heads: &[OrderingHeadExpectation],
+) -> Result<SealedReservation, ScopeStoreReservationError> {
+    let operation_id = transition.identity.operation_id.as_str();
+    let Some(scopes) = owner.store_scopes.clone() else {
+        return Err(ScopeStoreReservationError::ReserveRequired {
+            operation_id: operation_id.to_owned(),
+            detail: "control Store reservations require the composition-bound Store reserve; refusing without normal-partition fallback"
+                .to_owned(),
+        });
+    };
+    let claim = StoreCapacityClaim::Protected { scopes, operation };
+    let acquisition = claim.acquire(seed, operation_id)?;
+    reserve_inner(
+        owner,
+        acquisition,
+        seed,
+        context,
+        transition,
+        expected_revision_heads,
+        expected_ordering_heads,
+    )
+    .map_err(ScopeStoreReservationError::Reservation)
+}
+
+/// Shared reservation core behind [`reserve_for_transition`] and
+/// [`reserve_for_control_transition`].
+///
+/// The Store footprint arrives already acquired (a refusal leaves nothing
+/// behind: acquisition runs before any ORS contact), then the single ORS
+/// `stage_and_reserve` write runs. An ORS failure drops the caller-local
+/// permits back to their exact owner partitions, so neither failure leaves
+/// partial hidden ownership.
+fn reserve_inner(
+    owner: &CompositionReservation,
+    acquisition: ScopeStoreAcquisition,
     seed: &ReservationSeed,
     context: &RequestMetadata,
     transition: &PreparedTransition,
@@ -765,6 +1326,10 @@ pub fn reserve_for_transition(
                     .to_owned(),
         });
     }
+    // Store footprint arrives already acquired before any ORS mutation: a
+    // partition refusal failed in the caller with the exact owner bottleneck,
+    // and an ORS failure below drops the caller-local permits back to their
+    // exact partitions.
     let fence_snapshot = StateFenceSnapshot::capture(&context.state_fence, observed_sequence)
         .map_err(ReservationWriteError::Ors)?;
     let envelope = RecoveryPayloadEnvelope::encrypted(
@@ -831,6 +1396,8 @@ pub fn reserve_for_transition(
     Ok(SealedReservation {
         token,
         created_at_ms: seed.created_at_ms,
+        store_permits: acquisition.permits,
+        protected_hold: acquisition.hold,
     })
 }
 
