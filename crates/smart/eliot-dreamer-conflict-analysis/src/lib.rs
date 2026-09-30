@@ -4900,9 +4900,11 @@ fn collect_causal_claims(supplements: &ConflictSupplements) -> Vec<CausalClaimRe
     // order is deterministic without adding an ordering the enum does not need
     // for anything else.
     out.sort_by(|left, right| {
-        left.source_handle
-            .cmp(&right.source_handle)
-            .then(left.supplement_version.as_str().cmp(right.supplement_version.as_str()))
+        left.source_handle.cmp(&right.source_handle).then(
+            left.supplement_version
+                .as_str()
+                .cmp(right.supplement_version.as_str()),
+        )
     });
     out
 }
