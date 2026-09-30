@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 use super::activation_lifecycle::{
     DescendantClosureReceipt, DescendantRegistry, RegisteredDescendant,
 };
+use super::host_request_route::change_monitor;
 use super::{KernelComposition, KernelStoreGateway};
 use eliot_ipc::Session;
 use eliot_kernel_core::{
@@ -159,53 +160,85 @@ impl GovernedProcessEffectBinding {
 
 /// Complete tracked-source baseline captured before the admitted process effect.
 ///
-/// The Governor-owned adapter constructs the baseline; Kernel retains it
-/// between start capture and reconcile readback and checks only that it
-/// belongs to the exact operation being executed.
+/// The Kernel-owned effect port constructs the baseline from two
+/// independent opens of the lease-owned governed image plus the admission's
+/// own pins; Kernel retains it between start capture and reconcile
+/// readback and checks only that it belongs to the exact operation being
+/// executed. A baseline without content (`before_bytes: None`) carries no
+/// source identity: the operation runs unobserved and no hint is ingested
+/// for it, so monitor outage or an unreadable image can never wedge
+/// governed acceptance or fence the tool.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GovernedProcessEffectBaseline {
     binding: GovernedProcessEffectBinding,
+    executable: PathBuf,
+    lane_path: String,
+    resource: String,
+    before_bytes: Option<Vec<u8>>,
+    before_digest: Option<String>,
+    capture_fence: FencingToken,
+    effect_digest: String,
 }
 
 impl GovernedProcessEffectBaseline {
     pub(crate) fn binding(&self) -> &GovernedProcessEffectBinding {
         &self.binding
     }
+
+    pub(crate) fn observed(&self) -> bool {
+        self.before_bytes.is_some() && self.before_digest.is_some()
+    }
 }
 
 /// Validated post-effect readback for one admitted process operation.
 ///
-/// The Governor-owned adapter constructs the receipt; Kernel shuttles it from
-/// readback to ingest without inspecting its contents.
+/// The Kernel-owned effect port constructs the receipt from two further
+/// independent opens of the same lease-owned image plus the terminal
+/// evidence's own State Fence. A receipt without content proves nothing
+/// and ingests nothing; only agreeing real reads become evidence.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct GovernedProcessChangeReceipt;
+pub(crate) struct GovernedProcessChangeReceipt {
+    after_bytes: Option<Vec<u8>>,
+    after_first_digest: Option<String>,
+    after_reread_digest: Option<String>,
+    terminal_fence: FencingToken,
+}
+
+impl GovernedProcessChangeReceipt {
+    pub(crate) fn observed(&self) -> bool {
+        self.after_bytes.is_some()
+            && self.after_first_digest.is_some()
+            && self.after_reread_digest.is_some()
+    }
+}
 
 /// Stable categories for a missing or malformed independent source observation.
 ///
-/// The Governor-owned adapter introduces one variant per failure it can
-/// actually report; Kernel only forwards the value to the stable observation.
+/// The Kernel-owned port below reports I/O and binding outcomes through
+/// the baseline/receipt `observed` flags instead of failing: an unreadable
+/// image or a mismatched operation runs unobserved, never fenced. The type
+/// is retained so a future fallible adapter can introduce one variant per
+/// failure it can actually report; Kernel only forwards the value to the
+/// stable observation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GovernedProcessEffectPortError {}
 
-/// Required Governor-owned readback and `ChangeMonitor` ingress for process tools.
+/// Kernel-owned readback and `ChangeMonitor` ingress for process tools.
 ///
-/// Implementations capture the complete tracked-source baseline before launch,
-/// independently read the terminal source state, attach actual diff and fence
-/// invalidation handles, and ingest the validated receipt bound to the exact
-/// governed baseline Kernel retained for the operation. Kernel always supplies
-/// that baseline at ingest so the observation keeps its Session/operation/
-/// State-Fence attribution; process success is never source evidence.
-///
-/// STITCH (#1824, I10.21): no Governor-side implementor is attached. The
-/// designated `GovernedProcessEffectPort` implementor (Governor change-monitor
-/// adapter performing real content/Git readback) and the host/filesystem hint
-/// emitter do not exist yet, so `effect_port` stays `None` and execution runs
-/// unobserved. Kernel provides no fake-success implementor here; attaching one
-/// would invent source evidence.
+/// The attached implementor
+/// ([`KernelGovernedProcessEffectPort`]) opens the lease-owned governed
+/// image before launch and again at reconcile, hashes the exact bytes
+/// itself, and ingests the validated transition bound to the exact
+/// governed baseline Kernel retained for the operation. Kernel always
+/// supplies that baseline at ingest so the observation keeps its
+/// Session/operation/State-Fence attribution; process success is never
+/// source evidence, and unreadable or mismatched observations stay
+/// unobserved instead of inventing bytes.
 pub(crate) trait GovernedProcessEffectPort: Send + Sync {
     fn capture_before(
         &self,
         binding: &GovernedProcessEffectBinding,
+        source: &GovernedProcessEffectSource,
     ) -> Result<GovernedProcessEffectBaseline, GovernedProcessEffectPortError>;
 
     fn read_after(
@@ -216,9 +249,325 @@ pub(crate) trait GovernedProcessEffectPort: Send + Sync {
 
     fn ingest(
         &self,
-        baseline: &GovernedProcessEffectBaseline,
-        receipt: &GovernedProcessChangeReceipt,
+        baseline: GovernedProcessEffectBaseline,
+        receipt: GovernedProcessChangeReceipt,
     ) -> Result<(), GovernedProcessEffectPortError>;
+}
+
+/// Lease-owned tracked-source read for one governed process operation.
+///
+/// Built by the gateway from the admitted intent and the retained path
+/// proof: the executable and working directory the
+/// `RetainedProcessPathLease` owns, the admission-pinned content digest the
+/// intent validator checked, the pinned image identity that names the
+/// lane-stable artifact, and the validated effect digest that receipts this
+/// exact attempt.
+pub(crate) struct GovernedProcessEffectSource {
+    executable: PathBuf,
+    working_directory: PathBuf,
+    expected_sha256: String,
+    image_id: String,
+    effect_digest: String,
+    lease: Arc<RetainedProcessPathLease>,
+}
+
+/// Kernel-owned `ChangeMonitor` readback adapter for governed tool effects
+/// (#1824, I10.21 W2/A1/A2).
+///
+/// Attached at [`ProcessExecutionGateway::new`]. Every digest below comes
+/// from a real file open: two opens at capture (which must agree, or the
+/// operation runs unobserved) and two opens at readback (which the ledger
+/// itself compares, with disagreement refused as `UnstableReadback`). The
+/// admission-pinned digest is the independent authority a capture is
+/// compared against: a transition the new admission explains (re-pinned
+/// image) is adopted, while a transition no admission explains is ingested
+/// as a `FilesystemNotification` hint and confirmed Material on the spot,
+/// so an external uncorrelated mutation emits an unknown-origin change and
+/// blocks governed acceptance until reconciled. Per-artifact last-observed
+/// digests are retained here under one mutex (atomic publish); the ledger
+/// itself stays the only acceptance gate.
+pub(crate) struct KernelGovernedProcessEffectPort {
+    last_observed: Mutex<BTreeMap<String, String>>,
+}
+
+impl KernelGovernedProcessEffectPort {
+    pub(crate) fn new() -> Self {
+        Self {
+            last_observed: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// Opens the tracked image twice and hashes both reads. The digests
+    /// must agree: a single read proves nothing about stability, and two
+    /// reads that disagree prove the image is changing under observation.
+    fn read_tracked_source(executable: &Path) -> Option<(Vec<u8>, String, String)> {
+        let first_bytes = std::fs::read(executable).ok()?;
+        let second_bytes = std::fs::read(executable).ok()?;
+        let first = super::sha256_hex(&first_bytes);
+        let second = super::sha256_hex(&second_bytes);
+        (first == second).then_some((first_bytes, first, second))
+    }
+
+    /// Confirms one unexplained tracked-image transition: the previously
+    /// observed digest against two fresh agreeing reads. Ingest and
+    /// confirmation are one atomic pair with pairwise-independent values,
+    /// so the Material branch and its unknown-origin record are reachable
+    /// in production. Best-effort: ledger contention never fences the tool.
+    fn confirm_external_transition(
+        hint_id: &str,
+        hint: change_monitor::KernelChangeHint,
+        verification: change_monitor::HintVerification,
+    ) {
+        if change_monitor::ingest_hint(hint).is_err() {
+            return;
+        }
+        let _ = change_monitor::confirm_hint(hint_id, &verification);
+    }
+}
+
+impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
+    fn capture_before(
+        &self,
+        binding: &GovernedProcessEffectBinding,
+        source: &GovernedProcessEffectSource,
+    ) -> Result<GovernedProcessEffectBaseline, GovernedProcessEffectPortError> {
+        // The lane-stable artifact path derives from the admitted image
+        // identity (never a bare constant), so distinct images never share
+        // one artifact record.
+        let artifact = super::sha256_hex(source.image_id.as_bytes());
+        let lane_path = format!("process-image/{artifact}");
+        let resource = source.executable.to_string_lossy().into_owned();
+        let unobserved = || GovernedProcessEffectBaseline {
+            binding: binding.clone(),
+            executable: source.executable.clone(),
+            lane_path: lane_path.clone(),
+            resource: resource.clone(),
+            before_bytes: None,
+            before_digest: None,
+            capture_fence: binding.state_fence.clone(),
+            effect_digest: source.effect_digest.clone(),
+        };
+        // I10.21 W2: the readback lane only trusts the lease-owned scope.
+        // A path the lease cannot prove, or a resource name the ledger
+        // cannot carry, runs unobserved instead of inventing evidence.
+        if resource.trim().is_empty()
+            || resource.chars().any(char::is_control)
+            || source
+                .lease
+                .validate(
+                    &source.executable,
+                    &source.working_directory,
+                    &source.expected_sha256,
+                )
+                .is_err()
+        {
+            observe_process("kernel.process.effect_baseline_unavailable", "unobserved");
+            return Ok(unobserved());
+        }
+        let Some((before_bytes, first_digest, reread_digest)) =
+            Self::read_tracked_source(&source.executable)
+        else {
+            observe_process("kernel.process.effect_baseline_unavailable", "unobserved");
+            return Ok(unobserved());
+        };
+        let previous = self
+            .last_observed
+            .lock()
+            .ok()
+            .and_then(|last| last.get(&resource).cloned());
+        if let Some(previous) = previous
+            && previous != first_digest
+            && first_digest != source.expected_sha256
+        {
+            // The image moved between independent observations and the new
+            // admission still pins the old bytes: no governed operation
+            // explains the transition, so it is external and uncorrelated.
+            // Both agreeing capture reads become the confirmation evidence.
+            let hint_id = change_monitor::filesystem_hint_id(&artifact, &previous);
+            let hint = change_monitor::KernelChangeHint {
+                hint_id: hint_id.clone(),
+                resource: resource.clone(),
+                path: lane_path.clone(),
+                origin: change_monitor::HintOrigin::FilesystemNotification,
+                origin_ref: Some(binding.owner.module_id().to_owned()),
+            };
+            let verification = change_monitor::HintVerification {
+                before_digest: Some(previous),
+                first_read: change_monitor::ContentRead::Present {
+                    sha256: first_digest.clone(),
+                },
+                reread: change_monitor::ContentRead::Present {
+                    sha256: reread_digest,
+                },
+                git: None,
+            };
+            Self::confirm_external_transition(&hint_id, hint, verification);
+        }
+        if let Ok(mut last) = self.last_observed.lock() {
+            last.insert(resource.clone(), first_digest.clone());
+        }
+        Ok(GovernedProcessEffectBaseline {
+            binding: binding.clone(),
+            executable: source.executable.clone(),
+            lane_path,
+            resource,
+            before_bytes: Some(before_bytes),
+            before_digest: Some(first_digest),
+            capture_fence: binding.state_fence.clone(),
+            effect_digest: source.effect_digest.clone(),
+        })
+    }
+
+    fn read_after(
+        &self,
+        baseline: &GovernedProcessEffectBaseline,
+        terminal_evidence: &ProcessEvidence,
+    ) -> Result<GovernedProcessChangeReceipt, GovernedProcessEffectPortError> {
+        let unobserved = || GovernedProcessChangeReceipt {
+            after_bytes: None,
+            after_first_digest: None,
+            after_reread_digest: None,
+            terminal_fence: terminal_evidence.binding().state_fence().clone(),
+        };
+        // I10.21: evidence is bound to this operation. Terminal evidence
+        // for another operation proves nothing about this baseline.
+        if terminal_evidence.binding().operation_id() != baseline.binding.operation_id() {
+            observe_process("kernel.process.effect_readback_failed", "unobserved");
+            return Ok(unobserved());
+        }
+        let Some((after_bytes, first_digest, reread_digest)) =
+            Self::read_tracked_source(&baseline.executable)
+        else {
+            observe_process("kernel.process.effect_readback_failed", "unobserved");
+            return Ok(unobserved());
+        };
+        if let Ok(mut last) = self.last_observed.lock() {
+            last.insert(baseline.resource.clone(), first_digest.clone());
+        }
+        Ok(GovernedProcessChangeReceipt {
+            after_bytes: Some(after_bytes),
+            after_first_digest: Some(first_digest),
+            after_reread_digest: Some(reread_digest),
+            terminal_fence: terminal_evidence.binding().state_fence().clone(),
+        })
+    }
+
+    fn ingest(
+        &self,
+        baseline: GovernedProcessEffectBaseline,
+        receipt: GovernedProcessChangeReceipt,
+    ) -> Result<(), GovernedProcessEffectPortError> {
+        if !baseline.observed() || !receipt.observed() {
+            observe_process("kernel.process.effect_observed", "unobserved");
+            return Ok(());
+        }
+        let operation = baseline.binding.operation_id().as_str().to_owned();
+        let hint_id = change_monitor::host_hint_id(&operation);
+        let hint = change_monitor::KernelChangeHint {
+            hint_id: hint_id.clone(),
+            resource: baseline.resource.clone(),
+            path: baseline.lane_path.clone(),
+            origin: change_monitor::HintOrigin::HostEvent,
+            origin_ref: Some(baseline.binding.owner.module_id().to_owned()),
+        };
+        // A conflicting identity under the same hint reuses an operation
+        // handle for different content: evidence is ambiguous, so nothing
+        // is recorded or confirmed for it.
+        match change_monitor::ingest_hint(hint) {
+            Ok(_) => {}
+            Err(change_monitor::ChangeMonitorError::HintConflict) => {
+                observe_process("kernel.process.effect_observed", "unobserved");
+                return Ok(());
+            }
+            Err(_) => {}
+        }
+        let (Some(before_digest), Some(after_first), Some(after_reread)) = (
+            baseline.before_digest,
+            receipt.after_first_digest,
+            receipt.after_reread_digest,
+        ) else {
+            observe_process("kernel.process.effect_observed", "unobserved");
+            return Ok(());
+        };
+        // I10.21 A1: only a proven transition with real bytes on both sides
+        // becomes a governed record. The ledger hashes the supplied bytes
+        // itself and the diff handle is the ledger's own transition binder,
+        // so the handle resolves to the recorded transition by construction.
+        // The record is written before confirmation so the confirmation can
+        // reconcile against this exact evidence.
+        let mut recorded_transition: Option<String> = None;
+        if after_first == after_reread && after_first != before_digest {
+            let (_, transition) = change_monitor::material_transition_ids(
+                &operation,
+                Some(before_digest.as_str()),
+                Some(after_first.as_str()),
+            );
+            let change = change_monitor::GovernedToolChange {
+                change_id: operation.clone(),
+                resource: baseline.resource.clone(),
+                path: baseline.lane_path.clone(),
+                before_path: None,
+                before_revision: Some(before_digest.clone()),
+                before_bytes: baseline.before_bytes,
+                after_revision: Some(after_first.clone()),
+                after_bytes: receipt.after_bytes,
+                session: baseline.binding.session_id.as_str().to_owned(),
+                action_lease: baseline.binding.action_lease_ref.as_str().to_owned(),
+                operation: operation.clone(),
+                attempt_receipt: baseline.effect_digest,
+                diff_handle: transition.clone(),
+                fence_generation: receipt.terminal_fence.generation().get(),
+                fence_invalidated: receipt.terminal_fence != baseline.capture_fence,
+            };
+            match change_monitor::record_governed_tool_change(&change) {
+                Ok(_) => {
+                    recorded_transition = Some(transition);
+                    observe_process("kernel.process.effect_observed", "recorded");
+                }
+                Err(_) => {
+                    observe_process("kernel.process.effect_observed", "refused");
+                }
+            }
+        }
+        let verification = change_monitor::HintVerification {
+            before_digest: Some(before_digest),
+            first_read: change_monitor::ContentRead::Present { sha256: after_first },
+            reread: change_monitor::ContentRead::Present {
+                sha256: after_reread,
+            },
+            git: None,
+        };
+        match change_monitor::confirm_hint(&hint_id, &verification) {
+            Ok(change_monitor::HintConfirmation::VerifiedImmaterial) => {
+                observe_process("kernel.process.effect_observed", "immaterial");
+            }
+            Ok(change_monitor::HintConfirmation::MaterialRecorded {
+                change_id: unknown_id,
+                reconciled,
+            }) => {
+                // I10.21 A2: reconcile explicitly against the exact recorded
+                // transition, and only when the ledger accepted the governed
+                // record. A refused record reconciles nothing: the
+                // unknown-origin change stays unreconciled and keeps
+                // blocking governed acceptance until reconciled.
+                let mut outcome = if reconciled { "reconciled" } else { "material" };
+                if !reconciled
+                    && let Some(transition) = recorded_transition.as_deref()
+                    && change_monitor::reconcile_unknown_change(&unknown_id, transition).is_ok()
+                {
+                    outcome = "reconciled";
+                }
+                observe_process("kernel.process.effect_observed", outcome);
+            }
+            Err(change_monitor::ChangeMonitorError::UnstableReadback) => {
+                observe_process("kernel.process.effect_observed", "unstable");
+            }
+            Err(_) => {
+                observe_process("kernel.process.effect_observed", "unobserved");
+            }
+        }
+        Ok(())
+    }
 }
 
 struct OrsProcessEvidenceSink {
@@ -721,8 +1070,11 @@ pub(crate) struct ProcessExecutionGateway {
     /// Launched-but-not-closed descendants (CHILD-1/CHILD-2).
     pub(crate) descendants: Arc<Mutex<DescendantRegistry>>,
     /// Governor-owned `ChangeMonitor` ingress for governed tool effects (#1824,
-    /// I10.21). Attached once by composition when the readback/monitor
-    /// adapter exists; absent means process execution runs unobserved.
+    /// I10.21). Attached at construction to the Kernel-owned readback
+    /// adapter below, so process execution is observed with real
+    /// open/checksum/re-read evidence; `None` only ever means the gateway
+    /// was built without the adapter, in which case execution runs
+    /// unobserved rather than inventing source evidence.
     effect_port: Mutex<Option<Arc<dyn GovernedProcessEffectPort>>>,
     /// Pre-effect tracked-source baselines retained between `start` capture
     /// and `reconcile` readback, keyed by exact operation identity.
@@ -1064,6 +1416,8 @@ impl ProcessExecutionGateway {
             validation_contexts: Arc::clone(&validation_contexts),
         });
         let launch_admission: Arc<dyn ProcessLaunchAdmission> = path_admission.clone();
+        let effect_port: Arc<dyn GovernedProcessEffectPort> =
+            Arc::new(KernelGovernedProcessEffectPort::new());
         Self {
             controller,
             executor: WindowsProcessExecutor::new_with_launch_admission(port, launch_admission),
@@ -1075,7 +1429,7 @@ impl ProcessExecutionGateway {
             canonical_store: Arc::new(Mutex::new(None)),
             path_admission,
             descendants: Arc::new(Mutex::new(DescendantRegistry::new())),
-            effect_port: Mutex::new(None),
+            effect_port: Mutex::new(Some(effect_port)),
             effect_baselines: Mutex::new(BTreeMap::new()),
         }
     }
@@ -1224,16 +1578,22 @@ impl ProcessExecutionGateway {
 
     /// Captures the pre-effect tracked-source baseline for one admitted
     /// governed operation (I10.21 A1: exact before revisions, attempt/tool
-    /// operation binding).
+    /// operation binding; W2: host hint source).
     ///
-    /// A malformed binding fails the start with the same typed contract
-    /// rejection the admission pipeline would produce. A readback-owner
-    /// failure never fences the tool: it is observed and the operation runs
-    /// unobserved, so monitor outage cannot crash unrelated execution.
+    /// The readback runs against the retained path proof while its lease is
+    /// live: the admitted executable/working directory the lease owns, the
+    /// admission-pinned digest the intent validator checked, and two
+    /// independent opens that must agree. Anything less than that proof —
+    /// a lease the port cannot verify, an unreadable image, or disagreeing
+    /// reads — runs unobserved with no hint ingested, so a monitor gap can
+    /// never wedge governed acceptance. A malformed binding fails the start
+    /// with the same typed contract rejection the admission pipeline would
+    /// produce.
     fn capture_governed_effect_baseline(
         &self,
         owner: &ProcessOwnerBinding,
         admission: &ProcessExecutionAdmissionRequest,
+        path_proof: &ProcessPathProof,
     ) -> Result<(), ProcessExecutionError> {
         let port = self
             .effect_port
@@ -1246,9 +1606,19 @@ impl ProcessExecutionGateway {
             return Ok(());
         };
         let binding = GovernedProcessEffectBinding::from_admission(owner, admission)?;
-        let operation_id = binding.operation_id().clone();
-        match port.capture_before(&binding) {
+        let source = GovernedProcessEffectSource {
+            executable: path_proof.executable.clone(),
+            working_directory: path_proof.working_directory.clone(),
+            expected_sha256: admission.intent().executable_sha256().to_owned(),
+            image_id: admission.intent().image_id().as_str().to_owned(),
+            effect_digest: admission.intent().effect_digest().to_owned(),
+            lease: Arc::clone(&path_proof.lease),
+        };
+        match port.capture_before(&binding, &source) {
             Ok(baseline) => {
+                if !baseline.observed() {
+                    return Ok(());
+                }
                 self.effect_baselines
                     .lock()
                     .map_err(|_| {
@@ -1256,7 +1626,7 @@ impl ProcessExecutionGateway {
                             "governed effect baseline lock poisoned".to_owned(),
                         )
                     })?
-                    .insert(operation_id, baseline);
+                    .insert(binding.operation_id().clone(), baseline);
                 Ok(())
             }
             Err(error) => {
@@ -1301,10 +1671,12 @@ impl ProcessExecutionGateway {
     /// Reads the terminal source state against the retained pre-effect
     /// baseline and ingests the validated receipt bound to that exact
     /// baseline (I10.21 A1: exact before/after revisions, diff handle,
-    /// State-Fence invalidation; W2: Git/content re-read confirmation).
+    /// State-Fence invalidation; W2: content checksum/re-read confirmation).
     ///
     /// Monitor-path failures are observed and never fail the reconcile: the
-    /// reported terminal evidence stays the owner's.
+    /// reported terminal evidence stays the owner's. Terminal evidence for
+    /// a different operation is likewise observed and skipped, never
+    /// compared against this baseline.
     fn ingest_governed_effect_observation(
         &self,
         operation_id: &eliot_process::OperationId,
@@ -1317,6 +1689,10 @@ impl ProcessExecutionGateway {
         let Some(baseline) = baseline else {
             return;
         };
+        if baseline.binding().operation_id() != operation_id {
+            observe_process("kernel.process.effect_observed", "unobserved");
+            return;
+        }
         let port = match self.effect_port.lock() {
             Ok(guard) => guard.clone(),
             Err(_) => return,
@@ -1325,7 +1701,7 @@ impl ProcessExecutionGateway {
             return;
         };
         match port.read_after(&baseline, evidence) {
-            Ok(receipt) => match port.ingest(&baseline, &receipt) {
+            Ok(receipt) => match port.ingest(baseline, receipt) {
                 Ok(()) => observe_process("kernel.process.effect_observed", "success"),
                 Err(error) => observe_process(
                     "kernel.process.effect_ingest_failed",
@@ -1424,8 +1800,11 @@ impl ProcessExecutionGateway {
         // #1824 (I10.21 A1): capture the pre-effect tracked-source baseline
         // before the reservation/executor handoff below. This is the closest
         // pre-effect point that still carries the admission the binding is
-        // formed from.
-        if let Err(error) = self.capture_governed_effect_baseline(owner, &admission) {
+        // formed from, and the retained path proof whose lease owns the
+        // image the port opens.
+        if let Err(error) =
+            self.capture_governed_effect_baseline(owner, &admission, &path_proof)
+        {
             observe_process("kernel.process.start_failed", "rejected");
             super::kernel_diagnostics::observe_terminal_error(process_terminal_code(&error));
             return Err(error);

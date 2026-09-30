@@ -21,8 +21,7 @@
 
 use std::collections::BTreeMap;
 
-use eliot_contracts::canonical_json_bytes;
-use eliot_ors::{HostRequestRecord, HostRequestState, OperationIdentity, OrsError};
+use eliot_ors::{HostRequestState, OperationIdentity, OrsError};
 use eliot_protocol::{
     FinishAttempt, FinishResultBody, HOST_REQUEST_INVOKE_READ_WIRE_ID, HostRequestEnvelope,
     HostRequestInvokeReadPayload, HostRequestResultBody, TaskControllerAttempt,
@@ -856,7 +855,6 @@ impl KernelComposition {
                 _ => TransportError::SessionFenced,
             })?
             .ok_or(TransportError::UnknownRequest)?;
-        observe_finish_governed_change(body, &persisted);
         self.retire_finish_pair_under_transition(&body.operation_id, &body.request_sha256);
         Ok(LocalReadSubmitDisposition::Persisted(Box::new(persisted)))
     }
@@ -1200,77 +1198,6 @@ fn finish_stale_attempt(
         return Some(observation(StaleLocalReadReason::Superseded));
     }
     None
-}
-
-/// Forwards one completed `eliot.finish` result to the Kernel-owned
-/// `ChangeMonitor` ledger (issue #1824, I10.21 A1/A2).
-///
-/// The finish receipt is operation-bound evidence only: the operation handle
-/// is the idempotent change identity, the stored capability names the
-/// resource, the request digest is the operation's own before revision, and
-/// the canonical response bytes — already digest-bound to `result_digest` by
-/// `FinishResultBody::validate` — are the after bytes the ledger hashes
-/// itself. The diff handle is the ledger's own transition digest over the
-/// exact supplied sides, so it resolves to the recorded transition instead
-/// of copying an unrelated digest. The fenced attempt binds the session,
-/// the attempt-scoped lease, the operation, and the receipt; the State-Fence
-/// join `submit_finish_result` checks before persist showed no invalidation
-/// on the finish operation's fence scope.
-///
-/// What this leg cannot supply — and never invents — is the tracked-source
-/// mutation itself: no source path, no baseline content, and no source diff
-/// reach this function. The designated `GovernedProcessEffectPort`
-/// implementor (Governor change-monitor adapter performing real content/Git
-/// readback) does not exist workspace-wide, so `effect_port` stays `None`,
-/// and the finish wire carries no source fields. The ledger therefore
-/// refuses the governed record until a tool-effect lane supplies the real
-/// mutation; the refusal is best-effort and never fails the submit.
-/// Reconciliation of the operation's exact transition is still attempted
-/// explicitly for when the hint lane confirms it material. Best-effort:
-/// ledger contention or a shape refusal never fails the submit.
-fn observe_finish_governed_change(body: &FinishResultBody, persisted: &HostRequestRecord) {
-    let Ok(after_bytes) = canonical_json_bytes(&body.response) else {
-        return;
-    };
-    // I10.21 A1: the only content this leg holds is the finish artifact
-    // itself. `before_bytes` stays `None` because no tracked-source baseline
-    // reaches this function (see above); the ledger refuses the record on
-    // exactly that ground rather than storing envelope identity as source
-    // identity.
-    let after_digest = crate::sha256_hex(&after_bytes);
-    let (_, diff_handle) = super::change_monitor::material_transition_ids(
-        &body.operation_id,
-        None,
-        Some(after_digest.as_str()),
-    );
-    let change = super::change_monitor::GovernedToolChange {
-        change_id: body.operation_id.clone(),
-        resource: persisted.capability_ref.as_str().to_owned(),
-        path: super::change_monitor::FINISH_RESULT_PATH.to_owned(),
-        before_path: None,
-        before_revision: Some(body.request_sha256.clone()),
-        before_bytes: None,
-        after_revision: Some(body.result_digest.clone()),
-        after_bytes: Some(after_bytes),
-        session: body.attempt.session_id.clone(),
-        action_lease: format!(
-            "{}:{}",
-            body.attempt.attempt_id, body.attempt.fencing_generation
-        ),
-        operation: body.operation_id.clone(),
-        attempt_receipt: body.attempt.attempt_id.clone(),
-        diff_handle,
-        fence_generation: body.attempt.fencing_generation,
-        fence_invalidated: false,
-    };
-    let _ = super::change_monitor::record_governed_tool_change(&change);
-    let hint_id = super::change_monitor::host_hint_id(&body.operation_id);
-    let (unknown_change_id, transition_digest) = super::change_monitor::material_transition_ids(
-        &hint_id,
-        Some(body.request_sha256.as_str()),
-        Some(body.result_digest.as_str()),
-    );
-    let _ = super::change_monitor::reconcile_unknown_change(&unknown_change_id, &transition_digest);
 }
 
 /// Validates the closed Task Controller invoke-read pair before it enters the
