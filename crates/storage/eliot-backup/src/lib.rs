@@ -1403,7 +1403,18 @@ impl RestorePlan {
         })
     }
 
-    fn journal_key(&self) -> Result<String, BackupError> {
+    /// Derives the stable restore-journal STREAM key for this exact plan.
+    ///
+    /// This is the key every durable journal row for this plan/bundle pair is
+    /// filed under, and it is what keeps two restores of the same archive in
+    /// different journal streams. It is a property of ONE EXECUTION and is
+    /// deliberately NOT the durable channel's namespace identity: a channel is
+    /// fixed across every execution of every stream, so the two facts cannot
+    /// occupy one admission field. The namespace identity names the CHANNEL an
+    /// admission was issued for; this key names the STREAM a row belongs to, and
+    /// the operation binding a restore admission carries is proved through
+    /// [`transaction`](Self::transaction), not through this derivation.
+    pub fn journal_key(&self) -> Result<String, BackupError> {
         sha256(&(self.plan_id.as_str(), self.bundle_sha256.as_str()))
     }
 
