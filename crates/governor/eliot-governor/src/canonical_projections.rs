@@ -448,23 +448,6 @@ fn project_continuity(
     }))
 }
 
-fn project_safety(
-    task_id: &TaskId,
-) -> Result<GovernorSafetyProjection, GovernorProjectionError> {
-    // Rejection diagnostics remain in the retained ObservationJournal, but a
-    // rejection carries no exact task-selection evidence to bind it to this
-    // requested task. Do not promote cold, ambiguous, or otherwise unbound
-    // observation errors into task-specific safety/influence triggers.
-    let safety_note = "no governed task-bound negative triggers observed".to_owned();
-    check_text(&safety_note, "safety.safety_note")?;
-    Ok(GovernorSafetyProjection {
-        schema_version: GOVERNOR_PROJECTIONS_SCHEMA_VERSION,
-        task_id: task_id.clone(),
-        safety_note,
-        negative_memory_triggers: Vec::new(),
-    })
-}
-
 fn project_affordance(
     scope_snapshot: &WorkScopeBindingSnapshot,
     scope_ref: &str,
@@ -530,7 +513,15 @@ pub fn compose_canonical_projections(
         fence,
         &mut omissions,
     )?;
-    let safety = Some(project_safety(task_id)?);
+    // Rejection diagnostics remain in the retained ObservationJournal, but
+    // those rows carry no exact task-selection evidence to bind them to this
+    // requested task. Keep safety absent until a governed task-bound source is
+    // available instead of presenting an empty list as a clean safety result.
+    let safety = None;
+    omissions.push(ProjectionOmission {
+        missing: "safety".to_owned(),
+        reason: "no-governed-task-safety-source".to_owned(),
+    });
     let affordance = Some(project_affordance(scope_snapshot, &scope_ref, task_id)?);
 
     let set = GovernorProjectionSet {
