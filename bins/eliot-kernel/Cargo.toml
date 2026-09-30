@@ -23,9 +23,14 @@ blake3.workspace = true
 # Workspace edge (issue #974 N2, requested by the issue-959 report):
 # immutable content-addressed artifact identity, raw evidence handles,
 # omission references and lineage manifests live in eliot-artifact, which is
-# an already-admitted workspace member. The edge is manifest-scoped
-# preparation: the composition root declares the owner it will resolve
-# artifact identity through before any restore path consumes it.
+# an already-admitted workspace member.
+#
+# This edge is PREPARATION and is currently UNCONSUMED: no module under
+# bins/eliot-kernel/src names `eliot_artifact`. #974's "Must not modify" section
+# forbids Rust source edits in this issue, so the edge is declared ahead of the
+# restore path that will consume it. An unused dependency is not a resolution of
+# that path; do not read this line as evidence that artifact identity is already
+# resolved here.
 eliot-artifact.workspace = true
 eliot-authority.workspace = true
 eliot-backup = { path = "../../crates/storage/eliot-backup", version = "0.1.0" }
