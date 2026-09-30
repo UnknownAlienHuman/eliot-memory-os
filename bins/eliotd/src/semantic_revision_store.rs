@@ -87,6 +87,56 @@ impl SemanticRevisionEnvelope {
             supersessions: snapshot.semantic_supersessions.clone(),
         }
     }
+
+    /// Projects one committed envelope into the carrier-independent history a
+    /// reopened fabric rehydrates from (issue #1702 W6/A5).
+    ///
+    /// The four maps stay as they were written; this only moves them out of
+    /// the envelope so the recovery decision — which record is authority, and
+    /// which supplied claim contradicts it — stays with the caller that owns
+    /// the semantic records.
+    #[must_use]
+    pub fn into_history(self) -> SemanticRevisionHistory {
+        SemanticRevisionHistory {
+            definitions: self.definitions,
+            admissions: self.admissions,
+            executions: self.executions,
+            supersessions: self.supersessions,
+        }
+    }
+}
+
+/// The owner-separated revision history one committed envelope carries.
+///
+/// This is the durable authority for all three owners on reopen: the admitted
+/// work a restart must preserve is exactly these records, so recovery reads
+/// them from the envelope rather than accepting a supplied snapshot's maps as
+/// current (issue #1702 W6/A5).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SemanticRevisionHistory {
+    /// Definition revisions by definition identity.
+    pub definitions: BTreeMap<String, SwarmPlanDefinition>,
+    /// Governor admission revisions by admission identity.
+    pub admissions: BTreeMap<String, SwarmPlanAdmission>,
+    /// Coordinator execution revisions by execution identity.
+    pub executions: BTreeMap<String, SwarmExecutionRevision>,
+    /// Supersession links by replacement definition identity.
+    pub supersessions: BTreeMap<String, SupersessionLink>,
+}
+
+impl SemanticRevisionHistory {
+    /// Returns whether this history carries no owner record at all.
+    ///
+    /// The absent-history arm of reopen recovery: a fabric that never
+    /// published a revision has nothing to preserve, which is a consistent
+    /// history rather than a lost one.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.definitions.is_empty()
+            && self.admissions.is_empty()
+            && self.executions.is_empty()
+            && self.supersessions.is_empty()
+    }
 }
 
 /// Self-digest-bound persisted envelope: the payload plus the digest of the

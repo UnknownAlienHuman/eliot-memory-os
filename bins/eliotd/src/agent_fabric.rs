@@ -79,7 +79,7 @@ use eliot_store_api::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::semantic_revision_store::SemanticRevisionStore;
+use crate::semantic_revision_store::{SemanticRevisionHistory, SemanticRevisionStore};
 use crate::staffing_policy::{
     PolicyAuthorizedDegradation, StaffingPlanReceipt, check_attempt_route_continuity,
     enforce_plan_receipt, plan_coordinator_staffing, verify_receipt_digest,
@@ -1232,6 +1232,45 @@ pub struct CommittedOwnerRevision<'a> {
     pub receipt: &'a WriteReceipt,
 }
 
+/// The durable owner-separated history one reopen recovered, resolved as a
+/// projection over the committed records (issue #1702 W6/A5).
+///
+/// Every map below is a PROJECTION. The committed records are the authority;
+/// the admission-to-definition and execution joins are rebuilt from those
+/// records rather than accepted as supplied, and a `None` current identity
+/// means recovery resolved no current head — not that a default one was
+/// invented. Nothing here is a lease: a recovered [`SwarmCoordinatorLease`] is
+/// the recorded binding only, and the presenting coordinator is
+/// re-authenticated at the next write boundary against the committed owner
+/// stream, never against this view.
+pub struct RecoveredSemanticHistory {
+    /// Task Controller definitions by definition identity.
+    pub definitions: BTreeMap<String, SwarmPlanDefinition>,
+    /// Governor admissions by admission identity.
+    pub admissions: BTreeMap<String, SwarmPlanAdmission>,
+    /// Coordinator executions by execution identity.
+    pub executions: BTreeMap<String, SwarmExecutionRevision>,
+    /// Supersession links by replacement definition identity.
+    pub supersessions: BTreeMap<String, SupersessionLink>,
+    /// Admission identity per definition, rebuilt from the stored admissions.
+    pub admission_by_definition: BTreeMap<String, String>,
+    /// Execution identity per definition, rebuilt from the stored executions.
+    pub execution_by_definition: BTreeMap<String, String>,
+    /// Definition identity per execution, rebuilt from the stored executions.
+    pub definition_by_execution: BTreeMap<String, String>,
+    /// Identity of the definition no supersession replaced, when the recovered
+    /// history resolves exactly one current head. `None` when no head resolves
+    /// (empty history) or when several heads are unclaimed, which is the
+    /// contradiction recovery refuses instead of picking a winner for.
+    pub current_definition_id: Option<String>,
+    /// Executions whose own records still leave them free to advance, derived
+    /// from the records above rather than from a saved field.
+    pub advanceable_executions: Vec<String>,
+    /// Executions the recovered history has fenced. They keep their state,
+    /// coverage and unknown effects verbatim and are reconciled, not advanced.
+    pub fenced_executions: Vec<String>,
+}
+
 /// Requires the canonical Store transaction that durably persists one
 /// owner-separated revision, before that revision may be published as current
 /// (issue #1702 W2, I1.8 canonical write path).
@@ -1610,6 +1649,350 @@ fn rebuild_admission_by_definition(
     Ok(admission_by_definition)
 }
 
+/// Rebuilds the recovered owner-separated view as a PROJECTION over the
+/// committed records, verifying each record and each link exactly as fresh
+/// admission does (issue #1702 W6/A5).
+///
+/// Recovery is not weaker than admission, and it is not a copy either: every
+/// record is revalidated with its own `validate()` (which recomputes the full
+/// definition digest, so missing immutable content is caught here rather than
+/// restored), every map key must equal its record identity, and every join is
+/// resolved from the records themselves. Nothing supplied by a caller — a
+/// saved `Verified`/`Active` field, an open process, a linked admission — is
+/// accepted as authority; only what the committed records say counts.
+///
+/// The recovered execution keeps its recorded [`SwarmCoordinatorLease`] and its
+/// recorded state verbatim. That is preservation, not authority: the recorded
+/// state is exactly what a later restart must still see (a `Partial` or
+/// `UnknownOutcome` wave stays that way), and the next coordinator write is
+/// re-authenticated against the committed coordinator owner stream by
+/// [`require_durable_owner_revision`], so a saved label restores no permission.
+/// An execution is allowed to rest under a superseded or cancelled admission
+/// only once that admission actually carries the matching terminal
+/// disposition — a live `ADMITTED` wave under a replaced definition is the
+/// contradiction this refuses rather than revives.
+///
+/// # Errors
+///
+/// Returns the semantic contract rejection for a malformed record,
+/// [`FabricError::BrokenOwnershipLink`] for a dangling or contradictory join,
+/// [`FabricError::SemanticDrift`] for admitted ceilings that widen their
+/// definition, [`FabricError::DefinitionConflict`] for two admissions or two
+/// executions claiming one definition, and [`FabricError::Superseded`] for an
+/// active or still-admitted wave left under a replaced definition.
+fn recover_semantic_history(
+    history: SemanticRevisionHistory,
+) -> Result<RecoveredSemanticHistory, FabricError> {
+    let SemanticRevisionHistory {
+        definitions,
+        admissions,
+        executions,
+        supersessions,
+    } = history;
+    let mut admission_by_definition: BTreeMap<String, String> = BTreeMap::new();
+    let mut execution_by_definition: BTreeMap<String, String> = BTreeMap::new();
+    let mut definition_by_execution: BTreeMap<String, String> = BTreeMap::new();
+
+    for (key, definition) in &definitions {
+        definition.validate().map_err(contract_rejection)?;
+        if key != definition.definition_id.as_str() {
+            return Err(FabricError::BrokenOwnershipLink(
+                "recovered semantic definition map key does not match record identity".to_owned(),
+            ));
+        }
+    }
+    for (key, admission) in &admissions {
+        admission.validate().map_err(contract_rejection)?;
+        if key != admission.admission_id.as_str() {
+            return Err(FabricError::BrokenOwnershipLink(
+                "recovered semantic admission map key does not match record identity".to_owned(),
+            ));
+        }
+        let definition_key = admission.definition_id.as_str();
+        let definition = definitions.get(definition_key).ok_or_else(|| {
+            FabricError::BrokenOwnershipLink(
+                "recovered semantic admission without its stored definition".to_owned(),
+            )
+        })?;
+        if definition.lifecycle == SwarmPlanDefinitionLifecycle::Draft
+            || !admission.binds(definition)
+        {
+            return Err(FabricError::BrokenOwnershipLink(
+                "recovered semantic admission does not bind its frozen definition".to_owned(),
+            ));
+        }
+        if !admission
+            .admitted_ceilings
+            .narrowed_from(&definition.ceilings)
+        {
+            return Err(FabricError::SemanticDrift(
+                "recovered semantic admission widens definition ceilings".to_owned(),
+            ));
+        }
+        if admission_by_definition
+            .insert(definition_key.to_owned(), key.clone())
+            .is_some()
+        {
+            return Err(FabricError::DefinitionConflict(format!(
+                "recovered semantic definition {definition_key} has conflicting admissions"
+            )));
+        }
+    }
+    for (key, execution) in &executions {
+        execution.validate().map_err(contract_rejection)?;
+        if key != execution.execution_id.as_str() {
+            return Err(FabricError::BrokenOwnershipLink(
+                "recovered semantic execution map key does not match record identity".to_owned(),
+            ));
+        }
+        let definition = definitions
+            .get(execution.definition_id.as_str())
+            .ok_or_else(|| {
+                FabricError::BrokenOwnershipLink(
+                    "recovered semantic execution without its stored definition".to_owned(),
+                )
+            })?;
+        let admission = admissions
+            .get(execution.admission_id.as_str())
+            .ok_or_else(|| {
+                FabricError::BrokenOwnershipLink(
+                    "recovered semantic execution without its stored admission".to_owned(),
+                )
+            })?;
+        // Recovery validates the whole stored join, then adds the
+        // live-coherence decision a rest state must satisfy: an execution may
+        // rest under a replaced definition only under a matching terminal
+        // admission disposition, never under a still-admitted one.
+        check_owner_join(definition, admission, execution).map_err(contract_rejection)?;
+        if definition.lifecycle == SwarmPlanDefinitionLifecycle::Superseded
+            && admission.disposition == SwarmPlanAdmissionDisposition::Admitted
+        {
+            return Err(FabricError::Superseded(format!(
+                "recovered execution {} still runs under admission {} of superseded definition {}",
+                key,
+                admission.admission_id.as_str(),
+                execution.definition_id.as_str()
+            )));
+        }
+        if definition_by_execution
+            .insert(key.clone(), execution.definition_id.as_str().to_owned())
+            .is_some()
+        {
+            return Err(FabricError::DefinitionConflict(format!(
+                "recovered semantic execution {} claims two definitions",
+                key
+            )));
+        }
+        if execution_by_definition
+            .insert(execution.definition_id.as_str().to_owned(), key.clone())
+            .is_some()
+        {
+            return Err(FabricError::DefinitionConflict(format!(
+                "recovered semantic definition {} has conflicting executions",
+                execution.definition_id.as_str()
+            )));
+        }
+    }
+    for (key, link) in &supersessions {
+        let next = definitions.get(key).ok_or_else(|| {
+            FabricError::BrokenOwnershipLink(
+                "recovered supersession without its stored replacement definition".to_owned(),
+            )
+        })?;
+        let prior = definitions
+            .get(link.prior_definition_id.as_str())
+            .ok_or_else(|| {
+                FabricError::BrokenOwnershipLink(
+                    "recovered supersession without its stored prior definition".to_owned(),
+                )
+            })?;
+        if next.supersedes.as_ref() != Some(link) {
+            return Err(FabricError::BrokenOwnershipLink(
+                "recovered supersession link does not match its stored replacement".to_owned(),
+            ));
+        }
+        check_supersession(prior, next).map_err(contract_rejection)?;
+    }
+    check_supersession_acyclic(&supersessions)?;
+
+    // Owner loss fences only the affected owner's permission, and that
+    // decision is derived here from the recovered records rather than from a
+    // saved field: an execution is free to advance only while its own records
+    // leave it free. `DRAIN` is the one disposition that deliberately keeps
+    // mechanical progress under the old wave; `CANCEL` and `SUPERSEDE` fence
+    // it, and so does an admission that has left `ADMITTED` for any reason.
+    // Fencing preserves the record verbatim — state, coverage, partial results
+    // and unknown effects all stay exactly as they were recovered.
+    let mut advanceable_executions = Vec::new();
+    let mut fenced_executions = Vec::new();
+    for (key, execution) in &executions {
+        let still_admitted = admissions
+            .get(execution.admission_id.as_str())
+            .is_some_and(|admission| admission.disposition == SwarmPlanAdmissionDisposition::Admitted);
+        let definition_key = execution.definition_id.as_str();
+        let still_frozen = definitions
+            .get(definition_key)
+            .is_some_and(|definition| definition.lifecycle == SwarmPlanDefinitionLifecycle::Frozen);
+        let replaced_with_hold = supersessions
+            .values()
+            .find(|link| link.prior_definition_id.as_str() == definition_key)
+            .is_some_and(|link| {
+                matches!(
+                    link.disposition,
+                    OldWaveDisposition::Cancel | OldWaveDisposition::Supersede
+                )
+            });
+        if still_admitted && still_frozen && !replaced_with_hold {
+            advanceable_executions.push(key.clone());
+        } else {
+            fenced_executions.push(key.clone());
+        }
+    }
+
+    // The current head is resolved from the links, never from a saved field.
+    // An empty history resolves no head (nothing was ever published), and two
+    // unclaimed heads is a forked history: recovery reports no current head
+    // rather than picking one, so the caller keeps the work blocked.
+    let replaced: BTreeSet<&str> = supersessions
+        .values()
+        .map(|link| link.prior_definition_id.as_str())
+        .collect();
+    let mut heads: Vec<&str> = definitions
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !replaced.contains(key))
+        .collect();
+    heads.sort_unstable();
+    let current_definition_id = match heads.as_slice() {
+        [] => None,
+        [head] => Some((*head).to_owned()),
+        _ => None,
+    };
+
+    Ok(RecoveredSemanticHistory {
+        definitions,
+        admissions,
+        executions,
+        supersessions,
+        admission_by_definition,
+        execution_by_definition,
+        definition_by_execution,
+        current_definition_id,
+        advanceable_executions,
+        fenced_executions,
+    })
+}
+
+/// Rejects cyclic replacement chains in a recovered history (issue #1702 W6).
+///
+/// Each link is individually valid, but a cycle (A supersedes B while B
+/// transitively supersedes A) orders no current head, so recovery must not
+/// resolve authority from it. The walk follows prior links from every
+/// replacement; a revisited replacement is contradictory history.
+fn check_supersession_acyclic(
+    supersessions: &BTreeMap<String, SupersessionLink>,
+) -> Result<(), FabricError> {
+    for start in supersessions.keys() {
+        let mut visited = BTreeSet::new();
+        let mut current = start.as_str();
+        while let Some(link) = supersessions.get(current) {
+            if !visited.insert(current) {
+                return Err(FabricError::BrokenOwnershipLink(
+                    "recovered semantic supersession chain is cyclic".to_owned(),
+                ));
+            }
+            current = link.prior_definition_id.as_str();
+        }
+    }
+    Ok(())
+}
+
+/// Reloads the committed owner-separated history and resolves it as a
+/// projection, so a reopened fabric preserves all three owner histories
+/// instead of trusting a supplied image (issue #1702 W6/A5).
+///
+/// The commit point is [`SemanticRevisionStore::commit`], so the record set
+/// read here is the one a reader already saw as current. This method is the
+/// only way a caller obtains that history, and it never reports a partial or
+/// default set: a missing envelope, an unreadable or torn file, a digest that
+/// does not match its own payload, or a contradictory record set all return
+/// the typed [`FabricError::DurabilityUnproven`] / [`FabricError::BrokenOwnershipLink`]
+/// refusal, which the caller keeps as an explicit blocked recovery state
+/// rather than continuing with an empty new plan.
+///
+/// # Errors
+///
+/// Returns [`FabricError::DurabilityUnproven`] when the committed envelope
+/// cannot be loaded and verified, or the semantic refusal for a record set
+/// recovery cannot resolve.
+pub fn recover_committed_semantic_history(
+    store: &SemanticRevisionStore,
+) -> Result<RecoveredSemanticHistory, FabricError> {
+    recover_semantic_history(store.load()?.into_history())
+}
+
+/// Resolves which owner-separated record set a restore is allowed to adopt
+/// (issue #1702 W6/A5).
+///
+/// The committed envelope is the authority whenever a store is attached:
+/// recovery adopts THAT resolved history, and the supplied snapshot may only
+/// agree with it. A supplied image that lost, gained or altered a record is
+/// the "contradictory snapshot restores authority" failure named in the
+/// acceptance paragraph, so it fails closed here rather than after the fact.
+///
+/// A snapshot carrying no semantic records at all is a legacy image rather
+/// than a contradiction, so the committed history is adopted as-is and the
+/// restart keeps work it would otherwise have dropped; that is the
+/// crash-after-commit-before-acknowledgement case item 2 names, where the
+/// durable record is present and the projection is merely absent.
+///
+/// With no store attached there is no committed history to resolve against,
+/// and the supplied records are the only carrier, so they are re-verified by
+/// [`recover_semantic_history`] and adopted. That path is exactly as strict as
+/// fresh admission — it is never a weaker one — it just cannot detect a
+/// divergence from a commit it was never shown.
+///
+/// # Errors
+///
+/// Returns [`FabricError::DurabilityUnproven`] when the committed envelope
+/// cannot be loaded and verified, and the semantic or ownership-link refusal
+/// for a record set recovery cannot resolve.
+fn resolve_recovery_authority(
+    snapshot: &FabricSnapshot,
+    semantic_revisions: Option<&SemanticRevisionStore>,
+) -> Result<RecoveredSemanticHistory, FabricError> {
+    let Some(store) = semantic_revisions else {
+        return recover_semantic_history(supplied_history(snapshot));
+    };
+    let committed = recover_committed_semantic_history(store)?;
+    let supplied = supplied_history(snapshot);
+    if supplied.is_empty() {
+        return Ok(committed);
+    }
+    let recovered = recover_semantic_history(supplied)?;
+    if recovered.definitions != committed.definitions
+        || recovered.admissions != committed.admissions
+        || recovered.executions != committed.executions
+        || recovered.supersessions != committed.supersessions
+    {
+        return Err(FabricError::BrokenOwnershipLink(
+            "restored snapshot contradicts the committed owner-separated history".to_owned(),
+        ));
+    }
+    Ok(committed)
+}
+
+/// The owner-separated records a supplied snapshot carries, in the shape
+/// recovery validates.
+fn supplied_history(snapshot: &FabricSnapshot) -> SemanticRevisionHistory {
+    SemanticRevisionHistory {
+        definitions: snapshot.semantic_definitions.clone(),
+        admissions: snapshot.semantic_admissions.clone(),
+        executions: snapshot.semantic_executions.clone(),
+        supersessions: snapshot.semantic_supersessions.clone(),
+    }
+}
+
 /// B-MOD model registry seam (#694). The fabric resolves routes only through
 /// this injected port; ranking stays with the owner.
 pub trait ModelRegistryPort: Send + Sync {
@@ -1962,6 +2345,74 @@ impl AgentFabric {
     /// at that path. Attaching twice to the same root is idempotent.
     pub fn attach_semantic_revision_store(&mut self, state_root: &std::path::Path) {
         self.semantic_revisions = Some(SemanticRevisionStore::new(state_root));
+    }
+
+    /// Rehydrates the owner-separated history this instance lost, from the
+    /// attached durable store, and re-derives what that history now authorises
+    /// (issue #1702 W6/W7, A5/A6).
+    ///
+    /// This is the reopen leg for a daemon that re-attached its state root
+    /// after construction instead of restoring a snapshot. The in-memory owner
+    /// maps hold nothing on a freshly constructed fabric, so a commit that
+    /// landed just before a crash would be invisible to it; rehydrating from the
+    /// committed envelope through
+    /// [`recover_committed_semantic_history`] is what preserves all three
+    /// owner histories across that restart instead of leaving an empty plan
+    /// that looks like fresh work.
+    ///
+    /// The recovered records are adopted verbatim — definitions, admissions,
+    /// executions, supersession links and the recorded execution states — so a
+    /// `Partial` wave keeps its verified partial results and an
+    /// `UnknownOutcome` wave stays unknown. Nothing is granted: the stored
+    /// coordinator lease is a recorded binding, and the next coordinator write
+    /// is re-authenticated against the committed owner stream. What the
+    /// recovery DOES decide is which execution may still advance and which are
+    /// fenced, and that decision is derived from the recovered records rather
+    /// than from a saved field.
+    ///
+    /// Rehydrating an instance that already holds owner-separated records is a
+    /// conflict, not a merge: two different images of the same owners cannot
+    /// both be current, so the caller learns which one is in memory instead of
+    /// silently losing one of them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FabricError::DefinitionConflict`] when this instance already
+    /// holds owner-separated records, [`FabricError::DurabilityUnproven`] when
+    /// no store is attached or the committed envelope cannot be loaded and
+    /// verified, and the mapped semantic refusal for a record set recovery
+    /// cannot resolve.
+    pub fn rehydrate_committed_history(
+        &mut self,
+    ) -> Result<RecoveredSemanticHistory, FabricError> {
+        let store = self.semantic_revisions.clone().ok_or_else(|| {
+            FabricError::DurabilityUnproven(
+                "rehydrating owner-separated history requires an attached durable store".to_owned(),
+            )
+        })?;
+        if !self.semantic_definitions.is_empty()
+            || !self.semantic_admissions.is_empty()
+            || !self.semantic_executions.is_empty()
+            || !self.semantic_supersessions.is_empty()
+        {
+            return Err(FabricError::DefinitionConflict(
+                "owner-separated history is already present; rehydrating would merge two currents"
+                    .to_owned(),
+            ));
+        }
+        let recovered = recover_committed_semantic_history(&store)?;
+        self.semantic_definitions = recovered.definitions.clone();
+        self.semantic_admissions = recovered.admissions.clone();
+        self.semantic_executions = recovered.executions.clone();
+        self.semantic_supersessions = recovered.supersessions.clone();
+        self.record(
+            "semantic_history_rehydrated",
+            recovered
+                .current_definition_id
+                .as_deref()
+                .unwrap_or("no-current-head"),
+        );
+        Ok(recovered)
     }
 
     /// Rejects a second initialization on the same instance.
@@ -3788,6 +4239,18 @@ impl AgentFabric {
     /// reported current. `None` restores the historical plan-only behaviour:
     /// retained semantic records stay readable history, but publishing a new
     /// one is refused typed until a store is attached.
+    ///
+    /// Issue #1702 W6/A5: when a store IS supplied, the committed envelope is
+    /// the authority for the owner-separated records, not the supplied image.
+    /// Recovery reloads and re-verifies it through
+    /// [`recover_committed_semantic_history`], adopts that resolved history
+    /// verbatim, and requires the supplied snapshot to agree with it. A
+    /// snapshot that lost, gained or altered a record contradicts the commit
+    /// and fails closed instead of restoring authority; a snapshot with no
+    /// semantic records at all is a legacy image, so the committed history is
+    /// adopted as-is and nothing is lost. `None` keeps the plan-only path,
+    /// where the supplied records are the only carrier and are verified by
+    /// [`verify_snapshot_semantics`] as before.
     pub fn restore(
         snapshot: FabricSnapshot,
         config: CoordinatorConfig,
@@ -3809,6 +4272,7 @@ impl AgentFabric {
         // authority. Legacy snapshots carry no semantic records and pass
         // trivially.
         verify_snapshot_semantics(&snapshot)?;
+        let recovered = resolve_recovery_authority(&snapshot, semantic_revisions)?;
         let admission_by_definition = rebuild_admission_by_definition(&snapshot)?;
         let coordinator = AgentCoordinator::restore(
             snapshot.coordinator_snapshot.clone(),
@@ -3847,10 +4311,10 @@ impl AgentFabric {
             intent_by_operation,
             attempt_states: snapshot.attempt_states,
             cancellations: snapshot.cancellations,
-            semantic_definitions: snapshot.semantic_definitions,
-            semantic_admissions: snapshot.semantic_admissions,
-            semantic_executions: snapshot.semantic_executions,
-            semantic_supersessions: snapshot.semantic_supersessions,
+            semantic_definitions: recovered.definitions,
+            semantic_admissions: recovered.admissions,
+            semantic_executions: recovered.executions,
+            semantic_supersessions: recovered.supersessions,
             staffing_receipts: snapshot.staffing_receipts,
             attempt_routes: snapshot.attempt_routes,
             attempt_degradations: BTreeMap::new(),
@@ -3874,10 +4338,18 @@ impl AgentFabric {
     /// missing/stale/revoked evidence stays plan-only/blocked instead of
     /// silently resuming effecting operations.
     ///
+    /// Issue #1702 W6/A5: the provider capability is not semantic authority, so
+    /// the owner-separated records come from the same place the plan-only
+    /// restore takes them — the committed envelope, reloaded and re-verified
+    /// through [`recover_committed_semantic_history`], with the supplied image
+    /// required to agree. A freshly admitted provider never resurrects a
+    /// revoked or contradicted wave.
+    ///
     /// # Errors
     ///
     /// Returns the coordinator owner restore rejection, a stale-config
-    /// conflict, or a stale/revoked binding rejection unchanged.
+    /// conflict, the recovery refusal for a contradictory or unverifiable
+    /// owner-separated history, or a stale/revoked binding rejection unchanged.
     pub fn restore_with_admitted_provider(
         snapshot: FabricSnapshot,
         config: CoordinatorConfig,
@@ -3894,6 +4366,7 @@ impl AgentFabric {
         // authority. Legacy snapshots carry no semantic records and pass
         // trivially.
         verify_snapshot_semantics(&snapshot)?;
+        let recovered = resolve_recovery_authority(&snapshot, semantic_revisions)?;
         let admission_by_definition = rebuild_admission_by_definition(&snapshot)?;
         let coordinator = AgentCoordinator::restore_with_admitted_provider(
             snapshot.coordinator_snapshot.clone(),
@@ -3930,10 +4403,10 @@ impl AgentFabric {
             intent_by_operation,
             attempt_states: snapshot.attempt_states,
             cancellations: snapshot.cancellations,
-            semantic_definitions: snapshot.semantic_definitions,
-            semantic_admissions: snapshot.semantic_admissions,
-            semantic_executions: snapshot.semantic_executions,
-            semantic_supersessions: snapshot.semantic_supersessions,
+            semantic_definitions: recovered.definitions,
+            semantic_admissions: recovered.admissions,
+            semantic_executions: recovered.executions,
+            semantic_supersessions: recovered.supersessions,
             staffing_receipts: snapshot.staffing_receipts,
             attempt_routes: snapshot.attempt_routes,
             attempt_degradations: BTreeMap::new(),
