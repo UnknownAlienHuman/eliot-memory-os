@@ -30,6 +30,7 @@ use crate::negative_memory_probe::{
     NegativeMemoryProbeExecutor, admit_negative_memory_probe, execute_negative_memory_probe,
 };
 use crate::observation_reconciliation::GovernorObservationReconciliation;
+use crate::captured_lsp_evidence::consume_captured_lsp_observations;
 use crate::operator_reconciliation::GovernorOperatorReconciliation;
 use crate::owner_closure_feed::{
     OwnerPublishPort, synchronize_owner_feed, synchronize_owner_feed_with_canonical_receipts,
@@ -7003,6 +7004,24 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             ));
         }
         issue_source_artifact_admission(&mut self.owners.authority, input)
+    }
+
+    /// Revalidates retained LSP envelopes with Blob-owner-authenticated read
+    /// chunks and returns their bounded, historically stale evidence.
+    pub fn consume_captured_lsp_observations(
+        &self,
+        current_read_task_binding: eliot_store_api::TaskBinding,
+        current_read_causal_binding: eliot_store_api::CausalBinding,
+        observations: Vec<eliot_code_cortex::CapturedLspObservation>,
+    ) -> Result<Vec<NormalizedEvidence>, CapturedLspEvidenceError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CapturedLspEvidenceError::GovernorNotReady);
+        }
+        consume_captured_lsp_observations(
+            current_read_task_binding,
+            current_read_causal_binding,
+            observations,
+        )
     }
 
     #[allow(

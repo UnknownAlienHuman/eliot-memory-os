@@ -130,6 +130,7 @@ mod owner_projection_refresh;
 mod problem_owner_transitions;
 mod quality_applicability;
 mod reactive_admission;
+mod captured_lsp_evidence;
 mod route_registry;
 mod scan_disclosure_owner;
 mod scope_identity_admission;
@@ -278,6 +279,8 @@ pub use reactive_admission::{
     AtomRiskBinding, ReactiveAdmissionError, ReactiveRiskAssessment, ReactiveRiskTier,
     assess_reactive_risk, bind_atom_risk,
 };
+pub use captured_lsp_evidence::CapturedLspEvidenceError;
+pub use eliot_code_cortex::CapturedLspObservation;
 pub use route_registry::{
     ActualRouteReceipt, CapabilityRouteRegistry, EFFECTIVE_ROUTE_KEY_DOMAIN, ExecutionIdentity,
     ObservedRoute, RouteAdmission, RouteAdmissionDecision, RouteBehaviorFingerprint,
