@@ -27,8 +27,12 @@
 //! I10.18 anchored review consumes admitted observations; this ledger
 //! preserves immutable original identity (before-revisions are retained
 //! and reconciliation appends a link instead of rewriting), so anchors
-//! stay historically addressable. Resolver projection itself is a
-//! separate lane and is not built here.
+//! stay historically addressable. A proven deletion (two agreeing `Absent`
+//! reads from the production readback lane against a retained baseline)
+//! is stored as an immutable deletion observation (`after_digest: None`,
+//! I10.21 A4) and surfaced through [`deletion_observations_for`] for the
+//! resolver's historically addressable `deleted` result. Resolver
+//! projection itself is a separate lane and is not built here.
 //!
 //! Evidence rule: the Kernel never invents source bytes. Content checksums
 //! are computed here with [`crate::sha256_hex`] over the exact bytes the
@@ -121,18 +125,27 @@ pub(crate) struct KernelChangeHint {
     pub origin_ref: Option<String>,
 }
 
-/// One direct content read: the exact bytes hashed. Deletion readback has
-/// no in-crate producer yet, so absence is expressed only through a missing
-/// baseline (`None`), never through this type.
+/// One direct content read: the exact bytes hashed, or the proven absence
+/// of the tracked path. `Absent` is deletion evidence (I10.21 AUD5, audit
+/// 5910747803): two agreeing not-found reads from the production readback
+/// lane (`content_read_for` in `crate::process_execution`). Any other read
+/// failure is not representable here and must stay outside baselines and
+/// receipts — it proves nothing and never becomes a deletion observation.
+///
+/// Admitted here and bound by content compare in [`confirm_hint`]: the two
+/// reads must agree, and only agreement against a retained present baseline
+/// mints a deletion observation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ContentRead {
     Present { sha256: String },
+    Absent,
 }
 
 impl ContentRead {
-    fn digest(&self) -> &str {
+    fn digest(&self) -> Option<&str> {
         match self {
-            Self::Present { sha256 } => sha256,
+            Self::Present { sha256 } => Some(sha256),
+            Self::Absent => None,
         }
     }
 }
@@ -179,11 +192,16 @@ pub(crate) struct HintVerification {
 /// hashes the supplied bytes itself and drops them; only digests are
 /// retained.
 ///
-/// Ingress contract (fail-closed): both content sides must be present so the
-/// ledger hashes real before/after source bytes, and `diff_handle` must be
-/// the exact transition digest for `(change_id, before, after)` — a copied
-/// unrelated digest does not resolve and is refused with
-/// [`ChangeMonitorError::InvalidGovernedChange`]. The fence fields must be
+/// Ingress contract (fail-closed): at least one content side must be real
+/// bytes the producing lane read back, so the ledger hashes source truth
+/// instead of envelope identity. `before_bytes: None` with `after_bytes:
+/// Some` is a creation, `before_bytes: Some` with `after_bytes: None` is a
+/// deletion (I10.21 A4, audit 5910747803); both `None` carries no pair at
+/// all and both `Some` with equal digests carries no transition, so both
+/// are refused with [`ChangeMonitorError::InvalidGovernedChange`]. The
+/// `diff_handle` must be the exact transition digest for `(change_id,
+/// before, after)` — a copied unrelated digest does not resolve and is
+/// refused with [`ChangeMonitorError::InvalidGovernedChange`]. The fence fields must be
 /// the joined generation and the invalidation outcome the producing lane
 /// actually observed. A lane that observed only its own IPC envelope
 /// (request/result digests, no tracked-source bytes) cannot satisfy this
@@ -358,7 +376,12 @@ fn validate_verification(verification: &HintVerification) -> Result<(), ChangeMo
         return Err(ChangeMonitorError::InvalidGitEvidence);
     }
     for read in [&verification.first_read, &verification.reread] {
-        if !is_sha256_hex(read.digest()) {
+        // A `Present` side must carry exact sha256 hex, while `Absent`
+        // carries no digest at all (absence is bound by the agreement
+        // check in `confirm_hint`, never by a digest).
+        if let Some(digest) = read.digest()
+            && !is_sha256_hex(digest)
+        {
             return Err(ChangeMonitorError::InvalidGitEvidence);
         }
     }
@@ -438,11 +461,16 @@ pub(crate) fn material_transition_ids(
 
 /// Confirms one hint with trusted content and readback evidence (I10.21
 /// W2, second half). The two content reads must agree or the readback
-/// proves nothing; a Material transition (after digest differs from the
-/// retained baseline) emits an unknown-origin Material change (I10.21 A2),
-/// reconciled immediately only when a recorded governed change already
-/// proves the exact same resource transition (same before and after
-/// digests, not merely the same after bytes).
+/// proves nothing; an `Absent` pair against an absent baseline is
+/// immaterial, while a Material transition (after state differs from the
+/// retained baseline, including creation and deletion) emits an
+/// unknown-origin Material change (I10.21 A2), reconciled immediately only
+/// when a recorded governed change already proves the exact same resource
+/// transition (same before and after digests, not merely the same after
+/// bytes). A proven deletion (present baseline, agreeing `Absent` reads)
+/// becomes the immutable deletion observation (`after_digest: None`) the
+/// resolver needs for a historically addressable `deleted` result (see
+/// [`deletion_observations_for`]; I10.21 A4, audit 5910747803).
 ///
 /// Confirmation is evidence-driven, never sticky: identical evidence
 /// replays the identical outcome, while new evidence under a retried
@@ -460,13 +488,10 @@ pub(crate) fn confirm_hint(
     if verification.first_read != verification.reread {
         return Err(ChangeMonitorError::UnstableReadback);
     }
-    let after_digest = verification.reread.digest().to_owned();
+    let after_digest = verification.reread.digest().map(str::to_owned);
     let before_digest = verification.before_digest.clone();
-    let (change_id, transition_digest) = material_transition_ids(
-        hint_id,
-        before_digest.as_deref(),
-        Some(after_digest.as_str()),
-    );
+    let (change_id, transition_digest) =
+        material_transition_ids(hint_id, before_digest.as_deref(), after_digest.as_deref());
     let mut ledger = ledger()?;
     let resource = ledger
         .hints
@@ -475,7 +500,7 @@ pub(crate) fn confirm_hint(
         .hint
         .resource
         .clone();
-    if before_digest.as_deref() == Some(after_digest.as_str()) {
+    if before_digest == after_digest {
         let entry = ledger
             .hints
             .get_mut(hint_id)
@@ -488,8 +513,8 @@ pub(crate) fn confirm_hint(
         .iter()
         .find(|(_, record)| {
             record.resource == resource
-                && record.before_digest.as_deref() == before_digest.as_deref()
-                && record.after_digest.as_deref() == Some(after_digest.as_str())
+                && record.before_digest == before_digest
+                && record.after_digest == after_digest
         })
         .map(|(evidence_id, _)| evidence_id.clone());
     let reconciled = evidence_id.is_some();
@@ -498,7 +523,7 @@ pub(crate) fn confirm_hint(
             slot.insert(UnknownOriginRecord {
                 resource,
                 before_digest,
-                after_digest: Some(after_digest),
+                after_digest: after_digest.clone(),
                 transition_digest,
                 reconciled,
             });
@@ -538,13 +563,16 @@ pub(crate) fn confirm_hint(
 /// attempt receipt, the diff handle, and the observed State-Fence
 /// invalidation (I10.21 A1). Content checksums are computed here over the
 /// exact bytes supplied; the bytes are dropped and only digests retained.
-/// A record without both content sides, or whose diff handle does not name
-/// its exact before/after transition, is refused: the ledger stores source
-/// identity, never envelope identity. A recorded governed transition
-/// reconciles the matching unknown-origin change for the exact same
-/// resource transition. History is never rewritten: an exact replay is
-/// reported, a conflicting identity is refused, and a lease/session/
-/// operation owned by another operation is never reused.
+/// A creation carries `before_bytes: None`, a deletion carries
+/// `after_bytes: None`; a record with neither side, with agreeing present
+/// sides, or whose diff handle does not name its exact before/after
+/// transition, is refused: the ledger stores source identity, never
+/// envelope identity. A recorded governed transition reconciles the
+/// matching unknown-origin change for the exact same resource transition,
+/// including a governed deletion against its deletion observation.
+/// History is never rewritten: an exact replay is reported, a conflicting
+/// identity is refused, and a lease/session/operation owned by another
+/// operation is never reused.
 ///
 /// Caller (I10.21 A1):
 /// `crate::process_execution::KernelGovernedProcessEffectPort::ingest`.
@@ -577,14 +605,16 @@ pub(crate) fn record_governed_tool_change(
     }
     let before_digest = change.before_bytes.as_deref().map(crate::sha256_hex);
     let after_digest = change.after_bytes.as_deref().map(crate::sha256_hex);
-    // I10.21 A1: both content sides must be real bytes the producing lane
-    // read back. `None` on either side means no source identity exists for
-    // that side (an envelope/request digest is operation identity, not
-    // content), so there is no before/after pair to record.
-    let (Some(before_digest), Some(after_digest)) = (before_digest, after_digest) else {
+    // I10.21 A1 (AUD5): at least one content side must be real bytes the
+    // producing lane read back. `None` on exactly one side is the
+    // creation/deletion shape; `None` on both sides means no source
+    // identity exists for either side (an envelope/request digest is
+    // operation identity, not content), so there is no before/after pair
+    // to record.
+    if before_digest.is_none() && after_digest.is_none() {
         return Err(ChangeMonitorError::InvalidGovernedChange);
-    };
-    if before_digest == after_digest {
+    }
+    if before_digest.is_some() && before_digest == after_digest {
         return Err(ChangeMonitorError::InvalidGovernedChange);
     }
     // I10.21 A1: the diff handle must resolve to the exact recorded
@@ -594,8 +624,8 @@ pub(crate) fn record_governed_tool_change(
     // this ledger recorded and is refused.
     let (_, transition_digest) = material_transition_ids(
         &change.change_id,
-        Some(before_digest.as_str()),
-        Some(after_digest.as_str()),
+        before_digest.as_deref(),
+        after_digest.as_deref(),
     );
     if change.diff_handle != transition_digest {
         return Err(ChangeMonitorError::InvalidGovernedChange);
@@ -605,9 +635,9 @@ pub(crate) fn record_governed_tool_change(
         path: change.path.clone(),
         before_path: change.before_path.clone(),
         before_revision: change.before_revision.clone(),
-        before_digest: Some(before_digest.clone()),
+        before_digest: before_digest.clone(),
         after_revision: change.after_revision.clone(),
-        after_digest: Some(after_digest.clone()),
+        after_digest: after_digest.clone(),
         session: change.session.clone(),
         action_lease: change.action_lease.clone(),
         operation: change.operation.clone(),
@@ -638,8 +668,8 @@ pub(crate) fn record_governed_tool_change(
         .filter(|(_, unknown)| {
             !unknown.reconciled
                 && unknown.resource == change.resource
-                && unknown.before_digest.as_deref() == Some(before_digest.as_str())
-                && unknown.after_digest.as_deref() == Some(after_digest.as_str())
+                && unknown.before_digest == before_digest
+                && unknown.after_digest == after_digest
         })
         .map(|(unknown_id, _)| (unknown_id.clone(), change.change_id.clone()))
         .collect();
@@ -688,6 +718,52 @@ pub(crate) fn reconcile_unknown_change(
         evidence_change_id: format!("transition:{evidence_transition_digest}"),
     });
     Ok(())
+}
+
+/// One immutable deletion observation for the resolver projection (I10.21
+/// A4, audit 5910747803): the ledger identity of a proven tracked-target
+/// deletion plus the exact before-state it deletes from. The observation
+/// stays addressable after reconciliation (history is never rewritten),
+/// so an old review anchor over a deleted target resolves to historically
+/// addressable `deleted` instead of vanishing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DeletionObservation {
+    pub change_id: String,
+    pub transition_digest: String,
+    pub before_digest: Option<String>,
+}
+
+/// Resolver-visible deleted status for one tracked resource (I10.21 A4,
+/// I10.18 anchored review): every immutable deletion observation the
+/// ledger proved for `resource` — unknown-origin records whose after-state
+/// is proven absent (`after_digest: None`), in ledger (change-id) order.
+/// Only [`confirm_hint`] mints these, from agreeing `Absent` reads against
+/// a retained baseline, so a read failure or an unobserved path can never
+/// appear here: absence from this list means no proven deletion, never a
+/// silent erase. A poisoned ledger yields no observations here; the global
+/// acceptance gate ([`governed_acceptance_blocked`]) already fails closed,
+/// so callers must still consult it before accepting governed work.
+///
+/// Caller: the Kernel process-effect lane in `crate::process_execution`,
+/// which consults the minted observations for the exact transition before
+/// re-confirming a standing deletion, and the anchored-review/resolver
+/// lane resolving an old anchor whose target no longer exists.
+pub(crate) fn deletion_observations_for(resource: &str) -> Vec<DeletionObservation> {
+    let Ok(ledger) = ledger() else {
+        return Vec::new();
+    };
+    ledger
+        .unknown
+        .iter()
+        .filter(|(_, unknown)| {
+            unknown.resource.as_str() == resource && unknown.after_digest.is_none()
+        })
+        .map(|(change_id, unknown)| DeletionObservation {
+            change_id: change_id.clone(),
+            transition_digest: unknown.transition_digest.clone(),
+            before_digest: unknown.before_digest.clone(),
+        })
+        .collect()
 }
 
 /// Returns whether governed acceptance is currently blocked: a host-event
