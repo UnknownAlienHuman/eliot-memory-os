@@ -1972,16 +1972,17 @@ impl DaemonComposition {
     }
 
     /// Attaches the bounded pre-owner question using the exact Host observation
-    /// retained by the activation dispatch. The lease/key/evidence are carried
-    /// forward unchanged for the post-acceptance trigger owner route.
+    /// retained by the activation dispatch. The event is explicitly
+    /// `AttachOrLaunch`; the lease/key/evidence are carried forward unchanged
+    /// for the post-acceptance trigger owner route.
     ///
     /// Issue #2900 W12: this is the live attach/cold-start ingress that
     /// reaches the scan port. An installation-bound durable owner, when
     /// available, is connected before `BootstrapScanner::scan`; its exact
     /// receipt is read back under the same binding. Without that owner, only
     /// the storeless smallest-question leg may run and completion fails closed.
-    /// Caller: `daemon_runtime::resolve_valid_ticket`, which retains this
-    /// Host observation for the accepted-result trigger after Kernel ACK.
+    /// Caller: `daemon_runtime::resolve_valid_ticket`. The accepted-result
+    /// trigger caller is `daemon_runtime::trigger_cold_start_controller`.
     pub fn attach_cold_start_question(
         result: AgentActivationResolutionResult,
         observed: &mut crate::task_binding_admission::ColdStartDiscoveryInput,
@@ -1990,26 +1991,124 @@ impl DaemonComposition {
             &eliot_workscope::ScanDisclosureOwnerBinding,
         )>,
     ) -> Result<AgentActivationResolutionResult, DaemonError> {
-        if let Some((store, binding)) = owner {
-            match Self::attach_cold_start_owner_receipt(store, binding, observed) {
-                Ok(_handle) => return Ok(result),
-                Err(eliot_workscope::WorkScopeError::ScanContourNotAdmitted) => {}
-                Err(error) => {
-                    return Err(DaemonError::Composition(CompositionError::ScanDisclosure(
-                        error,
-                    )));
-                }
-            }
+        let now = observed.discovery.now;
+        let scan = Self::route_cold_start_trigger_discovery(
+            eliot_workscope::ColdStartTrigger::AttachOrLaunch,
+            observed,
+            owner,
+            now,
+        )?;
+        if matches!(
+            &scan,
+            eliot_workscope::BootstrapScanOutcome::Completed { .. }
+        ) {
+            // The trigger route has already validated and read back the exact
+            // installation-bound receipt before it can return Completed.
+            return Ok(result);
         }
-        let scan = eliot_workscope::run_bootstrap_discovery(
+        Self::project_cold_start_question(result, scan)
+    }
+
+    /// Dispatches one explicitly named I4.4.1 event through the
+    /// privacy-bounded discovery scanner.
+    ///
+    /// The observer's event owner supplies the trigger and authenticated
+    /// observation. This method rejects a mismatch between that trigger and
+    /// the retained read lease/evidence, then checks the trigger's required
+    /// read set before either scanner path. Missing privacy inputs use the
+    /// scanner's storeless smallest-question path, which cannot charge a lease
+    /// or persist a receipt. A completed scan requires both the exact owner
+    /// binding and installation-bound disclosure store and runs through
+    /// `GovernorComposition::run_cold_start_trigger_scan`, including durable
+    /// receipt readback. No event is inferred from an activation ticket.
+    ///
+    /// The live attach question-phase caller is
+    /// `daemon_runtime::resolve_valid_ticket`; the accepted trigger-phase
+    /// caller, `daemon_runtime::trigger_cold_start_controller`, calls the
+    /// Governor scan entry directly. `FirstProjectOpen`, `UnknownWorkspace`,
+    /// `OnboardingRequest`, `StaleGeneration`, and `ResumeWithoutTask` are
+    /// explicit hooks for their authenticated event owners; this composition
+    /// does not synthesize those events or claim an in-tree caller for them.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the explicit event, retained lease/evidence, owner binding, store, and scan clock are validated together"
+    )]
+    pub fn route_cold_start_trigger_discovery(
+        trigger: eliot_workscope::ColdStartTrigger,
+        observed: &mut crate::task_binding_admission::ColdStartDiscoveryInput,
+        owner: Option<(
+            &mut eliot_governor::InstallationScanDisclosureStore,
+            &eliot_workscope::ScanDisclosureOwnerBinding,
+        )>,
+        now: u64,
+    ) -> Result<eliot_workscope::BootstrapScanOutcome, DaemonError> {
+        if observed.trigger != trigger {
+            return Err(DaemonError::Lifecycle(format!(
+                "I4.4.1 trigger mismatch: event owner named {trigger:?}, retained discovery is {:?}",
+                observed.trigger
+            )));
+        }
+        if now == 0 {
+            return Err(DaemonError::Lifecycle(
+                "I4.4.1 scanner clock is not available".to_owned(),
+            ));
+        }
+        observed.discovery.now = now;
+        eliot_workscope::ColdStartController::check_discovery_with_scan(
+            trigger,
+            &observed.lease,
+            &observed.discovery.evidence,
+            now,
+        )
+        .map_err(|error| {
+            DaemonError::Lifecycle(format!(
+                "I4.4.1 {trigger:?} discovery lease/evidence refused: {error:?}"
+            ))
+        })?;
+
+        if let (Some(candidate_privacy), Some(privacy_boundary), Some(policy)) = (
+            observed.discovery.candidate_privacy,
+            observed.discovery.privacy_boundary.as_ref(),
+            observed.discovery.policy.as_ref(),
+        ) {
+            let Some((store, binding)) = owner else {
+                return Err(DaemonError::Composition(
+                    CompositionError::ScanDisclosure(
+                        eliot_workscope::WorkScopeError::ScanContourNotAdmitted,
+                    ),
+                ));
+            };
+            return eliot_governor::GovernorComposition::<
+                dyn eliot_governor::KernelGenerationPort,
+            >::run_cold_start_trigger_scan(
+                trigger,
+                &mut observed.lease,
+                &observed.key,
+                store,
+                binding,
+                candidate_privacy,
+                Some(privacy_boundary),
+                &observed.discovery.evidence,
+                observed.discovery.proposed_kind,
+                &observed.discovery.identity_fingerprint,
+                &policy.verifier_refs,
+                observed.discovery.governing_source_refs.clone(),
+                now,
+            )
+            .map_err(DaemonError::Composition);
+        }
+
+        // This path returns the privacy question without charging or
+        // persisting. Fully classified scans take the durable-owner branch
+        // above and cannot complete here.
+        eliot_workscope::run_bootstrap_discovery(
             None,
             None,
             &mut observed.lease,
             &observed.key,
             &observed.discovery,
         )
-        .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
-        Self::project_cold_start_question(result, scan)
+        .map_err(|error| DaemonError::Lifecycle(error.to_string()))
     }
 
     /// Binds the accepted activation's authenticated Kernel readiness owner

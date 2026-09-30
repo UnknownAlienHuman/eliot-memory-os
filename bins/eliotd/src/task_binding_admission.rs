@@ -151,7 +151,6 @@ use eliot_bootstrap::capture::{
     WorkspaceInstanceFacts, WorkspaceSourceDocumentKind, observe_workspace_instance,
     observe_workspace_source_candidates,
 };
-use eliot_contracts::sha256_hex;
 use eliot_contracts::{RequestMetadata, StateFence, TaskId};
 use eliot_governor::{
     CanonicalWriteEnvelope, ColdStartSurfaceView, GoverningSourceSet, PrivacyProfile, ScopeBinding,
@@ -171,22 +170,73 @@ use eliot_protocol::{
 use eliot_security_contracts::PrivacyClass;
 use eliot_store_api::{NamedMutationOperation, PreparedTransition};
 use eliot_workscope::{
-    BootstrapDiscoveryInputs, BootstrapScanEvidence, DiscoveryLeaseKey, DiscoveryLeaseRequest,
+    BootstrapDiscoveryInputs, BootstrapScanEvidence, ColdStartTrigger, DiscoveryLeaseKey,
+    DiscoveryLeaseRequest,
     DiscoveryRead, DiscoveryReadLease, GoverningSourceCandidateEvidence, GoverningSourceRole,
-    ManifestEvidence, ObservedScopeResources, OnboardingLease, OnboardingReadinessReceipt,
+    ObservedScopeResources, OnboardingLease, OnboardingReadinessReceipt,
     PrivacyBoundary, ReadinessLifecycle, ScopeBindingDisposition, ScopeResolutionState,
     TaskBindingState, issue_discovery_lease, task_selection_required,
 };
 
-/// Authenticated activation's bounded filesystem/VCS observation and its
-/// scanner inputs. The ticket binds the explicit selector to the admitted
-/// Bridge request and peer receipt; all identity/evidence fields below are
-/// derived from the Host observer, never accepted from the caller.
+/// One event's bounded Host observation and its scanner inputs. Its explicit
+/// trigger is retained with the lease so a later caller cannot route the same
+/// observation under a different event read set. Identity/evidence fields are
+/// derived from the Host observer, never accepted as scan evidence.
 #[derive(Clone, Debug)]
 pub struct ColdStartDiscoveryInput {
+    /// I4.4.1 event named by the authenticated event owner.
+    pub trigger: ColdStartTrigger,
     pub lease: DiscoveryReadLease,
     pub key: DiscoveryLeaseKey,
     pub discovery: BootstrapDiscoveryInputs,
+}
+
+/// Explicit event-owner inputs for one I4.4.1 discovery pass.
+///
+/// This payload is shape only: its producer must be the authenticated owner
+/// of the named cold-start event. `trigger`, `event_ref`, and the lease
+/// principals are never inferred from an activation ticket, filesystem
+/// recency, current directory, or a workspace label. Construction does not
+/// authenticate or admit the event; the source owner must do so before calling
+/// [`observe_cold_start_trigger_discovery`].
+#[derive(Clone, Copy, Debug)]
+pub struct ColdStartTriggerIngress<'a> {
+    pub trigger: ColdStartTrigger,
+    pub explicit_root: &'a Path,
+    pub event_ref: &'a str,
+    pub proposer_ref: &'a str,
+    pub session_ref: &'a str,
+    pub host_ref: &'a str,
+    pub deadline: u64,
+}
+
+impl ColdStartTriggerIngress<'_> {
+    /// Validates shape without treating the supplied references as authority.
+    pub fn validate(&self) -> Result<(), TaskBindingError> {
+        if !self.explicit_root.is_absolute() {
+            return Err(TaskBindingError::scope_incompatible(
+                "cold-start trigger root must be explicit and absolute",
+            ));
+        }
+        for (value, field) in [
+            (self.event_ref, "event_ref"),
+            (self.proposer_ref, "proposer_ref"),
+            (self.session_ref, "session_ref"),
+            (self.host_ref, "host_ref"),
+        ] {
+            if value.trim().is_empty() || value.chars().any(char::is_control) {
+                return Err(TaskBindingError::selection_required(format!(
+                    "cold-start trigger {field} is blank or contains control characters"
+                )));
+            }
+        }
+        if self.deadline == 0 {
+            return Err(TaskBindingError::selection_required(
+                "cold-start trigger deadline is zero",
+            ));
+        }
+        Ok(())
+    }
 }
 
 const SCAN_DISCLOSURE_OWNER_OPERATION: &str = "scan_disclosure_owner";
@@ -3041,20 +3091,14 @@ fn observe_explicit_workspace_facts(
     Ok((facts, observed))
 }
 
-/// Observes one authenticated activation selector and creates the exact
-/// discovery lease/evidence inputs admitted by the privacy-bounded scanner.
+/// Observes an authenticated activation's attach event using the same
+/// trigger-specific path as other I4.4.1 event owners.
 ///
-/// Host observes filesystem/VCS/manifests and a fixed set of root-relative
-/// governing-source filenames only; no document contents are opened. The
-/// authenticated ticket and observed root bind a short discovery lease that
-/// explicitly admits the source-candidate read. Known-format inspection stays
-/// unresolved. No privacy class, boundary, source closure, or task is inferred
-/// here; the scanner returns its smallest privacy question until the
-/// applicable owner supplies those inputs.
-#[allow(
-    clippy::too_many_lines,
-    reason = "bounded Host observations and the matching discovery lease are assembled in one auditable path"
-)]
+/// This compatibility entry preserves the current production caller. The
+/// activation ticket supplies the authenticated event correlation, root,
+/// session, host receipt and deadline; it does not supply or infer any other
+/// trigger. New event owners call [`observe_cold_start_trigger_discovery`]
+/// with their explicit trigger context.
 pub fn observe_cold_start_discovery(
     ticket: &eliot_protocol::AgentActivationResolutionTicket,
     fence: &StateFence,
@@ -3065,33 +3109,62 @@ pub fn observe_cold_start_discovery(
             "activation has no explicit workspace selector for bounded discovery",
         )
     })?;
-    let workspace_root = Path::new(selector);
-    if !workspace_root.is_absolute() {
-        return Err(TaskBindingError::scope_incompatible(
-            "activation workspace selector must be an explicit absolute path",
-        ));
-    }
+    let ingress = ColdStartTriggerIngress {
+        trigger: ColdStartTrigger::AttachOrLaunch,
+        explicit_root: Path::new(selector),
+        event_ref: &ticket.ticket_id,
+        proposer_ref: ticket.activation_request_id.as_str(),
+        session_ref: &ticket.connection_id,
+        host_ref: &ticket.peer_admission_receipt_sha256,
+        deadline: ticket.kernel_deadline_unix_ms,
+    };
+    observe_cold_start_trigger_discovery(&ingress, fence, now)
+}
+
+/// Observes one explicit I4.4.1 event and creates the bounded lease/evidence
+/// inputs consumed by the privacy-bounded scanner.
+///
+/// Host observes the event's explicit root and bounded identity evidence, then
+/// observes name-only governing-source candidates only when the trigger
+/// requires them. It never opens source document contents here. No privacy
+/// class, boundary, source closure, or task is inferred; until the applicable
+/// owner supplies those inputs, the scanner returns its smallest privacy
+/// question. Authentication of the event and its correlation references
+/// belongs to the caller and is never inferred by this observer.
+#[allow(
+    clippy::too_many_lines,
+    reason = "bounded Host observations and the matching discovery lease are assembled in one auditable path"
+)]
+pub fn observe_cold_start_trigger_discovery(
+    ingress: &ColdStartTriggerIngress<'_>,
+    fence: &StateFence,
+    now: u64,
+) -> Result<ColdStartDiscoveryInput, TaskBindingError> {
+    ingress.validate()?;
     if now == 0 {
         return Err(TaskBindingError::selection_required(
-            "activation discovery clock is not available",
+            "cold-start discovery clock is not available",
         ));
     }
-    let (facts, observed) = observe_explicit_workspace_facts(workspace_root, fence)?;
+    let (facts, observed) = observe_explicit_workspace_facts(ingress.explicit_root, fence)?;
     let instance = observed.instances.first().ok_or_else(|| {
         TaskBindingError::scope_incompatible("Host observer returned no workspace instance")
     })?;
     let instance_ref = instance.instance_ref.clone();
     let root_identity = instance.root_identity.clone();
     let proposed_kind = observed.kind;
-    let mut allowed_reads = vec![
-        DiscoveryRead::FilesystemIdentity,
-        DiscoveryRead::GoverningSourceCandidates,
-    ];
-    if facts.has_git {
-        allowed_reads.push(DiscoveryRead::VcsIdentity);
+    // The scanner evidence always binds the live filesystem identity. Keep
+    // that class admitted for every event, then add the trigger's read set.
+    let mut allowed_reads = vec![DiscoveryRead::FilesystemIdentity];
+    for required in ingress.trigger.required_discovery_reads() {
+        if !allowed_reads.contains(required) {
+            allowed_reads.push(*required);
+        }
     }
-    if !facts.manifest_names.is_empty() {
-        allowed_reads.push(DiscoveryRead::ManifestNamesAndHashes);
+    if facts.has_git {
+        if !allowed_reads.contains(&DiscoveryRead::VcsIdentity) {
+            allowed_reads.push(DiscoveryRead::VcsIdentity);
+        }
     }
     let consumption_limit = u32::try_from(allowed_reads.len()).map_err(|_| {
         TaskBindingError::scope_incompatible(
@@ -3099,14 +3172,14 @@ pub fn observe_cold_start_discovery(
         )
     })?;
     let request = DiscoveryLeaseRequest {
-        proposer_ref: ticket.activation_request_id.as_str().to_owned(),
-        session_ref: ticket.connection_id.clone(),
-        host_ref: ticket.peer_admission_receipt_sha256.clone(),
+        proposer_ref: ingress.proposer_ref.to_owned(),
+        session_ref: ingress.session_ref.to_owned(),
+        host_ref: ingress.host_ref.to_owned(),
         candidate_root_ref: root_identity.clone(),
         root_filesystem_identity_ref: root_identity.clone(),
         allowed_reads,
         consumption_limit,
-        deadline: ticket.kernel_deadline_unix_ms,
+        deadline: ingress.deadline,
     };
     let key = DiscoveryLeaseKey {
         proposer_ref: request.proposer_ref.clone(),
@@ -3119,58 +3192,73 @@ pub fn observe_cold_start_discovery(
             "Host-observed discovery lease refused: {error}"
         ))
     })?;
-    lease
-        .authorize(DiscoveryRead::GoverningSourceCandidates, now)
-        .map_err(|error| {
-            TaskBindingError::scope_incompatible(format!(
-                "Host source-candidate read is outside its discovery lease: {error:?}"
-            ))
-        })?;
-    let source_candidates = observe_workspace_source_candidates(Path::new(&facts.canonical_root))
-        .map_err(|error| {
-            TaskBindingError::scope_incompatible(format!(
-                "Host source-candidate observation failed: {error}"
-            ))
-        })?
-        .into_iter()
-        .map(|candidate| GoverningSourceCandidateEvidence {
-            source_ref: candidate.relative_path,
-            role: match candidate.kind {
-                WorkspaceSourceDocumentKind::UserTask => GoverningSourceRole::UserTask,
-                WorkspaceSourceDocumentKind::Architecture => GoverningSourceRole::Architecture,
-                WorkspaceSourceDocumentKind::Implementation => GoverningSourceRole::Implementation,
-                WorkspaceSourceDocumentKind::AgentInstruction => {
-                    GoverningSourceRole::AgentInstruction
-                }
-                WorkspaceSourceDocumentKind::BuildTestContract => {
-                    GoverningSourceRole::BuildTestContract
-                }
-                WorkspaceSourceDocumentKind::DomainPolicy => GoverningSourceRole::DomainPolicy,
-                WorkspaceSourceDocumentKind::SupportingReference => {
-                    GoverningSourceRole::SupportingReference
-                }
-            },
-        })
-        .collect::<Vec<_>>();
     let mut attested_reads = vec![DiscoveryRead::FilesystemIdentity];
-    attested_reads.push(DiscoveryRead::GoverningSourceCandidates);
     if facts.has_git {
         attested_reads.push(DiscoveryRead::VcsIdentity);
     }
-    let mut manifests = facts
-        .manifest_names
+    let source_candidates = if ingress
+        .trigger
+        .required_discovery_reads()
+        .contains(&DiscoveryRead::GoverningSourceCandidates)
+    {
+        lease
+            .authorize(DiscoveryRead::GoverningSourceCandidates, now)
+            .map_err(|error| {
+                TaskBindingError::scope_incompatible(format!(
+                    "Host source-candidate read is outside its discovery lease: {error:?}"
+                ))
+            })?;
+        attested_reads.push(DiscoveryRead::GoverningSourceCandidates);
+        Some(
+            observe_workspace_source_candidates(Path::new(&facts.canonical_root))
+                .map_err(|error| {
+                    TaskBindingError::scope_incompatible(format!(
+                        "Host source-candidate observation failed: {error}"
+                    ))
+                })?
+                .into_iter()
+                .map(|candidate| GoverningSourceCandidateEvidence {
+                    source_ref: candidate.relative_path,
+                    role: match candidate.kind {
+                        WorkspaceSourceDocumentKind::UserTask => GoverningSourceRole::UserTask,
+                        WorkspaceSourceDocumentKind::Architecture => {
+                            GoverningSourceRole::Architecture
+                        }
+                        WorkspaceSourceDocumentKind::Implementation => {
+                            GoverningSourceRole::Implementation
+                        }
+                        WorkspaceSourceDocumentKind::AgentInstruction => {
+                            GoverningSourceRole::AgentInstruction
+                        }
+                        WorkspaceSourceDocumentKind::BuildTestContract => {
+                            GoverningSourceRole::BuildTestContract
+                        }
+                        WorkspaceSourceDocumentKind::DomainPolicy => {
+                            GoverningSourceRole::DomainPolicy
+                        }
+                        WorkspaceSourceDocumentKind::SupportingReference => {
+                            GoverningSourceRole::SupportingReference
+                        }
+                    },
+                })
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        None
+    };
+    // Authorize the actual evidence classes after creating the lease. The
+    // source-candidate class above was authorized immediately before its
+    // bounded name-only filesystem observation.
+    for read in attested_reads
         .iter()
-        .map(|name| {
-            let name_hash = sha256_hex(name.as_bytes());
-            ManifestEvidence {
-                manifest_ref: format!("manifest:{name_hash}"),
-                name_hash,
-            }
-        })
-        .collect::<Vec<_>>();
-    manifests.sort_by(|left, right| left.manifest_ref.cmp(&right.manifest_ref));
-    if !manifests.is_empty() {
-        attested_reads.push(DiscoveryRead::ManifestNamesAndHashes);
+        .copied()
+        .filter(|read| *read != DiscoveryRead::GoverningSourceCandidates)
+    {
+        lease.authorize(read, now).map_err(|error| {
+            TaskBindingError::scope_incompatible(format!(
+                "Host discovery read {read:?} is outside its trigger lease: {error:?}"
+            ))
+        })?;
     }
     let evidence = BootstrapScanEvidence {
         canonical_root_ref: root_identity.clone(),
@@ -3179,13 +3267,13 @@ pub fn observe_cold_start_discovery(
         vcs_commit_ref: observed.generation.commit_ref.clone(),
         vcs_dirty_summary_ref: observed.generation.dirty_summary_ref.clone(),
         file_distribution: Vec::new(),
-        manifests,
+        manifests: Vec::new(),
         build_profiles: Vec::new(),
         root_services: Vec::new(),
         editor_workspaces: Vec::new(),
         existing_records: Vec::new(),
         adapters: Vec::new(),
-        governing_source_candidates: Some(source_candidates),
+        governing_source_candidates: source_candidates,
         recent_changes: Vec::new(),
         artifact_dirs: Vec::new(),
         execution_identity: None,
@@ -3202,7 +3290,7 @@ pub fn observe_cold_start_discovery(
         .map(|candidate| candidate.source_ref.clone())
         .collect();
     let discovery = BootstrapDiscoveryInputs {
-        scan_ref: format!("scan:{}", ticket.ticket_id),
+        scan_ref: format!("scan:{}", ingress.event_ref),
         candidate_privacy: None,
         privacy_boundary: None,
         observed,
@@ -3214,6 +3302,7 @@ pub fn observe_cold_start_discovery(
         now,
     };
     Ok(ColdStartDiscoveryInput {
+        trigger: ingress.trigger,
         lease,
         key,
         discovery,
