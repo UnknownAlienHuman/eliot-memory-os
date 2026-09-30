@@ -19,18 +19,35 @@ public sealed class RuntimeDiscoveryException(string code, string message) : Exc
 /// restart-required disposition: a replacement handoff is the owner's to
 /// issue, never this process to reconstruct from a PID, a user, a pipe name
 /// or a cached endpoint.
+///
+/// Single use is structural, not a side effect of the clear. The environment
+/// is consulted at most once per process whatever that attempt returns, and
+/// the first refusal becomes the process-wide terminal disposition reported
+/// verbatim afterwards, so one root cause can never be reported under a
+/// second code. There is no retry here and none is implied: recovery is a new
+/// owner-issued single-use handoff, which this process cannot obtain itself.
 public sealed class RuntimeDiscoveryService
 {
     internal const string EndpointEnvironmentVariable = "ELIOT_OPERATOR_ENDPOINT";
 
     private readonly object _gate = new();
     private OperatorHandoff? _inheritedHandoff;
+    /// Set before the single environment read, so no later call can reach it
+    /// again whatever the attempt returned.
+    private bool _endpointReadAttempted;
+    /// The first terminal refusal, kept verbatim. A latched refusal is never
+    /// recomputed, so one root cause is never reported under two codes.
+    private (string Code, string Message)? _terminalRefusal;
 
     public Task<OperatorHandoff> DiscoverAsync(CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         lock (_gate)
         {
+            if (_terminalRefusal is { } latched)
+            {
+                throw new RuntimeDiscoveryException(latched.Code, latched.Message);
+            }
             if (_inheritedHandoff is { } bound)
             {
                 if (bound.IsUsable)
@@ -39,23 +56,27 @@ public sealed class RuntimeDiscoveryService
                 }
                 // The consumed value is not re-read and not re-presented. The
                 // owner must issue a new single-use handoff.
-                throw new RuntimeDiscoveryException(
-                    "endpoint_missing",
-                    OperatorHandoff.ReacquisitionRequirement);
+                throw Latch("endpoint_missing", OperatorHandoff.ReacquisitionRequirement);
             }
+            if (_endpointReadAttempted)
+            {
+                // Unreachable while a refusal is latched; kept so the one read
+                // stays structural instead of relying on the clear below to make
+                // a second read harmless.
+                throw Latch("endpoint_missing", OperatorHandoff.ReacquisitionRequirement);
+            }
+            _endpointReadAttempted = true;
 
             var encoded = Environment.GetEnvironmentVariable(EndpointEnvironmentVariable);
             // The inherited value is a consuming authenticator, never a reconnect token.
             Environment.SetEnvironmentVariable(EndpointEnvironmentVariable, null);
             if (string.IsNullOrWhiteSpace(encoded))
             {
-                throw new RuntimeDiscoveryException(
-                    "endpoint_missing",
-                    OperatorHandoff.ReacquisitionRequirement);
+                throw Latch("endpoint_missing", OperatorHandoff.ReacquisitionRequirement);
             }
             if (encoded.Length > OperatorProtocol.MaxEndpointChars)
             {
-                throw new RuntimeDiscoveryException(
+                throw Latch(
                     "endpoint_unreadable",
                     $"{OperatorFaultReason.EndpointUnreadable}: encoded endpoint exceeds the closed endpoint bound");
             }
@@ -83,34 +104,53 @@ public sealed class RuntimeDiscoveryService
             }
             catch (JsonException)
             {
-                throw new RuntimeDiscoveryException("endpoint_unreadable", OperatorFaultReason.EndpointUnreadable);
+                throw Latch("endpoint_unreadable", OperatorFaultReason.EndpointUnreadable);
             }
             catch (OperatorProtocolException error)
             {
-                throw new RuntimeDiscoveryException(
+                throw Latch(
                     "endpoint_unreadable",
                     $"{OperatorFaultReason.EndpointUnreadable}: {error.Reason}");
             }
             catch (OperatorProcessIdentityException error)
             {
-                throw new RuntimeDiscoveryException("endpoint_invalid", error.Message);
+                throw Latch("endpoint_invalid", error.Message);
             }
             catch (ArgumentException error)
             {
-                throw new RuntimeDiscoveryException("endpoint_invalid", $"{OperatorFaultReason.EndpointInvalid}: {error.Message}");
+                throw Latch("endpoint_invalid", $"{OperatorFaultReason.EndpointInvalid}: {error.Message}");
             }
             catch (InvalidOperationException error)
             {
-                throw new RuntimeDiscoveryException("endpoint_invalid", $"{OperatorFaultReason.EndpointInvalid}: {error.Message}");
+                throw Latch("endpoint_invalid", $"{OperatorFaultReason.EndpointInvalid}: {error.Message}");
+            }
+            catch (RuntimeDiscoveryException error)
+            {
+                // A refusal raised inside the decode (for example the null
+                // endpoint) keeps its own typed code instead of being swallowed
+                // by the shape handlers above.
+                throw Latch(error.Code, error.Message);
             }
         }
+    }
+
+    /// Records the refusal as this process's terminal disposition and returns
+    /// it to throw. The exception is rebuilt per call so a stable typed code
+    /// never becomes a shared stack trace.
+    private RuntimeDiscoveryException Latch(string code, string message)
+    {
+        _terminalRefusal = (code, message);
+        return new RuntimeDiscoveryException(code, message);
     }
 
     public static void ValidateEndpoint(OperatorEndpoint endpoint)
     {
         // The role is exact; the accepted capabilities are a non-empty list of
-        // distinct members of the closed two-capability vocabulary. An empty,
-        // duplicated, unknown or wider set is refused.
+        // distinct members of the closed two-capability vocabulary. An absent,
+        // null, empty, duplicated, unknown or wider set is refused. The check is
+        // null-safe: the closed decode admits any subset of the six names, so a
+        // missing member arrives here as a null list and must be refused as a
+        // typed `endpoint_invalid` rather than dereferenced.
         //
         // This is a fail-early shape check, not the authority. The owner
         // (eliot-user-broker-core OperatorEndpoint::validate and
@@ -123,7 +163,7 @@ public sealed class RuntimeDiscoveryService
             || string.IsNullOrWhiteSpace(endpoint.InteractiveSessionId)
             || string.IsNullOrWhiteSpace(endpoint.HandoffNonce)
             || !string.Equals(endpoint.Role, OperatorCapabilityNames.HumanOperatorRole, StringComparison.Ordinal)
-            || endpoint.Capabilities.Count == 0
+            || endpoint.Capabilities is not { Count: > 0 }
             || endpoint.Capabilities.Any(capability =>
                 !string.Equals(capability, OperatorCapabilityNames.ControlboardRead, StringComparison.Ordinal)
                 && !string.Equals(capability, OperatorCapabilityNames.OperatorCommand, StringComparison.Ordinal))
