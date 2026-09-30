@@ -1211,10 +1211,20 @@ fn contract_rejection(error: eliot_agent_contracts::ContractError) -> FabricErro
 /// The committed owner revision for one semantic record, together with the
 /// canonical Store receipt that proves the commit (#1702 W3).
 ///
-/// The revision and its receipt are one fact and are never presented apart: a
-/// revision without its receipt is an uncommitted claim, and a receipt without
-/// its revision names no content to compare. Bundling them keeps a caller from
-/// forgetting one of the two.
+/// The two are presented together because both are needed to authorise a
+/// publish and neither alone is sufficient: a revision with no receipt is an
+/// uncommitted claim, and a receipt with no revision names no content to
+/// compare. Bundling them keeps a caller from forgetting one of the two.
+///
+/// What bundling does NOT do is bind the receipt to this record's content. The
+/// receipt is checked against the revision's ordering scope and sequence
+/// (which embed the owner kind), so a receipt from another owner stream or an
+/// earlier revision cannot authorise this publish — but two distinct
+/// self-consistent revisions committed on the same stream at the same revision
+/// number would both pass. Narrowing that further means comparing the receipt's
+/// request hash to the revision's `content_digest`, which is the Store
+/// contract's business and not this module's.
+#[derive(Clone, Copy)]
 pub struct CommittedOwnerRevision<'a> {
     /// The Store-committed owner revision.
     pub owner_revision: &'a SwarmOwnerRevision,
@@ -1250,16 +1260,21 @@ pub struct CommittedOwnerRevision<'a> {
 /// #1702 W3/A3: the owner this revision speaks for is also bound here, and
 /// the discriminator is [`SwarmOwnerRevision::owner_kind`] — the Store-owned
 /// stream the canonical transaction committed on — not a label the caller
-/// fills in. `SwarmOwnerRevision::validate` validates the record against
-/// whatever owner kind the revision *declares*, so a definition record
-/// committed on the Governor admission stream would pass that check while
-/// carrying the wrong owner's fields. `expected_owner` names the owner this
-/// particular write boundary is for; a mismatch is refused here, before the
-/// revision enters any in-memory map, which is what stops a stale or foreign
-/// controller or coordinator from writing the other owner's fields under its
-/// own labels. The check is deliberately a closed three-way match, so it has
-/// exactly one way to pass: the declared kind, the committed record shape and
-/// this operation's owner must all be the same owner.
+/// fills in. `expected_owner` names the owner this particular write boundary
+/// is for, and a mismatch is refused here, before the revision enters any
+/// in-memory map.
+///
+/// WHAT THIS CHECK IS NOT: it is not a cross-shape guard.
+/// [`SwarmOwnerRevision::validate`] already derives the permitted key set from
+/// the *declared* owner kind, so a record whose fields do not match its
+/// declared kind is rejected there. What `validate()` cannot know is which
+/// owner a particular call site is *for* — that is this parameter's whole
+/// content. The attack it closes is a well-formed, self-consistent revision of
+/// one owner presented at another owner's boundary: a committed `SwarmPlanAdmission`
+/// carrying its own `admission_id` and `receipt`, presented to
+/// `record_semantic_execution`, which is the `AgentCoordinator`'s boundary. Its
+/// shape, identity and bytes are all genuine; only the boundary is wrong, and
+/// without `expected_owner` nothing here would notice.
 ///
 /// `record` is the semantic record the caller wants published, as its JSON
 /// value. [`SwarmOwnerRevision::validate`] has already established that
@@ -2921,9 +2936,8 @@ impl AgentFabric {
     /// fails with [`FabricError::StaleOwnerLease`]; a coordinator stream that
     /// is not the one committed fails with [`FabricError::RevisionNotDurable`].
     /// The presented-lease comparison itself stays where the contracts owner
-    /// put it, in `check_execution_update`
-    /// (eliot-agent-contracts/src/lib.rs:2131), so there is one lease check
-    /// here rather than two.
+    /// put it, in [`check_execution_update`], so there is one lease check here
+    /// rather than two.
     ///
     /// # Errors
     ///
