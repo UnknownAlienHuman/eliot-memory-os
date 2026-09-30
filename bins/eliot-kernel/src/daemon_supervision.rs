@@ -289,10 +289,10 @@ impl AdmittedDaemonRestartPolicy {
     pub(crate) fn admit(
         policy: RestartPolicyV1,
         admitted_generation: ResourceGeneration,
-        state_fence: StateFence,
+        state_fence: &StateFence,
     ) -> Result<Self, RestartPolicyError> {
         let binding = policy.bind(admitted_generation, state_fence.clone())?;
-        binding.validate_for(&policy, &admitted_generation, &state_fence)?;
+        binding.validate_for(&policy, &admitted_generation, state_fence)?;
         Ok(Self { policy, binding })
     }
 

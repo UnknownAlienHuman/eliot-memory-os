@@ -1377,7 +1377,7 @@ impl KernelComposition {
                 AdmittedDaemonRestartPolicy::admit(
                     policy,
                     module_generation.generation,
-                    module_generation.state_fence.clone(),
+                    &module_generation.state_fence,
                 )
                 .map_err(|error| KernelBuildError::Service(error.to_string()))?,
             ),
