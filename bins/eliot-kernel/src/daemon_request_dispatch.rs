@@ -18,6 +18,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_kernel_service::AuthenticatedHostSession;
+// Issue #1872: the I5.11 `canonical_store` storage-replacement ingress. The
+// coordinator itself is the existing owner in `eliot_kernel_service`; this
+// import is the closed wire vocabulary the ingress projects out of it, never a
+// second stage machine or a second cutover gate.
+use eliot_kernel_service::{
+    IrreversibleStorageEffect, StorageReplacement, StorageReplacementCutoverReceipt,
+    StorageReplacementStage, StorageReplacementTransfer, StorageRollbackDisposition,
+};
 #[cfg(windows)]
 use eliot_kernel_service::{
     AuthenticatedUserAutomationHostExecutionTransport, NamedReadGatewayError, PreStageRejection,
@@ -47,6 +55,7 @@ use eliot_runtime_contracts::{
     DaemonChannelCursor, DaemonProgressObservation, DaemonSupervisionRenewalDecision,
     DaemonSupervisionRenewalReceipt, SupervisionLeasePredecessorProof,
 };
+use eliot_runtime_contracts::GenerationCutoverState;
 use eliot_store_api::{
     CampaignLearningStateViewLookup, CampaignLearningStateViewRead,
     CampaignLearningStateViewReadStatus, CampaignSourcePublication, CampaignSourceRevisionLookup,
@@ -213,6 +222,53 @@ const P07_DISPOSITION_UNAVAILABLE_OR_CAPACITY: &str = "UNAVAILABLE_OR_CAPACITY";
 /// Fence, operation identity, and canonical request hash from authenticated
 /// evidence, so the selector itself grants no authority.
 pub(crate) const USER_AUTOMATION_OPERATOR_OPERATION: &str = "eliot_user_automation";
+
+/// Authenticated daemon operation that drives the Kernel-owned I5.11
+/// `canonical_store` storage-replacement coordinator (issue #1872).
+///
+/// The coordinator is `eliot_kernel_service::StorageReplacement`, the existing
+/// owner of the eleven ordered I5.11 stages, the two `I5.10` transfer records,
+/// the irreversible-effect ledger, the ORS-re-derived cutover receipt and the
+/// rollback classifier. This operation is the production ingress that reaches
+/// it, and it is a selector on the same admitted daemon dispatch channel as
+/// `GENERATION_CUTOVER_OPERATION`: one closed request type, the same admission
+/// gates, the same `{"status","value","recovery"}` response discipline, and no
+/// second transport, pipe, or parallel dispatch table.
+///
+/// **Availability is stated, not assumed.** The arm below is served, but the
+/// front-door frame selector that lets a frame *reach* a daemon arm is
+/// `frame_dispatch::is_daemon_operation`, a separate closed mirror of this
+/// table. Until [`STORAGE_REPLACEMENT_OPERATION`] appears in that mirror, a
+/// `daemon_storage_replacement` frame falls through every predicate there, fails
+/// the generic decode and fences the session, exactly as
+/// `GENERATION_CUTOVER_OPERATION` did before its mirror entry existed. The
+/// operation is therefore **recognized but unavailable** from the front door:
+/// it is not an advertised, operator-reachable cutover, and it must not be
+/// reported as one.
+pub(crate) const STORAGE_REPLACEMENT_OPERATION: &str = "daemon_storage_replacement";
+
+/// Authenticated daemon operation that reconstructs an I5.11 replacement whose
+/// `canonical_store` route cutover is already committed.
+///
+/// This is the path a retry of a committed cutover reaches, and the only one:
+/// [`STORAGE_REPLACEMENT_OPERATION`] itself refuses a candidate generation that
+/// already owns the pinned route through a committed cutover. It carries the same
+/// availability caveat as that operation — it is recognized here and unreachable
+/// from the front door until `frame_dispatch::is_daemon_operation` lists it.
+pub(crate) const STORAGE_REPLACEMENT_RESUME_OPERATION: &str =
+    "daemon_storage_replacement_resume";
+
+/// Authenticated daemon operation that answers one I5.14 rollback request for a
+/// committed I5.11 replacement.
+///
+/// Separate from the reconstruction above because the answer differs: this one
+/// reaches [`StorageReplacement::request_rollback`], which reloads the
+/// ORS-committed cut ownership row its receipt names and refuses the request as
+/// a generation rollback once an irreversible migration or external effect is
+/// recorded. It carries the same availability caveat as
+/// [`STORAGE_REPLACEMENT_OPERATION`].
+pub(crate) const STORAGE_REPLACEMENT_ROLLBACK_OPERATION: &str =
+    "daemon_storage_replacement_rollback";
 
 const STARTUP_EVIDENCE_FIELDS: [&str; 8] = [
     "transport_binding",
@@ -515,6 +571,9 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "origin_control_decide" => "origin_control_decide",
         ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION => ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION,
         GENERATION_CUTOVER_OPERATION => GENERATION_CUTOVER_OPERATION,
+        STORAGE_REPLACEMENT_OPERATION => STORAGE_REPLACEMENT_OPERATION,
+        STORAGE_REPLACEMENT_RESUME_OPERATION => STORAGE_REPLACEMENT_RESUME_OPERATION,
+        STORAGE_REPLACEMENT_ROLLBACK_OPERATION => STORAGE_REPLACEMENT_ROLLBACK_OPERATION,
         DAEMON_STARTUP_EVIDENCE_OPERATION => DAEMON_STARTUP_EVIDENCE_OPERATION,
         USER_AUTOMATION_RUNTIME_OPERATION => USER_AUTOMATION_RUNTIME_OPERATION,
         "health" => "health",
@@ -1900,6 +1959,569 @@ struct UserAutomationDaemonTrigger {
     manual_nonce: String,
 }
 
+/// One recorded I5.11 stage an admitted replacement drive presents.
+///
+/// The stage is named by its own stable stage name
+/// ([`StorageReplacementStage::name`]) rather than by an ordinal this file
+/// could drift from, and the coordinator resolves it back through
+/// [`StorageReplacementStage::from_name`]. The Kernel never interprets the
+/// evidence: it is bounded opaque text the Store/candidate-bridge owner
+/// recorded, and the coordinator orders it.
+///
+/// `transfer` is present exactly for the two stages that move `I5.10` data into
+/// the candidate (snapshot import, canonical event tail). The two legs are
+/// mutually exclusive and the ingress enforces that before calling the
+/// coordinator, so a transferring stage can never be recorded without its
+/// transfer record and a non-transferring stage can never smuggle one.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StorageReplacementStageEvidence {
+    /// Exact I5.11 stage name.
+    stage: String,
+    /// Bounded opaque evidence the performing owner recorded.
+    evidence: String,
+    /// The `I5.10` transfer, for the two transferring stages only.
+    #[serde(default)]
+    transfer: Option<StorageReplacementTransfer>,
+}
+
+/// Exact request payload for [`STORAGE_REPLACEMENT_OPERATION`].
+///
+/// The caller names ONE replacement identity, the two store generations it is
+/// switching between, the ordered stage evidence its owners recorded, the
+/// irreversible effects it observed, and the identity of the ORS-committed cut
+/// ownership record the route cutover is proven against. It never supplies a
+/// route scope, a route-scope hash, a cutover state, a state-migration decision
+/// or a linearization record: the pinned `canonical_store` scope is declared by
+/// the coordinator, and every cutover field is re-derived by the coordinator
+/// from the durable ORS row this identity names. A request therefore cannot
+/// assert an authority field the ORS linearization point never recorded.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StorageReplacementDriveRequest {
+    /// Version of the authenticated replacement drive request.
+    version: u8,
+    /// Exact State Fence carried by the admitted daemon session.
+    state_fence: StateFence,
+    /// Exact replacement identity this drive is for.
+    replacement_id: String,
+    /// The store generation that owned the route before the cutover.
+    incumbent_generation: Option<ResourceGeneration>,
+    /// The store generation that will own the route after the cutover.
+    candidate_generation: ResourceGeneration,
+    /// Irreversible migrations/effects observed before the cutover. The
+    /// coordinator's ledger only grows, and the committed ORS row's
+    /// `migration` decision must agree with it exactly, so this list cannot
+    /// make a forward-repair cutover look reversible.
+    irreversible_effects: BTreeSet<IrreversibleStorageEffect>,
+    /// The I5.11 stages in the order the performing owners reached them.
+    stages: Vec<StorageReplacementStageEvidence>,
+    /// Identity of the ORS-committed cut ownership record the route cutover is
+    /// re-derived from. The coordinator loads it; it is never accepted inline.
+    cutover_id: String,
+    /// Bounded opaque evidence recorded for the I5.11 stage-8 route cutover.
+    cutover_evidence: String,
+}
+
+/// Exact request payload for [`STORAGE_REPLACEMENT_RESUME_OPERATION`].
+///
+/// The caller names the replacement identity, the two store generations, the
+/// cutover receipt the committed cutover produced, and the post-cutover I5.11
+/// stages its owners reached after the restart. It never supplies a route scope,
+/// a cutover state, or a rollback disposition.
+///
+/// `stages` is what makes this the path that finishes a replacement rather than
+/// only reconstructing it. The reconstruction resumes at I5.11 stage 9, so the
+/// canary, the read-only rollback window and the retirement are recorded here —
+/// and stage 11 is still refused by the coordinator until the receipt exists,
+/// which the same reconstruction guarantees. Pre-cutover stages are *not*
+/// accepted here: the reconstructed coordinator is positioned after the
+/// committed cutover, so a presented pre-cutover stage is refused by the
+/// coordinator's exact-predecessor rule rather than replayed.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StorageReplacementResumeRequest {
+    /// Version of the authenticated post-cutover request.
+    version: u8,
+    /// Exact State Fence carried by the admitted daemon session.
+    state_fence: StateFence,
+    /// Exact replacement identity this request is for.
+    replacement_id: String,
+    /// The store generation that owned the route before the cutover.
+    incumbent_generation: Option<ResourceGeneration>,
+    /// The store generation that owns the route after the cutover.
+    candidate_generation: ResourceGeneration,
+    /// The cutover receipt the committed cutover produced. The coordinator
+    /// validates it and re-derives it from the ORS row it names, so a
+    /// hand-built receipt cannot survive the reconstruction.
+    receipt: StorageReplacementCutoverReceipt,
+    /// The post-cutover I5.11 stages, in the order their owners reached them.
+    stages: Vec<StorageReplacementStageEvidence>,
+}
+
+/// Exact request payload for [`STORAGE_REPLACEMENT_ROLLBACK_OPERATION`].
+///
+/// The caller names the replacement identity, the two store generations, and the
+/// cutover receipt. It carries no stage evidence and no disposition: the I5.14
+/// decision is the coordinator's, reloaded from the durable ORS row the receipt
+/// names.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StorageReplacementRollbackRequest {
+    /// Version of the authenticated rollback request.
+    version: u8,
+    /// Exact State Fence carried by the admitted daemon session.
+    state_fence: StateFence,
+    /// Exact replacement identity this request is for.
+    replacement_id: String,
+    /// The store generation that owned the route before the cutover.
+    incumbent_generation: Option<ResourceGeneration>,
+    /// The store generation that owns the route after the cutover.
+    candidate_generation: ResourceGeneration,
+    /// The cutover receipt the committed cutover produced. The coordinator
+    /// validates it and re-derives it from the ORS row it names, so a
+    /// hand-built receipt cannot obtain a rollback decision.
+    receipt: StorageReplacementCutoverReceipt,
+}
+
+/// The identity, generations and receipt every post-cutover action presents.
+///
+/// Both post-cutover request shapes decode into this one carrier, so the two
+/// markers cannot drift into two admission vocabularies or two ways of naming a
+/// replacement, and the shared reconstruction boundary below is reached with
+/// exactly one identity.
+struct StorageReplacementResumption {
+    /// Exact replacement identity.
+    replacement_id: String,
+    /// The store generation that owned the route before the cutover.
+    incumbent_generation: Option<ResourceGeneration>,
+    /// The store generation that owns the route after the cutover.
+    candidate_generation: ResourceGeneration,
+    /// The cutover receipt.
+    receipt: StorageReplacementCutoverReceipt,
+}
+
+/// The I5.14 rollback answer projected on the admitted reply.
+///
+/// `disposition` is the coordinator's own stable disposition name, so the reply
+/// carries the decision rather than a re-derivation of it here.
+#[derive(Serialize)]
+struct StorageRollbackAnswer {
+    /// The coordinator's rollback disposition.
+    disposition: String,
+    /// The cutover state a refused rollback leaves behind. `None` when a
+    /// generation rollback is permitted, and `None` when the request was
+    /// refused before the disposition was reached at all.
+    forward_repair_state: Option<GenerationCutoverState>,
+}
+
+/// Closed outcome of one admitted storage-replacement request.
+///
+/// `terminal_code` is the ONE stable diagnostic code for a refused request and
+/// is `None` only when the coordinator actually answered. So "requested",
+/// "refused" and "committed" never collapse into one answer: a cutover receipt
+/// is present only when the coordinator constructed one from a committed ORS
+/// row, and a refusal that may have left the route already switched is reported
+/// as a refusal, never as a committed replacement.
+#[derive(Serialize)]
+struct StorageReplacementOutcome {
+    /// Version of the authenticated replacement outcome.
+    version: u8,
+    /// Terminal diagnostic code of the refused request, `None` when answered.
+    terminal_code: Option<&'static str>,
+    /// The I5.11 stages this replacement has recorded, in stage order. Empty
+    /// for a replacement reconstructed after a restart, because pre-cutover
+    /// per-stage evidence is not durable material.
+    recorded_stages: Vec<&'static str>,
+    /// The irreversible effects on the coordinator's append-only ledger.
+    irreversible_effects: Vec<IrreversibleStorageEffect>,
+    /// The cutover receipt, present only once the `canonical_store` route
+    /// cutover committed.
+    cutover_receipt: Option<StorageReplacementCutoverReceipt>,
+    /// The I5.14 rollback answer, present only for the rollback operation.
+    rollback: Option<StorageRollbackAnswer>,
+}
+
+/// Maps one storage-replacement coordinator refusal to its stable diagnostic
+/// code.
+///
+/// Only the variant is emitted; the `String` payload and the refusal's own
+/// `field` are never logged. The arms are the coordinator's own refusal classes
+/// one-for-one, so a refused stage, a stale fence, a missing ORS record and a
+/// fenced generation stay distinguishable on the admitted reply and none of them
+/// collapses into an effect-free success.
+fn storage_replacement_terminal_code(error: &KernelServiceError) -> &'static str {
+    match error {
+        KernelServiceError::InvalidField { .. } => "REPLACEMENT_INVALID_FIELD",
+        KernelServiceError::IllegalTransition { .. } => "REPLACEMENT_ILLEGAL_TRANSITION",
+        KernelServiceError::HandshakeMismatch { .. } => "REPLACEMENT_HANDSHAKE_MISMATCH",
+        KernelServiceError::MissingContainmentEvidence => "REPLACEMENT_MISSING_CONTAINMENT",
+        KernelServiceError::ReadinessNotProven => "REPLACEMENT_READINESS_NOT_PROVEN",
+        KernelServiceError::AdmissionClosed(_) => "REPLACEMENT_ADMISSION_CLOSED",
+        KernelServiceError::GenerationFenced => "REPLACEMENT_GENERATION_FENCED",
+        KernelServiceError::RestartBudgetExhausted => "REPLACEMENT_RESTART_BUDGET_EXHAUSTED",
+        KernelServiceError::ControlReserveExhausted => "REPLACEMENT_RESERVE_EXHAUSTED",
+        KernelServiceError::Platform(_) => "REPLACEMENT_PLATFORM",
+        KernelServiceError::Core(_) => "REPLACEMENT_CORE",
+    }
+}
+
+/// Projects the coordinator's own durable position on the admitted reply.
+///
+/// Both the position and the refusal code are read from the same coordinator
+/// value, so a reply can never claim a stage the coordinator did not record, a
+/// receipt it did not construct, or a rollback answer it did not classify.
+fn storage_replacement_outcome(
+    replacement: &StorageReplacement,
+    terminal_code: Option<&'static str>,
+    rollback: Option<StorageRollbackAnswer>,
+) -> StorageReplacementOutcome {
+    StorageReplacementOutcome {
+        version: 1,
+        terminal_code,
+        recorded_stages: replacement
+            .recorded_evidence()
+            .keys()
+            .copied()
+            .map(StorageReplacementStage::name)
+            .collect(),
+        irreversible_effects: replacement.irreversible_effects().iter().copied().collect(),
+        cutover_receipt: replacement.cutover_receipt().cloned(),
+        rollback,
+    }
+}
+
+/// The admitted-reply envelope, identical to every other arm on this channel.
+fn storage_replacement_response(outcome: StorageReplacementOutcome) -> serde_json::Value {
+    serde_json::json!({
+        "status": "known",
+        "value": outcome,
+        "recovery": null,
+    })
+}
+
+/// The outcome of a request the coordinator refused before it could construct a
+/// replacement to project a position from.
+///
+/// Every position field is empty on purpose: a request that never reached the
+/// coordinator's state machine has recorded no stage, holds no irreversible
+/// effect, owns no receipt and answers no rollback question. Reporting the
+/// refusal code alone is the honest shape — a refused request is not a
+/// replacement that made no progress, and it must not read as one.
+fn storage_replacement_refusal_outcome(
+    terminal_code: &'static str,
+) -> StorageReplacementOutcome {
+    StorageReplacementOutcome {
+        version: 1,
+        terminal_code: Some(terminal_code),
+        recorded_stages: Vec::new(),
+        irreversible_effects: Vec::new(),
+        cutover_receipt: None,
+        rollback: None,
+    }
+}
+
+/// Records one presented stage on the coordinator.
+///
+/// Which coordinator entry point a stage reaches is decided by the coordinator's
+/// own `transfers_data` classification, never by whether the request happened to
+/// carry a transfer: the two are required to agree, and a request that disagrees
+/// is refused here as an invalid field before the stage machine is touched. The
+/// coordinator then owns the ordering rule, so a skipped, repeated or
+/// out-of-order stage is refused by the owner rather than reordered here.
+fn record_storage_replacement_stage(
+    replacement: &mut StorageReplacement,
+    stage_evidence: &StorageReplacementStageEvidence,
+) -> Result<(), KernelServiceError> {
+    let stage = StorageReplacementStage::from_name(&stage_evidence.stage).ok_or(
+        KernelServiceError::InvalidField {
+            field: "storage_replacement.stage",
+            reason: "the presented stage is not one of the I5.11 ordered replacement stages",
+        },
+    )?;
+    let transfer = stage_evidence.transfer.as_ref();
+    if stage.transfers_data() != transfer.is_some() {
+        return Err(KernelServiceError::InvalidField {
+            field: "storage_replacement.stage_transfer",
+            reason: "exactly the snapshot import and the canonical event tail carry an I5.10 transfer record",
+        });
+    }
+    match transfer {
+        Some(transfer) => {
+            replacement.record_transfer_stage(stage, transfer, &stage_evidence.evidence)?;
+        }
+        None => {
+            replacement.record_stage(stage, &stage_evidence.evidence)?;
+        }
+    }
+    Ok(())
+}
+
+impl KernelComposition {
+    /// Drives one admitted I5.11 storage replacement from the first stage through
+    /// the committed `canonical_store` route cutover.
+    ///
+    /// The operation selector only picks this entry. The closed request carries
+    /// the replacement identity, the two store generations, the ordered stage
+    /// evidence its owners recorded, the observed irreversible effects, and the
+    /// identity of the ORS-committed cut ownership record; the pinned
+    /// `canonical_store` `CapabilityRouteScope` is declared by the coordinator
+    /// and every cutover field is re-derived from that durable row. A malformed
+    /// request, a fence that is not the exact admitted session fence, an
+    /// unsupported version, an out-of-order stage, or a cutover the durable row
+    /// does not prove is answered with the coordinator's own stable refusal code
+    /// and never with a fabricated cutover or success answer.
+    ///
+    /// A second cutover for a candidate generation that already owns the route
+    /// is refused by [`StorageReplacement::begin`] itself, and a stage recorded
+    /// twice is refused by the coordinator's exact-predecessor rule, so this
+    /// ingress cannot reach a committed cutover twice. What a retry after a
+    /// committed cutover reaches instead is
+    /// [`Self::storage_replacement_resume_operation`].
+    fn storage_replacement_drive_operation(
+        &self,
+        session: &Session,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let request: StorageReplacementDriveRequest =
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
+        self.validate_storage_replacement_fence(session, request.version, &request.state_fence)?;
+        if request.stages.len() > StorageReplacementStage::ORDER.len() {
+            return Err(TransportError::SessionFenced);
+        }
+        let ors = self.p07_ors.as_ref();
+        // `begin` is the coordinator's own restart guard: a candidate generation
+        // that already owns the pinned route through a committed cutover is
+        // refused here, so a replay of this request cannot reopen a replacement
+        // from the top. Its refusal is reported as a refusal.
+        let mut replacement = match StorageReplacement::begin(
+            ors,
+            request.replacement_id.clone(),
+            request.incumbent_generation,
+            request.candidate_generation,
+        ) {
+            Ok(replacement) => replacement,
+            Err(error) => {
+                return Ok(storage_replacement_response(
+                    storage_replacement_refusal_outcome(storage_replacement_terminal_code(&error)),
+                ));
+            }
+        };
+        for effect in &request.irreversible_effects {
+            replacement.record_irreversible_effect(*effect);
+        }
+        for stage_evidence in &request.stages {
+            if let Err(error) = record_storage_replacement_stage(&mut replacement, stage_evidence) {
+                // The stages already recorded are still reported: an effect that
+                // may have happened must not collapse into an effect-free
+                // refusal, and the operator has to see how far the machine went.
+                return Ok(storage_replacement_response(storage_replacement_outcome(
+                    &replacement,
+                    Some(storage_replacement_terminal_code(&error)),
+                    None,
+                )));
+            }
+        }
+        // Stage 8. The coordinator loads the ORS-committed cut ownership record
+        // and refuses anything that is not committed, so the receipt below is
+        // constructed only from a durable linearization point. A refusal here
+        // still reports the recorded stages and no receipt, because none was
+        // constructed.
+        let terminal_code =
+            match replacement.commit_canonical_store_route_cutover(
+                ors,
+                &request.cutover_id,
+                &request.cutover_evidence,
+            ) {
+                Ok(_) => None,
+                Err(error) => Some(storage_replacement_terminal_code(&error)),
+            };
+        Ok(storage_replacement_response(storage_replacement_outcome(
+            &replacement,
+            terminal_code,
+            None,
+        )))
+    }
+
+    /// Reconstructs an already-committed I5.11 replacement after a restart.
+    ///
+    /// This is the only path a retry of a committed cutover reaches, and it is
+    /// the coordinator's own reconstruction: the presented receipt is validated
+    /// and then re-derived from the ORS row it names, so it cannot be asserted.
+    /// The reconstructed replacement starts at the stage after the committed
+    /// cutover and carries the irreversible-effect ledger the receipt fixed at
+    /// the cutover, so a post-cutover request cannot silently reopen a
+    /// generation rollback either.
+    fn storage_replacement_resume_operation(
+        &self,
+        session: &Session,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let request: StorageReplacementResumeRequest =
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
+        self.validate_storage_replacement_fence(session, request.version, &request.state_fence)?;
+        if request.stages.len() > StorageReplacementStage::ORDER.len() {
+            return Err(TransportError::SessionFenced);
+        }
+        let mut replacement = match self.storage_replacement_resumption(
+            STORAGE_REPLACEMENT_RESUME_OPERATION,
+            StorageReplacementResumption {
+                replacement_id: request.replacement_id,
+                incumbent_generation: request.incumbent_generation,
+                candidate_generation: request.candidate_generation,
+                receipt: request.receipt,
+            },
+        ) {
+            Ok(replacement) => replacement,
+            Err(terminal_code) => {
+                return Ok(storage_replacement_response(
+                    storage_replacement_refusal_outcome(terminal_code),
+                ));
+            }
+        };
+        let mut terminal_code = None;
+        for stage_evidence in &request.stages {
+            if let Err(error) = record_storage_replacement_stage(&mut replacement, stage_evidence) {
+                // The post-cutover stages already recorded are still reported:
+                // an effect that may have happened must not collapse into an
+                // effect-free refusal.
+                terminal_code = Some(storage_replacement_terminal_code(&error));
+                break;
+            }
+        }
+        Ok(storage_replacement_response(storage_replacement_outcome(
+            &replacement,
+            terminal_code,
+            None,
+        )))
+    }
+
+    /// Answers one I5.14 rollback request for an already-committed I5.11
+    /// replacement.
+    ///
+    /// The decision is the coordinator's own and is not re-derived here:
+    /// [`StorageReplacement::request_rollback`] reloads the ORS-committed cut
+    /// ownership row the receipt names, so a durable `forward_repair_required`
+    /// migration refuses the request even when the in-process ledger is silent.
+    /// A refused rollback is answered as a refusal carrying the coordinator's
+    /// disposition and the cutover state it leaves behind — never as a
+    /// switched-back route and never as an effect-free success.
+    fn storage_replacement_rollback_operation(
+        &self,
+        session: &Session,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let request: StorageReplacementRollbackRequest =
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
+        self.validate_storage_replacement_fence(session, request.version, &request.state_fence)?;
+        let replacement = match self.storage_replacement_resumption(
+            STORAGE_REPLACEMENT_ROLLBACK_OPERATION,
+            StorageReplacementResumption {
+                replacement_id: request.replacement_id,
+                incumbent_generation: request.incumbent_generation,
+                candidate_generation: request.candidate_generation,
+                receipt: request.receipt,
+            },
+        ) {
+            Ok(replacement) => replacement,
+            // The receipt did not re-derive against the durable ORS row, so there
+            // is no replacement to answer a rollback question about. The refusal
+            // is reported and no disposition is projected: naming one here would
+            // be inventing a decision the coordinator never made.
+            Err(terminal_code) => {
+                return Ok(storage_replacement_response(
+                    storage_replacement_refusal_outcome(terminal_code),
+                ));
+            }
+        };
+        let (rollback, terminal_code) = match replacement.request_rollback(self.p07_ors.as_ref()) {
+            Ok(disposition) => (
+                Some(StorageRollbackAnswer {
+                    disposition: disposition.to_string(),
+                    forward_repair_state: None,
+                }),
+                None,
+            ),
+            // The I5.14 refusal: an irreversible migration or external effect is
+            // recorded, so the request is refused as a generation rollback and
+            // the disposition names the forward-repair state that follows. The
+            // state is the coordinator's own classification, read back from it.
+            Err(error @ KernelServiceError::GenerationFenced) => {
+                let disposition = replacement.rollback_disposition();
+                (
+                    Some(StorageRollbackAnswer {
+                        disposition: disposition.to_string(),
+                        forward_repair_state: match disposition {
+                            StorageRollbackDisposition::ForwardRepairRequired { state } => Some(state),
+                            StorageRollbackDisposition::GenerationRollbackPermitted => None,
+                        },
+                    }),
+                    Some(storage_replacement_terminal_code(&error)),
+                )
+            }
+            // Any other refusal never reached the disposition at all.
+            Err(error) => (None, Some(storage_replacement_terminal_code(&error))),
+        };
+        Ok(storage_replacement_response(storage_replacement_outcome(
+            &replacement,
+            terminal_code,
+            rollback,
+        )))
+    }
+
+    /// The one admission gate every storage-replacement request passes.
+    ///
+    /// Three checks, and they are the same ones the existing generation-cutover
+    /// arm applies (`generation_control::KernelComposition::apply_authenticated_generation_cutover`):
+    /// the request's own State Fence must be well formed, the version must be
+    /// the one this arm speaks, and the presented fence must be the **exact**
+    /// admitted session fence — a compatible-but-different fence is still stale
+    /// for this observation. A request failing any of them is fenced at the
+    /// transport, before the coordinator is touched, so an unfenced or
+    /// stale-fenced request never reaches a stage machine or a cutover.
+    fn validate_storage_replacement_fence(
+        &self,
+        session: &Session,
+        version: u8,
+        state_fence: &StateFence,
+    ) -> Result<(), TransportError> {
+        state_fence
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if version != 1 || state_fence != &session.module_generation.state_fence {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(())
+    }
+
+    /// Shared reconstruction for the two post-cutover operations.
+    ///
+    /// A refused reconstruction is reported with the coordinator's own stable
+    /// code rather than fenced, so the operator learns *why* a receipt did not
+    /// re-derive against the durable row instead of only learning that the
+    /// session was fenced. Both markers reach this one boundary with one
+    /// identity shape, so the two post-cutover actions cannot drift into two
+    /// admission vocabularies or two ways of reconstructing a replacement.
+    fn storage_replacement_resumption(
+        &self,
+        operation: &str,
+        resumption: StorageReplacementResumption,
+    ) -> Result<StorageReplacement, &'static str> {
+        observe_daemon_operation(operation, "replacement_committed_requested");
+        StorageReplacement::resume_after_committed_cutover(
+            self.p07_ors.as_ref(),
+            resumption.replacement_id,
+            resumption.incumbent_generation,
+            resumption.candidate_generation,
+            &resumption.receipt,
+        )
+        .map_err(|error| storage_replacement_terminal_code(&error))
+    }
+}
+
 impl KernelComposition {
     /// Executes one authenticated daemon lifecycle request.  Only the
     /// narrow handshake/health dispositions are handled here; semantic
@@ -2198,6 +2820,24 @@ impl KernelComposition {
             }
             GENERATION_CUTOVER_OPERATION => {
                 self.generation_cutover_operation(session, payload.clone())
+            }
+            // Issue #1872: the I5.11 `canonical_store` storage-replacement
+            // ingress. The three markers are the same admitted daemon channel
+            // `GENERATION_CUTOVER_OPERATION` above already uses, and the arms
+            // reach the Kernel-owned `StorageReplacement` coordinator — they do
+            // not implement a stage machine here. Each arm proves the daemon
+            // module binding, the admitted session State Fence and the exact
+            // request fence, and every route scope, cutover state, migration
+            // decision and linearization record is read from the coordinator or
+            // re-derived by it from the durable ORS row, never from the payload.
+            STORAGE_REPLACEMENT_OPERATION => {
+                self.storage_replacement_drive_operation(session, payload.clone())
+            }
+            STORAGE_REPLACEMENT_RESUME_OPERATION => {
+                self.storage_replacement_resume_operation(session, payload.clone())
+            }
+            STORAGE_REPLACEMENT_ROLLBACK_OPERATION => {
+                self.storage_replacement_rollback_operation(session, payload.clone())
             }
             DAEMON_STARTUP_EVIDENCE_OPERATION => {
                 self.daemon_startup_evidence_operation(session, &request_id, payload)
