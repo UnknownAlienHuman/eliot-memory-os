@@ -36,14 +36,14 @@
 
 use eliot_agent_contracts::RevisionId;
 use eliot_receipts::ReceiptEnvelope;
+use eliot_swarm::adapter_launch::{SealedChildInputs, SealedChildLaunch, launch_sealed_child};
+use eliot_swarm::durable_dispatch::DurableJobAttachment;
+use eliot_swarm::durable_work::{DurableWorkStore, WorkExecutor};
 use eliot_swarm::{
     AdmittedSwarmPlan, AgentRouteProvider, ExecutionState, ProviderRequest,
     ReceiptVerificationPort, RootContextRevision, SealedIndependentMaps, SwarmError,
     SwarmPlanProposal, admit_plan, begin_execution, plan_admission_request,
 };
-use eliot_swarm::adapter_launch::{SealedChildInputs, SealedChildLaunch, launch_sealed_child};
-use eliot_swarm::durable_dispatch::DurableJobAttachment;
-use eliot_swarm::durable_work::{DurableWorkStore, WorkExecutor};
 use serde::Serialize;
 
 use crate::model::{CoordinatorConfig, CoordinatorError};
