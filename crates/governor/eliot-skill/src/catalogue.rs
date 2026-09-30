@@ -1532,15 +1532,19 @@ impl SkillCatalogue {
     /// `IdentityMismatch`. Failure reasons reuse the display path's typed
     /// fields; no second refusal vocabulary is introduced.
     ///
-    /// # Caller: serve-then-resolve at the display boundary
+    /// # Caller: serve-then-resolve on the acknowledge path
     ///
     /// `caller: ForwardingSkillLifecycle::acknowledge_and_display`
-    /// (`bins/eliotd/src/skill_lifecycle_adapters.rs`): every served display
-    /// resolves through this chain check before it leaves the boundary, so a
-    /// substituted receipt chain fails closed at serve time rather than on a
-    /// later audit. The caller passes the just-served display with the exact
-    /// receipt/ack pair and tool-owner view the display bound, so no second
-    /// resolution path is manufactured here. Stored-state staleness resolves
+    /// (`bins/eliotd/src/skill_lifecycle_adapters.rs`): displays served on
+    /// the Hotset/injector acknowledge path resolve through this chain check
+    /// before they leave the boundary, so a substituted receipt chain fails
+    /// closed at serve time rather than on a later audit. The caller passes
+    /// the just-served display with the exact receipt/ack pair and
+    /// tool-owner view the display bound, so no second resolution path is
+    /// manufactured here. The owner-API display entry
+    /// (`SkillLifecycleApi::activation_display` over the same file) serves
+    /// the catalogue boundary checks without this resolution leg, so a chain
+    /// it serves is audit-resolved only. Stored-state staleness resolves
     /// through the catalogue-digest leg; live dependency-set and host/profile
     /// drift beyond the tool/definition legs still awaits the full-world
     /// entry ([`activation_display_against`](Self::activation_display_against)).
