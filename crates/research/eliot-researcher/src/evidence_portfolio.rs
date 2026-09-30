@@ -3099,11 +3099,12 @@ impl NoMatchEvaluationIssuer {
     /// Every held commitment is joined before the record exists, in this order:
     /// the presented scope digest is the held one; the presented manifest
     /// re-proves its own identity and is the held digest, revision and
-    /// denominator; the accounting is completely enumerated with no open
-    /// member, no exclusion and no stopped frontier; the owner observation
-    /// window covers `now_ms`; every closed member resolves through the same
-    /// ordered join [`AbsencePreconditions::derive`] applies — handle present,
-    /// vetted record present, handle bound, record current, manifest
+    /// denominator, and authorizes this exact accounting under an expiry the
+    /// assessment instant has not passed; the accounting is completely enumerated
+    /// with no open member, no exclusion and no stopped frontier; the owner
+    /// observation window covers `now_ms`; every closed member resolves through
+    /// the same ordered join [`AbsencePreconditions::derive`] applies — handle
+    /// present, vetted record present, handle bound, record current, manifest
     /// allowlisted and record-bound, evaluation observed no earlier than the
     /// record was retrieved — with a per-member result identity recomputed
     /// under the held predicate and revisions; and the held ceiling is checked
@@ -3123,10 +3124,11 @@ impl NoMatchEvaluationIssuer {
     /// Returns [`PortfolioError::IncompleteDenominator`] for a scope the
     /// accounting did not completely enumerate or close, or for an account with
     /// no closed member; [`PortfolioError::Conflict`] for a scope, manifest,
-    /// revision, denominator, frontier, clock or per-member join the issuer
-    /// cannot attest; [`PortfolioError::InvalidDigest`] when the presented
-    /// manifest no longer re-proves its own identity; the joined record's own
-    /// digest error when its canonical commitment cannot be recomputed; and
+    /// revision, denominator, frontier, authorized accounting, manifest expiry,
+    /// clock or per-member join the issuer cannot attest;
+    /// [`PortfolioError::InvalidDigest`] when the presented manifest no longer
+    /// re-proves its own identity; the joined record's own digest error when its
+    /// canonical commitment cannot be recomputed; and
     /// [`PortfolioError::CeilingViolation`] when the held ceiling exceeds the
     /// weakest grade behind the joined records.
     pub fn issue_for(
@@ -3138,7 +3140,7 @@ impl NoMatchEvaluationIssuer {
         now_ms: i64,
     ) -> Result<NoMatchEvaluation, PortfolioError> {
         self.check_scope_binding(frozen_scope_digest)?;
-        self.check_manifest_binding(manifest)?;
+        self.check_manifest_binding(manifest, account, now_ms)?;
         Self::check_enumeration(account)?;
         self.check_observation_window(now_ms)?;
         let predicate_digest = NoMatchEvaluation::predicate_digest_of(
@@ -3215,8 +3217,19 @@ impl NoMatchEvaluationIssuer {
     }
 
     /// Reads the presented manifest back and refuses one that is not the held
-    /// snapshot commitment.
-    fn check_manifest_binding(&self, manifest: &AuthorizedManifest) -> Result<(), PortfolioError> {
+    /// snapshot commitment, that authorizes a different accounting, or that has
+    /// already expired at the assessment instant.
+    ///
+    /// The last two are the issuer refusing to *mint* a record the assessor would
+    /// then refuse: both facts are already inside the manifest's own frozen
+    /// preimage, so issuance can join them here instead of leaving the record to
+    /// exist and be rejected on readback.
+    fn check_manifest_binding(
+        &self,
+        manifest: &AuthorizedManifest,
+        account: &CoverageAccount,
+        now_ms: i64,
+    ) -> Result<(), PortfolioError> {
         manifest.verify_integrity()?;
         if manifest.digest != self.manifest_digest {
             return Err(PortfolioError::Conflict {
@@ -3231,6 +3244,16 @@ impl NoMatchEvaluationIssuer {
         if manifest.denominator_digest != self.denominator_digest {
             return Err(PortfolioError::Conflict {
                 field: "no_match_issuer.manifest_denominator",
+            });
+        }
+        if manifest.coverage_digest != account.digest() {
+            return Err(PortfolioError::Conflict {
+                field: "no_match_issuer.manifest_coverage",
+            });
+        }
+        if now_ms > manifest.expires_ms {
+            return Err(PortfolioError::Conflict {
+                field: "no_match_issuer.manifest_expires_ms",
             });
         }
         Ok(())
@@ -3396,6 +3419,23 @@ pub const INCOMPATIBLE_EVALUATION_NOT_OBSERVED: &str = "evaluation_observed_in_f
 /// Route-level for the same reason as
 /// [`INCOMPATIBLE_EVALUATION_NOT_OBSERVED`]: one clock bound, one refusal.
 pub const INCOMPATIBLE_EVALUATION_EXPIRED: &str = "evaluation_expired_at_assessment";
+/// The authorized manifest authorizes a different coverage accounting than the
+/// one the claim is being assessed over.
+///
+/// Route-level for the same reason again, and for a sharper one: the manifest
+/// freezes one accounting, so either every member is authorized under an
+/// accounting that is not this one or none is. Retaining it per member would
+/// print N copies of one document fact and inflate the per-member count with a
+/// fault that is not about any member.
+pub const INCOMPATIBLE_MANIFEST_FOREIGN_COVERAGE: &str = "manifest_authorizes_other_coverage";
+/// The assessment time is past the authorized manifest's own frozen expiry.
+///
+/// Route-level for the same reason as
+/// [`INCOMPATIBLE_MANIFEST_FOREIGN_COVERAGE`]: an expiry is one instant owned by
+/// one document. It is also a different bound from the per-record freshness
+/// boundary and from the evaluation's observation window, and an expired
+/// manifest that still binds current records is still an expired authorization.
+pub const INCOMPATIBLE_MANIFEST_EXPIRED: &str = "manifest_expired_at_assessment";
 
 /// The owner-bound preconditions one exact negative claim is assessed against.
 ///
@@ -3443,11 +3483,11 @@ pub struct AbsencePreconditions {
     /// `INCOMPATIBLE_*` constants: a reason here always names a fact about
     /// *this member*, never a fact about the route as a whole.
     incompatible: Vec<(String, &'static str)>,
-    /// Route-level conditions the bound evaluation does not meet, in the order
+    /// Route-level conditions the bound evidence does not meet, in the order
     /// [`AbsencePreconditions::derive`] checks them. These are facts about the
-    /// evaluation as a whole rather than about any member, so they are retained
-    /// here and refused once, instead of being stamped onto every closed member
-    /// and inflating a per-member count with one fault.
+    /// evaluation or the manifest authorizing it rather than about any member, so
+    /// they are retained here and refused once, instead of being stamped onto
+    /// every closed member and inflating a per-member count with one fault.
     route_incompatible: Vec<&'static str>,
     /// Declared members the accounting closed *and* whose join to a compatible
     /// vetted record, authorized manifest and owner-issued result is complete.
@@ -3509,10 +3549,16 @@ impl AbsencePreconditions {
     /// joins apply either way. A route that binds no evaluation therefore still
     /// refuses a member with no handle, no record, a substituted handle or a
     /// stale record, and closes its members on the accounting and the records
-    /// alone. Two further conditions — the evaluation observed after `now_ms`, and
-    /// the evaluation expired at `now_ms` — are facts about the evaluation rather
-    /// than about any member, so they are retained once in
-    /// [`Self::route_incompatible`] and not per member.
+    /// alone.
+    ///
+    /// Four further conditions are facts about the presented evidence as a whole
+    /// rather than about any one member, so they are retained once in
+    /// [`Self::route_incompatible`] and not per member: the evaluation observed
+    /// after `now_ms`; the evaluation expired at `now_ms`; the presented manifest
+    /// authorizing a coverage accounting other than this one; and that manifest
+    /// past its own frozen expiry. The last two are facts about the document
+    /// authorizing the run rather than about the record, and they apply to every
+    /// member or to none.
     ///
     /// A presented manifest is read back before any of its content is used, so a
     /// manifest whose stored digest never matched its own fields cannot
@@ -3578,7 +3624,7 @@ impl AbsencePreconditions {
                 }
             }
         }
-        let binding = AbsenceJoinBinding::of(manifest, evaluation.as_ref(), now_ms);
+        let binding = AbsenceJoinBinding::of(manifest, evaluation.as_ref(), now_ms, account);
         let results: BTreeMap<&str, &MemberNoMatchResult> = evaluation
             .as_ref()
             .map(|evaluation| {
@@ -3636,6 +3682,14 @@ impl AbsencePreconditions {
         // member by `member_join_reason`. Reporting them per member made one
         // clock fault read as N record faults and inflated the per-member count
         // the reason prints. Order is the order they are checked in.
+        //
+        // The two authorizing-manifest conditions are route-level for the same
+        // reason and by the same argument: which accounting a manifest was frozen
+        // over, and whether that manifest has expired, are single facts about one
+        // document, not one fact per member. Every member is affected by both or
+        // by neither, so stamping them per member would report N copies of one
+        // document fault. The evaluation-clock pair is retained first because it
+        // describes the record rather than the document authorizing it.
         let mut route_incompatible: Vec<&'static str> = Vec::new();
         if binding.evaluation_bound {
             if binding.observed_in_future() {
@@ -3644,6 +3698,12 @@ impl AbsencePreconditions {
             if binding.expired() {
                 route_incompatible.push(INCOMPATIBLE_EVALUATION_EXPIRED);
             }
+        }
+        if binding.authorizes_other_coverage() {
+            route_incompatible.push(INCOMPATIBLE_MANIFEST_FOREIGN_COVERAGE);
+        }
+        if binding.manifest_expired() {
+            route_incompatible.push(INCOMPATIBLE_MANIFEST_EXPIRED);
         }
         // Weakest-link ceiling over the grades of the records behind the closed
         // members: a member with no grade poisons the result to unknown. The rule
@@ -3783,6 +3843,8 @@ struct AbsenceJoinBinding<'a> {
     current_until_ms: i64,
     /// The caller's assessment time.
     now_ms: i64,
+    /// Canonical digest of the exact accounting this assessment is over.
+    account_digest: String,
 }
 
 impl<'a> AbsenceJoinBinding<'a> {
@@ -3791,6 +3853,7 @@ impl<'a> AbsenceJoinBinding<'a> {
         manifest: Option<&'a AuthorizedManifest>,
         evaluation: Option<&NoMatchEvaluation>,
         now_ms: i64,
+        account: &CoverageAccount,
     ) -> Self {
         let manifest_binding = match (manifest, evaluation) {
             (Some(admitted), Some(evaluation)) => {
@@ -3810,6 +3873,7 @@ impl<'a> AbsenceJoinBinding<'a> {
             observed_at_ms: evaluation.map_or(0, |evaluation| evaluation.observed_at_ms),
             current_until_ms: evaluation.map_or(0, |evaluation| evaluation.current_until_ms),
             now_ms,
+            account_digest: account.digest(),
         }
     }
 
@@ -3831,6 +3895,38 @@ impl<'a> AbsenceJoinBinding<'a> {
     /// currentness bound.
     fn expired(&self) -> bool {
         self.now_ms > self.current_until_ms
+    }
+
+    /// Whether the presented manifest authorizes a different coverage accounting
+    /// than the one this claim is assessed over.
+    ///
+    /// `AuthorizedManifest` already freezes the digest of the exact accounting its
+    /// owner authorized in `coverage_digest`, and that value is inside its own
+    /// identity preimage, so a manifest cannot carry one without its digest
+    /// committing to it. It was nevertheless read only by the audit path: the
+    /// absence join checked the manifest's allowlist and its per-source record
+    /// commitments, never the accounting it was issued against. Two runs with the
+    /// same source handles and the same records therefore both passed the join
+    /// with a manifest frozen over one of the two accountings, which is a
+    /// different set of dispositions and a different member count.
+    fn authorizes_other_coverage(&self) -> bool {
+        self.manifest
+            .is_some_and(|admitted| admitted.coverage_digest != self.account_digest)
+    }
+
+    /// Whether the assessment time is past the presented manifest's own frozen
+    /// expiry.
+    ///
+    /// A manifest's expiry is its own currentness bound and is inside its identity
+    /// preimage, so "this manifest authorized these records under that accounting"
+    /// and "this manifest still authorizes them now" are two different facts. The
+    /// per-record freshness boundary and the evaluation's observation window are
+    /// separate bounds owned by separate records; neither of them is this one, and
+    /// an expired manifest that still binds current records must not read as a
+    /// live authorization.
+    fn manifest_expired(&self) -> bool {
+        self.manifest
+            .is_some_and(|admitted| self.now_ms > admitted.expires_ms)
     }
 }
 
@@ -3918,13 +4014,14 @@ fn member_join_reason(
 ///
 /// Only a complete denominator, an exact accounting of every declared member, an
 /// intact and currently-bound source record for each closed member under an
-/// authorized manifest that commits that exact record, an owner-issued per-member
-/// predicate result joined to that record and to the exact predicate and
-/// revisions, all five separately-established dimensions, a current (not
-/// historical) applicability, and a proof ceiling no stronger than the weakest
-/// closed member's grade, proves absence. A bounded enumeration that stopped is
-/// partial exhaustion. Every rejected claim names the retained fact that rejected
-/// it, so no verdict rests on a caller-supplied flag.
+/// authorized manifest that commits that exact record, authorizes this exact
+/// accounting and has not expired, an owner-issued per-member predicate result
+/// joined to that record and to the exact predicate and revisions, all five
+/// separately-established dimensions, a current (not historical) applicability,
+/// and a proof ceiling no stronger than the weakest closed member's grade, proves
+/// absence. A bounded enumeration that stopped is partial exhaustion. Every
+/// rejected claim names the retained fact that rejected it, so no verdict rests
+/// on a caller-supplied flag.
 ///
 /// Package-level `Proven` is not publication authority, and it is not
 /// owner-bound either: it is the strongest statement this package can make about
@@ -4083,7 +4180,8 @@ fn rewritten_evaluation(preconditions: &AbsencePreconditions) -> Option<AbsenceV
     None
 }
 
-/// Refuses a bound evaluation whose own clock does not support a current claim.
+/// Refuses a route whose bound evaluation or authorizing manifest does not support
+/// a current claim over the presented accounting.
 ///
 /// These are route-level conditions, so they are reported once here rather than
 /// once per closed member. Retaining them per member made a single expired
@@ -4095,8 +4193,9 @@ fn unmet_route_conditions(preconditions: &AbsencePreconditions) -> Option<Absenc
     }
     Some(AbsenceVerdict::Unproven {
         reason: format!(
-            "absence: the bound predicate evaluation does not support a current claim, and the \
-             condition applies to the whole route rather than to any one member: {}",
+            "absence: the route's own bounded evidence does not support a current claim over the \
+             accounting it was assessed against, and these conditions apply to the whole route \
+             rather than to any one member: {}",
             preconditions.route_incompatible.join(",")
         ),
     })
