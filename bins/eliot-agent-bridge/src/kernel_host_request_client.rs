@@ -161,6 +161,15 @@ pub struct KernelHostRequestClient {
 pub(super) struct ReplayCacheEntry {
     pub(super) payload_digest: String,
     pub(super) envelope: HostRequestEnvelope,
+    /// Whether the Kernel has settled the exact operation for this
+    /// correlation (issue #77 W8).
+    ///
+    /// Set only where the Kernel proves it staged the exact operation — an
+    /// admitted reply, an owner-resolved durable winner, or an exact
+    /// reconcile-probe success. Heartbeat/Health, preview, and resolve-miss
+    /// exchanges never set it. Status gates forwarding-readiness
+    /// advertisement on the existence of one such entry.
+    pub(super) owner_settled: bool,
 }
 
 /// Kernel-issued facts snapshotted from the shared owner for one call.
@@ -691,6 +700,58 @@ impl KernelHostRequestClient {
             .exchange_host_request_frame(frame)
     }
 
+    /// Records that the Kernel settled one exact host operation through this
+    /// client (issue #77 W8).
+    ///
+    /// Marks the replay-cache entry for `correlation` when one exists. A
+    /// missing entry (owner-resolved recovery without local bytes, or a
+    /// cancellation whose parent was built by another connection) stays
+    /// unmarked, which only under-reports readiness — fail-closed, never
+    /// advertised. A failed borrow is likewise skipped: the next successful
+    /// operation re-marks.
+    fn note_owner_settled(&mut self, correlation: &str) {
+        let Ok(mut owner) = self.shared.try_borrow_mut() else {
+            return;
+        };
+        if let Some(entry) = owner.replay_cache.get_mut(correlation) {
+            entry.owner_settled = true;
+        }
+    }
+
+    /// Records settlement only for a successful exact-operation outcome and
+    /// returns it unchanged (issue #77 W8).
+    ///
+    /// Only owner-confirmed settlement marks: admission, response, applied
+    /// cancellation, or an observed terminal state. Unknown-outcome and
+    /// delivery failures never mark, so readiness is never inferred from an
+    /// error.
+    fn record_settled<T, E>(&mut self, correlation: &str, outcome: Result<T, E>) -> Result<T, E> {
+        if outcome.is_ok() {
+            self.note_owner_settled(correlation);
+        }
+        outcome
+    }
+
+    /// Reports whether an exact real host operation has settled through this
+    /// client (issue #77 W8).
+    ///
+    /// Status gates forwarding-readiness advertisement on this: it is true
+    /// only after an admitted invoke/cancel reply, an owner-resolved durable
+    /// winner, or an exact reconcile-probe success proves the Kernel staged
+    /// the exact operation. Each probe itself remains per-operation
+    /// settlement — never a readiness label — while this observes the history
+    /// fact that such a probe succeeded. A failed borrow reports false so
+    /// readiness is never advertised on unknown state.
+    pub fn has_settled_host_operation(&self) -> bool {
+        let Ok(owner) = self.shared.try_borrow() else {
+            return false;
+        };
+        owner
+            .replay_cache
+            .values()
+            .any(|entry| entry.owner_settled)
+    }
+
     /// Captures owner-verified source-result and attach facts for a resource
     /// created from this exact responded operation. The returned digest is a
     /// local comparison commitment only; reads must call
@@ -955,6 +1016,7 @@ impl KernelHostRequestClient {
                         ReplayCacheEntry {
                             payload_digest: payload_digest.to_owned(),
                             envelope: envelope.clone(),
+                            owner_settled: false,
                         },
                     );
                 Ok(InvocationPreparation::Submit(Box::new(envelope)))
@@ -3523,11 +3585,14 @@ impl KernelHostRequestPort for KernelHostRequestClient {
                     .request_id
                     .clone()
                     .unwrap_or_else(|| correlation.clone());
-                return submit_outcome_for_resolved(
-                    &record,
-                    occurrence.as_str(),
-                    request.tool.canonical_name(),
-                    logical_key.as_str(),
+                return self.record_settled(
+                    correlation.as_str(),
+                    submit_outcome_for_resolved(
+                        &record,
+                        occurrence.as_str(),
+                        request.tool.canonical_name(),
+                        logical_key.as_str(),
+                    ),
                 );
             }
             InvocationPreparation::Submit(envelope) => envelope,
@@ -3541,7 +3606,10 @@ impl KernelHostRequestPort for KernelHostRequestClient {
             // unknown-outcome error is returned unchanged and MUST NOT be
             // rewritten into DeadlineExceeded. Only the Kernel-owned Expired
             // record state maps to an owner timeout.
-            return self.probe_settles_invocation(&facts, &session, &envelope, now_ms);
+            return self.record_settled(
+                correlation.as_str(),
+                self.probe_settles_invocation(&facts, &session, &envelope, now_ms),
+            );
         }
         let frame = match canonical_dispatch_entry(&request.tool) {
             CanonicalDispatchEntry::InvokeRead => {
@@ -3587,7 +3655,12 @@ impl KernelHostRequestPort for KernelHostRequestClient {
         let reply = match self.exchange(&frame) {
             Ok(reply) => reply,
             Err(error @ PortFailure::AgentResponse { .. }) => return Err(error),
-            Err(_) => return self.probe_settles_invocation(&facts, &session, &envelope, now_ms),
+            Err(_) => {
+                return self.record_settled(
+                    correlation.as_str(),
+                    self.probe_settles_invocation(&facts, &session, &envelope, now_ms),
+                );
+            }
         };
         if is_legacy_correlation_unresolved_reply(&reply, &envelope) {
             return Err(PortFailure::LegacyCorrelationUnresolved);
@@ -3614,9 +3687,15 @@ impl KernelHostRequestPort for KernelHostRequestClient {
                     }
                     _ => record,
                 };
-                submit_outcome(&receipt, &record, request, &envelope)
+                self.record_settled(
+                    correlation.as_str(),
+                    submit_outcome(&receipt, &record, request, &envelope),
+                )
             }
-            None => self.probe_settles_invocation(&facts, &session, &envelope, now_ms),
+            None => self.record_settled(
+                correlation.as_str(),
+                self.probe_settles_invocation(&facts, &session, &envelope, now_ms),
+            ),
         }
     }
 
@@ -3658,13 +3737,16 @@ impl KernelHostRequestPort for KernelHostRequestClient {
             // Unknown delivery: resolve the retained cancellation identity
             // before any probe, without generating another cancellation.
             Err(_) => {
-                return self.resolve_retained_cancellation(
-                    &parent,
-                    cancel_correlation.as_str(),
-                    &envelope,
-                    &facts,
-                    &session,
-                    now_ms,
+                return self.record_settled(
+                    parent.request_base.as_str(),
+                    self.resolve_retained_cancellation(
+                        &parent,
+                        cancel_correlation.as_str(),
+                        &envelope,
+                        &facts,
+                        &session,
+                        now_ms,
+                    ),
                 );
             }
         };
@@ -3675,16 +3757,20 @@ impl KernelHostRequestPort for KernelHostRequestClient {
             return Err(PortFailure::IdempotencyConflict);
         }
         match decode_admitted_reply(&reply, &envelope) {
-            Some((_, _intent_record)) => {
-                self.resolve_cancellation_parent_disposition(&parent, &facts, &session)
-            }
-            None => self.resolve_retained_cancellation(
-                &parent,
-                cancel_correlation.as_str(),
-                &envelope,
-                &facts,
-                &session,
-                now_ms,
+            Some((_, _intent_record)) => self.record_settled(
+                parent.request_base.as_str(),
+                self.resolve_cancellation_parent_disposition(&parent, &facts, &session),
+            ),
+            None => self.record_settled(
+                parent.request_base.as_str(),
+                self.resolve_retained_cancellation(
+                    &parent,
+                    cancel_correlation.as_str(),
+                    &envelope,
+                    &facts,
+                    &session,
+                    now_ms,
+                ),
             ),
         }
     }
