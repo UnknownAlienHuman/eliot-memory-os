@@ -1692,9 +1692,7 @@ fn validate_required_manifest_refs(
 /// Each name identifies one owner-side read by role, never by store path or
 /// live handle. The caller nominates already-admitted evidence for a read;
 /// nomination authorizes no access and establishes no completeness.
-#[derive(
-    Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize,
-)]
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum HumanAttentionEvidenceRead {
     /// Notification delivery attempts (I11.7 delivery outcomes).
@@ -1950,9 +1948,7 @@ pub struct HumanAttentionAssemblyInput {
 }
 
 /// Whether the assembled evidence is complete or carries exact gaps.
-#[derive(
-    Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize,
-)]
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum HumanAttentionAssemblyStatus {
     Complete,
@@ -2287,10 +2283,7 @@ fn privacy_observation(
 }
 
 /// Records an exact gap when a slot is unavailable.
-fn push_gap(
-    gaps: &mut Vec<HumanAttentionEvidenceGap>,
-    gap: Option<HumanAttentionEvidenceGap>,
-) {
+fn push_gap(gaps: &mut Vec<HumanAttentionEvidenceGap>, gap: Option<HumanAttentionEvidenceGap>) {
     if let Some(gap) = gap {
         gaps.push(gap);
     }
@@ -2313,20 +2306,18 @@ fn decision_denominator(
         && framing
             .unobservable_boundaries_and_blind_intervals
             .is_empty();
-    let coverage = if collection_full
-        && framing_complete
-        && scope_coverage == CoverageState::Complete
-    {
-        CoverageState::Complete
-    } else if collection_full {
-        if scope_coverage == CoverageState::Complete {
-            CoverageState::Partial
+    let coverage =
+        if collection_full && framing_complete && scope_coverage == CoverageState::Complete {
+            CoverageState::Complete
+        } else if collection_full {
+            if scope_coverage == CoverageState::Complete {
+                CoverageState::Partial
+            } else {
+                scope_coverage
+            }
         } else {
-            scope_coverage
-        }
-    } else {
-        CoverageState::Unavailable
-    };
+            CoverageState::Unavailable
+        };
     let denominator = DecisionOpportunityDenominator {
         eligible_subject_refs: eligible.to_vec(),
         ineligible_subject_refs_with_reason: Vec::new(),
@@ -2381,7 +2372,9 @@ fn empty_risk_metric(
 }
 
 /// Checks every nominated source revision is an exact non-blank binding.
-fn check_assembly_revisions(input: &HumanAttentionAssemblyInput) -> Result<(), EvaluationContractError> {
+fn check_assembly_revisions(
+    input: &HumanAttentionAssemblyInput,
+) -> Result<(), EvaluationContractError> {
     text(
         &input.notification.delivery_source_revision,
         "human_attention.assembly.delivery_source_revision",
@@ -2570,22 +2563,14 @@ pub fn assemble_human_attention_evidence(
     check_assembly_revisions(input)?;
     check_risk_absence_fields(input)?;
     let manifest = assemble_evidence_manifest(input)?;
-    let window_ref = input
-        .observation_window
-        .specification
-        .window_id
-        .clone();
+    let window_ref = input.observation_window.specification.window_id.clone();
 
     let task_collection_full = input
         .notification
         .deduplicated_inbox_items
         .observed
         .is_some()
-        && input
-            .notification
-            .delivery_attempts
-            .observed
-            .is_some()
+        && input.notification.delivery_attempts.observed.is_some()
         && input
             .approvals
             .notification_approval_telemetry_profile
@@ -2601,11 +2586,7 @@ pub fn assemble_human_attention_evidence(
             .benign_false_block_tasks
             .observed
             .is_some()
-        && input
-            .task_outcomes
-            .abandoned_work_tasks
-            .observed
-            .is_some()
+        && input.task_outcomes.abandoned_work_tasks.observed.is_some()
         && input.task_outcomes.rework_events.observed.is_some()
         && input
             .task_verifier
@@ -2617,11 +2598,7 @@ pub fn assemble_human_attention_evidence(
             .interruption_duration_ms
             .observed
             .is_some()
-        && input
-            .interruptions
-            .resumption_latency_ms
-            .observed
-            .is_some()
+        && input.interruptions.resumption_latency_ms.observed.is_some()
         && input
             .human_reports
             .human_attention_observation
@@ -2682,9 +2659,7 @@ pub fn assemble_human_attention_evidence(
         &tasks,
         &window_ref,
         HumanAttentionMetric::NotificationApprovalAndTelemetryProfile,
-        &input
-            .approvals
-            .notification_approval_telemetry_profile,
+        &input.approvals.notification_approval_telemetry_profile,
         HumanAttentionEvidenceRead::ExpiringApproval,
         &profile_candidates,
     )?;
@@ -2928,7 +2903,12 @@ pub fn assemble_human_attention_evidence(
                 &window_ref,
             )?;
             notification_approval_and_telemetry_profile = HumanAttentionMetricGroup {
-                metrics: vec![notification_profile, deduplicated_inbox_items, delivery_attempts, distinct],
+                metrics: vec![
+                    notification_profile,
+                    deduplicated_inbox_items,
+                    delivery_attempts,
+                    distinct,
+                ],
             };
             missed_critical_and_false_critical_counts = HumanAttentionMetricGroup {
                 metrics: vec![missed, false_critical],
@@ -3025,7 +3005,12 @@ pub fn assemble_human_attention_evidence(
                 });
             }
             notification_approval_and_telemetry_profile = HumanAttentionMetricGroup {
-                metrics: vec![notification_profile, deduplicated_inbox_items, delivery_attempts, distinct],
+                metrics: vec![
+                    notification_profile,
+                    deduplicated_inbox_items,
+                    delivery_attempts,
+                    distinct,
+                ],
             };
             missed_critical_and_false_critical_counts = HumanAttentionMetricGroup {
                 metrics: vec![missed, false_critical],
@@ -3038,11 +3023,7 @@ pub fn assemble_human_attention_evidence(
             };
         }
     } else {
-        let risk_collection_full = input
-            .risk_outcomes
-            .distinct_risk_events
-            .observed
-            .is_some()
+        let risk_collection_full = input.risk_outcomes.distinct_risk_events.observed.is_some()
             && input
                 .risk_outcomes
                 .missed_critical_risk_events
