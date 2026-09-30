@@ -256,7 +256,7 @@ pub use quality_applicability::{
     ACTIVE_DIRECTIVE_OWNER, GOVERNANCE_PROFILE_OWNER, GovernedDecision, IMPACT_OWNER,
     PROTECTED_FLOOR_OWNER, QualityApplicabilityError, QualityApplicabilityOwnerInputs, ROUTE_OWNER,
     TASK_ACCEPTANCE_OWNER, governed_decision, quality_applicability_of,
-    resolve_quality_applicability,
+    require_operation_ready, resolve_quality_applicability,
 };
 pub use reactive_admission::{
     AtomRiskBinding, ReactiveAdmissionError, ReactiveRiskAssessment, ReactiveRiskTier,

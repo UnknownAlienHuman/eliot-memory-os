@@ -54,7 +54,8 @@ use eliot_authority::ImpactClass;
 use eliot_context_contracts::{
     AdmittedContextSet, AuthorityClass, ContextBinding, QUALITY_APPLICABILITY_INPUTS,
     QualityApplicability, QualityApplicabilityInput, QualityApplicabilityResolution,
-    QualityApplicabilityResolutionSet, QualityDimension, QualityOperation, SemanticRole,
+    QualityApplicabilityResolutionSet, QualityDimension, QualityOperation, QualityRefusal,
+    QualityRefusalKind, QualityScorecard, QualitySuitability, SemanticRole,
 };
 use eliot_contracts::TaskRevision;
 use eliot_read::ReadIdentity;
@@ -480,4 +481,57 @@ fn resolve_active_directive(admitted: &AdmittedContextSet) -> QualityApplicabili
         return unknown(ACTIVE_DIRECTIVE_OWNER);
     }
     resolved(ACTIVE_DIRECTIVE_OWNER, governing.join(","))
+}
+
+/// Apply the one shared readiness rule to a graded packet, for the operation the
+/// Governor is about to authorize.
+///
+/// This is the consumer half of W5. [`governed_decision`] names the dimensions an
+/// operation independently requires, but naming them is not applying them: only
+/// the contract owner's own
+/// [`QualityScorecard::suitability`](eliot_context_contracts::QualityScorecard::suitability)
+/// can say whether *this* card's results are current passes. This function calls
+/// exactly that check and returns the owner's typed refusal verbatim, so a
+/// Governor caller cannot restate the rule, narrow it, or read a granted
+/// applicability as a granted action.
+///
+/// The two halves compose without either weakening the other: the six owner
+/// answers decide whether the packet is even governable
+/// ([`governed_decision`]), and this decides whether the graded output supports
+/// the specific operation. Both must hold before the effect proceeds.
+///
+/// # Why the second argument is the recipe's, never the operation's
+///
+/// `additional_required` is *unioned* into the operation's mandatory set by the
+/// owner, so it can only add a blocker. The operation's own required dimensions
+/// are read from the contract owner on every call and are not an input here at
+/// all — which is why passing an empty slice cannot let a missing exact anchor,
+/// active directive or required verifier through.
+///
+/// # Errors
+///
+/// Returns the owner's [`QualityRefusal`] unchanged. Its
+/// [`QualityRefusalKind::InvalidScorecard`] arm is a structural failure — the
+/// card does not describe a gradeable packet — and is deliberately *not* merged
+/// with the boundary error [`QualityApplicabilityError::InvalidOwnerValue`]
+/// these six resolvers return for a malformed owner answer. "Nobody answered"
+/// and "somebody answered with something inadmissible" stay distinguishable.
+pub fn require_operation_ready(
+    quality: &QualityScorecard,
+    decision: &GovernedDecision,
+    additional_required: &[QualityDimension],
+) -> Result<QualitySuitability, QualityRefusal> {
+    // A decision that already recorded a block never reaches the effect, so the
+    // rule is not even asked. This keeps the applicability half of the answer
+    // from being reported as a dimension failure: the two are distinct causes and
+    // the caller already has the exact unresolved inputs on the decision.
+    if decision.blocked {
+        return Err(QualityRefusal {
+            kind: QualityRefusalKind::ApplicabilityUnknown,
+            operation: decision.operation,
+            blocking: Vec::new(),
+            unresolved_applicability: decision.unresolved_applicability.clone(),
+        });
+    }
+    quality.suitability(decision.operation, additional_required)
 }
