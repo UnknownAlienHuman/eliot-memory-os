@@ -1130,6 +1130,15 @@ pub enum CompositionError {
     /// Durable recovery did not prove the complete owner set.
     #[error("Governor recovery failed: {0}")]
     Recovery(String),
+    /// Installation-bound scan disclosure refused an attach trigger's
+    /// completion with its exact owner cause preserved (issue #2900 B6).
+    ///
+    /// Missing, inaccessible, corrupt, replaced, stale, invalidated,
+    /// conflicted or unknown-commit scan records block completed readiness
+    /// here instead of collapsing into a recovery string, so the caller can
+    /// tell a lost record from a replaced one without re-reading the owner.
+    #[error(transparent)]
+    ScanDisclosure(#[from] WorkScopeError),
     /// Material readiness denied one effect with its exact receipt, directive,
     /// and missing-input details preserved for the caller.
     #[error(
@@ -6268,6 +6277,23 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .map_err(|error| CompositionError::Recovery(error.to_string()))
     }
 
+    /// Maps a cold-start driver failure to its typed composition cause
+    /// (issue #2900 B6).
+    ///
+    /// A compilation failure already carries its typed [`WorkScopeError`]
+    /// owner cause — including the scan receipt missing/inaccessible/corrupt/
+    /// replaced states that block completed readiness — so it travels
+    /// unchanged instead of collapsing into a recovery string. A lease
+    /// refusal has no owner cause and keeps the existing recovery string.
+    fn cold_start_driver_error(error: eliot_workscope::CompileDriverError) -> CompositionError {
+        match error {
+            eliot_workscope::CompileDriverError::Compile(inner) => inner.into(),
+            eliot_workscope::CompileDriverError::Lease(_) => {
+                CompositionError::Recovery(error.to_string())
+            }
+        }
+    }
+
     /// Binds the installation-owned durable scan disclosure store (issue
     /// #2900, defect D + W12 construction ingress).
     ///
@@ -6301,9 +6327,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             ors_object_ref.to_owned(),
             ors_generation,
         )
-        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        .map_err(CompositionError::ScanDisclosure)?;
         InstallationScanDisclosureStore::bind(contour, owner)
-            .map_err(|error| CompositionError::Recovery(error.to_string()))
+            .map_err(CompositionError::ScanDisclosure)
     }
 
     /// Runs one I4.4.1 cold-start trigger's discovery pass through the
@@ -6323,7 +6349,14 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// only then does [`BootstrapScanner::scan`] run and durably persist the
     /// receipt through the owner. No trigger reaches the scanner past an
     /// unadmitted or unattested read, and no trigger scan completes without
-    /// the owner receipt.
+    /// the owner receipt. A completed outcome is additionally replayed
+    /// through the same owner before return: the persisted handle is read
+    /// back under the same binding and its receipt identity is compared
+    /// against this operation's receipt, so a missing, inaccessible,
+    /// corrupt, replaced, stale, invalidated or unknown-commit record
+    /// surfaces its typed [`WorkScopeError`] cause through
+    /// [`CompositionError::ScanDisclosure`] instead of a completed outcome
+    /// (issue #2900 B2/B6).
     /// Live status: owning thin entry for attach/onboarding ingress; no live
     /// attach ingress builds the scanner inputs yet (BLOCKED-BY
     /// attach-transport: `bins/eliotd` `ScopeAttachIngress` carries no
@@ -6347,11 +6380,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         governing_source_refs: Vec<String>,
         now: u64,
     ) -> Result<BootstrapScanOutcome, CompositionError> {
-        ColdStartController::run_trigger_scan(
+        let outcome = ColdStartController::run_trigger_scan(
             trigger,
             discovery_lease,
             lease_key,
-            store,
+            &mut *store,
             binding,
             candidate_privacy,
             privacy_boundary,
@@ -6362,7 +6395,24 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             governing_source_refs,
             now,
         )
-        .map_err(|error| CompositionError::Recovery(error.to_string()))
+        .map_err(Self::cold_start_driver_error)?;
+        match &outcome {
+            BootstrapScanOutcome::Completed { persisted, .. } => {
+                persisted
+                    .validate()
+                    .map_err(CompositionError::ScanDisclosure)?;
+                let replayed =
+                    eliot_workscope::ScanDisclosureStore::readback(store, persisted, binding)
+                        .map_err(CompositionError::ScanDisclosure)?;
+                if replayed.scan_ref != persisted.receipt_ref {
+                    return Err(CompositionError::ScanDisclosure(
+                        WorkScopeError::ScanReceiptReplaced,
+                    ));
+                }
+            }
+            BootstrapScanOutcome::PrivacyBoundaryRequired { .. } => {}
+        }
+        Ok(outcome)
     }
 
     /// Quarantines one loose `scan-disclosure-*.json` capture left by the
@@ -6381,7 +6431,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     ) -> Result<LooseScanQuarantine, CompositionError> {
         store
             .quarantine_loose_capture(file_name, bytes)
-            .map_err(|error| CompositionError::Recovery(error.to_string()))
+            .map_err(CompositionError::ScanDisclosure)
     }
 
     /// Joins one I4.4.1 trigger to the retained cold-start single-flight
@@ -6444,18 +6494,25 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// [`ColdStartController::compile`] before the first scope-sensitive work
     /// and publishes it as the lease terminal, so compatible concurrent
     /// attaches receive the same receipt and no worker independently creates
-    /// a second `WorkScope` or "latest task" while the lease is active. A
-    /// supplied scan handle binds the terminal receipt to the exact durable
-    /// scan receipt that fed the compilation; without one the scan evidence
-    /// reference stays explicitly empty, never an in-memory or loose-file
-    /// fallback. An
+    /// a second `WorkScope` or "latest task" while the lease is active. The
+    /// terminal receipt always references the exact durable scan receipt
+    /// that fed the compilation: the caller supplies the installation-bound
+    /// scan store, the owner binding admitted for this trigger, and the
+    /// durable handle the trigger scan returned, and this entry reads the
+    /// handle back through the owner before compiling. A missing handle, or
+    /// a missing, inaccessible, corrupt, replaced, stale, invalidated or
+    /// unknown-commit record, fails with its typed [`WorkScopeError`] cause
+    /// through [`CompositionError::ScanDisclosure`] and never produces a
+    /// terminal receipt — there is no in-memory-only or loose-file fallback,
+    /// and an absent scan reference is never compiled as empty (issue #2900
+    /// W12/B2/B6). An
     /// already-terminal lease returns its `JoinedTerminal` surface without
     /// recompiling; a lease owned by an in-flight trigger returns `Joined`
     /// without a second compilation.
     /// Live status: owning thin entry for attach/onboarding ingress; no live
     /// attach ingress builds the compilation inputs yet (BLOCKED-BY
     /// attach-transport: `bins/eliotd` `ScopeAttachIngress` carries no
-    /// discovery or onboarding lease).
+    /// discovery or onboarding lease). Caller: STITCH.
     #[allow(
         clippy::too_many_arguments,
         reason = "cold-start compilation joins every frozen receipt field in one owner-checked entry"
@@ -6487,11 +6544,24 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         projection_generation: u64,
         privacy: &PrivacyProfile,
         task: TaskBindingInput,
+        scan_store: &InstallationScanDisclosureStore,
+        scan_binding: &ScanDisclosureOwnerBinding,
         scan_receipt: Option<&ScanReceiptHandle>,
         now: u64,
     ) -> Result<LeaseJoin, CompositionError> {
         if self.readiness != CompositionReadiness::Ready {
             return Err(CompositionError::NotReady);
+        }
+        let scan_handle = scan_receipt.ok_or(CompositionError::ScanDisclosure(
+            WorkScopeError::ScanReceiptMissing,
+        ))?;
+        let replayed =
+            eliot_workscope::ScanDisclosureStore::readback(scan_store, scan_handle, scan_binding)
+                .map_err(CompositionError::ScanDisclosure)?;
+        if replayed.scan_ref != scan_handle.receipt_ref {
+            return Err(CompositionError::ScanDisclosure(
+                WorkScopeError::ScanReceiptReplaced,
+            ));
         }
         self.cold_start
             .compile_and_publish(
@@ -6520,10 +6590,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 projection_generation,
                 privacy,
                 task,
-                scan_receipt,
+                Some(scan_handle),
                 now,
             )
-            .map_err(|error| CompositionError::Recovery(error.to_string()))
+            .map_err(Self::cold_start_driver_error)
     }
 
     /// Projects the retained terminal cold-start surface for one exact lease

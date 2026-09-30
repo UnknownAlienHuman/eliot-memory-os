@@ -1876,7 +1876,16 @@ impl DaemonComposition {
             Ok(result)
                 if result.resolved_binding().is_some() && ticket.workspace_selector.is_some() =>
             {
-                Self::attach_cold_start_question(ticket, now, result)
+                // Issue #2900 W12/B2: the installation-bound owner supply is
+                // STITCH — no live `eliotd` thread holds the canonical
+                // `Arc<dyn ScanDisclosureRecordOwner>` (Kernel
+                // `RedbRecoveryStore` lives in the separate kernel process;
+                // `eliotd` owns no store client and takes no new store
+                // dependency) and no installation/session owner issues the
+                // per-operation `ScanDisclosureOwnerBinding` yet — so the
+                // port stays disconnected and the question leg runs
+                // storeless with typed fail-closed completion.
+                Self::attach_cold_start_question(ticket, now, result, None)
             }
             other => other,
         };
@@ -1890,23 +1899,29 @@ impl DaemonComposition {
     /// until an installation-backed disclosure owner is supplied.
     ///
     /// Issue #2900 W12: this is the live attach/cold-start ingress that
-    /// reaches the scan port. The pre-owner question leg runs without a
-    /// store (no lease charge, no persistence). A completed scan must arrive
-    /// through the installation-bound durable owner
-    /// (`eliot_governor::InstallationScanDisclosureStore` bound via
-    /// `GovernorComposition::bind_installation_scan_store`) before
-    /// `BootstrapScanner::scan`, and the live terminal readiness receipt
-    /// must reference that durable handle through
-    /// `GovernorComposition::compile_cold_start_at_trigger`'s `scan_receipt`.
-    /// Caller: live `bins/eliotd/src/lib.rs:1872` for the question leg;
-    /// STITCH for the owner leg — the canonical
-    /// `Arc<dyn eliot_governor::ScanDisclosureRecordOwner>` (Kernel
-    /// `RedbRecoveryStore::open`) has no live `eliotd` thread yet, so
-    /// completion fails closed with no in-memory or loose-file fallback.
+    /// reaches the scan port. When the installation-bound durable owner is
+    /// supplied, it is connected before `BootstrapScanner::scan` through
+    /// [`Self::attach_cold_start_owner_receipt`]: the scan charges the
+    /// observed lease once, persists through the owner, replays the handle
+    /// back under the same binding, and the completed activation stands on
+    /// that durable receipt — no in-memory-only or loose-file fallback
+    /// exists anywhere on this route. An owner refusal of
+    /// `ScanContourNotAdmitted` (no persistable inputs) falls through to
+    /// the storeless question projection below, which charges nothing and
+    /// persists nothing; any other owner refusal fails closed with its
+    /// typed cause. Without the owner the pre-owner question leg below
+    /// runs without a store (no lease charge, no persistence), and a
+    /// completed scan fails closed with the typed inaccessible cause.
+    /// Caller: live `DaemonComposition::resolve_agent_activation_v2`; the
+    /// owner supply behind the owner arm is STITCH (see call site).
     fn attach_cold_start_question(
         ticket: &AgentActivationResolutionTicket,
         now: u64,
         result: AgentActivationResolutionResult,
+        owner: Option<(
+            &mut eliot_governor::InstallationScanDisclosureStore,
+            &eliot_workscope::ScanDisclosureOwnerBinding,
+        )>,
     ) -> Result<AgentActivationResolutionResult, DaemonError> {
         let mut observed = crate::task_binding_admission::observe_cold_start_discovery(
             ticket,
@@ -1914,6 +1929,25 @@ impl DaemonComposition {
             now.max(1),
         )
         .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        if let Some((store, binding)) = owner {
+            match Self::attach_cold_start_owner_receipt(store, binding, &mut observed) {
+                // The durable owner receipt stays retained in the
+                // installation-bound owner under its operation key with
+                // exact-replay semantics; the activation stands as
+                // resolved. The trigger-driven terminal compilation takes
+                // its own trigger-scan handle through
+                // `GovernorComposition::compile_cold_start_at_trigger`,
+                // which reads it back through the same store and binding
+                // before compiling.
+                Ok(_handle) => return Ok(result),
+                Err(eliot_workscope::WorkScopeError::ScanContourNotAdmitted) => {}
+                Err(error) => {
+                    return Err(DaemonError::Composition(CompositionError::ScanDisclosure(
+                        error,
+                    )));
+                }
+            }
+        }
         let scan = eliot_workscope::run_bootstrap_discovery(
             None,
             None,
@@ -1922,6 +1956,22 @@ impl DaemonComposition {
             &observed.discovery,
         )
         .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        Self::project_cold_start_question(result, scan)
+    }
+
+    /// Projects one storeless scan outcome onto the resolved activation.
+    ///
+    /// Issue #2900 B6: the question travels on the result; a completed scan
+    /// with no durable owner behind it is never a completed outcome — it
+    /// fails closed with the typed inaccessible cause. This leg charges no
+    /// lease and persists nothing, so reaching it after a refused owner
+    /// attempt is side-effect-free.
+    ///
+    /// Caller: live [`Self::attach_cold_start_question`].
+    fn project_cold_start_question(
+        result: AgentActivationResolutionResult,
+        scan: eliot_workscope::BootstrapScanOutcome,
+    ) -> Result<AgentActivationResolutionResult, DaemonError> {
         match scan {
             eliot_workscope::BootstrapScanOutcome::PrivacyBoundaryRequired {
                 code,
@@ -1939,9 +1989,72 @@ impl DaemonComposition {
                 persisted
                     .validate()
                     .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
-                Err(DaemonError::Lifecycle(
-                    "cold-start scan completion requires installation-bound InstallationScanDisclosureStore before BootstrapScanner::scan (bound via GovernorComposition::bind_installation_scan_store from Arc<dyn ScanDisclosureRecordOwner>); terminal OnboardingReadinessReceipt must reference the durable ScanReceiptHandle via GovernorComposition::compile_cold_start_at_trigger scan_receipt; missing producer: Kernel RedbRecoveryStore owner handle has no live eliotd thread (STITCH)".to_owned(),
-                ))
+                Err(DaemonError::Composition(CompositionError::ScanDisclosure(
+                    eliot_workscope::WorkScopeError::ScanReceiptInaccessible,
+                )))
+            }
+        }
+    }
+
+    /// Runs the installation-bound owner completion leg for one attach
+    /// discovery (issue #2900 W12/B2/B6).
+    ///
+    /// This is the live attach/cold-start ingress's completion join to the
+    /// exact durable port: the observed lease, key and discovery inputs run
+    /// through `eliot_workscope::run_bootstrap_discovery` with the
+    /// installation-bound `eliot_governor::InstallationScanDisclosureStore`
+    /// and the owner binding, so `BootstrapScanner::scan` executes only
+    /// against the durable owner and the completed scan returns the exact
+    /// replayable owner receipt. The persisted handle is read back through
+    /// the same store before return: a missing, inaccessible, corrupt,
+    /// replaced, stale, invalidated or unknown-commit record fails with its
+    /// typed `eliot_workscope::WorkScopeError` cause and never produces a
+    /// completed outcome, so no terminal readiness receipt may reference it.
+    /// The persisted handle stays retained in the installation-bound owner
+    /// under its operation key with exact-replay semantics. The
+    /// trigger-driven terminal compilation takes its own trigger-scan
+    /// handle: `GovernorComposition::compile_cold_start_at_trigger`
+    /// reads that handle back through the same store and binding before
+    /// compiling, so the terminal readiness receipt references a validated
+    /// durable scan receipt and never an in-memory or loose-file handle.
+    /// A question outcome means the observed discovery carries no
+    /// persistable privacy inputs, which fails as `ScanContourNotAdmitted`:
+    /// there is no in-memory-only or loose-file fallback. The live ingress
+    /// ([`Self::attach_cold_start_question`]) falls through to the
+    /// storeless question projection on exactly this cause, preserving the
+    /// progressive-onboarding question.
+    ///
+    /// Caller: live [`Self::attach_cold_start_question`] (owner arm). The
+    /// store+binding supply behind that arm is STITCH: no live `eliotd`
+    /// thread holds the `Arc<dyn eliot_governor::ScanDisclosureRecordOwner>`
+    /// (the Kernel `RedbRecoveryStore::open` implements it, unwired across
+    /// the process boundary), and the discovery-lease ingress carries no
+    /// owner-issued binding yet.
+    pub fn attach_cold_start_owner_receipt(
+        store: &mut eliot_governor::InstallationScanDisclosureStore,
+        binding: &eliot_workscope::ScanDisclosureOwnerBinding,
+        observed: &mut crate::task_binding_admission::ColdStartDiscoveryInput,
+    ) -> Result<eliot_workscope::ScanReceiptHandle, eliot_workscope::WorkScopeError> {
+        let port: &mut (dyn eliot_workscope::ScanDisclosureStore + '_) = &mut *store;
+        let outcome = eliot_workscope::run_bootstrap_discovery(
+            Some(port),
+            Some(binding),
+            &mut observed.lease,
+            &observed.key,
+            &observed.discovery,
+        )?;
+        match outcome {
+            eliot_workscope::BootstrapScanOutcome::Completed { persisted, .. } => {
+                persisted.validate()?;
+                let verified =
+                    eliot_workscope::ScanDisclosureStore::readback(store, &persisted, binding)?;
+                if verified.scan_ref != persisted.receipt_ref {
+                    return Err(eliot_workscope::WorkScopeError::ScanReceiptReplaced);
+                }
+                Ok(*persisted)
+            }
+            eliot_workscope::BootstrapScanOutcome::PrivacyBoundaryRequired { .. } => {
+                Err(eliot_workscope::WorkScopeError::ScanContourNotAdmitted)
             }
         }
     }
