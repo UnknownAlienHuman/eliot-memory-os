@@ -2180,6 +2180,13 @@ impl ProcessExecutionGateway {
     /// for one operation class (for example adoption) cannot authorize the
     /// effect named by `expected_operation`. An operation with no proven
     /// retained identity has nothing to compare against and fails closed.
+    ///
+    /// Currency is rechecked here too, against the live authority contour
+    /// and clock rather than the decide-time observation: a grant whose
+    /// challenge window has expired, or whose admitted fence no longer
+    /// matches the live epoch lineage and sequence, fails before the
+    /// privileged effect even when it still names the right operation and
+    /// target.
     fn authorize_effect_with_grant(
         &self,
         owner: &ProcessOwnerBinding,
@@ -2206,6 +2213,14 @@ impl ProcessExecutionGateway {
                 identity.physical(),
                 identity.generation(),
                 expected_operation,
+            )
+            .map_err(ProcessExecutionError::Contract)?;
+        let live_epoch = &self.snapshot_binding.authority_epoch().current;
+        grant
+            .binds_effect_currency(
+                live_epoch.lineage_id.as_str(),
+                live_epoch.epoch,
+                super::unix_ms(),
             )
             .map_err(ProcessExecutionError::Contract)
     }

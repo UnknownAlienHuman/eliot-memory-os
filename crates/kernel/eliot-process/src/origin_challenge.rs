@@ -494,6 +494,9 @@ pub struct OriginControlGrant {
     operation: OriginControlOperation,
     physical: PhysicalProcessBinding,
     generation: Generation,
+    installation_id: String,
+    state_fence: StateFence,
+    expires_at_unix_ms: u64,
     decided_at_unix_ms: u64,
     grant_digest: String,
 }
@@ -512,6 +515,21 @@ impl OriginControlGrant {
     /// Returns the decision time.
     pub const fn decided_at_unix_ms(&self) -> u64 {
         self.decided_at_unix_ms
+    }
+
+    /// Returns the installation identity the decided challenge bound.
+    pub fn installation_id(&self) -> &str {
+        &self.installation_id
+    }
+
+    /// Returns the admitted fence the decided challenge bound.
+    pub const fn state_fence(&self) -> &StateFence {
+        &self.state_fence
+    }
+
+    /// Returns the challenge expiry time (inclusive) this grant inherits.
+    pub const fn expires_at_unix_ms(&self) -> u64 {
+        self.expires_at_unix_ms
     }
 
     /// Returns the secret-bound decision tag.
@@ -570,6 +588,36 @@ impl OriginControlGrant {
         self.binds_target(physical, generation)
     }
 
+    /// Checks that this grant is still current for the effect about to run.
+    ///
+    /// The effect boundary calls this with the live authority contour and
+    /// clock after [`Self::binds_target_for_operation`], so a grant decided
+    /// under an older authority epoch, a moved fence, or an expired
+    /// challenge window cannot authorize a later privileged effect even
+    /// when it still names the right operation and target. The installation
+    /// identity rides in the proof and its secret-bound digest as admitted
+    /// intent evidence; its authoritative binding was already proven against
+    /// the durable issuance record by [`OriginChallengeAuthority::decide`],
+    /// and the target side is proven against the retained start receipt by
+    /// [`Self::binds_target_for_operation`]. Uses the existing typed
+    /// currency failures, never a new proof token or second authority.
+    pub fn binds_effect_currency(
+        &self,
+        live_lineage_id: &str,
+        live_authority_sequence: u64,
+        now_unix_ms: u64,
+    ) -> Result<(), ContractError> {
+        if now_unix_ms > self.expires_at_unix_ms {
+            return Err(ContractError::ExpiredDispatchPermit);
+        }
+        if self.state_fence.authority_epoch.sequence.get() != live_authority_sequence
+            || self.state_fence.authority_epoch.lineage_id.as_str() != live_lineage_id
+        {
+            return Err(ContractError::StaleStateFence);
+        }
+        Ok(())
+    }
+
     fn mint(
         key: &KernelDispatchKey,
         challenge: &OriginChallenge,
@@ -584,6 +632,9 @@ impl OriginControlGrant {
             operation: OriginControlOperation,
             physical: &'a PhysicalProcessBinding,
             generation: Generation,
+            installation_id: &'a str,
+            state_fence: &'a StateFence,
+            expires_at_unix_ms: u64,
             decided_at_unix_ms: u64,
         }
         let bytes = serde_json::to_vec(&GrantMaterial {
@@ -592,6 +643,9 @@ impl OriginControlGrant {
             operation: challenge.operation,
             physical,
             generation,
+            installation_id: &challenge.installation_id,
+            state_fence: &challenge.state_fence,
+            expires_at_unix_ms: challenge.expires_at_unix_ms,
             decided_at_unix_ms: now_unix_ms,
         })
         .map_err(|error| ContractError::Serialization(error.to_string()))?;
@@ -601,6 +655,9 @@ impl OriginControlGrant {
             operation: challenge.operation,
             physical: physical.clone(),
             generation,
+            installation_id: challenge.installation_id.clone(),
+            state_fence: challenge.state_fence.clone(),
+            expires_at_unix_ms: challenge.expires_at_unix_ms,
             decided_at_unix_ms: now_unix_ms,
             grant_digest,
         })
@@ -1009,6 +1066,9 @@ impl OriginChallengeAuthority {
         // generation equal the challenge's, so the grant carries those exact
         // values: the effect boundary can then recheck the still-running
         // target against the proof instead of trusting the caller's routing.
+        // The admitted installation, fence, and challenge window ride along
+        // in the same proof, so the boundary can also recheck currency
+        // against its live contour and clock.
         OriginControlGrant::mint(
             &self.key,
             &presentation.challenge,
