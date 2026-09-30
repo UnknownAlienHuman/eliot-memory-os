@@ -3154,6 +3154,123 @@ impl HostState {
             .iter()
             .find(|record| &record.dependency == dependency)
     }
+
+    /// Rebuilds a `HostState` from caller-assembled projection parts that the
+    /// append reducer provably cannot produce.
+    ///
+    /// This exists only so that a reader can be tested against *corrupt or
+    /// contradictory durable input*. The reducer is the sole production writer,
+    /// and it maintains invariants that no valid journal can violate — it pushes
+    /// an [`AppliedOperation`] for **every** record it applies, assigns strictly
+    /// increasing sequences, and appends in the same order to both
+    /// `store_rebinds` and `applied_operations`. Corrupt state cannot be
+    /// *appended*, but it genuinely can be *read*: a restore-from-disk of a
+    /// damaged journal, a partially-written frame, or an operator-tampered
+    /// image can present a record with no matching applied entry, two records at
+    /// the same applied sequence, or a stored checksum that disagrees with the
+    /// record bytes. Those are exactly the contours a reader must fail closed
+    /// on, and no production API may build them, so they are unwriteable
+    /// without this seam.
+    ///
+    /// The whole item is compiled out of every production build: the
+    /// `test-support` feature is enabled only from a consumer's
+    /// `[dev-dependencies]`, never from `[dependencies]`, so no production
+    /// composition root can name it. This mirrors
+    /// [`crate::ScmOperationStore::open`], the only other such seam in this
+    /// crate.
+    ///
+    /// This does **not** weaken the append invariant. It returns a detached
+    /// read-model value and never touches a backend: the only production inputs
+    /// to durable bytes are [`crate::HostStateRecord`] values through
+    /// [`crate::HostStateJournal::append`], so a state assembled here cannot be
+    /// appended, replayed, or reconciled back into a journal. A production
+    /// caller must not reintroduce an unconditional reconstruction route; a
+    /// genuinely valid state comes from
+    /// [`crate::HostStateJournal::snapshot`] or
+    /// [`crate::readonly_project_host_state`].
+    ///
+    /// [`AppliedOperation`]: AppliedOperation
+    /// [`crate::HostStateRecord`]: HostStateRecord
+    /// [`crate::HostStateJournal::append`]: HostStateJournal::append
+    /// [`crate::HostStateJournal::snapshot`]: HostStateJournal::snapshot
+    /// [`crate::readonly_project_host_state`]: crate::readonly_project_host_state
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn reconstruct_for_read_verification(
+        parts: HostStateReadVerificationParts,
+    ) -> Self {
+        Self {
+            host: parts.host,
+            sequence: parts.sequence,
+            last_checksum: parts.last_checksum,
+            activation: parts.activation,
+            kernel: parts.kernel,
+            kernel_history: parts.kernel_history,
+            prior_kernel: parts.prior_kernel,
+            prior_kernel_unknown: parts.prior_kernel_unknown,
+            dependencies: parts.dependencies,
+            drain: parts.drain,
+            drain_commit: parts.drain_commit,
+            wakes: parts.wakes,
+            observations: parts.observations,
+            readiness_observations: parts.readiness_observations,
+            store_rebinds: parts.store_rebinds,
+            reactive_context: parts.reactive_context,
+            pending_cutover: parts.pending_cutover,
+            backup_preparations: parts.backup_preparations,
+            module_build_provenance: parts.module_build_provenance,
+            clean_marker: parts.clean_marker,
+            retained_epochs: parts.retained_epochs,
+            retired_epochs: parts.retired_epochs,
+            applied_operations: parts.applied_operations,
+            // The cancellation-batch index is not a durable read-model part: the
+            // serialized form skips it and journal open rebuilds and validates
+            // it from the durable receipts. A read-verification fixture does not
+            // exercise it, so it starts empty exactly as `HostState::new` does.
+            wake_cancellation_batches: Arc::default(),
+            epoch_retirements: parts.epoch_retirements,
+        }
+    }
+}
+
+/// The caller-assembled durable read-model parts accepted by
+/// [`HostState::reconstruct_for_read_verification`].
+///
+/// This mirrors every durable [`HostState`] field except the cancellation-batch
+/// index, and deliberately declares **no** field defaults: a fixture must state
+/// every projection part explicitly rather than inheriting one, so that a
+/// fixture cannot silently omit durable state a reader would otherwise observe.
+/// It adds no constructor, because a fixture is exactly the literal the test
+/// means to assert, and a builder here would hide which parts were left empty.
+///
+/// This whole item is compiled out of every production build; see
+/// [`HostState::reconstruct_for_read_verification`].
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostStateReadVerificationParts {
+    pub host: HostInstallationEpoch,
+    pub sequence: u64,
+    pub last_checksum: Option<String>,
+    pub activation: Option<EliotActivationRecord>,
+    pub kernel: Option<KernelRecord>,
+    pub kernel_history: Vec<KernelRecord>,
+    pub prior_kernel: Option<KernelRecord>,
+    pub prior_kernel_unknown: bool,
+    pub dependencies: Vec<ManagedDependencyRecord>,
+    pub drain: Option<DrainRecord>,
+    pub drain_commit: Option<DrainCommitRecord>,
+    pub wakes: Vec<WakeRecord>,
+    pub observations: Vec<HostObservationRecord>,
+    pub readiness_observations: Vec<KernelReadinessObservationRecord>,
+    pub store_rebinds: Vec<StoreRebindRecord>,
+    pub reactive_context: Option<ReactiveContextQueueState>,
+    pub pending_cutover: Option<CutoverIntentRecord>,
+    pub backup_preparations: Vec<BackupPreparationRecord>,
+    pub module_build_provenance: Vec<ModuleBuildProvenanceRecord>,
+    pub clean_marker: Option<CleanMarker>,
+    pub retained_epochs: Vec<EpochEvidence>,
+    pub retired_epochs: Vec<HostInstallationEpoch>,
+    pub applied_operations: Vec<AppliedOperation>,
+    pub epoch_retirements: Vec<EpochRetirementRecord>,
 }
 
 pub(crate) fn activation_transition(

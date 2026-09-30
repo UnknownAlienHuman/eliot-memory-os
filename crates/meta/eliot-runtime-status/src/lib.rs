@@ -3750,30 +3750,34 @@ mod store_currentness_production_tests {
             nonce: h("nonce-1"),
             recovery: None,
         };
-        HostState {
-            host,
-            sequence: 10,
-            last_checksum: None,
-            activation: None,
-            kernel: None,
-            kernel_history: Vec::new(),
-            prior_kernel: None,
-            prior_kernel_unknown: false,
-            dependencies: Vec::new(),
-            drain: None,
-            drain_commit: None,
-            wakes: Vec::new(),
-            observations: Vec::new(),
-            readiness_observations: Vec::new(),
-            store_rebinds: records,
-            reactive_context: None,
-            pending_cutover: None,
-            clean_marker: None,
-            retained_epochs: Vec::new(),
-            retired_epochs: Vec::new(),
-            applied_operations: applied,
-            epoch_retirements: Vec::new(),
-        }
+        HostState::reconstruct_for_read_verification(
+            eliot_host_state::HostStateReadVerificationParts {
+                host,
+                sequence: 10,
+                last_checksum: None,
+                activation: None,
+                kernel: None,
+                kernel_history: Vec::new(),
+                prior_kernel: None,
+                prior_kernel_unknown: false,
+                dependencies: Vec::new(),
+                drain: None,
+                drain_commit: None,
+                wakes: Vec::new(),
+                observations: Vec::new(),
+                readiness_observations: Vec::new(),
+                store_rebinds: records,
+                reactive_context: None,
+                pending_cutover: None,
+                backup_preparations: Vec::new(),
+                module_build_provenance: Vec::new(),
+                clean_marker: None,
+                retained_epochs: Vec::new(),
+                retired_epochs: Vec::new(),
+                applied_operations: applied,
+                epoch_retirements: Vec::new(),
+            },
+        )
     }
     fn manifest_roots(portable: &str, host_root: &str) -> eliot_installation::RuntimeStateRoots {
         eliot_installation::RuntimeStateRoots {
@@ -4261,7 +4265,7 @@ mod live_production_observer_tests {
             checksum: "chk".to_owned(),
             sequence: 5,
         };
-        let host_state = HostState {
+        let host_state_parts = eliot_host_state::HostStateReadVerificationParts {
             host: host_epoch.clone(),
             sequence: 10,
             last_checksum: None,
@@ -4319,12 +4323,15 @@ mod live_production_observer_tests {
             store_rebinds: vec![store],
             reactive_context: None,
             pending_cutover: None,
+            backup_preparations: Vec::new(),
+            module_build_provenance: Vec::new(),
             clean_marker: None,
             retained_epochs: Vec::new(),
             retired_epochs: Vec::new(),
             applied_operations: vec![applied],
             epoch_retirements: Vec::new(),
         };
+        let host_state = HostState::reconstruct_for_read_verification(host_state_parts);
         let manifest = {
             let portable = if cfg!(windows) {
                 r"C:\tmpmp\portable"
@@ -4680,30 +4687,34 @@ mod live_production_observer_tests {
             lease_verified: true,
         };
         let observer = FakeWatchdogObserver { snap: Some(snap) };
-        let host = HostState {
-            host: make_host(),
-            sequence: 1,
-            last_checksum: None,
-            activation: None,
-            kernel: None,
-            kernel_history: Vec::new(),
-            prior_kernel: None,
-            prior_kernel_unknown: false,
-            dependencies: Vec::new(),
-            drain: None,
-            drain_commit: None,
-            wakes: Vec::new(),
-            observations: Vec::new(),
-            readiness_observations: Vec::new(),
-            store_rebinds: Vec::new(),
-            reactive_context: None,
-            pending_cutover: None,
-            clean_marker: None,
-            retained_epochs: Vec::new(),
-            retired_epochs: Vec::new(),
-            applied_operations: Vec::new(),
-            epoch_retirements: Vec::new(),
-        };
+        let host = HostState::reconstruct_for_read_verification(
+            eliot_host_state::HostStateReadVerificationParts {
+                host: make_host(),
+                sequence: 1,
+                last_checksum: None,
+                activation: None,
+                kernel: None,
+                kernel_history: Vec::new(),
+                prior_kernel: None,
+                prior_kernel_unknown: false,
+                dependencies: Vec::new(),
+                drain: None,
+                drain_commit: None,
+                wakes: Vec::new(),
+                observations: Vec::new(),
+                readiness_observations: Vec::new(),
+                store_rebinds: Vec::new(),
+                reactive_context: None,
+                pending_cutover: None,
+                backup_preparations: Vec::new(),
+                module_build_provenance: Vec::new(),
+                clean_marker: None,
+                retained_epochs: Vec::new(),
+                retired_epochs: Vec::new(),
+                applied_operations: Vec::new(),
+                epoch_retirements: Vec::new(),
+            },
+        );
         let manifest = host_with_kernel_and_store().1;
         let ors = OrsContour {
             state: ComponentState::Healthy,
@@ -4743,30 +4754,34 @@ mod live_production_observer_tests {
             lease_verified: true,
         };
         let observer = FakeWatchdogObserver { snap: Some(snap) };
-        let host = HostState {
-            host: make_host(),
-            sequence: 1,
-            last_checksum: None,
-            activation: None,
-            kernel: None,
-            kernel_history: Vec::new(),
-            prior_kernel: None,
-            prior_kernel_unknown: false,
-            dependencies: Vec::new(),
-            drain: None,
-            drain_commit: None,
-            wakes: Vec::new(),
-            observations: Vec::new(),
-            readiness_observations: Vec::new(),
-            store_rebinds: Vec::new(),
-            reactive_context: None,
-            pending_cutover: None,
-            clean_marker: None,
-            retained_epochs: Vec::new(),
-            retired_epochs: Vec::new(),
-            applied_operations: Vec::new(),
-            epoch_retirements: Vec::new(),
-        };
+        let host = HostState::reconstruct_for_read_verification(
+            eliot_host_state::HostStateReadVerificationParts {
+                host: make_host(),
+                sequence: 1,
+                last_checksum: None,
+                activation: None,
+                kernel: None,
+                kernel_history: Vec::new(),
+                prior_kernel: None,
+                prior_kernel_unknown: false,
+                dependencies: Vec::new(),
+                drain: None,
+                drain_commit: None,
+                wakes: Vec::new(),
+                observations: Vec::new(),
+                readiness_observations: Vec::new(),
+                store_rebinds: Vec::new(),
+                reactive_context: None,
+                pending_cutover: None,
+                backup_preparations: Vec::new(),
+                module_build_provenance: Vec::new(),
+                clean_marker: None,
+                retained_epochs: Vec::new(),
+                retired_epochs: Vec::new(),
+                applied_operations: Vec::new(),
+                epoch_retirements: Vec::new(),
+            },
+        );
         let manifest = host_with_kernel_and_store().1;
         let ors = OrsContour {
             state: ComponentState::Healthy,
