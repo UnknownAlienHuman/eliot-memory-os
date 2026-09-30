@@ -1056,16 +1056,12 @@ impl RecipeImprovementCandidate {
     /// had no reader anywhere in the tree before this, so flipping it moved
     /// `policy_sha256` while changing nothing.
     fn covers_declared_counter_metrics(&self, policy: &ContextRecipePolicy) -> bool {
-        policy
-            .qualification
-            .counter_metrics
-            .iter()
-            .all(|declared| {
-                self.counter_metrics.iter().any(|measured| {
-                    measured.metric_id == declared.metric_id
-                        && measured.forbidden_movement == declared.forbidden_movement
-                })
+        policy.qualification.counter_metrics.iter().all(|declared| {
+            self.counter_metrics.iter().any(|measured| {
+                measured.metric_id == declared.metric_id
+                    && measured.forbidden_movement == declared.forbidden_movement
             })
+        })
     }
 }
 
