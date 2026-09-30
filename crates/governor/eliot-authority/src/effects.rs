@@ -538,6 +538,10 @@ impl EffectAuthorizer {
     /// recovery snapshot enforces, so only snapshot-retainable
     /// authorizations are ever stored.
     #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the validated proposal is moved into the stored AuthorizedEffect; the shadow rebuild only re-checks its fields first"
+    )]
     pub fn authorize_with_revoked_roots(
         &mut self,
         lease: &mut ActionLease,
