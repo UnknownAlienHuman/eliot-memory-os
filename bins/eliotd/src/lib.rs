@@ -3293,13 +3293,24 @@ impl DaemonComposition {
     /// Readiness gates the construction exactly like
     /// [`Self::agent_fabric_descriptor`].
     ///
-    /// The ports returned here feed only the verifier-gated production path
-    /// [`Self::agent_fabric_new_verified_async`]: that sole production
-    /// consumer resolves the session halves over the live authenticated
-    /// session and verifies the binding through the Kernel
-    /// provider-admission verifier before any admitted capability is built,
-    /// so production ports never reach an effect without owner verification
-    /// (issue #1108 W1/W2).
+    /// The verifier-gated path named as this method's consumer,
+    /// [`Self::agent_fabric_new_verified_async`], resolves the session halves
+    /// over the live authenticated session and verifies the binding through the
+    /// Kernel provider-admission verifier before any admitted capability is
+    /// built, so ports that reach an effect through it do so only after owner
+    /// verification (issue #1108 W1/W2). **That consumer is not currently
+    /// reached, though.** `agent_fabric_new_verified_async` is not
+    /// `cfg(test)`-gated, so it is compiled in a non-test build, but no code in
+    /// this crate or workspace calls it: the only other reference to the name in
+    /// the tree is this doc link. The one call site of
+    /// `production_fabric_ports` itself is inside
+    /// `drive_verified_agent_fabric`, which *is* `#[cfg(test)]`-gated
+    /// and itself has no in-crate caller. So in a non-test build these
+    /// production ports are currently reached by no caller at all, and the
+    /// guarantee above is real for the path but latent for the daemon — it
+    /// becomes the production seam when the per-operation executor that owns
+    /// it is bound, which is the same open owner recorded in
+    /// `bins/eliotd/src/capability_evidence_wiring.rs`.
     ///
     /// # Errors
     ///
@@ -3369,9 +3380,19 @@ impl DaemonComposition {
     /// (session-half overwrite + owner validation) and
     /// [`crate::provider_capability::admit_provider_capability`]
     /// (per-operation content comparison against the driven `claimed`
-    /// halves): the only production path from resolved material to the
-    /// coordinator's closed admission. The `health` half rides input-only
+    /// halves): the only *compiled* non-test path from resolved material to
+    /// the coordinator's closed admission. The `health` half rides input-only
     /// into the capability and never mints admission (issue #265, W6).
+    ///
+    /// Not itself production-reached: this private function is not
+    /// `cfg(test)`-gated, but its only two call sites are
+    /// `agent_fabric_new_verified_async` and
+    /// `agent_fabric_restore_verified_async`, and neither of those is
+    /// called from anywhere in this crate or workspace. So the closed admission
+    /// this builds is reachable in a non-test build as compiled code, but
+    /// reached by no production run today. The refusal that keeps it that way
+    /// is the Kernel native-worker executable-binding owner plus the G-11
+    /// admission owner (issue #1678); no caller is invented here.
     ///
     /// # Errors
     ///
@@ -3390,10 +3411,15 @@ impl DaemonComposition {
 
     /// Constructs the production fabric on a sealed admitted provider
     /// capability verified through the Kernel admission verifier (issue #1108
-    /// W5/W2, production caller for A1).
+    /// W5/W2; written as the production caller for A1).
     ///
-    /// Sole production counterpart of the test-only
-    /// `agent_fabric_new_verified`: readiness plus the exact live
+    /// Non-test counterpart of the `#[cfg(test)]`-only
+    /// `agent_fabric_new_verified` — but currently *called* by nothing:
+    /// unlike its test-only counterpart this method is not `cfg(test)`-gated
+    /// and so is compiled in a production build, while `git grep` finds no
+    /// caller for it anywhere in this crate or workspace. Read "counterpart"
+    /// as "the shape this would take in production", not "the seam the daemon
+    /// currently builds fabric through". Readiness plus the exact live
     /// fence and the validated session binding gate the resolution, and
     /// caller-supplied session halves are overwritten with the live
     /// authenticated session values, never trusted (I15.2). The binding is
@@ -3444,8 +3470,17 @@ impl DaemonComposition {
     /// Restores the production fabric on freshly verified owner material in
     /// one call (issue #1108 A6/W2, verified restore for A8).
     ///
-    /// Sole production counterpart of the test-only
-    /// `agent_fabric_restore_verified`: the session halves are
+    /// Non-test counterpart of the `#[cfg(test)]`-only
+    /// `agent_fabric_restore_verified` — and currently *called* by nothing:
+    /// this method is not `cfg(test)`-gated and so is compiled in a production
+    /// build, but `git grep` finds no caller for it anywhere in this crate or
+    /// workspace. This matters for how the sibling restore in
+    /// `solo_agent_driver.rs` should be read: that module's two
+    /// `restore_solo_fabric` definitions do **not** route here. The
+    /// `#[cfg(test)]` one calls the `#[cfg(test)]`
+    /// `agent_fabric_restore_verified`, and the `#[cfg(not(test))]` one
+    /// refuses with `Err` unconditionally, so neither reaches this method.
+    /// The session halves are
     /// re-resolved over the live authenticated session and the binding is
     /// verified through the authenticated Kernel provider-admission verifier
     /// (`DaemonKernelClient::verify_provider_binding_async`) before the
@@ -3667,11 +3702,16 @@ impl DaemonComposition {
     /// Resolves the session-observed owner half of one verified provider
     /// material over the live authenticated session.
     ///
-    /// Shared by the test-only verified seam and the production async
-    /// verified constructors below: readiness plus the exact live fence and
-    /// the validated session binding gate the resolution, so both paths
-    /// overwrite caller-supplied halves with the live authenticated session
-    /// values and fail closed without them.
+    /// Shared by the `#[cfg(test)]`-only verified seam and the two non-test
+    /// async verified constructors below: readiness plus the exact live fence
+    /// and the validated session binding gate the resolution, so all three
+    /// paths overwrite caller-supplied halves with the live authenticated
+    /// session values and fail closed without them. This function itself is
+    /// *not* `cfg(test)`-gated — issue #1108 removed that gate from it — so it
+    /// is compiled in a production build, but its two production-side call
+    /// sites are the two async constructors named above, and neither of those
+    /// is called from anywhere in this crate or workspace. So this is compiled
+    /// non-test code that no production run reaches today.
     ///
     /// Readiness plus the exact live fence and the validated session binding
     /// gate the resolution: the threaded expectation must be current under
