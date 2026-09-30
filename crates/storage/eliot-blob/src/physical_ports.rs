@@ -175,23 +175,10 @@ impl WindowsBlobPlatform {
         let root = PathBuf::from(owner.root_id());
         let files = BlobFileStore::new(root).map_err(map_file_error)?;
         files.validate_root().map_err(map_file_error)?;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| BlobError::Provider("system clock is before Unix epoch".to_owned()))?
-            .as_nanos();
-        let now = u64::try_from(now).map_err(|_| {
-            BlobError::Provider(
-                "physical Blob provider generation could not be established".to_owned(),
-            )
-        })?;
-        let sequence =
-            PHYSICAL_PROVIDER_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let backend_generation = now ^ (u64::from(owner.process_id()) << 32) ^ sequence;
-        if backend_generation == 0 {
-            return Err(BlobError::Provider(
-                "physical Blob provider generation could not be established".to_owned(),
-            ));
-        }
+        let backend_generation = owner
+            .lifecycle_resource_generation()
+            .filter(|generation| *generation != 0)
+            .ok_or(BlobError::StaleFence)?;
         Ok(Self {
             owner,
             files,
@@ -268,9 +255,6 @@ impl WindowsBlobPlatform {
         Ok(Some(previous_result))
     }
 }
-
-static PHYSICAL_PROVIDER_GENERATION: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(1);
 
 impl BlobPlatformPort for WindowsBlobPlatform {
     fn claim_root(&mut self, lease: &BlobRootLease) -> Result<RootClaimProof, BlobError> {

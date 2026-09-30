@@ -16,7 +16,7 @@ use crate::plan;
 use crate::plan::validate_revision_heads;
 use crate::schema;
 use eliot_store_api::{
-    CanonicalValidationSnapshot, EVIDENCE_PACK_MAX_RECORDS, ExactJsonBytes,
+    CanonicalValidationSnapshot, CausalBinding, EVIDENCE_PACK_MAX_RECORDS, ExactJsonBytes,
     FencedProjectionPublication, NamedReadOperation, NamedReadRequest, NamedReadResponse,
     OperationId, OrderingHead, OrderingScopeId, PAYLOAD_AUTHORITY_VERSION, PayloadEncoding,
     PayloadSource, ProjectionPublicationRecord, RevisionHead, RevisionKey, ScopeId,
@@ -38,7 +38,7 @@ pub(super) const READ_VALIDATION_SNAPSHOT: &str = "BEGIN TRANSACTION; SELECT * F
 /// Must stay equal to the reference handler's version in
 /// `eliot-store-memory`: consumers match on this version before interpreting
 /// `records` / `provenance`; any shape change bumps it on both sides.
-const EVIDENCE_PACK_PAYLOAD_VERSION: u32 = 1;
+const EVIDENCE_PACK_PAYLOAD_VERSION: u32 = 2;
 
 /// Version of the T11.3 cognitive read payloads. Each must stay equal to its
 /// reference counterpart in `eliot-store-memory`.
@@ -350,10 +350,17 @@ async fn named_read_payload(
             )?)
         }
         NamedReadOperation::GetEvidencePack => {
+            let causal_binding =
+                read_evidence_pack_causal_binding(db, &adapter.config, state_fence).await?;
             let rows = read_evidence_records(db, &adapter.config).await?;
             let suppression = read_erasure_suppression(db, &adapter.config).await?;
-            evidence_pack_payload(query, state_fence, &rows, &suppression)
-                .map_err(AdapterError::Store)
+            let mut payload = evidence_pack_payload(query, state_fence, &rows, &suppression)
+                .map_err(AdapterError::Store)?;
+            let object = payload
+                .as_object_mut()
+                .ok_or(AdapterError::Store(StoreError::InvalidReceipt))?;
+            object.insert("causal_binding".to_owned(), to_value(&causal_binding)?);
+            Ok(payload)
         }
         NamedReadOperation::GetTaskState => {
             let rows = read_authority_records(db, &adapter.config).await?;
@@ -411,6 +418,26 @@ async fn named_read_payload(
             operation: format!("{other:?}"),
         }),
     }
+}
+
+/// Reads the actual canonical causal tip and next position for an evidence
+/// pack from the Store's bounded allocation snapshot. The generic allocation
+/// helper can describe a first-write Genesis when a Store fence is absent;
+/// this read surface refuses that synthetic bootstrap projection and exposes
+/// only a real Store readback.
+async fn read_evidence_pack_causal_binding(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    expected_state_fence: &StateFence,
+) -> Result<CausalBinding, AdapterError> {
+    let (allocation_fence, projection) = super::receipt_reconciliation::read_causal_allocation(
+        db,
+        config,
+        expected_state_fence,
+    )
+    .await?;
+    allocation_fence.ok_or(StoreError::ReceiptNotFound)?;
+    Ok(projection.binding().clone())
 }
 
 const READ_BLACKBOARD_ITEM_HEAD: &str = "SELECT VALUE { namespace: namespace, key: key, state_fence: state_fence, revision: revision, schema: schema, payload: payload, value_digest: value_digest } FROM recovery_owner WHERE namespace = $blackboard_namespace AND key = $blackboard_key LIMIT 1;";
