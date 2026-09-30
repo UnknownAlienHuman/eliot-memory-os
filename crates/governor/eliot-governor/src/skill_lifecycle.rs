@@ -273,6 +273,13 @@ fn map_composition_error(error: CompositionError, ctx: &StoreFailureIdentityCont
             StoreRecoveryAction::RestoreStoreConnectivity,
             ctx,
         ),
+        CompositionError::Clock(_) => map_composition_store_failure(
+            StoreFailureDisposition::Unavailable,
+            "CLOCK_UNAVAILABLE",
+            StoreRetryDirective::RetrySameIdentityAfterBackoff,
+            StoreRecoveryAction::None,
+            ctx,
+        ),
         CompositionError::Owner(_) => map_composition_store_failure(
             StoreFailureDisposition::DeterministicRejection,
             "OWNER_REJECTED",
