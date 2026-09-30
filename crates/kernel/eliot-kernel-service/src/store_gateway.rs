@@ -4938,12 +4938,30 @@ impl KernelStoreGateway {
         };
         // The retained record is consulted first, so an answered or reconciling
         // obligation is reported under its original owner operation identity
-        // without publishing the slice a second time.
-        let retained = classify_retained_horizon_publication(
-            &obligation,
-            &publication,
-            self.retain_user_automation_obligation(sealed, &obligation),
-        );
+        // without publishing the slice a second time. A row the durable owner
+        // classifies as possible-effect is first put to the schedule owner, which
+        // is the only party that can say whether the effect landed; a row it
+        // answers for settles here and any other answer keeps it reconciling.
+        let retained = self.retain_user_automation_obligation(sealed, &obligation);
+        if matches!(
+            &retained,
+            RetainedObligationLookup::Held(RetainedUserAutomationObligation::Reconciling { .. })
+        ) {
+            if let Some(phase) = self
+                .reconcile_wake_horizon_possible_effect(
+                    runtime,
+                    &mut obligation,
+                    &publication,
+                    &requested_occurrence_ids,
+                    &retry_handle,
+                )
+                .await?
+            {
+                obligations.push(obligation);
+                return Ok(Some(phase));
+            }
+        }
+        let retained = classify_retained_horizon_publication(&obligation, &publication, retained);
         if let Some(phase) = retained_horizon_phase(
             retained,
             &mut obligation,
@@ -4998,6 +5016,121 @@ impl KernelStoreGateway {
         Ok(UserAutomationRuntimeObligationDisposition::Answered {
             answer: Box::new(answer),
         })
+    }
+
+    /// Asks the schedule owner whether one possible-effect horizon obligation was
+    /// already applied, and settles the retained row out of the owner's own
+    /// answer.
+    ///
+    /// A row that reached the monotonic `Routed` state is reconciling until
+    /// something asks the owner the only question that can close it, so this is
+    /// that ask. It runs ahead of the ordinary classification and only for the
+    /// one durable classification that means "the owner may already have acted";
+    /// an absent, issued, answered, or unreadable row is left to
+    /// `classify_retained_horizon_publication` exactly as before.
+    ///
+    /// The discriminator is the SHAPE of the owner's answer, and it introduces
+    /// no new state, digest, nonce, cap, or timeout. `Ok` is the owner's own
+    /// retained acknowledgement for THIS exact publication, so it settles the row
+    /// to `Answered` through the same `settle_wake_horizon_acknowledgement` the
+    /// issue path uses: one retained body, one pair of validators, one ORS
+    /// writer, no second settlement path. The next attempt of this parent
+    /// operation then reads the row back as answered and serves that body
+    /// verbatim instead of publishing the slice again.
+    ///
+    /// EVERY other answer DEFERS, and the row stays reconciling. That set is
+    /// deliberately large, and `NotRetained` is the member that has to be argued
+    /// rather than assumed. It is a genuine complete negative, and it is still
+    /// not proof that the effect was never issued: it answers a question about
+    /// the owner's CURRENT activation generation, because the Host journal
+    /// clears its whole wake projection at an activation cutover
+    /// (`eliot_host_state::journal`), so a horizon published and fired under an
+    /// earlier generation reads as absent under this one. Settling that to
+    /// `Retained` would republish occurrences whose effect already happened,
+    /// which is the exact double-publish issue #2970 exists to close, and the
+    /// port's own contract forbids the inference: "an absent or inconclusive
+    /// lookup is an error, never proof that publication did not occur."
+    /// `Unavailable` proves less still, because `map_journal_error` collapses an
+    /// explicitly indeterminate `BackendError::Unknown` into it. Every deferred
+    /// answer keeps its typed detail in the reconciling reason, so the row
+    /// records that reconciliation was attempted and what the owner said.
+    ///
+    /// `None` means this obligation is not in the classification this reconciles
+    /// and the caller must run the ordinary path.
+    async fn reconcile_wake_horizon_possible_effect<R>(
+        &self,
+        runtime: Option<&R>,
+        obligation: &mut UserAutomationRuntimeObligation,
+        publication: &UserAutomationWakeHorizonPublication,
+        requested_occurrence_ids: &[String],
+        retry_handle: &str,
+    ) -> Result<Option<UserAutomationHorizonPhase>, String>
+    where
+        R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
+    {
+        let Some(runtime) = runtime else {
+            // The intent is durably retained and this transition composed no
+            // schedule owner at all, so there is nothing to ask and nothing to
+            // settle. The ordinary classification reports it as unresolved.
+            return Ok(None);
+        };
+        let acknowledgement =
+            match UserAutomationWakePort::read_wake_horizon_publication(runtime, publication.clone())
+                .await
+            {
+                Ok(acknowledgement) => acknowledgement,
+                Err(refusal) => {
+                    // No answer this boundary may close the question on. The row
+                    // keeps its `Reconciling` disposition and its possible-effect
+                    // state, and the reported reason now names the typed owner
+                    // answer that refused to settle it.
+                    let detail = unretained_horizon_outcome_reason(
+                        &publication.automation_revision,
+                        &obligation.owner_operation_id,
+                        &refusal.to_string(),
+                    );
+                    obligation.disposition =
+                        UserAutomationRuntimeObligationDisposition::Reconciling {
+                            reason: detail.clone(),
+                        };
+                    return Ok(Some(unreached_horizon_phase(
+                        publication,
+                        requested_occurrence_ids,
+                        retry_handle.to_owned(),
+                        UnreachedHorizonKind::UnknownOutcome,
+                        &detail,
+                    )));
+                }
+            };
+        // The owner's retained acknowledgement becomes this obligation's durable
+        // body through the existing settle seam. A refusal here — a foreign
+        // identity, a failed horizon accounting, a row that could not be
+        // retained — writes nothing and keeps the record reconciling, so a wrong
+        // answer can never become a settled horizon.
+        let disposition =
+            match self.settle_wake_horizon_acknowledgement(obligation, publication, &acknowledgement)
+            {
+                Ok(disposition) => disposition,
+                Err(reason) => {
+                    obligation.disposition =
+                        UserAutomationRuntimeObligationDisposition::Reconciling {
+                            reason: reason.clone(),
+                        };
+                    return Ok(Some(unreached_horizon_phase(
+                        publication,
+                        requested_occurrence_ids,
+                        retry_handle.to_owned(),
+                        UnreachedHorizonKind::UnknownOutcome,
+                        &reason,
+                    )));
+                }
+            };
+        obligation.disposition = disposition;
+        Ok(Some(acknowledged_horizon_phase(
+            publication,
+            requested_occurrence_ids,
+            &acknowledgement,
+        )?))
     }
 
     /// Issues one bounded wake horizon under a durably routed obligation and
