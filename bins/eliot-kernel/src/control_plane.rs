@@ -800,7 +800,7 @@ impl KernelComposition {
             if after.as_ref() != Some(expected) {
                 return Err(TransportError::SessionFenced.into());
             }
-            self.verify_published_eliotd_live_receipt(expected_live_receipt)
+            self.verify_published_eliotd_live_receipt(expected_live_receipt, context)
                 .map_err(|_| TransportError::SessionFenced)?;
             let after_receipt_readback = self
                 .supervision_lease_authority

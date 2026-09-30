@@ -420,10 +420,38 @@ impl KernelComposition {
     pub(crate) fn verify_published_eliotd_live_receipt(
         &self,
         expected: &EliotdLiveReceipt,
+        context: &tracing::Span,
+    ) -> Result<(), KernelServiceError> {
+        observe_live_receipt(
+            "kernel.live_receipt.validation_requested",
+            "attempt",
+            context,
+        );
+        let result = self.verify_published_eliotd_live_receipt_inner(expected, context);
+        observe_live_receipt(
+            "kernel.live_receipt.validation_observed",
+            if result.is_ok() {
+                "validated"
+            } else {
+                "rejected"
+            },
+            context,
+        );
+        // The calling control request owns any propagated failure terminal.
+        result
+    }
+
+    #[cfg(windows)]
+    fn verify_published_eliotd_live_receipt_inner(
+        &self,
+        expected: &EliotdLiveReceipt,
+        context: &tracing::Span,
     ) -> Result<(), KernelServiceError> {
         expected
             .validate()
             .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+        record_live_receipt_context_field(context, "lease", expected.supervision.lease_id.as_str());
+        record_live_receipt_context_field(context, "receipt", expected.receipt_sha256());
         let runtime_binding = self
             .eliotd_receipt_binding
             .as_ref()
