@@ -34,6 +34,14 @@
 //! admitting an eligible successor under a strictly greater ownership epoch, and
 //! [`Ownership::retained_epoch`] is what lets that successor clear the fenced
 //! epoch instead of being refused because the record currently has no owner.
+//!
+//! The one obligation with no lease identity behind it is the legacy migration:
+//! a record that never carried a lease has no [`LeaseIdentity`] to lose, so its
+//! [`Ownership::Unassigned`] variant carries `lost_lease: None` and an empty
+//! `loss_evidence`. That absence is the finding rather than a gap to be filled —
+//! it is never back-filled with a synthesized lease — and it is why
+//! `UnassignedOwnership::validate` treats the legacy case and the observed-loss
+//! case differently rather than treating every unassigned record alike.
 
 use eliot_contracts::{EpochId, StateFence, canonical_json_bytes, sha256_hex};
 use schemars::JsonSchema;

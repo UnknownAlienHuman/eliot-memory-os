@@ -51,6 +51,16 @@
 //! transition here is type-sound but production-unreachable until the lease owner
 //! supplies one. That is the designed state, not a gap worked around: no
 //! principal string is accepted anywhere on this path.
+//!
+//! Two consequences are recorded here rather than left for a reader to
+//! rediscover. First, the entry point that reaches this module,
+//! [`GovernorObservationReconciliation::commit_problem_owner_transition`](crate::GovernorObservationReconciliation),
+//! has no caller of its own anywhere in the tree, so this preparation path is
+//! reached from nothing at all — not from production and not from a test. It is
+//! type-sound and correct; it is simply not yet wired to an entry. Second,
+//! because the only construction path for [`AuthenticatedOwnerLease`] needs an
+//! issuer, no caller could reach this module even if one were added, until the
+//! lease owner exists. Both gaps are the same gap seen from two ends.
 
 #![forbid(unsafe_code)]
 
@@ -383,6 +393,7 @@ fn checked_source_signal<'a>(
 /// authorization the store never saw.
 fn check_retained_authorization(
     candidate: &Problem,
+    prior: Option<&Problem>,
     lease: &AuthenticatedOwnerLease,
 ) -> Result<(), CompositionError> {
     match &candidate.ownership {
@@ -395,10 +406,30 @@ fn check_retained_authorization(
                 Some(_) => Err(owner_refused(
                     "owner transition does not name the presented ownership lease".to_owned(),
                 )),
-                None => Err(owner_refused(
-                    "an unassigned record with no lost lease is not the product of an owner transition"
-                        .to_owned(),
-                )),
+                // A record migrated as legacy-without-lease has no lost lease to
+                // name, so there is no lease identity an escalation can present.
+                // Its authority is instead the record's own live predecessor: an
+                // `Escalate` on an already-unassigned record must restate an
+                // obligation the prior committed record already carried, or
+                // refuse. Without this, `Escalate` on a legacy-unassigned record
+                // is refused with "does not name the presented ownership lease"
+                // for every possible presented lease, which is the same
+                // undischargeable-obligation defect `Ownership::retained_epoch`
+                // was added to fix on the reassignment half.
+                None => match prior {
+                    Some(prior)
+                        if matches!(
+                            prior.ownership,
+                            eliot_problem::Ownership::Unassigned(_)
+                        ) =>
+                    {
+                        Ok(())
+                    }
+                    _ => Err(owner_refused(
+                        "an unassigned record with no lost lease is not the product of an owner transition"
+                            .to_owned(),
+                    )),
+                },
             }
         }
         eliot_problem::Ownership::Assigned(assigned) => {
@@ -833,7 +864,7 @@ pub fn prepare_problem_owner_transition(
             "candidate record is not bound to the admitted source Signal".to_owned(),
         ));
     }
-    check_retained_authorization(&candidate, lease)?;
+    check_retained_authorization(&candidate, current, lease)?;
     let bindings = problem_owner_parameters(
         &candidate,
         expected_revision,
