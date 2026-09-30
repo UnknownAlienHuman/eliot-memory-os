@@ -35,6 +35,14 @@ Scan discipline (mirrors the Rust oracles, no third design):
   `denominator_status()` lists every unproved file (unclosed lexical input,
   macro-rules definitions, include-macro fixture bytes, unresolvable enum
   declarations, unknown scan roots).
+- Pinned-owner rows (`ALLOWED_CURRENT_REEXPORTS`,
+  `ALLOWED_STRING_SWITCH_OWNERS`) are scoped to their owner's REMOVAL
+  (`expected_pinned_rows`), not to its survival. Each row stays in force
+  exactly while the file it names exists, which is what I0.8 P3
+  active-reference migration measures: a file inside a package being retired
+  is the donor itself, not an active reference to it. This makes the gate
+  survivable under #1143 W6 without weakening any check -- see the pinned-row
+  lifecycle note at the row declarations.
 
 Accepted interfaces reused (no invented process runner): unittest discovery,
 `pathlib` anchoring (`ROOT` from file location), TOML via stdlib `tomllib`,
@@ -1443,6 +1451,31 @@ PERMISSIVE_NEEDLES = ("untagged", "alias", "Other", "Unknown", "_ =>", "impl Def
 # both directions: it would pass a second, illegitimate `pub use` of the bare
 # current kind, and it would fail on the A-13 facade re-export that the issue
 # requires to survive.
+#
+# Pinned-row lifecycle (#1143 W6). Every row below names a file that is itself
+# inside a package this oracle's issue retires, so the row is scoped to the
+# package's REMOVAL rather than to its survival. I0.8 "Donor migration and
+# retirement policy" makes retirement a five-class proof and defines the class
+# this oracle measures:
+#
+#   P3 active-reference migration
+#      repository source, tests, schemas, Skills, prompts, configs, CI and
+#      generated artifacts no longer use donor prose as active authority;
+#
+# A file inside the package being retired is the donor itself, not an active
+# reference TO it: its presence can never be an illegitimate reference, and its
+# absence is precisely the P3 outcome. A pinned row therefore stays in force
+# for exactly as long as the file it names exists, and stops demanding anything
+# once that file is gone. Deleting the owner is not drift; the row re-arms by
+# itself if the file ever returns.
+#
+# This is a lifecycle scope, not a relaxation. While the file exists the exact
+# equality comparison below is byte-for-byte the previous one; when it is gone
+# the row is compared against the surviving rows only, and a NEW illegitimate
+# re-export or spelling-switch owner anywhere else -- inside the retired
+# package's former directory or outside it -- still fails closed. No row was
+# emptied, deleted, or widened; `expected_pinned_rows` is the only place the
+# lifecycle is expressed.
 ALLOWED_CURRENT_REEXPORTS = (
     (
         "crates/smart/eliot-cues/src/lib.rs",
@@ -1452,6 +1485,35 @@ ALLOWED_CURRENT_REEXPORTS = (
 # Exactly one live owner branches on historical V1 spelling literals: the named
 # #833 decoder, whose arms construct the A-10 owner.
 ALLOWED_STRING_SWITCH_OWNERS = ("crates/smart/eliot-cues/src/legacy_adapter.rs",)
+
+
+def pinned_row_path(row) -> str:
+    """The repository-relative path a pinned row names.
+
+    The two row tables are shaped differently -- a `(path, line)` pair for the
+    re-export pins, a bare path string for the spelling-switch owners -- so the
+    row is unwrapped by shape rather than by a hard-coded offset. Indexing a
+    bare string would take its first *character*, silently retiring every row;
+    a row that is neither shape is reported rather than mis-read.
+    """
+    if isinstance(row, str):
+        return row
+    for entry in row:
+        if isinstance(entry, str):
+            return entry
+    raise GateFailure("pinned row carries no path entry to scope on")
+
+
+def expected_pinned_rows(rows) -> list:
+    """Pinned rows still in force, in their declared order.
+
+    A row is in force while the file it names exists on the observed tree and
+    is retired with it once that file is gone (see the pinned-row lifecycle
+    note above). Rows are never reordered, merged, or rewritten: the result is
+    a subsequence of the frozen tuple, so the caller still compares an exact
+    observed set against an exact expected set.
+    """
+    return [row for row in rows if (ROOT / pinned_row_path(row)).is_file()]
 
 
 def current_owner_site_violations() -> list[str]:
@@ -1515,14 +1577,23 @@ def main() -> int:
     # needed their scan narrowed before wiring, because wiring them as written
     # would have produced a false red on a clean tree and taught everyone to
     # ignore this script.
-    if list(reexport_lines()) != list(ALLOWED_CURRENT_REEXPORTS):
+    #
+    # Both drift checks stay exact-set comparisons, never emptiness checks. Each
+    # compares against the pinned rows still in force for the observed tree: a
+    # row whose file has been retired with its package drops out of the expected
+    # set instead of forcing its deleted line to exist (pinned-row lifecycle,
+    # I0.8 P3). Every surviving row keeps byte-exact equality, so an added,
+    # altered or relocated owner still fails closed.
+    expected_reexports = expected_pinned_rows(ALLOWED_CURRENT_REEXPORTS)
+    if list(reexport_lines()) != expected_reexports:
         findings.append(
-            f"current-kind-reexport-drift: expected {list(ALLOWED_CURRENT_REEXPORTS)}, "
+            f"current-kind-reexport-drift: expected {expected_reexports}, "
             f"found {reexport_lines()}"
         )
-    if tuple(string_switch_owner_files()) != ALLOWED_STRING_SWITCH_OWNERS:
+    expected_switch_owners = expected_pinned_rows(ALLOWED_STRING_SWITCH_OWNERS)
+    if tuple(string_switch_owner_files()) != tuple(expected_switch_owners):
         findings.append(
-            f"string-switch-owner-drift: expected {list(ALLOWED_STRING_SWITCH_OWNERS)}, "
+            f"string-switch-owner-drift: expected {expected_switch_owners}, "
             f"found {string_switch_owner_files()}"
         )
     if string_switch_unresolved_files():
