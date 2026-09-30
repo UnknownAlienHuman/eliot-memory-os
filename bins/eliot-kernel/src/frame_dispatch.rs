@@ -258,6 +258,7 @@ fn actual_route_name(action: &KernelFrameAction) -> &'static str {
         KernelFrameAction::Doctor { .. } => "doctor_admitted",
         KernelFrameAction::Testd { .. } => "testd_admitted",
         KernelFrameAction::Dreamer { .. } => "dreamer_admitted",
+        KernelFrameAction::Backup { .. } => "backup_restore_admitted",
         KernelFrameAction::Research { .. } => "research_provider_admitted",
         KernelFrameAction::Fence(_) => "fenced_reply",
     }

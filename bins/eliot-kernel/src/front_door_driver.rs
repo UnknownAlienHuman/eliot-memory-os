@@ -507,6 +507,31 @@ async fn serve_connection(
                     return Err(error);
                 }
             }
+            KernelFrameAction::Backup {
+                request_id,
+                operation,
+                payload,
+            } => {
+                // #952 isolated Store restore batch: one bounded
+                // request/response through the closed route handler
+                // (`KernelComposition::execute_backup_store_restore`), which
+                // publishes the admitted archive's retained members and sends
+                // exactly one batch over the retained `KernelStoreGateway`.
+                // Frames are served strictly in receive order on this
+                // connection, so a second dispatch can never run concurrently
+                // with the first; unknown operations never reach this arm
+                // (dispatch fences them) and any handler failure fences the
+                // session instead of silently dropping the request. No second
+                // Store client, transport or credential is constructed here.
+                let reply = Box::pin(
+                    kernel.execute_backup_store_restore(&session, request_id, &operation, payload),
+                )
+                .await?;
+                if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
+                    session.fence();
+                    return Err(error);
+                }
+            }
             KernelFrameAction::Fence(rejection) => {
                 let result = send_checked(&mut front_door, &rejection, limits).await;
                 session.fence();
@@ -596,7 +621,8 @@ async fn serve_user_broker_connection(
             | KernelFrameAction::Doctor { .. }
             | KernelFrameAction::Testd { .. }
             | KernelFrameAction::Dreamer { .. }
-            | KernelFrameAction::Research { .. } => break Err(TransportError::SessionFenced),
+            | KernelFrameAction::Research { .. }
+            | KernelFrameAction::Backup { .. } => break Err(TransportError::SessionFenced),
         }
     };
     session.fence();
@@ -842,17 +868,22 @@ async fn serve_admitted_bridge_host_requests(
             | KernelFrameAction::Doctor { .. }
             | KernelFrameAction::Testd { .. }
             | KernelFrameAction::Research { .. }
-            | KernelFrameAction::Dreamer { .. } => {
+            | KernelFrameAction::Dreamer { .. }
+            | KernelFrameAction::Backup { .. } => {
                 // Bridge transports never carry process, daemon, Doctor,
-                // testd, research-provider, or Dreamer authority: the Doctor
+                // testd, research-provider, Dreamer, or isolated-restore
+                // authority: the Doctor
                 // serves only its own admitted generation-bound
                 // session/connection (T6-D2 P-07), testd serves only its own
                 // admitted generation-bound session/connection (T6-X1 P-07),
                 // the research-provider route serves only its own admitted
                 // module-generation session/connection (#24), and Dreamer
                 // serves only its own admitted eliotd requester
-                // session/connection (T12-05 K2), never the bridge's. Revoke
-                // and fence exactly as for the other kinds.
+                // session/connection (T12-05 K2), never the bridge's. The
+                // isolated-restore batch (#952) is admitted on the daemon
+                // front door only, so the bridge never reaches the destination
+                // transaction either. Revoke and fence exactly as for the other
+                // kinds.
                 kernel.revoke_agent_bridge(&connection_id);
                 return Err(TransportError::SessionFenced);
             }
