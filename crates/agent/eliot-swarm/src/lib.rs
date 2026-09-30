@@ -197,7 +197,9 @@ pub enum SwarmError {
     /// returns before any spend, reserve or commit is written, so it changes
     /// no accounting: an over-budget request still consumes nothing.
     #[error("independent {dimension:?} budget bound exceeded")]
-    BudgetExceeded { dimension: durable_work::BudgetDimension },
+    BudgetExceeded {
+        dimension: durable_work::BudgetDimension,
+    },
     #[error("operation identity was already applied")]
     DuplicateOperation,
     #[error("admitted route is unavailable or stale; no local fallback")]
