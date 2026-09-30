@@ -120,6 +120,29 @@ impl ManagedEnvironmentChangePlan {
         if self.family_id != self.request.target_family {
             return Err(InstallationError::IdentityConflict);
         }
+        // The managed-tool path is not the owner of an active core component.
+        // `I3.3.1` routes those to a different owner entirely: "The generic
+        // environment planner never updates the active canonical store, Host,
+        // Kernel, Watchdog or their protected state in place. `SurrealDB`/store
+        // changes use the store-generation, backup, migration and cutover
+        // contracts; Host/Kernel/Watchdog changes use their own side-by-side
+        // generation/rollback paths."
+        //
+        // The core-component test is the category's own independent
+        // classification, not this plan's family, so a family this planner
+        // never enumerated is still refused. The plan carries the category it
+        // was compiled from and is deserializable, so the refusal is re-proved
+        // here rather than trusted from the compile-time call: a plan naming a
+        // core component does not validate no matter who produced it.
+        if self.category.is_active_core_component() {
+            return Err(InstallationError::InvalidField {
+                field: "managed_change_plan.category".to_owned(),
+                reason: format!(
+                    "an active core component is not this path's to change: {} is owned by the store-generation, backup, migration and cutover contracts",
+                    self.request.target_family
+                ),
+            });
+        }
         if self.confirmed_owner != self.request.required_owner {
             return Err(InstallationError::IdentityConflict);
         }

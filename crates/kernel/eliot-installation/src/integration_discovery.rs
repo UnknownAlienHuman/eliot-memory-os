@@ -174,6 +174,35 @@ pub enum IntegrationCategory {
     CloudCli,
 }
 
+impl IntegrationCategory {
+    /// Returns whether this category names an active ELIOT core component
+    /// rather than an external integration.
+    ///
+    /// This is the independent expected core-component set. It is declared
+    /// here, next to the category itself, and is never derived from the
+    /// catalogue revision, the survey's family list, or the list a managed-tool
+    /// request is routed over — so a check built on it can refuse a family the
+    /// router never enumerated. `I3.3.1` binds the sole store category to the
+    /// active canonical store: "The generic environment planner never updates
+    /// the active canonical store, Host, Kernel, Watchdog or their protected
+    /// state in place. `SurrealDB`/store changes use the store-generation,
+    /// backup, migration and cutover contracts; Host/Kernel/Watchdog changes use
+    /// their own side-by-side generation/rollback paths." Host, Kernel and
+    /// Watchdog are not catalogue families at all — they arrive as ELIOT-owned
+    /// generation artifacts through the package planner, not as installable
+    /// external recipes — so the store category is the only way a catalogue
+    /// revision can name an active core component.
+    ///
+    /// The category is the identity here, not the family name, because family
+    /// names are open catalogue data: a signed revision may call its store
+    /// recipe anything, and refusing a literal name would let a rename route
+    /// around the refusal.
+    #[must_use]
+    pub const fn is_active_core_component(self) -> bool {
+        matches!(self, Self::Database)
+    }
+}
+
 /// The only behaviours a catalogue probe may declare.
 ///
 /// There is deliberately no variant that installs, mutates, starts, stops or
