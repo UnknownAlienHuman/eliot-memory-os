@@ -1325,6 +1325,198 @@ impl ToolExposureHistoryEntry {
     }
 }
 
+/// Refuses a second supply for one recorded history stage.
+///
+/// Recorded owner evidence is never overwritten in place: a changed observation
+/// persists as a successor revision through the existing observation/receipt
+/// path, never as a rewrite of the recorded fact.
+fn require_stage_unrecorded(
+    stage: &OwnerStageFact,
+    field: &'static str,
+) -> Result<(), ToolExposureError> {
+    if stage.observed.is_some() {
+        return Err(ToolExposureError::InvalidField {
+            field,
+            reason: "recorded stage evidence is never overwritten; persist a successor revision",
+        });
+    }
+    Ok(())
+}
+
+impl ToolExposureHistoryEntry {
+    /// Records the planner/model selection fact from the selection owner.
+    ///
+    /// Only this stage is set, from the supplied owner observation and its
+    /// source reference. No neighbouring stage is read or inferred, and an
+    /// already recorded selection is never overwritten. The dispatch admission
+    /// seam is the STITCH caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the stage is already recorded or the resulting
+    /// entry is inconsistent.
+    pub fn record_selected(
+        mut self,
+        observed: bool,
+        source_ref: String,
+    ) -> Result<Self, ToolExposureError> {
+        require_stage_unrecorded(
+            &self.selected_by_planner_or_model,
+            "history.selected_by_planner_or_model",
+        )?;
+        self.selected_by_planner_or_model = OwnerStageFact::supplied(observed, source_ref)?;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Records the call fact from the execution owner.
+    ///
+    /// Only this stage is set, from the supplied owner observation and its
+    /// source reference. Selection, transport, and delivery stages are never
+    /// inferred from the call, and an already recorded call is never
+    /// overwritten. The execution seam is the STITCH caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the stage is already recorded or the resulting
+    /// entry is inconsistent.
+    pub fn record_called(
+        mut self,
+        observed: bool,
+        source_ref: String,
+    ) -> Result<Self, ToolExposureError> {
+        require_stage_unrecorded(&self.called, "history.called")?;
+        self.called = OwnerStageFact::supplied(observed, source_ref)?;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Records the transport-completion fact from the transport owner.
+    ///
+    /// Only this stage is set, from the supplied owner observation and its
+    /// source reference. Transport completion never implies delivery
+    /// completeness, and an already recorded transport fact is never
+    /// overwritten. The transport seam is the STITCH caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the stage is already recorded or the resulting
+    /// entry is inconsistent.
+    pub fn record_transport_completed(
+        mut self,
+        observed: bool,
+        source_ref: String,
+    ) -> Result<Self, ToolExposureError> {
+        require_stage_unrecorded(&self.transport_completed, "history.transport_completed")?;
+        self.transport_completed = OwnerStageFact::supplied(observed, source_ref)?;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Records the delivery-completeness fact from the bridge/host projection owner.
+    ///
+    /// Delivery and its owner source reference are set as one pair: a supplied
+    /// delivery without its projection source fails, and unknown coverage stays
+    /// `None`. Execution and transport stages are never re-read here, and a
+    /// recorded delivery is never overwritten — a later authorized expansion
+    /// persists as a successor revision. The bridge/host projection seam is the
+    /// STITCH caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when delivery is already recorded or the resulting
+    /// entry is inconsistent.
+    pub fn record_delivery(
+        mut self,
+        delivery: ResultDelivery,
+        source_ref: String,
+    ) -> Result<Self, ToolExposureError> {
+        if self.result_delivery.is_some() {
+            return Err(ToolExposureError::InvalidField {
+                field: "history.result_delivery",
+                reason: "recorded delivery evidence is never overwritten; persist a successor revision",
+            });
+        }
+        text(&source_ref, "history.delivery_source_ref")?;
+        self.result_delivery = Some(delivery);
+        self.delivery_source_ref = Some(source_ref);
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Records the expansion/retry fact from the retry owner.
+    ///
+    /// Only this stage is set, from the supplied owner observation and its
+    /// source reference. Retry never implies progress — the no-progress signal
+    /// stays with the repeat-detection owner — and an already recorded retry
+    /// fact is never overwritten. The retry seam is the STITCH caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the stage is already recorded or the resulting
+    /// entry is inconsistent.
+    pub fn record_retry(
+        mut self,
+        observed: bool,
+        source_ref: String,
+    ) -> Result<Self, ToolExposureError> {
+        require_stage_unrecorded(&self.expanded_or_retried, "history.expanded_or_retried")?;
+        self.expanded_or_retried = OwnerStageFact::supplied(observed, source_ref)?;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Records the observable-use fact from the use owner.
+    ///
+    /// Only this stage is set, from the supplied owner observation and its
+    /// source reference. Observable use requires a public action/decision/
+    /// verifier link carried in the source reference; delivery alone never
+    /// implies use, and an already recorded use fact is never overwritten. The
+    /// verifier/use seam is the STITCH caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the stage is already recorded or the resulting
+    /// entry is inconsistent.
+    pub fn record_use(
+        mut self,
+        observed: bool,
+        source_ref: String,
+    ) -> Result<Self, ToolExposureError> {
+        require_stage_unrecorded(
+            &self.observably_used_in_decision_action_or_verifier,
+            "history.observably_used_in_decision_action_or_verifier",
+        )?;
+        self.observably_used_in_decision_action_or_verifier =
+            OwnerStageFact::supplied(observed, source_ref)?;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Records the terminal task/product outcome reference from the outcome owner.
+    ///
+    /// Only the outcome reference is set; no stage is inferred from it, and a
+    /// recorded outcome is never overwritten — a later outcome persists as a
+    /// successor revision. The task-completion seam is the STITCH caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an outcome is already recorded or the resulting
+    /// entry is inconsistent.
+    pub fn record_outcome(mut self, outcome_ref: String) -> Result<Self, ToolExposureError> {
+        if self.terminal_task_or_product_outcome_ref.is_some() {
+            return Err(ToolExposureError::InvalidField {
+                field: "history.terminal_task_or_product_outcome_ref",
+                reason: "a recorded outcome reference is never overwritten; persist a successor revision",
+            });
+        }
+        text(&outcome_ref, "history.terminal_task_or_product_outcome_ref")?;
+        self.terminal_task_or_product_outcome_ref = Some(outcome_ref);
+        self.validate()?;
+        Ok(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
