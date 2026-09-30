@@ -1056,6 +1056,12 @@ pub fn drive_solo_delegate(
     let ports = solo_fabric_ports(context, kernel, registry);
     let mut fabric = AgentFabric::new_with_admitted_provider(config, ports, capability)
         .map_err(DaemonError::ProviderAdmission)?;
+    // Issue #1702 W2: the drive runs against the daemon state root, so every
+    // owner-separated revision published on this fabric is committed and
+    // verified durably before anything reports it current. Attaching the store
+    // before the first semantic write is what makes the ordering property
+    // reachable from the production path instead of a separate test seam.
+    fabric.attach_semantic_revision_store(composition.state_root());
     let evidence = composition.capability_admission()?;
     let route = fabric.require_model_route(
         &intake.requirements,

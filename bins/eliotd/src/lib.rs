@@ -140,6 +140,7 @@ mod skill_evidence_read;
 mod skill_lifecycle_adapters;
 mod skill_surface_adapters;
 pub mod solo_agent_driver;
+pub mod semantic_revision_store;
 pub mod staffing_policy;
 pub mod startup_capability_bindings;
 pub mod startup_evidence_producer;
@@ -3236,7 +3237,13 @@ impl DaemonComposition {
         let material = self.resolve_verified_material(kernel, material)?;
         let config = daemon_coordinator_config()?;
         Ok(AgentFabric::restore_verified(
-            snapshot, config, ports, material,
+            snapshot,
+            config,
+            ports,
+            Some(crate::semantic_revision_store::SemanticRevisionStore::new(
+                self.state_root(),
+            )),
+            material,
         )?)
     }
 
