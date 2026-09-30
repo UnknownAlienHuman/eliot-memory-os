@@ -1,6 +1,7 @@
 //! Original Governor-admitted cue source for the Orientation stage.
 
 use eliot_contracts::StateFence;
+use eliot_contracts::TransactionSequence;
 use eliot_receipts::{EffectClass, ProofCeiling, ReceiptEnvelope, ReceiptKind};
 use eliot_contracts::TaskId;
 use eliot_receipts::WorkScopeId;
@@ -179,6 +180,8 @@ fn validate_decision_receipt(
                     .is_same_authority(&state_fence.authority_epoch)
         })
         || &core.operation.state_fence != state_fence
+        || core.operation.request_id != core.request.metadata.request_id
+        || core.operation.idempotency_key.as_str() != core.request.metadata.request_id.as_str()
         || core.operation.effect != EffectClass::Candidate
         || core.operation.operation_kind != ORIENTATION_CUE_ADMISSION_OPERATION_KIND
         || &core.authority.state_fence != state_fence
@@ -187,6 +190,9 @@ fn validate_decision_receipt(
         || core.authority.authority_owner != "owner:eliot-governor/orientation-cue-bindings"
         || core.authority.authority_epoch != state_fence.authority_epoch
         || &core.causal.state_fence != state_fence
+        || core.causal.transaction_sequence != TransactionSequence::genesis()
+        || core.causal.parent_receipt_id.is_some()
+        || !core.causal.predecessor_receipt_ids.is_empty()
         || core.disposition != expected_success
         || core.artifacts.len() != expected_artifact_count
         || !policy_artifact_matches
