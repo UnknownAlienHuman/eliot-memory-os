@@ -1737,7 +1737,9 @@ fn durable_work_case_25_replay_cannot_double_spend() -> TestResult {
             100,
             "case-25-overspend"
         ),
-        Err(SwarmError::BudgetExceeded)
+        Err(SwarmError::BudgetExceeded {
+            dimension: BudgetDimension::ComputeSteps
+        })
     );
     Ok(())
 }
@@ -1761,7 +1763,9 @@ fn durable_work_case_26_independent_budget_bounds_and_one_over() -> TestResult {
             1,
             "case-26-over"
         ),
-        Err(SwarmError::BudgetExceeded)
+        Err(SwarmError::BudgetExceeded {
+            dimension: BudgetDimension::ComputeSteps
+        })
     );
     machine.consume_budget(
         &wid("case-26")?,

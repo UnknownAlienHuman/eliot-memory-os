@@ -193,6 +193,16 @@ pub fn compile_swarm_definition_admission(
 /// failures keep their exact coordinator variant, and anything outside the
 /// coordinator vocabulary keeps its message inside `ProviderContract` rather
 /// than becoming a pretended admission or a generic serialization string.
+///
+/// [`SwarmError::BudgetExceeded`] deliberately takes that second path rather
+/// than becoming [`CoordinatorError::BudgetExceeded`] (issue #1683 A8). The two
+/// are different budgets over different values: this one is the swarm owner's
+/// independent per-dimension account (`ComputeSteps` / `CostMicrounits` /
+/// `EvidenceBytes`), and `CoordinatorError::BudgetExceeded`'s `field` names a
+/// `BudgetEnvelope` dimension this refusal never compared. Folding it in would
+/// put a dimension name from one budget's vocabulary into a variant that claims
+/// to report the other's. The swarm refusal keeps its own dimension in its own
+/// message, so the exact closed dimension still reaches the caller.
 fn swarm_error(error: SwarmError) -> CoordinatorError {
     match error {
         SwarmError::Blank(field)
@@ -214,7 +224,6 @@ fn swarm_error(error: SwarmError) -> CoordinatorError {
         SwarmError::OwnershipConflict => CoordinatorError::IdentityConflict("swarm_attachment"),
         SwarmError::PayloadConflict => CoordinatorError::IdempotencyConflict,
         SwarmError::RouteBlocked => CoordinatorError::RouteEvidence,
-        SwarmError::BudgetExceeded => CoordinatorError::BudgetExceeded,
         SwarmError::Serialization => {
             CoordinatorError::Serialization("swarm plan admission".to_owned())
         }
