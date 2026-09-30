@@ -61,8 +61,8 @@ pub mod cell_declaration_registry;
 /// calls `KernelContextReadClient::reconstruct_context_inputs`, the existing
 /// Governor composition edge over `GovernorContextInputs`.
 pub mod context_reconstruction_route;
-pub mod coordination_owner_ingress;
 mod controlboard_adapters;
+pub mod coordination_owner_ingress;
 mod daemon_config;
 mod daemon_kernel_client;
 mod daemon_kernel_port_adapters;

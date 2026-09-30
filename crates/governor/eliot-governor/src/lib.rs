@@ -51,13 +51,13 @@ pub use context_inputs::{
     ROLE_ATTENTION_CONFLICT, ROLE_CUE_ACTIVATION, ROLE_EPISTEMIC_POSITION, ROLE_EVIDENCE_ASSURANCE,
     ROLE_NEGATIVE_MEMORY, ROLE_TASK_FRAME, RoleAcquisition, SevenRoleInputs,
 };
+pub use coordination_owner_commit::{CommittedCoordinationResult, CoordinationCommitError};
 pub use cue_composition::{
     CueCacheKey, CueCompositionError, CueReconstruction, CueReconstructionCache,
     MAX_CACHED_CUE_RECONSTRUCTIONS, evidence_projection_payload, reconstruct_cue_snapshot,
 };
 pub use epistemic_composition::{GovernorEpistemicComposition, ObservedEpistemicProposal};
 pub use experience_commit::{commit_experience_bank, commit_experience_feedback};
-pub use coordination_owner_commit::{CommittedCoordinationResult, CoordinationCommitError};
 // The coordination owner commit entry is reached from the daemon composition
 // root, which has no `eliot-coordination` dependency edge. Re-exporting the
 // exact owner request/response types keeps that dependency graph unchanged

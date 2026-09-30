@@ -74,9 +74,7 @@ pub struct CoordinationResultIngress {
 }
 
 fn require_field(value: &str, field: &'static str) -> Result<(), DaemonError> {
-    if value.trim().is_empty()
-        || value.chars().any(char::is_control)
-        || value.len() > MAX_FIELD_LEN
+    if value.trim().is_empty() || value.chars().any(char::is_control) || value.len() > MAX_FIELD_LEN
     {
         return Err(DaemonError::ProviderAdmission(
             eliot_agent_coordinator::CoordinatorError::InvalidField(field),
