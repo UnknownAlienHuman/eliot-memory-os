@@ -2018,7 +2018,7 @@ fn admissible_sources(
 }
 
 /// Requires the exact caller-supplied reason an observation is unavailable.
-fn unavailable_reason(slot_reason: &Option<String>) -> Result<&str, EvaluationContractError> {
+fn unavailable_reason(slot_reason: Option<&String>) -> Result<&str, EvaluationContractError> {
     match slot_reason.as_deref() {
         Some(reason) => {
             text(reason, "human_attention.assembly.unavailable_reason")?;
@@ -2057,63 +2057,60 @@ fn count_observation(
             });
         }
     };
-    match slot.observed {
-        Some(observed) => {
-            let sources = admissible_sources(candidates, metric);
-            if sources.is_empty() {
-                return Err(EvaluationContractError::EvidenceState {
-                    field: "human_attention.assembly.source_refs",
-                    reason: "an available owner read without admissible evidence cannot support an observation",
-                });
-            }
-            let coefficient =
-                i64::try_from(observed).map_err(|_| EvaluationContractError::InvalidInterval {
-                    field: "human_attention.assembly.count",
-                })?;
-            let coverage = if binding.denominator_complete {
-                CoverageState::Complete
-            } else {
-                CoverageState::Partial
-            };
-            Ok((
-                HumanAttentionMetricObservation {
-                    metric,
-                    value: HumanAttentionMetricValue::ObservedNumber {
-                        coefficient,
-                        decimal_places: 0,
-                    },
-                    unit,
-                    observation_window_ref: window_ref.clone(),
-                    population: binding.population,
-                    denominator: binding.denominator.clone(),
-                    source_refs: sources,
-                    coverage,
-                },
-                None,
-            ))
+    if let Some(observed) = slot.observed {
+        let sources = admissible_sources(candidates, metric);
+        if sources.is_empty() {
+            return Err(EvaluationContractError::EvidenceState {
+                field: "human_attention.assembly.source_refs",
+                reason: "an available owner read without admissible evidence cannot support an observation",
+            });
         }
-        None => {
-            let reason = unavailable_reason(&slot.unavailable_reason)?;
-            Ok((
-                HumanAttentionMetricObservation {
-                    metric,
-                    value: HumanAttentionMetricValue::Unknown {
-                        reason: reason.to_string(),
-                    },
-                    unit,
-                    observation_window_ref: window_ref.clone(),
-                    population: binding.population,
-                    denominator: binding.denominator.clone(),
-                    source_refs: Vec::new(),
-                    coverage: CoverageState::Unavailable,
+        let coefficient =
+            i64::try_from(observed).map_err(|_| EvaluationContractError::InvalidInterval {
+                field: "human_attention.assembly.count",
+            })?;
+        let coverage = if binding.denominator_complete {
+            CoverageState::Complete
+        } else {
+            CoverageState::Partial
+        };
+        Ok((
+            HumanAttentionMetricObservation {
+                metric,
+                value: HumanAttentionMetricValue::ObservedNumber {
+                    coefficient,
+                    decimal_places: 0,
                 },
-                Some(HumanAttentionEvidenceGap {
-                    read,
-                    metric,
+                unit,
+                observation_window_ref: window_ref.clone(),
+                population: binding.population,
+                denominator: binding.denominator.clone(),
+                source_refs: sources,
+                coverage,
+            },
+            None,
+        ))
+    } else {
+        let reason = unavailable_reason(slot.unavailable_reason.as_ref())?;
+        Ok((
+            HumanAttentionMetricObservation {
+                metric,
+                value: HumanAttentionMetricValue::Unknown {
                     reason: reason.to_string(),
-                }),
-            ))
-        }
+                },
+                unit,
+                observation_window_ref: window_ref.clone(),
+                population: binding.population,
+                denominator: binding.denominator.clone(),
+                source_refs: Vec::new(),
+                coverage: CoverageState::Unavailable,
+            },
+            Some(HumanAttentionEvidenceGap {
+                read,
+                metric,
+                reason: reason.to_string(),
+            }),
+        ))
     }
 }
 
@@ -2139,59 +2136,56 @@ fn text_observation(
             reason: "text assembly reached a non-observation metric",
         });
     }
-    match &slot.observed {
-        Some(observed) => {
-            text(observed, "human_attention.assembly.observation")?;
-            let sources = admissible_sources(candidates, metric);
-            if sources.is_empty() {
-                return Err(EvaluationContractError::EvidenceState {
-                    field: "human_attention.assembly.source_refs",
-                    reason: "an available owner read without admissible evidence cannot support an observation",
-                });
-            }
-            let coverage = if binding.denominator_complete {
-                CoverageState::Complete
-            } else {
-                CoverageState::Partial
-            };
-            Ok((
-                HumanAttentionMetricObservation {
-                    metric,
-                    value: HumanAttentionMetricValue::ObservedText {
-                        observation: observed.clone(),
-                    },
-                    unit: HumanAttentionMetricUnit::Observation,
-                    observation_window_ref: window_ref.clone(),
-                    population: binding.population,
-                    denominator: binding.denominator.clone(),
-                    source_refs: sources,
-                    coverage,
-                },
-                None,
-            ))
+    if let Some(observed) = slot.observed.as_ref() {
+        text(observed, "human_attention.assembly.observation")?;
+        let sources = admissible_sources(candidates, metric);
+        if sources.is_empty() {
+            return Err(EvaluationContractError::EvidenceState {
+                field: "human_attention.assembly.source_refs",
+                reason: "an available owner read without admissible evidence cannot support an observation",
+            });
         }
-        None => {
-            let reason = unavailable_reason(&slot.unavailable_reason)?;
-            Ok((
-                HumanAttentionMetricObservation {
-                    metric,
-                    value: HumanAttentionMetricValue::Unknown {
-                        reason: reason.to_string(),
-                    },
-                    unit: HumanAttentionMetricUnit::Observation,
-                    observation_window_ref: window_ref.clone(),
-                    population: binding.population,
-                    denominator: binding.denominator.clone(),
-                    source_refs: Vec::new(),
-                    coverage: CoverageState::Unavailable,
+        let coverage = if binding.denominator_complete {
+            CoverageState::Complete
+        } else {
+            CoverageState::Partial
+        };
+        Ok((
+            HumanAttentionMetricObservation {
+                metric,
+                value: HumanAttentionMetricValue::ObservedText {
+                    observation: observed.clone(),
                 },
-                Some(HumanAttentionEvidenceGap {
-                    read,
-                    metric,
+                unit: HumanAttentionMetricUnit::Observation,
+                observation_window_ref: window_ref.clone(),
+                population: binding.population,
+                denominator: binding.denominator.clone(),
+                source_refs: sources,
+                coverage,
+            },
+            None,
+        ))
+    } else {
+        let reason = unavailable_reason(slot.unavailable_reason.as_ref())?;
+        Ok((
+            HumanAttentionMetricObservation {
+                metric,
+                value: HumanAttentionMetricValue::Unknown {
                     reason: reason.to_string(),
-                }),
-            ))
-        }
+                },
+                unit: HumanAttentionMetricUnit::Observation,
+                observation_window_ref: window_ref.clone(),
+                population: binding.population,
+                denominator: binding.denominator.clone(),
+                source_refs: Vec::new(),
+                coverage: CoverageState::Unavailable,
+            },
+            Some(HumanAttentionEvidenceGap {
+                read,
+                metric,
+                reason: reason.to_string(),
+            }),
+        ))
     }
 }
 
@@ -2222,63 +2216,60 @@ fn privacy_observation(
     }
     text(&slot.unit, "human_attention.assembly.privacy_unit")?;
     let unit = HumanAttentionMetricUnit::Named(slot.unit.clone());
-    match slot.observed {
-        Some(observed) => {
-            let sources = admissible_sources(candidates, metric);
-            if sources.is_empty() {
-                return Err(EvaluationContractError::EvidenceState {
-                    field: "human_attention.assembly.source_refs",
-                    reason: "an available owner read without admissible evidence cannot support an observation",
-                });
-            }
-            let coefficient =
-                i64::try_from(observed).map_err(|_| EvaluationContractError::InvalidInterval {
-                    field: "human_attention.assembly.count",
-                })?;
-            let coverage = if binding.denominator_complete {
-                CoverageState::Complete
-            } else {
-                CoverageState::Partial
-            };
-            Ok((
-                HumanAttentionMetricObservation {
-                    metric,
-                    value: HumanAttentionMetricValue::ObservedNumber {
-                        coefficient,
-                        decimal_places: 0,
-                    },
-                    unit,
-                    observation_window_ref: window_ref.clone(),
-                    population: binding.population,
-                    denominator: binding.denominator.clone(),
-                    source_refs: sources,
-                    coverage,
-                },
-                None,
-            ))
+    if let Some(observed) = slot.observed {
+        let sources = admissible_sources(candidates, metric);
+        if sources.is_empty() {
+            return Err(EvaluationContractError::EvidenceState {
+                field: "human_attention.assembly.source_refs",
+                reason: "an available owner read without admissible evidence cannot support an observation",
+            });
         }
-        None => {
-            let reason = unavailable_reason(&slot.unavailable_reason)?;
-            Ok((
-                HumanAttentionMetricObservation {
-                    metric,
-                    value: HumanAttentionMetricValue::Unknown {
-                        reason: reason.to_string(),
-                    },
-                    unit,
-                    observation_window_ref: window_ref.clone(),
-                    population: binding.population,
-                    denominator: binding.denominator.clone(),
-                    source_refs: Vec::new(),
-                    coverage: CoverageState::Unavailable,
+        let coefficient =
+            i64::try_from(observed).map_err(|_| EvaluationContractError::InvalidInterval {
+                field: "human_attention.assembly.count",
+            })?;
+        let coverage = if binding.denominator_complete {
+            CoverageState::Complete
+        } else {
+            CoverageState::Partial
+        };
+        Ok((
+            HumanAttentionMetricObservation {
+                metric,
+                value: HumanAttentionMetricValue::ObservedNumber {
+                    coefficient,
+                    decimal_places: 0,
                 },
-                Some(HumanAttentionEvidenceGap {
-                    read,
-                    metric,
+                unit,
+                observation_window_ref: window_ref.clone(),
+                population: binding.population,
+                denominator: binding.denominator.clone(),
+                source_refs: sources,
+                coverage,
+            },
+            None,
+        ))
+    } else {
+        let reason = unavailable_reason(slot.unavailable_reason.as_ref())?;
+        Ok((
+            HumanAttentionMetricObservation {
+                metric,
+                value: HumanAttentionMetricValue::Unknown {
                     reason: reason.to_string(),
-                }),
-            ))
-        }
+                },
+                unit,
+                observation_window_ref: window_ref.clone(),
+                population: binding.population,
+                denominator: binding.denominator.clone(),
+                source_refs: Vec::new(),
+                coverage: CoverageState::Unavailable,
+            },
+            Some(HumanAttentionEvidenceGap {
+                read,
+                metric,
+                reason: reason.to_string(),
+            }),
+        ))
     }
 }
 
@@ -2321,8 +2312,8 @@ fn decision_denominator(
     let denominator = DecisionOpportunityDenominator {
         eligible_subject_refs: eligible.to_vec(),
         ineligible_subject_refs_with_reason: Vec::new(),
-        opportunity_start: window.opened_at.clone(),
-        opportunity_end: window.closed_at.clone(),
+        opportunity_start: window.opened_at,
+        opportunity_end: window.closed_at,
         observable_boundaries: framing.observable_boundaries.clone(),
         unobservable_boundaries_and_blind_intervals: framing
             .unobservable_boundaries_and_blind_intervals
@@ -2547,24 +2538,69 @@ fn assemble_evidence_manifest(
     Ok(manifest)
 }
 
-/// Assembles the ten I11.10 metric groups from bounded owner evidence.
+/// Task-side observations for the notification/approval/telemetry profile.
 ///
-/// Every observation binds the input window; every denominator binds the
-/// complete declared population; every source revision is recorded. Available
-/// slots become observed values with admissible sources; unavailable slots
-/// become explicit unknowns with exact gaps, never synthetic zeros. The
-/// returned groups satisfy structural validation, so the Governor producer
-/// can embed them into a candidate record directly.
-pub fn assemble_human_attention_evidence(
-    input: &HumanAttentionAssemblyInput,
-) -> Result<HumanAttentionAssembledEvidence, EvaluationContractError> {
-    input.observation_window.validate()?;
-    input.evaluation_scope.validate()?;
-    check_assembly_revisions(input)?;
-    check_risk_absence_fields(input)?;
-    let manifest = assemble_evidence_manifest(input)?;
-    let window_ref = input.observation_window.specification.window_id.clone();
+/// The distinct-risk slot joins these in [`assemble_risk_groups`]; the three
+/// task-side slots bind the task population and push gaps in assembly order.
+struct NotificationTaskObservations {
+    notification_profile: HumanAttentionMetricObservation,
+    deduplicated_inbox_items: HumanAttentionMetricObservation,
+    delivery_attempts: HumanAttentionMetricObservation,
+}
 
+/// The six observed risk counts; the residual observation joins separately
+/// because it is text assembled under the same risk denominator.
+struct ObservedRiskCounts {
+    distinct: HumanAttentionMetricObservation,
+    missed: HumanAttentionMetricObservation,
+    false_critical: HumanAttentionMetricObservation,
+    prevented: HumanAttentionMetricObservation,
+    conditional: HumanAttentionMetricObservation,
+    harm: HumanAttentionMetricObservation,
+}
+
+/// The seven risk observations sharing one risk denominator path, whether that
+/// path is absent, unavailable, or fully observed.
+struct RiskMetricObservations {
+    distinct: HumanAttentionMetricObservation,
+    missed: HumanAttentionMetricObservation,
+    false_critical: HumanAttentionMetricObservation,
+    prevented: HumanAttentionMetricObservation,
+    conditional: HumanAttentionMetricObservation,
+    harm: HumanAttentionMetricObservation,
+    residual: HumanAttentionMetricObservation,
+}
+
+/// The four risk-sensitive I11.10 groups sharing one risk denominator path.
+struct RiskGroups {
+    notification_approval_and_telemetry_profile: HumanAttentionMetricGroup,
+    missed_critical_and_false_critical_counts: HumanAttentionMetricGroup,
+    pre_exposure_prevention_and_conditional_intervention: HumanAttentionMetricGroup,
+    final_harm_and_residual_risk: HumanAttentionMetricGroup,
+}
+
+/// The ten assembled I11.10 groups before validation and status.
+struct AssembledMetricGroups {
+    policy_and_task_risk_profile: HumanAttentionMetricGroup,
+    notification_approval_and_telemetry_profile: HumanAttentionMetricGroup,
+    missed_critical_and_false_critical_counts: HumanAttentionMetricGroup,
+    pre_exposure_prevention_and_conditional_intervention: HumanAttentionMetricGroup,
+    final_harm_and_residual_risk: HumanAttentionMetricGroup,
+    benign_false_blocks_and_abandoned_work: HumanAttentionMetricGroup,
+    interruption_and_resumption_time_quality: HumanAttentionMetricGroup,
+    task_correctness_rework_and_human_attention: HumanAttentionMetricGroup,
+    overtrust_undertrust_and_recoverability_observations: HumanAttentionMetricGroup,
+    privacy_purpose_retention_and_disclosure_cost: HumanAttentionMetricGroup,
+}
+
+/// Binds the task population denominator for task-side observations.
+///
+/// Collection completeness is the conjunction of every task-side slot being
+/// observed; missing outcomes keep the complete opportunity denominator and
+/// only change coverage, never the eligible set.
+fn task_population_binding(
+    input: &HumanAttentionAssemblyInput,
+) -> Result<PopulationBinding, EvaluationContractError> {
     let task_collection_full = input
         .notification
         .deduplicated_inbox_items
@@ -2630,582 +2666,724 @@ pub fn assemble_human_attention_evidence(
         input.evaluation_scope.task_population_coverage,
         task_collection_full,
     )?;
-    let tasks = PopulationBinding {
+    Ok(PopulationBinding {
         population: HumanAttentionPopulation::Tasks,
         denominator: task_denominator,
         denominator_complete: task_complete,
-    };
+    })
+}
 
-    let mut gaps: Vec<HumanAttentionEvidenceGap> = Vec::new();
-
+/// Assembles the policy and task-risk profile group from profile evidence.
+fn assemble_policy_profile_group(
+    input: &HumanAttentionAssemblyInput,
+    tasks: &PopulationBinding,
+    window_ref: &ContractId,
+    gaps: &mut Vec<HumanAttentionEvidenceGap>,
+) -> Result<HumanAttentionMetricGroup, EvaluationContractError> {
     let (policy_profile, gap) = text_observation(
-        &tasks,
-        &window_ref,
+        tasks,
+        window_ref,
         HumanAttentionMetric::PolicyAndTaskRiskProfile,
         &input.profiles.policy_and_task_risk_profile,
         HumanAttentionEvidenceRead::PolicyProfile,
         &input.profiles.evidence_refs,
     )?;
-    push_gap(&mut gaps, gap);
-    let policy_and_task_risk_profile = HumanAttentionMetricGroup {
+    push_gap(gaps, gap);
+    Ok(HumanAttentionMetricGroup {
         metrics: vec![policy_profile],
-    };
+    })
+}
 
+/// Assembles the task-side notification observations: the joint
+/// notification/approval/telemetry posture plus the distinct delivery and
+/// disposition counts, which stay distinct.
+fn assemble_notification_profile_observations(
+    input: &HumanAttentionAssemblyInput,
+    tasks: &PopulationBinding,
+    window_ref: &ContractId,
+    gaps: &mut Vec<HumanAttentionEvidenceGap>,
+) -> Result<NotificationTaskObservations, EvaluationContractError> {
     let mut profile_candidates = Vec::new();
     profile_candidates.extend_from_slice(&input.notification.evidence_refs);
     profile_candidates.extend_from_slice(&input.approvals.evidence_refs);
     profile_candidates.extend_from_slice(&input.privacy.evidence_refs);
     let (notification_profile, gap) = text_observation(
-        &tasks,
-        &window_ref,
+        tasks,
+        window_ref,
         HumanAttentionMetric::NotificationApprovalAndTelemetryProfile,
         &input.approvals.notification_approval_telemetry_profile,
         HumanAttentionEvidenceRead::ExpiringApproval,
         &profile_candidates,
     )?;
-    push_gap(&mut gaps, gap);
+    push_gap(gaps, gap);
     let (deduplicated_inbox_items, gap) = count_observation(
-        &tasks,
-        &window_ref,
+        tasks,
+        window_ref,
         HumanAttentionMetric::DeduplicatedInboxItems,
         &input.notification.deduplicated_inbox_items,
         HumanAttentionEvidenceRead::NotificationDisposition,
         &input.notification.evidence_refs,
     )?;
-    push_gap(&mut gaps, gap);
+    push_gap(gaps, gap);
     let (delivery_attempts, gap) = count_observation(
-        &tasks,
-        &window_ref,
+        tasks,
+        window_ref,
         HumanAttentionMetric::DeliveryAttempts,
         &input.notification.delivery_attempts,
         HumanAttentionEvidenceRead::NotificationDelivery,
         &input.notification.evidence_refs,
     )?;
-    push_gap(&mut gaps, gap);
+    push_gap(gaps, gap);
+    Ok(NotificationTaskObservations {
+        notification_profile,
+        deduplicated_inbox_items,
+        delivery_attempts,
+    })
+}
 
+/// Assembles the benign-false-block and abandoned-work group from task-outcome
+/// evidence joined with verifier references.
+fn assemble_benign_and_abandoned_group(
+    input: &HumanAttentionAssemblyInput,
+    tasks: &PopulationBinding,
+    window_ref: &ContractId,
+    gaps: &mut Vec<HumanAttentionEvidenceGap>,
+) -> Result<HumanAttentionMetricGroup, EvaluationContractError> {
     let mut task_verifier_candidates = Vec::new();
     task_verifier_candidates.extend_from_slice(&input.task_outcomes.evidence_refs);
     task_verifier_candidates.extend_from_slice(&input.task_verifier.evidence_refs);
     let (benign_false_blocks, gap) = count_observation(
-        &tasks,
-        &window_ref,
+        tasks,
+        window_ref,
         HumanAttentionMetric::BenignFalseBlockTasks,
         &input.task_outcomes.benign_false_block_tasks,
         HumanAttentionEvidenceRead::TaskOutcome,
         &task_verifier_candidates,
     )?;
-    push_gap(&mut gaps, gap);
+    push_gap(gaps, gap);
     let (abandoned_work, gap) = count_observation(
-        &tasks,
-        &window_ref,
+        tasks,
+        window_ref,
         HumanAttentionMetric::AbandonedWorkTasks,
         &input.task_outcomes.abandoned_work_tasks,
         HumanAttentionEvidenceRead::TaskOutcome,
         &task_verifier_candidates,
     )?;
-    push_gap(&mut gaps, gap);
-    let benign_false_blocks_and_abandoned_work = HumanAttentionMetricGroup {
+    push_gap(gaps, gap);
+    Ok(HumanAttentionMetricGroup {
         metrics: vec![benign_false_blocks, abandoned_work],
-    };
+    })
+}
 
+/// Assembles the interruption duration and resumption latency measurements.
+fn assemble_interruption_measurements(
+    input: &HumanAttentionAssemblyInput,
+    tasks: &PopulationBinding,
+    window_ref: &ContractId,
+    gaps: &mut Vec<HumanAttentionEvidenceGap>,
+) -> Result<
+    (
+        HumanAttentionMetricObservation,
+        HumanAttentionMetricObservation,
+    ),
+    EvaluationContractError,
+> {
     let (interruption_duration, gap) = count_observation(
-        &tasks,
-        &window_ref,
+        tasks,
+        window_ref,
         HumanAttentionMetric::InterruptionDuration,
         &input.interruptions.interruption_duration_ms,
         HumanAttentionEvidenceRead::InterruptionMeasurement,
         &input.interruptions.evidence_refs,
     )?;
-    push_gap(&mut gaps, gap);
+    push_gap(gaps, gap);
     let (resumption_latency, gap) = count_observation(
-        &tasks,
-        &window_ref,
+        tasks,
+        window_ref,
         HumanAttentionMetric::ResumptionLatency,
         &input.interruptions.resumption_latency_ms,
         HumanAttentionEvidenceRead::InterruptionMeasurement,
         &input.interruptions.evidence_refs,
     )?;
-    push_gap(&mut gaps, gap);
+    push_gap(gaps, gap);
+    Ok((interruption_duration, resumption_latency))
+}
+
+/// Assembles the resumption-quality observation from Human reports joined with
+/// interruption measurements.
+fn assemble_resumption_quality_observation(
+    input: &HumanAttentionAssemblyInput,
+    tasks: &PopulationBinding,
+    window_ref: &ContractId,
+    gaps: &mut Vec<HumanAttentionEvidenceGap>,
+) -> Result<HumanAttentionMetricObservation, EvaluationContractError> {
     let mut resumption_candidates = Vec::new();
     resumption_candidates.extend_from_slice(&input.human_reports.evidence_refs);
     resumption_candidates.extend_from_slice(&input.interruptions.evidence_refs);
     let (resumption_quality, gap) = text_observation(
-        &tasks,
-        &window_ref,
+        tasks,
+        window_ref,
         HumanAttentionMetric::ResumptionQualityObservation,
         &input.human_reports.resumption_quality_observation,
         HumanAttentionEvidenceRead::HumanReport,
         &resumption_candidates,
     )?;
-    push_gap(&mut gaps, gap);
-    let interruption_and_resumption_time_quality = HumanAttentionMetricGroup {
-        metrics: vec![
-            interruption_duration,
-            resumption_latency,
-            resumption_quality,
-        ],
-    };
+    push_gap(gaps, gap);
+    Ok(resumption_quality)
+}
 
+/// Assembles the task-correctness observation from verifier evidence joined
+/// with task-outcome references.
+fn assemble_task_correctness_observation(
+    input: &HumanAttentionAssemblyInput,
+    tasks: &PopulationBinding,
+    window_ref: &ContractId,
+    gaps: &mut Vec<HumanAttentionEvidenceGap>,
+) -> Result<HumanAttentionMetricObservation, EvaluationContractError> {
+    let mut task_verifier_candidates = Vec::new();
+    task_verifier_candidates.extend_from_slice(&input.task_outcomes.evidence_refs);
+    task_verifier_candidates.extend_from_slice(&input.task_verifier.evidence_refs);
     let (task_correctness, gap) = text_observation(
-        &tasks,
-        &window_ref,
+        tasks,
+        window_ref,
         HumanAttentionMetric::TaskCorrectnessObservation,
         &input.task_verifier.task_correctness_observation,
         HumanAttentionEvidenceRead::TaskVerifier,
         &task_verifier_candidates,
     )?;
-    push_gap(&mut gaps, gap);
+    push_gap(gaps, gap);
+    Ok(task_correctness)
+}
+
+/// Assembles the rework count from task-outcome evidence joined with verifier
+/// references.
+fn assemble_rework_observation(
+    input: &HumanAttentionAssemblyInput,
+    tasks: &PopulationBinding,
+    window_ref: &ContractId,
+    gaps: &mut Vec<HumanAttentionEvidenceGap>,
+) -> Result<HumanAttentionMetricObservation, EvaluationContractError> {
+    let mut task_verifier_candidates = Vec::new();
+    task_verifier_candidates.extend_from_slice(&input.task_outcomes.evidence_refs);
+    task_verifier_candidates.extend_from_slice(&input.task_verifier.evidence_refs);
     let (rework_events, gap) = count_observation(
-        &tasks,
-        &window_ref,
+        tasks,
+        window_ref,
         HumanAttentionMetric::ReworkEvents,
         &input.task_outcomes.rework_events,
         HumanAttentionEvidenceRead::TaskOutcome,
         &task_verifier_candidates,
     )?;
-    push_gap(&mut gaps, gap);
+    push_gap(gaps, gap);
+    Ok(rework_events)
+}
+
+/// Assembles the Human attention observation, sourced only from Human reports.
+fn assemble_human_attention_observation(
+    input: &HumanAttentionAssemblyInput,
+    tasks: &PopulationBinding,
+    window_ref: &ContractId,
+    gaps: &mut Vec<HumanAttentionEvidenceGap>,
+) -> Result<HumanAttentionMetricObservation, EvaluationContractError> {
     let (human_attention, gap) = text_observation(
-        &tasks,
-        &window_ref,
+        tasks,
+        window_ref,
         HumanAttentionMetric::HumanAttentionObservation,
         &input.human_reports.human_attention_observation,
         HumanAttentionEvidenceRead::HumanReport,
         &input.human_reports.evidence_refs,
     )?;
-    push_gap(&mut gaps, gap);
-    let task_correctness_rework_and_human_attention = HumanAttentionMetricGroup {
-        metrics: vec![task_correctness, rework_events, human_attention],
-    };
+    push_gap(gaps, gap);
+    Ok(human_attention)
+}
 
+/// Assembles the overtrust, undertrust, and recoverability group from Human
+/// reports. No interaction proxy is an input here.
+fn assemble_trust_recoverability_observations(
+    input: &HumanAttentionAssemblyInput,
+    tasks: &PopulationBinding,
+    window_ref: &ContractId,
+    gaps: &mut Vec<HumanAttentionEvidenceGap>,
+) -> Result<HumanAttentionMetricGroup, EvaluationContractError> {
     let (overtrust, gap) = text_observation(
-        &tasks,
-        &window_ref,
+        tasks,
+        window_ref,
         HumanAttentionMetric::OvertrustObservation,
         &input.human_reports.overtrust_observation,
         HumanAttentionEvidenceRead::HumanReport,
         &input.human_reports.evidence_refs,
     )?;
-    push_gap(&mut gaps, gap);
+    push_gap(gaps, gap);
     let (undertrust, gap) = text_observation(
-        &tasks,
-        &window_ref,
+        tasks,
+        window_ref,
         HumanAttentionMetric::UndertrustObservation,
         &input.human_reports.undertrust_observation,
         HumanAttentionEvidenceRead::HumanReport,
         &input.human_reports.evidence_refs,
     )?;
-    push_gap(&mut gaps, gap);
+    push_gap(gaps, gap);
     let (recoverability, gap) = text_observation(
-        &tasks,
-        &window_ref,
+        tasks,
+        window_ref,
         HumanAttentionMetric::RecoverabilityObservation,
         &input.human_reports.recoverability_observation,
         HumanAttentionEvidenceRead::HumanReport,
         &input.human_reports.evidence_refs,
     )?;
-    push_gap(&mut gaps, gap);
-    let overtrust_undertrust_and_recoverability_observations = HumanAttentionMetricGroup {
+    push_gap(gaps, gap);
+    Ok(HumanAttentionMetricGroup {
         metrics: vec![overtrust, undertrust, recoverability],
-    };
+    })
+}
 
+/// Assembles the purpose, retention, and disclosure privacy-cost group with
+/// explicit named units.
+fn assemble_privacy_cost_observations(
+    input: &HumanAttentionAssemblyInput,
+    tasks: &PopulationBinding,
+    window_ref: &ContractId,
+    gaps: &mut Vec<HumanAttentionEvidenceGap>,
+) -> Result<HumanAttentionMetricGroup, EvaluationContractError> {
     let (purpose_cost, gap) = privacy_observation(
-        &tasks,
-        &window_ref,
+        tasks,
+        window_ref,
         HumanAttentionMetric::PrivacyPurposeCost,
         &input.privacy.purpose_cost,
         HumanAttentionEvidenceRead::PrivacyRecord,
         &input.privacy.evidence_refs,
     )?;
-    push_gap(&mut gaps, gap);
+    push_gap(gaps, gap);
     let (retention_cost, gap) = privacy_observation(
-        &tasks,
-        &window_ref,
+        tasks,
+        window_ref,
         HumanAttentionMetric::PrivacyRetentionCost,
         &input.privacy.retention_cost,
         HumanAttentionEvidenceRead::PrivacyRecord,
         &input.privacy.evidence_refs,
     )?;
-    push_gap(&mut gaps, gap);
+    push_gap(gaps, gap);
     let (disclosure_cost, gap) = privacy_observation(
-        &tasks,
-        &window_ref,
+        tasks,
+        window_ref,
         HumanAttentionMetric::PrivacyDisclosureCost,
         &input.privacy.disclosure_cost,
         HumanAttentionEvidenceRead::PrivacyRecord,
         &input.privacy.evidence_refs,
     )?;
-    push_gap(&mut gaps, gap);
-    let privacy_purpose_retention_and_disclosure_cost = HumanAttentionMetricGroup {
+    push_gap(gaps, gap);
+    Ok(HumanAttentionMetricGroup {
         metrics: vec![purpose_cost, retention_cost, disclosure_cost],
-    };
+    })
+}
 
+/// Builds the seven risk metrics over one shared empty-population denominator.
+fn empty_risk_metrics(
+    value: &HumanAttentionMetricValue,
+    denominator: &HumanAttentionMetricDenominator,
+    coverage: CoverageState,
+    window_ref: &ContractId,
+) -> Result<RiskMetricObservations, EvaluationContractError> {
+    Ok(RiskMetricObservations {
+        distinct: empty_risk_metric(
+            HumanAttentionMetric::DistinctRiskEvents,
+            value,
+            denominator,
+            coverage,
+            window_ref,
+        )?,
+        missed: empty_risk_metric(
+            HumanAttentionMetric::MissedCriticalRiskEvents,
+            value,
+            denominator,
+            coverage,
+            window_ref,
+        )?,
+        false_critical: empty_risk_metric(
+            HumanAttentionMetric::FalseCriticalRiskEvents,
+            value,
+            denominator,
+            coverage,
+            window_ref,
+        )?,
+        prevented: empty_risk_metric(
+            HumanAttentionMetric::PreExposurePreventionEvents,
+            value,
+            denominator,
+            coverage,
+            window_ref,
+        )?,
+        conditional: empty_risk_metric(
+            HumanAttentionMetric::ConditionalInterventionEvents,
+            value,
+            denominator,
+            coverage,
+            window_ref,
+        )?,
+        harm: empty_risk_metric(
+            HumanAttentionMetric::FinalHarmEvents,
+            value,
+            denominator,
+            coverage,
+            window_ref,
+        )?,
+        residual: empty_risk_metric(
+            HumanAttentionMetric::ResidualRiskObservation,
+            value,
+            denominator,
+            coverage,
+            window_ref,
+        )?,
+    })
+}
+
+/// Joins the task-side notification observations with the seven risk
+/// observations into the four risk-sensitive groups.
+fn risk_groups(
+    notification: NotificationTaskObservations,
+    risks: RiskMetricObservations,
+) -> RiskGroups {
+    RiskGroups {
+        notification_approval_and_telemetry_profile: HumanAttentionMetricGroup {
+            metrics: vec![
+                notification.notification_profile,
+                notification.deduplicated_inbox_items,
+                notification.delivery_attempts,
+                risks.distinct,
+            ],
+        },
+        missed_critical_and_false_critical_counts: HumanAttentionMetricGroup {
+            metrics: vec![risks.missed, risks.false_critical],
+        },
+        pre_exposure_prevention_and_conditional_intervention: HumanAttentionMetricGroup {
+            metrics: vec![risks.prevented, risks.conditional],
+        },
+        final_harm_and_residual_risk: HumanAttentionMetricGroup {
+            metrics: vec![risks.harm, risks.residual],
+        },
+    }
+}
+
+/// Assembles the four risk-sensitive groups for a known empty risk population.
+/// Every risk slot is not-applicable with absence evidence; no gap is recorded.
+fn assemble_absent_risk_groups(
+    input: &HumanAttentionAssemblyInput,
+    window_ref: &ContractId,
+    notification: NotificationTaskObservations,
+) -> Result<RiskGroups, EvaluationContractError> {
+    let denominator = HumanAttentionMetricDenominator::NoEligibleOpportunities {
+        reason: RISK_ABSENCE_DENOMINATOR_REASON.to_string(),
+        evidence_refs: input.risk_absence_evidence_refs.clone(),
+    };
+    let value = HumanAttentionMetricValue::NotApplicable {
+        reason: RISK_ABSENCE_VALUE_REASON.to_string(),
+    };
+    let risks = empty_risk_metrics(
+        &value,
+        &denominator,
+        CoverageState::NotApplicable,
+        window_ref,
+    )?;
+    Ok(risk_groups(notification, risks))
+}
+
+/// Assembles the four risk-sensitive groups for an empty risk population with
+/// unavailable or unknown coverage. Every risk slot is unknown with the
+/// caller-supplied reason and records an exact gap.
+fn assemble_unavailable_risk_groups(
+    input: &HumanAttentionAssemblyInput,
+    window_ref: &ContractId,
+    gaps: &mut Vec<HumanAttentionEvidenceGap>,
+    notification: NotificationTaskObservations,
+) -> Result<RiskGroups, EvaluationContractError> {
     let scope = &input.evaluation_scope;
-    let notification_approval_and_telemetry_profile;
-    let missed_critical_and_false_critical_counts;
-    let pre_exposure_prevention_and_conditional_intervention;
-    let final_harm_and_residual_risk;
+    let coverage = scope.risk_population_coverage;
+    let reason = match input.risk_unavailable_reason.as_deref() {
+        Some(reason) => {
+            text(reason, "human_attention.assembly.risk_unavailable_reason")?;
+            reason
+        }
+        None => {
+            return Err(EvaluationContractError::InvalidText {
+                field: "human_attention.assembly.risk_unavailable_reason",
+            });
+        }
+    };
+    let denominator = HumanAttentionMetricDenominator::PopulationUnavailable {
+        coverage,
+        reason: reason.to_string(),
+        evidence_refs: Vec::new(),
+    };
+    let value = HumanAttentionMetricValue::Unknown {
+        reason: reason.to_string(),
+    };
+    let risks = empty_risk_metrics(&value, &denominator, coverage, window_ref)?;
+    for metric in [
+        HumanAttentionMetric::DistinctRiskEvents,
+        HumanAttentionMetric::MissedCriticalRiskEvents,
+        HumanAttentionMetric::FalseCriticalRiskEvents,
+        HumanAttentionMetric::PreExposurePreventionEvents,
+        HumanAttentionMetric::ConditionalInterventionEvents,
+        HumanAttentionMetric::FinalHarmEvents,
+        HumanAttentionMetric::ResidualRiskObservation,
+    ] {
+        gaps.push(HumanAttentionEvidenceGap {
+            read: HumanAttentionEvidenceRead::RiskEventOutcome,
+            metric,
+            reason: reason.to_string(),
+        });
+    }
+    Ok(risk_groups(notification, risks))
+}
+
+/// Assembles the six observed risk counts over the complete declared risk
+/// population. Missing outcomes keep the complete opportunity denominator.
+fn assemble_observed_risk_counts(
+    input: &HumanAttentionAssemblyInput,
+    risks: &PopulationBinding,
+    window_ref: &ContractId,
+    gaps: &mut Vec<HumanAttentionEvidenceGap>,
+) -> Result<ObservedRiskCounts, EvaluationContractError> {
+    let (distinct, gap) = count_observation(
+        risks,
+        window_ref,
+        HumanAttentionMetric::DistinctRiskEvents,
+        &input.risk_outcomes.distinct_risk_events,
+        HumanAttentionEvidenceRead::RiskEventOutcome,
+        &input.risk_outcomes.evidence_refs,
+    )?;
+    push_gap(gaps, gap);
+    let (missed, gap) = count_observation(
+        risks,
+        window_ref,
+        HumanAttentionMetric::MissedCriticalRiskEvents,
+        &input.risk_outcomes.missed_critical_risk_events,
+        HumanAttentionEvidenceRead::RiskEventOutcome,
+        &input.risk_outcomes.evidence_refs,
+    )?;
+    push_gap(gaps, gap);
+    let (false_critical, gap) = count_observation(
+        risks,
+        window_ref,
+        HumanAttentionMetric::FalseCriticalRiskEvents,
+        &input.risk_outcomes.false_critical_risk_events,
+        HumanAttentionEvidenceRead::RiskEventOutcome,
+        &input.risk_outcomes.evidence_refs,
+    )?;
+    push_gap(gaps, gap);
+    let (prevented, gap) = count_observation(
+        risks,
+        window_ref,
+        HumanAttentionMetric::PreExposurePreventionEvents,
+        &input.risk_outcomes.pre_exposure_prevention_events,
+        HumanAttentionEvidenceRead::RiskEventOutcome,
+        &input.risk_outcomes.evidence_refs,
+    )?;
+    push_gap(gaps, gap);
+    let (conditional, gap) = count_observation(
+        risks,
+        window_ref,
+        HumanAttentionMetric::ConditionalInterventionEvents,
+        &input.risk_outcomes.conditional_intervention_events,
+        HumanAttentionEvidenceRead::RiskEventOutcome,
+        &input.risk_outcomes.evidence_refs,
+    )?;
+    push_gap(gaps, gap);
+    let (harm, gap) = count_observation(
+        risks,
+        window_ref,
+        HumanAttentionMetric::FinalHarmEvents,
+        &input.risk_outcomes.final_harm_events,
+        HumanAttentionEvidenceRead::RiskEventOutcome,
+        &input.risk_outcomes.evidence_refs,
+    )?;
+    push_gap(gaps, gap);
+    Ok(ObservedRiskCounts {
+        distinct,
+        missed,
+        false_critical,
+        prevented,
+        conditional,
+        harm,
+    })
+}
+
+/// Assembles the four risk-sensitive groups for a populated risk scope from
+/// observed risk and outcome evidence.
+fn assemble_observed_risk_groups(
+    input: &HumanAttentionAssemblyInput,
+    window_ref: &ContractId,
+    gaps: &mut Vec<HumanAttentionEvidenceGap>,
+    notification: NotificationTaskObservations,
+) -> Result<RiskGroups, EvaluationContractError> {
+    let scope = &input.evaluation_scope;
+    let risk_collection_full = input.risk_outcomes.distinct_risk_events.observed.is_some()
+        && input
+            .risk_outcomes
+            .missed_critical_risk_events
+            .observed
+            .is_some()
+        && input
+            .risk_outcomes
+            .false_critical_risk_events
+            .observed
+            .is_some()
+        && input
+            .risk_outcomes
+            .pre_exposure_prevention_events
+            .observed
+            .is_some()
+        && input
+            .risk_outcomes
+            .conditional_intervention_events
+            .observed
+            .is_some()
+        && input.risk_outcomes.final_harm_events.observed.is_some()
+        && input
+            .risk_outcomes
+            .residual_risk_observation
+            .observed
+            .is_some();
+    let (risk_denominator, risk_complete) = decision_denominator(
+        &scope.risk_population_refs,
+        &input.risk_denominator,
+        &input.observation_window,
+        scope.risk_population_coverage,
+        risk_collection_full,
+    )?;
+    let risks = PopulationBinding {
+        population: HumanAttentionPopulation::RiskOpportunities,
+        denominator: risk_denominator,
+        denominator_complete: risk_complete,
+    };
+    let counts = assemble_observed_risk_counts(input, &risks, window_ref, gaps)?;
+    let (residual, gap) = text_observation(
+        &risks,
+        window_ref,
+        HumanAttentionMetric::ResidualRiskObservation,
+        &input.risk_outcomes.residual_risk_observation,
+        HumanAttentionEvidenceRead::RiskEventOutcome,
+        &input.risk_outcomes.evidence_refs,
+    )?;
+    push_gap(gaps, gap);
+    Ok(risk_groups(
+        notification,
+        RiskMetricObservations {
+            distinct: counts.distinct,
+            missed: counts.missed,
+            false_critical: counts.false_critical,
+            prevented: counts.prevented,
+            conditional: counts.conditional,
+            harm: counts.harm,
+            residual,
+        },
+    ))
+}
+
+/// Dispatches the risk-sensitive groups over the declared risk population:
+/// known-empty, empty-but-unavailable, or populated with observed evidence.
+fn assemble_risk_groups(
+    input: &HumanAttentionAssemblyInput,
+    window_ref: &ContractId,
+    gaps: &mut Vec<HumanAttentionEvidenceGap>,
+    notification: NotificationTaskObservations,
+) -> Result<RiskGroups, EvaluationContractError> {
+    let scope = &input.evaluation_scope;
     if scope.risk_population_refs.is_empty() {
         if scope.risk_population_coverage == CoverageState::NotApplicable {
-            let denominator = HumanAttentionMetricDenominator::NoEligibleOpportunities {
-                reason: RISK_ABSENCE_DENOMINATOR_REASON.to_string(),
-                evidence_refs: input.risk_absence_evidence_refs.clone(),
-            };
-            let value = HumanAttentionMetricValue::NotApplicable {
-                reason: RISK_ABSENCE_VALUE_REASON.to_string(),
-            };
-            let distinct = empty_risk_metric(
-                HumanAttentionMetric::DistinctRiskEvents,
-                &value,
-                &denominator,
-                CoverageState::NotApplicable,
-                &window_ref,
-            )?;
-            let missed = empty_risk_metric(
-                HumanAttentionMetric::MissedCriticalRiskEvents,
-                &value,
-                &denominator,
-                CoverageState::NotApplicable,
-                &window_ref,
-            )?;
-            let false_critical = empty_risk_metric(
-                HumanAttentionMetric::FalseCriticalRiskEvents,
-                &value,
-                &denominator,
-                CoverageState::NotApplicable,
-                &window_ref,
-            )?;
-            let prevented = empty_risk_metric(
-                HumanAttentionMetric::PreExposurePreventionEvents,
-                &value,
-                &denominator,
-                CoverageState::NotApplicable,
-                &window_ref,
-            )?;
-            let conditional = empty_risk_metric(
-                HumanAttentionMetric::ConditionalInterventionEvents,
-                &value,
-                &denominator,
-                CoverageState::NotApplicable,
-                &window_ref,
-            )?;
-            let harm = empty_risk_metric(
-                HumanAttentionMetric::FinalHarmEvents,
-                &value,
-                &denominator,
-                CoverageState::NotApplicable,
-                &window_ref,
-            )?;
-            let residual = empty_risk_metric(
-                HumanAttentionMetric::ResidualRiskObservation,
-                &value,
-                &denominator,
-                CoverageState::NotApplicable,
-                &window_ref,
-            )?;
-            notification_approval_and_telemetry_profile = HumanAttentionMetricGroup {
-                metrics: vec![
-                    notification_profile,
-                    deduplicated_inbox_items,
-                    delivery_attempts,
-                    distinct,
-                ],
-            };
-            missed_critical_and_false_critical_counts = HumanAttentionMetricGroup {
-                metrics: vec![missed, false_critical],
-            };
-            pre_exposure_prevention_and_conditional_intervention = HumanAttentionMetricGroup {
-                metrics: vec![prevented, conditional],
-            };
-            final_harm_and_residual_risk = HumanAttentionMetricGroup {
-                metrics: vec![harm, residual],
-            };
+            assemble_absent_risk_groups(input, window_ref, notification)
         } else {
-            let coverage = scope.risk_population_coverage;
-            let reason = match input.risk_unavailable_reason.as_deref() {
-                Some(reason) => {
-                    text(reason, "human_attention.assembly.risk_unavailable_reason")?;
-                    reason
-                }
-                None => {
-                    return Err(EvaluationContractError::InvalidText {
-                        field: "human_attention.assembly.risk_unavailable_reason",
-                    });
-                }
-            };
-            let denominator = HumanAttentionMetricDenominator::PopulationUnavailable {
-                coverage,
-                reason: reason.to_string(),
-                evidence_refs: Vec::new(),
-            };
-            let value = HumanAttentionMetricValue::Unknown {
-                reason: reason.to_string(),
-            };
-            let distinct = empty_risk_metric(
-                HumanAttentionMetric::DistinctRiskEvents,
-                &value,
-                &denominator,
-                coverage,
-                &window_ref,
-            )?;
-            let missed = empty_risk_metric(
-                HumanAttentionMetric::MissedCriticalRiskEvents,
-                &value,
-                &denominator,
-                coverage,
-                &window_ref,
-            )?;
-            let false_critical = empty_risk_metric(
-                HumanAttentionMetric::FalseCriticalRiskEvents,
-                &value,
-                &denominator,
-                coverage,
-                &window_ref,
-            )?;
-            let prevented = empty_risk_metric(
-                HumanAttentionMetric::PreExposurePreventionEvents,
-                &value,
-                &denominator,
-                coverage,
-                &window_ref,
-            )?;
-            let conditional = empty_risk_metric(
-                HumanAttentionMetric::ConditionalInterventionEvents,
-                &value,
-                &denominator,
-                coverage,
-                &window_ref,
-            )?;
-            let harm = empty_risk_metric(
-                HumanAttentionMetric::FinalHarmEvents,
-                &value,
-                &denominator,
-                coverage,
-                &window_ref,
-            )?;
-            let residual = empty_risk_metric(
-                HumanAttentionMetric::ResidualRiskObservation,
-                &value,
-                &denominator,
-                coverage,
-                &window_ref,
-            )?;
-            for metric in [
-                HumanAttentionMetric::DistinctRiskEvents,
-                HumanAttentionMetric::MissedCriticalRiskEvents,
-                HumanAttentionMetric::FalseCriticalRiskEvents,
-                HumanAttentionMetric::PreExposurePreventionEvents,
-                HumanAttentionMetric::ConditionalInterventionEvents,
-                HumanAttentionMetric::FinalHarmEvents,
-                HumanAttentionMetric::ResidualRiskObservation,
-            ] {
-                gaps.push(HumanAttentionEvidenceGap {
-                    read: HumanAttentionEvidenceRead::RiskEventOutcome,
-                    metric,
-                    reason: reason.to_string(),
-                });
-            }
-            notification_approval_and_telemetry_profile = HumanAttentionMetricGroup {
-                metrics: vec![
-                    notification_profile,
-                    deduplicated_inbox_items,
-                    delivery_attempts,
-                    distinct,
-                ],
-            };
-            missed_critical_and_false_critical_counts = HumanAttentionMetricGroup {
-                metrics: vec![missed, false_critical],
-            };
-            pre_exposure_prevention_and_conditional_intervention = HumanAttentionMetricGroup {
-                metrics: vec![prevented, conditional],
-            };
-            final_harm_and_residual_risk = HumanAttentionMetricGroup {
-                metrics: vec![harm, residual],
-            };
+            assemble_unavailable_risk_groups(input, window_ref, gaps, notification)
         }
     } else {
-        let risk_collection_full = input.risk_outcomes.distinct_risk_events.observed.is_some()
-            && input
-                .risk_outcomes
-                .missed_critical_risk_events
-                .observed
-                .is_some()
-            && input
-                .risk_outcomes
-                .false_critical_risk_events
-                .observed
-                .is_some()
-            && input
-                .risk_outcomes
-                .pre_exposure_prevention_events
-                .observed
-                .is_some()
-            && input
-                .risk_outcomes
-                .conditional_intervention_events
-                .observed
-                .is_some()
-            && input.risk_outcomes.final_harm_events.observed.is_some()
-            && input
-                .risk_outcomes
-                .residual_risk_observation
-                .observed
-                .is_some();
-        let (risk_denominator, risk_complete) = decision_denominator(
-            &scope.risk_population_refs,
-            &input.risk_denominator,
-            &input.observation_window,
-            scope.risk_population_coverage,
-            risk_collection_full,
-        )?;
-        let risks = PopulationBinding {
-            population: HumanAttentionPopulation::RiskOpportunities,
-            denominator: risk_denominator,
-            denominator_complete: risk_complete,
-        };
-        let (distinct, gap) = count_observation(
-            &risks,
-            &window_ref,
-            HumanAttentionMetric::DistinctRiskEvents,
-            &input.risk_outcomes.distinct_risk_events,
-            HumanAttentionEvidenceRead::RiskEventOutcome,
-            &input.risk_outcomes.evidence_refs,
-        )?;
-        push_gap(&mut gaps, gap);
-        let (missed, gap) = count_observation(
-            &risks,
-            &window_ref,
-            HumanAttentionMetric::MissedCriticalRiskEvents,
-            &input.risk_outcomes.missed_critical_risk_events,
-            HumanAttentionEvidenceRead::RiskEventOutcome,
-            &input.risk_outcomes.evidence_refs,
-        )?;
-        push_gap(&mut gaps, gap);
-        let (false_critical, gap) = count_observation(
-            &risks,
-            &window_ref,
-            HumanAttentionMetric::FalseCriticalRiskEvents,
-            &input.risk_outcomes.false_critical_risk_events,
-            HumanAttentionEvidenceRead::RiskEventOutcome,
-            &input.risk_outcomes.evidence_refs,
-        )?;
-        push_gap(&mut gaps, gap);
-        let (prevented, gap) = count_observation(
-            &risks,
-            &window_ref,
-            HumanAttentionMetric::PreExposurePreventionEvents,
-            &input.risk_outcomes.pre_exposure_prevention_events,
-            HumanAttentionEvidenceRead::RiskEventOutcome,
-            &input.risk_outcomes.evidence_refs,
-        )?;
-        push_gap(&mut gaps, gap);
-        let (conditional, gap) = count_observation(
-            &risks,
-            &window_ref,
-            HumanAttentionMetric::ConditionalInterventionEvents,
-            &input.risk_outcomes.conditional_intervention_events,
-            HumanAttentionEvidenceRead::RiskEventOutcome,
-            &input.risk_outcomes.evidence_refs,
-        )?;
-        push_gap(&mut gaps, gap);
-        let (harm, gap) = count_observation(
-            &risks,
-            &window_ref,
-            HumanAttentionMetric::FinalHarmEvents,
-            &input.risk_outcomes.final_harm_events,
-            HumanAttentionEvidenceRead::RiskEventOutcome,
-            &input.risk_outcomes.evidence_refs,
-        )?;
-        push_gap(&mut gaps, gap);
-        let (residual, gap) = text_observation(
-            &risks,
-            &window_ref,
-            HumanAttentionMetric::ResidualRiskObservation,
-            &input.risk_outcomes.residual_risk_observation,
-            HumanAttentionEvidenceRead::RiskEventOutcome,
-            &input.risk_outcomes.evidence_refs,
-        )?;
-        push_gap(&mut gaps, gap);
-        notification_approval_and_telemetry_profile = HumanAttentionMetricGroup {
-            metrics: vec![
-                notification_profile,
-                deduplicated_inbox_items,
-                delivery_attempts,
-                distinct,
-            ],
-        };
-        missed_critical_and_false_critical_counts = HumanAttentionMetricGroup {
-            metrics: vec![missed, false_critical],
-        };
-        pre_exposure_prevention_and_conditional_intervention = HumanAttentionMetricGroup {
-            metrics: vec![prevented, conditional],
-        };
-        final_harm_and_residual_risk = HumanAttentionMetricGroup {
-            metrics: vec![harm, residual],
-        };
+        assemble_observed_risk_groups(input, window_ref, gaps, notification)
     }
+}
 
-    policy_and_task_risk_profile.validate(
+/// Validates every assembled group against the window, manifest, and scope.
+fn validate_assembled_groups(
+    input: &HumanAttentionAssemblyInput,
+    manifest: &HumanAttentionEvidenceManifest,
+    groups: &AssembledMetricGroups,
+) -> Result<(), EvaluationContractError> {
+    let scope = &input.evaluation_scope;
+    groups.policy_and_task_risk_profile.validate(
         HumanAttentionMetricGroupKind::PolicyAndTaskRiskProfile,
         &input.observation_window,
-        &manifest,
+        manifest,
         scope,
     )?;
-    notification_approval_and_telemetry_profile.validate(
+    groups.notification_approval_and_telemetry_profile.validate(
         HumanAttentionMetricGroupKind::NotificationApprovalAndTelemetryProfile,
         &input.observation_window,
-        &manifest,
+        manifest,
         scope,
     )?;
-    missed_critical_and_false_critical_counts.validate(
+    groups.missed_critical_and_false_critical_counts.validate(
         HumanAttentionMetricGroupKind::MissedCriticalAndFalseCriticalCounts,
         &input.observation_window,
-        &manifest,
+        manifest,
         scope,
     )?;
-    pre_exposure_prevention_and_conditional_intervention.validate(
-        HumanAttentionMetricGroupKind::PreExposurePreventionAndConditionalIntervention,
-        &input.observation_window,
-        &manifest,
-        scope,
-    )?;
-    final_harm_and_residual_risk.validate(
+    groups
+        .pre_exposure_prevention_and_conditional_intervention
+        .validate(
+            HumanAttentionMetricGroupKind::PreExposurePreventionAndConditionalIntervention,
+            &input.observation_window,
+            manifest,
+            scope,
+        )?;
+    groups.final_harm_and_residual_risk.validate(
         HumanAttentionMetricGroupKind::FinalHarmAndResidualRisk,
         &input.observation_window,
-        &manifest,
+        manifest,
         scope,
     )?;
-    benign_false_blocks_and_abandoned_work.validate(
+    groups.benign_false_blocks_and_abandoned_work.validate(
         HumanAttentionMetricGroupKind::BenignFalseBlocksAndAbandonedWork,
         &input.observation_window,
-        &manifest,
+        manifest,
         scope,
     )?;
-    interruption_and_resumption_time_quality.validate(
+    groups.interruption_and_resumption_time_quality.validate(
         HumanAttentionMetricGroupKind::InterruptionAndResumptionTimeQuality,
         &input.observation_window,
-        &manifest,
+        manifest,
         scope,
     )?;
-    task_correctness_rework_and_human_attention.validate(
+    groups.task_correctness_rework_and_human_attention.validate(
         HumanAttentionMetricGroupKind::TaskCorrectnessReworkAndHumanAttention,
         &input.observation_window,
-        &manifest,
+        manifest,
         scope,
     )?;
-    overtrust_undertrust_and_recoverability_observations.validate(
-        HumanAttentionMetricGroupKind::OvertrustUndertrustAndRecoverabilityObservations,
-        &input.observation_window,
-        &manifest,
-        scope,
-    )?;
-    privacy_purpose_retention_and_disclosure_cost.validate(
-        HumanAttentionMetricGroupKind::PrivacyPurposeRetentionAndDisclosureCost,
-        &input.observation_window,
-        &manifest,
-        scope,
-    )?;
+    groups
+        .overtrust_undertrust_and_recoverability_observations
+        .validate(
+            HumanAttentionMetricGroupKind::OvertrustUndertrustAndRecoverabilityObservations,
+            &input.observation_window,
+            manifest,
+            scope,
+        )?;
+    groups
+        .privacy_purpose_retention_and_disclosure_cost
+        .validate(
+            HumanAttentionMetricGroupKind::PrivacyPurposeRetentionAndDisclosureCost,
+            &input.observation_window,
+            manifest,
+            scope,
+        )?;
+    Ok(())
+}
 
-    let source_bindings = vec![
+/// Records the exact source revision nominated for every bounded read.
+///
+/// The same read may bind two revisions when two owners contribute; each
+/// binding records which owner revision was nominated.
+fn assemble_source_bindings(
+    input: &HumanAttentionAssemblyInput,
+) -> Vec<HumanAttentionSourceBinding> {
+    vec![
         HumanAttentionSourceBinding {
             read: HumanAttentionEvidenceRead::NotificationDelivery,
             source_revision: input.notification.delivery_source_revision.clone(),
@@ -3258,7 +3436,79 @@ pub fn assemble_human_attention_evidence(
             read: HumanAttentionEvidenceRead::TaskRiskProfile,
             source_revision: input.profiles.task_risk_source_revision.clone(),
         },
-    ];
+    ]
+}
+
+/// Assembles the ten I11.10 metric groups from bounded owner evidence.
+///
+/// Every observation binds the input window; every denominator binds the
+/// complete declared population; every source revision is recorded. Available
+/// slots become observed values with admissible sources; unavailable slots
+/// become explicit unknowns with exact gaps, never synthetic zeros. The
+/// returned groups satisfy structural validation, so the Governor producer
+/// can embed them into a candidate record directly.
+pub fn assemble_human_attention_evidence(
+    input: &HumanAttentionAssemblyInput,
+) -> Result<HumanAttentionAssembledEvidence, EvaluationContractError> {
+    input.observation_window.validate()?;
+    input.evaluation_scope.validate()?;
+    check_assembly_revisions(input)?;
+    check_risk_absence_fields(input)?;
+    let manifest = assemble_evidence_manifest(input)?;
+    let window_ref = input.observation_window.specification.window_id.clone();
+    let tasks = task_population_binding(input)?;
+    let mut gaps: Vec<HumanAttentionEvidenceGap> = Vec::new();
+    let policy_and_task_risk_profile =
+        assemble_policy_profile_group(input, &tasks, &window_ref, &mut gaps)?;
+    let notification =
+        assemble_notification_profile_observations(input, &tasks, &window_ref, &mut gaps)?;
+
+    let benign_false_blocks_and_abandoned_work =
+        assemble_benign_and_abandoned_group(input, &tasks, &window_ref, &mut gaps)?;
+    let (interruption_duration, resumption_latency) =
+        assemble_interruption_measurements(input, &tasks, &window_ref, &mut gaps)?;
+    let resumption_quality =
+        assemble_resumption_quality_observation(input, &tasks, &window_ref, &mut gaps)?;
+    let interruption_and_resumption_time_quality = HumanAttentionMetricGroup {
+        metrics: vec![
+            interruption_duration,
+            resumption_latency,
+            resumption_quality,
+        ],
+    };
+
+    let task_correctness =
+        assemble_task_correctness_observation(input, &tasks, &window_ref, &mut gaps)?;
+    let rework_events = assemble_rework_observation(input, &tasks, &window_ref, &mut gaps)?;
+    let human_attention =
+        assemble_human_attention_observation(input, &tasks, &window_ref, &mut gaps)?;
+    let task_correctness_rework_and_human_attention = HumanAttentionMetricGroup {
+        metrics: vec![task_correctness, rework_events, human_attention],
+    };
+    let overtrust_undertrust_and_recoverability_observations =
+        assemble_trust_recoverability_observations(input, &tasks, &window_ref, &mut gaps)?;
+    let privacy_purpose_retention_and_disclosure_cost =
+        assemble_privacy_cost_observations(input, &tasks, &window_ref, &mut gaps)?;
+
+    let risks = assemble_risk_groups(input, &window_ref, &mut gaps, notification)?;
+    let groups = AssembledMetricGroups {
+        policy_and_task_risk_profile,
+        notification_approval_and_telemetry_profile: risks
+            .notification_approval_and_telemetry_profile,
+        missed_critical_and_false_critical_counts: risks.missed_critical_and_false_critical_counts,
+        pre_exposure_prevention_and_conditional_intervention: risks
+            .pre_exposure_prevention_and_conditional_intervention,
+        final_harm_and_residual_risk: risks.final_harm_and_residual_risk,
+        benign_false_blocks_and_abandoned_work,
+        interruption_and_resumption_time_quality,
+        task_correctness_rework_and_human_attention,
+        overtrust_undertrust_and_recoverability_observations,
+        privacy_purpose_retention_and_disclosure_cost,
+    };
+
+    validate_assembled_groups(input, &manifest, &groups)?;
+
+    let source_bindings = assemble_source_bindings(input);
 
     let status = if gaps.is_empty() {
         HumanAttentionAssemblyStatus::Complete
@@ -3269,16 +3519,21 @@ pub fn assemble_human_attention_evidence(
         observation_window_ref: window_ref,
         evidence_manifest: manifest,
         source_bindings,
-        policy_and_task_risk_profile,
-        notification_approval_and_telemetry_profile,
-        missed_critical_and_false_critical_counts,
-        pre_exposure_prevention_and_conditional_intervention,
-        final_harm_and_residual_risk,
-        benign_false_blocks_and_abandoned_work,
-        interruption_and_resumption_time_quality,
-        task_correctness_rework_and_human_attention,
-        overtrust_undertrust_and_recoverability_observations,
-        privacy_purpose_retention_and_disclosure_cost,
+        policy_and_task_risk_profile: groups.policy_and_task_risk_profile,
+        notification_approval_and_telemetry_profile: groups
+            .notification_approval_and_telemetry_profile,
+        missed_critical_and_false_critical_counts: groups.missed_critical_and_false_critical_counts,
+        pre_exposure_prevention_and_conditional_intervention: groups
+            .pre_exposure_prevention_and_conditional_intervention,
+        final_harm_and_residual_risk: groups.final_harm_and_residual_risk,
+        benign_false_blocks_and_abandoned_work: groups.benign_false_blocks_and_abandoned_work,
+        interruption_and_resumption_time_quality: groups.interruption_and_resumption_time_quality,
+        task_correctness_rework_and_human_attention: groups
+            .task_correctness_rework_and_human_attention,
+        overtrust_undertrust_and_recoverability_observations: groups
+            .overtrust_undertrust_and_recoverability_observations,
+        privacy_purpose_retention_and_disclosure_cost: groups
+            .privacy_purpose_retention_and_disclosure_cost,
         gaps,
         status,
     })
