@@ -282,11 +282,20 @@ pub(crate) fn part_e_surface_report(profile: &str) -> Result<Value> {
     let mut entries = Vec::with_capacity(tools.len());
     let mut combined_serialized = Vec::new();
     for tool in &tools {
-        let name = tool.get("name").and_then(Value::as_str).unwrap_or_default();
+        let name = tool
+            .get("name")
+            .and_then(Value::as_str)
+            .context("tool definition has no string name")?;
+        // An absent or non-string description is a typed failure, never a
+        // silent empty default: defaulting here would measure zero bytes and
+        // report a cheap STU for a description that does not exist, which is
+        // exactly the absent-becomes-zero/unknown-becomes-cheap collapse this
+        // migration forbids. A genuinely empty description still measures zero
+        // inside `canonical_serialized_measurement`.
         let description = tool
             .get("description")
             .and_then(Value::as_str)
-            .unwrap_or_default();
+            .context("tool definition has no string description")?;
         let measurement = canonical_serialized_measurement(description.as_bytes())?;
         combined_serialized.extend_from_slice(description.as_bytes());
         entries.push(json!({
