@@ -9,9 +9,7 @@ use std::time::Duration;
 use eliot_runtime::{
     ChildClass, Runtime, ShutdownOutcome, SupervisionOutcome, SupervisionStrategy, TaskFailure,
 };
-use eliot_watchdog_core::{
-    CountDelta, EvidenceRef, HealthObservationPair, MaintenanceDebtInput,
-};
+use eliot_watchdog_core::{CountDelta, EvidenceRef, HealthObservationPair, MaintenanceDebtInput};
 
 use crate::AdmittedIsolatedDestination;
 use crate::CompositionError;
@@ -222,11 +220,7 @@ pub fn project_actual_due_policy_snapshot(
         && facts.overdue.current <= facts.due_policy_records;
     MaintenanceDebtInput {
         pair,
-        due_policy_overdue: if agrees {
-            Some(facts.overdue)
-        } else {
-            None
-        },
+        due_policy_overdue: if agrees { Some(facts.overdue) } else { None },
         due_policy_evidence: if agrees {
             Some(facts.evidence.clone())
         } else {
