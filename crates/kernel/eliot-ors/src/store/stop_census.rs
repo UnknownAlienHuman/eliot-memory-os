@@ -142,7 +142,7 @@ impl StoreStopObligationCounts {
             self.cutover_ownership,
         ]
         .into_iter()
-        .try_fold(0_u64, |sum, count| sum.checked_add(count))
+        .try_fold(0_u64, u64::checked_add)
         .ok_or_else(|| crate::OrsError::IntegrityProblem {
             record_type: "store_stop_census",
             reason: "total obligation count overflowed its wire range".to_owned(),
@@ -201,7 +201,7 @@ pub struct StoreStopObligationCensus {
     pub activation_id: Option<String>,
     /// Activation/resource generation selected by `state_fence`.
     pub activation_generation: eliot_contracts::ResourceGeneration,
-    /// Existing monotone OPERATIONAL_CURRENT revision for #1678 admission state.
+    /// Existing monotone `OPERATIONAL_CURRENT` revision for #1678 admission state.
     pub admission_revision: u64,
     /// Content revision over every row in each source family scanned here.
     pub observation_revision: String,
@@ -212,7 +212,9 @@ pub struct StoreStopObligationCensus {
 impl StoreStopObligationCensus {
     /// Validates the exact generation binding, source revisions, and count range.
     pub fn validate(&self) -> Result<(), crate::OrsError> {
-        self.state_fence.validate()?;
+        self.state_fence
+            .validate()
+            .map_err(eliot_store_api::StoreError::Foundation)?;
         crate::model::validate_text(&self.installation_id, "store_stop_installation_id")?;
         if self.store_object_generation == 0
             || self.activation_generation != self.state_fence.resource_generation
@@ -255,7 +257,9 @@ impl RedbRecoveryStore {
         state_fence: &StateFence,
         activation_id: Option<&str>,
     ) -> Result<StoreStopObligationCensus, crate::OrsError> {
-        state_fence.validate()?;
+        state_fence
+            .validate()
+            .map_err(eliot_store_api::StoreError::Foundation)?;
         if let Some(activation_id) = activation_id {
             crate::model::validate_text(activation_id, "store_stop_activation_id")?;
         }
@@ -277,803 +281,77 @@ pub(super) fn census_in_read(
         .operational_current_revision;
     let mut builder = CensusBuilder::new();
 
-    {
-        let leases = read.open_table(RUNTIME_LEASE_CURRENT).map_err(storage)?;
-        for row in leases.iter().map_err(storage)? {
-            let (key, value) = row.map_err(storage)?;
-            let lease: RuntimeLease = decode(value.value())?;
-            if key.value() != lease.lease_id {
-                return Err(integrity(
-                    "runtime_lease_current",
-                    "current key does not match lease identity",
-                ));
-            }
-            builder.observe("runtime_leases", key.value(), value.value())?;
-            if !runtime_lease_is_terminal(lease.state) {
-                builder.counts.runtime_leases = increment(builder.counts.runtime_leases)?;
-            }
-        }
-    }
+    observe_runtime_lease_current(read, &mut builder)?;
 
-    {
-        let leases = read
-            .open_table(SUPERVISION_LEASE_CURRENT)
-            .map_err(storage)?;
-        for row in leases.iter().map_err(storage)? {
-            let (key, value) = row.map_err(storage)?;
-            let snapshot: SupervisionLeaseSnapshot =
-                decode_named(value.value(), "supervision_lease_current")?;
-            snapshot.validate()?;
-            if key.value() != snapshot.record.lease_id.as_str() {
-                return Err(integrity(
-                    "supervision_lease_current",
-                    "current key does not match lease identity",
-                ));
-            }
-            builder.observe("supervision_leases", key.value(), value.value())?;
-            if !runtime_lease_is_terminal(snapshot.record.state) {
-                builder.counts.supervision_leases = increment(builder.counts.supervision_leases)?;
-            }
-        }
-    }
+    observe_supervision_lease_current(read, &mut builder)?;
 
-    {
-        let staged = read.open_table(SUPERVISION_LEASE_STAGED).map_err(storage)?;
-        for row in staged.iter().map_err(storage)? {
-            let (key, value) = row.map_err(storage)?;
-            let stage: SupervisionLeaseStageReceipt =
-                decode_named(value.value(), "supervision_lease_staged")?;
-            stage.validate()?;
-            if key.value() != stage.ticket.lease_id.as_str() {
-                return Err(integrity(
-                    "supervision_lease_staged",
-                    "staged key does not match lease identity",
-                ));
-            }
-            builder.observe("supervision_lease_stages", key.value(), value.value())?;
-            builder.counts.supervision_lease_stages =
-                increment(builder.counts.supervision_lease_stages)?;
-        }
-    }
+    observe_supervision_lease_staged(read, &mut builder)?;
 
-    {
-        let reservations = read.open_table(RESERVATIONS).map_err(storage)?;
-        for row in reservations.iter().map_err(storage)? {
-            let (key, value) = row.map_err(storage)?;
-            let record: ReservationRecord = decode(value.value())?;
-            if key.value() != record.token.reservation_id.as_str() {
-                return Err(integrity(
-                    "store_stop_reservations",
-                    "reservation key does not match its owner identity",
-                ));
-            }
-            builder.observe("write_reservations", key.value(), value.value())?;
-            if !record.state.is_terminal() {
-                builder.counts.write_reservations = increment(builder.counts.write_reservations)?;
-            }
-        }
-    }
+    observe_reservations(read, &mut builder)?;
 
-    {
-        let commits = read.open_table(UNKNOWN_COMMIT_RECOVERY).map_err(storage)?;
-        for row in commits.iter().map_err(storage)? {
-            let (key, value) = row.map_err(storage)?;
-            let record: UnknownCommitRecord = decode(value.value())?;
-            if key.value() != record.idempotency_key {
-                return Err(integrity(
-                    "store_stop_unknown_commits",
-                    "unknown-commit key does not match its owner identity",
-                ));
-            }
-            builder.observe("unknown_commits", key.value(), value.value())?;
-            if record.is_open() {
-                builder.counts.unknown_commits = increment(builder.counts.unknown_commits)?;
-            }
-        }
-    }
+    observe_unknown_commit_recovery(read, &mut builder)?;
 
-    {
-        let current = read.open_table(OPERATIONAL_CURRENT).map_err(storage)?;
-        for row in current.iter().map_err(storage)? {
-            let (key, value) = row.map_err(storage)?;
-            let record: DurableOperationalRecord =
-                decode_named(value.value(), "operational_current")?;
-            let expected_key =
-                RedbRecoveryStore::operational_key(record.kind, &record.input.subject_id);
-            if key.value() != expected_key {
-                return Err(integrity(
-                    "store_stop_operational_current",
-                    "current key does not match its typed owner identity",
-                ));
-            }
-            builder.observe("operational_current", key.value(), value.value())?;
-            if record.kind == super::OperationalKind::AdmissionReservation {
-                let reservation = record.admission_reservation.as_ref().ok_or_else(|| {
-                    integrity(
-                        "store_stop_admission_reservation",
-                        "current admission row has no typed reservation state",
-                    )
-                })?;
-                if !matches!(
-                    reservation.state,
-                    AdmissionReservationState::Released | AdmissionReservationState::Expired
-                ) {
-                    builder.counts.admission_reservations =
-                        increment(builder.counts.admission_reservations)?;
-                }
-            } else if is_store_dependent_operational_kind(record.kind)
-                && !matches!(
-                    record.phase,
-                    OperationalPhase::Terminal | OperationalPhase::Released
-                )
-            {
-                builder.counts.operational_work = increment(builder.counts.operational_work)?;
-            }
-        }
-    }
+    observe_operational_current(read, &mut builder)?;
 
-    {
-        let inbox = read.open_table(RECOVERY_INBOX).map_err(storage)?;
-        for row in inbox.iter().map_err(storage)? {
-            let (key, value) = row.map_err(storage)?;
-            let record: DurableInboxRecord = decode_named(value.value(), "recovery_inbox")?;
-            if key.value() != record.item.item_id.as_str() {
-                return Err(integrity(
-                    "store_stop_recovery_inbox",
-                    "inbox key does not match its owner identity",
-                ));
-            }
-            builder.observe("recovery_inbox", key.value(), value.value())?;
-            if record.disposition == RecoveryInboxDisposition::Imported {
-                builder.counts.recovery_inbox = increment(builder.counts.recovery_inbox)?;
-            }
-        }
-    }
+    observe_recovery_inbox(read, &mut builder)?;
 
-    {
-        let problems = read.open_table(RECOVERY_PROBLEMS).map_err(storage)?;
-        for row in problems.iter().map_err(storage)? {
-            let (key, value) = row.map_err(storage)?;
-            let problem: RecoveryProblem = decode(value.value())?;
-            if key.value() != problem.operation_or_checkpoint_id.as_str() {
-                return Err(integrity(
-                    "store_stop_recovery_problems",
-                    "problem key does not match its owner identity",
-                ));
-            }
-            builder.observe("recovery_problems", key.value(), value.value())?;
-            if problem.terminal_receipt_id.is_none() {
-                builder.counts.recovery_problems = increment(builder.counts.recovery_problems)?;
-            }
-        }
-    }
+    observe_recovery_problems(read, &mut builder)?;
 
-    {
-        let leases = read.open_table(EFFECT_OPERATION_LEASES).map_err(storage)?;
-        for row in leases.iter().map_err(storage)? {
-            let (key, value) = row.map_err(storage)?;
-            let lease: crate::EffectOperationLease = decode(value.value())?;
-            if key.value() != lease.lease_id.as_str() {
-                return Err(integrity(
-                    "store_stop_effect_leases",
-                    "effect lease key does not match lease identity",
-                ));
-            }
-            builder.observe("effect_operation_leases", key.value(), value.value())?;
-            if !runtime_lease_is_terminal(lease.state)
-                || lease.delivery == crate::EffectDeliveryAcknowledgement::GapOpen
-                || lease.revocation == crate::RevocationAcknowledgement::Unacknowledged
-            {
-                builder.counts.effect_operation_leases =
-                    increment(builder.counts.effect_operation_leases)?;
-            }
-        }
-    }
+    observe_effect_operation_leases(read, &mut builder)?;
 
-    {
-        let reconciliations = read
-            .open_table(EFFECT_REPLAY_RECONCILIATIONS)
-            .map_err(storage)?;
-        for row in reconciliations.iter().map_err(storage)? {
-            let (key, value) = row.map_err(storage)?;
-            let item: KernelReconciliationItem = decode(value.value())?;
-            let operation_id = item.operation_id.as_ref().ok_or_else(|| {
-                integrity(
-                    "store_stop_effect_reconciliation",
-                    "durable effect reconciliation has no operation identity",
-                )
-            })?;
-            let expected_key = format!(
-                "{}::{:020}::{}",
-                RedbRecoveryStore::encode_key_component(&item.module_id),
-                item.generation.value(),
-                RedbRecoveryStore::encode_key_component(operation_id.as_str()),
-            );
-            if key.value() != expected_key {
-                return Err(integrity(
-                    "store_stop_effect_reconciliation",
-                    "reconciliation key does not match its typed owner identity",
-                ));
-            }
-            builder.observe("effect_replay_reconciliations", key.value(), value.value())?;
-            builder.counts.effect_reconciliations =
-                increment(builder.counts.effect_reconciliations)?;
-        }
-    }
+    observe_effect_replay_reconciliations(read, &mut builder)?;
 
-    {
-        let rebinds = read.open_table(STORE_REBIND_REPLAY).map_err(storage)?;
-        for row in rebinds.iter().map_err(storage)? {
-            let (key, value) = row.map_err(storage)?;
-            let record: crate::StoreRebindReplayRecord = decode(value.value())?;
-            record.validate()?;
-            let expected_key = format!(
-                "{}::{}",
-                record.operation_id.as_str(),
-                record.request_digest
-            );
-            if key.value() != expected_key {
-                return Err(integrity(
-                    "store_rebind_replay",
-                    "rebind key does not match its typed owner identity",
-                ));
-            }
-            builder.observe("store_rebinds", key.value(), value.value())?;
-            if record.state == crate::StoreRebindReplayState::Pending {
-                builder.counts.store_rebinds = increment(builder.counts.store_rebinds)?;
-            }
-        }
-    }
+    observe_store_rebind_replay(read, &mut builder)?;
 
-    {
-        let failures = read.open_table(STORE_FAILURE_RETENTION).map_err(storage)?;
-        for row in failures.iter().map_err(storage)? {
-            let (key, value) = row.map_err(storage)?;
-            let record: crate::StoreFailureRetentionRecord = decode(value.value())?;
-            record.validate()?;
-            if key.value() != record.record_key() {
-                return Err(integrity(
-                    "store_failure_retention",
-                    "failure key does not match its typed owner identity",
-                ));
-            }
-            builder.observe("store_failure_retention", key.value(), value.value())?;
-            if record.failure.disposition
-                == eliot_store_api::StoreFailureDisposition::UnknownOutcome
-                && record.reconciled_receipt.is_none()
-            {
-                builder.counts.unresolved_store_failures =
-                    increment(builder.counts.unresolved_store_failures)?;
-            }
-        }
-    }
+    observe_store_failure_retention(read, &mut builder)?;
 
-    {
-        let disclosures = read.open_table(SCAN_DISCLOSURE_RECORDS).map_err(storage)?;
-        for row in disclosures.iter().map_err(storage)? {
-            let (key, value) = row.map_err(storage)?;
-            let record: crate::ScanDisclosureOrsRecord = decode(value.value())?;
-            record.validate()?;
-            if key.value() != record.operation_key {
-                return Err(integrity(
-                    "scan_disclosure",
-                    "disclosure key does not match its typed owner identity",
-                ));
-            }
-            builder.observe("scan_disclosure", key.value(), value.value())?;
-            if record.state == crate::ScanDisclosureRecordState::Prepared {
-                builder.counts.prepared_scan_disclosures =
-                    increment(builder.counts.prepared_scan_disclosures)?;
-            }
-        }
-    }
+    observe_scan_disclosure_records(read, &mut builder)?;
 
     observe_cold_start_readiness(read, &identity, &mut builder)?;
 
-    {
-        let lifecycles = read.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
-        for row in lifecycles.iter().map_err(storage)? {
-            let (key, value) = row.map_err(storage)?;
-            let record: crate::ActivationLifecycleRecord = decode(value.value())?;
-            record.validate()?;
-            if key.value() != record.record_key() {
-                return Err(integrity(
-                    "activation_lifecycle",
-                    "lifecycle key does not match ticket identity",
-                ));
-            }
-            builder.observe("activation_lifecycles", key.value(), value.value())?;
-            match record.state {
-                crate::ActivationLifecycleState::Pending
-                | crate::ActivationLifecycleState::Claimed
-                | crate::ActivationLifecycleState::Reconciling => {
-                    builder.counts.activation_lifecycles =
-                        increment(builder.counts.activation_lifecycles)?;
-                }
-                // This immutable predecessor result may schedule a successor
-                // on a later activation, but it carries no live Store work.
-                // Retaining it must not keep the Store branch alive by itself.
-                crate::ActivationLifecycleState::DeferredNotReady
-                | crate::ActivationLifecycleState::ResultAccepted
-                | crate::ActivationLifecycleState::Cancelled
-                | crate::ActivationLifecycleState::Expired => {}
-            }
-        }
-    }
+    observe_activation_lifecycles(read, &mut builder)?;
 
-    {
-        let claims = read.open_table(NATIVE_WORKER_CLAIMS).map_err(storage)?;
-        for row in claims.iter().map_err(storage)? {
-            let (key, value) = row.map_err(storage)?;
-            let record: crate::NativeWorkerClaimRecord = decode(value.value())?;
-            record.validate()?;
-            if key.value() != record.record_key() {
-                return Err(integrity(
-                    "native_worker_claim",
-                    "claim key does not match its typed owner identity",
-                ));
-            }
-            builder.observe("native_worker_claims", key.value(), value.value())?;
-            if !record.state.is_terminal() {
-                builder.counts.native_worker_claims =
-                    increment(builder.counts.native_worker_claims)?;
-            }
-        }
-    }
+    observe_native_worker_claims(read, &mut builder)?;
 
-    {
-        let requests = read.open_table(HOST_REQUESTS).map_err(storage)?;
-        for row in requests.iter().map_err(storage)? {
-            let (key, value) = row.map_err(storage)?;
-            let record: HostRequestRecord = decode(value.value())?;
-            if key.value() != record.record_key() {
-                return Err(integrity(
-                    "store_stop_host_requests",
-                    "host-request key does not match its owner identity",
-                ));
-            }
-            builder.observe("host_requests", key.value(), value.value())?;
-            if !record.state.is_terminal() {
-                builder.counts.host_requests = increment(builder.counts.host_requests)?;
-            }
-        }
-    }
+    observe_host_requests(read, &mut builder)?;
 
     // The logical index is a second durable representation of HostRequest
     // ownership. A missing operation row behind a live link would otherwise
     // disappear from the request denominator and could make a corrupt Store
     // appear empty. Validate all index entries in this same read snapshot.
-    {
-        let requests = read.open_table(HOST_REQUESTS).map_err(storage)?;
-        let links = read
-            .open_table(HOST_REQUEST_LOGICAL_KEYS)
-            .map_err(storage)?;
-        for row in links.iter().map_err(storage)? {
-            let (key, value) = row.map_err(storage)?;
-            let parsed: serde_json::Value = serde_json::from_str(value.value()).map_err(|_| {
-                integrity(
-                    "host_request_logical_index",
-                    "index value is not valid JSON",
-                )
-            })?;
-            builder.observe("host_request_logical_index", key.value(), value.value())?;
-            if parsed.as_object().is_some_and(|object| {
-                object.contains_key("kind")
-                    && object.contains_key("session")
-                    && object.contains_key("occurrence")
-            }) {
-                let presence: super::HostRequestLegacyPresence = decode(value.value())?;
-                if RedbRecoveryStore::host_request_legacy_presence_key(
-                    presence.kind,
-                    &presence.session,
-                    &presence.occurrence,
-                ) != key.value()
-                {
-                    return Err(integrity(
-                        "host_request_legacy_presence",
-                        "presence index key diverges from its stored facts",
-                    ));
-                }
-                continue;
-            }
-            if parsed.as_object().is_some_and(|object| {
-                object.contains_key("tombstone")
-                    && object.contains_key("operation_id")
-                    && object.contains_key("request_digest")
-            }) {
-                let marker: super::HostRequestLogicalTombstone = decode(value.value())?;
-                let row_key = format!(
-                    "{}::{}",
-                    marker.operation_id.as_str(),
-                    marker.request_digest
-                );
-                let stored = requests
-                    .get(row_key.as_str())
-                    .map_err(storage)?
-                    .ok_or_else(|| {
-                        integrity(
-                            "host_request_logical_tombstone",
-                            "logical tombstone has no retained terminal host-request row",
-                        )
-                    })?;
-                let record: HostRequestRecord = decode(stored.value())?;
-                if record.operation_id != marker.operation_id
-                    || record.request_digest != marker.request_digest
-                    || record.state != crate::HostRequestState::Terminal
-                    || RedbRecoveryStore::host_request_logical_key_for_record(&record)?.as_deref()
-                        != Some(key.value())
-                {
-                    return Err(integrity(
-                        "host_request_logical_tombstone",
-                        "logical tombstone diverges from its retained host-request row",
-                    ));
-                }
-                continue;
-            }
+    observe_host_request_logical_keys(read, &mut builder)?;
 
-            let link: super::HostRequestLogicalLink = decode(value.value())?;
-            let row_key = format!("{}::{}", link.operation_id.as_str(), link.request_digest);
-            let stored = requests
-                .get(row_key.as_str())
-                .map_err(storage)?
-                .ok_or_else(|| {
-                    integrity(
-                        "host_request_logical_link",
-                        "logical link points at a missing host-request row",
-                    )
-                })?;
-            let record: HostRequestRecord = decode(stored.value())?;
-            if record.operation_id != link.operation_id
-                || record.request_digest != link.request_digest
-                || RedbRecoveryStore::host_request_logical_key_for_record(&record)?.as_deref()
-                    != Some(key.value())
-            {
-                return Err(integrity(
-                    "host_request_logical_link",
-                    "logical link diverges from its host-request row",
-                ));
-            }
-        }
-    }
+    observe_process_stream_recovery(read, &mut builder)?;
 
-    {
-        let projections = read.open_table(PROCESS_STREAM_RECOVERY).map_err(storage)?;
-        for row in projections.iter().map_err(storage)? {
-            let (key, value) = row.map_err(storage)?;
-            let projection: crate::ProcessStreamRecoveryProjection = decode(value.value())?;
-            if key.value() != projection.record_key()? {
-                return Err(integrity(
-                    "store_stop_process_stream_recovery",
-                    "process-stream key does not match its owner identity",
-                ));
-            }
-            builder.observe("process_stream_recovery", key.value(), value.value())?;
-            if projection.activation != crate::StreamRecoveryActivation::Retired
-                || projection.reconciliation.state
-                    != crate::StreamRecoveryReconciliationState::Reconciled
-                || !projection.gaps.is_empty()
-            {
-                builder.counts.process_stream_recovery =
-                    increment(builder.counts.process_stream_recovery)?;
-            }
-        }
-    }
+    observe_campaign_source_pending(read, &mut builder)?;
 
-    {
-        let pending = read.open_table(CAMPAIGN_SOURCE_PENDING).map_err(storage)?;
-        for row in pending.iter().map_err(storage)? {
-            let (key, value) = row.map_err(storage)?;
-            let reservation: super::CampaignSourceReservation = decode(value.value())?;
-            crate::model::validate_text(
-                &reservation.operation_id,
-                "campaign_source_pending_operation",
-            )?;
-            crate::model::validate_digest(
-                &reservation.request_digest,
-                "campaign_source_pending_request_digest",
-            )?;
-            reservation
-                .publication
-                .validate()
-                .map_err(|error| crate::OrsError::Contract(error.to_string()))?;
-            let expected_key = super::campaign_source_key(&reservation.publication.record)?;
-            if key.value() != expected_key {
-                return Err(integrity(
-                    "campaign_source_pending",
-                    "pending source key does not match its owner record",
-                ));
-            }
-            builder.observe("campaign_source_pending", key.value(), value.value())?;
-            builder.counts.campaign_source_reservations =
-                increment(builder.counts.campaign_source_reservations)?;
-        }
-    }
+    observe_process_start_replay(read, &mut builder)?;
 
-    {
-        let starts = read.open_table(PROCESS_START_REPLAY).map_err(storage)?;
-        for row in starts.iter().map_err(storage)? {
-            let (key, value) = row.map_err(storage)?;
-            let record: crate::ProcessStartReplayRecord = decode(value.value())?;
-            record.validate()?;
-            if key.value() != record.operation_id.as_str() {
-                return Err(integrity(
-                    "process_start_replay",
-                    "replay key does not match its typed owner identity",
-                ));
-            }
-            builder.observe("process_start_replay", key.value(), value.value())?;
-            if record.state != crate::ProcessStartReplayState::Completed {
-                builder.counts.process_start_replays =
-                    increment(builder.counts.process_start_replays)?;
-            }
-        }
-    }
+    observe_authority_handoffs(read, &mut builder)?;
 
-    {
-        let handoffs = read.open_table(AUTHORITY_HANDOFFS).map_err(storage)?;
-        for row in handoffs.iter().map_err(storage)? {
-            let (key, value) = row.map_err(storage)?;
-            let record: crate::AuthorityHandoffRecord = decode(value.value())?;
-            record.validate()?;
-            if key.value() != record.handoff_id.as_str() {
-                return Err(integrity(
-                    "authority_handoff",
-                    "handoff key does not match its typed owner identity",
-                ));
-            }
-            builder.observe("authority_handoffs", key.value(), value.value())?;
-            if record.state != crate::AuthorityHandoffState::Consumed {
-                builder.counts.authority_handoffs = increment(builder.counts.authority_handoffs)?;
-            }
-        }
-    }
+    observe_cutover_ownership(read, &mut builder)?;
 
-    {
-        let cutovers = read.open_table(CUTOVER_OWNERSHIP).map_err(storage)?;
-        for row in cutovers.iter().map_err(storage)? {
-            let (key, value) = row.map_err(storage)?;
-            let stored: super::StoredCutoverOwnership =
-                decode_named(value.value(), "cutover_ownership")?;
-            stored.validate_persisted()?;
-            if key.value() != stored.record.cutover_id {
-                return Err(integrity(
-                    "cutover_ownership",
-                    "cutover key does not match its typed owner identity",
-                ));
-            }
-            builder.observe("cutover_ownership", key.value(), value.value())?;
-            if stored.record.state != eliot_runtime_contracts::GenerationCutoverState::Committed {
-                builder.counts.cutover_ownership = increment(builder.counts.cutover_ownership)?;
-            }
-        }
-    }
+    observe_doctor_attempts(read, &mut builder)?;
 
-    {
-        let attempts = read.open_table(DOCTOR_ATTEMPTS).map_err(storage)?;
-        for row in attempts.iter().map_err(storage)? {
-            let (key, value) = row.map_err(storage)?;
-            let record: crate::DoctorAttemptRecord = decode(value.value())?;
-            record.validate()?;
-            if key.value() != record.record_key() {
-                return Err(integrity(
-                    "doctor_attempt",
-                    "attempt key does not match its typed owner identity",
-                ));
-            }
-            builder.observe("doctor_attempts", key.value(), value.value())?;
-            if !record.state.is_terminal() {
-                builder.counts.doctor_attempts = increment(builder.counts.doctor_attempts)?;
-            }
-        }
-    }
+    observe_doctor_effects(read, &mut builder)?;
 
-    {
-        let effects = read.open_table(DOCTOR_EFFECTS).map_err(storage)?;
-        for row in effects.iter().map_err(storage)? {
-            let (key, value) = row.map_err(storage)?;
-            let record: crate::DoctorEffectRecord = decode(value.value())?;
-            record.validate()?;
-            if key.value() != record.record_key() {
-                return Err(integrity(
-                    "doctor_effect",
-                    "effect key does not match its typed owner identity",
-                ));
-            }
-            builder.observe("doctor_effects", key.value(), value.value())?;
-            if !record.state.is_terminal() {
-                builder.counts.doctor_effects = increment(builder.counts.doctor_effects)?;
-            }
-        }
-    }
+    observe_replay_events(read, &mut builder)?;
 
-    {
-        let mut acknowledgements = std::collections::BTreeMap::new();
-        let acks = read.open_table(REPLAY_ACKS).map_err(storage)?;
-        for row in acks.iter().map_err(storage)? {
-            let (key, value) = row.map_err(storage)?;
-            let acknowledgement: crate::WorkerReplayAckRecord = decode(value.value())?;
-            acknowledgement.validate()?;
-            let expected_key = acknowledgement.record_key();
-            if key.value() != expected_key {
-                return Err(integrity(
-                    "worker_replay_ack",
-                    "acknowledgement key does not match its typed owner identity",
-                ));
-            }
-            builder.observe("worker_replay_acks", key.value(), value.value())?;
-            if acknowledgements
-                .insert(key.value().to_owned(), acknowledgement)
-                .is_some()
-            {
-                return Err(integrity(
-                    "worker_replay_ack",
-                    "duplicate acknowledgement identity was returned",
-                ));
-            }
-        }
+    observe_bridge_event_records(read, &mut builder)?;
 
-        let events = read.open_table(REPLAY_EVENTS).map_err(storage)?;
-        for row in events.iter().map_err(storage)? {
-            let (key, value) = row.map_err(storage)?;
-            let event: crate::WorkerReplayEvent = decode(value.value())?;
-            event.validate()?;
-            let expected_key = event.record_key();
-            if key.value() != expected_key {
-                return Err(integrity(
-                    "worker_replay_event",
-                    "event key does not match its typed owner identity",
-                ));
-            }
-            builder.observe("worker_replay_events", key.value(), value.value())?;
-            match acknowledgements.remove(key.value()) {
-                Some(acknowledgement)
-                    if acknowledgement.stream_id == event.stream_id
-                        && acknowledgement.event_id == event.event_id
-                        && acknowledgement.sequence == event.sequence =>
-                {
-                    if !matches!(
-                        acknowledgement.phase,
-                        crate::WorkerReplayPhase::Applied | crate::WorkerReplayPhase::Rejected
-                    ) {
-                        builder.counts.worker_replay_events =
-                            increment(builder.counts.worker_replay_events)?;
-                    }
-                }
-                Some(_) => {
-                    return Err(integrity(
-                        "worker_replay_ack",
-                        "acknowledgement does not bind its exact event",
-                    ));
-                }
-                None => {
-                    builder.counts.worker_replay_events =
-                        increment(builder.counts.worker_replay_events)?;
-                }
-            }
-        }
-        if !acknowledgements.is_empty() {
-            return Err(integrity(
-                "worker_replay_ack",
-                "acknowledgement has no retained source event",
-            ));
-        }
-    }
+    observe_bridge_event_projections(read, &mut builder)?;
 
-    {
-        let records = read.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
-        for row in records.iter().map_err(storage)? {
-            let (key, value) = row.map_err(storage)?;
-            let record: super::BridgeEventRow = decode(value.value())?;
-            record.validate()?;
-            let namespace = if record.owner_namespace.is_empty() {
-                record.stream_id.as_str()
-            } else {
-                record.owner_namespace.as_str()
-            };
-            let expected_key = format!("{namespace}::{}", record.event_id);
-            if key.value() != expected_key {
-                return Err(integrity(
-                    "bridge_event_record",
-                    "event key does not match its typed owner identity",
-                ));
-            }
-            builder.observe("bridge_event_records", key.value(), value.value())?;
-            builder.counts.bridge_event_records = increment(builder.counts.bridge_event_records)?;
-        }
-    }
+    observe_bridge_event_handoffs(read, &mut builder)?;
 
-    {
-        let projections = read.open_table(BRIDGE_EVENT_PROJECTIONS).map_err(storage)?;
-        for row in projections.iter().map_err(storage)? {
-            let (key, value) = row.map_err(storage)?;
-            let projection: super::BridgeEventProjectionRow = decode(value.value())?;
-            projection.validate()?;
-            let namespace = if projection.owner_namespace.is_empty() {
-                projection.stream_id.as_str()
-            } else {
-                projection.owner_namespace.as_str()
-            };
-            let expected_key = format!("{namespace}::{}", projection.event_id);
-            if key.value() != expected_key {
-                return Err(integrity(
-                    "bridge_event_projection",
-                    "projection key does not match its typed owner identity",
-                ));
-            }
-            builder.observe("bridge_event_projections", key.value(), value.value())?;
-            builder.counts.bridge_event_projections =
-                increment(builder.counts.bridge_event_projections)?;
-        }
-    }
-
-    {
-        let handoffs = read.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
-        for row in handoffs.iter().map_err(storage)? {
-            let (key, value) = row.map_err(storage)?;
-            let record: super::BridgeEventHandoffRow = decode(value.value())?;
-            record.validate()?;
-            let namespace = if record.owner_namespace.is_empty() {
-                record.stream_id.as_str()
-            } else {
-                record.owner_namespace.as_str()
-            };
-            let expected_key = format!("{namespace}::{}", record.event_id);
-            if key.value() != expected_key {
-                return Err(integrity(
-                    "bridge_event_handoff",
-                    "handoff key does not match its typed owner identity",
-                ));
-            }
-            builder.observe("bridge_event_handoffs", key.value(), value.value())?;
-            // Even RECONCILED is not receiver-owned terminal evidence for this
-            // contract; retirement remains unavailable until that evidence is
-            // represented and the owner removes the row.
-            builder.counts.bridge_event_handoffs = increment(builder.counts.bridge_event_handoffs)?;
-        }
-    }
-
-    {
-        let gaps = read.open_table(BRIDGE_EVENT_GAPS).map_err(storage)?;
-        for row in gaps.iter().map_err(storage)? {
-            let (key, value) = row.map_err(storage)?;
-            let record: super::BridgeEventGapRow = decode(value.value())?;
-            record.validate()?;
-            if key.value() != record.gap_id {
-                return Err(integrity(
-                    "bridge_event_gap",
-                    "gap key does not match its typed owner identity",
-                ));
-            }
-            builder.observe("bridge_event_gaps", key.value(), value.value())?;
-            builder.counts.bridge_event_gaps = increment(builder.counts.bridge_event_gaps)?;
-        }
-    }
+    observe_bridge_event_gaps(read, &mut builder)?;
 
     observe_bridge_event_maintenance(read, &mut builder)?;
 
     builder.counts.restore_journal_intents =
-        super::RedbRecoveryStore::unresolved_intents_for_store_stop_in(&read)?;
-    {
-        let intents = read.open_table(RESTORE_JOURNAL_INTENTS).map_err(storage)?;
-        for row in intents.iter().map_err(storage)? {
-            let (key, value) = row.map_err(storage)?;
-            builder.observe("restore_journal_intents", key.value(), value.value())?;
-        }
-    }
-    {
-        let results = read.open_table(RESTORE_JOURNAL_RESULTS).map_err(storage)?;
-        for row in results.iter().map_err(storage)? {
-            let (key, value) = row.map_err(storage)?;
-            builder.observe("restore_journal_results", key.value(), value.value())?;
-        }
-    }
-    {
-        let meta = read.open_table(RESTORE_JOURNAL_META).map_err(storage)?;
-        for row in meta.iter().map_err(storage)? {
-            let (key, value) = row.map_err(storage)?;
-            builder.observe("restore_journal_meta", key.value(), value.value())?;
-        }
-    }
+        super::RedbRecoveryStore::unresolved_intents_for_store_stop_in(read)?;
+    observe_restore_journal_intents(read, &mut builder)?;
+    observe_restore_journal_results(read, &mut builder)?;
+    observe_restore_journal_meta(read, &mut builder)?;
 
     Ok(StoreStopObligationCensus {
         installation_id: identity.installation_id().to_owned(),
@@ -1085,6 +363,916 @@ pub(super) fn census_in_read(
         observation_revision: builder.revision,
         counts: builder.counts,
     })
+}
+
+fn observe_runtime_lease_current(
+    read: &redb::ReadTransaction,
+    builder: &mut CensusBuilder,
+) -> Result<(), crate::OrsError> {
+    let leases = read.open_table(RUNTIME_LEASE_CURRENT).map_err(storage)?;
+    for row in leases.iter().map_err(storage)? {
+        let (key, value) = row.map_err(storage)?;
+        let lease: RuntimeLease = decode(value.value())?;
+        if key.value() != lease.lease_id {
+            return Err(integrity(
+                "runtime_lease_current",
+                "current key does not match lease identity",
+            ));
+        }
+        builder.observe("runtime_leases", key.value(), value.value());
+        if !runtime_lease_is_terminal(lease.state) {
+            builder.counts.runtime_leases = increment(builder.counts.runtime_leases)?;
+        }
+    }
+    Ok(())
+}
+
+fn observe_supervision_lease_current(
+    read: &redb::ReadTransaction,
+    builder: &mut CensusBuilder,
+) -> Result<(), crate::OrsError> {
+    let leases = read
+        .open_table(SUPERVISION_LEASE_CURRENT)
+        .map_err(storage)?;
+    for row in leases.iter().map_err(storage)? {
+        let (key, value) = row.map_err(storage)?;
+        let snapshot: SupervisionLeaseSnapshot =
+            decode_named(value.value(), "supervision_lease_current")?;
+        snapshot.validate()?;
+        if key.value() != snapshot.record.lease_id.as_str() {
+            return Err(integrity(
+                "supervision_lease_current",
+                "current key does not match lease identity",
+            ));
+        }
+        builder.observe("supervision_leases", key.value(), value.value());
+        if !runtime_lease_is_terminal(snapshot.record.state) {
+            builder.counts.supervision_leases = increment(builder.counts.supervision_leases)?;
+        }
+    }
+    Ok(())
+}
+
+fn observe_supervision_lease_staged(
+    read: &redb::ReadTransaction,
+    builder: &mut CensusBuilder,
+) -> Result<(), crate::OrsError> {
+    let staged = read.open_table(SUPERVISION_LEASE_STAGED).map_err(storage)?;
+    for row in staged.iter().map_err(storage)? {
+        let (key, value) = row.map_err(storage)?;
+        let stage: SupervisionLeaseStageReceipt =
+            decode_named(value.value(), "supervision_lease_staged")?;
+        stage.validate()?;
+        if key.value() != stage.ticket.lease_id.as_str() {
+            return Err(integrity(
+                "supervision_lease_staged",
+                "staged key does not match lease identity",
+            ));
+        }
+        builder.observe("supervision_lease_stages", key.value(), value.value());
+        builder.counts.supervision_lease_stages =
+            increment(builder.counts.supervision_lease_stages)?;
+    }
+    Ok(())
+}
+
+fn observe_reservations(
+    read: &redb::ReadTransaction,
+    builder: &mut CensusBuilder,
+) -> Result<(), crate::OrsError> {
+    let reservations = read.open_table(RESERVATIONS).map_err(storage)?;
+    for row in reservations.iter().map_err(storage)? {
+        let (key, value) = row.map_err(storage)?;
+        let record: ReservationRecord = decode(value.value())?;
+        if key.value() != record.token.reservation_id.as_str() {
+            return Err(integrity(
+                "store_stop_reservations",
+                "reservation key does not match its owner identity",
+            ));
+        }
+        builder.observe("write_reservations", key.value(), value.value());
+        if !record.state.is_terminal() {
+            builder.counts.write_reservations = increment(builder.counts.write_reservations)?;
+        }
+    }
+    Ok(())
+}
+
+fn observe_unknown_commit_recovery(
+    read: &redb::ReadTransaction,
+    builder: &mut CensusBuilder,
+) -> Result<(), crate::OrsError> {
+    let commits = read.open_table(UNKNOWN_COMMIT_RECOVERY).map_err(storage)?;
+    for row in commits.iter().map_err(storage)? {
+        let (key, value) = row.map_err(storage)?;
+        let record: UnknownCommitRecord = decode(value.value())?;
+        if key.value() != record.idempotency_key {
+            return Err(integrity(
+                "store_stop_unknown_commits",
+                "unknown-commit key does not match its owner identity",
+            ));
+        }
+        builder.observe("unknown_commits", key.value(), value.value());
+        if record.is_open() {
+            builder.counts.unknown_commits = increment(builder.counts.unknown_commits)?;
+        }
+    }
+    Ok(())
+}
+
+fn observe_operational_current(
+    read: &redb::ReadTransaction,
+    builder: &mut CensusBuilder,
+) -> Result<(), crate::OrsError> {
+    let current = read.open_table(OPERATIONAL_CURRENT).map_err(storage)?;
+    for row in current.iter().map_err(storage)? {
+        let (key, value) = row.map_err(storage)?;
+        let record: DurableOperationalRecord = decode_named(value.value(), "operational_current")?;
+        let expected_key =
+            RedbRecoveryStore::operational_key(record.kind, &record.input.subject_id);
+        if key.value() != expected_key {
+            return Err(integrity(
+                "store_stop_operational_current",
+                "current key does not match its typed owner identity",
+            ));
+        }
+        builder.observe("operational_current", key.value(), value.value());
+        if record.kind == super::OperationalKind::AdmissionReservation {
+            let reservation = record.admission_reservation.as_ref().ok_or_else(|| {
+                integrity(
+                    "store_stop_admission_reservation",
+                    "current admission row has no typed reservation state",
+                )
+            })?;
+            if !matches!(
+                reservation.state,
+                AdmissionReservationState::Released | AdmissionReservationState::Expired
+            ) {
+                builder.counts.admission_reservations =
+                    increment(builder.counts.admission_reservations)?;
+            }
+        } else if is_store_dependent_operational_kind(record.kind)
+            && !matches!(
+                record.phase,
+                OperationalPhase::Terminal | OperationalPhase::Released
+            )
+        {
+            builder.counts.operational_work = increment(builder.counts.operational_work)?;
+        }
+    }
+    Ok(())
+}
+
+fn observe_recovery_inbox(
+    read: &redb::ReadTransaction,
+    builder: &mut CensusBuilder,
+) -> Result<(), crate::OrsError> {
+    let inbox = read.open_table(RECOVERY_INBOX).map_err(storage)?;
+    for row in inbox.iter().map_err(storage)? {
+        let (key, value) = row.map_err(storage)?;
+        let record: DurableInboxRecord = decode_named(value.value(), "recovery_inbox")?;
+        if key.value() != record.item.item_id.as_str() {
+            return Err(integrity(
+                "store_stop_recovery_inbox",
+                "inbox key does not match its owner identity",
+            ));
+        }
+        builder.observe("recovery_inbox", key.value(), value.value());
+        if record.disposition == RecoveryInboxDisposition::Imported {
+            builder.counts.recovery_inbox = increment(builder.counts.recovery_inbox)?;
+        }
+    }
+    Ok(())
+}
+
+fn observe_recovery_problems(
+    read: &redb::ReadTransaction,
+    builder: &mut CensusBuilder,
+) -> Result<(), crate::OrsError> {
+    let problems = read.open_table(RECOVERY_PROBLEMS).map_err(storage)?;
+    for row in problems.iter().map_err(storage)? {
+        let (key, value) = row.map_err(storage)?;
+        let problem: RecoveryProblem = decode(value.value())?;
+        if key.value() != problem.operation_or_checkpoint_id.as_str() {
+            return Err(integrity(
+                "store_stop_recovery_problems",
+                "problem key does not match its owner identity",
+            ));
+        }
+        builder.observe("recovery_problems", key.value(), value.value());
+        if problem.terminal_receipt_id.is_none() {
+            builder.counts.recovery_problems = increment(builder.counts.recovery_problems)?;
+        }
+    }
+    Ok(())
+}
+
+fn observe_effect_operation_leases(
+    read: &redb::ReadTransaction,
+    builder: &mut CensusBuilder,
+) -> Result<(), crate::OrsError> {
+    let leases = read.open_table(EFFECT_OPERATION_LEASES).map_err(storage)?;
+    for row in leases.iter().map_err(storage)? {
+        let (key, value) = row.map_err(storage)?;
+        let lease: crate::EffectOperationLease = decode(value.value())?;
+        if key.value() != lease.lease_id.as_str() {
+            return Err(integrity(
+                "store_stop_effect_leases",
+                "effect lease key does not match lease identity",
+            ));
+        }
+        builder.observe("effect_operation_leases", key.value(), value.value());
+        if !runtime_lease_is_terminal(lease.state)
+            || lease.delivery == crate::EffectDeliveryAcknowledgement::GapOpen
+            || lease.revocation == crate::RevocationAcknowledgement::Unacknowledged
+        {
+            builder.counts.effect_operation_leases =
+                increment(builder.counts.effect_operation_leases)?;
+        }
+    }
+    Ok(())
+}
+
+fn observe_effect_replay_reconciliations(
+    read: &redb::ReadTransaction,
+    builder: &mut CensusBuilder,
+) -> Result<(), crate::OrsError> {
+    let reconciliations = read
+        .open_table(EFFECT_REPLAY_RECONCILIATIONS)
+        .map_err(storage)?;
+    for row in reconciliations.iter().map_err(storage)? {
+        let (key, value) = row.map_err(storage)?;
+        let item: KernelReconciliationItem = decode(value.value())?;
+        let operation_id = item.operation_id.as_ref().ok_or_else(|| {
+            integrity(
+                "store_stop_effect_reconciliation",
+                "durable effect reconciliation has no operation identity",
+            )
+        })?;
+        let expected_key = format!(
+            "{}::{:020}::{}",
+            RedbRecoveryStore::encode_key_component(&item.module_id),
+            item.generation.value(),
+            RedbRecoveryStore::encode_key_component(operation_id.as_str()),
+        );
+        if key.value() != expected_key {
+            return Err(integrity(
+                "store_stop_effect_reconciliation",
+                "reconciliation key does not match its typed owner identity",
+            ));
+        }
+        builder.observe("effect_replay_reconciliations", key.value(), value.value());
+        builder.counts.effect_reconciliations = increment(builder.counts.effect_reconciliations)?;
+    }
+    Ok(())
+}
+
+fn observe_store_rebind_replay(
+    read: &redb::ReadTransaction,
+    builder: &mut CensusBuilder,
+) -> Result<(), crate::OrsError> {
+    let rebinds = read.open_table(STORE_REBIND_REPLAY).map_err(storage)?;
+    for row in rebinds.iter().map_err(storage)? {
+        let (key, value) = row.map_err(storage)?;
+        let record: crate::StoreRebindReplayRecord = decode(value.value())?;
+        record.validate()?;
+        let expected_key = format!(
+            "{}::{}",
+            record.operation_id.as_str(),
+            record.request_digest
+        );
+        if key.value() != expected_key {
+            return Err(integrity(
+                "store_rebind_replay",
+                "rebind key does not match its typed owner identity",
+            ));
+        }
+        builder.observe("store_rebinds", key.value(), value.value());
+        if record.state == crate::StoreRebindReplayState::Pending {
+            builder.counts.store_rebinds = increment(builder.counts.store_rebinds)?;
+        }
+    }
+    Ok(())
+}
+
+fn observe_store_failure_retention(
+    read: &redb::ReadTransaction,
+    builder: &mut CensusBuilder,
+) -> Result<(), crate::OrsError> {
+    let failures = read.open_table(STORE_FAILURE_RETENTION).map_err(storage)?;
+    for row in failures.iter().map_err(storage)? {
+        let (key, value) = row.map_err(storage)?;
+        let record: crate::StoreFailureRetentionRecord = decode(value.value())?;
+        record.validate()?;
+        if key.value() != record.record_key() {
+            return Err(integrity(
+                "store_failure_retention",
+                "failure key does not match its typed owner identity",
+            ));
+        }
+        builder.observe("store_failure_retention", key.value(), value.value());
+        if record.failure.disposition == eliot_store_api::StoreFailureDisposition::UnknownOutcome
+            && record.reconciled_receipt.is_none()
+        {
+            builder.counts.unresolved_store_failures =
+                increment(builder.counts.unresolved_store_failures)?;
+        }
+    }
+    Ok(())
+}
+
+fn observe_scan_disclosure_records(
+    read: &redb::ReadTransaction,
+    builder: &mut CensusBuilder,
+) -> Result<(), crate::OrsError> {
+    let disclosures = read.open_table(SCAN_DISCLOSURE_RECORDS).map_err(storage)?;
+    for row in disclosures.iter().map_err(storage)? {
+        let (key, value) = row.map_err(storage)?;
+        let record: crate::ScanDisclosureOrsRecord = decode(value.value())?;
+        record.validate()?;
+        if key.value() != record.operation_key {
+            return Err(integrity(
+                "scan_disclosure",
+                "disclosure key does not match its typed owner identity",
+            ));
+        }
+        builder.observe("scan_disclosure", key.value(), value.value());
+        if record.state == crate::ScanDisclosureRecordState::Prepared {
+            builder.counts.prepared_scan_disclosures =
+                increment(builder.counts.prepared_scan_disclosures)?;
+        }
+    }
+    Ok(())
+}
+
+fn observe_activation_lifecycles(
+    read: &redb::ReadTransaction,
+    builder: &mut CensusBuilder,
+) -> Result<(), crate::OrsError> {
+    let lifecycles = read.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+    for row in lifecycles.iter().map_err(storage)? {
+        let (key, value) = row.map_err(storage)?;
+        let record: crate::ActivationLifecycleRecord = decode(value.value())?;
+        record.validate()?;
+        if key.value() != record.record_key() {
+            return Err(integrity(
+                "activation_lifecycle",
+                "lifecycle key does not match ticket identity",
+            ));
+        }
+        builder.observe("activation_lifecycles", key.value(), value.value());
+        match record.state {
+            crate::ActivationLifecycleState::Pending
+            | crate::ActivationLifecycleState::Claimed
+            | crate::ActivationLifecycleState::Reconciling => {
+                builder.counts.activation_lifecycles =
+                    increment(builder.counts.activation_lifecycles)?;
+            }
+            // This immutable predecessor result may schedule a successor
+            // on a later activation, but it carries no live Store work.
+            // Retaining it must not keep the Store branch alive by itself.
+            crate::ActivationLifecycleState::DeferredNotReady
+            | crate::ActivationLifecycleState::ResultAccepted
+            | crate::ActivationLifecycleState::Cancelled
+            | crate::ActivationLifecycleState::Expired => {}
+        }
+    }
+    Ok(())
+}
+
+fn observe_native_worker_claims(
+    read: &redb::ReadTransaction,
+    builder: &mut CensusBuilder,
+) -> Result<(), crate::OrsError> {
+    let claims = read.open_table(NATIVE_WORKER_CLAIMS).map_err(storage)?;
+    for row in claims.iter().map_err(storage)? {
+        let (key, value) = row.map_err(storage)?;
+        let record: crate::NativeWorkerClaimRecord = decode(value.value())?;
+        record.validate()?;
+        if key.value() != record.record_key() {
+            return Err(integrity(
+                "native_worker_claim",
+                "claim key does not match its typed owner identity",
+            ));
+        }
+        builder.observe("native_worker_claims", key.value(), value.value());
+        if !record.state.is_terminal() {
+            builder.counts.native_worker_claims = increment(builder.counts.native_worker_claims)?;
+        }
+    }
+    Ok(())
+}
+
+fn observe_host_requests(
+    read: &redb::ReadTransaction,
+    builder: &mut CensusBuilder,
+) -> Result<(), crate::OrsError> {
+    let requests = read.open_table(HOST_REQUESTS).map_err(storage)?;
+    for row in requests.iter().map_err(storage)? {
+        let (key, value) = row.map_err(storage)?;
+        let record: HostRequestRecord = decode(value.value())?;
+        if key.value() != record.record_key() {
+            return Err(integrity(
+                "store_stop_host_requests",
+                "host-request key does not match its owner identity",
+            ));
+        }
+        builder.observe("host_requests", key.value(), value.value());
+        if !record.state.is_terminal() {
+            builder.counts.host_requests = increment(builder.counts.host_requests)?;
+        }
+    }
+    Ok(())
+}
+
+fn observe_host_request_logical_keys(
+    read: &redb::ReadTransaction,
+    builder: &mut CensusBuilder,
+) -> Result<(), crate::OrsError> {
+    let requests = read.open_table(HOST_REQUESTS).map_err(storage)?;
+    let links = read
+        .open_table(HOST_REQUEST_LOGICAL_KEYS)
+        .map_err(storage)?;
+    for row in links.iter().map_err(storage)? {
+        let (key, value) = row.map_err(storage)?;
+        let parsed: serde_json::Value = serde_json::from_str(value.value()).map_err(|_| {
+            integrity(
+                "host_request_logical_index",
+                "index value is not valid JSON",
+            )
+        })?;
+        builder.observe("host_request_logical_index", key.value(), value.value());
+        if parsed.as_object().is_some_and(|object| {
+            object.contains_key("kind")
+                && object.contains_key("session")
+                && object.contains_key("occurrence")
+        }) {
+            let presence: super::HostRequestLegacyPresence = decode(value.value())?;
+            if RedbRecoveryStore::host_request_legacy_presence_key(
+                presence.kind,
+                &presence.session,
+                &presence.occurrence,
+            ) != key.value()
+            {
+                return Err(integrity(
+                    "host_request_legacy_presence",
+                    "presence index key diverges from its stored facts",
+                ));
+            }
+            continue;
+        }
+        if parsed.as_object().is_some_and(|object| {
+            object.contains_key("tombstone")
+                && object.contains_key("operation_id")
+                && object.contains_key("request_digest")
+        }) {
+            let marker: super::HostRequestLogicalTombstone = decode(value.value())?;
+            let row_key = format!(
+                "{}::{}",
+                marker.operation_id.as_str(),
+                marker.request_digest
+            );
+            let stored = requests
+                .get(row_key.as_str())
+                .map_err(storage)?
+                .ok_or_else(|| {
+                    integrity(
+                        "host_request_logical_tombstone",
+                        "logical tombstone has no retained terminal host-request row",
+                    )
+                })?;
+            let record: HostRequestRecord = decode(stored.value())?;
+            if record.operation_id != marker.operation_id
+                || record.request_digest != marker.request_digest
+                || record.state != crate::HostRequestState::Terminal
+                || RedbRecoveryStore::host_request_logical_key_for_record(&record)?.as_deref()
+                    != Some(key.value())
+            {
+                return Err(integrity(
+                    "host_request_logical_tombstone",
+                    "logical tombstone diverges from its retained host-request row",
+                ));
+            }
+            continue;
+        }
+
+        let link: super::HostRequestLogicalLink = decode(value.value())?;
+        let row_key = format!("{}::{}", link.operation_id.as_str(), link.request_digest);
+        let stored = requests
+            .get(row_key.as_str())
+            .map_err(storage)?
+            .ok_or_else(|| {
+                integrity(
+                    "host_request_logical_link",
+                    "logical link points at a missing host-request row",
+                )
+            })?;
+        let record: HostRequestRecord = decode(stored.value())?;
+        if record.operation_id != link.operation_id
+            || record.request_digest != link.request_digest
+            || RedbRecoveryStore::host_request_logical_key_for_record(&record)?.as_deref()
+                != Some(key.value())
+        {
+            return Err(integrity(
+                "host_request_logical_link",
+                "logical link diverges from its host-request row",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn observe_process_stream_recovery(
+    read: &redb::ReadTransaction,
+    builder: &mut CensusBuilder,
+) -> Result<(), crate::OrsError> {
+    let projections = read.open_table(PROCESS_STREAM_RECOVERY).map_err(storage)?;
+    for row in projections.iter().map_err(storage)? {
+        let (key, value) = row.map_err(storage)?;
+        let projection: crate::ProcessStreamRecoveryProjection = decode(value.value())?;
+        if key.value() != projection.record_key()? {
+            return Err(integrity(
+                "store_stop_process_stream_recovery",
+                "process-stream key does not match its owner identity",
+            ));
+        }
+        builder.observe("process_stream_recovery", key.value(), value.value());
+        if projection.activation != crate::StreamRecoveryActivation::Retired
+            || projection.reconciliation.state
+                != crate::StreamRecoveryReconciliationState::Reconciled
+            || !projection.gaps.is_empty()
+        {
+            builder.counts.process_stream_recovery =
+                increment(builder.counts.process_stream_recovery)?;
+        }
+    }
+    Ok(())
+}
+
+fn observe_campaign_source_pending(
+    read: &redb::ReadTransaction,
+    builder: &mut CensusBuilder,
+) -> Result<(), crate::OrsError> {
+    let pending = read.open_table(CAMPAIGN_SOURCE_PENDING).map_err(storage)?;
+    for row in pending.iter().map_err(storage)? {
+        let (key, value) = row.map_err(storage)?;
+        let reservation: super::CampaignSourceReservation = decode(value.value())?;
+        crate::model::validate_text(
+            &reservation.operation_id,
+            "campaign_source_pending_operation",
+        )?;
+        crate::model::validate_digest(
+            &reservation.request_digest,
+            "campaign_source_pending_request_digest",
+        )?;
+        reservation.publication.validate()?;
+        let expected_key = super::campaign_source_key(&reservation.publication.record)?;
+        if key.value() != expected_key {
+            return Err(integrity(
+                "campaign_source_pending",
+                "pending source key does not match its owner record",
+            ));
+        }
+        builder.observe("campaign_source_pending", key.value(), value.value());
+        builder.counts.campaign_source_reservations =
+            increment(builder.counts.campaign_source_reservations)?;
+    }
+    Ok(())
+}
+
+fn observe_process_start_replay(
+    read: &redb::ReadTransaction,
+    builder: &mut CensusBuilder,
+) -> Result<(), crate::OrsError> {
+    let starts = read.open_table(PROCESS_START_REPLAY).map_err(storage)?;
+    for row in starts.iter().map_err(storage)? {
+        let (key, value) = row.map_err(storage)?;
+        let record: crate::ProcessStartReplayRecord = decode(value.value())?;
+        record.validate()?;
+        if key.value() != record.operation_id.as_str() {
+            return Err(integrity(
+                "process_start_replay",
+                "replay key does not match its typed owner identity",
+            ));
+        }
+        builder.observe("process_start_replay", key.value(), value.value());
+        if record.state != crate::ProcessStartReplayState::Completed {
+            builder.counts.process_start_replays = increment(builder.counts.process_start_replays)?;
+        }
+    }
+    Ok(())
+}
+
+fn observe_authority_handoffs(
+    read: &redb::ReadTransaction,
+    builder: &mut CensusBuilder,
+) -> Result<(), crate::OrsError> {
+    let handoffs = read.open_table(AUTHORITY_HANDOFFS).map_err(storage)?;
+    for row in handoffs.iter().map_err(storage)? {
+        let (key, value) = row.map_err(storage)?;
+        let record: crate::AuthorityHandoffRecord = decode(value.value())?;
+        record.validate()?;
+        if key.value() != record.handoff_id.as_str() {
+            return Err(integrity(
+                "authority_handoff",
+                "handoff key does not match its typed owner identity",
+            ));
+        }
+        builder.observe("authority_handoffs", key.value(), value.value());
+        if record.state != crate::AuthorityHandoffState::Consumed {
+            builder.counts.authority_handoffs = increment(builder.counts.authority_handoffs)?;
+        }
+    }
+    Ok(())
+}
+
+fn observe_cutover_ownership(
+    read: &redb::ReadTransaction,
+    builder: &mut CensusBuilder,
+) -> Result<(), crate::OrsError> {
+    let cutovers = read.open_table(CUTOVER_OWNERSHIP).map_err(storage)?;
+    for row in cutovers.iter().map_err(storage)? {
+        let (key, value) = row.map_err(storage)?;
+        let stored: super::StoredCutoverOwnership =
+            decode_named(value.value(), "cutover_ownership")?;
+        stored.validate_persisted()?;
+        if key.value() != stored.record.cutover_id {
+            return Err(integrity(
+                "cutover_ownership",
+                "cutover key does not match its typed owner identity",
+            ));
+        }
+        builder.observe("cutover_ownership", key.value(), value.value());
+        if stored.record.state != eliot_runtime_contracts::GenerationCutoverState::Committed {
+            builder.counts.cutover_ownership = increment(builder.counts.cutover_ownership)?;
+        }
+    }
+    Ok(())
+}
+
+fn observe_doctor_attempts(
+    read: &redb::ReadTransaction,
+    builder: &mut CensusBuilder,
+) -> Result<(), crate::OrsError> {
+    let attempts = read.open_table(DOCTOR_ATTEMPTS).map_err(storage)?;
+    for row in attempts.iter().map_err(storage)? {
+        let (key, value) = row.map_err(storage)?;
+        let record: crate::DoctorAttemptRecord = decode(value.value())?;
+        record.validate()?;
+        if key.value() != record.record_key() {
+            return Err(integrity(
+                "doctor_attempt",
+                "attempt key does not match its typed owner identity",
+            ));
+        }
+        builder.observe("doctor_attempts", key.value(), value.value());
+        if !record.state.is_terminal() {
+            builder.counts.doctor_attempts = increment(builder.counts.doctor_attempts)?;
+        }
+    }
+    Ok(())
+}
+
+fn observe_doctor_effects(
+    read: &redb::ReadTransaction,
+    builder: &mut CensusBuilder,
+) -> Result<(), crate::OrsError> {
+    let effects = read.open_table(DOCTOR_EFFECTS).map_err(storage)?;
+    for row in effects.iter().map_err(storage)? {
+        let (key, value) = row.map_err(storage)?;
+        let record: crate::DoctorEffectRecord = decode(value.value())?;
+        record.validate()?;
+        if key.value() != record.record_key() {
+            return Err(integrity(
+                "doctor_effect",
+                "effect key does not match its typed owner identity",
+            ));
+        }
+        builder.observe("doctor_effects", key.value(), value.value());
+        if !record.state.is_terminal() {
+            builder.counts.doctor_effects = increment(builder.counts.doctor_effects)?;
+        }
+    }
+    Ok(())
+}
+
+fn observe_replay_events(
+    read: &redb::ReadTransaction,
+    builder: &mut CensusBuilder,
+) -> Result<(), crate::OrsError> {
+    let mut acknowledgements = std::collections::BTreeMap::new();
+    let acks = read.open_table(REPLAY_ACKS).map_err(storage)?;
+    for row in acks.iter().map_err(storage)? {
+        let (key, value) = row.map_err(storage)?;
+        let acknowledgement: crate::WorkerReplayAckRecord = decode(value.value())?;
+        acknowledgement.validate()?;
+        let expected_key = acknowledgement.record_key();
+        if key.value() != expected_key {
+            return Err(integrity(
+                "worker_replay_ack",
+                "acknowledgement key does not match its typed owner identity",
+            ));
+        }
+        builder.observe("worker_replay_acks", key.value(), value.value());
+        if acknowledgements
+            .insert(key.value().to_owned(), acknowledgement)
+            .is_some()
+        {
+            return Err(integrity(
+                "worker_replay_ack",
+                "duplicate acknowledgement identity was returned",
+            ));
+        }
+    }
+
+    let events = read.open_table(REPLAY_EVENTS).map_err(storage)?;
+    for row in events.iter().map_err(storage)? {
+        let (key, value) = row.map_err(storage)?;
+        let event: crate::WorkerReplayEvent = decode(value.value())?;
+        event.validate()?;
+        let expected_key = event.record_key();
+        if key.value() != expected_key {
+            return Err(integrity(
+                "worker_replay_event",
+                "event key does not match its typed owner identity",
+            ));
+        }
+        builder.observe("worker_replay_events", key.value(), value.value());
+        match acknowledgements.remove(key.value()) {
+            Some(acknowledgement)
+                if acknowledgement.stream_id == event.stream_id
+                    && acknowledgement.event_id == event.event_id
+                    && acknowledgement.sequence == event.sequence =>
+            {
+                if !matches!(
+                    acknowledgement.phase,
+                    crate::WorkerReplayPhase::Applied | crate::WorkerReplayPhase::Rejected
+                ) {
+                    builder.counts.worker_replay_events =
+                        increment(builder.counts.worker_replay_events)?;
+                }
+            }
+            Some(_) => {
+                return Err(integrity(
+                    "worker_replay_ack",
+                    "acknowledgement does not bind its exact event",
+                ));
+            }
+            None => {
+                builder.counts.worker_replay_events =
+                    increment(builder.counts.worker_replay_events)?;
+            }
+        }
+    }
+    if !acknowledgements.is_empty() {
+        return Err(integrity(
+            "worker_replay_ack",
+            "acknowledgement has no retained source event",
+        ));
+    }
+    Ok(())
+}
+
+fn observe_bridge_event_records(
+    read: &redb::ReadTransaction,
+    builder: &mut CensusBuilder,
+) -> Result<(), crate::OrsError> {
+    let records = read.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
+    for row in records.iter().map_err(storage)? {
+        let (key, value) = row.map_err(storage)?;
+        let record: super::BridgeEventRow = decode(value.value())?;
+        record.validate()?;
+        let namespace = if record.owner_namespace.is_empty() {
+            record.stream_id.as_str()
+        } else {
+            record.owner_namespace.as_str()
+        };
+        let expected_key = format!("{namespace}::{}", record.event_id);
+        if key.value() != expected_key {
+            return Err(integrity(
+                "bridge_event_record",
+                "event key does not match its typed owner identity",
+            ));
+        }
+        builder.observe("bridge_event_records", key.value(), value.value());
+        builder.counts.bridge_event_records = increment(builder.counts.bridge_event_records)?;
+    }
+    Ok(())
+}
+
+fn observe_bridge_event_projections(
+    read: &redb::ReadTransaction,
+    builder: &mut CensusBuilder,
+) -> Result<(), crate::OrsError> {
+    let projections = read.open_table(BRIDGE_EVENT_PROJECTIONS).map_err(storage)?;
+    for row in projections.iter().map_err(storage)? {
+        let (key, value) = row.map_err(storage)?;
+        let projection: super::BridgeEventProjectionRow = decode(value.value())?;
+        projection.validate()?;
+        let namespace = if projection.owner_namespace.is_empty() {
+            projection.stream_id.as_str()
+        } else {
+            projection.owner_namespace.as_str()
+        };
+        let expected_key = format!("{namespace}::{}", projection.event_id);
+        if key.value() != expected_key {
+            return Err(integrity(
+                "bridge_event_projection",
+                "projection key does not match its typed owner identity",
+            ));
+        }
+        builder.observe("bridge_event_projections", key.value(), value.value());
+        builder.counts.bridge_event_projections =
+            increment(builder.counts.bridge_event_projections)?;
+    }
+    Ok(())
+}
+
+fn observe_bridge_event_handoffs(
+    read: &redb::ReadTransaction,
+    builder: &mut CensusBuilder,
+) -> Result<(), crate::OrsError> {
+    let handoffs = read.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
+    for row in handoffs.iter().map_err(storage)? {
+        let (key, value) = row.map_err(storage)?;
+        let record: super::BridgeEventHandoffRow = decode(value.value())?;
+        record.validate()?;
+        let namespace = if record.owner_namespace.is_empty() {
+            record.stream_id.as_str()
+        } else {
+            record.owner_namespace.as_str()
+        };
+        let expected_key = format!("{namespace}::{}", record.event_id);
+        if key.value() != expected_key {
+            return Err(integrity(
+                "bridge_event_handoff",
+                "handoff key does not match its typed owner identity",
+            ));
+        }
+        builder.observe("bridge_event_handoffs", key.value(), value.value());
+        // Even RECONCILED is not receiver-owned terminal evidence for this
+        // contract; retirement remains unavailable until that evidence is
+        // represented and the owner removes the row.
+        builder.counts.bridge_event_handoffs = increment(builder.counts.bridge_event_handoffs)?;
+    }
+    Ok(())
+}
+
+fn observe_bridge_event_gaps(
+    read: &redb::ReadTransaction,
+    builder: &mut CensusBuilder,
+) -> Result<(), crate::OrsError> {
+    let gaps = read.open_table(BRIDGE_EVENT_GAPS).map_err(storage)?;
+    for row in gaps.iter().map_err(storage)? {
+        let (key, value) = row.map_err(storage)?;
+        let record: super::BridgeEventGapRow = decode(value.value())?;
+        record.validate()?;
+        if key.value() != record.gap_id {
+            return Err(integrity(
+                "bridge_event_gap",
+                "gap key does not match its typed owner identity",
+            ));
+        }
+        builder.observe("bridge_event_gaps", key.value(), value.value());
+        builder.counts.bridge_event_gaps = increment(builder.counts.bridge_event_gaps)?;
+    }
+    Ok(())
+}
+
+fn observe_restore_journal_intents(
+    read: &redb::ReadTransaction,
+    builder: &mut CensusBuilder,
+) -> Result<(), crate::OrsError> {
+    let intents = read.open_table(RESTORE_JOURNAL_INTENTS).map_err(storage)?;
+    for row in intents.iter().map_err(storage)? {
+        let (key, value) = row.map_err(storage)?;
+        builder.observe("restore_journal_intents", key.value(), value.value());
+    }
+    Ok(())
+}
+
+fn observe_restore_journal_results(
+    read: &redb::ReadTransaction,
+    builder: &mut CensusBuilder,
+) -> Result<(), crate::OrsError> {
+    let results = read.open_table(RESTORE_JOURNAL_RESULTS).map_err(storage)?;
+    for row in results.iter().map_err(storage)? {
+        let (key, value) = row.map_err(storage)?;
+        builder.observe("restore_journal_results", key.value(), value.value());
+    }
+    Ok(())
+}
+
+fn observe_restore_journal_meta(
+    read: &redb::ReadTransaction,
+    builder: &mut CensusBuilder,
+) -> Result<(), crate::OrsError> {
+    let meta = read.open_table(RESTORE_JOURNAL_META).map_err(storage)?;
+    for row in meta.iter().map_err(storage)? {
+        let (key, value) = row.map_err(storage)?;
+        builder.observe("restore_journal_meta", key.value(), value.value());
+    }
+    Ok(())
 }
 
 fn observe_cold_start_readiness(
@@ -1109,7 +1297,7 @@ fn observe_cold_start_readiness(
                     "readiness row key does not match its typed owner identity",
                 ));
             }
-            builder.observe("cold_start_readiness_records", key.value(), value.value())?;
+            builder.observe("cold_start_readiness_records", key.value(), value.value());
             if record.terminal.is_none() {
                 builder.counts.cold_start_readiness_leases =
                     increment(builder.counts.cold_start_readiness_leases)?;
@@ -1139,39 +1327,7 @@ fn observe_cold_start_readiness(
         }
     }
 
-    let mut head_count = 0_usize;
-    {
-        let heads = read
-            .open_table(COLD_START_READINESS_HEADS)
-            .map_err(storage)?;
-        for row in heads.iter().map_err(storage)? {
-            let (key, value) = row.map_err(storage)?;
-            let head: super::ColdStartReadinessRevisionHead = decode(value.value())?;
-            head.validate()?;
-            if key.value() != head.base_identity_digest.as_str()
-                || newest_by_base.get(key.value())
-                    != Some(&(head.record_key.clone(), head.record_revision))
-            {
-                return Err(integrity(
-                    "cold_start_readiness_head",
-                    "revision head does not identify the latest exact readiness row",
-                ));
-            }
-            builder.observe("cold_start_readiness_heads", key.value(), value.value())?;
-            head_count = head_count.checked_add(1).ok_or_else(|| {
-                integrity(
-                    "cold_start_readiness_head",
-                    "revision-head count overflowed its platform range",
-                )
-            })?;
-        }
-    }
-    if head_count != newest_by_base.len() {
-        return Err(integrity(
-            "cold_start_readiness_head",
-            "a readiness identity has no exact durable revision head",
-        ));
-    }
+    observe_cold_start_heads(read, builder, &newest_by_base)?;
 
     let mut binding_count = 0_usize;
     {
@@ -1196,7 +1352,7 @@ fn observe_cold_start_readiness(
                     "binding index does not identify the latest exact readiness row",
                 ));
             }
-            builder.observe("cold_start_readiness_bindings", key.value(), value.value())?;
+            builder.observe("cold_start_readiness_bindings", key.value(), value.value());
             binding_count = binding_count.checked_add(1).ok_or_else(|| {
                 integrity(
                     "cold_start_readiness_binding",
@@ -1211,6 +1367,48 @@ fn observe_cold_start_readiness(
             "a readiness binding has no exact durable index",
         ));
     }
+    Ok(())
+}
+
+fn observe_cold_start_heads(
+    read: &redb::ReadTransaction,
+    builder: &mut CensusBuilder,
+    newest_by_base: &std::collections::BTreeMap<String, (String, u64)>,
+) -> Result<(), crate::OrsError> {
+    let mut head_count = 0_usize;
+    {
+        let heads = read
+            .open_table(COLD_START_READINESS_HEADS)
+            .map_err(storage)?;
+        for row in heads.iter().map_err(storage)? {
+            let (key, value) = row.map_err(storage)?;
+            let head: super::ColdStartReadinessRevisionHead = decode(value.value())?;
+            head.validate()?;
+            if key.value() != head.base_identity_digest.as_str()
+                || newest_by_base.get(key.value())
+                    != Some(&(head.record_key.clone(), head.record_revision))
+            {
+                return Err(integrity(
+                    "cold_start_readiness_head",
+                    "revision head does not identify the latest exact readiness row",
+                ));
+            }
+            builder.observe("cold_start_readiness_heads", key.value(), value.value());
+            head_count = head_count.checked_add(1).ok_or_else(|| {
+                integrity(
+                    "cold_start_readiness_head",
+                    "revision-head count overflowed its platform range",
+                )
+            })?;
+        }
+    }
+    if head_count != newest_by_base.len() {
+        return Err(integrity(
+            "cold_start_readiness_head",
+            "a readiness identity has no exact durable revision head",
+        ));
+    }
+
     Ok(())
 }
 
@@ -1235,7 +1433,7 @@ fn observe_bridge_event_maintenance(
                     "cursor key does not match its typed owner identity",
                 ));
             }
-            builder.observe("bridge_event_cursors", key.value(), value.value())?;
+            builder.observe("bridge_event_cursors", key.value(), value.value());
             for scan in [
                 cursor.handoff_repair_scan.as_ref(),
                 cursor.handoff_retirement_scan.as_ref(),
@@ -1269,7 +1467,7 @@ fn observe_bridge_event_maintenance(
                 "bridge_event_owner_maintenance_cursors",
                 key.value(),
                 value.value(),
-            )?;
+            );
             if cursor.after_sequence != 0 {
                 builder.counts.bridge_event_maintenance_continuations =
                     increment(builder.counts.bridge_event_maintenance_continuations)?;
@@ -1332,11 +1530,10 @@ impl CensusBuilder {
         }
     }
 
-    fn observe(&mut self, family: &str, key: &str, value: &str) -> Result<(), crate::OrsError> {
+    fn observe(&mut self, family: &str, key: &str, value: &str) {
         let key_digest = crate::model::sha256_hex(key.as_bytes());
         let value_digest = crate::model::sha256_hex(value.as_bytes());
         let next = format!("{}\n{family}\n{key_digest}\n{value_digest}", self.revision);
         self.revision = crate::model::sha256_hex(next.as_bytes());
-        Ok(())
     }
 }

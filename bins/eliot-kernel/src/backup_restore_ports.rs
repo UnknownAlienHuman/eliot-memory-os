@@ -2063,6 +2063,7 @@ pub fn ors_to_backup(error: OrsError) -> BackupError {
             },
         },
         OrsError::Contract(detail) => BackupError::Foundation(detail),
+        OrsError::StoreContract(source) => BackupError::Store(source),
         OrsError::AuthorityHandoffNotFresh
         | OrsError::StaleWriterEpoch
         | OrsError::RecoveryOwnerMismatch => BackupError::FenceMismatch {

@@ -15,6 +15,7 @@
 //! lease references are checked for consistency, never used as the census.
 
 use super::*;
+use eliot_host_state::EliotActivationRecord;
 
 /// Complete identity of the Host activation generation whose retirement is
 /// being admitted.
@@ -123,7 +124,7 @@ impl HostComposition {
         };
         query
             .validate()
-            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            .map_err(|error| HostError::StoreCensusKernel(Box::new(error)))?;
         let request = kernel_control_request(
             candidate,
             launch.authority_generation,
@@ -136,11 +137,11 @@ impl HostComposition {
             state_fence.resource_generation.value()
         );
         let request_frame = eliot_kernel_service::control_request_frame(connection_id, &request)
-            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            .map_err(HostError::StoreCensusTransport)?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            .map_err(HostError::StoreCensusIo)?;
         let response = runtime.block_on(async {
             let mut transport =
                 connect_authenticated_kernel_front_door(candidate, &kernel_process).await?;
@@ -154,7 +155,7 @@ impl HostComposition {
             match transport
                 .send_frame(&request_frame, limits)
                 .await
-                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?
+                .map_err(HostError::StoreCensusTransport)?
             {
                 eliot_ipc::DeliveryOutcome::Delivered => {}
                 eliot_ipc::DeliveryOutcome::UnknownOutcome => {
@@ -166,13 +167,13 @@ impl HostComposition {
             let frame = transport
                 .receive_frame(limits)
                 .await
-                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+                .map_err(HostError::StoreCensusTransport)?;
             eliot_kernel_service::decode_control_response_frame(&frame)
                 .map_err(|error| HostError::RecoveryRequired(error.to_string()))
         })?;
         response
             .validate()
-            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            .map_err(|error| HostError::StoreCensusKernel(Box::new(error)))?;
         if response.message_id != request.message_id
             || response.request_digest != request.payload_digest
             || response.state != KernelServiceState::Ready
@@ -195,7 +196,7 @@ impl HostComposition {
         })?;
         census
             .validate()
-            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            .map_err(|error| HostError::StoreCensusKernel(Box::new(error)))?;
         let supervision = &census.supervision_lease.record;
         let store_stop = &census.store_stop_obligations;
         if census.state_fence != state_fence

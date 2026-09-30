@@ -1503,6 +1503,9 @@ pub const fn activation_state_code(state: ActivationState) -> &'static str {
 
 fn lease_census_reason(error: &HostError) -> &'static str {
     match error {
+        HostError::StoreCensusKernel(_) => "kernel-store-census-unavailable",
+        HostError::StoreCensusTransport(_) => "kernel-store-census-transport-unreadable",
+        HostError::StoreCensusIo(_) => "store-census-runtime-unavailable",
         HostError::Journal(_)
         | HostError::State(_)
         | HostError::Installation(_)

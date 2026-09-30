@@ -224,7 +224,6 @@ fn observe_audit_fallback_submission(outcome: &crate::audit_fallback::AuditFallb
 }
 
 mod idle_lease_census;
-pub(crate) use idle_lease_census::KernelIdleLeaseCensus;
 // The availability value every I1.13 admission guard reads. The guard
 // functions themselves stay owned by `kernel_unavailability`; only the type is
 // named here, by the composition that observes it.
@@ -4919,7 +4918,15 @@ impl KernelComposition {
         // DrainCommit linearization point. The committed State Fence is the
         // revalidated one, so the authority the commit fences is the same
         // authority the final census was proven under.
-        let authority_epochs_fenced = vec![final_admission.state_fence];
+        let authority_epochs_fenced = vec![format!(
+            "{}:{}",
+            final_admission
+                .state_fence
+                .authority_epoch
+                .lineage_id
+                .as_str(),
+            final_admission.state_fence.authority_epoch.sequence.get()
+        )];
         let decision = DrainCommitDecision {
             generation: generation.clone(),
             lease_and_pending_snapshot: Vec::new(),
@@ -5054,7 +5061,7 @@ impl KernelComposition {
         Ok(DrainAdmissionCoherence {
             drain_generation,
             state_fence,
-            activation_id,
+            activation_id: activation_id.as_str().to_owned(),
             activation_generation,
             service_state,
             bridge_sessions,

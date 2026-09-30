@@ -117,6 +117,9 @@ pub(crate) enum ReadinessFailureKind {
 #[cfg(windows)]
 pub(crate) fn readiness_failure_kind(error: &HostError) -> ReadinessFailureKind {
     match error {
+        HostError::StoreCensusKernel(_)
+        | HostError::StoreCensusTransport(_)
+        | HostError::StoreCensusIo(_) => ReadinessFailureKind::ProbeRejected,
         HostError::RecoveryRequired(_) => ReadinessFailureKind::DeliveryUnknown,
         HostError::Journal(JournalError::OutcomeUnknown { .. }) => {
             ReadinessFailureKind::JournalOutcomeUnknown

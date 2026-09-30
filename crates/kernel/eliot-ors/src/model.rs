@@ -4468,8 +4468,8 @@ pub enum OrsError {
     },
     #[error("foundation contract rejected ORS input: {0}")]
     Contract(String),
-    #[error("State Fence contract rejected ORS input: {0}")]
-    StateFenceContract(#[from] eliot_contracts::ContractError),
+    #[error("Store contract rejected ORS input: {0}")]
+    StoreContract(#[from] eliot_store_api::StoreError),
     #[error("unsupported recovery envelope contract version {0}")]
     UnsupportedContractVersion(u16),
     #[error("payload length exceeds the supported counter")]
