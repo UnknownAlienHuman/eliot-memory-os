@@ -4921,9 +4921,16 @@ async fn prepare_observation_capture(
         live_fence: retained.state_fence.clone(),
     };
     let prepared = prepare_governed_capture(&services, &retained, &admitted).await?;
-    let receipt = exchange_governed_capture(&services, &retained, &admitted, &prepared).await?;
-    let completion = accept_governed_capture(&services, &prepared, receipt).await?;
-    render_observe_completion(&retained, completion)
+    match exchange_governed_capture(&services, &retained, &admitted, &prepared).await? {
+        eliot_store_api::PreparedWriteOutcome::Staged(submission) => {
+            let source = observe_original_write_submission(&retained.claimed.tool)?;
+            render_staged_observe_submission(&retained, &prepared, &source, *submission)
+        }
+        eliot_store_api::PreparedWriteOutcome::Receipt(receipt) => {
+            let completion = accept_governed_capture(&services, &prepared, *receipt).await?;
+            render_observe_completion(&retained, completion)
+        }
+    }
 }
 
 fn retain_observe_capture(
@@ -5306,14 +5313,7 @@ async fn prepare_governed_capture(
     admitted: &AdmittedObserveCapture,
 ) -> Result<eliot_governor::PreparedMcpObservation, String> {
     let content = observe_content_value(&retained.claimed.tool)?;
-    let original_write_submission: eliot_store_api::OriginalWriteSubmission =
-        serde_json::from_value(
-            content
-                .get("write_submission")
-                .cloned()
-                .ok_or_else(|| "Observation capture omits original write submission".to_owned())?,
-        )
-        .map_err(|error| format!("Observation write submission is invalid: {error}"))?;
+    let original_write_submission = observe_original_write_submission(&retained.claimed.tool)?;
     let operation_id = OperationId::new(host_request_operation_id(&retained.claimed.envelope))
         .map_err(|error| format!("Observe operation identity is invalid: {error}"))?;
     let guard = services.composition.lock().await;
@@ -5360,7 +5360,7 @@ async fn exchange_governed_capture(
     retained: &RetainedObserveCapture<'_>,
     admitted: &AdmittedObserveCapture,
     prepared: &eliot_governor::PreparedMcpObservation,
-) -> Result<WriteReceipt, String> {
+) -> Result<eliot_store_api::PreparedWriteOutcome, String> {
     let receipt = if let Some(owner) = admitted.selection.as_ref() {
         let (principal, session) = app_identity(&retained.policy_origin).ok_or_else(|| {
             "task-bound Observe selection lost its authenticated owner".to_owned()
@@ -5397,10 +5397,68 @@ async fn exchange_governed_capture(
             .await
             .map_err(|error| format!("Governor cold Observe capture exchange: {error}"))?
     };
-    if receipt.status != eliot_store_api::WriteReceiptStatus::Committed {
-        return Err("Governor Observe capture did not produce a committed receipt".to_owned());
+    if let eliot_store_api::PreparedWriteOutcome::Receipt(receipt) = &receipt {
+        if receipt.status != eliot_store_api::WriteReceiptStatus::Committed {
+            return Err("Governor Observe capture did not produce a committed receipt".to_owned());
+        }
     }
     Ok(receipt)
+}
+
+fn render_staged_observe_submission(
+    retained: &RetainedObserveCapture<'_>,
+    prepared: &eliot_governor::PreparedMcpObservation,
+    source: &eliot_store_api::OriginalWriteSubmission,
+    submission: eliot_store_api::WriteSubmission,
+) -> Result<HostRequestResultBody, String> {
+    submission
+        .validate()
+        .map_err(|error| format!("staged Observe submission is invalid: {error}"))?;
+    let expected_operation = host_request_operation_id(&retained.claimed.envelope);
+    if submission.state != eliot_store_api::WriteSubmissionState::Staged
+        || submission.operation_id.as_str() != expected_operation
+        || retained.claimed.attempt.operation_id != expected_operation
+    {
+        return Err("staged Observe submission does not bind the original operation".to_owned());
+    }
+    let response = serde_json::json!({
+        "status": eliot_canonical::write_envelope::ACCEPTED_PENDING_STATUS,
+        "response_mode": source.response_mode.as_str(),
+        "submission": submission,
+    });
+    let bytes = canonical_json_bytes(&response)
+        .map_err(|error| format!("staged Observe response cannot canonicalize: {error}"))?;
+    let result_digest = sha256_hex(&bytes);
+    let body = HostRequestResultBody {
+        wire_id: HOST_REQUEST_RESULT_BODY_WIRE_ID.to_owned(),
+        wire_version: HostRequestResultBody::CONTRACT_VERSION,
+        operation_id: retained.claimed.attempt.operation_id.clone(),
+        request_sha256: retained.claimed.envelope.envelope_sha256.clone(),
+        result_digest: result_digest.clone(),
+        response,
+        lineage: Some(eliot_protocol::HostRequestResultLineage {
+            output_artifact_ref: None,
+            output_digest: result_digest,
+            producer_ref: None,
+            source_revisions: None,
+            source_state_fence: None,
+            input_refs: None,
+            transformation_lineage: None,
+            closure_refs: None,
+            policy_fence: None,
+            origin_evidence_refs: None,
+            semantic_receipt_ref: None,
+            result_class: eliot_protocol::HostRequestResultClass::Unclassified,
+            proof_ceiling: None,
+            influence_state: eliot_security_contracts::InfluenceState::Unknown,
+            instruction_taint: Some(prepared.access().instruction_taint),
+        }),
+        attempt: Some(retained.claimed.attempt.clone()),
+        evidence: None,
+    };
+    body.validate()
+        .map_err(|error| format!("staged Observe result body is invalid: {error}"))?;
+    Ok(body)
 }
 
 async fn accept_governed_capture(
@@ -5483,6 +5541,25 @@ fn observe_content_value(tool: &serde_json::Value) -> Result<serde_json::Value, 
         return Err("Observation suboperation omits original content".to_owned());
     }
     Ok(serde_json::Value::Object(content))
+}
+
+fn observe_original_write_submission(
+    tool: &serde_json::Value,
+) -> Result<eliot_store_api::OriginalWriteSubmission, String> {
+    let arguments = tool
+        .get("arguments")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "Observe tool arguments are not an object".to_owned())?;
+    let value = arguments
+        .get("write_submission")
+        .cloned()
+        .ok_or_else(|| "Observation capture omits original write submission".to_owned())?;
+    let source: eliot_store_api::OriginalWriteSubmission = serde_json::from_value(value)
+        .map_err(|error| format!("Observation write submission is invalid: {error}"))?;
+    source
+        .validate()
+        .map_err(|error| format!("Observation write submission is invalid: {error}"))?;
+    Ok(source)
 }
 
 fn observe_result_body(
