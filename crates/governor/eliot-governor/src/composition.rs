@@ -60,9 +60,9 @@ use eliot_change_monitor::ChangeMonitor;
 use eliot_config::ConfigPolicySnapshot;
 use eliot_context_contracts::{CanonicalProjectionSet, ContextBinding};
 use eliot_contracts::{
-    ArtifactId, ClockReading, ContractId, ContractVersion, EpochId, OperationId, TaskRevision,
-    ResourceGeneration, SessionId, StateFence, TaskId, canonical_json_bytes, fences_match_exact,
-    sha256_hex,
+    ArtifactId, ClockReading, ContractId, ContractVersion, EpochId, OperationId,
+    ResourceGeneration, SessionId, StateFence, TaskId, TaskRevision, canonical_json_bytes,
+    fences_match_exact, sha256_hex,
 };
 use eliot_coordination::{
     ActiveWorkLeaseProjection, ActiveWorkLeaseSelection, CoordinationError, CoordinationOwner,
@@ -7009,10 +7009,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             || activation.session_id != session_ref
             || activation.task_id.as_str() != task_ref
             || activation.task_revision != task_revision
-            || state_fence
-                .task_revision
-                .map(TaskRevision::value)
-                != Some(task_revision)
+            || state_fence.task_revision.map(TaskRevision::value) != Some(task_revision)
             || activation.work_scope_id != work_scope_ref
             || selected.work_item.work_item_id != activation.work_unit_id
             || selected.work_item.task_id != activation.task_id.as_str()
