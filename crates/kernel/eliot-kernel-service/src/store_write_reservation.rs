@@ -587,7 +587,9 @@ impl ProtectedScopeHold {
 /// [`ControlOperationClass`].
 enum StoreCapacityClaim {
     Unbound,
-    Normal { scopes: Arc<ScopeStoreReserve> },
+    Normal {
+        scopes: Arc<ScopeStoreReserve>,
+    },
     Protected {
         scopes: Arc<ScopeStoreReserve>,
         operation: ControlOperationClass,
@@ -631,7 +633,10 @@ impl StoreCapacityClaim {
             Self::Unbound => Ok(ScopeStoreAcquisition::empty()),
             Self::Normal { scopes } => {
                 let permits = acquire_normal_store_permits(scopes, seed, operation_id)?;
-                Ok(ScopeStoreAcquisition { permits, hold: None })
+                Ok(ScopeStoreAcquisition {
+                    permits,
+                    hold: None,
+                })
             }
             Self::Protected { scopes, operation } => {
                 acquire_protected_store_permits(scopes, *operation, seed, operation_id)
@@ -688,10 +693,16 @@ fn acquire_normal_store_permits(
     let owner = seed.recovery_owner.as_str();
     let bytes = staged_payload_bytes(seed, operation_id)?;
     let reserve = scopes.reserve();
-    let connection =
-        reserve.try_acquire_normal_connection(NormalWorkClass::CanonicalWrite, owner, operation_id)?;
-    let transaction =
-        reserve.try_acquire_normal_transaction(NormalWorkClass::CanonicalWrite, owner, operation_id)?;
+    let connection = reserve.try_acquire_normal_connection(
+        NormalWorkClass::CanonicalWrite,
+        owner,
+        operation_id,
+    )?;
+    let transaction = reserve.try_acquire_normal_transaction(
+        NormalWorkClass::CanonicalWrite,
+        owner,
+        operation_id,
+    )?;
     let pending = reserve.try_acquire_normal_pending_write_bytes(
         NormalWorkClass::CanonicalWrite,
         owner,
