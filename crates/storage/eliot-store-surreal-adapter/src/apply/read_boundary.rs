@@ -1426,6 +1426,8 @@ fn infer_authority_operation(
 struct IndexedAuthority {
     capture_index: u64,
     operation: eliot_store_api::NamedMutationOperation,
+    operation_id: OperationId,
+    receipt_state_fence: StateFence,
     parameters: BTreeMap<String, Value>,
     scope_id: String,
 }
@@ -1468,16 +1470,22 @@ fn indexed_authorities(rows: &[AuthorityReceiptRow]) -> Result<Vec<IndexedAuthor
             Some((
                 receipt.transition_class,
                 binding.scope_id.as_str().to_owned(),
+                receipt.operation_id.clone(),
+                receipt.state_fence.clone(),
             ))
         };
         for record in authorities {
             let parameters = validate_authority_record(row, record)?;
             let capture_index = operation_base.saturating_add(record.operation_index as u64);
-            if let Some((transition_class, scope_id)) = &in_scope_receipt {
+            if let Some((transition_class, scope_id, operation_id, receipt_state_fence)) =
+                &in_scope_receipt
+            {
                 let operation = infer_authority_operation(*transition_class, &parameters)?;
                 indexed.push(IndexedAuthority {
                     capture_index,
                     operation,
+                    operation_id: operation_id.clone(),
+                    receipt_state_fence: receipt_state_fence.clone(),
                     parameters,
                     scope_id: scope_id.clone(),
                 });
@@ -1546,7 +1554,18 @@ fn task_state_payload(
         })
         .collect();
     let matched_total = matched.len();
-    let current = matched.last().map(|record| record.parameters.clone());
+    let current = matched.last().map(|record| {
+        let mut current = Map::from_iter(record.parameters.clone());
+        current.insert(
+            "operation_id".to_owned(),
+            json!(record.operation_id.as_str()),
+        );
+        current.insert(
+            "receipt_state_fence".to_owned(),
+            json!(&record.receipt_state_fence),
+        );
+        Value::Object(current)
+    });
     let records: Vec<Value> = matched
         .into_iter()
         .take(limit)

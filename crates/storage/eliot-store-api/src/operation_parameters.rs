@@ -1152,9 +1152,10 @@ static GET_CAPABILITY_EVIDENCE_RECORD_RANGE_PARAMETERS: [ParameterDeclaration; 3
 /// the target state `to`, the owner-checked compare-and-swap base
 /// `expected_revision` as its decimal string (`"1"` on propose, the current
 /// task revision on apply, mirroring how `AppendAuditEvent` carries
-/// `expected_revision`), the admitted `actor_ref`, and `task_event_json` which
-/// preserves the complete lifecycle command in task history.
-static UPDATE_TASK_STATE_PARAMETERS: [ParameterDeclaration; 10] = [
+/// `expected_revision`), the owner-resulting task revision when emitted by
+/// current lifecycle owners, the admitted `actor_ref`, and `task_event_json`
+/// which preserves the complete lifecycle command in task history.
+static UPDATE_TASK_STATE_PARAMETERS: [ParameterDeclaration; 11] = [
     ParameterDeclaration {
         name: "task_id",
         shape: ParameterShape::Subject,
@@ -1179,6 +1180,11 @@ static UPDATE_TASK_STATE_PARAMETERS: [ParameterDeclaration; 10] = [
         name: "expected_revision",
         shape: ParameterShape::Subject,
         required: true,
+    },
+    ParameterDeclaration {
+        name: "resulting_revision",
+        shape: ParameterShape::Subject,
+        required: false,
     },
     ParameterDeclaration {
         name: "actor_ref",

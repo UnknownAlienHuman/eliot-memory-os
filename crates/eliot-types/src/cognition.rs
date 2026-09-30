@@ -901,7 +901,7 @@ pub struct AutonomyRunTransitionReceipt {
     pub canonical_receipt: Option<WriteReceiptRef>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ActiveDecisionState {
     pub task_id: TaskId,

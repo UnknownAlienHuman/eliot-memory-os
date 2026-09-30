@@ -11,6 +11,7 @@
 use std::collections::BTreeMap;
 
 use eliot_contracts::{ClockReading, EpochId, StateFence, TaskId};
+use eliot_types::ActiveDecisionState;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -35,6 +36,31 @@ pub const CONTRACT_VERSION: eliot_contracts::ContractVersion =
 fn text(value: &str, field: &'static str) -> Result<(), TaskError> {
     if value.trim().is_empty() || value.chars().any(char::is_control) {
         return Err(TaskError::InvalidField(field));
+    }
+    Ok(())
+}
+
+fn validate_active_decision_state(decision: &ActiveDecisionState) -> Result<(), TaskError> {
+    text(decision.task_id.as_str(), "active_decision.task_id")?;
+    text(&decision.packet_id, "active_decision.packet_id")?;
+    text(
+        &decision.next_allowed_action,
+        "active_decision.next_allowed_action",
+    )?;
+    text(
+        &decision.expected_observable,
+        "active_decision.expected_observable",
+    )?;
+    text(&decision.verifier, "active_decision.verifier")?;
+    text(&decision.stop_condition, "active_decision.stop_condition")?;
+    if let Some(owner) = &decision.selected_owner_or_module {
+        text(owner, "active_decision.selected_owner_or_module")?;
+    }
+    for path in &decision.killed_paths {
+        text(path, "active_decision.killed_path")?;
+    }
+    for unknown in &decision.open_unknowns {
+        text(unknown, "active_decision.open_unknown")?;
     }
     Ok(())
 }
@@ -149,6 +175,10 @@ pub enum TaskCommand {
     RecordProfessionalCompletionEvidence {
         evidence: Box<ProfessionalCompletionEvidence>,
     },
+    /// Retains the original admitted active-decision packet under TaskController.
+    SetActiveDecisionState {
+        decision: Box<ActiveDecisionState>,
+    },
 }
 
 impl TaskCommand {
@@ -180,7 +210,8 @@ impl TaskCommand {
             | Self::ReportProfessionalAttempt { .. }
             | Self::ChangeProfessionalApproach { .. }
             | Self::DecideProfessionalAbandonment { .. }
-            | Self::RecordProfessionalCompletionEvidence { .. } => current,
+            | Self::RecordProfessionalCompletionEvidence { .. }
+            | Self::SetActiveDecisionState { .. } => current,
         }
     }
 
@@ -241,6 +272,9 @@ impl TaskCommand {
             Self::RecordProfessionalCompletionEvidence { evidence } => {
                 text(&evidence.artifact_manifest.manifest_ref, "manifest_ref")
             }
+            Self::SetActiveDecisionState { decision } => {
+                validate_active_decision_state(decision)
+            }
             Self::Open
             | Self::RequireUnderstanding
             | Self::BeginExecution
@@ -294,6 +328,10 @@ pub struct TaskLifecycleEvent {
     pub from: Option<TaskState>,
     pub to: TaskState,
     pub command: Option<TaskCommand>,
+    /// Current TaskController-retained decision, including across later
+    /// lifecycle events. Omitted when the owner has never admitted one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_decision_state: Option<ActiveDecisionState>,
     /// Updated professional state carried with the lifecycle event so its
     /// derived signals and decisions travel through the same canonical write.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -337,6 +375,7 @@ pub struct TaskLifecycleOwner {
     tasks: BTreeMap<TaskId, TaskRecord>,
     events: Vec<TaskLifecycleEvent>,
     professional_execution: BTreeMap<TaskId, ProfessionalExecutionState>,
+    active_decisions: BTreeMap<TaskId, ActiveDecisionState>,
     requests: BTreeMap<String, (TaskId, Option<TaskCommand>, TaskLifecycleEvent)>,
 }
 
@@ -356,6 +395,7 @@ impl TaskLifecycleOwner {
             tasks: BTreeMap::new(),
             events: Vec::new(),
             professional_execution: BTreeMap::new(),
+            active_decisions: BTreeMap::new(),
             requests: BTreeMap::new(),
         })
     }
@@ -396,6 +436,7 @@ impl TaskLifecycleOwner {
         owner.professional_execution = snapshot.professional_execution;
         owner.next_sequence = snapshot.next_sequence;
         owner.events = snapshot.events;
+        owner.active_decisions = retained_active_decisions(&owner.events)?;
         let mut event_completion_evidence: BTreeMap<TaskId, Vec<ProfessionalCompletionEvidence>> =
             BTreeMap::new();
         for event in &owner.events {
@@ -473,6 +514,7 @@ impl TaskLifecycleOwner {
             TaskState::Proposed,
             None,
             None,
+            None,
         );
         self.tasks.insert(
             proposal.task_id.clone(),
@@ -526,30 +568,8 @@ impl TaskLifecycleOwner {
                 current: current.revision,
             });
         }
-        if matches!(command, TaskCommand::Verify { .. })
-            && let Some(state) = self.professional_execution.get(&task_id)
-        {
-            state.require_evaluator_result()?;
-        }
-        if matches!(
-            command,
-            TaskCommand::Block { .. } | TaskCommand::Fail { .. }
-        ) && self
-            .professional_execution
-            .get(&task_id)
-            .is_some_and(|state| !state.latest_attempt_stopped_with_signal())
-        {
-            return Err(TaskError::MissingEvidence {
-                field: "premature_abandonment_signal",
-            });
-        }
-        if matches!(command, TaskCommand::MarkPartial { .. })
-            && self.professional_execution.contains_key(&task_id)
-        {
-            return Err(TaskError::MissingEvidence {
-                field: "task_controller_partial_disposition",
-            });
-        }
+        validate_active_decision_revision(&task_id, &context, &command, current.revision)?;
+        self.validate_transition_evidence(&task_id, &command)?;
         let target = command.target(current.state);
         if !allowed(current.state, &command) {
             return Err(TaskError::IllegalTransition {
@@ -564,6 +584,10 @@ impl TaskLifecycleOwner {
             &context,
             &command,
         )?;
+        let next_active_decision = match &command {
+            TaskCommand::SetActiveDecisionState { decision } => Some(*decision.clone()),
+            _ => self.active_decisions.get(&task_id).cloned(),
+        };
         let event = self.emit(
             &context,
             task_id.clone(),
@@ -571,8 +595,12 @@ impl TaskLifecycleOwner {
             target,
             Some(command.clone()),
             next_professional_execution.get(&task_id).cloned(),
+            next_active_decision.clone(),
         );
         self.professional_execution = next_professional_execution;
+        if let Some(decision) = next_active_decision {
+            self.active_decisions.insert(task_id.clone(), decision);
+        }
         let record = self
             .tasks
             .get_mut(&task_id)
@@ -619,6 +647,36 @@ impl TaskLifecycleOwner {
         Ok(())
     }
 
+    fn validate_transition_evidence(
+        &self,
+        task_id: &TaskId,
+        command: &TaskCommand,
+    ) -> Result<(), TaskError> {
+        if matches!(command, TaskCommand::Verify { .. })
+            && let Some(state) = self.professional_execution.get(task_id)
+        {
+            state.require_evaluator_result()?;
+        }
+        if matches!(command, TaskCommand::Block { .. } | TaskCommand::Fail { .. })
+            && self
+                .professional_execution
+                .get(task_id)
+                .is_some_and(|state| !state.latest_attempt_stopped_with_signal())
+        {
+            return Err(TaskError::MissingEvidence {
+                field: "premature_abandonment_signal",
+            });
+        }
+        if matches!(command, TaskCommand::MarkPartial { .. })
+            && self.professional_execution.contains_key(task_id)
+        {
+            return Err(TaskError::MissingEvidence {
+                field: "task_controller_partial_disposition",
+            });
+        }
+        Ok(())
+    }
+
     fn emit(
         &mut self,
         context: &TaskCommandContext,
@@ -627,6 +685,7 @@ impl TaskLifecycleOwner {
         to: TaskState,
         command: Option<TaskCommand>,
         professional_execution: Option<ProfessionalExecutionState>,
+        active_decision_state: Option<ActiveDecisionState>,
     ) -> TaskLifecycleEvent {
         let event = TaskLifecycleEvent {
             sequence: self.next_sequence,
@@ -637,6 +696,7 @@ impl TaskLifecycleOwner {
             from,
             to,
             command,
+            active_decision_state,
             professional_execution,
             state_fence: context.state_fence.clone(),
             authority_epoch: context.authority_epoch.clone(),
@@ -713,6 +773,56 @@ impl TaskLifecycleOwner {
     }
 }
 
+fn validate_active_decision_revision(
+    task_id: &TaskId,
+    context: &TaskCommandContext,
+    command: &TaskCommand,
+    current_revision: u64,
+) -> Result<(), TaskError> {
+    let TaskCommand::SetActiveDecisionState { decision } = command else {
+        return Ok(());
+    };
+    let Some(task_revision) = context.state_fence.task_revision.as_ref() else {
+        return Err(TaskError::MissingEvidence {
+            field: "active_decision_task_revision",
+        });
+    };
+    if decision.task_id.as_str() != task_id.as_str()
+        || decision.revision_fence.value() != task_revision.value()
+        || decision.revision_fence.value() != current_revision
+    {
+        return Err(TaskError::InvalidField("active_decision_source_revision"));
+    }
+    Ok(())
+}
+
+fn retained_active_decisions(
+    events: &[TaskLifecycleEvent],
+) -> Result<BTreeMap<TaskId, ActiveDecisionState>, TaskError> {
+    let mut retained = BTreeMap::new();
+    for event in events {
+        if let Some(TaskCommand::SetActiveDecisionState { decision }) = &event.command {
+            validate_active_decision_state(decision)?;
+            if decision.task_id.as_str() != event.task_id.as_str() {
+                return Err(TaskError::InvalidField("active_decision_task_id"));
+            }
+            let Some(task_revision) = event.state_fence.task_revision.as_ref() else {
+                return Err(TaskError::MissingEvidence {
+                    field: "active_decision_task_revision",
+                });
+            };
+            if decision.revision_fence.value() != task_revision.value() {
+                return Err(TaskError::InvalidField("active_decision_source_revision"));
+            }
+            retained.insert(event.task_id.clone(), *decision.clone());
+        }
+        if event.active_decision_state.as_ref() != retained.get(&event.task_id) {
+            return Err(TaskError::InvalidField("active_decision_history"));
+        }
+    }
+    Ok(retained)
+}
+
 fn allowed(from: TaskState, command: &TaskCommand) -> bool {
     match command {
         TaskCommand::Open => from == TaskState::Proposed,
@@ -728,7 +838,8 @@ fn allowed(from: TaskState, command: &TaskCommand) -> bool {
             from.is_active()
         }
         TaskCommand::Reopen { .. } => from.is_terminal(),
-        TaskCommand::SetProfessionalExecutionContract { .. } => from.is_active(),
+        TaskCommand::SetProfessionalExecutionContract { .. }
+        | TaskCommand::SetActiveDecisionState { .. } => from.is_active(),
         TaskCommand::ReportProfessionalAttempt { .. }
         | TaskCommand::ChangeProfessionalApproach { .. } => {
             matches!(from, TaskState::Executing | TaskState::Verifying)

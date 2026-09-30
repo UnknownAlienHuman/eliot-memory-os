@@ -2229,8 +2229,9 @@ fn requires_scope(operation: NamedReadOperation) -> bool {
             | NamedReadOperation::GetCurrentEpistemicPosition
             | NamedReadOperation::GetEvidencePack
             | NamedReadOperation::GetUnderstandingProjectionInputs
+            | NamedReadOperation::GetLearningRecordRange
             | NamedReadOperation::GetAttentionAndProblems
-            | NamedReadOperation::GetCapabilityEvidenceState
+            | NamedReadOperation::GetCapabilityEvidenceRecordRange
             | NamedReadOperation::GetConformanceState
             | NamedReadOperation::GetMailbox
             | NamedReadOperation::GetAuditRange
@@ -2296,23 +2297,23 @@ fn operation_matches_intent(operation: NamedReadOperation, mode: QueryMode) -> b
 ///
 /// Canonical role order follows the T11 acquisition table: task frame,
 /// critical attention, current epistemic position, understanding-projection
-/// inputs (serving both the cue-activation and negative-memory roles through
-/// distinct closed selectors), evidence pack, and capability evidence
+/// inputs (cue activation), the exact activation-receipt learning range
+/// (negative memory), evidence pack, and capability-evidence record range
 /// (affordances). Every entry satisfies the facade intent gate for
 /// [`QueryMode::ContextReconstruction`]; any other operation fails that gate
 /// as [`ReadError::InvalidIntentOperation`]. The seven candidate provider
-/// roles bind to these six reads because the understanding projection serves
-/// two roles; role-to-payload projection stays with the owning Governor
-/// reconstruction composition, never with this facade.
+/// roles bind to these seven reads. Role-to-payload projection stays with the
+/// owning Governor reconstruction composition, never with this facade.
 #[must_use]
-pub const fn context_reconstruction_operations() -> [NamedReadOperation; 6] {
+pub const fn context_reconstruction_operations() -> [NamedReadOperation; 7] {
     [
         NamedReadOperation::GetTaskState,
         NamedReadOperation::GetAttentionAndProblems,
         NamedReadOperation::GetCurrentEpistemicPosition,
         NamedReadOperation::GetUnderstandingProjectionInputs,
+        NamedReadOperation::GetLearningRecordRange,
         NamedReadOperation::GetEvidencePack,
-        NamedReadOperation::GetCapabilityEvidenceState,
+        NamedReadOperation::GetCapabilityEvidenceRecordRange,
     ]
 }
 
