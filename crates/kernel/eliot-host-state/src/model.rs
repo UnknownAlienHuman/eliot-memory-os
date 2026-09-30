@@ -2653,6 +2653,10 @@ pub struct ModuleBuildProvenanceRecord {
 }
 
 impl ModuleBuildProvenanceRecord {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the closed provenance record validates its field shapes, pinned build, and activation binding as one invariant"
+    )]
     fn validate(&self) -> Result<(), JournalError> {
         self.fence.validate()?;
         self.operation.validate()?;

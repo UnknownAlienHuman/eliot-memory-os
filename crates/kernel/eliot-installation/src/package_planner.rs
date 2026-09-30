@@ -836,6 +836,10 @@ pub(crate) fn strict_role_bindings(
 /// pinned by exact installed path and digest in the candidate and launch
 /// descriptor, but remains outside Host-managed daemon roles. The notification
 /// adapter remains evidence-bound only and has no launch-descriptor binding.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the exact package bijection validates candidate roles, optional module provenance, and manifest membership together"
+)]
 pub(crate) fn validate_exact_candidate_package_binding(
     candidate: &CandidateManifest,
     manifest: &PackageManifest,
