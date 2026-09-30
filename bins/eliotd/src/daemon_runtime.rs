@@ -2283,7 +2283,8 @@ async fn evaluate_and_emit_maintenance_notification(
 }
 
 /// Publishes every applicable source result of one evaluated maintenance
-/// decision into the canonical observation path.
+/// decision into the canonical observation path, then records what that
+/// publication actually established.
 ///
 /// This is the production binding of publication to the maintenance decision
 /// owner. It runs for **every** decision the owner produced, not only the
@@ -2294,6 +2295,16 @@ async fn evaluate_and_emit_maintenance_notification(
 /// through the same route. A failed or unknown result is therefore never dropped
 /// for not being a success, and no result is reported through a diagnostic
 /// logger alone.
+///
+/// Work performed, observation durably recorded and actual improvement are
+/// three different facts, and this function establishes only the first two. A
+/// published result is admitted onto the retained job revision under the exact
+/// committed store receipt the canonical route returned; a result that could
+/// not be published is left as an explicit outstanding observation obligation
+/// with a visible owner and a named resolution condition. Nothing here
+/// reconciles such an obligation, back-fills a plausible outcome for it, or
+/// concludes that the maintained subsystem improved — a completed job is work
+/// performed, not utility.
 ///
 /// The exchange is awaited inside the retained maintenance flight with the
 /// composition lock released, exactly as the notification leg beside it is, so no
@@ -2318,6 +2329,12 @@ async fn publish_maintenance_source_results(
     // makes the existing job's failures and unknown outcomes visible, rather than
     // only the suppression itself.
     let mut obligations = Vec::new();
+    // The independent expected set. It is declared from the decision's own
+    // durable-job reference, never rebuilt from the obligation list this pass is
+    // iterating, so a completeness claim is measured against what the owner
+    // declared is owed rather than against the list being checked.
+    let mut expected: Vec<eliot_maintenance::ExpectedOutcomeObservation> = Vec::new();
+    let mut jobs: Vec<eliot_maintenance::MaintenanceJob> = Vec::new();
     {
         let guard = composition.lock().await;
         let live_fence = guard.governor_kernel_fence();
@@ -2326,9 +2343,13 @@ async fn publish_maintenance_source_results(
             &live_fence,
         ));
         if let Some(job_ref) = &decision.durable_job_ref {
+            expected.push(eliot_maintenance::ExpectedOutcomeObservation {
+                job_id: job_ref.clone(),
+            });
             match guard.retained_maintenance_job(job_ref) {
                 Ok(Some(job)) => {
                     obligations.extend(job.result_obligations.iter().cloned());
+                    jobs.push(job);
                 }
                 // No retained job is unavailable, not resolved: the decision's
                 // own result still publishes, and the job's results publish on
@@ -2347,11 +2368,15 @@ async fn publish_maintenance_source_results(
             }
         }
     }
-    for obligation in obligations {
+    // The admitted set is built only from committed store receipts the canonical
+    // route actually returned. A publication identity, the job's own
+    // `outcome_ref`, and the fact that a job completed settle nothing here.
+    let mut admitted: Vec<eliot_maintenance::AdmittedObservationReceipt> = Vec::new();
+    for obligation in &obligations {
         let publication = {
             let guard = composition.lock().await;
             guard
-                .publish_maintenance_result(&obligation.publication_id, &obligation)
+                .publish_maintenance_result(&obligation.publication_id, obligation)
                 .await
         };
         match publication {
@@ -2360,6 +2385,43 @@ async fn publish_maintenance_source_results(
                     receipt,
                 },
             ) => {
+                // Only a job-side obligation can be settled durably. The
+                // decision's own non-execution result has no retained job
+                // revision to admit onto, and inventing one would be a second
+                // store rather than a receipt.
+                if let Some(job_ref) = &obligation.job_ref
+                    && jobs.iter().any(|job| &job.job_id == job_ref)
+                {
+                    let admitted_receipt = eliot_maintenance::AdmittedObservationReceipt {
+                        publication_id: obligation.publication_id.clone(),
+                        observation_receipt_ref: receipt.operation_id.as_str().to_owned(),
+                    };
+                    let settlement = {
+                        let guard = composition.lock().await;
+                        guard.admit_maintenance_observation_receipt(
+                            job_ref,
+                            &admitted_receipt.publication_id,
+                            &admitted_receipt.observation_receipt_ref,
+                        )
+                    };
+                    match settlement {
+                        Ok(_) => admitted.push(admitted_receipt),
+                        Err(error) => {
+                            // The observation is admitted but the job revision
+                            // could not record it. The obligation stays owed, so
+                            // a later pass re-presents the same identity and
+                            // reconciles rather than publishing a second record.
+                            if failure_guard.should_emit() {
+                                let _ = eliotd::diagnostics::ErrorRecord::of(
+                                    eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                                    "maintenance-result-obligation",
+                                    &error.to_string(),
+                                )
+                                .emit();
+                            }
+                        }
+                    }
+                }
                 tracing::info!(
                     target: "eliotd::diagnostics",
                     event = "eliotd.maintenance_result_published",
@@ -2380,6 +2442,51 @@ async fn publish_maintenance_source_results(
                     )
                     .emit();
                 }
+            }
+        }
+    }
+    // Completeness against the independent expected set. Anything outstanding
+    // here is work performed whose observation is not durably recorded. It is
+    // reported as such and left owed: never reconciled, never back-filled with
+    // an outcome written after the fact, and never read as improvement.
+    match eliot_maintenance::outcome_observation_coverage(&expected, &jobs, &admitted) {
+        Ok(coverage) => {
+            for outstanding in coverage.outstanding {
+                let (job_ref, publication_id, detail) = match outstanding {
+                    eliot_maintenance::OutstandingOutcome::ObservationOwed(obligation) => (
+                        obligation.job_ref,
+                        obligation.publication_id,
+                        format!(
+                            "work performed ({:?}) has no admitted observation; owner={}; resolves when {}",
+                            obligation.work_performed,
+                            obligation.obligation_owner,
+                            obligation.resolution_condition,
+                        ),
+                    ),
+                    eliot_maintenance::OutstandingOutcome::RevisionUnavailable { job_ref } => (
+                        job_ref.clone(),
+                        String::new(),
+                        "the retained durable job revision is unavailable, so its owed observation is unverified"
+                            .to_owned(),
+                    ),
+                };
+                tracing::warn!(
+                    target: "eliotd::diagnostics",
+                    event = "eliotd.maintenance_outcome_observation_outstanding",
+                    job = %eliotd::diagnostics::sanitize_identity(&job_ref),
+                    publication_id = %eliotd::diagnostics::sanitize_identity(&publication_id),
+                    detail = %detail,
+                );
+            }
+        }
+        Err(error) => {
+            if failure_guard.should_emit() {
+                let _ = eliotd::diagnostics::ErrorRecord::of(
+                    eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                    "maintenance-outcome-coverage",
+                    &error.to_string(),
+                )
+                .emit();
             }
         }
     }
