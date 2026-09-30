@@ -79,7 +79,9 @@ pub enum SourceArtifactOwnerError {
     WrongCapturedPayloadKind,
     #[error("generic source staging cannot use the reserved LSP observation operation kind")]
     ReservedLspObservationOperationKind,
-    #[error("LSP observation publication requires the exact admitted request and live bridge projection")]
+    #[error(
+        "LSP observation publication requires the exact admitted request and live bridge projection"
+    )]
     LspObservationBindingMismatch,
     #[error("LSP observation publication requires its reserved operation kind")]
     WrongLspObservationOperationKind,
