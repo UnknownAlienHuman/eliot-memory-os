@@ -1499,7 +1499,6 @@ fn enforce_improvement_class_gate(
     Ok(())
 }
 
-
 /// The I12.24 evidence source this daemon's own maintenance decision belongs
 /// to (issue #1867 W2).
 ///
