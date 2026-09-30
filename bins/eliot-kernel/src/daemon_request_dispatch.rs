@@ -9360,10 +9360,6 @@ impl KernelComposition {
                     ));
                     return Ok::<(), TaskFailure>(());
                 }
-                let recovery_context = operation.context.clone();
-                let recovery_transition = operation.transition.clone();
-                let recovery_revision_heads = operation.expected_revision_heads.clone();
-                let recovery_ordering_heads = operation.expected_ordering_heads.clone();
                 let accepted = match gateway
                     .stage_reserved_with_original_submission(
                         &operation.context,
