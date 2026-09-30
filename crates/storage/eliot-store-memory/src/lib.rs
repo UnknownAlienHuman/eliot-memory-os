@@ -752,9 +752,11 @@ fn dispatch_apply_module_registry_snapshot(
     state: &mut MemoryState,
     transition: &PreparedTransition,
 ) -> Result<(), StoreError> {
-    let Some(command) = transition.named_operations.iter().find(|command| {
-        command.operation == NamedMutationOperation::RecordModuleCatalogSnapshot
-    }) else {
+    let Some(command) = transition
+        .named_operations
+        .iter()
+        .find(|command| command.operation == NamedMutationOperation::RecordModuleCatalogSnapshot)
+    else {
         return Ok(());
     };
     if transition.transition_class != TransitionClass::RecoverySchema {
@@ -792,10 +794,7 @@ fn dispatch_apply_module_registry_snapshot(
         return Err(StoreError::PayloadTooLarge);
     }
 
-    let key = RecoveryRecordKey::new(
-        MODULE_REGISTRY_OWNER_NAMESPACE,
-        MODULE_REGISTRY_OWNER_KEY,
-    )?;
+    let key = RecoveryRecordKey::new(MODULE_REGISTRY_OWNER_NAMESPACE, MODULE_REGISTRY_OWNER_KEY)?;
     let Some(existing) = state.recovery_records.get(&key) else {
         return Err(StoreError::RevisionConflict);
     };

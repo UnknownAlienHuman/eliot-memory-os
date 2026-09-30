@@ -1276,9 +1276,7 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
         b"ReconcileRecovery" => Some(NamedMutationOperation::ReconcileRecovery),
         b"RecordFinishDecision" => Some(NamedMutationOperation::RecordFinishDecision),
         b"RecordFinishEvidence" => Some(NamedMutationOperation::RecordFinishEvidence),
-        b"RecordModuleCatalogSnapshot" => {
-            Some(NamedMutationOperation::RecordModuleCatalogSnapshot)
-        }
+        b"RecordModuleCatalogSnapshot" => Some(NamedMutationOperation::RecordModuleCatalogSnapshot),
         b"AppendAuditEvent" => Some(NamedMutationOperation::AppendAuditEvent),
         b"RecordAuthorityRevocation" => Some(NamedMutationOperation::RecordAuthorityRevocation),
         b"ApplyErasure" => Some(NamedMutationOperation::ApplyErasure),

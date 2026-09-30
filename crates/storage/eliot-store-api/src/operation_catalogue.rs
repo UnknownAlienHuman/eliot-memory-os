@@ -854,26 +854,7 @@ pub fn validate_transition_against_catalogue(
         }
         return Ok(());
     }
-    let set_digest = operation_manifest_set_digest(entries)?;
-    if transition.operation_manifest_digest != set_digest {
-        return Err(StoreError::ManifestMismatch);
-    }
-    // `ERASURE_STATE_IRREVERSIBLE` execution direction (issue #1712): an
-    // `Erasure`-class plan executes only the named `ApplyErasure` operation.
-    // `PreparedTransition::validate` already aligns each command's family with
-    // the plan class, so this arm is defense in depth today: it stays
-    // mechanically evaluated on every erasure plan and refuses if a future
-    // operation ever maps to the `Erasure` family without travelling the
-    // named erasure transaction. No generic reversible-effect executor admits
-    // the erasure class through this gate.
-    if transition.transition_class == TransitionClass::Erasure
-        && transition
-            .named_operations
-            .iter()
-            .any(|command| command.operation != NamedMutationOperation::ApplyErasure)
-    {
-        return Err(StoreError::TransitionClassExceeded);
-    }
+    validate_named_plan_manifest_and_erasure(transition, entries)?;
     for command in &transition.named_operations {
         let entry = find_entry(entries, named_mutation_operation_name(command.operation))?;
         if entry.operation_kind != OperationKind::Mutation {
@@ -936,6 +917,33 @@ pub fn validate_transition_against_catalogue(
             }
         }
         validate_parameter_size(&command.parameters, entry.max_input_bytes)?;
+    }
+    Ok(())
+}
+
+fn validate_named_plan_manifest_and_erasure(
+    transition: &PreparedTransition,
+    entries: &[NamedOperationManifest],
+) -> Result<(), StoreError> {
+    let set_digest = operation_manifest_set_digest(entries)?;
+    if transition.operation_manifest_digest != set_digest {
+        return Err(StoreError::ManifestMismatch);
+    }
+    // `ERASURE_STATE_IRREVERSIBLE` execution direction (issue #1712): an
+    // `Erasure`-class plan executes only the named `ApplyErasure` operation.
+    // `PreparedTransition::validate` already aligns each command's family with
+    // the plan class, so this arm is defense in depth today: it stays
+    // mechanically evaluated on every erasure plan and refuses if a future
+    // operation ever maps to the `Erasure` family without travelling the
+    // named erasure transaction. No generic reversible-effect executor admits
+    // the erasure class through this gate.
+    if transition.transition_class == TransitionClass::Erasure
+        && transition
+            .named_operations
+            .iter()
+            .any(|command| command.operation != NamedMutationOperation::ApplyErasure)
+    {
+        return Err(StoreError::TransitionClassExceeded);
     }
     Ok(())
 }

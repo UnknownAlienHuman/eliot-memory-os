@@ -687,7 +687,7 @@ fn append_module_registry_owner_statement(
     record.insert("state_fence".to_owned(), json!(&transition.state_fence));
     record.insert(
         "revision".to_owned(),
-        json!(expected_revision.checked_add(1).ok_or_else(|| {
+        json!(expected_revision.checked_add(1).ok_or({
             AdapterError::Store(StoreError::InvalidField {
                 field: "module_registry.owner_revision",
                 reason: "revision overflow",
