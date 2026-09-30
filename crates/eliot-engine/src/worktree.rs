@@ -3,10 +3,10 @@ use crate::{
     work_lease_is_active,
 };
 use eliot_types::{
-    ActionLease, AgentId, AgentSessionId, CandidateDiff, CandidateDiffId, CandidateDiffStatus,
-    CandidateReview, CandidateReviewDecision, CandidateSourceSnapshotV1,
-    CANDIDATE_SOURCE_SNAPSHOT_SCHEMA_VERSION, CommandContext, CompletionGateDecision,
-    CompletionProof, CompletionStatus, LifecycleStatus, PatchRequest, SemanticCommand, TaintClass,
+    ActionLease, AgentId, AgentSessionId, CANDIDATE_SOURCE_SNAPSHOT_SCHEMA_VERSION, CandidateDiff,
+    CandidateDiffId, CandidateDiffStatus, CandidateReview, CandidateReviewDecision,
+    CandidateSourceSnapshotV1, CommandContext, CompletionGateDecision, CompletionProof,
+    CompletionStatus, LifecycleStatus, PatchRequest, SemanticCommand, TaintClass,
     ToolObservationRecordCommand, UnifiedDiff, VerifierRun, VerifierStatus, Visibility, WorkLease,
     WorkScope, WorktreeLease, WorktreeLeaseId, WorktreeLeaseKind, WorktreeLeaseRequest,
     WorktreeLeaseState, WriteId, WriteReceiptRef,
