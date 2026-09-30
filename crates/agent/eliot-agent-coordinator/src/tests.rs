@@ -19,7 +19,8 @@ use eliot_agent_contracts::{
     DeliveryPolicy, DescendantClosureReceipt, LivePeerMessage, LivePeerMessageState, RevisionId,
 };
 use eliot_contracts::{
-    EpochLineageId, IntegrationRevision, PolicyRevision, TaskRevision, sha256_hex,
+    EpochLineageId, IntegrationRevision, PolicyRevision, TaskRevision, canonical_json_bytes,
+    sha256_hex,
 };
 use eliot_evaluation_contracts::BudgetEvidence;
 use eliot_kernel_service::ProviderCapabilityExpectation;
@@ -27,16 +28,17 @@ use eliot_security_contracts::PrivacyClass;
 
 use crate::core::{ProviderProofKind, ProviderVerifier};
 use crate::{
-    AdmissionId, AdmittedLaneReceipt, AdmittedProviderCapability, AgentCoordinator, CancelCommand,
-    CancellationReconciliationId, CandidateId, CoordinatorConfig, CoordinatorError,
-    CoordinatorEvent, DescendantClosureSubmission, ExecutionContext, LearningRole, ObservationId,
-    OperationId, OutcomeReconciliationId, OwnerCurrentness, PlanGap, PresentedClaimMaterial,
-    ProviderAdmissionReceipt, ProviderBindingSnapshot, ProviderCancellationReconciliation,
-    ProviderExecutionBindingSubmission, ProviderIdentity, ProviderReassignmentReceipt,
-    ProviderUnknownOutcomeReconciliation, ProviderWorkerFenceReceipt, ReassignmentId, RecipeId,
-    RecipeManifest, ResultSubmission, RoleProfileId, RoleProfileManifest, RouteCandidateEvidence,
-    StaffingLaneRequest, StaffingPlanCandidate, StaffingPlanRequest, SubmissionId,
-    UnknownOutcomeResolution, WorkClass, WorkerId,
+    AdmissionId, AdmittedLaneReceipt, AdmittedProviderCapability, AdmittedProviderFactory,
+    AgentCoordinator, CancelCommand, CancellationReconciliationId, CandidateId,
+    CoordinatorConfig, CoordinatorError, CoordinatorEvent, DescendantClosureSubmission,
+    ExecutionContext, LearningRole, ObservationId, OperationId, OutcomeReconciliationId,
+    OwnerLoadedClaimRow, PlanGap, ProviderAdmissionReceipt, ProviderBindingSnapshot,
+    ProviderCancellationReconciliation, ProviderExecutionBindingSubmission, ProviderIdentity,
+    ProviderReassignmentReceipt, ProviderUnknownOutcomeReconciliation,
+    ProviderWorkerFenceReceipt, ReassignmentId, RecipeId, RecipeManifest, ResultSubmission,
+    RoleProfileId, RoleProfileManifest, RouteCandidateEvidence, StaffingLaneRequest,
+    StaffingPlanCandidate, StaffingPlanRequest, SubmissionId, UnknownOutcomeResolution,
+    WorkClass, WorkerId,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -176,8 +178,10 @@ fn admitted_capability(minimum_sequence: u64) -> TestResult<AdmittedProviderCapa
     )
 }
 
-/// Builds daemon-supplied Kernel admission from exact owner records. Every
-/// digest is recomputed here with the same `sha256_hex` validator the
+/// Builds daemon-supplied Kernel admission from exact owner records through the
+/// owner-witnessed factory: the loaded row repeats the presented identities
+/// and digests exactly as the daemon's ORS read projection would return them.
+/// Every digest is recomputed here with the same `sha256_hex` validator the
 /// verifier uses; no canned pass value is hardcoded.
 #[allow(
     clippy::too_many_arguments,
@@ -194,9 +198,23 @@ fn admitted_capability_for(
     live_sequence: u64,
     minimum_sequence: u64,
 ) -> TestResult<AdmittedProviderCapability> {
-    let live_epoch = test_epoch(TEST_LINEAGE_A, live_sequence);
-    let _ = live_epoch;
-    let presented = PresentedClaimMaterial::new(
+    let _ = live_sequence;
+    let presented_fence = fence();
+    let loaded = OwnerLoadedClaimRow::new(
+        "claim-t9-05-1".to_owned(),
+        "attempt-t9-05-1".to_owned(),
+        "op-t9-05-1".to_owned(),
+        sha256_hex(b"claim-binding-material-t9-05-1"),
+        sha256_hex(b"executable-material-t9-05-1"),
+        1,
+        sha256_hex(
+            &canonical_json_bytes(&presented_fence)
+                .map_err(|error| format!("fixture fence must serialize: {error}"))?,
+        ),
+    )?;
+    let factory = AdmittedProviderFactory::new(loaded);
+    Ok(factory.admit(
+        identity,
         "claim-t9-05-1".to_owned(),
         "attempt-t9-05-1".to_owned(),
         "op-t9-05-1".to_owned(),
@@ -205,9 +223,7 @@ fn admitted_capability_for(
         route_revision.to_owned(),
         capacity_revision.to_owned(),
         1,
-        fence(),
-    )?;
-    let currentness = OwnerCurrentness::new(
+        presented_fence,
         ProviderCapabilityExpectation {
             current_route_revision: current_route_revision.to_owned(),
             current_capacity_revision: current_capacity_revision.to_owned(),
@@ -216,11 +232,6 @@ fn admitted_capability_for(
         },
         fence(),
         "session-test-binding".to_owned(),
-    )?;
-    Ok(AdmittedProviderCapability::new(
-        identity,
-        presented,
-        currentness,
         None,
         minimum_sequence,
     )?)
