@@ -550,18 +550,15 @@ pub fn assemble_improvement_artifact(
     enforce_advisory_class_gate(&candidate)?;
 
     // The safe boundary is READ, not spelled. It used to be two formatted
-    // strings (`owner:{IMPROVEMENT_OWNER}` and `boundary:{scope_ref}`), which
+    // strings (a constant owner and a constant `boundary:{scope_ref}`), which
     // satisfied `SafeBoundary::validate` while observing nothing at all: the
-    // owner was a constant and the boundary was the scope this very pass is
-    // about to write, so the check proved nothing about the operation it claims
-    // to gate. `SafeBoundary` now has private fields and one constructor,
-    // `SafeBoundary::from_observed_closure`, which takes both values from a
-    // record the Governor's learning-closure owner actually committed from
-    // owner-recorded lifecycle activities
-    // (`crates/governor/eliot-governor/src/learning_closure.rs:483`). That
-    // boundary is derived by `derive_boundaries`, which refuses an ordinary
-    // read and an empty activity set before anything is committed, per
-    // I12.24:181.
+    // check proved nothing about the operation it claims to gate.
+    // `SafeBoundary::from_observed_closure` takes both values from a record the
+    // Governor's learning-closure owner actually committed from owner-recorded
+    // lifecycle activities (`crates/governor/eliot-governor/src/
+    // learning_closure.rs:483`), and that boundary is derived by
+    // `derive_boundaries`, which refuses an ordinary read and an empty activity
+    // set before anything is committed, per I12.24:181.
     //
     // STATED PLAINLY, because it changes what this pass does: `store` is read
     // from already-committed in-process state and performs no exchange, but an
@@ -603,11 +600,7 @@ pub fn assemble_improvement_artifact(
     );
     // What the observed closure actually concluded about behaviour, read
     // through the record's own predicates rather than re-spelled here.
-    let observed_effect = if observed.carries_behavioural_proposal {
-        "and proposes a next-behaviour change for the next attempt"
-    } else {
-        "and closed with no next-behaviour change proposed"
-    };
+    let observed_effect = observed_behaviour_effect(&observed);
     // The two values below are the boundary's OWN observed strings, so the
     // boundary this brief describes and the boundary it is gated on are
     // literally the same value.
@@ -829,6 +822,21 @@ fn newest_observed_closure(
         carries_behavioural_proposal: observed.carries_behavioural_proposal(),
         has_retry_lineage: observed.lineage_for_retry().is_some(),
     })
+}
+
+/// What the observed closure actually concluded about behaviour.
+///
+/// Read through the record's own predicate (`carries_behavioural_proposal`)
+/// rather than re-spelled at the call site, so the brief reports what the
+/// closure committed rather than what this dispatch layer would have chosen.
+/// Both arms are equally truthful statements about the record; neither is a
+/// prediction.
+fn observed_behaviour_effect(observed: &ObservedClosure) -> &'static str {
+    if observed.carries_behavioural_proposal {
+        "and proposes a next-behaviour change for the next attempt"
+    } else {
+        "and closed with no next-behaviour change proposed"
+    }
 }
 
 /// The unknowns the observed closure could not resolve, plus the one it cannot
