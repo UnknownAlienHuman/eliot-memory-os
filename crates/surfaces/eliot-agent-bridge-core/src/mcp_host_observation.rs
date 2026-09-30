@@ -162,7 +162,7 @@ impl std::error::Error for HostObservationReject {}
 /// carrying no invocation scope at all.
 ///
 /// In particular `ProviderTerminalObservation::terminal_ref` is NOT an
-/// invocation scope and is never read as one: the OpenCode producer emits the
+/// invocation scope and is never read as one: the `OpenCode` producer emits the
 /// constant `"opencode:step-finish-stop"` for every step-finish event, and the
 /// Codex producer emits the bound turn, which spans many invocations. Treating
 /// either as an invocation identity would compare one shared constant against
