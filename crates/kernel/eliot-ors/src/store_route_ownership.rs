@@ -4,11 +4,11 @@
 //! stage 8 the only transition that may change it: "commit the
 //! `canonical_store` CapabilityRouteScope cutover through Kernel Generation
 //! Registry". A route that has never been cut over therefore has no
-//! [`crate::GenerationCutoverOwnership`] row to read, and "no committed cutover
-//! for this scope" is on its own indistinguishable from "any generation may own
-//! this route". That is the state every installation starts in, so a
-//! configuration change or a restart could install an approved but uncommitted
-//! candidate bridge on the canonical route with no stage evidence at all.
+//! `GenerationCutoverOwnership` row to read, and "no committed cutover for this
+//! scope" is on its own indistinguishable from "any generation may own this
+//! route". That is the state every installation starts in, so a configuration
+//! change or a restart could install an approved but uncommitted candidate
+//! bridge on the canonical route with no stage evidence at all.
 //!
 //! This row is the missing owner record. It states which generation a route
 //! scope *started* at, it is written once per scope, and the only thing that may
