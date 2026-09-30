@@ -5526,6 +5526,14 @@ fn owner_record_digest_parts(records: &OwnerRecords) -> Vec<String> {
 }
 
 /// Builds the digest parts committing one owner-issued causal evidence record.
+///
+/// The returned parts are UNSORTED. `owner_record_digest_parts` sorts the whole
+/// vector before it is serialised, which is what makes every list this function
+/// emits order independent: two owners that declared the same members in a
+/// different order spell the same parts and therefore the same identity. That
+/// ordering is a property of the caller, so this function must not sort locally
+/// as well; a second sort here would be a second canonicalisation of the same
+/// value.
 fn causal_evidence_digest_parts(record: &CausalEvidenceRecord) -> Vec<String> {
     let mut parts: Vec<String> = vec![format!(
         "causal_evidence:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
@@ -5541,6 +5549,42 @@ fn causal_evidence_digest_parts(record: &CausalEvidenceRecord) -> Vec<String> {
         record.control.evaluator_result.as_str(),
         record.control.evidence_id
     )];
+    // The falsifier's own SPECIFICATION enters the preimage. The base part above
+    // commits the two falsifier cells that decide the claim — the observed status
+    // and the evidence identity the observation is traced to — but neither of
+    // those names WHICH falsifier the owner ran, so two owner records that ran
+    // materially different falsifiers against the same claim, and reported the
+    // same status from the same evidence, spelled byte-identical preimages and
+    // therefore shared one `candidate_digest`. `specification` is retained on
+    // the public `FalsifierBinding`, bounded by `check_bounded_text` in
+    // `CausalEvidenceRecord::validate`, and charged against the aggregate byte
+    // ceiling in `count_causal_evidence_bytes`, so it is a real budgeted
+    // admission cost that the identity did not pay for.
+    //
+    // It is committed even though no leg reads it: `blocking_causal_leg` tests
+    // `falsifier.observed`, never the text of the specification, which is
+    // exactly why the omission was invisible to the derivation. That is not a
+    // reason to leave it out. The specification is the owner's declaration of
+    // the discriminator being applied, and I12.18 makes the mechanism, rival and
+    // falsifier references named members of the causal relation evidence rather
+    // than decoration on a status label: a claim whose falsifier was "the result
+    // does not replicate on commit `abc`" and a claim whose falsifier was "the
+    // result does not replicate at all" are different retained records, and
+    // publishing the same identity for both is the partial-field-list defect
+    // this part closes.
+    //
+    // The spelling puts the specification LAST, after a fixed literal label, so
+    // the map from specification bytes to part string is injective and a
+    // specification containing `:` — `check_bounded_text` rejects control
+    // characters but admits every printable byte, so `:` is legal here, as it is
+    // in a handle — cannot be shifted onto a neighbouring field. It is also not
+    // the only part carrying this record's handle: the base part above and the
+    // `causal_derived` part below both name it, so two records on different
+    // source handles differ in the parts vector whatever this field contains.
+    parts.push(format!(
+        "falsifier_specification:{}:{}",
+        record.source_handle, record.falsifier.specification
+    ));
     // `map_or` cannot unify an `&str` default with a `String` closure result,
     // and the two branches are genuinely different types, so this is an
     // explicit match rather than a coerced default.
@@ -5556,18 +5600,53 @@ fn causal_evidence_digest_parts(record: &CausalEvidenceRecord) -> Vec<String> {
         parts.push(format!("rival_omitted:{}:{handle}", record.source_handle));
     }
     for evidence in &record.evidence {
-        // The envelope's own coverage and provenance are bound here because
-        // admission and qualification now both read them: a preimage that
+        // The envelope's own coverage, provenance, and fence are bound here
+        // because admission and qualification all read them: a preimage that
         // omitted them would keep one candidate identity across a changed
-        // coverage ceiling or a changed capture revision.
+        // coverage ceiling, a changed capture revision, or a changed fence.
+        //
+        // The FENCE is the last token, and it is the whole `StateFence`, not one
+        // member of it. `check_evidence_joins` compares it by exact tuple against
+        // the item's current fence and refuses a mixed-fence envelope, and I5.16
+        // carries `state_fence` on every durable semantic record, so which fence
+        // an envelope was captured under is a first-class property of the
+        // retained evidence rather than ambient context.
+        //
+        // It is committed even though it is DERIVABLE, which is the reason it is
+        // worth spelling out. Admission proves `envelope.state_fence ==
+        // item.state_fence` and separately `CausalEvidenceRecord.state_fence ==
+        // item.state_fence`, so every admissible record's envelope fence and its
+        // own fence are the same tuple. That derivation runs through `item`,
+        // though, and `compute_candidate_digest` does not take `item` as an
+        // argument at all: the boundary every owner record is measured against
+        // reaches no digest. So the retained record — the thing the candidate
+        // identity is supposed to commit, and the thing a later replay re-admits
+        // against whatever item it then holds — was carrying a load-bearing
+        // boundary that the identity never bound. Committing the fence here
+        // closes that for the envelope, and transitively for the record's own
+        // fence and its source member's fence, which admission forces to the
+        // same tuple.
+        //
+        // `{:?}` is the spelling this part already uses for the envelope's own
+        // enums, and it is deterministic here: `StateFence` and every type it
+        // reaches (`EpochId`, `EpochLineageId`, and the `counter!` revisions and
+        // `ResourceGeneration`) use derived `Debug` over scalars and a tuple
+        // struct, so there is no map iteration, pointer, or formatting order to
+        // vary between runs. Being last, the token cannot be shifted onto a
+        // neighbouring field, and a record on a different source handle already
+        // differs in the base part above.
         let revision = evidence
             .envelope
             .provenance
             .revision
             .as_deref()
             .unwrap_or("absent");
+        // Every placeholder is positional. `format!` refuses a positional
+        // argument placed after a named one, and the fence has to be the LAST
+        // token, so the revision is passed positionally rather than through the
+        // named `{revision}` capture the previous spelling used.
         parts.push(format!(
-            "causal_evidence_envelope:{}:{}:{}:{}:{}:{:?}:{:?}:{:?}:{:?}:{:?}:{}:{revision}",
+            "causal_evidence_envelope:{}:{}:{}:{}:{}:{:?}:{:?}:{:?}:{:?}:{:?}:{}:{}:{:?}",
             record.source_handle,
             evidence.evidence_id,
             evidence.owner,
@@ -5579,6 +5658,7 @@ fn causal_evidence_digest_parts(record: &CausalEvidenceRecord) -> Vec<String> {
             evidence.envelope.assertability,
             evidence.envelope.coverage,
             evidence.envelope.provenance.scope,
+            evidence.envelope.state_fence,
         ));
     }
     // The derived assessment is committed as well as the inputs it is derived
