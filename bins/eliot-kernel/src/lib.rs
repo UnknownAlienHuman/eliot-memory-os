@@ -83,7 +83,7 @@ mod process_stream_readback;
 mod lsp_current_executor;
 pub use lsp_current_executor::{
     GitAdmissionFuture, GitAdmissionPort, KernelGitProcessRunner, KernelLspCurrentExecutor,
-    KernelLspProcessOwnerPort, MAX_GIT_PROCESS_STREAM_BYTES,
+    KernelLspProcessOwnerPort,
 };
 mod supervision_lease_authority;
 mod testd_terminal_completion_route;

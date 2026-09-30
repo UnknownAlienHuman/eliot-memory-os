@@ -6,6 +6,7 @@
 //! identity still names the exact inert P-03 request before forwarding it to
 //! the Kernel's existing private process gateway.
 
+use eliot_contracts::TaskId;
 use eliot_ipc::Session;
 use eliot_kernel_service::{ProcessExecutionRejection, ProcessExecutionRequest};
 use eliot_protocol::RequestIdentity;
@@ -13,34 +14,38 @@ use eliot_protocol::RequestIdentity;
 /// A source-process payload joined to its validated original EBP identity.
 ///
 /// The value is created only after the request identity and process request
-/// agree on operation, task presence, fence, recipient, and (for Start) the
-/// original deadline. It is local to the Kernel call stack, is not authority,
-/// and cannot be serialized into a reusable admission token.
+/// agree on operation, the exact admitted task, fence, recipient, and (for
+/// Start) the original deadline. It is local to the Kernel call stack, is not
+/// authority, and cannot be serialized into a reusable admission token.
 pub(super) struct BoundCurrentSourceProcessRequest {
     request: ProcessExecutionRequest,
+    task_id: TaskId,
     _identity: RequestIdentity,
 }
 
 impl BoundCurrentSourceProcessRequest {
     pub(super) fn bind(
         identity: &RequestIdentity,
+        task_id: &TaskId,
         request: ProcessExecutionRequest,
         session: &Session,
     ) -> Result<Self, ProcessExecutionRejection> {
-        validate_current_source_request(identity, &request, session)?;
+        validate_current_source_request(identity, task_id, &request, session)?;
         Ok(Self {
             request,
+            task_id: task_id.clone(),
             _identity: identity.clone(),
         })
     }
 
-    pub(super) fn into_parts(self) -> (ProcessExecutionRequest, RequestIdentity) {
-        (self.request, self._identity)
+    pub(super) fn into_parts(self) -> (ProcessExecutionRequest, RequestIdentity, TaskId) {
+        (self.request, self._identity, self.task_id)
     }
 }
 
 pub(super) fn validate_current_source_request(
     identity: &RequestIdentity,
+    admitted_task_id: &TaskId,
     request: &ProcessExecutionRequest,
     session: &Session,
 ) -> Result<(), ProcessExecutionRejection> {
@@ -69,7 +74,7 @@ pub(super) fn validate_current_source_request(
     })?;
     if identity.request.state_fence != session.module_generation.state_fence
         || identity.request.metadata.state_fence != identity.request.state_fence
-        || identity.request.metadata.task_id.is_none()
+        || identity.request.metadata.task_id.as_ref() != Some(admitted_task_id)
         || identity.idempotency_key != operation_id.as_str()
         || identity.request.metadata.request_id.as_str() != operation_id.as_str()
     {
