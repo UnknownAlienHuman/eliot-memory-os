@@ -20,6 +20,7 @@
 //! only drop daemon-leg memory and never fabricate admission.
 
 use std::collections::BTreeMap;
+use std::path::{Component, Path, PathBuf};
 
 use eliot_ors::{HostRequestState, OperationIdentity, OrsError};
 use eliot_protocol::{
@@ -861,10 +862,22 @@ impl KernelComposition {
         // refusal fails closed without crashing the route.
         let candidate_blocked = {
             let resources = finish_candidate_resources(tool.as_ref());
-            if resources.is_empty() {
+            let mut resolved_paths = Vec::new();
+            let mut has_opaque_handle = false;
+            for resource in &resources {
+                match normalize_finish_candidate_resource(resource) {
+                    Some(normalized) => resolved_paths.push(normalized),
+                    None => has_opaque_handle = true,
+                }
+            }
+            if resolved_paths.is_empty() || has_opaque_handle {
+                // No resolvable declared target, or an opaque job/operation
+                // handle that could name a blocked resource: keep the global
+                // gate as fallback instead of letting an unresolvable list
+                // silently pass the per-resource comparison below.
                 super::change_monitor::governed_acceptance_blocked()
             } else {
-                resources.iter().any(|resource| {
+                resolved_paths.iter().any(|resource| {
                     super::change_monitor::governed_acceptance_blocked_for(resource.as_str())
                 })
             }
@@ -1227,6 +1240,62 @@ fn finish_candidate_resources(tool: Option<&serde_json::Value>) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Resolves one admitted finish-candidate `artifact_ref` into the Kernel
+/// ledger's tracked-source identity when it names an absolute path, and
+/// reports an opaque job/operation handle otherwise (issue #1824, I10.21
+/// A2).
+///
+/// The ledger keys hints and unknown-origin records by the lexically
+/// normalized absolute tracked source (`process_execution` admits argv
+/// targets with the same recipe), so the same recipe is applied here:
+/// trim, require an absolute path, resolve `.`/`..` lexically, drop
+/// trailing separators, and re-emit platform spelling. Anything that is
+/// not an absolute path — job ids (`testd-<hex>`), operation ids,
+/// relative names, blanks, control-carrying values, or `..` escapes past
+/// the root — is `None`, and the caller keeps the global acceptance gate
+/// instead of comparing a handle against absolute-path identity by `==`
+/// and silently passing.
+///
+/// Residual (no mapping fabricated): the only job/operation record on
+/// this path is `eliot_testd_core::TestJob`
+/// (`crates/instrument/eliot-testd-core/src/lib.rs`), whose declared
+/// identity is directory roots (`target_roots`) plus description strings
+/// (`invocation.target`/`declared_scope`) — never the file-granular
+/// absolute paths the ledger keys by (`declared_target_paths` in
+/// `process_execution.rs` excludes directories by construction), so no
+/// `==`-comparable identity is reachable from the finish leg; likewise no
+/// operation-to-resource map exists on the ORS host-request record. Total:
+/// no I/O, no panics, and unrelated lanes are untouched.
+fn normalize_finish_candidate_resource(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.chars().any(char::is_control) {
+        return None;
+    }
+    let path = Path::new(trimmed);
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(part) => out.push(part.as_os_str()),
+            Component::RootDir => out.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    return None;
+                }
+            }
+            Component::Normal(part) => out.push(part),
+        }
+    }
+    let normalized = out.to_string_lossy().into_owned();
+    if normalized.trim().is_empty() {
+        return None;
+    }
+    Some(normalized)
 }
 
 /// Joins a presented finish result against its live queue record.
