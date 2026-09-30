@@ -5758,7 +5758,12 @@ async fn run_improvement_intake(
 /// Governor pipeline refusing this candidate is the advisory outcome I12.24:76
 /// requires, because this daemon holds no independent executed evaluation and
 /// sets `ImprovementEvidenceExecution::NotExecuted` rather than claiming one.
-/// Reading what the disposition decided stays with
+/// When the ADMITTING pipeline refuses this way, the route asks the Governor
+/// admission gate for the closed disposition over the same records and, if the
+/// gate can answer, returns that outcome with the refusal carried whole beside
+/// it; if the gate refuses the same way — which is what happens while the
+/// proposal carries no owner-issued privacy class — the typed error crosses as
+/// itself. Reading what the disposition decided stays with
 /// [`report_improvement_candidate_route`], which this function hands the outcome
 /// to unchanged.
 ///
@@ -5789,6 +5794,10 @@ async fn route_and_reconcile_improvement_candidate(
             policy,
             state_fence: fence,
             retained,
+            // The learning-closure record this SAME pass read while assembling
+            // `artifact`, carried out of that read rather than opened a second
+            // time. The route binds its `meta.learning.closure` fields to it.
+            observed_closure: &artifact.observed_closure,
         },
     );
     // Phase 6 — the external effect this disposition names, read from the effect
@@ -5844,7 +5853,13 @@ async fn route_and_reconcile_improvement_candidate(
 /// - The `CanaryAdmitted` arm also names the repeat assessment the pipeline
 ///   derived against the retained prior record, so an absent assessment is
 ///   visibly the denial it is rather than a silent omission.
-/// - Every other terminal disposition keeps the verbatim record it always had.
+/// - Every other terminal disposition keeps the verbatim record it always had,
+///   and carries the ADMITTING pipeline's own typed refusal beside it when the
+///   route reached the gate after that path refused. The two are never merged:
+///   the closed disposition is the Governor admission gate's verdict over the
+///   same checked records, and the refusal is the reason the path that could
+///   have reached `CanaryAdmitted` never got there. Presenting one as the other
+///   would hide either a refusal or a verdict.
 ///
 /// The return value is the pipeline-checked current record the NEXT pass
 /// compares against, or the record this call was handed when the pass was not
@@ -5856,8 +5871,10 @@ async fn route_and_reconcile_improvement_candidate(
 /// a loop failure: the Governor pipeline refusing this candidate is the advisory
 /// outcome I12.24:76 requires, because this daemon holds no independent executed
 /// evaluation and sets `ImprovementEvidenceExecution::NotExecuted` rather than
-/// claiming one. Nothing on this path promotes, activates, installs, completes,
-/// or issues authority.
+/// claiming one. A refusal that the ADMITTING path returns is additionally
+/// reported inside a successful outcome, beside the closed admission
+/// disposition, rather than being collapsed into it. Nothing on this path
+/// promotes, activates, installs, completes, or issues authority.
 fn report_improvement_candidate_route(
     candidate_id: &str,
     routed: Result<
@@ -5906,10 +5923,10 @@ fn report_improvement_candidate_route(
                         // The repeat assessment the pipeline derived against the
                         // retained prior record, when both records existed. `None`
                         // on every pass that was not admitted, which is every pass on
-                        // this workspace: the execution gate refuses first, so no
-                        // current record is ever published. Recorded so an absent
-                        // assessment is visibly the denial it is rather than a silent
-                        // omission.
+                        // this workspace: no disposition publishes a checked current
+                        // record, so the comparison is never reached. Recorded so an
+                        // absent assessment is visibly the denial it is rather than a
+                        // silent omission.
                         repeat = ?outcome.repeat,
                     );
                 }
@@ -5948,12 +5965,25 @@ fn report_improvement_candidate_route(
                         // The pipeline's own advisory-only terminal disposition,
                         // recorded verbatim.
                         disposition = ?disposition,
+                        // The ADMITTING pipeline's own typed refusal, when the
+                        // route reached the admission gate after that pipeline
+                        // refused. Recorded beside the disposition rather than
+                        // resolved into it, so the two facts stay
+                        // distinguishable: the closed disposition is the Governor
+                        // admission gate's verdict over the same checked records,
+                        // and this is the reason the path that could reach
+                        // `CanaryAdmitted` never got there. `None` when the
+                        // admitting pipeline returned the disposition above
+                        // itself, and on this workspace also when the gate
+                        // refuses the same absent owner privacy class inside the
+                        // proposal bytes — that case is the `Err` arm below.
+                        admitting_pipeline_refusal = ?outcome.admitting_pipeline_refusal,
                         // The repeat assessment, when one was derived, and the
                         // external-effect state the owner gave for it. Recorded so
                         // "nobody settled this effect" and "no prior record was
                         // compared" are visible facts on the live pass instead of
-                        // unexamined omissions: on this workspace the execution
-                        // gate refuses first, so both are absent.
+                        // unexamined omissions: on this workspace no disposition
+                        // publishes a checked current record, so both are absent.
                         repeat = ?outcome.repeat,
                         effect = ?outcome.effect,
                     );

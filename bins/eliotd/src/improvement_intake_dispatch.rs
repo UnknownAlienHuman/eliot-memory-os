@@ -652,6 +652,17 @@ pub struct ImprovementArtifact {
     pub brief: ImprovementBrief,
     /// Recorded, non-mutating owner decision over that brief.
     pub decision: OwnerDecision,
+    /// The owner-committed learning-closure record this artifact was assembled
+    /// against, carried so a later phase binds to the SAME read.
+    ///
+    /// This is not a second read and not a re-derivation: it is the exact
+    /// [`ObservedClosure`] this pass already read at
+    /// [`newest_observed_closure`], moved out of the assembly so the Governor
+    /// candidate route can name the closure cell it read instead of reading the
+    /// image a second time. The route binds this record's own durable lineage
+    /// handle and canonical digest; see
+    /// `improvement_candidate_dispatch::route_closure_id`.
+    pub observed_closure: ObservedClosure,
 }
 
 /// Assembles the deduplicated improvement candidate, the owner-actionable
@@ -865,6 +876,10 @@ pub fn assemble_improvement_artifact(
         candidate,
         brief,
         decision: decision_record,
+        // Carried out of the assembly so the candidate route binds the SAME
+        // committed closure record this pass read, rather than opening the
+        // Governor image a second time between two phases of one pass.
+        observed_closure: observed,
     })
 }
 
@@ -1255,12 +1270,19 @@ fn maintenance_replay_plan(
 /// a value the candidate and brief only quote would be a new dependency. The
 /// closure's accessors are read through inference and their results carried by
 /// value, so nothing in this module depends on the record's concrete type.
-struct ObservedClosure {
+///
+/// Public because [`ImprovementArtifact`] now CARRIES this record, so the
+/// Governor candidate route binds its `meta.learning.closure` fields to the very
+/// read this intake already performed instead of performing a second one. Only
+/// the three fields that route needs to bind are reachable; everything else
+/// stays private to this module's own brief and evidence projection.
+pub struct ObservedClosure {
     /// Durable lineage handle and canonical digest the record committed.
-    lineage_artifact: String,
-    lineage_digest: String,
+    pub lineage_artifact: String,
+    /// Canonical digest of exactly the bytes that handle names.
+    pub lineage_digest: String,
     /// The closed attempt this observation belongs to.
-    attempt_id: String,
+    pub attempt_id: String,
     /// The campaign that attempt belonged to.
     campaign_id: String,
     /// The route the closed attempt ran.

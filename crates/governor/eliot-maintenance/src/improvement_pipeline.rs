@@ -2772,6 +2772,159 @@ pub fn run_improvement_candidate_pipeline(
     map_decision(&decision, &joined)
 }
 
+/// Returns the closed terminal disposition of the Governor admission gate over
+/// records whose experiment evidence has NOT been checked for execution.
+///
+/// # Why this exists at all
+///
+/// [`run_improvement_candidate_pipeline`] refuses a candidate whose experiment
+/// evidence is not independent, passed and EXECUTED before it ever reaches
+/// `improvement_admission::admit_improvement_candidate`, and it also requires a
+/// gap-free rollback contract first. Both refusals are guarantees and neither is
+/// touched here. The consequence is that a caller holding no executed evaluation
+/// gets a typed [`PipelineError`] and no terminal disposition at all, so "this
+/// candidate was refused" has no record to read. This function supplies that
+/// record and nothing else: it runs the same admission gate over the same records
+/// and returns the gate's own verdict in the same
+/// [`ImprovementTerminalDisposition`] vocabulary the full pipeline uses.
+///
+/// # What it checks, and what it deliberately does not
+///
+/// It runs the identity half of the join — operation identities, the bounded
+/// plan's own shape, its owner routing, the single normalized commitment and the
+/// record derived from it, the proposal/candidate identity join including the
+/// closure binding, and the proposal/experiment operation, scope, budget and
+/// deadline join — then calls `admit_improvement_candidate` with those exact
+/// values and maps the decision through this module's own private `map_rejection`
+/// / `map_block` projections. A caller therefore cannot present a disposition
+/// this crate did not derive from a decision the gate returned, and cannot
+/// substitute a hand-built one: this is the checked replacement for making
+/// `map_decision` public, not a widened `pub`.
+///
+/// It does NOT run `check_evaluation_shape` and does NOT run
+/// `check_rollback_contract`, and that omission is a CEILING rather than a
+/// relaxation. The only two decisions that could use the records those checks
+/// guard are refused outright below, so the check they would perform cannot
+/// change any outcome this function can return: an admit verdict is an
+/// [`PipelineError::UnboundRelation`], never a [`ImprovementTerminalDisposition`],
+/// and so is the retained-effect obligation, which needs a gap-free rollback
+/// contract to name its repair bindings. No canary handoff is built here either,
+/// so `execution_authorized` cannot become true and no record is published for a
+/// later pass to compare against.
+///
+/// It also does not run [`ImprovementProposal::validate`]. That check is a
+/// precondition of ADMISSION, and this function admits nothing: a proposal whose
+/// shape is incomplete is still disposed by the gate, over the gate's own rules
+/// rather than a second set of them. A caller that wants the full precondition
+/// set is calling [`run_improvement_candidate_pipeline`], which is unchanged and
+/// still validates first.
+///
+/// # What a caller therefore gets
+///
+/// One of the gate's own refusal dispositions — for a candidate whose closure
+/// binding is not currently valid, that is
+/// [`ImprovementTerminalDisposition::Rejected`] with cause
+/// [`ImprovementRejectCause::InvalidClosureBinding`] — or the typed error a join
+/// check or the gate produced. A proposal the commitment profile refuses is one
+/// of those errors, not a disposition: this function never repairs a malformed
+/// record to get past it. Never an admit, never a canary handoff, never a
+/// promotion, activation, rollback execution or Finish.
+pub fn admit_improvement_candidate_without_execution_evidence(
+    proposal: &ImprovementProposal,
+    experiment: &ExperimentPlan,
+    candidate: &ImprovementCandidateView,
+    admission_evidence: &ImprovementEvidenceView,
+    policy: &ImprovementAdmissionPolicy,
+) -> Result<ImprovementTerminalDisposition, PipelineError> {
+    check_operation_identities()?;
+    check_experiment_shape(experiment)?;
+    check_experiment_owner_routing(experiment)?;
+    // The gate's own fourth input, built by the single producer the full
+    // pipeline uses, so a caller never assembles a second commitment and cannot
+    // disagree with the one the pipeline commits.
+    let normalized = canonical_proposal(proposal)?;
+    let current = current_proposal_of(&normalized, experiment)?;
+    check_proposal_candidate_join(proposal, candidate)?;
+    check_proposal_experiment_join(experiment, proposal, candidate)?;
+    // The same bounded-reference ceiling the full pipeline applies to this field
+    // in `check_admission_evidence_join`, kept here so an unbounded reference is
+    // refused before the gate records it.
+    bounded_text(
+        &admission_evidence.run_ref,
+        "admission_evidence.run_ref",
+        IMPROVEMENT_MAX_REFERENCE_BYTES,
+    )?;
+    check_evaluator_distinct_from_owners(
+        admission_evidence.verifier_id.as_str(),
+        experiment,
+        policy,
+        [
+            "admission-evidence: reviewer-is-the-experiment-executor",
+            "admission-evidence: reviewer-is-the-governor-admission-owner",
+            "admission-evidence: reviewer-is-the-rollback-owner",
+        ],
+    )?;
+    // The gate owns the verdict; a typed admission refusal, including the
+    // identity conflict, crosses this boundary as itself and is never collapsed
+    // into reason text.
+    let decision = admit_improvement_candidate(candidate, admission_evidence, policy, &current)?;
+    map_unadmitted_decision(&decision)
+}
+
+/// Projects a decision this module must refuse into a disposition.
+///
+/// The two refusals are structural, not incidental: an admit verdict is exactly
+/// what the checks this entry point does not run exist to prevent, and a
+/// retained-effect obligation is built from a gap-free rollback contract this
+/// entry point does not hold. Both are typed [`PipelineError::UnboundRelation`]
+/// refusals with a static relation identity, so no caller can mistake them for
+/// a disposition and no disposition is invented in their place.
+///
+/// Every other decision is projected by the SAME private mappers
+/// `run_improvement_candidate_pipeline` uses, so a `Rejected` disposition read
+/// through this function is byte-for-byte the one the full pipeline would have
+/// returned for the same decision.
+fn map_unadmitted_decision(
+    decision: &ImprovementAdmissionDecision,
+) -> Result<ImprovementTerminalDisposition, PipelineError> {
+    match decision {
+        ImprovementAdmissionDecision::AdmitForExperiment { .. } => {
+            Err(PipelineError::UnboundRelation {
+                relation: "admission-without-execution-evidence: \
+                    admit-verdict-requires-independent-executed-evidence-and-a-gap-free-rollback",
+            })
+        }
+        ImprovementAdmissionDecision::RequiresReconciliation { .. } => {
+            Err(PipelineError::UnboundRelation {
+                relation: "admission-without-execution-evidence: \
+                    retained-effect-obligation-requires-a-gap-free-rollback-contract",
+            })
+        }
+        ImprovementAdmissionDecision::Reject {
+            cause,
+            reason,
+            owner_id,
+        } => Ok(map_rejection(*cause, reason, owner_id)),
+        ImprovementAdmissionDecision::NeedsMoreEvidence { missing, owner_id } => {
+            Ok(ImprovementTerminalDisposition::Inconclusive {
+                missing: missing.clone(),
+                owner_id: owner_id.clone(),
+            })
+        }
+        ImprovementAdmissionDecision::Blocked {
+            cause,
+            reason,
+            owner_id,
+        } => Ok(map_block(*cause, reason, owner_id)),
+        ImprovementAdmissionDecision::NoProgress { reason, owner_id } => {
+            Ok(ImprovementTerminalDisposition::NoProgress {
+                reason: reason.clone(),
+                owner_id: owner_id.clone(),
+            })
+        }
+    }
+}
+
 /// One private checked view over the seven borrowed pipeline inputs.
 ///
 /// The view has no public constructor and no bypass flag: the only way to hold

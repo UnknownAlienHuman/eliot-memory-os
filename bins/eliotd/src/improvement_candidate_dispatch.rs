@@ -28,11 +28,14 @@
 //! own delivery target; its data identity is the `eliot-improvement` owner's own
 //! evidence-lineage digest over that lineage; its runtime identity is the
 //! candidate's own admitted validity scope (the admitted authority epoch and
-//! resource generation); its operation and idempotency namespaces are the `G-19`
-//! policy record's own; its risk and effect ceilings are the pipeline's own
-//! admitted constants; and its rollback owner is the one the same policy record
-//! names, read back out of the operation owner map's `Rollback` row rather than
-//! re-spelled. See each field's `ASSUMPTION` note for what a value is and is not.
+//! resource generation); its `meta.learning.closure` binding is the Governor
+//! learning-closure owner's OWN committed record for the attempt this
+//! observation belongs to; its operation and idempotency namespaces are the
+//! `G-19` policy record's own; its risk and effect ceilings are the pipeline's
+//! own admitted constants; and its rollback owner is the one the same policy
+//! record names, read back out of the operation owner map's `Rollback` row
+//! rather than re-spelled. See each field's `ASSUMPTION` note for what a value
+//! is and is not.
 //!
 //! # One map, one read: the daemon names owners it does not own
 //!
@@ -201,37 +204,47 @@
 //!   alongside the result, and its own comment is that "package-green never
 //!   substitutes"; a green package is therefore not this pulse, and
 //!   `ImprovementEvidenceView::pulse` stays `Missing` without `#11`.
-//! - The `ImprovementCandidateView` supplies the `meta.learning.closure`
-//!   binding, and an owner privacy-class vocabulary is reachable, so
-//!   `ImprovementProposal::validate` stops refusing the absent `closure_id` and
-//!   `privacy_class`. Those are the FIRST refusals the pipeline reaches on this
-//!   path, ahead of every evidence check, so this precondition gates the
+//! - The `ImprovementCandidateView` supplies an owner privacy-class vocabulary
+//!   for [`ImprovementProposal::privacy_class`], so `ImprovementProposal::validate`
+//!   stops refusing the absent `privacy_class` and the ADMITTING pipeline
+//!   (`run_improvement_candidate_pipeline`) reaches the evaluation gates. The
+//!   `meta.learning.closure` binding no longer needs an owner: this daemon reads
+//!   the Governor learning-closure owner's own committed record and binds that.
+//!   `privacy_class` is the FIRST refusal the admitting pipeline still reaches on
+//!   this path, ahead of every evidence check, so this precondition gates the
 //!   evaluation ones rather than being independent of them; it is stated at
 //!   "What the daemon does not hold" below.
 //!
-//! Until then the disposition this path produces is a typed refusal, and the
-//! correct outcome of this issue's activation half is that the refusal IS the
-//! guarantee: no self-report, no model score, no exit zero, and no absent
-//! producer is substituted for the run that never happened.
+//! Until then what this path produces is a refusal, and the correct outcome of
+//! this issue's activation half is that the refusal IS the guarantee: no
+//! self-report, no model score, no exit zero, and no absent producer is
+//! substituted for the run that never happened. A closed `Rejected` disposition
+//! would be a refusal too — the candidate refused, not admitted — so reaching one
+//! weakens nothing; it is not reached only because the one field that would
+//! carry it has no owner-issued value on this path.
 //!
 //! # What the daemon does not hold, stated rather than filled
 //!
-//! Three things this path would need have no daemon-owned value, and they are
+//! Two things this path would need have no daemon-owned value, and they are
 //! left empty rather than relabelled from something else:
 //!
-//! 1. **The learning-closure binding.** [`ImprovementProposal::closure_id`] /
-//!    [`ImprovementProposal::closure_digest`] bind the `meta.learning.closure`
-//!    cell (`#819`). This daemon's maintenance intake produces an
-//!    `ImprovementCandidate`, a brief and an owner decision; it does not
-//!    assemble a `CampaignLearningClosure`, and nothing on the maintenance path
-//!    publishes one. Binding the improvement candidate's own identity to a field
-//!    that means a different proved cell would be exactly the misattribution
-//!    `improvement_intake_dispatch::maintenance_evidence_source` was written to
-//!    remove, so the binding stays absent and the pipeline refuses it.
-//! 2. **The privacy class.** No owner vocabulary for classifying the privacy
+//! 1. **The privacy class.** No owner vocabulary for classifying the privacy
 //!    class of a maintenance improvement proposal is reachable from this daemon,
 //!    so [`ImprovementProposal::privacy_class`] is empty rather than guessed.
-//! 3. **The executed-evaluation and repair-path references.**
+//!    The three candidates that were measured and rejected are named so the next
+//!    reader does not re-derive them: `eliot-security-contracts::PrivacyClass`
+//!    and `eliot-source-assurance::SourceAssurance` classify a SOURCE DOMAIN, and
+//!    this daemon holds no source-assurance record for a maintenance observation;
+//!    `eliot-improvement`'s own `PRIVACY_CEILING` (`"redacted-diagnostics-only"`)
+//!    is a ceiling on the `#972` promotion-input advisory, which this path does
+//!    not prepare; and the owner-issued privacy-class reference that DOES exist
+//!    for a maintenance trigger — `MaintenanceTriggerRecord::privacy_class_reference`
+//!    and `TriggerIntakeClasses::privacy_class_reference` — is issued on the
+//!    Kernel ORS staging path, which this daemon's intake does not traverse. The
+//!    one consequence is measured, not hidden, and it is the whole of what
+//!    stands between this path and a closed disposition: see "The terminal
+//!    disposition this path actually produces" below.
+//! 2. **The executed-evaluation and repair-path references.**
 //!    [`ActivationEvidence::run_ref`] and
 //!    [`ActivationEvidence::raw_evidence_ref`], plus the reopen, expiry and
 //!    forward-repair references of [`RollbackContract`], name a run that did not
@@ -239,21 +252,56 @@
 //!    recorded rollback and stop-condition references ARE real and are bound; the
 //!    rest stay absent.
 //!
+//! The `meta.learning.closure` binding is no longer in this list, and the reason
+//! is that an owner value turned out to be reachable after all:
+//! [`ImprovementRouteDispatch::observed_closure`] is the Governor learning-closure
+//! owner's OWN committed record for the attempt this observation belongs to, read
+//! once by `improvement_intake_dispatch::newest_observed_closure` and carried on
+//! the artifact. `route_closure_id` binds that record's own durable lineage
+//! handle and `route_closure_digest` its own canonical digest — see
+//! `route_closure_id` for the full statement of what this names. It is an
+//! identity, not an attestation: the admission evidence reports
+//! `closure_valid: false`, so the Governor gate rejects rather than admits.
+//!
 //! # The terminal disposition this path actually produces
 //!
-//! A typed [`PipelineError`] from the Governor pipeline, over a real request
-//! built from a real observation. The pipeline checks the proposal shape before
-//! it checks the experiment evidence, so on this workspace the FIRST refusal is
-//! [`PipelineError::MissingField`] naming `closure_id` (and `privacy_class`
-//! behind it) — the absent learning-closure binding, not a verdict on the
-//! candidate. Behind that gate sits the substantive one: even with those fields
-//! bound, `check_evaluation_shape` refuses this evidence as
-//! [`PipelineError::EvidenceNotExecuted`] because its execution status is
-//! `NotExecuted`, which is the I12.24:76 refusal. Both are refusals. Neither is
-//! a promotion: no result of this path promotes, activates, installs, completes
-//! or issues authority, and the advisory application-class ceiling (I12.24:81)
-//! is enforced upstream by
-//! `improvement_intake_dispatch::enforce_advisory_class_gate` on the artifact
+//! **Today: a typed [`PipelineError`], and NO disposition. This is measured, not
+//! assumed, and the measurement is the point of the paragraph below.**
+//!
+//! The closed [`ImprovementTerminalDisposition::Rejected`] that
+//! `admit_improvement_candidate` produces for an evidence view whose closure
+//! binding is not currently valid — `improvement_admission.rs:651`, mapped by
+//! this crate's own `map_rejection` — is one link away, and the missing link is
+//! [`ImprovementProposal::privacy_class`], not anything about closure or
+//! evidence. `admit_improvement_candidate` takes the pipeline's checked current
+//! record as its fourth input, and the only producer of that record
+//! (`current_proposal_of`) requires the normalized proposal, whose commitment
+//! profile refuses an empty required field at `improvement_pipeline.rs:3880`.
+//! `ImprovementProposal::validate` refuses the same field at
+//! `improvement_pipeline.rs:678`. So the gate cannot be reached at all by a
+//! proposal whose privacy class is absent, and the daemon holds no owner-issued
+//! value for it (item 1 above).
+//!
+//! What that means for this file is precise, and neither part is hidden:
+//!
+//! - The ADMITTING pipeline refuses with [`PipelineError::MissingField`] naming
+//!   `privacy_class`. Behind it sits the substantive refusal: with that field
+//!   bound, `check_evaluation_shape` refuses this evidence as
+//!   [`PipelineError::EvidenceNotExecuted`] because its execution status is
+//!   `NotExecuted`, which is the I12.24:76 refusal, and
+//!   `check_rollback_contract` refuses the absent reopen, expiry and
+//!   forward-repair references. The privacy class is the FIRST of three, and it
+//!   is the only one this daemon could clear by itself — which it does not.
+//! - [`admit_improvement_candidate_without_execution_evidence`] is wired and
+//!   live on this path, and it propagates that same typed refusal today, because
+//!   it commits the same proposal bytes through the same owner producer. The
+//!   moment an owner privacy class exists it returns the gate's own closed
+//!   `Rejected` disposition, and `admitting_pipeline_refusal` becomes `Some`
+//!   instead of the whole call propagating the error.
+//!
+//! Nothing here promotes, activates, installs, completes or issues authority,
+//! and the advisory application-class ceiling (I12.24:81) is enforced upstream
+//! by `improvement_intake_dispatch::enforce_advisory_class_gate` on the artifact
 //! this function is given, so it is not duplicated here.
 //!
 //! # The daemon CONSUMES the handoff, so the daemon checks it
@@ -443,6 +491,7 @@ use eliot_maintenance::{
     ImprovementEvidenceExecution, ImprovementEvidenceView, ImprovementOperation,
     ImprovementProposal, ImprovementPulseOutcome, ImprovementReplayAssessment,
     ImprovementTerminalDisposition, MechanismDeclaration, PipelineError, RollbackContract,
+    admit_improvement_candidate_without_execution_evidence,
 };
 use eliot_protocol::RequestIdentity;
 use eliot_receipts::RequestBinding;
@@ -457,7 +506,9 @@ use super::improvement_candidate_route::{
     check_improvement_handoff_identity, improvement_operation_owners,
     read_improvement_effect_state, route_improvement_candidate,
 };
-use super::improvement_intake_dispatch::{ImprovementArtifact, ImprovementDispatchError};
+use super::improvement_intake_dispatch::{
+    ImprovementArtifact, ImprovementDispatchError, ObservedClosure,
+};
 
 /// Closed store scope for the durable unresolved-effect obligation record.
 ///
@@ -502,6 +553,17 @@ pub struct ImprovementRouteDispatch<'a> {
     pub state_fence: &'a StateFence,
     /// The pipeline's checked current record from an earlier admitted pass.
     pub retained: Option<&'a RetainedImprovementProposal>,
+    /// The owner-committed learning-closure record the SAME maintenance pass
+    /// read while assembling `dispatch.artifact`.
+    ///
+    /// This is the very [`ObservedClosure`] `assemble_improvement_artifact`
+    /// read at `improvement_intake_dispatch::newest_observed_closure` and then
+    /// carried on the artifact; it is threaded here rather than read again so
+    /// the `meta.learning.closure` binding names one record from ONE pass, and
+    /// so a second read cannot disagree with the boundary the candidate's own
+    /// evidence lineage was built over. It is a borrowed read of committed
+    /// in-process state: no exchange, no store client, no extra lock.
+    pub observed_closure: &'a ObservedClosure,
 }
 
 /// What one bounded route step actually produced.
@@ -546,6 +608,27 @@ pub struct ImprovementRouteOutcome {
     /// recorded or retried: nothing here attaches an owner outcome, and nothing
     /// decides a retry this daemon is not already told about.
     pub effect: ImprovementEffectState,
+    /// The ADMITTING pipeline's own typed refusal, when it refused.
+    ///
+    /// `run_improvement_candidate_pipeline` is the only path that can reach
+    /// `CanaryAdmitted`, and on this workspace it refuses before the admission
+    /// gate: it checks the proposal shape first, and this daemon holds no
+    /// owner-issued privacy class for the proposal inputs
+    /// (`ImprovementProposal::privacy_class`, see the module documentation).
+    /// When that happens the gate is asked for the closed disposition over the
+    /// very same records, and the gate's own typed refusal is kept here WHOLE
+    /// rather than discarded, so a reader sees both facts: the admitting path
+    /// refused, and the Governor admission gate's verdict over the same checked
+    /// records is the closed `disposition`.
+    ///
+    /// `None` exactly when the admitting pipeline returned a disposition of its
+    /// own, which is the only case in which `disposition` is that pipeline's
+    /// answer. On this workspace it is also `None` in practice, because the
+    /// gate commits the same proposal bytes and refuses the same absent
+    /// `privacy_class` — that refusal propagates as the call's own `Err` rather
+    /// than as a disposition plus this field. The field exists for the day the
+    /// gate can answer, and it is not a place to park today's refusal.
+    pub admitting_pipeline_refusal: Option<PipelineError>,
 }
 
 /// The three owner identities this dispatch reads out of the operation map.
@@ -623,11 +706,12 @@ fn route_operation_owner(
 /// `dispatch.artifact` is the advisory candidate/brief/owner-decision artifact
 /// this daemon assembled and durably committed for the current maintenance
 /// observation, `dispatch.policy` is the `G-19` improvement admission policy
-/// read from the live maintenance owner for that same observation, and
+/// read from the live maintenance owner for that same observation,
 /// `dispatch.state_fence` is the Kernel fence the observation was admitted
-/// under. All three are real daemon-held values; the seven records this
-/// assembles are functions of their own fields, as the module documentation
-/// states field by field.
+/// under, and `dispatch.observed_closure` is the owner-committed learning-closure
+/// record the SAME pass read while assembling that artifact. All four are real
+/// daemon-held values; the seven records this assembles are functions of their
+/// own fields, as the module documentation states field by field.
 ///
 /// This module is the only place in the repository that constructs an
 /// [`ImprovementRouteRequest`], and this function is its production caller: it
@@ -638,13 +722,39 @@ fn route_operation_owner(
 /// daemon holds no independent executed evaluation — crosses this boundary as
 /// itself.
 ///
+/// # What happens when the admitting pipeline refuses
+///
+/// The admitting pipeline is tried FIRST and stays primary: it is the only call
+/// that can reach `CanaryAdmitted`. When it returns a typed refusal, this
+/// function does not stop there and does not resolve the refusal away. It reads
+/// the CLOSED admission disposition for the same candidate from the Governor
+/// owner's own gate through
+/// [`admit_improvement_candidate_without_execution_evidence`], over the very
+/// same two records the request borrowed, and returns BOTH: the closed
+/// disposition as `disposition`, the admitting pipeline's typed refusal whole in
+/// `admitting_pipeline_refusal`.
+///
+/// Two properties make that second read safe rather than a second opinion that
+/// could drift. The records are the same values, bound once above — never a
+/// second construction. And the wrapper can only return a REFUSAL: it refuses an
+/// admit verdict outright, so nothing read on this branch can reach an
+/// experiment, a canary handoff, an activation, or a record the next pass
+/// retains. `execution_authorized` remains false in every handoff this module
+/// can still receive, because the handoff branch is only reachable from the
+/// admitting pipeline's own `Ok`.
+///
+/// Today the wrapper propagates the same typed refusal the admitting pipeline
+/// produced, because the absent owner privacy class is inside the proposal bytes
+/// it commits. That is stated, not worked around: the module documentation says
+/// exactly which field is the remaining link.
+///
 /// It returns the pipeline's own advisory-only terminal disposition, the exact
 /// experiment plan the run committed it over, and the repeat assessment the
-/// admitted branch derived — or the typed [`PipelineError`] the pipeline refused
-/// with. It never promotes, activates, installs, completes, or issues authority,
-/// and it performs no durability of its own: the caller commits through the
-/// existing [`crate::DaemonComposition::commit_learning_record`] seam and
-/// retains the next pass's record in the intake flight it already owns.
+/// admitted branch derived — or the typed [`PipelineError`] both Governor reads
+/// refused with. It never promotes, activates, installs, completes, or issues
+/// authority, and it performs no durability of its own: the caller commits
+/// through the existing [`crate::DaemonComposition::commit_learning_record`]
+/// seam and retains the next pass's record in the intake flight it already owns.
 ///
 /// The route is bounded and non-looping: one call, one decision, per pass. It
 /// never promotes, activates, installs, completes, or issues authority, and a
@@ -673,21 +783,75 @@ pub fn dispatch_improvement_candidate_route(
     // is checked against, and the plan the outcome carries are the same value
     // rather than two constructions that could drift.
     let experiment = route_experiment(candidate, dispatch.policy, &owners);
-    let proposal = route_proposal(candidate, dispatch.policy, dispatch.state_fence);
-    let disposition = route_improvement_candidate(ImprovementRouteRequest {
+    let proposal = route_proposal(
+        candidate,
+        dispatch.policy,
+        dispatch.state_fence,
+        dispatch.observed_closure,
+    );
+    // The two records the Governor admission gate consumes are bound here, not
+    // inside the request literal, because BOTH the admitting pipeline and the
+    // closed-admission fallback below read the very same two values. Building
+    // them once is what makes the fallback a second opinion about one set of
+    // records rather than a second set of records.
+    let candidate_view =
+        route_candidate_view(candidate, dispatch.policy, dispatch.observed_closure);
+    let admission_evidence = route_admission_evidence(
+        candidate,
+        &owners,
+        dispatch.retained,
+        dispatch.observed_closure,
+    );
+    // The ADMITTING path runs first and stays the primary one: it is the only
+    // call that can reach `CanaryAdmitted`, and its typed refusal is a fact
+    // about this pass rather than something to be resolved away.
+    let admitting = route_improvement_candidate(ImprovementRouteRequest {
         proposal: &proposal,
         experiment: &experiment,
         evidence: &route_activation_evidence(candidate, &owners),
         rollback: &route_rollback_contract(candidate, &owners),
-        candidate: &route_candidate_view(candidate, dispatch.policy),
-        admission_evidence: &route_admission_evidence(candidate, &owners, dispatch.retained),
+        candidate: &candidate_view,
+        admission_evidence: &admission_evidence,
         policy: dispatch.policy,
-    })?;
-    // The handoff is consumed under this build's identity BEFORE anything reads
-    // its progress out of it, so the record the repeat assessment compares is
-    // always one this build was able to read. A refusal crosses as the typed
-    // `PipelineError` those checks produce, with no disposition returned at all.
-    check_handoff_consumable(&disposition, &experiment)?;
+    });
+    let (disposition, admitting_pipeline_refusal) = match admitting {
+        Ok(disposition) => {
+            // The handoff is consumed under this build's identity BEFORE anything
+            // reads its progress out of it, so the record the repeat assessment
+            // compares is always one this build was able to read. A refusal
+            // crosses as the typed `PipelineError` those checks produce, with no
+            // disposition returned at all.
+            check_handoff_consumable(&disposition, &experiment)?;
+            (disposition, None)
+        }
+        Err(refusal) => {
+            // The admitting path refused before the admission gate, so the
+            // closed disposition for this candidate is read from the gate
+            // itself, over the same checked records and this crate's own
+            // `admit_improvement_candidate_without_execution_evidence`. The two
+            // answers are then reported as two answers: the gate's verdict as the
+            // disposition and the admitting path's typed refusal whole beside it,
+            // never one presented as the other. When the GATE also refuses, its
+            // own typed error is what crosses this boundary — the gate was asked
+            // last and its answer is the one the disposition would have carried,
+            // so it is the one a caller needs; the admitting path's identical
+            // refusal is not re-reported as a second opinion about the same
+            // malformed proposal bytes.
+            //
+            // The fallback can only ever produce a refusal disposition — the
+            // wrapper refuses an admit verdict outright — so nothing read on
+            // this branch can reach an experiment, a canary handoff, an
+            // activation, or a record the next pass retains.
+            let disposition = admit_improvement_candidate_without_execution_evidence(
+                &proposal,
+                &experiment,
+                &candidate_view,
+                &admission_evidence,
+                dispatch.policy,
+            )?;
+            (disposition, Some(refusal))
+        }
+    };
 
     // The pipeline publishes its own checked current record inside the canary
     // handoff precisely so a consumer compares progress against the checked
@@ -715,6 +879,7 @@ pub fn dispatch_improvement_candidate_route(
         repeat,
         retained_next,
         effect,
+        admitting_pipeline_refusal,
     })
 }
 
@@ -1060,6 +1225,7 @@ fn route_proposal(
     candidate: &ImprovementCandidate,
     policy: &ImprovementAdmissionPolicy,
     state_fence: &StateFence,
+    observed_closure: &ObservedClosure,
 ) -> ImprovementProposal {
     let candidate_id = candidate.candidate_id.as_str();
     // The admitted boundary of this observation. It is the candidate's OWN
@@ -1093,10 +1259,12 @@ fn route_proposal(
         // purpose. The candidate carries the project identity the intake gave it,
         // so the campaign is a function of the artifact rather than a literal.
         campaign_id: format!("{project_id}-maintenance-improvement"),
-        // No `meta.learning.closure` record is held for a maintenance
-        // observation; see the module documentation. Absent, never relabelled.
-        closure_id: String::new(),
-        closure_digest: String::new(),
+        // The `meta.learning.closure` cell's OWN committed record, bound by its
+        // own durable lineage handle and the canonical digest of exactly those
+        // bytes. See `route_closure_binding` for what this names and what it
+        // deliberately does not claim.
+        closure_id: route_closure_id(observed_closure),
+        closure_digest: route_closure_digest(observed_closure),
         // The candidate's own canonical evidence lineage, verbatim. Declared set:
         // the intake assembled it through `canonical_evidence_lineage`, so it is
         // already duplicate-free and deterministic.
@@ -1127,7 +1295,10 @@ fn route_proposal(
         // `route_deadline_ref`.
         deadline_ref: route_deadline_ref(candidate),
         // No owner privacy-class vocabulary is reachable here; see the module
-        // documentation. Absent, never guessed.
+        // documentation. Absent, never guessed — and, because the ADMITTING
+        // pipeline validates the proposal shape before anything else, this
+        // absent field is the refusal the admitting path reports today. See
+        // `ImprovementRouteOutcome::admitting_pipeline_refusal`.
         privacy_class: String::new(),
         // The exact set the rollback contract must cover: the admitted boundary
         // this candidate is valid only within.
@@ -1147,6 +1318,57 @@ fn route_proposal(
         // see `route_data_identity`.
         data_identity: route_data_identity(candidate),
     }
+}
+
+/// The `meta.learning.closure` identity this proposal and candidate view bind.
+///
+/// # What the field means, and what this value is
+///
+/// [`ImprovementProposal::closure_id`] is documented "Closure candidate identity"
+/// (`eliot-maintenance/src/improvement_pipeline.rs:618`) and
+/// [`ImprovementCandidateView::closure_id`] "Closure candidate identity (`#819`)"
+/// (`improvement_admission.rs:75`); `closure_digest` is "Closure evidence digest
+/// (opaque, order-invariant at the source)" (`improvement_admission.rs:77`). The
+/// types are `String` and nothing in `validate` constrains them to a particular
+/// closure type, so the binding is free to name the cell it actually read — and
+/// it must, because a cell identity borrowed from a different owner record is
+/// the misattribution `improvement_intake_dispatch::maintenance_evidence_source`
+/// was written to remove.
+///
+/// What this daemon reads is the Governor learning-closure owner's own committed
+/// record: `DaemonComposition::learning_closure().store()`, a
+/// `CanonicalLearningDeltaStore` of `StoredLearningDelta` values, whose newest
+/// record `newest_observed_closure` read on THIS pass and carried on
+/// [`ImprovementArtifact::observed_closure`]. Its own accessor
+/// `StoredLearningDelta::lineage_ref`
+/// (`crates/smart/eliot-learning-delta/src/stored.rs:306`) returns the durable
+/// lineage handle and the canonical digest of exactly those bytes. So the handle
+/// IS the committed closure cell's identity and the digest IS the digest the
+/// owner recorded over it — neither is composed, formatted, or re-derived here,
+/// and both are already cited by the candidate's own evidence lineage as
+/// `learning-closure:<handle>` and `learning-closure-digest:<digest>`.
+///
+/// # What this binding is NOT
+///
+/// It is an IDENTITY, not an attestation. Nothing here claims the closure is
+/// still valid, and the admission evidence says so in machine state:
+/// `closure_valid: false` and `closure_stale: false` in
+/// [`route_admission_evidence`], because this daemon holds no owner-validated
+/// re-verification of the binding. That honest pair is what makes the Governor
+/// admission gate return its own closed `InvalidClosureBinding` rejection rather
+/// than admitting anything. Binding the identifiers and admitting the candidate
+/// are different questions and are answered by different fields.
+fn route_closure_id(observed: &ObservedClosure) -> String {
+    observed.lineage_artifact.clone()
+}
+
+/// The canonical digest of the bytes [`route_closure_id`] names.
+///
+/// Opaque by contract: the value is the closure record's own committed digest,
+/// read through its own accessor, and is neither recomputed over local state nor
+/// compared against a locally derived hash.
+fn route_closure_digest(observed: &ObservedClosure) -> String {
+    observed.lineage_digest.clone()
 }
 
 /// The causal mechanism this daemon declares BEFORE any result exists.
@@ -1299,6 +1521,54 @@ fn route_content_revision_ref(candidate: &ImprovementCandidate) -> String {
     format!("{candidate_id}/r{revision}")
 }
 
+/// The run this admission review observed.
+///
+/// # Why this field is bound at all
+///
+/// [`ImprovementEvidenceView::run_ref`] is "Exact run this admission review
+/// observed" (`improvement_admission.rs:119`), and the Governor admission gate
+/// refuses an empty one in `validate_evidence` (`improvement_admission.rs:1001`).
+/// An absent value there is a MALFORMED record rather than an honest one, so a
+/// review that observed nothing could not be recorded at all. Naming something
+/// that does not exist would be worse: a fabricated run identity is precisely
+/// what A0.3 forbids and what the audit behind AUD2/AUD3 exists to prevent. So
+/// this names the ONE run record this daemon actually holds.
+///
+/// # What it names
+///
+/// The closed attempt the Governor learning-closure owner committed on the
+/// learning-delta record this pass read — `StoredLearningDelta::attempt_id`,
+/// read through the same [`ObservedClosure`] whose lineage handle and digest
+/// [`route_closure_id`] binds. That is a real run: an attempt executed over a
+/// route, whose outcome the closure owner committed and whose lineage this
+/// candidate's evidence is already built over
+/// (`improvement_intake_dispatch::ObservedClosure::lineage_evidence_refs`). The
+/// value is the record's own committed identity, not a formatted composite, a
+/// counter, or a clock reading.
+///
+/// `ASSUMPTION:` this is the run the admission review observed. The review's
+/// input is the maintenance observation, and that observation's evidence lineage
+/// is bound to this attempt's committed closure; the review read that closure,
+/// so this is the run whose recorded outcome it read. It is a binding of WHAT
+/// WAS OBSERVED, and the review's verdict is derived from the records rather
+/// than from this reference.
+///
+/// # What it is NOT
+///
+/// It is NOT the bounded experiment run. That run does not exist: no experiment
+/// is released from this daemon, and the fields that say so are machine state
+/// and stay at their honest values — `independent: false`, `verifier_passed:
+/// false`, `pulse: ImprovementPulseOutcome::Missing` on this record, and
+/// `execution: ImprovementEvidenceExecution::NotExecuted` on the activation
+/// evidence beside it. Those booleans and that status are what the Governor
+/// pipeline and the admission gate read, in that order; a non-empty `run_ref`
+/// substitutes for none of them and admits nothing on its own. The gate refuses
+/// this candidate BEFORE reaching any experiment question, at
+/// `improvement_admission.rs:651`, on the absent closure validity below.
+fn route_admission_run_ref(observed: &ObservedClosure) -> String {
+    observed.attempt_id.clone()
+}
+
 /// The repair path named before any experiment is admitted.
 fn route_rollback_contract(
     candidate: &ImprovementCandidate,
@@ -1332,13 +1602,19 @@ fn route_rollback_contract(
 fn route_candidate_view(
     candidate: &ImprovementCandidate,
     policy: &ImprovementAdmissionPolicy,
+    observed_closure: &ObservedClosure,
 ) -> ImprovementCandidateView {
     let project_id = candidate.project_id.as_str();
     ImprovementCandidateView {
         candidate_id: candidate.candidate_id.clone(),
         campaign_id: format!("{project_id}-maintenance-improvement"),
-        closure_id: String::new(),
-        closure_digest: String::new(),
+        // The SAME closure record the proposal declares. The Governor pipeline
+        // compares the two views field by field in `check_proposal_candidate_join`,
+        // so a divergence here is a typed `UnboundRelation` rather than a
+        // rejection of a candidate bound to one closure and a view bound to
+        // another. See `route_closure_binding`.
+        closure_id: route_closure_id(observed_closure),
+        closure_digest: route_closure_digest(observed_closure),
         // The improvement package prepares no promotion input on this path, and
         // the owner does not re-read one, so neither is asserted.
         promotion_input_id: None,
@@ -1368,6 +1644,7 @@ fn route_admission_evidence(
     candidate: &ImprovementCandidate,
     owners: &RouteOwners,
     retained: Option<&RetainedImprovementProposal>,
+    observed_closure: &ObservedClosure,
 ) -> ImprovementEvidenceView {
     let candidate_id = candidate.candidate_id.as_str();
     ImprovementEvidenceView {
@@ -1378,7 +1655,10 @@ fn route_admission_evidence(
         bound_candidate_id: candidate.candidate_id.clone(),
         bound_experiment_id: format!("maintenance-improvement-experiment:{candidate_id}"),
         content_revision_ref: route_content_revision_ref(candidate),
-        run_ref: String::new(),
+        // The run this admission review actually observed. See
+        // `route_admission_run_ref` for what that names and, at more length,
+        // what it is not.
+        run_ref: route_admission_run_ref(observed_closure),
         independent: false,
         verifier_passed: false,
         // No product pulse was observed for this candidate, and a package-green
