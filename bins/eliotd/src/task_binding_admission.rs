@@ -2759,12 +2759,7 @@ pub fn admit_lsp_capture_from_owner(
                 "task-bound LSP capture requires the original request Task",
             )
         })?;
-    let scope_ref = selection
-        .work_scope()
-        .binding
-        .scope
-        .scope_ref
-        .as_str();
+    let scope_ref = selection.work_scope().binding.scope.scope_ref.as_str();
     let presented_fence = &identity.request.metadata.state_fence;
     admit_task_bound(
         Some(selection.evidence()),
@@ -2811,12 +2806,7 @@ pub fn admit_lsp_capture_with_live_binding(
     validate_lsp_capture_owner_join(identity, source_admission, transition, current_selection)?;
     if binding.evidence != *current_selection.evidence()
         || binding.admitted_task_ref != current_selection.task_ref()
-        || binding.scope_ref
-            != current_selection
-                .work_scope()
-                .binding
-                .scope
-                .scope_ref
+        || binding.scope_ref != current_selection.work_scope().binding.scope.scope_ref
         || binding.principal_ref != current_selection.principal_ref()
         || binding.session_ref != current_selection.session_ref()
         || binding.presented_fence != identity.request.metadata.state_fence
@@ -2889,9 +2879,7 @@ fn validate_lsp_capture_owner_join(
 ) -> Result<(), TaskBindingError> {
     validate_lsp_capture_source_admission(identity, source_admission)?;
     transition.validate().map_err(|error| {
-        TaskBindingError::selection_required(format!(
-            "prepared LSP capture is invalid: {error}"
-        ))
+        TaskBindingError::selection_required(format!("prepared LSP capture is invalid: {error}"))
     })?;
     let metadata = &identity.request.metadata;
     let Some(request_task) = metadata.task_id.as_deref() else {
@@ -2899,12 +2887,7 @@ fn validate_lsp_capture_owner_join(
             "task-bound LSP capture requires the original request Task",
         ));
     };
-    let owner_scope = selection
-        .work_scope()
-        .binding
-        .scope
-        .scope_ref
-        .as_str();
+    let owner_scope = selection.work_scope().binding.scope.scope_ref.as_str();
     let fence = &metadata.state_fence;
     let evidence = selection.evidence();
 
@@ -3107,23 +3090,22 @@ pub fn revalidate_dispatched_binding(
         admitted_receipt_revision,
         admitted_governance_profile_ref,
         admitted_projection_generation,
-    ) =
-        match &binding.provenance {
-            DispatchedBindingProvenance::Bootstrap {
-                receipt_revision,
-                governance_profile_ref,
-                projection_generation,
-            } => (
-                *receipt_revision,
-                governance_profile_ref.as_str(),
-                *projection_generation,
-            ),
-            DispatchedBindingProvenance::LiveTaskSelection(_) => {
-                return Err(TaskBindingError::selection_required(
-                    "live TaskSelection dispatch requires exact Governor owner revalidation",
-                ));
-            }
-        };
+    ) = match &binding.provenance {
+        DispatchedBindingProvenance::Bootstrap {
+            receipt_revision,
+            governance_profile_ref,
+            projection_generation,
+        } => (
+            *receipt_revision,
+            governance_profile_ref.as_str(),
+            *projection_generation,
+        ),
+        DispatchedBindingProvenance::LiveTaskSelection(_) => {
+            return Err(TaskBindingError::selection_required(
+                "live TaskSelection dispatch requires exact Governor owner revalidation",
+            ));
+        }
+    };
     let Some(live_task_ref) = live_task_ref else {
         return Err(TaskBindingError::selection_required(
             "task-bound dispatch revalidation names no live task",

@@ -9,6 +9,7 @@
 //! Forbidden authority: no Store/provider SDK, canonical ownership, semantic
 //! Governor reconstruction, retry/default synthesis, or alternate transport.
 
+use crate::task_binding_admission::DispatchedBinding;
 use eliot_contracts::{ArtifactId, OperationId, StateFence, TaskId};
 use eliot_governor::{
     KernelPortError, KernelPortFuture, KernelTransitionPort, SourceArtifactAdmission,
@@ -27,7 +28,6 @@ use eliot_store_api::{
     task_contract_acceptance_read_request, validate_store_receipt_envelope_with_causal,
     verify_canonical_request_hash,
 };
-use crate::task_binding_admission::DispatchedBinding;
 use tracing::Instrument as _;
 
 use super::{DaemonKernelClient, kernel_port_error, kind_value};
@@ -140,7 +140,10 @@ fn check_identity_binding_with_lsp_capture(
         current_selection,
     )
     .map_err(|error| KernelPortError::Contract(error.to_string()))?;
-    if !matches!(admission, super::task_binding_admission::TaskBindingAdmission::TaskBound(_)) {
+    if !matches!(
+        admission,
+        super::task_binding_admission::TaskBindingAdmission::TaskBound(_)
+    ) {
         return Err(KernelPortError::Contract(
             "live LSP capture binding was not admitted as TaskBound".to_owned(),
         ));

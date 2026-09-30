@@ -137,7 +137,9 @@ pub enum CapturedLspAdoptionError {
     TerminalBarrier(String),
     /// The process owner returned evidence for a different operation or a
     /// nonterminal process at the completion barrier.
-    #[error("original process owner completion evidence does not bind a terminal admitted operation")]
+    #[error(
+        "original process owner completion evidence does not bind a terminal admitted operation"
+    )]
     TerminalEvidenceMismatch,
     /// The original process owner's completion evidence failed local contract
     /// validation.
@@ -240,9 +242,7 @@ impl eliot_lsp_bridge::LspProcessOwnerPort for DaemonCurrentSourceLspProcessOwne
                     self.task_id.clone(),
                 )
                 .await
-                .map_err(|error| {
-                    eliot_lsp_bridge::LspProcessOwnerError::Owner(Box::new(error))
-                })?;
+                .map_err(|error| eliot_lsp_bridge::LspProcessOwnerError::Owner(Box::new(error)))?;
             match response {
                 eliot_kernel_service::ProcessExecutionResponse::Started(receipt) => Ok(receipt),
                 other => Err(current_source_process_rejection(other, "Started")),
@@ -263,9 +263,7 @@ impl eliot_lsp_bridge::LspProcessOwnerPort for DaemonCurrentSourceLspProcessOwne
                     self.task_id.clone(),
                 )
                 .await
-                .map_err(|error| {
-                    eliot_lsp_bridge::LspProcessOwnerError::Owner(Box::new(error))
-                })?;
+                .map_err(|error| eliot_lsp_bridge::LspProcessOwnerError::Owner(Box::new(error)))?;
             match response {
                 eliot_kernel_service::ProcessExecutionResponse::Reconciled(evidence) => {
                     Ok(evidence)
@@ -2308,18 +2306,12 @@ impl DaemonComposition {
         let request_task = source_artifact_admission.task().task_id.as_str();
         let request_session = source_artifact_admission.session().session_id.as_str();
         let request_principal = source_artifact_admission.holder().as_str();
-        let request_scope = source_artifact_admission
-            .work_scope()
-            .scope_id
-            .as_str();
+        let request_scope = source_artifact_admission.work_scope().scope_id.as_str();
         let request_fence = &identity.request.metadata.state_fence;
         let selection = self
             .governor
             .task_selection_evidence_for_request(
-                || {
-                    crate::try_unix_ms(SystemTime::now())
-                        .map_err(CompositionError::Clock)
-                },
+                || crate::try_unix_ms(SystemTime::now()).map_err(CompositionError::Clock),
                 request_principal,
                 request_session,
                 request_task,
@@ -2333,10 +2325,7 @@ impl DaemonComposition {
             identity: identity.clone(),
             task_id,
         };
-        let bridge = eliot_lsp_bridge::LspCurrentBridge::new(
-            Arc::new(process_owner),
-            git_owner,
-        );
+        let bridge = eliot_lsp_bridge::LspCurrentBridge::new(Arc::new(process_owner), git_owner);
         let profile = self
             .policy_owner()
             .ok_or(CapturedLspAdoptionError::MissingPolicyOwner)?

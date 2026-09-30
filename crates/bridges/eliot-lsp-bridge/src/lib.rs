@@ -2960,10 +2960,7 @@ impl<P: LspProcessOwnerPort, G: GitProcessRunner> LspCurrentBridge<P, G> {
         let process_completed = process_evidence_completed(&process_evidence);
         let process_truncated = process_outputs_incomplete(&process_evidence, &raw_outputs);
         let exit_code = process_evidence_exit_code(&process_evidence);
-        let invoked_at_unix_ms = started
-            .process_start
-            .identity()
-            .resumed_at_unix_ms();
+        let invoked_at_unix_ms = started.process_start.identity().resumed_at_unix_ms();
         let mut result = normalize_retained_operation(
             &started.config,
             &started.source_candidate,
