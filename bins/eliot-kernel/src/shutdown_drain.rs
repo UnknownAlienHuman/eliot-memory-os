@@ -714,38 +714,31 @@ fn validate_durable_state(durable: &DurableDrainState) -> Result<(), String> {
 
     // The installation-scoped fence must never name a lineage at sequence
     // zero: that is a blank identity, not a revocation. Every recorded fence
-    // is also a complete journal identity, held to the same rule the decision
-    // field itself is.
-    if durable.fenced_activation_generations.iter().any(|(lineage, sequence)| {
-        lineage.trim().is_empty()
-            || *sequence == 0
-            || SupervisionJournalEpoch {
-                lineage_id: lineage.clone(),
-                sequence: *sequence,
-            }
-            .validate("shutdown.fenced_activation_generations")
-            .is_err()
-    }) {
+    // is a complete journal identity, held to the same rule the decision field
+    // itself is.
+    if durable
+        .fenced_activation_generations
+        .iter()
+        .any(|(lineage, sequence)| {
+            lineage.trim().is_empty()
+                || *sequence == 0
+                || SupervisionJournalEpoch {
+                    lineage_id: lineage.clone(),
+                    sequence: *sequence,
+                }
+                .validate("shutdown.fenced_activation_generations")
+                .is_err()
+        })
+    {
         return Err("shutdown state contains an invalid activation fence".to_owned());
     }
-    // A persisted linearization whose activation generation is not covered by
-    // the installation fence would be a commit that forgot its own
-    // revocation. Repaired on load rather than refused: the repair only adds a
-    // fence, so it can never un-fence an authority.
-    if let Some(fenced) = durable
-        .committed
-        .as_ref()
-        .and_then(|committed| committed.activation_generation_fenced.as_ref())
-    {
-        let recorded = durable
-            .fenced_activation_generations
-            .get(&fenced.lineage_id)
-            .copied()
-            .unwrap_or(0);
-        if fenced.sequence > recorded {
-            return Err("shutdown state activation fence is behind its own commit".to_owned());
-        }
-    }
+    // Deliberately NO check that a recovered `committed` decision is covered by
+    // the fence map: a state file written before the fence field existed
+    // decodes with an empty map, so such a check would refuse exactly the
+    // pre-field state the compatibility note above says must stay readable. The
+    // one-directional repair in `load` covers that case by adding the fence,
+    // and only a fence that is *behind* its own commit can be repaired, never
+    // one that would un-fence an authority.
 
     // Pending identities are written only through the registration and
     // terminal paths, which refuse blank identities; a blank entry on disk
@@ -1638,14 +1631,14 @@ pub(crate) fn reverse_quiescence_order(
         .iter()
         .flat_map(|edge| [edge.dependent, edge.dependency])
         .collect();
-    if live.iter().any(|branch| !declared.contains(branch)) {
+    if live.iter().any(|branch| !declared.contains(*branch)) {
         return Err("quiescent contour has an undeclared branch".to_owned());
     }
     // Kahn's algorithm over the reverse edges: a branch is emittable only once
     // every branch that requires it has already been emitted.
     let mut outstanding: BTreeMap<&str, BTreeSet<&str>> = live
         .iter()
-        .map(|branch| (branch, BTreeSet::new()))
+        .map(|branch| (*branch, BTreeSet::new()))
         .collect();
     for edge in &KERNEL_QUIESCENCE_EDGES {
         if live.contains(edge.dependent)
