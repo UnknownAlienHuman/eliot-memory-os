@@ -17,8 +17,8 @@
 //! | Build the `GroundingRequest` | `grounding_stage::resolve_grounding_inputs` over the same admitted pair | wired |
 //! | Ground the admitted draft | `grounding_stage::ground_admitted_draft` | wired |
 //! | Validate the grounded draft | `validation_stage::validate_admitted_draft` (`ValidatedGroundingCandidate`) | wired |
-//! | Read/build the exact `CanonicalProjectionSet` from Governor/canonical owners | `eliot_governor::canonical_projections::emit_canonical_projection_set`, delivered over [`OrientationSupply`] | wired |
-//! | Acquire the remaining mandatory stages' owner input/receipt | Governor owner records over the same [`OrientationSupply`] channel | wired |
+//! | Read/build the exact `CanonicalProjectionSet` from Governor/canonical owners | `eliot_governor::canonical_projections::emit_canonical_projection_set`, delivered over [`OrientationSupply`] | producer exists in the Governor; no production source wired |
+//! | Acquire the remaining mandatory stages' owner input/receipt | Governor owner records over the same [`OrientationSupply`] channel | producer exists in the Governor; no production source wired |
 //! | Invoke the pure composer | [`compose_production_result`] below (this module) | wired |
 //! | Publish the typed result | `dispatch_stage::dispatch_orientation` as `DreamResult::Orientation` | wired |
 //!
@@ -30,6 +30,18 @@
 //! hypothesis pair enters beside them as explicit parameters, because
 //! `dispatch_orientation` is what derived and validated that pair. Only values
 //! a Governor/canonical owner publishes travel over [`OrientationSupply`].
+//!
+//! The last two owner-channel rows are measured, not aspirational: the
+//! Governor's producer exists (`eliot_governor::canonical_projections::emit_canonical_projection_set`),
+//! but no `OrientationSupplySource` is wired in production —
+//! `AuthenticatedKernelJobPort::connect` sets none and `with_orientation_source`
+//! has no caller, so the channel is unconstructible in-binary. The absence is
+//! reported through the typed disposition this module already publishes:
+//! [`resolve_production_inputs`] returns the [`OrientationDisposition::Blocked`]
+//! result from [`supply_missing_blocked`], carrying no packet, `CC004_MISSING`
+//! on the CC-004 boundary record, and `missing_owners` naming the canonical
+//! projection owner plus every stage owner. The carrier is not relaxed, no
+//! member is defaulted, and no check is skipped to make a stage fire.
 //!
 //! A missing adapter is implementation work, never substituted with local
 //! data: the v1 hypothesis pair derived in dispatch is reported only as the
