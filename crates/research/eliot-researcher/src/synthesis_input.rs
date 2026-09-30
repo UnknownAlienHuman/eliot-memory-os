@@ -574,7 +574,7 @@ impl SynthesisInputPack {
             lane_release_refused: !lane.evidence_class.is_confirmatory(),
             digest: String::new(),
         };
-        pack.digest = pack.compute_digest()?;
+        pack.digest = pack.compute_digest();
         Ok(pack)
     }
 
@@ -631,7 +631,12 @@ impl SynthesisInputPack {
     }
 
     /// Canonical digest over the whole pack shape.
-    fn compute_digest(&self) -> Result<String, InquiryError> {
+    ///
+    /// It is a pure fold over already-resolved values — no validator runs on the
+    /// path, so it cannot refuse — which is why it returns the digest directly.
+    /// `validate_integrity` is what re-proves the fold's output against the
+    /// digest the pack recorded, and that is the caller's question to ask.
+    fn compute_digest(&self) -> String {
         let mut preimage = String::from(SYNTHESIS_INPUT_PACK_DIGEST_DOMAIN);
         push_field(&mut preimage, "pack_id", &self.pack_id);
         push_field(
@@ -650,57 +655,12 @@ impl SynthesisInputPack {
         push_field(
             &mut preimage,
             "admitted_disclosure",
-            &disclosure_wire(self.admitted_disclosure),
+            disclosure_wire(self.admitted_disclosure),
         );
         push_field(&mut preimage, "question", &self.question);
         push_count(&mut preimage, "members", self.members.len());
         for member in &self.members {
-            push_field(&mut preimage, "member", &member.source_handle);
-            push_field(&mut preimage, "member_record_digest", &member.record_digest);
-            push_field(&mut preimage, "member_content_digest", &member.content_digest);
-            push_field(
-                &mut preimage,
-                "member_retained_revision_digest",
-                &member.retained_revision_digest,
-            );
-            push_field(
-                &mut preimage,
-                "member_retained_artifact_ref",
-                &member.retained_artifact_ref,
-            );
-            push_field(&mut preimage, "member_disclosure", disclosure_wire(member.disclosure));
-            push_field(&mut preimage, "member_allowed_use", &member.allowed_use);
-            push_field(&mut preimage, "member_allowed_effects", &member.allowed_effects);
-            push_field(&mut preimage, "member_verifier", &member.verifier);
-            match &member.quarantine {
-                Some(reason) => {
-                    push_field(&mut preimage, "member_quarantine_declared", "true");
-                    push_field(&mut preimage, "member_quarantine", reason);
-                }
-                None => push_field(&mut preimage, "member_quarantine_declared", "false"),
-            }
-            push_field(&mut preimage, "member_lane_class", &member.lane_class);
-            match member.grade_rank {
-                Some(rank) => {
-                    push_field(&mut preimage, "member_grade_declared", "true");
-                    push_field(&mut preimage, "member_grade_rank", &rank.to_string());
-                }
-                None => push_field(&mut preimage, "member_grade_declared", "false"),
-            }
-            push_count(
-                &mut preimage,
-                "member_authority_domains",
-                member.authority_domains.len(),
-            );
-            for domain in &member.authority_domains {
-                push_field(&mut preimage, "member_authority_domain", domain);
-            }
-            push_field(&mut preimage, "member_data_role", &member.data_role);
-            push_field(
-                &mut preimage,
-                "member_committed_freeze_digest",
-                &member.committed_freeze_digest,
-            );
+            push_pack_member(&mut preimage, member);
         }
         push_count(&mut preimage, "omissions", self.omissions.len());
         for omission in &self.omissions {
@@ -736,7 +696,7 @@ impl SynthesisInputPack {
             "lane_release_refused",
             bool_text(self.lane_release_refused),
         );
-        Ok(freeze(&preimage))
+        freeze(&preimage)
     }
 
     /// Re-proves this pack's own digest.
@@ -746,7 +706,7 @@ impl SynthesisInputPack {
     /// Returns [`InquiryError::IntegrityMismatch`] when the recomputed digest
     /// disagrees with the stored one.
     pub fn validate_integrity(&self) -> Result<(), InquiryError> {
-        if self.compute_digest()? != self.digest {
+        if self.compute_digest() != self.digest {
             return Err(InquiryError::IntegrityMismatch {
                 field: "synthesis_input.digest",
             });
@@ -755,14 +715,75 @@ impl SynthesisInputPack {
     }
 }
 
+/// Appends one member's whole shape to the pack's digest preimage.
+///
+/// Split out of `SynthesisInputPack::compute_digest` so the pack header and the
+/// omission list stay readable beside it: the per-member fields are a flat
+/// enumeration, and keeping them in their own fold is what makes the order of
+/// the pack's own top-level fields legible. The tags and their order are the
+/// digest's canonical spelling and are unchanged by this split.
+fn push_pack_member(preimage: &mut String, member: &PackMember) {
+    push_field(preimage, "member", &member.source_handle);
+    push_field(preimage, "member_record_digest", &member.record_digest);
+    push_field(preimage, "member_content_digest", &member.content_digest);
+    push_field(
+        preimage,
+        "member_retained_revision_digest",
+        &member.retained_revision_digest,
+    );
+    push_field(
+        preimage,
+        "member_retained_artifact_ref",
+        &member.retained_artifact_ref,
+    );
+    push_field(
+        preimage,
+        "member_disclosure",
+        disclosure_wire(member.disclosure),
+    );
+    push_field(preimage, "member_allowed_use", &member.allowed_use);
+    push_field(preimage, "member_allowed_effects", &member.allowed_effects);
+    push_field(preimage, "member_verifier", &member.verifier);
+    match &member.quarantine {
+        Some(reason) => {
+            push_field(preimage, "member_quarantine_declared", "true");
+            push_field(preimage, "member_quarantine", reason);
+        }
+        None => push_field(preimage, "member_quarantine_declared", "false"),
+    }
+    push_field(preimage, "member_lane_class", &member.lane_class);
+    match member.grade_rank {
+        Some(rank) => {
+            push_field(preimage, "member_grade_declared", "true");
+            push_field(preimage, "member_grade_rank", &rank.to_string());
+        }
+        None => push_field(preimage, "member_grade_declared", "false"),
+    }
+    push_count(
+        preimage,
+        "member_authority_domains",
+        member.authority_domains.len(),
+    );
+    for domain in &member.authority_domains {
+        push_field(preimage, "member_authority_domain", domain);
+    }
+    push_field(preimage, "member_data_role", &member.data_role);
+    push_field(
+        preimage,
+        "member_committed_freeze_digest",
+        &member.committed_freeze_digest,
+    );
+}
+
 /// Resolves one freeze member, or reports exactly why it did not resolve.
 ///
 /// The order of the checks is the order the five W3 requirements impose: freeze
 /// membership (already established by the caller's denominator), the reference
 /// manifest, the source record's presence and re-proved identity, the retained
-/// original, and finally the disclosure class. A member that fails the manifest
-/// check is reported as such rather than as "missing retention", because the
-/// first refusal is the one a reader can act on.
+/// original, the freeze's own exclusion set, and finally the disclosure class. A
+/// member that fails the manifest check is reported as such rather than as
+/// "missing retention", because the first refusal is the one a reader can act
+/// on.
 #[allow(clippy::too_many_arguments)]
 fn resolve_member(
     handle: &str,
@@ -810,10 +831,84 @@ fn resolve_member(
         reason: "the admitted source record no longer re-proves its own canonical identity"
             .to_owned(),
     })?;
-    // The retained original. W2 requires the exact bytes or an immutable
-    // accessible artifact; the artifact reference is what the pack carries, and
-    // its content digest must be the admitted record's own so a foreign revision
-    // cannot ride in on a well-formed reference.
+    // The retained original, with its own three refusals; see `retained_original`.
+    let retained_member = retained_original(handle, committed, retained, record)?;
+    // I21.7: never wider than the run admitted.
+    if disclosure_breadth(record.disclosure) > disclosure_breadth(admitted_disclosure) {
+        return Err(PackOmission {
+            source_handle: handle.to_owned(),
+            limitation: PackLimitation::DisclosureWidened,
+            reason: format!(
+                "the source record travels at {} but the run admitted {}",
+                disclosure_wire(record.disclosure),
+                disclosure_wire(admitted_disclosure)
+            ),
+        });
+    }
+    // The record is only usable if the admission record that put it in the
+    // evidence set still says `Eligible`. The freeze's own included set was built
+    // from those records, so a member that has since become ineligible is
+    // reported rather than resolved on the strength of the freeze alone. The
+    // freeze is excluded here and not over the denominator, so it cannot shrink
+    // what the pack resolves.
+    if let Some((_, reason)) = freeze
+        .excluded_evidence
+        .iter()
+        .find(|(excluded, _)| excluded == handle)
+    {
+        return Err(PackOmission {
+            source_handle: handle.to_owned(),
+            limitation: PackLimitation::ExcludedByFreeze,
+            reason: reason.clone(),
+        });
+    }
+    Ok(PackMember {
+        source_handle: handle.to_owned(),
+        record_digest,
+        content_digest: record.content_digest.clone(),
+        retained_revision_digest: retained_member.retained_revision_digest.clone(),
+        retained_artifact_ref: retained_member.retained_artifact_ref.clone(),
+        committed_freeze_digest: committed.freeze_digest.clone(),
+        disclosure: record.disclosure,
+        allowed_use: record.allowed_use.clone(),
+        allowed_effects: record.allowed_effects.clone(),
+        verifier: record.verifier.clone(),
+        quarantine: record.quarantine.clone(),
+        lane_class: lane.evidence_class.wire_name().to_owned(),
+        grade_rank: record.grade,
+        authority_domains: sorted_authority_domains(record),
+        data_role: record.data_role.clone(),
+    })
+}
+
+/// The record's authority domains, canonicalised for the pack's member shape.
+///
+/// A digest preimage cannot depend on the order the run happened to append the
+/// domains in, so the list is sorted and deduplicated before it is read: the
+/// same set of domains spells one way however it was assembled.
+fn sorted_authority_domains(record: &SourceRecord) -> Vec<String> {
+    let mut domains: Vec<String> = record.authority_domains.iter().cloned().collect();
+    domains.sort();
+    domains.dedup();
+    domains
+}
+
+/// The retained-original commitment for one member, or exactly why it is unusable.
+///
+/// W2 requires the exact bytes or an immutable accessible artifact, so this
+/// answers three questions in the order they are decided: that a retained
+/// original was committed for the handle at all, that its content digest is the
+/// admitted record's own — a well-formed reference to a foreign revision is
+/// still a foreign revision — and that the reference names something
+/// immutable. All three refusals are `NoRetainedOriginal`, because that is the
+/// one limitation a reader can act on: the bytes this pack would cite were not
+/// provably kept before the freeze.
+fn retained_original<'a>(
+    handle: &str,
+    committed: &'a CommittedFreeze,
+    retained: &'a BTreeMap<String, CommittedFreezeMember>,
+    record: &SourceRecord,
+) -> Result<&'a CommittedFreezeMember, PackOmission> {
     let Some(retained_member) = retained.get(handle).or_else(|| committed.member(handle)) else {
         return Err(PackOmission {
             source_handle: handle.to_owned(),
@@ -843,59 +938,7 @@ fn resolve_member(
                 .to_owned(),
         });
     }
-    // I21.7: never wider than the run admitted.
-    if disclosure_breadth(record.disclosure) > disclosure_breadth(admitted_disclosure) {
-        return Err(PackOmission {
-            source_handle: handle.to_owned(),
-            limitation: PackLimitation::DisclosureWidened,
-            reason: format!(
-                "the source record travels at {} but the run admitted {}",
-                disclosure_wire(record.disclosure),
-                disclosure_wire(admitted_disclosure)
-            ),
-        });
-    }
-    // The record is only usable if the admission record that put it in the
-    // evidence set still says `Eligible`. The freeze's own included set was built
-    // from those records, so a member that has since become ineligible is
-    // reported rather than resolved on the strength of the freeze alone.
-    if freeze
-        .excluded_evidence
-        .iter()
-        .any(|(excluded, _)| excluded == handle)
-    {
-        return Err(PackOmission {
-            source_handle: handle.to_owned(),
-            limitation: PackLimitation::ExcludedByFreeze,
-            reason: freeze
-                .excluded_evidence
-                .iter()
-                .find(|(excluded, _)| excluded == handle)
-                .map_or_else(String::new, |(_, reason)| reason.clone()),
-        });
-    }
-    Ok(PackMember {
-        source_handle: handle.to_owned(),
-        record_digest,
-        content_digest: record.content_digest.clone(),
-        retained_revision_digest: retained_member.retained_revision_digest.clone(),
-        retained_artifact_ref: retained_member.retained_artifact_ref.clone(),
-        committed_freeze_digest: committed.freeze_digest.clone(),
-        disclosure: record.disclosure,
-        allowed_use: record.allowed_use.clone(),
-        allowed_effects: record.allowed_effects.clone(),
-        verifier: record.verifier.clone(),
-        quarantine: record.quarantine.clone(),
-        lane_class: lane.evidence_class.wire_name().to_owned(),
-        grade_rank: record.grade,
-        authority_domains: {
-            let mut domains: Vec<String> = record.authority_domains.iter().cloned().collect();
-            domains.sort();
-            domains.dedup();
-            domains
-        },
-        data_role: record.data_role.clone(),
-    })
+    Ok(retained_member)
 }
 
 /// Canonical wire spelling of a disclosure class, shared by the pack's preimage

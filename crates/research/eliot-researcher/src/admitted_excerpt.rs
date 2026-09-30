@@ -701,7 +701,8 @@ const POPULATION_MARKERS: [&str; 8] = [
 
 /// Time-window and version markers, matched case-insensitively.
 const TIME_VERSION_MARKERS: [&str; 12] = [
-    "202", "version", "revision", "rev", "v1", "as of", "during", "between", "from", "until", "at least", "n ≥",
+    "202", "version", "revision", "rev", "v1", "as of", "during", "between", "from", "until",
+    "at least", "n ≥",
 ];
 
 /// How an occurrence's section membership is established.
@@ -929,7 +930,10 @@ pub fn verify_excerpt_occurrence(
 /// so there is no admitted text around one to read an axis over. That is a
 /// different state from a found occurrence with an uncarried axis, and
 /// collapsing the two would report a measurement that was never made.
-fn absent_check(excerpt: &AdmittedExcerpt, mut failures: Vec<OccurrenceFailure>) -> OccurrenceCheck {
+fn absent_check(
+    excerpt: &AdmittedExcerpt,
+    mut failures: Vec<OccurrenceFailure>,
+) -> OccurrenceCheck {
     failures.sort();
     failures.dedup();
     OccurrenceCheck {

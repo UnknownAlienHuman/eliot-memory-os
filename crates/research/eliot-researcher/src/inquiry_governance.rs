@@ -6281,27 +6281,12 @@ impl InquiryGovernance {
         // if every one of them already carried this exact freeze.
         let committed_freeze =
             crate::synthesis_input::CommittedFreeze::commit(&freeze, &source_admission_requests)?;
-        // W3: the synthesis pack is resolved from that committed freeze under the
-        // run-bound reference manifest and the admitted disclosure class, so a
-        // member the freeze excluded, the manifest revoked or the disclosure
-        // forbids is a published omission rather than a silent one.
-        //
-        // The question and the disclosure class are read off the PROFILE, not off
-        // the `Observation`, for the same reason
-        // `validate_committed_freeze_and_synthesis_input` reads them off the
-        // profile: the record has to re-derive the same pack from the values it
-        // publishes, and the observation is consumed here. The profile carries
-        // the admitted question verbatim (`profile_params` copies it) and the
-        // admitted disclosure class as its `disclosure_ceiling`, so a re-proof
-        // that read either from the observation could not exist.
-        let synthesis_input = crate::synthesis_input::SynthesisInputPack::resolve(
+        let synthesis_input = resolve_synthesis_input(
+            &observation,
+            &admissibility,
             &committed_freeze,
             &freeze,
-            &observation.reference_manifest,
-            &admitted_records(&admissibility),
-            &committed_freeze.members_by_handle(),
-            &profile.question,
-            profile.disclosure_ceiling,
+            &profile,
             &lane_discipline,
         )?;
         let record = Self {
@@ -9308,6 +9293,46 @@ fn admitted_records(
         .filter(|record| record.eligibility == SourceEligibility::Eligible)
         .map(|record| (record.record.handle.clone(), record.record.clone()))
         .collect()
+}
+
+/// Resolves the W3 synthesis pack for one recorded run.
+///
+/// W3: the synthesis pack is resolved from the committed freeze under the
+/// run-bound reference manifest and the admitted disclosure class, so a member
+/// the freeze excluded, the manifest revoked or the disclosure forbids is a
+/// published omission rather than a silent one.
+///
+/// The question and the disclosure class are read off the PROFILE, not off the
+/// `Observation`, for the same reason
+/// `validate_committed_freeze_and_synthesis_input` reads them off the profile:
+/// the record has to re-derive the same pack from the values it publishes, and
+/// the observation is consumed here. The profile carries the admitted question
+/// verbatim (`profile_params` copies it) and the admitted disclosure class as
+/// its `disclosure_ceiling`, so a re-proof that read either from the
+/// observation could not exist.
+///
+/// The pack's own denominator stays the freeze's included set, read inside
+/// `SynthesisInputPack::resolve` and not off `committed_freeze` here: a commit
+/// that had lost or gained a member still re-proves its own digest, and only
+/// the freeze is the authority on which members exist.
+fn resolve_synthesis_input(
+    observation: &InquiryObservation,
+    admissibility: &[SourceAdmissibilityRecord],
+    committed_freeze: &crate::synthesis_input::CommittedFreeze,
+    freeze: &EvidenceFreeze,
+    profile: &InquiryProtocolProfile,
+    lane_discipline: &LaneDisciplineOutcome,
+) -> Result<crate::synthesis_input::SynthesisInputPack, InquiryError> {
+    crate::synthesis_input::SynthesisInputPack::resolve(
+        committed_freeze,
+        freeze,
+        &observation.reference_manifest,
+        &admitted_records(admissibility),
+        &committed_freeze.members_by_handle(),
+        &profile.question,
+        profile.disclosure_ceiling,
+        lane_discipline,
+    )
 }
 
 /// Freezes the accepted evidence revision for one inquiry.
