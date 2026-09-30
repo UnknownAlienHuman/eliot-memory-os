@@ -6,7 +6,7 @@
 
 use eliot_context_contracts::{
     ApprovedRecipeCatalogue, ContextError as ContractContextError, ContextRecipe,
-    ReactiveInputError, RecipeResolutionRefusal, SessionDeliverySnapshot,
+    ReactiveInputError, RecipeResolutionRefusal, SafetyFloorIdentity, SessionDeliverySnapshot,
 };
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_learning_contracts::{CampaignOwnerRecordId, CampaignOwnerRevision, CampaignSourceRole};
@@ -72,6 +72,12 @@ pub enum ContextPublicationError {
     /// The rich `ContextRecipe` did not satisfy its closed contract.
     #[error("ContextRecipe is invalid: {0}")]
     Recipe(#[from] ContractContextError),
+    /// The owner-published Decision Safety Floor did not satisfy its closed
+    /// contract. This is a distinct variant rather than a `Recipe` reuse so a
+    /// floor refusal is never reported as a recipe refusal; the inner error is
+    /// the contract owner's own, kept verbatim.
+    #[error("Context owner Decision Safety Floor is invalid: {0}")]
+    SafetyFloor(ContractContextError),
     /// The compiler input did not satisfy the pure Context contract.
     #[error("ContextInput is invalid: {0}")]
     Input(#[from] ContextError),
@@ -247,6 +253,92 @@ pub fn context_delivery_publication(
         document,
         body_digest,
     })
+}
+
+/// The protected floor this admitted Context owner record publishes for the
+/// decision boundary its recipe is compiled under.
+///
+/// I7.11 places `DecisionSafetyFloor` at a Material/Critical boundary as the set
+/// of currently applicable non-droppable atoms, and the Context owner already
+/// publishes that record: the `ApprovedRecipeCatalogue` this body was resolved
+/// from carries it in `GoverningContextRequirements::floor`, and the resolved
+/// policy revision names the same floor in `RecipeAdmissionPolicy::safety_floor`.
+/// Every field below is an owner-recorded value read unchanged — the floor
+/// record with its own `rule_evidence` reference, the resolved revision's own
+/// floor reference, and the recipe's own `DecisionRevision`. Nothing is
+/// recomputed, defaulted, or supplied by a caller, and no rule is invented here.
+///
+/// The two owner records are cross-checked by the owner's own validators before
+/// anything is returned, through the same two calls
+/// [`context_recipe_body_digest`] makes: [`ApprovedRecipeCatalogue::resolve`]
+/// selects exactly one applicable approved revision, and
+/// [`GoverningContextRequirements::authorize`](eliot_context_contracts::GoverningContextRequirements::authorize)
+/// already refuses with `InvalidFence` unless the floor is bound to this
+/// recipe's own binding, and with `IdentityConflict` unless the resolved
+/// revision's floor reference equals the floor record's own `rule_evidence`.
+/// The returned value is then checked by the contract owner's own
+/// [`SafetyFloorIdentity::validate`].
+///
+/// The floor reference is carried as the identity's `floor_id` precisely because
+/// that owner cross-check is what makes it owner-issued: the value names this
+/// floor record only because the owner said the two agree, and a substituted
+/// reference cannot survive `authorize`.
+///
+/// ## What this record does NOT publish
+///
+/// This is the only packet admission-closure identity the Context owner record
+/// supplies, and the other four are absent for a reason each, not by omission:
+///
+/// - [`AdmissionRuleIdentity`](eliot_context_contracts::AdmissionRuleIdentity)
+///   needs `rule_sha256`, the digest of the admission rule's own record.
+///   `RecipeAdmissionPolicy` states in I12.13 that the rule is an *owner
+///   reference, not a copy* — it keeps its own owner and its own record — and
+///   the rule's content is not in the recipe body. `rule_id` alone is
+///   owner-recorded; the digest is not, and substituting the policy digest for
+///   the rule digest would be a different object under the same field.
+/// - [`PriorityPolicyIdentity`](eliot_context_contracts::PriorityPolicyIdentity)
+///   needs one `CandidatePriority` per candidate atom, each with a priority
+///   class and a meaningful ordinal. The Context owner body publishes no
+///   candidate atom set, and `RecipeLayoutPolicy::role_positions` is a per-ROLE
+///   position, which is not a per-ATOM class. I12.13's
+///   `SemanticSensitivityProfile` is the object that would own the class and the
+///   evidence-based order, and it has no representation here.
+/// - [`MeasurementCompositionProfile`](eliot_context_contracts::MeasurementCompositionProfile)
+///   needs a serializer identity and version, a serializer-options digest, a
+///   route id and a model id. The owner body publishes only
+///   `RecipeExecutionContour`, whose `transform` is the boundary *transform*
+///   revision — an external semantic-boundary transform, explicitly not
+///   interpreted as executable here — and whose `contour` is a contour
+///   identity, not a route or model identity. `capacity` is genuinely
+///   owner-recorded, but one published field of eleven is not an identity.
+/// - [`QualityScorecard`](eliot_context_contracts::QualityScorecard) is emitted
+///   by the admission and assembly stages, not published before them: its
+///   `output` binding must name the admitted and rendered digests those two
+///   stages produce, and each of its twelve dimension results needs observed
+///   evidence the Context recipe body does not carry.
+/// - the assembly `AssemblyPolicy` and the injected measurement port are the
+///   assembly cell's inputs, and their serializer/route/model identity and route
+///   byte ceiling are published by the route/measurement owner, not here.
+///
+/// The measured per-identity account of what this tree can and cannot supply
+/// today is recorded on
+/// `bins/eliotd/src/campaign_packet.rs::CampaignPacketGapCode::AdmissionClosureUnbound`.
+pub fn context_safety_floor_identity(
+    body: &ContextCampaignRecipeBody,
+) -> Result<SafetyFloorIdentity, ContextPublicationError> {
+    let resolved = body.catalogue.resolve()?;
+    body.catalogue
+        .governing
+        .authorize(&resolved, &body.recipe)?;
+    let identity = SafetyFloorIdentity {
+        floor_id: resolved.policy.admission.safety_floor.clone(),
+        decision: body.recipe.decision.clone(),
+        floor: body.catalogue.governing.floor.clone(),
+    };
+    identity
+        .validate()
+        .map_err(ContextPublicationError::SafetyFloor)?;
+    Ok(identity)
 }
 
 /// Compute the canonical digest of the exact current catalogue, recipe and input.

@@ -19,9 +19,11 @@
 //! [`check_campaign_view_for_admission`] refuses an immutable
 //! `CampaignLearningStateView` whose State Fence, task/scope identity or
 //! load-bearing Context recipe owner revision does not join the exact binding
-//! the admission decision is made under. It re-derives that join from this
-//! cell's own binding and inherits no other cell's verdict. The #40-frozen
-//! `eliot_context::ContextCompiler` decides nothing on this route.
+//! the admission decision is made under, and refuses a substituted
+//! `SafetyFloorIdentity` by content-comparing every relation
+//! `AdmissionInput::validate_contract` states about it. It re-derives that join
+//! from this cell's own binding and inherits no other cell's verdict. The
+//! #40-frozen `eliot_context::ContextCompiler` decides nothing on this route.
 
 #![forbid(unsafe_code)]
 
@@ -287,9 +289,21 @@ fn validate_admission_contract(input: &AdmissionInput) -> Result<(), ContextErro
 ///   from the same route and from
 ///   `kernel_context_read_client::compile_context_packet`. The two are separate
 ///   comparisons against different bindings, so neither inherits the other.
-///   Neither makes [`admit_context_traced`] reachable: the four admission-closure
-///   identities named above still have no production construction site. The
-///   `#40`-frozen
+///   Neither makes [`admit_context_traced`] reachable, and of the four
+///   admission-closure identities above exactly one now has a production
+///   construction site: `SafetyFloorIdentity` is resolved on the live route by
+///   the Context owner's own publication
+///   (`eliot_context::campaign_publication::context_safety_floor_identity`) and
+///   is content-compared by [`check_campaign_view_for_admission`] against the
+///   binding and recipe it admits under.
+///   `PriorityPolicyIdentity`, `AdmissionRuleIdentity` and
+///   `MeasurementCompositionProfile` are still minted nowhere outside `tests/`
+///   fixtures, and the per-identity account of what each lacks — each is a
+///   genuinely absent owner record, not an unminted call — is stated on
+///   `eliot_context::campaign_publication::context_safety_floor_identity` and
+///   recorded on
+///   `bins/eliotd/src/campaign_packet.rs::CampaignPacketGapCode::AdmissionClosureUnbound`.
+///   The `#40`-frozen
 ///   `eliot_context::ContextCompiler::compile_with_campaign_learning_state`
 ///   named by an earlier revision of this note has NO call site either, so it
 ///   is not on the live path.
