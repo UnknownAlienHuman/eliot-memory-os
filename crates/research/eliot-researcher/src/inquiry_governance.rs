@@ -38,16 +38,34 @@
 //! *inputs* for the existing deterministic `TaskGraphCompiler` (I10.15); a
 //! researcher-local compiler, a second graph, an order, a lease and a schedule
 //! are all outside this crate's ownership.
+//!
+//! # Where the evidence freeze is retained
+//!
+//! [`EvidenceFreeze`] has one store owner and it is in this module:
+//! [`EvidenceFreeze::retained_bytes`] is its write path and
+//! [`EvidenceFreeze::reload`] is its read path, over the repository's accepted
+//! canonical encoder. That is the whole retention mechanism, and it is here
+//! rather than in a store crate for the reason I21.1 gives: the freeze is a
+//! *non-canonical* candidate artifact, so it is not canonical state (the
+//! canonical store, I5.2), not operational metadata (ORS, I5.2) and not a
+//! large payload (Blob Store, I5.2). Its writer and reader are the same
+//! contract, and that contract is the domain that owns the freeze. What this
+//! does **not** do is place a blob, open a store handle, or move the freeze
+//! into canonical state — those belong to the owners I21.1 names: "canonical
+//! transition, Current Epistemic Position and finish → Governor through
+//! existing canonical/finish paths". A retained freeze is what a later
+//! synthesis author or auditor reads, and it is never admission.
 
 #![forbid(unsafe_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use eliot_contracts::StateFence;
+use eliot_contracts::{StateFence, canonical_json_bytes};
 use eliot_research_exchange_api::{
     AllowedReferenceManifest, AnchorPrecision, CompletionDisposition, DisclosureClass,
     LocatorClass, ResearchContractError, SourceClass, classify_locator,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::evidence_portfolio::{
     AbsencePreconditions, AbsenceVerdict, AuditBindingError, AuditReferenceBinding, AuditedClaim,
@@ -266,6 +284,17 @@ pub enum InquiryError {
         /// Failing field path.
         field: &'static str,
     },
+    /// Retained bytes are not an evidence freeze of this declared shape.
+    ///
+    /// The readback side of [`Self::Unencodable`]: a value that cannot be
+    /// encoded is never written, and bytes that are not a freeze of this shape
+    /// are not adopted as one. The two refusals stay separate because "this
+    /// freeze could not be written" and "these bytes are not a freeze this owner
+    /// wrote" are different facts about opposite sides of the same boundary.
+    FreezeStoreDecode {
+        /// Failing field path.
+        field: &'static str,
+    },
     /// The frozen acquisition-side discipline refused the material.
     Portfolio(PortfolioError),
     /// The run-bound audit reference authorization refused to bind.
@@ -373,6 +402,9 @@ impl std::fmt::Display for InquiryError {
                     formatter,
                     "{field} cannot be encoded into its canonical preimage"
                 )
+            }
+            Self::FreezeStoreDecode { field } => {
+                write!(formatter, "{field} is not a retained evidence freeze")
             }
             Self::Portfolio(error) => write!(formatter, "frozen portfolio discipline: {error}"),
             Self::AuditBinding(cause) => {
@@ -3714,7 +3746,16 @@ fn coordinate_residue(
 /// admission, so the accepted evidence revision is frozen before prose
 /// synthesis begins. The freeze is a non-canonical governed artifact: it is
 /// candidate material that only Governor admission can promote.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// The codec is `Serialize`/`Deserialize` with `deny_unknown_fields` and **no**
+/// `#[serde(default)]` on any field, because [`Self::retained_bytes`] and
+/// [`Self::reload`] are a store-owner pair: the bytes written are the bytes a
+/// later reader must decode, and a field that defaulted on read would let a
+/// body written under one shape be adopted as a freeze of another. A newly
+/// added field is therefore a wire-shape change, and its absence is a refusal
+/// rather than a silent empty value.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvidenceFreeze {
     /// Stable freeze identity.
     ///
@@ -4080,6 +4121,84 @@ impl EvidenceFreeze {
             });
         }
         Ok(())
+    }
+
+    /// Deterministic retained bytes of this freeze, digest included.
+    ///
+    /// This is the write path of the freeze's store owner, and it is the
+    /// repository's own accepted canonical encoder
+    /// ([`eliot_contracts::canonical_json_bytes`]) rather than a second
+    /// encoding invented here — the same encoder every other record on this
+    /// plane already digests through, and the same one the `digest` preimage
+    /// names for the fence. One encoder means the retained body and the
+    /// identity it is checked against cannot be spelled two different ways.
+    ///
+    /// `digest` is **not** excluded, and that is the difference from the
+    /// `canonical_bytes`/`canonical_digest` pair on the acquisition-side
+    /// records: those exclude the stored digest so the encoder can *produce*
+    /// it, whereas this one is the body a retention owner actually commits,
+    /// and a retained freeze that did not carry the digest it was frozen under
+    /// would force a reader to take the identity from outside the record
+    /// instead of re-proving it from the bytes it holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InquiryError::Unencodable`] when the freeze has no canonical
+    /// encoding.
+    pub fn retained_bytes(&self) -> Result<Vec<u8>, InquiryError> {
+        canonical_json_bytes(self).map_err(|_| InquiryError::Unencodable {
+            field: "freeze.retained_body",
+        })
+    }
+
+    /// Decodes one retained freeze and re-proves it against `origin`.
+    ///
+    /// This is the read path of the freeze's store owner, and it is the only
+    /// way a retained freeze becomes a value this domain will use. Three
+    /// checks run here, in this order, and each is one the constructor cannot
+    /// perform:
+    ///
+    /// 1. the bytes must decode as a freeze of this exact declared shape —
+    ///    `deny_unknown_fields` and no field defaults, so a body written under
+    ///    a different shape is refused rather than partially adopted;
+    /// 2. the decoded record must re-prove its **own** digest, the successor
+    ///    relation, and its non-canonical state, which is exactly what
+    ///    [`Self::validate_integrity`] does;
+    /// 3. it must be the **same** freeze that was written, which is what
+    ///    `origin` is for.
+    ///
+    /// Step 3 is what makes this a readback rather than a re-validation of a
+    /// live value. A freeze re-proving its own digest says the bytes in hand
+    /// are internally consistent; it cannot say they are the bytes that were
+    /// committed, because `digest` is a public field and a caller holding a
+    /// *different* self-consistent freeze would pass step 2. Comparing the
+    /// reloaded record against the original that `origin` names is what closes
+    /// that, and it is the comparison I21.8 asks for: "a report is a projection
+    /// of the frozen revision, not a truth source; correcting wording must not
+    /// require rewriting history" (A5.7) is only true if the reloaded
+    /// projection can be shown to be *of that revision*.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InquiryError::FreezeStoreDecode`] when the bytes are not a
+    /// freeze of this declared shape,
+    /// [`InquiryError::IntegrityMismatch`] when the decoded freeze does not
+    /// re-prove its own digest, claims canonical state or states a
+    /// half-present successor relation, and
+    /// [`InquiryError::UnknownHandle`] when the reloaded freeze is not the
+    /// freeze `origin` names.
+    pub fn reload(bytes: &[u8], origin: &EvidenceFreeze) -> Result<Self, InquiryError> {
+        let reloaded: Self =
+            serde_json::from_slice(bytes).map_err(|_| InquiryError::FreezeStoreDecode {
+                field: "freeze.retained_body",
+            })?;
+        reloaded.validate_integrity()?;
+        if reloaded != *origin {
+            return Err(InquiryError::UnknownHandle {
+                field: "freeze.retained_body",
+            });
+        }
+        Ok(reloaded)
     }
 }
 
