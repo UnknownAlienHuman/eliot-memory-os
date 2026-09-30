@@ -1558,10 +1558,9 @@ pub use credential_control::{HostCredentialControl, HostPhaseBRequest, HostPhase
 pub use eliot_host_control_endpoint::{
     AcceptedOwnerMethod, BackupDispatchRefusal, BackupOwnerOutcome, BackupRetainedOperation,
     HOST_RUNTIME_CONTROL_PIPE, HostBackupOwner, HostBackupOwnerRegistration, HostRuntimeControl,
-    HostRuntimeControlQueue, HostUserAutomationExecutionEnvelope,
-    HostUserAutomationExecutionQueue, UserAutomationHostExecutionEndpoint,
-    UserAutomationHostExecutionRequest, UserAutomationHostExecutionResponse,
-    UserAutomationRuntimeError, pop_user_automation_execution,
+    HostRuntimeControlQueue, HostUserAutomationExecutionEnvelope, HostUserAutomationExecutionQueue,
+    UserAutomationHostExecutionEndpoint, UserAutomationHostExecutionRequest,
+    UserAutomationHostExecutionResponse, UserAutomationRuntimeError, pop_user_automation_execution,
     process_user_automation_execution_queue, reject_unbound_user_automation_execution,
 };
 use eliot_host_service::runtime_control::runtime_control_unknown_ref;
@@ -5730,8 +5729,8 @@ struct BackupDispatchWork {
 fn retained_backup_operation(
     request: &eliot_host_control_endpoint::BackupRuntimeControlRequest,
 ) -> Result<BackupRetainedOperation, BackupDispatchRefusal> {
-    let identity_digest =
-        PlatformHandle::new(request.body.identity().identity_digest.clone()).map_err(|_| {
+    let identity_digest = PlatformHandle::new(request.body.identity().identity_digest.clone())
+        .map_err(|_| {
             BackupDispatchRefusal::new(
                 request.operation,
                 "the admitted backup request carries no nameable retained operation identity",
@@ -6275,35 +6274,40 @@ impl HostComposition {
                             "this Host retains no isolated-restore preparation for the admitted operation",
                         ))
                     }
-                    // Intent is durable, no result was ever recorded, and the
-                    // derived root is not observable. The owner's own record
-                    // calls the outcome UNKNOWN and says the effect "may or may
-                    // not have happened before the process stopped". That is
-                    // the possible-effect state, NOT an in-flight admitted one:
-                    // reporting it as `Admitted` would tell the requester the
-                    // operation is still running and invite a second
-                    // preparation under the same operation id.
+                    // Two dispositions, one answer, because they are the same
+                    // fact about authority.
+                    //
+                    // `AdmittedWithoutResult`: intent is durable, no result was
+                    // ever recorded, and the derived root is not observable. The
+                    // owner's own record calls the outcome UNKNOWN and says the
+                    // effect "may or may not have happened before the process
+                    // stopped". That is the possible-effect state, NOT an
+                    // in-flight admitted one: reporting it as `Admitted` would
+                    // tell the requester the operation is still running and
+                    // invite a second preparation under the same operation id.
+                    //
+                    // `Uncertain`: a recorded result that cannot be re-proved
+                    // against the live root. The effects are unverified, so the
+                    // retained operation is preserved and reconciled, never
+                    // deleted and never retried blindly.
+                    //
+                    // They are one arm because they carry the same obligation -
+                    // reconcile the original operation - and splitting them would
+                    // assert a distinction the owner does not make.
+                    //
+                    // The journal's own read failure joins them: it is a real
+                    // read failure, not a claim that no preparation ran, so it
+                    // carries the same obligation - reconcile the original
+                    // operation - and the same answer. A single arm keeps the
+                    // claim honest: the owner cannot distinguish these, and
+                    // neither can this projection.
                     Ok(
                         crate::backup_preparation::ReconcileDisposition::AdmittedWithoutResult {
                             ..
-                        },
-                    ) => Ok(BackupOwnerOutcome::PossibleEffect {
-                        retained: retained_backup_operation(request)?,
-                    }),
-                    // A recorded result that cannot be re-proved against the
-                    // live root. The effects are unverified, so the retained
-                    // operation is preserved and reconciled, never deleted and
-                    // never retried blindly.
-                    Ok(crate::backup_preparation::ReconcileDisposition::Uncertain { .. }) => {
-                        Ok(BackupOwnerOutcome::PossibleEffect {
-                            retained: retained_backup_operation(request)?,
-                        })
-                    }
-                    // The journal refused the read itself. This is a real read
-                    // failure, not a claim that no preparation ran, so the
-                    // operation is reported as possibly-effected rather than
-                    // refused.
-                    Err(_) => Ok(BackupOwnerOutcome::PossibleEffect {
+                        }
+                        | crate::backup_preparation::ReconcileDisposition::Uncertain { .. },
+                    )
+                    | Err(_) => Ok(BackupOwnerOutcome::PossibleEffect {
                         retained: retained_backup_operation(request)?,
                     }),
                 }
