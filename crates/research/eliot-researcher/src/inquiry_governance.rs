@@ -3928,48 +3928,6 @@ impl EvidenceFreeze {
             &params.coverage_receipt_digest,
             "freeze.coverage_receipt_digest",
         )?;
-        // I21.8 item 1: the receipt is what the freeze is required to record, so
-        // it is checked as a *relation* between the included set and the receipt
-        // list, not merely as a well-formed list. A member with no receipt, a
-        // receipt with no member, or a receipt filed under a different handle is
-        // the same contradiction in three spellings: a freeze that admits a
-        // member it cannot name the authorising receipt for. Refusing it here
-        // means a freeze that exists at all has a receipt for every one of its
-        // members. The identical relation is re-proved from the stored fields by
-        // `validate_member_receipts`, which `validate_integrity` runs — so the
-        // rule is stated once and asked of both carriers.
-        let mut record = Self {
-            freeze_id: format!(
-                "freeze-{}-{}@{}",
-                params.inquiry_id,
-                profile.profile_id_and_revision(),
-                &content_commitment[..16]
-            ),
-            supersedes: params.supersedes,
-            supersede_reason: params.supersede_reason,
-            expected_revision: params.expected_revision,
-            inquiry_id: params.inquiry_id,
-            profile_id_and_revision: profile.profile_id_and_revision(),
-            profile_digest: profile.integrity_digest.clone(),
-            portfolio_digest: params.portfolio_digest,
-            manifest_digest: params.manifest_digest,
-            coverage_receipt_digest: params.coverage_receipt_digest,
-            evidence_set_id: params.evidence_set_id,
-            included_evidence_refs: params.included_evidence_refs,
-            member_receipts: params.member_receipts,
-            excluded_evidence: params.excluded_evidence,
-            unresolved_contradictions: params.unresolved_contradictions,
-            open_research_debts: params.open_research_debts,
-            state_fence: profile.state_fence.clone(),
-            frozen_at_ms: params.frozen_at_ms,
-            canonical: false,
-            governor_admission_required: true,
-            digest: String::new(),
-        };
-        record.validate_member_receipts()?;
-        record.digest = record.compute_digest();
-        Ok(record)
-    }
         // `supersedes` and `expected_revision` are commitments and are checked as
         // digests; `supersede_reason` is the recorded cause and is bounded text,
         // because a digest would say only that some reason exists and not which
@@ -4043,6 +4001,16 @@ impl EvidenceFreeze {
             governor_admission_required: true,
             digest: String::new(),
         };
+        // I21.8 item 1: the admission/persistence receipt is checked as a
+        // *relation* between the included set and the receipt list, not merely as
+        // a well-formed list. A member with no receipt, a receipt with no member,
+        // or a receipt filed under a different handle is the same contradiction in
+        // three spellings: a freeze that admits a member it cannot name the
+        // authorising receipt for. The rule lives in `validate_member_receipts`,
+        // which `validate_integrity` also runs against the STORED fields, so a
+        // record that is built and a record that is reloaded are held to one
+        // relation rather than to a construction rule readback only inherits.
+        record.validate_member_receipts()?;
         record.digest = record.compute_digest();
         Ok(record)
     }
