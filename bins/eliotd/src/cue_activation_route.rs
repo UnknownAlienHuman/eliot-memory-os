@@ -32,7 +32,7 @@
 use std::collections::BTreeSet;
 
 use eliot_context_candidates::ProjectionState;
-use eliot_contracts::{canonical_json_bytes, sha256_hex};
+use eliot_contracts::{ClockReading, canonical_json_bytes, sha256_hex};
 use eliot_cue_activation::{ActivationError, ActivationProfile, MatchRule, evaluate_activation};
 use eliot_cue_contracts::{
     ActivationBounds, ActivationBoundsSpec, ActivationRequest, ActivationRequestId,
@@ -246,49 +246,59 @@ pub fn evaluate_cue_activation(seven: &SevenRoleInputs) -> CueActivationDisposit
         Ok(snapshot_id) => snapshot_id,
         Err(skip) => return CueActivationDisposition::Skipped(skip),
     };
-    let adapter_profile = match daemon_adapter_profile() {
-        Ok(adapter_profile) => adapter_profile,
+    let (candidate, adopted) = match reconstruct_adopted_candidate(seven, &snapshot_id) {
+        Ok(reconstructed) => reconstructed,
         Err(skip) => return CueActivationDisposition::Skipped(skip),
     };
+    match evaluate_reconstructed_candidate(&candidate, adopted, seven.clock) {
+        Ok(summary) => CueActivationDisposition::Evaluated(summary),
+        Err(skip) => CueActivationDisposition::Skipped(skip),
+    }
+}
+
+/// Reconstructs the cue candidate under the adopted capture profile.
+///
+/// The first reconstruction runs under the adapter reference so the Governor
+/// can decode the closure; the capture profile the admitted bindings agree on
+/// is then adopted for the build the evaluator will check.
+fn reconstruct_adopted_candidate(
+    seven: &SevenRoleInputs,
+    snapshot_id: &SnapshotId,
+) -> Result<(CueSnapshotBuildCandidate, NormalizationProfile), CueActivationSkip> {
+    let adapter_profile = daemon_adapter_profile()?;
     let mut cache = CueReconstructionCache::new();
-    let first = match reconstruct_cue_snapshot(seven, &snapshot_id, &adapter_profile, &mut cache) {
-        Ok(reconstruction) => reconstruction.candidate,
-        Err(error) => {
-            return CueActivationDisposition::Skipped(CueActivationSkip::ReconstructionFailed(
-                error,
-            ));
-        }
-    };
-    let adopted = match adopted_capture_profile(&first) {
-        Ok(adopted) => adopted,
-        Err(skip) => return CueActivationDisposition::Skipped(skip),
-    };
-    let candidate = if adopted == adapter_profile {
-        first
-    } else {
-        match reconstruct_cue_snapshot(seven, &snapshot_id, &adopted, &mut cache) {
-            Ok(reconstruction) => reconstruction.candidate,
-            Err(error) => {
-                return CueActivationDisposition::Skipped(CueActivationSkip::ReconstructionFailed(
-                    error,
-                ));
-            }
-        }
-    };
+    let first = reconstruct_cue_snapshot(seven, snapshot_id, &adapter_profile, &mut cache)
+        .map_err(CueActivationSkip::ReconstructionFailed)?
+        .candidate;
+    let adopted = adopted_capture_profile(&first)?;
+    if adopted == adapter_profile {
+        return Ok((first, adopted));
+    }
+    let candidate = reconstruct_cue_snapshot(seven, snapshot_id, &adopted, &mut cache)
+        .map_err(CueActivationSkip::ReconstructionFailed)?
+        .candidate;
+    Ok((candidate, adopted))
+}
+
+/// Evaluates one reconstructed candidate under the daemon fire policy.
+///
+/// Seeds are the candidate's own admitted cues; the direct-only request and
+/// numerical policy are built from the adopted capture profile, so the
+/// evaluator's binding checks compare governed values throughout.
+fn evaluate_reconstructed_candidate(
+    candidate: &CueSnapshotBuildCandidate,
+    adopted: NormalizationProfile,
+    observed_at: ClockReading,
+) -> Result<CueActivationSummary, CueActivationSkip> {
     let seeds: Vec<NormalizedCue> = candidate
         .admitted_bindings
         .iter()
         .map(|binding| binding.normalized.clone())
         .collect();
     if seeds.len() > MAX_SEEDS {
-        return CueActivationDisposition::Skipped(CueActivationSkip::TooManySeeds {
-            count: seeds.len(),
-        });
+        return Err(CueActivationSkip::TooManySeeds { count: seeds.len() });
     }
-    let rules = match daemon_match_rules(&seeds) {
-        Ok(rules) => rules,
-        Err(skip) => return CueActivationDisposition::Skipped(skip),
-    };
+    let rules = daemon_match_rules(&seeds)?;
     let bounds = ActivationBounds::new(ActivationBoundsSpec {
         max_depth: 0,
         max_fanout: 0,
@@ -304,29 +314,21 @@ pub fn evaluate_cue_activation(seven: &SevenRoleInputs) -> CueActivationDisposit
         max_output_bytes: MAX_OUTPUT_BYTES,
         activation_threshold: ActivationStrength(1),
     });
-    if let Err(error) = bounds.validate() {
-        return CueActivationDisposition::Skipped(CueActivationSkip::ContractRejected(error));
-    }
-    let profile = match ActivationProfile::seal(
+    bounds
+        .validate()
+        .map_err(CueActivationSkip::ContractRejected)?;
+    let profile = ActivationProfile::seal(
         ACTIVATION_PROFILE_ID.to_owned(),
         ACTIVATION_PROFILE_REVISION,
         bounds,
         rules,
         Vec::new(),
         None,
-    ) {
-        Ok(profile) => profile,
-        Err(error) => {
-            return CueActivationDisposition::Skipped(CueActivationSkip::ContractRejected(error));
-        }
-    };
+    )
+    .map_err(CueActivationSkip::ContractRejected)?;
     let build_digest = candidate.build_digest.as_str().to_owned();
-    let request_id = match ActivationRequestId::new(format!("cue-{build_digest}")) {
-        Ok(request_id) => request_id,
-        Err(error) => {
-            return CueActivationDisposition::Skipped(CueActivationSkip::ContractRejected(error));
-        }
-    };
+    let request_id = ActivationRequestId::new(format!("cue-{build_digest}"))
+        .map_err(CueActivationSkip::ContractRejected)?;
     let request = ActivationRequest::new(ActivationRequestSpec {
         schema_revision: CONTRACT_REVISION.to_owned(),
         request_id,
@@ -336,17 +338,13 @@ pub fn evaluate_cue_activation(seven: &SevenRoleInputs) -> CueActivationDisposit
         bounds,
         state_fence: candidate.snapshot.state_fence.clone(),
         normalization_profile: adopted,
-        observed_at: seven.clock.clone(),
+        observed_at,
         deadline_ms: None,
         cancelled: false,
     });
-    let evaluation = match evaluate_activation(&candidate, &request, &profile) {
-        Ok(evaluation) => evaluation,
-        Err(error) => {
-            return CueActivationDisposition::Skipped(CueActivationSkip::EvaluationRefused(error));
-        }
-    };
-    CueActivationDisposition::Evaluated(CueActivationSummary {
+    let evaluation =
+        evaluate_activation(candidate, &request, &profile).map_err(CueActivationSkip::EvaluationRefused)?;
+    Ok(CueActivationSummary {
         request_id: evaluation.result.request_id.as_str().to_owned(),
         snapshot_id: evaluation.result.snapshot_id.as_str().to_owned(),
         candidate_build_digest: evaluation.candidate_build_digest.as_str().to_owned(),
@@ -398,9 +396,8 @@ fn daemon_adapter_profile() -> Result<NormalizationProfile, CueActivationSkip> {
 fn adopted_capture_profile(
     candidate: &CueSnapshotBuildCandidate,
 ) -> Result<NormalizationProfile, CueActivationSkip> {
-    let first = match candidate.admitted_bindings.first() {
-        Some(binding) => binding,
-        None => return Err(CueActivationSkip::NoSeedCues),
+    let Some(first) = candidate.admitted_bindings.first() else {
+        return Err(CueActivationSkip::NoSeedCues);
     };
     let mut profiles = BTreeSet::new();
     for binding in &candidate.admitted_bindings {
@@ -439,10 +436,10 @@ fn seed_evaluable(seed: &NormalizedCue) -> bool {
     if seed.comparison_keys.is_empty() {
         return false;
     }
-    match &seed.outcome {
-        NormalizationOutcome::Ambiguous { .. } | NormalizationOutcome::Unsupported { .. } => false,
-        _ => true,
-    }
+    !matches!(
+        &seed.outcome,
+        NormalizationOutcome::Ambiguous { .. } | NormalizationOutcome::Unsupported { .. }
+    )
 }
 
 /// Synthesizes the daemon match rules covering exactly the seed keys.
@@ -493,7 +490,6 @@ fn completeness_label(completeness: &Completeness) -> &'static str {
         Completeness::Partial { .. } => "partial",
         Completeness::Blocked { .. } => "blocked",
         Completeness::Unavailable { .. } => "unavailable",
-        Completeness::Unknown { .. } => "unknown",
         Completeness::SourceUnavailable { .. } => "source_unavailable",
         Completeness::NoDirectMatch { .. } => "no_direct_match",
         Completeness::Stale { .. } => "stale",
