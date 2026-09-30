@@ -34,8 +34,7 @@ pub use outcome_observation::{
     AdmittedObservationReceipt, ExpectedOutcomeObservation, MaintenanceOutcomeDisposition,
     OUTCOME_OBSERVATION_OWNER, OUTCOME_OBSERVATION_RESOLUTION, ObservedOutcomeObservation,
     OutcomeObservationCoverage, OutstandingOutcome, OutstandingOutcomeObligation,
-    admit_observation_delivery, outcome_observation_coverage,
-    outcome_observation_disposition,
+    admit_observation_delivery, outcome_observation_coverage, outcome_observation_disposition,
 };
 
 pub use result_obligation::{

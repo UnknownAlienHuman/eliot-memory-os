@@ -221,13 +221,14 @@ impl OutcomeObservationCoverage {
 /// completed job with no obligation is not a job with nothing to observe.
 fn owed_result(job: &MaintenanceJob) -> Option<(String, MaintenanceExecutionOutcome)> {
     if let Some(latest) = job.result_obligations.last() {
-        return Some((
-            latest.publication_id.clone(),
-            latest.execution_outcome,
-        ));
+        return Some((latest.publication_id.clone(), latest.execution_outcome));
     }
-    result_outcome(job.state)
-        .map(|outcome| (publication_id_for(&job.job_id, job.state, job.attempts), outcome))
+    result_outcome(job.state).map(|outcome| {
+        (
+            publication_id_for(&job.job_id, job.state, job.attempts),
+            outcome,
+        )
+    })
 }
 
 /// Decides what the observation path actually holds for one job that owes an
@@ -312,14 +313,18 @@ pub fn outcome_observation_coverage(
     };
     for entry in expected {
         match jobs.iter().find(|job| job.job_id == entry.job_id) {
-            None => coverage.outstanding.push(OutstandingOutcome::RevisionUnavailable {
-                job_ref: entry.job_id.clone(),
-            }),
+            None => coverage
+                .outstanding
+                .push(OutstandingOutcome::RevisionUnavailable {
+                    job_ref: entry.job_id.clone(),
+                }),
             Some(job) => match outcome_observation_disposition(job, admitted)? {
                 MaintenanceOutcomeDisposition::NoResultDeclared => {
-                    coverage.outstanding.push(OutstandingOutcome::NoResultDeclared {
-                        job_ref: entry.job_id.clone(),
-                    });
+                    coverage
+                        .outstanding
+                        .push(OutstandingOutcome::NoResultDeclared {
+                            job_ref: entry.job_id.clone(),
+                        });
                 }
                 MaintenanceOutcomeDisposition::ResultObserved {
                     publication_id,
@@ -330,7 +335,9 @@ pub fn outcome_observation_coverage(
                     observation_receipt_ref,
                 }),
                 MaintenanceOutcomeDisposition::ObservationOwed(obligation) => {
-                    coverage.outstanding.push(OutstandingOutcome::ObservationOwed(obligation));
+                    coverage
+                        .outstanding
+                        .push(OutstandingOutcome::ObservationOwed(obligation));
                 }
             },
         }
