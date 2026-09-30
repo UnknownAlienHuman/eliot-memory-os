@@ -1,6 +1,26 @@
 //! Independent normative quality dimensions.
+//!
+//! Three relations are owned here and nowhere else.
+//!
+//! * **Applicability** — [`QualityApplicabilityEvidence`] and
+//!   [`QualityApplicability::resolve`] derive the six applicability inputs from
+//!   evidence that is actually present, so `unknown` is a derived fact and not
+//!   a value the grader typed in for itself. Unknown applicability blocks the
+//!   dependent decision or effect and never read-only display.
+//! * **Evidence currency** — [`QualityEvidenceIndex`] joins a dimension's
+//!   evidence handle to the packet's *current* observations. A well-shaped
+//!   handle with no current observation cannot be read as an observed pass.
+//! * **Readiness** — [`QualityScorecard::suitability_with_evidence`] is the one
+//!   readiness rule, and [`QualityScorecard::suitability`] is the same rule
+//!   without the observation join; [`QualityScorecard::validate`] stays
+//!   structural integrity and neither readiness entrypoint replaces it.
+//!
+//! The observation vocabulary itself is the measurement owner's
+//! (`eliot_context_measurement::observation`); the identities are re-validated
+//! through that owner's own [`ObservationOwnerRecheck::revalidate`] port, so no
+//! second validator exists here and no receipt contains its own output hash.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::ArtifactId;
 use eliot_receipts::ProofCeiling;
@@ -186,6 +206,16 @@ pub struct QualityDimensionResult {
     pub required_evidence: Vec<ArtifactId>,
     /// Evidence observed by the current compilation.
     pub evidence: Vec<ArtifactId>,
+    /// Measurements the dimension was read from.
+    ///
+    /// A `Passed` dimension must carry at least one. Shape validation cannot
+    /// decide this: an `evidence` list holds bare identities, so a dimension
+    /// whose only content is one well-shaped handle repeated twelve times
+    /// satisfies every list rule below. A measurement names bytes and the
+    /// serializer that produced them, and
+    /// [`QualityEvidenceIndex::binds`] joins exactly these references to the
+    /// packet's current observations — that join, not this list, is what
+    /// establishes the observation exists.
     pub measurements: Vec<MeasurementRef>,
     pub failed_invariant: Option<ArtifactId>,
     /// Missing or stale elements: exactly what the dimension still lacks.
@@ -237,7 +267,19 @@ impl QualityDimensionResult {
                         .required_evidence
                         .iter()
                         .all(|member| observed.contains(member));
-                if !complete || self.failed_invariant.is_some() || !self.unknown_evidence.is_empty()
+                // A pass also has to name what was measured. Without a
+                // measurement there is nothing for
+                // [`QualityEvidenceIndex::binds`] to join to an observation, so
+                // the dimension asserts an observed pass over no observation at
+                // all and the duplicated-handle card would validate. This is a
+                // stated precondition of the index, not a second currency check:
+                // the index still decides whether a named measurement is
+                // *current*, and a card carrying measurements here is still
+                // refused by the index when none of them bind.
+                if !complete
+                    || self.measurements.is_empty()
+                    || self.failed_invariant.is_some()
+                    || !self.unknown_evidence.is_empty()
                 {
                     return Err(ContextError::QualityIncomplete);
                 }
@@ -354,6 +396,145 @@ impl QualityApplicability {
     }
 }
 
+/// The evidence actually present for the six applicability inputs.
+///
+/// One optional entry per [`QualityApplicabilityInput`], except the route, which
+/// is read from the packet's own [`QualityOutputBinding`] instead. This is the
+/// *input* side of resolution: it reports what the owners supplied, and
+/// [`QualityApplicability::resolve`] derives the partition from it. A missing
+/// entry means the owner supplied no governing answer — it is never a default,
+/// a fallback profile, or an inferred "nothing applies".
+///
+/// `None` for a mandatory input is therefore a first-class fact: the
+/// dependent decision or effect stays blocked until the owner issues it, and
+/// read-only diagnostic display still works with the limitation visible.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct QualityApplicabilityEvidence {
+    /// Owner-issued task identity and acceptance revision.
+    pub task_acceptance: Option<ArtifactId>,
+    /// Route identity the packet is compiled for.
+    ///
+    /// Read-only. The route the grades were actually taken on is the packet's
+    /// own `QualityOutputBinding::route_id`, and that is the value
+    /// [`QualityApplicability::resolve`] uses; this field exists so a caller
+    /// that knows it is compiling for a route can declare it, and its
+    /// disagreement with the output binding is visible rather than silent.
+    pub route: Option<String>,
+    /// Owner-resolved impact classification of the requested effect.
+    pub impact: Option<ArtifactId>,
+    /// Governing Governance Profile identity.
+    pub governance_profile: Option<ArtifactId>,
+    /// Protected Safety Floor rule identity.
+    pub protected_floor: Option<ArtifactId>,
+    /// Directive-set identity in force for this compilation.
+    pub active_directive: Option<ArtifactId>,
+}
+
+impl QualityApplicabilityEvidence {
+    /// The owner-issued reference for one input, read from exactly this input.
+    ///
+    /// The match is total over [`QualityApplicabilityInput`], so adding an
+    /// applicability input later cannot leave this silently reading the wrong
+    /// field.
+    fn owner_reference(&self, input: QualityApplicabilityInput) -> Option<&ArtifactId> {
+        match input {
+            QualityApplicabilityInput::TaskAcceptance => self.task_acceptance.as_ref(),
+            QualityApplicabilityInput::Route => None,
+            QualityApplicabilityInput::Impact => self.impact.as_ref(),
+            QualityApplicabilityInput::GovernanceProfile => self.governance_profile.as_ref(),
+            QualityApplicabilityInput::ProtectedFloor => self.protected_floor.as_ref(),
+            QualityApplicabilityInput::ActiveDirective => self.active_directive.as_ref(),
+        }
+    }
+
+    /// The governing answer for one input, or the exact reason it is unknown.
+    ///
+    /// The route answer comes from the packet's own output binding, whose
+    /// `route_id` is compared for shape and never recomputed here: whether those
+    /// bytes are *this* packet's is decided by the assembly entrypoint and
+    /// `ActiveUnderstandingView::validate`. A declared route that contradicts
+    /// the binding does not resolve the input — the packet cannot be graded for
+    /// a route it was not compiled for, so the disagreement leaves the input
+    /// unknown and therefore blocking, instead of silently preferring one of
+    /// the two.
+    fn resolution(
+        &self,
+        output: &QualityOutputBinding,
+        input: QualityApplicabilityInput,
+    ) -> Result<(), String> {
+        match input {
+            QualityApplicabilityInput::Route => {
+                if let Some(declared) = &self.route
+                    && declared != &output.route_id
+                {
+                    return Err("declared route contradicts the graded output route".to_owned());
+                }
+                match crate::validate_text(
+                    output.route_id.as_str(),
+                    "quality.applicability.route",
+                ) {
+                    Ok(()) => Ok(()),
+                    Err(error) => Err(std::format!("{error:?}")),
+                }
+            }
+            _ => match self.owner_reference(input) {
+                Some(_) => Ok(()),
+                None => Err(std::format!("no owner answer for {input:?}")),
+            },
+        }
+    }
+}
+
+impl QualityApplicability {
+    /// Derive the applicability partition from the evidence that is present.
+    ///
+    /// The partition is a *derived fact*. The caller supplies evidence and this
+    /// decides which of [`QUALITY_APPLICABILITY_INPUTS`] it resolves, so a
+    /// grader cannot type "resolved" for an owner that issued nothing. Every
+    /// declared input is visited exactly once, and each lands in exactly one of
+    /// `resolved` or `unknown`; the derivation is exhaustive by construction,
+    /// so an empty side means the derivation found nothing there, never that
+    /// the rule forgot to look.
+    ///
+    /// An unknown input is never resolved to the weakest profile and never
+    /// dropped. It is carried into
+    /// [`QualityScorecard::suitability`], where
+    /// [`QualityOperation::blocks_on_unresolved_applicability`] refuses every
+    /// dependent decision or effect and lets read-only diagnostic display
+    /// through with the limitation visible.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::InvalidField`] or
+    /// [`ContextError::InvalidDigest`] when the output binding is malformed,
+    /// and [`ContextError::InvalidField`] when a derived unknown reason is
+    /// itself malformed. An absent owner reference is *not* an error here: it is
+    /// the derived `unknown` half of the partition, and a caller that supplied
+    /// no owner answers at all gets a fully unknown partition — which blocks
+    /// every dependent decision or effect and still permits read-only display.
+    pub fn resolve(
+        evidence: &QualityApplicabilityEvidence,
+        output: &QualityOutputBinding,
+    ) -> Result<Self, ContextError> {
+        output.validate()?;
+        let mut resolved = Vec::with_capacity(QUALITY_APPLICABILITY_INPUTS.len());
+        let mut unknown = Vec::with_capacity(QUALITY_APPLICABILITY_INPUTS.len());
+        for input in QUALITY_APPLICABILITY_INPUTS {
+            match evidence.resolution(output, input) {
+                Ok(()) => resolved.push(input),
+                Err(reason) => {
+                    crate::validate_text(&reason, "quality.applicability.unknown_reason")?;
+                    unknown.push(input);
+                }
+            }
+        }
+        let derived = Self { resolved, unknown };
+        derived.validate()?;
+        Ok(derived)
+    }
+}
+
 /// The exact output one scorecard graded.
 ///
 /// I12.13 grades a *rendered packet*, not a candidate set, so a grade is only
@@ -403,6 +584,13 @@ pub struct QualityOutputBinding {
     /// Source revisions every grade was read from, one entry per distinct
     /// admitted source snapshot. A repeated revision is one revision, never two
     /// observations, so a duplicated handle cannot stand in for coverage.
+    ///
+    /// This is a *claim*, and
+    /// [`QualityOutputBinding::validate_against_sources`] is what checks it
+    /// against the admitted records' own source identities. Nothing in this
+    /// crate can decide it alone: the admitted set is the record of which
+    /// sources the grades were actually read from, and it lives in the packet
+    /// that owns it.
     pub evidence_revisions: Vec<ArtifactId>,
     /// Omission handles this packet actually carries, in the order the
     /// admission owner recorded them.
@@ -452,6 +640,225 @@ impl QualityOutputBinding {
             }
         }
         Ok(())
+    }
+
+    /// Check the recorded source revisions against the sources actually read.
+    ///
+    /// `expected_revisions` is the admitted set's *own* denominator — one
+    /// `SourceSnapshot::snapshot_id` per distinct source the records were read
+    /// from, collected by the owner of those records. It is passed in rather
+    /// than derived from `self` because the only set here that is not a
+    /// self-description is the admitted one: reading it out of `self` would
+    /// compare the claim with a copy of itself and no source change could ever
+    /// fail. See `STITCH`.
+    ///
+    /// Two comparisons are made, both set comparisons in both directions:
+    ///
+    /// * every recorded revision is one this packet was actually read from, so
+    ///   a card cannot claim coverage of a source that contributed nothing; and
+    /// * every source the records were read from is recorded, so a card cannot
+    ///   omit the source that changed while a stale grade is still on it.
+    ///
+    /// This is the invalidation join. Neither side is recomputed: the recorded
+    /// values are the ones on the card and the expected values are the ones the
+    /// admitted records carry, and a source revision that moved is a mismatch
+    /// rather than a value this function recomputes over itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::SelectionIntegrityMismatch`] when the two sets
+    /// differ in either direction. An empty recorded list against a
+    /// non-empty denominator is that same mismatch, never a vacuous pass.
+    pub fn validate_against_sources(
+        &self,
+        expected_revisions: &BTreeSet<ArtifactId>,
+    ) -> Result<(), ContextError> {
+        self.validate()?;
+        if expected_revisions.is_empty() {
+            return Err(ContextError::MissingField("quality.output.expected_revisions"));
+        }
+        let recorded: BTreeSet<&ArtifactId> = self.evidence_revisions.iter().collect();
+        let expected: BTreeSet<&ArtifactId> = expected_revisions.iter().collect();
+        if recorded != expected {
+            return Err(ContextError::SelectionIntegrityMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// The packet's own rendered-output identity, as the expectation a current
+/// observation is validated against.
+///
+/// This is the *packet's* record of the bytes it was compiled into — under which
+/// serializer identity assembly produced them — and it is the same rendered
+/// digest `ActiveUnderstandingView::validate` already compares against the
+/// view's own recomputed output digest. It is held here so the currency check
+/// compares a measurement against **this packet's** identity and never against
+/// the identity the measurement itself carries. That asymmetry is the whole
+/// point: a reference is not evidence of itself.
+///
+/// The route, provider, model and tokenizer identities are deliberately absent:
+/// [`MeasurementRef`] carries only a digest and a serializer, so a comparison
+/// that read a route from here would be comparing the packet with itself. Those
+/// identities belong to the observation owner, and it is the owner's
+/// [`ObservationOwnerRecheck::revalidate`] that compares them against its own
+/// expectation. They are not restated here as a second scheme.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct QualityEvidenceExpectation {
+    /// Exact digest of the ordered rendered payload this packet produced.
+    ///
+    /// This is `ActiveUnderstandingView::canonical_output_digest`. It is the
+    /// existing canonical payload digest, read as recorded — the packet owner
+    /// already recomputes and compares it, and nothing here rehashes it or
+    /// substitutes a freshly computed value for the recorded one.
+    pub rendered_digest: String,
+    /// Serializer identity those bytes were produced under, which is the one
+    /// identity a [`MeasurementRef`] also names and so the only one both sides
+    /// hold independently.
+    pub serializer_id: String,
+}
+
+impl QualityEvidenceExpectation {
+    /// Validate the expectation's own identities.
+    pub fn validate(&self) -> Result<(), ContextError> {
+        crate::validate_digest(
+            &self.rendered_digest,
+            "quality.evidence.rendered_digest",
+        )?;
+        crate::validate_text(&self.serializer_id, "quality.evidence.serializer_id")
+    }
+
+    /// Whether this expectation describes the bytes one reference names.
+    ///
+    /// Both sides are compared because both hold them independently: the
+    /// expectation holds the packet's rendered digest and serializer, and the
+    /// reference holds the digest and serializer it claims to have measured.
+    /// This is not implied by the digest alone — the same bytes reached through
+    /// a different serializer are a different observation — which is the same
+    /// distinction `eliot_context_measurement::observation::validate_observation`
+    /// makes before it preserves an observation as `Exact`.
+    #[must_use]
+    pub fn describes(&self, reference: &MeasurementRef) -> bool {
+        let (digest, serializer) = reference.observation_identity();
+        self.rendered_digest == digest && self.serializer_id == serializer
+    }
+}
+
+/// The recheck the observation's owner performs for this crate.
+///
+/// `eliot-context-contracts` is a contract crate: it does not depend on the
+/// measurement crate and cannot construct an `ObservationInput`. This is the
+/// typed port through which the observation owner
+/// (`eliot_context_measurement::validate_observation`) is reused verbatim
+/// rather than re-implemented. A caller wires the owner in once, and every
+/// currency check then runs the owner's own comparison against the exact
+/// envelope bytes, operation binding, route/provider/model/tokenizer identity
+/// and serializer identity.
+///
+/// A truthful implementation returns `true` only for the outcomes the owner
+/// preserves as an exact current observation. `Absent`, `Unavailable`,
+/// `Unsupported`, `Stale`, `Transformed` and `Unknown` are all `false`: none of
+/// them is a current observation, and an unknown count is never zero and never
+/// a proven error. See `STITCH`.
+pub trait ObservationOwnerRecheck {
+    /// Revalidate the owner's own observation for this reference and return
+    /// whether it is a current exact observation.
+    fn revalidate(&self, reference: &MeasurementRef) -> Result<bool, ContextError>;
+}
+
+/// The join from an evidence handle to a current observation.
+///
+/// A `Passed` dimension's evidence is a list of bare identities, so its shape
+/// is provable while its currency is not: the same well-shaped handle can be
+/// written on all twelve axes and satisfy every structural rule. This index is
+/// the join that closes that gap. A dimension's grade is backed only when one
+/// of **that dimension's own** `measurements` names bytes that
+///
+/// 1. are this packet's own rendered bytes under this packet's own serializer —
+///    decided from [`QualityEvidenceExpectation`], never from the reference's
+///    own copy; and
+/// 2. have a current exact observation, as the observation's own owner
+///    confirms through [`ObservationOwnerRecheck::revalidate`], which is what
+///    also compares the route, provider, model and tokenizer identities.
+///
+/// A backed grade reports no gap; an unbacked one reports the exact handles
+/// that could not be joined. A structural failure stays structural — a
+/// malformed reference is an `Err` — while an unbacked pass is a *gap*, so a
+/// consumer can tell a malformed packet from a packet whose evidence is well
+/// shaped but unobserved.
+#[derive(Clone, Copy, Debug)]
+pub struct QualityEvidenceIndex<'a> {
+    /// The packet identity a reference is measured against.
+    expectation: &'a QualityEvidenceExpectation,
+    /// Revalidator wired to the observation owner.
+    recheck: &'a dyn ObservationOwnerRecheck,
+}
+
+impl<'a> QualityEvidenceIndex<'a> {
+    /// Join one packet's identity against an observation revalidator.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::InvalidDigest`] or
+    /// [`ContextError::InvalidField`] when the packet identity itself is
+    /// malformed, so a caller cannot index against an unusable expectation.
+    pub fn new(
+        expectation: &'a QualityEvidenceExpectation,
+        recheck: &'a dyn ObservationOwnerRecheck,
+    ) -> Result<Self, ContextError> {
+        expectation.validate()?;
+        Ok(Self {
+            expectation,
+            recheck,
+        })
+    }
+
+    /// Whether one reference names a current observation of this packet.
+    ///
+    /// Both facts must hold, and the first is not allowed to substitute for the
+    /// second: naming the right bytes is not the same as having observed them.
+    /// The owner's recheck is a re-validation of the owner's own recorded
+    /// observation, never a recomputation of a value derived from the handle
+    /// under test.
+    pub fn binds(&self, reference: &MeasurementRef) -> Result<bool, ContextError> {
+        reference.validate()?;
+        if !self.expectation.describes(reference) {
+            return Ok(false);
+        }
+        self.recheck.revalidate(reference)
+    }
+
+    /// The exact evidence a dimension still lacks, in canonical order.
+    ///
+    /// Reported handles are the result's own: the measurement references that
+    /// name no current observation, followed by the result's own missing or
+    /// stale members. A result whose grade is not an observed pass reports the
+    /// same way, so a failure that also lost its evidence still shows that loss.
+    ///
+    /// A result that is neither backed nor carrying a gap cannot occur:
+    /// `QualityScorecard::validate` already refuses a `Passed` result with an
+    /// empty `measurements` list, so a pass here always has at least one
+    /// reference and either one of them binds — no gap — or every one of them
+    /// fails and the loop above reports them.
+    pub fn unbacked_evidence(
+        &self,
+        result: &QualityDimensionResult,
+    ) -> Result<Vec<ArtifactId>, ContextError> {
+        let mut gaps: BTreeSet<ArtifactId> = BTreeSet::new();
+        for reference in &result.measurements {
+            if !self.binds(reference)? {
+                gaps.insert(
+                    ArtifactId::new(std::format!(
+                        "quality-measurement-unobserved:{}:{}",
+                        reference.serializer, reference.digest
+                    ))
+                    .map_err(|_| ContextError::InvalidField("quality.measurement.handle"))?,
+                );
+            }
+        }
+        gaps.extend(result.unknown_evidence.iter().cloned());
+        Ok(gaps.into_iter().collect())
     }
 }
 
@@ -539,6 +946,18 @@ pub enum QualityRefusalKind {
     ApplicabilityUnknown,
     /// The requested operation is blocked by the named dimension results.
     OperationBlocked,
+    /// A required dimension is graded `Passed` but its own evidence no longer
+    /// resolves to a current observation.
+    ///
+    /// This is distinct from [`QualityRefusalKind::InvalidScorecard`] on
+    /// purpose. The card is structurally intact — twelve real dimensions, a
+    /// declared rule revision, a well-formed output — so the packet is not
+    /// malformed and read-only display still works. What is missing is the
+    /// observation the pass was taken over, which makes the operation
+    /// *degraded and blocked* rather than *refused as invalid*. Collapsing the
+    /// two would force a consumer to either discard a usable diagnostic view or
+    /// report a stale pass as if it were current.
+    EvidenceUnobserved,
 }
 
 /// Typed refusal naming the requested operation and every exact dimension
@@ -558,6 +977,18 @@ pub struct QualityRefusal {
     /// [`QualityRefusalKind::InvalidScorecard`], and carried alongside the
     /// blocking results so no unresolved input is hidden by a dimension grade.
     pub unresolved_applicability: Vec<QualityApplicabilityInput>,
+    /// Exact evidence each blocking result lacks, keyed by the blocking result's
+    /// own dimension. Empty only for [`QualityRefusalKind::InvalidScorecard`].
+    ///
+    /// This is the "naming the exact missing evidence" half of the refusal,
+    /// and it is keyed per dimension so evidence bound to one axis is never read
+    /// as satisfying another. Entries are the unobserved measurement references
+    /// and missing or stale members the result itself declares, plus — for a
+    /// `Passed` result whose measurements no longer resolve to a current
+    /// observation — the exact handles the observation join could not bind. A
+    /// consumer reports this list instead of re-deriving it, so a blocked
+    /// dependent action always arrives with the evidence that would unblock it.
+    pub missing_evidence: BTreeMap<QualityDimension, Vec<ArtifactId>>,
 }
 
 /// Granted suitability of one operation, carrying its remaining limitations.
@@ -623,21 +1054,58 @@ impl QualityScorecard {
     /// Check suitability for one requested dependent decision or effect.
     ///
     /// [`QualityScorecard::validate`] stays structural integrity; this is the
-    /// separate operation-scoped readiness fact. Three things block, and none of
+    /// separate operation-scoped readiness fact. Four things block, and none of
     /// them can be traded against the others:
     ///
     /// * every dimension in [`QualityOperation::required_dimensions`] must be
     ///   an observed pass, so a failed, unknown, degraded or not-applicable
     ///   dimension blocks its dependent action;
-    /// * any unresolved applicability input blocks every operation except
+    /// * every unresolved applicability input blocks every operation except
     ///   read-only diagnostic display, which reports it instead;
     /// * `additional_required` carries the blockers a recipe selected. It is
     ///   unioned with the independently mandatory set, so it can add a
-    ///   constraint but never remove one.
+    ///   constraint but never remove one;
+    /// * when an [`QualityEvidenceIndex`] is supplied, every required dimension
+    ///   must additionally be backed by a current observation of *its own*
+    ///   measurements. This is the A5 join: a well-shaped evidence handle
+    ///   without the corresponding current observation is not a pass.
+    ///
+    /// A refusal is typed: it names the requested [`QualityOperation`], every
+    /// blocking result, and the exact evidence each of those results lacks. A
+    /// non-blocking uncertainty is *returned* in [`QualitySuitability`] instead
+    /// of refused, which is what keeps an informational unknown visible without
+    /// globally refusing unrelated safe work — the dimensions that operation
+    /// does not require are neither checked nor allowed to block it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`QualityRefusal`] of kind
+    /// [`QualityRefusalKind::InvalidScorecard`] when the card is not
+    /// structurally valid, [`QualityRefusalKind::ApplicabilityUnknown`] when
+    /// applicability blocks, and [`QualityRefusalKind::OperationBlocked`]
+    /// otherwise.
     pub fn suitability(
         &self,
         operation: QualityOperation,
         additional_required: &[QualityDimension],
+    ) -> Result<QualitySuitability, QualityRefusal> {
+        self.suitability_with_evidence(operation, additional_required, None)
+    }
+
+    /// [`QualityScorecard::suitability`] with the evidence-observation join
+    /// supplied.
+    ///
+    /// This is the same one rule. It exists as a separate entrypoint rather than
+    /// as a parameter on [`QualityScorecard::suitability`] so the two
+    /// requirements cannot be confused for one: structural validity of the card
+    /// is always checked, while the observation join is only applied when a
+    /// caller has an [`QualityEvidenceIndex`] to hand. Passing `None` is exactly
+    /// [`QualityScorecard::suitability`].
+    pub fn suitability_with_evidence(
+        &self,
+        operation: QualityOperation,
+        additional_required: &[QualityDimension],
+        evidence: Option<&QualityEvidenceIndex<'_>>,
     ) -> Result<QualitySuitability, QualityRefusal> {
         if self.validate().is_err() {
             return Err(QualityRefusal {
@@ -645,6 +1113,7 @@ impl QualityScorecard {
                 operation,
                 blocking: Vec::new(),
                 unresolved_applicability: Vec::new(),
+                missing_evidence: BTreeMap::new(),
             });
         }
         let required: BTreeSet<QualityDimension> = operation
@@ -653,19 +1122,55 @@ impl QualityScorecard {
             .chain(additional_required)
             .copied()
             .collect();
-        // A required dimension blocks when it is not a current pass. A recorded
-        // invalidation therefore blocks the same way a failure does: the grade
-        // it carried was invalidated and only reevaluation can replace it.
-        let blocking = self
-            .results
-            .iter()
-            .filter(|result| required.contains(&result.dimension) && !result.is_current_pass())
-            .cloned()
-            .collect::<Vec<_>>();
         let unresolved_applicability = self.applicability.unresolved();
         let applicability_blocks =
             operation.blocks_on_unresolved_applicability() && !unresolved_applicability.is_empty();
+        // A required dimension blocks when it is not a current pass, or when its
+        // own measurements do not resolve to a current observation. A recorded
+        // invalidation therefore blocks the same way a failure does: the grade
+        // it carried was invalidated and only reevaluation can replace it.
+        let mut blocking: Vec<QualityDimensionResult> = Vec::new();
+        let mut missing_evidence: BTreeMap<QualityDimension, Vec<ArtifactId>> = BTreeMap::new();
+        // Tracked separately from `blocking` so the refusal can say *why* a
+        // dimension blocked. A dimension whose own state is a pass but whose
+        // observation is gone is a different fact from a dimension that failed,
+        // and a consumer that receives only "blocked" would have to re-derive it.
+        let mut unobserved_evidence = false;
+        for result in &self.results {
+            if !required.contains(&result.dimension) {
+                continue;
+            }
+            let mut gaps: Vec<ArtifactId> = result.unknown_evidence.clone();
+            let mut blocks = !result.is_current_pass();
+            if let Some(index) = evidence {
+                // The result is compared with its own measurements. A `Passed`
+                // result whose evidence no longer resolves to a current
+                // observation blocks exactly as a failure does, and the refusal
+                // names the handles that could not be joined.
+                let unbacked = index.unbacked_evidence(result).map_err(|_| QualityRefusal {
+                    kind: QualityRefusalKind::InvalidScorecard,
+                    operation,
+                    blocking: Vec::new(),
+                    unresolved_applicability: Vec::new(),
+                    missing_evidence: BTreeMap::new(),
+                })?;
+                if !unbacked.is_empty() {
+                    blocks = true;
+                    unobserved_evidence |= result.state.is_pass();
+                }
+                gaps.extend(unbacked);
+            }
+            if blocks {
+                blocking.push(result.clone());
+                if !gaps.is_empty() {
+                    missing_evidence.insert(result.dimension, gaps);
+                }
+            }
+        }
         if blocking.is_empty() && !applicability_blocks {
+            // The non-blocking unknown is returned, not refused: an unrelated
+            // safe action stays available and the limitation stays visible on
+            // the granted suitability.
             return Ok(QualitySuitability {
                 operation,
                 unresolved_applicability,
@@ -674,12 +1179,15 @@ impl QualityScorecard {
         Err(QualityRefusal {
             kind: if applicability_blocks {
                 QualityRefusalKind::ApplicabilityUnknown
+            } else if unobserved_evidence {
+                QualityRefusalKind::EvidenceUnobserved
             } else {
                 QualityRefusalKind::OperationBlocked
             },
             operation,
             blocking,
             unresolved_applicability,
+            missing_evidence,
         })
     }
 }
