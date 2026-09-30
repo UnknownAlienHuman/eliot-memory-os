@@ -647,92 +647,17 @@ pub fn assemble_improvement_artifact(
     // newest record. `load` is the same mutex-guarded read of already-committed
     // in-process state; it opens no transport and no store client.
     let observed = newest_observed_closure(observed_closures)?;
-    // The evidence bundle is selected by a DERIVED source, not asserted
-    // (issue #1867 W2). Two discriminators are consulted, in this order, and
-    // every arm terminates in the same `eliot_improvement::sourced_evidence`
-    // validation, so no arm can bypass it. The replay plan is selected WITH the
-    // evidence rather than separately, so a candidate's fixed replay can never
-    // claim evidence the candidate itself does not cite.
-    //
-    // 1. A REAL recorded repeated-failure signature on the newest committed
-    //    closure record. This is the second disjunct of A1 ("a real repeated
-    //    verifier failure") and it is selected on recorded owner content, never
-    //    on a caller label: see [`recorded_repeated_failure`] for what the
-    //    Governor's own boundary derivation proves and for the exact measured
-    //    reason `diagnose_self_quality` is NOT on this arm. The same decision
-    //    also selects the candidate's decision fields and the brief's problem,
-    //    benefit and next reversible step below, so no owner-facing field of a
-    //    candidate can describe a maintenance family its evidence never names.
-    // 2. The DERIVED maintenance source below. Every source but one is the
-    //    maintenance occurrence itself, and is assembled by the funnel's own
-    //    validated constructor. The conformance-audit source is different in
-    //    kind: I12.24:50 names the trigger "Architecture/Implementation/
-    //    runtime conformance gap", so that evidence enters the funnel through
-    //    the Self-Quality conformance diagnosis contract, which owns the
-    //    finding's inert owner handoff
-    //    (`eliot_self_quality::conformance_evidence`), rather than being
-    //    labelled as a maintenance occurrence and losing the conformance
-    //    owner, the priority axis and the invalidation set the finding
-    //    recorded.
-    let repeated_failure = recorded_repeated_failure(&observed);
-    let (evidence, replay_plan, decision_fields) = if repeated_failure {
-        (
-            repeated_failure_evidence(&observed, &admitted_scope)?,
-            repeated_failure_replay_plan(&observed),
-            repeated_failure_decision_fields(&observed),
-        )
-    } else {
-        // The replay plan is diagnostic-only (I12.24:76-77): the fixed replay,
-        // holdout and transfer legs are the decision's own canonical refs, and
-        // the counter metrics name what must not regress. Promotion is
-        // separately refused by the intake's budget gate, which this advisory
-        // path does not attempt to satisfy.
-        //
-        // The three bindings below are scoped to this arm on purpose. The
-        // repeated-failure arm's evidence is the committed closure record, so
-        // deriving a maintenance-decision ref set and a trigger statement it
-        // never cites would be a value with no consumer. `trigger` reads
-        // `decision.family` through its own `Display` impl while
-        // `AutomationDecision` and `DecisionReason` are `Debug`-only closed
-        // owner enums and gain no `Display` here, so those two are named by
-        // their derived variant spelling instead.
-        let evidence_refs = maintenance_evidence_refs(decision);
-        let trace_refs = vec![format!("maintenance-family:{}", decision.family)];
-        let trigger = maintenance_trigger_text(decision);
-        let plan = maintenance_replay_plan(decision, &evidence_refs);
-        let bundle = match maintenance_evidence_source(decision) {
-            EvidenceSource::ConformanceDiagnosis => {
-                conformance_diagnosis_evidence(decision, &trigger, &admitted_scope)?
-            }
-            source => sourced_evidence(
-                source,
-                &evidence_refs,
-                &trace_refs,
-                &trigger,
-                &[format!(
-                    "unproven-blocked-automation:{}",
-                    decision.trigger_id
-                )],
-                &admitted_scope,
-                IMPROVEMENT_OWNER,
-            )?,
-        };
-        (
-            bundle,
-            plan,
-            CandidateDecisionFields {
-                proposed_change: format!(
-                    "evaluate and resolve the blocked maintenance family {} at {}",
-                    decision.family, decision.scope_ref
-                ),
-                delivery_target: format!("maintenance-family:{}", decision.family),
-                canary_plan: format!("maintenance-canary:{}", decision.trigger_id),
-                rollback: format!("maintenance-rollback:{}", decision.trigger_id),
-                stop_condition: format!("maintenance-stop:{}", decision.trigger_id),
-            },
-        )
-    };
-
+    // The evidence bundle, replay plan and decision fields are selected
+    // together by [`selected_observation`], which carries the two discriminators
+    // and both arms. Selection is a DERIVED source, never an asserted one
+    // (issue #1867 W2), and every arm terminates in the same
+    // `eliot_improvement::sourced_evidence` validation, so no arm can bypass it.
+    let SourcedArm {
+        evidence,
+        replay_plan,
+        decision_fields,
+        repeated_failure,
+    } = selected_observation(decision, &observed, &admitted_scope)?;
     let mut candidate = candidate_from_evidence(
         SERVICE_NAME,
         IMPROVEMENT_SURFACE,
@@ -762,8 +687,8 @@ pub fn assemble_improvement_artifact(
     // Stated plainly so this call is not read as broader than it is: the
     // candidate assembled above records [`IMPROVEMENT_SURFACE`] (`Memory`),
     // which is not a protected surface, so on BOTH live arms the class taken is
-    // `Advisory` and the gate passes. What the gate buys here is
-    // that the class is a FUNCTION of the candidate's recorded surface rather
+    // `Advisory` and the gate passes. What the gate buys here is that the class
+    // is a FUNCTION of the candidate's recorded surface rather
     // than of literals — a candidate carrying `Verifier` or `Scheduler` is
     // refused. See `enforce_advisory_class_gate` for the exact ceiling,
     // including the two classes this path cannot represent at all.
@@ -844,35 +769,16 @@ pub fn assemble_improvement_artifact(
     // behaviour-preserving for the two maintenance arms (both pass this same
     // `trigger` string straight through) and correct for the repeated-failure
     // arm, whose problem is the committed closure record rather than a trigger
-    // evaluation.
-    let (likely_benefit, next_reversible_step) = if repeated_failure {
-        (
-            format!(
-                "the failure signature the committed closure record {observed_artifact} recorded \
-                 for attempt {} of campaign {} recurred across more than one physical attempt of \
-                 one job, and the closure this brief is gated on {observed_effect}; resolving the \
-                 cause behind that signature stops it recurring again",
-                observed.attempt_id, observed.campaign_id
-            ),
-            format!(
-                "triage the committed learning-closure record {observed_artifact} against the \
-                 observed boundary {boundary_ref}"
-            ),
-        )
-    } else {
-        (
-            format!(
-                "the blocked family {} is evaluated on every cadence and cannot start, and the \
-                 closure this brief is gated on {observed_effect}; giving that family a start route \
-                 removes a blocked evaluation per cadence",
-                decision.family
-            ),
-            format!(
-                "triage maintenance trigger {} against the observed boundary {boundary_ref}",
-                decision.trigger_id
-            ),
-        )
-    };
+    // evaluation. The benefit and next step are selected by
+    // [`brief_benefit_and_next_step`] under that same discriminator.
+    let (likely_benefit, next_reversible_step) = brief_benefit_and_next_step(
+        decision,
+        &observed,
+        repeated_failure,
+        &observed_artifact,
+        observed_effect,
+        boundary_ref,
+    );
     let brief = brief_at_safe_boundary(
         &candidate,
         &format!(
@@ -984,6 +890,184 @@ pub fn assemble_improvement_artifact(
 /// Never a fresh per-observation value: the refs are the decision's own
 /// `trigger_id` and `scope_ref`, so two evaluations of the same occurrence
 /// under the same admitted fence carry the same lineage and deduplicate.
+/// The evidence bundle, replay plan and decision fields one arm selected,
+/// plus the discriminator that chose it.
+struct SourcedArm {
+    /// The evidence bundle, from the funnel's own validated constructor.
+    evidence: SourcedEvidence,
+    /// The replay plan that belongs to THIS evidence.
+    replay_plan: ReplayPlan,
+    /// The I12.24 decision fields that belong to THIS evidence.
+    decision_fields: CandidateDecisionFields,
+    /// Whether the selected arm was the recorded repeated-failure one.
+    ///
+    /// Carried rather than re-derived so the brief selects its problem, benefit,
+    /// and next reversible step on the SAME decision that selected the evidence,
+    /// with no second read of the record and no chance of the two disagreeing.
+    repeated_failure: bool,
+}
+
+/// Selects the evidence, replay plan and decision fields for the observation
+/// this pass actually made (issue #1867 W2, I12.24).
+///
+/// The bundle is selected by a DERIVED source, not asserted. Two discriminators
+/// are consulted, in this order, and every arm terminates in the same
+/// `eliot_improvement::sourced_evidence` validation, so no arm can bypass it.
+/// The replay plan and the decision fields are selected WITH the evidence rather
+/// than separately, so a candidate's fixed replay can never claim evidence the
+/// candidate itself does not cite and its `proposed_change` can never describe an
+/// observation its own evidence never names.
+///
+/// 1. A REAL recorded repeated-failure signature on the newest committed closure
+///    record. This is the second disjunct of A1 ("a real repeated verifier
+///    failure") and it is selected on recorded owner content, never on a caller
+///    label: see [`recorded_repeated_failure`] for what the Governor's own
+///    boundary derivation proves and for the exact measured reason
+///    `diagnose_self_quality` is NOT on this arm.
+/// 2. The DERIVED maintenance source. Every source but one is the maintenance
+///    occurrence itself, and is assembled by the funnel's own validated
+///    constructor. The conformance-audit source is different in kind: I12.24:50
+///    names the trigger "Architecture/Implementation/runtime conformance gap", so
+///    that evidence enters the funnel through the Self-Quality conformance
+///    diagnosis contract, which owns the finding's inert owner handoff
+///    (`eliot_self_quality::conformance_evidence`), rather than being labelled as
+///    a maintenance occurrence and losing the conformance owner, the priority axis
+///    and the invalidation set the finding recorded.
+///
+/// The arm-2 replay plan is diagnostic-only (I12.24:76-77): the fixed replay,
+/// holdout and transfer legs are the decision's own canonical refs, and the
+/// counter metrics name what must not regress. Promotion is separately refused
+/// by the intake's budget gate, which this advisory path does not attempt to
+/// satisfy.
+///
+/// The three arm-2 bindings below are scoped to that arm on purpose. The
+/// repeated-failure arm's evidence is the committed closure record, so deriving a
+/// maintenance-decision ref set and a trigger statement it never cites would be a
+/// value with no consumer. `trigger` reads `decision.family` through its own
+/// `Display` impl while `AutomationDecision` and `DecisionReason` are `Debug`-only
+/// closed owner enums and gain no `Display` here, so those two are named by their
+/// derived variant spelling instead.
+///
+/// Falls through to the arm-2 evidence, so an arm-2 bundle that
+/// `sourced_evidence` or the conformance projection refuses returns its own typed
+/// [`ImprovementDispatchError`] here, unchanged, at the same point in the pass.
+fn selected_observation(
+    decision: &eliot_maintenance::AutomationTriggerDecision,
+    observed: &ObservedClosure,
+    admitted_scope: &str,
+) -> Result<SourcedArm, ImprovementDispatchError> {
+    let (evidence, replay_plan, decision_fields, repeated_failure) =
+        if recorded_repeated_failure(observed) {
+            (
+                repeated_failure_evidence(observed, admitted_scope)?,
+                repeated_failure_replay_plan(observed),
+                repeated_failure_decision_fields(observed),
+                true,
+            )
+        } else {
+            let evidence_refs = maintenance_evidence_refs(decision);
+            let trace_refs = vec![format!("maintenance-family:{}", decision.family)];
+            let trigger = maintenance_trigger_text(decision);
+            let plan = maintenance_replay_plan(decision, &evidence_refs);
+            let bundle = match maintenance_evidence_source(decision) {
+                EvidenceSource::ConformanceDiagnosis => {
+                    conformance_diagnosis_evidence(decision, &trigger, admitted_scope)?
+                }
+                source => sourced_evidence(
+                    source,
+                    &evidence_refs,
+                    &trace_refs,
+                    &trigger,
+                    &[format!(
+                        "unproven-blocked-automation:{}",
+                        decision.trigger_id
+                    )],
+                    admitted_scope,
+                    IMPROVEMENT_OWNER,
+                )?,
+            };
+            (
+                bundle,
+                plan,
+                CandidateDecisionFields {
+                    proposed_change: format!(
+                        "evaluate and resolve the blocked maintenance family {} at {}",
+                        decision.family, decision.scope_ref
+                    ),
+                    delivery_target: format!("maintenance-family:{}", decision.family),
+                    canary_plan: format!("maintenance-canary:{}", decision.trigger_id),
+                    rollback: format!("maintenance-rollback:{}", decision.trigger_id),
+                    stop_condition: format!("maintenance-stop:{}", decision.trigger_id),
+                },
+                false,
+            )
+        };
+    Ok(SourcedArm {
+        evidence,
+        replay_plan,
+        decision_fields,
+        repeated_failure,
+    })
+}
+
+/// The brief's likely benefit and next reversible step, selected under the SAME
+/// arm discriminator that chose the evidence.
+///
+/// I12.24:74 asks the brief to show likely benefit and the next reversible step
+/// so a named decision owner needs no raw-metric search. A brief whose benefit
+/// claims to unblock a maintenance family its own evidence never names is exactly
+/// the search that sentence forbids, so both strings follow the selected arm: the
+/// repeated-failure arm describes the committed closure record, and the two
+/// maintenance arms describe the trigger decision.
+///
+/// `observed_artifact`, `observed_effect` and `boundary_ref` are the committed
+/// record's own durable lineage handle, the record's own behaviour conclusion
+/// read through its predicate ([`observed_behaviour_effect`]), and the observed
+/// boundary ref. They are passed in rather than re-read so this selection is
+/// pure in the same values the brief's other fields already use.
+fn brief_benefit_and_next_step(
+    decision: &eliot_maintenance::AutomationTriggerDecision,
+    observed: &ObservedClosure,
+    repeated_failure: bool,
+    observed_artifact: &str,
+    observed_effect: &str,
+    boundary_ref: &str,
+) -> (String, String) {
+    if repeated_failure {
+        return (
+            format!(
+                "the failure signature the committed closure record {observed_artifact} recorded \
+                 for attempt {} of campaign {} recurred across more than one physical attempt of \
+                 one job, and the closure this brief is gated on {observed_effect}; resolving the \
+                 cause behind that signature stops it recurring again",
+                observed.attempt_id, observed.campaign_id
+            ),
+            format!(
+                "triage the committed learning-closure record {observed_artifact} against the \
+                 observed boundary {boundary_ref}"
+            ),
+        );
+    }
+    (
+        format!(
+            "the blocked family {} is evaluated on every cadence and cannot start, and the closure \
+             this brief is gated on {observed_effect}; giving that family a start route removes a \
+             blocked evaluation per cadence",
+            decision.family
+        ),
+        format!(
+            "triage maintenance trigger {} against the observed boundary {boundary_ref}",
+            decision.trigger_id
+        ),
+    )
+}
+
+/// The evidence lineage this maintenance observation raises, over the decision's
+/// own stable identity.
+///
+/// Never a fresh per-observation value: the refs are the decision's own
+/// `trigger_id` and `scope_ref`, so two evaluations of the same occurrence under
+/// the same admitted fence carry the same lineage and deduplicate.
 fn maintenance_evidence_refs(
     decision: &eliot_maintenance::AutomationTriggerDecision,
 ) -> Vec<String> {
@@ -1273,7 +1357,9 @@ fn repeated_failure_evidence(
             observed.route_id,
             observed.evidence_ref_count,
         ),
-        &[format!("unproven-symptom:consequential-boundary:{boundary}")],
+        &[format!(
+            "unproven-symptom:consequential-boundary:{boundary}"
+        )],
         validity_scope,
         IMPROVEMENT_OWNER,
     )?)
@@ -1363,7 +1449,10 @@ fn repeated_failure_replay_plan(observed: &ObservedClosure) -> ReplayPlan {
     ReplayPlan {
         fixed_replay_refs,
         holdout_refs: vec![format!("learning-closure-holdout:{}", observed.campaign_id)],
-        transfer_refs: vec![format!("learning-closure-transfer:{}", observed.campaign_id)],
+        transfer_refs: vec![format!(
+            "learning-closure-transfer:{}",
+            observed.campaign_id
+        )],
         counter_metric_names: vec!["repeated_verifier_failures".to_owned()],
         verifier_refs: vec![IMPROVEMENT_EVALUATOR.to_owned()],
     }
