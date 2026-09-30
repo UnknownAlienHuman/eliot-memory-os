@@ -358,6 +358,12 @@ jobs:
       - name: Record derived third-party action manifest
         shell: pwsh
         run: |
+          # Issue #1225 N_step10 (I18.27): judge the candidate tree with the
+          # verifier's own finite fixtures BEFORE trusting its verdict. A
+          # candidate that weakens a rule without co-editing every fixture
+          # fails here and publishes no manifest.
+          python scripts/verify-github-workflows.py --self-test
+          if ($LASTEXITCODE -ne 0) { throw "GITHUB_WORKFLOWS_MANIFEST_REJECTED: common verifier self-test failed; the oracle is weakened and no manifest is published" }
           $gwfJson = Join-Path $env:RUNNER_TEMP 'gwf-actions.json'
           python scripts/verify-github-workflows.py --root . --json-out $gwfJson
           if ($LASTEXITCODE -ne 0) { throw "GITHUB_WORKFLOWS_MANIFEST_REJECTED: common verifier failed; no action manifest is published" }
@@ -366,3 +372,9 @@ jobs:
           $derivedActions = @($gwf.actions | Where-Object { $_.workflow -eq '.github/workflows/integration.yml' } | ForEach-Object { "$($_.action)@$($_.ref)" } | Select-Object -Unique)
           if ($derivedActions.Count -eq 0) { throw 'GITHUB_WORKFLOWS_MANIFEST_REJECTED: derived record holds no action identities for integration.yml' }
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ("- Actions: " + ($derivedActions -join ', '))
+          # Issue #1225 N_step10 (I18.27): name the exact oracle bytes behind
+          # this verdict so the independent/manual source-candidate or Review
+          # owner attests a named oracle, not a self-certified pass.
+          if ($null -eq $gwf.oracle -or [string]::IsNullOrWhiteSpace($gwf.oracle.digest)) { throw 'GITHUB_WORKFLOWS_MANIFEST_REJECTED: verifier payload carries no oracle identity; the verdict is unattested' }
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ("- Oracle: " + $gwf.oracle.version + " digest=" + $gwf.oracle.digest)
+          foreach ($oracleFile in $gwf.oracle.files) { Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ("  - oracle file: " + $oracleFile.path + " sha256=" + $oracleFile.sha256) }

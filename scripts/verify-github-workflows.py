@@ -1971,6 +1971,42 @@ def run_self_tests() -> int:
     import io
     import tempfile
 
+    # Production-dispatch probes (issue #1225 N_step9). Every refusal below is
+    # judged twice: once against its own rule and once through verify_all, the
+    # production dispatch owner. Deleting a rule from verify_all, or gutting
+    # its body while leaving the dispatch line, still fails the suite because
+    # the re-judgment no longer carries the expected code. `probed_rules`
+    # records which production rule each probe verified, so the completeness
+    # check at the end proves EVERY check_* rule was exercised, not just the
+    # ones this file historically called directly.
+    dispatch_probes = 0
+    probed_rules: set[str] = set()
+
+    def require_dispatched(tmp_root: Path, direct: list[Finding], case_name: str, rule_name: str) -> bool:
+        """Re-judge a refusal through verify_all and record the rule probed.
+
+        Asserts every finding the direct rule call just produced reappears in
+        the production dispatch output with identical code, path, line and
+        detail. Code membership alone is not enough: two rules can share one
+        code (GWF-021 is emitted by both the privilege rule and the
+        cache-manifest-coverage rule), so a dispatched code does not prove
+        the rule under test ran. Prints the failure and returns False
+        otherwise; the caller turns False into a nonzero exit.
+        """
+        nonlocal dispatch_probes
+        dispatched = set(verify_all(tmp_root))
+        missing = [f for f in direct if f not in dispatched]
+        if missing:
+            print(
+                f"SELF_TEST_FAILURE in {case_name}: {len(missing)} refusal finding(s) from "
+                f"{rule_name} missing from the production dispatch: {missing}",
+                file=sys.stderr,
+            )
+            return False
+        probed_rules.add(rule_name)
+        dispatch_probes += 1
+        return True
+
     # (name, filename, workflow yaml, expected finding or None for clean[, extra files]).
     # Negative fixtures stay on test.yml (default dispatch-only policy); the
     # ci.yml exception and the compile-only Operator class get their own cases.
@@ -2111,6 +2147,9 @@ def run_self_tests() -> int:
             elif expected_code not in codes:
                 print(f"SELF_TEST_FAILURE in {name}: expected finding {expected_code}, got {codes}", file=sys.stderr)
                 return 1
+            else:
+                if not require_dispatched(tmp_root, findings, name, "check_workflows"):
+                    return 1
 
     # Cross-workflow pin divergence (issue #1225 step 2): the same action at two
     # different SHAs is a finding, and one SHA everywhere is clean. Each pair of
@@ -2136,6 +2175,8 @@ def run_self_tests() -> int:
                     f"SELF_TEST_FAILURE in {name}: expected GWF-011 for divergent action pin, got {findings}",
                     file=sys.stderr,
                 )
+                return 1
+            if expect_finding and not require_dispatched(tmp_root, findings, name, "check_action_pin_divergence"):
                 return 1
             if not expect_finding and findings:
                 print(
@@ -2208,6 +2249,8 @@ def run_self_tests() -> int:
                     file=sys.stderr,
                 )
                 return 1
+            if expect_finding and not require_dispatched(tmp_root, findings, name, "check_cache_key_fingerprints"):
+                return 1
 
     # A second cache step in the same file must be judged on its own key, not
     # inherit the first step's verdict: the bound-then-unbound pair is the exact
@@ -2264,6 +2307,8 @@ def run_self_tests() -> int:
                     file=sys.stderr,
                 )
                 return 1
+            if expect_finding and not require_dispatched(tmp_root, findings, name, "check_cache_key_fingerprints"):
+                return 1
 
     # Cache-key manifest COVERAGE (issue #1923). The expected set is the root
     # manifest's own member list, so a key that reaches `crates/**` and
@@ -2313,6 +2358,10 @@ def run_self_tests() -> int:
                     file=sys.stderr,
                 )
                 return 1
+            if expect_finding and not require_dispatched(
+                tmp_root, findings, name, "check_cache_key_manifest_coverage"
+            ):
+                return 1
 
     # A workspace whose members cannot be read is a coverage gap, never a
     # silent pass: an unreadable expected set must not make the rule vacuous.
@@ -2327,6 +2376,13 @@ def run_self_tests() -> int:
                 f"SELF_TEST_FAILURE in cache_manifest_coverage_without_workspace_manifest_rejected: {findings}",
                 file=sys.stderr,
             )
+            return 1
+        if not require_dispatched(
+            tmp_root,
+            findings,
+            "cache_manifest_coverage_without_workspace_manifest_rejected",
+            "check_cache_key_manifest_coverage",
+        ):
             return 1
 
     # The identity record is derived from the files and deterministic: the same
@@ -2388,6 +2444,8 @@ def run_self_tests() -> int:
         if not any(f.code == "GWF-004" for f in findings):
             print("SELF_TEST_FAILURE: expected GWF-004 for unhashed requirement", file=sys.stderr)
             return 1
+        if not require_dispatched(tmp_root, findings, "unhashed_requirement_rejected", "check_python_requirements"):
+            return 1
 
     # Test valid requirements
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -2413,6 +2471,8 @@ def run_self_tests() -> int:
         if not any(f.code == "GWF-005" for f in findings):
             print("SELF_TEST_FAILURE: expected GWF-005 for missing RestorePackagesWithLockFile", file=sys.stderr)
             return 1
+        if not require_dispatched(tmp_root, findings, "missing_nuget_lock_rejected", "check_nuget_lock"):
+            return 1
 
     # Test harness project without lock flag or lock file
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -2427,6 +2487,8 @@ def run_self_tests() -> int:
             f.code == "GWF-005" and "Eliot.Operator.Tests" in f.path for f in findings
         ):
             print("SELF_TEST_FAILURE: expected GWF-005 for unlocked Operator harness", file=sys.stderr)
+            return 1
+        if not require_dispatched(tmp_root, findings, "unlocked_harness_rejected", "check_nuget_lock"):
             return 1
 
     # Test locked harness project accepted
@@ -2461,6 +2523,8 @@ def run_self_tests() -> int:
         findings = check_pip_install_lock(tmp_root)
         if not any(f.code == "GWF-009" for f in findings):
             print("SELF_TEST_FAILURE: expected GWF-009 for unhashed pip install", file=sys.stderr)
+            return 1
+        if not require_dispatched(tmp_root, findings, "unhashed_pip_install_rejected", "check_pip_install_lock"):
             return 1
 
     # Test hash-locked pip install accepted
@@ -2538,6 +2602,10 @@ def run_self_tests() -> int:
         lock = json.loads((tmp_root / rel_lock).read_text(encoding="utf-8"))
         return check_nuget_lock_graph(rel_csproj, rel_lock, content, lock)
 
+    # The adapter judges check_nuget_lock_graph by its production name, so the
+    # completeness check below counts this table for that rule.
+    call_lock_graph.__exercises__ = "check_nuget_lock_graph"  # type: ignore[attr-defined]
+
     fail_closed_tables = [
         (
             "GWF-021",
@@ -2579,7 +2647,6 @@ def run_self_tests() -> int:
             ],
         ),
     ]
-    dispatch_probes = 0
     for expected_code, rule, setup, cases in fail_closed_tables:
         for name, fixture_name, expect_finding in cases:
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -2593,21 +2660,34 @@ def run_self_tests() -> int:
                             file=sys.stderr,
                         )
                         return 1
-                    dispatched = {f.code for f in verify_all(tmp_root)}
-                    if expected_code not in dispatched:
-                        print(
-                            f"SELF_TEST_FAILURE in {name}: {expected_code} missing from "
-                            f"the production dispatch, got {sorted(dispatched)}",
-                            file=sys.stderr,
-                        )
+                    if not require_dispatched(
+                        tmp_root, direct, name, getattr(rule, "__exercises__", rule.__name__)
+                    ):
                         return 1
-                    dispatch_probes += 1
                 elif direct:
                     print(
                         f"SELF_TEST_FAILURE in {name}: expected clean, got {direct}",
                         file=sys.stderr,
                     )
                     return 1
+
+    # Completeness (issue #1225 N_step9): the probes above must have verified
+    # EVERY production check_* rule. The expected set is derived from this
+    # module's globals, not from a hand list that could silently shrink beside
+    # a rule deletion: a new check_* rule without a probe group fails here,
+    # while a deleted rule fails earlier at its own group's by-name call
+    # (NameError) or at its probe (code missing from the dispatch).
+    defined_rules = {
+        name for name, obj in globals().items() if name.startswith("check_") and callable(obj)
+    }
+    if probed_rules != defined_rules:
+        print(
+            f"SELF_TEST_FAILURE in rule_coverage_completeness: probed {sorted(probed_rules)} "
+            f"!= defined {sorted(defined_rules)}",
+            file=sys.stderr,
+        )
+        return 1
+    completeness_cases = 1
 
     # Oracle identity (issue #1225 N_step10; I18.27). Every property is judged
     # against real file bytes: the record derives from the files, is
@@ -2673,7 +2753,8 @@ def run_self_tests() -> int:
     # + 1 derived-identity case + 7 rule-level cases below, plus the two
     # cache-key groups (issue #1923) and the four fail-closed rule tables
     # (issue #1225 N_step9), each judged directly with every refusal re-judged
-    # through verify_all (dispatch_probes), plus the seven oracle-identity
+    # through verify_all (dispatch_probes), the rule-coverage completeness
+    # case (completeness_cases), plus the seven oracle-identity
     # cases (issue #1225 N_step10; oracle_case_count). The reported count is derived from
     # the case lists themselves: a hardcoded total would keep reporting PASS
     # with the same number after a case group was added, which is the count
@@ -2689,6 +2770,7 @@ def run_self_tests() -> int:
         + 1
         + sum(len(cases) for _, _, _, cases in fail_closed_tables)
         + dispatch_probes
+        + completeness_cases
         + oracle_case_count
     )
     print(f"GITHUB_WORKFLOW_VERIFIER_SELF_TEST: PASS ({case_count}/{case_count} cases verified)")

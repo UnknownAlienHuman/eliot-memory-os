@@ -539,6 +539,14 @@ jobs:
           pair_sha="$(sha256sum docs/normative-pair.toml | cut -d' ' -f1)"
           active_sha="$(sha256sum workstreams/ACTIVE.toml | cut -d' ' -f1)"
           inventory_sha="$(sha256sum workstreams/core-daemons/inventory.json | cut -d' ' -f1)"
+          # Issue #1225 N_step10 (I18.27): judge the candidate tree with the
+          # verifier's own finite fixtures BEFORE trusting its verdict. A
+          # candidate that weakens a rule without co-editing every fixture
+          # fails here and publishes no manifest.
+          if ! python scripts/verify-github-workflows.py --self-test; then
+            echo 'GITHUB_WORKFLOWS_MANIFEST_REJECTED: common verifier self-test failed; the oracle is weakened and no manifest is published' >&2
+            exit 1
+          fi
           python scripts/verify-github-workflows.py --root . --json-out "$RUNNER_TEMP/gwf-actions.json"
           actions_row="$(python - "$RUNNER_TEMP/gwf-actions.json" <<'PY'
           import json
@@ -557,12 +565,29 @@ jobs:
           print(', '.join(seen))
           PY
           )"
+          # Issue #1225 N_step10 (I18.27): name the exact oracle bytes behind
+          # this verdict so the independent/manual source-candidate or Review
+          # owner attests a named oracle, not a self-certified pass.
+          oracle_block="$(python - "$RUNNER_TEMP/gwf-actions.json" <<'PY'
+          import json
+          import sys
+          payload = json.load(open(sys.argv[1], encoding='utf-8'))
+          oracle = payload.get('oracle') or {}
+          if not oracle.get('digest'):
+              raise SystemExit('GITHUB_WORKFLOWS_MANIFEST_REJECTED: verifier payload carries no oracle identity; the verdict is unattested')
+          lines = ['- Oracle: ' + str(oracle.get('version', '')) + ' digest=' + str(oracle.get('digest'))]
+          for entry in oracle.get('files', []):
+              lines.append('  - oracle file: ' + str(entry.get('path', '')) + ' sha256=' + str(entry.get('sha256', '')))
+          print('\n'.join(lines))
+          PY
+          )"
           {
             echo '### Manual Repository Policy Run Manifest'
             echo "- Repository: $GITHUB_REPOSITORY event=$GITHUB_EVENT_NAME ref=$GITHUB_REF run=$GITHUB_RUN_ID"
             echo "- Source SHA: $source_sha"
             echo "- Workflow: .github/workflows/repository-policy.yml sha256=$workflow_sha"
             echo "- Actions: $actions_row"
+            echo "$oracle_block"
             echo "- Policy inputs: normative-pair=$pair_sha ACTIVE=$active_sha inventory=$inventory_sha"
             echo '- Ordered checks: branch identity, authority receipts, retired-surface rejection, normative identity, stale-link rejection, trigger/profile/privilege/cache/candidate wiring'
             echo '- Gate states: fail-fast job; this manifest runs only after every prior step passed'
