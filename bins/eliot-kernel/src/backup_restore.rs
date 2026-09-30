@@ -1714,11 +1714,14 @@ impl<'a> KernelRestoreTarget<'a> {
     /// ## Ordering against the revision cross-check
     ///
     /// The owner counter read here is the owner's own
-    /// [`RedbRecoveryStore::purge_ledger_revision`] — read BEFORE this function
-    /// applies anything, so the value cross-checked by
-    /// [`check_purge_revision_closure`] is the ledger position this owner
-    /// already held when the archive's ledger arrived, not one this restore
-    /// moved afterwards. [`KernelRestoreTarget::apply_purge_ledger`] passes it
+    /// [`RedbRecoveryStore::purge_ledger_revision`] — read AFTER this function
+    /// applies the archive's ledger, so the value cross-checked by
+    /// [`check_purge_revision_closure`] is the ledger position this owner has
+    /// now reached, which is the same kind of quantity the archive's
+    /// `manifest.purge_ledger_revision` declares. Reading it BEFORE would
+    /// compare the position the destination started from against the position
+    /// the source finished at, which is not a closure check at all.
+    /// [`KernelRestoreTarget::apply_purge_ledger`] passes it
     /// to that check on the result of THIS function, so a rehearsal carrying a
     /// purge entry still refuses at the guard above, before any owner call, and
     /// never reaches the cross-check: adding it does not move the live owner one
@@ -1746,12 +1749,21 @@ impl<'a> KernelRestoreTarget<'a> {
             });
         };
         // The owner's own durable counter, read through the owner's own
-        // accessor and BEFORE this phase moves it. This is the only value that
-        // answers "which purge-ledger revision has this owner applied", and it
-        // is read from the same durable counter the applying transactions
-        // commit with each ledger row — never counted over `entries`, never
-        // read out of the archive under check (issue #960, A14).
-        let owner_revision = ors.purge_ledger_revision().map_err(ors_to_backup)?;
+        // accessor AFTER this phase has applied the archive's ledger. This is
+        // the only value that answers "which purge-ledger revision has this
+        // owner reached", and it is read from the same durable counter the
+        // applying transactions commit with each ledger row — never counted
+        // over `entries`, never read out of the archive under check.
+        //
+        // The read is AFTER, not before, and the position matters: the
+        // archive's `manifest.purge_ledger_revision` is the ledger position the
+        // SOURCE observed once it had applied its own ledger, so it is a
+        // POST-apply position. Comparing a pre-apply counter against it
+        // compares two different quantities — on a rebuilt destination whose
+        // counter starts at 0, applying 7 entries correctly leaves the owner at
+        // 7, and a pre-apply read of 0 would refuse a restore that did exactly
+        // the right thing, AFTER having committed the whole ledger (issue #960,
+        // A14).
         let mut applied = Vec::with_capacity(entries.len());
         for entry in entries {
             let revision = ors.apply_purge_ledger_entry(entry).map_err(ors_to_backup)?;
@@ -1760,6 +1772,7 @@ impl<'a> KernelRestoreTarget<'a> {
                 revision,
             });
         }
+        let owner_revision = ors.purge_ledger_revision().map_err(ors_to_backup)?;
         Ok((Some(owner_revision), applied))
     }
 
@@ -3095,17 +3108,26 @@ fn check_ors_journal_budget(bundle: &BackupBundle) -> Result<(), KernelRestoreEr
 /// `owner_revision` is that owner answer, and it is the ONLY owner answer this
 /// check may use: the durable counter
 /// [`RedbRecoveryStore::purge_ledger_revision`] reports, read through the
-/// owner itself before this phase applied anything. It is deliberately NOT the
-/// highest revision [`RedbRecoveryStore::apply_purge_ledger_entry`] returned
-/// while applying the entries: those revisions are the positions THIS restore
-/// allocated in a ledger that was already at some other position, so on any
-/// store that had applied a purge before, that maximum disagreed with the
-/// archive's declaration by exactly the store's prior count and the purge
-/// phase refused for every archive carrying a non-empty ledger, passing only
-/// where a virgin store's counter happened to make the two agree
-/// arithmetically. Comparing an archive's declaration against a copy of the
-/// caller's own entry list is a completeness check with no owner behind it
-/// (`A14`), and a coincidence is not evidence.
+/// owner itself AFTER this phase applied the archive's ledger.
+///
+/// It is deliberately NOT the highest revision
+/// [`RedbRecoveryStore::apply_purge_ledger_entry`] returned while applying the
+/// entries. Those are the positions THIS restore allocated, in a ledger that was
+/// already at some other position: on a destination that had applied purges
+/// before, that maximum disagreed with the archive's declaration by exactly the
+/// destination's prior count, so the phase refused for every archive carrying a
+/// non-empty ledger and passed only where a virgin store's arithmetic happened
+/// to agree. Comparing an archive's declaration against a copy of the caller's
+/// own entry list is a completeness check with no owner behind it (`A14`), and
+/// a coincidence is not evidence.
+///
+/// Nor is it the counter read BEFORE this phase applied anything. The archive's
+/// declared revision is the position the SOURCE reached once it had applied its
+/// own ledger, so it is a post-apply position; a pre-apply read is the position
+/// the DESTINATION started from, and the two are different quantities. On a
+/// rebuilt destination starting at 0, applying 7 entries correctly leaves the
+/// owner at the declared 7, and a pre-apply read of 0 refuses a restore that did
+/// exactly the right thing — after having already committed the whole ledger.
 ///
 /// The compared values are therefore only ever the two legitimate ones: the
 /// archive's declared `manifest.purge_ledger_revision`, and the revision the
