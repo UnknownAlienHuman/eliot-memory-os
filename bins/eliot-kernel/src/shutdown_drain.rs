@@ -2046,13 +2046,26 @@ pub(crate) struct QuiescenceEdge {
 /// structural fact about the contour, stated once here; the quiesce order is
 /// computed from it rather than restated at each call site.
 ///
-/// Scope note: the Governor's `eliot-module-registry` graph
-/// (`ModuleDependency::invalidation_edges`, #1682) is the authority for
-/// *optional* module dependencies, but `eliot-kernel` has no dependency edge
-/// to that crate and the Kernel runtime root may not grow one, so these two
-/// hard composition branches declare their own relation here. A branch with no
-/// declared edge is refused rather than placed by assumption — see
-/// [`reverse_quiescence_order`].
+/// Scope note (#1686 item 6 residual, honest PARTIAL): no #1682-owned admitted
+/// dependency/restart feed reaches this module. There is no `SupervisionManifest`
+/// type anywhere on current main (verified 2026-09-30 against origin/main
+/// `8a95fd6b9`), and the admitted dependency graph lives Governor-side in
+/// `crates/governor/eliot-module-registry/src/lib.rs`
+/// (`ModuleCatalog::select_invalidation_dependents` over
+/// `ModuleDependency::invalidated_by` on `invalidation_triggers`,
+/// `ModuleManifest::restart_policy`, projected as `ModuleCatalogSnapshot` by
+/// `ModuleCatalog::snapshot`): its sole Cargo consumer is `eliot-governor`,
+/// `eliot-kernel` has no dependency edge to that crate, and the Kernel runtime
+/// root may not grow one. #1682's kernel-side artifacts
+/// (`daemon_supervision.rs::AdmittedDaemonRestartPolicy`, the restart intensity
+/// gate, and the `daemon_runtime.rs::ProcessLifecycle::Quarantined` refusal)
+/// admit the single supervised `eliotd` child restart — they are not a
+/// stop-order graph over drain branches, so [`reverse_quiescence_order`] keeps
+/// consuming only these declared edges. A branch with no declared edge is
+/// refused rather than placed by assumption (fail closed), and the Kernel takes
+/// no host-state dependency to reach one. Pre-commit wake readiness
+/// revalidation belongs to the activation path lane, named here and not
+/// implemented.
 pub(crate) const KERNEL_QUIESCENCE_EDGES: [QuiescenceEdge; 1] = [QuiescenceEdge {
     dependent: DAEMON_BRANCH,
     dependency: STORE_BRIDGE_BRANCH,
