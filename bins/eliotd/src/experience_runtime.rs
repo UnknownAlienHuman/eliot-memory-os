@@ -1143,9 +1143,11 @@ mod position_binding_tests {
         // fixture honours it instead of relaxing it.
         let supersession = match currentness {
             Currentness::Current => BTreeSet::new(),
-            Currentness::Superseded => BTreeSet::from([
-                ArtifactId::new(format!("supersedes-{claim}")).expect("valid artifact id"),
-            ]),
+            Currentness::Superseded => {
+                BTreeSet::from([
+                    ArtifactId::new(format!("supersedes-{claim}")).expect("valid artifact id")
+                ])
+            }
         };
         CurrentEpistemicPosition::new(
             AdmittedReceipt::new(AdmittedReceiptParams {
