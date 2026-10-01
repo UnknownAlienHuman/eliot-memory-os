@@ -8993,8 +8993,16 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             return Err(WorkScopeError::ScanContourNotAdmitted.into());
         }
         let replayed = store.readback(handle, binding)?;
+        replayed
+            .validate()
+            .map_err(CompositionError::ScanDisclosure)?;
         if replayed.scan_ref != handle.receipt_ref {
             return Err(WorkScopeError::ScanReceiptReplaced.into());
+        }
+        let canonical = eliot_contracts::canonical_json_bytes(&replayed)
+            .map_err(|_| WorkScopeError::ScanReceiptInaccessible)?;
+        if eliot_contracts::sha256_hex(&canonical) != handle.receipt_digest {
+            return Err(WorkScopeError::ScanReceiptCorrupt.into());
         }
         Ok(())
     }
@@ -9089,27 +9097,22 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// `bins/eliotd/src/daemon_runtime.rs` supplies the retained discovery and
     /// installation-bound store, then persists the exact scan receipt into
     /// WorkScope before readiness compilation.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "trigger scan carries the trigger, lease, key, owner store, owner binding, privacy, evidence, and identity inputs in one fail-closed entry"
-    )]
     pub fn run_cold_start_trigger_scan(
         &self,
         trigger: ColdStartTrigger,
         discovery_lease: &mut DiscoveryReadLease,
         lease_key: &DiscoveryLeaseKey,
         binding: &ScanDisclosureOwnerBinding,
-        candidate_privacy: PrivacyClass,
-        privacy_boundary: Option<&PrivacyBoundary>,
-        evidence: &BootstrapScanEvidence,
-        proposed_kind: ScopeKind,
-        identity_fingerprint: &str,
-        verifier_candidates: &[String],
-        governing_source_refs: Vec<String>,
+        discovery: &BootstrapDiscoveryInputs,
         now: u64,
     ) -> Result<BootstrapScanOutcome, CompositionError> {
-        ColdStartController::check_discovery_with_scan(trigger, discovery_lease, evidence, now)
-            .map_err(CompositionError::ColdStartLease)?;
+        ColdStartController::check_discovery_with_scan(
+            trigger,
+            discovery_lease,
+            &discovery.evidence,
+            now,
+        )
+        .map_err(CompositionError::ColdStartLease)?;
         let fence = self.snapshot.state_fence();
         let owner = self
             .owners
@@ -9137,18 +9140,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .validate()
             .map_err(CompositionError::ScanDisclosure)?;
         if original.original_observed_scope.is_none()
-            || original_discovery.evidence != *evidence
-            || original_discovery.candidate_privacy != Some(candidate_privacy)
-            || original_discovery.privacy_boundary.as_ref() != Some(boundary)
-            || original_discovery.proposed_kind != proposed_kind
-            || original_discovery.identity_fingerprint != identity_fingerprint
-            || original_discovery.governing_source_refs != governing_source_refs
-            || original_discovery
-                .policy
-                .as_ref()
-                .is_some_and(|policy| policy.verifier_refs.as_slice() != verifier_candidates)
-            || candidate_privacy != original.privacy_class
-            || privacy_boundary != Some(boundary)
+            || original_discovery != discovery
+            || discovery.candidate_privacy != Some(original.privacy_class)
+            || discovery.privacy_boundary.as_ref() != Some(boundary)
+            || discovery.evidence.canonical_root_ref != original.explicit_root_identity
             || discovery_lease.proposer_ref != original.principal_ref
             || discovery_lease.session_ref != original.session_ref
             || discovery_lease.candidate_root_ref != original.explicit_root_identity
@@ -9187,7 +9182,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             Some(binding),
             discovery_lease,
             lease_key,
-            original_discovery,
+            discovery,
         )
         .map_err(CompositionError::ScanDisclosure)?;
         match &outcome {

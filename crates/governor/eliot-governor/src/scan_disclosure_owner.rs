@@ -18,6 +18,7 @@ use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_ors::{
     ColdStartReadinessClaim, ColdStartReadinessOrsRecord, ColdStartReadinessRecordOwner,
     ColdStartReadinessStageOutcome, ColdStartReadinessTerminalDisposition, OrsError,
+    ScanDisclosureReadFailure,
     SCAN_DISCLOSURE_RECORD_TYPE, ScanDisclosureOrsRecord, ScanDisclosureRecordOwner,
     ScanDisclosureRecordState, ScanDisclosureStageOutcome,
 };
@@ -737,6 +738,7 @@ fn decode_receipt(
 /// stay conflicts, everything else is an inaccessible write.
 fn conflict_error(error: &OrsError) -> WorkScopeError {
     match error {
+        OrsError::ScanDisclosureReadFailure(failure) => read_failure_error(*failure),
         OrsError::IntegrityProblem { record_type, .. }
             if *record_type == SCAN_DISCLOSURE_RECORD_TYPE =>
         {
@@ -750,11 +752,24 @@ fn conflict_error(error: &OrsError) -> WorkScopeError {
 /// are corruption, everything else is an inaccessible record.
 fn read_error(error: &OrsError) -> WorkScopeError {
     match error {
+        OrsError::ScanDisclosureReadFailure(failure) => read_failure_error(*failure),
         OrsError::IntegrityProblem { record_type, .. }
             if *record_type == SCAN_DISCLOSURE_RECORD_TYPE =>
         {
             WorkScopeError::ScanReceiptCorrupt
         }
         _ => WorkScopeError::ScanReceiptInaccessible,
+    }
+}
+
+fn read_failure_error(failure: ScanDisclosureReadFailure) -> WorkScopeError {
+    match failure {
+        ScanDisclosureReadFailure::Missing => WorkScopeError::ScanReceiptMissing,
+        ScanDisclosureReadFailure::Inaccessible => WorkScopeError::ScanReceiptInaccessible,
+        ScanDisclosureReadFailure::Corrupt => WorkScopeError::ScanReceiptCorrupt,
+        ScanDisclosureReadFailure::Replaced => WorkScopeError::ScanReceiptReplaced,
+        ScanDisclosureReadFailure::Stale => WorkScopeError::ScanReceiptStale,
+        ScanDisclosureReadFailure::Invalidated => WorkScopeError::ScanReceiptInvalidated,
+        ScanDisclosureReadFailure::UnknownCommit => WorkScopeError::ScanReceiptUnknownCommit,
     }
 }

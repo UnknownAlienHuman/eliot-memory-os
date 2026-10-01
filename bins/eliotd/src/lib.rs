@@ -4490,20 +4490,11 @@ impl DaemonComposition {
 
     /// Runs one trigger through the Governor-bound installation scan owner.
     /// No caller-supplied store or disclosure binding can replace that owner.
-    #[allow(clippy::too_many_arguments)]
     pub fn run_cold_start_trigger_scan(
         &self,
         trigger: eliot_workscope::ColdStartTrigger,
-        discovery_lease: &mut eliot_workscope::DiscoveryReadLease,
-        lease_key: &eliot_workscope::DiscoveryLeaseKey,
+        observed: &mut task_binding_admission::ColdStartDiscoveryInput,
         binding: &eliot_workscope::ScanDisclosureOwnerBinding,
-        candidate_privacy: eliot_workscope::PrivacyClass,
-        privacy_boundary: Option<&eliot_workscope::PrivacyBoundary>,
-        evidence: &eliot_workscope::BootstrapScanEvidence,
-        proposed_kind: eliot_workscope::ScopeKind,
-        identity_fingerprint: &str,
-        verifier_candidates: &[String],
-        governing_source_refs: Vec<String>,
         now: u64,
     ) -> Result<eliot_workscope::BootstrapScanOutcome, DaemonError> {
         if self.readiness() != CompositionReadiness::Ready {
@@ -4512,16 +4503,10 @@ impl DaemonComposition {
         self.governor
             .run_cold_start_trigger_scan(
                 trigger,
-                discovery_lease,
-                lease_key,
+                &mut observed.lease,
+                &observed.key,
                 binding,
-                candidate_privacy,
-                privacy_boundary,
-                evidence,
-                proposed_kind,
-                identity_fingerprint,
-                verifier_candidates,
-                governing_source_refs,
+                &observed.discovery,
                 now,
             )
             .map_err(DaemonError::Composition)

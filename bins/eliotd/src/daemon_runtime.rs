@@ -7346,14 +7346,16 @@ async fn retain_discovery_lease_revision(
     ticket: &AgentActivationResolutionTicket,
     lease: &eliot_workscope::DiscoveryReadLease,
     owner: eliot_governor::WorkScopeBindingOwner,
-) -> Result<(), String> {
+) -> Result<(), ColdStartIngressError> {
     let snapshot = owner
         .read_current(&ticket.state_fence)
-        .map_err(|error| format!("lease-stage WorkScope snapshot is invalid: {error}"))?;
+        .map_err(ColdStartIngressError::WorkScope)?;
     let expected_owner_revision = snapshot
         .owner_revision
         .checked_sub(1)
-        .ok_or_else(|| "lease-stage WorkScope revision has no predecessor".to_owned())?;
+        .ok_or(ColdStartIngressError::WorkScope(
+            eliot_workscope::WorkScopeError::BindingReceiptMismatch,
+        ))?;
     let persist = || {
         eliotd::task_binding_admission::retain_scan_discovery_lease_owner_revision(
             kernel,
@@ -7364,15 +7366,18 @@ async fn retain_discovery_lease_revision(
             &snapshot,
         )
     };
-    if let Err(first) = persist().await {
+    if persist().await.is_err() {
         // The Kernel child identity is derived from the retained original
         // activation identity and expected revision, so an exact retry is the
         // same CAS operation and safely reconciles a lost acknowledgement.
-        persist().await.map_err(|second| {
-            format!("WorkScope lease-stage CAS failed: {first}; exact retry: {second}")
-        })?;
+        persist().await.map_err(scan_owner_error)?;
     }
-    install_readback_work_scope_revision(kernel, composition, &ticket.state_fence, snapshot).await
+    install_readback_work_scope_revision(kernel, composition, &ticket.state_fence, snapshot)
+        .await
+        .map_err(|detail| ColdStartIngressError::Owner {
+            owner: "durable WorkScope discovery-lease readback",
+            detail,
+        })
 }
 
 async fn retain_scan_evidence_revision(
@@ -7384,14 +7389,16 @@ async fn retain_scan_evidence_revision(
     binding: &eliot_workscope::ScanDisclosureOwnerBinding,
     receipt_handle: &eliot_workscope::ScanReceiptHandle,
     owner: eliot_governor::WorkScopeBindingOwner,
-) -> Result<(), String> {
+) -> Result<(), ColdStartIngressError> {
     let snapshot = owner
         .read_current(&ticket.state_fence)
-        .map_err(|error| format!("scan-stage WorkScope snapshot is invalid: {error}"))?;
+        .map_err(ColdStartIngressError::WorkScope)?;
     let expected_owner_revision = snapshot
         .owner_revision
         .checked_sub(1)
-        .ok_or_else(|| "scan-stage WorkScope revision has no predecessor".to_owned())?;
+        .ok_or(ColdStartIngressError::WorkScope(
+            eliot_workscope::WorkScopeError::BindingReceiptMismatch,
+        ))?;
     let persist = || {
         eliotd::task_binding_admission::retain_scan_evidence_owner_revision(
             kernel,
@@ -7405,12 +7412,47 @@ async fn retain_scan_evidence_revision(
             &snapshot,
         )
     };
-    if let Err(first) = persist().await {
+    if persist().await.is_err() {
         persist().await.map_err(|second| {
-            format!("WorkScope scan-stage CAS failed: {first}; exact retry: {second}")
+            scan_owner_error(second)
         })?;
     }
-    install_readback_work_scope_revision(kernel, composition, &ticket.state_fence, snapshot).await
+    install_readback_work_scope_revision(kernel, composition, &ticket.state_fence, snapshot)
+        .await
+        .map_err(|detail| ColdStartIngressError::Owner {
+            owner: "durable WorkScope scan-evidence readback",
+            detail,
+        })
+}
+
+fn scan_owner_error(error: eliot_ors::OrsError) -> ColdStartIngressError {
+    use eliot_ors::ScanDisclosureReadFailure as Failure;
+    let cause = match error {
+        eliot_ors::OrsError::ScanDisclosureReadFailure(Failure::Missing) => {
+            eliot_workscope::WorkScopeError::ScanReceiptMissing
+        }
+        eliot_ors::OrsError::ScanDisclosureReadFailure(Failure::Inaccessible) => {
+            eliot_workscope::WorkScopeError::ScanReceiptInaccessible
+        }
+        eliot_ors::OrsError::ScanDisclosureReadFailure(Failure::Corrupt) => {
+            eliot_workscope::WorkScopeError::ScanReceiptCorrupt
+        }
+        eliot_ors::OrsError::ScanDisclosureReadFailure(Failure::Replaced) => {
+            eliot_workscope::WorkScopeError::ScanReceiptReplaced
+        }
+        eliot_ors::OrsError::ScanDisclosureReadFailure(Failure::Stale) => {
+            eliot_workscope::WorkScopeError::ScanReceiptStale
+        }
+        eliot_ors::OrsError::ScanDisclosureReadFailure(Failure::Invalidated) => {
+            eliot_workscope::WorkScopeError::ScanReceiptInvalidated
+        }
+        eliot_ors::OrsError::ScanDisclosureReadFailure(Failure::UnknownCommit)
+        | eliot_ors::OrsError::StagingCommitOutcomeUnknown { .. } => {
+            eliot_workscope::WorkScopeError::ScanReceiptUnknownCommit
+        }
+        _ => eliot_workscope::WorkScopeError::ScanReceiptInaccessible,
+    };
+    ColdStartIngressError::WorkScope(cause)
 }
 
 async fn trigger_cold_start_controller(
@@ -7447,11 +7489,10 @@ async fn trigger_cold_start_controller(
         });
     }
 
-    let (Some(candidate_privacy), Some(privacy_boundary), Some(policy)) = (
-        discovery.discovery.candidate_privacy,
-        discovery.discovery.privacy_boundary.as_ref(),
-        discovery.discovery.policy.as_ref(),
-    ) else {
+    if discovery.discovery.candidate_privacy.is_none()
+        || discovery.discovery.privacy_boundary.is_none()
+        || discovery.discovery.policy.is_none()
+    {
         // The privacy-bounded scanner's question path validates this exact
         // retained lease/key/evidence and performs no charge or persistence.
         let outcome = eliot_workscope::run_bootstrap_discovery(
@@ -7465,7 +7506,7 @@ async fn trigger_cold_start_controller(
         return Ok(eliotd::task_binding_admission::ColdStartTriggerResult::Question(
             outcome,
         ));
-    };
+    }
 
     // Retain the exact accepted discovery lease as a WorkScope owner revision
     // before asking Kernel to issue a scan binding. The Kernel route only
@@ -7486,11 +7527,7 @@ async fn trigger_cold_start_controller(
         &discovery.lease,
         lease_owner,
     )
-    .await
-    .map_err(|detail| ColdStartIngressError::Owner {
-        owner: "durable WorkScope discovery-lease CAS/readback",
-        detail,
-    })?;
+    .await?;
 
     let route_kernel = Arc::clone(kernel);
     let connection_id = ticket.connection_id.clone();
@@ -7538,16 +7575,8 @@ async fn trigger_cold_start_controller(
         .await
         .run_cold_start_trigger_scan(
             trigger,
-            &mut discovery.lease,
-            &discovery.key,
+            &mut discovery,
             &binding,
-            candidate_privacy,
-            Some(privacy_boundary),
-            &scan_evidence,
-            discovery.discovery.proposed_kind,
-            &discovery.discovery.identity_fingerprint,
-            &policy.verifier_refs,
-            discovery.discovery.governing_source_refs.clone(),
             now,
         )
         .map_err(|error| ColdStartIngressError::Owner {
@@ -7601,11 +7630,7 @@ async fn trigger_cold_start_controller(
                 &receipt_handle,
                 evidence_owner,
             )
-            .await
-            .map_err(|detail| ColdStartIngressError::Owner {
-                owner: "durable WorkScope scan-evidence CAS/readback",
-                detail,
-            })?;
+            .await?;
             Ok(eliotd::task_binding_admission::ColdStartTriggerResult::Persisted {
                 scan: eliotd::task_binding_admission::ColdStartScanOwnerReceipt {
                     trigger,
