@@ -3856,7 +3856,7 @@ impl WorkScopeBindingOwner {
         if existing.original_observed_scope.is_none() {
             return Err(WorkScopeError::OriginalObservationMissing);
         }
-        existing
+        let discovery = existing
             .bootstrap_discovery_inputs
             .as_ref()
             .ok_or(WorkScopeError::ScanReceiptMissing)?;
@@ -3866,7 +3866,7 @@ impl WorkScopeBindingOwner {
             || lease.proposer_ref != existing.principal_ref
             || lease.session_ref != existing.session_ref
             || lease.candidate_root_ref != existing.explicit_root_identity
-            || boundary.boundary_ref != existing.privacy.boundary_ref
+            || discovery.privacy_boundary.as_ref() != Some(boundary)
             || !boundary.admits(existing.privacy_class)
         {
             return Err(WorkScopeError::BindingReceiptMismatch);
