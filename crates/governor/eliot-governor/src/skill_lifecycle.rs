@@ -343,13 +343,8 @@ fn map_composition_error(error: CompositionError, ctx: &StoreFailureIdentityCont
             verdict,
             report,
         })),
-        CompositionError::ScanDisclosure(_) => map_composition_store_failure(
-            StoreFailureDisposition::DeterministicRejection,
-            "SCAN_DISCLOSURE_REFUSED",
-            StoreRetryDirective::DoNotRetry,
-            StoreRecoveryAction::None,
-            ctx,
-        ),
+        CompositionError::ScanDisclosure(error) => SkillError::WorkScope(error),
+        CompositionError::ColdStartLease(error) => SkillError::ColdStartLease(error),
         CompositionError::MaterialReadinessDenied {
             receipt_ref,
             effect,

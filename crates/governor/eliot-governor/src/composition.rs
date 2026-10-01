@@ -95,6 +95,7 @@ use eliot_maintenance::{
 use eliot_module_registry::ModuleCatalog;
 use eliot_module_registry::ModuleCatalogSnapshot;
 use eliot_observation::{ObservationJournal, ObservationJournalEntry};
+use eliot_observation::TaskSelectionEvidence;
 use eliot_ors::{
     ColdStartReadinessClaim, ColdStartReadinessOrsRecord, ColdStartReadinessOwnerKey,
     ColdStartReadinessRecordOwner, ColdStartReadinessStageOutcome,
@@ -126,8 +127,8 @@ use eliot_workscope::{
     MaterialReadinessDirective, MaterialReadinessInputs, ObservedScopeResources, OnboardingLease,
     PrivacyBoundary, PrivacyProfile, QuarantinedScopeRecord, ReadinessLifecycle,
     RepositoryLineageIdentity, RequestedEffect, ResolutionAuthentication, ResolutionRequest,
-    ScanDisclosureOwnerBinding, ScanReceiptHandle, ScannerResolverInputs, ScopeBinding,
-    ScopeBindingDisposition, ScopeBindingGuard, ScopeIdentity, ScopeKind,
+    ScanDisclosureOwnerBinding, ScanDisclosureStore, ScanReceiptHandle, ScannerResolverInputs,
+    ScopeBinding, ScopeBindingDisposition, ScopeBindingGuard, ScopeIdentity, ScopeKind,
     ScopeRelocationOrAttachReceipt, ScopeResolution, SourceAdmissionRequest, TaskBindingInput,
     TaskBindingState, TaskIntakeCandidate, TaskSelectionRequired, TriggerAdmission, TriggerReport,
     WorkScopeBindingOwner, WorkScopeBindingSnapshot, WorkScopeCandidate, WorkScopeCandidateSet,
@@ -1290,6 +1291,9 @@ pub enum CompositionError {
     /// tell a lost record from a replaced one without re-reading the owner.
     #[error(transparent)]
     ScanDisclosure(#[from] WorkScopeError),
+    /// A cold-start discovery lease refusal with its exact degraded cause.
+    #[error("cold-start lease admission failed: {0:?}")]
+    ColdStartLease(eliot_workscope::OnboardingDegraded),
     /// Material readiness denied one effect with its exact receipt, directive,
     /// and missing-input details preserved for the caller.
     #[error(
@@ -7586,10 +7590,41 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     fn cold_start_driver_error(error: eliot_workscope::CompileDriverError) -> CompositionError {
         match error {
             eliot_workscope::CompileDriverError::Compile(inner) => inner.into(),
-            eliot_workscope::CompileDriverError::Lease(_) => {
-                CompositionError::Recovery(error.to_string())
+            eliot_workscope::CompileDriverError::Lease(inner) => {
+                CompositionError::ColdStartLease(inner)
             }
         }
+    }
+
+    fn verify_ready_scan_readback(
+        receipt: &eliot_workscope::OnboardingReadinessReceipt,
+        scan_readback: Option<(
+            &dyn ScanDisclosureStore,
+            &ScanReceiptHandle,
+            &ScanDisclosureOwnerBinding,
+        )>,
+    ) -> Result<(), CompositionError> {
+        if !matches!(
+            receipt.readiness,
+            ReadinessLifecycle::ReadyMaterial | ReadinessLifecycle::ReadyReadOnly
+        ) {
+            return Ok(());
+        }
+        let (store, handle, binding) = scan_readback
+            .ok_or(WorkScopeError::ScanReceiptMissing)?;
+        if receipt.scan_receipt_ref.as_deref() != Some(handle.record_commitment.as_str()) {
+            return Err(WorkScopeError::ScanReceiptReplaced.into());
+        }
+        if binding.principal_ref != receipt.principal_ref
+            || binding.session_ref != receipt.session_ref
+        {
+            return Err(WorkScopeError::ScanContourNotAdmitted.into());
+        }
+        let replayed = store.readback(handle, binding)?;
+        if replayed.scan_ref != handle.receipt_ref {
+            return Err(WorkScopeError::ScanReceiptReplaced.into());
+        }
+        Ok(())
     }
 
     /// Binds the installation-owned durable scan disclosure store (issue
@@ -7921,10 +7956,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                     .map_err(|error| CompositionError::Recovery(error.to_string()))?;
             receipt
                 .validate()
-                .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+                .map_err(CompositionError::ScanDisclosure)?;
             let surface = receipt
                 .surface(&lease)
-                .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+                .map_err(CompositionError::ScanDisclosure)?;
             return Ok(LeaseJoin::JoinedTerminal {
                 lease_ref: lease.lease_ref,
                 surface,
@@ -7999,9 +8034,14 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             return Err(CompositionError::NotReady);
         }
         ColdStartController::check_discovery_with_scan(trigger, discovery_lease, scan, now)
-            .map_err(|error| {
-                CompositionError::Recovery(format!("cold-start lease join refused: {error:?}"))
-            })?;
+            .map_err(CompositionError::ColdStartLease)?;
+        if scan_binding.lease_ref != discovery_lease.lease_ref
+            || scan_binding.candidate_root_ref != discovery_lease.candidate_root_ref
+        {
+            return Err(CompositionError::ScanDisclosure(
+                WorkScopeError::ScanContourNotAdmitted,
+            ));
+        }
         let claim = self.build_cold_start_readiness_claim(
             proposed,
             candidate,
@@ -8043,40 +8083,107 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         Self::readiness_join_from_record(&record, now, created)
     }
 
-    /// Drives one I4.4.1 trigger end to end — join, compile, publish — against
-    /// the retained registry (issue #1790, cold-start compilation production
-    /// caller; issue #2900, durable scan receipt reference).
-    ///
-    /// The trigger that creates the lease compiles exactly one
-    /// [`eliot_workscope::OnboardingReadinessReceipt`] through
-    /// [`ColdStartController::compile`] before the first scope-sensitive work
-    /// and publishes it as the lease terminal, so compatible concurrent
-    /// attaches receive the same receipt and no worker independently creates
-    /// a second `WorkScope` or "latest task" while the lease is active. The
-    /// terminal receipt always references the exact durable scan receipt
-    /// that fed the compilation: the caller supplies the installation-bound
-    /// scan store, the owner binding admitted for this trigger, and the
-    /// durable handle the trigger scan returned, and this entry reads the
-    /// handle back through the owner before compiling. A missing handle, or
-    /// a missing, inaccessible, corrupt, replaced, stale, invalidated or
-    /// unknown-commit record, fails with its typed [`WorkScopeError`] cause
-    /// through [`CompositionError::ScanDisclosure`] and never produces a
-    /// terminal receipt — there is no in-memory-only or loose-file fallback,
-    /// and an absent scan reference is never compiled as empty (issue #2900
-    /// W12/B2/B6). An
-    /// already-terminal lease returns its `JoinedTerminal` surface without
-    /// recompiling; a lease owned by an in-flight trigger returns `Joined`
-    /// without a second compilation.
-    /// Live status: owning thin entry for attach/onboarding ingress; no live
-    /// attach ingress builds the compilation inputs yet (BLOCKED-BY
-    /// attach-transport: `bins/eliotd` `ScopeAttachIngress` carries no
-    /// discovery or onboarding lease). Caller: STITCH.
+    /// Resolves a cold-start task selection from the current Governor owners
+    /// and the Kernel TaskContract acceptance owner. Caller references are
+    /// comparison constraints only; they never become selection evidence.
+    pub async fn select_current_task_binding_for_cold_start(
+        &self,
+        now: u64,
+        principal_ref: &str,
+        session_ref: &str,
+        scope_ref: &str,
+        state_fence: &StateFence,
+        expected_task_ref: &str,
+        expected_task_revision: Option<u64>,
+    ) -> Result<TaskBindingInput, CompositionError> {
+        let result = self
+            .issue_task_selection_evidence_for_binding(
+                now,
+                (principal_ref, session_ref),
+                scope_ref,
+                state_fence,
+                (expected_task_ref, expected_task_revision, None),
+            )
+            .await;
+        match result {
+            Ok((evidence, _)) => Ok(TaskBindingInput::Selected(evidence)),
+            Err(CompositionError::ActivationTaskSelectionRequired) => {
+                Ok(TaskBindingInput::NoTask)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn issue_task_selection_evidence_for_binding(
+        &self,
+        now: u64,
+        authenticated_identity: (&str, &str),
+        work_scope_ref: &str,
+        state_fence: &StateFence,
+        task_binding: (&str, Option<u64>, Option<&str>),
+    ) -> Result<(TaskSelectionEvidence, String), CompositionError> {
+        let (principal_ref, session_ref) = authenticated_identity;
+        let (expected_task_ref, expected_revision, expected_digest) = task_binding;
+        let state_fence_current = self.snapshot.state_fence();
+        if !fences_match_exact(&state_fence_current, state_fence) {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        let work = self.prove_unique_activation_work(now, state_fence)?;
+        let task_id = self.admit_activation_lifecycle_session(now, state_fence, &work)?;
+        let task = self.admit_activation_task(&task_id, state_fence)?;
+        let (activation_scope, _) = self.admit_activation_plan(&task_id, state_fence)?;
+        if work.session.principal_id != principal_ref
+            || work.session.session_id != session_ref
+            || task_id.as_str() != expected_task_ref
+            || expected_revision.is_some_and(|revision| revision != task.revision)
+            || state_fence.task_revision.map(|revision| revision.value()) != Some(task.revision)
+            || activation_scope != work_scope_ref
+            || work.work_item.task_id != task_id.as_str()
+            || work.work_item.state_fence != *state_fence
+            || work.work_item.owner_session_id.as_deref() != Some(session_ref)
+            || work.lease.work_item_id != work.work_item.work_item_id
+            || work.lease.holder_session_id != session_ref
+            || work.lease.state_fence != *state_fence
+        {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+
+        let acceptance = self
+            .kernel
+            .task_contract_acceptance_set(&task_id, task.revision, state_fence)
+            .await?;
+        acceptance.validate()?;
+        if acceptance.task_id != task_id
+            || acceptance.task_revision != task.revision
+            || expected_digest.is_some_and(|digest| digest != acceptance.acceptance_digest)
+            || !fences_match_exact(&acceptance.read_state_fence, state_fence)
+        {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        let evidence = TaskSelectionEvidence {
+            task_ref: task_id.to_string(),
+            task_revision: task.revision,
+            acceptance_digest: acceptance.acceptance_digest.clone(),
+            work_scope_ref: activation_scope,
+            selection_source_ref: work.lease.lease_id,
+            evidence_ref: work.work_item.work_item_id,
+            contamination_flags: Vec::new(),
+        };
+        evidence
+            .validate()
+            .map_err(|_| CompositionError::ActivationStaleFence)?;
+        Ok((evidence, acceptance.acceptance_digest))
+    }
+
+    /// Joins the owner-held cold-start lease, verifies the durable scan
+    /// receipt, revalidates any current task evidence, then publishes the
+    /// terminal readiness receipt through the cold-start owner.
     #[allow(
         clippy::too_many_arguments,
         clippy::too_many_lines,
         reason = "cold-start compilation joins every frozen receipt field and the durable terminal in one owner-checked entry"
     )]
-    pub fn compile_cold_start_at_trigger(
+    pub async fn compile_cold_start_at_trigger(
         &mut self,
         trigger: ColdStartTrigger,
         discovery_lease: &DiscoveryReadLease,
@@ -8106,19 +8213,14 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         scan: &BootstrapScanEvidence,
         scan_store: &InstallationScanDisclosureStore,
         scan_binding: &ScanDisclosureOwnerBinding,
-        scan_receipt: Option<&ScanReceiptHandle>,
+        scan_receipt: &ScanReceiptHandle,
         now: u64,
     ) -> Result<LeaseJoin, CompositionError> {
         if self.readiness != CompositionReadiness::Ready {
             return Err(CompositionError::NotReady);
         }
-        let scan_handle = scan_receipt.ok_or(CompositionError::ScanDisclosure(
-            WorkScopeError::ScanReceiptMissing,
-        ))?;
         ColdStartController::check_discovery_with_scan(trigger, discovery_lease, scan, now)
-            .map_err(|error| {
-                CompositionError::Recovery(format!("cold-start lease join refused: {error:?}"))
-            })?;
+            .map_err(CompositionError::ColdStartLease)?;
         let claim = self.build_cold_start_readiness_claim(
             proposed,
             candidate,
@@ -8127,8 +8229,17 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             scan,
             scan_store,
             scan_binding,
-            scan_handle,
+            scan_receipt,
         )?;
+        if scan_binding.principal_ref != principal_ref
+            || scan_binding.session_ref != session_ref
+            || scan_binding.lease_ref != discovery_lease.lease_ref
+            || scan_binding.candidate_root_ref != discovery_lease.candidate_root_ref
+        {
+            return Err(CompositionError::ScanDisclosure(
+                WorkScopeError::ScanContourNotAdmitted,
+            ));
+        }
         if !fences_match_exact(&claim.key.state_fence, state_fence) {
             return Err(CompositionError::ActivationStaleFence);
         }
@@ -8181,13 +8292,62 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         let lease: OnboardingLease = serde_json::from_str(&record.claim.lease_bytes)
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         let replayed =
-            eliot_workscope::ScanDisclosureStore::readback(scan_store, scan_handle, scan_binding)
+            eliot_workscope::ScanDisclosureStore::readback(scan_store, scan_receipt, scan_binding)
                 .map_err(CompositionError::ScanDisclosure)?;
-        if replayed.scan_ref != scan_handle.receipt_ref {
+        if replayed.scan_ref != scan_receipt.receipt_ref {
             return Err(CompositionError::ScanDisclosure(
                 WorkScopeError::ScanReceiptReplaced,
             ));
         }
+        let task = match task {
+            TaskBindingInput::Current {
+                task_ref,
+                task_revision,
+                acceptance_digest,
+                selection_source_ref,
+                evidence_ref,
+            } => {
+                let (evidence, _) = self
+                    .issue_task_selection_evidence_for_binding(
+                        now,
+                        (principal_ref, session_ref),
+                        &scope.scope_ref,
+                        state_fence,
+                        (
+                            &task_ref,
+                            Some(task_revision),
+                            Some(&acceptance_digest),
+                        ),
+                    )
+                    .await?;
+                if evidence.selection_source_ref != selection_source_ref
+                    || evidence.evidence_ref != evidence_ref
+                {
+                    return Err(CompositionError::ActivationStaleFence);
+                }
+                TaskBindingInput::Selected(evidence)
+            }
+            TaskBindingInput::Selected(supplied) => {
+                let (evidence, _) = self
+                    .issue_task_selection_evidence_for_binding(
+                        now,
+                        (principal_ref, session_ref),
+                        &scope.scope_ref,
+                        state_fence,
+                        (
+                            &supplied.task_ref,
+                            Some(supplied.task_revision),
+                            Some(&supplied.acceptance_digest),
+                        ),
+                    )
+                    .await?;
+                if evidence != supplied {
+                    return Err(CompositionError::ActivationStaleFence);
+                }
+                TaskBindingInput::Selected(evidence)
+            }
+            other => other,
+        };
         let mut receipt = ColdStartController
             .compile(
                 receipt_ref,
@@ -8213,14 +8373,14 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 projection_generation,
                 privacy,
                 task,
-                Some(scan_handle),
+                Some(scan_receipt),
                 now,
             )
-            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+            .map_err(CompositionError::ScanDisclosure)?;
         receipt.receipt_revision = record.record_revision;
         receipt
             .validate()
-            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+            .map_err(CompositionError::ScanDisclosure)?;
         let receipt_bytes = canonical_json_bytes(&receipt)
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         let receipt_bytes = String::from_utf8(receipt_bytes)
@@ -8300,8 +8460,13 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         &self,
         claim: &ColdStartReadinessClaim,
         now: u64,
+        scan_readback: Option<(
+            &dyn ScanDisclosureStore,
+            &ScanReceiptHandle,
+            &ScanDisclosureOwnerBinding,
+        )>,
     ) -> Result<ColdStartSurfaceView, CompositionError> {
-        self.cold_start_owner_readback_for_claim(claim, now)
+        self.cold_start_owner_readback_for_claim(claim, now, scan_readback)
             .map(|(_, surface)| surface)
     }
 
@@ -8312,8 +8477,14 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         &self,
         claim: &ColdStartReadinessClaim,
         now: u64,
+        scan_readback: Option<(
+            &dyn ScanDisclosureStore,
+            &ScanReceiptHandle,
+            &ScanDisclosureOwnerBinding,
+        )>,
     ) -> Result<(OnboardingLease, ColdStartSurfaceView), CompositionError> {
         let (lease, receipt) = self.cold_start_readiness_terminal_for_claim(claim, now)?;
+        Self::verify_ready_scan_readback(&receipt, scan_readback)?;
         let surface = Self::cold_start_surface_view(&lease, &receipt)?;
         Ok((lease, surface))
     }
@@ -8377,7 +8548,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         receipt
             .validate()
-            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+            .map_err(CompositionError::ScanDisclosure)?;
         if lease.lease_ref != record.claim.lease_ref
             || lease.deadline != record.claim.lease_deadline
             || lease.lineage_candidate_ref != claim.key.lineage_candidate_ref
@@ -8420,7 +8591,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     ) -> Result<ColdStartSurfaceView, CompositionError> {
         let surface = receipt
             .surface(lease)
-            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+            .map_err(CompositionError::ScanDisclosure)?;
         Ok(ColdStartSurfaceView {
             receipt_ref: surface.receipt_ref,
             lease_ref: receipt.lease_ref.clone(),
