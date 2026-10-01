@@ -2144,6 +2144,26 @@ impl DaemonComposition {
             .map_err(|error| DaemonError::Lifecycle(error.to_string()))
     }
 
+    /// Re-reads the current Policy and WorkScope owners for an authenticated
+    /// cold Observe capture. This owner read is tied to the retained Session
+    /// and State Fence and does not require a unique active task selection.
+    pub fn current_cold_observation_owner_binding(
+        &self,
+        authenticated_principal_ref: &str,
+        authenticated_session_ref: &str,
+        state_fence: &eliot_contracts::StateFence,
+    ) -> Result<eliot_governor::ObservationCaptureOwnerBinding, DaemonError> {
+        let session_id = eliot_contracts::SessionId::new(authenticated_session_ref.to_owned())
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        self.governor
+            .observation_capture_owner_binding_for_principal_session(
+                authenticated_principal_ref,
+                &session_id,
+                state_fence,
+            )
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))
+    }
+
     /// Reads the current Policy and WorkScope owners for the exact Host peer
     /// admission origin. This path deliberately has no semantic application
     /// principal, session, or task applicability.
