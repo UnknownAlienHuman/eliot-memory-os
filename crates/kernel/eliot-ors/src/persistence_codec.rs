@@ -26,6 +26,7 @@ use crate::CanonicalStoreRouteOwnership;
 use crate::EffectOperationLease;
 use crate::KernelExecutionManifest;
 use crate::KernelReconciliationItem;
+use crate::InitialSetupAuthorityRecord;
 use crate::OpaqueLabel;
 use crate::OperationalPhase;
 use crate::OrsError;
@@ -504,6 +505,14 @@ impl PersistedValue for BlobProcessStreamGrantRecord {
 
 impl PersistedValue for BlobProcessStreamOwnerFactsPullRecord {
     const RECORD_TYPE: &'static str = "blob_process_stream_owner_facts_pull";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+impl PersistedValue for InitialSetupAuthorityRecord {
+    const RECORD_TYPE: &'static str = "initial_setup_authority";
 
     fn validate_persisted(&self) -> Result<(), OrsError> {
         self.validate()
