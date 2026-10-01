@@ -43,7 +43,7 @@
 //! * [`trigger_admitted_doctor_launch`] is the T6-D2 front-door trigger:
 //!   pre-admit through the composed gate, derive the launch material from
 //!   the composed registry (admitted manifest revision plus installed
-//!   executable digest — never caller bytes), then delegate to the launch
+//!   executable digest Ã¢â‚¬â€ never caller bytes), then delegate to the launch
 //!   seam above. The absolute child anchor arrives from the owning
 //!   composition ([`DoctorChildBinding`]).
 //! * a launched-but-unreconciled attempt reconciles by its original
@@ -55,7 +55,7 @@
 //!
 //! Delivery contract (I7.5/I15.2): each launched child receives a launch
 //! nonce plus a launch grant delivered over the protected dispatch file
-//! next to its executable — never via the command line, stdin, or the
+//! next to its executable Ã¢â‚¬â€ never via the command line, stdin, or the
 //! environment. The Doctor file carries exactly what
 //! `bins/eliot-doctor/src/dispatched_material.rs::read_dispatched_material_from`
 //! validates (envelope bytes plus canonical digest, parsed closed request
@@ -114,8 +114,9 @@ use eliot_kernel_service::{
     reconcile_testd_admission,
 };
 use eliot_ors::{
-    DoctorAttemptRecord, DoctorEffectRecord, DoctorLedgerError, DoctorRecoveryLedger,
-    NativeWorkerClaimRecord, OperationIdentity, StateFenceSnapshot, epoch_lineage_for,
+    AdmissionReservationLaunchPrerequisite, DoctorAttemptRecord, DoctorEffectRecord,
+    DoctorLedgerError, DoctorRecoveryLedger, NativeWorkerClaimRecord, OperationIdentity,
+    StateFenceSnapshot, epoch_lineage_for,
 };
 use eliot_process::{OperationId, ProcessRequest};
 use eliot_protocol::dreamer_job::{DurableJobResponse, JobState};
@@ -298,23 +299,23 @@ impl DispatchedWorkerKind {
 ///   "expires_at": 1750000060000
 /// }
 /// ```
-/// * `grant_digest: String` — lowercase SHA-256 over the canonical grant
+/// * `grant_digest: String` Ã¢â‚¬â€ lowercase SHA-256 over the canonical grant
 ///   binding (identity digest + epoch + generation + fence nonce +
 ///   idempotency key + expiry); carried as the child-side `one_shot_nonce`
 ///   plus the `launch-grant` revision-head value (both require opaque/hex
 ///   shape, which hex satisfies).
-/// * `authority_epoch: EpochId` — canonical lineage-aware epoch
+/// * `authority_epoch: EpochId` Ã¢â‚¬â€ canonical lineage-aware epoch
 ///   (`eliot_contracts::EpochId`); the child calls
 ///   `FencingToken::new(authority_epoch, Generation, fence_nonce)`.
-/// * `fence_generation: u64` — non-zero live activation generation; the
+/// * `fence_generation: u64` Ã¢â‚¬â€ non-zero live activation generation; the
 ///   child calls `Generation::new(fence_generation)`.
-/// * `fence_nonce: String` — deterministic per-identity fence nonce
+/// * `fence_nonce: String` Ã¢â‚¬â€ deterministic per-identity fence nonce
 ///   (`<operation_prefix>-fence-<short_identity>`); the child passes it to
 ///   `FencingToken::new`.
-/// * `idempotency_key: String` — deterministic per-identity lease
+/// * `idempotency_key: String` Ã¢â‚¬â€ deterministic per-identity lease
 ///   (`<operation_prefix>-lease-<short_identity>`); the child calls
 ///   `ActionLeaseRef::new(idempotency_key)`.
-/// * `expires_at: u64` — Unix milliseconds
+/// * `expires_at: u64` Ã¢â‚¬â€ Unix milliseconds
 ///   (`admitted_at_ms.saturating_add(60_000)`); the child passes it as
 ///   `PermitIssuance::new(..., issued_at = now_ms, expires_at, ...)`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -387,7 +388,7 @@ impl DispatchGrant {
 /// Inputs are all Kernel-side live authority plus the durable admission
 /// identity: `identity_digest` is the admission-bound digest
 /// (`attempt_digest` for Doctor, `request_digest` for testd,
-/// `binding_digest` for native — all lowercase SHA-256 by contract),
+/// `binding_digest` for native Ã¢â‚¬â€ all lowercase SHA-256 by contract),
 /// `authority_epoch`/`generation` are the live values bound at admission,
 /// and `admitted_at_unix_nanos` is the durable admission time (for native,
 /// `admitted_at_unix_ms * 1_000_000`). Derivations are replay-stable, so an
@@ -965,7 +966,7 @@ pub fn compose_dispatch_contour(installation_id: String) -> Result<(), DispatchL
 /// Composes the production Doctor front-door state: the durable recovery
 /// ledger plus the immutable recipe registry.
 ///
-/// The ledger is any live [`DoctorRecoveryLedger`] implementation — the
+/// The ledger is any live [`DoctorRecoveryLedger`] implementation Ã¢â‚¬â€ the
 /// production redb store once its slice lands, or the faithful contract
 /// ledger in tests. The registry is the supplier-built immutable revision
 /// (content authority stays with the supplying composition). Requires the
@@ -1001,7 +1002,7 @@ pub fn compose_doctor_front_door<L: DoctorRecoveryLedger + 'static>(
 ///
 /// `installed_doctor_digest` is the installed Doctor package artifact
 /// digest (lowercase SHA-256) from the installation manifest through the
-/// Host injection — never minted here. A malformed digest fails closed
+/// Host injection Ã¢â‚¬â€ never minted here. A malformed digest fails closed
 /// with [`DispatchLaunchError::InvalidMaterial`] before any cell is
 /// touched; otherwise this delegates to [`compose_doctor_front_door`],
 /// so the contour-first, non-empty-registry, and set-once rules hold
@@ -1021,7 +1022,7 @@ pub fn compose_production_doctor_front_door(
 ///
 /// `installed_testd_digest` is the installed testd package artifact digest
 /// (lowercase SHA-256) from the installation manifest through the Host
-/// injection — never minted here. Testd admission is stateless (wire plus
+/// injection Ã¢â‚¬â€ never minted here. Testd admission is stateless (wire plus
 /// live authority only), so no ledger composition is required: this records
 /// the verified digest on the contour cell from
 /// [`compose_dispatch_contour`] as the production-composed marker the
@@ -1058,7 +1059,7 @@ pub fn compose_production_testd_front_door(
 ///
 /// `installed_native_worker_digest` is the installed native-worker package
 /// artifact digest (lowercase SHA-256) from the installation manifest
-/// through the Host injection — never minted here. Native-worker admission
+/// through the Host injection Ã¢â‚¬â€ never minted here. Native-worker admission
 /// runs through live service authority plus the ORS claim table, so no
 /// ledger composition is required: this records the verified digest on the
 /// contour cell from [`compose_dispatch_contour`] as the
@@ -1161,7 +1162,7 @@ pub fn doctor_repair_advertised() -> bool {
 ///
 /// True exactly when the dispatch contour cell is composed: testd admission
 /// is stateless (wire plus live authority only), so no ledger composition
-/// is required — only the contour cell from [`compose_dispatch_contour`]
+/// is required Ã¢â‚¬â€ only the contour cell from [`compose_dispatch_contour`]
 /// for the Kernel-owned principal. The inert
 /// `TESTD_ADMISSION_ADVERTISED` default never flips in place; this path
 /// flips only through the composed contour, via
@@ -1242,7 +1243,7 @@ pub(crate) fn admit_doctor_repair_cancellation(
 /// live service authority.
 ///
 /// Testd admission is stateless: the answer derives from the presented wire
-/// plus live authority only, so no ledger composition is required — only
+/// plus live authority only, so no ledger composition is required Ã¢â‚¬â€ only
 /// the contour cell from [`compose_dispatch_contour`] for the
 /// Kernel-owned principal. Fails closed until it lands; mechanical
 /// failures surface as [`DispatchLaunchError::Gate`]; every typed refusal
@@ -1414,7 +1415,7 @@ pub(crate) async fn submit_testd_owner_job(
     // Issue #1897 (AUD1): resolve the lane's admitted identity BEFORE the
     // layout. `workspace_component` comes from the Governor-issued project
     // identity and `checkout_component` from the canonical, verified source
-    // root above, so the lane runs under the real admitted checkout — no Git
+    // root above, so the lane runs under the real admitted checkout Ã¢â‚¬â€ no Git
     // worktree is created because a historical field is named `worktree_id`.
     let workspace_component =
         TargetLayoutBinding::derive_workspace_component(&request.submission.project_id)
@@ -2211,7 +2212,7 @@ fn require_digest(value: &str, what: &'static str) -> Result<(), DispatchLaunchE
 ///
 /// `request_json` must equal the parse of `attempt.closed_request_json`
 /// (byte-identity, re-proved before any write); `manifest_json` is the
-/// exact admitted manifest revision carried through opaquely — the child
+/// exact admitted manifest revision carried through opaquely Ã¢â‚¬â€ the child
 /// validates the request against it fail-closed, since this contour mints
 /// no recipe authority. The executable binding (path, digest, working
 /// directory) is supplied by the owning composition like the approved
@@ -2302,7 +2303,7 @@ pub enum DoctorLaunchOutcome {
         receipt: Box<ProcessStartReceipt>,
     },
     /// The spawn outcome is unknown: the attempt was admitted and the
-    /// launch was retained as unreconciled under its original identity —
+    /// launch was retained as unreconciled under its original identity Ã¢â‚¬â€
     /// reconcile later, never blind-retry as a new attempt.
     LaunchUnknown {
         /// The admission for the original attempt identity.
@@ -2329,8 +2330,8 @@ pub enum DoctorLaunchOutcome {
 /// The envelope object holds the wire attempt, the parsed closed request
 /// (byte-identical to the envelope bytes, re-proved by the caller), the
 /// admitted manifest revision, the live epoch, the fence-bound generation,
-/// and the session nonce — the six fields
-/// `read_dispatched_material_from` checks — plus a seventh `grant` object
+/// and the session nonce Ã¢â‚¬â€ the six fields
+/// `read_dispatched_material_from` checks Ã¢â‚¬â€ plus a seventh `grant` object
 /// carrying the launch-grant material the child needs to construct its own
 /// local `DispatchPermitAuthority` (`grant_digest`, `authority_epoch`,
 /// `fence_generation`, `fence_nonce`, `idempotency_key`, `expires_at`).
@@ -2385,22 +2386,22 @@ fn doctor_material_bytes(
 ///   "grant": DispatchGrant
 /// }
 /// ```
-/// * `request` — the full wire envelope the contour admitted
+/// * `request` Ã¢â‚¬â€ the full wire envelope the contour admitted
 ///   (`job_id`, `attempt_seq`, `closed_request_json`, digests).
-/// * `envelope` — the parsed `closed_request_json`
+/// * `envelope` Ã¢â‚¬â€ the parsed `closed_request_json`
 ///   (`TestdAdmissionEnvelope`: `job_id`, `operation_id`, `cancellation`,
 ///   `fence`); derived Kernel-side by re-parsing, never taken as extra
 ///   caller bytes beyond the already-admitted `request`.
-/// * `admission` — the Kernel-issued receipt (`TestdAdmission`); its
+/// * `admission` Ã¢â‚¬â€ the Kernel-issued receipt (`TestdAdmission`); its
 ///   `operation_id` is the bounded evidence handle the child maps to
 ///   `PresentedAdmission.evidence_ref`, and `cancelled` maps to
 ///   `PresentedAdmission.cancelled`.
-/// * `epoch` — the live authority epoch (maps to
+/// * `epoch` Ã¢â‚¬â€ the live authority epoch (maps to
 ///   `PresentedAdmission.epoch`; never envelope bytes).
-/// * `generation` — the live activation generation (the child proves its
+/// * `generation` Ã¢â‚¬â€ the live activation generation (the child proves its
 ///   fence generation against this).
-/// * `nonce` — the I7.5/I15.2 session nonce.
-/// * `grant` — the shared `DispatchGrant` object (see its docs).
+/// * `nonce` Ã¢â‚¬â€ the I7.5/I15.2 session nonce.
+/// * `grant` Ã¢â‚¬â€ the shared `DispatchGrant` object (see its docs).
 ///
 /// The concrete `ProcessRequest` is never serialized (it is
 /// `Serialize`-only by design on the child side and `Clone`-only here);
@@ -2451,15 +2452,15 @@ fn testd_material_bytes(
 ///   "grant": DispatchGrant
 /// }
 /// ```
-/// * `request` — the exact `NativeWorkerClaimRequest` the contour admitted
+/// * `request` Ã¢â‚¬â€ the exact `NativeWorkerClaimRequest` the contour admitted
 ///   (existing `eliot-kernel-service` vocabulary; never a parallel type).
-/// * `receipt` — the Kernel-issued `NativeWorkerClaimReceipt` (existing
+/// * `receipt` Ã¢â‚¬â€ the Kernel-issued `NativeWorkerClaimReceipt` (existing
 ///   vocabulary; its `receipt_digest` is the admission identity).
-/// * `epoch`/`generation` — the live authority bound at admission.
-/// * `nonce` — the I7.5/I15.2 session nonce (must equal the v2
+/// * `epoch`/`generation` Ã¢â‚¬â€ the live authority bound at admission.
+/// * `nonce` Ã¢â‚¬â€ the I7.5/I15.2 session nonce (must equal the v2
 ///   executable-join launch nonce when the join is present; the caller
 ///   request already binds it, and the child re-proves binding).
-/// * `grant` — the shared `DispatchGrant` object.
+/// * `grant` Ã¢â‚¬â€ the shared `DispatchGrant` object.
 ///
 /// The concrete `ProcessRequest` plus the composed provider ports arrive
 /// only with the execution context the child builds in-process from `grant`
@@ -2622,7 +2623,7 @@ fn launches_table(
 ///
 /// Sequence: validate the caller material (attempt shape plus canonical
 /// digest, closed-request byte-identity, child binding); admit through the
-/// composed owner (exact replays rebuild the original admission — the
+/// composed owner (exact replays rebuild the original admission Ã¢â‚¬â€ the
 /// lost-reply rule); skip cancelled admissions and terminal effects
 /// without spawning; reserve the original identity single-flight; mint the
 /// replay-stable nonce; write exactly what the child reader validates.
@@ -2748,7 +2749,7 @@ pub fn prepare_doctor_launch(
     )?;
     // Launch eligibility against the durable truth: the just-issued
     // admission must match the staged row, and an already-reported effect
-    // is terminal — nothing to drive.
+    // is terminal Ã¢â‚¬â€ nothing to drive.
     {
         let ledger = doctor_ledger(contour)?;
         let attempt_key = OperationIdentity::new(&admission.attempt_digest)
@@ -2970,8 +2971,8 @@ fn require_live_activation_for_doctor_launch(
 
 /// Spawns one prepared Doctor launch through the admitted process gateway.
 ///
-/// The child admission carries an empty argv — the attempt material travels
-/// only over the protected dispatch file — plus a secret-free environment
+/// The child admission carries an empty argv Ã¢â‚¬â€ the attempt material travels
+/// only over the protected dispatch file Ã¢â‚¬â€ plus a secret-free environment
 /// and bounded resource limits, mirroring the approved `eliotd` launch
 /// contour. The path proof pins the composition-supplied executable
 /// binding; the owner binds the Kernel principal. An unknown spawn outcome
@@ -3022,7 +3023,7 @@ pub enum ChildStartOutcome {
     /// dwarf the unknown outcome).
     Started(Box<SpawnedChild>),
     /// The spawn outcome is unknown; the caller must retain the launch as
-    /// unreconciled under its original identity and reconcile later —
+    /// unreconciled under its original identity and reconcile later Ã¢â‚¬â€
     /// never blind-retry as a new attempt.
     Unknown(UncertainSpawn),
 }
@@ -3041,7 +3042,7 @@ pub struct SpawnedChild {
 
 /// A spawn whose outcome is unknown: admitted and possibly started, but
 /// unproven. The caller must retain it as unreconciled under its original
-/// identity and reconcile later — never blind-retry as a new attempt.
+/// identity and reconcile later Ã¢â‚¬â€ never blind-retry as a new attempt.
 pub struct UncertainSpawn {
     /// Child process operation identity.
     pub operation_id: OperationId,
@@ -3075,8 +3076,8 @@ struct SpawnInputs<'a> {
     native_worker_attempt_id: Option<&'a str>,
     /// The EXACT State Fence the admitted native-worker claim was staged under.
     /// The launch gate presents it to the ORS owner so the reservation is
-    /// verified against the claim's OWN original recorded fence — the fence the
-    /// claim route validated and the reservation was staged under — not a fence
+    /// verified against the claim's OWN original recorded fence Ã¢â‚¬â€ the fence the
+    /// claim route validated and the reservation was staged under Ã¢â‚¬â€ not a fence
     /// recomputed here. `None` for the contours that stage no reservation.
     native_worker_state_fence: Option<&'a StateFence>,
     executable: &'a Path,
@@ -3208,7 +3209,7 @@ fn stage_pending_native_worker_process_start(
 ///
 /// * A contour that stages no admission reservation (Doctor, testd, Dreamer)
 ///   has no `work_item_id`/`attempt` pair to verify, so the gate is a no-op
-///   pass — the gate resolves no reservation and returns `Ok(None)`. It never
+///   pass Ã¢â‚¬â€ the gate resolves no reservation and returns `Ok(None)`. It never
 ///   stages one, because a second reservation scheme is exactly what #1678
 ///   forbids.
 /// * A contour that DOES carry one (the native-worker claim, whose reservation
@@ -3219,8 +3220,8 @@ fn stage_pending_native_worker_process_start(
 ///
 /// A refusal is surfaced as [`DispatchLaunchError::Inconsistent`] carrying the
 /// owner's own state discriminant, so the launch caller sees WHICH state blocked
-/// the launch — `STAGED`, `RELEASED`, `EXPIRED`, `RECONCILING`, `STALE_FENCE`,
-/// `FOREIGN_OWNER`, `IDENTITY_CONFLICT`, `MISSING`, or `UNREADABLE:<tag>` — and
+/// the launch Ã¢â‚¬â€ `STAGED`, `RELEASED`, `EXPIRED`, `RECONCILING`, `STALE_FENCE`,
+/// `FOREIGN_OWNER`, `IDENTITY_CONFLICT`, `MISSING`, or `UNREADABLE:<tag>` Ã¢â‚¬â€ and
 /// never a bare "launch denied". It is returned BEFORE the gateway, so a
 /// non-admissible reservation cannot spawn a child.
 fn require_dispatch_launch_reservation(
@@ -3280,21 +3281,45 @@ fn require_dispatch_launch_reservation(
             "launch gate clock is not a positive millisecond value".to_owned(),
         )
     })?;
-    super::admission_reservation_saga::require_bound_admission_reservation_launch(
+    // #1678 W8: a contour that CARRIES a claim binding is expected to have a
+    // durable reservation. `require_bound_admission_reservation_launch` returns
+    // `Ok(None)` only when the owner found no reservation binding this exact
+    // work item and proposed attempt, and that is the owner's `MISSING`
+    // disposition for a launch that was supposed to be reserved - not a permit.
+    // Launching here would spawn a child with a staged-but-unreadable, deleted,
+    // never-written or mismatched reservation, and I14.6 admits only an `active`
+    // reservation. So the absence is refused by name, exactly like the other
+    // eight states. The ungated no-op pass above is reserved for the contours that
+    // genuinely carry no reservation binding at all, which is decided by the three
+    // `Option` fields and not by a failed lookup.
+    //
+    // The MISSING refusal is built from the OWNER's own variant through the same
+    // constructor every other non-ACTIVE state uses, rather than a route-local
+    // label that could drift from the nine-state set.
+    match super::admission_reservation_saga::require_bound_admission_reservation_launch(
         kernel.generation_gateway.ors.as_ref(),
         &work_item,
         &proposed_attempt,
         &authority_epoch,
         &fence_snapshot,
         now_unix_ms,
-    )
-    .map(|_| ())
-    .map_err(|refusal| {
-        // The refusal names the owner's own state; `Inconsistent` keeps it typed
-        // and surfaces the discriminant through `Display` so the launch caller
-        // can tell a `STAGED` reservation from a `RELEASED` one.
-        DispatchLaunchError::Inconsistent(refusal.to_string())
-    })
+    ) {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(DispatchLaunchError::Inconsistent(
+            super::admission_reservation_saga::AdmissionReservationLaunchRefusal::from_prerequisite(
+                &work_item,
+                &AdmissionReservationLaunchPrerequisite::Missing {
+                    work_item_id: work_item.clone(),
+                    proposed_attempt_id: proposed_attempt.clone(),
+                },
+            )
+            .to_string(),
+        )),
+        // The gate's own refusal already names the owner's state; `Inconsistent`
+        // keeps it typed and surfaces the discriminant through `Display` so the
+        // launch caller can tell a `STAGED` reservation from a `RELEASED` one.
+        Err(refusal) => Err(DispatchLaunchError::Inconsistent(refusal.to_string())),
+    }
 }
 
 /// Spawns one prepared child through the admitted process gateway.
@@ -3316,7 +3341,7 @@ async fn spawn_ready_child(
     // carries an ORS claim reservation (the native-worker contour), the gate
     // resolves the reservation that binds THIS claim's work item and proposed
     // attempt and refuses unless the owner verifier returns its sealed `Active`
-    // typestate — naming `STAGED`, `RELEASED`, `EXPIRED`, `RECONCILING`,
+    // typestate Ã¢â‚¬â€ naming `STAGED`, `RELEASED`, `EXPIRED`, `RECONCILING`,
     // `STALE_FENCE`, `FOREIGN_OWNER`, `IDENTITY_CONFLICT`, `MISSING` or an
     // unreadable row by the owner's own discriminant. The Doctor/testd/Dreamer
     // contours stage no reservation, so the gate resolves none and the launch
@@ -3524,7 +3549,7 @@ pub async fn launch_admitted_doctor_attempt(
 /// input the dispatch contour cannot derive: the contour owns the
 /// principal, the ledger, the immutable registry (including the installed
 /// artifact digest bound into the admitted executable binding), and the
-/// live epoch/generation — but the absolute installed-generation root is
+/// live epoch/generation Ã¢â‚¬â€ but the absolute installed-generation root is
 /// Host installation state. The production composition root supplies it
 /// from Host injection through the installation manifest
 /// (manager-serialized `main` call-in); this struct only carries it.
@@ -3543,7 +3568,7 @@ pub struct DoctorChildBinding<'a> {
 
 /// Contour-derived Doctor launch material: the admitted manifest revision
 /// plus the admitted executable digest, both read back from the composed
-/// registry — never caller bytes.
+/// registry Ã¢â‚¬â€ never caller bytes.
 #[allow(
     dead_code,
     reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
@@ -3582,7 +3607,7 @@ fn composed_doctor_registry(
 /// composed registry for one admitted attempt.
 ///
 /// Fail-closed: the admission must bind this contour's manifest revision
-/// (`admission.manifest_digest` equals the composed registry digest — a
+/// (`admission.manifest_digest` equals the composed registry digest Ã¢â‚¬â€ a
 /// stale or foreign admission is `Inconsistent`, never staged), and the
 /// admitted operation must resolve to an executable binding in the
 /// composed manifest (an unknown or forged operation is
@@ -3630,7 +3655,7 @@ fn contour_doctor_material(
 /// admitted effect through the existing launch seam: the T6-D2 front-door
 /// trigger (issue #461, plan slice 5).
 ///
-/// Owner: the dispatch contour owns this trigger — not the frame dispatch
+/// Owner: the dispatch contour owns this trigger Ã¢â‚¬â€ not the frame dispatch
 /// arm and not the front-door driver pump. The frame arm
 /// (`frame_dispatch::execute_doctor_request`) admits and replies but never
 /// spawns, keeping the admission and execution axes separate (I14.6); the
@@ -3639,7 +3664,7 @@ fn contour_doctor_material(
 /// (owner plus ledger plus principal), reserve, nonce, material-write,
 /// spawn, and reconcile-by-identity, so the trigger lives here: pre-admit
 /// through the composed gate, derive the launch material from the composed
-/// contour (admitted manifest revision plus installed executable digest —
+/// contour (admitted manifest revision plus installed executable digest Ã¢â‚¬â€
 /// never caller bytes), then delegate to
 /// [`launch_admitted_doctor_attempt`] (prepare, start-ready, and launch
 /// through the admitted executor; no second launch path). Reconcile stays
@@ -3650,11 +3675,11 @@ fn contour_doctor_material(
 /// with no file staged and no slot retained; a forged operation or a stale
 /// manifest binding errors before staging any file; a replay rebuilds the
 /// original admission (the lost-reply rule) and the delegated prepare
-/// single-flights it (`LaunchInFlight`) instead of spawning twice — the
+/// single-flights it (`LaunchInFlight`) instead of spawning twice Ã¢â‚¬â€ the
 /// concurrent-duplicate case included, since reservation happens inside the
 /// delegated prepare. The absolute child anchor comes from the owning
 /// composition ([`DoctorChildBinding`], supplied by Host injection through
-/// the installation manifest) — never from the wire, argv, or the
+/// the installation manifest) Ã¢â‚¬â€ never from the wire, argv, or the
 /// environment.
 ///
 /// Production call-in (manager-serialized, outside this slice): the
@@ -4436,7 +4461,7 @@ pub enum TestdLaunchOutcome {
         receipt: Box<ProcessStartReceipt>,
     },
     /// The spawn outcome is unknown: retained as unreconciled under the
-    /// original job identity — reconcile later, never blind-retry.
+    /// original job identity Ã¢â‚¬â€ reconcile later, never blind-retry.
     LaunchUnknown {
         /// The admission for the job identity.
         admission: Box<TestdAdmission>,
@@ -4828,7 +4853,7 @@ pub async fn launch_admitted_testd_attempt(
 /// else stays unreconciled for a later call. Unknown job identities
 /// report unknown instead of inventing state.
 ///
-/// Note: this proves the front-door admission still binds — durable job
+/// Note: this proves the front-door admission still binds Ã¢â‚¬â€ durable job
 /// terminality lives in the testd owner's store, so an operator release
 /// through [`release_launched_attempt`] (or a process restart) is the
 /// only slot release besides this reconcile.
@@ -5040,7 +5065,7 @@ pub enum NativeWorkerLaunchOutcome {
         receipt_process: Box<ProcessStartReceipt>,
     },
     /// The spawn outcome is unknown: retained as unreconciled under the
-    /// original claim identity — reconcile later, never blind-retry.
+    /// original claim identity Ã¢â‚¬â€ reconcile later, never blind-retry.
     LaunchUnknown {
         /// The receipt for the claim identity.
         receipt: Box<NativeWorkerClaimReceipt>,
@@ -5079,7 +5104,7 @@ struct NativeWorkerLaunchAttempt {
 ///
 /// Sequence: validate the child binding plus the closed claim shape and
 /// canonical digest; admit through live service authority plus the ORS
-/// claim table (`KernelService::admit_native_worker_claim` — the existing
+/// claim table (`KernelService::admit_native_worker_claim` Ã¢â‚¬â€ the existing
 /// vocabulary, never a parallel one; exact replays rebuild the original
 /// receipt); reserve the original claim identity single-flight (changed
 /// terms under one identity refuse with `ChangedTerms`); mint the
@@ -5742,7 +5767,7 @@ pub enum DreamerLaunchOutcome {
         receipt: Box<ProcessStartReceipt>,
     },
     /// The spawn outcome is unknown: retained as unreconciled under the
-    /// original job identity — reconcile later, never blind-retry.
+    /// original job identity Ã¢â‚¬â€ reconcile later, never blind-retry.
     LaunchUnknown {
         /// The launch nonce retained for the session proof.
         nonce: String,
@@ -6123,7 +6148,7 @@ pub async fn launch_admitted_dreamer_attempt(
 /// Note: durable job terminality lives in the Store Dreamer ledger, so an
 /// operator release through
 /// [`dreamer_dispatch_launch::release_dreamer_launch`] (or a process
-/// restart) is the only slot release besides this reconcile — the same
+/// restart) is the only slot release besides this reconcile Ã¢â‚¬â€ the same
 /// shape as the testd arm.
 #[allow(
     dead_code,
@@ -6305,7 +6330,7 @@ mod tests {
     }
 
     /// Drives one production composition to `Ready` at the standalone live
-    /// epoch (lineage `550e…`, sequence 1), so session binds prove exact
+    /// epoch (lineage `550eÃ¢â‚¬Â¦`, sequence 1), so session binds prove exact
     /// authority agreement.
     fn ready_kernel(root: &Path) -> KernelComposition {
         let kernel = KernelComposition::new(KernelConfig::new(root)).expect("kernel composition");
@@ -7267,7 +7292,7 @@ mod tests {
         // derived contour material (admitted manifest revision plus
         // installed executable digest, read back from the composed
         // registry) flows through the real prepare seam, which refuses
-        // the shape request typed — proving the trigger constructs
+        // the shape request typed Ã¢â‚¬â€ proving the trigger constructs
         // exactly what prepare validates.
         let trigger_child_dir = root.join("doctor-trigger-child");
         std::fs::create_dir_all(&trigger_child_dir).expect("trigger child dir");
@@ -7887,13 +7912,13 @@ mod tests {
 
     /// Slice of #1678 (I14.6): the Doctor launch boundary requires the live
     /// Kernel activation receipt. A prepared admission presented to a Kernel
-    /// without one — or with a receipt that no longer matches the prepared
-    /// epoch/generation — is rejected before any child effect. Removing the
+    /// without one Ã¢â‚¬â€ or with a receipt that no longer matches the prepared
+    /// epoch/generation Ã¢â‚¬â€ is rejected before any child effect. Removing the
     /// gate lets the same calls fall through to the executor error instead.
     /// Gate scope is receipt-match only (prepared epoch/generation against
     /// the live receipt); attempt-budget, cooldown, and receipt linkage
-    /// stay remainder. Every rejection — and the executor-boundary
-    /// fall-through — is asserted effect-free: no material artifact is
+    /// stay remainder. Every rejection Ã¢â‚¬â€ and the executor-boundary
+    /// fall-through Ã¢â‚¬â€ is asserted effect-free: no material artifact is
     /// created and no child handle exists.
     #[tokio::test]
     async fn doctor_launch_requires_live_activation_receipt() {
@@ -8413,8 +8438,8 @@ mod tests {
         let _ = lease;
     }
 
-    /// The trigger derives its launch material from the composed registry —
-    /// never caller bytes — and refuses forgeries before staging anything.
+    /// The trigger derives its launch material from the composed registry Ã¢â‚¬â€
+    /// never caller bytes Ã¢â‚¬â€ and refuses forgeries before staging anything.
     ///
     /// Global-state-free: the registry is built locally from the installed
     /// digest through the real production builders, and the admission is a
