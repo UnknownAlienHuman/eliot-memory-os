@@ -190,7 +190,7 @@ enum Command {
     Version,
     /// Start or reuse the authenticated User Broker and launch Operator.
     Ui,
-    /// Submit one authenticated UserAutomation operator operation (I11.12,
+    /// Submit one authenticated `UserAutomation` operator operation (I11.12,
     /// #1779).
     ///
     /// This is the argv spelling the catalogue already advertises at
