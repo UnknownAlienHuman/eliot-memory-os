@@ -1782,7 +1782,8 @@ pub fn backup_create(
         BACKUP_WIRE_OK => BACKUP_STATE_UNKNOWN,
         other => other,
     };
-    let mut outcome = undecided_create_outcome(&params, state, &operation_id, effect, proof_ceiling);
+    let mut outcome =
+        undecided_create_outcome(&params, state, &operation_id, effect, proof_ceiling);
     match wire_status {
         BACKUP_WIRE_OK => {
             return apply_captured_archive(request, &response, outcome, &operation_id, &params);
@@ -1977,9 +1978,7 @@ fn apply_captured_archive(
 /// through the same typed member: A13.7 requires separate authority for cutover
 /// and keeps operational validation with the isolated restore owner, so a capture
 /// answer naming either is IMPOSSIBLE and is refused rather than rendered.
-fn require_capture_publication_claim(
-    evidence: &VerifyEvidence<'_>,
-) -> Result<(), UnprovenClaim> {
+fn require_capture_publication_claim(evidence: &VerifyEvidence<'_>) -> Result<(), UnprovenClaim> {
     // The archived fence's PROOF axis is a provenance claim about who produced
     // the fence value, so it is held to the same rule as the level that carries
     // one: naming a capture owner requires the owner-issued receipt that proves
@@ -3288,10 +3287,7 @@ impl RestoreAuthorityClaim {
     /// this arm is reached for them, so the class/level agreement is never asked
     /// about a level that is already out of band.
     fn level_band_refusal(receipt_id: &str, evidence_level: &str) -> Option<UnprovenClaim> {
-        if !matches!(
-            evidence_level,
-            "operationally_validated" | "cutover"
-        ) {
+        if !matches!(evidence_level, "operationally_validated" | "cutover") {
             return None;
         }
         Some(UnprovenClaim {
@@ -3415,7 +3411,7 @@ struct RestoreReceiptEvidence<'a> {
     bundle_sha256: &'a str,
     /// Digest of the owner's terminal effect receipt.
     effect_receipt_sha256: &'a str,
-    /// Owner's own proof level, in the owner's own snake_case spelling.
+    /// Owner's own proof level, in the owner's own `snake_case` spelling.
     evidence_level: &'a str,
     /// Everything the receipt claims about authority, as the owner derived it.
     authority: RestoreAuthorityClaim,
