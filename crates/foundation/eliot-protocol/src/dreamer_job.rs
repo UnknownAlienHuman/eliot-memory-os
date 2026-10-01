@@ -377,10 +377,14 @@ pub struct OrientationHeadroomOwnerClosureV1 {
     pub source_request_digest: String,
     /// Digest of the exact candidate this reservation protects.
     pub candidate_digest: String,
+    /// Exact current source revision used by the admitted recipe supplier.
+    pub source_revision: String,
     /// Original downstream completion receipt that closes the reservation.
     pub completion_receipt: ArtifactId,
     /// Original policy for returning capacity when the job is cancelled.
     pub release_on_cancel: bool,
+    /// Original cancellation identity for this operation.
+    pub cancellation_id: String,
     /// Original absolute deadline from the owner request.
     pub deadline_ms: u64,
     /// Exact owner request for this single capacity dimension.
@@ -401,6 +405,8 @@ impl OrientationHeadroomOwnerClosureV1 {
             .map_err(|_| DurableJobError::RuntimeOwnerExecutionInputMismatch)?;
         lowercase_digest(&self.source_request_digest, "headroom.source_request_digest")?;
         lowercase_digest(&self.candidate_digest, "headroom.candidate_digest")?;
+        bounded_text(&self.source_revision, "headroom.source_revision")?;
+        bounded_text(&self.cancellation_id, "headroom.cancellation_id")?;
         bounded_text(self.completion_receipt.as_str(), "headroom.completion_receipt")?;
         bounded_text(self.operation_id.as_str(), "headroom.operation_id")?;
         if self.work_scope.state_fence != self.state_fence

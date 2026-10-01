@@ -1428,8 +1428,12 @@ impl KernelComposition {
         payload: &serde_json::Value,
         request_identity: Option<&RequestIdentity>,
     ) -> Result<serde_json::Value, TransportError> {
+        let request_payload = payload
+            .get("request")
+            .cloned()
+            .ok_or(TransportError::SessionFenced)?;
         let request: OrientationHeadroomOwnerRequestV1 =
-            serde_json::from_value(payload.clone()).map_err(|_| TransportError::SessionFenced)?;
+            serde_json::from_value(request_payload).map_err(|_| TransportError::SessionFenced)?;
         request
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
@@ -1448,10 +1452,9 @@ impl KernelComposition {
             || closure.work_scope.resource_generation != self.runtime_owner_generation
             || closure.task_id.as_str()
                 != identity.request.metadata.task_id.as_ref().map(|task| task.as_str()).unwrap_or("")
-            || closure.operation_id.as_str() != identity.request.metadata.request_id.as_str()
             || identity.deadline_unix_ms != closure.deadline_ms
+            || identity.cancellation_id != closure.cancellation_id
             || source.requesting_generation_ref != self.runtime_owner_generation
-            || source.requesting_owner_ref != ACTIVE_DAEMON_CALLER
             || !source.authority_epoch_ref.is_same_authority(&session.authority_epoch)
             || !session
                 .module_generation

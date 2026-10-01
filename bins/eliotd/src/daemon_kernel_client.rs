@@ -56,6 +56,8 @@ use eliot_protocol::{
     HostRequestResultBody, HostRequestResultLineage, LocalReadAttempt, LocalReadExecutionEvidence,
     MessageType, ProtocolPayload, ProtocolVersion, RequestIdentity, TaskControllerAttempt,
     TaskControllerInvocation, TaskControllerResultBody, host_request_operation_id,
+    ORIENTATION_HEADROOM_OWNER_OPERATION, OrientationHeadroomOwnerReadbackV1,
+    OrientationHeadroomOwnerRequestV1,
 };
 use eliot_receipts::RequestBinding;
 #[cfg(windows)]
@@ -1428,6 +1430,72 @@ pub fn parse_observe_defer_outcome(
 }
 
 impl DaemonKernelClient {
+    /// Performs one authenticated Kernel Orientation headroom owner phase.
+    ///
+    /// Each phase gets a transport identity derived from the exact action
+    /// bytes, then the original admitted task, fence, cancellation identity,
+    /// and deadline are retained on that identity. The opaque native permit
+    /// binding is the only permit value returned to the daemon.
+    #[cfg(windows)]
+    pub async fn orientation_headroom_owner_action_async(
+        &self,
+        request: &OrientationHeadroomOwnerRequestV1,
+    ) -> Result<OrientationHeadroomOwnerReadbackV1, super::DaemonError> {
+        request
+            .validate()
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let payload = serde_json::json!({ "request": request });
+        let mut identity = self
+            .next_identity(&CanonicalKernelRequest {
+                operation: ORIENTATION_HEADROOM_OWNER_OPERATION,
+                scope: &self.connection_id,
+                request: &payload,
+            })
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let closure = &request.closure;
+        if closure.state_fence != self.snapshot.state_fence() {
+            return Err(super::DaemonError::Kernel(
+                "headroom owner request is outside the authenticated Kernel fence".to_owned(),
+            ));
+        }
+        identity.request.metadata.task_id = Some(closure.task_id.clone());
+        identity.request.metadata.product_id = closure.work_scope.product_id.clone();
+        identity.deadline_unix_ms = closure.deadline_ms;
+        identity.cancellation_id = closure.cancellation_id.clone();
+        let value = self
+            .transact_async_with_identity(
+                ORIENTATION_HEADROOM_OWNER_OPERATION,
+                payload,
+                identity,
+            )
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        if value.get("status").and_then(serde_json::Value::as_str) != Some("known") {
+            let reason = value
+                .pointer("/recovery/code")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("KERNEL_OWNER_REFUSED");
+            return Err(super::DaemonError::Kernel(format!(
+                "Kernel Orientation headroom owner refused the action: {reason}"
+            )));
+        }
+        let readback: OrientationHeadroomOwnerReadbackV1 = serde_json::from_value(
+            value
+                .get("value")
+                .cloned()
+                .ok_or_else(|| {
+                    super::DaemonError::Kernel(
+                        "Kernel Orientation headroom owner omitted its readback".to_owned(),
+                    )
+                })?,
+        )
+        .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        readback
+            .validate_against(request)
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        Ok(readback)
+    }
+
     #[cfg(windows)]
     pub async fn claim_agent_activation_ticket(
         &self,
