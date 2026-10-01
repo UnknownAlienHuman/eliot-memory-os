@@ -1560,6 +1560,14 @@ impl KernelComposition {
         // never handed to that queue or selector derivation.
         if record.result_digest.is_none() {
             let mut mismatch_reason: Option<&'static str> = None;
+            // #2564 I4/AUD-C2/AUD-C5: a lane whose carrier could not retain
+            // its pair must not be answered with a successful acknowledgement.
+            // The carrier's OWN typed reason is carried out of the routing
+            // match and re-raised once the audit evidence for the refusal has
+            // been recorded, so a refusal is never downgraded into a recorded
+            // mismatch beside a successful reply, and a gate failure is never
+            // flattened into a generic fence. `None` until a lane sets it.
+            let mut refused_carrier_error: Option<TransportError> = None;
             let routed_lane = match check_local_read_admission(envelope, tool) {
                 Ok(LocalReadAdmission::Query(_)) => {
                     // Queue admission is part of the same authenticated
@@ -1601,16 +1609,24 @@ impl KernelComposition {
                         self.enqueue_finish_pair_under_transition(envelope, tool)?;
                         Some("finish")
                     } else if check_local_state_admission(envelope, tool).is_ok() {
-                        // #2564 I4 state-carrier seam: validated `eliot.state`
-                        // pairs attempt the shared local-read carrier for the
-                        // outbound-only eliotd poller. The carrier enqueue
-                        // gate and the claim gate are query-only today, so the
-                        // attempt is refused without side effects (the gate is
-                        // the first statement of the enqueue fn, before any
-                        // mutation); the serve leg that admits state pairs is
-                        // #2565's dispatch lane.
-                        let _ = self.enqueue_local_read_pair_under_transition(envelope, tool);
+                        // #2564 I4/AUD-C2/AUD-C5: a validated `eliot.state` pair
+                        // enters the shared local-read carrier, and the carrier's
+                        // disposition IS this lane's admission result — never a
+                        // remark. The disposition used to be discarded with
+                        // `let _ =` while the request was still acknowledged as
+                        // accepted, so an admitted read produced a recorded
+                        // refusal and nothing else. The typed refusal reason is
+                        // recorded first (so it keeps its durable evidence) and
+                        // the carrier's own error is then propagated, so a state
+                        // read is never acknowledged when its pair could not be
+                        // retained and the real gate failure is never flattened
+                        // into a generic fence.
                         mismatch_reason = Some("state_carrier_refused");
+                        if let Err(error) =
+                            self.enqueue_local_read_pair_under_transition(envelope, tool)
+                        {
+                            refused_carrier_error = Some(error);
+                        }
                         None
                     } else {
                         mismatch_reason = Some("no_lane");
@@ -1638,6 +1654,13 @@ impl KernelComposition {
                 // route. The requested capability matched no serving lane,
                 // so the work was refused before queueing.
                 self.audit_observe(AuditEventDraft::route_mismatch_routing(envelope, reason));
+            }
+            // #2564 AUD-C2/AUD-C5: retention is part of admission. The refusal
+            // above has already been recorded durably, so the carrier's own
+            // typed gate failure is raised here instead of being answered with
+            // a successful admission record.
+            if let Some(error) = refused_carrier_error {
+                return Err(error);
             }
         }
         // Coherence gate before serving: a resulted record must carry a
