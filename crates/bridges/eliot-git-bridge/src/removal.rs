@@ -2,9 +2,12 @@
 //!
 //! Declared versus observed capability/health and the current
 //! contract/artifact revisions are exposed as a projection value built from
-//! the admitted generation line and caller-attested receipt evidence. An
-//! absent observation stays an explicit unknown: observation state is never
-//! copied into a support claim, and there is no support field to promote.
+//! the admitted generation line and caller-attested receipt evidence: the
+//! projection carries the live declaration revision, the bound upstream
+//! artifact digest, and the retained generation's digest when one is kept.
+//! An absent observation stays an explicit unknown: observation state is
+//! never copied into a support claim, and there is no support field to
+//! promote.
 //!
 //! Removal fences new calls, drains owned operations by exact identity,
 //! records the precise route/session/credential revocations through their
@@ -136,9 +139,12 @@ impl OperationStatusRow {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BridgeStatusProjection {
     bridge_route: String,
+    declaration_revision: u64,
     declared_upstream_version: String,
+    declared_artifact_digest: String,
     declared_operations: Vec<String>,
     retained_upstream_version: Option<String>,
+    retained_artifact_digest: Option<String>,
     overall: ObservedHealth,
     operations: Vec<OperationStatusRow>,
 }
@@ -167,10 +173,14 @@ impl BridgeStatusProjection {
             .collect();
         Self {
             bridge_route: current.route_executable().to_owned(),
+            declaration_revision: current.declaration_revision(),
             declared_upstream_version: current.upstream_version().to_owned(),
+            declared_artifact_digest: current.upstream_artifact_digest().to_owned(),
             declared_operations: current.admitted_operations().to_owned(),
             retained_upstream_version: retained
                 .map(|generation| generation.upstream_version().to_owned()),
+            retained_artifact_digest: retained
+                .map(|generation| generation.upstream_artifact_digest().to_owned()),
             overall: ObservedHealth::from_last_exit(last_exit),
             operations,
         }
@@ -208,6 +218,18 @@ impl BridgeStatusProjection {
         &self.declared_upstream_version
     }
 
+    /// Returns the bridge declaration revision bound to the live generation.
+    #[must_use]
+    pub fn declaration_revision(&self) -> u64 {
+        self.declaration_revision
+    }
+
+    /// Returns the upstream artifact digest bound to the live generation.
+    #[must_use]
+    pub fn declared_artifact_digest(&self) -> &str {
+        &self.declared_artifact_digest
+    }
+
     /// Returns the declared admitted operations.
     #[must_use]
     pub fn declared_operations(&self) -> &[String] {
@@ -218,6 +240,12 @@ impl BridgeStatusProjection {
     #[must_use]
     pub fn retained_upstream_version(&self) -> Option<&str> {
         self.retained_upstream_version.as_deref()
+    }
+
+    /// Returns the retained generation's artifact digest, when one is kept.
+    #[must_use]
+    pub fn retained_artifact_digest(&self) -> Option<&str> {
+        self.retained_artifact_digest.as_deref()
     }
 
     /// Returns the overall observed health (unknown when unobserved).

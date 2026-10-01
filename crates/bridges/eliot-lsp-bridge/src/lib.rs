@@ -1636,6 +1636,176 @@ pub fn lsp_application_obligations() -> LspApplicationObligations {
     }
 }
 
+/// Revision of the versioned lsp-bridge declaration schema.
+///
+/// Stamped into every [`LspBridgeDeclaration`] and every staged and admitted
+/// generation. A declaration-schema change mints a new revision; generations
+/// staged under another revision are refused as updates, never reinterpreted.
+pub const LSP_DECLARATION_REVISION: u64 = 1;
+
+/// Reports whether a caller-attested upstream artifact digest is well shaped:
+/// exactly 64 hexadecimal characters (SHA-256 hex).
+pub(crate) fn is_artifact_digest(value: &str) -> bool {
+    value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Versioned, artifact-bound bridge declaration for the analyzer application.
+///
+/// This is the A1 declaration for the lsp bridge: the I10.13 obligations
+/// above plus the exact bound artifact (route executable, caller-observed
+/// upstream identity line, caller-attested upstream artifact digest) under one
+/// declaration revision, with a binding digest over the whole. The snapshot
+/// of admitted operations comes from [`lsp_application_obligations`], so the
+/// declaration and the generation staged from it cannot drift apart. Unknown
+/// required metadata stays a refusal (typed error), never a qualification
+/// silently absorbed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LspBridgeDeclaration {
+    revision: u64,
+    route_executable: String,
+    upstream_version_line: String,
+    upstream_artifact_digest: String,
+    admitted_operations: Vec<String>,
+    binding_digest: String,
+}
+
+impl LspBridgeDeclaration {
+    /// Admits a declaration for one caller-observed upstream artifact.
+    ///
+    /// Records the observed `rust-analyzer --version` identity line (in its
+    /// parser-validated form) and the attested artifact digest; installs and
+    /// probes nothing. The admitted-operation snapshot is taken from
+    /// [`lsp_application_obligations`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GenerationError::BlankField`] on a blank identity line or
+    /// digest, [`GenerationError::ArtifactDigestShape`] on a malformed
+    /// digest, or [`GenerationError::UpstreamIdentity`] when the line is not
+    /// an exact analyzer version line. No authority, operation identity, or
+    /// task decision is created.
+    pub fn admit(
+        upstream_version_line: impl Into<String>,
+        upstream_artifact_digest: impl Into<String>,
+    ) -> Result<Self, GenerationError> {
+        let upstream_version_line = upstream_version_line.into();
+        let upstream_artifact_digest = upstream_artifact_digest.into();
+        if upstream_version_line.trim().is_empty() {
+            return Err(GenerationError::BlankField {
+                field: "upstream_version_line",
+            });
+        }
+        if upstream_artifact_digest.trim().is_empty() {
+            return Err(GenerationError::BlankField {
+                field: "upstream_artifact_digest",
+            });
+        }
+        if !is_artifact_digest(&upstream_artifact_digest) {
+            return Err(GenerationError::ArtifactDigestShape {
+                detail: "upstream_artifact_digest must be 64 hexadecimal characters".to_owned(),
+            });
+        }
+        let upstream_version_line = parse_version_output(upstream_version_line.as_bytes())
+            .map_err(|error| GenerationError::UpstreamIdentity {
+                detail: error.to_string(),
+            })?;
+        let obligations = lsp_application_obligations();
+        let admitted_operations: Vec<String> = obligations
+            .supported_operations
+            .iter()
+            .map(|operation| (*operation).to_owned())
+            .collect();
+        let binding_digest = Self::compute_binding_digest(
+            LSP_DECLARATION_REVISION,
+            RUST_ANALYZER_EXECUTABLE,
+            &upstream_version_line,
+            &upstream_artifact_digest,
+            &admitted_operations,
+        );
+        Ok(Self {
+            revision: LSP_DECLARATION_REVISION,
+            route_executable: RUST_ANALYZER_EXECUTABLE.to_owned(),
+            upstream_version_line,
+            upstream_artifact_digest,
+            admitted_operations,
+            binding_digest,
+        })
+    }
+
+    /// Computes the binding digest over one declaration snapshot.
+    ///
+    /// The encoding is fixed (`revision`, route, upstream identity line,
+    /// artifact digest, admitted operations in declaration order), so the
+    /// digest binds the exact contract the loader and the gate recheck.
+    fn compute_binding_digest(
+        revision: u64,
+        route_executable: &str,
+        upstream_version_line: &str,
+        upstream_artifact_digest: &str,
+        admitted_operations: &[String],
+    ) -> String {
+        let mut canonical = format!(
+            "lsp-bridge-declaration\nrevision: {revision}\nroute: {route_executable}\n\
+             upstream-version-line: {upstream_version_line}\nupstream-artifact-digest: {upstream_artifact_digest}\n\
+             operations:\n"
+        );
+        for operation in admitted_operations {
+            canonical.push_str(operation);
+            canonical.push('\n');
+        }
+        hex_bytes(Sha256::digest(canonical.as_bytes()).as_slice())
+    }
+
+    /// Recomputes the binding digest and reports whether it still covers
+    /// this declaration exactly.
+    #[must_use]
+    pub fn binding_verifies(&self) -> bool {
+        Self::compute_binding_digest(
+            self.revision,
+            &self.route_executable,
+            &self.upstream_version_line,
+            &self.upstream_artifact_digest,
+            &self.admitted_operations,
+        ) == self.binding_digest
+    }
+
+    /// Returns the declaration schema revision.
+    #[must_use]
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Returns the bound route executable.
+    #[must_use]
+    pub fn route_executable(&self) -> &str {
+        &self.route_executable
+    }
+
+    /// Returns the parser-validated upstream identity line.
+    #[must_use]
+    pub fn upstream_version_line(&self) -> &str {
+        &self.upstream_version_line
+    }
+
+    /// Returns the caller-attested upstream artifact digest.
+    #[must_use]
+    pub fn upstream_artifact_digest(&self) -> &str {
+        &self.upstream_artifact_digest
+    }
+
+    /// Returns the admitted operation snapshot bound to this declaration.
+    #[must_use]
+    pub fn admitted_operations(&self) -> &[String] {
+        &self.admitted_operations
+    }
+
+    /// Returns the binding digest over this declaration snapshot.
+    #[must_use]
+    pub fn binding_digest(&self) -> &str {
+        &self.binding_digest
+    }
+}
+
 /// Reports whether `executable` names the admitted analyzer route.
 ///
 /// Explicit pinning (`C:/tools/rust-analyzer.exe`, `./rust-analyzer`) is
@@ -1761,8 +1931,9 @@ pub struct LspBridge<E> {
 ///
 /// The bridge never stages generations or attests canaries itself: staged
 /// values come from [`lsp_application_obligations`] through
-/// [`LspBridge::stage_generation`] with a caller-observed upstream identity
-/// line, and the canary-gated switch stays with the composition owner
+/// [`LspBridge::stage_generation`] or [`LspBridge::load_admitted`] with a
+/// caller-observed upstream identity line and a caller-attested artifact
+/// digest, and the canary-gated switch stays with the composition owner
 /// holding the [`AdmittedLine`]. What dispatch owns is fence consultation,
 /// exact-identity in-flight tracking across the launch/reconcile boundary
 /// (a launch notes the operation identity with its admitted first-argv
@@ -1795,25 +1966,96 @@ impl<E> LspBridge<E> {
     /// [`lsp_application_obligations`], so the declaration and the staged
     /// generation cannot drift apart. The upstream identity line is the
     /// caller-observed `rust-analyzer --version` output, validated through
-    /// the original identity parser: staging records it and never installs
+    /// the original identity parser, and `upstream_artifact_digest` is the
+    /// caller-attested digest of the bound artifact (64 hexadecimal
+    /// characters): staging records both and never installs
     /// anything. The route is the default analyzer executable; an explicitly
     /// pinned route is staged directly by the composition owner holding the
     /// [`AdmittedLine`], as is the canary-gated switch.
     ///
     /// # Errors
     ///
-    /// Returns [`GenerationError::BlankField`] on a blank identity line, or
-    /// [`GenerationError::UpstreamIdentity`] when the line is not an exact
-    /// analyzer version line.
+    /// Returns [`GenerationError::BlankField`] on a blank identity line or
+    /// digest, [`GenerationError::ArtifactDigestShape`] on a malformed
+    /// digest, or [`GenerationError::UpstreamIdentity`] when the line is not
+    /// an exact analyzer version line.
     pub fn stage_generation(
         upstream_version_line: &str,
+        upstream_artifact_digest: &str,
     ) -> Result<StagedGeneration, GenerationError> {
         let obligations = lsp_application_obligations();
         StagedGeneration::stage(
             RUST_ANALYZER_EXECUTABLE,
             upstream_version_line,
+            upstream_artifact_digest,
             obligations.supported_operations,
         )
+    }
+
+    /// Loads the admitted generation line from a versioned declaration.
+    ///
+    /// This is the artifact-bound loader for the lsp bridge: it consumes the
+    /// presented [`LspBridgeDeclaration`], refuses revision, route, digest,
+    /// or operation-set drift against the live bridge declaration with a
+    /// typed error, and only then admits the initial generation. The
+    /// canary-gated switch to a later generation stays with the composition
+    /// owner holding the returned [`AdmittedLine`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GenerationError::RouteMismatch`] when the declaration names
+    /// another route, [`GenerationError::OperationsMismatch`] on revision or
+    /// operation-set drift, [`GenerationError::ArtifactDigestShape`] on a
+    /// malformed digest, [`GenerationError::UpstreamIdentity`] on an
+    /// unrecognized identity line, or [`GenerationError::BlankField`] on a
+    /// blank input. Nothing is admitted on these paths.
+    pub fn load_admitted(
+        declaration: &LspBridgeDeclaration,
+    ) -> Result<AdmittedLine, GenerationError> {
+        if declaration.route_executable() != RUST_ANALYZER_EXECUTABLE {
+            return Err(GenerationError::RouteMismatch {
+                staged: declaration.route_executable().to_owned(),
+                admitted: RUST_ANALYZER_EXECUTABLE.to_owned(),
+            });
+        }
+        if declaration.revision() != LSP_DECLARATION_REVISION {
+            return Err(GenerationError::OperationsMismatch {
+                detail: format!(
+                    "presented declaration revision {} does not match bridge revision {}",
+                    declaration.revision(),
+                    LSP_DECLARATION_REVISION
+                ),
+            });
+        }
+        if !declaration.binding_verifies() {
+            return Err(GenerationError::OperationsMismatch {
+                detail: "presented declaration binding digest does not cover its snapshot"
+                    .to_owned(),
+            });
+        }
+        let obligations = lsp_application_obligations();
+        let live: Vec<String> = obligations
+            .supported_operations
+            .iter()
+            .map(|operation| (*operation).to_owned())
+            .collect();
+        if declaration.admitted_operations() != live.as_slice() {
+            return Err(GenerationError::OperationsMismatch {
+                detail: format!(
+                    "presented declaration admits {} operations, bridge admits {}",
+                    declaration.admitted_operations().len(),
+                    live.len()
+                ),
+            });
+        }
+        let admitted: Vec<&str> = live.iter().map(String::as_str).collect();
+        let staged = StagedGeneration::stage(
+            declaration.route_executable(),
+            declaration.upstream_version_line(),
+            declaration.upstream_artifact_digest(),
+            &admitted,
+        )?;
+        Ok(AdmittedLine::admit_initial(staged))
     }
 }
 
@@ -1985,7 +2227,9 @@ impl<E: ProcessExecutor + 'static> LspBridge<E> {
 
     /// Projects declared-versus-observed status against the owner's line.
     ///
-    /// The declaration side comes from the caller-held [`AdmittedLine`];
+    /// The declaration side comes from the caller-held [`AdmittedLine`], and
+    /// the presented [`LspBridgeDeclaration`] must bind that live generation
+    /// (revision, route, identity line, artifact digest, and operation set);
     /// the evidence side (overall and per-operation exits) is dispatch's own
     /// reconciled evidence recorded on this bridge. Operations with no
     /// observed exit stay explicitly unknown instead of inheriting bridge
@@ -1993,11 +2237,22 @@ impl<E: ProcessExecutor + 'static> LspBridge<E> {
     ///
     /// # Errors
     ///
-    /// Returns [`BridgeError::Process`] when the stitch lock is poisoned.
+    /// Returns [`BridgeError::Declaration`] when the presented declaration
+    /// does not bind the live generation, or [`BridgeError::Process`] when
+    /// the stitch lock is poisoned.
     pub fn status_against(
         &self,
         line: &AdmittedLine,
+        declaration: &LspBridgeDeclaration,
     ) -> Result<BridgeStatusProjection, BridgeError> {
+        line.check_bound(
+            declaration.revision(),
+            declaration.route_executable(),
+            declaration.upstream_version_line(),
+            declaration.upstream_artifact_digest(),
+            declaration.admitted_operations(),
+        )
+        .map_err(BridgeError::Declaration)?;
         let stitch = self.stitch.lock().map_err(|_| {
             BridgeError::Process(ProcessExecutionError::Unavailable(
                 "bridge stitch state lock poisoned".to_owned(),
@@ -2148,6 +2403,10 @@ pub enum BridgeError {
     /// Removal fenced new launches: dispatch refused before any process ran.
     #[error("bridge fenced for removal: new launches refused")]
     RemovalFenced,
+    /// A presented bridge declaration does not bind the live generation:
+    /// admission or status was refused before any process ran.
+    #[error("declaration does not bind the bridge: {0}")]
+    Declaration(GenerationError),
     /// A removal-plan step refused the call.
     #[error(transparent)]
     Removal(#[from] RemovalError),

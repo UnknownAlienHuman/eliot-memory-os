@@ -655,6 +655,9 @@ pub enum BridgeError {
     DestructiveOpRejected(&'static str),
     /// Removal fenced new calls: dispatch refused before any process ran.
     RemovalFenced,
+    /// A presented bridge declaration does not bind the live generation:
+    /// admission or status was refused before any process ran.
+    Declaration(GenerationError),
     /// A removal-plan step refused the call.
     Removal(RemovalError),
     /// The process port failed.
@@ -690,6 +693,7 @@ impl fmt::Display for BridgeError {
                 write!(f, "destructive operation rejected: {reason}")
             }
             Self::RemovalFenced => write!(f, "bridge fenced for removal: new calls refused"),
+            Self::Declaration(error) => write!(f, "declaration does not bind the bridge: {error}"),
             Self::Removal(error) => write!(f, "removal plan refused: {error}"),
             Self::Runner(detail) => write!(f, "process runner failed: {detail}"),
         }
@@ -1083,6 +1087,169 @@ pub fn git_application_obligations() -> GitApplicationObligations {
     }
 }
 
+/// Revision of the versioned git-bridge declaration schema.
+///
+/// Stamped into every [`GitBridgeDeclaration`] and every staged and admitted
+/// generation. A declaration-schema change mints a new revision; generations
+/// staged under another revision are refused as updates, never reinterpreted.
+pub const GIT_DECLARATION_REVISION: u64 = 1;
+
+/// Reports whether a caller-attested upstream artifact digest is well shaped:
+/// exactly 64 hexadecimal characters (SHA-256 hex).
+pub(crate) fn is_artifact_digest(value: &str) -> bool {
+    value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Versioned, artifact-bound bridge declaration for the Git application.
+///
+/// This is the A1 declaration for the git bridge: the I10.13 obligations
+/// above plus the exact bound artifact (route executable, caller-observed
+/// upstream version, caller-attested upstream artifact digest) under one
+/// declaration revision, with a binding digest over the whole. The snapshot
+/// of admitted operations comes from [`git_application_obligations`], so the
+/// declaration and the generation staged from it cannot drift apart. Unknown
+/// required metadata stays a refusal (typed error), never a qualification
+/// silently absorbed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitBridgeDeclaration {
+    revision: u64,
+    route_executable: String,
+    upstream_version: String,
+    upstream_artifact_digest: String,
+    admitted_operations: Vec<String>,
+    binding_digest: String,
+}
+
+impl GitBridgeDeclaration {
+    /// Admits a declaration for one caller-observed upstream artifact.
+    ///
+    /// Records the observed `git` version string and the attested artifact
+    /// digest; installs and probes nothing. The admitted-operation snapshot
+    /// is taken from [`git_application_obligations`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GenerationError::BlankField`] on a blank version or digest,
+    /// or [`GenerationError::ArtifactDigestShape`] on a malformed digest.
+    /// No authority, operation identity, or task decision is created.
+    pub fn admit(
+        upstream_version: impl Into<String>,
+        upstream_artifact_digest: impl Into<String>,
+    ) -> Result<Self, GenerationError> {
+        let upstream_version = upstream_version.into();
+        let upstream_artifact_digest = upstream_artifact_digest.into();
+        if upstream_version.trim().is_empty() {
+            return Err(GenerationError::BlankField {
+                field: "upstream_version",
+            });
+        }
+        if upstream_artifact_digest.trim().is_empty() {
+            return Err(GenerationError::BlankField {
+                field: "upstream_artifact_digest",
+            });
+        }
+        if !is_artifact_digest(&upstream_artifact_digest) {
+            return Err(GenerationError::ArtifactDigestShape {
+                detail: "upstream_artifact_digest must be 64 hexadecimal characters".to_owned(),
+            });
+        }
+        let obligations = git_application_obligations();
+        let admitted_operations: Vec<String> = obligations
+            .supported_operations
+            .iter()
+            .map(|operation| (*operation).to_owned())
+            .collect();
+        let binding_digest = Self::compute_binding_digest(
+            GIT_DECLARATION_REVISION,
+            "git",
+            &upstream_version,
+            &upstream_artifact_digest,
+            &admitted_operations,
+        );
+        Ok(Self {
+            revision: GIT_DECLARATION_REVISION,
+            route_executable: "git".to_owned(),
+            upstream_version,
+            upstream_artifact_digest,
+            admitted_operations,
+            binding_digest,
+        })
+    }
+
+    /// Computes the binding digest over one declaration snapshot.
+    ///
+    /// The encoding is fixed (`revision`, route, upstream version, artifact
+    /// digest, admitted operations in declaration order), so the digest
+    /// binds the exact contract the loader and the gate recheck.
+    fn compute_binding_digest(
+        revision: u64,
+        route_executable: &str,
+        upstream_version: &str,
+        upstream_artifact_digest: &str,
+        admitted_operations: &[String],
+    ) -> String {
+        let mut canonical = format!(
+            "git-bridge-declaration\nrevision: {revision}\nroute: {route_executable}\n\
+             upstream-version: {upstream_version}\nupstream-artifact-digest: {upstream_artifact_digest}\n\
+             operations:\n"
+        );
+        for operation in admitted_operations {
+            canonical.push_str(operation);
+            canonical.push('\n');
+        }
+        sha256_hex(canonical.as_bytes())
+    }
+
+    /// Recomputes the binding digest and reports whether it still covers
+    /// this declaration exactly.
+    #[must_use]
+    pub fn binding_verifies(&self) -> bool {
+        Self::compute_binding_digest(
+            self.revision,
+            &self.route_executable,
+            &self.upstream_version,
+            &self.upstream_artifact_digest,
+            &self.admitted_operations,
+        ) == self.binding_digest
+    }
+
+    /// Returns the declaration schema revision.
+    #[must_use]
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Returns the bound route executable.
+    #[must_use]
+    pub fn route_executable(&self) -> &str {
+        &self.route_executable
+    }
+
+    /// Returns the caller-observed upstream version.
+    #[must_use]
+    pub fn upstream_version(&self) -> &str {
+        &self.upstream_version
+    }
+
+    /// Returns the caller-attested upstream artifact digest.
+    #[must_use]
+    pub fn upstream_artifact_digest(&self) -> &str {
+        &self.upstream_artifact_digest
+    }
+
+    /// Returns the admitted operation snapshot bound to this declaration.
+    #[must_use]
+    pub fn admitted_operations(&self) -> &[String] {
+        &self.admitted_operations
+    }
+
+    /// Returns the binding digest over this declaration snapshot.
+    #[must_use]
+    pub fn binding_digest(&self) -> &str {
+        &self.binding_digest
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Bridge
 // ---------------------------------------------------------------------------
@@ -1102,7 +1269,8 @@ pub struct GitBridge<R> {
 ///
 /// The bridge never stages generations or attests canaries itself: staged
 /// values come from [`git_application_obligations`] through
-/// [`GitBridge::stage_generation`] with a caller-observed upstream version,
+/// [`GitBridge::stage_generation`] or [`GitBridge::load_admitted`] with a
+/// caller-observed upstream version and a caller-attested artifact digest,
 /// and the canary-gated switch stays with the composition owner holding the
 /// [`AdmittedLine`]. What dispatch owns is fence consultation, exact-identity
 /// in-flight tracking, and receipt-exit evidence — recorded here under one
@@ -2120,32 +2288,117 @@ impl<R: ProcessRunner> GitBridge<R> {
     /// The admitted-operation snapshot comes from
     /// [`git_application_obligations`], so the declaration and the staged
     /// generation cannot drift apart. The upstream version is the
-    /// caller-observed `git` version string: staging records it and never
-    /// installs or probes anything. The canary-gated switch itself stays
-    /// with the composition owner holding the [`AdmittedLine`].
+    /// caller-observed `git` version string and `upstream_artifact_digest`
+    /// is the caller-attested digest of the bound artifact (64 hexadecimal
+    /// characters): staging records both and never installs or probes
+    /// anything. The canary-gated switch itself stays with the composition
+    /// owner holding the [`AdmittedLine`].
     ///
     /// # Errors
     ///
-    /// Returns [`GenerationError::BlankField`] on a blank version.
-    pub fn stage_generation(upstream_version: &str) -> Result<StagedGeneration, GenerationError> {
+    /// Returns [`GenerationError::BlankField`] on a blank version or digest,
+    /// or [`GenerationError::ArtifactDigestShape`] on a malformed digest.
+    pub fn stage_generation(
+        upstream_version: &str,
+        upstream_artifact_digest: &str,
+    ) -> Result<StagedGeneration, GenerationError> {
         let obligations = git_application_obligations();
-        StagedGeneration::stage("git", upstream_version, obligations.supported_operations)
+        let admitted: Vec<&str> = obligations.supported_operations.to_vec();
+        StagedGeneration::stage("git", upstream_version, upstream_artifact_digest, &admitted)
+    }
+
+    /// Loads the admitted generation line from a versioned declaration.
+    ///
+    /// This is the artifact-bound loader for the git bridge: it consumes the
+    /// presented [`GitBridgeDeclaration`], refuses revision, route, digest,
+    /// or operation-set drift against the live bridge declaration with a
+    /// typed error, and only then admits the initial generation. The
+    /// canary-gated switch to a later generation stays with the composition
+    /// owner holding the returned [`AdmittedLine`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GenerationError::RouteMismatch`] when the declaration names
+    /// another route, [`GenerationError::OperationsMismatch`] on revision or
+    /// operation-set drift, [`GenerationError::ArtifactDigestShape`] on a
+    /// malformed digest, or [`GenerationError::BlankField`] on a blank
+    /// version. Nothing is admitted on these paths.
+    pub fn load_admitted(
+        declaration: &GitBridgeDeclaration,
+    ) -> Result<AdmittedLine, GenerationError> {
+        if declaration.route_executable() != "git" {
+            return Err(GenerationError::RouteMismatch {
+                staged: declaration.route_executable().to_owned(),
+                admitted: "git".to_owned(),
+            });
+        }
+        if declaration.revision() != GIT_DECLARATION_REVISION {
+            return Err(GenerationError::OperationsMismatch {
+                detail: format!(
+                    "presented declaration revision {} does not match bridge revision {}",
+                    declaration.revision(),
+                    GIT_DECLARATION_REVISION
+                ),
+            });
+        }
+        if !declaration.binding_verifies() {
+            return Err(GenerationError::OperationsMismatch {
+                detail: "presented declaration binding digest does not cover its snapshot"
+                    .to_owned(),
+            });
+        }
+        let obligations = git_application_obligations();
+        let live: Vec<String> = obligations
+            .supported_operations
+            .iter()
+            .map(|operation| (*operation).to_owned())
+            .collect();
+        if declaration.admitted_operations() != live.as_slice() {
+            return Err(GenerationError::OperationsMismatch {
+                detail: format!(
+                    "presented declaration admits {} operations, bridge admits {}",
+                    declaration.admitted_operations().len(),
+                    live.len()
+                ),
+            });
+        }
+        let admitted: Vec<&str> = live.iter().map(String::as_str).collect();
+        let staged = StagedGeneration::stage(
+            declaration.route_executable(),
+            declaration.upstream_version(),
+            declaration.upstream_artifact_digest(),
+            &admitted,
+        )?;
+        Ok(AdmittedLine::admit_initial(staged))
     }
 
     /// Projects declared-versus-observed status against the owner's line.
     ///
-    /// The declaration side comes from the caller-held [`AdmittedLine`];
-    /// the evidence side (overall and per-operation exits) is dispatch's own
+    /// The declaration side comes from the caller-held [`AdmittedLine`], and
+    /// the presented [`GitBridgeDeclaration`] must bind that live generation
+    /// (revision, route, version, artifact digest, and operation set); the
+    /// evidence side (overall and per-operation exits) is dispatch's own
     /// receipt evidence recorded on this bridge. Operations with no observed
     /// receipt stay explicitly unknown instead of inheriting bridge health.
     ///
     /// # Errors
     ///
-    /// Returns [`BridgeError::Runner`] when the stitch lock is poisoned.
+    /// Returns [`BridgeError::Declaration`] when the presented declaration
+    /// does not bind the live generation, or [`BridgeError::Runner`] when
+    /// the stitch lock is poisoned.
     pub fn status_against(
         &self,
         line: &AdmittedLine,
+        declaration: &GitBridgeDeclaration,
     ) -> Result<BridgeStatusProjection, BridgeError> {
+        line.check_bound(
+            declaration.revision(),
+            declaration.route_executable(),
+            declaration.upstream_version(),
+            declaration.upstream_artifact_digest(),
+            declaration.admitted_operations(),
+        )
+        .map_err(BridgeError::Declaration)?;
         let stitch = self
             .stitch
             .lock()
