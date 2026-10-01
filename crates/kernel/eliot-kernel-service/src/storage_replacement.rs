@@ -139,20 +139,31 @@
 //!   write-once, so from the second composition onward the recorded name is the
 //!   only one that can serve.
 //!
+//! - A candidate store bridge is admitted as a canonical Store **writer** only
+//!   through the durable route owner. [`StorageReplacement::canonical_store_writer_admission`]
+//!   reads [`canonical_store_route_owner`] — the ORS-backed owner, never the
+//!   caller's claim or the composition's in-memory route snapshot — and admits
+//!   only the generation that owner names, returning the typed
+//!   [`CanonicalStoreWriterRefusal`] otherwise. The production composition
+//!   connect
+//!   (`bins/eliot-kernel/src/canonical_store_runtime.rs::KernelComposition::connect_canonical_store_inner`)
+//!   consults it before it builds or retains a `KernelStoreGateway`, so an
+//!   approved-but-uncommitted candidate bridge is never connected at all rather
+//!   than connected and left to fail at its first Store operation. That is the
+//!   difference the read/write gate cannot make on its own: refusing an
+//!   operation is not the same as never holding the writer.
+//!
 //! **Not** established by this module, and stated here so no reader mistakes
 //! this file for a safety net it is not:
 //!
-//! - This coordinator is not the only way a `KernelStoreGateway` comes into
-//!   being. `KernelStoreGateway::new` is reachable from the composition root's
-//!   initial canonical-store connect and from `KernelComposition::rebind_store`,
-//!   and that rebind path mints its own unrelated `StoreRebindReceipt` without
-//!   consulting this module. What the route gate closes is the consequence: a
-//!   gateway composed for a generation the durable `canonical_store` route does
-//!   not name is refused every read and write, so neither a direct construction
-//!   nor a rebind to a candidate that has no committed cutover can serve as a
-//!   second canonical writer. What it does **not** do is stop such a gateway
-//!   from being constructed. The row that names the owner after a cutover is
-//!   written by the Kernel Generation Registry ingress
+//! - The writer admission is enforced at the composition connect path only.
+//!   `KernelComposition::rebind_store` (`bins/eliot-kernel/src/lib.rs`) is the
+//!   second production `KernelStoreGateway::new` site; it mints its own
+//!   unrelated `StoreRebindReceipt` and does not yet consult this admission, so
+//!   a rebind to a non-owner generation is still stopped by the Store-layer
+//!   route gate ([`StorageReplacement::canonical_store_writer_admission`] is the
+//!   call it needs) rather than at construction. The row that names the owner after a cutover
+//!   is written by the Kernel Generation Registry ingress
 //!   (`bins/eliot-kernel/src/generation_control.rs::apply_authenticated_generation_cutover`)
 //!   for exactly a completed replacement this coordinator re-derives through
 //!   [`StorageReplacement::replay_recorded_stages`] and then re-derives its
@@ -485,6 +496,142 @@ pub fn establish_canonical_store_route_owner(
     ors.commit_canonical_store_route_ownership(&record)
         .map_err(|error| ors_refusal(&error))?;
     Ok(initial_generation)
+}
+
+/// The durable-owner admission that lets one candidate generation be connected
+/// as a live canonical Store writer.
+///
+/// It is returned only by [`StorageReplacement::canonical_store_writer_admission`]
+/// and only when the durable `canonical_store` route owner names that exact
+/// generation. Carrying the owner generation makes the grant self-describing at
+/// the composition boundary: the caller records which owner admitted it, so an
+/// admitted connection is auditable without re-reading ORS. The scope is not
+/// carried because it is this module's own pinned
+/// [`canonical_store_route_scope`] and is never caller-supplied.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CanonicalStoreWriterAdmission {
+    /// The generation the durable route owner names, which is necessarily the
+    /// candidate the caller asked to connect.
+    pub durable_owner_generation: ResourceGeneration,
+}
+
+/// Why one candidate canonical Store generation may not be connected as a live
+/// canonical Store writer.
+///
+/// This is the refusal half of
+/// [`StorageReplacement::canonical_store_writer_admission`]. It is a separate
+/// type rather than a bare `bool` so the two refusable facts stay apart: an
+/// owner that could not be READ is not an owner that says no, and an owner that
+/// names a different generation is not the absence of an owner. Each arm also
+/// carries the generations it decided between, because the decision is only
+/// auditable when the candidate that was refused and the generation that holds
+/// the route are both visible, and the composition's own route snapshot
+/// descends from the same Host descriptor as the candidate and therefore
+/// cannot supply that contrast by itself.
+///
+/// [`A0.3`](docs/architecture/A00-03-hard-boundaries.md) lists "a second
+/// ungoverned canonical owner or write path" in its fail-closed class, so no
+/// arm of this type falls back to admitting the candidate.
+// Only `Debug` is derived: the first arm carries a [`KernelServiceError`], and
+// that enum is deliberately neither `Clone` nor comparable, so a refusal stays
+// a single owned decision rather than a value that could be duplicated or
+// compared into admitting.
+#[derive(Debug)]
+pub enum CanonicalStoreWriterRefusal {
+    /// The durable route owner could not be read at all.
+    ///
+    /// The typed ORS refusal travels with it unchanged, so an unavailability
+    /// stays distinguishable from an ownership answer across the layer
+    /// boundary instead of collapsing into one string.
+    DurableRouteOwnerUnreadable {
+        /// The typed ORS refusal the durable owner read produced.
+        source: KernelServiceError,
+    },
+    /// No owner is established for the pinned route scope and no committed
+    /// cutover names one, so no generation is provably the canonical writer.
+    ///
+    /// On a composed installation this state is unreachable, because
+    /// composition establishes the owner before any Store gateway exists
+    /// ([`establish_canonical_store_route_owner`]). It is the state of a
+    /// database this build has not composed, and it is refused rather than
+    /// treated as "any generation may serve".
+    NoDurableRouteOwner {
+        /// The candidate generation the composition asked to connect.
+        candidate_generation: ResourceGeneration,
+    },
+    /// The durable owner names a different generation than the candidate.
+    ///
+    /// This is the shape an approved-but-uncommitted candidate store bridge
+    /// takes: the Host descriptor activated a new package generation, the route
+    /// was rebuilt from it, and the durable pin stayed at the incumbent. A
+    /// cut-over incumbent reaches the same arm for the same reason.
+    NotTheDurableRouteOwner {
+        /// The candidate generation the composition asked to connect.
+        candidate_generation: ResourceGeneration,
+        /// The generation the durable `canonical_store` route owner names.
+        durable_owner_generation: ResourceGeneration,
+    },
+}
+
+impl CanonicalStoreWriterRefusal {
+    /// The bounded reason code for this refusal, safe for a diagnostic line.
+    ///
+    /// It names WHICH fact was missing — an unreadable owner, an absent owner,
+    /// or a different owner — without carrying any generation or ORS material,
+    /// so the three refusable facts stay distinguishable in the diagnostics
+    /// ledger the same way the read/write gate keeps
+    /// connectivity, process readiness and semantic freshness apart.
+    #[must_use]
+    pub const fn reason_code(&self) -> &'static str {
+        match self {
+            Self::DurableRouteOwnerUnreadable { .. } => "durable_route_owner_unreadable",
+            Self::NoDurableRouteOwner { .. } => "no_durable_route_owner",
+            Self::NotTheDurableRouteOwner { .. } => "not_the_durable_route_owner",
+        }
+    }
+}
+
+impl fmt::Display for CanonicalStoreWriterRefusal {
+    /// The operator-visible refusal text.
+    ///
+    /// Every arm names the governed path that must be used instead, so an
+    /// operator reading the refusal is told to run the `I5.11` stage-8 cutover
+    /// rather than left to infer it from the absence of a connection.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DurableRouteOwnerUnreadable { source } => write!(
+                f,
+                "the durable canonical_store route owner could not be read ({source}); a \
+                 candidate store bridge serves the canonical Store only through the governed \
+                 I5.11 stage-8 canonical_store cutover committed by the Kernel Generation \
+                 Registry, never by activating a package generation and restarting"
+            ),
+            Self::NoDurableRouteOwner {
+                candidate_generation,
+            } => write!(
+                f,
+                "canonical Store generation {} is not the durable canonical_store route owner \
+                 because no owner is established and no committed cutover names one; establish \
+                 it through the governed I5.11 stage-8 canonical_store cutover committed by the \
+                 Kernel Generation Registry before connecting a candidate store bridge",
+                candidate_generation.value()
+            ),
+            Self::NotTheDurableRouteOwner {
+                candidate_generation,
+                durable_owner_generation,
+            } => write!(
+                f,
+                "canonical Store generation {} is not the durable canonical_store route owner, \
+                 which is generation {}; serve a new store generation only through the governed \
+                 I5.11 stage-8 canonical_store cutover committed by the Kernel Generation \
+                 Registry (import, verify, shadow-read, tail, quiesce, reconcile, cutover, \
+                 canary, read-only rollback window, retire), never by activating a package \
+                 generation and restarting",
+                candidate_generation.value(),
+                durable_owner_generation.value()
+            ),
+        }
+    }
 }
 
 /// One recorded `I5.10` exchange into the candidate store.
@@ -838,6 +985,99 @@ impl fmt::Display for StorageRollbackDisposition {
 }
 
 impl StorageReplacement {
+    /// Admits exactly one canonical Store generation to be connected as a live
+    /// canonical Store WRITER, or refuses it with the generation that does own
+    /// the route.
+    ///
+    /// This is the writer-side admission that pairs with
+    /// [`canonical_store_route_owner`]: where that function answers *which*
+    /// generation owns the pinned `canonical_store` route scope, this one
+    /// answers whether a specific candidate may act as the canonical writer.
+    /// It exists because `KernelStoreGateway::new` is reachable from two
+    /// production composition sites, and the read/write gate
+    /// `require_active_store_generation` already refuses every Store operation
+    /// a non-owner gateway could issue. A dead Store path is not an absent
+    /// bridge: an approved-but-uncommitted candidate store bridge must not be
+    /// constructed and *retained* as the composition's live canonical Store
+    /// connection at all, because that is exactly the reachability
+    /// [`A12.3`](docs/architecture/A12-03-one-governed-write-path.md) forbids
+    /// and [`A0.3`](docs/architecture/A00-03-hard-boundaries.md) lists as a
+    /// fail-closed class ("a second ungoverned canonical owner or write
+    /// path"). Refusing at construction is strictly stronger than refusing at
+    /// first use, and it is what makes the candidate bridge reachable *only*
+    /// through the governed `I5.11` cutover workflow.
+    ///
+    /// ## The answer is read from durable state, never from the caller's claim
+    ///
+    /// The decision is made by [`canonical_store_route_owner`] alone, which
+    /// reads:
+    ///
+    /// 1. the committed `CUTOVER_OWNERSHIP` rows for the pinned route-scope
+    ///    hash, rebuilt through the same [`CutoverRouteSnapshot::rebuild`] the
+    ///    Kernel's own recovery performs, so the strictly newest committed
+    ///    epoch wins; then
+    /// 2. the established [`CanonicalStoreRouteOwnership`] row, which is the
+    ///    write-once record of the generation the scope started at.
+    ///
+    /// Both are ORS state written by an admitted owner — the Kernel Generation
+    /// Registry ingress
+    /// (`bins/eliot-kernel/src/generation_control.rs::apply_authenticated_generation_cutover`)
+    /// for (1) and the one-time composition
+    /// [`establish_canonical_store_route_owner`] for (2). `candidate_generation`
+    /// is only ever *compared against* that answer; it is never a way to obtain
+    /// it, and there is no parameter by which a caller could name the owner it
+    /// wants. A composition that reads its own in-memory route snapshot gets no
+    /// admission from it here, which is the whole point: the route snapshot and
+    /// the candidate both descend from the Host descriptor, so a self-check
+    /// between them is tautological, while this read is against a different
+    /// durable owner that the Host chain never consults.
+    ///
+    /// ## Behaviour
+    ///
+    /// The generation the durable owner DOES name is admitted unchanged, so the
+    /// normal boot — where composition established the owner from the same
+    /// Host descriptor that registers the route — is unaffected. A candidate
+    /// that is not the durable owner's generation is refused with
+    /// [`CanonicalStoreWriterRefusal::NotTheDurableRouteOwner`], and an
+    /// unreadable owner is refused with
+    /// [`CanonicalStoreWriterRefusal::DurableRouteOwnerUnreadable`] carrying its
+    /// typed ORS refusal rather than being treated as permission. No arm admits.
+    ///
+    /// # Errors
+    ///
+    /// Returns the typed [`CanonicalStoreWriterRefusal`] naming the candidate and,
+    /// where the owner could be read, the generation that actually owns the
+    /// route. Its `Display` names the governed `I5.11` stage-8 cutover the
+    /// operator must run instead.
+    pub fn canonical_store_writer_admission(
+        ors: &RedbRecoveryStore,
+        candidate_generation: ResourceGeneration,
+    ) -> Result<CanonicalStoreWriterAdmission, CanonicalStoreWriterRefusal> {
+        // `canonical_store_route_owner` declares and validates the pinned route
+        // scope itself, so this admission never re-derives a scope and never
+        // accepts one: there is no parameter a caller could use to point the
+        // question at a route whose owner it likes.
+        let owner = canonical_store_route_owner(ors).map_err(|source| {
+            CanonicalStoreWriterRefusal::DurableRouteOwnerUnreadable { source }
+        })?;
+        match owner {
+            Some(durable_owner_generation) if durable_owner_generation == candidate_generation => {
+                Ok(CanonicalStoreWriterAdmission {
+                    durable_owner_generation,
+                })
+            }
+            Some(durable_owner_generation) => {
+                Err(CanonicalStoreWriterRefusal::NotTheDurableRouteOwner {
+                    candidate_generation,
+                    durable_owner_generation,
+                })
+            }
+            None => Err(CanonicalStoreWriterRefusal::NoDurableRouteOwner {
+                candidate_generation,
+            }),
+        }
+    }
+
     /// Starts one replacement bound to the pinned `canonical_store` capability
     /// route scope.
     ///
