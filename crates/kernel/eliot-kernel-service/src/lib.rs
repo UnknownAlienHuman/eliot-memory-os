@@ -27,6 +27,7 @@ pub use commit_recovery::{
 };
 mod capacity_evidence;
 mod contract_rejection_gate;
+mod control_reserve_coordination;
 mod doctor;
 mod doctor_front_door;
 mod host_request_binding;
@@ -82,6 +83,10 @@ pub use contract_rejection_gate::{
     PRE_STAGE_RETRY_RULE, PreStageDecision, PreStageIdentityCache, PreStageIdentitySnapshot,
     PreStageJournalReadiness, PreStageRejection, PreStageState, VerifiedCorrectionLink,
     derive_rejection_id, pre_stage_check,
+};
+pub use control_reserve_coordination::{
+    CapacityCoordinatedLaunch, RevalidatedCapacityClaim, StagedCapacityClaim,
+    authorize_capacity_coordinated_launch, revalidate_staged_claim_at_activation,
 };
 pub use doctor::{
     ComposedDoctorFrontDoor, DOCTOR_CONFLICT_MAX_FIELDS, DOCTOR_MAX_ENVELOPE_BYTES,
