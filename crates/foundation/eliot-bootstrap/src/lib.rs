@@ -2249,7 +2249,16 @@ mod tests {
         let first = CurrentSystemEvidenceCompiler::compile(evidence_source())?;
         let second = CurrentSystemEvidenceCompiler::compile(evidence_source())?;
         assert_eq!(first, second);
-        assert_eq!(first.records[0].key, "source.head");
+        let keys: Vec<&str> = first
+            .records
+            .iter()
+            .map(|record| record.key.as_str())
+            .collect();
+        let mut ordered = keys.clone();
+        ordered.sort_unstable();
+        assert_eq!(keys, ordered, "snapshot records must be key-sorted");
+        assert!(keys.contains(&"source.head"));
+        assert!(keys.contains(&"identity.active_generations_epochs"));
         first.validate()?;
         Ok(())
     }
@@ -2810,10 +2819,15 @@ mod tests {
                 .all(|row| row.state == SupportObservationState::Unknown)
         );
         assert!(snapshot.support_rows.is_empty());
-        assert_eq!(
-            snapshot.records[0].evaluation,
-            EvidenceEvaluation::VerifierBacked
-        );
+        // Product identity coverage prepends key-sorted `identity.*`
+        // records, so the legacy record is found by key, not by index. Its
+        // recorded `VerifierBacked` label is preserved byte-identically.
+        let head = snapshot
+            .records
+            .iter()
+            .find(|record| record.key == "source.head")
+            .ok_or("legacy source.head record must survive import")?;
+        assert_eq!(head.evaluation, EvidenceEvaluation::VerifierBacked);
         assert!(
             !snapshot
                 .domain_coverage
