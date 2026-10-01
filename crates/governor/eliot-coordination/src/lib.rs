@@ -2866,4 +2866,149 @@ mod tests {
             Err(CoordinationError::InvalidState)
         ));
     }
+
+    /// One candidate result reference for the `claimed_owner` lifecycle, exactly
+    /// as the live producer's ingress lowers it: the identity fields are the
+    /// issued ones, `result_ref` is the handle naming the recorded result bytes,
+    /// and the ceiling is the only representable candidate value.
+    fn candidate_result_draft(state_fence: &StateFence) -> AgentResultDraft {
+        AgentResultDraft {
+            request_id: "submit-result".to_owned(),
+            result_id: "coordwork-result:recorded-bytes".to_owned(),
+            lease_id: "lease-1".to_owned(),
+            session_id: "session-1".to_owned(),
+            work_item_id: "work-1".to_owned(),
+            authority_epoch: test_epoch(1),
+            state_fence: state_fence.clone(),
+            result_ref: "coordwork-artifact:recorded-bytes".to_owned(),
+            ceiling: ResultAdmissionCeiling::CandidateArtifact,
+            now: 30,
+        }
+    }
+
+    /// Positive case for the live candidate-result leg (issue #370 R1).
+    ///
+    /// The full four-leg lifecycle reaches the owner mutation, the owner stores
+    /// the reference on the item, and the ORDINARY read/status consumer
+    /// ([`Self::finish_projection`]) reads that stored value back joined to the
+    /// terminal owner event. The projection is asserted from the owner's own
+    /// persisted state, so this cannot pass by the writer re-asserting what it
+    /// just wrote in memory.
+    #[test]
+    fn admit_candidate_result_stores_the_reference_the_projection_reads_back() {
+        let (mut owner, state_fence) = claimed_owner();
+        let receipt = owner
+            .admit_candidate_result(candidate_result_draft(&state_fence))
+            .expect("candidate result admission");
+
+        // The receipt proves a candidate reference was admitted, and the owner
+        // itself stamped the ceiling; nothing in the request chose it.
+        assert_eq!(receipt.ceiling, ResultAdmissionCeiling::CandidateArtifact);
+        assert_eq!(receipt.event.kind, CoordinationEventKind::ResultSubmitted);
+        assert_eq!(
+            receipt.event.payload_digest,
+            "coordwork-artifact:recorded-bytes"
+        );
+
+        // The mutation landed on the work item the lease holds.
+        let item = &owner.work["work-1"];
+        assert_eq!(item.state, WorkState::Submitted);
+        assert_eq!(
+            item.result_ref.as_deref(),
+            Some("coordwork-artifact:recorded-bytes")
+        );
+
+        // The ordinary read/status consumer sees the stored reference joined to
+        // the terminal owner event, with nothing left unresolved.
+        let projection = owner
+            .finish_projection("task-1", &state_fence)
+            .expect("finish projection");
+        assert!(
+            projection.unresolved_refs.is_empty(),
+            "stored candidate left unresolved refs: {:?}",
+            projection.unresolved_refs
+        );
+        assert!(
+            projection
+                .artifact_refs
+                .contains(&"coordwork-artifact:recorded-bytes".to_owned())
+        );
+        assert!(projection.descendant_receipt_ref.is_some());
+    }
+
+    /// Refusal case: a foreign or substituted operation identity.
+    ///
+    /// Two distinct substitutions are refused by the owner's own typed errors,
+    /// not by the caller: a session that never holds the lease, and one request
+    /// identity carrying different recorded bytes for a different item.
+    #[test]
+    fn admit_candidate_result_refuses_a_foreign_and_a_substituted_identity() {
+        let (mut owner, state_fence) = claimed_owner();
+
+        // A session that never holds this lease cannot submit its result.
+        let mut foreign_session = candidate_result_draft(&state_fence);
+        foreign_session.session_id = "session-foreign".to_owned();
+        assert_eq!(
+            owner.admit_candidate_result(foreign_session),
+            Err(CoordinationError::LeaseOwnerMismatch {
+                holder: "session-1".to_owned()
+            })
+        );
+
+        // A second claim gives a live submittable item, so the substituted
+        // reference reaches the owner's own idempotency arbitration instead of
+        // being stopped by the item's already-submitted state.
+        add_claim(&mut owner, &state_fence, "b");
+        owner
+            .admit_candidate_result(candidate_result_draft(&state_fence))
+            .expect("candidate result admission");
+
+        let mut substituted = candidate_result_draft(&state_fence);
+        substituted.result_id = "coordwork-result:other".to_owned();
+        substituted.work_item_id = "work-b".to_owned();
+        substituted.lease_id = "lease-b".to_owned();
+        substituted.session_id = "session-b".to_owned();
+        substituted.result_ref = "coordwork-artifact:other-bytes".to_owned();
+        assert_eq!(
+            owner.submit_result(substituted),
+            Err(CoordinationError::IdempotencyConflict(
+                "submit-result".to_owned()
+            ))
+        );
+    }
+
+    /// Refusal case: a result for an operation that was never issued.
+    ///
+    /// No work item and no lease were ever registered under these identities, so
+    /// the single enforcement owner refuses before any state moves, and an item
+    /// that already carries a result takes no second one.
+    #[test]
+    fn admit_candidate_result_refuses_a_result_for_an_operation_never_issued() {
+        let (mut owner, state_fence) = claimed_owner();
+
+        let mut unknown_work = candidate_result_draft(&state_fence);
+        unknown_work.work_item_id = "work-never-issued".to_owned();
+        assert_eq!(
+            owner.admit_candidate_result(unknown_work),
+            Err(CoordinationError::InvalidState)
+        );
+
+        let mut unknown_lease = candidate_result_draft(&state_fence);
+        unknown_lease.lease_id = "lease-never-issued".to_owned();
+        assert_eq!(
+            owner.submit_result(unknown_lease),
+            Err(CoordinationError::NotFound {
+                kind: "lease",
+                id: "lease-never-issued".to_owned()
+            })
+        );
+
+        owner
+            .admit_candidate_result(candidate_result_draft(&state_fence))
+            .expect("candidate result admission");
+        assert_eq!(
+            owner.submit_result(candidate_result_draft(&state_fence)),
+            Err(CoordinationError::InvalidState)
+        );
+    }
 }
