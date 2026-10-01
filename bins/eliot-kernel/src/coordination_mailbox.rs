@@ -59,6 +59,23 @@
 //! they are declared here so the names cannot drift between the Kernel surface
 //! and the bridge registration.
 //!
+//! # Live status
+//!
+//! The Store bridge slice named above is not compiled. Measured on this tree,
+//! no code in any crate names any of this module's `pub` entries other than
+//! their defining lines and the prose in this header, and no path in
+//! `daemon_request_dispatch.rs` matches any `COORDINATION_MAILBOX_*` or
+//! `COORDINATION_MAP_VIEW_NAME` key, so none of the named slices can reach
+//! them. That covers the whole surface, not one entry: the internal
+//! cross-references ([`record_mailbox_delivery`] from
+//! [`resolve_mailbox_route`], [`project_mailbox_queue`] from
+//! [`rebuild_coordination_map_view`]) are the only call edges that exist, and
+//! their callers are themselves uncalled. The module is declared
+//! `pub mod coordination_mailbox` in `lib.rs`, so it compiles and its shapes
+//! are documented, but no production route reaches it. No wiring was added and
+//! no caller was invented; whether the front door registers these keys or the
+//! surface is retired is an owner decision.
+//!
 //! # What this deliberately does not do
 //!
 //! No scheduler, task graph, subscription engine, or routing authority: route
