@@ -1207,14 +1207,12 @@ pub fn recover_handoff(
     // durable readback of the stored bytes, and the payload must bind to its
     // own retained link. This runs before the gate so a payload no boundary
     // ever captured cannot reach authority, dispatch, or binding.
-    retained
-        .checkpoint
-        .validate_capture_binding(
-            inputs.ledger,
-            inputs.boundary,
-            &retained.link,
-            &retained.attempt_identity,
-        )?;
+    retained.checkpoint.validate_capture_binding(
+        inputs.ledger,
+        inputs.boundary,
+        &retained.link,
+        &retained.attempt_identity,
+    )?;
     let admission = HandoffResumeGate::admit(inputs.evidence, inputs.observations, intent)?;
     let rebuild_required = match &admission {
         HandoffResumeAdmission::Executable {
