@@ -103,6 +103,29 @@ const PROVIDER_CAPABILITY_CLAIM_ROW_READ_OPERATION: &str =
 /// Expected `kind` of the sealed claim-row read reply body (issue #1108).
 const PROVIDER_CAPABILITY_CLAIM_ROW_KIND: &str = "native_worker_provider_capability_claim_row";
 
+/// Records one provider receipt's ORIGINAL canonical bytes on its claim row
+/// (issue #1108, A5 five-kind recording op).
+///
+/// Daemon-target operation of the Kernel receipt-record arm
+/// (`bins/eliot-kernel/src/provider_capability_route.rs::handle_provider_capability_receipt_record`):
+/// the request carries `wire_version` plus `claim_id`, `proof_kind`, and the
+/// receipt's ORIGINAL `canonical_receipt` bytes, and the Kernel records them
+/// through the ORS advance-time recorder, which validates the bytes and
+/// computes the retained digest itself. No caller digest travels: the reply
+/// carries the owner-retained digest under the sealed envelope.
+const PROVIDER_CAPABILITY_RECEIPT_RECORD_OPERATION: &str =
+    "native_worker.provider_capability.receipt.record";
+
+/// Expected `kind` of the sealed receipt-record reply body (issue #1108).
+const PROVIDER_CAPABILITY_RECEIPT_RECORDED_KIND: &str =
+    "native_worker_provider_capability_receipt_recorded";
+
+/// Expected content disposition of the sealed receipt-record reply body
+/// (issue #1108): the first record and an exact replay are indistinguishable
+/// by content and share it; a changed payload under one identity never
+/// returns a disposition and fails as a typed conflict instead.
+const PROVIDER_CAPABILITY_RECEIPT_RETAINED_DISPOSITION: &str = "retained";
+
 /// Renders the release builder's `eliotd` manifest from the exact contract
 /// constructor used by the live Kernel handshake.
 ///
@@ -171,6 +194,32 @@ struct ProviderClaimRowReadWire {
     #[serde(default)]
     receipt_payloads: NativeWorkerClaimReceiptPayloads,
     read_at_unix_ms: u64,
+    receipt_digest: String,
+}
+
+/// Sealed receipt-record projection for one provider receipt kind (issue
+/// #1108, A5 five-kind recording op).
+///
+/// Mirrors the Kernel receipt-record reply body
+/// (`bins/eliot-kernel/src/provider_capability_route.rs::handle_provider_capability_receipt_record`,
+/// sealed by `seal_capability_receipt`): the `kind` discriminator, the
+/// capability wire version, the exact `claim_id` the request named, the
+/// `proof_kind` wire name the request named, the content `disposition`
+/// (`retained`: first record and exact replay share it), the owner-retained
+/// `retained_payload_sha256` computed Kernel-side from the forwarded ORIGINAL
+/// bytes, the record timestamp, and the seal digest.
+/// `deny_unknown_fields` keeps a widened reply a typed failure, never a
+/// silently accepted record.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderReceiptRecordWire {
+    kind: String,
+    wire_version: String,
+    claim_id: String,
+    proof_kind: String,
+    disposition: String,
+    retained_payload_sha256: String,
+    recorded_at_unix_ms: u64,
     receipt_digest: String,
 }
 
@@ -2000,6 +2049,198 @@ impl DaemonKernelClient {
             row.receipt_payloads.unknown_outcome_payload_sha256,
         )
         .map_err(|error| KernelClientError::Unknown(error.to_string()))
+    }
+
+    /// Records one provider receipt's ORIGINAL canonical bytes on its claim
+    /// row through the authenticated Kernel recording op (issue #1108, A5
+    /// five-kind recording op).
+    ///
+    /// Sends [`PROVIDER_CAPABILITY_RECEIPT_RECORD_OPERATION`] with
+    /// `wire_version` plus `claim_id`, `proof_kind`, and the receipt's
+    /// ORIGINAL `canonical_receipt` bytes over the existing
+    /// [`transact_async`](Self::transact_async) path, then parses the sealed
+    /// reply and returns the owner-retained payload digest. The bytes travel
+    /// verbatim: no digest is computed here and none is accepted from the
+    /// caller — the Kernel recorder validates the bytes and computes the
+    /// retained digest itself, so a caller echo can never become owner
+    /// evidence. The first record wins per kind; an exact replay of recorded
+    /// bytes returns the same retained digest; a changed payload under one
+    /// identity fails as a typed conflict; an unknown claim fails as a typed
+    /// refusal. This method mints no bytes: the caller passes the exact
+    /// canonical string it also presents to the coordinator verifier, so the
+    /// retained digest is by construction the digest the verifier compares
+    /// against.
+    ///
+    /// Fail-closed, never synthesized: a non-five `proof_kind`, empty bytes,
+    /// or a missing owner session fails before transport; a missing or
+    /// invalid seal digest, a reply that does not decode under
+    /// `deny_unknown_fields`, a wrong kind or wire version, a claim or kind
+    /// echo that does not equal the request, a non-`retained` disposition, a
+    /// zero record timestamp, or a malformed retained digest all return typed
+    /// [`KernelClientError`] failures.
+    ///
+    /// Production callers: the five per-kind wrappers below, one per
+    /// daemon-threaded kind, for the daemon production sites holding the
+    /// provider receipts with the exact claim identity (those sites live
+    /// outside this module; this client only carries their ORIGINAL bytes).
+    pub(super) async fn record_provider_receipt_payload_async(
+        &self,
+        claim_id: &str,
+        proof_kind: &str,
+        canonical_receipt: &str,
+    ) -> Result<String, KernelClientError> {
+        if !matches!(
+            proof_kind,
+            "Cancellation" | "WorkerFence" | "Reassignment" | "Result" | "UnknownOutcome"
+        ) {
+            return Err(KernelClientError::Contract(
+                "provider receipt record requires one of the five daemon-threaded receipt kinds"
+                    .to_owned(),
+            ));
+        }
+        if canonical_receipt.is_empty() {
+            return Err(KernelClientError::Contract(
+                "provider receipt record requires the receipt's ORIGINAL canonical bytes"
+                    .to_owned(),
+            ));
+        }
+        let claim = OperationIdentity::new(claim_id)
+            .map_err(|error| KernelClientError::Contract(error.to_string()))?;
+        self.owner_session_facts().ok_or_else(|| {
+            KernelClientError::Contract(
+                "provider receipt record requires an already validated Kernel owner session"
+                    .to_owned(),
+            )
+        })?;
+        let payload = serde_json::json!({
+            "wire_version": PROVIDER_CAPABILITY_WIRE_VERSION,
+            "claim_id": claim.as_str(),
+            "proof_kind": proof_kind,
+            "canonical_receipt": canonical_receipt,
+        });
+        let response = self
+            .transact_async(PROVIDER_CAPABILITY_RECEIPT_RECORD_OPERATION, payload)
+            .await?;
+        let mut body = response.clone();
+        let receipt_digest = body
+            .as_object_mut()
+            .and_then(|object| object.remove("receipt_digest"))
+            .and_then(|digest| digest.as_str().map(str::to_owned))
+            .ok_or_else(|| {
+                KernelClientError::Unknown(
+                    "Kernel receipt-record reply has no sealed digest".to_owned(),
+                )
+            })?;
+        let body_bytes = serde_json::to_vec(&body)
+            .map_err(|error| KernelClientError::Unknown(error.to_string()))?;
+        if sha256_hex(&body_bytes) != receipt_digest {
+            return Err(KernelClientError::Unknown(
+                "Kernel receipt-record reply digest is invalid".to_owned(),
+            ));
+        }
+        let record: ProviderReceiptRecordWire = serde_json::from_value(response)
+            .map_err(|error| KernelClientError::Unknown(error.to_string()))?;
+        if record.kind != PROVIDER_CAPABILITY_RECEIPT_RECORDED_KIND
+            || record.wire_version != PROVIDER_CAPABILITY_WIRE_VERSION
+            || record.receipt_digest != receipt_digest
+            || record.claim_id != claim.as_str()
+            || record.proof_kind != proof_kind
+            || record.disposition != PROVIDER_CAPABILITY_RECEIPT_RETAINED_DISPOSITION
+            || record.recorded_at_unix_ms == 0
+            || record.retained_payload_sha256.len() != 64
+            || !record
+                .retained_payload_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(KernelClientError::Unknown(
+                "Kernel receipt-record reply does not bind the recorded receipt".to_owned(),
+            ));
+        }
+        Ok(record.retained_payload_sha256)
+    }
+
+    /// Records the ORIGINAL canonical bytes of one cancellation receipt
+    /// `eliot_agent_coordinator::ProviderCancellationReconciliation`, as consumed by `AgentCoordinator::reconcile_cancellation`) on its claim
+    /// row (issue #1108, A5).
+    ///
+    /// Thin kind-fixed path over
+    /// [`Self::record_provider_receipt_payload_async`]: the bytes travel
+    /// verbatim and the retained digest is returned unchanged. For the daemon cancellation production site holding the receipt with the
+    /// exact claim identity.
+    pub(super) async fn record_cancellation_receipt_async(
+        &self,
+        claim_id: &str,
+        canonical_receipt: &str,
+    ) -> Result<String, KernelClientError> {
+        self.record_provider_receipt_payload_async(claim_id, "Cancellation", canonical_receipt)
+            .await
+    }
+
+    /// Records the ORIGINAL canonical bytes of one worker-fence receipt
+    /// `eliot_agent_coordinator::ProviderWorkerFenceReceipt`, as consumed by `AgentCoordinator::mark_worker_lost`) on its claim row (issue #1108,
+    /// A5).
+    ///
+    /// Thin kind-fixed path over
+    /// [`Self::record_provider_receipt_payload_async`]: the bytes travel
+    /// verbatim and the retained digest is returned unchanged. For the daemon worker-fence production site holding the receipt with the
+    /// exact claim identity.
+    pub(super) async fn record_worker_fence_receipt_async(
+        &self,
+        claim_id: &str,
+        canonical_receipt: &str,
+    ) -> Result<String, KernelClientError> {
+        self.record_provider_receipt_payload_async(claim_id, "WorkerFence", canonical_receipt)
+            .await
+    }
+
+    /// Records the ORIGINAL canonical bytes of one reassignment receipt
+    /// `eliot_agent_coordinator::ProviderReassignmentReceipt`, as consumed by `AgentCoordinator::reassign`) on its claim row (issue #1108, A5).
+    ///
+    /// Thin kind-fixed path over
+    /// [`Self::record_provider_receipt_payload_async`]: the bytes travel
+    /// verbatim and the retained digest is returned unchanged. For the daemon reassignment production site holding the receipt with the
+    /// exact claim identity.
+    pub(super) async fn record_reassignment_receipt_async(
+        &self,
+        claim_id: &str,
+        canonical_receipt: &str,
+    ) -> Result<String, KernelClientError> {
+        self.record_provider_receipt_payload_async(claim_id, "Reassignment", canonical_receipt)
+            .await
+    }
+
+    /// Records the ORIGINAL canonical bytes of one result submission
+    /// `eliot_agent_coordinator::ResultSubmission`, as consumed by `AgentCoordinator::submit_result`) on its claim row (issue #1108, A5).
+    ///
+    /// Thin kind-fixed path over
+    /// [`Self::record_provider_receipt_payload_async`]: the bytes travel
+    /// verbatim and the retained digest is returned unchanged. For the daemon result production site holding the submission with the
+    /// exact claim identity.
+    pub(super) async fn record_result_receipt_async(
+        &self,
+        claim_id: &str,
+        canonical_receipt: &str,
+    ) -> Result<String, KernelClientError> {
+        self.record_provider_receipt_payload_async(claim_id, "Result", canonical_receipt)
+            .await
+    }
+
+    /// Records the ORIGINAL canonical bytes of one unknown-outcome receipt
+    /// `eliot_agent_coordinator::ProviderUnknownOutcomeReconciliation`, as consumed by `AgentCoordinator::reconcile_unknown_outcome`) on its
+    /// claim row (issue #1108, A5).
+    ///
+    /// Thin kind-fixed path over
+    /// [`Self::record_provider_receipt_payload_async`]: the bytes travel
+    /// verbatim and the retained digest is returned unchanged. For the daemon unknown-outcome production site holding the receipt with
+    /// the exact claim identity.
+    pub(super) async fn record_unknown_outcome_receipt_async(
+        &self,
+        claim_id: &str,
+        canonical_receipt: &str,
+    ) -> Result<String, KernelClientError> {
+        self.record_provider_receipt_payload_async(claim_id, "UnknownOutcome", canonical_receipt)
+            .await
     }
 
     /// Clones the retained validated binding string, if any. A poisoned slot
