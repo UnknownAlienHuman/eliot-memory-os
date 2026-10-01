@@ -510,16 +510,24 @@ impl KernelTransportOwner {
             OpenAgentBridgeActivationDisposition::Authenticated { binding } => {
                 let b = *binding;
                 self.activated_session = Some(b.session_id.clone());
-                // Retain the task and `WorkScope` the SAME typed response
-                // resolved (#2857). The session above was kept only, so the
-                // host-request envelope builder had no authenticated task
-                // identity to bind and every production `eliot.query` envelope
-                // was admitted with `task_id: None`. These are the Kernel's own
-                // resolved strings, copied verbatim next to the session they
-                // were issued under; nothing is derived, defaulted or minted.
+                // Retain the complete tuple the SAME typed response resolved.
+                // These Kernel owner values are copied verbatim beside the
+                // session they were issued under; Finish uses the revision as
+                // a selector check against the Kernel-retained current task
+                // binding, never as authority supplied by the draft.
+                let task_revision = b
+                    .task_revision
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|revision| *revision > 0)
+                    .ok_or_else(provider_failure)?;
                 self.activated_task_binding = Some(crate::ActivatedTaskBinding {
+                    principal_id: b.principal_id.clone(),
+                    session_id: b.session_id.clone(),
                     task_id: b.task_id.clone(),
                     work_scope_id: b.work_scope_id.clone(),
+                    task_revision,
+                    state_fence: b.state_fence.clone(),
                 });
                 let principal_id =
                     PrincipalId::new(b.principal_id).map_err(|_| provider_failure())?;

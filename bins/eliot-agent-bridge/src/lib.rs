@@ -220,8 +220,9 @@ struct KernelTransportOwner {
 
 type SharedTransport = Rc<RefCell<KernelTransportOwner>>;
 
-/// The task identity the one-shot activation exchange resolved, retained for
-/// the host-request envelope builder (issue #2857).
+/// The authenticated application binding the one-shot activation exchange
+/// resolved, retained for the host-request envelope builder and Finish's
+/// owner-bound current-revision join.
 ///
 /// The activation response is the ONLY place this bridge learns which task and
 /// `WorkScope` a live connection acts for: `KernelHostActivationPort` decodes
@@ -231,21 +232,25 @@ type SharedTransport = Rc<RefCell<KernelTransportOwner>>;
 /// envelope members an admitted read needs unbound, which is why every
 /// production `eliot.query` envelope was built with `task_id: None`.
 ///
-/// This type carries the exact authenticated strings the typed Kernel
-/// response decoded — never host request text, never a derived or defaulted
-/// value, and never a minted identifier. The activation revision is
-/// deliberately NOT retained: `StateFence::I45_KEY_OMISSIONS` gives the
-/// revision dimension to `RevisionHeadExpectation` at the operation's own
-/// owner, and the transport fence an envelope rides structurally carries no
-/// task revision (`host_request_frame_for_envelope` refuses one outright), so
-/// the task revision is compared where the owner read resolves it, not
-/// smuggled in from here.
+/// This type carries the exact authenticated tuple the typed Kernel response
+/// decoded — never host request text, never a derived or defaulted value, and
+/// never a minted identifier. The transport fence remains generation-only;
+/// Finish compares its strict draft revision against this separately retained
+/// owner value and Kernel revalidates it at admission, claim, and submit.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ActivatedTaskBinding {
+    /// Authenticated application principal selected by activation.
+    principal_id: String,
+    /// Authenticated application session selected by activation.
+    session_id: String,
     /// Governor-owned task selected at activation time.
     task_id: String,
     /// Governor-owned `WorkScope` selected at activation time.
     work_scope_id: String,
+    /// Current task revision selected at activation time.
+    task_revision: u64,
+    /// Activation's generation fence, without the semantic task revision.
+    state_fence: StateFence,
 }
 
 /// Disposition of the one retained consumed-frontier offer (issue #2800).
