@@ -59,6 +59,9 @@ use eliot_contracts::{
     ArtifactId, HostCorrelationDomain, HostCorrelationProjection, OperationId, RequestMetadata,
     ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex,
 };
+use eliot_blob_api::wire::{
+    BlobProcessStreamFrameRequest, BlobProcessStreamFrameResponse,
+};
 use eliot_ipc::NamedPipeTransport;
 use eliot_kernel_core::GenerationRoute;
 use eliot_kernel_core::KernelError;
@@ -84,7 +87,7 @@ use eliot_protocol::dreamer_job::{DurableJobRequest, DurableJobResponse, JobOper
 use eliot_protocol::{
     MaintenanceTriggerAck, MaintenanceTriggerClaim, MaintenanceTriggerDecisionReceipt,
     MaintenanceTriggerGapKind, MaintenanceTriggerIntakeReceipt, MaintenanceTriggerPage,
-    MaintenanceTriggerRecord, MaintenanceTriggerRevocation, ProtocolError,
+    MaintenanceTriggerRecord, MaintenanceTriggerRevocation, ProtocolError, RequestIdentity,
 };
 use eliot_runtime_contracts::{
     AffectedOperationClass, BackpressureDisposition, BottleneckAvailability,
@@ -114,7 +117,7 @@ use crate::commit_recovery::{
     resolve_open_record, verify_dreamer_canonical_request_hash, verify_receipt_binding,
     verify_retained_binding, verify_terminal_evidence,
 };
-use crate::store_client::DreamerCommitEvidence;
+use crate::store_client::{DreamerCommitEvidence, StoreClientError};
 use crate::store_write_reservation::{
     CompositionReservation, ReservationSeed, ReservedSubmission, ResolvedSendOutcome,
     StagedWriteRecovery, begin_execute_after_send, cancel_before_send, ensure_eligible,
@@ -8380,6 +8383,44 @@ impl KernelStoreGateway {
         Ok(health)
     }
 
+    /// Sends one exact Blob process-stream operation through the gateway's
+    /// retained authenticated Store client.
+    ///
+    /// This route shares the canonical Store transport, replacement flight,
+    /// shadow-effect gate, and durable active-generation check. The Kernel
+    /// caller supplies the per-operation identity minted from its retained
+    /// capability grant; this method neither creates a Store connection nor
+    /// retries an exchange whose delivery outcome is uncertain.
+    pub async fn process_stream_exchange(
+        &self,
+        request: BlobProcessStreamFrameRequest,
+        identity: RequestIdentity,
+    ) -> Result<BlobProcessStreamFrameResponse, BlobProcessStreamGatewayError> {
+        let _flight = self
+            .flight
+            .enter()
+            .map_err(BlobProcessStreamGatewayError::Refused)?;
+        if self.is_fenced() {
+            return Err(BlobProcessStreamGatewayError::Refused(
+                "canonical-store gateway is fenced for rebind".to_owned(),
+            ));
+        }
+        self.refuse_shadow_mutation()
+            .map_err(BlobProcessStreamGatewayError::Refused)?;
+        self.require_active_store_generation()
+            .map_err(|error| BlobProcessStreamGatewayError::Refused(error.to_string()))?;
+
+        self.store
+            .process_stream_exchange(request, identity)
+            .await
+            .map_err(|error| match error {
+                StoreClientError::BlobProcessStreamUnknownOutcome => {
+                    BlobProcessStreamGatewayError::UnknownOutcome
+                }
+                other => BlobProcessStreamGatewayError::Refused(other.to_string()),
+            })
+    }
+
     /// Restores one bounded canonical batch into its admitted isolated
     /// destination through this gateway's own Store client (issue #952).
     ///
@@ -9917,6 +9958,23 @@ pub enum StoreApplyRefusal {
     /// A pre-existing gateway refusal, preserved exactly.
     #[error("{0}")]
     GatewayRefusal(String),
+}
+
+/// Closed error set for one Blob process-stream Store exchange.
+///
+/// `UnknownOutcome` means the request crossed the shared EBP send boundary or
+/// its response could not be authenticated/decoded. The caller must retain
+/// that exact call identity for reconciliation and must not issue the Store
+/// operation again under a replacement identity.
+#[derive(Debug, thiserror::Error)]
+pub enum BlobProcessStreamGatewayError {
+    /// The Store exchange may have taken effect, but no exact result arrived.
+    #[error("Blob process-stream outcome is unknown")]
+    UnknownOutcome,
+    /// A local gateway, authority, generation, or closed-contract check refused
+    /// the exchange before it could be treated as a successful Store result.
+    #[error("{0}")]
+    Refused(String),
 }
 
 impl StoreApplyRefusal {
