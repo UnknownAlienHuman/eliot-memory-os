@@ -1682,10 +1682,7 @@ fn gate_lsp_call(
             operation: "<empty argv>".to_owned(),
         });
     };
-    if !obligations
-        .supported_operations
-        .contains(&first.as_str())
-    {
+    if !obligations.supported_operations.contains(&first.as_str()) {
         return Err(BridgeError::OperationNotAdmitted {
             operation: first.clone(),
         });
@@ -1775,14 +1772,12 @@ impl<E: ProcessExecutor + 'static> LspBridge<E> {
         let operation_id = request.operation_id().clone();
         let request_digest = request.invocation_digest().to_owned();
         let generation = request.generation().get();
-        let receipt = self
-            .executor
-            .start(request, sink)
-            .await
-            .map_err(|error| BridgeError::ProcessLaunch {
+        let receipt = self.executor.start(request, sink).await.map_err(|error| {
+            BridgeError::ProcessLaunch {
                 invocation: command.describe(),
                 error,
-            })?;
+            }
+        })?;
         if receipt.operation_id() != &operation_id
             || receipt.request_digest() != request_digest
             || receipt.accepted_generation().get() != generation
@@ -1894,7 +1889,9 @@ pub enum BridgeError {
     /// The call did not target the admitted analyzer route. No provider is
     /// substituted under the same operation (identity/route outcome,
     /// pre-dispatch).
-    #[error("route mismatch: bridge serves the admitted rust-analyzer executable, observed '{observed}'")]
+    #[error(
+        "route mismatch: bridge serves the admitted rust-analyzer executable, observed '{observed}'"
+    )]
     RouteMismatch {
         /// Observed executable.
         observed: String,
