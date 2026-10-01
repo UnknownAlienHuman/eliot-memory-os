@@ -5676,6 +5676,18 @@ fn build_observe_identity(
         .transpose()
         .map_err(|error| format!("Observe owner session id is invalid: {error}"))?;
     if let Some(owner) = selection.as_ref() {
+        if identity
+            .request
+            .metadata
+            .task_id
+            .as_ref()
+            .is_some_and(|task| task.as_str() != owner.task_ref())
+        {
+            return Err(
+                "TASK_SCOPE_INCOMPATIBLE: original Observe task hint differs from the independently selected current task"
+                    .to_owned(),
+            );
+        }
         identity.request.metadata.task_id = Some(
             eliot_contracts::TaskId::new(owner.task_ref().to_owned())
                 .map_err(|error| format!("selected Observe task id is invalid: {error}"))?,

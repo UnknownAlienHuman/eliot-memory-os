@@ -150,7 +150,7 @@ use eliot_protocol::{
     AgentActivationResolutionResult, AgentActivationResolutionTicket,
 };
 use eliot_security_contracts::PrivacyClass;
-use eliot_store_api::{NamedMutationOperation, PreparedTransition};
+use eliot_store_api::{EffectClass, NamedMutationOperation, PreparedTransition, TransitionClass};
 use eliot_workscope::{
     BootstrapDiscoveryInputs, BootstrapScanEvidence, DiscoveryLeaseKey, DiscoveryLeaseRequest,
     DiscoveryRead, DiscoveryReadLease, GoverningSourceCandidate, GoverningSourceCandidateEvidence,
@@ -170,7 +170,7 @@ pub struct ColdStartDiscoveryInput {
     pub discovery: BootstrapDiscoveryInputs,
 }
 
-/// Closed, caller-declared WorkScope tuple carried by the authenticated
+/// Closed, caller-declared `WorkScope` tuple carried by the authenticated
 /// `BIND_SCOPE` Task Controller action. This is input, not owner evidence:
 /// authority over `sources` and `privacy` must still be checked against their
 /// retained owners before any binding is installed.
@@ -179,7 +179,7 @@ pub struct ColdStartDiscoveryInput {
 pub struct InitialWorkScopeBindingRequest {
     /// The one explicit absolute root Host independently observes.
     pub explicit_root: PathBuf,
-    /// Original WorkScope descriptor supplied by the authenticated binding
+    /// Original `WorkScope` descriptor supplied by the authenticated binding
     /// operation.
     pub descriptor: WorkScopeDescriptor,
     /// Resolved binding to check against both descriptor and Host observation.
@@ -3142,8 +3142,9 @@ pub fn admit_named_mutation_capture(
             .any(|named| requirement_for_named_mutation(named.operation) == requirement)
     };
     let has_capture = carries_requirement(CanonicalOperationRequirement::SafeRawCapture);
-    let names_a_task = transition.task_id.is_some() || context.task_id.is_some();
-    if names_a_task || carries_requirement(CanonicalOperationRequirement::TaskRelativeEffectful) {
+    if transition.task_id.is_some()
+        || carries_requirement(CanonicalOperationRequirement::TaskRelativeEffectful)
+    {
         // Issue #1746, A6: the bridge transport edge enforces the same binding
         // rule as the direct internal intake — task-relative work needs owner
         // evidence, so its binding decision belongs to the ingress that owns
@@ -3163,6 +3164,9 @@ pub fn admit_named_mutation_capture(
         ));
     }
     if !has_capture {
+        if context.task_id.is_some() {
+            return Ok(TaskBindingAdmission::TaskRelative);
+        }
         return Ok(TaskBindingAdmission::NotTaskRelative);
     }
     if transition.named_operations.iter().any(|named| {
@@ -3175,6 +3179,45 @@ pub fn admit_named_mutation_capture(
             "task-free cold capture may contain only CaptureObservation and AppendAuditEvent",
         ));
     }
+    let capture_count = transition
+        .named_operations
+        .iter()
+        .filter(|named| named.operation == NamedMutationOperation::CaptureObservation)
+        .count();
+    if capture_count != 1 {
+        return Err(TaskBindingError::selection_required(
+            "cold unbound capture requires exactly one retained original observation submission",
+        ));
+    }
+    if transition.transition_class != TransitionClass::CaptureCandidate
+        || transition.requested_effect_ceiling != EffectClass::Candidate
+    {
+        return Err(TaskBindingError::selection_required(
+            "cold unbound capture must remain a Candidate-only CaptureCandidate transition",
+        ));
+    }
+    let Some(operation) = transition
+        .named_operations
+        .iter()
+        .find(|named| named.operation == NamedMutationOperation::CaptureObservation)
+    else {
+        return Err(TaskBindingError::selection_required(
+            "cold unbound capture has no retained original observation operation",
+        ));
+    };
+    if transition.named_operations.iter().any(|named| {
+        named
+            .parameters
+            .keys()
+            .any(|key| key.starts_with("task_selection_") || key == "task_id")
+    })
+        || !transition.required_proof_and_approval_refs.is_empty()
+    {
+        return Err(TaskBindingError::selection_required(
+            "cold unbound capture cannot discard flat task-selection markers or proof handles",
+        ));
+    }
+    validate_cold_capture_submission(context, transition, operation)?;
     match admit_capture(
         transition.identity.operation_id.as_str().to_owned(),
         context.state_fence.clone(),
@@ -3192,6 +3235,82 @@ pub fn admit_named_mutation_capture(
             )))
         }
     }
+}
+
+/// Proves that a task-free capture carrying a contextual task hint is still
+/// the original unbound observation prepared against this operation's exact
+/// scope and fence. The retained submission is Governor-normalized and its
+/// contract validator rejects unknown or malformed fields.
+fn validate_cold_capture_submission(
+    context: &RequestMetadata,
+    transition: &PreparedTransition,
+    operation: &eliot_store_api::NamedMutationRequest,
+) -> Result<(), TaskBindingError> {
+    let encoded = operation
+        .parameters
+        .get("observation_submission_json")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            TaskBindingError::selection_required(
+                "cold unbound capture omits its retained original ObservationSubmission",
+            )
+        })?;
+    let submission: eliot_observation::ObservationSubmission =
+        serde_json::from_str(encoded).map_err(|error| {
+            TaskBindingError::selection_required(format!(
+                "retained original ObservationSubmission is invalid: {error}"
+            ))
+        })?;
+    submission.validate().map_err(|error| {
+        TaskBindingError::selection_required(format!(
+            "retained original ObservationSubmission failed validation: {error}"
+        ))
+    })?;
+    if submission.operation_id != transition.identity.operation_id.as_str()
+        || submission.idempotency_key != transition.identity.idempotency_key.as_str()
+    {
+        return Err(TaskBindingError::selection_required(
+            "retained original ObservationSubmission belongs to another operation identity",
+        ));
+    }
+    if submission.task_selection.is_some() {
+        return Err(TaskBindingError::selection_required(
+            "cold unbound capture cannot discard original TaskSelectionEvidence",
+        ));
+    }
+    let Some(event) = submission.record.event.as_ref() else {
+        return Err(TaskBindingError::selection_required(
+            "cold unbound capture has no retained observation event scope",
+        ));
+    };
+    if event.affected_scope.task_ref.is_some() {
+        return Err(TaskBindingError::selection_required(
+            "cold unbound capture cannot carry a task-relative affected scope",
+        ));
+    }
+    if operation
+        .parameters
+        .get("subject")
+        .and_then(serde_json::Value::as_str)
+        != Some(submission.record.record_id.as_str())
+    {
+        return Err(TaskBindingError::selection_required(
+            "cold unbound capture subject differs from its original observation",
+        ));
+    }
+    if event.affected_scope.work_scope.as_str() != transition.scope_id.as_str() {
+        return Err(TaskBindingError::scope_incompatible(
+            "retained original ObservationSubmission names another WorkScope",
+        ));
+    }
+    if !eliot_contracts::fences_match_exact(&submission.state_fence, &transition.state_fence)
+        || !eliot_contracts::fences_match_exact(&submission.state_fence, &context.state_fence)
+    {
+        return Err(TaskBindingError::scope_incompatible(
+            "retained original ObservationSubmission differs from the complete prepared request fence",
+        ));
+    }
+    Ok(())
 }
 
 /// Admits one task-bound prepared transition with the original owner-issued
