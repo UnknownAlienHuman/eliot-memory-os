@@ -3,8 +3,8 @@
 //! I12.24 requires that retrieval verify campaign identity, local-admission
 //! status, expiry, closure status, State Fence, and cross-task admission
 //! before exposing any overlay/candidate-derived behavior. This module is the
-//! retrieval-side enforcement point, driven by the existing
-//! [`admit_context`](crate::admit_context) entrypoint:
+//! retrieval-side enforcement point of the crate's single composed admission
+//! entrypoint, [`admit_context_governed`](crate::admit_context_governed):
 //!
 //! - Learning provenance is *intrinsic*: [`LearningProvenance`] rides on the
 //!   candidate itself (`ContextCandidate.learning`) and is covered by the
@@ -15,18 +15,24 @@
 //!   evidence with ordinary checks and no learning treatment.
 //! - The governed entrypoint ([`admit_context_with_learning`]) binds every
 //!   marked atom to a live Governor issuance through the shared governed
-//!   carriage check ([`check_governed_carriage`]): the presented wire ticket
-//!   must be shape-valid, digest-identical to the owner-verified permit, and
-//!   freshly re-verified against the live owner epoch/generation and the
-//!   exact compilation fence; overlay subjects require the exact live
+//!   carriage check ([`check_governed_carriage`]) and the per-mark screen,
+//!   both reached through `check_governed_admission_carriage`: the presented
+//!   wire ticket must be shape-valid, digest-identical to the owner-verified
+//!   permit, and freshly re-verified against the live owner epoch/generation
+//!   and the exact compilation fence; overlay subjects require the exact live
 //!   `LOCAL_ADMITTED` overlay; reusable subjects require an ACTIVE backlog
 //!   entry; cross-task carryover requires the distinct owner-issued
 //!   revalidating admission. Any failure refuses the whole retrieval before
 //!   any value surfaces.
+//! - Issue #1869 composes that half with the bounded headroom half: the
+//!   `DownstreamReservation` the caller states is applied by the same
+//!   composed entrypoint before its single selection, so neither entrypoint
+//!   can reach the selector with only one of the two screens.
 //! - [`screen_admission_input_learning`] remains the standalone preflight
 //!   fragment (per-mark binding against an owner-verified permit). It is NOT
 //!   sufficient for authority on its own: production retrieval MUST go
-//!   through [`admit_context_with_learning`].
+//!   through [`admit_context_with_learning`] or
+//!   [`admit_context_governed`](crate::admit_context_governed).
 //! - Cross-task rule: the compilation task must equal the task the presented
 //!   admission admits. That is the LOCAL permit's target task when no carryover
 //!   is presented, and the FOREIGN task a distinct owner-issued cross-task
@@ -46,7 +52,7 @@ use eliot_improvement::{
     CarriageMark, PresentedLearning, bounds_to_context_error, check_governed_carriage,
 };
 
-use crate::admit_context_inner;
+use crate::{DownstreamReservation, LearningGovernance, into_admission_result};
 
 /// One learning-marked atom with its compilation identity, for screening.
 pub struct LearningSubject<'a> {
@@ -171,18 +177,19 @@ pub fn screen_admission_input_learning<'a>(
     screen_learning_subjects(&subjects, verified, cross_task, now_unix_secs)
 }
 
-/// Governed retrieval entrypoint: run the owner-bound carriage gate
-/// (ticket re-verification, overlay liveness, backlog backing, cross-task
-/// carryover) plus the per-mark screen, then the unchanged
-/// [`admit_context_inner`] decision.
+/// The learning half of the composed admission gate: the owner-bound carriage
+/// check plus the per-mark screen, for exactly the inputs that present a live
+/// carriage.
 ///
-/// Inputs without learning marks and without tickets are decided exactly
-/// as before; any marked or ticketed input passes the full gate, and any
-/// failure refuses the whole retrieval before any value surfaces.
-pub fn admit_context_with_learning(
+/// This is the single implementation of that half.
+/// [`admit_context_governed`](crate::admit_context_governed) reaches selection
+/// only through it, so the live [`check_governed_carriage`] is called here
+/// rather than restated at a call site, and no entrypoint can reach the selector
+/// with a presented carriage it never screened.
+pub(crate) fn check_governed_admission_carriage(
     input: &AdmissionInput,
     presented: PresentedLearning<'_>,
-) -> Result<AdmissionResult, ContextError> {
+) -> Result<(), ContextError> {
     let marked = input
         .candidates
         .candidates
@@ -214,6 +221,33 @@ pub fn admit_context_with_learning(
         presented.verified,
         presented.cross_task,
         presented.now_unix_secs,
-    )?;
-    admit_context_inner(input)
+    )
+}
+
+/// Governed retrieval entrypoint: run the owner-bound carriage gate
+/// (ticket re-verification, overlay liveness, backlog backing, cross-task
+/// carryover) plus the per-mark screen, then the one composed admission
+/// decision this cell owns.
+///
+/// Inputs without learning marks and without tickets are decided exactly
+/// as before; any marked or ticketed input passes the full gate, and any
+/// failure refuses the whole retrieval before any value surfaces.
+///
+/// This is a thin projection of the composed admission entrypoint onto the
+/// historical result-only signature: it presents
+/// [`LearningGovernance::Presented`] and [`DownstreamReservation::NotReserved`],
+/// so the composed decision reports `HeadroomCheck::NotReserved` for this
+/// compilation. A compilation that holds an owner-issued downstream reservation
+/// calls [`admit_context_governed`](crate::admit_context_governed) with
+/// [`DownstreamReservation::Reserved`], which runs the same two screens before
+/// the same single selection.
+pub fn admit_context_with_learning(
+    input: &AdmissionInput,
+    presented: PresentedLearning<'_>,
+) -> Result<AdmissionResult, ContextError> {
+    into_admission_result(crate::admit_context_composed(
+        input,
+        &LearningGovernance::Presented(presented),
+        &DownstreamReservation::NotReserved,
+    ))
 }
