@@ -82,7 +82,7 @@ use thiserror::Error;
 
 use crate::{
     NamedMutationOperation, NamedMutationRequest, NamedReadOperation, NamedReadRequest,
-    ReadConsistency, StateFence, StoreError,
+    ReadConsistency, ScopeId, StateFence, StoreError,
 };
 
 /// Versioned wire/schema identity for canonical user-automation state.
@@ -1087,7 +1087,6 @@ pub fn automation_invocation_read_request(
 }
 
 /// Builds an exact read for one independently retained normalization record.
-#[must_use]
 pub fn automation_normalization_read_request(
     state_fence: StateFence,
     automation_id: String,
@@ -1142,9 +1141,10 @@ pub fn validate_automation_mutation_params(
     }
     let leg = text_param(parameters, AUTOMATION_PARAM_OPERATION)?;
     validate_automation_id(text_param(parameters, AUTOMATION_PARAM_AUTOMATION_ID)?)?;
-    if leg != AUTOMATION_OPERATION_RETAIN_NORMALIZATION
-        && parameters.contains_key(AUTOMATION_PARAM_NORMALIZATION_REQUEST_JSON)
-    {
+    if leg == AUTOMATION_OPERATION_RETAIN_NORMALIZATION {
+        return validate_automation_normalization_mutation_params(parameters);
+    }
+    if parameters.contains_key(AUTOMATION_PARAM_NORMALIZATION_REQUEST_JSON) {
         return Err(StoreError::InvalidField {
             field: AUTOMATION_PARAM_NORMALIZATION_REQUEST_JSON,
             reason: "original normalization request is only valid for normalization retention",
@@ -1166,40 +1166,6 @@ pub fn validate_automation_mutation_params(
         }
     }
     match leg {
-        AUTOMATION_OPERATION_RETAIN_NORMALIZATION => {
-            if parameters.keys().any(|name| {
-                !matches!(
-                    name.as_str(),
-                    AUTOMATION_PARAM_OPERATION
-                        | AUTOMATION_PARAM_AUTOMATION_ID
-                        | AUTOMATION_PARAM_REVISION
-                        | AUTOMATION_PARAM_REVISION_JSON
-                        | AUTOMATION_PARAM_NORMALIZATION_RECEIPT_JSON
-                        | AUTOMATION_PARAM_NORMALIZATION_REQUEST_JSON
-                )
-            }) {
-                return Err(StoreError::InvalidField {
-                    field: "automation.operation",
-                    reason: "parameter is not valid for normalization retention",
-                });
-            }
-            validate_revision_id(text_param(parameters, AUTOMATION_PARAM_REVISION)?)?;
-            validate_automation_doc(
-                text_param(parameters, AUTOMATION_PARAM_REVISION_JSON)?,
-                AUTOMATION_PARAM_REVISION_JSON,
-            )?;
-            validate_automation_doc(
-                text_param(parameters, AUTOMATION_PARAM_NORMALIZATION_REQUEST_JSON)?,
-                AUTOMATION_PARAM_NORMALIZATION_REQUEST_JSON,
-            )?;
-            match parameters.get(AUTOMATION_PARAM_NORMALIZATION_RECEIPT_JSON) {
-                Some(Value::Object(_)) => Ok(()),
-                _ => Err(StoreError::InvalidField {
-                    field: AUTOMATION_PARAM_NORMALIZATION_RECEIPT_JSON,
-                    reason: "owner normalization envelope must be a JSON object",
-                }),
-            }
-        }
         AUTOMATION_OPERATION_CREATE => {
             validate_revision_id(text_param(parameters, AUTOMATION_PARAM_REVISION)?)?;
             validate_configuration_state(text_param(
@@ -1253,6 +1219,49 @@ pub fn validate_automation_mutation_params(
         }
         _ => Err(StoreError::UnknownOperation),
     }
+}
+
+/// Validates the closed internal leg that independently retains owner-issued
+/// normalization evidence. Its strict parameter and document rules do not
+/// change the historical acceptance boundary for the existing mutation legs.
+fn validate_automation_normalization_mutation_params(
+    parameters: &BTreeMap<String, Value>,
+) -> Result<(), StoreError> {
+    if !matches!(
+        parameters.get(AUTOMATION_PARAM_NORMALIZATION_RECEIPT_JSON),
+        Some(Value::Object(_))
+    ) {
+        return Err(StoreError::InvalidField {
+            field: AUTOMATION_PARAM_NORMALIZATION_RECEIPT_JSON,
+            reason: "owner normalization envelope must be a JSON object",
+        });
+    }
+    if parameters.keys().any(|name| {
+        !matches!(
+            name.as_str(),
+            AUTOMATION_PARAM_OPERATION
+                | AUTOMATION_PARAM_AUTOMATION_ID
+                | AUTOMATION_PARAM_REVISION
+                | AUTOMATION_PARAM_REVISION_JSON
+                | AUTOMATION_PARAM_NORMALIZATION_RECEIPT_JSON
+                | AUTOMATION_PARAM_NORMALIZATION_REQUEST_JSON
+        )
+    }) {
+        return Err(StoreError::InvalidField {
+            field: "automation.operation",
+            reason: "parameter is not valid for normalization retention",
+        });
+    }
+    validate_revision_id(text_param(parameters, AUTOMATION_PARAM_REVISION)?)?;
+    validate_automation_doc(
+        text_param(parameters, AUTOMATION_PARAM_REVISION_JSON)?,
+        AUTOMATION_PARAM_REVISION_JSON,
+    )?;
+    validate_automation_doc(
+        text_param(parameters, AUTOMATION_PARAM_NORMALIZATION_REQUEST_JSON)?,
+        AUTOMATION_PARAM_NORMALIZATION_REQUEST_JSON,
+    )?;
+    Ok(())
 }
 
 /// Decodes one validated mutation parameter map into its raw leg.
