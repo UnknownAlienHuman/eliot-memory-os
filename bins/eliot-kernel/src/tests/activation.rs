@@ -273,6 +273,11 @@ fn activation_v2_ticket(ticket_id: &str, deadline: u64) -> AgentActivationResolu
 }
 
 #[cfg(windows)]
+fn activation_test_deadline() -> u64 {
+    unix_ms().saturating_add(300_000)
+}
+
+#[cfg(windows)]
 fn activation_v2_entry(ticket: &AgentActivationResolutionTicket) -> AgentActivationPending {
     let (_, template) = activation_test_entry(ticket.kernel_deadline_unix_ms);
     AgentActivationPending {
@@ -394,6 +399,14 @@ fn activation_kernel_with_ticket(
     std::fs::create_dir_all(&root).expect("test work root");
     let kernel = KernelComposition::new(KernelConfig::new(&root)).expect("kernel composition");
     let entry = activation_v2_entry(ticket);
+    // Keep the persisted claim live through durable result retention. The
+    // previous 1/2/3 timestamps expired long before retain_activation_result_durably
+    // supplied its real wall-clock time, so ORS correctly rejected the fixture.
+    let current_unix_ms = unix_ms();
+    let lifecycle_now = current_unix_ms.min(ticket.kernel_deadline_unix_ms.saturating_sub(2));
+    let claim_expiry = lifecycle_now
+        .saturating_add(60_000)
+        .min(ticket.kernel_deadline_unix_ms);
     kernel
         .generation_gateway
         .ors
@@ -424,14 +437,21 @@ fn activation_kernel_with_ticket(
                 successor_ticket_id: None,
                 terminal_reason: None,
             },
-            1,
+            lifecycle_now,
         )
         .expect("stage activation lifecycle");
-    kernel
-        .generation_gateway
-        .ors
-        .claim_activation_ticket(&ticket.ticket_id, "eliotd", 2, 3)
-        .expect("claim activation lifecycle");
+    if current_unix_ms < ticket.kernel_deadline_unix_ms {
+        kernel
+            .generation_gateway
+            .ors
+            .claim_activation_ticket(
+                &ticket.ticket_id,
+                "eliotd",
+                lifecycle_now.saturating_add(1),
+                claim_expiry,
+            )
+            .expect("claim activation lifecycle");
+    }
     {
         let mut pending = kernel
             .agent_activation_pending
@@ -700,7 +720,7 @@ fn activation_kernel_with_live_bridge_ticket(
         declaration: declaration.clone(),
     });
 
-    let deadline = unix_ms().saturating_add(60_000);
+    let deadline = unix_ms().saturating_add(300_000);
     let pipe_name = format!(r"\\.\pipe\eliot\activation-v2-live-{}", std::process::id());
     let (receipt_sha256, connection_id) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -776,6 +796,10 @@ fn activation_kernel_with_live_bridge_ticket(
         .with_computed_digest()
         .expect("live bridge ticket digest");
     let entry = activation_v2_entry(&ticket);
+    let lifecycle_now = unix_ms();
+    let claim_expiry = lifecycle_now
+        .saturating_add(60_000)
+        .min(ticket.kernel_deadline_unix_ms);
     kernel
         .generation_gateway
         .ors
@@ -806,13 +830,18 @@ fn activation_kernel_with_live_bridge_ticket(
                 successor_ticket_id: None,
                 terminal_reason: None,
             },
-            1,
+            lifecycle_now,
         )
         .expect("stage live activation lifecycle");
     kernel
         .generation_gateway
         .ors
-        .claim_activation_ticket(&ticket.ticket_id, "eliotd", 2, 3)
+        .claim_activation_ticket(
+            &ticket.ticket_id,
+            "eliotd",
+            lifecycle_now.saturating_add(1),
+            claim_expiry,
+        )
         .expect("claim live activation lifecycle");
     kernel
         .agent_activation_pending
@@ -898,7 +927,7 @@ fn activation_result_ledger_rehydrates_without_bridge_state_or_session() {
         unix_ms()
     ));
     std::fs::create_dir_all(root.join(".eliot")).expect("test ORS directory");
-    let ticket = activation_v2_ticket("activation-ticket-rehydrate", 2_000);
+    let ticket = activation_v2_ticket("activation-ticket-rehydrate", activation_test_deadline());
     let result = activation_v2_resolved(&ticket, 1_000);
     let ors_path = root.join(".eliot").join("kernel-ors.redb");
     let ors = eliot_ors::RedbRecoveryStore::open(&ors_path).expect("open ORS");
@@ -973,7 +1002,7 @@ fn activation_result_ledger_typed_corruption_fences_startup() {
         unix_ms()
     ));
     std::fs::create_dir_all(root.join(".eliot")).expect("test ORS directory");
-    let ticket = activation_v2_ticket("activation-ticket-corrupt", 2_000);
+    let ticket = activation_v2_ticket("activation-ticket-corrupt", activation_test_deadline());
     let mut result = activation_v2_resolved(&ticket, 1_000);
     result.ticket_sha256 = "e".repeat(64);
     let ors_path = root.join(".eliot").join("kernel-ors.redb");
@@ -991,7 +1020,7 @@ fn activation_result_ledger_typed_corruption_fences_startup() {
 #[cfg(windows)]
 #[test]
 fn activation_host_request_resolves_canonical_v2_envelope_result() {
-    let ticket = activation_v2_ticket("activation-ticket-v2", 2_000);
+    let ticket = activation_v2_ticket("activation-ticket-v2", activation_test_deadline());
     let result = activation_v2_resolved(&ticket, 1_000);
     let (root, kernel) = activation_kernel_with_ticket("canonical", &ticket, Some(result.clone()));
     let envelope = activation_host_envelope(&ticket, &result.result_sha256, &ticket.connection_id);
@@ -1007,7 +1036,7 @@ fn activation_host_request_resolves_canonical_v2_envelope_result() {
 #[cfg(windows)]
 #[test]
 fn activation_host_request_without_any_result_is_unknown() {
-    let ticket = activation_v2_ticket("activation-ticket-unknown", 2_000);
+    let ticket = activation_v2_ticket("activation-ticket-unknown", activation_test_deadline());
     let probe = activation_v2_resolved(&ticket, 1_000);
     let (root, kernel) = activation_kernel_with_ticket("unknown", &ticket, None);
     let envelope = activation_host_envelope(&ticket, &probe.result_sha256, &ticket.connection_id);
@@ -1025,7 +1054,7 @@ fn activation_host_request_without_any_result_is_unknown() {
 #[cfg(windows)]
 #[test]
 fn activation_host_request_non_resolved_v2_fails_closed() {
-    let ticket = activation_v2_ticket("activation-ticket-negative", 2_000);
+    let ticket = activation_v2_ticket("activation-ticket-negative", activation_test_deadline());
     let failed = activation_v2_failed(&ticket, 1_000);
     let (root, kernel) = activation_kernel_with_ticket("negative", &ticket, Some(failed.clone()));
     let envelope = activation_host_envelope(&ticket, &failed.result_sha256, &ticket.connection_id);
@@ -1043,7 +1072,7 @@ fn activation_host_request_non_resolved_v2_fails_closed() {
 #[cfg(windows)]
 #[test]
 fn activation_host_request_wrong_connection_fails_closed() {
-    let ticket = activation_v2_ticket("activation-ticket-conn", 2_000);
+    let ticket = activation_v2_ticket("activation-ticket-conn", activation_test_deadline());
     let result = activation_v2_resolved(&ticket, 1_000);
     let (root, kernel) = activation_kernel_with_ticket("connection", &ticket, Some(result.clone()));
     let envelope = activation_host_envelope(&ticket, &result.result_sha256, "other-connection");
@@ -1070,7 +1099,10 @@ fn activation_host_request_wrong_connection_fails_closed() {
 #[cfg(windows)]
 #[test]
 fn activation_host_request_projected_retry_answers_from_retained_result() {
-    let ticket = activation_v2_ticket("activation-ticket-projected-retry-203", 2_000);
+    let ticket = activation_v2_ticket(
+        "activation-ticket-projected-retry-203",
+        activation_test_deadline(),
+    );
     let result = activation_v2_resolved(&ticket, 1_000);
     let (root, kernel) =
         activation_kernel_with_ticket("projected-retry-203", &ticket, Some(result.clone()));
@@ -1113,7 +1145,10 @@ fn activation_host_request_projected_retry_answers_from_retained_result() {
 #[cfg(windows)]
 #[test]
 fn activation_host_request_projected_retry_wrong_connection_fails_closed() {
-    let ticket = activation_v2_ticket("activation-ticket-projected-conn-203", 2_000);
+    let ticket = activation_v2_ticket(
+        "activation-ticket-projected-conn-203",
+        activation_test_deadline(),
+    );
     let result = activation_v2_resolved(&ticket, 1_000);
     let (root, kernel) =
         activation_kernel_with_ticket("projected-conn-203", &ticket, Some(result.clone()));
@@ -1234,7 +1269,10 @@ fn activation_terminal_negative_replay_survives_restart_without_pending_entry() 
     drop(restarted_commit);
     let _ = std::fs::remove_dir_all(commit_root);
 
-    let ticket = activation_v2_ticket("activation-ticket-negative-restart", 2_000);
+    let ticket = activation_v2_ticket(
+        "activation-ticket-negative-restart",
+        activation_test_deadline(),
+    );
     let failed = activation_v2_failed(&ticket, 1_000);
     let retained_root = std::env::temp_dir().join(format!(
         "eliot-kernel-activation-negative-restart-{}",
