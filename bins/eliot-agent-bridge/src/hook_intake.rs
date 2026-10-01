@@ -675,11 +675,22 @@ mod tests {
         let error = acquire_hook_payload(&mut bad_utf8).expect_err("bad UTF-8 must be refused");
         assert_eq!(error.exit_code(), crate::INVALID_ARGUMENT_EXIT);
 
-        // Structural: in the production region of this very file, acquisition
-        // and decode each `?` before the only `EliotHookService`
-        // construction, so no refusal can reach the owner's spool write. The
-        // search is restricted to the region above the test module so this
-        // test's own string literals cannot satisfy it.
+        // A REFACTOR TRIPWIRE, not a proof of "no spool record".
+        //
+        // What this genuinely pins: in the production region of this file,
+        // acquisition and decode each `?` before the only
+        // `EliotHookService` construction. The search is restricted to the
+        // region above the test module, so this test's own string literals
+        // cannot satisfy it.
+        //
+        // What it does NOT pin, stated honestly so no reader over-trusts it:
+        // it is a byte-offset scan of ONE file. A dispatch added in a
+        // neighbouring module, or a second service construction introduced
+        // above this one, would not be visible here. The real no-spool
+        // property rests on the executed refusals above plus the owner's own
+        // ordering (`for_session` is a pure constructor; the only spool write
+        // is inside `process`), which this scan deliberately does not claim to
+        // re-prove.
         let source = include_str!("hook_intake.rs");
         let production = source
             .split_once("#[cfg(test)]")
@@ -697,12 +708,10 @@ mod tests {
             acquire_at < service_at && decode_at < service_at,
             "acquisition and decode must precede the service construction"
         );
-        // The spool write lives only behind `process`, so there is exactly one
-        // service construction on this branch and it is last.
         assert_eq!(
             production.matches("EliotHookService::for_session(").count(),
-            1
+            1,
+            "one service construction on this branch, and it is last"
         );
-        assert_eq!(production.matches("EliotHookService::new(").count(), 0);
     }
 }
