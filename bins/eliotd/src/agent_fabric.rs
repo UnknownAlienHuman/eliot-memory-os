@@ -916,6 +916,14 @@ pub struct ActivationEvidence {
     pub fence: StateFence,
     /// Epoch at activation time; must match admission exactly.
     pub epoch: EpochId,
+    /// Exact Governor-issued task/admission association for this operational
+    /// attempt, when the definition has an owner-issued semantic admission.
+    /// This is populated only by the activation owner after it joins the
+    /// canonical FabricAdmission and registered AttemptId to the durable
+    /// semantic owner readback. Legacy activations retain `None` and cannot
+    /// publish a semantic stop boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_boundary_admission: Option<eliot_protocol::StopBoundaryAdmissionBinding>,
 }
 
 /// Provider-neutral externally dispatchable intent.
@@ -1406,11 +1414,85 @@ fn verify_snapshot_semantics(snapshot: &FabricSnapshot) -> Result<(), FabricErro
         &snapshot.semantic_executions,
         &snapshot.semantic_supersessions,
     )?;
+    verify_snapshot_admission_owner_readbacks(snapshot)?;
+    verify_snapshot_stop_boundaries(snapshot)?;
     // #1702 W7/A6: retained unknown effects are retained evidence, so they are
     // held to the same standard as the records they hang off. An effect with no
     // stored execution is detached history and is refused rather than restored
     // as if some execution still owned it.
     verify_snapshot_unknown_effects(snapshot)
+}
+
+fn verify_snapshot_admission_owner_readbacks(
+    snapshot: &FabricSnapshot,
+) -> Result<(), FabricError> {
+    if snapshot.semantic_admission_owner_revisions.keys().collect::<BTreeSet<_>>()
+        != snapshot.semantic_admission_write_receipts.keys().collect::<BTreeSet<_>>()
+    {
+        return Err(FabricError::RevisionNotDurable(StoreError::InvalidField {
+            field: "swarm.admission.owner_readback",
+            reason: "Governor admission revision and committed Store receipt keys differ",
+        }));
+    }
+    for (key, owner_revision) in &snapshot.semantic_admission_owner_revisions {
+        let admission = snapshot.semantic_admissions.get(key).ok_or_else(|| {
+            FabricError::BrokenOwnershipLink(
+                "Governor owner readback has no semantic admission record".to_owned(),
+            )
+        })?;
+        let record = serde_json::to_value(admission)
+            .map_err(|error| FabricError::Contract(format!("semantic admission encode: {error}")))?;
+        let receipt = &snapshot.semantic_admission_write_receipts[key];
+        require_durable_owner_revision(owner_revision, receipt, &record)?;
+    }
+    Ok(())
+}
+
+fn verify_snapshot_stop_boundaries(snapshot: &FabricSnapshot) -> Result<(), FabricError> {
+    for (stop_id, revisions) in &snapshot.stop_boundaries {
+        if revisions.is_empty() {
+            return Err(FabricError::BrokenOwnershipLink(
+                "stop boundary identity has no owner-observed revision".to_owned(),
+            ));
+        }
+        let mut seen = BTreeSet::new();
+        for record in revisions {
+            record.validate_shape().map_err(|error| {
+                FabricError::Contract(format!("stored stop boundary is invalid: {error}"))
+            })?;
+            let binding = &record.admission_binding;
+            if record.stop_id != *stop_id || !seen.insert(record.stop_id.as_str()) {
+                return Err(FabricError::IdentityConflict(
+                    "stop boundary key differs from record identity or repeats".to_owned(),
+                ));
+            }
+            let admission = snapshot
+                .semantic_admissions
+                .get(&binding.admission_id)
+                .ok_or_else(|| FabricError::BrokenOwnershipLink(
+                    "stored stop boundary has no retained Governor admission".to_owned(),
+                ))?;
+            let definition = snapshot
+                .semantic_definitions
+                .get(&binding.definition_id)
+                .ok_or_else(|| FabricError::BrokenOwnershipLink(
+                    "stored stop boundary has no retained Task Controller definition".to_owned(),
+                ))?;
+            if admission.admission_id.as_str() != binding.admission_id.as_str()
+                || admission.receipt != binding.admission_receipt
+                || !admission.binds(definition)
+                || definition.definition_digest != binding.definition_digest
+                || definition.task_id.as_str() != binding.task_id.as_str()
+                || definition.task_revision != binding.task_revision
+                || !fences_match_exact(&admission.state_fence, &binding.state_fence)
+            {
+                return Err(FabricError::IdentityConflict(
+                    "stored stop boundary no longer joins its original semantic owner records".to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Verifies the retained unknown effects a snapshot carries (issue #1702
@@ -1867,11 +1949,19 @@ pub fn recover_semantic_revisions(
         || !supplied_snapshot.semantic_admissions.is_empty()
         || !supplied_snapshot.semantic_executions.is_empty()
         || !supplied_snapshot.semantic_supersessions.is_empty()
+        || !supplied_snapshot.semantic_admission_owner_revisions.is_empty()
+        || !supplied_snapshot.semantic_admission_write_receipts.is_empty()
+        || !supplied_snapshot.stop_boundaries.is_empty()
     {
         let supplied_consistent = supplied_snapshot.semantic_definitions == recovered.definitions
             && supplied_snapshot.semantic_admissions == recovered.admissions
             && supplied_snapshot.semantic_executions == recovered.executions
-            && supplied_snapshot.semantic_supersessions == recovered.supersessions;
+            && supplied_snapshot.semantic_supersessions == recovered.supersessions
+            && supplied_snapshot.semantic_admission_owner_revisions
+                == recovered.admission_owner_revisions
+            && supplied_snapshot.semantic_admission_write_receipts
+                == recovered.admission_write_receipts
+            && supplied_snapshot.stop_boundaries == recovered.stop_boundaries;
         if !supplied_consistent {
             return Err(FabricError::SemanticRecoveryBlocked(
                 "supplied snapshot contradicts the committed durable owner-separated image"
@@ -2035,6 +2125,15 @@ pub struct FabricSnapshot {
     /// Governor semantic admissions by admission identity (issue #1702).
     #[serde(default)]
     pub semantic_admissions: BTreeMap<String, SwarmPlanAdmission>,
+    /// Exact Store-owned revisions/receipts for the Governor semantic
+    /// admissions above. Legacy snapshots without this readback cannot be
+    /// used to mint a current stop boundary.
+    #[serde(default)]
+    pub semantic_admission_owner_revisions:
+        BTreeMap<String, SwarmOwnerRevision>,
+    /// Exact committed Store receipts paired with the admission revisions.
+    #[serde(default)]
+    pub semantic_admission_write_receipts: BTreeMap<String, WriteReceipt>,
     /// Coordinator execution revisions by execution identity (issue #1702).
     #[serde(default)]
     pub semantic_executions: BTreeMap<String, SwarmExecutionRevision>,
@@ -2071,6 +2170,11 @@ pub struct FabricSnapshot {
     /// as before.
     #[serde(default)]
     pub tool_results: BTreeMap<String, ToolResultReceipt>,
+    /// Append-only owner-observed stop revisions by stable stop identity.
+    /// Older snapshots restore with no stop history, never with inferred
+    /// empty coverage.
+    #[serde(default)]
+    pub stop_boundaries: BTreeMap<String, Vec<eliot_protocol::StopBoundaryRecord>>,
 }
 
 /// Attempt lifecycle tracked by this composition. Terminal states never
@@ -2166,6 +2270,9 @@ pub struct AgentFabric {
     semantic_definitions: BTreeMap<String, SwarmPlanDefinition>,
     /// Governor semantic admissions by admission identity.
     semantic_admissions: BTreeMap<String, SwarmPlanAdmission>,
+    semantic_admission_owner_revisions: BTreeMap<String, SwarmOwnerRevision>,
+    semantic_admission_write_receipts: BTreeMap<String, WriteReceipt>,
+    stop_boundaries: BTreeMap<String, Vec<eliot_protocol::StopBoundaryRecord>>,
     /// Coordinator execution revisions by execution identity.
     semantic_executions: BTreeMap<String, SwarmExecutionRevision>,
     /// Supersession links by replacement definition identity.
@@ -2235,6 +2342,9 @@ impl AgentFabric {
             cancellations: BTreeMap::new(),
             semantic_definitions: BTreeMap::new(),
             semantic_admissions: BTreeMap::new(),
+            semantic_admission_owner_revisions: BTreeMap::new(),
+            semantic_admission_write_receipts: BTreeMap::new(),
+            stop_boundaries: BTreeMap::new(),
             semantic_executions: BTreeMap::new(),
             semantic_supersessions: BTreeMap::new(),
             semantic_unknown_effects: BTreeMap::new(),
@@ -2290,6 +2400,9 @@ impl AgentFabric {
             cancellations: BTreeMap::new(),
             semantic_definitions: BTreeMap::new(),
             semantic_admissions: BTreeMap::new(),
+            semantic_admission_owner_revisions: BTreeMap::new(),
+            semantic_admission_write_receipts: BTreeMap::new(),
+            stop_boundaries: BTreeMap::new(),
             semantic_executions: BTreeMap::new(),
             semantic_supersessions: BTreeMap::new(),
             semantic_unknown_effects: BTreeMap::new(),
@@ -3044,6 +3157,39 @@ impl AgentFabric {
         let key = admission.admission_id.as_str().to_owned();
         if let Some(stored) = self.semantic_admissions.get(&key).cloned() {
             if stored == admission {
+                if self.semantic_admission_owner_revisions.get(&key) == Some(owner_revision)
+                    && self.semantic_admission_write_receipts.get(&key) == Some(receipt)
+                {
+                    self.record("semantic_admission_replayed", &key);
+                    return Ok(());
+                }
+                let previous_revision = self
+                    .semantic_admission_owner_revisions
+                    .insert(key.clone(), owner_revision.clone());
+                let previous_receipt = self
+                    .semantic_admission_write_receipts
+                    .insert(key.clone(), receipt.clone());
+                if let Err(error) = self.publish_semantic_revision() {
+                    match previous_revision {
+                        Some(previous) => {
+                            self.semantic_admission_owner_revisions
+                                .insert(key.clone(), previous);
+                        }
+                        None => {
+                            self.semantic_admission_owner_revisions.remove(&key);
+                        }
+                    }
+                    match previous_receipt {
+                        Some(previous) => {
+                            self.semantic_admission_write_receipts
+                                .insert(key.clone(), previous);
+                        }
+                        None => {
+                            self.semantic_admission_write_receipts.remove(&key);
+                        }
+                    }
+                    return Err(error);
+                }
                 self.record("semantic_admission_replayed", &key);
                 return Ok(());
             }
@@ -3052,9 +3198,15 @@ impl AgentFabric {
             )));
         }
         self.semantic_admissions.insert(key.clone(), admission);
+        self.semantic_admission_owner_revisions
+            .insert(key.clone(), owner_revision.clone());
+        self.semantic_admission_write_receipts
+            .insert(key.clone(), receipt.clone());
         // #1702 W2: the admission is durable before it is reported current.
         if let Err(error) = self.publish_semantic_revision() {
             self.semantic_admissions.remove(&key);
+            self.semantic_admission_owner_revisions.remove(&key);
+            self.semantic_admission_write_receipts.remove(&key);
             return Err(error);
         }
         self.record("semantic_admission_bound", &key);
@@ -3097,6 +3249,41 @@ impl AgentFabric {
                 FabricError::Contract(format!("unknown semantic admission {key}"))
             })?;
         if stored.disposition == disposition {
+            let record = serde_json::to_value(&stored).map_err(|error| {
+                FabricError::Contract(format!("semantic admission encode: {error}"))
+            })?;
+            require_durable_owner_revision(owner_revision, receipt, &record)?;
+            if self.semantic_admission_owner_revisions.get(&key) != Some(owner_revision)
+                || self.semantic_admission_write_receipts.get(&key) != Some(receipt)
+            {
+                let previous_revision = self
+                    .semantic_admission_owner_revisions
+                    .insert(key.clone(), owner_revision.clone());
+                let previous_receipt = self
+                    .semantic_admission_write_receipts
+                    .insert(key.clone(), receipt.clone());
+                if let Err(error) = self.publish_semantic_revision() {
+                    match previous_revision {
+                        Some(previous) => {
+                            self.semantic_admission_owner_revisions
+                                .insert(key.clone(), previous);
+                        }
+                        None => {
+                            self.semantic_admission_owner_revisions.remove(&key);
+                        }
+                    }
+                    match previous_receipt {
+                        Some(previous) => {
+                            self.semantic_admission_write_receipts
+                                .insert(key.clone(), previous);
+                        }
+                        None => {
+                            self.semantic_admission_write_receipts.remove(&key);
+                        }
+                    }
+                    return Err(error);
+                }
+            }
             self.record("semantic_admission_disposition_replayed", &key);
             return Ok(());
         }
@@ -3111,10 +3298,34 @@ impl AgentFabric {
         })?;
         require_durable_owner_revision(owner_revision, receipt, &record)?;
         self.semantic_admissions.insert(key.clone(), admission);
+        let previous_revision = self
+            .semantic_admission_owner_revisions
+            .insert(key.clone(), owner_revision.clone());
+        let previous_receipt = self
+            .semantic_admission_write_receipts
+            .insert(key.clone(), receipt.clone());
         // #1702 W2: the disposition is durable before it becomes the current
         // one; a failed write leaves the previous disposition authoritative.
         if let Err(error) = self.publish_semantic_revision() {
             self.semantic_admissions.insert(key.clone(), stored);
+            match previous_revision {
+                Some(previous) => {
+                    self.semantic_admission_owner_revisions
+                        .insert(key.clone(), previous);
+                }
+                None => {
+                    self.semantic_admission_owner_revisions.remove(&key);
+                }
+            }
+            match previous_receipt {
+                Some(previous) => {
+                    self.semantic_admission_write_receipts
+                        .insert(key.clone(), previous);
+                }
+                None => {
+                    self.semantic_admission_write_receipts.remove(&key);
+                }
+            }
             return Err(error);
         }
         self.record("semantic_admission_disposition_noted", &key);
@@ -4043,7 +4254,7 @@ impl AgentFabric {
             Some(admission.fence.clone()),
             Some(admission.epoch.clone()),
         )?;
-        let evidence = self
+        let mut evidence = self
             .ports
             .activation_authority
             .activate(&admission, attempt_id)?;
@@ -4063,11 +4274,158 @@ impl AgentFabric {
             ));
         }
         validate_text(&evidence.activation_digest, "activation_digest")?;
+        let has_semantic_binding = self.semantic_admissions.values().any(|semantic| {
+            semantic.definition_id.as_str() == admission.definition_id.as_str()
+                && semantic.definition_digest == admission.definition_digest
+        });
+        evidence.stop_boundary_admission = if has_semantic_binding {
+            Some(self.stop_boundary_admission_binding(admission_id, attempt_id)?)
+        } else {
+            None
+        };
         self.activations.insert(key.clone(), evidence.clone());
         self.attempt_states
             .insert(attempt_id.as_str().to_owned(), AttemptLifecycle::Activated);
         self.record("activation_committed", &key);
         Ok(evidence)
+    }
+
+    /// Reads the exact Governor admission association for one canonically
+    /// admitted fabric attempt. This joins the operational admission and its
+    /// attempt membership to the independently persisted semantic definition,
+    /// admission, Store revision, and write receipt; it does not infer a task
+    /// attempt from caller labels or from TaskRevision.
+    pub fn stop_boundary_admission_binding(
+        &self,
+        fabric_admission_id: &AdmissionId,
+        attempt_id: &AttemptId,
+    ) -> Result<eliot_protocol::StopBoundaryAdmissionBinding, FabricError> {
+        let fabric_admission = self
+            .admissions
+            .get(fabric_admission_id.as_str())
+            .ok_or_else(|| FabricError::Contract("unknown canonical fabric admission".to_owned()))?;
+        if !fabric_admission.attempt_ids.contains(attempt_id) {
+            return Err(FabricError::IdentityConflict(
+                "stop association attempt is not registered by this admission".to_owned(),
+            ));
+        }
+        let mut matches = self.semantic_admissions.iter().filter(|(_, admission)| {
+            admission.definition_id.as_str() == fabric_admission.definition_id.as_str()
+                && admission.definition_digest == fabric_admission.definition_digest
+        });
+        let (semantic_key, semantic_admission) = matches.next().ok_or_else(|| {
+            FabricError::BrokenOwnershipLink(
+                "canonical fabric admission has no exact Governor semantic admission".to_owned(),
+            )
+        })?;
+        if matches.next().is_some() {
+            return Err(FabricError::IdentityConflict(
+                "fabric definition has more than one semantic admission".to_owned(),
+            ));
+        }
+        if semantic_admission.disposition != SwarmPlanAdmissionDisposition::Admitted
+            || !fences_match_exact(&semantic_admission.state_fence, &fabric_admission.fence)
+        {
+            return Err(FabricError::StaleFence(
+                "semantic and operational admissions are not jointly current".to_owned(),
+            ));
+        }
+        let definition = self
+            .semantic_definitions
+            .get(semantic_admission.definition_id.as_str())
+            .ok_or_else(|| FabricError::BrokenOwnershipLink("admitted definition is missing".to_owned()))?;
+        let owner_revision = self
+            .semantic_admission_owner_revisions
+            .get(semantic_key)
+            .ok_or_else(|| {
+                FabricError::RevisionNotDurable(StoreError::InvalidField {
+                    field: "swarm.admission.owner_revision",
+                    reason: "admission owner revision is absent",
+                })
+            })?;
+        let write_receipt = self
+            .semantic_admission_write_receipts
+            .get(semantic_key)
+            .ok_or_else(|| {
+                FabricError::RevisionNotDurable(StoreError::InvalidField {
+                    field: "swarm.admission.write_receipt",
+                    reason: "admission write receipt is absent",
+                })
+            })?;
+        let canonical_admission = serde_json::to_value(semantic_admission).map_err(|error| {
+            FabricError::Contract(format!("semantic admission encode: {error}"))
+        })?;
+        require_durable_owner_revision(owner_revision, write_receipt, &canonical_admission)?;
+        if !semantic_admission.binds(definition)
+            || definition.task_revision.parse::<u64>().ok().filter(|value| value.to_string() == definition.task_revision).is_none()
+        {
+            return Err(FabricError::BrokenOwnershipLink(
+                "definition and semantic admission no longer form an exact task binding".to_owned(),
+            ));
+        }
+        Ok(eliot_protocol::StopBoundaryAdmissionBinding {
+            admission_id: semantic_admission.admission_id.as_str().to_owned(),
+            admission_owner_revision: owner_revision.revision,
+            admission_receipt: semantic_admission.receipt.clone(),
+            definition_id: definition.definition_id.as_str().to_owned(),
+            definition_digest: definition.definition_digest.clone(),
+            task_id: eliot_contracts::TaskId::new(definition.task_id.clone())
+                .map_err(|_| FabricError::Contract("definition task identity is malformed".to_owned()))?,
+            task_revision: definition.task_revision.clone(),
+            attempt_id: attempt_id.as_str().to_owned(),
+            state_fence: semantic_admission.state_fence.clone(),
+        })
+    }
+
+    /// Publishes one owner-observed stop boundary after rejoining every
+    /// admission identity to the current durable Governor owner readback.
+    /// Exact replay is idempotent; reuse of a stop identity with changed
+    /// observation bytes is rejected. A complete or explicitly unknown
+    /// coverage value is persisted verbatim.
+    pub fn publish_stop_boundary(
+        &mut self,
+        fabric_admission_id: &AdmissionId,
+        record: eliot_protocol::StopBoundaryRecord,
+    ) -> Result<(), FabricError> {
+        record
+            .validate_shape()
+            .map_err(|error| FabricError::Contract(format!("invalid stop boundary: {error}")))?;
+        let binding = self.stop_boundary_admission_binding(
+            fabric_admission_id,
+            &AttemptId::new(record.attempt_id.clone())
+                .map_err(|error| FabricError::Contract(format!("invalid attempt id: {error}")))?,
+        )?;
+        if record.admission_binding != binding
+            || record.task_id.as_str() != binding.task_id.as_str()
+            || !fences_match_exact(&record.state_fence, &binding.state_fence)
+        {
+            return Err(FabricError::IdentityConflict(
+                "stop boundary does not retain the exact current Governor admission binding".to_owned(),
+            ));
+        }
+        let key = record.stop_id.clone();
+        if let Some(existing) = self.stop_boundaries.get(&key) {
+            if existing.last() == Some(&record) {
+                return Ok(());
+            }
+            return Err(FabricError::IdentityConflict(
+                "stop identity was reused with different observed bytes".to_owned(),
+            ));
+        }
+        self.stop_boundaries.insert(key.clone(), vec![record]);
+        if let Err(error) = self.publish_semantic_revision() {
+            self.stop_boundaries.remove(&key);
+            return Err(error);
+        }
+        self.record("stop_boundary_published", &key);
+        Ok(())
+    }
+
+    /// Reads a stop boundary from the durable semantic owner state, preserving
+    /// unknown coverage for downstream reconciliation and Finish evaluation.
+    #[must_use]
+    pub fn stop_boundary(&self, stop_id: &str) -> Option<&eliot_protocol::StopBoundaryRecord> {
+        self.stop_boundaries.get(stop_id).and_then(|revisions| revisions.last())
     }
 
     /// Builds the provider-neutral dispatch intent for one activated attempt.
@@ -4854,6 +5212,9 @@ impl AgentFabric {
             cancellations: self.cancellations.clone(),
             semantic_definitions: self.semantic_definitions.clone(),
             semantic_admissions: self.semantic_admissions.clone(),
+            semantic_admission_owner_revisions: self.semantic_admission_owner_revisions.clone(),
+            semantic_admission_write_receipts: self.semantic_admission_write_receipts.clone(),
+            stop_boundaries: self.stop_boundaries.clone(),
             semantic_executions: self.semantic_executions.clone(),
             semantic_supersessions: self.semantic_supersessions.clone(),
             semantic_unknown_effects: self.semantic_unknown_effects.clone(),
@@ -4900,7 +5261,7 @@ impl AgentFabric {
     /// retained semantic records stay readable history, but publishing a new
     /// one is refused typed until a store is attached.
     pub fn restore(
-        snapshot: FabricSnapshot,
+        mut snapshot: FabricSnapshot,
         config: CoordinatorConfig,
         ports: FabricPorts,
         semantic_revisions: Option<&SemanticRevisionStore>,
@@ -4935,7 +5296,15 @@ impl AgentFabric {
         if let Some(store) = semantic_revisions
             && store.has_committed_image()
         {
-            recover_semantic_revisions(store, &snapshot)?;
+            let recovered = recover_semantic_revisions(store, &snapshot)?;
+            snapshot.semantic_definitions = recovered.definitions;
+            snapshot.semantic_admissions = recovered.admissions;
+            snapshot.semantic_admission_owner_revisions = recovered.admission_owner_revisions;
+            snapshot.semantic_admission_write_receipts = recovered.admission_write_receipts;
+            snapshot.stop_boundaries = recovered.stop_boundaries;
+            snapshot.semantic_executions = recovered.executions;
+            snapshot.semantic_supersessions = recovered.supersessions;
+            verify_snapshot_semantics(&snapshot)?;
         }
         let admission_by_definition = rebuild_admission_by_definition(&snapshot)?;
         let coordinator = AgentCoordinator::restore(
@@ -4977,6 +5346,9 @@ impl AgentFabric {
             cancellations: snapshot.cancellations,
             semantic_definitions: snapshot.semantic_definitions,
             semantic_admissions: snapshot.semantic_admissions,
+            semantic_admission_owner_revisions: snapshot.semantic_admission_owner_revisions,
+            semantic_admission_write_receipts: snapshot.semantic_admission_write_receipts,
+            stop_boundaries: snapshot.stop_boundaries,
             semantic_executions: snapshot.semantic_executions,
             semantic_supersessions: snapshot.semantic_supersessions,
             // #1702 W7/A6: retained unknown effects are part of the durable
@@ -5088,7 +5460,7 @@ impl AgentFabric {
     /// durable document, and it receives the same freshly admitted capability
     /// either way. Everything checked here is checked once, for both.
     fn restore_through_coordinator_ingress(
-        snapshot: FabricSnapshot,
+        mut snapshot: FabricSnapshot,
         config: CoordinatorConfig,
         ports: FabricPorts,
         semantic_revisions: Option<&SemanticRevisionStore>,
@@ -5122,7 +5494,15 @@ impl AgentFabric {
         if let Some(store) = semantic_revisions
             && store.has_committed_image()
         {
-            recover_semantic_revisions(store, &snapshot)?;
+            let recovered = recover_semantic_revisions(store, &snapshot)?;
+            snapshot.semantic_definitions = recovered.definitions;
+            snapshot.semantic_admissions = recovered.admissions;
+            snapshot.semantic_admission_owner_revisions = recovered.admission_owner_revisions;
+            snapshot.semantic_admission_write_receipts = recovered.admission_write_receipts;
+            snapshot.stop_boundaries = recovered.stop_boundaries;
+            snapshot.semantic_executions = recovered.executions;
+            snapshot.semantic_supersessions = recovered.supersessions;
+            verify_snapshot_semantics(&snapshot)?;
         }
         let admission_by_definition = rebuild_admission_by_definition(&snapshot)?;
         let coordinator = build_coordinator(config.clone(), capability)?;
@@ -5158,6 +5538,9 @@ impl AgentFabric {
             cancellations: snapshot.cancellations,
             semantic_definitions: snapshot.semantic_definitions,
             semantic_admissions: snapshot.semantic_admissions,
+            semantic_admission_owner_revisions: snapshot.semantic_admission_owner_revisions,
+            semantic_admission_write_receipts: snapshot.semantic_admission_write_receipts,
+            stop_boundaries: snapshot.stop_boundaries,
             semantic_executions: snapshot.semantic_executions,
             semantic_supersessions: snapshot.semantic_supersessions,
             // #1702 W7/A6: retained unknown effects are part of the durable

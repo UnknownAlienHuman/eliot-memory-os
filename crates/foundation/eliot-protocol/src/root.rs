@@ -112,7 +112,7 @@ pub use finish_attempt::{
 mod stop_boundary;
 pub use stop_boundary::{
     STOP_BOUNDARY_RECORD_WIRE_ID, STOP_BOUNDARY_RECORD_WIRE_VERSION,
-    StopBoundaryActionCoverage, StopBoundaryActionPlan,
+    StopBoundaryActionCoverage, StopBoundaryActionPlan, StopBoundaryAdmissionBinding,
     StopBoundaryCoverage, StopBoundaryCoverageGap, StopBoundaryCursorState,
     StopBoundaryCursorUnknownReason, StopBoundaryDescendant, StopBoundaryEffectDisposition,
     StopBoundaryEnumeration, StopBoundaryEventPosition, StopBoundaryEventPositions,

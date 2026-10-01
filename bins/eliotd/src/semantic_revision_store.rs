@@ -97,6 +97,18 @@ pub struct SemanticRevisionEnvelope {
     executions: BTreeMap<String, SwarmExecutionRevision>,
     /// Supersession links by replacement definition identity.
     supersessions: BTreeMap<String, SupersessionLink>,
+    /// Exact Store-issued Governor admission revisions and receipts.
+    ///
+    /// Without this owner readback, an opaque `SwarmPlanAdmission` alone does
+    /// not prove which canonical admission revision supplied the attempt.
+    #[serde(default)]
+    admission_owner_revisions: BTreeMap<String, eliot_store_api::SwarmOwnerRevision>,
+    /// Original committed Store receipts paired with admission revisions.
+    #[serde(default)]
+    admission_write_receipts: BTreeMap<String, eliot_store_api::WriteReceipt>,
+    /// Original owner-observed stop boundaries, keyed by stable stop identity.
+    #[serde(default)]
+    stop_boundaries: BTreeMap<String, Vec<eliot_protocol::StopBoundaryRecord>>,
 }
 
 /// Owner-separated revisions rehydrated from real storage (issue #1702 W6).
@@ -117,6 +129,13 @@ pub struct RecoveredSemanticRevisions {
     pub executions: BTreeMap<String, SwarmExecutionRevision>,
     /// Supersession links read back, keyed by replacement definition identity.
     pub supersessions: BTreeMap<String, SupersessionLink>,
+    /// Store-issued Governor admission revisions read back from the committed
+    /// owner image.
+    pub admission_owner_revisions: BTreeMap<String, eliot_store_api::SwarmOwnerRevision>,
+    /// Original committed Store receipts paired with admission revisions.
+    pub admission_write_receipts: BTreeMap<String, eliot_store_api::WriteReceipt>,
+    /// Append-only stop-boundary revisions read back from the committed image.
+    pub stop_boundaries: BTreeMap<String, Vec<eliot_protocol::StopBoundaryRecord>>,
 }
 
 /// What the committed image already says about one publish operation identity
@@ -161,6 +180,9 @@ impl SemanticRevisionEnvelope {
             admissions: snapshot.semantic_admissions.clone(),
             executions: snapshot.semantic_executions.clone(),
             supersessions: snapshot.semantic_supersessions.clone(),
+            admission_owner_revisions: snapshot.semantic_admission_owner_revisions.clone(),
+            admission_write_receipts: snapshot.semantic_admission_write_receipts.clone(),
+            stop_boundaries: snapshot.stop_boundaries.clone(),
         }
     }
 }
@@ -348,6 +370,9 @@ impl SemanticRevisionStore {
             admissions: file.payload.admissions,
             executions: file.payload.executions,
             supersessions: file.payload.supersessions,
+            admission_owner_revisions: file.payload.admission_owner_revisions,
+            admission_write_receipts: file.payload.admission_write_receipts,
+            stop_boundaries: file.payload.stop_boundaries,
         })
     }
 
