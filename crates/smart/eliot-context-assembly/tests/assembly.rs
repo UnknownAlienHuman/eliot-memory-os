@@ -1214,8 +1214,7 @@ fn multi_role_provider_set_is_deterministic() {
 // WORK_UNIT_CASE: 626/4
 #[test]
 fn denominator_mismatch_is_rejected() {
-    let value = admitted();
-    let context = value.binding.clone();
+    let context = admitted().binding.clone();
     let mut foreign = recipe(&context);
     let slot = provider_role_named("foreign-provider", SemanticRole::Goal);
     foreign.denominator = ProviderRoleDenominator {
@@ -1229,11 +1228,21 @@ fn denominator_mismatch_is_rejected() {
     foreign.recipe_sha256 = foreign
         .canonical_policy_digest()
         .expect("foreign recipe digest");
+    // Re-stamp the admitted set under this recipe instance. Without it the
+    // assembly refuses earlier and for an unrelated reason:
+    // `admitted.economy.recipe_digest` still names the ORIGINAL instance, so
+    // assemble.rs:541 returns `IdentityConflict` before `validate_recipe_membership`
+    // at :549 ever runs, and this test would not reach the denominator check it
+    // exists to prove. `refinalize` is how every other mutated-recipe fixture in
+    // this file binds its admitted set (see
+    // `missing_admitted_material_yields_exact_incomplete`).
+    let mut foreign_admitted = admitted();
+    refinalize(&mut foreign_admitted, &foreign.recipe_sha256.clone());
     let result = assemble_active_view(
-        &value,
+        &foreign_admitted,
         &foreign,
         &approved_for(&foreign),
-        quality_for(&value, &foreign),
+        quality_for(&foreign_admitted, &foreign),
         &policy(100_000),
         |bytes| Ok(measurement(&context, bytes)),
     );
@@ -2456,6 +2465,17 @@ fn unknown_mandatory_quality_blocks_complete() {
         Err(AssemblyError::QualityIncomplete(_, _))
     ));
 
+    // A PASSING dimension that still carries unknown evidence is a different
+    // refusal from the failed one above, and the assembly keeps the two apart.
+    // `QualityDimensionResult::validate` refuses a pass carrying
+    // `unknown_evidence` (quality.rs:240), so `suitability` reports
+    // `InvalidScorecard`, and assemble.rs:572-573 turns that into a
+    // `Contract` rejection. `assemble.rs:569-570` states this precedence
+    // directly: "A card that is not even structurally valid is still a
+    // contract rejection unless the owner reported it as quality
+    // incompleteness." The operation is still blocked either way; what the
+    // caller receives is the more specific refusal, naming the structural
+    // defect instead of a generic blocking dimension.
     let mut qualified_unknown = quality_for(&value, &recipe(&context));
     qualified_unknown.results[1].unknown_evidence = vec![id("unknown-evidence")];
     let result = assemble_active_view(
@@ -2468,7 +2488,7 @@ fn unknown_mandatory_quality_blocks_complete() {
     );
     assert!(matches!(
         result,
-        Err(AssemblyError::QualityIncomplete(_, _))
+        Err(AssemblyError::Contract(ContextError::QualityIncomplete))
     ));
 }
 
