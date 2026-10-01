@@ -191,7 +191,10 @@ impl std::fmt::Display for AnchoredReviewError {
                 write!(f, "anchored review batch mismatch: {batch_id}")
             }
             Self::MissingRejectionReason { review_id } => {
-                write!(f, "anchored review rejection requires a reason: {review_id}")
+                write!(
+                    f,
+                    "anchored review rejection requires a reason: {review_id}"
+                )
             }
             Self::NotRequestedChange { review_id } => {
                 write!(f, "anchored review is not a requested change: {review_id}")
@@ -452,10 +455,7 @@ impl AnchorResolutionStatus {
     /// similar fragment.
     #[must_use]
     pub const fn attaches(&self) -> bool {
-        matches!(
-            self,
-            Self::Exact | Self::Moved | Self::Modified
-        )
+        matches!(self, Self::Exact | Self::Moved | Self::Modified)
     }
 }
 
@@ -1215,8 +1215,7 @@ pub fn advance_review_item(
     advance: ReviewAdvance,
     reason: Option<String>,
 ) -> Result<AnchoredReviewRecord, AnchoredReviewError> {
-    if record.lifecycle == ReviewLifecycle::RejectedWithReason
-        && record.rejection_reason.is_none()
+    if record.lifecycle == ReviewLifecycle::RejectedWithReason && record.rejection_reason.is_none()
     {
         return Err(AnchoredReviewError::InvalidField {
             field: "rejection_reason",
@@ -1234,11 +1233,15 @@ pub fn advance_review_item(
             ReviewLifecycle::RejectedWithReason
         }
         (
-            ReviewLifecycle::PendingDelivery | ReviewLifecycle::Delivered | ReviewLifecycle::Answered,
+            ReviewLifecycle::PendingDelivery
+            | ReviewLifecycle::Delivered
+            | ReviewLifecycle::Answered,
             ReviewAdvance::MarkStale,
         ) => ReviewLifecycle::Stale,
         (
-            ReviewLifecycle::PendingDelivery | ReviewLifecycle::Delivered | ReviewLifecycle::Answered,
+            ReviewLifecycle::PendingDelivery
+            | ReviewLifecycle::Delivered
+            | ReviewLifecycle::Answered,
             ReviewAdvance::MarkSuperseded,
         ) => ReviewLifecycle::Superseded,
         _ => {
@@ -1292,7 +1295,8 @@ pub fn route_requested_change(
             review_id: record.review_id.clone(),
         });
     }
-    if record.lifecycle != ReviewLifecycle::Delivered && record.lifecycle != ReviewLifecycle::Answered
+    if record.lifecycle != ReviewLifecycle::Delivered
+        && record.lifecycle != ReviewLifecycle::Answered
     {
         return Err(AnchoredReviewError::InvalidField {
             field: "lifecycle",
@@ -1538,16 +1542,8 @@ fn validate_anchor(anchor: &ReviewAnchor, field: &'static str) -> Result<(), Anc
     require_text(&anchor.target_id, field, MAX_REVIEW_IDENTITY_LEN)?;
     require_text(&anchor.target_revision, field, MAX_REVIEW_IDENTITY_LEN)?;
     require_text(&anchor.target_digest, field, MAX_REVIEW_IDENTITY_LEN)?;
-    validate_optional_text(
-        anchor.path.as_deref(),
-        field,
-        MAX_REVIEW_SELECTOR_LEN,
-    )?;
-    validate_optional_text(
-        anchor.symbol.as_deref(),
-        field,
-        MAX_REVIEW_IDENTITY_LEN,
-    )?;
+    validate_optional_text(anchor.path.as_deref(), field, MAX_REVIEW_SELECTOR_LEN)?;
+    validate_optional_text(anchor.symbol.as_deref(), field, MAX_REVIEW_IDENTITY_LEN)?;
     match (anchor.line_start, anchor.line_end) {
         (Some(start), Some(end)) => {
             if end == 0 || start > end {
@@ -1596,11 +1592,7 @@ fn validate_reference(
     require_text(&reference.kind, field, MAX_REVIEW_IDENTITY_LEN)?;
     require_text(&reference.id, field, MAX_REVIEW_IDENTITY_LEN)?;
     require_text(&reference.revision, field, MAX_REVIEW_IDENTITY_LEN)?;
-    validate_optional_text(
-        reference.digest.as_deref(),
-        field,
-        MAX_REVIEW_IDENTITY_LEN,
-    )?;
+    validate_optional_text(reference.digest.as_deref(), field, MAX_REVIEW_IDENTITY_LEN)?;
     Ok(())
 }
 
