@@ -233,14 +233,13 @@ fn unavailable_blob_owner_facts(
     Ok(response)
 }
 
-fn available_launch_owner_facts(
+fn verified_owner_facts(
     composition: &DaemonComposition,
     request: &BlobProcessStreamOwnerFactsPullRequest,
     scope: &CurrentWorkScopeSourceReceipt,
     policy: &CurrentBlobPolicyResidency,
     catalog: &CurrentModuleCatalogGeneration,
-    source_admission: Option<(&str, &str, &str, &str)>,
-) -> Result<BlobProcessStreamOwnerFactsPullResponse, String> {
+) -> Result<(BlobProcessStreamVerifiedOwnerFacts, String, String), String> {
     let authority: eliot_receipts::AuthorityBinding =
         serde_json::from_str(&request.kernel_authority_binding_json)
             .map_err(|error| format!("Kernel authority binding is invalid: {error}"))?;
@@ -431,6 +430,22 @@ fn available_launch_owner_facts(
     let facts_sha256 = sha256_hex(&facts_bytes);
     let facts_json = String::from_utf8(facts_bytes)
         .map_err(|error| format!("verified owner facts are not UTF-8: {error}"))?;
+    Ok((facts, facts_json, facts_sha256))
+}
+
+fn available_launch_owner_facts(
+    composition: &DaemonComposition,
+    request: &BlobProcessStreamOwnerFactsPullRequest,
+    scope: &CurrentWorkScopeSourceReceipt,
+    policy: &CurrentBlobPolicyResidency,
+    catalog: &CurrentModuleCatalogGeneration,
+    source_admission: Option<(&str, &str, &str, &str)>,
+) -> Result<BlobProcessStreamOwnerFactsPullResponse, String> {
+    let (_, facts_json, facts_sha256) =
+        verified_owner_facts(composition, request, scope, policy, catalog)?;
+    let facts: BlobProcessStreamVerifiedOwnerFacts = serde_json::from_str(&facts_json)
+        .map_err(|error| format!("verified owner facts did not round trip: {error}"))?;
+    let currentness_sha256 = facts.currentness_sha256.clone();
     let policy_ref = serde_json::from_str::<serde_json::Value>(&policy.policy_json)
         .ok()
         .and_then(|value| {
@@ -485,6 +500,119 @@ fn available_launch_owner_facts(
         .validate_for_request(request)
         .map_err(|error| format!("invalid available owner-facts response: {error}"))?;
     Ok(response)
+}
+
+fn store_open_source_admission(
+    composition: &DaemonComposition,
+    request: &BlobProcessStreamOwnerFactsPullRequest,
+) -> Result<(String, String, String, String), String> {
+    use eliot_store_api::blob_process_source_admission::{
+        BlobProcessSourceAdmission, BlobProcessSourceAdmissionIdentity,
+        BlobProcessSourceAdmissionPhase,
+    };
+    use eliot_process::stream_sink::ProcessStreamSinkOpenRequest;
+
+    let scope_ref = request.expected_work_scope_ref.as_deref()
+        .ok_or_else(|| "StoreOpen lacks its retained WorkScope selector".to_owned())?;
+    let pending_json = request.source_admission_json.as_deref()
+        .ok_or_else(|| "StoreOpen lacks its exact Pending admission".to_owned())?;
+    let pending_sha = request.source_admission_sha256.as_deref()
+        .ok_or_else(|| "StoreOpen lacks its Pending admission digest".to_owned())?;
+    let receipt_json = request.source_admission_write_receipt_json.as_deref()
+        .ok_or_else(|| "StoreOpen lacks its Pending WriteReceipt".to_owned())?;
+    let receipt_sha = request.source_admission_write_receipt_sha256.as_deref()
+        .ok_or_else(|| "StoreOpen lacks its Pending WriteReceipt digest".to_owned())?;
+    if sha256_hex(pending_json.as_bytes()) != pending_sha
+        || sha256_hex(receipt_json.as_bytes()) != receipt_sha
+    {
+        return Err("StoreOpen Pending proof digest mismatch".to_owned());
+    }
+    let pending: BlobProcessSourceAdmission = serde_json::from_str(pending_json)
+        .map_err(|error| format!("StoreOpen Pending admission is invalid: {error}"))?;
+    pending.validate().map_err(|error| format!("StoreOpen Pending admission failed validation: {error}"))?;
+    let identity = BlobProcessSourceAdmissionIdentity {
+        work_scope_ref: scope_ref.to_owned(),
+        session_id: pending.identity.session_id.clone(),
+        source_id: pending.identity.source_id.clone(),
+        process_binding_sha256: request.process_binding_sha256.clone(),
+    };
+    if pending.phase != BlobProcessSourceAdmissionPhase::Pending
+        || pending.owner_revision != 1
+        || pending.identity != identity
+        || pending.state_fence != request.state_fence
+        || pending.pending_operation_id != request.source_admission_operation_id.as_deref().unwrap_or_default()
+        || pending.process_binding_json != request.process_binding_json
+        || pending.open_request_json != request.open_request_json.as_deref().unwrap_or_default()
+    {
+        return Err("StoreOpen selectors differ from the exact Pending source admission".to_owned());
+    }
+    let open: ProcessStreamSinkOpenRequest = serde_json::from_str(&pending.open_request_json)
+        .map_err(|error| format!("StoreOpen Open request is invalid: {error}"))?;
+    open.validate().map_err(|error| format!("StoreOpen Open request failed validation: {error}"))?;
+    if sha256_hex(pending.process_binding_json.as_bytes()) != pending.process_binding_sha256
+        || sha256_hex(pending.open_request_json.as_bytes()) != pending.open_request_sha256
+        || open.binding().state_fence() != &request.state_fence
+        || open.session_id().as_str() != pending.identity.session_id
+        || open.source_id().as_str() != pending.identity.source_id
+    {
+        return Err("StoreOpen Pending source does not bind the exact Open request".to_owned());
+    }
+    let scope_readback = composition.current_testd_blob_work_scope_readback(&request.state_fence)?
+        .ok_or_else(|| "StoreOpen WorkScope owner is unavailable".to_owned())?;
+    if scope_readback.snapshot.binding.scope.scope_ref != scope_ref
+        || scope_readback.owner_revision != pending.work_scope_owner_revision
+        || scope_readback.value_digest != pending.work_scope_owner_digest
+    {
+        return Err("StoreOpen Pending source is stale against the current WorkScope".to_owned());
+    }
+    let current = composition.current_testd_blob_process_source_admission(
+        &identity, &request.state_fence,
+    )?.ok_or_else(|| "StoreOpen Pending source row is absent".to_owned())?;
+    current.validate_for(&identity, &request.state_fence)
+        .map_err(|error| format!("StoreOpen current source row is invalid: {error}"))?;
+    if current.admission != pending || current.value_digest != pending_sha || current.owner_revision != 1 {
+        return Err("StoreOpen Pending source row differs from its exact CAS".to_owned());
+    }
+    let receipt: eliot_store_api::WriteReceipt = serde_json::from_str(receipt_json)
+        .map_err(|error| format!("StoreOpen Pending WriteReceipt is invalid: {error}"))?;
+    receipt.validate().map_err(|error| format!("StoreOpen Pending WriteReceipt failed validation: {error}"))?;
+    let envelope = receipt.envelope.as_ref()
+        .ok_or_else(|| "StoreOpen Pending WriteReceipt has no canonical envelope".to_owned())?;
+    let original_identity: eliot_contracts::RequestIdentity = serde_json::from_str(
+        &pending.pending_request_identity_json,
+    ).map_err(|error| format!("Pending source RequestIdentity is invalid: {error}"))?;
+    let expected_authority: eliot_receipts::AuthorityBinding = serde_json::from_str(
+        &request.kernel_authority_binding_json,
+    ).map_err(|error| format!("StoreOpen authority binding is invalid: {error}"))?;
+    let expected_causal: eliot_receipts::CausalBinding = serde_json::from_str(
+        &request.kernel_causal_binding_json,
+    ).map_err(|error| format!("StoreOpen causal binding is invalid: {error}"))?;
+    let pending_sequence = envelope.core.causal.transaction_sequence.value();
+    let expected_sequence = pending_sequence.checked_add(1)
+        .ok_or_else(|| "StoreOpen causal sequence is exhausted".to_owned())?;
+    if receipt.status != eliot_store_api::WriteReceiptStatus::Committed
+        || receipt.operation_id.as_str() != pending.pending_operation_id
+        || envelope.core.operation.operation_id.as_str() != pending.pending_operation_id
+        || envelope.core.request != original_identity.request
+        || receipt.idempotency_key != original_identity.idempotency_key
+        || envelope.core.authority != expected_authority
+        || expected_causal.state_fence != request.state_fence
+        || expected_causal.transaction_sequence.value() != expected_sequence
+        || expected_causal.parent_receipt_id.as_ref() != Some(&envelope.identity.receipt_id)
+        || expected_causal.predecessor_receipt_ids != vec![envelope.identity.receipt_id.clone()]
+    {
+        return Err("StoreOpen owner context is not the exact successor of Pending".to_owned());
+    }
+    let readback_bytes = canonical_json_bytes(&current)
+        .map_err(|error| format!("StoreOpen named readback cannot be encoded: {error}"))?;
+    let readback_json = String::from_utf8(readback_bytes)
+        .map_err(|error| format!("StoreOpen named readback is not UTF-8: {error}"))?;
+    Ok((
+        readback_json.clone(),
+        sha256_hex(readback_json.as_bytes()),
+        receipt_json.to_owned(),
+        receipt_sha.to_owned(),
+    ))
 }
 
 fn source_readback_admission(
@@ -616,6 +744,545 @@ fn source_readback_admission(
     ))
 }
 
+async fn commit_source_admission_update(
+    composition: &DaemonComposition,
+    request: &BlobProcessStreamOwnerFactsPullRequest,
+    identity: &eliot_contracts::RequestIdentity,
+    operation_id: &str,
+    expected_revision: u64,
+    expected_digest: &str,
+    admission: &eliot_store_api::blob_process_source_admission::BlobProcessSourceAdmission,
+    scope: &eliot_governor::WorkScopeBindingSnapshot,
+) -> Result<eliot_store_api::WriteReceipt, String> {
+    use eliot_canonical::CanonicalWriteEnvelope;
+    use eliot_store_api::{
+        EffectClass, EventProjectionRelationIntents, ScopeId, SecurityContext,
+        TransitionClass, blob_process_source_admission_mutation,
+        generated_operation_manifests, operation_manifest_set_digest,
+        supported_admission_contract_set_digest,
+    };
+
+    let authority: eliot_receipts::AuthorityBinding = serde_json::from_str(
+        &request.kernel_authority_binding_json,
+    ).map_err(|error| format!("source-admission authority is invalid: {error}"))?;
+    let causal: eliot_receipts::CausalBinding = serde_json::from_str(
+        &request.kernel_causal_binding_json,
+    ).map_err(|error| format!("source-admission cause is invalid: {error}"))?;
+    let operation: eliot_receipts::OperationBinding = serde_json::from_str(
+        request.kernel_operation_binding_json.as_deref()
+            .ok_or_else(|| "source-admission operation binding is absent".to_owned())?,
+    ).map_err(|error| format!("source-admission operation binding is invalid: {error}"))?;
+    let operation_sha256 = request.kernel_operation_binding_sha256.as_deref()
+        .ok_or_else(|| "source-admission operation digest is absent".to_owned())?;
+    let operation_id = eliot_contracts::OperationId::new(operation_id.to_owned())
+        .map_err(|error| format!("source-admission operation ID is invalid: {error}"))?;
+    if identity.validate().is_err()
+        || identity.request.state_fence != request.state_fence
+        || identity.request.metadata.state_fence != request.state_fence
+        || authority.state_fence != request.state_fence
+        || authority.authority_epoch != request.state_fence.authority_epoch
+        || causal.state_fence != request.state_fence
+        || operation.operation_id != operation_id
+        || operation.request_id != identity.request.metadata.request_id
+        || operation.idempotency_key != identity.idempotency_key
+        || operation.operation_kind != eliot_blob_api::wire::BLOB_PROCESS_STREAM_WIRE_ID
+        || operation.effect != EffectClass::ReversibleMutation
+        || operation.state_fence != request.state_fence
+        || sha256_hex(request.kernel_operation_binding_json.as_deref().unwrap_or_default().as_bytes())
+            != operation_sha256
+        || identity.request.metadata.product_id.as_str() != request.product_id
+        || identity.request.metadata.source_id.as_str() != request.source_id
+        || identity.request.metadata.task_id.as_ref().map(ToString::to_string)
+            != request.task_id
+        || identity.request.metadata.session_id.as_ref().map(ToString::to_string)
+            != request.session_id
+        || identity.request.metadata.request_id.as_str() != operation.request_id.as_str()
+    {
+        return Err("source-admission identity, operation, authority, or cause does not match its retained PULL".to_owned());
+    }
+    let command = blob_process_source_admission_mutation(
+        admission,
+        expected_revision,
+        expected_digest,
+        &admission.admission_ref().map_err(|error| error.to_string())?,
+    ).map_err(|error| format!("source-admission mutation is invalid: {error}"))?;
+    let manifests = generated_operation_manifests()
+        .map_err(|error| format!("current operation catalogue is unavailable: {error}"))?;
+    let envelope = CanonicalWriteEnvelope {
+        operation_id,
+        request: identity.request.metadata.clone(),
+        idempotency_key: identity.idempotency_key.clone(),
+        scope_id: ScopeId::new(scope.binding.scope.scope_ref.as_str())
+            .map_err(|error| format!("WorkScope identity is invalid: {error}"))?,
+        task_id: identity.request.metadata.task_id.as_ref().map(ToString::to_string),
+        transition_class: TransitionClass::RecoverySchema,
+        requested_effect_ceiling: EffectClass::ReversibleMutation,
+        admission_contract_set_digest: supported_admission_contract_set_digest()
+            .map_err(|error| format!("admission contract set is unavailable: {error}"))?,
+        operation_manifest_digest: operation_manifest_set_digest(&manifests)
+            .map_err(|error| format!("operation manifest set is invalid: {error}"))?,
+        semantic_commands: vec![command],
+        event_projection_relation_intents: EventProjectionRelationIntents {
+            event_ids: Vec::new(),
+            projection_kinds: Vec::new(),
+            relation_kinds: Vec::new(),
+        },
+        security: SecurityContext {
+            authority_binding: Some(authority),
+            causal_binding: Some(causal),
+            ..SecurityContext::default()
+        },
+        required_proof_and_approval_refs: Vec::new(),
+        expected_revision_heads: Vec::new(),
+        expected_ordering_heads: Vec::new(),
+    };
+    let prepared = envelope.prepare()
+        .map_err(|error| format!("source-admission canonical preparation failed: {error}"))?;
+    if prepared.security.authority_binding.as_ref()
+            != Some(&serde_json::from_str::<eliot_receipts::AuthorityBinding>(
+                &request.kernel_authority_binding_json,
+            ).map_err(|error| format!("source-admission authority is invalid: {error}"))?)
+        || prepared.security.causal_binding.as_ref()
+            != Some(&serde_json::from_str::<eliot_receipts::CausalBinding>(
+                &request.kernel_causal_binding_json,
+            ).map_err(|error| format!("source-admission cause is invalid: {error}"))?)
+    {
+        return Err("canonical preparation changed the retained source authority or cause".to_owned());
+    }
+    composition.commit_blob_process_source_admission(
+        identity,
+        envelope,
+        &scope.binding,
+        &scope.source_admission.as_ref()
+            .ok_or_else(|| "current WorkScope has no admitted source closure".to_owned())?.sources,
+        &scope.source_admission.as_ref()
+            .ok_or_else(|| "current WorkScope has no admitted source privacy".to_owned())?.privacy,
+    ).await
+}
+
+async fn resolve_source_admission_update(
+    composition: &DaemonComposition,
+    request: &BlobProcessStreamOwnerFactsPullRequest,
+) -> Result<BlobProcessStreamOwnerFactsPullResponse, String> {
+    use eliot_blob_api::wire::{
+        BlobProcessStreamOwnerFactsPullPurpose, BlobProcessStreamOwnerFactsPullOutcome,
+    };
+    use eliot_store_api::blob_process_source_admission::{
+        BlobProcessSourceAdmission, BlobProcessSourceAdmissionIdentity,
+        BlobProcessSourceAdmissionPhase, BlobProcessSourceReadyCommitment,
+    };
+    use eliot_process::stream_sink::ProcessStreamSinkOpenRequest;
+
+    if !matches!(request.purpose,
+        BlobProcessStreamOwnerFactsPullPurpose::OpenAdmission
+            | BlobProcessStreamOwnerFactsPullPurpose::ReadyAttach)
+    {
+        return Err("source admission updater received an unrelated PULL purpose".to_owned());
+    }
+    if unix_ms() >= request.deadline_ms {
+        return Err("source admission update deadline elapsed".to_owned());
+    }
+    let expected_scope_ref = request.expected_work_scope_ref.as_deref()
+        .ok_or_else(|| "source admission PULL lacks its retained WorkScope selector".to_owned())?;
+    let catalog = read_current_module_catalog_generation(
+        composition,
+        &request.state_fence,
+        request.expected_module_id.as_deref(),
+        request.expected_generation_id.as_deref(),
+    )?;
+    let work_scope = composition.current_testd_blob_work_scope_readback(&request.state_fence)?
+        .ok_or_else(|| "current matched WorkScope readback is unavailable".to_owned())?;
+    let snapshot = &work_scope.snapshot;
+    if snapshot.binding.scope.scope_ref != expected_scope_ref {
+        return Err("source admission PULL selected another WorkScope".to_owned());
+    }
+    let scope = canonical_current_work_scope_source_receipt(snapshot)?;
+    if scope.work_scope_snapshot_sha256 != work_scope.value_digest {
+        return Err("current WorkScope digest differs from its owner readback".to_owned());
+    }
+    let source_owner = snapshot.source_admission.as_ref()
+        .ok_or_else(|| "current WorkScope lacks its admitted source closure".to_owned())?;
+    let policy = read_current_blob_policy_residency(
+        composition,
+        &request.state_fence,
+        expected_scope_ref,
+    )?;
+    let owner_identity_json = request.owner_update_identity_json.as_deref()
+        .ok_or_else(|| "source admission PULL lacks its exact owner RequestIdentity".to_owned())?;
+    let owner_identity_sha256 = request.owner_update_identity_sha256.as_deref()
+        .ok_or_else(|| "source admission PULL lacks its owner identity digest".to_owned())?;
+    let owner_identity: eliot_contracts::RequestIdentity = serde_json::from_str(owner_identity_json)
+        .map_err(|error| format!("owner RequestIdentity is invalid: {error}"))?;
+    let canonical_identity = canonical_json_bytes(&owner_identity)
+        .map_err(|error| format!("owner RequestIdentity cannot be canonicalized: {error}"))?;
+    if sha256_hex(owner_identity_json.as_bytes()) != owner_identity_sha256
+        || canonical_identity.as_slice() != owner_identity_json.as_bytes()
+    {
+        return Err("source admission RequestIdentity is not its exact canonical payload".to_owned());
+    }
+    let operation_id = match request.purpose {
+        BlobProcessStreamOwnerFactsPullPurpose::OpenAdmission => request.source_admission_operation_id.as_deref(),
+        BlobProcessStreamOwnerFactsPullPurpose::ReadyAttach => request.ready_operation_id.as_deref(),
+        _ => None,
+    }.ok_or_else(|| "source admission operation ID is absent".to_owned())?;
+    let process_binding: eliot_process::ProcessExecutionBinding = serde_json::from_str(
+        &request.process_binding_json,
+    ).map_err(|error| format!("retained process binding is invalid: {error}"))?;
+    let process_binding_bytes = canonical_json_bytes(&process_binding)
+        .map_err(|error| format!("process binding cannot be encoded: {error}"))?;
+    if sha256_hex(&process_binding_bytes) != request.process_binding_sha256
+        || String::from_utf8(process_binding_bytes).ok().as_deref()
+            != Some(request.process_binding_json.as_str())
+        || owner_identity.request.state_fence != request.state_fence
+        || owner_identity.request.metadata.state_fence != request.state_fence
+        || owner_identity.request.metadata.product_id.as_str() != request.product_id
+        || owner_identity.request.metadata.source_id.as_str() != request.source_id
+        || owner_identity.request.metadata.task_id.as_ref().map(ToString::to_string)
+            != request.task_id
+        || owner_identity.request.metadata.session_id.as_ref().map(ToString::to_string)
+            != request.session_id
+        || owner_identity.deadline_unix_ms != request.deadline_ms
+        || request.outer_request_sha256 != sha256_hex(owner_identity_json.as_bytes())
+    {
+        return Err("source admission owner identity differs from its exact Kernel PULL".to_owned());
+    }
+    let admission_identity = match request.purpose {
+        BlobProcessStreamOwnerFactsPullPurpose::OpenAdmission => {
+            let open_json = request.open_request_json.as_deref()
+                .ok_or_else(|| "OpenAdmission PULL lacks its exact Open request".to_owned())?;
+            let open_sha256 = request.open_request_sha256.as_deref()
+                .ok_or_else(|| "OpenAdmission PULL lacks its Open request digest".to_owned())?;
+            if sha256_hex(open_json.as_bytes()) != open_sha256 {
+                return Err("Open request digest differs from its exact bytes".to_owned());
+            }
+            let open: ProcessStreamSinkOpenRequest = serde_json::from_str(open_json)
+                .map_err(|error| format!("Open request is invalid: {error}"))?;
+            open.validate().map_err(|error| format!("Open request failed validation: {error}"))?;
+            let open_binding = canonical_json_bytes(open.binding())
+                .map_err(|error| format!("Open process binding cannot be encoded: {error}"))?;
+            if String::from_utf8(open_binding.clone()).ok().as_deref()
+                    != Some(request.process_binding_json.as_str())
+                || sha256_hex(&open_binding) != request.process_binding_sha256
+                || open.binding().state_fence() != &request.state_fence
+                || open.session_id().as_str() != request.session_id.as_deref().unwrap_or_default()
+            {
+                return Err("Open request differs from the exact admitted process binding".to_owned());
+            }
+            BlobProcessSourceAdmissionIdentity {
+                work_scope_ref: expected_scope_ref.to_owned(),
+                session_id: open.session_id().as_str().to_owned(),
+                source_id: open.source_id().as_str().to_owned(),
+                process_binding_sha256: request.process_binding_sha256.clone(),
+            }
+        }
+        BlobProcessStreamOwnerFactsPullPurpose::ReadyAttach => {
+            let pending_json = request.source_admission_json.as_deref()
+                .ok_or_else(|| "ReadyAttach PULL lacks its exact Pending admission".to_owned())?;
+            let pending_sha256 = request.source_admission_sha256.as_deref()
+                .ok_or_else(|| "ReadyAttach PULL lacks its Pending admission digest".to_owned())?;
+            if sha256_hex(pending_json.as_bytes()) != pending_sha256 {
+                return Err("Pending admission digest differs from its exact bytes".to_owned());
+            }
+            let pending: BlobProcessSourceAdmission = serde_json::from_str(pending_json)
+                .map_err(|error| format!("Pending admission is invalid: {error}"))?;
+            pending.validate().map_err(|error| format!("Pending admission failed validation: {error}"))?;
+            if pending.phase != BlobProcessSourceAdmissionPhase::Pending
+                || pending.owner_revision != 1
+                || pending.identity.work_scope_ref != expected_scope_ref
+                || pending.identity.process_binding_sha256 != request.process_binding_sha256
+                || pending.state_fence != request.state_fence
+                || Some(pending.pending_operation_id.as_str()) != request.source_admission_operation_id.as_deref()
+                || pending.work_scope_owner_revision != work_scope.owner_revision
+                || pending.work_scope_owner_digest != work_scope.value_digest
+                || pending.open_request_json.is_empty()
+            {
+                return Err("ReadyAttach Pending admission differs from the fresh source owner".to_owned());
+            }
+            let current = composition.current_testd_blob_process_source_admission(
+                &pending.identity,
+                &request.state_fence,
+            )?.ok_or_else(|| "fresh Pending process-source owner row is absent".to_owned())?;
+            current.validate_for(&pending.identity, &request.state_fence)
+                .map_err(|error| format!("fresh Pending source row is invalid: {error}"))?;
+            if current.admission != pending {
+                return Err("fresh Pending row differs from the exact ReadyAttach predecessor".to_owned());
+            }
+            let pending_receipt_json = request.source_admission_write_receipt_json.as_deref()
+                .ok_or_else(|| "ReadyAttach PULL lacks the Pending WriteReceipt".to_owned())?;
+            let pending_receipt_sha = request.source_admission_write_receipt_sha256.as_deref()
+                .ok_or_else(|| "ReadyAttach PULL lacks the Pending WriteReceipt digest".to_owned())?;
+            if sha256_hex(pending_receipt_json.as_bytes()) != pending_receipt_sha {
+                return Err("Pending WriteReceipt digest differs from its exact bytes".to_owned());
+            }
+            let pending_receipt: eliot_store_api::WriteReceipt = serde_json::from_str(pending_receipt_json)
+                .map_err(|error| format!("Pending WriteReceipt is invalid: {error}"))?;
+            pending_receipt.validate().map_err(|error| format!("Pending WriteReceipt failed validation: {error}"))?;
+            let pending_envelope = pending_receipt.envelope.as_ref()
+                .ok_or_else(|| "Pending WriteReceipt lacks its canonical envelope".to_owned())?;
+            let pending_identity: eliot_contracts::RequestIdentity = serde_json::from_str(
+                &pending.pending_request_identity_json,
+            ).map_err(|error| format!("Pending RequestIdentity is invalid: {error}"))?;
+            let expected_authority: eliot_receipts::AuthorityBinding = serde_json::from_str(
+                &request.kernel_authority_binding_json,
+            ).map_err(|error| format!("Ready authority binding is invalid: {error}"))?;
+            let expected_causal: eliot_receipts::CausalBinding = serde_json::from_str(
+                &request.kernel_causal_binding_json,
+            ).map_err(|error| format!("Ready causal binding is invalid: {error}"))?;
+            let pending_receipt_id = &pending_envelope.identity.receipt_id;
+            let expected_sequence = pending_envelope.core.causal.transaction_sequence.value()
+                .checked_add(1).ok_or_else(|| "Pending transaction sequence exhausted".to_owned())?;
+            if pending_receipt.status != eliot_store_api::WriteReceiptStatus::Committed
+                || pending_receipt.operation_id.as_str() != pending.pending_operation_id
+                || pending_envelope.core.operation.operation_id.as_str() != pending.pending_operation_id
+                || pending_envelope.core.operation.state_fence != request.state_fence
+                || pending_envelope.core.request != pending_identity.request
+                || pending_receipt.idempotency_key != pending_identity.idempotency_key
+                || pending_envelope.core.authority != expected_authority
+                || expected_causal.state_fence != request.state_fence
+                || expected_causal.transaction_sequence.value() != expected_sequence
+                || expected_causal.parent_receipt_id.as_ref() != Some(pending_receipt_id)
+                || expected_causal.predecessor_receipt_ids != vec![pending_receipt_id.clone()]
+            {
+                return Err("ReadyAttach is not chained to the exact Pending WriteReceipt".to_owned());
+            }
+            pending.identity
+        }
+        _ => unreachable!("purpose was checked above"),
+    };
+    if admission_identity.process_binding_sha256 != request.process_binding_sha256
+        || admission_identity.work_scope_ref != expected_scope_ref
+    {
+        return Err("source admission identity differs from the request process or scope".to_owned());
+    }
+    let existing = composition.current_testd_blob_process_source_admission(
+        &admission_identity,
+        &request.state_fence,
+    )?;
+    let (expected_revision, expected_digest, admission) = match request.purpose {
+        BlobProcessStreamOwnerFactsPullPurpose::OpenAdmission => {
+            let (_, facts_json, facts_sha256) = verified_owner_facts(
+                composition, request, &scope, &policy, &catalog,
+            )?;
+            let open_json = request.open_request_json.as_deref().unwrap_or_default();
+            let admission = BlobProcessSourceAdmission {
+                schema: eliot_store_api::blob_process_source_admission::BLOB_PROCESS_SOURCE_ADMISSION_SCHEMA.to_owned(),
+                phase: BlobProcessSourceAdmissionPhase::Pending,
+                owner_revision: 1,
+                state_fence: request.state_fence.clone(),
+                identity: admission_identity.clone(),
+                pending_operation_id: operation_id.to_owned(),
+                pending_request_identity_json: owner_identity_json.to_owned(),
+                pending_request_identity_sha256: owner_identity_sha256.to_owned(),
+                process_binding_json: request.process_binding_json.clone(),
+                process_binding_sha256: request.process_binding_sha256.clone(),
+                open_request_json: open_json.to_owned(),
+                open_request_sha256: request.open_request_sha256.clone().unwrap_or_default(),
+                work_scope_owner_revision: work_scope.owner_revision,
+                work_scope_owner_digest: work_scope.value_digest.clone(),
+                owner_facts_json: facts_json,
+                owner_facts_sha256: facts_sha256,
+                ready: None,
+            };
+            admission.validate().map_err(|error| format!("new Pending admission is invalid: {error}"))?;
+            (0, "absent".to_owned(), admission)
+        }
+        BlobProcessStreamOwnerFactsPullPurpose::ReadyAttach => {
+            let pending_json = request.source_admission_json.as_deref().unwrap_or_default();
+            let pending_sha = request.source_admission_sha256.as_deref().unwrap_or_default();
+            let pending: BlobProcessSourceAdmission = serde_json::from_str(pending_json)
+                .map_err(|error| format!("Pending admission is invalid: {error}"))?;
+            let current = existing.as_ref().ok_or_else(|| "Pending source admission row is absent".to_owned())?;
+            current.validate_for(&admission_identity, &request.state_fence)
+                .map_err(|error| format!("Pending source admission readback is invalid: {error}"))?;
+            let retrying_ready = current.admission.phase == BlobProcessSourceAdmissionPhase::Ready
+                && current.owner_revision == 2
+                && current.admission.ready.as_ref().is_some_and(|ready| {
+                    Some(ready.ready_operation_id.as_str()) == request.ready_operation_id.as_deref()
+                        && ready.ready_request_identity_json == owner_identity_json
+                        && ready.pending_admission_json == pending_json
+                        && ready.pending_admission_sha256 == pending_sha
+                        && Some(ready.blob_ready_receipt_json.as_str()) == request.blob_ready_receipt_json.as_deref()
+                        && Some(ready.blob_ready_receipt_sha256.as_str()) == request.blob_ready_receipt_sha256.as_deref()
+                        && Some(ready.whole_source_sha256.as_str()) == request.whole_source_sha256.as_deref()
+                        && Some(ready.whole_source_byte_length) == request.whole_source_byte_length
+                });
+            let exact_pending = current.admission == pending
+                && current.value_digest == pending_sha
+                && current.owner_revision == 1;
+            if (!exact_pending && !retrying_ready)
+                || pending.phase != BlobProcessSourceAdmissionPhase::Pending
+            {
+                return Err("ReadyAttach CAS predecessor differs from fresh Pending source read".to_owned());
+            }
+            let receipt_json = request.blob_ready_receipt_json.as_deref()
+                .ok_or_else(|| "ReadyAttach lacks the owner-issued BlobReadyReceipt".to_owned())?;
+            let receipt_sha = request.blob_ready_receipt_sha256.as_deref()
+                .ok_or_else(|| "ReadyAttach lacks the BlobReadyReceipt digest".to_owned())?;
+            if sha256_hex(receipt_json.as_bytes()) != receipt_sha {
+                return Err("BlobReadyReceipt digest differs from its exact bytes".to_owned());
+            }
+            let ready_receipt: serde_json::Value = serde_json::from_str(receipt_json)
+                .map_err(|error| format!("BlobReadyReceipt JSON is invalid: {error}"))?;
+            let receipt_id = ready_receipt.pointer("/receipt/identity/receipt_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "BlobReadyReceipt omitted its receipt identity".to_owned())?;
+            let locator_hash = ready_receipt.pointer("/locator/hash")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "BlobReadyReceipt omitted its immutable locator hash".to_owned())?;
+            let whole_sha = request.whole_source_sha256.as_deref()
+                .ok_or_else(|| "ReadyAttach lacks whole-source digest".to_owned())?;
+            let whole_length = request.whole_source_byte_length
+                .ok_or_else(|| "ReadyAttach lacks whole-source length".to_owned())?;
+            let open: ProcessStreamSinkOpenRequest = serde_json::from_str(&pending.open_request_json)
+                .map_err(|error| format!("Pending Open request is invalid: {error}"))?;
+            open.validate().map_err(|error| format!("Pending Open request failed validation: {error}"))?;
+            if ready_receipt.get("plaintext_sha256").and_then(serde_json::Value::as_str)
+                    != Some(whole_sha)
+                || ready_receipt.get("plaintext_length").and_then(serde_json::Value::as_u64)
+                    != Some(whole_length)
+                || locator_hash.is_empty()
+                || open.binding().state_fence() != &request.state_fence
+                || open.session_id().as_str() != pending.identity.session_id.as_str()
+                || open.source_id().as_str() != pending.identity.source_id.as_str()
+            {
+                return Err("BlobReadyReceipt differs from its whole-source commitment".to_owned());
+            }
+            let ready_identity_sha = owner_identity_sha256.to_owned();
+            let ready_op = request.ready_operation_id.as_deref()
+                .ok_or_else(|| "ReadyAttach lacks its Ready operation ID".to_owned())?;
+            let ready = BlobProcessSourceReadyCommitment {
+                ready_operation_id: ready_op.to_owned(),
+                ready_request_identity_json: owner_identity_json.to_owned(),
+                ready_request_identity_sha256: ready_identity_sha,
+                pending_admission_json: pending_json.to_owned(),
+                pending_admission_sha256: pending_sha.to_owned(),
+                whole_source_sha256: whole_sha.to_owned(),
+                whole_source_byte_length: whole_length,
+                blob_ready_receipt_json: receipt_json.to_owned(),
+                blob_ready_receipt_sha256: receipt_sha.to_owned(),
+            };
+            let admission = BlobProcessSourceAdmission {
+                schema: pending.schema.clone(),
+                phase: BlobProcessSourceAdmissionPhase::Ready,
+                owner_revision: 2,
+                state_fence: pending.state_fence.clone(),
+                identity: pending.identity.clone(),
+                pending_operation_id: pending.pending_operation_id.clone(),
+                pending_request_identity_json: pending.pending_request_identity_json.clone(),
+                pending_request_identity_sha256: pending.pending_request_identity_sha256.clone(),
+                process_binding_json: pending.process_binding_json.clone(),
+                process_binding_sha256: pending.process_binding_sha256.clone(),
+                open_request_json: pending.open_request_json.clone(),
+                open_request_sha256: pending.open_request_sha256.clone(),
+                work_scope_owner_revision: pending.work_scope_owner_revision,
+                work_scope_owner_digest: pending.work_scope_owner_digest.clone(),
+                owner_facts_json: pending.owner_facts_json.clone(),
+                owner_facts_sha256: pending.owner_facts_sha256.clone(),
+                ready: Some(ready),
+            };
+            admission.validate().map_err(|error| format!("new Ready admission is invalid: {error}"))?;
+            (1, pending_sha.to_owned(), admission)
+        }
+        _ => unreachable!("purpose was checked above"),
+    };
+    if let Some(current) = existing.as_ref() {
+        current.validate_for(&admission_identity, &request.state_fence)
+            .map_err(|error| format!("existing source admission is invalid: {error}"))?;
+        let exact_owner_update = match request.purpose {
+            BlobProcessStreamOwnerFactsPullPurpose::OpenAdmission =>
+                current.owner_revision == admission.owner_revision && current.admission == admission,
+            BlobProcessStreamOwnerFactsPullPurpose::ReadyAttach => {
+                let predecessor: BlobProcessSourceAdmission = serde_json::from_str(
+                    request.source_admission_json.as_deref().unwrap_or_default(),
+                ).map_err(|error| format!("Pending admission is invalid: {error}"))?;
+                (current.owner_revision == predecessor.owner_revision && current.admission == predecessor)
+                    || (current.owner_revision == admission.owner_revision && current.admission == admission)
+            }
+            _ => false,
+        };
+        if !exact_owner_update {
+            return Err("existing source row differs from this exact idempotent owner update".to_owned());
+        }
+    }
+    let operation_identity: eliot_contracts::RequestIdentity = serde_json::from_str(owner_identity_json)
+        .map_err(|error| format!("source admission RequestIdentity is invalid: {error}"))?;
+    let write_receipt = commit_source_admission_update(
+        composition,
+        request,
+        &operation_identity,
+        operation_id,
+        expected_revision,
+        &expected_digest,
+        &admission,
+        snapshot,
+    ).await?;
+    validate_source_admission_write_receipt(request, &write_receipt, &operation_identity, operation_id)?;
+    let readback = composition.current_testd_blob_process_source_admission(
+        &admission_identity,
+        &request.state_fence,
+    )?.ok_or_else(|| "committed process-source row is absent from fresh named readback".to_owned())?;
+    readback.validate_for(&admission_identity, &request.state_fence)
+        .map_err(|error| format!("committed source readback is invalid: {error}"))?;
+    if readback.admission != admission
+        || readback.owner_revision != admission.owner_revision
+        || readback.state_fence != request.state_fence
+    {
+        return Err("fresh source readback does not equal the committed Pending/Ready update".to_owned());
+    }
+    let readback_bytes = canonical_json_bytes(&readback)
+        .map_err(|error| format!("source admission readback cannot be encoded: {error}"))?;
+    let readback_json = String::from_utf8(readback_bytes)
+        .map_err(|error| format!("source admission readback is not UTF-8: {error}"))?;
+    let write_receipt_bytes = canonical_json_bytes(&write_receipt)
+        .map_err(|error| format!("source admission WriteReceipt cannot be encoded: {error}"))?;
+    let write_receipt_json = String::from_utf8(write_receipt_bytes)
+        .map_err(|error| format!("source admission WriteReceipt is not UTF-8: {error}"))?;
+    let write_receipt_sha256 = sha256_hex(write_receipt_json.as_bytes());
+    available_launch_owner_facts(
+        composition,
+        request,
+        &scope,
+        &policy,
+        &catalog,
+        Some((
+            &readback_json,
+            &sha256_hex(readback_json.as_bytes()),
+            &write_receipt_json,
+            &write_receipt_sha256,
+        )),
+    )
+}
+
+fn validate_source_admission_write_receipt(
+    request: &BlobProcessStreamOwnerFactsPullRequest,
+    receipt: &eliot_store_api::WriteReceipt,
+    identity: &eliot_contracts::RequestIdentity,
+    operation_id: &str,
+) -> Result<(), String> {
+    let envelope = receipt.envelope.as_ref()
+        .ok_or_else(|| "source admission WriteReceipt has no canonical envelope".to_owned())?;
+    let authority: eliot_receipts::AuthorityBinding = serde_json::from_str(
+        &request.kernel_authority_binding_json,
+    ).map_err(|error| format!("source admission authority is invalid: {error}"))?;
+    let causal: eliot_receipts::CausalBinding = serde_json::from_str(
+        &request.kernel_causal_binding_json,
+    ).map_err(|error| format!("source admission cause is invalid: {error}"))?;
+    receipt.validate().map_err(|error| format!("source admission WriteReceipt failed validation: {error}"))?;
+    if receipt.status != eliot_store_api::WriteReceiptStatus::Committed
+        || receipt.operation_id.as_str() != operation_id
+        || receipt.idempotency_key != identity.idempotency_key
+        || envelope.core.request != identity.request
+        || envelope.core.operation.operation_id.as_str() != operation_id
+        || envelope.core.operation.idempotency_key != identity.idempotency_key
+        || envelope.core.operation.state_fence != request.state_fence
+        || envelope.core.authority != authority
+        || envelope.core.causal != causal
+    {
+        return Err("source admission WriteReceipt differs from exact PULL identity, authority, or cause".to_owned());
+    }
+    Ok(())
+}
+
 /// Produces a closed owner answer for one Kernel-retained pull.
 ///
 /// Launch grants resolve the current named WorkScope, module generation, and
@@ -635,6 +1302,19 @@ pub async fn resolve_blob_owner_facts(
             request,
             BlobProcessStreamOwnerFactsUnavailableReason::DeadlineElapsed,
         );
+    }
+    if matches!(
+        request.purpose,
+        BlobProcessStreamOwnerFactsPullPurpose::OpenAdmission
+            | BlobProcessStreamOwnerFactsPullPurpose::ReadyAttach
+    ) {
+        return match resolve_source_admission_update(composition, request).await {
+            Ok(response) => Ok(response),
+            Err(_) => unavailable_blob_owner_facts(
+                request,
+                BlobProcessStreamOwnerFactsUnavailableReason::SourceReceiptUnavailable,
+            ),
+        };
     }
     if request.purpose == BlobProcessStreamOwnerFactsPullPurpose::SourceReadback {
         let Some(expected_scope_ref) = request.expected_work_scope_ref.as_deref() else {
@@ -706,6 +1386,73 @@ pub async fn resolve_blob_owner_facts(
                 &ready_receipt_json,
                 &ready_receipt_sha256,
             )),
+        );
+    }
+    if request.purpose == BlobProcessStreamOwnerFactsPullPurpose::StoreOpen {
+        let Some(expected_scope_ref) = request.expected_work_scope_ref.as_deref() else {
+            return unavailable_blob_owner_facts(
+                request,
+                BlobProcessStreamOwnerFactsUnavailableReason::ScopeGuardUnavailable,
+            );
+        };
+        let catalog = match read_current_module_catalog_generation(
+            composition,
+            &request.state_fence,
+            request.expected_module_id.as_deref(),
+            request.expected_generation_id.as_deref(),
+        ) {
+            Ok(value) => value,
+            Err(_) => return unavailable_blob_owner_facts(
+                request,
+                BlobProcessStreamOwnerFactsUnavailableReason::StaleBinding,
+            ),
+        };
+        let readback = match composition.current_testd_blob_work_scope_readback(&request.state_fence) {
+            Ok(Some(value)) => value,
+            _ => return unavailable_blob_owner_facts(
+                request,
+                BlobProcessStreamOwnerFactsUnavailableReason::ScopeGuardUnavailable,
+            ),
+        };
+        if readback.snapshot.binding.scope.scope_ref != expected_scope_ref {
+            return unavailable_blob_owner_facts(
+                request,
+                BlobProcessStreamOwnerFactsUnavailableReason::StaleBinding,
+            );
+        }
+        let scope = match canonical_current_work_scope_source_receipt(&readback.snapshot) {
+            Ok(value) if value.work_scope_snapshot_sha256 == readback.value_digest => value,
+            _ => return unavailable_blob_owner_facts(
+                request,
+                BlobProcessStreamOwnerFactsUnavailableReason::StaleBinding,
+            ),
+        };
+        let policy = match read_current_blob_policy_residency(
+            composition,
+            &request.state_fence,
+            expected_scope_ref,
+        ) {
+            Ok(value) => value,
+            Err(_) => return unavailable_blob_owner_facts(
+                request,
+                BlobProcessStreamOwnerFactsUnavailableReason::PolicyUnavailable,
+            ),
+        };
+        let (readback_json, readback_sha, receipt_json, receipt_sha) =
+            match store_open_source_admission(composition, request) {
+                Ok(value) => value,
+                Err(_) => return unavailable_blob_owner_facts(
+                    request,
+                    BlobProcessStreamOwnerFactsUnavailableReason::SourceReceiptUnavailable,
+                ),
+            };
+        return available_launch_owner_facts(
+            composition,
+            request,
+            &scope,
+            &policy,
+            &catalog,
+            Some((&readback_json, &readback_sha, &receipt_json, &receipt_sha)),
         );
     }
     if request.purpose != BlobProcessStreamOwnerFactsPullPurpose::LaunchGrant {
