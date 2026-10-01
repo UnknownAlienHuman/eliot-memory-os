@@ -957,12 +957,15 @@ fn surface_expired_wake_demands(
 /// effect runs — so a failed admission refuses the console query instead of
 /// answering from a generation that refused the trigger.
 ///
-/// Cancel/queue handling mirrors `HostIdleDrainSupervisor::note_observable_use`
+/// Cancel/queue/Err handling mirrors `HostIdleDrainSupervisor::note_observable_use`
 /// for the arms a console loop can meet. This loop owns no census and runs no
 /// readiness tick, so there is nothing to invalidate and no tick resume: a
 /// cancelled drain attempts the same trigger-driven resume with its own fresh
-/// probe, and a post-commit trigger is verified against the durable handoff
-/// instead of reporting a queued generation nothing can fire.
+/// probe — including on the Err arm, where a refused trigger still retries the
+/// resume before the typed refusal reaches the caller — and a post-commit
+/// trigger is verified against the durable handoff instead of reporting a
+/// queued generation nothing can fire. A failed resume re-arms on the next
+/// console trigger, never busy-loops.
 ///
 /// The evidence is a process-unique serving correlation (`console-status` or
 /// `console-stop` plus the serving sequence). The console wire carries no
@@ -1022,7 +1025,51 @@ fn admit_console_trigger(
                 Err(error) => Err(error),
             }
         }
-        outcome => outcome,
+        Ok(DrainWakeOutcome::ReplayAlreadyConsumed) => {
+            // Mirrors `HostIdleDrainSupervisor::note_observable_use`: a
+            // delayed duplicate is neither new work nor a cancellation of
+            // the current attempt, so it is a true no-op — no resume
+            // attempt, and this loop owns no timing to touch.
+            let _ = writeln!(
+                io::stderr().lock(),
+                "eliot-host: console use repeated a trigger the current drain attempt already consumed; it did not cancel the attempt"
+            );
+            Ok(DrainWakeOutcome::ReplayAlreadyConsumed)
+        }
+        Ok(DrainWakeOutcome::Proceed) => Ok(DrainWakeOutcome::Proceed),
+        Err(error) => {
+            // Mirrors the supervisor Err arm (audit 5906086103 D1): a fresh
+            // trigger the current generation could not admit is still demand,
+            // so retry the trigger-driven resume before reporting — a failed
+            // probe must not strand the generation. This loop runs no
+            // readiness tick, so this attempt and the next console trigger
+            // are the only retries: a failed resume re-arms on the next
+            // trigger, never busy-loops. The admission failure itself still
+            // reaches the caller as the typed refusal.
+            match host.resume_cancelled_drain_on_observable_use() {
+                Ok(true) => {
+                    let _ = writeln!(
+                        io::stderr().lock(),
+                        "eliot-host: console use was not admitted, but the trigger returned the same activation generation to ACTIVE after readiness revalidation"
+                    );
+                    Err(error)
+                }
+                Ok(false) => {
+                    let _ = writeln!(
+                        io::stderr().lock(),
+                        "eliot-host: console use was not admitted by the current activation generation: {error}"
+                    );
+                    Err(error)
+                }
+                Err(resume_error) => {
+                    let _ = writeln!(
+                        io::stderr().lock(),
+                        "eliot-host: console use was not admitted by the current activation generation: {error}; cancelled-drain resume also failed: {resume_error}"
+                    );
+                    Err(error)
+                }
+            }
+        }
     }
 }
 
