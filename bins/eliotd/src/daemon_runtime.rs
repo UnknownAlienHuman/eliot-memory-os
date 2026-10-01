@@ -4913,26 +4913,27 @@ enum ObservePollOutcome {
     ReconciliationRequired,
 }
 
-/// Completion of one in-flight observe step. Claim, serve, and defer share
-/// one flight branch so health and shutdown stay pollable while the step is
-/// outstanding; the step handles at most one pair per tick.
+/// Completion of one in-flight observe step. Claim, route, and capture/defer
+/// share one flight branch so health and shutdown stay pollable while the step
+/// is outstanding; the step handles at most one pair per tick.
 enum ObserveCompletion {
     Settled(Result<ObserveStep, String>),
 }
 
-/// What one settled observe step produced: its poll outcome plus the exact
-/// owner identity the serve named, so the loop's own record distinguishes
-/// which admission is still missing without reading payload bytes.
+/// What one settled observe step produced: its poll outcome plus either the
+/// connected owner or exact residual owner, without reading payload bytes.
 struct ObserveStep {
     /// The poll outcome the loop acts on.
     outcome: ObservePollOutcome,
     /// Served suboperation discriminator (`None` on an empty claim).
     suboperation: Option<&'static str>,
-    /// Missing owner admission the serve named (`None` on an empty claim).
+    /// Connected handler capability (`None` when the route is deferred).
     owner_capability: Option<&'static str>,
-    /// Residual program that owns the missing semantics (`None` on an empty claim).
+    /// Connected production owner (`None` when the route is deferred).
+    owner: Option<&'static str>,
+    /// Residual program that owns deferred semantics.
     residual_owner: Option<&'static str>,
-    /// Exact condition that resumes the deferred pair (`None` on an empty claim).
+    /// Exact condition for a deferred pair or retained staged receipt.
     resume: Option<&'static str>,
     /// Exact claim and prepared capture retained across staged receipt polling.
     pending: Option<PendingObserveCapture>,
@@ -4949,9 +4950,12 @@ struct PendingObserveCapture {
     terminal_body: Option<HostRequestResultBody>,
     suboperation: &'static str,
     owner_capability: &'static str,
-    residual_owner: &'static str,
+    owner: &'static str,
     resume: &'static str,
 }
+
+const OBSERVE_CAPTURE_RECEIPT_RESUME: &str =
+    "poll this retained staged capture for its exact committed receipt; do not replay the original submission";
 
 enum PreparedObserveCapture {
     Terminal(HostRequestResultBody),
@@ -5048,7 +5052,8 @@ fn pending_observe_step(
         outcome,
         suboperation: Some(pending.suboperation),
         owner_capability: Some(pending.owner_capability),
-        residual_owner: Some(pending.residual_owner),
+        owner: Some(pending.owner),
+        residual_owner: None,
         resume: Some(pending.resume),
         pending: Some(pending),
     }
@@ -5062,7 +5067,8 @@ fn settled_staged_observe_step(
         outcome,
         suboperation: Some(pending.suboperation),
         owner_capability: Some(pending.owner_capability),
-        residual_owner: Some(pending.residual_owner),
+        owner: Some(pending.owner),
+        residual_owner: None,
         resume: None,
         pending: None,
     }
@@ -5094,6 +5100,7 @@ fn settle_observe_completion(
                 outcome = observe_outcome_name(&step.outcome),
                 suboperation = step.suboperation.unwrap_or("none"),
                 owner_capability = step.owner_capability.unwrap_or("none"),
+                owner = step.owner.unwrap_or("none"),
                 residual_owner = step.residual_owner.unwrap_or("none"),
                 resume = step.resume.unwrap_or("none"),
             );
@@ -5132,8 +5139,8 @@ async fn run_observe_poll(
     kernel: &DaemonKernelClient,
     composition: &SharedComposition,
 ) -> Result<ObserveStep, String> {
-    // #740: receipt span over the claim/serve/defer poll step. Pair
-    // presence and defer outcome are named; payload bytes never are.
+    // #740: receipt span over the claim/route/capture-or-defer poll step.
+    // Owner route and outcome are named; payload bytes never are.
     let _span = tracing::info_span!("eliotd.observe_poll").entered();
     let pair = kernel
         .claim_observe_pair_async()
@@ -5144,6 +5151,7 @@ async fn run_observe_poll(
             outcome: ObservePollOutcome::IdleBackoff,
             suboperation: None,
             owner_capability: None,
+            owner: None,
             residual_owner: None,
             resume: None,
             pending: None,
@@ -5154,105 +5162,123 @@ async fn run_observe_poll(
     let attempt = &claimed.attempt;
     let operation_id = host_request_operation_id(envelope);
     let request_digest = envelope.envelope_sha256.clone();
-    let deferral = serve_admitted_observe(envelope, tool, attempt)
+    let route = serve_admitted_observe(envelope, tool, attempt)
         .map_err(|error| format!("daemon observe serve: {error}"))?;
-    let step = |outcome: ObservePollOutcome| ObserveStep {
+    let (suboperation, owner_capability, owner, resume) = match route {
+        eliotd::ObserveOwnerRoute::ObservationCapture {
+            owner_capability,
+            owner,
+        } => (
+            eliotd::ObserveSuboperation::Observation.as_str(),
+            owner_capability,
+            Some(owner),
+            None,
+        ),
+        eliotd::ObserveOwnerRoute::Deferred(deferral) => {
+            let outcome = match kernel
+                .defer_observe_claim_async(&operation_id, &request_digest, attempt)
+                .await
+                .map_err(|error| format!("Kernel Observe defer reconciliation: {error}"))?
+            {
+                ObserveDeferOutcome::ReconciliationRequired => {
+                    ObservePollOutcome::ReconciliationRequired
+                }
+            };
+            return Ok(ObserveStep {
+                outcome,
+                suboperation: Some(deferral.suboperation.as_str()),
+                owner_capability: Some(deferral.owner_capability),
+                owner: None,
+                residual_owner: Some(deferral.residual_owner),
+                resume: Some(deferral.resume),
+                pending: None,
+            });
+        }
+    };
+    let step = |outcome: ObservePollOutcome, resume| ObserveStep {
         outcome,
-        suboperation: Some(deferral.suboperation.as_str()),
-        owner_capability: Some(deferral.owner_capability),
-        residual_owner: Some(deferral.residual_owner),
-        resume: (outcome != ObservePollOutcome::ReconciliationRequired).then_some(deferral.resume),
+        suboperation: Some(suboperation),
+        owner_capability: Some(owner_capability),
+        owner,
+        residual_owner: None,
+        resume,
         pending: None,
     };
-    if deferral.suboperation == eliotd::governor_observe_serve::ObserveSuboperation::Observation {
-        let prepared_capture = match prepare_observation_capture(kernel, composition, &claimed)
-            .await
-        {
-            Ok(prepared_capture) => prepared_capture,
-            Err(error) => {
-                kernel
-                    .defer_observe_claim_async(&operation_id, &request_digest, attempt)
-                    .await
-                    .map_err(|defer_error| {
-                        format!(
-                            "Observe capture failed after pair publication ({error}); exact-attempt reconciliation handoff failed: {defer_error}"
-                        )
-                    })?;
-                return Ok(step(ObservePollOutcome::ReconciliationRequired));
-            }
-        };
-        let body = match prepared_capture {
-            PreparedObserveCapture::Terminal(body) => body,
-            PreparedObserveCapture::Staged { body, prepared } => {
-                let staged_submission: eliot_store_api::WriteSubmission =
-                    serde_json::from_value(body.response.get("submission").cloned().ok_or_else(
-                        || "staged Observe response omits its submission".to_owned(),
-                    )?)
-                    .map_err(|error| format!("staged Observe submission cannot decode: {error}"))?;
-                let pending = PendingObserveCapture {
-                    claimed,
-                    prepared,
-                    staged_body: body,
-                    stage_acknowledged: false,
-                    terminal_body: None,
-                    suboperation: deferral.suboperation.as_str(),
-                    owner_capability: deferral.owner_capability,
-                    residual_owner: deferral.residual_owner,
-                    resume: deferral.resume,
-                };
-                let mut pending = pending;
-                let outcome = match submit_observe_result_idempotent(kernel, &pending.staged_body)
-                    .await
-                {
-                    Ok(eliotd::ObserveSubmitOutcome::Staged(ack)) if *ack == staged_submission => {
-                        pending.stage_acknowledged = true;
-                        ObservePollOutcome::StagedPending
-                    }
-                    // A staged write already has a durable Store owner. Keep
-                    // this exact claim and prepared capture across ticks; a
-                    // failed stage ACK must never defer it as no-effect or
-                    // cause a second capture admission.
-                    Ok(_) | Err(_) => ObservePollOutcome::ReconciliationRequired,
-                };
-                return Ok(pending_observe_step(outcome, pending));
-            }
-        };
-        let outcome = match submit_observe_result_idempotent(kernel, &body).await {
-            Ok(eliotd::ObserveSubmitOutcome::Accepted) => ObservePollOutcome::Settled,
-            // The canonical capture is already committed at this point. An
-            // expired/stale attempt response cannot turn that effect into a
-            // no-effect outcome; leave the original operation for repair.
-            Ok(
-                eliotd::ObserveSubmitOutcome::Expired | eliotd::ObserveSubmitOutcome::StaleAttempt,
-            ) => ObservePollOutcome::ReconciliationRequired,
-            // A staged result is durable but has no committed receipt yet.
-            // The capture effect already occurred, so preserve the operation
-            // for receipt reconciliation instead of reporting completion.
-            Ok(eliotd::ObserveSubmitOutcome::Staged(_)) => {
-                ObservePollOutcome::ReconciliationRequired
-            }
-            Err(error) => {
-                kernel
-                    .defer_observe_claim_async(&operation_id, &request_digest, attempt)
-                    .await
-                    .map_err(|defer_error| {
-                        format!(
-                            "Observe result submission is ambiguous ({error}); exact-attempt reconciliation handoff failed: {defer_error}"
-                        )
-                    })?;
-                return Ok(step(ObservePollOutcome::ReconciliationRequired));
-            }
-        };
-        return Ok(step(outcome));
-    }
-    let outcome = match kernel
-        .defer_observe_claim_async(&operation_id, &request_digest, attempt)
-        .await
-        .map_err(|error| format!("Kernel Observe defer reconciliation: {error}"))?
-    {
-        ObserveDeferOutcome::ReconciliationRequired => ObservePollOutcome::ReconciliationRequired,
+    let prepared_capture = match prepare_observation_capture(kernel, composition, &claimed).await {
+        Ok(prepared_capture) => prepared_capture,
+        Err(error) => {
+            kernel
+                .defer_observe_claim_async(&operation_id, &request_digest, attempt)
+                .await
+                .map_err(|defer_error| {
+                    format!(
+                        "Observe capture failed after pair publication ({error}); exact-attempt reconciliation handoff failed: {defer_error}"
+                    )
+                })?;
+            return Ok(step(ObservePollOutcome::ReconciliationRequired, None));
+        }
     };
-    Ok(step(outcome))
+    let body = match prepared_capture {
+        PreparedObserveCapture::Terminal(body) => body,
+        PreparedObserveCapture::Staged { body, prepared } => {
+            let staged_submission: eliot_store_api::WriteSubmission =
+                serde_json::from_value(body.response.get("submission").cloned().ok_or_else(
+                    || "staged Observe response omits its submission".to_owned(),
+                )?)
+                .map_err(|error| format!("staged Observe submission cannot decode: {error}"))?;
+            let pending = PendingObserveCapture {
+                claimed,
+                prepared,
+                staged_body: body,
+                stage_acknowledged: false,
+                terminal_body: None,
+                suboperation,
+                owner_capability,
+                owner: owner.ok_or_else(|| {
+                    "connected Observe capture lost its production owner".to_owned()
+                })?,
+                resume: OBSERVE_CAPTURE_RECEIPT_RESUME,
+            };
+            let mut pending = pending;
+            let outcome = match submit_observe_result_idempotent(kernel, &pending.staged_body).await
+            {
+                Ok(eliotd::ObserveSubmitOutcome::Staged(ack)) if *ack == staged_submission => {
+                    pending.stage_acknowledged = true;
+                    ObservePollOutcome::StagedPending
+                }
+                // A staged write already has a durable Store owner. Keep this
+                // exact claim and prepared capture across ticks; a failed
+                // stage ACK must never cause a second capture admission.
+                Ok(_) | Err(_) => ObservePollOutcome::ReconciliationRequired,
+            };
+            return Ok(pending_observe_step(outcome, pending));
+        }
+    };
+    let outcome = match submit_observe_result_idempotent(kernel, &body).await {
+        Ok(eliotd::ObserveSubmitOutcome::Accepted) => ObservePollOutcome::Settled,
+        // The canonical capture is already committed at this point. An
+        // expired/stale attempt response cannot turn that effect into a
+        // no-effect outcome; leave the original operation for repair.
+        Ok(eliotd::ObserveSubmitOutcome::Expired | eliotd::ObserveSubmitOutcome::StaleAttempt) => {
+            ObservePollOutcome::ReconciliationRequired
+        }
+        // A staged result is durable but has no committed receipt yet. The
+        // capture effect already occurred, so preserve the operation for
+        // receipt reconciliation instead of reporting completion.
+        Ok(eliotd::ObserveSubmitOutcome::Staged(_)) => ObservePollOutcome::ReconciliationRequired,
+        Err(error) => {
+            kernel
+                .defer_observe_claim_async(&operation_id, &request_digest, attempt)
+                .await
+                .map_err(|defer_error| {
+                    format!(
+                        "Observe result submission is ambiguous ({error}); exact-attempt reconciliation handoff failed: {defer_error}"
+                    )
+                })?;
+            return Ok(step(ObservePollOutcome::ReconciliationRequired, None));
+        }
+    };
+    Ok(step(outcome, resume))
 }
 
 /// Continues one retained staged Observe operation on a normal poll tick.
@@ -6125,6 +6151,20 @@ fn observe_content_value(tool: &serde_json::Value) -> Result<serde_json::Value, 
         .get("arguments")
         .and_then(serde_json::Value::as_object)
         .ok_or_else(|| "Observe tool arguments are not an object".to_owned())?;
+    // Retain the complete typed ObservationContent object. Reject any extra
+    // caller fields before dropping only the outer suboperation discriminator;
+    // otherwise forged task or authority metadata could be silently ignored.
+    if arguments.keys().any(|field| {
+        !matches!(
+            field.as_str(),
+            "kind" | "content" | "affected_resources" | "source_handles" | "write_submission"
+        )
+    }) {
+        return Err("Observation suboperation contains unsupported original fields".to_owned());
+    }
+    if arguments.get("kind").and_then(serde_json::Value::as_str) != Some("observation") {
+        return Err("Observation capture no longer carries its admitted suboperation".to_owned());
+    }
     let mut content = serde_json::Map::new();
     for field in [
         "content",

@@ -5,25 +5,26 @@
 //! only the closed shared tool vocabulary (the five I7.6 suboperations), and
 //! routes each suboperation through the one explicit owner map below.
 //!
-//! Caller chain: daemon runtime observe poller -> this decoder ->
-//! `DaemonKernelClient::defer_observe_claim_async` (pair retired, durable
-//! record `Routed`) or, once the matching owner admission connects,
-//! `DaemonKernelClient::submit_observe_result_async` (retained result).
+//! Caller chain: daemon runtime observe poller -> this decoder -> the
+//! connected Observation capture route (`prepare_observation_capture` ->
+//! Governor's original `prepare_mcp_observation` normalizer) or
+//! `DaemonKernelClient::defer_observe_claim_async` for residual suboperations.
+//! The exact claim and prepared capture remain retained through staged receipt
+//! polling and result submission.
 //!
 //! Production edges out of this module:
-//! [`serve_admitted_observe`] serves one admitted pair as an honest
-//! [`ObserveDeferral`] naming its exact owner and resume condition;
+//! [`serve_admitted_observe`] serves one admitted pair as either a connected
+//! [`ObserveOwnerRoute::ObservationCapture`] or an honest residual
+//! [`ObserveOwnerRoute::Deferred`] naming its exact owner and resume condition;
 //! [`decode_observe_suboperation`] decodes the closed vocabulary;
 //! [`observe_suboperation_owner`] is the single suboperation-to-owner map.
 //!
-//! The Governor observation owner has no connected MCP-observe admission on
-//! this path yet, so every served pair defers: no effect is produced and
-//! none is claimed. A deferral is never completion — the pending handle
-//! stays live under the daemon owner, the status/resolve/rehydrate entries
-//! keep serving the live record, and resubmitting the same logical request
-//! once the owner connects re-enqueues the pair for execution without
-//! duplicating anything. Missing handler semantics stay with their owners
-//! and never justify a second semantic engine here.
+//! Observation is connected through the daemon's retained claim owner and the
+//! Governor observation normalizer. It produces only a governed candidate
+//! capture; canonical Store exchange, receipt validation, and readback remain
+//! on the original path. Decision, Failure, Outcome, and InfluenceAck remain
+//! residual deferrals until their matching semantic owner connects. Those
+//! deferrals are never completion and never justify a second semantic engine.
 
 #![forbid(unsafe_code)]
 
@@ -63,60 +64,59 @@ impl ObserveSuboperation {
 }
 
 /// One explicit owner route for an observe suboperation (issue #2565 item
-/// 7: one handler/capability map with the exact real caller and the residual
-/// owner for everything not yet connected).
+/// 7). The connected observation branch names the live caller; all other
+/// branches remain honest residual deferrals.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ObserveOwnerRoute {
-    /// Routed suboperation.
-    pub suboperation: ObserveSuboperation,
-    /// Missing owner admission that must connect before execution.
-    pub owner_capability: &'static str,
-    /// Program that owns the missing semantics (never this adapter).
-    pub residual_owner: &'static str,
-    /// Exact condition that resumes the deferred pair.
-    pub resume: &'static str,
+pub enum ObserveOwnerRoute {
+    /// Observation uses the real retained claim -> Governor capture path.
+    ObservationCapture {
+        /// Connected capability admitted for this operation.
+        owner_capability: &'static str,
+        /// Exact production owner path that supplies normalized capture data.
+        owner: &'static str,
+    },
+    /// A suboperation whose semantic owner is not connected on this path.
+    Deferred(ObserveDeferral),
 }
 
 /// Returns the single recorded owner route for one suboperation.
 ///
 /// Exhaustive over [`ObserveSuboperation`]: a new suboperation is a compile
-/// error here until its owner, residual program, and resume condition are
-/// recorded. The real caller for every row today is the daemon observe
-/// poller (`bins/eliotd/src/daemon_runtime.rs`); the residual owner is the
-/// Governor semantic program that must connect the matching admission
-/// (integration #18).
+/// error here until its connected caller or residual owner and resume
+/// condition are recorded.
 pub fn observe_suboperation_owner(suboperation: ObserveSuboperation) -> ObserveOwnerRoute {
     match suboperation {
-        ObserveSuboperation::Observation => ObserveOwnerRoute {
-            suboperation,
+        ObserveSuboperation::Observation => ObserveOwnerRoute::ObservationCapture {
             owner_capability: "governor-observation-owner.mcp-observe-admission",
-            residual_owner: "Governor observation admission (integration #18)",
-            resume: "resubmit the same logical request once the observation admission connects; exact replay re-enqueues the pair",
+            owner: concat!(
+                "daemon_runtime::prepare_observation_capture -> ",
+                "GovernorObservationReconciliation::prepare_mcp_observation",
+            ),
         },
-        ObserveSuboperation::Decision => ObserveOwnerRoute {
+        ObserveSuboperation::Decision => ObserveOwnerRoute::Deferred(ObserveDeferral {
             suboperation,
             owner_capability: "governor-observation-owner.mcp-observe-decision",
             residual_owner: "Governor observation admission (integration #18)",
             resume: "resubmit the same logical request once the decision admission connects; exact replay re-enqueues the pair",
-        },
-        ObserveSuboperation::Failure => ObserveOwnerRoute {
+        }),
+        ObserveSuboperation::Failure => ObserveOwnerRoute::Deferred(ObserveDeferral {
             suboperation,
             owner_capability: "governor-observation-owner.mcp-observe-failure",
             residual_owner: "Governor observation admission (integration #18)",
             resume: "resubmit the same logical request once the failure admission connects; exact replay re-enqueues the pair",
-        },
-        ObserveSuboperation::Outcome => ObserveOwnerRoute {
+        }),
+        ObserveSuboperation::Outcome => ObserveOwnerRoute::Deferred(ObserveDeferral {
             suboperation,
             owner_capability: "governor-observation-owner.mcp-observe-outcome",
             residual_owner: "Governor observation admission (integration #18)",
             resume: "resubmit the same logical request once the outcome admission connects; exact replay re-enqueues the pair",
-        },
-        ObserveSuboperation::InfluenceAck => ObserveOwnerRoute {
+        }),
+        ObserveSuboperation::InfluenceAck => ObserveOwnerRoute::Deferred(ObserveDeferral {
             suboperation,
             owner_capability: "governor-observation-owner.mcp-observe-influence-ack",
             residual_owner: "Governor observation admission (integration #18)",
             resume: "resubmit the same logical request once the influence-ack admission connects; exact replay re-enqueues the pair",
-        },
+        }),
     }
 }
 
@@ -181,14 +181,15 @@ pub struct ObserveDeferral {
 /// Re-proves the admitted linkage (capability echoes the tool name,
 /// canonical tool bytes digest to the admitted payload digest), the admitted
 /// envelope shape, and the attempt binding (operation handle plus validated
-/// capability admitted for this facet) before any defer touches the pair. Returns the honest
-/// deferral with its exact owner and resume condition. Pure: no IO, no
-/// semantic interpretation, no invented receipt.
+/// capability admitted for this facet) before routing the pair. Returns the
+/// connected capture route for Observation or an honest residual deferral for
+/// the other suboperations. Pure: no IO, no semantic interpretation, no
+/// invented receipt.
 pub fn serve_admitted_observe(
     envelope: &HostRequestEnvelope,
     tool: &serde_json::Value,
     attempt: &LocalReadAttempt,
-) -> Result<ObserveDeferral, String> {
+) -> Result<ObserveOwnerRoute, String> {
     envelope
         .validate()
         .map_err(|error| format!("daemon observe pair envelope is not admitted shape: {error}"))?;
@@ -231,11 +232,5 @@ pub fn serve_admitted_observe(
         );
     }
     let suboperation = decode_observe_suboperation(tool)?;
-    let route = observe_suboperation_owner(suboperation);
-    Ok(ObserveDeferral {
-        suboperation: route.suboperation,
-        owner_capability: route.owner_capability,
-        residual_owner: route.residual_owner,
-        resume: route.resume,
-    })
+    Ok(observe_suboperation_owner(suboperation))
 }
