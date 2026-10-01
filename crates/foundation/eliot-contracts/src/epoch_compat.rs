@@ -11,7 +11,7 @@
 //! is not newer, restore imports snapshots only as historical/suspended
 //! evidence, and old epochs never revive. [`decode_scalar_epoch`] therefore
 //! requires a [`LineageEvidence`] value whose [`EpochLineageId`] was validated
-//! at its own owner boundary (installation records or the HostStateJournal
+//! at its own owner boundary (installation records or the `HostStateJournal`
 //! `HostInstallationEpoch`, projected here without depending on the kernel).
 //! [`suspend_scalar_record`] is the fail-closed disposition for a record that
 //! carries no such evidence: the returned [`SuspendedScalarRecord`] preserves
@@ -55,7 +55,7 @@ pub struct ScalarEpochRecord {
 /// The proven source of the lineage a scalar record is bound to.
 ///
 /// Only the two evidence sources issue #64 A6 admits: installation records and
-/// the HostStateJournal installation epoch. Wave-4 callers project these from
+/// the `HostStateJournal` installation epoch. Wave-4 callers project these from
 /// their owning records; this crate defines the closed kind set so the
 /// decoder never invents a third source.
 #[derive(Clone, Copy, Debug, Eq, Hash, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -63,7 +63,7 @@ pub struct ScalarEpochRecord {
 pub enum LineageEvidenceKind {
     /// Lineage proven by installation records.
     Installation,
-    /// Lineage proven by the HostStateJournal installation epoch.
+    /// Lineage proven by the `HostStateJournal` installation epoch.
     HostJournal,
 }
 
