@@ -3916,6 +3916,19 @@ pub(crate) const ACT_CAPABILITY: &str = "eliot.act";
 /// owner yet, so no tool bytes are retained here.
 pub(crate) const COORDINATE_CAPABILITY: &str = "eliot.coordinate";
 
+/// Closed capability admitted to the state submit entry (issue #1739
+/// W5; projection-owner readback join still open).
+///
+/// Digest-only `eliot.state` invocations ride the shared submit entry
+/// through [`KernelComposition::admit_and_queue_observe_submit`]. The Kernel
+/// owns only the mechanical dispatch binding here — capability plus
+/// invocation kind, checked before any staging — never the projection
+/// verdict: the current authorized task/scope/attention/health projection
+/// stays the projection owner's to serve at the future live state
+/// claim/flight (I01-08 read path; I07-08 step 9). No tool bytes are
+/// retained here.
+pub(crate) const STATE_CAPABILITY: &str = "eliot.state";
+
 /// Whether one requested capability is task-relative or effectful and
 /// therefore needs the exact applicable task binding (issue #1746, W2).
 ///
@@ -4117,6 +4130,32 @@ pub(crate) fn check_coordinate_submit_binding(
     Ok(())
 }
 
+/// Kernel-owned dispatch binding for one `eliot.state` submit (issue
+/// #1739 W5; projection-owner readback join still open).
+///
+/// `Invocation` kind the submit entry serves. A swapped capability or a
+/// non-invocation kind fails closed as `SessionFenced` before the caller
+/// stages anything. Pure: validation performs no IO by construction.
+///
+/// Digest-only state submits carry no tool bytes, so there is no payload
+/// digest to link here — the envelope digest already commits to the exact
+/// canonical request through admission, and the live session/fence/
+/// connection binding is enforced by the frame gateway plus the admission
+/// gates. The projection itself stays the projection owner's at the
+/// future live state claim/flight, never a Kernel verdict (I01-08
+/// read path).
+pub(crate) fn check_state_submit_binding(
+    envelope: &HostRequestEnvelope,
+) -> Result<(), TransportError> {
+    if envelope.identity.capability != STATE_CAPABILITY {
+        return Err(TransportError::SessionFenced);
+    }
+    if envelope.kind != HostRequestKind::Invocation {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(())
+}
+
 fn observe_tool_requires_exact_task_binding(
     tool: &serde_json::Value,
 ) -> Result<bool, TransportError> {
@@ -4148,6 +4187,10 @@ impl KernelComposition {
     /// is revalidated before admission, while the fabric verdict stays the
     /// #1740 execution-fabric owner's at the future live coordinate
     /// claim/flight.
+    /// Digest-only `eliot.state` invocations take the same entry: the
+    /// Kernel-owned dispatch binding ([`check_state_submit_binding`])
+    /// is revalidated before admission, while the projection readback
+    /// stays the projection owner's at the future live state claim/flight.
     pub(crate) fn admit_and_queue_observe_submit(
         &self,
         envelope: &HostRequestEnvelope,
@@ -4171,6 +4214,14 @@ impl KernelComposition {
         // owner at the future live coordinate claim/flight.
         if !is_observe && envelope.identity.capability == COORDINATE_CAPABILITY {
             check_coordinate_submit_binding(envelope)?;
+        }
+        // State projection dispatch (issue #1739 W5; the projection-owner
+        // readback join is still open): digest-only `eliot.state` submits
+        // ride this same entry. Revalidate the Kernel-owned dispatch
+        // binding before staging; the projection itself stays the
+        // projection owner's at the future live state claim/flight.
+        if !is_observe && envelope.identity.capability == STATE_CAPABILITY {
+            check_state_submit_binding(envelope)?;
         }
         let task_relative_tool = if is_observe {
             tool.map(|tool| check_observe_tool_linkage(envelope, tool))
