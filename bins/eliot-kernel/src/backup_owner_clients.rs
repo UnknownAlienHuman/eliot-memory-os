@@ -6,6 +6,15 @@
 //! signals pipe. No new pipe family is introduced here; both pipes are the
 //! canonical names the platform already owns.
 //!
+//! Pipe-name ownership (#962): the Watchdog signals pipe identity has exactly
+//! one owner. [`WATCHDOG_BACKUP_PIPE`] is not spelled here; it is read from
+//! [`eliot_protocol::EliotPipeName::watchdog_signals`], the single typed owner
+//! of the `I07-05-named-pipes.md` namespace. This file consumes that identity
+//! and never restates it, so the Kernel client and the protocol owner cannot
+//! drift apart into two spellings of one canonical name. The Host pipe has no
+//! owner reachable from this crate and its gap is recorded on
+//! [`HOST_BACKUP_PIPE`].
+//!
 //! Registration mapping (Writers A-C own the registrations; this module only
 //! references their vocabulary and never imports their implementation crates,
 //! so no circular dependency can form):
@@ -83,22 +92,53 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::LazyLock;
 
 use eliot_protocol::AckPhase;
 use eliot_protocol::backup::{
     BackupOperationKind, BackupRole, BackupStage, MAX_BACKUP_PAYLOAD_BYTES,
 };
+use eliot_protocol::EliotPipeName;
 
 /// Canonical Host backup pipe: the exact Host runtime-control pipe name.
 ///
 /// No new pipe family: this is the canonical Host control pipe the platform
 /// already owns.
+///
+/// # Single-owner gap (not this file's defect)
+///
+/// `I07-05-named-pipes.md` does not list the Host runtime-control pipe in the
+/// closed canonical family, and `eliot_protocol::EliotPipeName` therefore
+/// cannot produce this name: the protocol owner's closed family is the Kernel
+/// front door, the Kernel store, the generation-specific Kernel daemon, the
+/// generation-specific module endpoint, and the Watchdog signals endpoint.
+/// The name's actual owner is `eliot_host_control_endpoint::HOST_RUNTIME_CONTROL_PIPE`,
+/// which is a crate this composition root has no edge to. The literal is
+/// retained here only until that owner is reachable; it is NOT claimed to
+/// match an owner, and it is deliberately NOT compared against a typed name.
 pub const HOST_BACKUP_PIPE: &str = r"\\.\pipe\eliot\host\runtime-control-v1";
-/// Canonical Watchdog backup pipe: the exact Watchdog signals pipe name.
+/// Canonical Watchdog backup pipe: the exact Watchdog signals pipe name,
+/// read from the single namespace owner
+/// ([`EliotPipeName::watchdog_signals`]).
+///
+/// This is deliberately NOT a typed-in literal. `I07-05-named-pipes.md` lists
+/// the Watchdog signals endpoint in the closed canonical family, and
+/// `eliot_protocol::EliotPipeName` is that family's owner: it holds the
+/// `WatchdogSignals` endpoint, its display spelling, the parser arm and the
+/// `Watchdog` family classification. Spelling the name here as well would
+/// create a second, unowned copy of a canonical identity. The spelling is
+/// therefore absent from this file entirely, and this file's source is scanned
+/// to prove it.
+///
+/// The owner exposes no `const fn` yielding `&'static str` - the string is
+/// produced by its `Display` implementation - so the value is bound exactly
+/// once through a lazy static and every read is a borrow of the owner's own
+/// `Display` output. One allocation per process, no second spelling.
 ///
 /// No new pipe family: this is the canonical Watchdog signals pipe the
-/// platform already owns.
-pub const WATCHDOG_BACKUP_PIPE: &str = r"\\.\pipe\eliot\watchdog\signals";
+/// protocol owner already owns.
+pub static WATCHDOG_BACKUP_PIPE: LazyLock<String> =
+    LazyLock::new(|| EliotPipeName::watchdog_signals().to_string());
 /// Exact peer expectation marker for the Host backup owner.
 pub const HOST_BACKUP_PEER: &str = "host-backup-owner";
 /// Exact peer expectation marker for the Watchdog backup owner.
@@ -414,11 +454,16 @@ pub enum OwnerRole {
 
 impl OwnerRole {
     /// Exact canonical pipe for this owner.
+    ///
+    /// Not `const`: the Watchdog leg reads the protocol owner's own `Display`
+    /// output through [`WATCHDOG_BACKUP_PIPE`], and the owner has no
+    /// `const fn` that yields the spelled name. Every caller of this method is
+    /// already on a runtime path.
     #[must_use]
-    pub const fn pipe(self) -> &'static str {
+    pub fn pipe(self) -> &'static str {
         match self {
             Self::Host => HOST_BACKUP_PIPE,
-            Self::Watchdog => WATCHDOG_BACKUP_PIPE,
+            Self::Watchdog => WATCHDOG_BACKUP_PIPE.as_str(),
         }
     }
 
@@ -965,7 +1010,7 @@ impl WatchdogBackupOwnerClient {
     /// Binds the production Watchdog owner: exact canonical pipe plus exact
     /// peer expectation. Fails closed on any fake or mismatch.
     pub fn production() -> Result<Self, OwnerClientError> {
-        Self::new(WATCHDOG_BACKUP_PIPE, WATCHDOG_BACKUP_PEER)
+        Self::new(WATCHDOG_BACKUP_PIPE.as_str(), WATCHDOG_BACKUP_PEER)
     }
 
     /// Binds an explicitly presented Watchdog owner. Only the exact

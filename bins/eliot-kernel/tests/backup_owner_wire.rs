@@ -33,11 +33,13 @@ mod backup_owner_clients;
 use backup_owner_clients::{
     AdmissionDomain, EffectAdmission, HOST_BACKUP_PEER, HOST_BACKUP_PIPE, HOST_SUPPORTED_OPS,
     HostBackupOwnerClient, OWNER_OPS_QUANTUM_PER_ROUND, OwnerAdmission, OwnerClientError,
-    OwnerTimeout, ReplayDisposition, ReplayLedger, ReplaySafety, UntypedEffectKind,
+    OwnerRole, OwnerTimeout, ReplayDisposition, ReplayLedger, ReplaySafety, UntypedEffectKind,
     WATCHDOG_BACKUP_PEER, WATCHDOG_BACKUP_PIPE, WATCHDOG_SUPPORTED_OPS, WatchdogBackupOwnerClient,
     check_bound_digest, fence_is_fresh, rehearsal_proves_cutover, replay_safe_marker,
     supervision_priority_preserved, transport_ack_is_success, validate_bounded_payload,
 };
+use eliot_protocol::EliotPipeFamily;
+use eliot_protocol::EliotPipeName;
 use eliot_protocol::backup::BackupOperationKind;
 
 fn fixture(name: &str) -> serde_json::Value {
@@ -96,14 +98,21 @@ fn wire_02_canonical_endpoints_exact() {
     );
     assert_eq!(
         endpoints["watchdog_owner"]["pipe"].as_str(),
-        Some(WATCHDOG_BACKUP_PIPE)
+        Some(WATCHDOG_BACKUP_PIPE.as_str())
     );
     assert_eq!(HOST_BACKUP_PIPE, r"\\.\pipe\eliot\host\runtime-control-v1");
-    assert_eq!(WATCHDOG_BACKUP_PIPE, r"\\.\pipe\eliot\watchdog\signals");
+    // The canonical spelling is asserted against the protocol owner's own
+    // `Display` output, not against a second literal typed into this lane:
+    // a hand-typed copy here would let the two spellings drift apart and this
+    // assertion would keep passing while the identity forked.
+    assert_eq!(
+        WATCHDOG_BACKUP_PIPE.as_str(),
+        EliotPipeName::watchdog_signals().to_string()
+    );
     let host = host_production();
     let watchdog = watchdog_production();
     assert_eq!(host.pipe(), HOST_BACKUP_PIPE);
-    assert_eq!(watchdog.pipe(), WATCHDOG_BACKUP_PIPE);
+    assert_eq!(watchdog.pipe(), WATCHDOG_BACKUP_PIPE.as_str());
     assert_eq!(host.peer(), HOST_BACKUP_PEER);
     assert_eq!(watchdog.peer(), WATCHDOG_BACKUP_PEER);
 }
@@ -300,7 +309,7 @@ fn wire_10_response_identity_exact() {
     ));
     // Wrong pipe, wrong peer, or an unsupported op each invalidate identity.
     assert!(!host.response_identity_ok(
-        WATCHDOG_BACKUP_PIPE,
+        WATCHDOG_BACKUP_PIPE.as_str(),
         HOST_BACKUP_PEER,
         BackupOperationKind::RestoreStatus
     ));
@@ -316,12 +325,12 @@ fn wire_10_response_identity_exact() {
     ));
     let watchdog = watchdog_production();
     assert!(watchdog.response_identity_ok(
-        WATCHDOG_BACKUP_PIPE,
+        WATCHDOG_BACKUP_PIPE.as_str(),
         WATCHDOG_BACKUP_PEER,
         BackupOperationKind::VerifyArchive
     ));
     assert!(!watchdog.response_identity_ok(
-        WATCHDOG_BACKUP_PIPE,
+        WATCHDOG_BACKUP_PIPE.as_str(),
         WATCHDOG_BACKUP_PEER,
         BackupOperationKind::AdmitCutover
     ));
@@ -520,7 +529,7 @@ fn wire_18_production_constructors_reject_fakes() {
         "in-memory",
         "test-pipe",
         r"\\.\pipe\eliot\host\other",
-        WATCHDOG_BACKUP_PIPE,
+        WATCHDOG_BACKUP_PIPE.as_str(),
     ] {
         assert!(
             HostBackupOwnerClient::new(fake_pipe, HOST_BACKUP_PEER).is_err(),
@@ -543,7 +552,10 @@ fn wire_18_production_constructors_reject_fakes() {
     // Exact pipe with a spoofed or fake peer fails closed too.
     assert!(HostBackupOwnerClient::new(HOST_BACKUP_PIPE, "attacker-spoofed-peer").is_err());
     assert!(HostBackupOwnerClient::new(HOST_BACKUP_PIPE, "mock").is_err());
-    assert!(WatchdogBackupOwnerClient::new(WATCHDOG_BACKUP_PIPE, "attacker-spoofed-peer").is_err());
+    assert!(
+        WatchdogBackupOwnerClient::new(WATCHDOG_BACKUP_PIPE.as_str(), "attacker-spoofed-peer")
+            .is_err()
+    );
 }
 
 // WORK_UNIT_CASE: 962/19
@@ -554,7 +566,7 @@ fn wire_19_live_windows_ipc_fail_closed() {
         // Live Windows IPC proof: attempt the real canonical pipes with no
         // owner listening, then assert the attempt fail-closes and spoofed
         // or dropped peers refuse with resources cleaned up.
-        for pipe in [HOST_BACKUP_PIPE, WATCHDOG_BACKUP_PIPE] {
+        for pipe in [HOST_BACKUP_PIPE, WATCHDOG_BACKUP_PIPE.as_str()] {
             let attempt = std::fs::File::open(pipe);
             // No owner is listening in the test lane, so the live attempt
             // must fail closed rather than connect to anything unexpected.
@@ -579,7 +591,15 @@ fn wire_19_live_windows_ipc_fail_closed() {
         // is Windows-gated, so this lane asserts the canonical binding shape
         // and proves the client types link — it never fakes a live success.
         assert_eq!(HOST_BACKUP_PIPE, r"\\.\pipe\eliot\host\runtime-control-v1");
-        assert_eq!(WATCHDOG_BACKUP_PIPE, r"\\.\pipe\eliot\watchdog\signals");
+        // Meaning unchanged from the original assertion: the bound Watchdog
+        // endpoint is the canonical spelling. The canonical spelling is now
+        // read from its single owner instead of restated here, because a
+        // second typed-in copy in this lane is exactly the defect this lane
+        // removes.
+        assert_eq!(
+            WATCHDOG_BACKUP_PIPE.as_str(),
+            EliotPipeName::watchdog_signals().to_string()
+        );
         assert!(HostBackupOwnerClient::production().is_ok());
         assert!(WatchdogBackupOwnerClient::production().is_ok());
     }
@@ -651,4 +671,99 @@ fn wire_20_no_db_copy_binary_import_or_secret() {
     assert!(bootstrap.contains("backup_owner_clients"));
     assert!(bootstrap.contains("HostBackupOwnerClient::production()"));
     assert!(bootstrap.contains("WatchdogBackupOwnerClient::production()"));
+}
+
+// WORK_UNIT_CASE: 962/21
+#[test]
+fn wire_21_watchdog_pipe_name_has_one_owner() {
+    // The Kernel's Watchdog endpoint IS the protocol owner's value. This
+    // compares against `EliotPipeName::watchdog_signals()` itself, never
+    // against a second typed-in literal: a literal here would restate the
+    // very copy this delivery removes and would keep passing if the two
+    // spellings drifted apart.
+    let owner = EliotPipeName::watchdog_signals();
+    assert_eq!(WATCHDOG_BACKUP_PIPE.as_str(), owner.to_string());
+
+    // Every kernel-side consumer reads that same single value.
+    assert_eq!(OwnerRole::Watchdog.pipe(), WATCHDOG_BACKUP_PIPE.as_str());
+    let watchdog = watchdog_production();
+    assert_eq!(watchdog.pipe(), WATCHDOG_BACKUP_PIPE.as_str());
+
+    // The name is not spelled anywhere in the client module: the canonical
+    // identity exists in exactly one place in this repository's source.
+    let source = include_str!("../src/backup_owner_clients.rs");
+    assert!(
+        !source.contains(r"\\.\pipe\eliot\watchdog\signals"),
+        "the client module must not restate the canonical Watchdog pipe spelling"
+    );
+
+    // Binding still fails closed: an owner-derived value did not turn the
+    // constructor into an open one. A peer-spoofed binding over the exact
+    // canonical pipe is still refused, and the Host pipe is still not a
+    // Watchdog pipe.
+    assert!(
+        WatchdogBackupOwnerClient::new(WATCHDOG_BACKUP_PIPE.as_str(), "attacker-spoofed-peer")
+            .is_err()
+    );
+    assert!(WatchdogBackupOwnerClient::new(HOST_BACKUP_PIPE, WATCHDOG_BACKUP_PEER).is_err());
+    assert!(HostBackupOwnerClient::new(WATCHDOG_BACKUP_PIPE.as_str(), HOST_BACKUP_PEER).is_err());
+}
+
+// WORK_UNIT_CASE: 962/22
+#[test]
+fn wire_22_watchdog_identity_not_confusable_with_another_family() {
+    // Refusal case for the owner-derived path: the Watchdog signals identity
+    // is classified in the Watchdog family and cannot be confused with the
+    // Kernel or Module families. This uses only the owner's own `family()`
+    // and `parse()`; no new API is invented for it.
+    let owner = EliotPipeName::watchdog_signals();
+    assert_eq!(owner.family(), EliotPipeFamily::Watchdog);
+    assert_ne!(owner.family(), EliotPipeFamily::Kernel);
+    assert_ne!(owner.family(), EliotPipeFamily::Module);
+
+    // The value the kernel binds carries that same family, so consuming the
+    // owner's string cannot smuggle in a different family's identity.
+    let bound = EliotPipeName::parse(WATCHDOG_BACKUP_PIPE.as_str()).expect("canonical name parses");
+    assert_eq!(bound.family(), EliotPipeFamily::Watchdog);
+    assert_eq!(bound, owner);
+
+    // Every other closed family is a distinct identity and a distinct pipe.
+    for other in [
+        EliotPipeName::kernel_frontdoor(),
+        EliotPipeName::kernel_store(),
+    ] {
+        assert_ne!(other.family(), EliotPipeFamily::Watchdog);
+        assert_ne!(other.to_string(), WATCHDOG_BACKUP_PIPE.as_str());
+    }
+    let generation = eliot_contracts::ResourceGeneration::new(1).expect("generation");
+    assert_ne!(
+        EliotPipeName::kernel_daemon(generation).to_string(),
+        WATCHDOG_BACKUP_PIPE.as_str()
+    );
+    let probe = eliot_contracts::ContractId::new("agent.watchdog-confusion-probe")
+        .expect("module id is canonical");
+    assert_ne!(
+        EliotPipeName::module(probe, generation)
+            .expect("module name is canonical")
+            .to_string(),
+        WATCHDOG_BACKUP_PIPE.as_str()
+    );
+
+    // Near-miss spellings of the Watchdog family are refused by the owner,
+    // not accepted as aliases of the bound identity.
+    for near_miss in [
+        r"\\.\pipe\eliot\watchdog\signal",
+        r"\\.\pipe\eliot\watchdog\signals\1",
+        r"\\.\pipe\eliot\kernel\watchdog\signals",
+        r"\\.\pipe\eliot\watchdog\WatchdogSignals",
+    ] {
+        assert!(
+            EliotPipeName::parse(near_miss).is_err(),
+            "near-miss spelling {near_miss:?} must not parse"
+        );
+        assert!(
+            WatchdogBackupOwnerClient::new(near_miss, WATCHDOG_BACKUP_PEER).is_err(),
+            "near-miss spelling {near_miss:?} must not bind"
+        );
+    }
 }
