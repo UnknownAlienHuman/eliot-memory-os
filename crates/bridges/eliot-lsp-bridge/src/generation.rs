@@ -20,10 +20,12 @@
 //! The upstream package itself is never touched: staging records the
 //! caller-observed identity line, it does not install anything.
 //!
-//! Wiring: the stitch phase declares `mod generation;` in the crate root.
-//! The launch path (caller STITCH) feeds staged values built from
-//! `lsp_application_obligations().supported_operations`, records dispatched
-//! operation identities in the ledger, and supplies the canary verdict.
+//! Wiring: the crate root declares `mod generation;` and re-exports this
+//! sequence. LspBridge::stage_generation feeds staged values built from
+//! `lsp_application_obligations().supported_operations`, the launch path
+//! records dispatched operation identities in the ledger, and the
+//! composition owner holding the AdmittedLine supplies the canary verdict
+//! and performs the switch.
 
 use thiserror::Error;
 
@@ -246,8 +248,8 @@ impl CanaryVerdict {
 
 /// Exact-identity ledger of dispatched but unsettled operations.
 ///
-/// The launch path (caller STITCH) notes every dispatched operation
-/// identity and settles it when the terminal outcome is reconciled. Noting
+/// The launch path notes every dispatched operation identity and settles
+/// it when the terminal outcome is reconciled. Noting
 /// is idempotent: retries repeat the same operation identity, so a second
 /// note for an already open identity changes nothing. Settling an identity
 /// that was never dispatched is refused.

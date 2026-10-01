@@ -18,10 +18,12 @@
 //! The upstream package itself is never touched: staging records the
 //! caller-observed upstream version string, it does not install anything.
 //!
-//! Wiring: the stitch phase declares `mod generation;` in the crate root.
-//! The dispatch path (caller STITCH) feeds staged values built from
-//! `git_application_obligations().supported_operations`, records dispatched
-//! invocation identities in the ledger, and supplies the canary verdict.
+//! Wiring: the crate root declares `mod generation;` and re-exports this
+//! sequence. GitBridge::stage_generation feeds staged values built from
+//! `git_application_obligations().supported_operations`, the dispatch path
+//! (exec/exec_stdin) records dispatched invocation identities in the
+//! ledger, and the composition owner holding the AdmittedLine supplies the
+//! canary verdict and performs the switch.
 
 use std::fmt;
 
@@ -257,8 +259,8 @@ impl CanaryVerdict {
 
 /// Exact-identity ledger of dispatched but unsettled invocations.
 ///
-/// The dispatch path (caller STITCH) notes every dispatched invocation
-/// identity and settles it when the terminal outcome is reconciled. Noting
+/// The dispatch path notes every dispatched invocation identity and
+/// settles it when the terminal outcome is reconciled. Noting
 /// is idempotent: retries repeat the same invocation identity, so a second
 /// note for an already open identity changes nothing. Settling an identity
 /// that was never dispatched is refused.
