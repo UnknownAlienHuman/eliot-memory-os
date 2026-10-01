@@ -4012,9 +4012,20 @@ impl AgentFabric {
     ///
     /// # Errors
     ///
-    /// Returns the coordinator owner rejection unchanged, including the
-    /// profile's own validation failure when it is not a valid versioned
-    /// nine-class set.
+    /// Returns the coordinator's non-staleness owner rejection unchanged,
+    /// including the profile's own validation failure when it is not a valid
+    /// versioned nine-class set.
+    ///
+    /// Stated precisely, because it is narrower than it looks (issue #1683
+    /// W3/W5): a **staleness** rejection from the start boundary no longer
+    /// reaches here. `AgentCoordinator::drive_fair_pull` spends one fresh
+    /// bounded read over it and continues, so a release that found its next
+    /// item's owner evidence stale still advances work in this same call
+    /// instead of waiting for another command. That refusal is not lost: it
+    /// comes back inside the returned [`FairPullOutcome::stale_refusals`] as
+    /// an exact typed disposition, one per refusal, and this forwarder
+    /// re-decides nothing about it. What still returns as an `Err` is a
+    /// quota/pressure or inconsistency refusal, unchanged and unflattened.
     pub fn drive_fair_pull(
         &mut self,
         profile: &SchedulingProfile,

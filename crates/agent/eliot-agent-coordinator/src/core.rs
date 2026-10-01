@@ -23,7 +23,8 @@ use serde::Serialize;
 
 use crate::SNAPSHOT_SCHEMA_VERSION;
 use crate::fair_pull_loop::{
-    FAIR_PULL_LOOP_PROOF_CEILING, FairPullLoop, FairPullOutcome, FairPullStart,
+    FAIR_PULL_LOOP_PROOF_CEILING, FairPullLoop, FairPullOutcome, FairPullStaleRefusal,
+    FairPullStart, stale_selection_disposition,
 };
 use crate::model::{
     AdmissionId, AttemptRecord, CancelCommand, CancellationFinalReceipt, CancellationReceipt,
@@ -2272,6 +2273,53 @@ impl AgentCoordinator {
     /// also stops at the first pull that selects nothing, so re-polling an
     /// unchanged projection costs exactly one pull instead of spinning.
     ///
+    /// **A stale selection is re-read against a fresh bounded pull rather than
+    /// propagated** (issue #1683 W3/W5, I14.8). `start_attempt` refuses a
+    /// selection whose owner evidence went stale between the pull and the
+    /// start; propagating that refusal ended the whole drive, so the capacity
+    /// the caller had just released did not pull the next eligible item until
+    /// some later event or cadence tick told the coordinator to look again —
+    /// which is exactly the "mechanical queue progress never depends on an
+    /// LLM remembering to start another agent" failure I14.8 names. So a
+    /// **staleness** refusal now spends one fresh pull over the live view and
+    /// the drive continues with whatever that read offers. The refusal is not
+    /// lost on the way: it is published in
+    /// [`FairPullOutcome::stale_refusals`] with its exact typed disposition
+    /// ([`crate::FairPullStaleDisposition`]), which is what keeps A8/W7's
+    /// exact-disposition requirement true across the retry instead of trading
+    /// it for silence.
+    ///
+    /// Three properties keep that a bounded re-read and not a retry loop, and
+    /// none of them is a constant chosen here:
+    ///
+    /// 1. **The bound is the one that already existed.** An attempt is
+    ///    *spent* at most once per drive — it is either started or refused
+    ///    stale — so the re-read is charged against the same `poll_bound` the
+    ///    starts are, and `pulls_performed` stays at most `poll_bound + 1`.
+    ///    `select_ready` offers only `Admitted` items (`class_views`), so the
+    ///    set of attempts a drive can spend is a subset of the non-terminal
+    ///    admitted set `poll_bound` counts.
+    /// 2. **A re-read that finds the same item again ends the drive.** A
+    ///    refused start mutates nothing — all three owner checks run before any
+    ///    write — and this drive is the only writer on this call, so spending
+    ///    that item again would produce the identical refusal. The drive stops
+    ///    instead, and says so through
+    ///    `FairPullStaleRefusal::repull_reselected_same_item`.
+    /// 3. **Only staleness re-reads.** A refusal that means "nothing more is
+    ///    eligible" — [`CoordinatorError::Backpressure`] naming a route already
+    ///    at its effective limit, or a variant saying this coordinator's own
+    ///    records disagree ([`CoordinatorError::IdentityConflict`],
+    ///    [`CoordinatorError::ProviderVerification`],
+    ///    [`CoordinatorError::InvalidAttemptState`], and the rest) — propagates
+    ///    unchanged and ends the drive. `Backpressure` in particular carries
+    ///    its exact `active`, `requested` and `limit` to the caller that way,
+    ///    which is A8's demand for a quota/pressure refusal.
+    ///
+    /// The re-read is the same selector over the same projection, later, with
+    /// the same [`SchedulingProfile`] the caller passed and the same fairness
+    /// credit the drive has been advancing; it is not a second selection
+    /// scheme and it mints nothing.
+    ///
     /// A missed wake cannot strand work, and a restart cannot renew an age.
     /// [`Self::note_selection_inputs_changed`] arms the loop from the seven
     /// transitions that change the projection, and the published cursor is the
@@ -2330,9 +2378,12 @@ impl AgentCoordinator {
     ///
     /// Returns the profile's own validation failure when it is not a valid
     /// versioned nine-class set — the drive is then refused whole rather than
-    /// run without per-class partitions — and any owner rejection from
-    /// [`Self::start_attempt`], which is the same rejection a caller driving
-    /// the pull by hand would receive.
+    /// run without per-class partitions — and any **non-staleness** owner
+    /// rejection from [`Self::start_attempt`], unchanged: a quota/pressure
+    /// [`CoordinatorError::Backpressure`] reaches the caller with its exact
+    /// `active`/`requested`/`limit`, and an inconsistency reaches it as itself.
+    /// A staleness rejection does not appear here; it is re-read over and
+    /// published in [`FairPullOutcome::stale_refusals`] instead.
     pub fn drive_fair_pull(
         &mut self,
         profile: &SchedulingProfile,
@@ -2343,6 +2394,14 @@ impl AgentCoordinator {
         let cursor = self.fair_pull_loop.cursor();
         let poll_bound = self.active_attempt_count();
         let mut started = Vec::new();
+        let mut stale_refusals = Vec::new();
+        // Issue #1683 W3/W5: every attempt this drive has already spent, whether
+        // it started or was refused stale. Membership is what makes the fresh
+        // bounded read terminating rather than spinning: `select_ready` offers
+        // only `Admitted` items, and a refused `start_attempt` mutates nothing,
+        // so a read that re-offers a spent attempt can only produce the refusal
+        // that item already produced.
+        let mut spent = BTreeSet::new();
         let mut pulls_performed = 0usize;
         let mut last_selection = self.select_ready(Some(profile), true);
         pulls_performed += 1;
@@ -2350,6 +2409,13 @@ impl AgentCoordinator {
             if started.len() >= poll_bound {
                 break;
             }
+            if spent.contains(&attempt_id) {
+                // The fresh bounded read offered an item this drive already
+                // spent. Re-spending it would re-derive the refusal it already
+                // produced, so the drive ends here rather than spins.
+                break;
+            }
+            spent.insert(attempt_id.clone());
             // The selected attempt is `Admitted`, so it carries a stored
             // record, a canonical enqueue ordinal and the admission receipt
             // that admitted it. All three are read; none is constructed.
@@ -2371,15 +2437,39 @@ impl AgentCoordinator {
                 .clone();
             let work_class = record.work_class;
             let admission_id = record.admission_id.clone();
-            self.start_attempt(ExecutionContext::from(&receipt), attempt_id.clone())?;
-            started.push(FairPullStart {
-                attempt_id,
-                admission_id,
-                work_class,
-                enqueue_sequence,
-            });
-            pulls_performed += 1;
-            last_selection = self.select_ready(Some(profile), true);
+            match self.start_attempt(ExecutionContext::from(&receipt), attempt_id.clone()) {
+                Ok(_) => {
+                    started.push(FairPullStart {
+                        attempt_id,
+                        admission_id,
+                        work_class,
+                        enqueue_sequence,
+                    });
+                    last_selection = self.select_ready(Some(profile), true);
+                    pulls_performed += 1;
+                }
+                Err(refusal) => {
+                    // The owner's exact refusal, never a summary of it. A drive
+                    // that re-read does so over a refusal it still reports; a
+                    // drive that cannot re-read returns the refusal itself.
+                    let disposition = match stale_selection_disposition(&refusal) {
+                        Some(disposition) => disposition,
+                        None => return Err(refusal),
+                    };
+                    last_selection = self.select_ready(Some(profile), true);
+                    pulls_performed += 1;
+                    let repull_reselected_same_item =
+                        last_selection.selected_attempt_id.as_ref() == Some(&attempt_id);
+                    stale_refusals.push(FairPullStaleRefusal {
+                        attempt_id,
+                        admission_id,
+                        work_class,
+                        enqueue_sequence,
+                        disposition,
+                        repull_reselected_same_item,
+                    });
+                }
+            }
         }
         Ok(FairPullOutcome {
             algorithm: FAIR_PULL_ALGORITHM,
@@ -2393,6 +2483,7 @@ impl AgentCoordinator {
             poll_bound,
             pulls_performed,
             started,
+            stale_refusals,
             last_selection,
         })
     }
