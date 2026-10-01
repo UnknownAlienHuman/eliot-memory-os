@@ -2778,7 +2778,8 @@ impl DaemonKernelClient {
         let pair = parse_local_read_claimed_pair(&value).map_err(super::DaemonError::Kernel)?;
         if pair.as_ref().is_some_and(|(envelope, tool, _)| {
             envelope.identity.capability != LOCAL_STATE_CAPABILITY
-                || tool.get("name").and_then(serde_json::Value::as_str) != Some(LOCAL_STATE_CAPABILITY)
+                || tool.get("name").and_then(serde_json::Value::as_str)
+                    != Some(LOCAL_STATE_CAPABILITY)
         }) {
             // Issue #1839: structured route-mismatch evidence for the live
             // claim, identical to the query and packet claim gates.

@@ -57,12 +57,15 @@ revision_key = "startup_readiness_projection.source_revision_heads"
 queue_id = "local_read_claim"
 bounds = { max_items = 1, max_bytes = 4194304, max_in_flight_items = 1, max_deadline_ms = 30000 }
 
-# Issue #2564: the retained `eliot.state` pair legs. These are the same bounded
-# carrier and the same owner ledger as the query claim above - one claim flight,
-# one pair in flight, one 30 s front-door deadline - read under the State form
-# rather than the Query form, so the state claim is charged through the same
-# per-poll bounded step rather than through a second coordinator. The
-# entrypoints are the one production state poll step and its submit half.
+# Issue #2564: the retained `eliot.state` pair legs. The State leg rides the SAME
+# bounded carrier as the query claim - one carrier, one claim flight type, one
+# bounded owner read - but it is a SEPARATE declared queue with its own
+# `max_in_flight_items = 1`, so one state read and one query read may be
+# outstanding at the same time. That is deliberate: the two forms are read
+# through different owner operations and neither may be starved by the other.
+# The two declarations therefore describe two in-flight slots over one carrier,
+# NOT "one pair in flight" in total. Both share the 4 MiB byte bound and the
+# 30 s front-door deadline of the query claim above.
 [[supported_operations]]
 operation = "local_state_claim"
 operation_version = "1.0.0"
@@ -73,13 +76,17 @@ crate_closure = [
   "eliot-contracts",
   "eliot-protocol",
   "eliot-store-api",
+  "eliot-read",
+  "eliot-security-contracts",
 ]
 
 synchronous_external_calls = []
-# A null claim is a backoff signal and leaves the flight idle. A state pair that
-# cannot produce an owner-backed preview is settled as a typed refusal through
-# the same submit leg, never as an empty healthy preview, so this operation has
-# no success fallback that could stand in for a read.
+# A null claim is a backoff signal and leaves the flight idle. When the owner
+# read cannot produce a preview, the poll returns that typed reason to the run
+# loop, which reports it as a poll-step failure - no result body is submitted,
+# so this operation has NO success fallback that could stand in for a read. A
+# partial or unavailable owner verdict IS submitted, through the same submit
+# leg, as a retained record carrying that status and no payload.
 fallback_or_degradation = { Handle = { handle_ref = "host_request_result_body" } }
 # #1734 owns profile production; no profile exists for this operation yet.
 hot_path_profile_ref = {}
