@@ -7,7 +7,7 @@
 
 use std::collections::BTreeSet;
 
-use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
+use eliot_contracts::{ProductId, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_security_contracts::{
     FreshnessStatus, IntegrityStatus, ObservationDomainRef, PrivacyClass, QuarantineState,
     SourceAssurance,
@@ -481,6 +481,11 @@ pub struct WorkScopeBindingSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkScopeSourceAdmission {
+    /// Product leg of the original authenticated scope admission. Legacy
+    /// rows may omit it; such rows remain readable but cannot mint a complete
+    /// WorkScopeBinding for process-stream authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_id: Option<ProductId>,
     /// Exact owner-admitted sources, including their source references,
     /// content digests, assurance and authority bases.
     pub sources: GoverningSourceSet,
@@ -3234,6 +3239,66 @@ impl WorkScopeBindingSnapshot {
         Ok(snapshot)
     }
 
+    /// Product-aware variant used only by an authenticated initial scope
+    /// admission. The product is retained with the admitted source closure
+    /// so later readers never reconstruct it from a selector.
+    pub fn new_with_normative_pair_source_capture_for_product(
+        state_fence: StateFence,
+        owner_revision: u64,
+        binding: ScopeBinding,
+        guard_receipt: ScopeBindingGuardReceipt,
+        sources: GoverningSourceSet,
+        privacy: PrivacyProfile,
+        product_id: ProductId,
+        capture_json: String,
+        capture_sha256: String,
+    ) -> Result<Self, WorkScopeError> {
+        let mut snapshot = Self::new_with_source_admission_for_product(
+            state_fence,
+            owner_revision,
+            binding,
+            guard_receipt,
+            sources,
+            privacy,
+            product_id,
+        )?;
+        let admission = snapshot
+            .source_admission
+            .as_mut()
+            .ok_or(WorkScopeError::SourceSetMismatch)?;
+        validate_normative_pair_capture(&capture_json, &capture_sha256)?;
+        admission.normative_pair_source_capture_json = Some(capture_json);
+        admission.normative_pair_source_capture_sha256 = Some(capture_sha256);
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    /// Constructs a source admission while retaining its authenticated
+    /// ProductId. The original no-product constructor remains for legacy
+    /// owner compatibility only.
+    pub fn new_with_source_admission_for_product(
+        state_fence: StateFence,
+        owner_revision: u64,
+        binding: ScopeBinding,
+        guard_receipt: ScopeBindingGuardReceipt,
+        sources: GoverningSourceSet,
+        privacy: PrivacyProfile,
+        product_id: ProductId,
+    ) -> Result<Self, WorkScopeError> {
+        let mut snapshot = Self::new(state_fence, owner_revision, binding, guard_receipt)?;
+        let mut source_admission = WorkScopeSourceAdmission::new(
+            &snapshot.state_fence,
+            &snapshot.binding,
+            &snapshot.guard_receipt,
+            sources,
+            privacy,
+        )?;
+        source_admission.product_id = Some(product_id);
+        snapshot.source_admission = Some(source_admission);
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
     /// Returns the exact source admission retained with this owner snapshot.
     #[must_use]
     pub fn source_admission(&self) -> Option<&WorkScopeSourceAdmission> {
@@ -3302,6 +3367,7 @@ impl WorkScopeSourceAdmission {
         }
         let _ = (state_fence, binding);
         Ok(Self {
+            product_id: None,
             sources,
             privacy,
             normative_pair_source_capture_json: None,
