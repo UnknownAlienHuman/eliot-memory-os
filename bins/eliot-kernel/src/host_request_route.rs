@@ -5267,7 +5267,14 @@ impl KernelComposition {
             ObserveQueueReservation::Reserved {
                 token,
                 had_reference,
-            } => self.fill_observe_reservation(session, envelope, tool, token, had_reference, admitted),
+            } => self.fill_observe_reservation(
+                session,
+                envelope,
+                tool,
+                token,
+                had_reference,
+                admitted,
+            ),
         }
     }
 
@@ -5429,9 +5436,11 @@ impl KernelComposition {
         let payload_bytes = eliot_contracts::canonical_json_bytes(tool)
             .map_err(|_| TransportError::SessionFenced)?;
         let privacy_authorization =
-            self.observe_payload_privacy_authorization(session, envelope, &payload_bytes)?;
-        let privacy =
-            RedbRecoveryStore::bridge_event_privacy_decision(&payload_bytes, Some(&privacy_authorization));
+            Self::observe_payload_privacy_authorization(session, envelope, &payload_bytes)?;
+        let privacy = RedbRecoveryStore::bridge_event_privacy_decision(
+            &payload_bytes,
+            Some(&privacy_authorization),
+        );
         let admission_owner = self
             .agent_activation_pending
             .lock()
@@ -5464,14 +5473,8 @@ impl KernelComposition {
                 return Err(TransportError::SessionFenced);
             }
         };
-        let executable = matches!(
-            current.state,
-            HostRequestState::Admitted | HostRequestState::Routed
-        ) && current.result_digest.is_none()
-            && current.result_response.is_none();
-        let retained_result = current.state == HostRequestState::ResultReceived
-            && current.result_digest.is_some()
-            && current.result_response.is_some();
+        let executable = Self::observe_row_is_executable(&current);
+        let retained_result = Self::observe_row_has_retained_result(&current);
         // Issue #1739 W2: bind the exact typed payload bytes durably before
         // the in-memory observe pair is attached and the claim is handed out.
         // A digest alone cannot execute after a restart.
@@ -5528,6 +5531,24 @@ impl KernelComposition {
         } else {
             Err(TransportError::SessionFenced)
         }
+    }
+
+    /// Whether a stored observe row may still execute: it is admitted or
+    /// routed and carries neither a result digest nor a result body.
+    const fn observe_row_is_executable(current: &HostRequestRecord) -> bool {
+        matches!(
+            current.state,
+            HostRequestState::Admitted | HostRequestState::Routed
+        ) && current.result_digest.is_none()
+            && current.result_response.is_none()
+    }
+
+    /// Whether a stored observe row already holds a complete retained answer,
+    /// which is the only non-executable row that may be served as a replay.
+    fn observe_row_has_retained_result(current: &HostRequestRecord) -> bool {
+        current.state == HostRequestState::ResultReceived
+            && current.result_digest.is_some()
+            && current.result_response.is_some()
     }
 
     /// Binds the exact typed payload bytes durably before the observe claim.
@@ -5612,7 +5633,6 @@ impl KernelComposition {
     /// verdict's `source_sha256` is the same value the store compares against,
     /// not a re-serialization of them.
     fn observe_payload_privacy_authorization(
-        &self,
         session: &Session,
         envelope: &HostRequestEnvelope,
         payload_bytes: &[u8],
@@ -6961,8 +6981,11 @@ impl KernelComposition {
                     // payload handoff before the acknowledgement below.
                     // Digest-only submits keep the legacy shape untouched.
                     let observe_tool = payload.get("tool").cloned();
-                    let (receipt, record) =
-                        self.admit_and_queue_observe_submit(session, envelope, observe_tool.as_ref())?;
+                    let (receipt, record) = self.admit_and_queue_observe_submit(
+                        session,
+                        envelope,
+                        observe_tool.as_ref(),
+                    )?;
                     host_request_admitted_response(&receipt, &record)
                 }
                 AGENT_HOST_REQUEST_CANCEL_OPERATION => {
