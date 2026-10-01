@@ -946,6 +946,15 @@ mod tests {
 
     const LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
 
+    /// Closed leg name of this gate's own probe transition, so its declared
+    /// write intent is derived by the OWNER from a leg and a subject rather
+    /// than manufactured as a literal (#1925).
+    const GATE_PROBE_WRITE_INTENT_LEG: &str = "contract-rejection-gate-probe";
+
+    /// The single scope this gate's probe transition addresses, and therefore
+    /// the owner-issued subject its declared write intent is derived from.
+    const GATE_PROBE_SCOPE: &str = "scope-gate";
+
     fn fence() -> StateFence {
         let lineage = EpochLineageId::new(LINEAGE).expect("lineage");
         let epoch = EpochId::new(lineage, NonZeroU64::new(1).expect("nz")).expect("epoch");
@@ -967,15 +976,26 @@ mod tests {
     fn transition(op: &str, idem: &str, hash: &str) -> PreparedTransition {
         let mut transition = PreparedTransition {
             contract_version: eliot_store_api::CONTRACT_VERSION,
+            // #1925: the declared write intent is the OWNER's derivation over
+            // this leg's own scope, never a literal and never a default. The
+            // gate probes refusal of the transition, so the value only has to
+            // be a real owner-declared one, exactly as on the six production
+            // legs.
+            write_intent_id: eliot_store_api::admission_write_intent(
+                GATE_PROBE_WRITE_INTENT_LEG,
+                GATE_PROBE_SCOPE,
+            )
+            .expect("the gate probe scope declares a stable write intent"),
+            write_envelope_protocol_version: eliot_store_api::WRITE_ENVELOPE_PROTOCOL_VERSION,
             identity: OperationIdentity {
                 operation_id: OperationId::new(op).expect("op"),
                 idempotency_key: idem.to_owned(),
                 canonical_request_hash: hash.to_owned(),
             },
             state_fence: fence(),
-            scope_id: ScopeId::new("scope-gate").expect("scope"),
+            scope_id: ScopeId::new(GATE_PROBE_SCOPE).expect("scope"),
             task_id: None,
-            ordering_scopes: vec![OrderingScopeId::new("scope-gate").expect("ordering")],
+            ordering_scopes: vec![OrderingScopeId::new(GATE_PROBE_SCOPE).expect("ordering")],
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
             admission_contract_set_digest: "c".repeat(64),

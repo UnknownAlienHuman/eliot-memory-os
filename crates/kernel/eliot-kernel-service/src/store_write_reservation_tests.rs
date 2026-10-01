@@ -300,6 +300,11 @@ fn context_for_with(fixture: &ReservationFixture, tag: &str) -> RequestMeta {
     }
 }
 
+/// Closed leg name of the reserved-write reservation fixture transition, so
+/// its declared write intent is derived by the OWNER from a leg and this leg's
+/// own scope rather than manufactured as a literal (#1925).
+const RESERVATION_WRITE_INTENT_LEG: &str = "store-write-reservation";
+
 fn transition_for(tag: &str, scopes: &[&str]) -> PreparedTransition {
     transition_for_with(&fixture_992(), tag, scopes)
 }
@@ -350,6 +355,15 @@ fn transition_for_with(
     );
     let mut transition = PreparedTransition {
         contract_version: eliot_store_api::CONTRACT_VERSION,
+        // #1925: the declared write intent is the OWNER's derivation over this
+        // reserved-write leg's own fixture-provided scope, never a literal,
+        // never a default, and never the same value for two different scopes.
+        write_intent_id: eliot_store_api::admission_write_intent(
+            RESERVATION_WRITE_INTENT_LEG,
+            &scope_id,
+        )
+        .expect("the 992 fixture scope declares a stable reserved-write intent"),
+        write_envelope_protocol_version: eliot_store_api::WRITE_ENVELOPE_PROTOCOL_VERSION,
         identity: OperationIdentity {
             operation_id: OperationId::new(operation_id).unwrap(),
             idempotency_key,

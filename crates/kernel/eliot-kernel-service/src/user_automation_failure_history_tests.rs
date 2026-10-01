@@ -425,6 +425,16 @@ async fn create_revision(store: &MemoryStore, automation_id: &str, revision_id: 
             .expect("set digest");
     let mut transition = PreparedTransition {
         contract_version: eliot_store_api::CONTRACT_VERSION,
+        // #1925: this fixture creates the owning revision through the SAME
+        // user-automation-state leg the production adapter commits, so it
+        // declares that leg's intent through the OWNER's derivation rather
+        // than manufacturing a value or restating the leg name.
+        write_intent_id: eliot_store_api::admission_write_intent(
+            super::user_automation_store::USER_AUTOMATION_WRITE_INTENT_LEG,
+            automation_id,
+        )
+        .expect("the automation id declares a stable user-automation write intent"),
+        write_envelope_protocol_version: eliot_store_api::WRITE_ENVELOPE_PROTOCOL_VERSION,
         identity: OperationIdentity {
             operation_id: OperationId::new(format!("op-create-{automation_id}-{revision_id}"))
                 .expect("operation"),

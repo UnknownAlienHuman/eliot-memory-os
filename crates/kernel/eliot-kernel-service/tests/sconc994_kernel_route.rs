@@ -82,6 +82,11 @@ const LINEAGE_994: &str = "550e8400-e29b-41d4-a716-446655440000";
 const EPOCH_SEQUENCE: u64 = 1;
 const EXPECTED_REVISION: u64 = 3;
 
+/// Closed leg name of this Kernel-route reserved-write fixture, so its
+/// declared write intent is derived by the OWNER from a leg and this leg's own
+/// scope rather than manufactured as a literal (#1925).
+const KERNEL_ROUTE_WRITE_INTENT_LEG: &str = "sconc994-kernel-route";
+
 fn handle(value: &str) -> PlatformHandle {
     PlatformHandle::new(value).expect("994-kr handle builds")
 }
@@ -124,15 +129,24 @@ fn context_for(tag: &str) -> RequestMeta {
 
 fn transition_for(tag: &str, scopes: &[&str]) -> PreparedTransition {
     let operation_id = format!("op-994-kr-{tag}");
+    let scope = format!("scope-994-kr-{tag}");
     let mut transition = PreparedTransition {
         contract_version: eliot_store_api::CONTRACT_VERSION,
+        // #1925: the declared write intent is the OWNER's derivation over this
+        // kernel-route leg's own scope, never a literal and never a default.
+        write_intent_id: eliot_store_api::admission_write_intent(
+            KERNEL_ROUTE_WRITE_INTENT_LEG,
+            &scope,
+        )
+        .expect("the 994-kr route scope declares a stable write intent"),
+        write_envelope_protocol_version: eliot_store_api::WRITE_ENVELOPE_PROTOCOL_VERSION,
         identity: OperationIdentity {
             operation_id: OperationId::new(operation_id.clone()).expect("994-kr operation id"),
             idempotency_key: format!("idem-994-kr-{tag}"),
             canonical_request_hash: "a".repeat(64),
         },
         state_fence: fence(),
-        scope_id: ScopeId::new(format!("scope-994-kr-{tag}")).expect("994-kr scope id"),
+        scope_id: ScopeId::new(scope).expect("994-kr scope id"),
         task_id: None,
         ordering_scopes: scopes
             .iter()

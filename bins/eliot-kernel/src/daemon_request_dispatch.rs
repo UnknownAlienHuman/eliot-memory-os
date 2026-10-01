@@ -9357,21 +9357,29 @@ impl KernelComposition {
                 ));
             }
         };
-        // Owner times come from the request's own admitted clock observation
-        // plus the crate-wide Kernel clock, never from a second fresh read at
-        // this call site.
-        let observed_at_ms = i64::try_from(unix_ms()).unwrap_or(i64::MAX);
-        let created_at_ms = operation
-            .context
-            .clock
-            .valid_time_ms
-            .unwrap_or(observed_at_ms);
-        let known_at_ms = operation
-            .context
-            .clock
-            .known_time_ms
-            .unwrap_or(created_at_ms)
-            .max(created_at_ms);
+        // `created_at_ms`/`known_at_ms` are the OWNER's own clock, read once at
+        // the point of staging. They are deliberately NOT taken from
+        // `operation.context.clock`: that `ClockReading` is decoded from the
+        // caller's payload, and its only validation
+        // (`ClockReading::validate`, `crates/foundation/eliot-contracts/src/lib.rs:744`)
+        // checks `known >= valid` — no upper bound, no skew tolerance, and no
+        // comparison against the Kernel's own clock. A caller could therefore
+        // present `valid_time_ms: Some(0)` and have the envelope created at the
+        // epoch, which then flows into `envelope.created_at_ms` and, through
+        // `payload_created_at_ms`, into a hash-relevant and
+        // validation-relevant member of the write binding. Neither field is
+        // ADMITTED by anything on this route, so the envelope's creation
+        // instant is taken from the owner that creates it. No tolerance is
+        // invented here: a bound needs an owner behind the bound, and the
+        // owner clock is the whole of the truth available at staging.
+        //
+        // `expires_at_ms` is NOT derived from this read. It stays
+        // `RESERVED_WRITE_CLEANUP_HORIZON_MS` (`i64::MAX`), because I5.2 makes
+        // it a cleanup horizon that an unresolved operation must not cross
+        // automatically, and no named document supplies a duration.
+        let staged_at_ms = i64::try_from(unix_ms()).unwrap_or(i64::MAX);
+        let created_at_ms = staged_at_ms;
+        let known_at_ms = staged_at_ms;
         let reservation_seed = match eliot_kernel_service::gateway_seed(
             self.platform(),
             &operation.transition,
@@ -12340,6 +12348,25 @@ fn staged_write_recovery_view(
                     "epoch": envelope.authority_epoch_sequence,
                 },
                 "state_fence_sha256": envelope.state_fence_sha256,
+                // #1925: the bound write identity travels with the staged
+                // envelope so this report reconciles BY OPERATION IDENTITY
+                // (idempotency key, write intent, canonical request digest and
+                // the complete ordering-scope set) rather than by the
+                // operation-id string alone. A retained non-write envelope
+                // carries no binding and is reported as explicit `null` rather
+                // than as an invented identity.
+                "write_identity": envelope.write_identity.as_ref().map(|identity| {
+                    serde_json::json!({
+                        "write_envelope_protocol_version": identity.write_envelope_protocol_version,
+                        "write_intent_id": identity.write_intent_id,
+                        "idempotency_key": identity.idempotency_key,
+                        "canonical_request_sha256": identity.canonical_request_sha256,
+                        "prepared_transition_sha256": identity.prepared_transition_sha256,
+                        "admission_contract_set_digest": identity.admission_contract_set_digest,
+                        "operation_manifest_digest": identity.operation_manifest_digest,
+                        "ordering_scopes": identity.ordering_scopes,
+                    })
+                }),
             })
         })
         .collect();

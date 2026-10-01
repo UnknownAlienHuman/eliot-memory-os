@@ -614,7 +614,11 @@ fn canonical_payload_digest(payload: &Value) -> Result<String, StoreError> {
 
 /// Closed leg name of the user-automation state commit, so its declared write
 /// intent can never collide with another leg committing the same scope (#1925).
-const USER_AUTOMATION_WRITE_INTENT_LEG: &str = "user-automation-state";
+///
+/// Crate-visible so the store-facing proof of this exact leg declares the SAME
+/// intent through the SAME owner derivation instead of restating the leg name
+/// or manufacturing a value: one leg, one declared intent, one derivation.
+pub(crate) const USER_AUTOMATION_WRITE_INTENT_LEG: &str = "user-automation-state";
 
 /// Closed automation-state query kinds carried to the store read.
 const QUERY_LIST: &str = "list";
