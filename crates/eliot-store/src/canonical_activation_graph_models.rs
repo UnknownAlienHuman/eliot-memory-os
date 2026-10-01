@@ -2,7 +2,32 @@
 //! Architecture A13.2 (Kernel and failure domains): minimal live Kernel preserves canonical history, fencing, health and recovery entrypoint and does not depend on model/Dreamer/graph/provider/UI; this cell owns no canonical state, authority, or write path.
 //! Implementation I16.1 (Four surfaces): operational logs, metrics, durable audit, and reports — reports are Human/agent projections generated from canonical state ("prose not truth"); this cell is the I16.1 report/projection truth-boundary handle for UL activation graph rows (`CoChange` plus Card/Capsule/Concept/Support/Verified edges). Reports/projections are not truth/authority; they are derived, rebuildable, and must not confer canonical write authority.
 //! Mechanical extraction from `crates/eliot-store/src/canonical_store.rs` — preserves exact behavior, public API, imports, serde shape, and `CanonicalStore` facade. No semantic redesign and no canonical write-authority change. Excludes provider/handshake/migration/atomic-write, capacity/L2/recall, and Dreamer/Luna semantics.
+//!
+//! Transport decode boundary (#940). These two records are the real decoder on
+//! the production activation-graph path:
+//!
+//! ```text
+//! eliot_engine::ul::activation::ActivationEngine::activate
+//! → CanonicalStore::load_ul_activation_graph
+//! → execute_value(LoadUlActivationGraph)
+//! → decode_value::<RawActivationGraphRows>  (serde_json::from_value)
+//! → eliot_types::UlActivationGraphRows
+//! ```
+//!
+//! The closed public projection is constructed only after this decode, so it
+//! cannot reject anything erased here. A family may therefore never be
+//! defaulted to an empty vector, and no member may be discarded silently:
+//! absence of evidence is not evidence of an empty graph.
 
+/// Transport decoder: derived struct, no `flatten`, no tag, no `alias`.
+/// Unknown member keys are refused (`deny_unknown_fields`); duplicate member
+/// keys are already refused by the derived `MapAccess` visitor.
+///
+/// Bound projection: `surql/load_ul_activation_graph.surql` selects exactly
+/// `type::string(from) AS from_ref, type::string(to) AS to_ref` for all six
+/// relation families, so no record id or extra column reaches this struct.
+/// An added, renamed or re-derived projected column invalidates this decoder
+/// and must be reviewed here rather than absorbed.
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RawActivationRelation {
@@ -10,12 +35,49 @@ pub(super) struct RawActivationRelation {
     pub(super) to_ref: String,
 }
 
-/// Decoder: derived struct, no `flatten`. Unknown member keys are refused;
-/// duplicate member keys are already refused by the derived `MapAccess`.
-/// Every family key is required: the `LoadUlActivationGraph` projection
-/// always emits all seven keys (an empty family arrives as `[]`), so an
-/// absent family is a partial transport and must be refused rather than
-/// read as a known-empty graph.
+/// Transport decoder: derived struct, no `flatten`, no tag, no `alias`.
+/// Unknown completeness/source/lineage members are refused
+/// (`deny_unknown_fields`); duplicate member keys are already refused by the
+/// derived `MapAccess` visitor.
+///
+/// Every family key is REQUIRED, and none carries `#[serde(default)]`.
+/// `surql/load_ul_activation_graph.surql` closes with
+///
+/// ```text
+/// RETURN { co_change: …, card_covers: …, capsule_covers: …,
+///           concept_implemented_by: …, concept_depends_on: …,
+///           supports: …, verified_by: … };
+/// ```
+///
+/// so a genuinely empty family arrives as `[]` and never as an absent key.
+/// Absence is a partial or foreign transport shape; it is refused here as
+/// `StoreError::Decode` instead of being read as a known-empty graph, because
+/// an omitted family would otherwise remove edges from the graph that
+/// spreading activation consumes.
+///
+/// Sole production caller: `CanonicalStore::load_ul_activation_graph` in
+/// `crates/eliot-store/src/canonical_store.rs`, the only construction site of
+/// `eliot_types::UlActivationGraphRows` in production source. A second decode
+/// of this record from any other query, or a construction of the public
+/// projection that does not pass through it, invalidates this repair.
+///
+/// Preceding `Value` normalization boundary: the query result already reaches
+/// this decoder materialized as `serde_json::Value`, via
+/// `CanonicalStore::execute_value` → `last_query_result` → `decode_value`
+/// (`serde_json::from_value`). Lexical duplicate JSON keys are collapsed by
+/// that parse before these attributes run. This decoder therefore proves
+/// refusal of unknown and absent members of the materialized projection only;
+/// duplicate-sensitive validation of the original response bytes belongs to
+/// the SurrealDB transport ingress owner (`DbClientSet::execute_named` and
+/// `SurrealServerSupervisor`), and no downstream attribute is claimed to
+/// prove those bytes.
+///
+/// Inventory rows closed by this decoder. The #929 integrator records the
+/// owner; this file does not edit the shared boundary artifact:
+/// `eliot-store:crates/eliot-store/src/canonical_activation_graph_models.rs:derive:RawActivationGraphRows:<root>`
+/// and `eliot-store:crates/eliot-store/src/canonical_activation_graph_models.rs:derive:RawActivationRelation:<root>`
+/// (both inventoried `owner = UNASSIGNED`, `repair_child = UNASSIGNED`,
+/// `repair_readiness = BLOCKED`).
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RawActivationGraphRows {

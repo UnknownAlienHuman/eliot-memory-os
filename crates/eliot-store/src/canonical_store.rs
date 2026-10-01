@@ -3687,6 +3687,18 @@ impl CanonicalStore {
         Ok(())
     }
 
+    /// Sole production producer of `eliot_types::UlActivationGraphRows` (#940).
+    ///
+    /// The public projection is constructed here and nowhere else in production
+    /// source, and it is constructed only from `RawActivationGraphRows`, the
+    /// closed transport decoder in
+    /// `crates/eliot-store/src/canonical_activation_graph_models.rs`. That
+    /// decoder refuses an absent relation family and any unknown
+    /// completeness/source/lineage member, so a partial or foreign projection
+    /// can never reach `ActivationEngine::activate` as a complete row set. A
+    /// new construction site of the public type, or a decode of the raw record
+    /// from any other query, invalidates that guarantee and must be reviewed
+    /// at this call site.
     pub async fn load_ul_activation_graph(
         &self,
         project_id: ProjectId,
