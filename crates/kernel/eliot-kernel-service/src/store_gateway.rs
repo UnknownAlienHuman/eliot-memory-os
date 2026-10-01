@@ -9130,25 +9130,20 @@ fn decode_retained_cancellation_answer(
     expected_transport_request_sha256: Option<&str>,
     owner_readback_binds_answer: bool,
 ) -> Result<(Vec<String>, UserAutomationWakeEnumerationReceipt), String> {
+    let refuse = || unretained_cancellation_answer_reason(automation_revision, owner_operation_id);
     let Some(expected_receipt) = expected_receipt else {
-        return Err(unretained_cancellation_answer_reason(
-            automation_revision,
-            owner_operation_id,
-        ));
+        return Err(refuse());
     };
     if let Ok(UserAutomationRuntimeObligationAnswer::WakeCancellation {
         cancelled_wake_ids,
         enumeration_receipt: Some(enumeration_receipt),
     }) = serde_json::from_value::<UserAutomationRuntimeObligationAnswer>(result_response.clone())
     {
-        enumeration_receipt.validate_integrity().map_err(|_| {
-            unretained_cancellation_answer_reason(automation_revision, owner_operation_id)
-        })?;
+        enumeration_receipt
+            .validate_integrity()
+            .map_err(|_| refuse())?;
         if enumeration_receipt.as_ref() != expected_receipt {
-            return Err(unretained_cancellation_answer_reason(
-                automation_revision,
-                owner_operation_id,
-            ));
+            return Err(refuse());
         }
         let expected_wake_ids = expected_cancellation_wake_ids(
             enumeration_receipt.as_ref(),
@@ -9156,10 +9151,7 @@ fn decode_retained_cancellation_answer(
             owner_operation_id,
         )?;
         if expected_wake_ids.is_empty() || cancelled_wake_ids != expected_wake_ids {
-            return Err(unretained_cancellation_answer_reason(
-                automation_revision,
-                owner_operation_id,
-            ));
+            return Err(refuse());
         }
         return Ok((cancelled_wake_ids, *enumeration_receipt));
     }
@@ -9179,14 +9171,11 @@ fn decode_retained_cancellation_answer(
             wake_ids,
         }) = serde_json::from_value::<UserAutomationHostExecutionResponse>(result_response.clone())
         else {
-            return Err(unretained_cancellation_answer_reason(
-                automation_revision,
-                owner_operation_id,
-            ));
+            return Err(refuse());
         };
-        expected_receipt.validate_integrity().map_err(|_| {
-            unretained_cancellation_answer_reason(automation_revision, owner_operation_id)
-        })?;
+        expected_receipt
+            .validate_integrity()
+            .map_err(|_| refuse())?;
         let expected_wake_ids = expected_cancellation_wake_ids(
             expected_receipt,
             automation_revision,
@@ -9198,16 +9187,10 @@ fn decode_retained_cancellation_answer(
         {
             return Ok((wake_ids, expected_receipt.clone()));
         }
-        return Err(unretained_cancellation_answer_reason(
-            automation_revision,
-            owner_operation_id,
-        ));
+        return Err(refuse());
     }
     let Some(expected_transport_request_sha256) = expected_transport_request_sha256 else {
-        return Err(unretained_cancellation_answer_reason(
-            automation_revision,
-            owner_operation_id,
-        ));
+        return Err(refuse());
     };
     let Ok(UserAutomationHostExecutionResponse::Cancelled {
         request_sha256,
@@ -9215,22 +9198,13 @@ fn decode_retained_cancellation_answer(
         wake_ids,
     }) = serde_json::from_value::<UserAutomationHostExecutionResponse>(result_response)
     else {
-        return Err(unretained_cancellation_answer_reason(
-            automation_revision,
-            owner_operation_id,
-        ));
+        return Err(refuse());
     };
-    expected_receipt.validate_integrity().map_err(|_| {
-        unretained_cancellation_answer_reason(automation_revision, owner_operation_id)
-    })?;
-    let expected_wake_ids = expected_receipt
-        .cancellation_targets()
-        .map_err(|_| {
-            unretained_cancellation_answer_reason(automation_revision, owner_operation_id)
-        })?
-        .into_iter()
-        .map(|target| target.wake_id)
-        .collect::<Vec<_>>();
+    expected_receipt
+        .validate_integrity()
+        .map_err(|_| refuse())?;
+    let expected_wake_ids =
+        expected_cancellation_wake_ids(expected_receipt, automation_revision, owner_operation_id)?;
     if request_sha256 != expected_transport_request_sha256
         || state_fence != expected_receipt.state_fence
         || wake_ids != expected_wake_ids
