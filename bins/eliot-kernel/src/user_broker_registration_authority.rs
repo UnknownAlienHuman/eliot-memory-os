@@ -14,8 +14,10 @@ use eliot_ors::{OperationIdentity, OperationalRecordInput, UserBrokerRegistratio
 use eliot_protocol::{ProtocolVersion, RequestIdentity};
 use eliot_user_broker_core::{
     RegistrationFenceReceipt, RegistrationFenceRequest, RegistrationGrant, RegistrationReceipt,
-    RegistrationRequest,
+    RegistrationRequest, RegistrationStatus,
 };
+
+use super::TransportError;
 
 /// One exact authenticated transport binding retained with a registration.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -133,6 +135,63 @@ pub(crate) struct UserBrokerFenceReplay {
     pub(crate) store_operation_order: u64,
     pub(crate) store_record: OperationalRecordInput,
     pub(crate) spent: Vec<SpentUserBrokerOperationIdentity>,
+}
+
+/// I1.6 WorkScope execution identity bound to one broker registration.
+///
+/// A broker registration is inherently user-session-bound: the only WorkScope
+/// it can ever authorize is `interactive_user:<sid>` for the exact SID it was
+/// admitted for. `service` and `remote` scopes are never derived from a broker
+/// registration here; they are admitted (or refused) on their own owner
+/// paths, never through this cell.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum BrokerWorkScope {
+    InteractiveUser { sid: String },
+}
+
+impl BrokerWorkScope {
+    /// Derives the single WorkScope identity one registration authorizes.
+    pub(crate) fn for_registration(registration: &RegistrationRequest) -> Self {
+        Self::InteractiveUser {
+            sid: registration.windows_sid.clone(),
+        }
+    }
+
+    /// Projects the scope to its I1.6 route string (`interactive_user:<sid>`).
+    pub(crate) fn route_string(&self) -> String {
+        match self {
+            Self::InteractiveUser { sid } => format!("interactive_user:{sid}"),
+        }
+    }
+}
+
+/// Admits one `interactive_user:<sid>` scoped execution against the exact
+/// live registration that authorizes it (issue #1889 AC1).
+///
+/// The claimed scope must equal the WorkScope identity derived from the live
+/// registration, the presenting receipt must still name that same
+/// SID/session tuple with an Active status, and both the receipt and the
+/// registration lease must be unexpired at `now`. Anything else fails closed
+/// with [`TransportError::SessionFenced`]: a scope mismatch is presented
+/// evidence that does not match, never a reason to fence a live registration.
+pub(crate) fn admit_interactive_user_execution(
+    registration: &RegistrationRequest,
+    receipt: &RegistrationReceipt,
+    scope: &str,
+    now: u64,
+) -> Result<BrokerWorkScope, TransportError> {
+    let expected = BrokerWorkScope::for_registration(registration);
+    if scope != expected.route_string()
+        || receipt.status != RegistrationStatus::Active
+        || receipt.windows_sid != registration.windows_sid
+        || receipt.interactive_session_id != registration.interactive_session_id
+        || receipt.registration_digest.trim().is_empty()
+        || now >= receipt.expires_at
+        || now >= registration.lease_expires_at
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(expected)
 }
 
 /// The Kernel-owned current registration table. It is deliberately not a
