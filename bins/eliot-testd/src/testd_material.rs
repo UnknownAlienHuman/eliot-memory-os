@@ -686,7 +686,7 @@ fn validate_blob_stream_material(
         }
         for (index, token) in stream.tokens.iter().enumerate() {
             validate_wire_text(&token.reference, "testd_material.blob_stream.token.reference")?;
-            if token.ordinal as usize != index
+            if token.ordinal as usize != index + 1
                 || stream.tokens[..index]
                     .iter()
                     .any(|previous| previous.reference == token.reference)
