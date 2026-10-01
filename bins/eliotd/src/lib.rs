@@ -835,42 +835,201 @@ impl SwarmControlPort for ProductionSwarmControlPort {
     }
 }
 
-/// Production Governor admission authority port (issue #1108 W4/A2).
+/// Accepted interface revision the daemon speaks to the retained Governor
+/// swarm-admission owner (`eliot_governor::SwarmAttachmentComposition`).
 ///
-/// Closed over the retained composition: no accepted swarm
-/// reservation/admission interface revision exists on the retained Governor
-/// composition on this base, so the port honestly reports
-/// [`PortBindingState::Missing`] and every staging/commit attempt raises the
-/// typed [`FabricOperation::StageReservation`]/[`FabricOperation::CommitAdmission`]
-/// residual instead of minting a reservation or admission. Kernel staging
-/// and Governor admission stay with their owners; owner delegation lands
-/// with the Governor swarm-admission owner.
-struct ProductionAdmissionAuthorityPort;
+/// The value is the owner's OWN published revision identity, re-exported from
+/// `eliot_governor` (a crate this daemon already depends on) rather than a
+/// string chosen here. A revision the daemon spelled itself would be a second
+/// naming of the owner's interface and would prove nothing about it.
+///
+/// `eliot_governor` re-exports `ATTACHMENT_REVISION_KEY`
+/// (`"governor.swarm-plan-attachment.v1"`), the canonical revision-head key
+/// under which the owner versions its attachment image. The owner's separate
+/// wire-shape constant `elipt_coordination::SWARM_PLAN_ATTACHMENT_REVISION` is
+/// NOT re-exported through `eliot_governor`, and this daemon does not depend on
+/// `elipt-coordination`, so that identity is deliberately not spelled here; the
+/// absent re-export is reported as a residual with this change rather than
+/// papered over with a second naming.
+const GOVERNOR_ADMISSION_INTERFACE_REVISION: &str = eliot_governor::ATTACHMENT_REVISION_KEY;
+
+/// Production Governor admission authority port (issue #1108 W4/A2, #370 R1).
+///
+/// Closed over the single retained Governor swarm-admission owner
+/// ([`eliot_governor::SwarmAttachmentComposition`], issue #1126 W1/A1): the one
+/// owner this daemon retains that commits a canonical swarm plan admission.
+/// The port never mints an admission decision; it asks that owner and reports
+/// what the owner answered.
+///
+/// # The binding is derived from the owner, not asserted
+///
+/// [`AdmissionAuthorityPort::interface_binding`] is a live read of the
+/// retained owner's own canonical store, not a hard-coded verdict. The port
+/// reports [`PortBindingState::Bound`] only when that owner read answers, and
+/// [`PortBindingState::Unavailable`] when the owner cannot answer (poisoned
+/// store); a port with no owner wired reports [`PortBindingState::Missing`].
+/// This is why the binding and the admission decision cannot disagree: both
+/// are answered by the same retained owner instance, so there is no second
+/// admission scheme to drift away from it.
+///
+/// Whether the owner admits THIS reservation stays a per-call decision, made
+/// by the owner's own canonical `attach` in
+/// [`AdmissionAuthorityPort::commit_admission`] and compared by value against
+/// this operation's reservation. A predictable interface name is not
+/// ownership, so the binding never stands in for that decision.
+///
+/// # The Kernel staging leg is a separate owner and still refuses
+///
+/// [`AdmissionAuthorityPort::stage_reservation`] has no owner-issued source on
+/// this base. The Kernel ORS staged-reservation record
+/// (`elipt_ors::AdmissionReservationRecord`) is reachable only over an
+/// authenticated Kernel request route, and the daemon's Kernel client exposes
+/// no such route here; minting a WorkLease or reservation locally is forbidden
+/// to this daemon and to the coordinator crate alike. Rather than fabricate a
+/// reservation identity, the call refuses with the typed
+/// [`FabricError::DurabilityUnproven`] naming the exact absent leg. The typed
+/// missing-prerequisite residual stays reserved for the binding check itself
+/// and is unchanged by this port.
+struct ProductionAdmissionAuthorityPort {
+    /// The single retained Governor swarm-admission owner. `None` only for a
+    /// construction that retained no owner; the production wiring in
+    /// [`DaemonComposition::production_fabric_ports`] always supplies
+    /// [`DaemonComposition::swarm_attachment`].
+    governor: Option<Arc<eliot_governor::SwarmAttachmentComposition>>,
+}
+
+impl ProductionAdmissionAuthorityPort {
+    /// Binds the port to the single retained Governor swarm-admission owner.
+    fn governor(governor: &Arc<eliot_governor::SwarmAttachmentComposition>) -> Self {
+        Self {
+            governor: Some(Arc::clone(governor)),
+        }
+    }
+}
 
 impl AdmissionAuthorityPort for ProductionAdmissionAuthorityPort {
-    fn stage_reservation(&self, definition: &SwarmDefinition) -> Result<Reservation, FabricError> {
-        Err(blocked_port(
-            FabricPortId::AdmissionAuthority,
-            FabricOperation::StageReservation,
-            definition.definition_id.as_str().to_owned(),
-            Some(definition.fence.clone()),
-            None,
+    fn stage_reservation(&self, _definition: &SwarmDefinition) -> Result<Reservation, FabricError> {
+        // No owner-issued staged-reservation identity is reachable from this
+        // daemon on this base: the Kernel ORS reservation record is served only
+        // over an authenticated Kernel request route this daemon's Kernel
+        // client does not expose, so `reservation_id` has no owner-issued
+        // source. Returning a locally derived identity would be a second
+        // reservation scheme the Kernel does not own, so the call refuses
+        // typed instead. The fabric's binding check is unaffected: it passes on
+        // the owner's own answer, and this refusal is the per-operation verdict.
+        Err(FabricError::DurabilityUnproven(
+            "no owner-issued staged reservation identity: the Kernel ORS admission-reservation \
+             route is not exposed to this daemon, so the reservation cannot be staged durably"
+                .to_owned(),
         ))
     }
 
     fn commit_admission(&self, reservation: &Reservation) -> Result<FabricAdmission, FabricError> {
-        Err(blocked_port(
-            FabricPortId::AdmissionAuthority,
-            FabricOperation::CommitAdmission,
-            reservation.reservation_id.clone(),
-            Some(reservation.fence.clone()),
-            None,
-        ))
+        let Some(governor) = self.governor.as_ref() else {
+            return Err(FabricError::AdmissionDenied(
+                "no Governor swarm-admission owner is bound to this port".to_owned(),
+            ));
+        };
+        // The Governor owner decides admission against its own canonical
+        // image. These are the identities the owner itself pins and later
+        // compares by value (see `SwarmPlanAttachmentOwner::attach_plan_once`):
+        // the definition digest is the admission identity the owner binds, the
+        // plan revision and fence digest pin the exact definition and fence,
+        // and the caller supplies only the opaque durable job handle.
+        let fence_digest = reservation_fence_digest(&reservation.fence)?;
+        let consumer = governor
+            .vend_consumer(
+                &reservation.definition_digest,
+                reservation.definition_id.as_str(),
+                &fence_digest,
+            )
+            .map_err(|error| FabricError::AdmissionDenied(error.to_string()))?;
+        let binding = governor
+            .attach(&consumer, &reservation.reservation_id)
+            .map_err(|error| admission_attach_rejection(&error))?;
+        // The owner's canonical binding is read back and compared BY VALUE
+        // against this operation's reservation. Existence or shape proves
+        // nothing: a binding naming a different definition digest, plan
+        // revision, job handle or fence is a refusal, never an admission of
+        // this reservation.
+        if binding.admission_digest() != reservation.definition_digest
+            || binding.plan_revision() != reservation.definition_id.as_str()
+            || binding.job_handle() != reservation.reservation_id
+            || binding.fence_digest() != fence_digest
+        {
+            return Err(FabricError::ReceiptBinding(
+                "Governor admission binding does not bind the exact staged reservation".to_owned(),
+            ));
+        }
+        // The admission identity is the digest the OWNER computed over the
+        // exact tuple it admitted, never one derived here.
+        let admission_id = eliot_agent_coordinator::AdmissionId::new(binding.binding_digest())
+            .map_err(|error| FabricError::Contract(format!("admission identity: {error}")))?;
+        Ok(FabricAdmission {
+            admission_id,
+            definition_id: reservation.definition_id.clone(),
+            definition_digest: reservation.definition_digest.clone(),
+            work_class: reservation.work_class,
+            reservation_id: reservation.reservation_id.clone(),
+            fence: reservation.fence.clone(),
+            epoch: reservation.fence.authority_epoch.clone(),
+            // The retained Governor owner commits a plan-to-durable-job
+            // admission and holds no attempt registry, so it issues no attempt
+            // identity for this admission. Reporting none is honest; inventing
+            // one would be an attempt-registry scheme the owner does not run.
+            // An admission with no attempt therefore cannot be activated, which
+            // is the correct refusal at the activation gate rather than a
+            // fabricated attempt identity here.
+            attempt_ids: Vec::new(),
+        })
     }
 
     fn interface_binding(&self) -> PortBindingState {
-        PortBindingState::Missing
+        let Some(governor) = self.governor.as_ref() else {
+            return PortBindingState::Missing;
+        };
+        // A live owner read, not an asserted verdict. `is_empty` takes the
+        // retained owner's own store lock and reads its committed image, so a
+        // poisoned owner store refuses here and the port reports `Unavailable`
+        // (no claim either way) instead of a `Bound` the owner never gave.
+        // This proves the owner is present and answering; whether it admits
+        // THIS reservation is decided per call by the owner's own canonical
+        // `attach` above. The stricter `SwarmPlanAttachmentOwner::
+        // from_snapshot` revalidation runs inside that decision and is not
+        // reachable from here, because its entry points live on the
+        // `elipt-coordination` store trait this daemon does not depend on.
+        match governor.store().is_empty() {
+            Ok(_) => PortBindingState::bound(GOVERNOR_ADMISSION_INTERFACE_REVISION.to_owned())
+                .unwrap_or(PortBindingState::Unavailable),
+            Err(_) => PortBindingState::Unavailable,
+        }
     }
+}
+
+/// Canonical digest of one staged reservation's State Fence, in the same form
+/// the Governor attachment owner pins as `fence_digest`.
+///
+/// # Errors
+///
+/// Returns [`FabricError::Contract`] when the fence cannot be canonically
+/// encoded.
+fn reservation_fence_digest(fence: &StateFence) -> Result<String, FabricError> {
+    let bytes = eliot_contracts::canonical_json_bytes(fence)
+        .map_err(|error| FabricError::Contract(format!("reservation fence digest: {error}")))?;
+    Ok(eliot_contracts::sha256_hex(&bytes))
+}
+
+/// Maps one Governor attach refusal onto the fabric's typed admission
+/// vocabulary, carrying the owner's own refusal message verbatim.
+///
+/// The owner's error type is generic over its store and is not nameable from
+/// this daemon, so the refusal is carried as the owner's own rendered message
+/// inside [`FabricError::AdmissionDenied`] rather than reconstructed here. The
+/// daemon never interprets that message and never adopts the canonical winner
+/// an `OwnershipConflict` names: the admission identity above comes only from a
+/// binding this reservation matched by value.
+fn admission_attach_rejection(error: &impl std::fmt::Display) -> FabricError {
+    FabricError::AdmissionDenied(format!("Governor admission owner refused: {error}"))
 }
 
 /// Production Kernel activation authority port (issue #1108 W4/A2).
@@ -3393,12 +3552,24 @@ impl DaemonComposition {
     /// Non-test construction of [`FabricPorts`]: every seam is bound to the
     /// closed production port above, so the verified fabric path is
     /// reachable without the test-only fakes in
-    /// `bins/eliotd/tests/agent_fabric_wiring.rs`. Each port reports
-    /// [`PortBindingState::Missing`] until its prerequisite owner (B-MOD
-    /// #694, B-PEER #696, B-SWARM #698, governor-admission,
-    /// B-ACTIVATION-PROJECTION #839, dispatch-egress) binds an accepted
-    /// interface revision; dependent operations block with the typed
-    /// missing-prerequisite residual instead of inventing authority.
+    /// `bins/eliotd/tests/agent_fabric_wiring.rs`. A port whose owner is not
+    /// wired at all reports [`PortBindingState::Missing`]; the remaining closed
+    /// ports report it until their prerequisite owner (B-MOD #694, B-PEER
+    /// #696, B-SWARM #698, B-ACTIVATION-PROJECTION #839, dispatch-egress)
+    /// binds an accepted interface revision, and dependent operations block
+    /// with the typed missing-prerequisite residual instead of inventing
+    /// authority.
+    ///
+    /// #370 R1: the admission authority port is the exception. It is closed
+    /// over the single retained [`eliot_governor::SwarmAttachmentComposition`]
+    /// (issue #1126 W1/A1), and both its [`PortBindingState`] report and its
+    /// admission decision are answered by that same owner instance, so
+    /// `stage_reservation`/`commit_admission` are no longer unconditionally
+    /// refused by the fabric's binding check and the admission decision is the
+    /// owner's. The Kernel staged-reservation leg still refuses typed from the
+    /// port itself ([`FabricError::DurabilityUnproven`]), because that
+    /// identity has no owner-issued source reachable from this daemon on this
+    /// base; see [`ProductionAdmissionAuthorityPort`].
     /// Readiness gates the construction exactly like
     /// [`Self::agent_fabric_descriptor`].
     ///
@@ -3425,7 +3596,9 @@ impl DaemonComposition {
             model_registry: Arc::new(ProductionModelRegistryPort),
             peer_channel: Arc::new(ProductionPeerChannelPort),
             swarm_control: Arc::new(ProductionSwarmControlPort),
-            admission_authority: Arc::new(ProductionAdmissionAuthorityPort),
+            admission_authority: Arc::new(ProductionAdmissionAuthorityPort::governor(
+                &self.swarm_attachment,
+            )),
             activation_authority: Arc::new(ProductionActivationAuthorityPort),
             dispatch_egress: Arc::new(ProductionDispatchEgressPort),
         })
