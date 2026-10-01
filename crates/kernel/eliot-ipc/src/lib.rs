@@ -538,7 +538,7 @@ pub fn dispatch_lifecycle_cancel(
             reason: "lifecycle Cancel dispatch requires a Cancel frame carrying a Cancel message",
         }));
     }
-    let identity = frame.request_identity.as_ref().ok_or_else(|| {
+    let identity = frame.request_identity.as_ref().ok_or({
         TransportError::Protocol(ProtocolError::InvalidField {
             field: "request_identity",
             reason: "required for request and cancel frames",
