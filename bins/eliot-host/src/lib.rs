@@ -1589,6 +1589,8 @@ pub use lease_drain::{GenerationRetirementBarrier, GenerationRetirementFence};
 pub use reactive_context_delivery::{
     HostReactiveContextDeliveryError, HostReactiveContextProducer, HostReactiveContextProducerError,
 };
+#[cfg(windows)]
+pub use scm_launch::publish_supervision_record_table;
 pub use scm_launch::{
     HOST_SCM_CAUSE_MAX_CHARS, HostScmRegistrationCause, InstalledCandidateManifestSummary,
     InstalledCandidateReadback, InstalledCandidateSpec, SUPERVISION_RECORD_COMPONENTS,
@@ -1596,8 +1598,6 @@ pub use scm_launch::{
     SupervisionRecordTable, ValidatedHostScmLaunch, classify_host_scm_inspection,
     read_installed_candidate_contour, read_supervision_record_table, validate_host_scm_bootstrap,
 };
-#[cfg(windows)]
-pub use scm_launch::publish_supervision_record_table;
 pub use store_kernel_launch_sequence::StoreLivenessEvidence;
 #[cfg(all(test, windows))]
 use store_kernel_launch_sequence::{StoreKernelLaunchError, launch_store_then_kernel};
@@ -10813,14 +10813,16 @@ impl HostComposition {
     /// published.
     #[cfg(windows)]
     fn publish_restart_budget(&mut self, generation: &PlatformHandle) -> Result<(), HostError> {
-        let retained =
-            contour_restart_budget(&self.registry_host_root, &self.host.installation, generation)?;
+        let retained = contour_restart_budget(
+            &self.registry_host_root,
+            &self.host.installation,
+            generation,
+        )?;
         let mut budget = match retained {
             Some(budget) => budget,
-            None => HostRestartBudget::for_contour(
-                self.host.installation.as_str(),
-                generation.as_str(),
-            ),
+            None => {
+                HostRestartBudget::for_contour(self.host.installation.as_str(), generation.as_str())
+            }
         };
         budget.observe_attempts(
             self.jobs.kernel_restart_attempts,
@@ -10861,11 +10863,12 @@ impl HostComposition {
         let manifest = &active.manifest;
         let installation = self.host.installation.as_str();
         let generation_approved = manifest.generation.as_str();
-        let budget =
-            contour_restart_budget(&self.registry_host_root, &self.host.installation, &manifest.generation)?
-                .unwrap_or_else(|| {
-                    HostRestartBudget::for_contour(installation, generation_approved)
-                });
+        let budget = contour_restart_budget(
+            &self.registry_host_root,
+            &self.host.installation,
+            &manifest.generation,
+        )?
+        .unwrap_or_else(|| HostRestartBudget::for_contour(installation, generation_approved));
         let profile = format!("{:?}", manifest.runtime_launch.profile);
         let roots = &manifest.runtime_launch.runtime_state_roots;
         let live_generation = self
@@ -10892,13 +10895,18 @@ impl HostComposition {
                 .ok()
             });
         let watchdog_unapproved =
-            "installer approval unavailable (fail-closed; SystemService start requires it)".to_owned();
-        let kernel_lineage = self.jobs.kernel_candidate.as_ref().map_or_else(String::new, |candidate| {
-            format!(
-                " lineage remaining={} maximum={}",
-                candidate.restart_budget.remaining, candidate.restart_budget.maximum
-            )
-        });
+            "installer approval unavailable (fail-closed; SystemService start requires it)"
+                .to_owned();
+        let kernel_lineage =
+            self.jobs
+                .kernel_candidate
+                .as_ref()
+                .map_or_else(String::new, |candidate| {
+                    format!(
+                        " lineage remaining={} maximum={}",
+                        candidate.restart_budget.remaining, candidate.restart_budget.maximum
+                    )
+                });
         let rows = vec![
             SupervisionComponentRecord {
                 component: SUPERVISION_RECORD_COMPONENTS[0].to_owned(),

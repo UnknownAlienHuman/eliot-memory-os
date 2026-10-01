@@ -590,10 +590,7 @@ impl SupervisionRecordTable {
                 "supervision record wire is not the canonical record version".to_owned(),
             ));
         }
-        for bound in [
-            &self.installation,
-            &self.host_lineage,
-        ] {
+        for bound in [&self.installation, &self.host_lineage] {
             if bound.trim().is_empty() || bound.chars().any(char::is_control) {
                 return Err(HostError::RecoveryRequired(
                     "supervision record publisher binding is malformed".to_owned(),
@@ -881,11 +878,10 @@ pub fn read_installed_candidate_contour(
     let inspection = platform.inspect_service_registration_runtime(&request);
     let configuration_digest = request.expected_configuration_digest();
     let service_name = request.service_name().to_owned();
-    let store =
-        super::open_installation_registry_with_transient_retry_for_profile(
-            &spec.host_state_root,
-            spec.profile,
-        )?;
+    let store = super::open_installation_registry_with_transient_retry_for_profile(
+        &spec.host_state_root,
+        spec.profile,
+    )?;
     let manifest = match store.as_ref() {
         None => None,
         Some(store) => {

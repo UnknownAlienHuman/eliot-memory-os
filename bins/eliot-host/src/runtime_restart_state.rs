@@ -370,12 +370,8 @@ impl HostRestartBudget {
     /// episode, and a fresh episode is created only by replacing this record
     /// for a newly admitted generation binding.
     pub(super) fn observe_attempts(&mut self, kernel_attempts: u8, store_attempts: u8) {
-        self.kernel_attempts = self
-            .kernel_attempts
-            .max(u32::from(kernel_attempts));
-        self.store_attempts = self
-            .store_attempts
-            .max(u32::from(store_attempts));
+        self.kernel_attempts = self.kernel_attempts.max(u32::from(kernel_attempts));
+        self.store_attempts = self.store_attempts.max(u32::from(store_attempts));
         let bound = u32::from(HOST_RESTART_EPISODE_BOUND);
         if self.kernel_attempts >= bound {
             self.kernel_exhausted = true;
@@ -431,8 +427,11 @@ pub(super) fn load_restart_budget(
             "restart budget record is malformed or too large".to_owned(),
         ));
     }
-    let bytes =
-        read_bounded_runtime_restart_file(&path, MAX_RESTART_BUDGET_BYTES, "restart budget record")?;
+    let bytes = read_bounded_runtime_restart_file(
+        &path,
+        MAX_RESTART_BUDGET_BYTES,
+        "restart budget record",
+    )?;
     let record = serde_json::from_slice::<RestartBudgetRecord>(&bytes).map_err(|error| {
         HostError::RecoveryRequired(format!("restart budget record is malformed: {error}"))
     })?;
@@ -445,9 +444,9 @@ pub(super) fn load_restart_budget(
         kernel_exhausted: record.kernel_exhausted,
         store_exhausted: record.store_exhausted,
     };
-    budget
-        .validate()
-        .map_err(|error| HostError::RecoveryRequired(format!("restart budget record is invalid: {error}")))?;
+    budget.validate().map_err(|error| {
+        HostError::RecoveryRequired(format!("restart budget record is invalid: {error}"))
+    })?;
     host_restart_observe("host.restart budget loaded observed");
     Ok(Some(budget))
 }
@@ -466,18 +465,15 @@ pub(super) fn persist_restart_budget(
     budget.validate().map_err(HostError::Platform)?;
     let dir = runtime_restart_store_dir(host_state_root);
     std::fs::create_dir_all(&dir).map_err(|error| HostError::Platform(error.to_string()))?;
-    let bytes =
-        serde_json::to_vec(&restart_budget_payload(budget)).map_err(|error| HostError::Platform(error.to_string()))?;
+    let bytes = serde_json::to_vec(&restart_budget_payload(budget))
+        .map_err(|error| HostError::Platform(error.to_string()))?;
     if bytes.len() as u64 > MAX_RESTART_BUDGET_BYTES {
         return Err(HostError::Platform(
             "restart budget record exceeds its bounded size".to_owned(),
         ));
     }
     let path = restart_budget_path(host_state_root);
-    let tmp = dir.join(format!(
-        ".restart-budget.{}.tmp",
-        Uuid::new_v4().simple()
-    ));
+    let tmp = dir.join(format!(".restart-budget.{}.tmp", Uuid::new_v4().simple()));
     let publication = (|| {
         write_durable_file(&tmp, &bytes)?;
         eliot_windows_ipc::atomic_replace_file(&tmp, &path).map_err(|error| {
