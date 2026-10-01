@@ -371,7 +371,7 @@ static RECONCILE_RECOVERY_PARAMETERS: [ParameterDeclaration; 10] = [
 /// with a binding missing; `validate_problem_owner_state_params` then closes the
 /// verb set, compares the candidate record against them, and gates the optional
 /// retained closure record to exactly the two verbs that produce one.
-static APPLY_PROBLEM_OWNER_STATE_PARAMETERS: [ParameterDeclaration; 9] = [
+static APPLY_PROBLEM_OWNER_STATE_PARAMETERS: [ParameterDeclaration; 14] = [
     ParameterDeclaration {
         name: "transition",
         shape: ParameterShape::Subject,
@@ -406,6 +406,31 @@ static APPLY_PROBLEM_OWNER_STATE_PARAMETERS: [ParameterDeclaration; 9] = [
         name: "record_json",
         shape: ParameterShape::ProblemOwnerState,
         required: true,
+    },
+    ParameterDeclaration {
+        name: "owner_lease_grant",
+        shape: ParameterShape::ProblemOwnerState,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "owner_lease_revocation",
+        shape: ParameterShape::ProblemOwnerState,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: "expected_current_record_digest",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: "expected_current_owner_revoked",
+        shape: ParameterShape::ProblemOwnerState,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: "expected_current_lease_identity",
+        shape: ParameterShape::ProblemOwnerState,
+        required: false,
     },
     ParameterDeclaration {
         name: "closure_json",

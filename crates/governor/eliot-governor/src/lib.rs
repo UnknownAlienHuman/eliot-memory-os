@@ -270,8 +270,8 @@ pub use owner_closure_provider::{
 };
 pub use problem_owner_transitions::{
     PreparedProblemOwnerTransition, ProblemOwnerAuthorizationRefusal, ProblemOwnerClosure,
-    ProblemOwnerTransitionBody, ProblemOwnerTransitionOutcome, ProblemOwnerTransitionRequest,
-    prepare_problem_owner_transition,
+    ProblemOwnerTransitionBody, ProblemOwnerTransitionFromReadback,
+    ProblemOwnerTransitionOutcome, ProblemOwnerTransitionRequest, prepare_problem_owner_transition,
 };
 pub use problem_read_site::{
     ProblemReadback, ProblemReadbackError, ProblemReadbackRevision, read_committed_problem,

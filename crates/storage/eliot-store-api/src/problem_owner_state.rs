@@ -82,6 +82,23 @@ pub const PROBLEM_PARAM_RECORD_JSON: &str = "record_json";
 /// those two verbs and absent for every other one, so a closure can never be
 /// attached to a transition that did not produce one.
 pub const PROBLEM_PARAM_CLOSURE_JSON: &str = "closure_json";
+/// The complete issuer grant used for this transition, retained in the same
+/// canonical receipt as the resulting Problem record.
+pub const PROBLEM_PARAM_OWNER_LEASE_GRANT: &str = "owner_lease_grant";
+/// Issuer-observed revocation, present only when this transition records the
+/// loss of the exact grant it also carries.
+pub const PROBLEM_PARAM_OWNER_LEASE_REVOCATION: &str = "owner_lease_revocation";
+/// Digest of the exact currently committed predecessor Problem record. The
+/// Store compares this to its owner row inside the transaction.
+pub const PROBLEM_PARAM_EXPECTED_CURRENT_RECORD_DIGEST: &str =
+    "expected_current_record_digest";
+/// Whether the exact current predecessor retained a revoked/lost lease.
+pub const PROBLEM_PARAM_EXPECTED_CURRENT_OWNER_REVOKED: &str =
+    "expected_current_owner_revoked";
+/// Exact current predecessor's retained lease identity, compared to the
+/// Store-owned owner row inside the transaction.
+pub const PROBLEM_PARAM_EXPECTED_CURRENT_LEASE_IDENTITY: &str =
+    "expected_current_lease_identity";
 
 /// `closure_json.kind` for an accepted risk.
 pub const PROBLEM_CLOSURE_WAIVED: &str = "WAIVED";
@@ -208,6 +225,18 @@ pub struct DecodedProblemOwnerState {
     pub record_digest: String,
     /// The complete canonical candidate Problem record.
     pub record_json: Value,
+    /// Complete lease grant presented by the lease owner, retained for an
+    /// exact future issuer readback.
+    pub owner_lease_grant: Value,
+    /// Exact issuer-observed revocation, required only for `UNASSIGN`.
+    pub owner_lease_revocation: Option<Value>,
+    /// Digest of the current committed Problem, absent only for `CREATE`.
+    pub expected_current_record_digest: Option<String>,
+    /// Current predecessor's assignment/revocation state, absent only for
+    /// `CREATE`.
+    pub expected_current_owner_revoked: Option<bool>,
+    /// Current predecessor's exact lease identity, absent only for `CREATE`.
+    pub expected_current_lease_identity: Option<Value>,
     /// The retained closure record, present for exactly `WAIVE` and
     /// `SUPERSEDE`.
     pub closure_json: Option<Value>,
@@ -400,8 +429,162 @@ impl DecodedProblemOwnerState {
                 reason: "authorization digest does not describe the lease the record retains",
             });
         }
+        validate_problem_owner_lease_evidence(
+            self.transition,
+            record,
+            &self.owner_lease_grant,
+            self.owner_lease_revocation.as_ref(),
+        )?;
         Ok(())
     }
+}
+
+/// Holds the complete grant and optional revocation to the candidate record's
+/// own lease identity. This is a consistency check; the grant becomes
+/// authoritative only after it is written in a Store-owned transaction and
+/// read back from that committed receipt.
+fn validate_problem_owner_lease_evidence(
+    transition: ProblemOwnerTransition,
+    record: &Value,
+    grant: &Value,
+    revocation: Option<&Value>,
+) -> Result<(), StoreError> {
+    let ownership = record
+        .get("ownership")
+        .and_then(Value::as_object)
+        .ok_or(StoreError::InvalidField {
+            field: "record_json.ownership",
+            reason: "candidate record must retain its ownership",
+        })?;
+    let (owner, identity) = if let Some(assigned) = ownership.get("ASSIGNED") {
+        (
+            assigned.get("holder"),
+            assigned.get("lease"),
+        )
+    } else if let Some(unassigned) = ownership.get("UNASSIGNED") {
+        (
+            unassigned.get("last_holder"),
+            unassigned.get("lost_lease"),
+        )
+    } else {
+        return Err(StoreError::InvalidField {
+            field: "record_json.ownership",
+            reason: "candidate record must be assigned or retain an observed lost lease",
+        });
+    };
+    let identity = identity.and_then(Value::as_object).ok_or(StoreError::InvalidField {
+        field: "record_json.ownership.lease",
+        reason: "candidate record must retain the original lease identity",
+    })?;
+    let grant_obj = grant.as_object().ok_or(StoreError::InvalidField {
+        field: PROBLEM_PARAM_OWNER_LEASE_GRANT,
+        reason: "must carry the exact lease grant object",
+    })?;
+    let field_text = |object: &serde_json::Map<String, Value>, field: &'static str| {
+        object.get(field).and_then(Value::as_str).ok_or(StoreError::InvalidField {
+            field: PROBLEM_PARAM_OWNER_LEASE_GRANT,
+            reason: "grant is missing a required text field",
+        })
+    };
+    let grant_epoch = grant_obj
+        .get("ownership_epoch")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .ok_or(StoreError::InvalidField {
+            field: PROBLEM_PARAM_OWNER_LEASE_GRANT,
+            reason: "grant ownership epoch must be non-zero",
+        })?;
+    if field_text(grant_obj, "lease_id")? != identity.get("lease_id").and_then(Value::as_str).unwrap_or("")
+        || grant_epoch != identity.get("ownership_epoch").and_then(Value::as_u64).unwrap_or(0)
+    {
+        return Err(StoreError::InvalidField {
+            field: PROBLEM_PARAM_OWNER_LEASE_GRANT,
+            reason: "grant identity differs from the candidate's original owner lease",
+        });
+    }
+    if grant_obj.get("holder") != owner {
+        return Err(StoreError::InvalidField {
+            field: PROBLEM_PARAM_OWNER_LEASE_GRANT,
+            reason: "grant holder differs from the candidate's original owner",
+        });
+    }
+    let state_fence = record.get("state_fence").ok_or(StoreError::InvalidField {
+        field: "record_json.state_fence",
+        reason: "candidate record must retain its current full state fence",
+    })?;
+    if grant_obj.get("state_fence") != Some(state_fence) {
+        return Err(StoreError::InvalidField {
+            field: PROBLEM_PARAM_OWNER_LEASE_GRANT,
+            reason: "grant is not bound to the candidate's exact current state fence",
+        });
+    }
+    let authority_epoch = grant_obj.get("authority_epoch").ok_or(StoreError::InvalidField {
+        field: PROBLEM_PARAM_OWNER_LEASE_GRANT,
+        reason: "grant must retain its authority epoch",
+    })?;
+    let issued_at_ms = grant_obj.get("issued_at_ms").and_then(Value::as_u64).ok_or(
+        StoreError::InvalidField {
+            field: PROBLEM_PARAM_OWNER_LEASE_GRANT,
+            reason: "grant issue time must be a non-negative integer",
+        },
+    )?;
+    let expires_at_ms = grant_obj.get("expires_at_ms").and_then(Value::as_u64).ok_or(
+        StoreError::InvalidField {
+            field: PROBLEM_PARAM_OWNER_LEASE_GRANT,
+            reason: "grant expiry must be a non-negative integer",
+        },
+    )?;
+    if expires_at_ms <= issued_at_ms
+        || authority_epoch != state_fence.get("authority_epoch").unwrap_or(&Value::Null)
+    {
+        return Err(StoreError::InvalidField {
+            field: PROBLEM_PARAM_OWNER_LEASE_GRANT,
+            reason: "grant validity window or authority epoch differs from the current fence",
+        });
+    }
+    let grant_bytes = crate::canonical_json_bytes(&(
+        "eliot.problem.owner-lease.v1",
+        field_text(grant_obj, "lease_id")?,
+        grant_obj.get("holder").ok_or(StoreError::InvalidField {
+            field: PROBLEM_PARAM_OWNER_LEASE_GRANT,
+            reason: "grant must retain its exact holder",
+        })?,
+        authority_epoch,
+        state_fence,
+        grant_epoch,
+        issued_at_ms,
+        expires_at_ms,
+    ))
+    .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    if crate::sha256_hex(&grant_bytes)
+        != identity.get("commitment").and_then(Value::as_str).unwrap_or("")
+    {
+        return Err(StoreError::InvalidField {
+            field: PROBLEM_PARAM_OWNER_LEASE_GRANT,
+            reason: "grant commitment differs from the candidate's original lease identity",
+        });
+    }
+    if revocation.is_some() != matches!(transition, ProblemOwnerTransition::Unassign) {
+        return Err(StoreError::InvalidField {
+            field: PROBLEM_PARAM_OWNER_LEASE_REVOCATION,
+            reason: "issuer revocation is required exactly for UNASSIGN",
+        });
+    }
+    if let Some(revocation) = revocation {
+        let unassigned = ownership.get("UNASSIGNED").and_then(Value::as_object);
+        if revocation.as_object().is_none()
+            || unassigned.is_none_or(|unassigned| {
+                revocation.get("reason") != unassigned.get("reason")
+                    || revocation.get("evidence") != unassigned.get("loss_evidence")
+            })
+        {
+            return Err(StoreError::InvalidField {
+                field: PROBLEM_PARAM_OWNER_LEASE_REVOCATION,
+                reason: "must equal the revocation retained by the candidate owner-loss record",
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Builds the closed `ApplyProblemOwnerState` mutation request.
@@ -583,6 +766,77 @@ pub fn validate_problem_owner_state_params(
     }
     required_digest(parameters, PROBLEM_PARAM_AUTHORIZATION_DIGEST)?;
     required_digest(parameters, PROBLEM_PARAM_RECORD_DIGEST)?;
+    match (
+        transition,
+        parameters.get(PROBLEM_PARAM_EXPECTED_CURRENT_RECORD_DIGEST),
+    ) {
+        (ProblemOwnerTransition::Create, None) => {}
+        (ProblemOwnerTransition::Create, Some(_)) => {
+            return Err(StoreError::InvalidField {
+                field: PROBLEM_PARAM_EXPECTED_CURRENT_RECORD_DIGEST,
+                reason: "CREATE has no predecessor record",
+            });
+        }
+        (_, Some(value)) => {
+            let digest = value.as_str().ok_or(StoreError::InvalidField {
+                field: PROBLEM_PARAM_EXPECTED_CURRENT_RECORD_DIGEST,
+                reason: "must be a SHA-256 digest",
+            })?;
+            if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(StoreError::InvalidField {
+                    field: PROBLEM_PARAM_EXPECTED_CURRENT_RECORD_DIGEST,
+                    reason: "must be a SHA-256 digest",
+                });
+            }
+        }
+        (_, None) => {
+            return Err(StoreError::InvalidField {
+                field: PROBLEM_PARAM_EXPECTED_CURRENT_RECORD_DIGEST,
+                reason: "non-CREATE transition must bind its exact predecessor record",
+            });
+        }
+    }
+    match (
+        transition,
+        parameters.get(PROBLEM_PARAM_EXPECTED_CURRENT_OWNER_REVOKED),
+    ) {
+        (ProblemOwnerTransition::Create, None) => {}
+        (ProblemOwnerTransition::Create, Some(_)) => {
+            return Err(StoreError::InvalidField {
+                field: PROBLEM_PARAM_EXPECTED_CURRENT_OWNER_REVOKED,
+                reason: "CREATE has no predecessor owner state",
+            });
+        }
+        (_, Some(Value::Bool(_))) => {}
+        (_, _) => {
+            return Err(StoreError::InvalidField {
+                field: PROBLEM_PARAM_EXPECTED_CURRENT_OWNER_REVOKED,
+                reason: "non-CREATE transition must bind the predecessor owner state",
+            });
+        }
+    }
+    match (
+        transition,
+        parameters.get(PROBLEM_PARAM_EXPECTED_CURRENT_LEASE_IDENTITY),
+    ) {
+        (ProblemOwnerTransition::Create, None) => {}
+        (ProblemOwnerTransition::Create, Some(_)) => {
+            return Err(StoreError::InvalidField {
+                field: PROBLEM_PARAM_EXPECTED_CURRENT_LEASE_IDENTITY,
+                reason: "CREATE has no predecessor lease identity",
+            });
+        }
+        (_, Some(Value::Object(identity)))
+            if identity.get("lease_id").and_then(Value::as_str).is_some()
+                && identity.get("commitment").and_then(Value::as_str).is_some()
+                && identity.get("ownership_epoch").and_then(Value::as_u64).is_some() => {}
+        (_, _) => {
+            return Err(StoreError::InvalidField {
+                field: PROBLEM_PARAM_EXPECTED_CURRENT_LEASE_IDENTITY,
+                reason: "non-CREATE transition must bind the exact predecessor lease identity",
+            });
+        }
+    }
     if !matches!(
         parameters.get(PROBLEM_PARAM_RECORD_JSON),
         Some(Value::Object(_))
@@ -591,6 +845,20 @@ pub fn validate_problem_owner_state_params(
             field: PROBLEM_PARAM_RECORD_JSON,
             reason: "problem owner transition must carry its candidate record object",
         });
+    }
+    if !matches!(parameters.get(PROBLEM_PARAM_OWNER_LEASE_GRANT), Some(Value::Object(_))) {
+        return Err(StoreError::InvalidField {
+            field: PROBLEM_PARAM_OWNER_LEASE_GRANT,
+            reason: "must carry the complete issuer grant",
+        });
+    }
+    match parameters.get(PROBLEM_PARAM_OWNER_LEASE_REVOCATION) {
+        Some(value) if matches!(transition, ProblemOwnerTransition::Unassign) && value.is_object() => {}
+        None if !matches!(transition, ProblemOwnerTransition::Unassign) => {}
+        _ => return Err(StoreError::InvalidField {
+            field: PROBLEM_PARAM_OWNER_LEASE_REVOCATION,
+            reason: "issuer revocation is present exactly for UNASSIGN",
+        }),
     }
     match parameters.get(PROBLEM_PARAM_CLOSURE_JSON) {
         Some(value) => validate_closure_json(transition, value)?,
@@ -638,6 +906,23 @@ pub fn decode_problem_owner_state_mutation(
                 reason: "problem owner transition must carry its candidate record object",
             },
         )?,
+        owner_lease_grant: parameters.get(PROBLEM_PARAM_OWNER_LEASE_GRANT).cloned().ok_or(
+            StoreError::InvalidField {
+                field: PROBLEM_PARAM_OWNER_LEASE_GRANT,
+                reason: "must carry the complete issuer grant",
+            },
+        )?,
+        owner_lease_revocation: parameters.get(PROBLEM_PARAM_OWNER_LEASE_REVOCATION).cloned(),
+        expected_current_record_digest: parameters
+            .get(PROBLEM_PARAM_EXPECTED_CURRENT_RECORD_DIGEST)
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        expected_current_owner_revoked: parameters
+            .get(PROBLEM_PARAM_EXPECTED_CURRENT_OWNER_REVOKED)
+            .and_then(Value::as_bool),
+        expected_current_lease_identity: parameters
+            .get(PROBLEM_PARAM_EXPECTED_CURRENT_LEASE_IDENTITY)
+            .cloned(),
         closure_json: parameters.get(PROBLEM_PARAM_CLOSURE_JSON).cloned(),
     };
     decoded.record_satisfies_bindings()?;

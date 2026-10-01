@@ -680,6 +680,13 @@ impl OwnerLeaseLoss {
         &self.observed_lease
     }
 
+    /// Whether this issuer-observed loss names exactly the authenticated lease
+    /// the current owner transition is using.
+    #[must_use]
+    pub fn is_observed_for(&self, identity: &LeaseIdentity) -> bool {
+        self.observed_lease.is_exactly(identity)
+    }
+
     /// Why the issuing owner stopped holding this lease.
     #[must_use]
     pub const fn reason(&self) -> OwnerLossReason {
@@ -690,6 +697,15 @@ impl OwnerLeaseLoss {
     #[must_use]
     pub fn evidence(&self) -> &[ArtifactId] {
         &self.revocation.evidence
+    }
+
+    /// The exact revocation the issuing owner returned for this grant.
+    ///
+    /// This can be retained with the canonical owner transition so a later
+    /// issuer readback can distinguish an observed loss from an asserted one.
+    #[must_use]
+    pub const fn revocation(&self) -> &OwnerLeaseRevocation {
+        &self.revocation
     }
 
     /// Observes the loss of `grant` against the issuer that granted it.

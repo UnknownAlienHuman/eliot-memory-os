@@ -181,7 +181,8 @@ use eliot_store_api::{
 };
 
 use crate::problem_owner_transitions::{
-    ProblemOwnerTransitionOutcome, ProblemOwnerTransitionRequest, prepare_problem_owner_transition,
+    ProblemOwnerTransitionFromReadback, ProblemOwnerTransitionOutcome,
+    ProblemOwnerTransitionRequest, prepare_problem_owner_transition,
 };
 use crate::{
     CanonicalAdmissionOwner, CompositionError, CompositionReadiness, KernelPortError,
@@ -2118,6 +2119,42 @@ impl<P: KernelTransitionPort + ?Sized> GovernorObservationReconciliation<'_, P> 
             &manifest_digest,
         )
         .await
+    }
+
+    /// Commits a named transition using the current lease authenticated from
+    /// the same complete committed readback that supplied the record. A
+    /// principal or serialized readback cannot supply the lease authority.
+    pub async fn commit_problem_owner_transition_from_readback(
+        &self,
+        readback: &crate::ProblemReadback,
+        input: &ProblemOwnerTransitionFromReadback<'_>,
+    ) -> Result<ProblemOwnerTransitionOutcome, CompositionError> {
+        if &readback.head != input.current {
+            return Err(CompositionError::Owner(
+                "Problem transition current record differs from its committed readback".to_owned(),
+            ));
+        }
+        if !readback.history_complete {
+            return Err(CompositionError::Owner(
+                "Problem transition needs a complete committed readback".to_owned(),
+            ));
+        }
+        let lease = readback
+            .authenticate_current_lease()
+            .map_err(|error| CompositionError::Owner(format!(
+                "committed Problem readback cannot authenticate its current lease: {error}"
+            )))?;
+        let request = ProblemOwnerTransitionRequest {
+            identity: input.identity,
+            base_operation_id: input.base_operation_id,
+            current: Some(input.current),
+            expected_revision: input.expected_revision,
+            source_signal: input.source_signal,
+            lease: &lease,
+            now_ms: input.now_ms,
+            body: input.body,
+        };
+        self.commit_problem_owner_transition(&request).await
     }
 
     /// Commits one named Problem owner transition (issue #1759 I2).

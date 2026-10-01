@@ -97,8 +97,12 @@ use eliot_store_api::{
     EffectClass, EventId, EventProjectionRelationIntents, OperationManifestDigest,
     OrderingHeadExpectation, OrderingScopeId, PROBLEM_AUTHORIZATION_DOMAIN,
     PROBLEM_CLOSURE_SUPERSEDED_BY, PROBLEM_CLOSURE_WAIVED, PROBLEM_PARAM_AUTHORIZATION_DIGEST,
-    PROBLEM_PARAM_CLOSURE_JSON, PROBLEM_PARAM_EXPECTED_REVISION, PROBLEM_PARAM_PROBLEM_ID,
+    PROBLEM_PARAM_CLOSURE_JSON, PROBLEM_PARAM_EXPECTED_CURRENT_RECORD_DIGEST,
+    PROBLEM_PARAM_EXPECTED_CURRENT_LEASE_IDENTITY,
+    PROBLEM_PARAM_EXPECTED_CURRENT_OWNER_REVOKED,
+    PROBLEM_PARAM_EXPECTED_REVISION, PROBLEM_PARAM_PROBLEM_ID,
     PROBLEM_PARAM_RECORD_DIGEST, PROBLEM_PARAM_RECORD_JSON, PROBLEM_PARAM_SOURCE_SIGNAL_ID,
+    PROBLEM_PARAM_OWNER_LEASE_GRANT, PROBLEM_PARAM_OWNER_LEASE_REVOCATION,
     PROBLEM_PARAM_TRANSITION, ProblemOwnerTransition, RevisionHeadExpectation, ScopeId,
     SecurityContext, StateFence, TransitionClass, problem_owner_state_mutation_request,
     problem_revision_key,
@@ -293,6 +297,27 @@ pub struct ProblemOwnerTransitionRequest<'a> {
     /// window.
     pub now_ms: u64,
     /// The closed per-verb body, which selects the named transition.
+    pub body: &'a ProblemOwnerTransitionBody,
+}
+
+/// Inputs for a production transition whose current lease is proved from the
+/// complete committed Problem readback. Callers cannot provide an
+/// [`AuthenticatedOwnerLease`] in this form; the canonical readback owns that
+/// step.
+pub struct ProblemOwnerTransitionFromReadback<'a> {
+    /// Admitted request identity.
+    pub identity: &'a eliot_protocol::RequestIdentity,
+    /// Base operation identity.
+    pub base_operation_id: &'a eliot_contracts::OperationId,
+    /// Committed Problem record being advanced.
+    pub current: &'a Problem,
+    /// Current revision expected by this transition.
+    pub expected_revision: u64,
+    /// Source Signal bound to the record.
+    pub source_signal: &'a Signal,
+    /// Current Unix time in milliseconds.
+    pub now_ms: u64,
+    /// Closed named transition body.
     pub body: &'a ProblemOwnerTransitionBody,
 }
 
@@ -549,6 +574,9 @@ fn problem_owner_parameters(
     transition: ProblemOwnerTransition,
     authorization: &str,
     closure: Option<&ProblemOwnerClosure>,
+    lease: &AuthenticatedOwnerLease,
+    body: &ProblemOwnerTransitionBody,
+    current: Option<&Problem>,
 ) -> Result<(BTreeMap<String, Value>, String), CompositionError> {
     let record_json = serde_json::to_value(candidate)
         .map_err(|error| owner_refused(format!("cannot render the candidate record: {error}")))?;
@@ -582,8 +610,71 @@ fn problem_owner_parameters(
             Value::String(record_digest.clone()),
         ),
         (PROBLEM_PARAM_RECORD_JSON, record_json),
+        (
+            PROBLEM_PARAM_OWNER_LEASE_GRANT,
+            serde_json::to_value(lease.grant()).map_err(|error| {
+                owner_refused(format!("cannot render the authenticated owner lease grant: {error}"))
+            })?,
+        ),
     ] {
         parameters.insert(name.to_owned(), value);
+    }
+    if let ProblemOwnerTransitionBody::Unassign(loss) = body {
+        if !loss.is_observed_for(lease.identity()) {
+            return Err(owner_refused(
+                "owner-loss evidence does not name the authenticated current lease".to_owned(),
+            ));
+        }
+        parameters.insert(
+            PROBLEM_PARAM_OWNER_LEASE_REVOCATION.to_owned(),
+            serde_json::to_value(loss.revocation()).map_err(|error| {
+                owner_refused(format!("cannot render the issuer-observed lease revocation: {error}"))
+            })?,
+        );
+    }
+    match current {
+        Some(current) => {
+            let current_value = serde_json::to_value(current).map_err(|error| {
+                owner_refused(format!("cannot render the committed predecessor Problem: {error}"))
+            })?;
+            let current_bytes = canonical_json_bytes(&current_value).map_err(|error| {
+                owner_refused(format!("cannot canonicalize the predecessor Problem: {error}"))
+            })?;
+            parameters.insert(
+                PROBLEM_PARAM_EXPECTED_CURRENT_RECORD_DIGEST.to_owned(),
+                Value::String(sha256_hex(&current_bytes)),
+            );
+            parameters.insert(
+                PROBLEM_PARAM_EXPECTED_CURRENT_OWNER_REVOKED.to_owned(),
+                Value::Bool(matches!(
+                    &current.ownership,
+                    eliot_problem::Ownership::Unassigned(_)
+                )),
+            );
+            let current_lease = match &current.ownership {
+                eliot_problem::Ownership::Assigned(assigned) => &assigned.lease,
+                eliot_problem::Ownership::Unassigned(unassigned) => {
+                    unassigned.lost_lease.as_ref().ok_or_else(|| {
+                        owner_refused(
+                            "legacy owner state has no original lease identity for a control transition"
+                                .to_owned(),
+                        )
+                    })?
+                }
+            };
+            parameters.insert(
+                PROBLEM_PARAM_EXPECTED_CURRENT_LEASE_IDENTITY.to_owned(),
+                serde_json::to_value(current_lease).map_err(|error| {
+                    owner_refused(format!("cannot render the predecessor lease identity: {error}"))
+                })?,
+            );
+        }
+        None if transition == ProblemOwnerTransition::Create => {}
+        None => {
+            return Err(owner_refused(
+                "non-CREATE owner transition must bind its committed predecessor".to_owned(),
+            ));
+        }
     }
     // The retained closure record travels with the transition it was produced
     // by, so an accepted risk or a supersession is durable in the committed
@@ -931,6 +1022,9 @@ pub fn prepare_problem_owner_transition(
         transition,
         &authorization,
         closure.as_ref(),
+        lease,
+        request.body,
+        current,
     )?;
     let envelope = problem_owner_envelope(
         identity,

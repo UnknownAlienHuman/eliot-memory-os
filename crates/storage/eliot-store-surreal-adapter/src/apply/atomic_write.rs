@@ -162,6 +162,8 @@ const SEMANTIC_CONFLICT_MARKERS: &[&str] = &[
     "swarm_owner_revision_conflict",
     "blackboard_item_revision_conflict",
     "task_contract_acceptance_revision_conflict",
+    "problem_owner_create_conflict",
+    "problem_owner_currentness_conflict",
     "notification_revision_conflict",
     "reactive_session_conflict",
     "reactive_snapshot_conflict",
@@ -969,6 +971,7 @@ fn build_apply_statements(
     append_module_registry_owner_statement(&mut sql, &mut bindings, transition)?;
     append_finish_evidence_owner_statement(&mut sql, &mut bindings, transition)?;
     append_finish_owner_statement(&mut sql, &mut bindings, transition)?;
+    append_problem_owner_lease_statement(&mut sql, &mut bindings, transition)?;
 
     sql.push_str(schema::TX_CREATE_RECEIPT);
     bindings.insert(
@@ -1441,6 +1444,215 @@ fn append_capability_evidence_owner_statements(
         "capability_evidence_record".to_owned(),
         Value::Object(record),
     );
+    Ok(())
+}
+
+/// Persists the current Problem owner grant/revocation with the exact candidate
+/// record in the same transaction as its canonical receipt. The predecessor
+/// digest is compared inside the transaction, alongside its full State Fence
+/// and revision; a stale owner or lease cannot update the owner row.
+fn append_problem_owner_lease_statement(
+    sql: &mut String,
+    bindings: &mut Map<String, Value>,
+    transition: &eliot_store_api::PreparedTransition,
+) -> Result<(), AdapterError> {
+    let mut matching = transition.named_operations.iter().filter(|command| {
+        command.operation == eliot_store_api::NamedMutationOperation::ApplyProblemOwnerState
+    });
+    let Some(command) = matching.next() else {
+        return Ok(());
+    };
+    if matching.next().is_some() {
+        return Err(AdapterError::Store(StoreError::Duplicate {
+            field: "problem_owner.named_operations",
+        }));
+    }
+    if transition.transition_class != eliot_store_api::TransitionClass::RecoverySchema {
+        return Err(AdapterError::Store(StoreError::TransitionClassExceeded));
+    }
+    let decoded = eliot_store_api::decode_problem_owner_state_mutation(
+        &command.parameters,
+    )
+    .map_err(AdapterError::Store)?;
+    let record_revision = decoded
+        .required_record_revision()
+        .ok_or(AdapterError::Store(StoreError::InvalidField {
+            field: "problem_owner.revision",
+            reason: "record revision overflow",
+        }))?;
+    let ownership = decoded
+        .record_json
+        .get("ownership")
+        .and_then(Value::as_object)
+        .ok_or(AdapterError::Store(StoreError::InvalidField {
+            field: "problem_owner.ownership",
+            reason: "candidate record has no ownership object",
+        }))?;
+    let (holder, identity, revoked) = if let Some(assigned) = ownership.get("ASSIGNED") {
+        (
+            assigned.get("holder").cloned().ok_or(AdapterError::Store(
+                StoreError::InvalidField {
+                    field: "problem_owner.holder",
+                    reason: "assigned ownership has no holder",
+                },
+            ))?,
+            assigned.get("lease").cloned().ok_or(AdapterError::Store(
+                StoreError::InvalidField {
+                    field: "problem_owner.lease",
+                    reason: "assigned ownership has no lease identity",
+                },
+            ))?,
+            false,
+        )
+    } else if let Some(unassigned) = ownership.get("UNASSIGNED") {
+        (
+            unassigned.get("last_holder").cloned().ok_or(AdapterError::Store(
+                StoreError::InvalidField {
+                    field: "problem_owner.last_holder",
+                    reason: "unassigned ownership has no last holder",
+                },
+            ))?,
+            unassigned.get("lost_lease").cloned().ok_or(AdapterError::Store(
+                StoreError::InvalidField {
+                    field: "problem_owner.lost_lease",
+                    reason: "unassigned ownership has no lost lease identity",
+                },
+            ))?,
+            true,
+        )
+    } else {
+        return Err(AdapterError::Store(StoreError::InvalidField {
+            field: "problem_owner.ownership",
+            reason: "candidate ownership must be assigned or unassigned",
+        }));
+    };
+    let identity = identity.as_object().ok_or(AdapterError::Store(
+        StoreError::InvalidField {
+            field: "problem_owner.lease",
+            reason: "candidate lease identity must be an object",
+        },
+    ))?;
+    let text = |name: &'static str| {
+        identity
+            .get(name)
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned)
+            .ok_or(AdapterError::Store(StoreError::InvalidField {
+                field: "problem_owner.lease",
+                reason: "candidate lease identity is incomplete",
+            }))
+    };
+    let lease_id = text("lease_id")?;
+    let lease_commitment = text("commitment")?;
+    let ownership_epoch = identity
+        .get("ownership_epoch")
+        .and_then(Value::as_u64)
+        .ok_or(AdapterError::Store(StoreError::InvalidField {
+            field: "problem_owner.ownership_epoch",
+            reason: "candidate ownership epoch is missing",
+        }))?;
+    let fence = decoded
+        .record_json
+        .get("state_fence")
+        .cloned()
+        .ok_or(AdapterError::Store(StoreError::InvalidField {
+            field: "problem_owner.state_fence",
+            reason: "candidate record has no full State Fence",
+        }))?;
+    let payload_value = json!({
+        "problem_id": decoded.problem_id.clone(),
+        "problem_revision": record_revision,
+        "record_digest": decoded.record_digest.clone(),
+        "record_json": decoded.record_json.clone(),
+        "owner_lease_grant": decoded.owner_lease_grant.clone(),
+        "owner_lease_revocation": decoded.owner_lease_revocation.clone(),
+        "holder": holder,
+        "state_fence": fence,
+        "operation_id": transition.identity.operation_id.clone(),
+        "canonical_request_hash": transition.identity.canonical_request_hash.clone(),
+    });
+    let payload = eliot_store_api::canonical_json_bytes(&payload_value)
+        .map_err(|error| AdapterError::Serialization(error.to_string()))?;
+    let key = eliot_store_api::RecoveryRecordKey::new(
+        "problem-owner-lease-v1",
+        &decoded.problem_id,
+    )
+    .map_err(AdapterError::Store)?;
+    let owner_id = recovery_owner_id(&key)?;
+    let mut owner_record = Map::new();
+    owner_record.insert("namespace".to_owned(), json!(key.namespace));
+    owner_record.insert("key".to_owned(), json!(key.key));
+    owner_record.insert("state_fence".to_owned(), json!(&transition.state_fence));
+    owner_record.insert("revision".to_owned(), json!(record_revision));
+    owner_record.insert(
+        "schema".to_owned(),
+        json!("eliot.problem.owner-lease.v1"),
+    );
+    owner_record.insert("payload".to_owned(), json!(payload));
+    owner_record.insert(
+        "value_digest".to_owned(),
+        json!(eliot_store_api::sha256_hex(&payload)),
+    );
+    owner_record.insert("record_digest".to_owned(), json!(decoded.record_digest));
+    owner_record.insert("lease_id".to_owned(), json!(lease_id));
+    owner_record.insert("lease_commitment".to_owned(), json!(lease_commitment));
+    owner_record.insert("ownership_epoch".to_owned(), json!(ownership_epoch));
+    owner_record.insert("revoked".to_owned(), json!(revoked));
+    owner_record.insert(
+        "operation_id".to_owned(),
+        json!(transition.identity.operation_id.as_str()),
+    );
+    owner_record.insert(
+        "canonical_request_hash".to_owned(),
+        json!(transition.identity.canonical_request_hash.as_str()),
+    );
+    sql.push_str(schema::TX_PROBLEM_OWNER_LEASE);
+    bindings.insert("problem_owner_table".to_owned(), json!(schema::table::RECOVERY_OWNER));
+    bindings.insert("problem_owner_id".to_owned(), json!(owner_id));
+    bindings.insert(
+        "problem_owner_is_create".to_owned(),
+        json!(decoded.transition == eliot_store_api::ProblemOwnerTransition::Create),
+    );
+    bindings.insert(
+        "problem_owner_expected_state_fence".to_owned(),
+        json!(&transition.state_fence),
+    );
+    bindings.insert(
+        "problem_owner_expected_revision".to_owned(),
+        json!(decoded.expected_revision),
+    );
+    bindings.insert(
+        "problem_owner_expected_record_digest".to_owned(),
+        json!(decoded.expected_current_record_digest),
+    );
+    let current_lease = decoded
+        .expected_current_lease_identity
+        .as_ref()
+        .and_then(Value::as_object);
+    bindings.insert(
+        "problem_owner_expected_lease_id".to_owned(),
+        current_lease.and_then(|lease| lease.get("lease_id")).cloned().unwrap_or(Value::Null),
+    );
+    bindings.insert(
+        "problem_owner_expected_lease_commitment".to_owned(),
+        current_lease
+            .and_then(|lease| lease.get("commitment"))
+            .cloned()
+            .unwrap_or(Value::Null),
+    );
+    bindings.insert(
+        "problem_owner_expected_ownership_epoch".to_owned(),
+        current_lease
+            .and_then(|lease| lease.get("ownership_epoch"))
+            .cloned()
+            .unwrap_or(Value::Null),
+    );
+    bindings.insert(
+        "problem_owner_expected_revoked".to_owned(),
+        json!(decoded.expected_current_owner_revoked),
+    );
+    bindings.insert("problem_owner_record".to_owned(), Value::Object(owner_record));
     Ok(())
 }
 

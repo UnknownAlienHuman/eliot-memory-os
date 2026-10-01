@@ -55,7 +55,9 @@
 use std::collections::BTreeMap;
 
 use eliot_context_candidates::ProjectionState;
-use eliot_problem::Problem;
+use eliot_problem::{
+    OwnerLeaseGrant, OwnerLeaseIssuer, OwnerLeaseRevocation, Ownership, Problem,
+};
 use eliot_store_api::{
     PROBLEM_OWNER_STATE_MUTATION_NAME, PROBLEM_PARAM_PROBLEM_ID, ProblemOwnerTransition,
     SequenceDispositionChoice, SequenceDispositionEvidence, SequenceGapStatus,
@@ -117,6 +119,59 @@ pub struct ProblemReadback {
     /// complete for this Problem. A partial page never presents a prefix as
     /// the complete set of open gaps.
     pub sequence_gaps_complete: bool,
+    /// Exact lease grants carried by the committed transitions in this read.
+    /// This field is populated only by the committed read path; serde decoding
+    /// deliberately drops it so a caller cannot turn a serialized projection
+    /// into lease authority.
+    #[serde(skip)]
+    lease_grants: Vec<OwnerLeaseGrant>,
+    /// Issuer-observed revocations carried beside the grant they revoke.
+    /// Like grants, these are usable only on a fresh store read.
+    #[serde(skip)]
+    lease_revocations: Vec<(OwnerLeaseGrant, OwnerLeaseRevocation)>,
+}
+
+impl OwnerLeaseIssuer for ProblemReadback {
+    fn commitment_for(&self, grant: &OwnerLeaseGrant) -> Option<String> {
+        if !self.history_complete {
+            return None;
+        }
+        let held = self.lease_grants.last()?;
+        let assigned = self.head.ownership.assigned().ok()?;
+        let commitment = held.expected_commitment().ok()?;
+        let identity = held.identity(commitment.clone()).ok()?;
+        (held == grant
+            && assigned.holder == grant.holder
+            && assigned.lease == identity
+            && grant.state_fence == self.head.state_fence)
+            .then_some(commitment)
+    }
+
+    fn revoked_lease(&self, grant: &OwnerLeaseGrant) -> Option<OwnerLeaseRevocation> {
+        if !self.history_complete {
+            return None;
+        }
+        self.lease_revocations
+            .iter()
+            .find(|(held, _)| held == grant)
+            .map(|(_, revocation)| revocation.clone())
+    }
+}
+
+impl ProblemReadback {
+    /// Authenticates the current assigned lease from the complete committed
+    /// Problem history this read returned. Truncated pages and serialized
+    /// readbacks have no issuer capability and cannot produce an authenticated
+    /// lease.
+    pub fn authenticate_current_lease(
+        &self,
+    ) -> Result<eliot_problem::AuthenticatedOwnerLease, eliot_problem::ProblemError> {
+        let grant = self
+            .lease_grants
+            .last()
+            .ok_or(eliot_problem::ProblemError::OwnerLeaseMismatch)?;
+        eliot_problem::AuthenticatedOwnerLease::authenticate(grant, self)
+    }
 }
 
 /// Typed refusals of the committed Problem read site.
@@ -190,11 +245,46 @@ pub fn read_committed_problem(
     };
     let mut committed: Vec<(Problem, ProblemReadbackRevision)> = Vec::new();
     let mut sequence_gaps = BTreeMap::new();
+    let mut lease_grants = Vec::new();
+    let mut lease_revocations = Vec::new();
     for (index, record) in records.iter().enumerate() {
         let page_position = u64::try_from(index).unwrap_or(u64::MAX);
         let Some(parameters) = owner_transition_parameters(record, problem_id) else {
             continue;
         };
+        let grant: OwnerLeaseGrant = serde_json::from_value(
+            parameters
+                .get("owner_lease_grant")
+                .cloned()
+                .ok_or_else(|| ProblemReadbackError::TransitionUndecodable {
+                    page_position,
+                    reason: "committed transition omitted its owner lease grant".to_owned(),
+                })?,
+        )
+        .map_err(|error| ProblemReadbackError::TransitionUndecodable {
+            page_position,
+            reason: format!("committed owner lease grant is malformed: {error}"),
+        })?;
+        grant.validate().map_err(|error| ProblemReadbackError::TransitionUndecodable {
+            page_position,
+            reason: format!("committed owner lease grant is invalid: {error}"),
+        })?;
+        if let Some(value) = parameters.get("owner_lease_revocation") {
+            let revocation: OwnerLeaseRevocation = serde_json::from_value(value.clone()).map_err(
+                |error| ProblemReadbackError::TransitionUndecodable {
+                    page_position,
+                    reason: format!("committed owner lease revocation is malformed: {error}"),
+                },
+            )?;
+            revocation.validate().map_err(|error| {
+                ProblemReadbackError::TransitionUndecodable {
+                    page_position,
+                    reason: format!("committed owner lease revocation is invalid: {error}"),
+                }
+            })?;
+            lease_revocations.push((grant.clone(), revocation));
+        }
+        lease_grants.push(grant);
         if let Some(value) = parameters.get("sequence_disposition") {
             let evidence: SequenceDispositionEvidence = serde_json::from_value(value.clone())
                 .map_err(|error| {
@@ -256,6 +346,8 @@ pub fn read_committed_problem(
         history_complete,
         sequence_gaps: sequence_gaps.into_values().collect(),
         sequence_gaps_complete: history_complete,
+        lease_grants,
+        lease_revocations,
     }))
 }
 
