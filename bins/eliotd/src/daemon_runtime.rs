@@ -1845,8 +1845,12 @@ async fn run_loop(
                 // same cadence without sharing the local-read completion branch.
                 maybe_start_finish_poll(&kernel, &composition, &mut finish_flight);
                 // Issue #1108: start at most one tracked Kernel verification
-                // flight. The flight snapshots under a short composition
-                // lock and releases it before awaiting owner IO.
+                // flight. The poll snapshots its head plus the expected
+                // revisions under a short try-lock; the verified drive holds
+                // the composition borrow across the bounded seam await (the
+                // sole-path seam resolves session halves on
+                // `&DaemonComposition`) and both adopts revalidate before
+                // dequeuing, so ticks never overlap a drive.
                 maybe_start_solo_poll(&kernel, &composition, &mut solo_poll_flight);
                 // Issue #1683 W5: the bounded fair-pull recovery poll rides
                 // this same cadence branch and is started on every tick. It is
