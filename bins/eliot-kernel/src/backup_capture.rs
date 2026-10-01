@@ -76,10 +76,10 @@ use eliot_security_contracts::PurgeLedgerEntry;
 use eliot_store_api::WriteReceipt;
 
 use super::backup_capture_ports::{
-    CaptureBudgets, CaptureCallerAuth, CapturePorts, FrozenCapturePlan, KernelCaptureError,
-    MEMBER_DOMAIN_PROJECTION, SnapshotRelation, owner_fence_dispositions,
-    owner_residency_key_digest, owner_suspended_recovery_refs, require_capture_admitted,
-    validate_disposition_identities,
+    CaptureBudgets, CaptureCallerAuth, CapturePorts, FrozenCapturePlan, KernelArchiveOwner,
+    KernelCaptureError, MEMBER_DOMAIN_PROJECTION, PublicationPort, PublishedArchive,
+    SnapshotRelation, owner_fence_dispositions, owner_residency_key_digest,
+    owner_suspended_recovery_refs, require_capture_admitted, validate_disposition_identities,
 };
 
 /// Owner order for per-owner budget accounting: canonical, blob, purge, ORS,
@@ -221,12 +221,17 @@ pub enum CaptureState {
 /// restore call and mutates nothing.
 ///
 /// A [`StructurallyValidCandidate`] is never promoted to
-/// [`ProvenanceBoundCapture`] by this owner, because no retained-artifact owner
-/// exists in the repository today: there is no production
-/// `impl PublicationPort` (the only implementation is `MemPublisher` inside
-/// `bins/eliot-kernel/tests/backup_capture.rs`), and
-/// `KernelBackupCapture::capture` / `request_from_ports` have zero production
-/// callers. Nothing here may invent a capture receipt to cross that gap.
+/// [`ProvenanceBoundCapture`] on the VERIFY path, and that is a property of
+/// verify rather than a missing owner: `verify_only` performs no publication and
+/// no retained-artifact lookup, so nothing on it can authenticate origin. The
+/// capture path itself does reach an owner — [`KernelBackupCapture::capture_admitted`]
+/// publishes through `KernelArchiveOwner`, and the receipt it returns is that
+/// owner's durable receipt. What remains open there is upstream: the
+/// canonical/blob/purge/ORS/Watchdog/Host evidence that
+/// [`CapturePorts::from_owner_evidence`] accepts still has to be acquired from
+/// those owners, and a caller that cannot supply a member its frozen class
+/// requires is refused with a typed class-capability failure rather than
+/// promoted on a self-reported claim.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CaptureEvidenceLevel {
     /// Bytes that decode and validate internally; carries no retained capture
@@ -585,6 +590,54 @@ impl KernelBackupCapture {
     #[must_use]
     pub fn work_root(&self) -> &Path {
         &self.work_root
+    }
+
+    /// Executes one admitted capture end to end over the production retained
+    /// archive owner: admit, validate the owner evidence, cross it into the
+    /// owned request, build, validate, encode, publish exactly once, and return
+    /// the owner's real archive identity and durable receipt.
+    ///
+    /// This is the production caller of both [`request_from_ports`] and
+    /// [`Self::capture`]. Before it existed neither had a non-test caller, so
+    /// `CapturePorts` was a bundle nothing consumed and `capture` was a
+    /// coordinator nothing reached.
+    ///
+    /// What it deliberately does NOT do: it does not read a source. The
+    /// `CapturePorts` it consumes is already-accepted OWNER evidence, and this
+    /// owner validates each value through that value's own `validate` rather
+    /// than deriving any of it. Acquiring that evidence is the caller's job
+    /// against the canonical, blob, purge, ORS, Watchdog and Host owners; a
+    /// caller that cannot supply what the frozen class requires is refused with
+    /// the class gate's typed `ClassCapabilityUnsupported`, never a silently
+    /// weakened capture.
+    ///
+    /// The frozen plan and the owner's suspended-entry count travel with the
+    /// request, and the receipt this returns is the OWNER's durable receipt for
+    /// this operation, not a descriptor-validation receipt. A lost publication
+    /// response is reconciled by identity inside `capture`; a reconciliation
+    /// that cannot prove the recorded receipt names this operation crosses as a
+    /// typed rollback-required failure.
+    ///
+    /// `purge_ledger_revision` is a PARAMETER and not a value this coordinator
+    /// can supply: it is the purge OWNER's own declared ledger-wide revision
+    /// (`RedbRecoveryStore::purge_ledger_revision`, or the read-only
+    /// `eliot_ors::read_purge_ledger_revision_read_only` answer), and a count of
+    /// the carried `purge_ledger` entries is the caller's own list rather than
+    /// the owner's value. An archive that carried a count instead would fail the
+    /// restore owner's purge-revision closure check against the owner it applies
+    /// the ledger through, so the caller MUST read it from that owner; this
+    /// coordinator has no purge owner to ask and will not substitute a number.
+    pub fn capture_admitted(
+        &self,
+        ports: &CapturePorts<'_>,
+        plan: FrozenCapturePlan,
+        purge_ledger_revision: u64,
+    ) -> Result<CaptureReport, KernelCaptureError> {
+        require_capture_admitted(ports.caller)?;
+        let request =
+            request_from_ports(ports, plan, ports.suspended_count, purge_ledger_revision)?;
+        let mut publisher = KernelArchiveOwner::bind(&self.work_root)?;
+        self.capture(&request, &mut publisher)
     }
 
     /// Executes one admitted capture: admit, freeze, gate, relate, bound,

@@ -105,12 +105,14 @@ pub use backup_capture::{
     archive_fence_restrictions, archived_state_fence_digest, request_from_ports,
 };
 pub use backup_capture_ports::{
-    CaptureBudgets, CaptureCallerAuth, CapturePorts, FrozenCapturePlan, KernelCaptureError,
-    MEMBER_DOMAIN_HOST_AUDIT, MEMBER_DOMAIN_ORDERING_HEAD, MEMBER_DOMAIN_ORS_CHECKPOINT,
-    MEMBER_DOMAIN_ORS_CUTOVER, MEMBER_DOMAIN_ORS_PENDING, MEMBER_DOMAIN_REVISION_HEAD,
-    MEMBER_DOMAIN_WATCHDOG_SIGNAL, PublicationPort, PublicationReceipt, PublishedArchive,
-    SnapshotRelation, owner_fence_dispositions, owner_residency_key_digest,
-    owner_suspended_recovery_refs, require_capture_admitted,
+    CAPTURE_ARCHIVE_AREA, CAPTURE_PUBLICATION_RECEIPT_FILE, CAPTURE_PUBLISHED_ARCHIVE_FILE,
+    CaptureBudgets, CaptureCallerAuth, CapturePorts, FrozenCapturePlan, KernelArchiveOwner,
+    KernelCaptureError, MAX_PUBLICATION_ID_LEN, MEMBER_DOMAIN_HOST_AUDIT,
+    MEMBER_DOMAIN_ORDERING_HEAD, MEMBER_DOMAIN_ORS_CHECKPOINT, MEMBER_DOMAIN_ORS_CUTOVER,
+    MEMBER_DOMAIN_ORS_PENDING, MEMBER_DOMAIN_REVISION_HEAD, MEMBER_DOMAIN_WATCHDOG_SIGNAL,
+    PublicationPort, PublicationReceipt, PublishedArchive, SnapshotRelation,
+    owner_fence_dispositions, owner_residency_key_digest, owner_suspended_recovery_refs,
+    require_capture_admitted,
 };
 pub use backup_restore::{
     BlobOwnerClient, CanonicalOwnerClient, CutoverQualification, InvalidationKind,
@@ -944,11 +946,13 @@ impl KernelComposition {
     /// The coordinator is not merely held: `dispatch_backup_frame`'s verify
     /// arm calls [`KernelBackupCapture::verify_only`] through this accessor
     /// (`request_dispatch.rs`, `handle_backup_verify`), so the object is
-    /// reached on the production front door today. What is still absent is the
-    /// *capture* side of it — `capture` and `request_from_ports` have no
-    /// production caller and no production [`PublicationPort`] provider, which
-    /// is the owner-blocked half this issue's `backup.create` leg refuses with
-    /// `plan_gap` naming #959.
+    /// reached on the production front door today. The *capture* side now has
+    /// its owner and its production caller too — [`KernelBackupCapture::capture_admitted`]
+    /// is the non-test caller of both `capture` and `request_from_ports`, and it
+    /// publishes through the production [`PublicationPort`] implementor
+    /// `KernelArchiveOwner`. What `backup.create` still cannot reach is that
+    /// call, because no owner produces the accepted evidence bundle it consumes;
+    /// the route refuses with `plan_gap` naming exactly that absent product.
     #[must_use]
     pub fn backup_capture(&self) -> &KernelBackupCapture {
         &self.backup_capture
@@ -990,8 +994,9 @@ impl KernelComposition {
     /// [`KernelBackupRestore::admit_restore_journal`]
     /// and calls this entry, so the durable ORS journal a production restore runs
     /// on is the one this composition opened. `backup.create` still answers
-    /// `plan_gap` naming the absent capture owner, which is the other half of
-    /// this issue and is not reached from here.
+    /// `plan_gap`, but the reason is now narrow and measured: the capture owner
+    /// and its production `PublicationPort` exist, and the absent product is the
+    /// owner-issued evidence bundle the capture coordinator consumes.
     ///
     /// What this entry still does not do is reach cutover: it runs in rehearsal
     /// posture, so nothing here activates, retires or qualifies an installation.

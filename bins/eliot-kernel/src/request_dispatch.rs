@@ -26,20 +26,27 @@
 //!   ([`admit_backup_caller`], the one reader of the platform-proved peer
 //!   identity plus this Kernel's own exact `daemon` front-door capability), and
 //!   only then refuses naming the capture owner (`backup-capture-owner (#959)`,
-//!   open). The refusal names the exact owner entry the request cannot reach
-//!   and the exact capability that entry is missing, so an operator is told
-//!   what has to exist rather than that "admitted capture is not implemented":
-//!   `KernelBackupCapture::capture` consumes a caller-issued
-//!   `CaptureCallerAuth`, a `PublicationPort` that publishes exactly once, and
-//!   an already-accepted `CaptureRequest` evidence bundle, and NEITHER the port
-//!   nor the bundle has a production producer on this tree (the port's only
-//!   implementation is `MemPublisher` inside
-//!   `bins/eliot-kernel/tests/backup_capture.rs`; `request_from_ports` and
-//!   `EbpCanonicalStoreClient::backup_begin`/`backup_page`/`backup_end` have no
-//!   production caller). Admitting capture here would invent authority, so the
-//!   item's "any missing capture-owner behavior remains with #959" holds and
-//!   this route refuses a typed owner-absence instead of a receipt for having
-//!   read its own arguments.
+//!   open). The refusal names the exact capability that is still missing, so an
+//!   operator is told what has to exist rather than that "admitted capture is not
+//!   implemented". Since #2569 the OWNER HALF is production code and the MISSING
+//!   half is only its input: `KernelArchiveOwner` is the production
+//!   `impl PublicationPort` (the port's only other implementation is
+//!   `MemPublisher` inside `bins/eliot-kernel/tests/backup_capture.rs`),
+//!   `CapturePorts::from_owner_evidence` is the only production constructor of
+//!   the accepted evidence bundle, and `KernelBackupCapture::capture_admitted`
+//!   is the production caller of both `request_from_ports` and `capture`. What
+//!   no owner still produces is the BUNDLE those three consume — the coherent
+//!   canonical export fence and its members — because the single production
+//!   `impl EcxfSourceStore` refuses with `BackupError::UnobservedSourceMember`
+//!   rather than default a fence member
+//!   (`bins/eliot-store-surreal/src/ecxf_export.rs:119`/`:145`) and the Kernel's
+//!   retained Store gateway exposes only `backup_restore_batch`
+//!   (`crates/kernel/eliot-kernel-service/src/store_gateway.rs:8419`), never
+//!   `EbpCanonicalStoreClient::backup_begin`/`backup_page`/`backup_end`. Building
+//!   an empty bundle here would certify "no canonical records observed" as a
+//!   complete denominator, so the item's "any missing capture-owner behavior
+//!   remains with #959" holds and this route refuses a typed owner-absence
+//!   instead of a receipt for having read its own arguments.
 //! - `backup.verify` admits the bounded inline bundle bytes, then decodes and
 //!   validates them through the real capture owner
 //!   ([`KernelBackupCapture::verify_only`], bound on the composition by #959
@@ -748,38 +755,66 @@ fn cancellation_reply(idempotency_key: &str, owner_reason: &str) -> Value {
 /// consumes, then returns the exact owner absence that keeps the archive out of
 /// this route's reach.
 ///
-/// # WHY THIS STILL REFUSES, AND WHAT IS DIFFERENT NOW
+/// # WHAT #2569's KERNEL HALF LANDED, AND WHAT IS STILL ABSENT
 ///
-/// The item this implements asks for the REAL capture owner and forbids a
-/// descriptor-validation receipt in its place. Reaching
-/// [`KernelBackupCapture::capture`] needs three things this front door does not
-/// hold and must never manufacture:
+/// The owner half this arm needed now exists and is production code, not a plan:
+/// [`KernelArchiveOwner`] is the production `impl PublicationPort` (the only
+/// other implementation in the tree is the `MemPublisher` inside
+/// `bins/eliot-kernel/tests/backup_capture.rs`),
+/// [`CapturePorts::from_owner_evidence`] is the only production constructor of
+/// the accepted evidence bundle, and [`KernelBackupCapture::capture_admitted`] is
+/// the production caller of both [`request_from_ports`] and
+/// [`KernelBackupCapture::capture`]. So the publication receipt this route would
+/// report, and the archive identity it would report it against, now have a real
+/// owner to come from.
 ///
-/// 1. an already-accepted `CaptureRequest` evidence bundle — the coherent
-///    canonical export fence, its event/projection/receipt members, the sealed
-///    blob envelopes, the purge ledger plus the purge OWNER's own declared
-///    ledger-wide revision, the ORS snapshot fence, the Watchdog spool fence,
-///    the checksummed artifacts and the optional Host audit fence. There is no
-///    production producer of one: `request_from_ports` and
-///    `EbpCanonicalStoreClient::backup_begin`/`backup_page`/`backup_end` have no
-///    production caller, and the accepted read is ASYNC while
-///    `KernelComposition::dispatch_backup_frame` is the synchronous frame
-///    route.
-/// 2. a production `PublicationPort`. `capture` publishes exactly once through
-///    it and reconciles a lost response by operation identity through it; the
-///    only implementation in the repository is `MemPublisher` inside
-///    `bins/eliot-kernel/tests/backup_capture.rs`.
-/// 3. a `FrozenCapturePlan` whose `build_digest` and `policy_digest` are
-///    owner-ISSUED approved 64-hex digests. This route holds no such digest and
-///    will not synthesise one, because a plausible digest in that field is the
-///    laundered-absence this item names.
+/// What this route still cannot do is ASSEMBLE the evidence that owner consumes,
+/// and the reason is measured rather than assumed. `capture_admitted` needs a
+/// `CapturePorts`, and a `CapturePorts` needs the accepted owner values
+/// `from_owner_evidence` takes: the coherent canonical `ExportFence`, the
+/// canonical event/projection/write-receipt members, the sealed blob envelopes,
+/// the purge ledger, the ORS snapshot fence, the Watchdog spool fence, the
+/// checksummed manifest artifacts, the Host audit fence, and the purge OWNER's own
+/// ledger-wide revision. There is no production producer of that bundle:
+///
+/// - `git grep -n "ExportFence {"` over non-test sources returns ONE production
+///   construction site, `crates/storage/eliot-backup/src/ecxf_export.rs:272`, and
+///   it is reachable only through
+///   [`eliot_backup::export_ecxf_package`](crates/storage/eliot-backup/src/ecxf_export.rs:262),
+///   which takes an [`EcxfSourceStore`](crates/storage/eliot-backup/src/ecxf_export.rs:229).
+/// - The ONE production `impl EcxfSourceStore` is
+///   `StoreOwnerEcxfSource::coherent_export`
+///   (`bins/eliot-store-surreal/src/ecxf_export.rs:119`), and its body is an
+///   unconditional `Err(BackupError::UnobservedSourceMember { .. })`
+///   (`:145`). The store owner states in its own capture that it cannot be
+///   projected into a complete source view while it declares evidence gaps, and
+///   it refuses rather than defaulting a fence member. That refusal is correct
+///   and this route does not route around it.
+/// - The Kernel's own retained Store gateway
+///   ([`KernelStoreGateway`](crates/kernel/eliot-kernel-service/src/store_gateway.rs:836))
+///   exposes exactly one backup method, `backup_restore_batch` (`:8419`). The
+///   snapshot read the bundle needs exists only on
+///   [`EbpCanonicalStoreClient`](crates/kernel/eliot-kernel-service/src/store_client.rs:1016)
+///   as `backup_begin`/`backup_page`/`backup_end` (`:1022`/`:1034`/`:1048`), all
+///   `async`, all with zero production callers, and the accepted read being async
+///   is itself a composition decision #962 owns rather than one this route may
+///   take by nesting a `block_on` under the control loop.
 ///
 /// So the create arm does what the item says to do with an absent owner: it
-/// returns a TYPED FAILURE NAMING THE ABSENT OWNER BEHAVIOUR. It emits no
-/// archive id, no manifest digest and no receipt, and it never occupies the
-/// field an owner receipt belongs in — the reply carries `code`,
+/// returns a TYPED FAILURE NAMING THE ABSENT OWNER BEHAVIOUR, and the reason text
+/// names the ONE product that is missing rather than a bundle of guesses. It
+/// emits no archive id, no manifest digest and no receipt, and it never occupies
+/// the field an owner receipt belongs in — the reply carries `code`,
 /// `missing_owner` and `reason` only, which is why the operator surface admits
 /// exactly that key set for a create refusal.
+///
+/// Building a `CapturePorts` here anyway would be the substitution this item
+/// names: empty member vectors are not "no canonical records observed", they are
+/// a claim that the installation has none, and `check_denominator` would then
+/// certify that claim as a complete denominator. `from_owner_evidence`'s own doc
+/// states the rule this route follows — a caller that cannot supply a member its
+/// frozen class requires is refused with a typed failure, never a bundle that
+/// looks complete.
 ///
 /// # WHAT THE ROUTE DOES ADMIT, AND IN WHICH ORDER
 ///
@@ -872,14 +907,37 @@ fn handle_backup_create(
     // admission verify already applied and the reason this arm is no longer the
     // one backup operation that answers whoever asked.
     admit_backup_caller(session)?;
+    // The one product this arm is still waiting for, and the ONLY reason the
+    // owner call below is not made. It is named as a missing owner capability
+    // rather than as a missing publication port, because the publication port now
+    // EXISTS: `KernelArchiveOwner` is production `impl PublicationPort` and
+    // `KernelBackupCapture::capture_admitted` is its production caller. What is
+    // absent is the accepted owner evidence bundle those two consume - the
+    // coherent canonical export fence and its members - which no owner produces
+    // on this product: the single production `impl EcxfSourceStore`
+    // (`bins/eliot-store-surreal/src/ecxf_export.rs:119`) refuses outright with
+    // `BackupError::UnobservedSourceMember` (`:145`) rather than default a fence
+    // member, and the Kernel's retained Store gateway
+    // (`crates/kernel/eliot-kernel-service/src/store_gateway.rs:836`) exposes
+    // only `backup_restore_batch` (`:8419`), never the snapshot read.
+    //
+    // The reply therefore names the capability and its owner, and it stays a
+    // `plan_gap` because that is exactly what it is: no planned owner work has
+    // produced the bundle. It is not a permanent answer — the moment an owner
+    // channel issues that evidence, this arm calls `capture_admitted` and
+    // reports the owner's own archive identity and durable receipt. Emitting a
+    // receipt-shaped `ok` before then would be the descriptor-validation receipt
+    // the item forbids: an archive id, a manifest digest and a capture receipt
+    // whose archive nobody ever captured.
     Ok(refused_reply(
         BACKUP_CREATE_OPERATION,
         idempotency_key,
         "plan_gap",
         BACKUP_CREATE_MISSING_OWNER,
-        "capture owner entry KernelBackupCapture::capture is unreachable: no \
-         production PublicationPort and no producer of the accepted \
-         CaptureRequest evidence; #959 owns both",
+        "owner evidence acquisition: the capture owner is reachable through \
+         KernelArchiveOwner and capture_admitted, but no owner issues the \
+         accepted export fence and its members, so the one production \
+         EcxfSourceStore refuses with UnobservedSourceMember (#959/#962)",
     ))
 }
 
@@ -1184,9 +1242,11 @@ fn verified_reply(
         );
     }
     // Explicitly null, never omitted: no retained-artifact owner issues a
-    // capture receipt on this path. The missing symbol is a production
-    // `impl PublicationPort`; the only implementation is `MemPublisher` inside
-    // `bins/eliot-kernel/tests/backup_capture.rs`.
+    // capture receipt on the VERIFY path, because verify performs no publication
+    // and reads no retained archive. A production `impl PublicationPort` does
+    // exist now (`KernelArchiveOwner`), and the CAPTURE path publishes through it
+    // — but this projection is verify's, and a receipt from a different
+    // operation would be a different operation's proof.
     let capture_receipt = projection
         .capture_receipt
         .clone()
