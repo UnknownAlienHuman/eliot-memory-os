@@ -95,10 +95,10 @@ use std::fmt;
 use std::sync::LazyLock;
 
 use eliot_protocol::AckPhase;
+use eliot_protocol::EliotPipeName;
 use eliot_protocol::backup::{
     BackupOperationKind, BackupRole, BackupStage, MAX_BACKUP_PAYLOAD_BYTES,
 };
-use eliot_protocol::EliotPipeName;
 
 /// Canonical Host backup pipe: the exact Host runtime-control pipe name.
 ///

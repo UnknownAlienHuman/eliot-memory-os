@@ -40,6 +40,7 @@ use backup_owner_clients::{
 };
 use eliot_protocol::EliotPipeFamily;
 use eliot_protocol::EliotPipeName;
+use eliot_protocol::EliotPipeNameError;
 use eliot_protocol::backup::BackupOperationKind;
 
 fn fixture(name: &str) -> serde_json::Value {
@@ -736,8 +737,14 @@ fn wire_22_watchdog_identity_not_confusable_with_another_family() {
         assert_ne!(other.to_string(), WATCHDOG_BACKUP_PIPE.as_str());
     }
     let generation = eliot_contracts::ResourceGeneration::new(1).expect("generation");
+    // `kernel_daemon` is a checked constructor returning
+    // `Result<EliotPipeName, EliotPipeNameError>`; the error type derives
+    // `Debug` (pipe_name.rs:799) but the `Result` itself is not formatted.
+    // `expect` needs only `Debug` on the error, which the owner does provide.
     assert_ne!(
-        EliotPipeName::kernel_daemon(generation).to_string(),
+        EliotPipeName::kernel_daemon(generation)
+            .expect("kernel daemon name is canonical")
+            .to_string(),
         WATCHDOG_BACKUP_PIPE.as_str()
     );
     let probe = eliot_contracts::ContractId::new("agent.watchdog-confusion-probe")
@@ -750,16 +757,23 @@ fn wire_22_watchdog_identity_not_confusable_with_another_family() {
     );
 
     // Near-miss spellings of the Watchdog family are refused by the owner,
-    // not accepted as aliases of the bound identity.
+    // not accepted as aliases of the bound identity. The refusal is named,
+    // not merely counted: the owner answers `InvalidFamily` for each of
+    // these, which is the closed-family refusal rather than an incidental
+    // length or prefix complaint. Matching the variant needs only the
+    // owner's exported error type - no `Display` on the `Result` is
+    // required, and the owner's crate is not modified to make one appear.
     for near_miss in [
         r"\\.\pipe\eliot\watchdog\signal",
         r"\\.\pipe\eliot\watchdog\signals\1",
         r"\\.\pipe\eliot\kernel\watchdog\signals",
         r"\\.\pipe\eliot\watchdog\WatchdogSignals",
     ] {
+        let refused = EliotPipeName::parse(near_miss)
+            .expect_err("near-miss spelling must not parse as a canonical name");
         assert!(
-            EliotPipeName::parse(near_miss).is_err(),
-            "near-miss spelling {near_miss:?} must not parse"
+            matches!(refused, EliotPipeNameError::InvalidFamily { .. }),
+            "near-miss {near_miss:?} must be refused by the closed family, got {refused:?}"
         );
         assert!(
             WatchdogBackupOwnerClient::new(near_miss, WATCHDOG_BACKUP_PEER).is_err(),
