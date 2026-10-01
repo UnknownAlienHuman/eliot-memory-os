@@ -87,7 +87,6 @@ use crate::model::{
 #[derive(Clone, Debug)]
 pub struct PresentedClaimMaterial {
     claim_id: String,
-    attempt_id: String,
     operation_id: String,
     binding_digest: String,
     executable_digest: String,
@@ -122,6 +121,11 @@ impl PresentedClaimMaterial {
         presented_fence: StateFence,
     ) -> Result<Self, CoordinatorError> {
         validate_text(&claim_id, "claim_id")?;
+        // The claimed attempt identity is shape-checked here, proven against
+        // the loaded owner row by the factory agreement gate before this
+        // constructor ever runs, and bound per proof through the receipt
+        // ORIGINAL bytes plus the witnessed row: retaining a third copy on
+        // the presented half would be an unread alias, so it is not stored.
         validate_text(&attempt_id, "claim_attempt_id")?;
         validate_text(&operation_id, "claim_operation_id")?;
         require_digest(&binding_digest, "binding_digest")?;
@@ -134,9 +138,9 @@ impl PresentedClaimMaterial {
         presented_fence
             .validate()
             .map_err(|error| CoordinatorError::ProviderContract(error.to_string()))?;
+        let _ = attempt_id;
         Ok(Self {
             claim_id,
-            attempt_id,
             operation_id,
             binding_digest,
             executable_digest,
