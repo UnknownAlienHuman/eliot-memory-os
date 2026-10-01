@@ -640,6 +640,26 @@ pub enum BridgeError {
     InvalidArgument(String),
     /// A destructive invocation was requested or constructed.
     DestructiveOpRejected(&'static str),
+    /// The requested subcommand is outside the declared supported set: the
+    /// bridge serves a closed, already-admitted operation list and creates
+    /// no task policy to accommodate anything else (capability outcome).
+    OperationNotAdmitted { operation: String },
+    /// The call did not target the bridge's exact route (`git` on the bound
+    /// runner port). No provider is substituted under the same operation
+    /// (identity/route outcome).
+    RouteMismatch { observed: String },
+    /// Bounded-input violation: over-long argv, NUL byte, over-large stdin,
+    /// or non-absolute working directory (protocol outcome, pre-dispatch).
+    CallOverBound { what: &'static str },
+    /// A mutating call (`worktree add`/`remove`, `apply`) returned failure
+    /// after possible execution. This is not proof of no effect: the outcome
+    /// keeps its original invocation identity for reconciliation and must
+    /// not be retried under a new identity (uncertain-effect outcome).
+    UncertainEffect {
+        invocation: String,
+        code: i32,
+        stderr: String,
+    },
     /// The process port failed.
     Runner(String),
 }
@@ -672,6 +692,24 @@ impl fmt::Display for BridgeError {
             Self::DestructiveOpRejected(reason) => {
                 write!(f, "destructive operation rejected: {reason}")
             }
+            Self::OperationNotAdmitted { operation } => {
+                write!(f, "operation not admitted by the git bridge: {operation}")
+            }
+            Self::RouteMismatch { observed } => {
+                write!(
+                    f,
+                    "route mismatch: bridge serves the 'git' executable, observed '{observed}'"
+                )
+            }
+            Self::CallOverBound { what } => write!(f, "call over bound: {what}"),
+            Self::UncertainEffect {
+                invocation,
+                code,
+                stderr,
+            } => write!(
+                f,
+                "uncertain effect after '{invocation}' (exit {code}): {stderr}"
+            ),
             Self::Runner(detail) => write!(f, "process runner failed: {detail}"),
         }
     }
@@ -977,6 +1015,168 @@ pub struct BaseDriftReceipt {
 }
 
 // ---------------------------------------------------------------------------
+// I10.13 application obligations and the W5 pre-dispatch call gate
+// ---------------------------------------------------------------------------
+
+/// Exact git subcommands this bridge admits, in first-argv position.
+///
+/// Single source for the `supported_operations` declaration below and the
+/// pre-dispatch gate: adding a subcommand here without a typed operation
+/// that constructs its argv changes nothing, and no other subcommand can
+/// pass the gate.
+const GIT_ADMITTED_SUBCOMMANDS: &[&str] = &[
+    "status",
+    "branch",
+    "show",
+    "diff",
+    "worktree",
+    "apply",
+    "blame",
+    "log",
+    "merge-base",
+    "rev-list",
+];
+
+/// Denial-of-weirdness ceilings for one dispatch. Generous on purpose: every
+/// typed operation in this crate fits comfortably; anything beyond is
+/// refused before any process is launched.
+const GIT_ARGV_CAP: usize = 256;
+const GIT_ARG_BYTES_CAP: usize = 16_384;
+const GIT_ARGV_BYTES_CAP: usize = 262_144;
+const GIT_STDIN_BYTES_CAP: usize = 16_777_216;
+
+/// I10.13 application obligations for the Git professional-application
+/// bridge: exact supported artifacts/actions, API-versus-UI observation
+/// quality, side effects, undo/recovery scope, artifact verifier,
+/// representation loss, and the interactive Human/session requirement,
+/// resolved per application (the `git` executable bound to the runner port).
+/// There is no universal pipeline: these statements describe only what the
+/// typed operations in this crate do.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitApplicationObligations {
+    /// Exact admitted subcommands, in first-argv position.
+    pub supported_operations: &'static [&'static str],
+    /// Exact supported artifacts and actions.
+    pub supported_artifacts_actions: &'static str,
+    /// API versus UI observation quality.
+    pub observation_quality: &'static str,
+    /// Side effects of the admitted operations.
+    pub side_effects: &'static str,
+    /// Undo and recovery scope.
+    pub undo_recovery_scope: &'static str,
+    /// Artifact verifier carried on every receipt.
+    pub artifact_verifier: &'static str,
+    /// Representation loss in normalized output.
+    pub representation_loss: &'static str,
+    /// Interactive Human and session requirement.
+    pub human_session_requirement: &'static str,
+}
+
+/// Returns the I10.13 declaration for the Git application bridged here.
+///
+/// Consumed by the pre-dispatch gate on every call (exact-operation check),
+/// so the declaration and the enforcement cannot drift apart.
+#[must_use]
+pub fn git_application_obligations() -> GitApplicationObligations {
+    GitApplicationObligations {
+        supported_operations: GIT_ADMITTED_SUBCOMMANDS,
+        supported_artifacts_actions: "git repositories (working trees), worktree checkouts and \
+            unified-diff patches; read-only inspection (status, branch, show, diff, blame, log, \
+            co-change, manifest and drift probes) plus guarded worktree add/remove and patch \
+            check/apply; reset, checkout, clean, forced worktree removal, forced branch deletion, \
+            forced push and stash destruction are never admitted",
+        observation_quality: "CLI/API capture only, no UI automation and no screenshots: exact \
+            exit code with full stdout/stderr hashed over the observed bytes; a successful exit \
+            reports the tool's claim and the porcelain parsers normalize best-effort, skipping \
+            malformed lines rather than failing",
+        side_effects: "worktree add/remove create or remove checkouts and patch apply mutates \
+            tracked files; every other admitted operation is a read-only probe, including the \
+            dirty-state preflight",
+        undo_recovery_scope: "no bridge-local undo: an applied patch is never reverted by the \
+            bridge and a created worktree is removed only through lease-scoped worktree_remove \
+            (never --force); recovery is a new authorized operation, never restoration of old \
+            state or undo of effects already performed",
+        artifact_verifier: "every receipt carries the exact invocation (executable, argv, working \
+            directory), the exit disposition and SHA-256 over the full observed output bytes; \
+            patch_apply additionally binds patch_sha256 over the applied bytes",
+        representation_loss: "output handles keep a bounded 4096-byte lossy UTF-8 preview with \
+            truncation flagged and the hash over the complete bytes; parsers skip lines that do \
+            not match the expected porcelain shape, which is an explicit observation limit",
+        human_session_requirement: "every call runs under a declared ExecutionIdentity SID and \
+            user-owned roots additionally require a broker-issued lease or explicit ACL \
+            admission; missing interaction/session permission is refused and is never bypassed \
+            by cached credentials or another session",
+    }
+}
+
+/// Validates bounded input and the exact operation/route before the
+/// underlying call. Session/grant validation stays in [`GitBridge::admit`];
+/// this gate covers what `admit` cannot see: the concrete dispatch.
+///
+/// Refusals are typed and create no authority, no operation identity, no
+/// task decision and no permission. Retries repeat the same invocation
+/// identity; no provider is ever substituted under the same operation.
+fn gate_git_call(
+    obligations: &GitApplicationObligations,
+    exe: &str,
+    args: &[String],
+    cwd: &Path,
+    stdin_len: usize,
+) -> Result<(), BridgeError> {
+    if exe != "git" {
+        return Err(BridgeError::RouteMismatch {
+            observed: exe.to_owned(),
+        });
+    }
+    if !cwd.is_absolute() {
+        return Err(BridgeError::RootNotAbsolute(cwd.to_owned()));
+    }
+    let Some(subcommand) = args.first() else {
+        return Err(BridgeError::OperationNotAdmitted {
+            operation: "<empty argv>".to_owned(),
+        });
+    };
+    if !obligations
+        .supported_operations
+        .contains(&subcommand.as_str())
+    {
+        return Err(BridgeError::OperationNotAdmitted {
+            operation: subcommand.clone(),
+        });
+    }
+    if args.len() > GIT_ARGV_CAP {
+        return Err(BridgeError::CallOverBound {
+            what: "argv exceeds the admitted argument count",
+        });
+    }
+    let mut total = 0usize;
+    for arg in args {
+        if arg.contains('\0') {
+            return Err(BridgeError::CallOverBound {
+                what: "argv must not contain NUL bytes",
+            });
+        }
+        if arg.len() > GIT_ARG_BYTES_CAP {
+            return Err(BridgeError::CallOverBound {
+                what: "single argument exceeds the admitted byte length",
+            });
+        }
+        total += arg.len();
+    }
+    if total > GIT_ARGV_BYTES_CAP {
+        return Err(BridgeError::CallOverBound {
+            what: "argv exceeds the admitted total byte length",
+        });
+    }
+    if stdin_len > GIT_STDIN_BYTES_CAP {
+        return Err(BridgeError::CallOverBound {
+            what: "stdin exceeds the admitted patch byte length",
+        });
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Bridge
 // ---------------------------------------------------------------------------
 
@@ -1097,6 +1297,13 @@ impl<R: ProcessRunner> GitBridge<R> {
             args,
             cwd: cwd.to_owned(),
         };
+        gate_git_call(
+            &git_application_obligations(),
+            &invocation.exe,
+            &invocation.args,
+            &invocation.cwd,
+            0,
+        )?;
         let arg_slices: Vec<&str> = invocation.args.iter().map(String::as_str).collect();
         validate_invocation(&invocation.exe, &arg_slices)?;
         let outcome = self
@@ -1108,7 +1315,7 @@ impl<R: ProcessRunner> GitBridge<R> {
                 // stdin is supplied via exec_stdin; plain exec sends none.
                 &[],
             )
-            .map_err(BridgeError::Runner)?;
+            .map_err(|e| BridgeError::Runner(format!("{}: {e}", invocation.describe())))?;
         let exit = ExitDisposition {
             code: outcome.code,
             success: outcome.code == 0,
@@ -1127,12 +1334,19 @@ impl<R: ProcessRunner> GitBridge<R> {
             args,
             cwd: cwd.to_owned(),
         };
+        gate_git_call(
+            &git_application_obligations(),
+            &invocation.exe,
+            &invocation.args,
+            &invocation.cwd,
+            stdin.len(),
+        )?;
         let arg_slices: Vec<&str> = invocation.args.iter().map(String::as_str).collect();
         validate_invocation(&invocation.exe, &arg_slices)?;
         let outcome = self
             .runner
             .run(&invocation.exe, &arg_slices, &invocation.cwd, stdin)
-            .map_err(BridgeError::Runner)?;
+            .map_err(|e| BridgeError::Runner(format!("{}: {e}", invocation.describe())))?;
         let exit = ExitDisposition {
             code: outcome.code,
             success: outcome.code == 0,
@@ -1169,6 +1383,29 @@ impl<R: ProcessRunner> GitBridge<R> {
             return Ok(());
         }
         Err(BridgeError::GitFailed {
+            invocation: invocation.describe(),
+            code: outcome.code,
+            stderr: String::from_utf8_lossy(&outcome.stderr).into_owned(),
+        })
+    }
+
+    /// Maps the result of a mutating call (`worktree add`/`remove`, `apply`).
+    ///
+    /// Read-only probes keep [`BridgeError::GitFailed`] (no effect was
+    /// possible, so failure is definite). A mutating call that reports
+    /// failure after possible execution instead yields
+    /// [`BridgeError::UncertainEffect`]: malformed output after possible
+    /// execution is not proof of no effect, and the outcome keeps its
+    /// original invocation identity for reconciliation rather than being
+    /// retried under a new one.
+    fn check_mutation_success(
+        outcome: &ProcessOutcome,
+        invocation: &Invocation,
+    ) -> Result<(), BridgeError> {
+        if outcome.code == 0 {
+            return Ok(());
+        }
+        Err(BridgeError::UncertainEffect {
             invocation: invocation.describe(),
             code: outcome.code,
             stderr: String::from_utf8_lossy(&outcome.stderr).into_owned(),
@@ -1393,7 +1630,8 @@ impl<R: ProcessRunner> GitBridge<R> {
     ///
     /// # Errors
     /// Identity/root/lease failures, dirty-guard refusals, runner failures,
-    /// or git failures.
+    /// or uncertain-effect failures (a failed mutation keeps its invocation
+    /// identity for reconciliation).
     #[allow(clippy::too_many_arguments)]
     pub fn worktree_create(
         &self,
@@ -1425,7 +1663,7 @@ impl<R: ProcessRunner> GitBridge<R> {
             rev.to_owned(),
         ];
         let (outcome, invocation, exit) = self.exec(args, &resolved)?;
-        Self::check_success(&outcome, &invocation)?;
+        Self::check_mutation_success(&outcome, &invocation)?;
         let Some(lease) = lease else {
             // Service-owned roots without a presented lease still receive a
             // receipt-bound scope record minted locally (never broker-forged:
@@ -1478,10 +1716,11 @@ impl<R: ProcessRunner> GitBridge<R> {
     ///
     /// The presented lease must scope the exact worktree path. Removal runs
     /// plain `git worktree remove <path>`; a dirty/locked worktree fails the
-    /// operation instead of being destroyed.
+    /// operation instead of being destroyed. A failed removal reports an
+    /// uncertain effect with its invocation identity, never a proven no-op.
     ///
     /// # Errors
-    /// Identity/root/lease failures, runner failures, or git failures.
+    /// Identity/root/lease failures, runner failures, or uncertain-effect failures.
     pub fn worktree_remove(
         &self,
         identity: &ExecutionIdentity,
@@ -1502,7 +1741,7 @@ impl<R: ProcessRunner> GitBridge<R> {
             worktree_path.to_string_lossy().into_owned(),
         ];
         let (outcome, invocation, exit) = self.exec(args, &resolved)?;
-        Self::check_success(&outcome, &invocation)?;
+        Self::check_mutation_success(&outcome, &invocation)?;
         let common = Self::common(
             identity,
             resolved,
@@ -1555,7 +1794,8 @@ impl<R: ProcessRunner> GitBridge<R> {
     ///
     /// # Errors
     /// Identity/root/lease failures, dirty-guard refusals, inapplicable
-    /// patches, runner failures, or git failures.
+    /// patches, runner failures, or uncertain-effect failures (a failed apply
+    /// keeps its invocation identity for reconciliation).
     pub fn patch_apply(
         &self,
         identity: &ExecutionIdentity,
@@ -1582,7 +1822,7 @@ impl<R: ProcessRunner> GitBridge<R> {
         }
         let args = vec!["apply".to_owned(), "-v".to_owned()];
         let (outcome, invocation, exit) = self.exec_stdin(args, &resolved, patch)?;
-        Self::check_success(&outcome, &invocation)?;
+        Self::check_mutation_success(&outcome, &invocation)?;
         let common = Self::common(
             identity, resolved, None, lease, invocation, exit, &outcome, dirty,
         );
