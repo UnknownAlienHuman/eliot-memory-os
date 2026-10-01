@@ -81,6 +81,33 @@
 //!   runner stay explicit caller ports until their production owners land
 //!   (#1699 ledger/store, #2866 items 2-4 registry, #22 permit runner).
 //!
+//! # Prepare-admit-begin-launch seam (issue #1699)
+//!
+//! [`SwarmComposition::admit_prepared_definition`],
+//! [`SwarmComposition::begin_admitted_execution`], and
+//! [`SwarmComposition::launch_sealed_child_candidate`] extend the
+//! prepare -> admit -> begin -> launch seam through injected ports only. The
+//! prepare leg arrives as the candidate-only `SwarmDefinitionAdmissionPrep`
+//! (compiled by the coordinator owner, reachable through `agent_fabric`);
+//! admit forwards it through the coordinator owner onto the existing
+//! `eliot_swarm::admit_plan` admission port with the Governor-issued receipt
+//! and the injected receipt verifier; begin forwards the admitted plan
+//! through the coordinator owner onto the existing
+//! `eliot_swarm::begin_execution` activation port over the injected A-02
+//! route provider; launch forwards the sealed child through the coordinator
+//! owner onto the existing
+//! `eliot_swarm::adapter_launch::launch_sealed_child` dispatch path over the
+//! injected `DurableWorkStore`/`WorkExecutor` feeding seam. Every leg is
+//! candidate-only: no receipt is minted, no intent persists, no executor is
+//! called, and no scheduler, task store, attempt journal, write authority,
+//! or recovery path is added — Kernel stays the sole durable writer and
+//! `eliotd` stays outbound-only Governor wiring. When a plan is attached,
+//! each leg additionally refuses a revision (and, for launch, job and fence)
+//! that disagrees with the sealed attachment before any owner is contacted.
+//! STITCH (named, not built, here): receipt issuance (#1678), production
+//! port implementations (#1701/#698), and the daemon run-loop driver
+//! (#872/#1126).
+//!
 //! # No-lost-child accounting over the durable ledger
 //!
 //! The in-memory `launched` list is a cache, never the source of truth. Both
@@ -107,8 +134,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
+use eliot_agent_coordinator::{AgentCoordinator, CoordinatorError, SwarmDefinitionAdmissionPrep};
 use eliot_governor::SwarmAttachmentComposition;
-use eliot_swarm::durable_dispatch::MAX_PLAN_DRAIN_CANCELS;
+use eliot_receipts::ReceiptEnvelope;
+use eliot_swarm::adapter_launch::{SealedChildInputs, SealedChildLaunch};
+use eliot_swarm::durable_dispatch::{DurableJobAttachment, MAX_PLAN_DRAIN_CANCELS};
+use eliot_swarm::durable_work::{DurableWorkStore, WorkExecutor};
+use eliot_swarm::{
+    AdmittedSwarmPlan, AgentRouteProvider, ExecutionState, ReceiptVerificationPort,
+    SealedIndependentMaps, SwarmPlanProposal,
+};
 use thiserror::Error;
 
 /// Upper bound on exact active children named for cancellation in one drain
@@ -874,6 +909,20 @@ fn source_display_chain(error: &dyn std::error::Error) -> Option<String> {
     error.source().map(std::string::ToString::to_string)
 }
 
+/// Projects a coordinator-owner failure onto the composition seam without
+/// reclassifying it (issue #1699).
+///
+/// The exact coordinator rendering travels in `detail`, so typed coordinator
+/// failures stay typed underneath: an unavailable prerequisite port surfaces
+/// as its typed coordinator residual, never as a pretended admission,
+/// activation, or dispatch. This performs no durable write and mints nothing;
+/// it only carries the owner failure across the seam.
+fn coordinator_owner_failure(error: CoordinatorError) -> SwarmCompositionError {
+    SwarmCompositionError::OwnerFailure {
+        detail: error.to_string(),
+    }
+}
+
 /// Computes the bounded drain decision for one attached plan denominator.
 ///
 /// Pure decision mirroring `eliot-swarm` `plan_cancellation_drain`: no
@@ -1181,6 +1230,152 @@ impl<'a, L: LaunchIntentLedger, R: ChildRunner> SwarmComposition<'a, L, R> {
         // lost-child accounting this composition exists to prevent.
         self.reconciled = self.ledger.intents().is_empty();
         Ok(attached)
+    }
+
+    /// Fail-closed lineage gate binding one seam revision to the sealed
+    /// attachment (issue #1699).
+    ///
+    /// When a plan is attached, the revision the seam leg presents must equal
+    /// the sealed attachment revision exactly; drift is
+    /// [`SwarmCompositionError::StaleLineage`] before any owner is contacted.
+    /// With no plan attached yet (admit precedes attach on a fresh boot) the
+    /// gate passes and the attach leg pins the binding.
+    fn check_seam_plan_revision(&self, plan_revision: &str) -> Result<(), SwarmCompositionError> {
+        if let Some(attached) = &self.plan
+            && attached.plan_revision != plan_revision
+        {
+            return Err(SwarmCompositionError::StaleLineage {
+                detail: format!(
+                    "seam plan revision {plan_revision:?} disagrees with sealed attachment for job {}",
+                    attached.job_handle
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Admits one prepared swarm definition through the Governor admission
+    /// owner on the composition seam (issue #1699 R2).
+    ///
+    /// The caller supplies the candidate-only prep from the prepare leg
+    /// (`AgentCoordinator::prepare_swarm_definition_admission`, reachable
+    /// through `agent_fabric`/`DaemonComposition`) plus the exact presented
+    /// definition, the Governor-issued admission receipt, and the injected
+    /// receipt verifier. This method only forwards them through the real
+    /// coordinator owner (`AgentCoordinator::admit_swarm_definition`) onto
+    /// the existing `eliot_swarm::admit_plan` admission port. No Governor
+    /// receipt is minted here, no durable write occurs, and nothing is
+    /// launched: an unavailable prerequisite port fails typed as the
+    /// coordinator residual carried in
+    /// [`SwarmCompositionError::OwnerFailure`], and the definition stays in
+    /// preparation instead of being presented as admitted.
+    ///
+    /// Chain position: prepare (existing `agent_fabric` leg) -> admit (here)
+    /// -> begin (below) -> launch (below) -> persist-before-launch
+    /// ([`SwarmComposition::launch_child`]) once attached and reconciled.
+    /// Receipt issuance stays with #1678, production port implementations
+    /// with #1701/#698, and the daemon run-loop driver with #872/#1126
+    /// (STITCH; named, not built, here).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SwarmCompositionError::StaleLineage`] when the prep revision
+    /// disagrees with the sealed attachment, or
+    /// [`SwarmCompositionError::OwnerFailure`] carrying the exact coordinator
+    /// failure otherwise.
+    pub fn admit_prepared_definition(
+        &self,
+        coordinator: &AgentCoordinator,
+        prep: &SwarmDefinitionAdmissionPrep,
+        proposal: &SwarmPlanProposal,
+        maps: &SealedIndependentMaps,
+        admission_receipt: ReceiptEnvelope,
+        verifier: Option<&dyn ReceiptVerificationPort>,
+    ) -> Result<AdmittedSwarmPlan, SwarmCompositionError> {
+        self.check_seam_plan_revision(prep.plan_revision().as_str())?;
+        coordinator
+            .admit_swarm_definition(prep, proposal, maps, admission_receipt, verifier)
+            .map_err(coordinator_owner_failure)
+    }
+
+    /// Begins provider-owned P3 execution for one admitted swarm plan through
+    /// the injected A-02 activation port on the composition seam (issue #1699
+    /// R2).
+    ///
+    /// The caller supplies the admitted plan plus the injected route provider
+    /// and receipt verifier, and this method only forwards them through the
+    /// real coordinator owner (`AgentCoordinator::begin_swarm_execution`)
+    /// onto the existing `eliot_swarm::begin_execution` activation port. This
+    /// performs no durable write and starts no process: a missing route
+    /// provider or verifier fails typed as the coordinator residual carried
+    /// in [`SwarmCompositionError::OwnerFailure`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SwarmCompositionError::StaleLineage`] when the admitted
+    /// revision disagrees with the sealed attachment, or
+    /// [`SwarmCompositionError::OwnerFailure`] carrying the exact coordinator
+    /// failure otherwise.
+    pub fn begin_admitted_execution(
+        &self,
+        coordinator: &AgentCoordinator,
+        plan: &AdmittedSwarmPlan,
+        a02: Option<&dyn AgentRouteProvider>,
+        verifier: Option<&dyn ReceiptVerificationPort>,
+    ) -> Result<ExecutionState, SwarmCompositionError> {
+        self.check_seam_plan_revision(plan.revision().as_str())?;
+        coordinator
+            .begin_swarm_execution(plan, a02, verifier)
+            .map_err(coordinator_owner_failure)
+    }
+
+    /// Dispatches one sealed swarm child through the existing injected
+    /// dispatch ports on the composition seam (issue #1699 R2).
+    ///
+    /// The caller supplies the admitted plan, the durable-job attachment, the
+    /// sealed child inputs, and the injected store/executor ports, and this
+    /// method only forwards them through the real coordinator owner
+    /// (`AgentCoordinator::launch_swarm_child`) onto the existing
+    /// `eliot_swarm::adapter_launch::launch_sealed_child` dispatch path. The
+    /// returned intent is candidate-only: the store and executor travel here
+    /// only to pin the `DurableWorkStore`/`WorkExecutor` feeding seam, and
+    /// this performs no store append, no executor call, and no scheduler
+    /// step. Persisting the intent through the owner-side append path BEFORE
+    /// calling the executor stays with the Kernel writer owner, driven
+    /// through [`SwarmComposition::launch_child`] persist-before-launch order
+    /// by the daemon run-loop driver (#872/#1126, STITCH).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SwarmCompositionError::StaleLineage`] when the plan revision
+    /// or the attachment job, revision, or fence disagrees with the sealed
+    /// attachment, or [`SwarmCompositionError::OwnerFailure`] carrying the
+    /// exact coordinator failure otherwise.
+    pub fn launch_sealed_child_candidate(
+        &self,
+        coordinator: &AgentCoordinator,
+        plan: &AdmittedSwarmPlan,
+        attachment: &DurableJobAttachment,
+        inputs: SealedChildInputs<'_>,
+        store: &dyn DurableWorkStore,
+        executor: &dyn WorkExecutor,
+    ) -> Result<SealedChildLaunch, SwarmCompositionError> {
+        self.check_seam_plan_revision(plan.revision().as_str())?;
+        if let Some(attached) = &self.plan
+            && (attached.job_handle != attachment.job_handle()
+                || attached.plan_revision != attachment.plan_revision().as_str()
+                || attached.fence_digest != attachment.state_fence_digest())
+        {
+            return Err(SwarmCompositionError::StaleLineage {
+                detail: format!(
+                    "sealed child attachment for job {} disagrees with sealed composition attachment",
+                    attachment.job_handle()
+                ),
+            });
+        }
+        coordinator
+            .launch_swarm_child(plan, attachment, inputs, store, executor)
+            .map_err(coordinator_owner_failure)
     }
 
     /// Dispatches one admitted child over the `AdapterRegistry` surface.
