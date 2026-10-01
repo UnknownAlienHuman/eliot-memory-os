@@ -286,6 +286,13 @@ pub enum CausalCheckAssignment {
     BoundedInquiry(String),
 }
 
+/// I14.1 work class a causal discriminative check is submitted through.
+///
+/// Both assigned-check forms — a verifier work item and a bounded inquiry —
+/// route through `verification`, so the check that makes a causal claim
+/// load-bearing for a Critical action stays a verification-class work unit.
+pub const CAUSAL_DISCRIMINATIVE_CHECK_WORK_CLASS: &str = "verification";
+
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum CausalCandidateValidationError {
     #[error("material causal candidate is missing A6.5 field `{field}`")]
@@ -458,6 +465,24 @@ impl CausalCandidate {
             return Err(CausalCandidateValidationError::MissingCriticalCheck);
         }
         Ok(())
+    }
+
+    /// Admit a causal claim as load-bearing for a Critical action and hand the
+    /// dispatcher the assigned discriminative check with its work class.
+    ///
+    /// Runs the [`CausalCandidate::validate_for_critical_action`] gate — recorded
+    /// predicted observable, rival explanation or explicit no-rival rationale,
+    /// and assigned verifier or bounded inquiry — then returns the check bound
+    /// to [`CAUSAL_DISCRIMINATIVE_CHECK_WORK_CLASS`], so submission stays in
+    /// the I14.1 `verification` class whichever check form is assigned.
+    pub fn critical_action_check(
+        &self,
+    ) -> Result<(&CausalCheckAssignment, &'static str), CausalCandidateValidationError> {
+        self.validate_for_critical_action()?;
+        match &self.assigned_check {
+            Some(check) => Ok((check, CAUSAL_DISCRIMINATIVE_CHECK_WORK_CLASS)),
+            None => Err(CausalCandidateValidationError::MissingCriticalCheck),
+        }
     }
 
     /// Append an explicitly assessed intervention outcome and update current state atomically.
