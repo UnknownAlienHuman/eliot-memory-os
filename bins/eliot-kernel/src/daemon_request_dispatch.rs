@@ -3373,14 +3373,19 @@ impl KernelComposition {
                 Box::pin(self.notification_state_read_operation(session, payload.clone())).await
             }
             // Issue #1678 W3/W5/REQ4/REQ6/A3/A4/A7: the admit + activate leg of
-            // the normative admission-reservation saga. The arm never mints an
-            // admission: it reads the canonical owner's OWN committed
-            // `WriteReceipt` for the ORIGINAL operation identity through the
-            // retained production gateway, proves the exact launch-outbox row
-            // from that receipt, and activates the staged reservation under
-            // the reservation-bound activation identity. Every non-committed
+            // the normative admission-reservation saga. The submit leg runs
+            // first: it ensures the canonical owner's OWN committed
+            // `WriteReceipt` exists for the ORIGINAL operation identity
+            // (submitting the owner-built `ADMITTED` transition through the
+            // retained production gateway when the owner holds no committed
+            // receipt), so the coordinator below reads back a commit instead
+            // of an eternal absence. Nothing is fabricated on this arm: the
+            // coordinator then proves the exact launch-outbox row from that
+            // owner receipt, and activates the staged reservation under the
+            // reservation-bound activation identity. Every non-committed
             // outcome keeps the reservation inactive and launch blocked.
             ADMISSION_RESERVATION_ADMIT_OPERATION => {
+                self.ensure_reservation_canonical_admitted(&payload).await?;
                 Box::pin(self.admission_reservation_admit_operation(session, payload.clone())).await
             }
             "receipt" => {

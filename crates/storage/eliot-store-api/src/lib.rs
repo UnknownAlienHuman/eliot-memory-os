@@ -55,6 +55,7 @@ mod payload_authority;
 mod problem_owner_state;
 mod reactive_state;
 mod request_hash;
+mod reservation_admission;
 mod store_failure;
 mod swarm_owner_revisions;
 mod task_contract_acceptance;
@@ -204,6 +205,13 @@ pub use request_hash::{
     canonical_request_hash, derive_corrected_operation_id, mutation_plan_digest_hex,
     verify_admission_digest, verify_canonical_request_hash, verify_mutation_plan_digest,
     verify_ordering_scope_binding,
+};
+
+pub use reservation_admission::{
+    RESERVATION_ADMISSION_DISPOSITION_ADMITTED, RESERVATION_DEFINITION_DIGEST_DOMAIN,
+    ReservationAdmissionClaim, ReservationAdmissionClaims, ReservationAdmissionRequest,
+    ReservationAdmissionSubmission, prepare_reservation_admission_transition,
+    reservation_admission_scope,
 };
 
 pub use store_failure::{
