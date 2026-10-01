@@ -732,15 +732,13 @@ pub struct GovernorCoverageDerivation {
     observation_binding: Option<ObservationDerivationBinding>,
 }
 
-/// Minimal last-input binding used only for revision idempotency. It records
-/// source reasons and bounded coverage gaps, never caches event pages.
+/// Exact last-input binding used only for revision idempotency. This retains
+/// the original typed observation so any changed source row, owner binding,
+/// privacy/provenance field, availability reason, or cursor advances the
+/// existing derivation revision. It is not used to restore authority.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ObservationDerivationBinding {
-    fingerprint: String,
-    source: String,
-    gaps: Vec<String>,
-    watchdog: String,
-    trace: String,
+    observation: GovernorAuthorityObservation,
 }
 
 impl GovernorCoverageDerivation {
@@ -910,22 +908,8 @@ impl GovernorCoverageDerivation {
                 )?
             }
         };
-        let watchdog = match &validated_observation.watchdog {
-            EvidenceAvailability::Available { evidence } => {
-                format!("available:{}:{}", evidence.supervisor_id, evidence.fresh)
-            }
-            EvidenceAvailability::Unavailable { reason } => format!("unavailable:{reason}"),
-        };
-        let trace = match &validated_observation.trace {
-            EvidenceAvailability::Available { evidence } => format!("available:{evidence:?}"),
-            EvidenceAvailability::Unavailable { reason } => format!("unavailable:{reason}"),
-        };
         let binding = ObservationDerivationBinding {
-            fingerprint: coverage.fingerprint.clone(),
-            source: coverage.source.clone(),
-            gaps: coverage.gaps.clone(),
-            watchdog,
-            trace,
+            observation: observation.clone(),
         };
         let watchdog_fresh = matches!(
             &validated_observation.watchdog,
