@@ -33,7 +33,7 @@ use eliot_testd_core::{
     SourceObservationGitPort, TargetRoots, TestJob, TestdError, TestdSourceObservation,
     TestdStore, is_admitted_testd_profile, issue_process_admission, testd_profile_binding,
     testd_profile_resource_limits, validate_running_lease, verify_envelope_layout_binding,
-    verify_layout_binding,
+    verify_layout_binding, TESTD_PRODUCTIVE_ADAPTER,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -413,9 +413,15 @@ impl TestdComposition {
                 reason: "profile is not registered by the current Testd execution plane",
             });
         }
-        if eliot_testd_core::is_productive_testd_profile(&request.invocation.profile)
-            && request.verifier_dispatch.is_none()
-        {
+        let productive =
+            eliot_testd_core::is_productive_testd_profile(&request.invocation.profile);
+        if productive && request.stage.is_none() {
+            return Err(TestdError::Invalid {
+                field: "stage",
+                reason: "productive process dispatch requires the exact runner-admitted stage",
+            });
+        }
+        if productive && request.verifier_dispatch.is_none() {
             return Err(TestdError::Invalid {
                 field: "verifier_dispatch",
                 reason: "productive verifier dispatch requires a persisted canonical owner binding",
@@ -544,6 +550,10 @@ pub(crate) async fn start_claimed_from_store<E: ProcessExecutor + 'static>(
     })?;
     validate_running_lease(&current, lease, now)?;
     current.target_roots.validate()?;
+    validate_job_process_stage(&current)?;
+    if current.stage_request != job.stage_request {
+        return Err(TestdError::InvalidBinding);
+    }
     // Issue #1897 (AUD4): the consuming start is the execution path, so the
     // envelope's COMPLETE admission gate runs here, on the row the store just
     // reloaded. `requalify` alone only proved the tuple was well-formed and
@@ -2029,6 +2039,10 @@ fn load_dispatch_job(
             field: "job_id",
             reason: "admitted dispatch has no canonical TestD job row",
         })?;
+    validate_job_process_stage(&job)?;
+    if material.stage_request != job.stage_request {
+        return Err(TestdError::InvalidBinding);
+    }
     if eliot_testd_core::is_productive_testd_profile(&job.invocation.profile) {
         job.verifier_dispatch
             .as_ref()
@@ -2037,6 +2051,29 @@ fn load_dispatch_job(
     }
     job.target_roots.validate()?;
     Ok((store, job))
+}
+
+fn validate_job_process_stage(job: &TestJob) -> Result<(), TestdError> {
+    match job.stage_request.as_ref() {
+        Some(stage) => {
+            stage.validate()?;
+            if stage.execution != StageExecutionKind::Process
+                || stage.invocation != job.invocation
+                || (eliot_testd_core::is_productive_testd_profile(&job.invocation.profile)
+                    && stage.adapter != TESTD_PRODUCTIVE_ADAPTER)
+            {
+                return Err(TestdError::InvalidBinding);
+            }
+        }
+        None if eliot_testd_core::is_productive_testd_profile(&job.invocation.profile) => {
+            return Err(TestdError::Invalid {
+                field: "stage_request",
+                reason: "productive process dispatch requires the exact runner-admitted stage",
+            });
+        }
+        None => {}
+    }
+    Ok(())
 }
 
 fn canonicalize_dispatch_roots(

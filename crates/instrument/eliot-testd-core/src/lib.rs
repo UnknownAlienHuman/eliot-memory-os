@@ -215,6 +215,9 @@ impl InstrumentStageRequest {
 pub const TESTD_ADMITTED_PROFILE: &str = "cargo-test";
 /// Separately registered productive nextest profile.
 pub const TESTD_PRODUCTIVE_PROFILE: &str = "cargo-nextest";
+/// Exact registered adapter currently accepted by the productive owner path.
+/// Other stage adapters need their own governed process-intent binding.
+pub const TESTD_PRODUCTIVE_ADAPTER: &str = "eliot.instrument.nextest";
 /// Separately registered dev-fast discovery profile (issue #1802, step 4):
 /// `cargo nextest list --message-format json` with validated scope slots.
 pub const TESTD_LIST_PROFILE: &str = "cargo-nextest-list";
@@ -1995,6 +1998,10 @@ pub struct TestdVerifierJobSubmission {
     pub job_id: String,
     pub project_id: String,
     pub invocation: InstrumentInvocation,
+    /// Exact runner-admitted profile/provider stage persisted with the job.
+    /// Missing values decode only for legacy rows and fail productive submit.
+    #[serde(default)]
+    pub stage_request: Option<InstrumentStageRequest>,
     pub target_roots: TargetRoots,
     /// Owner-issued layout binding the roots resolve from, when the
     /// submitting owner derived them from a workspace/checkout/class layout.
@@ -2034,6 +2041,10 @@ pub struct TestdOwnerJobSubmission {
     pub project_id: String,
     pub invocation: InstrumentInvocation,
     pub source_root: String,
+    /// Exact runner-admitted stage identity. Productive owner submissions
+    /// require a process stage; this carries no executable or authority.
+    #[serde(default)]
+    pub stage_request: Option<InstrumentStageRequest>,
 }
 
 impl TestdOwnerJobSubmission {
@@ -2043,13 +2054,21 @@ impl TestdOwnerJobSubmission {
         self.invocation
             .validate()
             .map_err(|error| TestdError::Contract(error.to_string()))?;
+        let stage = self.stage_request.as_ref().ok_or(TestdError::Invalid {
+            field: "stage_request",
+            reason: "productive owner submission requires the runner-admitted stage",
+        })?;
+        stage.validate()?;
         if self.invocation.kind != InstrumentKind::Test
             || self.invocation.profile != TESTD_PRODUCTIVE_PROFILE
             || !self.invocation.arguments.is_empty()
+            || stage.invocation != self.invocation
+            || stage.execution != StageExecutionKind::Process
+            || stage.adapter != TESTD_PRODUCTIVE_ADAPTER
         {
             return Err(TestdError::Invalid {
-                field: "invocation",
-                reason: "productive submission requires the registered TestD profile and no caller arguments",
+                field: "stage_request",
+                reason: "productive submission requires the registered Nextest process stage and no caller arguments",
             });
         }
         Ok(())
@@ -2287,6 +2306,17 @@ impl TestdVerifierJobSubmission {
                 field: "invocation",
                 reason: "productive submission requires the registered TestD profile and no caller arguments",
             });
+        }
+        let stage = self.stage_request.as_ref().ok_or(TestdError::Invalid {
+            field: "stage_request",
+            reason: "productive submission requires the runner-admitted stage",
+        })?;
+        stage.validate()?;
+        if stage.invocation != self.invocation
+            || stage.execution != StageExecutionKind::Process
+            || stage.adapter != TESTD_PRODUCTIVE_ADAPTER
+        {
+            return Err(TestdError::InvalidBinding);
         }
         if let Some(layout) = self.target_layout.as_ref() {
             layout.validate()?;
@@ -4606,7 +4636,7 @@ impl TestdStore {
             submission.metadata,
             now,
             Some(identity),
-            None,
+            submission.stage_request,
         )
     }
 
