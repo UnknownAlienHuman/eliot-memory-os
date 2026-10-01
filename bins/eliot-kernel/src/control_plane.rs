@@ -433,24 +433,25 @@ impl KernelComposition {
             evidence
                 .validate(&request.candidate, request.generation)
                 .map_err(|_| TransportError::SessionFenced)?;
-            // I1.5/A8.1: this carrier is the one owner-correct route by which a
-            // Host-observed Watchdog branch reaches Kernel. Host just
-            // revalidated the live SCM Watchdog incarnation (bound PID/start
-            // pair plus image bytes equal to the approved Watchdog artifact);
-            // Kernel binds that observation to the presented candidate contour
-            // and only then marks the I1.11 supervision step. Without that
-            // step there is no supervised health projection and no
-            // Material/Critical admission.
+            // Process probes alone only advance their own I1.11 steps. The
+            // final supervision step has exactly one producer: the original
+            // Host-admitted continuous heartbeat bound to its verified
+            // descriptor, receive/deadline, incarnation, candidate and fence.
             #[cfg(windows)]
-            {
+            if let Some(heartbeat) = &evidence.supervision_heartbeat {
                 let target =
                     StateFence::new(request.candidate.kernel_epoch.clone(), request.generation);
                 self.admit_host_observed_watchdog_branch(
                     &evidence.startup_evidence,
+                    heartbeat,
                     &request.candidate,
                     &target,
                 )
                 .map_err(|_| TransportError::SessionFenced)?;
+            }
+            #[cfg(not(windows))]
+            if evidence.supervision_heartbeat.is_some() {
+                return Err(TransportError::SessionFenced.into());
             }
             // Typed provenance rows are validated as transport input above.
             // They are not an I1.11 probe and have no Kernel candidate
@@ -458,6 +459,19 @@ impl KernelComposition {
             // into startup or generation authority.
             self.consume_host_startup_evidence(&evidence.startup_evidence)?;
         }
+        let supervision_revocation = if let KernelControlCommand::RevokeHostSupervisionEvidence(
+            revocation,
+        ) = &request.command
+        {
+            Some(self.revoke_host_observed_supervision_evidence(
+                &revocation.candidate_digest,
+                &revocation.state_fence,
+                revocation.expected_observation_digest.as_ref(),
+            )
+            .map_err(|_| TransportError::SessionFenced)?)
+        } else {
+            None
+        };
         if let Some(handoff) = bootstrap {
             self.install_store_bootstrap(handoff.clone())
                 .map_err(|_| TransportError::SessionFenced)?;
@@ -955,6 +969,7 @@ impl KernelComposition {
                 | KernelControlCommand::ReconcileActivation(_)
                 | KernelControlCommand::RebindStore(_)
                 | KernelControlCommand::ReconcileRebindStore(_)
+                | KernelControlCommand::RevokeHostSupervisionEvidence(_)
                 | KernelControlCommand::ReportHostStartupEvidence(_)
                 // I18.53 ACT-1 (#1918): the retirement census is a read-only
                 // owner read, never a service state transition. Serving it
@@ -1026,6 +1041,7 @@ impl KernelComposition {
             // only on its dedicated wire arm, never beside another receipt.
             runtime_lease_census,
             introduction_rows: None,
+            supervision_revocation,
             error: None,
             payload_digest: String::new(),
         }

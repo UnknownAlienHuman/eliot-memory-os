@@ -3151,6 +3151,7 @@ impl KernelComposition {
     pub(crate) fn admit_host_observed_watchdog_branch(
         &self,
         evidence: &HostStartupEvidence,
+        heartbeat_proof: &eliot_kernel_service::AdmittedWatchdogHeartbeatProof,
         candidate: &eliot_kernel_service::HostKernelCandidateBinding,
         target: &StateFence,
     ) -> Result<(), KernelServiceError> {
@@ -3176,6 +3177,38 @@ impl KernelComposition {
         }
         verify_scm_watchdog_observation_shape(&evidence.scm_watchdog_observation_digest)
             .map_err(|reason| KernelServiceError::Platform(reason.to_owned()))?;
+        let now_ms = unix_ms();
+        let valid_for_ms = heartbeat_proof
+            .freshness_deadline_wall_ms
+            .checked_sub(heartbeat_proof.received_wall_ms)
+            .ok_or_else(|| {
+                KernelServiceError::Platform(
+                    "original Host heartbeat deadline precedes its receive time".to_owned(),
+                )
+            })?;
+        if heartbeat_proof.received_wall_ms > now_ms
+            || heartbeat_proof.freshness_deadline_wall_ms <= now_ms
+            || valid_for_ms == 0
+            || valid_for_ms > SUPERVISION_LEASE_RENEWAL_POLICY.max_observation_age_ms
+        {
+            return Err(KernelServiceError::Platform(
+                "original Host heartbeat is future-dated, expired, or outside the admitted freshness interval"
+                    .to_owned(),
+            ));
+        }
+        let mut scm_parts = evidence
+            .scm_watchdog_observation_digest
+            .as_str()
+            .split(':');
+        let scm_pid = scm_parts.nth(1).and_then(|value| value.parse::<u32>().ok());
+        let scm_start = scm_parts.next().and_then(|value| value.parse::<u64>().ok());
+        if scm_pid != Some(heartbeat_proof.scm_watchdog_pid)
+            || scm_start != Some(heartbeat_proof.scm_watchdog_start_100ns)
+        {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "startup_evidence.supervision_heartbeat.scm_incarnation",
+            });
+        }
         let candidate_digest =
             eliot_platform::PlatformHandle::new(candidate_digest).map_err(|_| {
                 KernelServiceError::Platform(
@@ -3187,6 +3220,7 @@ impl KernelComposition {
             &candidate_digest,
             &evidence.state_fence,
             &incarnation.watchdog_epoch,
+            heartbeat_proof,
         )
     }
 
@@ -3285,6 +3319,27 @@ impl KernelComposition {
         Ok(())
     }
 
+    /// Withdraws one current Host heartbeat observation through the
+    /// authenticated control command, matching the exact candidate, fence,
+    /// and original observation digest under the coordinator lock. A missing
+    /// digest is idempotent only when the current observation is already absent.
+    pub(crate) fn revoke_host_observed_supervision_evidence(
+        &self,
+        candidate_digest: &str,
+        state_fence: &StateFence,
+        expected_observation_digest: Option<&eliot_platform::PlatformHandle>,
+    ) -> Result<eliot_kernel_service::HostSupervisionRevocationDisposition, KernelServiceError> {
+        self.startup_coordinator
+            .lock()
+            .map_err(|_| KernelServiceError::Platform("startup gate lock poisoned".to_owned()))?
+            .revoke_supervision_evidence_for(
+                candidate_digest,
+                state_fence,
+                expected_observation_digest.map(eliot_platform::PlatformHandle::as_str),
+            )
+            .map_err(KernelServiceError::Platform)
+    }
+
     /// Admits a process `Start` admission under Material/Critical authority.
     ///
     /// The target fence is derived from the already-validated admission, never
@@ -3366,26 +3421,31 @@ impl KernelComposition {
         candidate_digest: &eliot_platform::PlatformHandle,
         state_fence: &StateFence,
         watchdog_epoch: &eliot_runtime_contracts::SupervisionJournalEpoch,
+        heartbeat_proof: &eliot_kernel_service::AdmittedWatchdogHeartbeatProof,
     ) -> Result<(), KernelServiceError> {
         let mut coordinator = self
             .startup_coordinator
             .lock()
             .map_err(|_| KernelServiceError::Platform("startup gate lock poisoned".to_owned()))?;
+        let valid_for_ms = heartbeat_proof
+            .freshness_deadline_wall_ms
+            .checked_sub(heartbeat_proof.received_wall_ms)
+            .ok_or_else(|| {
+                KernelServiceError::Platform(
+                    "original Host heartbeat deadline precedes its receive time".to_owned(),
+                )
+            })?;
         coordinator
             .record_live_supervision_evidence(
                 incarnation.clone(),
                 candidate_digest.clone(),
                 state_fence.clone(),
                 watchdog_epoch.clone(),
-                unix_ms(),
-                // I1.5 (#1750): the finite freshness interval is not a new
-                // constant. `SUPERVISION_LEASE_RENEWAL_POLICY` is the single
-                // timing owner for supervision and already declares
-                // `max_observation_age_ms`; reusing it keeps one clock and one
-                // bound for a supervision claim, and the comment on that policy
-                // forbids reintroducing a parallel bound beside it.
-                SUPERVISION_LEASE_RENEWAL_POLICY.max_observation_age_ms,
+                heartbeat_proof.clone(),
+                heartbeat_proof.received_wall_ms,
+                valid_for_ms,
             )
+            .map(|_| ())
             .map_err(KernelServiceError::Platform)
     }
 
