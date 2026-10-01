@@ -1086,6 +1086,19 @@ impl EventEnvelope {
             Err(ProtocolError::UnknownEventPayloadType)
         }
     }
+
+    /// Resolves the disclosure source class the closed producer registry
+    /// proves for this envelope (issue #1934, I7.23).
+    ///
+    /// The class is the envelope's admitted producer route
+    /// ([`source_class_for_event_payload_type`]): only a payload type the
+    /// closed registry admits names a class, so an unknown producer proves
+    /// nothing. The ingest authorizer threads this class — never a
+    /// producer-asserted label — into the `WorkScope` privacy owner rule.
+    #[must_use]
+    pub fn proven_source_class(&self) -> Option<&'static str> {
+        source_class_for_event_payload_type(&self.payload_type)
+    }
 }
 
 /// Bridge-event payload type minted by the `OpenCode` plugin route.
@@ -1109,6 +1122,31 @@ pub fn is_known_event_payload_type(payload_type: &str) -> bool {
         payload_type,
         REACTIVE_CONTEXT_PAYLOAD_TYPE | BACKUP_PAYLOAD_TYPE | OPENCODE_HOST_EVENT_PAYLOAD_TYPE
     )
+}
+
+/// Returns the disclosure source class the closed producer registry proves
+/// for one event payload type (issue #1934, I7.23).
+///
+/// The class is the admitted producer route itself: only the three payload
+/// types [`is_known_event_payload_type`] admits name a class, so the class
+/// proven for an envelope's exact bytes is the closed route that minted it —
+/// never a producer-asserted label. Paired with
+/// [`is_known_event_payload_type`]: both name the same closed producer set
+/// and must change together. The ingest authorizer threads this class into
+/// the `WorkScope` privacy owner rule, where a session recipient grant
+/// naming the route admits verbatim persistence and anything else withholds
+/// it; an unknown payload type proves nothing and resolves to `None`.
+#[must_use]
+pub fn source_class_for_event_payload_type(payload_type: &str) -> Option<&'static str> {
+    if payload_type == REACTIVE_CONTEXT_PAYLOAD_TYPE {
+        Some(REACTIVE_CONTEXT_PAYLOAD_TYPE)
+    } else if payload_type == BACKUP_PAYLOAD_TYPE {
+        Some(BACKUP_PAYLOAD_TYPE)
+    } else if payload_type == OPENCODE_HOST_EVENT_PAYLOAD_TYPE {
+        Some(OPENCODE_HOST_EVENT_PAYLOAD_TYPE)
+    } else {
+        None
+    }
 }
 
 /// Explicit acknowledgement phase for a durable event.

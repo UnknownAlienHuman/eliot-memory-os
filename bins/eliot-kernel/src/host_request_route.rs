@@ -6924,11 +6924,12 @@ impl KernelComposition {
     ///   `Session::establish_agent_bridge`, the only constructor on this
     ///   route, negotiates it empty — but a class-bearing session resolves
     ///   through its real grant);
-    /// - the event's proven source class: none — `EventEnvelope`
-    ///   (`crates/foundation/eliot-protocol/src/lib.rs`) carries no source
-    ///   privacy class, source/recipient class, or provider-retention field,
-    ///   so no disclosure class is proven for these exact bytes and no grant
-    ///   membership can hold for them. No grant is invented to fill the gap.
+    /// - the event's proven source class: the closed producer route
+    ///   [`eliot_protocol::EventEnvelope::proven_source_class`] proves for
+    ///   these exact bytes — the envelope's admitted `payload_type`, never a
+    ///   producer-asserted label. An unknown producer proves nothing, so no
+    ///   grant membership can hold for it. No grant is invented to fill the
+    ///   gap.
     ///
     /// Absent evidence is UNRESOLVED, never permission: the owner withholds
     /// raw persistence and names the side the evaluated evidence determined,
@@ -6963,14 +6964,15 @@ impl KernelComposition {
         )
         .map_err(|_| TransportError::SessionFenced)?;
         // The verdict is the owner's evaluation over the evidence for THIS
-        // event: the retained session's recipient grant and the (unproven)
-        // source class of these exact bytes inside the Governor-resolved
-        // scope. The policy revision recorded alongside it is the owner's own
+        // event: the retained session's recipient grant and the envelope's
+        // proven source class inside the Governor-resolved scope. The policy
+        // revision recorded alongside it is the owner's own
         // rule revision — never the fencing generation, which measures
         // liveness rather than policy.
+        let source_class = event.proven_source_class();
         let disclosure = eliot_workscope::resolve_bridge_ingest_disclosure(
             work_scope_id,
-            None,
+            source_class,
             &session.privacy_classes,
         )
         .map_err(|_| TransportError::SessionFenced)?;
@@ -6981,7 +6983,7 @@ impl KernelComposition {
             "policy_revision": eliot_workscope::BRIDGE_INGEST_PRIVACY_POLICY_REVISION,
             "declared_class": disclosure.declared_class().map_or(serde_json::Value::Null, serde_json::Value::from),
             "scope_ref": work_scope_id,
-            "source_class": serde_json::Value::Null,
+            "source_class": source_class.map_or(serde_json::Value::Null, serde_json::Value::from),
             "recipient_grant": &session.privacy_classes,
         }))
     }
