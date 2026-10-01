@@ -2668,6 +2668,8 @@ fn bundle_parts(
         "outcome": null,
         "selection_coverage": [],
         "selection_frontier": null,
+        "semantic_input": submission.get("semantic_input").cloned().expect("semantic input"),
+        "semantic_input_bytes": submission.get("semantic_input_bytes").cloned().unwrap_or(Value::Null),
     }))
     .expect("response parses");
     let mut record = valid_ledger_record(job, attempt);
