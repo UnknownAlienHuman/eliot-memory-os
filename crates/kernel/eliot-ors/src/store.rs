@@ -28907,7 +28907,7 @@ impl RedbRecoveryStore {
             ..
         }) = records.get_mut(index)
         {
-            *problem = Some(retained);
+            *problem = Some(Box::new(retained));
         }
         Ok(())
     }
