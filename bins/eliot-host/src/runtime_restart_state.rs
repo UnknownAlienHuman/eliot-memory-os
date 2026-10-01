@@ -1,6 +1,7 @@
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
+use serde::Deserialize;
 use uuid::Uuid;
 
 use super::{
@@ -108,6 +109,19 @@ pub(super) fn read_bounded_runtime_restart_file(
     Ok(bytes)
 }
 
+/// Notes and reports whether a restart-store entry is the Host-managed
+/// episode budget file (issue #1801 W5): read by its own owner
+/// (`load_restart_budget`), it is never a restart receipt and therefore
+/// never adopted here.
+#[cfg(windows)]
+fn note_unadopted_restart_budget(file_name: &str) -> bool {
+    let skip = file_name == RESTART_BUDGET_FILE_NAME;
+    if skip {
+        host_restart_observe("host.restart budget not adopted observed");
+    }
+    skip
+}
+
 #[cfg(windows)]
 pub(super) fn load_durable_runtime_restarts(
     host_state_root: &Path,
@@ -159,12 +173,14 @@ pub(super) fn load_durable_runtime_restarts(
                     "runtime restart store contains a non-text filename".to_owned(),
                 )
             })?;
+        if note_unadopted_restart_budget(file_name) {
+            continue;
+        }
         let pending_digest = file_name
             .strip_suffix(".pending.json")
             .filter(|digest| valid_sha256_text(digest));
         if pending_digest.is_some() {
-            // Pending records are validated by the bounded reader below. They
-            // are not receipts and therefore never enter the adoption map.
+            // Pending records go to the bounded reader below, never the adoption map.
             host_restart_observe("host.restart pending not adopted observed");
             let _ = read_runtime_restart_pending_identity(&path)?;
             continue;
@@ -213,13 +229,307 @@ pub(super) fn load_durable_runtime_restarts(
     Ok(map)
 }
 
+// Host-managed restart-episode budget (#1801 W5/A5).
+//
+// A13.2 requires separate restart budgets whose repeated failure becomes a
+// Problem State rather than an endless restart loop, and #1801 Work item 5
+// requires the episode/exhaustion state to survive supervisor-process
+// replacement. The in-memory `HostJobBranches` counters are zeroed on every
+// `HostComposition::open`, so this durable record — owned by the same
+// restart-budget store beside the runtime-restart receipts — carries the
+// episode attempts and explicit exhaustion flags through the current owner.
+// One retained record per installation, bound to the currently admitted
+// approved generation: admitting a different approved generation starts a
+// new episode (the prior episode record is replaced, since only the live
+// contour's budget steers the reconcile branch), while re-admitting the
+// same generation — including after a Host crash or SCM restart — inherits
+// the retained budget (fail-closed quarantine while the Problem State
+// remains open, I1.4). ARCH-MOD-03: exactly one owner (Host,
+// through `HostComposition`) reads and publishes this record; the generic
+// reconcile machine only consumes the seeded in-memory counters. The
+// product's restart budget has no wall-clock cooldown — the bound is
+// count-per-episode — so the persisted state is episode attempts plus
+// exhaustion flags, and a static read distinguishes the first episode from
+// an exhausted one.
+#[cfg(windows)]
+pub(super) const HOST_RESTART_EPISODE_BOUND: u8 = 1;
+
+#[cfg(windows)]
+pub(super) const RESTART_BUDGET_FILE_NAME: &str = "restart-budget.json";
+
+#[cfg(windows)]
+const MAX_RESTART_BUDGET_BYTES: u64 = 4096;
+
+#[cfg(windows)]
+const RESTART_BUDGET_WIRE: &str = "eliot.host.restart-budget.v1";
+
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct HostRestartBudget {
+    wire: String,
+    installation: String,
+    generation: String,
+    kernel_attempts: u32,
+    store_attempts: u32,
+    kernel_exhausted: bool,
+    store_exhausted: bool,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RestartBudgetRecord {
+    wire: String,
+    installation: String,
+    generation: String,
+    kernel_attempts: u32,
+    store_attempts: u32,
+    kernel_exhausted: bool,
+    store_exhausted: bool,
+}
+
+#[cfg(windows)]
+fn restart_budget_shape_valid(value: &str) -> bool {
+    !value.trim().is_empty() && !value.chars().any(char::is_control)
+}
+
+#[cfg(windows)]
+impl HostRestartBudget {
+    pub(super) fn for_contour(installation: &str, generation: &str) -> Self {
+        Self {
+            wire: RESTART_BUDGET_WIRE.to_owned(),
+            installation: installation.to_owned(),
+            generation: generation.to_owned(),
+            kernel_attempts: 0,
+            store_attempts: 0,
+            kernel_exhausted: false,
+            store_exhausted: false,
+        }
+    }
+
+    pub(super) fn validate(&self) -> Result<(), String> {
+        if self.wire != RESTART_BUDGET_WIRE {
+            return Err("restart budget wire is not the canonical budget version".to_owned());
+        }
+        if !restart_budget_shape_valid(&self.installation) {
+            return Err("restart budget installation binding is malformed".to_owned());
+        }
+        if !restart_budget_shape_valid(&self.generation) {
+            return Err("restart budget generation binding is malformed".to_owned());
+        }
+        let bound = u32::from(HOST_RESTART_EPISODE_BOUND);
+        if (self.kernel_exhausted && self.kernel_attempts < bound)
+            || (self.store_exhausted && self.store_attempts < bound)
+        {
+            return Err("restart budget exhaustion is set without a spent episode".to_owned());
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub(super) fn installation(&self) -> &str {
+        &self.installation
+    }
+
+    #[must_use]
+    pub(super) fn generation(&self) -> &str {
+        &self.generation
+    }
+
+    #[must_use]
+    pub(super) fn kernel_attempts(&self) -> u32 {
+        self.kernel_attempts
+    }
+
+    #[must_use]
+    pub(super) fn store_attempts(&self) -> u32 {
+        self.store_attempts
+    }
+
+    #[must_use]
+    pub(super) fn kernel_exhausted(&self) -> bool {
+        self.kernel_exhausted
+    }
+
+    #[must_use]
+    pub(super) fn store_exhausted(&self) -> bool {
+        self.store_exhausted
+    }
+
+    /// Saturates the durable Kernel attempts into the in-memory `u8` counter
+    /// domain. Saturation keeps a corrupt-large value fail-operational toward
+    /// refusal (never toward a fresh budget): any value above `u8::MAX` is
+    /// already far past the episode bound.
+    #[must_use]
+    pub(super) fn kernel_attempts_saturated(&self) -> u8 {
+        u8::try_from(self.kernel_attempts).unwrap_or(u8::MAX)
+    }
+
+    /// Saturates the durable Store attempts into the in-memory `u8` counter
+    /// domain; see [`Self::kernel_attempts_saturated`].
+    #[must_use]
+    pub(super) fn store_attempts_saturated(&self) -> u8 {
+        u8::try_from(self.store_attempts).unwrap_or(u8::MAX)
+    }
+
+    /// Merges observed in-memory attempts monotonically, then recomputes the
+    /// exhaustion flags from the episode bound. The durable counters never
+    /// move backward: a zeroed supervisor process cannot erase a spent
+    /// episode, and a fresh episode is created only by replacing this record
+    /// for a newly admitted generation binding.
+    pub(super) fn observe_attempts(&mut self, kernel_attempts: u8, store_attempts: u8) {
+        self.kernel_attempts = self.kernel_attempts.max(u32::from(kernel_attempts));
+        self.store_attempts = self.store_attempts.max(u32::from(store_attempts));
+        let bound = u32::from(HOST_RESTART_EPISODE_BOUND);
+        if self.kernel_attempts >= bound {
+            self.kernel_exhausted = true;
+        }
+        if self.store_attempts >= bound {
+            self.store_exhausted = true;
+        }
+    }
+}
+
+#[cfg(windows)]
+pub(super) fn restart_budget_path(host_state_root: &Path) -> PathBuf {
+    runtime_restart_store_dir(host_state_root).join(RESTART_BUDGET_FILE_NAME)
+}
+
+#[cfg(windows)]
+fn restart_budget_payload(budget: &HostRestartBudget) -> serde_json::Value {
+    serde_json::json!({
+        "wire": budget.wire,
+        "installation": budget.installation,
+        "generation": budget.generation,
+        "kernel_attempts": budget.kernel_attempts,
+        "store_attempts": budget.store_attempts,
+        "kernel_exhausted": budget.kernel_exhausted,
+        "store_exhausted": budget.store_exhausted,
+    })
+}
+
+/// Loads the retained Host restart-episode budget, if any. An absent record
+/// is a fresh episode, never an error; a present but malformed or invalid
+/// record fails closed through the existing `validate()` before any restart
+/// decision can consume it.
+#[cfg(windows)]
+pub(super) fn load_restart_budget(
+    host_state_root: &Path,
+) -> Result<Option<HostRestartBudget>, HostError> {
+    host_restart_observe("host.restart budget load requested");
+    let path = restart_budget_path(host_state_root);
+    let metadata = match std::fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            host_restart_observe("host.restart budget absent observed");
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(HostError::RecoveryRequired(format!(
+                "restart budget record cannot be inspected: {error}"
+            )));
+        }
+    };
+    if !metadata.is_file() || metadata.len() > MAX_RESTART_BUDGET_BYTES {
+        return Err(HostError::RecoveryRequired(
+            "restart budget record is malformed or too large".to_owned(),
+        ));
+    }
+    let bytes = read_bounded_runtime_restart_file(
+        &path,
+        MAX_RESTART_BUDGET_BYTES,
+        "restart budget record",
+    )?;
+    let record = serde_json::from_slice::<RestartBudgetRecord>(&bytes).map_err(|error| {
+        HostError::RecoveryRequired(format!("restart budget record is malformed: {error}"))
+    })?;
+    let budget = HostRestartBudget {
+        wire: record.wire,
+        installation: record.installation,
+        generation: record.generation,
+        kernel_attempts: record.kernel_attempts,
+        store_attempts: record.store_attempts,
+        kernel_exhausted: record.kernel_exhausted,
+        store_exhausted: record.store_exhausted,
+    };
+    budget.validate().map_err(|error| {
+        HostError::RecoveryRequired(format!("restart budget record is invalid: {error}"))
+    })?;
+    host_restart_observe("host.restart budget loaded observed");
+    Ok(Some(budget))
+}
+
+/// Publishes the retained Host restart-episode budget durably. The staged
+/// bytes are synced, atomically moved over the retained record on the same
+/// volume, committed with a directory sync, and proven back by an exact
+/// validated reload; a failed publication never reports success and never
+/// leaves a half-written record behind.
+#[cfg(windows)]
+pub(super) fn persist_restart_budget(
+    host_state_root: &Path,
+    budget: &HostRestartBudget,
+) -> Result<(), HostError> {
+    host_restart_observe("host.restart budget persist requested");
+    budget.validate().map_err(HostError::Platform)?;
+    let dir = runtime_restart_store_dir(host_state_root);
+    std::fs::create_dir_all(&dir).map_err(|error| HostError::Platform(error.to_string()))?;
+    let bytes = serde_json::to_vec(&restart_budget_payload(budget))
+        .map_err(|error| HostError::Platform(error.to_string()))?;
+    if bytes.len() as u64 > MAX_RESTART_BUDGET_BYTES {
+        return Err(HostError::Platform(
+            "restart budget record exceeds its bounded size".to_owned(),
+        ));
+    }
+    let path = restart_budget_path(host_state_root);
+    let tmp = dir.join(format!(".restart-budget.{}.tmp", Uuid::new_v4().simple()));
+    let publication = (|| {
+        write_durable_file(&tmp, &bytes)?;
+        eliot_windows_ipc::atomic_replace_file(&tmp, &path).map_err(|error| {
+            HostError::Platform(format!("restart budget atomic replace failed: {error}"))
+        })?;
+        sync_runtime_restart_store_dir(&dir)?;
+        Ok(())
+    })();
+    // The atomic move consumes the staging file on success; on failure the
+    // staging file is removed so a crash cannot leave ambiguous evidence.
+    // Publication failure stays primary across cleanup and its commit.
+    let cleanup = std::fs::remove_file(&tmp);
+    let sync_after_cleanup = sync_runtime_restart_store_dir(&dir);
+    if let Err(publication_error) = publication {
+        host_restart_observe("host.restart budget publication failed observed");
+        return Err(publication_error);
+    }
+    match cleanup {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            host_restart_observe("host.restart budget cleanup failed observed");
+            return Err(HostError::RecoveryRequired(format!(
+                "restart budget temporary cleanup failed: {error}"
+            )));
+        }
+    }
+    sync_after_cleanup?;
+    let reloaded = load_restart_budget(host_state_root)?.ok_or_else(|| {
+        HostError::RecoveryRequired(
+            "restart budget record disappeared after publication".to_owned(),
+        )
+    })?;
+    if reloaded != *budget {
+        return Err(HostError::RecoveryRequired(
+            "restart budget readback differs from the published record".to_owned(),
+        ));
+    }
+    host_restart_observe("host.restart budget persisted observed");
+    Ok(())
+}
+
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum RuntimeRestartPendingPublication {
     Created,
     Replay,
 }
-
 #[cfg(windows)]
 fn sync_runtime_restart_store_dir(dir: &Path) -> Result<(), HostError> {
     sync_dir(dir)

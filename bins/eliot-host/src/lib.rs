@@ -1589,9 +1589,14 @@ pub use lease_drain::{GenerationRetirementBarrier, GenerationRetirementFence};
 pub use reactive_context_delivery::{
     HostReactiveContextDeliveryError, HostReactiveContextProducer, HostReactiveContextProducerError,
 };
+#[cfg(windows)]
+pub use scm_launch::publish_supervision_record_table;
 pub use scm_launch::{
-    HOST_SCM_CAUSE_MAX_CHARS, HostScmRegistrationCause, ValidatedHostScmLaunch,
-    classify_host_scm_inspection, validate_host_scm_bootstrap,
+    HOST_SCM_CAUSE_MAX_CHARS, HostScmRegistrationCause, InstalledCandidateManifestSummary,
+    InstalledCandidateReadback, InstalledCandidateSpec, SUPERVISION_RECORD_COMPONENTS,
+    SUPERVISION_RECORD_FILE_NAME, SUPERVISION_RECORD_WIRE, SupervisionComponentRecord,
+    SupervisionRecordTable, ValidatedHostScmLaunch, classify_host_scm_inspection,
+    read_installed_candidate_contour, read_supervision_record_table, validate_host_scm_bootstrap,
 };
 pub use store_kernel_launch_sequence::StoreLivenessEvidence;
 #[cfg(all(test, windows))]
@@ -2448,7 +2453,9 @@ where
     let store_degraded = store_observation == ReconciliationObservation::Unknown;
 
     if kernel_dead && !store_degraded && state.store.is_some() {
-        if terminate_kernel(&mut state.kernel).is_err() || state.kernel_restart_attempts >= 1 {
+        if terminate_kernel(&mut state.kernel).is_err()
+            || state.kernel_restart_attempts >= HOST_RESTART_EPISODE_BOUND
+        {
             kernel_degraded = true;
         } else {
             state.kernel_restart_attempts += 1;
@@ -2477,6 +2484,64 @@ where
         (false, true) => HostBranchDisposition::StoreDegraded,
         (true, true) => HostBranchDisposition::BothDegraded,
     })
+}
+
+/// Loads the retained Host restart-episode budget for one admitted contour
+/// (#1801 W5/A5). A record bound to another installation or generation is a
+/// different episode and is never adopted: the caller starts that episode
+/// fresh instead. An absent record is a fresh episode; a malformed record
+/// fails closed inside `load_restart_budget` before any restart decision.
+#[cfg(windows)]
+fn contour_restart_budget(
+    host_state_root: &Path,
+    installation: &PlatformHandle,
+    generation: &PlatformHandle,
+) -> Result<Option<HostRestartBudget>, HostError> {
+    match load_restart_budget(host_state_root)? {
+        Some(budget)
+            if budget.installation() == installation.as_str()
+                && budget.generation() == generation.as_str() =>
+        {
+            Ok(Some(budget))
+        }
+        Some(_) | None => Ok(None),
+    }
+}
+
+/// Seeds the in-memory episode counters from the retained budget so replacing
+/// the Host process cannot reset an exhausted loop (#1801 W5/A5). A retained
+/// record for this exact (installation, generation) contour restores both
+/// counters; any other binding leaves the fresh counters untouched and the
+/// caller publishes the new episode on its next bounded decision.
+#[cfg(windows)]
+fn seed_host_restart_budget(
+    host_state_root: &Path,
+    installation: &PlatformHandle,
+    generation: &PlatformHandle,
+    jobs: &mut HostJobBranches,
+) -> Result<(), HostError> {
+    if let Some(budget) = contour_restart_budget(host_state_root, installation, generation)? {
+        jobs.kernel_restart_attempts = budget.kernel_attempts_saturated();
+        jobs.store_restart_attempts = budget.store_attempts_saturated();
+    }
+    Ok(())
+}
+
+/// Renders one branch child as a Job-qualified process lineage cell for the
+/// supervision record. A branch with no child is pre-admission evidence,
+/// never an adopted PID.
+#[cfg(windows)]
+fn observed_branch_process(child: Option<&RunningJobChild<PlatformHandle>>) -> String {
+    match child {
+        None => "pre-admission (no child)".to_owned(),
+        Some(child) => {
+            let process = child.evidence().process();
+            format!(
+                "pid={} start={} image={}",
+                process.process_id, process.start_time_100ns, process.image_path
+            )
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -5425,8 +5490,9 @@ mod host_durable_persistence;
 mod runtime_restart_state;
 #[cfg(windows)]
 use runtime_restart_state::{
-    RuntimeRestartPendingPublication, has_runtime_restart_pending, load_durable_runtime_restarts,
-    persist_runtime_restart_pending, persist_runtime_restart_receipt,
+    HOST_RESTART_EPISODE_BOUND, HostRestartBudget, RuntimeRestartPendingPublication,
+    has_runtime_restart_pending, load_durable_runtime_restarts, load_restart_budget,
+    persist_restart_budget, persist_runtime_restart_pending, persist_runtime_restart_receipt,
     read_bounded_runtime_restart_file, rebind_runtime_restart_receipt,
 };
 #[cfg(all(windows, test))]
@@ -7512,12 +7578,23 @@ impl HostComposition {
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         }
         #[cfg(windows)]
-        let jobs = if store_recovery_startup_fence.is_fenced() {
+        let mut jobs = if store_recovery_startup_fence.is_fenced() {
             HostJobBranches::new_fenced(&host)
         } else {
             HostJobBranches::new(&host)
         }
         .map_err(|error| HostError::Platform(error.to_string()))?;
+        // Retained budget at open: a replacement Host process inherits the
+        // spent episode instead of resetting it (#1801 W5/A5). A record bound
+        // to another installation or generation leaves the fresh counters
+        // untouched; the reconcile branch publishes that new episode.
+        #[cfg(windows)]
+        seed_host_restart_budget(
+            &host_state_root,
+            &host.installation,
+            &startup_manifest.generation,
+            &mut jobs,
+        )?;
         #[cfg(all(windows, test))]
         let _ = &profile_root_leases;
         let mut composition = Self {
@@ -7576,6 +7653,7 @@ impl HostComposition {
             // F-LOG-HOST-1: fenced is distinct from admitted; no false ready.
             host_terminal.disarm();
             host_lifecycle_observe_requested(BOUNDARY_OPEN_FENCED_STORE_RECOVERY);
+            composition.publish_supervision_record()?;
             return Ok(composition);
         }
         #[cfg(windows)]
@@ -7592,6 +7670,7 @@ impl HostComposition {
                 // F-LOG-HOST-1: fenced bridge-stage is not admitted/ready.
                 host_terminal.disarm();
                 host_lifecycle_observe_requested(BOUNDARY_OPEN_FENCED_BRIDGE_STAGE);
+                composition.publish_supervision_record()?;
                 return Ok(composition);
             }
             if let Some(prepared) = pending.phase_b_prepared.as_ref() {
@@ -7659,6 +7738,7 @@ impl HostComposition {
                     host_lifecycle_observe_requested(
                         BOUNDARY_OPEN_DEGRADED_PREPARED_WITHOUT_RECEIPT,
                     );
+                    composition.publish_supervision_record()?;
                     return Ok(composition);
                 } else if let Some(binding) = materialization.agent_bridge() {
                     // A crash after the receipt CAS and before backup cleanup
@@ -7703,6 +7783,7 @@ impl HostComposition {
                 // F-LOG-HOST-1: fenced is distinct from admitted.
                 host_terminal.disarm();
                 host_lifecycle_observe_requested(BOUNDARY_OPEN_FENCED_STORE_RECOVERY_ACTIVE);
+                composition.publish_supervision_record()?;
                 return Ok(composition);
             }
             // A committed ActiveVerified fence is source evidence only.  Every
@@ -7720,6 +7801,10 @@ impl HostComposition {
                 None,
             )?;
         }
+        // The supervision record is the inspectable product artifact for the
+        // admitted contour (#1801 W1); publication failure fails the open closed.
+        #[cfg(windows)]
+        composition.publish_supervision_record()?;
         // F-LOG-HOST-1: admitted only with durable evidence; guard disarmed.
         host_terminal.disarm();
         host_lifecycle_observe_requested(BOUNDARY_OPEN_ADMITTED);
@@ -10694,6 +10779,334 @@ impl HostComposition {
         Ok(tick)
     }
 
+    /// Re-reads the retained restart-episode budget into the reconcile branch
+    /// (#1801 W5/A5). The generic machine refuses a relaunch once the seeded
+    /// counters reach the episode bound, so an exhausted loop stays refused
+    /// no matter which Host process performs this tick.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the retained budget cannot be loaded or is
+    /// invalid.
+    #[cfg(windows)]
+    fn rehydrate_restart_budget(&mut self, generation: &PlatformHandle) -> Result<(), HostError> {
+        seed_host_restart_budget(
+            &self.registry_host_root,
+            &self.host.installation,
+            generation,
+            &mut self.jobs,
+        )
+    }
+
+    /// Merges the reconcile outcome back into the retained budget (#1801
+    /// W5/A5). Attempts merge monotonically: a consumed bounded restart is
+    /// durable before the next tick, so repeated failure reaches durable
+    /// exhaustion (and the existing degraded/Problem persistence on the
+    /// refused path) instead of looping after a supervisor replacement. A
+    /// failed publication fails the tick closed rather than running on with
+    /// a silently lost budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the retained budget cannot be loaded, merged, or
+    /// published.
+    #[cfg(windows)]
+    fn publish_restart_budget(&mut self, generation: &PlatformHandle) -> Result<(), HostError> {
+        let retained = contour_restart_budget(
+            &self.registry_host_root,
+            &self.host.installation,
+            generation,
+        )?;
+        let mut budget = match retained {
+            Some(budget) => budget,
+            None => {
+                HostRestartBudget::for_contour(self.host.installation.as_str(), generation.as_str())
+            }
+        };
+        budget.observe_attempts(
+            self.jobs.kernel_restart_attempts,
+            self.jobs.store_restart_attempts,
+        );
+        persist_restart_budget(&self.registry_host_root, &budget)
+    }
+
+    /// Builds the per-component supervision record (artifact, descriptor,
+    /// profile, identity, owner, Job, journal/root, generation, and
+    /// restart-policy reference for Host, Watchdog, Kernel, the canonical
+    /// store, and Doctor) from the existing owners (#1801 W1).
+    ///
+    /// Approved facts come from the active installation-registry manifest;
+    /// live facts come from the retained branches without adopting PIDs or
+    /// performing new launches; the Host-managed episode budget comes from
+    /// the retained restart-budget record; facts Host never owns (the
+    /// Kernel-managed Doctor budget, the installer-owned SCM recovery
+    /// policies) are explicit not-owned markers, never invented values.
+    /// Published at open by [`Self::publish_supervision_record`]; read back
+    /// with `read_supervision_record_table`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no approved generation is admitted or the
+    /// retained budget cannot be loaded.
+    #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the five supervision rows keep every owner binding visible in one projection"
+    )]
+    pub fn supervision_record_table(&self) -> Result<SupervisionRecordTable, HostError> {
+        let active = self.registry.active().cloned().ok_or_else(|| {
+            HostError::ProcessContour(
+                "supervision record has no approved active generation".to_owned(),
+            )
+        })?;
+        let manifest = &active.manifest;
+        let installation = self.host.installation.as_str();
+        let generation_approved = manifest.generation.as_str();
+        let budget = contour_restart_budget(
+            &self.registry_host_root,
+            &self.host.installation,
+            &manifest.generation,
+        )?
+        .unwrap_or_else(|| HostRestartBudget::for_contour(installation, generation_approved));
+        let profile = format!("{:?}", manifest.runtime_launch.profile);
+        let roots = &manifest.runtime_launch.runtime_state_roots;
+        let live_generation = self
+            .jobs
+            .approved_generation
+            .as_ref()
+            .map_or("none", |generation| generation.as_str());
+        let generation = format!("approved:{generation_approved} live:{live_generation}");
+        let journal_path = self
+            .registry_host_root
+            .join(HOST_JOURNAL_FILE_NAME)
+            .display()
+            .to_string();
+        let watchdog_request = select_watchdog_approval_for_inspection(&self.registry, manifest)
+            .ok()
+            .flatten()
+            .and_then(|approval| {
+                approved_service_registration_request(
+                    &manifest.runtime_launch,
+                    &approval,
+                    InstallerServiceRole::Watchdog,
+                    &manifest.runtime_launch.watchdog_executable_path,
+                )
+                .ok()
+            });
+        let watchdog_unapproved =
+            "installer approval unavailable (fail-closed; SystemService start requires it)"
+                .to_owned();
+        let kernel_lineage =
+            self.jobs
+                .kernel_candidate
+                .as_ref()
+                .map_or_else(String::new, |candidate| {
+                    format!(
+                        " lineage remaining={} maximum={}",
+                        candidate.restart_budget.remaining, candidate.restart_budget.maximum
+                    )
+                });
+        let rows = vec![
+            SupervisionComponentRecord {
+                component: SUPERVISION_RECORD_COMPONENTS[0].to_owned(),
+                artifact: format!(
+                    "approved:{}",
+                    manifest.host_artifact_digest.as_str()
+                ),
+                descriptor: format!(
+                    "scm-service '{}' config '{}' host-state-root '{}'",
+                    ELIOT_HOST_SERVICE_NAME,
+                    self.launch_options.config_descriptor_path().display(),
+                    self.registry_host_root.display()
+                ),
+                profile: profile.clone(),
+                identity: format!(
+                    "installation={installation} epoch={} lineage={}",
+                    self.host.epoch.current.sequence.get(),
+                    self.host.epoch.current.lineage_id.as_str()
+                ),
+                owner: "windows-scm/installer (Host performs no self-registration; binary replacement stays with the installer/SCM procedure, I1.2)"
+                    .to_owned(),
+                job: "none (Host is the SCM service; never inside its own kill-on-close Job, I1.4)"
+                    .to_owned(),
+                journal_or_root: format!("journal={journal_path}"),
+                generation: generation.clone(),
+                restart_policy: "installer-owned SCM recovery policy (Host performs no self-restart; Host-service replacement belongs to the installer/SCM procedure, I1.2)"
+                    .to_owned(),
+            },
+            SupervisionComponentRecord {
+                component: SUPERVISION_RECORD_COMPONENTS[1].to_owned(),
+                artifact: format!(
+                    "approved-image:{}",
+                    manifest.runtime_launch.watchdog_executable_path.as_str()
+                ),
+                descriptor: watchdog_request.as_ref().map_or_else(
+                    || watchdog_unapproved.clone(),
+                    |request| {
+                        format!(
+                            "scm-service '{}' image '{}'",
+                            request.service_name(),
+                            request.binary_path().display()
+                        )
+                    },
+                ),
+                profile: profile.clone(),
+                identity: watchdog_request.as_ref().map_or_else(
+                    || watchdog_unapproved.clone(),
+                    |request| {
+                        format!(
+                            "service={} account={:?} start={:?}",
+                            request.service_name(),
+                            request.account(),
+                            request.start_mode()
+                        )
+                    },
+                ),
+                owner: "windows-scm (independent sibling; Host requests start/stop only and owns neither the Job Object nor a kill-on-close handle, I1.2)"
+                    .to_owned(),
+                job: "none (Watchdog is never inside a Host Job; a Host crash does not terminate it, I1.2)"
+                    .to_owned(),
+                journal_or_root: format!("watchdog-state-root={}", roots.watchdog_state_root.as_str()),
+                generation: generation.clone(),
+                restart_policy: "independent SCM service policy (installer-owned; separate identity and budget, A13.2)"
+                    .to_owned(),
+            },
+            SupervisionComponentRecord {
+                component: SUPERVISION_RECORD_COMPONENTS[2].to_owned(),
+                artifact: format!(
+                    "approved:{} live:{}",
+                    manifest.kernel_artifact_digest.as_str(),
+                    self.jobs
+                        .kernel_artifact_digest
+                        .as_ref()
+                        .map_or("none", |digest| digest.as_str())
+                ),
+                descriptor: format!(
+                    "approved-image:{} live-image:{} config:{}",
+                    manifest.kernel_executable_path.as_str(),
+                    self.jobs.kernel_executable.as_ref().map_or_else(
+                        || "none".to_owned(),
+                        |image| image.display().to_string()
+                    ),
+                    manifest.config_path.as_str()
+                ),
+                profile: profile.clone(),
+                identity: format!(
+                    "job={} {}",
+                    self.jobs.kernel_name(),
+                    observed_branch_process(self.jobs.kernel.as_ref())
+                ),
+                owner: "host (Host-owned Kernel Job with kill-on-close; Host starts/stops/bounded-restarts approved services, A13.2)"
+                    .to_owned(),
+                job: self.jobs.kernel_name().to_owned(),
+                journal_or_root: format!(
+                    "kernel-ors-root={} kernel-work-root={}",
+                    roots.kernel_ors_root.as_str(),
+                    roots.kernel_work_root.as_str()
+                ),
+                generation: generation.clone(),
+                restart_policy: format!(
+                    "host-episode-budget kernel attempts={} exhausted={} bound={} durable=restart-budget.json{kernel_lineage}",
+                    budget.kernel_attempts(),
+                    budget.kernel_exhausted(),
+                    HOST_RESTART_EPISODE_BOUND
+                ),
+            },
+            SupervisionComponentRecord {
+                component: SUPERVISION_RECORD_COMPONENTS[3].to_owned(),
+                artifact: format!(
+                    "approved:{} live:{}",
+                    manifest.canonical_store_artifact_digest.as_str(),
+                    self.jobs
+                        .store_artifact_digest
+                        .as_ref()
+                        .map_or("none", |digest| digest.as_str())
+                ),
+                descriptor: format!(
+                    "approved-image:{} live-image:{}",
+                    manifest.canonical_store_executable_path.as_str(),
+                    self.jobs.store_bridge_executable.as_ref().map_or_else(
+                        || "none".to_owned(),
+                        |image| image.display().to_string()
+                    )
+                ),
+                profile: profile.clone(),
+                identity: format!(
+                    "job={} {}",
+                    self.jobs.store_name(),
+                    observed_branch_process(self.jobs.store.as_ref())
+                ),
+                owner: "host (Host-owned canonical-store Job with kill-on-close, separate from the Kernel Job, I1.4; the canonical provider runs inside the validated Store bridge boundary)"
+                    .to_owned(),
+                job: self.jobs.store_name().to_owned(),
+                journal_or_root: format!(
+                    "store-data-root={} store-work-root={}",
+                    roots.store_data_root.as_str(),
+                    roots.store_work_root.as_str()
+                ),
+                generation: generation.clone(),
+                restart_policy: format!(
+                    "host-episode-budget store attempts={} exhausted={} bound={} durable=restart-budget.json",
+                    budget.store_attempts(),
+                    budget.store_exhausted(),
+                    HOST_RESTART_EPISODE_BOUND
+                ),
+            },
+            SupervisionComponentRecord {
+                component: SUPERVISION_RECORD_COMPONENTS[4].to_owned(),
+                artifact: format!(
+                    "approved:{}",
+                    manifest.doctor_artifact_digest.as_str()
+                ),
+                descriptor: format!(
+                    "approved-image:{}",
+                    manifest.doctor_executable_path.as_str()
+                ),
+                profile,
+                identity: "kernel-supervised on-demand process (Host holds no Doctor handle)"
+                    .to_owned(),
+                owner: "kernel (own admitted role/budget; not a Host-owned or SCM service)"
+                    .to_owned(),
+                job: "kernel-supervised sibling of the daemon (not a Host Job; not an SCM service, I1.4)"
+                    .to_owned(),
+                journal_or_root: "kernel-owned (no Host root)".to_owned(),
+                generation,
+                restart_policy: "kernel-managed Doctor budget (not Host-owned; separate identity and budget, A13.2)"
+                    .to_owned(),
+            },
+        ];
+        Ok(SupervisionRecordTable {
+            wire: SUPERVISION_RECORD_WIRE.to_owned(),
+            installation: installation.to_owned(),
+            host_epoch_sequence: self.host.epoch.current.sequence.get(),
+            host_lineage: self.host.epoch.current.lineage_id.as_str().to_owned(),
+            rows,
+        })
+    }
+
+    /// Publishes the supervision record at open beside the Host journal and
+    /// proves it back with an exact validated reload (#1801 W1). The table
+    /// is the inspectable product artifact the installed-candidate RUN
+    /// under #11 reads next to live SCM and Job observations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the table cannot be built, published, or read
+    /// back exactly. Publication failure fails the open closed: a missing
+    /// record never stands in for a published one.
+    #[cfg(windows)]
+    fn publish_supervision_record(&self) -> Result<(), HostError> {
+        let table = self.supervision_record_table()?;
+        publish_supervision_record_table(&self.registry_host_root, &table)?;
+        let reloaded = read_supervision_record_table(&self.registry_host_root)?;
+        if reloaded != table {
+            return Err(HostError::RecoveryRequired(
+                "supervision record readback differs from the published table".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Reconciles the approved contour and records fresh process observations.
     ///
     /// # Errors
@@ -10807,6 +11220,10 @@ impl HostComposition {
             DurableKernelActivationDriver::resume(&self.journal, current)
                 .fail("kernel-process-observed-dead")?;
         }
+        // Retained budget first: the bounded reconcile decision below must
+        // refuse an exhausted episode even when this Host process never saw
+        // the failures that spent it (#1801 W5/A5).
+        self.rehydrate_restart_budget(&active.manifest.generation)?;
         let reconciled = if store_requires_restart {
             None
         } else {
@@ -10842,6 +11259,12 @@ impl HostComposition {
             &request,
             |request| self.execute_store_recovery(request).map(|_| ()),
         )?;
+        // Durable budget before any disposition: both the bounded Kernel
+        // relaunch above and the Store recovery inside the route consumed
+        // from this episode, and the spend must survive this process (#1801
+        // W5/A5). A failed publication fails the tick closed rather than
+        // running on with a silently lost budget.
+        self.publish_restart_budget(&active.manifest.generation)?;
         let disposition = match route {
             ScmStoreRecoveryRoute::Recovered => {
                 let disposition = self.reconcile_branch_readiness_at(
