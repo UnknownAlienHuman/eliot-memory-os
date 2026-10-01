@@ -264,6 +264,8 @@ fn validate_ready_process_source_admission(
         .get("owner_revision")
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| "fresh WorkScope snapshot omitted its owner revision".to_owned())?;
+    let work_scope_snapshot_sha256 =
+        eliot_testd_core::sha256_hex(owner_facts.work_scope_binding_json.as_bytes());
     let work_scope_fence: eliot_contracts::StateFence = serde_json::from_value(
         work_scope
             .get("state_fence")
@@ -329,6 +331,7 @@ fn validate_ready_process_source_admission(
         || readback.owner_revision != 2
         || admission.owner_revision != 2
         || admission.work_scope_owner_revision != work_scope_revision
+        || admission.work_scope_owner_digest != work_scope_snapshot_sha256
         || admission.state_fence != *source.binding.state_fence()
         || !work_scope_fence_matches
         || admission.owner_facts_sha256 != owner.owner_facts_sha256
