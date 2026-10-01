@@ -1,11 +1,11 @@
 //! Initial WorkScope source admission and canonical snapshot preparation.
 //!
-//! This module joins the authenticated request and authority fence, a real
-//! initial WorkScope binding admission, the exact Bootstrap source capture,
-//! and a fresh WorkScope-owner CAS expectation. It does not resolve a scope,
-//! infer an observed workspace, admit source candidates, or install a Store
-//! row. Those facts come from their respective owners and are supplied by the
-//! owning daemon ingress.
+//! This module joins a verified signed source approval, an exact-root
+//! discovery lease, live Bootstrap source capture, initial WorkScope binding
+//! admission, and a fresh WorkScope-owner CAS expectation. It does not resolve
+//! a scope, infer an observed workspace, sign user approval, or install a
+//! Store row. Those facts come from their respective owners and the owning
+//! daemon ingress.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -23,10 +23,13 @@ use eliot_store_api::{
 };
 use crate::composition::WorkScopeOwnerSnapshotReadback;
 use eliot_workscope::{
-    AuthorityBasis, GoverningSource, GoverningSourceRole, GoverningSourceSet,
-    ObservedScopeResources, PrivacyProfile, ScopeBinding, ScopeIdentity, SourceStatus,
-    WorkScopeBindingOwner, WorkScopeBindingSnapshot, WorkScopeDescriptor,
-    admit_initial_binding, observed_scope_binding,
+    AuthorityBasis, DiscoveryLeaseKey, DiscoveryLeaseRequest, DiscoveryRead,
+    GoverningSourceAdmission, GoverningSourceCandidate, GoverningSourceRole,
+    GoverningSourceSet, NewSourceCandidate, ObservedScopeResources, PrivacyProfile,
+    ScopeBinding, ScopeIdentity, SourceAdmissionRequest,
+    SourceCoverage, WorkScopeBindingOwner, WorkScopeBindingSnapshot, WorkScopeDescriptor,
+    admit_governing_sources, admit_initial_binding, issue_discovery_lease,
+    observed_scope_binding,
 };
 use eliot_security_contracts::{
     CompetenceLevel, EffectCeiling, EpistemicUse, FreshnessStatus, InstructionTaint,
@@ -215,21 +218,77 @@ impl GoverningSourceApproval {
         Ok(())
     }
 
-    /// Build the two-source WorkScope closure authorized by this verified
-    /// approval and the exact current normative capture.
+    /// Build candidate parameters for one approved role from the exact live
+    /// capture. The returned claim is only a claim; admission is always
+    /// resolved by `admit_governing_sources` against the signed Human owner.
     #[allow(clippy::too_many_arguments)]
-    fn derive_work_scope_sources(
+    fn candidate_parameters(
+        &self,
+        capture: &NormativePairSourceCapture,
+        state_fence: &StateFence,
+        scope_ref: &str,
+        generation: u64,
+        document: &ApprovedNormativeSource,
+        role: GoverningSourceRole,
+    ) -> Result<NewSourceCandidate, WorkScopeSourceAdmissionError> {
+        let captured = match role {
+            GoverningSourceRole::Architecture => &capture.architecture,
+            GoverningSourceRole::Implementation => &capture.implementation,
+            _ => return Err(WorkScopeSourceAdmissionError::SourceApprovalBindingMismatch),
+        };
+        if captured.source_ref != document.source_ref
+            || captured.content_sha256 != document.content_sha256
+            || state_fence.resource_generation.value() != generation
+        {
+            return Err(WorkScopeSourceAdmissionError::SourceApprovalBindingMismatch);
+        }
+        Ok(NewSourceCandidate {
+            source_ref: document.source_ref.clone(),
+            digest: document.content_sha256.clone(),
+            role,
+            applicable_scope_ref: scope_ref.to_owned(),
+            applicable_generation: generation,
+            assurance: SourceAssurance {
+                source_ref: document.source_ref.clone(),
+                provenance_ref: format!("normative-pair:{}", capture.receipt.pair_key),
+                integrity: IntegrityStatus::Verified,
+                freshness: FreshnessStatus::Current,
+                competence: CompetenceLevel::Unknown,
+                independence: IndependenceLevel::Unknown,
+                privacy_class: document.privacy_class,
+                instruction_taint: InstructionTaint::DataOnly,
+                allowed_epistemic_use: vec![EpistemicUse::Observation],
+                allowed_effects: vec![EffectCeiling::NoExternalEffect],
+                required_verifier: None,
+                quarantine: QuarantineState::ReviewRequired,
+                state_fence: state_fence.clone(),
+            },
+            domains: Vec::new(),
+            claim: Some(AuthorityBasis::HumanOwner {
+                owner_ref: self.approver_principal_ref.clone(),
+            }),
+        })
+    }
+
+    /// Issues a bounded, exact-root discovery lease and resolves the signed
+    /// approval's source rows through `from_discovery_lease`. Authority still
+    /// flows through WorkScope's ordinary Human-claim admission API.
+    #[allow(clippy::too_many_arguments)]
+    fn admit_signed_candidates_for_discovery(
         &self,
         capture: &NormativePairSourceCapture,
         explicit_root_identity: &str,
         product_id: &ProductId,
         source_id: &SourceId,
+        lease_key: &DiscoveryLeaseKey,
         privacy: &PrivacyProfile,
         scope_privacy_class: eliot_security_contracts::PrivacyClass,
         state_fence: &StateFence,
         authenticated_approver_principal_ref: &str,
         scope_ref: &str,
         generation: u64,
+        now: u64,
+        expires_at: u64,
     ) -> Result<GoverningSourceSet, WorkScopeSourceAdmissionError> {
         self.validate_live_binding(
             capture,
@@ -241,55 +300,128 @@ impl GoverningSourceApproval {
             state_fence,
             authenticated_approver_principal_ref,
         )?;
-        if state_fence.resource_generation.value() != generation {
-            return Err(WorkScopeSourceAdmissionError::FenceMismatch);
+        if now > expires_at || expires_at == 0 {
+            return Err(WorkScopeSourceAdmissionError::SourceAdmission(
+                "source discovery lease is expired".to_owned(),
+            ));
         }
-        let source = |document: &ApprovedNormativeSource, role, provenance: &str| {
-            GoverningSource {
-                source_ref: document.source_ref.clone(),
+        lease_key
+            .validate()
+            .map_err(|error| WorkScopeSourceAdmissionError::SourceAdmission(error.to_string()))?;
+        if lease_key.root_filesystem_identity_ref != explicit_root_identity {
+            return Err(WorkScopeSourceAdmissionError::SourceAdmission(
+                "discovery lease root differs from the verified source root".to_owned(),
+            ));
+        }
+        let allowed_reads = vec![DiscoveryRead::GoverningSourceCandidates];
+        let consumption_limit = u32::try_from(allowed_reads.len()).map_err(|_| {
+            WorkScopeSourceAdmissionError::SourceAdmission(
+                "source discovery lease read count is invalid".to_owned(),
+            )
+        })?;
+        let lease = issue_discovery_lease(&DiscoveryLeaseRequest {
+            proposer_ref: lease_key.proposer_ref.clone(),
+            session_ref: lease_key.session_ref.clone(),
+            host_ref: lease_key.host_ref.clone(),
+            candidate_root_ref: explicit_root_identity.to_owned(),
+            root_filesystem_identity_ref: lease_key.root_filesystem_identity_ref.clone(),
+            allowed_reads,
+            consumption_limit,
+            deadline: expires_at,
+        })
+        .map_err(|error| WorkScopeSourceAdmissionError::SourceAdmission(error.to_string()))?;
+        if !lease.key_matches(
+            &lease_key.proposer_ref,
+            &lease_key.session_ref,
+            &lease_key.host_ref,
+            &lease_key.root_filesystem_identity_ref,
+        ) {
+            return Err(WorkScopeSourceAdmissionError::SourceAdmission(
+                "source discovery lease key does not match the authenticated setup".to_owned(),
+            ));
+        }
+        let candidates = [
+            (&self.architecture, GoverningSourceRole::Architecture),
+            (&self.implementation, GoverningSourceRole::Implementation),
+        ]
+        .into_iter()
+        .map(|(document, role)| {
+            let params = self.candidate_parameters(
+                capture,
+                state_fence,
+                scope_ref,
+                generation,
+                document,
                 role,
-                assurance: SourceAssurance {
-                    source_ref: document.source_ref.clone(),
-                    provenance_ref: provenance.to_owned(),
-                    integrity: IntegrityStatus::Verified,
-                    freshness: FreshnessStatus::Current,
-                    competence: CompetenceLevel::Unknown,
-                    independence: IndependenceLevel::Unknown,
-                    privacy_class: document.privacy_class,
-                    instruction_taint: InstructionTaint::DataOnly,
-                    allowed_epistemic_use: vec![EpistemicUse::Observation],
-                    allowed_effects: vec![EffectCeiling::NoExternalEffect],
-                    required_verifier: None,
-                    quarantine: QuarantineState::ReviewRequired,
-                    state_fence: state_fence.clone(),
-                },
-                applicable_generation: generation,
-                status: SourceStatus::Admitted,
-                domains: Vec::new(),
-                digest: document.content_sha256.clone(),
-                authority_basis: Some(AuthorityBasis::HumanOwner {
-                    owner_ref: self.approver_principal_ref.clone(),
-                }),
-            }
-        };
-        GoverningSourceSet::new(
+            )?;
+            GoverningSourceCandidate::from_discovery_lease(
+                params,
+                &lease,
+                explicit_root_identity,
+                now,
+            )
+            .map_err(|error| {
+                WorkScopeSourceAdmissionError::SourceAdmission(error.to_string())
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+        admit_approved_candidates(
+            candidates,
             scope_ref,
             generation,
-            vec![
-                source(
-                    &self.architecture,
-                    GoverningSourceRole::Architecture,
-                    &self.pair_key,
-                ),
-                source(
-                    &self.implementation,
-                    GoverningSourceRole::Implementation,
-                    &self.pair_key,
-                ),
-            ],
-            Vec::new(),
+            &self.approver_principal_ref,
+            state_fence,
+            now,
+            expires_at,
+            &self.architecture,
+            &self.implementation,
         )
-        .map_err(|error| WorkScopeSourceAdmissionError::InitialAdmission(error.to_string()))
+    }
+
+    /// Resolve signed-approval candidates through a short-lived,
+    /// exact-root discovery lease and WorkScope's ordinary admission API.
+    #[allow(clippy::too_many_arguments)]
+    fn derive_work_scope_sources(
+        &self,
+        capture: &NormativePairSourceCapture,
+        explicit_root_identity: &str,
+        product_id: &ProductId,
+        source_id: &SourceId,
+        lease_key: &DiscoveryLeaseKey,
+        privacy: &PrivacyProfile,
+        scope_privacy_class: eliot_security_contracts::PrivacyClass,
+        state_fence: &StateFence,
+        authenticated_approver_principal_ref: &str,
+        scope_ref: &str,
+        generation: u64,
+        now: u64,
+        expires_at: u64,
+    ) -> Result<GoverningSourceSet, WorkScopeSourceAdmissionError> {
+        self.validate_live_binding(
+            capture,
+            explicit_root_identity,
+            product_id,
+            source_id,
+            privacy,
+            scope_privacy_class,
+            state_fence,
+            authenticated_approver_principal_ref,
+        )?;
+        self.admit_signed_candidates_for_discovery(
+            capture,
+            explicit_root_identity,
+            product_id,
+            source_id,
+            lease_key,
+            privacy,
+            scope_privacy_class,
+            state_fence,
+            authenticated_approver_principal_ref,
+            scope_ref,
+            generation,
+            now,
+            expires_at,
+        )
     }
 
     /// Serialize this approval as canonical bytes for the existing signed
@@ -350,6 +482,96 @@ fn validate_approved_document(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn admit_approved_candidates(
+    candidates: Vec<GoverningSourceCandidate>,
+    scope_ref: &str,
+    generation: u64,
+    required_owner_ref: &str,
+    state_fence: &StateFence,
+    now: u64,
+    expires_at: u64,
+    architecture: &ApprovedNormativeSource,
+    implementation: &ApprovedNormativeSource,
+) -> Result<GoverningSourceSet, WorkScopeSourceAdmissionError> {
+    if candidates.len() != 2 || now > expires_at || expires_at == 0 {
+        return Err(WorkScopeSourceAdmissionError::SourceAdmission(
+            "source admission is incomplete or expired".to_owned(),
+        ));
+    }
+    let admission = admit_governing_sources(SourceAdmissionRequest {
+        scope_ref: scope_ref.to_owned(),
+        generation,
+        candidates,
+        precedences: Vec::new(),
+        required_owner_ref: required_owner_ref.to_owned(),
+        proven_current_bindings: Vec::new(),
+        proven_contracts: Vec::new(),
+        absence_reason_ref: None,
+        state_fence: state_fence.clone(),
+        expires_at,
+    })
+    .map_err(|error| WorkScopeSourceAdmissionError::SourceAdmission(error.to_string()))?;
+    admission
+        .require_live(now)
+        .and_then(|()| admission.require_admitted_authority())
+        .map_err(|error| WorkScopeSourceAdmissionError::SourceAdmission(error.to_string()))?;
+    require_exact_admitted_pair(
+        &admission,
+        required_owner_ref,
+        architecture,
+        implementation,
+    )?;
+    Ok(admission.admitted)
+}
+
+fn require_exact_admitted_pair(
+    admission: &GoverningSourceAdmission,
+    required_owner_ref: &str,
+    architecture: &ApprovedNormativeSource,
+    implementation: &ApprovedNormativeSource,
+) -> Result<(), WorkScopeSourceAdmissionError> {
+    if admission.coverage != SourceCoverage::Complete
+        || admission.conflict.is_some()
+        || !admission.preserved.is_empty()
+        || admission.admitted.sources.len() != 2
+    {
+        return Err(WorkScopeSourceAdmissionError::SourceAdmission(
+            "both approved source roles must have complete, conflict-free admission".to_owned(),
+        ));
+    }
+    let matches = |role, document: &ApprovedNormativeSource| {
+        admission.admitted.sources.iter().filter(|source| {
+            source.role == role
+                && source.source_ref == document.source_ref
+                && source.digest == document.content_sha256
+                && source.authority_basis
+                    == Some(AuthorityBasis::HumanOwner {
+                        owner_ref: required_owner_ref.to_owned(),
+                    })
+                && source.assurance.source_ref == document.source_ref
+                && source.assurance.integrity == IntegrityStatus::Verified
+                && source.assurance.freshness == FreshnessStatus::Current
+                && source.assurance.privacy_class == document.privacy_class
+                && source.assurance.competence == CompetenceLevel::Unknown
+                && source.assurance.independence == IndependenceLevel::Unknown
+                && source.assurance.instruction_taint == InstructionTaint::DataOnly
+                && source.assurance.allowed_epistemic_use == [EpistemicUse::Observation]
+                && source.assurance.allowed_effects == [EffectCeiling::NoExternalEffect]
+                && source.assurance.quarantine == QuarantineState::ReviewRequired
+        }).count() == 1
+    };
+    if !matches(GoverningSourceRole::Architecture, architecture)
+        || !matches(GoverningSourceRole::Implementation, implementation)
+    {
+        return Err(WorkScopeSourceAdmissionError::SourceAdmission(
+            "admitted source rows differ from the signed architecture/implementation pair"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// A source approval extracted from a trust-anchor-verified initial snapshot.
 /// Its private fields prevent callers from promoting an unverified JSON value.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -399,23 +621,29 @@ impl VerifiedGoverningSourceApproval {
         explicit_root_identity: &str,
         product_id: &ProductId,
         source_id: &SourceId,
+        lease_key: &DiscoveryLeaseKey,
         privacy: &PrivacyProfile,
         scope_privacy_class: eliot_security_contracts::PrivacyClass,
         state_fence: &StateFence,
         scope_ref: &str,
         generation: u64,
+        now: u64,
+        expires_at: u64,
     ) -> Result<GoverningSourceSet, WorkScopeSourceAdmissionError> {
         self.approval.derive_work_scope_sources(
             capture,
             explicit_root_identity,
             product_id,
             source_id,
+            lease_key,
             privacy,
             scope_privacy_class,
             state_fence,
             &self.approval.approver_principal_ref,
             scope_ref,
             generation,
+            now,
+            expires_at,
         )
     }
 }
@@ -477,6 +705,9 @@ pub enum WorkScopeSourceAdmissionError {
     /// The initial scope, source closure, or matched-guard admission refused.
     #[error("initial WorkScope binding admission refused: {0}")]
     InitialAdmission(String),
+    /// Existing governing-source candidate admission refused or was incomplete.
+    #[error("WorkScope governing-source admission refused: {0}")]
+    SourceAdmission(String),
     /// The source-capture-enriched snapshot failed owner validation.
     #[error("WorkScope source-admission snapshot is invalid: {0}")]
     Snapshot(String),
@@ -518,6 +749,8 @@ pub fn prepare_initial_work_scope_source_admission(
     approval: &VerifiedGoverningSourceApproval,
     capture: &NormativePairSourceCapture,
     owner_readback: &WorkScopeOwnerSnapshotReadback,
+    lease_key: &DiscoveryLeaseKey,
+    now: u64,
 ) -> Result<PreparedWorkScopeSourceAdmission, WorkScopeSourceAdmissionError> {
     identity
         .validate()
@@ -548,16 +781,45 @@ pub fn prepare_initial_work_scope_source_admission(
         approved.scope_privacy_class,
         governing_source_generation,
     )?;
+    if now > identity.deadline_unix_ms {
+        return Err(WorkScopeSourceAdmissionError::SourceAdmission(
+            "request deadline has elapsed".to_owned(),
+        ));
+    }
+    let request_session = identity
+        .request
+        .metadata
+        .session_id
+        .as_ref()
+        .ok_or_else(|| {
+            WorkScopeSourceAdmissionError::SourceAdmission(
+                "initial source admission requires an authenticated request session".to_owned(),
+            )
+        })?;
+    lease_key
+        .validate()
+        .map_err(|error| WorkScopeSourceAdmissionError::SourceAdmission(error.to_string()))?;
+    if lease_key.proposer_ref != identity.request.metadata.request_id.as_str()
+        || lease_key.session_ref != request_session.as_str()
+        || lease_key.root_filesystem_identity_ref != binding.scope.root_identity
+    {
+        return Err(WorkScopeSourceAdmissionError::SourceAdmission(
+            "discovery lease key differs from the authenticated request or approved root".to_owned(),
+        ));
+    }
     let sources = approval.derive_work_scope_sources(
         capture,
         &binding.scope.root_identity,
         &identity.request.metadata.product_id,
         &identity.request.metadata.source_id,
+        lease_key,
         &approved.privacy,
         approved.scope_privacy_class,
         fence,
         &binding.scope.scope_ref,
         governing_source_generation,
+        now,
+        identity.deadline_unix_ms,
     )?;
     let (expected_revision, expected_digest) = match owner_readback {
         WorkScopeOwnerSnapshotReadback::Empty {
@@ -586,9 +848,10 @@ pub fn prepare_initial_work_scope_source_admission(
         .checked_add(1)
         .ok_or(WorkScopeSourceAdmissionError::OwnerRevisionOverflow)?;
 
-    // The same source set that proved the initial MATCHED guard is retained
-    // with the capture; callers cannot guard one closure and persist another.
-    let initially_admitted = admit_initial_binding(
+    // The same discovery-lease-backed admission that resolved the Human
+    // approval proves the source closure used for this owner guard and stored
+    // capture. No status is copied from the caller.
+    let final_owner = admit_initial_binding(
         descriptor,
         owner_revision,
         fence,
@@ -598,7 +861,7 @@ pub fn prepare_initial_work_scope_source_admission(
         &approved.privacy,
     )
     .map_err(|error| WorkScopeSourceAdmissionError::InitialAdmission(error.to_string()))?;
-    let initial_snapshot = initially_admitted
+    let final_snapshot = final_owner
         .read_current(fence)
         .map_err(|error| WorkScopeSourceAdmissionError::InitialAdmission(error.to_string()))?;
 
@@ -611,8 +874,8 @@ pub fn prepare_initial_work_scope_source_admission(
     let snapshot = WorkScopeBindingSnapshot::new_with_normative_pair_source_capture_for_product(
         fence.clone(),
         owner_revision,
-        initial_snapshot.binding.clone(),
-        initial_snapshot.guard_receipt.clone(),
+        final_snapshot.binding.clone(),
+        final_snapshot.guard_receipt.clone(),
         sources.clone(),
         approved.privacy.clone(),
         product_id.clone(),
