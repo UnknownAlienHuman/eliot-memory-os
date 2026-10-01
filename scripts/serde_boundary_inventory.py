@@ -38,6 +38,18 @@ Freshness and integrity:
   commit that carries the artifact, so it is explicitly classified as
   informational and outside the proof ceiling; the validated input digests are
   the evidence. The artifact never appears in its own input universe.
+- A row ``id`` is a stable *name* for one declaration, derived only from
+  ``package : path : kind : type : enclosing-function``. The declaration's
+  line number is deliberately excluded: it is bound as validated fields
+  (``span_start``/``span_end``/``span_digest``) and it feeds ``digest`` and
+  ``input_digest``, so a moved or hand-edited declaration still fails closed as
+  ``STALE_INPUT``/``HAND_EDIT_OR_DRIFT``. Putting the line inside the id made
+  ordinary source growth - inserting any declaration above a pinned one - rename
+  that row into a simultaneous missing/extra pair, which is a regeneration
+  treadmill rather than a guard. Where the structural tuple genuinely collides
+  inside one file, ``_disambiguate_row_ids`` resolves it with line-independent
+  components (enclosing module, test scope, declaration text) or fails closed
+  with ``AMBIGUOUS_ROW_IDENTITY``; it never merges two candidates into one row.
 
 Proof ceiling: SOURCE_INVENTORY_AND_OWNERSHIP_ONLY. Findings remain blocking
 for #710; this artifact never certifies decoder safety, runtime closure,
@@ -68,8 +80,8 @@ import tomllib
 from pathlib import Path
 
 SCHEMA = "eliot.serde-boundary-inventory.v1"
-TOOL_VERSION = "0.2.0"
-RULE_REVISION = "929.2"
+TOOL_VERSION = "0.3.0"
+RULE_REVISION = "929.3"
 ISSUE = 929
 OWNED_TOML_REL = (
     "crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml"
@@ -814,6 +826,132 @@ def _is_test_scope(rel: str, masked: str, offset: int, func: str, mod: str) -> b
     return False
 
 
+# ---------------------------------------------------------------------------
+# Row identity.
+#
+# A row id is a *stable name* for one declaration, not a coordinate. It is
+# derived only from structural facts of the declaration that are independent of
+# where the declaration happens to sit in the file:
+#
+#     package : path : kind : type : enclosing-function
+#
+# The declaration's line range is deliberately NOT part of the id. It is bound
+# as validated fields (``span_start``/``span_end``/``span_digest``) and it is
+# inside ``digest`` and ``input_digest``, so a moved or hand-edited declaration
+# still fails closed as ``HAND_EDIT_OR_DRIFT`` (or ``STALE_INPUT``) instead of
+# silently becoming a missing/extra pair. Embedding the line number in the id
+# meant that inserting any declaration above a pinned one renamed that row, so
+# the artifact failed closed on ordinary source growth - which is a treadmill,
+# not a guard.
+#
+# ``kind`` is in the tuple because one type can legitimately have both a
+# ``derive`` and a ``manual-impl`` row, and the enclosing function because a
+# type may be declared inside a function body. Two declarations can still share
+# the whole tuple; ``_disambiguate_row_ids`` resolves that explicitly rather
+# than hoping, and a residual collision is a hard error, never a silent merge.
+# ---------------------------------------------------------------------------
+def _stable_row_id(
+    package: str, rel: str, kind: str, type_name: str, func: str
+) -> str:
+    """Identity of one declaration, independent of its line number."""
+    return "%s:%s:%s:%s:%s" % (
+        package,
+        rel,
+        kind,
+        type_name,
+        func or "<root>",
+    )
+
+
+# Ordered disambiguation ladder used only where the base identity collides.
+# Each rung supplies (component key of a candidate, id renderer).
+_ROW_ID_RUNGS: tuple[tuple, ...] = (
+    (
+        lambda cand: str(cand.get("module", "") or ""),
+        lambda base, key: "%s@mod:%s" % (base, key or "<root>"),
+    ),
+    (
+        lambda cand: "test" if cand.get("test_scope") else "prod",
+        lambda base, key: "%s@scope:%s" % (base, key),
+    ),
+    (
+        lambda cand: str(cand.get("span_digest", ""))[:12],
+        lambda base, key: "%s@span:%s" % (base, key),
+    ),
+)
+
+
+def _disambiguate_row_ids(candidates: list[dict]) -> None:
+    """Make every candidate id unique without reintroducing line numbers.
+
+    The base identity is structural, so a collision means two declarations
+    share a name in one file: a same-named type in two modules, the same macro
+    invoked twice in one function, or a type and a free function of one name.
+    The resolver narrows such a group with a fixed, deterministic ladder of
+    components that are read from the declaration itself and therefore move
+    with it:
+
+    ``@mod:<enclosing module>``   the ``mod`` block the declaration sits in;
+    ``@scope:test``/``@prod``     whether the declaration is test scope;
+    ``@span:<span_digest[:12]>``  a digest of the declaration's own text, which
+                                  separates two same-named invocations with
+                                  different arguments.
+
+    Every rung is content- or structure-derived; none is a coordinate, so
+    inserting a declaration above another still renames nothing. Each rung is
+    applied only to the groups that still collide, and a rung is used only when
+    it actually splits the group.
+
+    If a group survives the whole ladder the declarations are byte-identical in
+    name, module, scope and text. There is then no line-independent evidence
+    that distinguishes them, so the tool fails closed with
+    ``AMBIGUOUS_ROW_IDENTITY`` and names every member. It never invents a
+    positional tiebreak and never merges two candidates into one row.
+    """
+    pending: dict[str, list[dict]] = {}
+    for cand in candidates:
+        pending.setdefault(cand["id"], []).append(cand)
+    pending = {base: members for base, members in pending.items() if len(members) > 1}
+    for _key_of, render in _ROW_ID_RUNGS:
+        if not pending:
+            break
+        survivors: dict[str, list[dict]] = {}
+        for base in sorted(pending):
+            members = pending[base]
+            buckets: dict[str, list[dict]] = {}
+            for member in members:
+                buckets.setdefault(_key_of(member), []).append(member)
+            for bucket_key, bucket in sorted(buckets.items()):
+                for member in bucket:
+                    member["id"] = render(base, bucket_key)
+                if len(bucket) > 1:
+                    survivors.setdefault(member["id"], []).extend(bucket)
+        pending = survivors
+    for base in sorted(pending):
+        members = pending[base]
+        raise InventoryError(
+            "AMBIGUOUS_ROW_IDENTITY",
+            "cannot give %d distinct declarations in this file distinct "
+            "line-independent ids; all share %r and identical enclosing "
+            "module, scope and declaration text. Members: %s"
+            % (
+                len(members),
+                base,
+                "; ".join(
+                    "%s span %d..%d" % (c["type"], c["span_start"], c["span_end"])
+                    for c in sorted(members, key=lambda c: (c["span_start"], c["span_end"]))
+                ),
+            ),
+        )
+    unique = {row["id"] for row in candidates}
+    if len(unique) != len(candidates):
+        raise InventoryError(
+            "AMBIGUOUS_ROW_IDENTITY",
+            "row id resolution left %d candidates on %d ids; identity is not "
+            "line-independently nameable" % (len(candidates), len(unique)),
+        )
+
+
 def _scan_text(
     rel: str,
     text: str,
@@ -828,11 +966,12 @@ def _scan_text(
         span_digest = _sha256_text(rel + ":unreadable-span")
         return [
             {
-                "id": "%s:%s:<unparsed>:1" % (package, rel),
+                "id": _stable_row_id(package, rel, "unreadable-source", "<unparsed>", ""),
                 "package": package,
                 "path": rel,
                 "type": "<unparsed>",
                 "function": "",
+                "module": "",
                 "kind": "unreadable-source",
                 "span_start": 1,
                 "span_end": 1,
@@ -869,6 +1008,7 @@ def _scan_text(
         attr_start_line: int,
         func: str,
         evidence: str,
+        mod_name: str,
     ) -> None:
         end_off = _extend_to_close_brace(masked, end_off)
         start_line = _line_of(start_off, line_starts)
@@ -898,17 +1038,18 @@ def _scan_text(
             helpers.append("deserialize_with")
         if flags.get("remote"):
             helpers.append("remote:%s" % flags["remote"])
-        test_scope = _is_test_scope(rel, masked, start_off, func, _enclosing_item(masked, start_off)[1])
+        test_scope = _is_test_scope(rel, masked, start_off, func, mod_name)
         protected_hint = any(
             field in span_text
             for field in ("identity", "authority", "scope", "principal", "fence", "receipt")
         )
         candidates.append(
             {
-                "id": "%s:%s:%s:%d" % (package, rel, type_name, start_line),
+                "id": _stable_row_id(package, rel, kind, type_name, func),
                 "package": package,
                 "path": rel,
                 "type": type_name,
+                "module": mod_name,
                 "function": func,
                 "kind": kind,
                 "span_start": start_line,
@@ -944,19 +1085,19 @@ def _scan_text(
             if "deserialize" not in attrs.lower():
                 continue
             func, _mod = _enclosing_item(masked, m.start())
-            push_candidate(m.group(1), "derive", m.start(), m.end(), attrs, attr_start, func, "derive-deserialize")
+            push_candidate(m.group(1), "derive", m.start(), m.end(), attrs, attr_start, func, "derive-deserialize", _mod)
     # Manual Deserialize impls.
     for m in _MANUAL_IMPL_RE.finditer(masked):
         target = m.group(1).split("::")[-1].strip()
         attrs, attr_start = _preceding_attr_block(masked_lines, raw_lines, line_starts, m.start())
         func, _mod = _enclosing_item(masked, m.start())
         # Avoid double-counting a derive row for the same type+line.
-        push_candidate(target, "manual-impl", m.start(), m.end(), attrs, attr_start, func, "manual-deserialize-impl")
+        push_candidate(target, "manual-impl", m.start(), m.end(), attrs, attr_start, func, "manual-deserialize-impl", _mod)
     # Custom visitors.
     for m in _VISITOR_IMPL_RE.finditer(masked):
         attrs, attr_start = _preceding_attr_block(masked_lines, raw_lines, line_starts, m.start())
         func, _mod = _enclosing_item(masked, m.start())
-        push_candidate(m.group(1), "visitor", m.start(), m.end(), attrs, attr_start, func, "custom-visitor")
+        push_candidate(m.group(1), "visitor", m.start(), m.end(), attrs, attr_start, func, "custom-visitor", _mod)
 
     # Decoder call sites: attach to a local type row when the target matches,
     # otherwise accumulate as standalone acquisition candidates keyed by
@@ -993,11 +1134,12 @@ def _scan_text(
         if entry is None:
             span_digest = _sha256_text("%s:%s:%s" % (rel, target, func))
             entry = {
-                "id": "%s:%s:%s@%s:%d" % (package, rel, target, func or "<root>", start_line),
+                "id": _stable_row_id(package, rel, "decoder-callsite", target, func),
                 "package": package,
                 "path": rel,
                 "type": target,
                 "function": func,
+                "module": mod,
                 "kind": "decoder-callsite",
                 "span_start": start_line,
                 "span_end": start_line,
@@ -1033,24 +1175,32 @@ def _scan_text(
     for pattern in (_MACRO_UNSUPPORTED_RE, _MAKE_MACRO_CALL_RE):
         for m in pattern.finditer(masked):
             name = m.group(1)
-            func, _mod = _enclosing_item(masked, m.start())
+            func, mod_name = _enclosing_item(masked, m.start())
             start_line = _line_of(m.start(), line_starts)
             if (name, start_line) in seen_macro_sites:
                 continue
             seen_macro_sites.add((name, start_line))
-            span_digest = _sha256_text("%s:unsupported:%s:%d" % (rel, name, start_line))
+            # Digest the invocation text, not its line: a digest derived from a
+            # coordinate would make the row id (and any content-derived
+            # tiebreak) move whenever an unrelated line is inserted above it.
+            span_end = _extend_to_close_brace(masked, m.end())
+            macro_text = "\n".join(lines[start_line - 1 : _line_of(span_end, line_starts)])
+            span_digest = _sha256_text(rel + "\n" + macro_text)
             candidates.append(
                 {
-                    "id": "%s:%s:<macro-%s>:%d" % (package, rel, name, start_line),
+                    "id": _stable_row_id(
+                        package, rel, "unsupported-macro", "<macro-%s>" % name, func
+                    ),
                     "package": package,
                     "path": rel,
                     "type": "<macro-%s>" % name,
                     "function": func,
+                    "module": mod_name,
                     "kind": "unsupported-macro",
                     "span_start": start_line,
                     "span_end": start_line,
                     "span_digest": span_digest,
-                    "digest": _sha256_text(":".join((package, rel, name, str(start_line), span_digest))),
+                    "digest": _sha256_text(":".join((package, rel, name, span_digest))),
                     "attributes": {
                         "deny_unknown_fields": False,
                         "tag": "",
@@ -1065,7 +1215,7 @@ def _scan_text(
                     "helpers": [name],
                     "decoder_calls": [],
                     "value_routing": False,
-                    "test_scope": _is_test_scope(rel, masked, m.start(), func, _mod if "_mod" in dir() else ""),
+                    "test_scope": _is_test_scope(rel, masked, m.start(), func, mod_name),
                     "build_class": build_class,
                     "release_class": release_class,
                     "evidence": "unsupported-macro: regex discovery cannot resolve generated Deserialize",
@@ -1075,6 +1225,9 @@ def _scan_text(
     # File digest binds every row for staleness checks.
     for row in candidates:
         row["file_digest"] = file_digest
+    # Row identity is structural; a name collision inside one file is resolved
+    # explicitly (or fails closed) before any row is sorted or emitted.
+    _disambiguate_row_ids(candidates)
     # Deterministic order regardless of traversal.
     candidates.sort(key=lambda r: r["id"])
     return candidates
