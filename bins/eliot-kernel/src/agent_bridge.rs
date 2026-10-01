@@ -2446,10 +2446,10 @@ impl KernelComposition {
             }
             state.accepted_transport = None;
         }
-        self.fence_host_requests_for_connection(connection_id);
+        let requests_fenced = self.fence_host_requests_for_connection(connection_id);
         self.note_agent_bridge_peer_set_change();
         self.agent_activation_changed.notify_waiters();
-        if connections_poisoned {
+        if connections_poisoned || requests_fenced.is_err() {
             Err(TransportError::SessionFenced)
         } else {
             Ok(())
@@ -2628,10 +2628,10 @@ impl KernelComposition {
             }
             state.accepted_transport = None;
         }
-        self.fence_host_requests_for_connection(connection_id);
+        let requests_fenced = self.fence_host_requests_for_connection(connection_id);
         self.note_agent_bridge_peer_set_change();
         self.agent_activation_changed.notify_waiters();
-        if connections_poisoned {
+        if connections_poisoned || requests_fenced.is_err() {
             Err(TransportError::SessionFenced)
         } else {
             Ok(())

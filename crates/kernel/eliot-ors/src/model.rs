@@ -7802,9 +7802,11 @@ pub struct HostRequestRecord {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_admission_binding: Option<eliot_contracts::StopBoundaryAdmissionBinding>,
-    /// Full protocol stop-boundary JSON retained atomically with the Unknown
-    /// close. ORS treats the body as opaque, verifies its digest and exact
-    /// admission association, and never interprets it as Finish proof.
+    /// Full protocol stop-boundary JSON retained as a durable publication
+    /// intent and then with its Unknown close. A non-Unknown row with this
+    /// payload is pending recovery; ORS treats the body as opaque, verifies its
+    /// digest and exact admission association, and never interprets it as
+    /// Finish proof.
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_boundary_payload: Option<Value>,
@@ -8001,10 +8003,10 @@ impl HostRequestRecord {
                     field: "host_request_stop_boundary_payload",
                     reason: "boundary payload could not be canonicalized",
                 })?;
-                if sha256_hex(&bytes) != *digest || self.state != HostRequestState::Unknown {
+                if sha256_hex(&bytes) != *digest || self.state.is_terminal() {
                     return Err(OrsError::InvalidField {
                         field: "host_request_stop_boundary_payload",
-                        reason: "digest mismatch or boundary payload is not retained under Unknown",
+                        reason: "digest mismatch or boundary intent is attached to a terminal operation",
                     });
                 }
                 let observed_binding = payload

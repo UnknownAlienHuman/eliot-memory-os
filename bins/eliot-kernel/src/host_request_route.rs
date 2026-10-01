@@ -2101,36 +2101,49 @@ impl KernelComposition {
     /// Promotion replaces the live profile and revokes all connections, so no
     /// presenting connection survives: every still-uncertain indexed operation
     /// is fenced to `Unknown` under the same owner-continuation rules as the
-    /// per-connection fence. Like revocation, this never fails.
+    /// per-connection fence. A Store failure keeps the exact operation
+    /// reference and admission charge indexed for authenticated recovery.
     pub(super) fn fence_all_host_requests(&self) -> Result<(), TransportError> {
         let (outstanding, poisoned) = match self.host_request_connection_index.lock() {
             Ok(mut index) => (
-                std::mem::take(&mut *index)
-                    .into_values()
-                    .flatten()
-                    .collect::<Vec<_>>(),
+                std::mem::take(&mut *index).into_iter().collect::<Vec<_>>(),
                 false,
             ),
             Err(poisoned) => {
                 let mut index = poisoned.into_inner();
                 (
-                    std::mem::take(&mut *index)
-                        .into_values()
-                        .flatten()
-                        .collect::<Vec<_>>(),
+                    std::mem::take(&mut *index).into_iter().collect::<Vec<_>>(),
                     true,
                 )
             }
         };
-        // I12.14 step 5: this promotion takes the whole index, so these pairs'
-        // admission charges are returned here from the byte counts recorded at
-        // admission. Without this the ledger would keep charging for pairs the
-        // index no longer holds and the bound would ratchet down to refusal.
-        self.release_local_read_capacity_for_refs(&outstanding);
-        for operation_ref in &outstanding {
-            fence_one_host_request(self, operation_ref);
+        let mut store_failed = false;
+        let mut completed = Vec::new();
+        let mut pending = BTreeMap::new();
+        for (connection_id, operation_refs) in &outstanding {
+            for operation_ref in operation_refs {
+                if fence_one_host_request(self, operation_ref).is_err() {
+                    store_failed = true;
+                    pending
+                        .entry(connection_id.clone())
+                        .or_insert_with(Vec::new)
+                        .push(operation_ref.clone());
+                } else {
+                    completed.push(operation_ref.clone());
+                }
+            }
         }
-        if poisoned {
+        self.release_local_read_capacity_for_refs(&completed);
+        if !pending.is_empty() {
+            let mut index = match self.host_request_connection_index.lock() {
+                Ok(index) => index,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            for (connection_id, mut refs) in pending {
+                index.entry(connection_id).or_default().append(&mut refs);
+            }
+        }
+        if poisoned || store_failed {
             Err(TransportError::SessionFenced)
         } else {
             Ok(())
@@ -2144,23 +2157,43 @@ impl KernelComposition {
     /// reconciliation observes the disconnect instead of retrying blindly.
     /// Terminal records, and records that may already have produced effects
     /// beyond the pre-effect fence, stay under their owner's continuation
-    /// rules. Revocation never fails: every store error is contained because
-    /// fencing must hold even when the store is unavailable.
-    pub(super) fn fence_host_requests_for_connection(&self, connection_id: &str) {
+    /// rules. A failed Store write retains its original operation reference
+    /// and charge for recovery; the connection itself remains revoked.
+    pub(super) fn fence_host_requests_for_connection(
+        &self,
+        connection_id: &str,
+    ) -> Result<(), TransportError> {
         let outstanding = match self.host_request_connection_index.lock() {
-            Ok(mut index) => index.remove(connection_id).unwrap_or_default(),
+            Ok(index) => index.get(connection_id).cloned().unwrap_or_default(),
             Err(poisoned) => {
-                let mut index = poisoned.into_inner();
-                index.remove(connection_id).unwrap_or_default()
+                let index = poisoned.into_inner();
+                index.get(connection_id).cloned().unwrap_or_default()
             }
         };
-        // I12.14 step 5: fencing removes these pairs from the index, so their
-        // admission charges are returned here from the byte counts recorded at
-        // admission. Without this the ledger would keep charging for pairs the
-        // index no longer holds and the bound would ratchet down to refusal.
-        self.release_local_read_capacity_for_refs(&outstanding);
+        let mut store_failed = false;
+        let mut completed = Vec::new();
         for operation_ref in &outstanding {
-            fence_one_host_request(self, operation_ref);
+            if fence_one_host_request(self, operation_ref).is_err() {
+                store_failed = true;
+            } else {
+                completed.push(operation_ref.clone());
+            }
+        }
+        self.release_local_read_capacity_for_refs(&completed);
+        let mut index = match self.host_request_connection_index.lock() {
+            Ok(index) => index,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(refs) = index.get_mut(connection_id) {
+            refs.retain(|reference| {
+                !completed.iter().any(|done: &HostRequestOperationRef| {
+                    done.operation_id == reference.operation_id
+                        && done.request_digest == reference.request_digest
+                })
+            });
+            if refs.is_empty() {
+                index.remove(connection_id);
+            }
         }
         // Issue #1837: durable audit evidence for orphan cleanup.
         self.audit_observe(AuditEventDraft::orphan_connection_fenced(
@@ -2171,6 +2204,11 @@ impl KernelComposition {
         // Issue #1844: an orphan fencing is a security/integration gap;
         // compile its brief.
         self.observe_diagnostic_problem(DiagnosticTrigger::SecurityOrIntegrationGap);
+        if store_failed {
+            Err(TransportError::SessionFenced)
+        } else {
+            Ok(())
+        }
     }
 
     /// Verifies the envelope arrives on a currently retained bridge
@@ -2986,13 +3024,37 @@ impl KernelComposition {
             .ok_or(TransportError::UnknownRequest)?;
         require_host_request_parent_generation(envelope, &parent, descriptor)?;
         self.require_host_request_parent_owner(envelope, &parent, &retained, &admission_owner)?;
+        let parent = if let (Some(payload), Some(digest)) =
+            (&parent.stop_boundary_payload, &parent.stop_boundary_digest)
+        {
+            if parent.state == HostRequestState::Unknown {
+                parent
+            } else {
+                self.generation_gateway
+                    .ors
+                    .retain_host_request_stop_boundary(
+                        &parent_operation,
+                        &parent_digest,
+                        payload,
+                        digest,
+                    )
+                    .map_err(|_| TransportError::SessionFenced)?
+                    .ok_or(TransportError::UnknownRequest)?
+            }
+        } else {
+            parent
+        };
         if parent.state == HostRequestState::Unknown {
-            let _ = self.generation_gateway.ors.advance_host_request(
-                &parent_operation,
-                &parent_digest,
-                HostRequestState::Reconciling,
-                None,
-            );
+            self.generation_gateway
+                .ors
+                .advance_host_request(
+                    &parent_operation,
+                    &parent_digest,
+                    HostRequestState::Reconciling,
+                    None,
+                )
+                .map_err(|_| TransportError::SessionFenced)?
+                .ok_or(TransportError::UnknownRequest)?;
         }
         Ok(())
     }
@@ -6287,45 +6349,59 @@ fn parent_operation_key(
     Ok((operation, digest.to_owned()))
 }
 
-/// Advances one indexed operation to `Unknown` unless it already closed.
+/// Persists one indexed operation's exact stop publication intent and closes
+/// it as `Unknown`, unless it already closed.
 ///
-/// Terminal records stay under their owner's continuation rules; every store
-/// error is contained because disconnect fencing must hold even when the
-/// store is unavailable.
+/// Terminal records stay under their owner's continuation rules. A Store
+/// failure propagates so the caller retains this exact operation reference for
+/// a retry; no failed write is reported as a durable boundary.
 ///
-/// The caller drops the indexed reference after fencing, which also retires
+/// The caller drops the indexed reference only after the fence commits, which also retires
 /// any queued local-read pair: removal from the connection index IS attempt
 /// invalidation, and submit requires a live claim record, so a fenced pair
 /// can never complete afterwards. Claimed pairs are never exempt.
 fn fence_one_host_request(
     composition: &KernelComposition,
     operation_ref: &HostRequestOperationRef,
-) {
-    let Ok(operation_id) = OperationIdentity::new(operation_ref.operation_id.clone()) else {
-        return;
-    };
-    let Ok(current) = composition
+) -> Result<(), TransportError> {
+    let operation_id = OperationIdentity::new(operation_ref.operation_id.clone())
+        .map_err(|_| TransportError::SessionFenced)?;
+    let current = composition
         .generation_gateway
         .ors
         .load_host_request(&operation_id, &operation_ref.request_digest)
-    else {
-        return;
-    };
+        .map_err(|_| TransportError::SessionFenced)?;
     let Some(record) = current else {
-        return;
+        return Err(TransportError::UnknownRequest);
     };
-    if record.stop_boundary_payload.is_some() {
-        return;
+    if let (Some(payload), Some(digest)) =
+        (&record.stop_boundary_payload, &record.stop_boundary_digest)
+    {
+        if record.state == HostRequestState::Unknown {
+            return Ok(());
+        }
+        composition
+            .generation_gateway
+            .ors
+            .retain_host_request_stop_boundary(
+                &operation_id,
+                &operation_ref.request_digest,
+                payload,
+                digest,
+            )
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::UnknownRequest)?;
+        return Ok(());
     }
     if record.state.is_terminal() {
-        return;
+        return Ok(());
     }
     if let Some(binding) = record.stop_admission_binding.as_ref() {
         let Some(session_id) = record.session_ref.as_ref().map(|session| session.as_str()) else {
-            return;
+            return Err(TransportError::SessionFenced);
         };
         let now = unix_ms();
-        let Ok(observed_at) = i64::try_from(now) else { return; };
+        let observed_at = i64::try_from(now).map_err(|_| TransportError::SessionFenced)?;
         let stop = StopBoundaryRecord {
             wire_id: STOP_BOUNDARY_RECORD_WIRE_ID.to_owned(),
             wire_version: STOP_BOUNDARY_RECORD_WIRE_VERSION,
@@ -6378,24 +6454,47 @@ fn fence_one_host_request(
                 reason: StopBoundarySourceContentUnknownReason::SourceUnavailable,
             },
         };
-        if stop.validate_shape().is_err() { return; }
-        let Ok(payload) = serde_json::to_value(&stop) else { return; };
-        let Ok(bytes) = eliot_contracts::canonical_json_bytes(&payload) else { return; };
+        stop.validate_shape().map_err(|_| TransportError::SessionFenced)?;
+        let payload = serde_json::to_value(&stop).map_err(|_| TransportError::SessionFenced)?;
+        let bytes = eliot_contracts::canonical_json_bytes(&payload)
+            .map_err(|_| TransportError::SessionFenced)?;
         let digest = eliot_contracts::sha256_hex(&bytes);
-        let _ = composition.generation_gateway.ors.retain_host_request_stop_boundary(
-            &operation_id,
-            &operation_ref.request_digest,
-            &payload,
-            &digest,
-        );
+        composition
+            .generation_gateway
+            .ors
+            .prepare_host_request_stop_boundary_intent(
+                &operation_id,
+                &operation_ref.request_digest,
+                &payload,
+                &digest,
+            )
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::UnknownRequest)?;
+        composition
+            .generation_gateway
+            .ors
+            .retain_host_request_stop_boundary(
+                &operation_id,
+                &operation_ref.request_digest,
+                &payload,
+                &digest,
+            )
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::UnknownRequest)?;
     } else {
-        let _ = composition.generation_gateway.ors.advance_host_request(
-            &operation_id,
-            &operation_ref.request_digest,
-            HostRequestState::Unknown,
-            None,
-        );
+        composition
+            .generation_gateway
+            .ors
+            .advance_host_request(
+                &operation_id,
+                &operation_ref.request_digest,
+                HostRequestState::Unknown,
+                None,
+            )
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::UnknownRequest)?;
     }
+    Ok(())
 }
 
 /// Requires a parent record to belong to the current descriptor generation

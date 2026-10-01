@@ -536,7 +536,7 @@ fn governed_revocation_roundtrip(kernel: &KernelComposition, fence: &StateFence,
         .claim_local_read_pair(owner)
         .expect("claim must not fail")
         .expect("pair must claim");
-    kernel.fence_host_requests_for_connection("conn-test-1");
+    let _ = kernel.fence_host_requests_for_connection("conn-test-1");
     let revoked_body = body_with_revision(&revoked, revoked_attempt, 5);
     match kernel
         .submit_local_read_result(owner, &revoked_body)

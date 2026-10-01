@@ -4185,6 +4185,16 @@ pub trait OperationalRecoveryStore: Send + Sync {
         target: crate::HostRequestState,
         result_digest: Option<&str>,
     ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
+    /// Persists the exact source-owner stop intent before attempting the
+    /// operational Unknown close. Launch admission blocks on this intent so a
+    /// close failure or restart cannot reopen the bound task attempt.
+    fn prepare_host_request_stop_boundary_intent(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        payload: &serde_json::Value,
+        digest: &str,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
     /// Atomically retains the exact owner-observed stop boundary and closes
     /// the associated host operation as Unknown. A retry must present the
     /// same canonical boundary bytes and digest.
@@ -7544,6 +7554,29 @@ impl RedbRecoveryStore {
             }
             Ok(existing)
         } else {
+            // Serialize ordinary invocation admission against a durable stop
+            // boundary for the exact independently supplied task-attempt
+            // binding. Status, cancellation and reconciliation retain their
+            // control path. The scan and insert share the caller's ORS write
+            // transaction, so a concurrent stop either sees this request in
+            // its operation set or this invocation observes the committed stop.
+            if record.kind == crate::HostRequestKind::Invocation
+                && let Some(binding) = record.stop_admission_binding.as_ref()
+            {
+                for entry in table.iter().map_err(storage)? {
+                    let (stored_key, stored_value) = entry.map_err(storage)?;
+                    if !stored_key.value().starts_with("hostreq:") {
+                        continue;
+                    }
+                    let stopped: crate::HostRequestRecord = decode(stored_value.value())?;
+                    stopped.validate()?;
+                    if stopped.stop_admission_binding.as_ref() == Some(binding)
+                        && stopped.stop_boundary_payload.is_some()
+                    {
+                        return Err(OrsError::InvalidTransition);
+                    }
+                }
+            }
             let payload = encode(record)?;
             table
                 .insert(key.as_str(), payload.as_str())
@@ -10126,6 +10159,64 @@ impl RedbRecoveryStore {
         }
         let mut next = existing.clone();
         next.state = crate::HostRequestState::Unknown;
+        next.stop_boundary_payload = Some(payload.clone());
+        next.stop_boundary_digest = Some(digest.to_owned());
+        next.validate()?;
+        let encoded = encode(&next)?;
+        let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+        table.insert(key.as_str(), encoded.as_str()).map_err(storage)?;
+        write.commit().map_err(storage)?;
+        Ok(Some(next))
+    }
+
+    /// Retains a publication intent independently of the following Unknown
+    /// close. This is the restart-safe commit point when the close response is
+    /// lost or the second transaction cannot complete.
+    pub fn prepare_host_request_stop_boundary_intent(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        payload: &serde_json::Value,
+        digest: &str,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        validate_digest(digest, "host_request_stop_boundary_digest")?;
+        let bytes = canonical_json_bytes(payload).map_err(|error| OrsError::Encoding(error.to_string()))?;
+        if sha256_hex(&bytes) != digest {
+            return Err(OrsError::PayloadIntegrityMismatch);
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let key = format!("{}::{}", operation_id.as_str(), request_digest);
+        let existing: Option<crate::HostRequestRecord> = {
+            let table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table.get(key.as_str()).map_err(storage)?.map(|value| decode(value.value())).transpose()?
+        };
+        let Some(existing) = existing else { return Ok(None); };
+        existing.validate()?;
+        if let (Some(current_payload), Some(current_digest)) =
+            (&existing.stop_boundary_payload, &existing.stop_boundary_digest)
+        {
+            if current_payload != payload || current_digest != digest {
+                return Err(OrsError::HostRequestIdentityConflict {
+                    operation_id: operation_id.as_str().to_owned(),
+                    request_digest: request_digest.to_owned(),
+                });
+            }
+            return Ok(Some(existing));
+        }
+        if existing.stop_admission_binding.is_none() || existing.state.is_terminal() {
+            return Err(OrsError::InvalidTransition);
+        }
+        let observed_binding = payload
+            .get("admission_binding")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<eliot_contracts::StopBoundaryAdmissionBinding>(value).ok());
+        if observed_binding != existing.stop_admission_binding {
+            return Err(OrsError::InvalidField {
+                field: "host_request_stop_boundary_payload.admission_binding",
+                reason: "publication intent must retain this row's exact admission association",
+            });
+        }
+        let mut next = existing.clone();
         next.stop_boundary_payload = Some(payload.clone());
         next.stop_boundary_digest = Some(digest.to_owned());
         next.validate()?;
@@ -35236,6 +35327,18 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         )
     }
 
+    fn prepare_host_request_stop_boundary_intent(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        payload: &serde_json::Value,
+        digest: &str,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        RedbRecoveryStore::prepare_host_request_stop_boundary_intent(
+            self, operation_id, request_digest, payload, digest,
+        )
+    }
+
     fn cancel_host_request_parent(
         &self,
         cancellation_operation_id: &crate::OperationIdentity,
@@ -35905,6 +36008,17 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
         digest: &str,
     ) -> Result<Option<HostRequestRecord>, OrsError> {
         self.store.retain_host_request_stop_boundary(operation_id, request_digest, payload, digest)
+    }
+
+    /// Persists the exact owner boundary before the operational close.
+    pub fn prepare_host_request_stop_boundary_intent(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        payload: &serde_json::Value,
+        digest: &str,
+    ) -> Result<Option<HostRequestRecord>, OrsError> {
+        self.store.prepare_host_request_stop_boundary_intent(operation_id, request_digest, payload, digest)
     }
 
     /// Atomically classifies cancellation using the current durable attempt.
