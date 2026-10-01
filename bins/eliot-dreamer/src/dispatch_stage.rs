@@ -1902,6 +1902,27 @@ mod slice_7_native_owner_tests {
         }
     }
 
+    /// The owner carriers these cases exercise.
+    ///
+    /// `screen` and `curation_protection` are members of
+    /// [`OwnerCarriers`] rather than separate `dispatch_admitted` parameters:
+    /// both are derived from one screened binding, so passing them separately
+    /// let a caller supply a protection set with no binding behind it. Each case
+    /// names which carriers it supplies so the refusal it asserts stays the
+    /// refusal the arm under test produces.
+    fn carriers(
+        curation: Option<CurationExecutionCarrier<'_>>,
+        screen: Option<ScreenBinding>,
+        curation_protection: Option<CurationProtectionSet>,
+    ) -> OwnerCarriers<'_> {
+        OwnerCarriers {
+            curation,
+            screen,
+            curation_protection,
+            orientation: None,
+        }
+    }
+
     /// Orientation genuinely projects from the admitted pair: the structured
     /// A-05 receipt is proved at the dispatch gate, then the v1 hypothesis
     /// pair validates through the real v1 A-05 entry, the owner
@@ -1915,8 +1936,7 @@ mod slice_7_native_owner_tests {
         let result = dispatch_admitted(
             &admission,
             &job,
-            None,
-            None,
+            carriers(None, None, None),
             JobClass::Orientation,
             Some(&validated),
             None,
@@ -1986,8 +2006,7 @@ mod slice_7_native_owner_tests {
         let refused = dispatch_admitted(
             &admission,
             &job,
-            None,
-            None,
+            carriers(None, None, None),
             JobClass::Orientation,
             Some(&validated),
             None,
@@ -2014,8 +2033,7 @@ mod slice_7_native_owner_tests {
         let refused = dispatch_admitted(
             &admission(),
             &semantic_job(JobClass::Orientation),
-            None,
-            None,
+            carriers(None, None, None),
             JobClass::Orientation,
             None,
             None,
@@ -2044,8 +2062,7 @@ mod slice_7_native_owner_tests {
         let refused = dispatch_admitted(
             &admission,
             &job,
-            None,
-            None,
+            carriers(None, None, None),
             JobClass::Orientation,
             None,
             None,
@@ -2063,8 +2080,7 @@ mod slice_7_native_owner_tests {
         let refused = dispatch_admitted(
             &admission(),
             &semantic_job(JobClass::Orientation),
-            None,
-            None,
+            carriers(None, None, None),
             JobClass::Curation,
             None,
             None,
@@ -2086,8 +2102,7 @@ mod slice_7_native_owner_tests {
         let refused = dispatch_admitted(
             &admission(),
             &semantic_job(JobClass::Curation),
-            Some(valid_screen()),
-            None,
+            carriers(None, Some(valid_screen()), None),
             JobClass::Curation,
             None,
             None,
@@ -2122,8 +2137,7 @@ mod slice_7_native_owner_tests {
         let refused = dispatch_admitted(
             &admission(),
             &semantic_job(JobClass::Curation),
-            None,
-            None,
+            carriers(None, None, None),
             JobClass::Curation,
             None,
             None,
@@ -2149,8 +2163,7 @@ mod slice_7_native_owner_tests {
         let refused = dispatch_admitted(
             &admission(),
             &semantic_job(JobClass::Curation),
-            None,
-            Some(harness.carrier()),
+            carriers(Some(harness.carrier()), None, None),
             JobClass::Curation,
             None,
             None,
@@ -2183,8 +2196,7 @@ mod slice_7_native_owner_tests {
         let refused = dispatch_admitted(
             &admission(),
             &semantic_job(JobClass::Curation),
-            Some(valid_screen()),
-            Some(carrier),
+            carriers(Some(carrier), Some(valid_screen()), None),
             JobClass::Curation,
             None,
             None,
@@ -2221,8 +2233,7 @@ mod slice_7_native_owner_tests {
         let result = dispatch_admitted(
             &admission(),
             &semantic_job(JobClass::Curation),
-            Some(valid_screen()),
-            Some(harness.carrier()),
+            carriers(Some(harness.carrier()), Some(valid_screen()), None),
             JobClass::Curation,
             None,
             None,
@@ -2321,7 +2332,14 @@ mod slice_7_native_owner_tests {
             let job = semantic_job(class);
             let validated = validated_for(&admission, &job);
             let refused =
-                dispatch_admitted(&admission, &job, None, None, class, Some(&validated), None);
+                dispatch_admitted(
+                    &admission,
+                    &job,
+                    carriers(None, None, None),
+                    class,
+                    Some(&validated),
+                    None,
+                );
             assert!(
                 matches!(refused, Err(DreamerError::InvalidAdmission(got)) if got == reason),
                 "class {class:?} must name its governed input, got {refused:?}"
@@ -2350,8 +2368,7 @@ mod slice_7_native_owner_tests {
             let refused = dispatch_admitted(
                 &admission(),
                 &semantic_job(class),
-                None,
-                None,
+                carriers(None, None, None),
                 class,
                 None,
                 None,
