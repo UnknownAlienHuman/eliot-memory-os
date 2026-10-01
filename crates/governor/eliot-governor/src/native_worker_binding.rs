@@ -214,6 +214,11 @@ pub struct NativeWorkerExecutableBinding {
     pub grant_graph_revision: u64,
     /// Admitted Module Catalog revision this generation was compiled against.
     pub module_catalog_revision: u64,
+    /// Original admitted Kernel manifest owner key; this is a lookup selector,
+    /// never authority until Kernel reads the matching admitted record.
+    pub manifest_module_id: String,
+    /// Original admitted Kernel manifest generation.
+    pub manifest_generation: u64,
     /// Lowercase SHA-256 of the original validated generated #13 cell registry.
     pub capability_cell_registry_digest: String,
     /// Lowercase SHA-256 of the admitted Kernel execution manifest.
@@ -299,6 +304,7 @@ impl NativeWorkerExecutableBinding {
             (&self.session_id, "session_id"),
             (&self.process_tree_id, "process_tree_id"),
             (&self.job_object_lineage_ref, "job_object_lineage_ref"),
+            (&self.manifest_module_id, "manifest_module_id"),
             (&self.process_fence, "process_fence"),
             (&self.route_ref, "route_ref"),
             (&self.adapter_id, "adapter_id"),
@@ -328,6 +334,7 @@ impl NativeWorkerExecutableBinding {
             (self.adapter_revision, "adapter_revision"),
             (self.grant_graph_revision, "grant_graph_revision"),
             (self.module_catalog_revision, "module_catalog_revision"),
+            (self.manifest_generation, "manifest_generation"),
             (self.task_revision, "task_revision"),
         ] {
             if value == 0 {

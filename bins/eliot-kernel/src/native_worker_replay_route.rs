@@ -420,12 +420,13 @@ impl KernelComposition {
             })?;
         let service = self.service_guard()?;
         let live_epoch = service.authority_epoch();
-        let expectation = Self::build_executable_expectation(
+        let mut expectation = Self::build_executable_expectation(
             request.executable_binding.as_ref(),
             registration,
             &registration_fence,
             &live_epoch,
         )?;
+        self.bind_native_worker_manifest_owner(&request, registration, &mut expectation)?;
         Self::enforce_claim_executable_binding(&request, &expectation, now)?;
         let verified_digest = request
             .executable_binding

@@ -162,6 +162,10 @@ pub struct NativeWorkerExecutableBinding {
     pub adapter_revision: u64,
     /// Lowercase SHA-256 of the admitted worker configuration bytes.
     pub config_digest: String,
+    /// Lowercase SHA-256 of the admitted worker artifact bytes.
+    pub artifact_digest: String,
+    /// Lowercase SHA-256 of the admitted native-worker protocol bytes.
+    pub protocol_digest: String,
     /// Facet manifest reference.
     pub facet_manifest_ref: String,
     /// Admitted `FunctionalCapabilityCell` identity from the owner record.
@@ -170,6 +174,10 @@ pub struct NativeWorkerExecutableBinding {
     pub grant_graph_revision: u64,
     /// Admitted Module Catalog revision from the owner record; nonzero.
     pub module_catalog_revision: u64,
+    /// Original admitted Kernel manifest module key; a lookup selector only.
+    pub manifest_module_id: String,
+    /// Original admitted Kernel manifest generation; a lookup selector only.
+    pub manifest_generation: u64,
     /// SHA-256 of the original validated generated capability-cell registry.
     pub capability_cell_registry_digest: String,
     /// SHA-256 of the admitted Kernel execution manifest.
@@ -237,6 +245,10 @@ impl NativeWorkerExecutableBinding {
                 "native_worker_claim.executable_binding.facet_manifest_ref",
             ),
             (
+                &self.manifest_module_id,
+                "native_worker_claim.executable_binding.manifest_module_id",
+            ),
+            (
                 &self.replay_stream_id,
                 "native_worker_claim.executable_binding.replay_stream_id",
             ),
@@ -248,6 +260,14 @@ impl NativeWorkerExecutableBinding {
             (
                 &self.config_digest,
                 "native_worker_claim.executable_binding.config_digest",
+            ),
+            (
+                &self.artifact_digest,
+                "native_worker_claim.executable_binding.artifact_digest",
+            ),
+            (
+                &self.protocol_digest,
+                "native_worker_claim.executable_binding.protocol_digest",
             ),
             (
                 &self.process_invocation_digest,
@@ -264,10 +284,11 @@ impl NativeWorkerExecutableBinding {
         if self.adapter_revision == 0
             || self.grant_graph_revision == 0
             || self.module_catalog_revision == 0
+            || self.manifest_generation == 0
         {
             return Err(KernelServiceError::InvalidField {
                 field: "native_worker_claim.executable_binding.revisions",
-                reason: "adapter, grant-graph, and Module Catalog revisions must be non-zero",
+                reason: "adapter, grant-graph, Module Catalog, and manifest generations must be non-zero",
             });
         }
         if self.generation.value() == 0 {
@@ -887,6 +908,16 @@ fn compare_executable_currentness(
             field: "native_worker_claim.executable_binding.module_catalog_revision",
         });
     }
+    if presented.manifest_module_id != current.manifest_module_id {
+        return Err(KernelServiceError::HandshakeMismatch {
+            field: "native_worker_claim.executable_binding.manifest_module_id",
+        });
+    }
+    if presented.manifest_generation != current.manifest_generation {
+        return Err(KernelServiceError::HandshakeMismatch {
+            field: "native_worker_claim.executable_binding.manifest_generation",
+        });
+    }
     compare_lifecycle_currentness(presented, current)?;
     if presented.replay_stream_id != current.replay_stream_id {
         return Err(KernelServiceError::HandshakeMismatch {
@@ -970,6 +1001,16 @@ fn compare_lifecycle_currentness(
         if !matches {
             return Err(KernelServiceError::HandshakeMismatch { field });
         }
+    }
+    if presented.artifact_digest != current.artifact_digest {
+        return Err(KernelServiceError::HandshakeMismatch {
+            field: "native_worker_claim.executable_binding.artifact_digest",
+        });
+    }
+    if presented.protocol_digest != current.protocol_digest {
+        return Err(KernelServiceError::HandshakeMismatch {
+            field: "native_worker_claim.executable_binding.protocol_digest",
+        });
     }
     Ok(())
 }
@@ -1323,10 +1364,14 @@ mod executable_binding_tests {
             adapter_id: "adapter-test".to_owned(),
             adapter_revision: 3,
             config_digest: "c".repeat(64),
+            artifact_digest: "a".repeat(64),
+            protocol_digest: "b".repeat(64),
             facet_manifest_ref: "facet-manifest-7".to_owned(),
             capability_cell: CapabilityCellId::new("native-worker-core").expect("cell id"),
             grant_graph_revision: 5,
             module_catalog_revision: 7,
+            manifest_module_id: "eliot-native-worker".to_owned(),
+            manifest_generation: 1,
             capability_cell_registry_digest: "e".repeat(64),
             kernel_execution_manifest_digest: "f".repeat(64),
             job_object_lineage_ref: "job-lineage-1".to_owned(),

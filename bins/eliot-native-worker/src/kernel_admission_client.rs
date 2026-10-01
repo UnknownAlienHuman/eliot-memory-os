@@ -2011,6 +2011,8 @@ mod tests {
             adapter_id: "adapter-live-test".to_owned(),
             adapter_revision: 3,
             config_digest: registration.worker_config_digest.clone(),
+            artifact_digest: registration.worker_artifact_digest.clone(),
+            protocol_digest: "f".repeat(64),
             facet_manifest_ref: "facet-manifest-live-1".to_owned(),
             capability_cell: live(
                 eliot_contracts::CapabilityCellId::new("cell-test-1"),
@@ -2018,6 +2020,8 @@ mod tests {
             )?,
             grant_graph_revision: 5,
             module_catalog_revision: 7,
+            manifest_module_id: "eliot-native-worker".to_owned(),
+            manifest_generation: 1,
             replay_stream_id: "stream-live-1/gen-1".to_owned(),
             launch_nonce: "launch-nonce-live-0123456789abcdef".to_owned(),
             process_invocation_digest: invocation_digest,

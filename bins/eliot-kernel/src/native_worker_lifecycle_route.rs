@@ -581,6 +581,7 @@ pub(crate) fn require_digest(
     {
         return Err(NativeWorkerRouteError::Shape { field });
     }
+
     Ok(digest)
 }
 
@@ -1925,6 +1926,66 @@ impl KernelComposition {
         Ok(request)
     }
 
+    /// Loads the immutable manifest selected by the presented owner key and
+    /// builds the independently owner-backed portion of the executable join.
+    /// The key is only a selector: every identity, revision and byte digest is
+    /// verified against the ORS record before it enters `current`.
+    pub(crate) fn bind_native_worker_manifest_owner(
+        &self,
+        request: &NativeWorkerClaimRequest,
+        registration: &serde_json::Value,
+        expectation: &mut NativeWorkerExecutableExpectation,
+    ) -> Result<(), NativeWorkerRouteError> {
+        let presented = request.executable_binding.as_ref().ok_or(
+            NativeWorkerRouteError::Shape {
+                field: "executable_binding",
+            },
+        )?;
+        let manifest = self
+            .generation_gateway
+            .ors
+            .load_kernel_execution_manifest(
+                &presented.manifest_module_id,
+                presented.manifest_generation,
+            )
+            .map_err(|_| NativeWorkerRouteError::Fence {
+                field: "kernel_execution_manifest_readback",
+            })?
+            .ok_or(NativeWorkerRouteError::Fence {
+                field: "kernel_execution_manifest_absent",
+            })?;
+        manifest.validate().map_err(|_| NativeWorkerRouteError::Fence {
+            field: "kernel_execution_manifest_integrity",
+        })?;
+        let (_, registration_catalog_revision) = native_worker_catalog_binding(registration)?;
+        let fence = &request.state_fence;
+        if manifest.admission.module_id != presented.manifest_module_id
+            || manifest.admission.generation.value() != presented.manifest_generation
+            || manifest.manifest_sha256 != presented.kernel_execution_manifest_digest
+            || manifest.admission.catalog_revision != registration_catalog_revision
+            || manifest.admission.catalog_revision != presented.module_catalog_revision
+            || !manifest
+                .admission
+                .authority_epoch
+                .is_same_authority(&fence.authority_epoch)
+            || manifest.projection.artifact_sha256 != request.worker_artifact_digest
+            || manifest.projection.config_sha256 != request.worker_config_digest
+            || manifest.projection.protocol_sha256 != presented.protocol_digest
+        {
+            return Err(NativeWorkerRouteError::Fence {
+                field: "kernel_execution_manifest_binding",
+            });
+        }
+        expectation.current.manifest_module_id = manifest.admission.module_id;
+        expectation.current.manifest_generation = manifest.admission.generation.value();
+        expectation.current.module_catalog_revision = manifest.admission.catalog_revision;
+        expectation.current.kernel_execution_manifest_digest = manifest.manifest_sha256;
+        expectation.current.artifact_digest = manifest.projection.artifact_sha256;
+        expectation.current.config_digest = manifest.projection.config_sha256;
+        expectation.current.protocol_digest = manifest.projection.protocol_sha256;
+        Ok(())
+    }
+
     /// Builds the current owner-record expectation for the executable gate.
     ///
     /// The cell and original registry digest are resolved independently from
@@ -1967,11 +2028,15 @@ impl KernelComposition {
                     adapter_id: join.adapter_id.clone(),
                     adapter_revision: join.adapter_revision,
                     config_digest,
+                    artifact_digest: join.artifact_digest.clone(),
+                    protocol_digest: join.protocol_digest.clone(),
                     facet_manifest_ref: join.facet_manifest_ref.clone(),
                     capability_cell: join.capability_cell.clone(),
                     capability_cell_registry_digest: registry_digest,
                     grant_graph_revision: join.grant_graph_revision,
                     module_catalog_revision: join.module_catalog_revision,
+                    manifest_module_id: join.manifest_module_id.clone(),
+                    manifest_generation: join.manifest_generation,
                     kernel_execution_manifest_digest: join.kernel_execution_manifest_digest.clone(),
                     job_object_lineage_ref: join.job_object_lineage_ref.clone(),
                     resource_limits_digest: join.resource_limits_digest.clone(),
@@ -1996,11 +2061,15 @@ impl KernelComposition {
                 adapter_id: String::new(),
                 adapter_revision: 0,
                 config_digest,
+                artifact_digest: String::new(),
+                protocol_digest: String::new(),
                 facet_manifest_ref: String::new(),
                 capability_cell,
                 capability_cell_registry_digest: String::new(),
                 grant_graph_revision: 0,
                 module_catalog_revision,
+                manifest_module_id: String::new(),
+                manifest_generation: 0,
                 kernel_execution_manifest_digest: String::new(),
                 job_object_lineage_ref: String::new(),
                 resource_limits_digest: String::new(),
@@ -2773,6 +2842,21 @@ impl KernelComposition {
                 field: "capability_cell_registry_digest",
             });
         }
+        let service = self.service_guard()?;
+        let live_epoch = service.authority_epoch();
+        // Independently read the original manifest before staging or semantic
+        // claim admission. A presented module/generation pair is only a
+        // selector; currentness comes from the verified ORS owner row.
+        if request.executable_binding.is_some() {
+            let mut expectation = Self::build_executable_expectation(
+                request.executable_binding.as_ref(),
+                registration,
+                &registration_fence,
+                &live_epoch,
+            )?;
+            self.bind_native_worker_manifest_owner(&request, registration, &mut expectation)?;
+            Self::enforce_claim_executable_binding(&request, &expectation, now)?;
+        }
         // #1678 REQ3: stage the exact STAGED_INACTIVE reservation BEFORE any
         // semantic admission effect. This creates only the durable reservation
         // row; it launches nothing, provisions nothing and allocates no
@@ -2783,29 +2867,13 @@ impl KernelComposition {
             i64::try_from(now).map_err(|_| NativeWorkerRouteError::Fence { field: "now" })?;
         let reservation_id =
             self.stage_claim_admission_reservation(&request, claim, registration, stage_now_ms)?;
-        let service = self.service_guard()?;
-        let live_epoch = service.authority_epoch();
         let decision = service
             .admit_native_worker_claim(self.generation_gateway.ors.as_ref(), &request, now)
             .map_err(|_| NativeWorkerRouteError::Fence {
                 field: "service_state",
             })?;
-        // T9-02 executable enforcement (Implements #22): an `Admitted`
-        // decision carries no launch authority until the presented v2 join
-        // agrees with the current owner record built from the live
-        // registration, admission, activation, and epoch records above. A
-        // stale or old-wire binding is a typed reject here — `ADMITTED` is
-        // never emitted — while `Rejected`/`Conflict` decisions seal
-        // unchanged below.
-        if matches!(decision, NativeWorkerClaimResponse::Admitted(_)) {
-            let expectation = Self::build_executable_expectation(
-                request.executable_binding.as_ref(),
-                registration,
-                &registration_fence,
-                &live_epoch,
-            )?;
-            Self::enforce_claim_executable_binding(&request, &expectation, now)?;
-        }
+        // The typed claim path above verifies executable owner currentness
+        // before admission. Only an admitted verdict proceeds to saga work.
         // #1678 W4/W5/W6/A4/A7: drive the residual saga halves for an ADMITTED
         // claim only. A `Rejected`/`Conflict` verdict admits no canonical work,
         // so there is no canonical admission outcome to reconcile and no

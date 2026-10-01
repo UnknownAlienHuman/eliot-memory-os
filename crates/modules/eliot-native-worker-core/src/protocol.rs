@@ -898,6 +898,10 @@ pub struct NativeWorkerExecutableBinding {
     pub adapter_revision: u64,
     /// Lowercase SHA-256 of the admitted worker configuration bytes.
     pub config_digest: String,
+    /// Lowercase SHA-256 of the admitted worker artifact bytes.
+    pub artifact_digest: String,
+    /// Lowercase SHA-256 of the admitted native-worker protocol bytes.
+    pub protocol_digest: String,
     /// Facet manifest reference.
     pub facet_manifest_ref: String,
     /// Capability-cell identity (issue #13 family) the owner bound the
@@ -909,6 +913,10 @@ pub struct NativeWorkerExecutableBinding {
     /// nonzero. A catalog change makes the binding stale: it needs a new
     /// admission, never a local repair.
     pub module_catalog_revision: u64,
+    /// Original admitted Kernel manifest module key; a lookup selector only.
+    pub manifest_module_id: String,
+    /// Original admitted Kernel manifest generation; a lookup selector only.
+    pub manifest_generation: u64,
     /// Replay stream identity bound to this claim.
     pub replay_stream_id: String,
     /// Claim-bound launch nonce (16..=256 chars, mirroring T9-01).
@@ -971,7 +979,10 @@ impl NativeWorkerExecutableBinding {
     /// generation/fence disagreement.
     pub fn validate(&self) -> Result<(), WorkerError> {
         self.validate_identity_fields()?;
-        if self.adapter_revision == 0 || self.grant_graph_revision == 0 {
+        if self.adapter_revision == 0
+            || self.grant_graph_revision == 0
+            || self.manifest_generation == 0
+        {
             return Err(WorkerError::InvalidRequest("executable_binding.revisions"));
         }
         if self.module_catalog_revision == 0 {
@@ -1015,6 +1026,10 @@ impl NativeWorkerExecutableBinding {
                 "executable_binding.facet_manifest_ref",
             ),
             (
+                &self.manifest_module_id,
+                "executable_binding.manifest_module_id",
+            ),
+            (
                 &self.replay_stream_id,
                 "executable_binding.replay_stream_id",
             ),
@@ -1031,6 +1046,8 @@ impl NativeWorkerExecutableBinding {
         }
         for (digest, field) in [
             (&self.config_digest, "executable_binding.config_digest"),
+            (&self.artifact_digest, "executable_binding.artifact_digest"),
+            (&self.protocol_digest, "executable_binding.protocol_digest"),
             (
                 &self.process_invocation_digest,
                 "executable_binding.process_invocation_digest",
@@ -1582,6 +1599,16 @@ fn compare_executable_currentness(
             "executable_binding.config_digest",
         ));
     }
+    if presented.artifact_digest != current.artifact_digest {
+        return Err(WorkerError::InvalidRequest(
+            "executable_binding.artifact_digest",
+        ));
+    }
+    if presented.protocol_digest != current.protocol_digest {
+        return Err(WorkerError::InvalidRequest(
+            "executable_binding.protocol_digest",
+        ));
+    }
     if presented.facet_manifest_ref != current.facet_manifest_ref {
         return Err(WorkerError::InvalidRequest(
             "executable_binding.facet_manifest_ref",
@@ -1632,6 +1659,16 @@ fn compare_executable_currentness(
     }
     if presented.state_fence != current.state_fence {
         return Err(WorkerError::StaleFence);
+    }
+    if presented.manifest_module_id != current.manifest_module_id {
+        return Err(WorkerError::InvalidRequest(
+            "executable_binding.manifest_module_id",
+        ));
+    }
+    if presented.manifest_generation != current.manifest_generation {
+        return Err(WorkerError::InvalidRequest(
+            "executable_binding.manifest_generation",
+        ));
     }
     Ok(())
 }

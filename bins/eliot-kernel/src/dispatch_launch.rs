@@ -5120,6 +5120,7 @@ pub fn prepare_native_worker_launch(
         .request
         .validate_canonical_digest()
         .map_err(gate_error)?;
+    validate_native_worker_execution_manifest(kernel, material.request)?;
     if material.request.worker_artifact_digest != material.executable_sha256 {
         return Err(DispatchLaunchError::InvalidMaterial(
             "composition-pinned native worker executable does not match the claim artifact digest"
@@ -5304,6 +5305,47 @@ pub fn prepare_native_worker_launch(
         authority_epoch,
         generation,
     }))
+}
+
+/// Re-reads the original Kernel execution-manifest owner immediately before
+/// native process admission. The request's module/generation pair is only a
+/// selector; manifest identity, catalog revision, epoch and immutable artifact
+/// bytes are compared against the owner record before the executor can run.
+fn validate_native_worker_execution_manifest(
+    kernel: &KernelComposition,
+    request: &NativeWorkerClaimRequest,
+) -> Result<(), DispatchLaunchError> {
+    let binding = request.executable_binding.as_ref().ok_or_else(|| {
+        DispatchLaunchError::Gate("native executable owner binding is missing".to_owned())
+    })?;
+    let manifest = kernel
+        .generation_gateway
+        .ors
+        .load_kernel_execution_manifest(&binding.manifest_module_id, binding.manifest_generation)
+        .map_err(|error| {
+            DispatchLaunchError::Gate(format!("native execution manifest readback failed: {error}"))
+        })?
+        .ok_or_else(|| DispatchLaunchError::Gate("native execution manifest is absent".to_owned()))?;
+    manifest
+        .validate()
+        .map_err(|error| DispatchLaunchError::Gate(format!("native execution manifest invalid: {error}")))?;
+    if manifest.admission.module_id != binding.manifest_module_id
+        || manifest.admission.generation.value() != binding.manifest_generation
+        || manifest.manifest_sha256 != binding.kernel_execution_manifest_digest
+        || manifest.admission.catalog_revision != binding.module_catalog_revision
+        || !manifest
+            .admission
+            .authority_epoch
+            .is_same_authority(&request.authority_epoch)
+        || manifest.projection.artifact_sha256 != request.worker_artifact_digest
+        || manifest.projection.config_sha256 != request.worker_config_digest
+        || manifest.projection.protocol_sha256 != binding.protocol_digest
+    {
+        return Err(DispatchLaunchError::Gate(
+            "native request disagrees with the current Kernel execution manifest".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Spawns one prepared native-worker launch through the admitted process
@@ -6529,12 +6571,16 @@ mod tests {
             adapter_id: "adapter-test".to_owned(),
             adapter_revision: 3,
             config_digest: "b".repeat(64),
+            artifact_digest: "a".repeat(64),
+            protocol_digest: "c".repeat(64),
             facet_manifest_ref: "facet-manifest-7".to_owned(),
             capability_cell: eliot_contracts::CapabilityCellId::new("native-worker-core")
                 .expect("cell id"),
             capability_cell_registry_digest: native_test_capability_cell_registry_digest(),
             grant_graph_revision: 5,
             module_catalog_revision: 7,
+            manifest_module_id: "eliot-native-worker".to_owned(),
+            manifest_generation: 1,
             kernel_execution_manifest_digest: native_test_lifecycle_owner_digest(
                 b"t9-02 dispatch admitted kernel execution manifest",
             ),
