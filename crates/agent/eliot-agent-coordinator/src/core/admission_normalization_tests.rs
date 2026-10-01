@@ -6,7 +6,7 @@ use eliot_agent_api::{
     TaskId, WorkLeaseId, WorkUnitId, candidate_digest_for,
 };
 use eliot_agent_contracts::RevisionId;
-use eliot_contracts::{EpochLineageId, sha256_hex};
+use eliot_contracts::{EpochLineageId, PolicyRevision, sha256_hex};
 use eliot_evaluation_contracts::BudgetEvidence;
 use eliot_security_contracts::PrivacyClass;
 
@@ -107,6 +107,16 @@ fn config() -> CoordinatorConfig {
         max_active_per_route: 8,
         capacity_identity: "capacity-normalization".to_owned(),
         capacity_revision: rev("capacity-normalization-v1"),
+    }
+}
+
+// I3.6 requires staffing and route mix to follow current policy. This fixture
+// uses the explicit genesis policy revision; it does not stand in for live
+// policy evidence (`docs/architecture/I03-06-model-route-and-portfolio-policy.md`).
+fn route_policy_fence() -> StateFence {
+    StateFence {
+        policy_revision: Some(PolicyRevision::genesis()),
+        ..StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::genesis())
     }
 }
 
@@ -304,7 +314,7 @@ fn plan_request() -> TestResult<StaffingPlanRequest> {
         },
         task_revision: "task-normalization-v1".to_owned(),
         plan_revision: rev("plan-normalization-v1"),
-        state_fence: StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::genesis()),
+        state_fence: route_policy_fence(),
         human_staffing_intent: crate::HumanStaffingIntent {
             preset: crate::StaffingPreset::Balanced,
             per_job_budget: budget(),
