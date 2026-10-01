@@ -16,6 +16,7 @@ use eliot_host_service::{
     ReactiveContextEndpointResolution, ReactiveContextQueryOutcome, ReactiveContextQueryRequest,
     ReactiveContextResolveRequest, ReactiveContextResolvedEndpoint, ReactiveContextSendOutcome,
     ReactiveContextSendRequest, ReactiveContextTransportError, ReactiveContextTransportPort,
+    ReconnectReplayReport, RestartReconciliation,
 };
 use eliot_host_state::{
     ActivationState, IdempotencyIdentity, ProductionHostStateJournal,
@@ -521,6 +522,67 @@ impl HostComposition {
             ReactiveContextDeliveryLimits::default(),
         )?;
         Ok(delivery.deliver(&admission, request)?)
+    }
+
+    /// Reconcile attempted-but-unknown reactive Context operations after a
+    /// restart against the current authenticated Host/Kernel contour.
+    ///
+    /// I7.2 durable envelope: a generation switch cannot discard an
+    /// unacknowledged durable stream, so every `DeliveryAttempted` /
+    /// `UnknownDelivery` entry is re-queried under its stable same-operation
+    /// identity. No new send is issued here; entries the same-operation
+    /// delivery query owner cannot answer stay `Unknown` and block further
+    /// work until reconciliation evidence arrives.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostReactiveContextDeliveryError`] when the current contour
+    /// is not the authenticated Active one or when the durable queue cannot
+    /// be reconciled within service limits.
+    pub fn reconcile_reactive_context_after_restart(
+        &self,
+    ) -> Result<RestartReconciliation, HostReactiveContextDeliveryError> {
+        let contour = self.current_reactive_context_contour(true)?;
+        let transport = AuthenticatedKernelReactiveTransport::new(contour)?;
+        let queue = ProductionReactiveContextQueue(&self.journal);
+        let mut delivery = ReactiveContextDelivery::new(
+            queue,
+            transport,
+            eliot_host_service::SystemReactiveContextClock,
+            ReactiveContextDeliveryLimits::default(),
+        )?;
+        Ok(delivery.reconcile_after_restart()?)
+    }
+
+    /// Re-drive every durable-but-never-sent reactive Context event after the
+    /// Kernel pipe reconnected, reusing each entry's stored envelope.
+    ///
+    /// I7.2 durable envelope: the producer replays unacknowledged events
+    /// after reconnect with the same `event_id`, producer generation,
+    /// authority epoch, sequence and payload/blob reference; replay never
+    /// creates a second logical event. Only `EnqueuedPersisted` entries are
+    /// re-driven; attempted-but-unknown entries stay reconcile-only (see
+    /// [`Self::reconcile_reactive_context_after_restart`]) and acknowledged
+    /// entries are never sent twice.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostReactiveContextDeliveryError`] when the current contour
+    /// is not the authenticated Active one or when the durable queue cannot
+    /// be replayed within service limits.
+    pub fn replay_reactive_context_after_reconnect(
+        &self,
+    ) -> Result<ReconnectReplayReport, HostReactiveContextDeliveryError> {
+        let contour = self.current_reactive_context_contour(true)?;
+        let transport = AuthenticatedKernelReactiveTransport::new(contour)?;
+        let queue = ProductionReactiveContextQueue(&self.journal);
+        let mut delivery = ReactiveContextDelivery::new(
+            queue,
+            transport,
+            eliot_host_service::SystemReactiveContextClock,
+            ReactiveContextDeliveryLimits::default(),
+        )?;
+        Ok(delivery.replay_unacknowledged_after_reconnect()?)
     }
 
     fn current_reactive_context_contour(
