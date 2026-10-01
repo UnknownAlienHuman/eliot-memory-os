@@ -9,11 +9,14 @@
 //! the prose-proof ban hold wherever a read reaches this gate, not only in
 //! the contract crate. [`admit_workflow_view_for_projection`] binds a
 //! [`WorkflowStateView`] to the shared [`MemoryScopeBinding`] the batch is
-//! projected under, and [`admit_workflow_continuity_for_projection`] binds the
+//! projected under, `admit_workflow_continuity_for_projection` binds the
 //! observation owner's [`WorkflowContinuity`] to the view that attests the same
-//! workflow position.
+//! workflow position, and `admit_view_gaps_are_typed` refuses a view whose
+//! own free-text representation-gap clause has no typed per-property status
+//! behind it — without which the per-property gate is never reached and an
+//! absent modality property travels as prose.
 //!
-//! [`project_batch`](crate::project_batch) is the only caller of all three
+//! [`project_batch`](crate::project_batch) is the only caller of all four
 //! gates: it invokes them immediately after the request validates and before
 //! the first record is built, and maps a refusal into
 //! [`ProjectionError`](crate::ProjectionError) so the read fails closed. A
@@ -66,6 +69,11 @@ pub fn admit_continuity_for_projection(
 /// view outside the binding fails the read instead of travelling unverified.
 /// That caller is the crate's only one and is not yet on a binary path — see
 /// the module documentation.
+///
+/// This gate deliberately does not read the view's representation-gap clause;
+/// that clause is untyped, so refusing it here would be a string rule. It is
+/// `admit_view_gaps_are_typed`, run on the same read, that requires the typed
+/// per-property status to exist behind a declared gap.
 pub fn admit_workflow_view_for_projection(
     view: &WorkflowStateView,
     binding: &MemoryScopeBinding,
@@ -74,6 +82,56 @@ pub fn admit_workflow_view_for_projection(
     if view.task_id != binding.task_id || view.scope_id != binding.scope_id {
         return Err(MemoryProjectionError::ScopeMismatch {
             reason: "workflow view binding differs from the projection binding",
+        });
+    }
+    Ok(())
+}
+
+/// Refuses a view whose representation-gap clause has no typed per-property
+/// status behind it.
+///
+/// `WorkflowStateView` carries `unresolved_representation_gaps` as free text,
+/// and the projection owner does not re-type that field: the observation owner
+/// supplies the typed per-property record, `WorkflowContinuity`'s
+/// `unresolved_representation_gaps`, whose `RepresentationGap::property_status`
+/// is non-optional and non-defaulted, so an absent modality property can only be
+/// spelled `Unknown` or earned as `Degraded` behind a competent evaluator.
+/// `check_gap_status` is what refuses a gap that claims more than its evidence
+/// carries, and it runs on the typed record only.
+///
+/// The defect this closes is reachability, not a missing check. The typed gate
+/// is reached solely through `ProjectionRequest.workflow_continuity`, which
+/// `project_batch` admits inside `if let Some(...)`. So a view could declare
+/// `unresolved_representation_gaps` as free text and supply no typed record at
+/// all: `admit_workflow_view_for_projection` accepts it, because a non-blank
+/// string is a well-formed string, and the gap then travels to the batch with no
+/// `property_status` at all — not `Unknown`, not `Degraded`, not gated by
+/// `check_gap_status`. That is exactly the state I12.35 forbids: an absent
+/// modality property reported as settled prose.
+///
+/// The rule binds against the view's OWN recorded clause. It is a presence
+/// requirement, not a re-derivation and not a string comparison: a view that
+/// names at least one unresolved representation gap must arrive with the typed
+/// record that governs that same workflow position, so every such property
+/// reaches `check_gap_status` under its own modality and loss warning. A view
+/// that declares no gap is untouched, and a view with no typed record and no
+/// declared gap continues to pass exactly as before — this refuses only the
+/// ungated gap clause, and it never weakens an existing gate to reach it.
+///
+/// A gap the typed record does not cover cannot be detected here, because the
+/// view's clause is prose and the record's is typed; cross-checking the two
+/// vocabularies is a re-typing of the projection owner's field and is left to its
+/// owner rather than guessed at from this side.
+pub fn admit_view_gaps_are_typed(
+    view: &WorkflowStateView,
+    continuity: Option<&WorkflowContinuity>,
+) -> Result<(), ProjectionError> {
+    if view.unresolved_representation_gaps.is_empty() {
+        return Ok(());
+    }
+    if continuity.is_none() {
+        return Err(ProjectionError::WorkflowContinuityDiscontinuous {
+            reason: "the view names unresolved representation gaps with no typed per-property status to govern them",
         });
     }
     Ok(())

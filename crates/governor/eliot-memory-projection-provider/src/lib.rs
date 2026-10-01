@@ -24,11 +24,13 @@
 //! Continuity is enforced at this boundary whenever a read reaches it:
 //! [`project_batch`] refuses the whole read when a continuity observation
 //! breaks the I12.35 ingestion rules, when an attached workflow view does
-//! not belong to the batch binding, or when attached workflow continuity
-//! evidence is not continuous with that same view, before a single record is
-//! built. Admitted continuity then reaches the denominator exactly once, so a
-//! continuity-gated read can never report a denominator that quietly dropped
-//! the continuity material it was gated on.
+//! not belong to the batch binding, when a view declares unresolved
+//! representation gaps with no typed per-property status to govern them, or
+//! when attached workflow continuity evidence is not continuous with that
+//! same view, before a single record is built. Admitted continuity then
+//! reaches the denominator exactly once, so a continuity-gated read can never
+//! report a denominator that quietly dropped the continuity material it was
+//! gated on.
 //!
 //! That boundary is not reached at runtime today, and this prose does not
 //! claim it is. No package in this repository depends on this one, so no
@@ -44,8 +46,8 @@
 
 mod continuity;
 pub use continuity::{
-    admit_continuity_for_projection, admit_workflow_continuity_for_projection,
-    admit_workflow_view_for_projection,
+    admit_continuity_for_projection, admit_view_gaps_are_typed,
+    admit_workflow_continuity_for_projection, admit_workflow_view_for_projection,
 };
 
 use eliot_contracts::{ArtifactId, SessionId, SourceId, StateFence, TaskId};
@@ -267,6 +269,13 @@ pub fn project_batch(
     admit_continuity_for_projection(&request.continuity)?;
     if let Some(view) = &request.workflow_view {
         admit_workflow_view_for_projection(view, &request.binding)?;
+        // Ordering is load-bearing here too: the view's own representation-gap
+        // clause is free text, and the typed record that governs it arrives on
+        // a separate optional field. Checking the typed record first would let
+        // a view with gaps and no record skip the per-property status gate
+        // entirely, so the presence requirement is enforced on the same read,
+        // before the first record exists.
+        admit_view_gaps_are_typed(view, request.workflow_continuity.as_ref())?;
     }
     if let Some(continuity) = &request.workflow_continuity {
         admit_workflow_continuity_for_projection(continuity, request.workflow_view.as_ref())?;
