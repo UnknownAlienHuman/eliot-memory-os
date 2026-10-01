@@ -2420,23 +2420,52 @@ mod host_lifecycle_boundary_table_tests {
             &ingress,
         )
         .unwrap();
-        super::journal_append::append_reconciled(&journal, HostStateRecord::Activation(starting))
-            .unwrap();
-        let active = {
-            let snapshot = journal.snapshot().unwrap();
-            let current = snapshot.activation.clone().unwrap();
-            super::journal_append::transition_activation_record(
-                &current,
-                ActivationState::Active,
-                "891-case-8-active",
-            )
-            .unwrap()
-        };
+        super::journal_append::append_reconciled(
+            &journal,
+            HostStateRecord::Activation(starting.clone()),
+        )
+        .unwrap();
+        // The drain contour can only begin from a live `Active` activation, and
+        // `Active` is itself reachable only through `ControlReady`: the
+        // activation reducer refuses `Starting -> Active` as a skip, exactly as
+        // case 7 proves. The fixture therefore walks the same legal
+        // Starting -> ControlReady -> Active ordering production walks, so the
+        // drain assertions below sit on a real live activation rather than on
+        // a record the reducer would never admit.
+        let control_ready = super::journal_append::transition_activation_record(
+            &starting,
+            ActivationState::ControlReady,
+            "891-case-8-control-ready",
+        )
+        .unwrap();
+        assert!(
+            control_ready.readiness.control_ready,
+            "ControlReady is the first activation state that may carry ready evidence"
+        );
+        super::journal_append::append_reconciled(
+            &journal,
+            HostStateRecord::Activation(control_ready.clone()),
+        )
+        .unwrap();
+        let active = super::journal_append::transition_activation_record(
+            &control_ready,
+            ActivationState::Active,
+            "891-case-8-active",
+        )
+        .unwrap();
+        assert_eq!(active.state, ActivationState::Active);
         super::journal_append::append_reconciled(
             &journal,
             HostStateRecord::Activation(active.clone()),
         )
         .unwrap();
+        let live = journal.snapshot().unwrap();
+        let live_state = live.activation.as_ref().map(|record| record.state);
+        assert_eq!(
+            live_state,
+            Some(ActivationState::Active),
+            "the drain fixture must begin from a durably committed Active activation"
+        );
         let drain_generation = active.fence.activation_generation.clone();
 
         // Progressing without a request is refused: the reducer owns the order.
