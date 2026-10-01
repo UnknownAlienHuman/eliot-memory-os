@@ -3,6 +3,9 @@
 mod hook_intake;
 mod request_input;
 
+use eliot_agent_bridge::opencode_host_events::{
+    BridgeIntroductionStore, HostEventsServiceError, serve_host_events,
+};
 use eliot_agent_bridge::{
     AdmissionBasis, BootstrapContext, BootstrapTaskInputs, BridgeRunner, CliError,
     CurrentAssessment, DeliveryStatus, FiringEvidence, HotResourceView, InjectionReceipt,
@@ -10,9 +13,6 @@ use eliot_agent_bridge::{
     OwnerDryRunPreview, Profile, ToolResultReceipt, TransportAdmissionError, TransportProfile,
     UnderstandingBootstrap, UseOutcome, kernel_ports_with_declaration, loopback_http_route,
     parse_args, reactive_runtime_composition, validate_credential, validate_host, validate_origin,
-};
-use eliot_agent_bridge::opencode_host_events::{
-    BridgeIntroductionStore, HostEventsServiceError, serve_host_events,
 };
 use eliot_agent_bridge_core::{
     ACTIVATION_DISPOSITION_INVALID_REQUEST, ACTIVATION_DISPOSITION_STALE_OR_CONFLICT,
