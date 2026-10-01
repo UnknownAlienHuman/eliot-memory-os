@@ -22,6 +22,14 @@
 //!   reconciliation and lost-acknowledgement readback stay with the Governor
 //!   owner; this adapter never claims a result was published without that
 //!   receipt.
+//! - `admit_captured_observation` forwards one Kernel-admitted `eliot.observe`
+//!   capture, with its identities already re-proved against the admitted
+//!   envelope and its minted attempt, to the Governor canonical observation
+//!   path and returns only the exact issued store receipt. This is the one
+//!   `eliot.observe` suboperation whose semantic owner is connected
+//!   (issue #2565 W4); it adds no admission rule, and a retry of the same
+//!   capture reconciles the existing receipt rather than committing a second
+//!   observation.
 //! - Watchdog export acknowledgement mapping is pure and lives here (never
 //!   in the Governor, which must not depend on the Watchdog): a terminal
 //!   canonical receipt maps to its sink disposition, an unknown outcome maps
@@ -93,6 +101,31 @@ impl<P: KernelTransitionPort + ?Sized> ForwardingObservationReconciliation<'_, P
     ) -> Result<eliot_store_api::WriteReceipt, CompositionError> {
         self.inner
             .admit_maintenance_result(identity, base_operation_id, record)
+            .await
+    }
+
+    /// Forwards one captured `eliot.observe` observation to the Governor
+    /// canonical path and returns only the exact issued store receipt
+    /// (issue #2565 W4).
+    ///
+    /// This is the production caller of
+    /// [`admit_captured_observation`](eliot_governor::GovernorObservationReconciliation::admit_captured_observation),
+    /// used by the daemon observe flight for the one suboperation whose
+    /// semantic owner is connected. The capture's identities were already
+    /// re-proved against the Kernel-admitted envelope and its minted attempt
+    /// before this call, so the adapter adds no validation, retry, or state of
+    /// its own: fence agreement, the journal's own admission, the proactive
+    /// same-operation receipt check and the canonical commit all stay with the
+    /// Governor owner, and a retry of the same capture reconciles the existing
+    /// receipt instead of committing a second observation.
+    pub async fn admit_captured_observation(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        base_operation_id: &eliot_contracts::OperationId,
+        capture: &eliot_governor::CapturedObservation,
+    ) -> Result<eliot_store_api::WriteReceipt, CompositionError> {
+        self.inner
+            .admit_captured_observation(identity, base_operation_id, capture)
             .await
     }
 
