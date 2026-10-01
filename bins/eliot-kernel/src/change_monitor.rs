@@ -942,8 +942,8 @@ fn read_hinted_source_twice(
         },
         None => ContentRead::Absent,
     };
-    let first_read = to_read(read_once(&tracked)?);
-    let reread = to_read(read_once(&tracked)?);
+    let first_read = to_read(read_once(tracked)?);
+    let reread = to_read(read_once(tracked)?);
     if first_read != reread {
         return Err(ChangeMonitorError::UnstableReadback);
     }
