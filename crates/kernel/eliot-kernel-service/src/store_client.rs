@@ -909,9 +909,6 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
                     })
                     .await;
                 match snapshot {
-                    Err(_) => Err(StoreError::UnknownOutcome {
-                        operation_id: request.operation_id.clone(),
-                    }),
                     Ok(snapshot) if snapshot.state_fence == state_fence => {
                         match snapshot.owner_records.as_slice() {
                             [record]
@@ -927,7 +924,7 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
                             }),
                         }
                     }
-                    Ok(_) => Err(StoreError::UnknownOutcome {
+                    Err(_) | Ok(_) => Err(StoreError::UnknownOutcome {
                         operation_id: request.operation_id.clone(),
                     }),
                 }
