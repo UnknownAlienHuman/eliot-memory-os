@@ -67,7 +67,8 @@ use eliot_conformance_contracts::{
 };
 use eliot_contracts::{StateFence, sha256_hex};
 use eliot_controlboard::{
-    BoardItemKind, ControlBoard, ControlBoardView, NotificationInbox, ReadRequest, ReviewLifecycle,
+    AnchorResolution, AnchorTargetKind, Attribution, BoardItemKind, ControlBoard,
+    ControlBoardError, ControlBoardView, NotificationInbox, ReadRequest, ReviewLifecycle,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -500,6 +501,551 @@ pub fn read_controlboard_contour(
             detail: error.to_string(),
         })?;
     project_controlboard_contour(&view, bindings)
+}
+
+/// Stable contract identity for the bounded review-detail read.
+///
+/// The lightweight [`ControlBoardContour`] stays at
+/// [`CONTROLBOARD_CONTOUR_CONTRACT`] and is never widened with anchor,
+/// candidate, or graph bodies: review detail travels only through this
+/// separately versioned read, so health/status refreshes keep their bounded
+/// contour.
+pub const CONTROLBOARD_REVIEW_DETAIL_CONTRACT: &str =
+    "eliot.runtime-status.controlboard-review-detail/v1";
+
+/// Maximum candidate/provenance references carried by one detail read
+/// (allocation guard, fail-closed).
+const MAX_REVIEW_DETAIL_REFS: usize = 64;
+
+/// Which side of a provenance edge the queried subject stands on.
+///
+/// The direction is relative to the subject the detail read was asked for;
+/// the counterparty is the other endpoint. Both endpoints are already
+/// role/privacy-filtered by the board's own `filter_view`, which keeps an
+/// edge only when the edge itself and both endpoints are visible to this
+/// reader.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReviewProvenanceDirection {
+    /// The subject is the edge origin (`from_id`).
+    FromSubject,
+    /// The subject is the edge target (`to_id`).
+    ToSubject,
+}
+
+/// One navigable provenance reference touching a review or code identity.
+///
+/// The edge is reproduced verbatim from the role-filtered view: `attribution`
+/// keeps the owner's correlation vocabulary (`Correlated` and `Ambiguous`
+/// never become causation), and `receipt_ref` names the recorded evidence
+/// handle without rebinding it. Reverse lookup from a current code identity
+/// reports every retained edge that names it; absence lands in an explicit
+/// gap list, never in an invented link.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlBoardReviewProvenanceRef {
+    /// Retained edge identity.
+    pub edge_id: String,
+    /// The endpoint that is not the queried subject.
+    pub counterparty: String,
+    /// Which side the queried subject stands on.
+    pub direction: ReviewProvenanceDirection,
+    /// Owner-recorded attribution, reproduced verbatim.
+    pub attribution: Attribution,
+    /// Recorded evidence handle, when the owner retained one.
+    pub receipt_ref: Option<String>,
+}
+
+/// Review correction/disposition actions available through the existing
+/// authenticated operator path.
+///
+/// The set mirrors the board's own review-action gates: the actions the
+/// frozen fixture accepts from `Delivered` (`AcknowledgeReview`,
+/// `AnswerReview`, `RejectReview`) and from `Answered` (`ResolveReview`,
+/// `RejectReview`). Listing an action states lifecycle permission only;
+/// change authority is checked by the board submit path and is never granted
+/// here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReviewCorrectionAction {
+    /// `OperatorAction::AcknowledgeReview` for a `Delivered` review.
+    Acknowledge,
+    /// `OperatorAction::AnswerReview` for a `Delivered` review.
+    Answer,
+    /// `OperatorAction::ResolveReview` for an `Answered` review.
+    Resolve,
+    /// `OperatorAction::RejectReview` for a `Delivered`/`Answered` review.
+    Reject,
+}
+
+/// Bounded owner-issued-style detail for one visible review.
+///
+/// Every field reproduces the role-filtered view verbatim: the original
+/// anchor (`anchor_*`) is never rewritten by a later head, the current
+/// resolution claim rides beside it (a historical claim, never a
+/// current-target proof), and `candidate_refs` are the retained
+/// `response_change_refs` in order — the current-mapping candidates, not a
+/// continuity verdict. The detail is pinned to the exact `(view_revision,
+/// view_fence)` it was read at, so stale revisions are preserved across
+/// refresh instead of being silently replaced.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlBoardReviewDetail {
+    /// Always [`CONTROLBOARD_REVIEW_DETAIL_CONTRACT`].
+    pub contract: String,
+    /// Visible review identity this detail was read for.
+    pub review_id: String,
+    /// This item's own lifecycle, reproduced verbatim.
+    pub lifecycle: ReviewLifecycle,
+    /// Original anchor target kind, exactly as submitted.
+    pub anchor_target_kind: AnchorTargetKind,
+    /// Original anchor revision; never rewritten by a later head.
+    pub anchor_original_revision: u64,
+    /// Original anchor selector, exactly as submitted.
+    pub anchor_selector: String,
+    /// Resolution claimed for the anchor; kept distinct across
+    /// `Exact`/`Moved`/`Modified`/`Ambiguous`/`Stale`/`Deleted`/`Unavailable`.
+    /// A `Modified` target never inherits the old approval, and an
+    /// `Ambiguous` target is never silently attached.
+    pub anchor_resolution: AnchorResolution,
+    /// Retained response/change references in order (bounded). These are the
+    /// current-mapping candidates; an empty set with a non-ambiguous
+    /// resolution states that no current target is established, not that the
+    /// historical target moved.
+    pub candidate_refs: Vec<String>,
+    /// Lifecycle-permitted correction/disposition actions for this item.
+    /// Permission only; authority stays with the board submit path.
+    pub correction_actions: Vec<ReviewCorrectionAction>,
+    /// Lifecycle-permitted transitions from the current lifecycle, via the
+    /// owner's own `ReviewLifecycle::can_transition`. Never an authority
+    /// grant.
+    pub permitted_next: Vec<ReviewLifecycle>,
+    /// Retained provenance edges touching this review (bounded). Both
+    /// endpoints were already filtered by the board, so every ref is
+    /// navigable by this reader without a foreign/private expansion.
+    pub provenance_refs: Vec<ControlBoardReviewProvenanceRef>,
+    /// Exact board revision this detail was read at.
+    pub view_revision: u64,
+    /// Exact shared fence this detail was read at (typed, never Debug text).
+    pub view_fence: StateFence,
+    /// SHA-256 freshness binding over the exact detailed bytes.
+    pub detail_digest: String,
+}
+
+/// Per-item status inside the visible review set.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlBoardReviewItemStatus {
+    /// Visible review identity.
+    pub review_id: String,
+    /// This item's own lifecycle.
+    pub lifecycle: ReviewLifecycle,
+    /// This item's own anchor resolution claim.
+    pub anchor_resolution: AnchorResolution,
+    /// True for an explicit terminal disposition (`Resolved`,
+    /// `RejectedWithReason`, `Superseded`). `Stale` is explicitly not
+    /// accepted: it needs a correction, not a completion mark. One item's
+    /// outcome never stands in for another item's.
+    pub accepted: bool,
+}
+
+/// Batch status over the visible reviews of one read.
+///
+/// The denominator is the role-filtered view at `(view_revision,
+/// view_fence)`: hidden items are not counted and never disclosed, and the
+/// coordination owner's separately recorded expectation is not visible on
+/// this path, so `complete` covers visible items only and says so. A missing
+/// producer fails the read instead of producing an apparently empty completed
+/// section.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlBoardReviewBatchStatus {
+    /// Always [`CONTROLBOARD_REVIEW_DETAIL_CONTRACT`].
+    pub contract: String,
+    /// Exact board revision this status was read at.
+    pub view_revision: u64,
+    /// Exact shared fence this status was read at (typed, never Debug text).
+    pub view_fence: StateFence,
+    /// One status per visible review, in view order.
+    pub items: Vec<ControlBoardReviewItemStatus>,
+    /// Visible review identities still lacking an accepted disposition, in
+    /// view order.
+    pub outstanding_ids: Vec<String>,
+    /// True only when every visible review carries an accepted disposition.
+    /// Never claims anything about hidden or unrecorded items.
+    pub complete: bool,
+    /// Authorized coverage semantics for this status, stated verbatim on
+    /// every read.
+    pub coverage_note: String,
+    /// SHA-256 freshness binding over the exact status bytes.
+    pub status_digest: String,
+}
+
+/// Reverse provenance lookup from one current code identity.
+///
+/// Reports every retained edge that names `code_id` on either endpoint, with
+/// the recorded attribution intact so multiple origins stay multiple and no
+/// arbitrary single origin is chosen. When no retained edge names the
+/// identity, `refs` is empty and `gaps` states the limitation; a nearest
+/// match is never substituted.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlBoardCodeProvenance {
+    /// Always [`CONTROLBOARD_REVIEW_DETAIL_CONTRACT`].
+    pub contract: String,
+    /// Requested code identity, reproduced verbatim.
+    pub code_id: String,
+    /// Exact board revision this lookup was read at.
+    pub view_revision: u64,
+    /// Exact shared fence this lookup was read at (typed, never Debug text).
+    pub view_fence: StateFence,
+    /// Retained edges naming `code_id`, in view order (bounded).
+    pub refs: Vec<ControlBoardReviewProvenanceRef>,
+    /// Missing coverage with reasons; empty when at least one edge was
+    /// retained.
+    pub gaps: Vec<String>,
+    /// SHA-256 freshness binding over the exact lookup bytes.
+    pub provenance_digest: String,
+}
+
+/// Fail-closed review-detail failure. Any variant refuses the detail instead
+/// of projecting partial, inferred, or foreign evidence.
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum ControlBoardReviewDetailError {
+    /// A required binding field is empty or carries control characters.
+    #[error("invalid review detail binding: {field}")]
+    InvalidBinding {
+        /// Binding field that failed shape validation.
+        field: &'static str,
+    },
+    /// A value exceeds its detail-side allocation bound.
+    #[error("review detail value exceeds bound: {field}")]
+    Oversized {
+        /// Field that exceeded its bound.
+        field: &'static str,
+    },
+    /// The review is absent from this read or was filtered by role/privacy.
+    /// One variant covers both: an unauthorized reader learns nothing about
+    /// hidden item contents or counts, mirroring the board's own
+    /// `HiddenOrMissingTarget`.
+    #[error("review unavailable from this read (absent or role-filtered): {review_id}")]
+    ReviewUnavailable {
+        /// Requested review identity (diagnostic only, never persisted).
+        review_id: String,
+    },
+    /// A required producer is missing, so no detail exists. This is an
+    /// explicit unavailable state, never an apparently empty completed
+    /// review section.
+    #[error("review detail producer unavailable: {detail}")]
+    ProducerUnavailable {
+        /// Underlying provider gap detail (diagnostic only, never persisted).
+        detail: String,
+    },
+    /// The authenticated board read itself failed; no detail exists.
+    #[error("review detail read failed: {detail}")]
+    ReadFailed {
+        /// Diagnostic board error text (diagnostic only, never persisted).
+        detail: String,
+    },
+    /// Canonical encoding for the freshness digest failed.
+    #[error("review detail encoding failed: {detail}")]
+    EncodingFailed {
+        /// Underlying encoding failure detail.
+        detail: String,
+    },
+}
+
+/// Maps one board-read failure onto the typed detail failures.
+///
+/// A missing required producer (`PlanGap`: no access resolver, no canonical
+/// state, no command port) is `ProducerUnavailable`, never a silent empty.
+/// Every other board failure stays `ReadFailed` with its detail intact.
+fn map_detail_read_error(error: ControlBoardError) -> ControlBoardReviewDetailError {
+    if matches!(error, ControlBoardError::PlanGap(_)) {
+        ControlBoardReviewDetailError::ProducerUnavailable {
+            detail: error.to_string(),
+        }
+    } else {
+        ControlBoardReviewDetailError::ReadFailed {
+            detail: error.to_string(),
+        }
+    }
+}
+
+/// Validates one detail-subject identity against the projection shape rules.
+fn bound_subject(value: &str, field: &'static str) -> Result<(), ControlBoardReviewDetailError> {
+    bound_text(value, field, MAX_BINDING_CHARS).map_err(|error| match error {
+        ControlBoardProjectionError::InvalidBinding { .. } => {
+            ControlBoardReviewDetailError::InvalidBinding { field }
+        }
+        ControlBoardProjectionError::Oversized { .. } => {
+            ControlBoardReviewDetailError::Oversized { field }
+        }
+        _ => ControlBoardReviewDetailError::InvalidBinding { field },
+    })
+}
+
+/// Reports whether one lifecycle is an explicit terminal disposition.
+///
+/// `Resolved` accepts, `RejectedWithReason` disposes by reasoned rejection,
+/// and `Superseded` disposes by operator supersede. `Stale` is explicitly
+/// excluded: a stale target needs a correction, not a completion mark.
+/// Shared with the native renderer so both sides apply one rule.
+pub(crate) fn accepted_disposition(lifecycle: ReviewLifecycle) -> bool {
+    matches!(
+        lifecycle,
+        ReviewLifecycle::Resolved
+            | ReviewLifecycle::RejectedWithReason
+            | ReviewLifecycle::Superseded
+    )
+}
+
+/// Lists the lifecycle-permitted correction/disposition actions for one item.
+///
+/// The set mirrors the board's own review-action gates: `Delivered` admits
+/// acknowledge, answer and reject; `Answered` admits resolve and reject. Any
+/// other lifecycle admits none. Permission only; the board submit path checks
+/// authority.
+fn correction_actions_for(lifecycle: ReviewLifecycle) -> Vec<ReviewCorrectionAction> {
+    match lifecycle {
+        ReviewLifecycle::Delivered => vec![
+            ReviewCorrectionAction::Acknowledge,
+            ReviewCorrectionAction::Answer,
+            ReviewCorrectionAction::Reject,
+        ],
+        ReviewLifecycle::Answered => vec![
+            ReviewCorrectionAction::Resolve,
+            ReviewCorrectionAction::Reject,
+        ],
+        _ => Vec::new(),
+    }
+}
+
+/// Lists the lifecycle-permitted transitions from one lifecycle via the
+/// owner's own validator. Never an authority grant.
+fn permitted_transitions(lifecycle: ReviewLifecycle) -> Vec<ReviewLifecycle> {
+    const ALL: [ReviewLifecycle; 8] = [
+        ReviewLifecycle::Draft,
+        ReviewLifecycle::PendingDelivery,
+        ReviewLifecycle::Delivered,
+        ReviewLifecycle::Answered,
+        ReviewLifecycle::Resolved,
+        ReviewLifecycle::RejectedWithReason,
+        ReviewLifecycle::Stale,
+        ReviewLifecycle::Superseded,
+    ];
+    ALL.into_iter()
+        .filter(|next| lifecycle.can_transition(*next))
+        .collect()
+}
+
+/// Collects the retained provenance edges naming one subject (bounded).
+///
+/// Both endpoints were already role/privacy-filtered by the board, so every
+/// returned ref is navigable by this reader. Edges that name neither
+/// endpoint are skipped, never reinterpreted.
+fn provenance_refs_for(
+    view: &ControlBoardView,
+    subject_id: &str,
+    field: &'static str,
+) -> Result<Vec<ControlBoardReviewProvenanceRef>, ControlBoardReviewDetailError> {
+    let mut refs = Vec::new();
+    for edge in &view.provenance {
+        let direction = if edge.from_id == subject_id {
+            ReviewProvenanceDirection::FromSubject
+        } else if edge.to_id == subject_id {
+            ReviewProvenanceDirection::ToSubject
+        } else {
+            continue;
+        };
+        if refs.len() >= MAX_REVIEW_DETAIL_REFS {
+            return Err(ControlBoardReviewDetailError::Oversized { field });
+        }
+        refs.push(ControlBoardReviewProvenanceRef {
+            edge_id: edge.edge_id.clone(),
+            counterparty: if matches!(direction, ReviewProvenanceDirection::FromSubject) {
+                edge.to_id.clone()
+            } else {
+                edge.from_id.clone()
+            },
+            direction,
+            attribution: edge.attribution,
+            receipt_ref: edge.receipt_ref.clone(),
+        });
+    }
+    Ok(refs)
+}
+
+/// Reads the bounded detail for one visible review.
+///
+/// This performs a fresh authenticated `ControlBoard::view` on every call:
+/// access is re-resolved server-side by the board's own resolver, so every
+/// expansion revalidates role/privacy and a revoked grant cannot ride a
+/// cached view. A review that is absent or filtered for this reader fails as
+/// [`ControlBoardReviewDetailError::ReviewUnavailable`] without
+/// distinguishing the two; a missing producer fails as
+/// `ProducerUnavailable`, never as an empty detail.
+pub fn read_review_detail(
+    board: &mut ControlBoard,
+    request: &ReadRequest,
+    review_id: &str,
+) -> Result<ControlBoardReviewDetail, ControlBoardReviewDetailError> {
+    bound_subject(review_id, "review_detail.review_id")?;
+    let view = board.view(request).map_err(map_detail_read_error)?;
+    let review = view
+        .reviews
+        .iter()
+        .find(|review| review.review_item_id == review_id)
+        .ok_or_else(|| ControlBoardReviewDetailError::ReviewUnavailable {
+            review_id: review_id.to_owned(),
+        })?;
+    if review.response_change_refs.len() > MAX_REVIEW_DETAIL_REFS {
+        return Err(ControlBoardReviewDetailError::Oversized {
+            field: "review_detail.candidate_refs",
+        });
+    }
+    let revision = view.revision.get();
+    let provenance_refs = provenance_refs_for(&view, review_id, "review_detail.provenance_refs")?;
+    let detail = ControlBoardReviewDetail {
+        contract: CONTROLBOARD_REVIEW_DETAIL_CONTRACT.to_owned(),
+        review_id: review_id.to_owned(),
+        lifecycle: review.lifecycle,
+        anchor_target_kind: review.anchor.target_kind,
+        anchor_original_revision: review.anchor.original_revision.get(),
+        anchor_selector: review.anchor.selector.clone(),
+        anchor_resolution: review.anchor.resolution,
+        candidate_refs: review.response_change_refs.clone(),
+        correction_actions: correction_actions_for(review.lifecycle),
+        permitted_next: permitted_transitions(review.lifecycle),
+        provenance_refs,
+        view_revision: revision,
+        view_fence: view.fence.clone(),
+        detail_digest: String::new(),
+    };
+    let digest_bytes = serde_json::to_vec(&(
+        CONTROLBOARD_REVIEW_DETAIL_CONTRACT,
+        &detail.review_id,
+        &detail.lifecycle,
+        &detail.anchor_target_kind,
+        &detail.anchor_original_revision,
+        &detail.anchor_selector,
+        &detail.anchor_resolution,
+        &detail.candidate_refs,
+        &detail.correction_actions,
+        &detail.permitted_next,
+        &detail.provenance_refs,
+        revision,
+        &view.fence,
+    ))
+    .map_err(|error| ControlBoardReviewDetailError::EncodingFailed {
+        detail: error.to_string(),
+    })?;
+    Ok(ControlBoardReviewDetail {
+        detail_digest: sha256_hex(&digest_bytes),
+        ..detail
+    })
+}
+
+/// Reads the batch status over the visible reviews of one fresh read.
+///
+/// Every visible item keeps its own outcome: one item's kind or answer never
+/// disposes another, and the batch reports complete only when every visible
+/// item carries an accepted disposition. The coverage note states the
+/// denominator on every read: the role-filtered view, not the owner's
+/// separately recorded expectation.
+pub fn read_review_batch_status(
+    board: &mut ControlBoard,
+    request: &ReadRequest,
+) -> Result<ControlBoardReviewBatchStatus, ControlBoardReviewDetailError> {
+    let view = board.view(request).map_err(map_detail_read_error)?;
+    let revision = view.revision.get();
+    let mut items = Vec::with_capacity(view.reviews.len());
+    let mut outstanding_ids = Vec::new();
+    for review in &view.reviews {
+        let accepted = accepted_disposition(review.lifecycle);
+        if !accepted {
+            outstanding_ids.push(review.review_item_id.clone());
+        }
+        items.push(ControlBoardReviewItemStatus {
+            review_id: review.review_item_id.clone(),
+            lifecycle: review.lifecycle,
+            anchor_resolution: review.anchor.resolution,
+            accepted,
+        });
+    }
+    let complete = outstanding_ids.is_empty();
+    let status = ControlBoardReviewBatchStatus {
+        contract: CONTROLBOARD_REVIEW_DETAIL_CONTRACT.to_owned(),
+        view_revision: revision,
+        view_fence: view.fence.clone(),
+        items,
+        outstanding_ids,
+        complete,
+        coverage_note: "denominator is the role-filtered view at this revision and fence; hidden items are not counted and never disclosed; the coordination owner's separately recorded expectation is not visible on this path"
+            .to_owned(),
+        status_digest: String::new(),
+    };
+    let digest_bytes = serde_json::to_vec(&(
+        CONTROLBOARD_REVIEW_DETAIL_CONTRACT,
+        revision,
+        &view.fence,
+        &status.items,
+        &status.outstanding_ids,
+        &status.complete,
+    ))
+    .map_err(|error| ControlBoardReviewDetailError::EncodingFailed {
+        detail: error.to_string(),
+    })?;
+    Ok(ControlBoardReviewBatchStatus {
+        status_digest: sha256_hex(&digest_bytes),
+        ..status
+    })
+}
+
+/// Reads the reverse provenance lookup for one code identity.
+///
+/// Reports every retained edge naming `code_id` with its recorded
+/// attribution, preserving all supported origins and any gaps. When nothing
+/// names the identity, `refs` is empty and `gaps` states the limitation; no
+/// nearest match is substituted and no continuity is invented.
+pub fn read_code_provenance(
+    board: &mut ControlBoard,
+    request: &ReadRequest,
+    code_id: &str,
+) -> Result<ControlBoardCodeProvenance, ControlBoardReviewDetailError> {
+    bound_subject(code_id, "code_provenance.code_id")?;
+    let view = board.view(request).map_err(map_detail_read_error)?;
+    let revision = view.revision.get();
+    let refs = provenance_refs_for(&view, code_id, "code_provenance.refs")?;
+    let gaps = if refs.is_empty() {
+        vec![format!(
+            "no retained provenance edge names {code_id} at this revision; origins are unrecorded here, never inferred from a nearest match"
+        )]
+    } else {
+        Vec::new()
+    };
+    let lookup = ControlBoardCodeProvenance {
+        contract: CONTROLBOARD_REVIEW_DETAIL_CONTRACT.to_owned(),
+        code_id: code_id.to_owned(),
+        view_revision: revision,
+        view_fence: view.fence.clone(),
+        refs,
+        gaps,
+        provenance_digest: String::new(),
+    };
+    let digest_bytes = serde_json::to_vec(&(
+        CONTROLBOARD_REVIEW_DETAIL_CONTRACT,
+        &lookup.code_id,
+        revision,
+        &view.fence,
+        &lookup.refs,
+        &lookup.gaps,
+    ))
+    .map_err(|error| ControlBoardReviewDetailError::EncodingFailed {
+        detail: error.to_string(),
+    })?;
+    Ok(ControlBoardCodeProvenance {
+        provenance_digest: sha256_hex(&digest_bytes),
+        ..lookup
+    })
 }
 
 /// Owner-record fixtures shared by this crate's controlboard test modules.

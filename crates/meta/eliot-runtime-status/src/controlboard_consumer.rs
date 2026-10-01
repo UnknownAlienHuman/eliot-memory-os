@@ -81,13 +81,18 @@ use eliot_conformance_contracts::{
     CapabilitySupportRow, DomainCoverage, EvidenceExecutionStatus, SupportObservationState,
 };
 use eliot_contracts::StateFence;
-use eliot_controlboard::{ControlBoard, NotificationInbox, ReadRequest};
+use eliot_controlboard::{
+    AnchorResolution, AnchorTargetKind, Attribution, ControlBoard, NotificationInbox, ReadRequest,
+    ReviewLifecycle,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::controlboard_projection::{
-    ControlBoardContour, ControlBoardProjectionBindings, ControlBoardStatusRow,
-    read_controlboard_contour,
+    ControlBoardContour, ControlBoardProjectionBindings, ControlBoardReviewDetail,
+    ControlBoardStatusRow, ReviewCorrectionAction, ReviewProvenanceDirection,
+    accepted_disposition, read_code_provenance, read_controlboard_contour,
+    read_review_batch_status, read_review_detail,
 };
 
 /// Stable contract identity for this read-only consumer rendering.
@@ -596,6 +601,15 @@ pub enum ControlBoardConsumerError {
         /// Override entry identity not present in the denominator.
         entry_id: String,
     },
+    /// A review rendering was bound to a row for a different entry. The bind
+    /// fails instead of displaying one review's detail on another row.
+    #[error("review detail does not belong to this row: {entry_id} != {review_id}")]
+    ReviewRowMismatch {
+        /// Reconciled row entry identity.
+        entry_id: String,
+        /// Rendered review identity.
+        review_id: String,
+    },
     /// The observation time is the zero sentinel, never a real observation.
     #[error("controlboard consumer requires a non-zero observation time")]
     InvalidObservationTime,
@@ -754,6 +768,498 @@ pub fn read_controlboard_status(
         }
     })?;
     render_controlboard_status(&contour, context, expected, overrides)
+}
+
+/// Stable contract identity for the native review-detail rendering.
+///
+/// The reconciled [`RenderedControlBoard`] keeps its contour-bound rows: the
+/// historical target, current mapping, correction actions, and retained
+/// history below travel only through this separately versioned rendering, so
+/// status refreshes never grow graph bodies.
+pub const CONTROLBOARD_REVIEW_RENDER_CONTRACT: &str =
+    "eliot.runtime-status.controlboard-review-render/v1";
+
+/// Authority scope stamped on every displayed correction action.
+const CORRECTION_AUTHORITY_NOTE: &str = "lifecycle-permitted only; change authority is checked by the board submit path and is never granted by this rendering";
+
+/// One lifecycle-permitted correction/disposition action, as displayed.
+///
+/// The action names the operator-action kind the board would accept from the
+/// current lifecycle; it carries no session, capability, or authority, and
+/// submitting it is outside this read-only renderer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RenderedCorrectionAction {
+    /// Operator-action kind (`AcknowledgeReview`, `AnswerReview`,
+    /// `ResolveReview`, or `RejectReview`).
+    pub action: String,
+    /// Always [`CORRECTION_AUTHORITY_NOTE`].
+    pub authority_note: String,
+}
+
+/// How the historical target maps to current code, as displayed.
+///
+/// A `Mapped` rendering names retained candidates; a `Failed` rendering keeps
+/// the historical anchor visible and states the exact limitation. The
+/// renderer never invents continuity, never attaches an ambiguous note to
+/// one current fragment, and never redirects a deleted handle to current
+/// code.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RenderedReviewMapping {
+    /// Retained candidate refs name at least one current target.
+    Mapped {
+        /// Current-target candidates, reproduced verbatim in retained order.
+        candidates: Vec<String>,
+    },
+    /// No current target is established, or the original is gone.
+    Failed {
+        /// Claimed resolution label.
+        resolution: String,
+        /// Exact limitation; never fabricated target bytes.
+        limitation: String,
+    },
+}
+
+/// Native rendering of one review: historical target beside current mapping.
+///
+/// Retention lives with the coordination owner; this rendering holds no
+/// cache and performs a fresh authenticated read per call, so unresolved
+/// obligations re-render identically after restart, code movement, or source
+/// unavailability from the retained records. Replay is `retained_history`:
+/// the lifecycle plus candidate refs in retained order, never synthesized
+/// text. No elapsed-time, speed, or quality scalar is carried anywhere here:
+/// faster rendering or a lower note count cannot establish review quality
+/// (I11.10).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RenderedReviewDetail {
+    /// Always [`CONTROLBOARD_REVIEW_RENDER_CONTRACT`].
+    pub contract: String,
+    /// Rendered review identity.
+    pub review_id: String,
+    /// This item's own lifecycle, reproduced verbatim.
+    pub lifecycle: ReviewLifecycle,
+    /// True for an explicit terminal disposition, via the one shared rule.
+    pub disposed: bool,
+    /// Original anchor target-kind label.
+    pub anchor_target_kind: String,
+    /// Original anchor selector, exactly as submitted.
+    pub anchor_selector: String,
+    /// Original anchor revision; never rewritten by a later head.
+    pub anchor_original_revision: u64,
+    /// Current mapping or exact failure.
+    pub current_mapping: RenderedReviewMapping,
+    /// Lifecycle-permitted correction actions; permission only.
+    pub correction_actions: Vec<RenderedCorrectionAction>,
+    /// Retained history replay: lifecycle line plus candidate refs in
+    /// retained order.
+    pub retained_history: Vec<String>,
+    /// Stamped from the observer context installation.
+    pub installation: ControlBoardInstallation,
+    /// Stamped from the observer context observation time.
+    pub observed_at: ControlBoardObservationTime,
+    /// Stamped from the observer context source digest.
+    pub source_digest: ControlBoardSourceDigest,
+    /// Stamped from the observer context recovery owner.
+    pub recovery_owner: ControlBoardRecoveryOwner,
+    /// Exact board revision the detail was read at (projection-owned).
+    pub view_revision: u64,
+    /// Exact shared fence the detail was read at (typed, never Debug text).
+    pub view_fence: StateFence,
+    /// Freshness binding over the exact detailed bytes (projection-owned).
+    pub detail_digest: String,
+}
+
+/// Native rendering of the visible review batch summary.
+///
+/// Carries per-item delivery/disposition completeness (`total`,
+/// `disposed_count`, `outstanding_ids`) for evaluation evidence; it carries
+/// no timing or quality claim (I11.10). The denominator is the role-filtered
+/// view stated in `coverage_note`, never the owner's separately recorded
+/// expectation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RenderedReviewBatchSummary {
+    /// Always [`CONTROLBOARD_REVIEW_RENDER_CONTRACT`].
+    pub contract: String,
+    /// Visible review count at this revision and fence.
+    pub total: usize,
+    /// Visible reviews carrying an accepted disposition.
+    pub disposed_count: usize,
+    /// Visible review identities still lacking an accepted disposition, in
+    /// view order.
+    pub outstanding_ids: Vec<String>,
+    /// True only when every visible review carries an accepted disposition.
+    pub complete: bool,
+    /// Authorized coverage semantics, reproduced verbatim from the status.
+    pub coverage_note: String,
+    /// Stamped from the observer context installation.
+    pub installation: ControlBoardInstallation,
+    /// Stamped from the observer context observation time.
+    pub observed_at: ControlBoardObservationTime,
+    /// Stamped from the observer context source digest.
+    pub source_digest: ControlBoardSourceDigest,
+    /// Stamped from the observer context recovery owner.
+    pub recovery_owner: ControlBoardRecoveryOwner,
+    /// Exact board revision the status was read at (projection-owned).
+    pub view_revision: u64,
+    /// Exact shared fence the status was read at (typed, never Debug text).
+    pub view_fence: StateFence,
+    /// Freshness binding over the exact status bytes (projection-owned).
+    pub status_digest: String,
+}
+
+/// One displayed provenance reference behind a code identity.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RenderedProvenanceRef {
+    /// Retained edge identity.
+    pub edge_id: String,
+    /// The endpoint that is not the queried code identity.
+    pub counterparty: String,
+    /// Which side the queried identity stands on (`FROM_SUBJECT` or
+    /// `TO_SUBJECT`).
+    pub direction: String,
+    /// Owner-recorded attribution label, reproduced verbatim.
+    pub attribution: String,
+    /// Recorded evidence handle, when the owner retained one.
+    pub receipt_ref: Option<String>,
+}
+
+/// Native rendering of the reverse lookup from current code to its recorded
+/// origins.
+///
+/// Every retained edge that names the code identity is displayed with its
+/// attribution intact, so multiple origins stay multiple; gaps are displayed
+/// verbatim when nothing names the identity.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RenderedCodeProvenance {
+    /// Always [`CONTROLBOARD_REVIEW_RENDER_CONTRACT`].
+    pub contract: String,
+    /// Requested code identity, reproduced verbatim.
+    pub code_id: String,
+    /// Retained edges naming the identity, in view order.
+    pub refs: Vec<RenderedProvenanceRef>,
+    /// Missing coverage with reasons, reproduced verbatim.
+    pub gaps: Vec<String>,
+    /// Stamped from the observer context installation.
+    pub installation: ControlBoardInstallation,
+    /// Stamped from the observer context observation time.
+    pub observed_at: ControlBoardObservationTime,
+    /// Stamped from the observer context source digest.
+    pub source_digest: ControlBoardSourceDigest,
+    /// Stamped from the observer context recovery owner.
+    pub recovery_owner: ControlBoardRecoveryOwner,
+    /// Exact board revision the lookup was read at (projection-owned).
+    pub view_revision: u64,
+    /// Exact shared fence the lookup was read at (typed, never Debug text).
+    pub view_fence: StateFence,
+    /// Freshness binding over the exact lookup bytes (projection-owned).
+    pub provenance_digest: String,
+}
+
+/// Renders the distinct non-green resolution label for one anchor resolution.
+fn resolution_label(resolution: AnchorResolution) -> &'static str {
+    match resolution {
+        AnchorResolution::Exact => "EXACT",
+        AnchorResolution::Moved => "MOVED",
+        AnchorResolution::Modified => "MODIFIED",
+        AnchorResolution::Ambiguous => "AMBIGUOUS",
+        AnchorResolution::Stale => "STALE",
+        AnchorResolution::Deleted => "DELETED",
+        AnchorResolution::Unavailable => "UNAVAILABLE",
+    }
+}
+
+/// Renders the owner-recorded anchor target-kind label.
+fn target_kind_label(kind: AnchorTargetKind) -> &'static str {
+    match kind {
+        AnchorTargetKind::PublicMessage => "PUBLIC_MESSAGE",
+        AnchorTargetKind::PublicPlan => "PUBLIC_PLAN",
+        AnchorTargetKind::PublicRationale => "PUBLIC_RATIONALE",
+        AnchorTargetKind::ToolResult => "TOOL_RESULT",
+        AnchorTargetKind::Diff => "DIFF",
+        AnchorTargetKind::Source => "SOURCE",
+        AnchorTargetKind::VerifierResult => "VERIFIER_RESULT",
+    }
+}
+
+/// Renders the owner-recorded attribution label, reproduced verbatim in
+/// meaning: `CORRELATED` and `AMBIGUOUS` never become causation.
+fn attribution_label(attribution: Attribution) -> &'static str {
+    match attribution {
+        Attribution::Exact => "EXACT",
+        Attribution::ReceiptLinked => "RECEIPT_LINKED",
+        Attribution::Correlated => "CORRELATED",
+        Attribution::Ambiguous => "AMBIGUOUS",
+        Attribution::Unknown => "UNKNOWN",
+    }
+}
+
+/// Renders the distinct non-green lifecycle label for one review lifecycle.
+fn lifecycle_label(lifecycle: ReviewLifecycle) -> &'static str {
+    match lifecycle {
+        ReviewLifecycle::Draft => "DRAFT",
+        ReviewLifecycle::PendingDelivery => "PENDING_DELIVERY",
+        ReviewLifecycle::Delivered => "DELIVERED",
+        ReviewLifecycle::Answered => "ANSWERED",
+        ReviewLifecycle::Resolved => "RESOLVED",
+        ReviewLifecycle::RejectedWithReason => "REJECTED_WITH_REASON",
+        ReviewLifecycle::Stale => "STALE",
+        ReviewLifecycle::Superseded => "SUPERSEDED",
+    }
+}
+
+/// Renders the operator-action kind name for one correction action.
+fn correction_action_label(action: ReviewCorrectionAction) -> &'static str {
+    match action {
+        ReviewCorrectionAction::Acknowledge => "AcknowledgeReview",
+        ReviewCorrectionAction::Answer => "AnswerReview",
+        ReviewCorrectionAction::Resolve => "ResolveReview",
+        ReviewCorrectionAction::Reject => "RejectReview",
+    }
+}
+
+/// States the exact limitation for one unmapped resolution.
+///
+/// Pruned or purged originals (`DELETED`/`UNAVAILABLE`) report the limitation
+/// with the retained handle; no historical text is reproduced and the handle
+/// is never redirected to current code.
+fn mapping_limitation(detail: &ControlBoardReviewDetail, resolution: AnchorResolution) -> String {
+    match resolution {
+        AnchorResolution::Exact | AnchorResolution::Moved | AnchorResolution::Modified => {
+            format!(
+                "resolution claims {} but the view carries no current-target candidate; continuity is not established",
+                resolution_label(resolution)
+            )
+        }
+        AnchorResolution::Ambiguous => {
+            "duplicate or ambiguous candidates: the note is attached to no current fragment; explicit correction required"
+                .to_owned()
+        }
+        AnchorResolution::Stale => {
+            "stale target: the original anchor below is preserved; correction required before use"
+                .to_owned()
+        }
+        AnchorResolution::Deleted | AnchorResolution::Unavailable => {
+            format!(
+                "original {} at revision {} is {}; retained bytes are unavailable, so no historical text is reproduced and the handle is not redirected to current code",
+                detail.anchor_selector,
+                detail.anchor_original_revision,
+                resolution_label(resolution)
+            )
+        }
+    }
+}
+
+/// Renders the current mapping or exact failure for one detail.
+fn render_mapping(detail: &ControlBoardReviewDetail) -> RenderedReviewMapping {
+    match detail.anchor_resolution {
+        AnchorResolution::Exact | AnchorResolution::Moved | AnchorResolution::Modified
+            if !detail.candidate_refs.is_empty() =>
+        {
+            RenderedReviewMapping::Mapped {
+                candidates: detail.candidate_refs.clone(),
+            }
+        }
+        resolution => RenderedReviewMapping::Failed {
+            resolution: resolution_label(resolution).to_owned(),
+            limitation: mapping_limitation(detail, resolution),
+        },
+    }
+}
+
+/// Renders the lifecycle-permitted correction actions for one detail.
+fn render_correction_actions(detail: &ControlBoardReviewDetail) -> Vec<RenderedCorrectionAction> {
+    detail
+        .correction_actions
+        .iter()
+        .map(|action| RenderedCorrectionAction {
+            action: correction_action_label(*action).to_owned(),
+            authority_note: CORRECTION_AUTHORITY_NOTE.to_owned(),
+        })
+        .collect()
+}
+
+/// Replays the retained history for one detail: the lifecycle line plus the
+/// candidate refs in retained order. Nothing is synthesized.
+fn replay_history(detail: &ControlBoardReviewDetail) -> Vec<String> {
+    let mut history = Vec::with_capacity(detail.candidate_refs.len().saturating_add(1));
+    history.push(format!("lifecycle: {}", lifecycle_label(detail.lifecycle)));
+    for (index, candidate) in detail.candidate_refs.iter().enumerate() {
+        history.push(format!("candidate[{index}]: {candidate}"));
+    }
+    history
+}
+
+/// Renders one retained provenance ref for display.
+fn render_provenance_ref(
+    edge_id: &str,
+    counterparty: &str,
+    direction: &str,
+    attribution: Attribution,
+    receipt_ref: &Option<String>,
+) -> RenderedProvenanceRef {
+    RenderedProvenanceRef {
+        edge_id: edge_id.to_owned(),
+        counterparty: counterparty.to_owned(),
+        direction: direction.to_owned(),
+        attribution: attribution_label(attribution).to_owned(),
+        receipt_ref: receipt_ref.clone(),
+    }
+}
+
+impl RenderedReviewDetail {
+    /// Reads one review through a fresh authenticated board read and renders
+    /// its historical target beside the current mapping or exact failure,
+    /// with the authorized correction actions.
+    ///
+    /// This performs exactly the projection-owned `ControlBoard::view` read
+    /// via the detail contract, then stamps the observer context. There is
+    /// no command construction, no port access, and no submit path in scope;
+    /// a correction action displayed here is lifecycle permission only and
+    /// must still pass the board submit path.
+    pub fn read(
+        board: &mut ControlBoard,
+        request: &ReadRequest,
+        review_id: &str,
+        context: &ControlBoardObservationContext,
+    ) -> Result<Self, ControlBoardConsumerError> {
+        context.validate()?;
+        let detail = read_review_detail(board, request, review_id).map_err(|error| {
+            ControlBoardConsumerError::ProjectionFailed {
+                detail: error.to_string(),
+            }
+        })?;
+        Ok(Self {
+            contract: CONTROLBOARD_REVIEW_RENDER_CONTRACT.to_owned(),
+            review_id: detail.review_id.clone(),
+            lifecycle: detail.lifecycle,
+            disposed: accepted_disposition(detail.lifecycle),
+            anchor_target_kind: target_kind_label(detail.anchor_target_kind).to_owned(),
+            anchor_selector: detail.anchor_selector.clone(),
+            anchor_original_revision: detail.anchor_original_revision,
+            current_mapping: render_mapping(&detail),
+            correction_actions: render_correction_actions(&detail),
+            retained_history: replay_history(&detail),
+            installation: context.installation.clone(),
+            observed_at: context.observed_at,
+            source_digest: context.source_digest.clone(),
+            recovery_owner: context.recovery_owner.clone(),
+            view_revision: detail.view_revision,
+            view_fence: detail.view_fence.clone(),
+            detail_digest: detail.detail_digest.clone(),
+        })
+    }
+
+    /// Binds this rendering to one reconciled row, refusing a wrong-fragment
+    /// attachment: the row entry must equal the rendered review identity, or
+    /// the bind fails instead of displaying one review's detail on another
+    /// row.
+    pub fn bind_row(&self, row: &RenderedControlBoardRow) -> Result<(), ControlBoardConsumerError> {
+        if row.entry_id == self.review_id {
+            Ok(())
+        } else {
+            Err(ControlBoardConsumerError::ReviewRowMismatch {
+                entry_id: row.entry_id.clone(),
+                review_id: self.review_id.clone(),
+            })
+        }
+    }
+}
+
+impl RenderedReviewBatchSummary {
+    /// Reads the visible batch status through a fresh authenticated board
+    /// read and renders per-item completeness for evaluation evidence.
+    ///
+    /// This performs exactly the projection-owned `ControlBoard::view` read
+    /// via the batch-status contract. The rendering carries counts and the
+    /// outstanding identities only; it carries no elapsed-time, speed, or
+    /// quality scalar (I11.10).
+    pub fn read(
+        board: &mut ControlBoard,
+        request: &ReadRequest,
+        context: &ControlBoardObservationContext,
+    ) -> Result<Self, ControlBoardConsumerError> {
+        context.validate()?;
+        let status = read_review_batch_status(board, request).map_err(|error| {
+            ControlBoardConsumerError::ProjectionFailed {
+                detail: error.to_string(),
+            }
+        })?;
+        Ok(Self {
+            contract: CONTROLBOARD_REVIEW_RENDER_CONTRACT.to_owned(),
+            disposed_count: status
+                .items
+                .len()
+                .saturating_sub(status.outstanding_ids.len()),
+            total: status.items.len(),
+            outstanding_ids: status.outstanding_ids.clone(),
+            complete: status.complete,
+            coverage_note: status.coverage_note.clone(),
+            installation: context.installation.clone(),
+            observed_at: context.observed_at,
+            source_digest: context.source_digest.clone(),
+            recovery_owner: context.recovery_owner.clone(),
+            view_revision: status.view_revision,
+            view_fence: status.view_fence.clone(),
+            status_digest: status.status_digest.clone(),
+        })
+    }
+}
+
+impl RenderedCodeProvenance {
+    /// Reads the reverse lookup for one code identity through a fresh
+    /// authenticated board read and renders every retained origin with its
+    /// attribution, plus any gaps.
+    ///
+    /// This performs exactly the projection-owned `ControlBoard::view` read
+    /// via the code-provenance contract. Multiple origins stay multiple; an
+    /// identity with no retained edge renders its gaps, never an invented
+    /// link.
+    pub fn read(
+        board: &mut ControlBoard,
+        request: &ReadRequest,
+        code_id: &str,
+        context: &ControlBoardObservationContext,
+    ) -> Result<Self, ControlBoardConsumerError> {
+        context.validate()?;
+        let lookup = read_code_provenance(board, request, code_id).map_err(|error| {
+            ControlBoardConsumerError::ProjectionFailed {
+                detail: error.to_string(),
+            }
+        })?;
+        Ok(Self {
+            contract: CONTROLBOARD_REVIEW_RENDER_CONTRACT.to_owned(),
+            code_id: lookup.code_id.clone(),
+            refs: lookup
+                .refs
+                .iter()
+                .map(|edge| {
+                    let direction = match edge.direction {
+                        ReviewProvenanceDirection::FromSubject => "FROM_SUBJECT",
+                        ReviewProvenanceDirection::ToSubject => "TO_SUBJECT",
+                    };
+                    render_provenance_ref(
+                        &edge.edge_id,
+                        &edge.counterparty,
+                        direction,
+                        edge.attribution,
+                        &edge.receipt_ref,
+                    )
+                })
+                .collect(),
+            gaps: lookup.gaps.clone(),
+            installation: context.installation.clone(),
+            observed_at: context.observed_at,
+            source_digest: context.source_digest.clone(),
+            recovery_owner: context.recovery_owner.clone(),
+            view_revision: lookup.view_revision,
+            view_fence: lookup.view_fence.clone(),
+            provenance_digest: lookup.provenance_digest.clone(),
+        })
+    }
 }
 
 #[cfg(test)]
