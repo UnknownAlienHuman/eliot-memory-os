@@ -26,6 +26,35 @@ pub(crate) struct SelectedSourceArtifactInputs {
     pub(crate) runner: Arc<dyn AsyncProcessRunner>,
 }
 
+/// Exact owner-captured source snapshot retained while the caller obtains a
+/// distinct mutation admission for its content digest.
+pub(crate) struct ObservedSelectedSourceSnapshot {
+    snapshot: eliot_git_bridge::SourceTreeSnapshot,
+    archive_sha256: String,
+    source_id: SourceId,
+    captured_at: ClockReading,
+    candidate: SourceCandidate,
+    root: RepoRoot,
+    runner: Arc<dyn AsyncProcessRunner>,
+}
+
+impl ObservedSelectedSourceSnapshot {
+    /// SHA-256 of the exact bytes retained in this non-Serde snapshot.
+    pub(crate) fn archive_sha256(&self) -> &str {
+        &self.archive_sha256
+    }
+
+    /// Size of the exact bytes retained in this non-Serde snapshot.
+    pub(crate) fn archive_size_bytes(&self) -> u64 {
+        self.snapshot.archive_bytes().len() as u64
+    }
+
+    /// Captured Git tree identity, supplemental to the exact archive digest.
+    pub(crate) fn tree_id(&self) -> &str {
+        self.snapshot.tree_id()
+    }
+}
+
 /// Original-owner snapshot staging result held across admission of the
 /// separate exact-reference Read. It cannot cross a serde boundary.
 pub(crate) struct StagedSelectedSourceSnapshot {
@@ -34,6 +63,14 @@ pub(crate) struct StagedSelectedSourceSnapshot {
     candidate: SourceCandidate,
     root: RepoRoot,
     runner: Arc<dyn AsyncProcessRunner>,
+}
+
+impl StagedSelectedSourceSnapshot {
+    /// Exact reference minted by the original Blob owner, needed to admit the
+    /// separate resource-specific source Read.
+    pub(crate) fn artifact_reference(&self) -> &ArtifactReference {
+        &self.reference
+    }
 }
 
 /// Failures while joining the current owner-observed source to its stored
@@ -52,13 +89,10 @@ pub(crate) enum SelectedSourceArtifactInputError {
     Artifact(#[from] ArtifactError),
 }
 
-/// Captures and publishes the selected source tree under its own original
-/// ReversibleMutation admission. A later caller must obtain a distinct Read
-/// admission bound to the returned ArtifactReference before readback.
-pub(crate) async fn stage_selected_source_snapshot(
-    owner: &SourceArtifactOwner,
-    mutation_admission: &SourceArtifactAdmission,
-    mutation_profile: &SourceArtifactBlobProfile,
+/// Captures the selected source snapshot once and retains its exact bytes
+/// while the caller obtains the original ReversibleMutation admission bound
+/// to this digest. The bytes are not reopened or recaptured before staging.
+pub(crate) async fn capture_selected_source_snapshot(
     max_archive_bytes: u64,
     source_id: SourceId,
     captured_at: ClockReading,
@@ -66,7 +100,7 @@ pub(crate) async fn stage_selected_source_snapshot(
     selected: &BoundSelectedSourceObservation,
     root: RepoRoot,
     runner: Arc<dyn AsyncProcessRunner>,
-) -> Result<StagedSelectedSourceSnapshot, SelectedSourceArtifactInputError> {
+) -> Result<ObservedSelectedSourceSnapshot, SelectedSourceArtifactInputError> {
     if max_archive_bytes == 0 {
         return Err(SelectedSourceArtifactInputError::BindingMismatch);
     }
@@ -95,27 +129,51 @@ pub(crate) async fn stage_selected_source_snapshot(
     )
     .await?;
 
+    let archive_sha256 = eliot_contracts::sha256_hex(snapshot.archive_bytes());
+    Ok(ObservedSelectedSourceSnapshot {
+        snapshot,
+        archive_sha256,
+        source_id,
+        captured_at,
+        candidate: candidate.clone(),
+        root,
+        runner,
+    })
+}
+
+/// Persists the already-captured exact tree bytes under a separate original
+/// ReversibleMutation admission bound by the caller to `observed`'s digest.
+/// This function never reopens the selected source or recaptures the tree.
+pub(crate) fn stage_selected_source_snapshot(
+    owner: &SourceArtifactOwner,
+    mutation_admission: &SourceArtifactAdmission,
+    mutation_profile: &SourceArtifactBlobProfile,
+    observed: ObservedSelectedSourceSnapshot,
+) -> Result<StagedSelectedSourceSnapshot, SelectedSourceArtifactInputError> {
+    if mutation_admission.request().metadata.source_id != observed.source_id {
+        return Err(SelectedSourceArtifactInputError::BindingMismatch);
+    }
     let identity = ArtifactIdentity::bind_source_snapshot(
         &mutation_admission.operation().operation_id,
-        source_id,
-        snapshot.tree_id(),
-        snapshot.archive_bytes(),
+        observed.source_id.clone(),
+        observed.snapshot.tree_id(),
+        observed.snapshot.archive_bytes(),
         None,
-        captured_at,
+        observed.captured_at.clone(),
     )?;
     let reference = owner.stage_source_snapshot(
         mutation_admission,
         mutation_profile,
         identity,
-        snapshot.archive_bytes(),
+        observed.snapshot.archive_bytes(),
     )?;
 
     Ok(StagedSelectedSourceSnapshot {
-        snapshot,
+        snapshot: observed.snapshot,
         reference,
-        candidate: candidate.clone(),
-        root,
-        runner,
+        candidate: observed.candidate,
+        root: observed.root,
+        runner: observed.runner,
     })
 }
 
