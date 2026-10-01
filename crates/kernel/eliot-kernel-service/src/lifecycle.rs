@@ -476,10 +476,8 @@ impl KernelService {
         control_capacity: usize,
         ledger_capacity: usize,
     ) -> Result<Self, KernelServiceError> {
-        let authority = KernelAuthority::new(
-            KernelAuthorityKey::from_bytes(key_bytes),
-            genesis_epoch(),
-        );
+        let authority =
+            KernelAuthority::new(KernelAuthorityKey::from_bytes(key_bytes), genesis_epoch());
         Ok(Self {
             state: KernelServiceState::Cold,
             front_door: FrontDoor::new(authority.clone(), control_capacity, ledger_capacity)?,

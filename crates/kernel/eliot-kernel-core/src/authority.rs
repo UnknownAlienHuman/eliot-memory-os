@@ -628,10 +628,8 @@ mod tests {
     fn a_different_key_cannot_consume_the_receipt() -> Result<(), KernelError> {
         let issuer = KernelAuthority::new(key(), genesis_epoch()?);
         let receipt = issuer.issue(request()?)?;
-        let other = KernelAuthority::new(
-            KernelAuthorityKey::from_bytes([9u8; 32]),
-            genesis_epoch()?,
-        );
+        let other =
+            KernelAuthority::new(KernelAuthorityKey::from_bytes([9u8; 32]), genesis_epoch()?);
         let route = RouteScope::new("daemon")?;
         assert!(matches!(
             other.consume(&receipt, &route, 500),

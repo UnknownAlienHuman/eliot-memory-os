@@ -198,11 +198,13 @@ mod tests {
     use std::num::NonZeroU64;
 
     fn test_genesis_epoch() -> Result<eliot_contracts::EpochId, KernelError> {
-        let lineage_id = eliot_contracts::EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
-            .map_err(|_| KernelError::InvalidField {
-                field: "lineage_id",
-                reason: "must be a canonical UUID lineage",
-            })?;
+        let lineage_id = eliot_contracts::EpochLineageId::new(
+            "550e8400-e29b-41d4-a716-446655440000",
+        )
+        .map_err(|_| KernelError::InvalidField {
+            field: "lineage_id",
+            reason: "must be a canonical UUID lineage",
+        })?;
         eliot_contracts::EpochId::new(lineage_id, NonZeroU64::MIN).map_err(|_| {
             KernelError::InvalidField {
                 field: "epoch_id",
