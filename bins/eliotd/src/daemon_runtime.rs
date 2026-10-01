@@ -7168,22 +7168,28 @@ async fn trigger_accepted_cold_start(
                         "accepted activation's I4.4.1 scanner trigger refused"
                     );
                 }
-                Ok(eliot_workscope::BootstrapScanOutcome::PrivacyBoundaryRequired {
-                    code, ..
-                }) => {
+                Ok(eliotd::task_binding_admission::ColdStartTriggerResult::Question(
+                    eliot_workscope::BootstrapScanOutcome::PrivacyBoundaryRequired { code, .. },
+                )) => {
                     tracing::info!(
                         ticket = %eliotd::diagnostics::sanitize_identity(&ticket_id),
                         question_code = %code,
                         "accepted activation's I4.4.1 scanner retained its privacy question"
                     );
                 }
-                Ok(eliot_workscope::BootstrapScanOutcome::Completed { persisted, .. }) => {
+                Ok(eliotd::task_binding_admission::ColdStartTriggerResult::Persisted {
+                    scan,
+                    readiness_refusal,
+                }) => {
                     tracing::info!(
                         ticket = %eliotd::diagnostics::sanitize_identity(&ticket_id),
-                        scan_receipt = %persisted.receipt_ref,
-                        "accepted activation's I4.4.1 scanner retained its owner receipt"
+                        scan_receipt = %scan.receipt_handle.receipt_ref,
+                        owner_commitment = %scan.receipt_handle.record_commitment,
+                        readiness_refusal = ?readiness_refusal,
+                        "accepted activation's I4.4.1 scanner retained its owner receipt; readiness was withheld"
                     );
                 }
+                Ok(eliotd::task_binding_admission::ColdStartTriggerResult::Question(_)) => {}
             },
         );
     }
@@ -7223,7 +7229,7 @@ fn trigger_cold_start_controller(
     ticket: &AgentActivationResolutionTicket,
     mut discovery: eliotd::task_binding_admission::ColdStartDiscoveryInput,
     contour_result: Result<eliot_governor::InstallationScanContour, String>,
-) -> Result<eliot_workscope::BootstrapScanOutcome, ColdStartIngressError> {
+) -> Result<eliotd::task_binding_admission::ColdStartTriggerResult, ColdStartIngressError> {
     let now = unix_ms(SystemTime::now()).map_err(ColdStartIngressError::Clock)?;
     let trigger = eliot_workscope::ColdStartTrigger::AttachOrLaunch;
     let controller_result = eliot_workscope::ColdStartController::check_discovery_with_scan(
@@ -7274,14 +7280,17 @@ fn trigger_cold_start_controller(
     ) else {
         // The privacy-bounded scanner's question path validates this exact
         // retained lease/key/evidence and performs no charge or persistence.
-        return eliot_workscope::run_bootstrap_discovery(
+        let outcome = eliot_workscope::run_bootstrap_discovery(
             None,
             None,
             &mut discovery.lease,
             &discovery.key,
             &discovery.discovery,
         )
-        .map_err(ColdStartIngressError::WorkScope);
+        .map_err(ColdStartIngressError::WorkScope)?;
+        return Ok(eliotd::task_binding_admission::ColdStartTriggerResult::Question(
+            outcome,
+        ));
     };
 
     let contour = contour_result.map_err(|detail| ColdStartIngressError::Owner {
@@ -7306,7 +7315,8 @@ fn trigger_cold_start_controller(
         contour.ors_generation(),
         owner,
     )?;
-    eliot_governor::GovernorComposition::<dyn eliot_governor::KernelGenerationPort>::run_cold_start_trigger_scan(
+    let scan_evidence = discovery.discovery.evidence.clone();
+    let outcome = eliot_governor::GovernorComposition::<dyn eliot_governor::KernelGenerationPort>::run_cold_start_trigger_scan(
         trigger,
         &mut discovery.lease,
         &discovery.key,
@@ -7320,7 +7330,42 @@ fn trigger_cold_start_controller(
         &policy.verifier_refs,
         discovery.discovery.governing_source_refs.clone(),
         now,
-    )
+    )?;
+    match outcome {
+        eliot_workscope::BootstrapScanOutcome::PrivacyBoundaryRequired { .. } => {
+            Ok(eliotd::task_binding_admission::ColdStartTriggerResult::Question(
+                outcome,
+            ))
+        }
+        eliot_workscope::BootstrapScanOutcome::Completed {
+            receipt: expected_receipt,
+            persisted,
+            ..
+        } => {
+            let disclosure_receipt =
+                eliot_workscope::ScanDisclosureStore::readback(&store, &persisted, &binding)?;
+            if disclosure_receipt != *expected_receipt
+                || disclosure_receipt.scan_ref != persisted.receipt_ref
+            {
+                return Err(ColdStartIngressError::WorkScope(
+                    eliot_workscope::WorkScopeError::ScanReceiptReplaced,
+                ));
+            }
+            Ok(eliotd::task_binding_admission::ColdStartTriggerResult::Persisted {
+                scan: eliotd::task_binding_admission::ColdStartScanOwnerReceipt {
+                    trigger,
+                    discovery,
+                    contour,
+                    binding,
+                    scan_evidence,
+                    disclosure_receipt,
+                    receipt_handle: *persisted,
+                    store,
+                },
+                readiness_refusal: eliotd::task_binding_admission::ColdStartReadinessRefusal::CompilerProfileOwnerUnavailable,
+            })
+        }
+    }
 }
 
 /// Builds the lost-acknowledgement reconcile query from the single retained
