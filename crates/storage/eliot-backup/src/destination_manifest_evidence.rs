@@ -55,8 +55,11 @@
 //! registry fails closed instead of proceeding.
 //!
 //! Nothing here applies an effect, imports a byte, or reaches cutover; the
-//! restore owner still refuses an unvalidated plan, and a bundle with no
-//! destination admission stays the supported rehearsal-without-admission shape.
+//! restore owner still refuses an unvalidated plan. A bundle that arrives with
+//! no destination admission is NOT a supported rehearsal shape: the restore
+//! owner refuses it with `KernelRestoreError::DestinationNotAdmitted` before it
+//! compiles a plan and before it constructs a destination root, so this issuer
+//! is the only way that shape can ever be replaced by an admitted one.
 
 use super::{BackupError, OwnerTrustBinding, RestorePlan, RestoreTransaction, digest, text};
 
@@ -255,10 +258,7 @@ impl DestinationManifestAdmission {
     /// name this operation's destination or when the re-read record does not
     /// agree with the one issued, [`BackupError::InvalidField`] when a recorded
     /// value is malformed, and the owner's own typed error otherwise.
-    pub fn issue_for_operation<O>(
-        owner: &O,
-        plan: &RestorePlan,
-    ) -> Result<Self, BackupError>
+    pub fn issue_for_operation<O>(owner: &O, plan: &RestorePlan) -> Result<Self, BackupError>
     where
         O: RestoreDestinationAdmissionOwner + ?Sized,
     {
