@@ -2452,9 +2452,8 @@ impl AgentCoordinator {
                     // The owner's exact refusal, never a summary of it. A drive
                     // that re-read does so over a refusal it still reports; a
                     // drive that cannot re-read returns the refusal itself.
-                    let disposition = match stale_selection_disposition(&refusal) {
-                        Some(disposition) => disposition,
-                        None => return Err(refusal),
+                    let Some(disposition) = stale_selection_disposition(&refusal) else {
+                        return Err(refusal);
                     };
                     last_selection = self.select_ready(Some(profile), true);
                     pulls_performed += 1;
