@@ -124,6 +124,19 @@
 //!   Err(refused)    -> release (still Eligible, proved no effect)
 //! ```
 //!
+//! The two `reconcile` steps above are REFUSED on this base, not merely
+//! unexercised. ORS requires the committed ordering link as head evidence and
+//! pins it against the head the reservation reserved against, and the store
+//! exposes no read that returns it, so [`reconcile_receipt`] closes nothing and
+//! returns [`ReservationWriteError::Unsupported`] instead of naming a head it
+//! has not read. Every such reservation therefore stays `Reconciling` and is
+//! reported unresolved, which is the correct ceiling: an unresolved reservation
+//! is retried by no one and released by no one, whereas a forged head would let
+//! ORS advance a scope on an identity no owner ever committed. See
+//! [`reconcile_receipt`]'s `# Refused` section for the measured proof and for
+//! the exact owner read that closes this. The reserved-write path stays dormant
+//! until it does.
+//!
 //! `begin_execute_after_send` runs only after the single send resolves and
 //! requires the typed [`ResolvedSendOutcome`] evidence binding the exact
 //! reservation operation, so a refused backend never strands an `Executing`
@@ -141,12 +154,11 @@ use std::sync::Arc;
 
 use eliot_contracts::{EpochId, RequestMetadata, StateFence};
 use eliot_ors::{
-    CanonicalDisposition, CanonicalReconciliation, CanonicalScopeObservation, EpochIdentity,
-    EpochLineage, ExpectedOrderingHead, OpaqueLabel, OperationIdentity as OrsOperationIdentity,
-    OperationalRecoveryStore, RecoveryAccessClass, RecoveryCursor, RecoveryEnvelopeContext,
-    RecoveryOwner, RecoveryPage, RecoveryPayloadEnvelope, RedbRecoveryStore, ReservationRecord,
-    ReservationRequest, ReservationState, ScopeReservationRequest, StateFenceSnapshot,
-    WriterReservationToken,
+    CanonicalReconciliation, EpochIdentity, EpochLineage, ExpectedOrderingHead, OpaqueLabel,
+    OperationIdentity as OrsOperationIdentity, OperationalRecoveryStore, RecoveryAccessClass,
+    RecoveryCursor, RecoveryEnvelopeContext, RecoveryOwner, RecoveryPage, RecoveryPayloadEnvelope,
+    RedbRecoveryStore, ReservationRecord, ReservationRequest, ReservationState,
+    ScopeReservationRequest, StateFenceSnapshot, WriterReservationToken,
 };
 use eliot_platform::SecretReference;
 use eliot_receipts::ReceiptDispositionKind;
@@ -269,8 +281,12 @@ pub enum ReservationWriteError {
         /// Exact mismatched binding.
         detail: String,
     },
-    /// The Store backend has no reserved-write capability. This is explicit
-    /// unsupported behavior, never a silent unreserved `Apply` fallback.
+    /// The Store boundary cannot supply what this path needs: either the
+    /// backend has no reserved-write capability, or the store client surface
+    /// exposes no read of a value the closure requires. Both are explicit
+    /// unsupported behaviour, never a silent substitute value and never an
+    /// unreserved `Apply` fallback. See [`reconcile_receipt`] for the second
+    /// case, where the missing value is the committed ordering link.
     #[error("reserved write unsupported for operation {operation_id}: {detail}")]
     Unsupported {
         /// Admitted operation the refusal preserves.
@@ -1100,15 +1116,21 @@ pub fn mark_unknown_outcome(
         .mark_unknown(token, owner.writer_identity(), reason)?)
 }
 
-/// Builds the exact receipt-evidence closure for one token from a verified
-/// Store receipt, without mutating ORS.
+/// Checks one verified Store receipt against one token and, only if the
+/// committed ordering link can be read from its owner, builds the exact
+/// receipt-evidence closure — without mutating ORS.
+///
+/// On this base it never reaches the closure: it validates the receipt and the
+/// token binding, then refuses. See `# Refused` below for why, and for what
+/// would have to exist first. Nothing here is weakened by that refusal: every
+/// check below still runs, and each still refuses with its own typed reason.
 ///
 /// The receipt must be the committed-or-terminally-not-applied answer to the
 /// same operation: operation identity, fence snapshot, scope/sequence
 /// coverage, and the envelope binding are all re-checked here, and the owner
 /// re-checks them again with its evidence provider at [`finalize_reservation`].
 /// A terminally-not-applied status (`Rejected`, `Cancelled`, `DeadLetter`)
-/// releases only when the verified reconciliation envelope explicitly proves
+/// is admitted only when the verified reconciliation envelope explicitly proves
 /// the operation was not applied (envelope kind `Failure` or `Cancelled`);
 /// any other envelope kind (including `Success`, `Partial`, or `Unknown`)
 /// yields [`ReservationWriteError::Unknown`] and retains the reservation for
@@ -1116,6 +1138,54 @@ pub fn mark_unknown_outcome(
 /// reconciliation envelope (still unknown) fails here and stays distinct from
 /// proved-not-applied. This constructs evidence, never authority: only
 /// [`finalize_reservation`] closes the token.
+///
+/// # Refused: no owner read of the committed ordering link (issue #1925 W0)
+///
+/// `CanonicalScopeObservation::committed_link` is the one ordering link the
+/// canonical owner committed for this scope (`I5.8`
+/// `CanonicalEvent::ordering_links`), and ORS pins it against the head this
+/// reservation reserved against. This producer cannot observe that link on
+/// this base, so it refuses rather than name a head it has not read:
+///
+/// - The write reply does not carry it.
+///   [`eliot_store_api::WriteReceipt::ordering_sequences`] is
+///   `Vec<OrderingHead>`, and `OrderingHead` is scope, sequence and state
+///   fence only (`eliot-store-api/src/lib.rs:5662` and `:4383`) — no digest at
+///   all. The reconciliation envelope is
+///   [`eliot_receipts::ReceiptEnvelope`] = identity + core
+///   (`eliot-receipts/src/lib.rs:1087`), whose `identity.canonical_sha256` is
+///   the receipt CORE digest that value previously entered the head field with.
+///   That is a different object, and asserting the head IS the envelope is the
+///   forged identity this refusal removes.
+/// - The link cannot be recomputed locally either.
+///   [`eliot_store_api::ordering_link_hash`] (`canonical_event.rs:57`, "one
+///   algorithm, one owner") hashes `event_id`, `payload_digest`, scope,
+///   sequence and previous hash; `WriteReceipt` carries no `payload_digest` at
+///   all, so the preimage this producer holds is not merely unauthorised but
+///   incomplete.
+/// - No owner read exposes it. The store commits the link twice, in the same
+///   transaction as the receipt: on the `ordering_head` row beside the CAS'd
+///   head body (`apply/atomic_write.rs:849-855`) and on the `canonical_event`
+///   row (`apply/atomic_write.rs:876-884`). The one read that sees either is
+///   `read_ordering_chain_tips_inner` (`apply.rs:2169`), a private
+///   pre-transaction planner read over `READ_ORDERING_CHAIN_TIPS_BY_SCOPES`
+///   (`schema.rs:978`) that returns a bare `BTreeMap<scope, event_hash>` — no
+///   sequence, no previous hash, not reachable from any client operation.
+///   Every ordering read a client can call is `SELECT VALUE body`
+///   (`schema.rs:972` and `:993` for `store.ordering_heads` and the
+///   `GetOrderingHeads` named read), and the chain-tip hashes are sibling
+///   fields on the schemaless record, invisible to it.
+///
+/// The refusal is [`ReservationWriteError::Unsupported`]: the store client
+/// surface has no admitted capability that returns the committed ordering
+/// link, which is explicit unsupported behaviour, never a silent substitute
+/// value and never an unreserved `Apply` fallback. The reservation is left for
+/// its caller to report as unresolved. The owner read that closes this is the
+/// Canonical Store `ordering_link` read: one operation on
+/// [`eliot_store_api::CanonicalStoreClient`] returning, for the committed
+/// operation, the exact [`eliot_store_api::OrderingLink`] the owner minted —
+/// scope, committed sequence, previous hash and the committed chain tip — read
+/// from the same rows the transaction CAS-compares.
 pub fn reconcile_receipt(
     token: &WriterReservationToken,
     receipt: &WriteReceipt,
@@ -1143,14 +1213,17 @@ pub fn reconcile_receipt(
             ReservationWriteError::Store(error)
         }
     })?;
-    let disposition = match receipt.status {
-        WriteReceiptStatus::Committed => CanonicalDisposition::Committed,
+    // Gate: a terminally-not-applied status is admitted only when the envelope
+    // itself proves the operation was not applied. The gate is decided here and
+    // is deliberately not turned into a disposition, because there is no
+    // evidence closure to carry a disposition in and a value no owner produced
+    // would only invite a later caller to trust it.
+    match receipt.status {
+        WriteReceiptStatus::Committed => {}
         WriteReceiptStatus::Rejected
         | WriteReceiptStatus::Cancelled
         | WriteReceiptStatus::DeadLetter => match envelope.core.disposition.kind() {
-            ReceiptDispositionKind::Failure | ReceiptDispositionKind::Cancelled => {
-                CanonicalDisposition::Rejected
-            }
+            ReceiptDispositionKind::Failure | ReceiptDispositionKind::Cancelled => {}
             _ => {
                 return Err(ReservationWriteError::Unknown {
                     operation_id: operation_id.clone(),
@@ -1159,31 +1232,24 @@ pub fn reconcile_receipt(
                 });
             }
         },
-    };
+    }
     check_receipt_token_binding(token, receipt, envelope, &operation_id)?;
-    let receipt_id = OpaqueLabel::new(envelope.identity.receipt_id.as_str())
-        .map_err(ReservationWriteError::Ors)?;
-    let scopes = token
-        .scopes
-        .iter()
-        .map(|reserved| CanonicalScopeObservation {
-            scope: reserved.scope.clone(),
-            prior_head: reserved.expected_head.clone(),
-            committed_sequence: reserved.reserved_sequence,
-            committed_head_sha256: envelope.identity.canonical_sha256.clone(),
-            committed_revision_head: None,
-            receipt_id: receipt_id.clone(),
-        })
-        .collect();
-    Ok(CanonicalReconciliation {
-        reservation_id: token.reservation_id.clone(),
-        operation_id: token.operation_id.clone(),
-        reservation_order: token.reservation_order,
-        state_fence: token.state_fence.clone(),
-        recovery_owner: token.recovery_owner.clone(),
-        scopes,
-        receipt: envelope.clone(),
-        disposition,
+    // ORS pins `committed_link` against the head this reservation reserved
+    // against, so any value invented here — from the receipt envelope identity,
+    // from the reserved sequence, or from a locally computed digest — would be
+    // a forged head that happens to parse. See this function's `# Refused`
+    // section for the measured proof that no owner read supplies it on this
+    // base.
+    Err(ReservationWriteError::Unsupported {
+        operation_id,
+        detail: "the canonical store exposes no read of the committed ordering link: \
+             WriteReceipt::ordering_sequences is OrderingHead (scope, sequence, state fence) \
+             with no digest, the reconciliation envelope carries none, the link's preimage \
+             (event_id, payload_digest) is not in the reply, and every client-reachable \
+             ordering read is SELECT VALUE body, which cannot see the chain-tip hashes the \
+             transaction CAS-compares; reconciliation is refused rather than closed with a \
+             forged head"
+            .to_owned(),
     })
 }
 

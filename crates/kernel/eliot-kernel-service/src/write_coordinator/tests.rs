@@ -234,25 +234,47 @@ fn receipt(token: &WriterReservationToken) -> TestResult<ReceiptEnvelope> {
 fn reconciliation(token: &WriterReservationToken) -> TestResult<CanonicalReconciliation> {
     let envelope = receipt(token)?;
     let receipt_id = label(envelope.identity.receipt_id.as_str())?;
-    let receipt_sha = envelope.identity.canonical_sha256.clone();
+    // Issue #1925 (W0): the committed head evidence is the ordering link the
+    // canonical owner commits for this scope, minted by the one owner algorithm
+    // `eliot_store_api::ordering_link_hash` and chained from the reserved
+    // expected head — the same preimage the store transaction CAS-compares. The
+    // receipt envelope's own identity digest is a different object and is
+    // never a head.
+    let event_id = eliot_store_api::EventId::new("event-committed-head")?;
+    let payload_digest = "cd".repeat(32);
+    let scopes = token
+        .scopes
+        .iter()
+        .map(|reserved| -> TestResult<CanonicalScopeObservation> {
+            let ordering_scope = eliot_store_api::OrderingScopeId::new(reserved.scope.as_str())?;
+            let event_hash = eliot_store_api::ordering_link_hash(
+                &event_id,
+                &payload_digest,
+                &ordering_scope,
+                reserved.reserved_sequence,
+                &reserved.expected_head.head_sha256,
+            )?;
+            Ok(CanonicalScopeObservation {
+                scope: reserved.scope.clone(),
+                prior_head: reserved.expected_head.clone(),
+                committed_link: eliot_store_api::OrderingLink {
+                    ordering_scope,
+                    ordering_sequence: reserved.reserved_sequence,
+                    previous_event_hash: reserved.expected_head.head_sha256.clone(),
+                    event_hash,
+                },
+                committed_revision_head: Some(format!("receipt:{}", receipt_id.as_str())),
+                receipt_id: receipt_id.clone(),
+            })
+        })
+        .collect::<TestResult<Vec<_>>>()?;
     Ok(CanonicalReconciliation {
         reservation_id: token.reservation_id.clone(),
         operation_id: token.operation_id.clone(),
         reservation_order: token.reservation_order,
         state_fence: token.state_fence.clone(),
         recovery_owner: token.recovery_owner.clone(),
-        scopes: token
-            .scopes
-            .iter()
-            .map(|reserved| CanonicalScopeObservation {
-                scope: reserved.scope.clone(),
-                prior_head: reserved.expected_head.clone(),
-                committed_sequence: reserved.reserved_sequence,
-                committed_head_sha256: receipt_sha.clone(),
-                committed_revision_head: Some(format!("receipt:{}", receipt_id.as_str())),
-                receipt_id: receipt_id.clone(),
-            })
-            .collect(),
+        scopes,
         receipt: envelope,
         disposition: CanonicalDisposition::Committed,
     })
