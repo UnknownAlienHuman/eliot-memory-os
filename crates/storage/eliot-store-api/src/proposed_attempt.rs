@@ -52,8 +52,6 @@ pub struct ProposedAttemptRecord {
     pub work_lease_id: String,
     /// Authenticated principal retained by the source-selection owner.
     pub principal_id: String,
-    /// Selected role retained by the source-selection owner.
-    pub selected_role: String,
     /// Closed source-capture operation name.
     pub operation: String,
     /// Selected relative source path.
@@ -95,7 +93,6 @@ impl ProposedAttemptRecord {
             (&self.work_scope_id, "proposed_attempt.work_scope_id"),
             (&self.work_lease_id, "proposed_attempt.work_lease_id"),
             (&self.principal_id, "proposed_attempt.principal_id"),
-            (&self.selected_role, "proposed_attempt.selected_role"),
             (&self.operation, "proposed_attempt.operation"),
             (
                 &self.selected_relative_path,
