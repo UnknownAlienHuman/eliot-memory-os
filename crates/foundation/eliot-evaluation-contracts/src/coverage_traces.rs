@@ -224,6 +224,72 @@ pub struct ObservationCoverageManifest {
     pub invalidation_dependencies: Vec<String>,
 }
 
+struct ProjectedChannelCoverage {
+    expected: Vec<String>,
+    streams: Vec<StreamCursorRange>,
+    blind_intervals: Vec<CoverageBlindInterval>,
+    missing_sources: Vec<String>,
+    material: Vec<MaterialActionCoverage>,
+}
+
+fn project_channel_coverage(
+    binding: &InstallationCoverageBinding,
+    channels: &[InstallationChannelCoverage],
+) -> ProjectedChannelCoverage {
+    let mut projected = ProjectedChannelCoverage {
+        expected: Vec::new(),
+        streams: Vec::new(),
+        blind_intervals: Vec::new(),
+        missing_sources: Vec::new(),
+        material: Vec::new(),
+    };
+    for channel in channels {
+        let stream = format!("watchdog:{}", channel.channel);
+        for class in &channel.expected_classes {
+            projected
+                .expected
+                .push(format!("watchdog:{}:{class}", channel.channel));
+        }
+        projected.streams.push(StreamCursorRange {
+            stream: stream.clone(),
+            first_expected_cursor: binding.interval_start_ms,
+            last_expected_cursor: binding.interval_end_ms,
+        });
+        let covered = channel.disposition.as_str() == "CONTINUOUS";
+        if !covered {
+            projected.blind_intervals.push(CoverageBlindInterval {
+                stream: stream.clone(),
+                first_missing_cursor: binding.interval_start_ms,
+                last_missing_cursor: binding.interval_end_ms,
+                reason: format!("{}:{}", channel.channel, channel.gap_reasons.join(";")),
+            });
+            if channel.disposition.as_str() == "BLIND" {
+                projected.missing_sources.push(format!(
+                    "{}:{}",
+                    channel.channel,
+                    channel.gap_reasons.join(";")
+                ));
+            }
+        }
+        projected.material.push(MaterialActionCoverage {
+            action_or_effect_route: stream,
+            covered,
+            detail: format!(
+                "source {}; expected [{}]; observed [{}]; disposition {}; dropped {}; sensor_map {}; interval {}..={}",
+                channel.expected_source,
+                channel.expected_classes.join(","),
+                channel.observed_classes.join(","),
+                channel.disposition,
+                channel.dropped_samples,
+                binding.sensor_map_revision,
+                binding.interval_start_ms,
+                binding.interval_end_ms,
+            ),
+        });
+    }
+    projected
+}
+
 impl ObservationCoverageManifest {
     /// Validates the denominator shape. A `COMPLETE` denominator carries no
     /// blind intervals; anything else stays `PARTIAL`, `UNKNOWN`, or
@@ -521,57 +587,7 @@ impl ObservationCoverageManifest {
         } else {
             CoverageCompleteness::Partial
         };
-        let mut expected = Vec::new();
-        let mut streams = Vec::new();
-        let mut blind_intervals = Vec::new();
-        let mut missing_sources = Vec::new();
-        let mut material = Vec::new();
-        for channel in channels {
-            let stream = format!("watchdog:{}", channel.channel);
-            for class in &channel.expected_classes {
-                expected.push(format!("watchdog:{}:{class}", channel.channel));
-            }
-            streams.push(StreamCursorRange {
-                stream: stream.clone(),
-                first_expected_cursor: binding.interval_start_ms,
-                last_expected_cursor: binding.interval_end_ms,
-            });
-            let covered = channel.disposition.as_str() == "CONTINUOUS";
-            if !covered {
-                blind_intervals.push(CoverageBlindInterval {
-                    stream: stream.clone(),
-                    first_missing_cursor: binding.interval_start_ms,
-                    last_missing_cursor: binding.interval_end_ms,
-                    reason: format!(
-                        "{}:{}",
-                        channel.channel,
-                        channel.gap_reasons.join(";")
-                    ),
-                });
-                if channel.disposition.as_str() == "BLIND" {
-                    missing_sources.push(format!(
-                        "{}:{}",
-                        channel.channel,
-                        channel.gap_reasons.join(";")
-                    ));
-                }
-            }
-            material.push(MaterialActionCoverage {
-                action_or_effect_route: stream,
-                covered,
-                detail: format!(
-                    "source {}; expected [{}]; observed [{}]; disposition {}; dropped {}; sensor_map {}; interval {}..={}",
-                    channel.expected_source,
-                    channel.expected_classes.join(","),
-                    channel.observed_classes.join(","),
-                    channel.disposition,
-                    channel.dropped_samples,
-                    binding.sensor_map_revision,
-                    binding.interval_start_ms,
-                    binding.interval_end_ms,
-                ),
-            });
-        }
+        let projected = project_channel_coverage(binding, channels);
         let manifest = Self {
             fingerprint: RunFingerprint {
                 product_id: binding.installation_id.clone(),
@@ -589,10 +605,10 @@ impl ObservationCoverageManifest {
                 ),
             },
             allowed_manifest_digest: binding.allowed_manifest_digest.clone(),
-            expected_event_sources_and_event_classes: expected.clone(),
-            observable_actions: expected,
+            expected_event_sources_and_event_classes: projected.expected.clone(),
+            observable_actions: projected.expected,
             unobservable_actions: Vec::new(),
-            first_and_last_expected_cursors_by_stream: streams,
+            first_and_last_expected_cursors_by_stream: projected.streams,
             counts: EventCounts {
                 received,
                 applied: continuous,
@@ -605,9 +621,9 @@ impl ObservationCoverageManifest {
                 reorders: 0,
                 payload_mutations: 0,
             },
-            blind_intervals_and_missing_source_reasons: blind_intervals,
-            missing_source_reasons: missing_sources,
-            coverage_by_material_action_and_effect_route: material,
+            blind_intervals_and_missing_source_reasons: projected.blind_intervals,
+            missing_source_reasons: projected.missing_sources,
+            coverage_by_material_action_and_effect_route: projected.material,
             denominator_origin_and_sampling_policy: DenominatorOrigin {
                 origin: INSTALLATION_COVERAGE_ORIGIN.to_owned(),
                 sampling_policy: format!(
@@ -775,10 +791,7 @@ impl InstallationChannelCoverage {
             &self.expected_source,
             "installation_channel.expected_source",
         )?;
-        text(
-            &self.disposition,
-            "installation_channel.disposition",
-        )?;
+        text(&self.disposition, "installation_channel.disposition")?;
         match self.disposition.as_str() {
             "CONTINUOUS" | "PARTIAL" | "BLIND" | "UNKNOWN" => {}
             _ => {
