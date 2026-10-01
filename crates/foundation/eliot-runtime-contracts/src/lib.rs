@@ -1027,8 +1027,7 @@ impl KernelAuthoritySnapshot {
             {
                 return Err(RuntimeContractError::InvalidField {
                     field: "active_generations",
-                    reason:
-                        "generation fence epoch must equal the snapshot authority tuple",
+                    reason: "generation fence epoch must equal the snapshot authority tuple",
                 });
             }
         }
