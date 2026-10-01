@@ -2565,9 +2565,10 @@ impl DaemonComposition {
     /// Issues the Hotset delivery receipt the runtime injector carries
     /// (issue #1882).
     ///
-    /// Same seam discipline as [`Self::skill_install_package`]: driven by the
-    /// runtime Hotset injector caller with its own approval handle; operates
-    /// on the shared catalogue only.
+    /// Same seam discipline as [`Self::skill_install_package`]: intended to be
+    /// driven by the runtime Hotset injector caller with its own approval
+    /// handle, and operates on the shared catalogue only. No production caller
+    /// reaches this seam in this tree.
     pub fn skill_deliver_hotset(
         &self,
         hotset_id: String,

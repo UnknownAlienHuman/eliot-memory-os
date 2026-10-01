@@ -351,7 +351,10 @@ impl DaemonComposition {
 
     /// Evaluates one durable maintenance trigger and never fails the caller.
     ///
-    /// This is the entry the daemon runtime loop uses. A trigger that cannot
+    /// This is the seam the daemon runtime loop is specified to use. It has no
+    /// production caller in this tree: the loop calls
+    /// `evaluate_maintenance_trigger_with_evidence` directly and handles the
+    /// typed gap there. A trigger that cannot
     /// be evaluated — the Governor is not ready yet, or the owner rejected the
     /// input — is recorded as an explicit typed gap through the same minimal
     /// operational diagnostics and the daemon continues. A maintenance
