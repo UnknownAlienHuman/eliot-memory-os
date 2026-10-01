@@ -170,6 +170,8 @@ fn unbound_normalization_receipt_envelope() -> Box<eliot_receipts::ReceiptEnvelo
     };
     let mut context = context();
     context.task_id = None;
+    context.product_id = ProductId::new(revision.work_scope.product_id.clone())
+        .expect("normalization fixture WorkScope product");
     let request = crate::user_automation::UserAutomationServiceRequest {
         context,
         authenticated_principal: "human-1".to_owned(),
