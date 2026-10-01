@@ -9389,17 +9389,16 @@ impl KernelComposition {
                 // is exhaustive and clean; an unresolved reservation, a retained
                 // problem, or a truncated scan keeps normal writes gated, and
                 // nothing is retried, decoded, or dropped to reach readiness.
-                let recovery_owner = match eliot_ors::RecoveryOwner::new(
-                    RESERVED_WRITE_RECOVERY_OWNER,
-                ) {
-                    Ok(owner) => owner,
-                    Err(error) => {
-                        return Ok(Self::store_error_response_text(
-                            "store_recovery",
-                            &error.to_string(),
-                        ));
-                    }
-                };
+                let recovery_owner =
+                    match eliot_ors::RecoveryOwner::new(RESERVED_WRITE_RECOVERY_OWNER) {
+                        Ok(owner) => owner,
+                        Err(error) => {
+                            return Ok(Self::store_error_response_text(
+                                "store_recovery",
+                                &error.to_string(),
+                            ));
+                        }
+                    };
                 let staged = match gateway
                     .reconcile_staged_writes(
                         &recovery_owner,

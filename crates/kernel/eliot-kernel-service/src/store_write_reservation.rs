@@ -1688,14 +1688,15 @@ pub fn admitted_write_binding(
     token: &WriterReservationToken,
 ) -> Result<&RecoveryWriteBinding, ReservationWriteError> {
     let operation_id = token.operation_id.as_str();
-    let binding = token.write_binding.as_ref().ok_or_else(|| {
-        ReservationWriteError::Binding {
+    let binding = token
+        .write_binding
+        .as_ref()
+        .ok_or_else(|| ReservationWriteError::Binding {
             operation_id: operation_id.to_owned(),
             detail: "the persisted reservation retains no admitted write identity, so its \
                      staged envelope cannot be reconciled by operation identity"
                 .to_owned(),
-        }
-    })?;
+        })?;
     binding.validate().map_err(ReservationWriteError::Ors)?;
     if binding.operation_id != token.operation_id
         || binding.prepared_transition_sha256 != token.prepared_transition_sha256

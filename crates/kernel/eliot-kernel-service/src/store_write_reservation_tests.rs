@@ -3633,8 +3633,8 @@ use crate::store_write_reservation::{
     StartupReconciliationReadiness, reconcile_pending_at_startup, unresolved_reservations,
 };
 use crate::{
-    EbpCanonicalStoreClient, HostStoreBootstrapRequirement,
-    admit_reserved_write_recovery_owner, admitted_write_binding,
+    EbpCanonicalStoreClient, HostStoreBootstrapRequirement, admit_reserved_write_recovery_owner,
+    admitted_write_binding,
 };
 
 /// The recovery owner the fixture's seeds record, read from the frozen
@@ -3646,11 +3646,8 @@ fn fixture_recovery_owner() -> eliot_ors::RecoveryOwner {
 
 /// A recovery owner that staged nothing: the foreign-owner instrument.
 fn foreign_recovery_owner() -> eliot_ors::RecoveryOwner {
-    OpaqueLabel::new(format!(
-        "{}-foreign",
-        fixture_992().recovery_owner
-    ))
-    .expect("992 foreign recovery owner label")
+    OpaqueLabel::new(format!("{}-foreign", fixture_992().recovery_owner))
+        .expect("992 foreign recovery owner label")
 }
 
 /// Startup-reconciliation proof harness (I1.11 step 6): a real named-pipe
@@ -4042,8 +4039,8 @@ async fn startup_reconciliation_finalizes_resolved_pending_work() {
         &route.client,
         64,
     )
-        .await
-        .expect("startup scan completes");
+    .await
+    .expect("startup scan completes");
     assert_eq!(report.scanned, 2);
     assert!(!report.truncated);
     assert!(report.pending.is_empty() && report.unknown.is_empty());
@@ -4083,8 +4080,8 @@ async fn startup_reconciliation_keeps_unknown_outcome_unresolved() {
         &route.client,
         64,
     )
-        .await
-        .expect("startup scan completes");
+    .await
+    .expect("startup scan completes");
     assert_eq!(report.scanned, 1);
     assert!(!report.truncated);
     assert!(report.pending.is_empty());
@@ -4133,8 +4130,8 @@ async fn startup_reconciliation_refuses_foreign_epoch_tokens() {
         &route.client,
         64,
     )
-        .await
-        .expect("startup scan completes");
+    .await
+    .expect("startup scan completes");
     assert_eq!(report.scanned, 1);
     assert_eq!(report.fence, stale_fence);
     assert_eq!(report.pending.len(), 1);
@@ -4187,8 +4184,8 @@ async fn startup_reconciliation_reports_truncation_bounded() {
         &route.client,
         2,
     )
-        .await
-        .expect("startup scan completes");
+    .await
+    .expect("startup scan completes");
     assert_eq!(report.scanned, 2);
     assert!(report.truncated, "cut bound reports truncation");
     assert_eq!(
@@ -4264,8 +4261,8 @@ async fn startup_reconciliation_rejects_substituted_receipt_identity() {
         &route.client,
         64,
     )
-        .await
-        .expect_err("substituted answers fail the scan");
+    .await
+    .expect_err("substituted answers fail the scan");
     assert!(
         matches!(
             error,
@@ -4331,8 +4328,8 @@ async fn startup_reconciliation_refuses_mismatched_receipts() {
         &route.client,
         64,
     )
-        .await
-        .unwrap_or_else(|error| panic!("startup mismatch scan failed: {error:?}"));
+    .await
+    .unwrap_or_else(|error| panic!("startup mismatch scan failed: {error:?}"));
     assert_eq!(report.scanned, 2);
     assert_eq!(
         report.pending.len(),
@@ -4392,10 +4389,8 @@ fn admitted_binding_for(
         payload_created_at_ms: seed.created_at_ms,
         payload_known_at_ms: seed.known_at_ms,
         payload_expires_at_ms: Some(seed.expires_at_ms),
-        operation_id: eliot_ors::OperationIdentity::new(
-            transition.identity.operation_id.as_str(),
-        )
-        .expect("992 binding operation identity"),
+        operation_id: eliot_ors::OperationIdentity::new(transition.identity.operation_id.as_str())
+            .expect("992 binding operation identity"),
         // Fixture-derived: the stable intent label the test drives, from the
         // same frozen namespace the idempotency key prefix comes from.
         write_intent_id: OpaqueLabel::new(format!(
@@ -4441,7 +4436,11 @@ fn token_with_admitted_binding(
     tag: &str,
     scope: &str,
     recovery_owner: &eliot_ors::RecoveryOwner,
-) -> (PreparedTransition, ReservationSeed, eliot_ors::WriterReservationToken) {
+) -> (
+    PreparedTransition,
+    ReservationSeed,
+    eliot_ors::WriterReservationToken,
+) {
     let fixture = fixture_992();
     let context = context_for(tag);
     let mut transition = transition_for(tag, &[scope]);
@@ -4453,11 +4452,9 @@ fn token_with_admitted_binding(
         observed_seq(&[scope], fixture.expected_sequence, ""),
     );
     let epoch = writer_epoch();
-    let fence_snapshot = eliot_ors::StateFenceSnapshot::capture(
-        &transition.state_fence,
-        epoch.current.epoch,
-    )
-    .expect("token fence snapshot");
+    let fence_snapshot =
+        eliot_ors::StateFenceSnapshot::capture(&transition.state_fence, epoch.current.epoch)
+            .expect("token fence snapshot");
     let scopes = vec![eliot_ors::ReservedScope {
         scope: OpaqueLabel::new(scope.to_owned()).expect("token scope"),
         reserved_sequence: fixture.expected_sequence,
@@ -4471,10 +4468,8 @@ fn token_with_admitted_binding(
     let token = eliot_ors::WriterReservationToken {
         reservation_id: OpaqueLabel::new(format!("{}{tag}", fixture.reservation_id_prefix))
             .expect("token reservation id"),
-        operation_id: eliot_ors::OperationIdentity::new(
-            transition.identity.operation_id.as_str(),
-        )
-        .expect("token operation id"),
+        operation_id: eliot_ors::OperationIdentity::new(transition.identity.operation_id.as_str())
+            .expect("token operation id"),
         writer_epoch: epoch,
         state_fence: fence_snapshot,
         reservation_order: 1,
@@ -4526,7 +4521,11 @@ fn admitted_write_binding_refuses_a_substituted_operation_identity() {
     let (transition, seed, mut token) =
         token_with_admitted_binding("awb2", &fixture.scope_a, &owner);
     let foreign_operation = format!("{}{}", fixture.operation_id_prefix, "foreign");
-    token.write_binding.as_mut().expect("binding present").operation_id =
+    token
+        .write_binding
+        .as_mut()
+        .expect("binding present")
+        .operation_id =
         eliot_ors::OperationIdentity::new(foreign_operation).expect("foreign operation identity");
     let error = admitted_write_binding(&token)
         .expect_err("a substituted operation identity must not be read back");
@@ -4535,7 +4534,9 @@ fn admitted_write_binding_refuses_a_substituted_operation_identity() {
         "substitution is a typed binding refusal, got {error:?}"
     );
     assert!(
-        error.to_string().contains(transition.identity.operation_id.as_str()),
+        error
+            .to_string()
+            .contains(transition.identity.operation_id.as_str()),
         "the refusal preserves the reservation's own operation identity: {error}"
     );
     // The same substituted token is refused by the owner gate too, so the
@@ -4564,7 +4565,8 @@ fn recovery_owner_refuses_a_reservation_owned_by_another_owner() {
         fixture.recovery_owner,
         "the foreign owner is a different owner, not a relabelling"
     );
-    let (_transition, _seed, token) = token_with_admitted_binding("ro1", &fixture.scope_a, &foreign);
+    let (_transition, _seed, token) =
+        token_with_admitted_binding("ro1", &fixture.scope_a, &foreign);
     let error = admit_reserved_write_recovery_owner(&token, &fixture_recovery_owner())
         .expect_err("a foreign owner's reservation is not ours to close");
     assert!(
@@ -4590,7 +4592,8 @@ fn recovery_owner_refuses_a_legacy_reservation_with_no_admitted_binding() {
     // documents as "absent only on legacy retained rows".
     let fixture = fixture_992();
     let owner = fixture_recovery_owner();
-    let (_transition, _seed, mut token) = token_with_admitted_binding("ro2", &fixture.scope_a, &owner);
+    let (_transition, _seed, mut token) =
+        token_with_admitted_binding("ro2", &fixture.scope_a, &owner);
     token.write_binding = None;
     let error = admitted_write_binding(&token)
         .expect_err("a legacy row with no admitted identity must not be reconciled");
@@ -4605,4 +4608,3 @@ fn recovery_owner_refuses_a_legacy_reservation_with_no_admitted_binding() {
         "owner gate refuses an unbound row, got {owner_error:?}"
     );
 }
-
