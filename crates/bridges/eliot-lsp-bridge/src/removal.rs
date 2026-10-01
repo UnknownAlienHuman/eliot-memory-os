@@ -205,9 +205,7 @@ impl BridgeStatusProjection {
         receipt: Option<&ObservationReceipt>,
         per_operation_exits: &BTreeMap<String, i32>,
     ) -> Self {
-        let overall = receipt
-            .map(ObservedHealth::from_receipt)
-            .unwrap_or(ObservedHealth::Unknown);
+        let overall = receipt.map_or(ObservedHealth::Unknown, ObservedHealth::from_receipt);
         Self::project(current, retained, overall, per_operation_exits)
     }
 
