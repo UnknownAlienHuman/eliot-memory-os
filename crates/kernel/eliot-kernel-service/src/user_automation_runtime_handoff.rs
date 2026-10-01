@@ -23,11 +23,10 @@
 use eliot_contracts::{RequestMetadata, StateFence};
 use eliot_kernel_core::user_automation::{
     AutomationExecutionReference, AutomationOccurrenceIdentity, DstFoldPolicy, DstGapPolicy,
-    ScheduleKind, ScheduleNormalizationReceipt, UserAutomationConfigurationState,
-    UserAutomationDeferReason,
-    UserAutomationOperation, UserAutomationRevision, UserAutomationTrigger,
-    USER_AUTOMATION_LEGACY_MIGRATION_OPERATION_KIND,
-    USER_AUTOMATION_NORMALIZATION_OPERATION_KIND,
+    ScheduleKind, ScheduleNormalizationReceipt, USER_AUTOMATION_LEGACY_MIGRATION_OPERATION_KIND,
+    USER_AUTOMATION_NORMALIZATION_OPERATION_KIND, UserAutomationConfigurationState,
+    UserAutomationDeferReason, UserAutomationOperation, UserAutomationRevision,
+    UserAutomationTrigger,
 };
 use eliot_receipts::ReceiptEnvelope;
 use eliot_runtime_contracts::WakeIntentState;
@@ -168,11 +167,9 @@ impl<'de> Deserialize<'de> for UserAutomationOperatorResultValue {
             "context" => serde_json::from_value(value)
                 .map(Self::Context)
                 .map_err(D::Error::custom),
-            "schedule_normalized" | "legacy_schedule_migrated" => {
-                serde_json::from_value(value)
-                    .map(Self::NormalizedSchedule)
-                    .map_err(D::Error::custom)
-            }
+            "schedule_normalized" | "legacy_schedule_migrated" => serde_json::from_value(value)
+                .map(Self::NormalizedSchedule)
+                .map_err(D::Error::custom),
             "transition" => serde_json::from_value(value)
                 .map(Box::new)
                 .map(Self::Transition)
@@ -411,7 +408,10 @@ impl UserAutomationOperatorResultEnvelope {
     /// Builds the read-only fence handshake response from the authenticated
     /// request already admitted by the UserAutomation route.
     pub fn from_context(request: &UserAutomationServiceRequest) -> Result<Self, String> {
-        if !matches!(&request.intent.operation, UserAutomationOperation::GetContext) {
+        if !matches!(
+            &request.intent.operation,
+            UserAutomationOperation::GetContext
+        ) {
             return Err("get_context result was requested for another operation".to_owned());
         }
         let envelope = Self {
@@ -420,12 +420,10 @@ impl UserAutomationOperatorResultEnvelope {
             status: UserAutomationOperatorResultStatus::Known,
             correlation: result_correlation(request),
             state_fence: request.context.state_fence.clone(),
-            value: UserAutomationOperatorResultValue::Context(
-                UserAutomationOperatorContextValue {
-                    outcome: "context".to_owned(),
-                    state_fence: request.context.state_fence.clone(),
-                },
-            ),
+            value: UserAutomationOperatorResultValue::Context(UserAutomationOperatorContextValue {
+                outcome: "context".to_owned(),
+                state_fence: request.context.state_fence.clone(),
+            }),
             recovery: None,
         };
         envelope.validate_for_request(request)?;
@@ -439,11 +437,8 @@ impl UserAutomationOperatorResultEnvelope {
         revision: UserAutomationRevision,
         normalization_receipt_envelope: ReceiptEnvelope,
     ) -> Result<Self, String> {
-        let outcome = validate_normalization_result(
-            request,
-            &revision,
-            &normalization_receipt_envelope,
-        )?;
+        let outcome =
+            validate_normalization_result(request, &revision, &normalization_receipt_envelope)?;
         let envelope = Self {
             wire_id: USER_AUTOMATION_RESULT_WIRE_ID.to_owned(),
             wire_version: USER_AUTOMATION_RESULT_WIRE_VERSION,
@@ -574,13 +569,19 @@ impl UserAutomationOperatorResultEnvelope {
                     || self.recovery.is_some()
                     || value.outcome != "context"
                     || value.state_fence != self.state_fence
-                    || !matches!(&request.intent.operation, UserAutomationOperation::GetContext)
+                    || !matches!(
+                        &request.intent.operation,
+                        UserAutomationOperation::GetContext
+                    )
                 {
-                    return Err("UserAutomation context result does not match its request".to_owned());
+                    return Err(
+                        "UserAutomation context result does not match its request".to_owned()
+                    );
                 }
             }
             UserAutomationOperatorResultValue::NormalizedSchedule(value) => {
-                if self.status != UserAutomationOperatorResultStatus::Known || self.recovery.is_some()
+                if self.status != UserAutomationOperatorResultStatus::Known
+                    || self.recovery.is_some()
                 {
                     return Err("UserAutomation normalization result is unresolved".to_owned());
                 }
@@ -590,7 +591,9 @@ impl UserAutomationOperatorResultEnvelope {
                     &value.normalization_receipt_envelope,
                 )?;
                 if value.outcome != expected_outcome {
-                    return Err("UserAutomation normalization result outcome mismatches request".to_owned());
+                    return Err(
+                        "UserAutomation normalization result outcome mismatches request".to_owned(),
+                    );
                 }
             }
             UserAutomationOperatorResultValue::AttemptRefusal(value) => {

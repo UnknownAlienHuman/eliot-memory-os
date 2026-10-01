@@ -92,9 +92,7 @@ impl UserAutomationServiceRequest {
     /// Store transition from which to derive `canonical_request_hash`. Its
     /// retry identity is still validated and the hash must remain empty until a
     /// later Create/Edit transition seals the exact returned receipt bytes.
-    pub fn validate_for_schedule_normalization(
-        &self,
-    ) -> Result<(), UserAutomationError> {
+    pub fn validate_for_schedule_normalization(&self) -> Result<(), UserAutomationError> {
         self.context
             .validate()
             .map_err(|_| UserAutomationError::Invalid("request.context"))?;
@@ -466,8 +464,7 @@ fn validate_mutation_result(
     match (operation, result) {
         (
             UserAutomationOperation::Create {
-                revision: expected,
-                ..
+                revision: expected, ..
             },
             UserAutomationMutationResult::Revision {
                 revision,

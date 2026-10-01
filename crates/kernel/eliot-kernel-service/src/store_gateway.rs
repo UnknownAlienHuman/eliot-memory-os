@@ -2679,10 +2679,7 @@ impl KernelStoreGateway {
     pub fn normalize_user_automation_schedule(
         request: &UserAutomationServiceRequest,
     ) -> Result<
-        (
-            UserAutomationRevision,
-            eliot_receipts::ReceiptEnvelope,
-        ),
+        (UserAutomationRevision, eliot_receipts::ReceiptEnvelope),
         UserAutomationExecutionError,
     > {
         request

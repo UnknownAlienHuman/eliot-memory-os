@@ -41,12 +41,12 @@ use std::collections::BTreeMap;
 
 use eliot_contracts::{ArtifactId, ContractId, ProductId, RequestMetadata, TransactionSequence};
 use eliot_kernel_core::user_automation::{
-    AutomationReconciliationCause, AutomationReconciliationReference,
-    ScheduleNormalizationReceipt, USER_AUTOMATION_LEGACY_MIGRATION_OPERATION_KIND,
-    USER_AUTOMATION_NORMALIZATION_AUTHORITY_ID, USER_AUTOMATION_NORMALIZATION_AUTHORITY_OWNER,
-    USER_AUTOMATION_NORMALIZATION_OPERATION_KIND, USER_AUTOMATION_NORMALIZATION_VERIFIER_ID,
-    USER_AUTOMATION_NORMALIZATION_VERIFIER_REVISION, UserAutomationExecutionProjection,
-    UserAutomationInvocation, UserAutomationOperation, UserAutomationRevision,
+    AutomationReconciliationCause, AutomationReconciliationReference, ScheduleNormalizationReceipt,
+    USER_AUTOMATION_LEGACY_MIGRATION_OPERATION_KIND, USER_AUTOMATION_NORMALIZATION_AUTHORITY_ID,
+    USER_AUTOMATION_NORMALIZATION_AUTHORITY_OWNER, USER_AUTOMATION_NORMALIZATION_OPERATION_KIND,
+    USER_AUTOMATION_NORMALIZATION_VERIFIER_ID, USER_AUTOMATION_NORMALIZATION_VERIFIER_REVISION,
+    UserAutomationExecutionProjection, UserAutomationInvocation, UserAutomationOperation,
+    UserAutomationRevision,
 };
 use eliot_receipts::{
     ArtifactBinding, AuthorityBinding, CausalBinding, EffectClass, OperationBinding, ProofCeiling,
@@ -55,11 +55,11 @@ use eliot_receipts::{
 };
 use eliot_store_api::{
     CanonicalRequestView, CanonicalStoreClient, NamedReadOperation, NamedReadRequest,
-    NamedReadResponse, OrderingScopeId, PreparedTransition, RevisionHead, ScopeId, SecurityContext,
-    OperationIdentity, StateFence, StoreError, TransitionClass, USER_AUTOMATION_SCOPE, WriteReceipt,
-    WriteReceiptStatus, audit_heads_digest, automation_create_params, automation_edit_params,
-    automation_invocation_read_request, automation_mutation_request, automation_read_request,
-    automation_revision_read_request, automation_run_now_params,
+    NamedReadResponse, OperationIdentity, OrderingScopeId, PreparedTransition, RevisionHead,
+    ScopeId, SecurityContext, StateFence, StoreError, TransitionClass, USER_AUTOMATION_SCOPE,
+    WriteReceipt, WriteReceiptStatus, audit_heads_digest, automation_create_params,
+    automation_edit_params, automation_invocation_read_request, automation_mutation_request,
+    automation_read_request, automation_revision_read_request, automation_run_now_params,
     automation_state_transition_params, canonical_json_bytes, canonical_request_hash,
     generated_operation_manifests, operation_manifest_set_digest, sha256_hex,
     with_automation_normalization_receipt,
@@ -2051,9 +2051,9 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
                     });
                 }
                 Ok(UserAutomationMutationResult::Revision {
-                        revision: stored,
-                        cancelled_wake_ids: Vec::new(),
-                    })
+                    revision: stored,
+                    cancelled_wake_ids: Vec::new(),
+                })
             }
             UserAutomationOperation::Edit {
                 previous_revision,
@@ -2284,14 +2284,11 @@ fn owner_normalization_bindings(
             return Err(UserAutomationError::ReceiptBinding);
         }
     };
-    let session = context
-        .session_id
-        .clone()
-        .map(|session_id| SessionBinding {
-            session_id,
-            authority_epoch: state_fence.authority_epoch.clone(),
-            state_fence: state_fence.clone(),
-        });
+    let session = context.session_id.clone().map(|session_id| SessionBinding {
+        session_id,
+        authority_epoch: state_fence.authority_epoch.clone(),
+        state_fence: state_fence.clone(),
+    });
     Ok((task, session))
 }
 
@@ -2305,8 +2302,8 @@ pub(crate) fn normalize_user_automation_operation(
     eliot_kernel_core::user_automation::UserAutomationError,
 > {
     use eliot_kernel_core::user_automation::{
-        UserAutomationError, USER_AUTOMATION_LEGACY_MIGRATION_OPERATION_KIND,
-        USER_AUTOMATION_NORMALIZATION_OPERATION_KIND,
+        USER_AUTOMATION_LEGACY_MIGRATION_OPERATION_KIND,
+        USER_AUTOMATION_NORMALIZATION_OPERATION_KIND, UserAutomationError,
     };
 
     request.validate_for_schedule_normalization()?;
@@ -2328,13 +2325,15 @@ pub(crate) fn normalize_user_automation_operation(
             usize::from(*occurrence_count),
             USER_AUTOMATION_LEGACY_MIGRATION_OPERATION_KIND,
         ),
-        _ => return Err(UserAutomationError::Invalid("operation.schedule_normalization")),
+        _ => {
+            return Err(UserAutomationError::Invalid(
+                "operation.schedule_normalization",
+            ));
+        }
     };
     draft.validate_for_schedule_normalization()?;
-    let schedule = super::user_automation_compiler::normalize_schedule(
-        &draft.schedule,
-        occurrence_count,
-    )?;
+    let schedule =
+        super::user_automation_compiler::normalize_schedule(&draft.schedule, occurrence_count)?;
     let mut revision = draft.clone();
     revision.schedule = schedule;
     let (declared_receipt, envelope) = issue_owner_normalization_receipt(
