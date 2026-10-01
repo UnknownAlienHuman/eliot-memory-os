@@ -4,6 +4,7 @@ use eliot_contracts::{
     ClockReading, EpochId, EpochLineageId, ReceiptId, ResourceGeneration, SourceId, StateFence,
     TaskId,
 };
+use eliot_cue_activation::derived_stage::{DerivedStage, RelationCoverage};
 use eliot_cue_activation::{
     ActivationError, ActivationProfile, MatchRule, RelationRule, evaluate_activation,
 };
@@ -866,9 +867,25 @@ fn wrong_registry_revision_is_rejected() {
         vec![candidate.admitted_bindings[0].normalized.clone()],
         2,
     );
+    // A registry revision the profile does not admit is optional-domain
+    // coverage, not corrupted shared input: the direct domain still completed,
+    // so the evaluation stands and the typed reason names the rejected edge.
+    let evaluation = evaluate_activation(&candidate, &req, &p).unwrap();
+    evaluation.validate_against(&candidate, &req, &p).unwrap();
+    assert_eq!(
+        evaluation.derived_stage,
+        DerivedStage::Unavailable {
+            reason: RelationCoverage::RegistryRevisionChanged,
+            unusable: vec![RelationEdgeId::new("edge-1".to_string()).unwrap()],
+        }
+    );
+    assert_eq!(evaluation.result.direct.len(), 1);
+    assert_eq!(evaluation.result.direct[0].target.as_str(), "a");
+    assert!(evaluation.result.derived.is_empty());
     assert!(matches!(
-        evaluate_activation(&candidate, &req, &p),
-        Err(ActivationError::ProfileBinding)
+        &evaluation.result.completeness,
+        eliot_cue_contracts::Completeness::Partial { frontier }
+            if frontier.iter().any(|id| id.as_str() == "edge-1")
     ));
 }
 
@@ -1702,9 +1719,16 @@ fn path_length_boundary_is_explicit() {
         Some("registry-1".into()),
     )
     .unwrap();
+    // Both `a` and `b` seed directly, so `edge-1` and `edge-2` are each
+    // followed inside the path-length cap. The two-hop route `a -> b -> c` is
+    // the only path that exceeds it, and it leaves no un-followed edge behind,
+    // so the bound refuses the whole evaluation instead of reporting a frontier.
     let mut req = request(
         &candidate,
-        vec![candidate.admitted_bindings[0].normalized.clone()],
+        vec![
+            candidate.admitted_bindings[0].normalized.clone(),
+            candidate.admitted_bindings[1].normalized.clone(),
+        ],
         2,
     );
     req.bounds = limited;
