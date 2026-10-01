@@ -380,9 +380,9 @@ mod tests {
     };
     use eliot_governor::{
         OPERATOR_INTENT_CONTRACT_VERSION, OperatorIntentApprovals, OperatorIntentBudget,
-        OperatorIntentEpistemic, OperatorIntentIdentity, OperatorIntentPlan,
-        OperatorIntentPlanRevision, OperatorIntentPlanRevisionRef, OperatorIntentRisk,
-        OperatorIntentRoute, OperatorIntentScope,
+        OperatorIntentEffectDisposition, OperatorIntentEpistemic, OperatorIntentIdentity,
+        OperatorIntentPlan, OperatorIntentPlanRevision, OperatorIntentPlanRevisionRef,
+        OperatorIntentRisk, OperatorIntentRoute, OperatorIntentScope,
     };
     use eliot_protocol::dreamer_job::{
         AdmissionRef, CancellationState, DurableJobRecord, DurableRequestIdentity, JobLease,
@@ -686,6 +686,7 @@ mod tests {
             selection_coverage: Vec::new(),
             selection_frontier: None,
             applicability_history: Vec::new(),
+            admission_history: Vec::new(),
         })
     }
 
@@ -732,6 +733,7 @@ mod tests {
             selection_coverage: Vec::new(),
             selection_frontier: None,
             applicability_history: Vec::new(),
+            admission_history: Vec::new(),
         })
     }
 
