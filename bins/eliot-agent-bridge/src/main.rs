@@ -13,9 +13,9 @@ use eliot_agent_bridge::{
 };
 use eliot_agent_bridge_core::{
     ACTIVATION_DISPOSITION_INVALID_REQUEST, ACTIVATION_DISPOSITION_STALE_OR_CONFLICT,
-    ACTIVATION_DISPOSITION_UNAVAILABLE_OR_CAPACITY, AttachKind, AttachRequest, BridgeError, ConnectionId,
-    CoverageGap, DemandId, EventForwardStatus, FencingToken, Generation, HostEventEnvelope,
-    ReconnectRequest, RecoveryProjectionPage, ResourceHandle, SessionId,
+    ACTIVATION_DISPOSITION_UNAVAILABLE_OR_CAPACITY, AttachKind, AttachRequest, BridgeError,
+    ConnectionId, CoverageGap, DemandId, EventForwardStatus, FencingToken, Generation,
+    HostEventEnvelope, ReconnectRequest, RecoveryProjectionPage, ResourceHandle, SessionId,
 };
 use eliot_contracts::{
     BridgeEventCapacityPressure, BridgeTransportBackpressure, EpochId, HostCorrelationDomain,

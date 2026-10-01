@@ -714,7 +714,10 @@ impl KernelComposition {
         if let Some(evidence) = bind_scope_evidence {
             self.pre_scope_bind_scope_application_gate_under_transition(envelope, evidence)?;
         } else {
-            self.host_request_application_binding_gate_under_transition(envelope, task_relative_tool)?;
+            self.host_request_application_binding_gate_under_transition(
+                envelope,
+                task_relative_tool,
+            )?;
         }
         if matches!(
             envelope.kind,
@@ -1558,7 +1561,9 @@ impl KernelComposition {
         // it without the pre-scope owner gate.
         let bind_scope_evidence = daemon_claim_queue::task_controller_admission(envelope, tool)
             .ok()
-            .filter(|invocation| invocation.action == eliot_protocol::TaskControllerAction::BindScope)
+            .filter(|invocation| {
+                invocation.action == eliot_protocol::TaskControllerAction::BindScope
+            })
             .and_then(|invocation| invocation.bind_scope_evidence);
         let binder_dispatched = if bind_scope_evidence.is_some() {
             false
@@ -2399,7 +2404,7 @@ impl KernelComposition {
     /// accepted activation result, durable ORS lifecycle/result, same bridge
     /// connection, complete fence, and current independent P-07 owner. This
     /// does not publish an application Session or an activated task binding.
-    fn pre_scope_bind_scope_evidence_still_retained_in(
+    pub(super) fn pre_scope_bind_scope_evidence_still_retained_in(
         &self,
         pending: &super::AgentActivationPendingState,
         evidence: &eliot_protocol::AgentActivationBindScopeEvidence,
@@ -2410,8 +2415,7 @@ impl KernelComposition {
             || envelope.identity.capability != "eliot.task-controller"
             || envelope.identity.session_id.as_deref() != Some(evidence.session_id.as_str())
             || envelope.identity.task_id.as_deref() != Some(evidence.task_id.as_str())
-            || envelope.identity.work_scope_id.as_deref()
-                != Some(evidence.work_scope_id.as_str())
+            || envelope.identity.work_scope_id.as_deref() != Some(evidence.work_scope_id.as_str())
             || envelope.identity.deadline_unix_ms != evidence.ticket_deadline_unix_ms
             || envelope.state_fence != evidence.state_fence
         {
@@ -2445,10 +2449,11 @@ impl KernelComposition {
         {
             return false;
         }
-        let Ok(Some(retained)) = self.generation_gateway.ors.load_activation_result(
-            &evidence.ticket_id,
-            &local.result.result_sha256,
-        ) else {
+        let Ok(Some(retained)) = self
+            .generation_gateway
+            .ors
+            .load_activation_result(&evidence.ticket_id, &local.result.result_sha256)
+        else {
             return false;
         };
         if retained.phase != eliot_ors::ActivationResultRetentionPhase::AcceptedTerminal
@@ -6539,36 +6544,34 @@ impl KernelComposition {
         {
             return Err(TransportError::SessionFenced);
         }
-        let (tool, bind_scope_evidence) =
-            if operation == AGENT_HOST_REQUEST_REHYDRATE_OPERATION {
-                let evidence = payload
-                    .get("bind_scope_evidence")
-                    .cloned()
-                    .ok_or(TransportError::SessionFenced)
-                    .and_then(|value| {
-                        serde_json::from_value::<
-                            eliot_protocol::AgentActivationBindScopeEvidence,
-                        >(value)
-                        .map_err(|_| TransportError::SessionFenced)
-                    })?;
-                (None, evidence)
-            } else {
-                let tool = host_request_tool_from_payload(&payload)?;
-                let invocation = daemon_claim_queue::task_controller_admission(&envelope, &tool)?;
-                if invocation.action != eliot_protocol::TaskControllerAction::BindScope {
-                    return Err(TransportError::SessionFenced);
-                }
-                let evidence = invocation
-                    .bind_scope_evidence
-                    .ok_or(TransportError::SessionFenced)?;
-                (Some(tool), evidence)
-            };
+        let (tool, bind_scope_evidence) = if operation == AGENT_HOST_REQUEST_REHYDRATE_OPERATION {
+            let evidence = payload
+                .get("bind_scope_evidence")
+                .cloned()
+                .ok_or(TransportError::SessionFenced)
+                .and_then(|value| {
+                    serde_json::from_value::<eliot_protocol::AgentActivationBindScopeEvidence>(
+                        value,
+                    )
+                    .map_err(|_| TransportError::SessionFenced)
+                })?;
+            (None, evidence)
+        } else {
+            let tool = host_request_tool_from_payload(&payload)?;
+            let invocation = daemon_claim_queue::task_controller_admission(&envelope, &tool)?;
+            if invocation.action != eliot_protocol::TaskControllerAction::BindScope {
+                return Err(TransportError::SessionFenced);
+            }
+            let evidence = invocation
+                .bind_scope_evidence
+                .ok_or(TransportError::SessionFenced)?;
+            (Some(tool), evidence)
+        };
         let evidence = &bind_scope_evidence;
         if envelope.state_fence != evidence.state_fence
             || envelope.identity.session_id.as_deref() != Some(evidence.session_id.as_str())
             || envelope.identity.task_id.as_deref() != Some(evidence.task_id.as_str())
-            || envelope.identity.work_scope_id.as_deref()
-                != Some(evidence.work_scope_id.as_str())
+            || envelope.identity.work_scope_id.as_deref() != Some(evidence.work_scope_id.as_str())
         {
             return Err(TransportError::SessionFenced);
         }
@@ -6594,8 +6597,7 @@ impl KernelComposition {
                     {
                         let _transition = self.agent_bridge_transition_read()?;
                         self.pre_scope_bind_scope_application_gate_under_transition(
-                            &envelope,
-                            evidence,
+                            &envelope, evidence,
                         )?;
                     }
                     let receipt = host_request_receipt_from_payload(&payload)?;

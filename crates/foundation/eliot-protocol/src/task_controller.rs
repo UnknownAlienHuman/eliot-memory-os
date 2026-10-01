@@ -207,10 +207,13 @@ impl TaskControllerInvocation {
         )?;
         structured_object(&self.task_input, "task_controller_invocation.task_input")?;
         if self.action == TaskControllerAction::BindScope {
-            let evidence = self.bind_scope_evidence.as_ref().ok_or(ProtocolError::InvalidField {
-                field: "task_controller_invocation.bind_scope_evidence",
-                reason: "BIND_SCOPE requires the exact retained pre-scope owner proof",
-            })?;
+            let evidence =
+                self.bind_scope_evidence
+                    .as_ref()
+                    .ok_or(ProtocolError::InvalidField {
+                        field: "task_controller_invocation.bind_scope_evidence",
+                        reason: "BIND_SCOPE requires the exact retained pre-scope owner proof",
+                    })?;
             evidence.validate()?;
             if evidence.task_id != self.task_id.as_str()
                 || evidence.work_scope_id != self.work_scope_id
