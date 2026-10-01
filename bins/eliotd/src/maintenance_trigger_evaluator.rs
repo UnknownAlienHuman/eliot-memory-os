@@ -1219,9 +1219,7 @@ impl AdmitMaintenanceRevocationError {
             Self::StaleFence => {
                 "committed closure is not bound to the live composition State Fence"
             }
-            Self::NoAdmittedSession => {
-                "no Kernel-validated session binding for this connection"
-            }
+            Self::NoAdmittedSession => "no Kernel-validated session binding for this connection",
         }
     }
 }

@@ -3332,7 +3332,8 @@ impl DaemonClosureLinkPort {
     ) -> Result<Option<GrantClosureReceipt>, KernelPortError> {
         if self.client.kernel_fence() != self.state_fence {
             return Err(KernelPortError::Contract(
-                "closure link port is bound to a different Kernel generation State Fence".to_owned(),
+                "closure link port is bound to a different Kernel generation State Fence"
+                    .to_owned(),
             ));
         }
         let value = self
@@ -3347,9 +3348,7 @@ impl DaemonClosureLinkPort {
             .await
             .map_err(kernel_port_error)?;
         let object = value.as_object().ok_or_else(|| {
-            KernelPortError::Contract(
-                "grant closure receipt read is not a typed object".to_owned(),
-            )
+            KernelPortError::Contract("grant closure receipt read is not a typed object".to_owned())
         })?;
         let payload = match object.get("kind").and_then(serde_json::Value::as_str) {
             Some(GRANT_CLOSURE_RECEIPT_KIND) => object.get("value").cloned().ok_or_else(|| {
@@ -3376,12 +3375,11 @@ impl DaemonClosureLinkPort {
                 )));
             }
         };
-        let closure: GrantClosureReceipt =
-            serde_json::from_value(payload).map_err(|error| {
-                KernelPortError::Contract(format!(
-                    "grant closure receipt for {target_grant_id} does not decode: {error}"
-                ))
-            })?;
+        let closure: GrantClosureReceipt = serde_json::from_value(payload).map_err(|error| {
+            KernelPortError::Contract(format!(
+                "grant closure receipt for {target_grant_id} does not decode: {error}"
+            ))
+        })?;
         closure.validate().map_err(|error| {
             KernelPortError::Contract(format!(
                 "committed closure for {target_grant_id} fails its own receipt contract: {error}"
@@ -3415,7 +3413,8 @@ impl DaemonClosureLinkPort {
     ) -> Result<GrantClosureSecondPhaseLink, KernelPortError> {
         if self.client.kernel_fence() != self.state_fence {
             return Err(KernelPortError::Contract(
-                "closure link port is bound to a different Kernel generation State Fence".to_owned(),
+                "closure link port is bound to a different Kernel generation State Fence"
+                    .to_owned(),
             ));
         }
         let value = self
@@ -3468,30 +3467,28 @@ impl DaemonClosureLinkPort {
                 "canonical closure link projection is not a typed object".to_owned(),
             )
         })?;
-        let commit: GrantClosureReceipt = serde_json::from_value(
-            projection.get("commit").cloned().ok_or_else(|| {
+        let commit: GrantClosureReceipt =
+            serde_json::from_value(projection.get("commit").cloned().ok_or_else(|| {
                 KernelPortError::Contract(
                     "canonical closure link projection is missing its committed closure".to_owned(),
                 )
-            })?,
-        )
-        .map_err(|error| {
-            KernelPortError::Contract(format!(
-                "canonical closure link projection does not decode: {error}"
-            ))
-        })?;
-        let second_phase: Option<ReceiptIdentity> = serde_json::from_value(
-            projection.get("second_phase").cloned().ok_or_else(|| {
+            })?)
+            .map_err(|error| {
+                KernelPortError::Contract(format!(
+                    "canonical closure link projection does not decode: {error}"
+                ))
+            })?;
+        let second_phase: Option<ReceiptIdentity> =
+            serde_json::from_value(projection.get("second_phase").cloned().ok_or_else(|| {
                 KernelPortError::Contract(
                     "canonical closure link projection is missing its second phase".to_owned(),
                 )
-            })?,
-        )
-        .map_err(|error| {
-            KernelPortError::Contract(format!(
-                "canonical closure link receipt does not decode: {error}"
-            ))
-        })?;
+            })?)
+            .map_err(|error| {
+                KernelPortError::Contract(format!(
+                    "canonical closure link receipt does not decode: {error}"
+                ))
+            })?;
         commit.validate().map_err(|error| {
             KernelPortError::Contract(format!(
                 "linked closure for {operation_id} fails its own receipt contract: {error}"

@@ -314,8 +314,8 @@ pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionRead
 pub use maintenance_dispatch::{MaintenanceDecisionGap, MaintenanceDispatch, decision_gap};
 pub use maintenance_trigger_evaluator::{
     AdmitMaintenanceRevocationError, AdmittedMaintenanceRevocation, BoundRevocationResume,
-    MaintenanceObservation, MaintenanceTriggerOrigin, RevocationResumeIngress, SELF_OBSERVED_FAMILY,
-    UNRESOLVED_AUTHORITIES,
+    MaintenanceObservation, MaintenanceTriggerOrigin, RevocationResumeIngress,
+    SELF_OBSERVED_FAMILY, UNRESOLVED_AUTHORITIES,
 };
 pub use negative_memory_action_gate::{
     NegativeMemoryActionError, NegativeMemoryActionOutcome, NegativeMemoryPendingAction,
