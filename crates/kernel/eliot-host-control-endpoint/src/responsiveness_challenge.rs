@@ -25,7 +25,8 @@
 //! Credentials, nonces, and raw path/user data are never fields here.
 
 use eliot_host_service::runtime_control::{
-    HostRuntimeControlRequest, HostRuntimeControlResponse, response_matches_request,
+    HostControlChallenge, HostControlChallengeResponse, HostRuntimeControlRequest,
+    HostRuntimeControlResponse, response_matches_request,
 };
 
 /// Protocol revision of the owner-challenge binding. Responses carrying any
@@ -149,4 +150,124 @@ pub fn validate_owner_challenge_response(
         return Err("response does not exactly correlate with the challenge".to_owned());
     }
     Ok(())
+}
+
+/// One Watchdog-issued responsiveness challenge bound to the wire-owner
+/// challenge contract (`eliot-host-service::runtime_control`).
+///
+/// This is the typed form of [`OwnerChallengeEnvelope`]: the challenge
+/// identity is the carrier request's `request_id` (exactly the wire-owner
+/// challenge's `challenge_id`), and the expected owner digest is the
+/// wire-owner challenge's `expected_owner_epoch_digest`. Every validation
+/// below reuses the wire-owner validators; this cell adds only the
+/// carrier-to-challenge identity binding.
+///
+/// The answering side is the Host control-owner contour that drains the
+/// bounded owner queue (see [`owner_answer_correlates`]). STITCH: the
+/// production caller lives in the Host composition lane
+/// (`bins/eliot-host/src/main.rs`, `process_runtime_control_requests`), which
+/// must call the wire-owner [`HostControlChallengeResponse::answer`]
+/// constructor at the queue drain and pass the result through the correlation
+/// gate here; until it is wired, neither call has a production caller.
+pub struct TypedOwnerChallenge {
+    request: HostRuntimeControlRequest,
+    challenge: HostControlChallenge,
+}
+
+impl TypedOwnerChallenge {
+    /// Binds an issued wire-owner challenge to the exact owner-path request
+    /// that carries it.
+    ///
+    /// Runs both wire-owner validators, then requires the challenge identity
+    /// to equal the carrier request identity: a challenge bound to another
+    /// carrier cannot be issued here. Agreement on the expected owner digest
+    /// is enforced at answer time by exact correlation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a refusal when either peer fails its own validation or when
+    /// the challenge identity is not the carrier request identity.
+    pub fn bind(
+        request: HostRuntimeControlRequest,
+        challenge: HostControlChallenge,
+    ) -> Result<Self, String> {
+        request.validate()?;
+        challenge.validate()?;
+        if challenge.challenge_id.as_str() != request.request_id.as_str() {
+            return Err("challenge identity is not the carrier request identity".to_owned());
+        }
+        Ok(Self { request, challenge })
+    }
+
+    /// The exact owner-path request carrying this challenge.
+    #[must_use]
+    pub const fn request(&self) -> &HostRuntimeControlRequest {
+        &self.request
+    }
+
+    /// The bound wire-owner challenge.
+    #[must_use]
+    pub const fn challenge(&self) -> &HostControlChallenge {
+        &self.challenge
+    }
+
+    /// The challenge identity: exactly the carrier request identity.
+    #[must_use]
+    pub fn challenge_id(&self) -> &str {
+        self.challenge.challenge_id.as_str()
+    }
+}
+
+/// Checks one contour-produced answer for exact correlation before the
+/// endpoint serializes it onto the owner queue reply.
+///
+/// The answer itself is constructed with the wire-owner constructor
+/// ([`HostControlChallengeResponse::answer`]) at the owner-queue drain, from
+/// the contour's current owner/epoch digests plus the defined control-progress
+/// observation. This gate then requires both wire-owner validators to hold
+/// and the answer to correlate exactly (same challenge identity, same
+/// revision, answering owner/epoch equal to the expected owner-epoch digest).
+/// A listener-thread echo, a healthy-helper answer, or a Kernel/daemon reply
+/// carries a different owner digest and cannot correlate.
+///
+/// STITCH (Host composition lane): call the wire-owner `answer` constructor
+/// inside the owner-queue drain in `bins/eliot-host/src/main.rs`
+/// (`process_runtime_control_requests`) so the answer carries the contour's
+/// live owner/epoch plus its loop-advance observation, then pass the result
+/// through this gate before replying. Until then neither call has a
+/// production caller.
+#[must_use]
+pub fn owner_answer_correlates(
+    bound: &TypedOwnerChallenge,
+    response: &HostControlChallengeResponse,
+) -> bool {
+    bound.request.validate().is_ok()
+        && response.validate().is_ok()
+        && response.correlates(bound.challenge())
+}
+
+/// Validates one typed owner answer against the bound challenge.
+///
+/// Runs both wire-owner validators, then requires exact correlation (same
+/// challenge identity, same revision, answering owner/epoch equal to the
+/// expected owner-epoch digest), freshness within the absolute deadline, and
+/// replay refusal when the challenger already consumed this identity. A
+/// forged, replayed, wrong-epoch, or stale answer cannot satisfy all gates at
+/// once.
+///
+/// A successful validation proves only that the current Host control owner
+/// answered this exact challenge within its bound — the declared control
+/// property — not whole-product readiness.
+///
+/// # Errors
+///
+/// Returns a refusal when any gate above fails.
+pub fn validate_typed_owner_challenge_response(
+    bound: &TypedOwnerChallenge,
+    response: &HostControlChallengeResponse,
+    already_answered: bool,
+    now_unix_ms: u64,
+) -> Result<(), String> {
+    bound.request.validate()?;
+    response.validate_against(bound.challenge(), already_answered, now_unix_ms)
 }

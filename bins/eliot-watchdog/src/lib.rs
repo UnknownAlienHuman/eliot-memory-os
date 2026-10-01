@@ -72,11 +72,14 @@ mod self_admission;
 mod service_registration_projection;
 mod supervision_lease_load;
 mod watchdog_admission;
+mod watchdog_challenge;
+mod watchdog_challenge_audit;
 mod watchdog_composition;
 mod watchdog_config;
 pub mod watchdog_fallback_composition;
 mod watchdog_fallback_envelope;
 mod watchdog_publication_readback;
+mod watchdog_recovery_policy;
 mod watchdog_spool;
 
 pub use diagnostics::install_subscriber;
@@ -91,8 +94,9 @@ pub use eliot_watchdog_core::{WatchdogSpoolAcknowledgement, WatchdogSpoolExportB
 use host_identity_observation::classify_host_error;
 use host_identity_observation::read_host_registration_runtime;
 pub use host_identity_observation::{
+    ApprovedRecoveryPolicy, BoundedChallengeWait, ChallengeAttemptOutcome, ChallengeUncertainty,
     HostIdentityMonitor, HostObservation, HostObservationSource, HostObservationState,
-    LiveHostObservationSource,
+    HostResponsiveness, LiveHostObservationSource, RecoveryBudgetDecision,
 };
 pub use independent_sensor::{
     ApprovedSensorBinding, ArtifactDigestObservation, MAX_APPROVED_ARTIFACT_DIGEST_BYTES,
@@ -201,6 +205,19 @@ use watchdog_admission::validate_runtime_binding;
 pub use watchdog_admission::{
     AdmittedIsolatedDestination, FileWatchdogAdmission, WatchdogRuntimeBinding,
     admit_isolated_destination,
+};
+pub use watchdog_challenge::{
+    ChallengeReplayGuard, WATCHDOG_CHALLENGE_PROTOCOL_REVISION, WatchdogChallengeBinding,
+    WatchdogChallengeError, WatchdogChallengeSpec, rechecked_responsiveness,
+};
+pub use watchdog_challenge_audit::{
+    AuditDelivery, BoundedAuditHandoff, ChallengeAuditError, ChallengeAuditEvent,
+    ChallengeAuditRecord, WATCHDOG_AUDIT_DETAIL_MAX_CHARS, WATCHDOG_AUDIT_HANDOFF_CAPACITY,
+    WATCHDOG_EVENT_LOG_SOURCE, observe_audit_delivery,
+};
+pub use watchdog_recovery_policy::{
+    InstalledRecoveryPolicyInput, RecoveryPolicyLoadError, decide_recovery,
+    load_installed_recovery_policy,
 };
 pub use watchdog_composition::{
     WatchdogAuthorityState, WatchdogBackupPort, WatchdogComposition, WatchdogReadiness,

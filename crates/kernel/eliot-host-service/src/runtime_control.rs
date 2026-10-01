@@ -2478,6 +2478,323 @@ fn validate_production_trace_context(frame: &Frame) -> Result<(), String> {
     Ok(())
 }
 
+// --- Host control-owner responsiveness challenge (issue #1757, I8.3) ---
+//
+// The wire contract below stays owned by this module (`eliot-host-service` is
+// the Host wire owner). It distinguishes a live Host process from a responsive
+// current Host control owner: a challenge is bound to the exact owner-path
+// request that carries it, and only the control-owner contour that drains the
+// bounded owner queue can answer it with an exactly correlated response. A
+// listener-thread echo cannot prove the control loop is making progress, and
+// a response proves only the declared control property, never
+// whole-product readiness.
+//
+// Redaction: only digests and coordination identities travel here. The 256-bit
+// nonce itself never travels — only its sha256 digest — and credentials, raw
+// paths, and user data are never fields.
+
+/// Protocol revision of the Host control-owner challenge binding. Answers
+/// carrying any other revision are refused so a stale or foreign challenge
+/// can never establish responsiveness.
+pub const HOST_CONTROL_CHALLENGE_PROTOCOL_REVISION: u16 = 1;
+
+/// Upper bound, in seconds, for one challenge wait. The challenge travels the
+/// existing bounded owner queue (30s response bound); a longer wait would
+/// outlive the queue guarantee and is refused at issue time.
+pub const HOST_CONTROL_CHALLENGE_MAX_WAIT_SECS: u64 = 30;
+
+fn is_challenge_identity(value: &PlatformHandle) -> bool {
+    !value.as_str().trim().is_empty()
+        && !value.as_str().chars().any(char::is_control)
+}
+
+/// One Watchdog-issued responsiveness challenge bound to the installation's
+/// pre-authorized recovery contour.
+///
+/// `challenge_id` is the challenge identity and must equal the carrier
+/// request's `request_id`: exact correlation is a content comparison, never a
+/// second lookup. `nonce_digest` is the sha256 of a fresh 256-bit nonce the
+/// challenger generated for this challenge identity; the nonce itself never
+/// travels. `expected_owner_epoch_digest` is the canonical owner-epoch digest
+/// (`eliot-host-state::host_owner_epoch_digest`) the answering owner must
+/// report. `deadline_unix_ms` is the absolute freshness bound for the answer.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostControlChallenge {
+    pub challenge_id: PlatformHandle,
+    pub nonce_digest: PlatformHandle,
+    pub watchdog_installation: PlatformHandle,
+    pub policy_digest: PlatformHandle,
+    pub expected_owner_epoch_digest: PlatformHandle,
+    pub approved_service: PlatformHandle,
+    pub approved_generation: PlatformHandle,
+    pub deadline_unix_ms: u64,
+    pub protocol_revision: u16,
+}
+
+impl HostControlChallenge {
+    /// Issues a challenge binding every required identity at once.
+    ///
+    /// Refuses a blank challenge identity, a non-sha256 nonce digest, any
+    /// blank coordination identity, a zero deadline, a deadline that does not
+    /// follow `issued_at_unix_ms`, a wait longer than
+    /// [`HOST_CONTROL_CHALLENGE_MAX_WAIT_SECS`], and any protocol revision
+    /// other than [`HOST_CONTROL_CHALLENGE_PROTOCOL_REVISION`].
+    pub fn issue(
+        challenge_id: PlatformHandle,
+        nonce_digest: PlatformHandle,
+        watchdog_installation: PlatformHandle,
+        policy_digest: PlatformHandle,
+        expected_owner_epoch_digest: PlatformHandle,
+        approved_service: PlatformHandle,
+        approved_generation: PlatformHandle,
+        issued_at_unix_ms: u64,
+        wait_secs: u64,
+    ) -> Result<Self, String> {
+        let value = Self {
+            challenge_id,
+            nonce_digest,
+            watchdog_installation,
+            policy_digest,
+            expected_owner_epoch_digest,
+            approved_service,
+            approved_generation,
+            deadline_unix_ms: issued_at_unix_ms
+                .checked_add(wait_secs.checked_mul(1000).ok_or_else(|| {
+                    "challenge wait overflows the deadline bound".to_owned()
+                })?)
+                .ok_or_else(|| "challenge deadline overflows".to_owned())?,
+            protocol_revision: HOST_CONTROL_CHALLENGE_PROTOCOL_REVISION,
+        };
+        if wait_secs == 0 || wait_secs > HOST_CONTROL_CHALLENGE_MAX_WAIT_SECS {
+            return Err("challenge wait is outside the bounded owner-queue guarantee".to_owned());
+        }
+        value.validate()?;
+        if value.deadline_unix_ms <= issued_at_unix_ms {
+            return Err("challenge deadline does not follow issue time".to_owned());
+        }
+        Ok(value)
+    }
+
+    /// Validates the challenge shape with this wire owner's own rules.
+    pub fn validate(&self) -> Result<(), String> {
+        if !is_challenge_identity(&self.challenge_id) {
+            return Err("challenge identity is not a coordination identity".to_owned());
+        }
+        if !is_sha256_digest(&self.nonce_digest) {
+            return Err("challenge nonce digest must be lowercase sha256".to_owned());
+        }
+        for (value, name) in [
+            (&self.watchdog_installation, "watchdog installation"),
+            (&self.policy_digest, "policy binding"),
+            (&self.expected_owner_epoch_digest, "expected owner epoch"),
+            (&self.approved_service, "approved service"),
+            (&self.approved_generation, "approved generation"),
+        ] {
+            if !is_challenge_identity(value) {
+                return Err(format!("challenge {name} is not a coordination identity"));
+            }
+        }
+        if self.deadline_unix_ms == 0 {
+            return Err("challenge deadline is zero".to_owned());
+        }
+        if self.protocol_revision != HOST_CONTROL_CHALLENGE_PROTOCOL_REVISION {
+            return Err("challenge protocol revision mismatch".to_owned());
+        }
+        Ok(())
+    }
+
+    /// Refuses a challenge answered after its absolute deadline.
+    pub fn fresh_at(&self, now_unix_ms: u64) -> Result<(), String> {
+        if now_unix_ms > self.deadline_unix_ms {
+            return Err("challenge answer arrived after its deadline".to_owned());
+        }
+        Ok(())
+    }
+}
+
+/// The control-progress observation the Host control owner reports with its
+/// answer. It is owner-local progress evidence (a digest over the owner's
+/// loop-advance counter plus its monotonic sequence), not whole-product
+/// readiness: `progress_seq` proves the loop advanced, nothing more.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostControlProgressObservation {
+    pub progress_digest: PlatformHandle,
+    pub progress_seq: u64,
+}
+
+impl HostControlProgressObservation {
+    /// Validates the observation shape. A digest over no progress is still a
+    /// well-formed digest; whether the sequence advanced is the challenger's
+    /// comparison against its retained predecessor.
+    pub fn validate(&self) -> Result<(), String> {
+        validate_runtime_control_digest(&self.progress_digest, "control progress digest")
+    }
+}
+
+/// The Host control owner's answer to one [`HostControlChallenge`].
+///
+/// It carries the same challenge identity plus the answering owner's current
+/// owner/epoch digests and the defined control-progress observation. The
+/// owner/epoch digests must equal the challenge's expected digest: a forged,
+/// replayed-across-epoch, or wrong-epoch answer cannot correlate.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostControlChallengeResponse {
+    pub challenge_id: PlatformHandle,
+    pub owner_digest: PlatformHandle,
+    pub owner_epoch_digest: PlatformHandle,
+    pub control_progress: HostControlProgressObservation,
+    pub protocol_revision: u16,
+}
+
+impl HostControlChallengeResponse {
+    /// Answers one validated challenge from the control-owner contour.
+    ///
+    /// Runs the challenge validator first so no answer can be minted against
+    /// an ill-formed challenge. The caller must be the control-owner contour
+    /// that drained the bounded owner queue; a healthy-helper echo elsewhere
+    /// carries a different owner digest and cannot correlate.
+    pub fn answer(
+        challenge: &HostControlChallenge,
+        owner_digest: PlatformHandle,
+        owner_epoch_digest: PlatformHandle,
+        control_progress: HostControlProgressObservation,
+    ) -> Result<Self, String> {
+        challenge.validate()?;
+        control_progress.validate()?;
+        if !is_challenge_identity(&owner_digest) {
+            return Err("answering owner digest is not a coordination identity".to_owned());
+        }
+        if !is_challenge_identity(&owner_epoch_digest) {
+            return Err("answering owner epoch digest is not a coordination identity".to_owned());
+        }
+        Ok(Self {
+            challenge_id: challenge.challenge_id.clone(),
+            owner_digest,
+            owner_epoch_digest,
+            control_progress,
+            protocol_revision: HOST_CONTROL_CHALLENGE_PROTOCOL_REVISION,
+        })
+    }
+
+    /// Validates the answer shape with this wire owner's own rules.
+    pub fn validate(&self) -> Result<(), String> {
+        if !is_challenge_identity(&self.challenge_id) {
+            return Err("challenge answer identity is not a coordination identity".to_owned());
+        }
+        for (value, name) in [
+            (&self.owner_digest, "answering owner"),
+            (&self.owner_epoch_digest, "answering owner epoch"),
+        ] {
+            if !is_challenge_identity(value) {
+                return Err(format!("challenge answer {name} is not a coordination identity"));
+            }
+        }
+        self.control_progress.validate()?;
+        if self.protocol_revision != HOST_CONTROL_CHALLENGE_PROTOCOL_REVISION {
+            return Err("challenge answer protocol revision mismatch".to_owned());
+        }
+        Ok(())
+    }
+
+    /// Whether this answer exactly correlates with the challenge that issued
+    /// it: same challenge identity, same protocol revision, and the answering
+    /// owner/epoch equal the expected owner-epoch digest.
+    #[must_use]
+    pub fn correlates(&self, challenge: &HostControlChallenge) -> bool {
+        self.challenge_id == challenge.challenge_id
+            && self.protocol_revision == challenge.protocol_revision
+            && self.owner_digest == challenge.expected_owner_epoch_digest
+            && self.owner_epoch_digest == challenge.expected_owner_epoch_digest
+    }
+
+    /// Validates one owner answer against the challenge that issued it:
+    /// both peers' wire validators, exact correlation, freshness bound, and
+    /// replay refusal when the challenger already consumed this identity.
+    ///
+    /// A successful validation proves only that the current Host control
+    /// owner answered this exact challenge within its bound — the declared
+    /// control property — not whole-product readiness.
+    pub fn validate_against(
+        &self,
+        challenge: &HostControlChallenge,
+        already_answered: bool,
+        now_unix_ms: u64,
+    ) -> Result<(), String> {
+        challenge.validate()?;
+        self.validate()?;
+        if already_answered {
+            return Err("challenge identity was already answered; replay refused".to_owned());
+        }
+        challenge.fresh_at(now_unix_ms)?;
+        if !self.correlates(challenge) {
+            return Err("response does not exactly correlate with the challenge".to_owned());
+        }
+        Ok(())
+    }
+}
+
+/// A bounded control-lane reservation held for one challenge identity.
+///
+/// The reservation binds the challenge to the answering owner digest and its
+/// absolute deadline. It reserves the bounded owner queue only: it never
+/// routes through the unavailable Kernel/daemon contour, and it never treats
+/// a healthy-helper echo as the control loop's own progress — only an answer
+/// whose owner digest equals the reserved one correlates.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlLaneReservation {
+    pub challenge_id: PlatformHandle,
+    pub owner_digest: PlatformHandle,
+    pub deadline_unix_ms: u64,
+}
+
+impl ControlLaneReservation {
+    /// Reserves the control lane for one validated challenge.
+    ///
+    /// Refuses a zero or over-bound wait (mirroring the owner-queue
+    /// guarantee), a deadline that does not follow `now_unix_ms`, and any
+    /// owner digest that is not a coordination identity.
+    pub fn reserve(
+        challenge: &HostControlChallenge,
+        owner_digest: PlatformHandle,
+        wait_secs: u64,
+        now_unix_ms: u64,
+    ) -> Result<Self, String> {
+        challenge.validate()?;
+        if !is_challenge_identity(&owner_digest) {
+            return Err("reserved owner digest is not a coordination identity".to_owned());
+        }
+        if wait_secs == 0 || wait_secs > HOST_CONTROL_CHALLENGE_MAX_WAIT_SECS {
+            return Err("control-lane reservation is outside the bounded owner-queue guarantee"
+                .to_owned());
+        }
+        let deadline_unix_ms = now_unix_ms
+            .checked_add(
+                wait_secs
+                    .checked_mul(1000)
+                    .ok_or_else(|| "control-lane wait overflows the deadline bound".to_owned())?,
+            )
+            .ok_or_else(|| "control-lane deadline overflows".to_owned())?;
+        if deadline_unix_ms <= now_unix_ms || deadline_unix_ms > challenge.deadline_unix_ms {
+            return Err("control-lane reservation outlives its challenge".to_owned());
+        }
+        Ok(Self {
+            challenge_id: challenge.challenge_id.clone(),
+            owner_digest,
+            deadline_unix_ms,
+        })
+    }
+
+    /// Whether the reservation still holds at `now_unix_ms`.
+    #[must_use]
+    pub const fn live_at(self, now_unix_ms: u64) -> bool {
+        now_unix_ms <= self.deadline_unix_ms
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

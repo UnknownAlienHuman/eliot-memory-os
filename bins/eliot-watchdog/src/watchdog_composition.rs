@@ -1392,3 +1392,126 @@ impl WatchdogBackupPort {
         Ok(disposition)
     }
 }
+
+/// One composed Watchdog responsiveness-challenge attempt (issue #1757 W1).
+///
+/// The verdict, budget decision, correlated audit record, and handoff
+/// disposition for a single challenge identity. This value requests no
+/// effect: durable journaling of the outcome/budget/intent before SCM effects
+/// is owned by the composition/spool lane (STITCH: #1754 writer), and fenced
+/// SCM execution is owned by the Host-state lane (STITCH: Host composition
+/// lane).
+pub struct ComposedChallengeAttempt {
+    pub binding: crate::watchdog_challenge::WatchdogChallengeBinding,
+    pub verdict: crate::HostResponsiveness,
+    pub decision: crate::RecoveryBudgetDecision,
+    pub audit: crate::watchdog_challenge_audit::ChallengeAuditRecord,
+    pub delivery: crate::watchdog_challenge_audit::AuditDelivery,
+}
+
+/// Composes one challenge attempt from already-observed evidence: issue the
+/// installation-bound challenge, recheck target identity around the bounded
+/// interval, decide recovery eligibility from the verdict plus the durable
+/// used-attempt count, and record one correlated audit record through the
+/// finite handoff.
+///
+/// `durable_used_attempts` is the count read from the durable Watchdog
+/// journal — never invented and never reset here. When the loaded policy's
+/// audit-failure disposition refuses effects, the executing lane must withhold
+/// the SCM request unless `delivery` is `Delivered`; this function itself
+/// replays no effect for a pending or failed handoff.
+///
+/// # Errors
+///
+/// Returns [`CompositionError::InvalidConfiguration`] when the challenge
+/// spec, the installed policy, or the audit correlation identities are not
+/// admissible.
+pub fn compose_responsiveness_challenge_attempt(
+    spec: &crate::watchdog_challenge::WatchdogChallengeSpec,
+    challenge_id: &str,
+    issued_at_unix_ms: u64,
+    wait_secs: u64,
+    before: &crate::HostObservation,
+    after: &crate::HostObservation,
+    wait: &crate::BoundedChallengeWait,
+    attempt: &crate::ChallengeAttemptOutcome,
+    policy_input: &crate::watchdog_recovery_policy::InstalledRecoveryPolicyInput,
+    durable_used_attempts: u64,
+    audit_sink: Option<&crate::watchdog_challenge_audit::BoundedAuditHandoff>,
+) -> Result<ComposedChallengeAttempt, CompositionError> {
+    use crate::host_identity_observation::{ChallengeUncertainty, HostResponsiveness};
+    use crate::watchdog_challenge_audit::ChallengeAuditEvent;
+
+    let binding = crate::watchdog_challenge::WatchdogChallengeBinding::issue(
+        spec,
+        challenge_id,
+        issued_at_unix_ms,
+        wait_secs,
+    )
+    .map_err(|error| CompositionError::InvalidConfiguration(error.to_string()))?;
+    let policy = crate::watchdog_recovery_policy::load_installed_recovery_policy(policy_input)
+        .map_err(|error| CompositionError::InvalidConfiguration(error.to_string()))?;
+    let verdict = crate::watchdog_challenge::rechecked_responsiveness(before, after, wait, attempt);
+    let decision = crate::watchdog_recovery_policy::decide_recovery(
+        verdict,
+        &policy,
+        durable_used_attempts,
+    );
+    let (verdict_name, event) = match (verdict, decision) {
+        (HostResponsiveness::Responsive, _) => ("responsive", ChallengeAuditEvent::Answered),
+        (
+            HostResponsiveness::AliveUnresponsive,
+            crate::RecoveryBudgetDecision::Admitted { .. },
+        ) => ("alive_unresponsive", ChallengeAuditEvent::BudgetAdmitted),
+        (HostResponsiveness::AliveUnresponsive, crate::RecoveryBudgetDecision::Exhausted) => {
+            ("alive_unresponsive", ChallengeAuditEvent::BudgetExhausted)
+        }
+        (HostResponsiveness::AliveUnresponsive, _) => {
+            ("alive_unresponsive", ChallengeAuditEvent::TimedOut)
+        }
+        (HostResponsiveness::Uncertain(ChallengeUncertainty::Unauthenticated), _) => {
+            ("uncertain", ChallengeAuditEvent::Unauthenticated)
+        }
+        (HostResponsiveness::Uncertain(ChallengeUncertainty::ConnectionDenied), _) => {
+            ("uncertain", ChallengeAuditEvent::ConnectionDenied)
+        }
+        (
+            HostResponsiveness::Uncertain(
+                ChallengeUncertainty::TargetChanged | ChallengeUncertainty::TargetNotLive,
+            ),
+            _,
+        ) => ("uncertain", ChallengeAuditEvent::TargetChanged),
+        (HostResponsiveness::Uncertain(ChallengeUncertainty::InadequateCoverage), _) => {
+            ("uncertain", ChallengeAuditEvent::InadequateCoverage)
+        }
+    };
+    let decision_name = match decision {
+        crate::RecoveryBudgetDecision::NoRecoveryRequired => "no_recovery_required",
+        crate::RecoveryBudgetDecision::Admitted { .. } => "admitted",
+        crate::RecoveryBudgetDecision::Exhausted => "exhausted",
+        crate::RecoveryBudgetDecision::ChallengeUnresolved => "challenge_unresolved",
+    };
+    let audit = crate::watchdog_challenge_audit::ChallengeAuditRecord::new(
+        challenge_id,
+        spec.policy_digest.as_str(),
+        spec.approved_service.as_str(),
+        spec.approved_generation.as_str(),
+        spec.expected_owner_digest.as_str(),
+        event,
+        issued_at_unix_ms,
+        format!("verdict={verdict_name} decision={decision_name}").as_str(),
+    )
+    .map_err(|error| CompositionError::InvalidConfiguration(error.to_string()))?;
+    let delivery = match audit_sink {
+        Some(sink) => sink.try_hand_off(audit.clone()),
+        None => crate::watchdog_challenge_audit::AuditDelivery::Pending,
+    };
+    crate::watchdog_challenge_audit::observe_audit_delivery(&delivery, challenge_id);
+    Ok(ComposedChallengeAttempt {
+        binding,
+        verdict,
+        decision,
+        audit,
+        delivery,
+    })
+}
