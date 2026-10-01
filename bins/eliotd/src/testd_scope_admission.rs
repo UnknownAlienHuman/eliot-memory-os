@@ -623,7 +623,7 @@ fn source_readback_admission(
 /// durable process-source admission and remain unavailable until that exact
 /// row has been written/read or found current. Governing-document references
 /// are a distinct identity domain from generated process-stream source IDs.
-pub fn resolve_blob_owner_facts(
+pub async fn resolve_blob_owner_facts(
     composition: &DaemonComposition,
     request: &BlobProcessStreamOwnerFactsPullRequest,
 ) -> Result<BlobProcessStreamOwnerFactsPullResponse, String> {
