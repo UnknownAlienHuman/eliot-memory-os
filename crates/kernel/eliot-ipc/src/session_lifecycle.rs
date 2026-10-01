@@ -25,6 +25,7 @@ use std::fmt;
 use eliot_contracts::{EpochId, EpochRelation};
 use thiserror::Error;
 
+use crate::AcceptedAgentBridgeTransport;
 use crate::role_lease::{
     AgentRole, CapabilityContext, DelegatedAuthority, IndependenceDowngrade, RoleLeaseError,
     RoleTransitionRecord, ScopeBinding, WorkScopePolicy,
@@ -165,6 +166,15 @@ pub enum SessionLifecycleError {
     /// context for this session.
     #[error("no role capability context is admitted for this session")]
     RoleCapabilityNotAdmitted,
+    /// A transport-route operation named a route the admitted capability is
+    /// not bound to. Authority never crosses routes by relabeling.
+    #[error("capability route mismatch: admitted for {expected:?}, presented on {presented:?}")]
+    RouteMismatch {
+        /// Route the active capability token is bound to.
+        expected: String,
+        /// Route the operation was presented on.
+        presented: String,
+    },
 }
 
 /// The replaceable transport kinds that can bind to one application session.
@@ -512,6 +522,146 @@ impl ApplicationSession {
             now_unix_ms,
         )?;
         Ok(record)
+    }
+
+    /// Admits the session role capability bound to one accepted bridge transport.
+    ///
+    /// This is the transport-route wiring for [`Self::admit_role_capability`]
+    /// (issue #1943): the exact `State Fence` is cloned from the
+    /// server-selected transport challenge evidence, never from caller input,
+    /// so the issued token fence always matches the admitted fence. Every
+    /// other binding is the owner's exact value, validated fail-closed by
+    /// [`CapabilityContext::admit`]; `WorkScope` and delegation narrow only.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionLifecycleError::IllegalTransition`] when the session
+    /// is terminal, [`SessionLifecycleError::RoleCapabilityAlreadyAdmitted`]
+    /// when a context is already admitted, or
+    /// [`SessionLifecycleError::RoleLease`] when compilation fails closed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn admit_role_capability_for_transport(
+        &mut self,
+        transport: &AcceptedAgentBridgeTransport,
+        context_id: impl Into<String>,
+        role: AgentRole,
+        scope: String,
+        task_id: String,
+        work_item_id: Option<String>,
+        route: String,
+        governance_revision: String,
+        lease_epoch: u64,
+        issued_at_unix_ms: u64,
+        expires_at_unix_ms: u64,
+        workscope: &WorkScopePolicy,
+        delegated: &DelegatedAuthority,
+    ) -> Result<(), SessionLifecycleError> {
+        let binding = ScopeBinding {
+            scope,
+            task_id,
+            work_item_id,
+            route,
+            governance_revision,
+            state_fence: transport.challenge().state_fence.clone(),
+            lease_epoch,
+            issued_at_unix_ms,
+            expires_at_unix_ms,
+        };
+        self.admit_role_capability(context_id, role, binding, workscope, delegated)
+    }
+
+    /// Performs the session role transition bound to one accepted bridge transport.
+    ///
+    /// This is the transport-route wiring for
+    /// [`Self::transition_role_capability`] (issue #1943): the preceding
+    /// capability context is closed and revoked, the newly scoped context
+    /// carries the server-selected transport challenge fence at an advanced
+    /// lease epoch, and the Independence Profile is updated, so stronger
+    /// authority from the previous role is never silently retained. A
+    /// Verifier moving to a mutating role still requires the explicit
+    /// [`IndependenceDowngrade`] record. Returns the explicit transition
+    /// record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionLifecycleError::IllegalTransition`] when the session
+    /// is terminal, [`SessionLifecycleError::RoleCapabilityNotAdmitted`]
+    /// when no context was admitted, or
+    /// [`SessionLifecycleError::RoleLease`] when the transition fails closed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn transition_role_capability_for_transport(
+        &mut self,
+        transport: &AcceptedAgentBridgeTransport,
+        new_context_id: impl Into<String>,
+        new_role: AgentRole,
+        scope: String,
+        task_id: String,
+        work_item_id: Option<String>,
+        route: String,
+        governance_revision: String,
+        lease_epoch: u64,
+        issued_at_unix_ms: u64,
+        expires_at_unix_ms: u64,
+        workscope: &WorkScopePolicy,
+        delegated: &DelegatedAuthority,
+        downgrade: Option<IndependenceDowngrade>,
+        now_unix_ms: u64,
+    ) -> Result<RoleTransitionRecord, SessionLifecycleError> {
+        let new_binding = ScopeBinding {
+            scope,
+            task_id,
+            work_item_id,
+            route,
+            governance_revision,
+            state_fence: transport.challenge().state_fence.clone(),
+            lease_epoch,
+            issued_at_unix_ms,
+            expires_at_unix_ms,
+        };
+        self.transition_role_capability(
+            new_context_id,
+            new_role,
+            &new_binding,
+            workscope,
+            delegated,
+            downgrade,
+            now_unix_ms,
+        )
+    }
+
+    /// Authorizes one operation on the presenting transport route.
+    ///
+    /// Transport-route enforcement for the admitted capability (issue #1943):
+    /// `route` is the exact route the presenting transport serves. The
+    /// operation runs only when the session holds an admitted context whose
+    /// bound route equals it; the compiled token then authorizes the
+    /// operation fail-closed (revoked contexts, lease window, forbidden and
+    /// out-of-allow operations all deny with typed reasons).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionLifecycleError::RoleCapabilityNotAdmitted`] when no
+    /// context is admitted, [`SessionLifecycleError::RouteMismatch`] when the
+    /// presenting route differs from the bound route, or
+    /// [`SessionLifecycleError::RoleLease`] when the token denies.
+    pub fn authorize_route_operation(
+        &self,
+        route: &str,
+        operation: &str,
+        now_unix_ms: u64,
+    ) -> Result<(), SessionLifecycleError> {
+        let Some(context) = self.role_capability.as_ref() else {
+            return Err(SessionLifecycleError::RoleCapabilityNotAdmitted);
+        };
+        let bound_route = &context.active().binding().route;
+        if bound_route.as_str() != route {
+            return Err(SessionLifecycleError::RouteMismatch {
+                expected: bound_route.clone(),
+                presented: route.to_owned(),
+            });
+        }
+        context.active().authorize(operation, now_unix_ms)?;
+        Ok(())
     }
 
     /// Records one replaceable transport binding as a continuity observation.
