@@ -37,7 +37,7 @@ use super::{
     transaction_store_private::{self, TransactionVersion},
 };
 use eliot_config::initial_snapshot::SignedInitialConfigSnapshot;
-use eliot_contracts::ContractVersion;
+use eliot_contracts::{ContractVersion, canonical_json_bytes};
 use eliot_platform::PlatformHandle;
 use eliot_platform_windows::{
     AuthenticodeEvidence, AuthenticodeVerdict, AuthenticodeVerifier, DirectoryPublicationReceipt,
@@ -58,6 +58,8 @@ const SETUP_EFFECT_INTENT_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("setup_effect_intents_v1");
 const INITIAL_SNAPSHOT_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("initial_config_snapshots_v1");
+const INITIAL_SNAPSHOT_KEY_TABLE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("initial_config_signing_key_records_v1");
 const TRANSACTION_TEMP_CREATE_ATTEMPTS: usize = 16;
 static NEXT_TRANSACTION_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -643,6 +645,91 @@ enum PublicationJournalStoreFault {
 }
 
 impl RedbInstallationTransactionStore {
+    /// Records the original protected signing-key identity and its independent
+    /// verifier anchor before initial Config publication. The write is
+    /// accepted only for the exact live transaction at the service-key
+    /// milestone with its original durable intent. Replays converge only on
+    /// byte-identical metadata from that same key creation.
+    pub fn record_initial_snapshot_key(
+        &mut self,
+        record: &super::initial_config_snapshot::InitialSnapshotKeyRecord,
+    ) -> Result<(), InstallationError> {
+        record.validate()?;
+        let setup = self
+            .load_setup_binding(&record.transaction_id)?
+            .ok_or_else(|| InstallationError::TransactionNotFound {
+                transaction_id: record.transaction_id.as_str().to_owned(),
+            })?;
+        if setup.state() != SetupMilestone::SystemOwnerEstablished
+            || setup.revision() != record.setup_revision
+            || setup.installation_id.as_str() != record.trust_anchor.installation_id
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        self.require_setup_effect_intent(
+            &record.transaction_id,
+            SetupMilestone::ServiceKeysGenerated,
+        )?;
+
+        let bytes = encode_initial_snapshot_key_record(record)?;
+        let database = self.open_for_mutation()?;
+        let write = database
+            .begin_write()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        {
+            let mut table = write
+                .open_table(INITIAL_SNAPSHOT_KEY_TABLE)
+                .map_err(|error| InstallationError::Platform(error.to_string()))?;
+            let key = record.transaction_id.as_str();
+            if let Some(existing) = table
+                .get(key)
+                .map_err(|error| InstallationError::Platform(error.to_string()))?
+            {
+                if existing.value() != bytes.as_slice() {
+                    return Err(InstallationError::IdentityConflict);
+                }
+                return Ok(());
+            }
+            table
+                .insert(key, bytes.as_slice())
+                .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        }
+        write
+            .commit()
+            .map_err(|error| InstallationError::Platform(error.to_string()))
+    }
+
+    /// Reads back the exact immutable protected-key expectation retained for
+    /// this setup transaction. Missing data stays missing; callers must not
+    /// regenerate or adopt a slot when the original expectation is absent.
+    pub fn load_initial_snapshot_key(
+        &self,
+        transaction_id: &PlatformHandle,
+    ) -> Result<Option<super::initial_config_snapshot::InitialSnapshotKeyRecord>, InstallationError>
+    {
+        let database = self.open_read_only()?;
+        let read = database
+            .begin_read()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        let table = match read.open_table(INITIAL_SNAPSHOT_KEY_TABLE) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(InstallationError::Platform(error.to_string())),
+        };
+        let Some(value) = table
+            .get(transaction_id.as_str())
+            .map_err(|error| InstallationError::Platform(error.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let record = decode_initial_snapshot_key_record(value.value())?;
+        if record.transaction_id != *transaction_id {
+            return Err(InstallationError::IdentityConflict);
+        }
+        record.validate()?;
+        Ok(Some(record))
+    }
+
     /// Persist and read back a source-bundle publication intent in the exact
     /// caller-selected store before any native directory move occurs.
     pub fn begin_source_bundle_publication_at_exact_path(
@@ -1743,6 +1830,67 @@ fn decode_setup_binding(bytes: &[u8]) -> Result<SetupBinding, InstallationError>
 struct InitialSnapshotEnvelope {
     wire_version: ContractVersion,
     snapshot: SignedInitialConfigSnapshot,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct InitialSnapshotKeyRecordEnvelope {
+    wire_version: ContractVersion,
+    record: super::initial_config_snapshot::InitialSnapshotKeyRecord,
+}
+
+fn encode_initial_snapshot_key_record(
+    record: &super::initial_config_snapshot::InitialSnapshotKeyRecord,
+) -> Result<Vec<u8>, InstallationError> {
+    canonical_json_bytes(&InitialSnapshotKeyRecordEnvelope {
+        wire_version: ContractVersion::new(1, 0, 0),
+        record: record.clone(),
+    })
+    .map_err(|error| InstallationError::CorruptRegistry {
+        reason: error.to_string(),
+    })
+}
+
+fn decode_initial_snapshot_key_record(
+    bytes: &[u8],
+) -> Result<super::initial_config_snapshot::InitialSnapshotKeyRecord, InstallationError> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|error| InstallationError::CorruptRegistry {
+            reason: error.to_string(),
+        })?;
+    let version = value
+        .get("wire_version")
+        .cloned()
+        .ok_or_else(|| InstallationError::MigrationRequired {
+            reason: "initial snapshot key record lacks a wire discriminator".to_owned(),
+        })?;
+    let version: ContractVersion = serde_json::from_value(version).map_err(|_| {
+        InstallationError::MigrationRequired {
+            reason: "initial snapshot key record has an unsupported wire discriminator".to_owned(),
+        }
+    })?;
+    if version != ContractVersion::new(1, 0, 0) {
+        return Err(InstallationError::MigrationRequired {
+            reason: format!("initial snapshot key record wire {version} requires migration"),
+        });
+    }
+    let envelope: InitialSnapshotKeyRecordEnvelope = serde_json::from_value(value).map_err(|error| {
+        InstallationError::CorruptRegistry {
+            reason: format!("initial snapshot key record is malformed: {error}"),
+        }
+    })?;
+    if canonical_json_bytes(&envelope)
+        .map_err(|error| InstallationError::CorruptRegistry {
+            reason: error.to_string(),
+        })?
+        != bytes
+    {
+        return Err(InstallationError::CorruptRegistry {
+            reason: "initial snapshot key record is not canonical JSON".to_owned(),
+        });
+    }
+    envelope.record.validate()?;
+    Ok(envelope.record)
 }
 
 fn encode_initial_snapshot(
