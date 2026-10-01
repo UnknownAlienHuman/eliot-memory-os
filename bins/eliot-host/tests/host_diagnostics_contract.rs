@@ -563,3 +563,118 @@ fn host_reference_failure_and_registration_are_singular() {
         "wrapper must keep the typed unavailable seam"
     );
 }
+
+// WORK_UNIT_CASE: 889/6
+#[test]
+fn projection_phase_record_carries_identity_tuple() {
+    // Positive: a projection holding owner identities emits one host.phase
+    // record carrying the exact handle values, with no _missing flags.
+    let projection = eliot_host::host_diagnostics::HostRequestProjection::observed(
+        EntrypointStage::ConsoleLoop,
+    )
+    .with_transaction_handle("tx-op-1")
+    .with_effect_handle("eff-op-1")
+    .with_request_digest("req-op-1")
+    .with_fence_handle("fence-op-1");
+    let sink = CaptureSink::default();
+    let writer_sink = sink.clone();
+    let captured = {
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer_sink.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            eliot_host::host_diagnostics::observe_phase_projection(&projection);
+        });
+        sink.bytes.lock().unwrap().clone()
+    };
+    let text = String::from_utf8_lossy(&captured);
+    assert!(text.contains("host.phase"), "must emit the phase event");
+    for handle in ["tx-op-1", "eff-op-1", "req-op-1", "fence-op-1"] {
+        assert!(
+            text.contains(handle),
+            "phase record must carry the held handle {handle}"
+        );
+    }
+    assert!(
+        !text.contains("transaction_missing=true"),
+        "held tx slot must not render missing: {text}"
+    );
+    assert!(
+        !text.contains("effect_missing=true"),
+        "held effect slot must not render missing: {text}"
+    );
+    assert!(
+        text.contains("process_missing=true"),
+        "unheld slot must still render missing: {text}"
+    );
+}
+
+// WORK_UNIT_CASE: 889/7
+#[test]
+fn projection_missing_slots_render_missing_never_guessed() {
+    // Refusal: a bare projection renders every identity slot missing and
+    // never substitutes a caller string or placeholder for owner data.
+    let projection = eliot_host::host_diagnostics::HostRequestProjection::observed(
+        EntrypointStage::ConsoleLoop,
+    );
+    let sink = CaptureSink::default();
+    let writer_sink = sink.clone();
+    let captured = {
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer_sink.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            eliot_host::host_diagnostics::observe_phase_projection(&projection);
+        });
+        sink.bytes.lock().unwrap().clone()
+    };
+    let text = String::from_utf8_lossy(&captured);
+    for flag in [
+        "transaction_missing=true",
+        "effect_missing=true",
+        "request_digest_missing=true",
+        "fence_missing=true",
+    ] {
+        assert!(
+            text.contains(flag),
+            "unheld slot must render missing ({flag}): {text}"
+        );
+    }
+}
+
+// WORK_UNIT_CASE: 889/8
+#[test]
+fn terminal_projection_shares_phase_identity() {
+    // Positive: the terminal record for an operation carries the same
+    // identity tuple as its phase records, so one failure correlates to
+    // its operation under concurrency.
+    let projection = eliot_host::host_diagnostics::HostRequestProjection::observed(
+        EntrypointStage::ConsoleLoop,
+    )
+    .with_transaction_handle("tx-op-9")
+    .with_effect_handle("eff-op-9");
+    let sink = CaptureSink::default();
+    let writer_sink = sink.clone();
+    let captured = {
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer_sink.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            eliot_host::host_diagnostics::observe_terminal_projection(
+                &projection,
+                HOST_TERMINAL_CODE_CONSOLE_FAILED,
+            );
+        });
+        sink.bytes.lock().unwrap().clone()
+    };
+    let text = String::from_utf8_lossy(&captured);
+    assert!(
+        text.contains("host.terminal_error"),
+        "must emit the terminal event"
+    );
+    assert!(text.contains("tx-op-9"), "terminal must carry tx identity");
+    assert!(text.contains("eff-op-9"), "terminal must carry effect identity");
+}
