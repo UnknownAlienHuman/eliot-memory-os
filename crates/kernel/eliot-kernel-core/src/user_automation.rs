@@ -4084,20 +4084,7 @@ impl UserAutomationOperation {
             Self::Create {
                 revision,
                 normalization_receipt_envelope,
-            } => {
-                revision.validate()?;
-                let envelope = normalization_receipt_envelope;
-                if envelope.core.operation.operation_kind
-                    != USER_AUTOMATION_NORMALIZATION_OPERATION_KIND
-                {
-                    return Err(UserAutomationError::ReceiptBinding);
-                }
-                revision.schedule.validate_normalization_receipt_envelope(
-                    &revision.schedule.normalization_receipt,
-                    envelope,
-                    revision,
-                )
-            }
+            } => validate_create_normalization_binding(revision, normalization_receipt_envelope),
             Self::GetContext | Self::List { .. } => Ok(()),
             Self::NormalizeSchedule {
                 revision,
@@ -4138,27 +4125,11 @@ impl UserAutomationOperation {
                 previous_revision,
                 revision,
                 normalization_receipt_envelope,
-            } => {
-                let legacy_predecessor = previous_revision.validate().is_err()
-                    && previous_revision
-                        .validate_legacy_for_schedule_migration()
-                        .is_ok();
-                let operation_kind = if legacy_predecessor {
-                    revision.validate_normalized_migration_supersedes(previous_revision)?;
-                    USER_AUTOMATION_LEGACY_MIGRATION_OPERATION_KIND
-                } else {
-                    revision.validate_supersedes(previous_revision)?;
-                    USER_AUTOMATION_NORMALIZATION_OPERATION_KIND
-                };
-                if normalization_receipt_envelope.core.operation.operation_kind != operation_kind {
-                    return Err(UserAutomationError::ReceiptBinding);
-                }
-                revision.schedule.validate_normalization_receipt_envelope(
-                    &revision.schedule.normalization_receipt,
-                    normalization_receipt_envelope,
-                    revision,
-                )
-            }
+            } => validate_edit_normalization_binding(
+                previous_revision,
+                revision,
+                normalization_receipt_envelope,
+            ),
             Self::RunNow {
                 automation_id,
                 automation_revision,
@@ -4194,6 +4165,47 @@ impl UserAutomationOperation {
     pub fn validate_for_normalization_submission(&self) -> Result<(), UserAutomationError> {
         self.validate()
     }
+}
+
+fn validate_create_normalization_binding(
+    revision: &UserAutomationRevision,
+    envelope: &ReceiptEnvelope,
+) -> Result<(), UserAutomationError> {
+    revision.validate()?;
+    if envelope.core.operation.operation_kind != USER_AUTOMATION_NORMALIZATION_OPERATION_KIND {
+        return Err(UserAutomationError::ReceiptBinding);
+    }
+    revision.schedule.validate_normalization_receipt_envelope(
+        &revision.schedule.normalization_receipt,
+        envelope,
+        revision,
+    )
+}
+
+fn validate_edit_normalization_binding(
+    previous_revision: &UserAutomationRevision,
+    revision: &UserAutomationRevision,
+    envelope: &ReceiptEnvelope,
+) -> Result<(), UserAutomationError> {
+    let legacy_predecessor = previous_revision.validate().is_err()
+        && previous_revision
+            .validate_legacy_for_schedule_migration()
+            .is_ok();
+    let operation_kind = if legacy_predecessor {
+        revision.validate_normalized_migration_supersedes(previous_revision)?;
+        USER_AUTOMATION_LEGACY_MIGRATION_OPERATION_KIND
+    } else {
+        revision.validate_supersedes(previous_revision)?;
+        USER_AUTOMATION_NORMALIZATION_OPERATION_KIND
+    };
+    if envelope.core.operation.operation_kind != operation_kind {
+        return Err(UserAutomationError::ReceiptBinding);
+    }
+    revision.schedule.validate_normalization_receipt_envelope(
+        &revision.schedule.normalization_receipt,
+        envelope,
+        revision,
+    )
 }
 
 fn validate_normalization_occurrence_count(count: u16) -> Result<(), UserAutomationError> {
