@@ -291,9 +291,7 @@ impl<'a> AuthenticatedKernelJobPort<'a> {
             // publishes, which is the same disposition the unwired channel
             // produced but now reached through a real read rather than through
             // a hardcoded absence.
-            orientation_source: Some(
-                &orientation_supply_source::KERNEL_STAGED_OWNER_RECORD_SOURCE,
-            ),
+            orientation_source: Some(&orientation_supply_source::KERNEL_STAGED_OWNER_RECORD_SOURCE),
         })
     }
 

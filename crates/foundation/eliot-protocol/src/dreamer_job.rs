@@ -1902,10 +1902,7 @@ impl DurableJobResponse {
     ///
     /// Any positive revision is admitted: an idempotent resubmit may return
     /// the already-advanced record.
-    fn validate_response_submit(
-        &self,
-        submission: &JobSubmission,
-    ) -> Result<(), DurableJobError> {
+    fn validate_response_submit(&self, submission: &JobSubmission) -> Result<(), DurableJobError> {
         if self.job_id != submission.job_id || self.attempt_id != submission.attempt_id {
             return Err(DurableJobError::OperationMismatch);
         }

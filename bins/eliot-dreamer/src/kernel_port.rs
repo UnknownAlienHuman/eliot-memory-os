@@ -1329,12 +1329,13 @@ fn validate_owner_response_binding(
         owner_record
             .validate("owner_record.sha256")
             .map_err(|error| KernelPortError::OwnerRecordStale(error.to_string()))?;
-        let staged = material.owner_record.as_ref().ok_or(
-            KernelPortError::OwnerRecordStale(
+        let staged = material
+            .owner_record
+            .as_ref()
+            .ok_or(KernelPortError::OwnerRecordStale(
                 "Kernel owner reply carries an owner record this claim was not staged with"
                     .to_owned(),
-            ),
-        )?;
+            ))?;
         if owner_record != staged {
             return Err(KernelPortError::OwnerRecordStale(
                 "Kernel owner reply changed the original owner record".to_owned(),
