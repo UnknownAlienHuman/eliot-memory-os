@@ -54,7 +54,7 @@
 //!
 //! # The ordering head is read, never synthesized
 //!
-//! `CanonicalWriteEnvelope::prepare` *derives* `ordering_scopes` from
+//! The admission sequence derives `ordering_scopes` from
 //! `expected_ordering_heads`, and `PreparedTransition::validate` refuses an
 //! empty `ordering_scopes` (`StoreError::Empty { field: "ordering_scopes" }`).
 //! An owner-side envelope therefore cannot declare a no-ordering-contract leg,
@@ -65,6 +65,18 @@
 //! through the retained [`KernelContextReadClient`] and submits the observed
 //! sequence. See [`FRESH_ORDERING_SEQUENCE`] for the only value the store
 //! admits for a scope with no stored head yet.
+//!
+//! # The I5.6 admission sequence is not restated here
+//!
+//! Issue #1927 makes the plan an `eliotd` product with a single owner. This
+//! module derives the semantic inputs — the failure key, the record draft, the
+//! source receipt, the live ordering head — and hands them to
+//! `super::notification_plan_admission::admit_notification_transition`, which
+//! binds the eighteen I5.6 plan keys, builds the immutable plan, checks it
+//! against current admissible support, and returns the exact submission its
+//! recorded canonical request hash was verified against. The acknowledgement leg
+//! in `notification_acknowledge_emit.rs` builds the same plan through the same
+//! call, so neither leg restates the field list.
 //!
 //! # Why the `ApplyNotificationState` route and not `apply_prepared`
 //!
@@ -140,9 +152,7 @@ use eliot_contracts::{
     ArtifactId, ClockReading, ContractId, OperationId, ProductId, RequestId, RequestMetadata,
     SourceId, StateFence, TransactionSequence, canonical_json_bytes, sha256_hex,
 };
-use eliot_governor::{
-    CanonicalWriteEnvelope, CompositionError, KernelGenerationSnapshotProvider, KernelPortError,
-};
+use eliot_governor::{CompositionError, KernelGenerationSnapshotProvider, KernelPortError};
 use eliot_kernel_core::{
     DeadlineOrReview, DeliveryChannel, NotificationDraft, NotificationSeverity,
 };
@@ -158,13 +168,11 @@ use eliot_receipts::{
     WorkScopeId,
 };
 use eliot_store_api::{
-    CanonicalReadClient, EffectClass, EventProjectionRelationIntents,
-    NOTIFICATION_STATE_MUTATION_NAME, NOTIFICATION_STATE_SCOPE, NOTIFY_MUTATION_UPSERT,
-    NOTIFY_PARAM_DEDUP_KEY, NOTIFY_PARAM_MUTATION, NOTIFY_PARAM_RECORD_JSON,
-    NOTIFY_PARAM_SOURCE_RECEIPT_JSON, NamedReadOperation, NamedReadRequest, OrderingHead,
-    OrderingHeadExpectation, OrderingScopeId, PreparedTransition, ReadConsistency,
-    RevisionHeadExpectation, ScopeId, SecurityContext, StoreError, TransitionClass, WriteReceipt,
-    WriteReceiptStatus, notification_read_request,
+    CanonicalReadClient, NOTIFICATION_STATE_MUTATION_NAME, NOTIFICATION_STATE_SCOPE,
+    NOTIFY_MUTATION_UPSERT, NOTIFY_PARAM_DEDUP_KEY, NOTIFY_PARAM_MUTATION,
+    NOTIFY_PARAM_RECORD_JSON, NOTIFY_PARAM_SOURCE_RECEIPT_JSON, NamedReadOperation,
+    NamedReadRequest, OrderingHead, OrderingHeadExpectation, OrderingScopeId, ReadConsistency,
+    StoreError, WriteReceipt, WriteReceiptStatus, notification_read_request,
 };
 use serde::Serialize;
 use thiserror::Error;
@@ -645,11 +653,24 @@ pub async fn emit_blocked_automation_notification(
         return Ok(None);
     }
     let ordering_head = read_notification_ordering_head(&reads).await?;
-    // The submission identity is derived from the exact compare-and-swap state
-    // this transition observed: the same failure resubmitted against the same
+    // The OPERATION TEXT is derived from the exact compare-and-swap state this
+    // transition observed: the same failure resubmitted against the same
     // ordering sequence is the same operation and replays idempotently, while
     // the sequence's own advance after a commit gives the next occurrence its
-    // own identity. No counter, clock, or random value is involved.
+    // own identity. No counter, clock, or random value enters THAT string.
+    //
+    // Stated precisely because the rest of the identity is not clock-free
+    // (issue #1927): `notification_commit_identity` below reads `unix_ms_i64()`
+    // into `RequestMetadata::clock` and derives `deadline_unix_ms` from
+    // `unix_ms()`. `RequestMetadata` is a hashed member of
+    // `canonical_request_hash`, so the plan's `identity.canonical_request_hash`
+    // and therefore its `prepared_transition_digest` differ between two runs a
+    // millisecond apart. The idempotent replay above does not depend on them:
+    // it is keyed on the operation text and the observed ordering sequence.
+    // Whether an authenticated daemon write may carry no time observation at
+    // all is an I5.5 request-authentication decision owned by
+    // `eliot_contracts::RequestMetadata` and `eliot_protocol`; it is recorded
+    // in `notification_plan_admission.rs` and deliberately not taken here.
     let operation_text = format!(
         "notify-state:{}:upsert:seq{}",
         key.dedup_key, ordering_head.expected_sequence
@@ -657,27 +678,32 @@ pub async fn emit_blocked_automation_notification(
     let identity = notification_commit_identity(&operation_text, &state_fence)?;
     let record_json = notification_record_json(&key, &state_fence)?;
     let source_receipt = source_receipt_json(&key, decision, &identity, &state_fence)?;
-    let transition = notification_transition(
-        &identity,
-        &operation_text,
-        &key,
-        record_json,
-        source_receipt,
-        &ordering_head,
+    let mut parameters = BTreeMap::new();
+    parameters.insert(
+        NOTIFY_PARAM_MUTATION.to_owned(),
+        serde_json::Value::String(NOTIFY_MUTATION_UPSERT.to_owned()),
+    );
+    parameters.insert(
+        NOTIFY_PARAM_DEDUP_KEY.to_owned(),
+        serde_json::Value::String(key.dedup_key.clone()),
+    );
+    parameters.insert(NOTIFY_PARAM_RECORD_JSON.to_owned(), record_json);
+    parameters.insert(NOTIFY_PARAM_SOURCE_RECEIPT_JSON.to_owned(), source_receipt);
+    // Issue #1927: the whole I5.6 admission sequence runs in one place, and
+    // the plan it returns is the plan that is submitted. The admitted semantic
+    // contract set for this notification is exactly the decision's own
+    // identity, so its digest is that identity's canonical-JSON digest — the
+    // same value the record's evidence handle and the source receipt's artifact
+    // carry.
+    let submitted = super::notification_plan_admission::admit_notification_transition(
+        &super::notification_plan_admission::NotificationPlanAdmission {
+            identity: &identity,
+            operation_text: &operation_text,
+            admission_contract_set_digest: &key.fingerprint,
+            parameters,
+            ordering_head: &ordering_head,
+        },
     )?;
-    // The submitted expectation is the very value the envelope was prepared
-    // from, not a second formatting of it: the prepared transition already
-    // carries it inside its derived ordering scopes and its canonical request
-    // hash, so any substitution is refused at every recheck.
-    let submitted = NotificationCommit {
-        context: identity.request.metadata.clone(),
-        transition,
-        // No revision head is compared: the notification record is not derived
-        // from a canonical revision head, and the store's revision advance for
-        // the fixed notification scope is driven by the ordering head alone.
-        expected_revision_heads: Vec::new(),
-        expected_ordering_heads: vec![ordering_head],
-    };
     let answer = kernel
         .transact_async_with_identity(
             NOTIFICATION_STATE_MUTATION_NAME,
@@ -760,18 +786,6 @@ fn observed_evidence_summary(evidence: &MaintenanceNotificationEvidence) -> Stri
         return "unobserved".to_owned();
     }
     evidence.observed_refs.join("+")
-}
-
-/// The exact four-field flat apply contract the admitted Kernel route decodes.
-///
-/// Mirrors `bins/eliotd/src/kernel_transition_client.rs`'s `apply_prepared`
-/// payload field-for-field; grouping it keeps the submitted head the same value
-/// the envelope was prepared from.
-struct NotificationCommit {
-    context: RequestMetadata,
-    transition: PreparedTransition,
-    expected_revision_heads: Vec<RevisionHeadExpectation>,
-    expected_ordering_heads: Vec<OrderingHeadExpectation>,
 }
 
 /// Derives the admitted ingress identity for one notification commit.
@@ -940,83 +954,4 @@ fn source_receipt_json(
     };
     let receipt = ReceiptEnvelope::issue(core).map_err(StoreError::Receipt)?;
     serde_json::to_value(&receipt).map_err(|error| StoreError::Serialization(error.to_string()))
-}
-
-/// Prepares the one canonical `NotificationState` transition for this commit.
-///
-/// The envelope is the owner-side proposal only: `CanonicalWriteEnvelope::
-/// prepare` derives the ordering scopes from the submitted head, binds the
-/// issue-#18 digests, and returns the single `PreparedTransition` that Kernel
-/// and the store bridge execute. `task_id` stays `None` because a notification
-/// record is not task-bound, which is also what keeps this leg out of the
-/// task-scope and `CaptureObservation` admission rules.
-///
-/// # Errors
-///
-/// Returns [`StoreError`] when the envelope inputs are refused, and
-/// [`CompositionError`] when canonical admission refuses the prepared
-/// transition. The projection is `CompositionError::Owner` because
-/// `CompositionError::Canonical(#[from] CanonicalError)` exists but is
-/// unnameable here: `eliot-canonical` is not a dependency of this composition
-/// root, and adding a second canonical dependency path for one error type would
-/// be the wider change. The same `Owner` projection is what the other ~25
-/// canonical-envelope sites in this composition root use — `owner_feed.rs` and
-/// `dreamer_admission.rs` — so this leg is the established shape, not a new
-/// one.
-fn notification_transition(
-    identity: &RequestIdentity,
-    operation_text: &str,
-    key: &AutomationFailureKey,
-    record_json: serde_json::Value,
-    source_receipt: serde_json::Value,
-    ordering_head: &OrderingHeadExpectation,
-) -> Result<PreparedTransition, NotificationEmitError> {
-    let mut parameters = BTreeMap::new();
-    parameters.insert(
-        NOTIFY_PARAM_MUTATION.to_owned(),
-        serde_json::Value::String(NOTIFY_MUTATION_UPSERT.to_owned()),
-    );
-    parameters.insert(
-        NOTIFY_PARAM_DEDUP_KEY.to_owned(),
-        serde_json::Value::String(key.dedup_key.clone()),
-    );
-    parameters.insert(NOTIFY_PARAM_RECORD_JSON.to_owned(), record_json);
-    parameters.insert(NOTIFY_PARAM_SOURCE_RECEIPT_JSON.to_owned(), source_receipt);
-    let envelope = CanonicalWriteEnvelope {
-        operation_id: OperationId::new(operation_text).map_err(StoreError::Foundation)?,
-        request: identity.request.metadata.clone(),
-        idempotency_key: identity.idempotency_key.clone(),
-        scope_id: ScopeId::new(NOTIFICATION_STATE_SCOPE)?,
-        task_id: None,
-        transition_class: TransitionClass::NotificationState,
-        // Exactly the class maximum, never a wider ceiling.
-        requested_effect_ceiling: EffectClass::ReversibleMutation,
-        // The admitted semantic contract set for this notification is exactly
-        // the decision's own identity, so its digest is that identity's
-        // canonical-JSON digest — the same value the record's evidence handle
-        // and the source receipt's artifact carry.
-        admission_contract_set_digest: key.fingerprint.clone(),
-        operation_manifest_digest: eliot_store_api::operation_manifest_set_digest(
-            &eliot_store_api::generated_operation_manifests()?,
-        )?,
-        // Exactly one named command: the closed upsert leg.
-        semantic_commands: vec![eliot_store_api::notification_mutation_request(parameters)],
-        event_projection_relation_intents: EventProjectionRelationIntents {
-            event_ids: Vec::new(),
-            projection_kinds: Vec::new(),
-            relation_kinds: Vec::new(),
-        },
-        security: SecurityContext::default(),
-        // Proof/approval handles are an erasure-only requirement; this
-        // reversible class carries none.
-        required_proof_and_approval_refs: Vec::new(),
-        // No semantic source revisions: the notification record is not derived
-        // from a canonical revision head, and declaring one would bind a head
-        // this transition does not compare-and-swap.
-        expected_revision_heads: Vec::new(),
-        expected_ordering_heads: vec![ordering_head.clone()],
-    };
-    envelope.prepare().map_err(|error| {
-        NotificationEmitError::Admission(CompositionError::Owner(error.to_string()))
-    })
 }
