@@ -411,7 +411,7 @@ impl GenerationRouter {
         // sequence is a backward transition, and a skipped sequence is a replay
         // — so a restart within one lineage advances only by an admitted
         // direct-child step.
-        if decision.new_epoch().relation_to(&self.epoch) != EpochRelation::DirectChild {
+        if self.epoch.relation_to(decision.new_epoch()) != EpochRelation::DirectChild {
             return Err(KernelError::StaleEpochTuple {
                 observed: decision.new_epoch().clone(),
                 active: self.epoch.clone(),

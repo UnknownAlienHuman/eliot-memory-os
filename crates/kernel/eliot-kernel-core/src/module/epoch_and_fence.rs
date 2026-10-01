@@ -208,10 +208,10 @@ impl RouteFence {
     #[must_use]
     pub fn is_stale(&self, active_epoch: &EpochId) -> bool {
         match self.authority_epoch.relation_to(active_epoch) {
-            EpochRelation::Same | EpochRelation::DirectChild | EpochRelation::SameLineageNewer => {
+            EpochRelation::Same | EpochRelation::DirectParent | EpochRelation::SameLineageNewer => {
                 false
             }
-            EpochRelation::DirectParent
+            EpochRelation::DirectChild
             | EpochRelation::SameLineageOlder
             | EpochRelation::UnrelatedLineage => true,
         }
