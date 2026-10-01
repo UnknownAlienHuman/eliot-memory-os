@@ -283,13 +283,15 @@ pub fn parse_kernel_change_transfer(
         ))
     })?;
     if document.format_version != KERNEL_CHANGE_TRANSFER_FORMAT_VERSION {
+        let format_version = document.format_version;
         return Err(recovery_refusal(format!(
-            "kernel change transfer format version {document.format_version} is not ingestible (expected {KERNEL_CHANGE_TRANSFER_FORMAT_VERSION})"
+            "kernel change transfer format version {format_version} is not ingestible (expected {KERNEL_CHANGE_TRANSFER_FORMAT_VERSION})"
         )));
     }
     if document.projection != KERNEL_CHANGE_TRANSFER_PROJECTION {
+        let projection = document.projection.as_str();
         return Err(recovery_refusal(format!(
-            "kernel change transfer projection '{document.projection}' is not the Kernel change-ledger projection"
+            "kernel change transfer projection '{projection}' is not the Kernel change-ledger projection"
         )));
     }
     Ok(document)
@@ -400,8 +402,9 @@ fn hydrate_transfer_hints(
             // route: coercing it would repeat audit 5910747803 defect #2, so
             // the hydration refuses and finish stays blocked instead.
             KernelTransferHintOrigin::PollReconcile => {
+                let hint_id = hint.hint_id.as_str();
                 return Err(recovery_refusal(format!(
-                    "kernel change transfer hint '{hint.hint_id}' uses a poll-reconcile route, which cannot confirm a host/filesystem hint"
+                    "kernel change transfer hint '{hint_id}' uses a poll-reconcile route, which cannot confirm a host/filesystem hint"
                 )));
             }
         };
@@ -414,8 +417,9 @@ fn hydrate_transfer_hints(
             origin_ref: hint.origin_ref.clone(),
         };
         monitor.ingest_hint(observation_hint).map_err(|error| {
+            let hint_id = hint.hint_id.as_str();
             recovery_refusal(format!(
-                "kernel change transfer hint '{hint.hint_id}' is not admittable: {error}"
+                "kernel change transfer hint '{hint_id}' is not admittable: {error}"
             ))
         })?;
     }
@@ -432,8 +436,9 @@ fn hydrate_transfer_governed(
     for original in &transfer.governed_originals {
         let observation = governed_transfer_observation(fence, original)?;
         if let Err(error) = observation.validate() {
+            let change_id = original.change_id.as_str();
             return Err(recovery_refusal(format!(
-                "kernel change transfer governed original '{original.change_id}' is malformed: {error}"
+                "kernel change transfer governed original '{change_id}' is malformed: {error}"
             )));
         }
         match monitor.ingest_governed_tool_mutation(observation) {
@@ -449,8 +454,9 @@ fn hydrate_transfer_governed(
             // (audit 5910747803 defect #4).
             Err(ChangeMonitorError::InvalidGovernedMutationReceipt) => {}
             Err(error) => {
+                let change_id = original.change_id.as_str();
                 return Err(recovery_refusal(format!(
-                    "kernel change transfer governed original '{original.change_id}' cannot be projected: {error}"
+                    "kernel change transfer governed original '{change_id}' cannot be projected: {error}"
                 )));
             }
         }
@@ -494,8 +500,9 @@ fn governed_transfer_observation(
         });
     let kind = match (&before, &after) {
         (None, None) => {
+            let change_id = original.change_id.as_str();
             return Err(recovery_refusal(format!(
-                "kernel change transfer governed original '{original.change_id}' carries neither a before nor an after revision"
+                "kernel change transfer governed original '{change_id}' carries neither a before nor an after revision"
             )));
         }
         (None, Some(_)) => ChangeKind::Created,
@@ -560,8 +567,10 @@ fn hydrate_transfer_reconciliations(
             monitor
                 .reconcile_unknown_change(&link.unknown_change_id, &link.evidence_change_id)
                 .map_err(|error| {
+                    let unknown_change_id = link.unknown_change_id.as_str();
+                    let evidence_change_id = link.evidence_change_id.as_str();
                     recovery_refusal(format!(
-                        "kernel change transfer reconciliation '{link.unknown_change_id}' <- '{link.evidence_change_id}' is invalid: {error}"
+                        "kernel change transfer reconciliation '{unknown_change_id}' <- '{evidence_change_id}' is invalid: {error}"
                     ))
                 })?;
             continue;
@@ -572,8 +581,10 @@ fn hydrate_transfer_reconciliations(
             .find(|unknown| unknown.change_id == link.unknown_change_id)
             .is_some_and(|unknown| unknown.reconciled);
         if !resolved {
+            let unknown_change_id = link.unknown_change_id.as_str();
+            let evidence_change_id = link.evidence_change_id.as_str();
             return Err(recovery_refusal(format!(
-                "kernel change transfer reconciliation '{link.unknown_change_id}' <- '{link.evidence_change_id}' names observations this owner has not projected"
+                "kernel change transfer reconciliation '{unknown_change_id}' <- '{evidence_change_id}' names observations this owner has not projected"
             )));
         }
     }
@@ -602,8 +613,9 @@ fn hydrate_transfer_unknowns(
             KernelTransferEvidenceClass::UnknownReconciled => {
                 // The owning ledger contradicts itself on this row: fail
                 // closed instead of guessing which half to trust.
+                let change_id = unknown.change_id.as_str();
                 return Err(recovery_refusal(format!(
-                    "kernel change transfer unknown change '{unknown.change_id}' is marked resolved but not reconciled"
+                    "kernel change transfer unknown change '{change_id}' is marked resolved but not reconciled"
                 )));
             }
             KernelTransferEvidenceClass::UnknownUnreconciled
