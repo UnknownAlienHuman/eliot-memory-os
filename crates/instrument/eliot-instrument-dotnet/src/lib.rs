@@ -69,6 +69,25 @@ pub struct DotnetTestSummary {
     pub total: u64,
 }
 
+impl DotnetTestSummary {
+    /// Evaluates a VSTest result only when its complete, nonempty totals agree.
+    #[must_use]
+    pub fn outcome(&self) -> VerificationOutcome {
+        if self.failed > 0 || !self.succeeded {
+            return VerificationOutcome::Fail;
+        }
+        if self.total > 0
+            && self.passed > 0
+            && self.passed.saturating_add(self.skipped) == self.total
+            && self.failed == 0
+        {
+            VerificationOutcome::Pass
+        } else {
+            VerificationOutcome::Unknown
+        }
+    }
+}
+
 /// Terminal summary emitted by MSBuild's console logger.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DotnetBuildSummary {
@@ -113,17 +132,7 @@ impl DotnetBuildReport {
         let Some(summary) = &self.test_summary else {
             return VerificationOutcome::Unknown;
         };
-        if summary.failed > 0 || !summary.succeeded {
-            return VerificationOutcome::Fail;
-        }
-        if summary.total > 0
-            && summary.passed.saturating_add(summary.skipped) == summary.total
-            && summary.failed == 0
-        {
-            VerificationOutcome::Pass
-        } else {
-            VerificationOutcome::Unknown
-        }
+        summary.outcome()
     }
 }
 
@@ -145,6 +154,9 @@ pub enum DotnetOutputError {
     /// A VSTest summary is malformed or has missing/invalid totals.
     #[error("MSBuild output has a malformed VSTest summary")]
     MalformedTestSummary,
+    /// Output did not include a VSTest completion summary.
+    #[error("MSBuild output has no VSTest completion summary")]
+    MissingTestSummary,
     /// A numeric total overflowed the owning counter.
     #[error("MSBuild diagnostic total is outside the supported range")]
     CounterOverflow,
@@ -215,6 +227,24 @@ pub fn parse_build_output(bytes: &[u8]) -> Result<DotnetBuildReport, DotnetOutpu
         }),
         _ => Err(DotnetOutputError::MissingOrDuplicateSummary),
     }
+}
+
+/// Parses one exact VSTest completion summary without requiring a build log.
+///
+/// This covers admitted `dotnet test --no-build` invocations as well as the
+/// ordinary combined build-and-test command. A missing or duplicate summary
+/// cannot produce a positive test result.
+pub fn parse_test_output(bytes: &[u8]) -> Result<DotnetTestSummary, DotnetOutputError> {
+    let output = std::str::from_utf8(bytes).map_err(|_| DotnetOutputError::InvalidUtf8)?;
+    let mut summary = None;
+    for line in output.lines().map(str::trim) {
+        if line.starts_with("Passed! - ") || line.starts_with("Failed! - ") {
+            if summary.replace(parse_test_summary(line)?).is_some() {
+                return Err(DotnetOutputError::DuplicateTestSummary);
+            }
+        }
+    }
+    summary.ok_or(DotnetOutputError::MissingTestSummary)
 }
 
 fn parse_test_summary(line: &str) -> Result<DotnetTestSummary, DotnetOutputError> {

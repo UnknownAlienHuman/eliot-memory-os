@@ -16,7 +16,9 @@ use eliot_instrument_api::{
     EvidenceCoverage, InstrumentKind, RawEvidence, RawEvidenceSource, VerificationOutcome,
 };
 use eliot_instrument_cargo::{CONTRACT_NAME as CARGO_INSTRUMENT, parse_jsonl as parse_cargo_jsonl};
-use eliot_instrument_dotnet::{CONTRACT_ID as DOTNET_INSTRUMENT, parse_build_output};
+use eliot_instrument_dotnet::{
+    CONTRACT_ID as DOTNET_INSTRUMENT, parse_build_output, parse_test_output,
+};
 use eliot_instrument_nextest::{
     NEXTEST_INSTRUMENT, NEXTEST_STDOUT_CONTENT_TYPE, parse_jsonl, parse_list_json,
 };
@@ -1371,6 +1373,30 @@ fn dotnet_receipt(
     terminal: Option<&ExitStatus>,
     finished_at: ClockReading,
 ) -> Result<ProfileReplayReceipt, ProfileReplayError> {
+    if kind == InstrumentKind::Test {
+        let summary = match parse_test_output(bytes.bytes()) {
+            Ok(summary) => summary,
+            Err(error) => {
+                return parse_failed_receipt(
+                    source,
+                    verified,
+                    entry,
+                    parser_revision,
+                    error.to_string(),
+                    finished_at,
+                );
+            }
+        };
+        return evaluated_report_receipt(
+            source,
+            verified,
+            entry,
+            parser_revision,
+            terminal_outcome(summary.outcome(), terminal),
+            "nonempty-vstest-summary-and-terminal-outcome",
+            finished_at,
+        );
+    }
     let report = match parse_build_output(bytes.bytes()) {
         Ok(report) => report,
         Err(error) => {
@@ -1384,33 +1410,16 @@ fn dotnet_receipt(
             );
         }
     };
-    let (parsed_outcome, policy) = if kind == InstrumentKind::Test {
-        let build = report.outcome();
-        let tests = report.test_outcome();
-        let outcome = match (build, tests) {
-            (VerificationOutcome::Fail, _) | (_, VerificationOutcome::Fail) => {
-                VerificationOutcome::Fail
-            }
-            (VerificationOutcome::Pass, VerificationOutcome::Pass) => VerificationOutcome::Pass,
-            _ => VerificationOutcome::Unknown,
-        };
-        (
-            outcome,
-            "msbuild-and-nonempty-vstest-summary-with-terminal-outcome",
-        )
-    } else {
-        (
-            report.outcome(),
-            "msbuild-console-diagnostic-summary-and-terminal-outcome",
-        )
-    };
     evaluated_report_receipt(
         source,
         verified,
         entry,
         parser_revision,
-        terminal_outcome(parsed_outcome, terminal),
-        policy,
+        terminal_outcome(
+            report.outcome(),
+            terminal,
+        ),
+        "msbuild-console-diagnostic-summary-and-terminal-outcome",
         finished_at,
     )
 }
