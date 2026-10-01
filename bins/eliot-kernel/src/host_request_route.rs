@@ -8745,8 +8745,7 @@ pub(crate) fn watchdog_intent_outcome_from_payload(
         .and_then(|value| {
             serde_json::from_value(value).map_err(|_| TransportError::SessionFenced)
         })?;
-    if outcomes.is_empty()
-        || outcomes.len() > eliot_protocol::MAX_WATCHDOG_SPOOL_INTENT_SUBMISSIONS
+    if outcomes.is_empty() || outcomes.len() > eliot_protocol::MAX_WATCHDOG_SPOOL_INTENT_SUBMISSIONS
     {
         return Err(TransportError::SessionFenced);
     }
