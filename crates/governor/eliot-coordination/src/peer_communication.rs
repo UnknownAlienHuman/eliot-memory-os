@@ -5168,7 +5168,10 @@ impl CoordinationOwner {
             audience_scope: draft.audience_scope.clone(),
             source_refs: vec![
                 format!("review:{}", review.review_id),
-                format!("artifact:{}:{}", review.artifact_id, review.artifact_revision),
+                format!(
+                    "artifact:{}:{}",
+                    review.artifact_id, review.artifact_revision
+                ),
             ],
             anchor: Some(BoardAnchor {
                 artifact_id: review.artifact_id.clone(),

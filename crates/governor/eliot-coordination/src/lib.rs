@@ -55,11 +55,11 @@ pub use peer_communication::{
     PeerDurabilityAttestation, PeerDurabilityPort, PeerEndpointLossReport, PeerEnqueueReceipt,
     PeerEnvelopeHeader, PeerMessage, PeerMessageDiagnostic, PeerMessageKind, PeerMessageState,
     PeerReconnectReport, PeerReviewAckReceipt, PeerReviewAdvance, PeerReviewBatch,
-    PeerReviewBatchReceipt, PeerReviewCorrection, PeerReviewCorrectionReceipt, PeerReviewDenominator,
-    PeerReviewLifecycle, PeerReviewObligation, PeerReviewReceipt, PeerReviewStanding,
-    PeerSafeBoundaryPort, PeerStreamHead, PeerStreamId, PostBoardEntry, PrivacyClass,
-    REQUIRED_PEER_ENVELOPE_FIELDS, RawField, RecordPeerConflict, ReviewBlockerEscalationReceipt,
-    ReviewCompleteness, ReviewKind, ReviewRecommendation,
+    PeerReviewBatchReceipt, PeerReviewCorrection, PeerReviewCorrectionReceipt,
+    PeerReviewDenominator, PeerReviewLifecycle, PeerReviewObligation, PeerReviewReceipt,
+    PeerReviewStanding, PeerSafeBoundaryPort, PeerStreamHead, PeerStreamId, PostBoardEntry,
+    PrivacyClass, REQUIRED_PEER_ENVELOPE_FIELDS, RawField, RecordPeerConflict,
+    ReviewBlockerEscalationReceipt, ReviewCompleteness, ReviewKind, ReviewRecommendation,
     ReviewTargetKind, ReviseBoardEntry, SubmitPeerReview, decode_peer_envelope, peer_digest_hex,
     review_is_blocker,
 };
@@ -694,7 +694,7 @@ impl CoordinationOwner {
         if snapshot
             .peer_review_resolutions
             .values()
-            .any(|status| status.satisfies_required_review())
+            .any(AnchorResolution::satisfies_required_review)
             || snapshot
                 .peer_review_resolutions
                 .keys()
