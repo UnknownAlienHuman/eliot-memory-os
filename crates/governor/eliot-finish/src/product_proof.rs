@@ -389,6 +389,36 @@ fn fail_closed_rollup(
 /// `validate()` would otherwise refuse. Reading the observation here rather
 /// than leaving it to `validate()` is what keeps the record publishable instead
 /// of collapsing to an absent field.
+///
+/// # The shared `Blocked` arm is one cell, not one fact
+///
+/// I18.24 defines `BLOCKED` as "policy/environment/capability prevents required
+/// proof", and both inputs prevent the same required proof — the installed-route
+/// execution — so they legitimately share the one outcome cell.
+///
+/// They are nonetheless different facts, and this arm is where that is stated so
+/// the shared body cannot be read as the two inputs being interchangeable:
+///
+/// * `FinishDecisionOutcome::Blocked` — the Finish owner stopped the candidate
+///   itself, before the candidate contract was proven.
+/// * `VerifiedComplete` with `installed_route_observed == false` — the Finish
+///   owner did prove the candidate, and the installed route still never ran.
+///
+/// The difference survives on the record because this owner maps the execution
+/// axis separately: a decision the Finish owner blocked closes as
+/// `EnterBlocked`, which records the terminal `Blocked` position and carries the
+/// `InfrastructureResource` failure class on an incomplete attempt, while an
+/// unobserved `VerifiedComplete` closes as `CloseCompleted`, which records the
+/// `Succeeded` position with no failure class. The reason, the authority, and
+/// the still-missing installed-route requirement are derived per receipt as
+/// well. So the merge costs no readable distinction; it only stops the outcome
+/// axis from inventing a meaning the six-state I18.24 vocabulary does not have.
+///
+/// This arm is reached by `VerifiedComplete` only when the guard above already
+/// declined it, because match arms are tried in order — so merging here cannot
+/// let an unobserved `VerifiedComplete` reach `Pass`. If the vocabulary ever
+/// separates these two states, that is a change to I18.24 and to this mapping
+/// together, not a local edit to this arm.
 pub fn outcome_of_decision(
     decision: &FinishDecision,
     installed_route_observed: bool,
@@ -397,11 +427,12 @@ pub fn outcome_of_decision(
         FinishDecisionOutcome::VerifiedComplete if installed_route_observed => {
             VerificationOutcome::Pass
         }
-        FinishDecisionOutcome::VerifiedComplete => VerificationOutcome::Blocked,
+        FinishDecisionOutcome::VerifiedComplete | FinishDecisionOutcome::Blocked => {
+            VerificationOutcome::Blocked
+        }
         FinishDecisionOutcome::FailedVerification => VerificationOutcome::Fail,
         FinishDecisionOutcome::Partial => VerificationOutcome::Partial,
         FinishDecisionOutcome::DegradedNoProof => VerificationOutcome::Unknown,
-        FinishDecisionOutcome::Blocked => VerificationOutcome::Blocked,
         FinishDecisionOutcome::Cancelled => VerificationOutcome::Cancelled,
         FinishDecisionOutcome::Superseded | FinishDecisionOutcome::UnsafeToFinish => {
             VerificationOutcome::Unknown
