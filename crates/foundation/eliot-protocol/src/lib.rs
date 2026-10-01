@@ -7650,41 +7650,79 @@ mod tests {
         let wire = codec.encode(&source)?;
         assert_eq!(codec.decode(&wire)?, source);
 
-        let operation = NativeWorkerOperationV1::Heartbeat;
-        let native_worker_payload = NativeWorkerFramePayloadV1 {
-            wire_version: NATIVE_WORKER_FRAME_V1_WIRE_VERSION,
-            native_protocol_version: NATIVE_WORKER_PROTOCOL_VERSION.to_owned(),
-            operation,
-            deadline_unix_ms: 10,
-            authority_epoch: test_epoch(TEST_LINEAGE_A, 1),
-            state_fence: fence(),
-            lease_id: serde_json::from_value(serde_json::json!({
-                "namespace": "eliot.governor.work-lease",
-                "revision": "v1",
-                "value": "native-worker-lease-1"
-            }))
-            .map_err(|error| ProtocolError::Json(error.to_string()))?,
-            admission_revision: "admission-1".to_owned(),
-            producer_generation: 1,
-            body: serde_json::json!({"kind": operation.body_kind()}),
-        };
-        let native_worker_frame = Frame {
-            protocol_version: ProtocolVersion::CURRENT,
-            encoding_profile: EncodingProfile::JsonV1,
-            connection_id: "native-worker-connection".to_owned(),
-            request_id: Some(RequestId::new("native-worker-heartbeat-1")?),
-            kind: operation.frame_kind(),
-            message_type: operation.message_type(),
-            request_identity: None,
-            payload: ProtocolPayload::NativeWorkerFrameV1(native_worker_payload),
-            trace_context: BTreeMap::new(),
-        };
-        let native_worker_wire = codec.encode(&native_worker_frame)?;
-        assert_eq!(codec.decode(&native_worker_wire)?, native_worker_frame);
+        let expected_native_messages = [
+            (
+                NativeWorkerOperationV1::Heartbeat,
+                FrameKind::Heartbeat,
+                MessageType::NativeWorkerHeartbeat,
+                "NativeWorkerHeartbeat",
+            ),
+            (
+                NativeWorkerOperationV1::Reconnect,
+                FrameKind::Request,
+                MessageType::NativeWorkerReconnect,
+                "NativeWorkerReconnect",
+            ),
+            (
+                NativeWorkerOperationV1::Reconcile,
+                FrameKind::Request,
+                MessageType::NativeWorkerReconcile,
+                "NativeWorkerReconcile",
+            ),
+            (
+                NativeWorkerOperationV1::Acknowledge,
+                FrameKind::Control,
+                MessageType::NativeWorkerAcknowledge,
+                "NativeWorkerAcknowledge",
+            ),
+        ];
+        let mut native_worker_heartbeat_frame = None;
+        for (operation, expected_kind, expected_message_type, expected_wire_name) in
+            expected_native_messages
+        {
+            assert_eq!(operation.frame_kind(), expected_kind);
+            assert_eq!(operation.message_type(), expected_message_type);
+            assert!(is_known_message_type(expected_wire_name));
 
-        let mut unknown =
-            serde_json::to_value(native_worker_frame)
-                .map_err(|error| ProtocolError::Json(error.to_string()))?;
+            let native_worker_payload = NativeWorkerFramePayloadV1 {
+                wire_version: NATIVE_WORKER_FRAME_V1_WIRE_VERSION,
+                native_protocol_version: NATIVE_WORKER_PROTOCOL_VERSION.to_owned(),
+                operation,
+                deadline_unix_ms: 10,
+                authority_epoch: test_epoch(TEST_LINEAGE_A, 1),
+                state_fence: fence(),
+                lease_id: serde_json::from_value(serde_json::json!({
+                    "namespace": "eliot.governor.work-lease",
+                    "revision": "v1",
+                    "value": "native-worker-lease-1"
+                }))
+                .map_err(|error| ProtocolError::Json(error.to_string()))?,
+                admission_revision: "admission-1".to_owned(),
+                producer_generation: 1,
+                body: serde_json::json!({"kind": operation.body_kind()}),
+            };
+            let native_worker_frame = Frame {
+                protocol_version: ProtocolVersion::CURRENT,
+                encoding_profile: EncodingProfile::JsonV1,
+                connection_id: "native-worker-connection".to_owned(),
+                request_id: Some(RequestId::new("native-worker-wire-roundtrip")?),
+                kind: operation.frame_kind(),
+                message_type: operation.message_type(),
+                request_identity: None,
+                payload: ProtocolPayload::NativeWorkerFrameV1(native_worker_payload),
+                trace_context: BTreeMap::new(),
+            };
+            if operation == NativeWorkerOperationV1::Heartbeat {
+                native_worker_heartbeat_frame = Some(native_worker_frame.clone());
+            }
+            let native_worker_wire = codec.encode(&native_worker_frame)?;
+            assert_eq!(codec.decode(&native_worker_wire)?, native_worker_frame);
+        }
+
+        let mut unknown = serde_json::to_value(
+            native_worker_heartbeat_frame.expect("expected heartbeat fixture"),
+        )
+        .map_err(|error| ProtocolError::Json(error.to_string()))?;
         unknown["message_type"] = Value::String("UnknownLifecycleMessage".to_owned());
         let body =
             serde_json::to_vec(&unknown).map_err(|error| ProtocolError::Json(error.to_string()))?;
