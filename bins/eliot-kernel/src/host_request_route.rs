@@ -6752,6 +6752,7 @@ impl KernelComposition {
                     &envelope_sha,
                     &privacy,
                     expired,
+                    deadline_unix_ms,
                 )
             }
             DeliveryClass::BestEffortTelemetry => {
@@ -6903,7 +6904,9 @@ impl KernelComposition {
     /// return below still leaves a recoverable handoff: a timeout after
     /// stage is never proof of non-acceptance, and the duplicate/reconcile
     /// recovery legs report the exact pending phase instead of a blanket
-    /// safe-to-resubmit answer.
+    /// safe-to-resubmit answer. The observed absolute submit deadline is
+    /// staged as `submit_deadline_ms` evidence for bounded owner recovery;
+    /// it never gates admission and never joins identity comparisons.
     fn stage_bridge_event_durable(
         &self,
         session: &Session,
@@ -6912,6 +6915,7 @@ impl KernelComposition {
         envelope_sha: &str,
         privacy: &serde_json::Value,
         expired: bool,
+        deadline_unix_ms: u64,
     ) -> Result<serde_json::Value, TransportError> {
         let privacy_legs = Self::bridge_event_privacy_legs(privacy)?;
         let staged = serde_json::json!({
@@ -6947,6 +6951,11 @@ impl KernelComposition {
             "owner_connection": evidence.connection,
             "owner_launch_nonce": evidence.launch_nonce,
             "owner_session_epoch": evidence.session_epoch,
+            // Issue #2731 item 3: the observed absolute submit deadline
+            // travels as durable-stage evidence so bounded owner recovery
+            // can distinguish an expired submit from a non-acceptance. It
+            // never gates admission and never joins identity comparisons.
+            "submit_deadline_ms": deadline_unix_ms,
         });
         let outcome = match self
             .generation_gateway
