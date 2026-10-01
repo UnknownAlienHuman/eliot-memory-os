@@ -71,6 +71,7 @@ pub use activation_resolution::{
     AGENT_ACTIVATION_RESULT_SUBMIT_WIRE_ID, AGENT_ACTIVATION_RESULT_SUBMIT_WIRE_VERSION,
     AgentActivationCandidateCoverage, AgentActivationClaimRequest,
     AgentActivationColdStartQuestion, AgentActivationDependencyObservation,
+    AgentActivationBindScopeEvidence,
     AgentActivationKernelOwnerReadback, AgentActivationOwnerEvidence, AgentActivationOwnerReadback,
     AgentActivationResolutionDisposition, AgentActivationResolutionResult,
     AgentActivationResolvedBinding, AgentActivationResultAck, AgentActivationResultAckOutcome,

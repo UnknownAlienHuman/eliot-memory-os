@@ -314,6 +314,95 @@ pub struct AgentActivationOwnerReadback {
     pub readback_sha256: String,
 }
 
+/// Authenticated semantic-owner proof that a single admitted task selection
+/// can bind its explicitly selected WorkScope before a Resolved activation
+/// exists. This is a BIND_SCOPE-only capability: it does not create a
+/// Session, a Resolved binding, or readiness. Every semantic field is copied
+/// from the Governor's existing WorkLease/session/task/canonical-plan and
+/// TaskContract-acceptance proof and is sealed to the exact activation ticket.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentActivationBindScopeEvidence {
+    pub owner_id: String,
+    pub owner_revision: u64,
+    pub ticket_id: String,
+    pub ticket_sha256: String,
+    pub state_fence: StateFence,
+    pub principal_id: String,
+    pub session_id: String,
+    pub work_lease_id: String,
+    pub work_item_id: String,
+    pub task_id: String,
+    pub task_revision: u64,
+    pub work_scope_id: String,
+    pub plan_id: String,
+    pub plan_revision: u64,
+    pub acceptance_digest: String,
+    pub kernel_owner: AgentActivationKernelOwnerReadback,
+    pub observed_at_unix_ms: u64,
+}
+
+impl AgentActivationBindScopeEvidence {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.owner_id != AGENT_ACTIVATION_OWNER_ID || self.owner_revision == 0 {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_activation_bind_scope_evidence.owner",
+                reason: "must name the authenticated semantic owner at a non-zero revision",
+            });
+        }
+        bounded_text(&self.ticket_id, "agent_activation_bind_scope_evidence.ticket_id")?;
+        lowercase_sha256(
+            &self.ticket_sha256,
+            "agent_activation_bind_scope_evidence.ticket_sha256",
+        )?;
+        self.state_fence
+            .validate()
+            .map_err(ProtocolError::Foundation)?;
+        for (value, field) in [
+            (&self.principal_id, "principal_id"),
+            (&self.session_id, "session_id"),
+            (&self.work_lease_id, "work_lease_id"),
+            (&self.work_item_id, "work_item_id"),
+            (&self.task_id, "task_id"),
+            (&self.work_scope_id, "work_scope_id"),
+            (&self.plan_id, "plan_id"),
+        ] {
+            bounded_text(value, field)?;
+        }
+        if self.task_revision == 0 || self.plan_revision == 0 || self.observed_at_unix_ms == 0 {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_activation_bind_scope_evidence.revisions",
+                reason: "task, plan, and observation revisions must be non-zero",
+            });
+        }
+        lowercase_sha256(
+            &self.acceptance_digest,
+            "agent_activation_bind_scope_evidence.acceptance_digest",
+        )?;
+        self.kernel_owner.validate()?;
+        Ok(())
+    }
+
+    pub fn validate_against(
+        &self,
+        ticket: &AgentActivationResolutionTicket,
+    ) -> Result<(), ProtocolError> {
+        self.validate()?;
+        ticket.validate()?;
+        if self.ticket_id != ticket.ticket_id
+            || self.ticket_sha256 != ticket.ticket_sha256
+            || self.state_fence != ticket.state_fence
+            || ticket.successor_of.is_some()
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_activation_bind_scope_evidence.ticket",
+                reason: "must bind the exact initial activation ticket and complete StateFence",
+            });
+        }
+        Ok(())
+    }
+}
+
 impl AgentActivationOwnerReadback {
     pub fn from_evidence(
         evidence: AgentActivationOwnerEvidence,
@@ -818,6 +907,10 @@ pub struct AgentActivationResolutionResult {
     /// every negative disposition.
     #[serde(default)]
     pub owner_evidence: Option<AgentActivationOwnerEvidence>,
+    /// Pre-scope owner proof authorizing only an explicit BIND_SCOPE claim.
+    /// It never creates an activated binding, Session, or readiness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind_scope_evidence: Option<AgentActivationBindScopeEvidence>,
     /// Optional Host-observed cold-start question. It grants no readiness or
     /// task authority and is present only for the privacy-boundary hold.
     #[serde(default)]
@@ -885,6 +978,7 @@ impl AgentActivationResolutionResult {
             disposition,
             dependency_observation: None,
             owner_evidence,
+            bind_scope_evidence: None,
             cold_start_question: None,
             result_sha256: String::new(),
         }
@@ -967,6 +1061,30 @@ impl AgentActivationResolutionResult {
         Ok(self)
     }
 
+    /// Attaches the owner-produced pre-scope proof for an explicit BIND_SCOPE
+    /// operation and reseals the exact result digest. The ticket join is
+    /// checked by `validate_against` at the authenticated Kernel boundary.
+    pub fn with_bind_scope_evidence(
+        mut self,
+        evidence: AgentActivationBindScopeEvidence,
+    ) -> Result<Self, ProtocolError> {
+        if !matches!(
+            self.disposition,
+            AgentActivationResolutionDisposition::ScopeSelectionRequired { .. }
+        ) {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_activation_resolution_result.bind_scope_evidence",
+                reason: "pre-scope evidence is permitted only for ScopeSelectionRequired",
+            });
+        }
+        evidence.validate()?;
+        self.bind_scope_evidence = Some(evidence);
+        self.result_sha256.clear();
+        self.result_sha256 = self.compute_digest()?;
+        self.validate()?;
+        Ok(self)
+    }
+
     /// Attaches the exact scanner question to a resolved activation result
     /// and reseals its digest before Kernel submission.
     pub fn with_cold_start_question(
@@ -1036,6 +1154,21 @@ impl AgentActivationResolutionResult {
         if let Some(observation) = &self.dependency_observation {
             observation.validate()?;
         }
+        if let Some(evidence) = &self.bind_scope_evidence {
+            evidence.validate()?;
+            if !matches!(
+                self.disposition,
+                AgentActivationResolutionDisposition::ScopeSelectionRequired { .. }
+            ) || evidence.ticket_id != self.ticket_id
+                || evidence.ticket_sha256 != self.ticket_sha256
+                || evidence.state_fence != self.ticket_state_fence
+            {
+                return Err(ProtocolError::InvalidField {
+                    field: "agent_activation_resolution_result.bind_scope_evidence",
+                    reason: "must bind this exact ScopeSelectionRequired result ticket",
+                });
+            }
+        }
         match (&self.disposition, &self.owner_evidence) {
             (AgentActivationResolutionDisposition::Resolved { binding }, Some(evidence)) => {
                 evidence.validate_against_binding(binding, &self.ticket_state_fence)?;
@@ -1088,6 +1221,9 @@ impl AgentActivationResolutionResult {
                 field: "agent_activation_resolution_result.resolved_at_unix_ms",
                 reason: "must be earlier than the Kernel ticket deadline",
             });
+        }
+        if let Some(evidence) = &self.bind_scope_evidence {
+            evidence.validate_against(ticket)?;
         }
         match (
             ticket.successor_of.as_ref(),
