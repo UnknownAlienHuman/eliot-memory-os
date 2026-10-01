@@ -10,8 +10,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_graph_api::{
-    CoordinateKind, GraphCoordinate, GraphCoverage, GraphEdge, GraphFreshness, GraphNode,
-    GraphQuery, GraphQueryKind, GraphQueryResult, GraphQueryStatus, GraphRevision,
+    AbsenceEvidence, AbsenceResolution, ContradictionCheck, CoordinateKind, GraphCoordinate,
+    GraphCoverage, GraphEdge, GraphFreshness, GraphNode, GraphQuery, GraphQueryKind,
+    GraphQueryResult, GraphQueryStatus, GraphRevision, GraphUnknownReason,
 };
 use thiserror::Error;
 
@@ -171,6 +172,14 @@ impl ScipIndex {
             }
         };
         let selected: BTreeSet<_> = nodes.keys().filter(|node| matches(node)).cloned().collect();
+        // Coverage denominator: the occurrences actually scanned for this
+        // query. It is measured from the decoded index, not from whether the
+        // match set happened to be empty.
+        let inspected = self
+            .documents
+            .iter()
+            .map(|document| document.occurrences.len() as u64)
+            .sum::<u64>();
         let result_nodes: Vec<_> = nodes
             .into_iter()
             .filter_map(|(key, value)| selected.contains(&key).then_some(value))
@@ -187,23 +196,44 @@ impl ScipIndex {
                 )
             })
             .collect();
+        // I10.8.6: "Absence is a fact only when all conditions hold". This
+        // adapter decodes one emitted index and resolves no instrument
+        // contract and no counterevidence, so an empty projection is a
+        // typed unknown rather than a proved absence. Freshness is the
+        // currency of this decode, not a binding to an exact source
+        // candidate, so it is recorded as unknown rather than asserted.
+        let resolution = AbsenceResolution {
+            freshness: GraphFreshness::Unknown,
+            coverage: if inspected == 0 {
+                GraphCoverage::Unknown
+            } else {
+                GraphCoverage::Complete
+            },
+            capability: None,
+            contradiction_check: ContradictionCheck::NotEstablished,
+            cfg_or_macro_coverage_limited: false,
+            worktree_overlay_present: false,
+            truncated: false,
+            tool_failed: false,
+        };
         let status = if result_nodes.is_empty() && result_edges.is_empty() {
-            GraphQueryStatus::NotFound
+            resolution.classify_empty_lookup()
         } else {
             GraphQueryStatus::Found
         };
-        let absence = if matches!(status, GraphQueryStatus::NotFound) {
-            Some(eliot_graph_api::AbsenceEvidence {
+        let absence = if status.is_absence() {
+            Some(AbsenceEvidence {
                 checked_scope: query.scope.clone(),
-                inspected_records: self
-                    .documents
-                    .iter()
-                    .map(|d| d.occurrences.len() as u64)
-                    .sum::<u64>()
-                    .max(1),
+                inspected_records: inspected,
                 query_digest: GraphQueryResult::query_digest(query)
                     .map_err(|e| ScipError::Graph(e.to_string()))?,
                 checked_revision: revision,
+                capability: resolution.capability.clone().ok_or_else(|| {
+                    ScipError::Graph(
+                        eliot_graph_api::GraphContractError::UnqualifiedNegativeResult.to_string(),
+                    )
+                })?,
+                contradiction_check: resolution.contradiction_check,
             })
         } else {
             None
@@ -212,8 +242,8 @@ impl ScipIndex {
             query_id: query.query_id.clone(),
             status,
             revision,
-            freshness: GraphFreshness::Current,
-            coverage: GraphCoverage::Complete,
+            freshness: resolution.freshness,
+            coverage: resolution.coverage,
             nodes: result_nodes,
             edges: result_edges,
             absence,

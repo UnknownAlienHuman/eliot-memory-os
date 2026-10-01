@@ -9,8 +9,9 @@
 #![forbid(unsafe_code)]
 
 use eliot_graph_api::{
-    GraphContractError, GraphCoordinate, GraphCoverage, GraphEdge, GraphFreshness, GraphNode,
-    GraphQuery, GraphQueryKind, GraphQueryResult, GraphQueryStatus, GraphRevision,
+    AbsenceEvidence, AbsenceResolution, ContradictionCheck, GraphContractError, GraphCoordinate,
+    GraphCoverage, GraphEdge, GraphFreshness, GraphNode, GraphQuery, GraphQueryKind,
+    GraphQueryResult, GraphQueryStatus, GraphRevision, GraphUnknownReason,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -217,24 +218,28 @@ impl CodeGraphOwner {
                 }
             }
         }
+        let resolution = self.absence_resolution(freshness, coverage);
         let mut result = GraphQueryResult {
             query_id: query.query_id.clone(),
             status: if nodes.is_empty() && edges.is_empty() {
+                // An empty lookup is routed through the I10.8.6 gate rather
+                // than reported as "not found" on the strength of being
+                // empty. This index owns no instrument contract and runs no
+                // counterevidence search, so the two owner-join
+                // preconditions are unattested and the gate refuses an
+                // absence here. `inspected` is a real denominator measured
+                // from the projections scanned, never `items.is_empty()`.
                 if inspected == 0 {
-                    GraphQueryStatus::Unknown
-                } else if matches!(freshness, GraphFreshness::Current)
-                    && matches!(coverage, GraphCoverage::Complete)
-                {
-                    GraphQueryStatus::NotFound
+                    GraphQueryStatus::Unknown(GraphUnknownReason::NotFoundInPartialIndex)
                 } else {
-                    GraphQueryStatus::Partial
+                    resolution.classify_empty_lookup()
                 }
             } else if matches!(freshness, GraphFreshness::Current)
                 && matches!(coverage, GraphCoverage::Complete)
             {
                 GraphQueryStatus::Found
             } else {
-                GraphQueryStatus::Partial
+                GraphQueryStatus::Partial(GraphUnknownReason::NotFoundInPartialIndex)
             },
             revision: current,
             freshness,
@@ -244,15 +249,45 @@ impl CodeGraphOwner {
             absence: None,
             diagnostics: Vec::new(),
         };
-        if matches!(result.status, GraphQueryStatus::NotFound) {
-            result.absence = Some(eliot_graph_api::AbsenceEvidence {
+        if result.status.is_absence() {
+            result.absence = Some(AbsenceEvidence {
                 checked_scope: query.scope.clone(),
                 inspected_records: inspected,
                 query_digest: GraphQueryResult::query_digest(query)?,
                 checked_revision: current,
+                capability: resolution.capability.clone().ok_or_else(|| {
+                    CodeGraphError::Contract(GraphContractError::UnqualifiedNegativeResult)
+                })?,
+                contradiction_check: resolution.contradiction_check,
             });
         }
         Ok(result)
+    }
+
+    /// Resolves the I10.8.6 preconditions this index can establish on its own.
+    ///
+    /// Freshness and coverage are composed from the scanned projections. The
+    /// two owner-join preconditions are not this index's to make: it holds no
+    /// admitted instrument contract and runs no counterevidence search, so
+    /// both are recorded as unattested and the gate refuses an absence.
+    /// A caller that can resolve both must call
+    /// [`AbsenceResolution::classify_empty_lookup`] with its own resolution
+    /// rather than through this index.
+    fn absence_resolution(
+        &self,
+        freshness: GraphFreshness,
+        coverage: GraphCoverage,
+    ) -> AbsenceResolution {
+        AbsenceResolution {
+            freshness,
+            coverage,
+            capability: None,
+            contradiction_check: ContradictionCheck::NotEstablished,
+            cfg_or_macro_coverage_limited: false,
+            worktree_overlay_present: false,
+            truncated: false,
+            tool_failed: false,
+        }
     }
 
     fn persist(&self) -> Result<(), CodeGraphError> {

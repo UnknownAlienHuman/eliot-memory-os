@@ -711,16 +711,26 @@ impl NormalizedResult {
     /// listing answers only its own scope, never the workspace).
     /// `exact_candidate_binding` attests that the analyzed index is bound to
     /// the exact candidate and scope under evaluation; the receipt alone never
-    /// proves that binding. The bridge tracks no counterevidence, so
-    /// contradiction is always unattested here and downstream disagreement
-    /// handling (I10.8.19) owns it instead.
+    /// proves that binding.
+    ///
+    /// `capability` is narrowed to [`AbsenceCapability::ContradictionUnattested`]
+    /// when it claims admission, because the bridge tracks no counterevidence
+    /// and an unattested contradiction is not `false`: this convenience path
+    /// therefore cannot produce `ProvenAbsent`, only a typed unknown. A caller
+    /// that has genuinely completed a bounded counterevidence search calls
+    /// [`classify_lookup`] directly with the capability it actually resolved.
     #[must_use]
     pub fn lookup_outcome(
         &self,
         config: &AnalyzerConfig,
         scope_complete_for_query: bool,
         exact_candidate_binding: bool,
+        capability: AbsenceCapability,
     ) -> LookupOutcome {
+        let capability = match capability {
+            AbsenceCapability::Admitted { .. } => AbsenceCapability::ContradictionUnattested,
+            other => other,
+        };
         let found_any = match self {
             Self::Definitions { items, .. } => !items.is_empty(),
             Self::References { items, .. } => !items.is_empty(),
@@ -738,6 +748,7 @@ impl NormalizedResult {
                 cfg_or_macro_coverage_limited: config.cfg_or_macro_coverage_limited(),
                 contradicted_by_higher_authority: false,
             },
+            capability,
         )
     }
 }
@@ -792,6 +803,50 @@ pub struct LookupClassification {
     pub contradicted_by_higher_authority: bool,
 }
 
+/// The admitted instrument contract behind a lookup's absence capability.
+///
+/// I10.8.6: "the instrument contract can prove absence" and "no
+/// higher-authority contradictory evidence exists". Both are independent
+/// preconditions, not consequences of the run succeeding: the bridge cannot
+/// infer from an exit code that any instrument can prove absence for the
+/// requested relation, and it cannot infer from an absent search result that
+/// no counterevidence exists. A lookup that did not resolve a contract, or
+/// that did not complete a bounded counterevidence search, is refused.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AbsenceCapability {
+    /// An admitted instrument contract was resolved for this relation and a
+    /// bounded counterevidence search completed over the applicable
+    /// authorities, finding nothing contradicting.
+    Admitted {
+        /// Identity of the admitted contract.
+        contract: &'static str,
+        /// Revision of the admitted contract.
+        revision: &'static str,
+    },
+    /// No admitted contract proves absence for this relation, so the lookup
+    /// cannot produce an absence result at all.
+    NotProven {
+        /// Why the capability is unavailable.
+        reason: UnknownOutcome,
+    },
+    /// The instrument is absence-capable in principle, but no bounded
+    /// counterevidence search was completed, so the no-higher-authority-
+    /// contradiction precondition is unattested.
+    ContradictionUnattested,
+}
+
+impl AbsenceCapability {
+    /// Resolves the capability into the gate's `Result`.
+    #[must_use]
+    pub const fn to_result(self) -> Result<(), UnknownOutcome> {
+        match self {
+            Self::Admitted { .. } => Ok(()),
+            Self::NotProven { reason } => Err(reason),
+            Self::ContradictionUnattested => Err(UnknownOutcome::NotFoundInPartialIndex),
+        }
+    }
+}
+
 /// Classifies one lookup from its observation receipt.
 ///
 /// A run that failed, truncated, or did not normalize reports
@@ -808,24 +863,34 @@ pub struct LookupClassification {
 pub fn classify_lookup(
     receipt: &ObservationReceipt,
     classification: LookupClassification,
+    capability: AbsenceCapability,
 ) -> LookupOutcome {
     if classification.found_any {
         return LookupOutcome::Found;
     }
-    let absence_capability = match receipt.disposition {
-        FailureDisposition::Success => {
-            if classification.cfg_or_macro_coverage_limited {
-                Err(UnknownOutcome::UnknownDueToCfgOrMacroCoverage)
-            } else {
-                Ok(())
+    // The admitted instrument contract's own absence capability bounds what
+    // this lookup can mean. A successful run is not that capability, so a
+    // run that succeeded without a resolved contract stays unknown: the
+    // disposition only refines the reason a contract-less lookup is
+    // undeterminable, it never substitutes for the capability.
+    let absence_capability = match &capability {
+        AbsenceCapability::NotProven { reason } => Err(*reason),
+        AbsenceCapability::ContradictionUnattested => Err(UnknownOutcome::NotFoundInPartialIndex),
+        AbsenceCapability::Admitted { .. } => match receipt.disposition {
+            FailureDisposition::Success => {
+                if classification.cfg_or_macro_coverage_limited {
+                    Err(UnknownOutcome::UnknownDueToCfgOrMacroCoverage)
+                } else {
+                    Ok(())
+                }
             }
-        }
-        FailureDisposition::ToolFailed { .. }
-        | FailureDisposition::OutputTruncated
-        | FailureDisposition::ParseFailed { .. }
-        | FailureDisposition::UnsupportedOperation => {
-            Err(UnknownOutcome::UnknownDueToTruncationOrToolFailure)
-        }
+            FailureDisposition::ToolFailed { .. }
+            | FailureDisposition::OutputTruncated
+            | FailureDisposition::ParseFailed { .. }
+            | FailureDisposition::UnsupportedOperation => {
+                Err(UnknownOutcome::UnknownDueToTruncationOrToolFailure)
+            }
+        },
     };
     let freshness = match receipt.freshness {
         Freshness::Current if classification.exact_candidate_binding => {

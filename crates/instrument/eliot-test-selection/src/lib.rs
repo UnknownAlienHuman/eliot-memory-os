@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_graph_api::{
     CoordinateKind, GraphCoordinate, GraphCoverage, GraphFreshness, GraphQueryResult,
-    GraphQueryStatus,
+    GraphQueryStatus, GraphUnknownReason,
 };
 use eliot_instrument_api::InstrumentKind;
 use schemars::JsonSchema;
@@ -191,6 +191,13 @@ pub struct SelectedTest {
 }
 
 /// Planner disposition, including safe fail-closed states.
+///
+/// `BlockedUnknown` retains the typed reason the affected scope could not be
+/// established. I10.8.6: "Statements such as `no callers`, `dead symbol`,
+/// `no dependents` and `change cannot affect X` never arise from incomplete
+/// heuristic evidence." Carrying the reason means a finish or claim path can
+/// tell "nothing was affected" (a proved absence) from "we could not look"
+/// (a typed unknown), which a single `Blocked` cannot express.
 #[derive(Clone, Copy, Debug, Eq, Hash, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum SelectionDisposition {
@@ -200,6 +207,32 @@ pub enum SelectionDisposition {
     Empty,
     /// The graph could not safely establish the affected scope.
     Blocked,
+    /// The graph could not establish the affected scope for this typed
+    /// reason; the scope is unknown, not unaffected.
+    BlockedUnknown(GraphUnknownReason),
+}
+
+impl SelectionDisposition {
+    /// Whether this plan may stand in for a proved no-impact result.
+    ///
+    /// Always false. A plan is a selection over a query that answered
+    /// positively or not at all; `Blocked` and `BlockedUnknown` answer
+    /// nothing, so no disposition here is a substitute for the
+    /// [`GraphQueryStatus::NotFound`] proof that nothing was affected. The
+    /// method exists so a finish path can state that refusal structurally.
+    #[must_use]
+    pub const fn asserts_no_impact(self) -> bool {
+        false
+    }
+
+    /// The typed unknown blocking this plan, when it carries one.
+    #[must_use]
+    pub const fn unknown_reason(self) -> Option<GraphUnknownReason> {
+        match self {
+            Self::BlockedUnknown(reason) => Some(reason),
+            _ => None,
+        }
+    }
 }
 
 /// Immutable output of one bounded selection operation.
@@ -247,18 +280,48 @@ impl SelectionPlan {
     }
 }
 
+/// Maps a typed unknown reason onto a blocked disposition.
+///
+/// A status that is blocked without naming a reason cannot be told apart
+/// from one where the reason was lost, so the generic [`SelectionDisposition::Blocked`]
+/// is reserved for a status that genuinely carries none.
+fn blocked_for(reason: Option<GraphUnknownReason>) -> SelectionDisposition {
+    match reason {
+        Some(reason) => SelectionDisposition::BlockedUnknown(reason),
+        None => SelectionDisposition::Blocked,
+    }
+}
+
 /// Builds a conservative, deterministic plan from a graph impact result.
+///
+/// I10.8.6: a partial, stale, truncated or contested impact query may not be
+/// read as "nothing is affected". A disposition is only `Ready` when the
+/// impact query actually answered, and a proved absence (`NotFound`) is kept
+/// distinct from every unknown by carrying its typed reason into
+/// [`SelectionDisposition::BlockedUnknown`].
 pub fn plan_selection(request: &SelectionRequest) -> Result<SelectionPlan, SelectionError> {
     request.validate()?;
-    let disposition = if matches!(
-        request.impact.status,
-        GraphQueryStatus::Found | GraphQueryStatus::NotFound
-    ) && matches!(request.impact.freshness, GraphFreshness::Current)
-        && matches!(request.impact.coverage, GraphCoverage::Complete)
-    {
-        SelectionDisposition::Ready
-    } else {
-        SelectionDisposition::Blocked
+    let impact_status = request.impact.status;
+    // An unknown or partial impact query has not answered the question, so
+    // it can never reach a disposition a finish path could read as a
+    // negative answer. The typed reason is retained rather than collapsed.
+    let disposition = match impact_status {
+        // `Found` and `NotFound` both answered the question: one found an
+        // impact, the other proved there is none. Neither is blocked.
+        GraphQueryStatus::Found | GraphQueryStatus::NotFound => {
+            if matches!(request.impact.freshness, GraphFreshness::Current)
+                && matches!(request.impact.coverage, GraphCoverage::Complete)
+            {
+                SelectionDisposition::Ready
+            } else {
+                blocked_for(request.impact.unknown_reason())
+            }
+        }
+        // A contested query answered and disagreed; that is not an absence.
+        GraphQueryStatus::Contradicted => {
+            SelectionDisposition::BlockedUnknown(GraphUnknownReason::NotFoundInPartialIndex)
+        }
+        other => blocked_for(other.unknown_reason()),
     };
 
     let mut selected = Vec::new();

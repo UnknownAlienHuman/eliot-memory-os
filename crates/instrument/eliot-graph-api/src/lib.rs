@@ -308,7 +308,59 @@ impl GraphEdge {
     }
 }
 
+/// Whether the admitted instrument contract can prove absence at all.
+///
+/// I10.8.6 requires "the instrument contract can prove absence" as an
+/// independent condition. Successful execution is not that capability: only
+/// an instrument whose admitted contract names the queried relation as
+/// absence-provable may report absence.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstrumentAbsenceCapability {
+    /// Identity of the admitted instrument contract.
+    pub instrument_contract: String,
+    /// Revision of that admitted contract.
+    pub contract_revision: GraphRevision,
+    /// Relation this contract was admitted to prove absent.
+    pub admitted_relation: String,
+}
+
+impl InstrumentAbsenceCapability {
+    /// Validates the admitted contract identity and relation.
+    pub fn validate(&self) -> Result<(), GraphContractError> {
+        validate_text(&self.instrument_contract, "capability.instrument_contract")?;
+        validate_text(&self.admitted_relation, "capability.admitted_relation")
+    }
+}
+
+/// How the no-higher-authority-contradiction precondition was established.
+///
+/// I10.8.6 requires "no higher-authority contradictory evidence exists".
+/// Absence of a contradiction is a fact only when a bounded search actually
+/// completed; a search that was never run or that did not cover the
+/// applicable authorities has not established the precondition.
+#[derive(Clone, Copy, Debug, Eq, Hash, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ContradictionCheck {
+    /// A bounded counterevidence search completed over the applicable
+    /// authorities and found nothing contradicting.
+    CompletedBoundedSearch,
+    /// No counterevidence search covered the applicable authorities, so the
+    /// precondition is unattested and absence cannot be claimed.
+    NotEstablished,
+    /// A higher-authority source contradicts the absence; the claim is
+    /// contested rather than absent.
+    FoundContradiction,
+}
+
 /// Explicit evidence required before reporting absence.
+///
+/// I10.8.6: "Absence is a fact only when all conditions hold: freshness is
+/// exact for the candidate and scope; coverage is complete for the queried
+/// relation/scope; the instrument contract can prove absence; no
+/// higher-authority contradictory evidence exists." All four are recorded
+/// here independently and gated together by [`AbsenceEvidence::validate`];
+/// three of four is not absence.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AbsenceEvidence {
@@ -320,10 +372,18 @@ pub struct AbsenceEvidence {
     pub query_digest: String,
     /// Revision at which absence was checked.
     pub checked_revision: GraphRevision,
+    /// Admitted instrument contract able to prove absence for the relation.
+    pub capability: InstrumentAbsenceCapability,
+    /// How the no-higher-authority-contradiction precondition was resolved.
+    pub contradiction_check: ContradictionCheck,
 }
 
 impl AbsenceEvidence {
-    /// Validates explicit absence qualification.
+    /// Validates the four absence preconditions as an AND-gate.
+    ///
+    /// I10.8.6: "Absence is a fact only when all conditions hold." Every
+    /// precondition is checked; the first unmet one refuses the absence, so
+    /// a three-of-four record is never qualified.
     pub fn validate(&self) -> Result<(), GraphContractError> {
         validate_text(&self.checked_scope, "absence.checked_scope")?;
         if self.inspected_records == 0 {
@@ -341,24 +401,123 @@ impl AbsenceEvidence {
                 reason: "absence query digest must be lowercase SHA-256",
             });
         }
+        // Precondition: the instrument contract can prove absence.
+        self.capability.validate()?;
+        if self.capability.contract_revision != self.checked_revision {
+            return Err(GraphContractError::UnqualifiedNegativeResult);
+        }
+        // Precondition: no higher-authority contradictory evidence exists.
+        if !matches!(
+            self.contradiction_check,
+            ContradictionCheck::CompletedBoundedSearch
+        ) {
+            return Err(GraphContractError::UnqualifiedNegativeResult);
+        }
         Ok(())
     }
 }
 
+/// Typed unknown reason for a lookup that cannot prove absence.
+///
+/// I10.8.6: "Otherwise ELIOT returns a typed unknown such as: ..."
+/// The reasons stay distinct because "the tool failed" and "the scope was
+/// partial" demand different next actions; collapsing them into one generic
+/// unknown is how a partial result starts reading as an answer. Each variant
+/// names exactly one of the seven reasons that block a sound absence claim.
+#[derive(Clone, Copy, Debug, Eq, Hash, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphUnknownReason {
+    /// Freshness is not exact for the candidate and scope.
+    UnknownDueToStaleness,
+    /// Coverage is not complete for the queried relation/scope.
+    NotFoundInPartialIndex,
+    /// Configuration or macro coverage excludes the queried scope.
+    UnknownDueToCfgOrMacroCoverage,
+    /// A worktree overlay splits the queried view.
+    UnknownDueToWorktreeOverlay,
+    /// Truncation prevents a sound answer.
+    UnknownDueToTruncation,
+    /// Tool failure prevents a sound answer.
+    UnknownDueToToolFailure,
+    /// The adapter cannot determine whether the relation is absent.
+    UnknownDueToUndeterminableRelation,
+}
+
+impl GraphUnknownReason {
+    /// Exact contract spelling of this unknown reason.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UnknownDueToStaleness => "unknown_due_to_staleness",
+            Self::NotFoundInPartialIndex => "not_found_in_partial_index",
+            Self::UnknownDueToCfgOrMacroCoverage => "unknown_due_to_cfg_or_macro_coverage",
+            Self::UnknownDueToWorktreeOverlay => "unknown_due_to_worktree_overlay",
+            Self::UnknownDueToTruncation => "unknown_due_to_truncation",
+            Self::UnknownDueToToolFailure => "unknown_due_to_tool_failure",
+            Self::UnknownDueToUndeterminableRelation => "unknown_due_to_undeterminable_relation",
+        }
+    }
+}
+
+impl fmt::Display for GraphUnknownReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Top-level query status retaining unknown/partial outcomes.
+///
+/// `NotFound` is a capability, not a value: it is only constructible from a
+/// resolved [`AbsenceEvidence`] whose four preconditions hold, and every
+/// non-absence outcome carries the specific reason it is unknown.
 #[derive(Clone, Copy, Debug, Eq, Hash, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum GraphQueryStatus {
     /// At least one matching node or edge was observed.
     Found,
-    /// No match, with qualified absence evidence.
+    /// No match, with qualified absence evidence. Reachable only through
+    /// [`GraphQueryResult::proved_absent`].
     NotFound,
-    /// Some requested scope was observed.
-    Partial,
-    /// Adapter could not answer safely.
-    Unknown,
+    /// Some requested scope was observed but the answer is not complete;
+    /// the reason it cannot be an absence is retained.
+    Partial(GraphUnknownReason),
+    /// Adapter could not answer safely; the blocking reason is retained.
+    Unknown(GraphUnknownReason),
+    /// Higher-authority evidence contradicts the absence; the claim is
+    /// contested rather than absent, and is still not an absence.
+    Contradicted,
     /// Graph capability unavailable.
     Unavailable,
+}
+
+impl GraphQueryStatus {
+    /// Whether this status is a proved absence.
+    ///
+    /// An unknown or partial outcome is never proof, so this is the only
+    /// question a finish/claim path may ask about a negative result.
+    #[must_use]
+    pub const fn is_absence(self) -> bool {
+        matches!(self, Self::NotFound)
+    }
+
+    /// The typed unknown blocking an absence claim, when this status is one.
+    #[must_use]
+    pub const fn unknown_reason(self) -> Option<GraphUnknownReason> {
+        match self {
+            Self::Partial(reason) | Self::Unknown(reason) => Some(reason),
+            Self::Found | Self::NotFound | Self::Contradicted | Self::Unavailable => None,
+        }
+    }
+
+    /// Whether this status answered the queried relation negatively.
+    ///
+    /// `NotFound` is a proved absence; `Contradicted` answered the question
+    /// and disagreed, which is still not proof of absence. `Partial`,
+    /// `Unknown` and `Unavailable` did not answer at all.
+    #[must_use]
+    pub const fn is_negative_answer(self) -> bool {
+        matches!(self, Self::NotFound | Self::Contradicted)
+    }
 }
 
 /// Revision/freshness/coverage-bound graph query result.
@@ -385,8 +544,97 @@ pub struct GraphQueryResult {
     pub diagnostics: Vec<String>,
 }
 
+/// Facts one adapter established about a lookup, before the absence gate.
+///
+/// Each field is one of the four I10.8.6 preconditions, resolved by the
+/// adapter that owns the relevant join. Nothing here is inferred from whether
+/// the lookup returned items: an empty result is an observation, not a
+/// coverage measurement.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AbsenceResolution {
+    /// Freshness of the analyzed view for the queried candidate and scope.
+    pub freshness: GraphFreshness,
+    /// Coverage of the queried relation and scope.
+    pub coverage: GraphCoverage,
+    /// Admitted instrument contract able to prove absence for the relation.
+    pub capability: Option<InstrumentAbsenceCapability>,
+    /// How the no-higher-authority-contradiction precondition resolved.
+    pub contradiction_check: ContradictionCheck,
+    /// Whether configuration/macro coverage excluded part of the scope.
+    pub cfg_or_macro_coverage_limited: bool,
+    /// Whether a worktree overlay split the queried view.
+    pub worktree_overlay_present: bool,
+    /// Whether the adapter's output was truncated.
+    pub truncated: bool,
+    /// Whether the adapter's execution failed.
+    pub tool_failed: bool,
+}
+
+impl AbsenceResolution {
+    /// Runs the four-precondition AND-gate and returns the status an empty
+    /// lookup must carry.
+    ///
+    /// I10.8.6: "Absence is a fact only when all conditions hold ... Otherwise
+    /// ELIOT returns a typed unknown." The four are evaluated in root-cause
+    /// order, so the returned unknown names the reason that actually blocks
+    /// the claim rather than its symptom: a failed or truncated adapter is
+    /// reported as such instead of as staleness, and an instrument that
+    /// cannot prove absence at all is reported as undeterminable rather than
+    /// as a complete-but-empty index.
+    #[must_use]
+    pub fn classify_empty_lookup(&self) -> GraphQueryStatus {
+        if matches!(
+            self.contradiction_check,
+            ContradictionCheck::FoundContradiction
+        ) {
+            return GraphQueryStatus::Contradicted;
+        }
+        if self.tool_failed {
+            return GraphQueryStatus::Unknown(GraphUnknownReason::UnknownDueToToolFailure);
+        }
+        if self.truncated {
+            return GraphQueryStatus::Unknown(GraphUnknownReason::UnknownDueToTruncation);
+        }
+        // Precondition: the instrument contract can prove absence. An adapter
+        // with no admitted capability has not established this, whatever its
+        // freshness and coverage say.
+        let Some(capability) = &self.capability else {
+            return GraphQueryStatus::Unknown(
+                GraphUnknownReason::UnknownDueToUndeterminableRelation,
+            );
+        };
+        if self.cfg_or_macro_coverage_limited {
+            return GraphQueryStatus::Partial(GraphUnknownReason::UnknownDueToCfgOrMacroCoverage);
+        }
+        if self.worktree_overlay_present {
+            return GraphQueryStatus::Partial(GraphUnknownReason::UnknownDueToWorktreeOverlay);
+        }
+        if !matches!(self.freshness, GraphFreshness::Current) {
+            return GraphQueryStatus::Unknown(GraphUnknownReason::UnknownDueToStaleness);
+        }
+        if !matches!(self.coverage, GraphCoverage::Complete) {
+            return GraphQueryStatus::Partial(GraphUnknownReason::NotFoundInPartialIndex);
+        }
+        if !matches!(
+            self.contradiction_check,
+            ContradictionCheck::CompletedBoundedSearch
+        ) {
+            return GraphQueryStatus::Unknown(
+                GraphUnknownReason::UnknownDueToUndeterminableRelation,
+            );
+        }
+        debug_assert!(capability.validate().is_ok());
+        GraphQueryStatus::NotFound
+    }
+}
+
 impl GraphQueryResult {
     /// Validates result shape and guards unqualified negative answers.
+    ///
+    /// I10.8.6 makes absence an AND-gate over four independent preconditions;
+    /// a three-of-four record is refused here, so a lookup that cannot
+    /// establish all four cannot produce an absence status at all.
     pub fn validate(&self) -> Result<(), GraphContractError> {
         for node in &self.nodes {
             node.validate()?;
@@ -402,23 +650,36 @@ impl GraphQueryResult {
                 reason: "FOUND requires at least one node or edge",
             });
         }
-        if matches!(self.status, GraphQueryStatus::NotFound) {
+        if self.status.is_absence() {
+            // Precondition 1: freshness is exact for the candidate and scope.
+            // Precondition 2: coverage is complete for the queried
+            // relation/scope.
             if !matches!(self.freshness, GraphFreshness::Current)
                 || !matches!(self.coverage, GraphCoverage::Complete)
             {
                 return Err(GraphContractError::UnqualifiedNegativeResult);
             }
+            // Preconditions 3 and 4: the instrument contract can prove
+            // absence, and no higher-authority contradictory evidence exists.
             match &self.absence {
                 Some(absence) => absence.validate()?,
                 None => return Err(GraphContractError::UnqualifiedNegativeResult),
             }
         }
-        if !matches!(self.status, GraphQueryStatus::NotFound) && self.absence.is_some() {
+        if !self.status.is_absence() && self.absence.is_some() {
             return Err(GraphContractError::InvalidResult {
                 reason: "absence evidence is only valid for NOT_FOUND",
             });
         }
         Ok(())
+    }
+
+    /// Returns the typed unknown this result carries, when it is not an
+    /// absence. A finish/claim path must consult this rather than treating a
+    /// non-absence status as a negative answer.
+    #[must_use]
+    pub const fn unknown_reason(&self) -> Option<GraphUnknownReason> {
+        self.status.unknown_reason()
     }
 
     /// Computes a stable digest for a canonical query representation.
@@ -450,6 +711,12 @@ mod tests {
             inspected_records: 12,
             query_digest: GraphQueryResult::query_digest(query).unwrap_or_else(|_| unreachable!()),
             checked_revision: GraphRevision::new(3).unwrap_or_else(|_| unreachable!()),
+            capability: InstrumentAbsenceCapability {
+                instrument_contract: "scip-index/v1".to_owned(),
+                contract_revision: GraphRevision::new(3).unwrap_or_else(|_| unreachable!()),
+                admitted_relation: "references".to_owned(),
+            },
+            contradiction_check: ContradictionCheck::CompletedBoundedSearch,
         }
     }
 

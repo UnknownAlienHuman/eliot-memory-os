@@ -9,7 +9,8 @@
 #![forbid(unsafe_code)]
 
 use eliot_graph_api::{
-    GraphCoverage, GraphEdge, GraphFreshness, GraphNode, GraphQueryResult, GraphRevision,
+    GraphCoverage, GraphEdge, GraphFreshness, GraphNode, GraphQueryResult, GraphQueryStatus,
+    GraphRevision, GraphUnknownReason,
 };
 use eliot_instrument_api::{EvidenceCoverage, EvidenceFreshness, NormalizedEvidence};
 use serde::{Deserialize, Serialize};
@@ -262,6 +263,34 @@ impl CodeCortexService {
     }
 }
 
+/// The cheapest probe that would resolve one typed unknown.
+///
+/// I10.8.6 keeps the reasons distinct because they demand different next
+/// actions: a stale index needs a refresh, a partial scope needs a wider
+/// scan, and a failed tool needs a re-run. Collapsing them into one probe
+/// would tell a caller to do the wrong thing for the reason it has.
+fn unknown_cheapest_probe(reason: GraphUnknownReason) -> &'static str {
+    match reason {
+        GraphUnknownReason::UnknownDueToStaleness => {
+            "rebuild the graph projection for the exact candidate"
+        }
+        GraphUnknownReason::NotFoundInPartialIndex => "expand the declared graph scope",
+        GraphUnknownReason::UnknownDueToCfgOrMacroCoverage => {
+            "re-run the analyzer with build scripts and proc macros enabled"
+        }
+        GraphUnknownReason::UnknownDueToWorktreeOverlay => {
+            "reconcile the worktree overlay with the indexed candidate"
+        }
+        GraphUnknownReason::UnknownDueToTruncation => "re-run with a complete output capture limit",
+        GraphUnknownReason::UnknownDueToToolFailure => {
+            "re-run the owning instrument and inspect its exit status"
+        }
+        GraphUnknownReason::UnknownDueToUndeterminableRelation => {
+            "admit an instrument contract that proves the queried relation"
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 pub fn compose_snapshot(
     request: &CompositionRequest,
@@ -277,6 +306,35 @@ pub fn compose_snapshot(
     for result in &snapshot.graph_results {
         let source = result.query_id.to_string();
         handles.insert(source.clone());
+        // I10.8.6: aggregate verification preserves the typed unknown. An
+        // empty or unanswerable lookup is reported as the specific reason it
+        // could not be resolved, so aggregation never launders an unknown
+        // into a coverage gap that a finish path could read as "nothing
+        // found here".
+        if let Some(reason) = result.unknown_reason() {
+            gaps.push(CoverageGap {
+                scope: request.scope.clone(),
+                reason: format!("graph lookup is unknown: {reason}"),
+                cheapest_probe: Some(unknown_cheapest_probe(reason).to_owned()),
+            });
+        } else if matches!(result.status, GraphQueryStatus::Unavailable) {
+            gaps.push(CoverageGap {
+                scope: request.scope.clone(),
+                reason: "graph capability is unavailable for this lookup".to_owned(),
+                cheapest_probe: Some(
+                    "admit a graph instrument that serves the queried relation".to_owned(),
+                ),
+            });
+        } else if matches!(result.status, GraphQueryStatus::Contradicted) {
+            gaps.push(CoverageGap {
+                scope: request.scope.clone(),
+                reason: "higher-authority evidence contradicts the graph lookup".to_owned(),
+                cheapest_probe: Some(
+                    "reconcile the contradicting authority before relying on this lookup"
+                        .to_owned(),
+                ),
+            });
+        }
         if !matches!(result.freshness, GraphFreshness::Current) {
             gaps.push(CoverageGap {
                 scope: request.scope.clone(),
