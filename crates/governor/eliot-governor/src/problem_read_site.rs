@@ -41,6 +41,19 @@
 //! reader is told, in the type, that the revision it holds is the newest the page
 //! returned and **not** established as the record's head.
 //!
+//! # The Diagnostic Brief (issue #1759 I7, I13.11)
+//!
+//! A read that resolves a Problem also compiles and carries that record's I13.11
+//! [`DiagnosticBrief`]. This is deliberately the *same* bounded read rather than
+//! a second fetch: the brief is a projection of the canonical head this page
+//! already resolved, so a Controller or operator reading after restart resolves
+//! to the same Problem, attention and Incident records the writer committed.
+//! Because [`DiagnosticBrief::compile`] accepts only `&Problem`, the brief
+//! cannot be a log dump or a model summary wearing the record's name — every
+//! handle in it is one the record already retained, and an input the record
+//! holds no history for is served as an explicit unknown rather than an empty
+//! vector that would read as "none".
+//!
 //! # Why `None` is an honest outcome
 //!
 //! `Ok(None)` means the read genuinely established that no committed Problem
@@ -55,7 +68,7 @@
 use std::collections::BTreeMap;
 
 use eliot_context_candidates::ProjectionState;
-use eliot_problem::Problem;
+use eliot_problem::{DiagnosticBrief, Problem};
 use eliot_store_api::{
     PROBLEM_OWNER_STATE_MUTATION_NAME, PROBLEM_PARAM_PROBLEM_ID, ProblemOwnerTransition,
     decode_problem_owner_state_mutation,
@@ -108,6 +121,20 @@ pub struct ProblemReadback {
     /// When `false`, [`Self::head`] is the newest revision this page returned and
     /// is not established as the record's head.
     pub history_complete: bool,
+    /// The I13.11 Diagnostic Brief compiled from [`Self::head`] (issue #1759 I7,
+    /// I13.11).
+    ///
+    /// This is the SERVE half of the brief, and it is served by compilation rather
+    /// than by a second assembly: [`DiagnosticBrief::compile`] takes only
+    /// `&Problem`, so the brief is a projection of exactly the canonical record
+    /// this same read resolved to. A Controller or operator reading after restart
+    /// therefore resolves to the same Problem, and the brief cannot carry an
+    /// evidence handle, hypothesis or config change the committed record does not
+    /// hold. The brief is a read model: it closes nothing, promotes nothing and
+    /// grants no repair, and its `source_revision` is the head revision it was
+    /// compiled from, so a brief is always attributable to the exact revision
+    /// that produced it rather than to "the current state".
+    pub diagnostic_brief: DiagnosticBrief,
 }
 
 /// Typed refusals of the committed Problem read site.
@@ -195,15 +222,28 @@ pub fn read_committed_problem(
     let Some((head, head_revision)) = committed.pop() else {
         return Ok(None);
     };
-    let timeline = committed
+    let timeline: Vec<ProblemReadbackRevision> = committed
         .into_iter()
         .map(|(_, revision)| revision)
         .chain(std::iter::once(head_revision))
         .collect();
+    // The I13.11 brief is compiled from the head this read resolved to, and is
+    // refused with the same typed error rather than served empty: a brief is a
+    // problem model, so a Problem the read could not reduce to a model is a
+    // Problem the read could not describe. `compile` takes only `&Problem` and
+    // re-runs the record's own `validate`, so no caller-supplied handle, summary
+    // or log text can enter it.
+    let diagnostic_brief = DiagnosticBrief::compile(&head).map_err(|error| {
+        ProblemReadbackError::TransitionUndecodable {
+            page_position: u64::try_from(timeline.len()).unwrap_or(u64::MAX),
+            reason: format!("committed head does not compile an I13.11 brief: {error}"),
+        }
+    })?;
     Ok(Some(ProblemReadback {
         head,
         timeline,
         history_complete,
+        diagnostic_brief,
     }))
 }
 
