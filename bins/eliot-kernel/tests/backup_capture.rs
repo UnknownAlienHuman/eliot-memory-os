@@ -475,9 +475,32 @@ fn to_request(input: &BackupInput, suspended: u64) -> CaptureRequest {
 /// applied exactly that entry — otherwise the owner reports 0 and `eliot-backup`
 /// refuses a non-empty ledger bound to a zero revision. The degraded and scope
 /// cases carry no ledger and need a virgin owner, so each case gets its own.
+///
+/// The store path is UNIQUE PER CALL, never per label: redb takes an exclusive
+/// OS file lock for `Database::create`/`open`
+/// (`crates/kernel/eliot-installation/src/redb_state.rs:81-88`), so two
+/// coordinators holding an owner at the same path cannot coexist and the second
+/// open fails with `DatabaseAlreadyOpen` ("Database already open. Cannot
+/// acquire lock."). Every case in this file asked for the `case` label, so one
+/// label-named directory was shared by the whole suite and the tests raced for
+/// that one lock. Each call therefore names its own store after the same
+/// counter + clock + pid triple the rest of this crate's suites use
+/// (`tests/kernel_front_door_diagnostics.rs:71-77`,
+/// `tests/store_concurrency_product.rs:853-856`): the counter separates calls
+/// inside one test binary even when the OS clock is coarse, the pid separates
+/// concurrent runs and other test binaries, and the clock separates successive
+/// runs that reuse a pid. Nothing about the fixture changes — only where the
+/// store lives.
 fn purge_owner(entries: &[PurgeLedgerEntry], label: &str) -> std::sync::Arc<RedbRecoveryStore> {
-    let path = std::env::temp_dir().join(format!("eliot-960-capture-owner-{label}"));
-    let _ = std::fs::remove_dir_all(&path);
+    static OWNER_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let serial = OWNER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(u128::from(serial), |elapsed| elapsed.as_nanos());
+    let path = std::env::temp_dir().join(format!(
+        "eliot-960-capture-owner-{label}-{serial}-{nanos}-{}",
+        std::process::id()
+    ));
     let owner = std::sync::Arc::new(
         RedbRecoveryStore::open(&path).expect("fixture purge owner opens for the capture"),
     );
