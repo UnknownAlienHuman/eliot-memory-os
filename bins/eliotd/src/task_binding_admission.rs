@@ -108,12 +108,13 @@ use eliot_observation::TaskSelectionEvidence;
 use eliot_ors::{
     ColdStartReadinessClaim, ColdStartReadinessOrsRecord, ColdStartReadinessRecordOwner,
     ColdStartReadinessStageOutcome, ColdStartReadinessTerminalDisposition, OrsError,
-    ScanDisclosureOrsRecord, ScanDisclosureReadFailure, ScanDisclosureRecordOwner,
-    ScanDisclosureStageOutcome,
+    ScanDisclosureOrsRecord, ScanDisclosureQuarantineRecord, ScanDisclosureReadFailure,
+    ScanDisclosureRecordOwner, ScanDisclosureStageOutcome,
 };
 use eliot_protocol::{
-    AgentActivationCandidateCoverage, AgentActivationResolutionDisposition,
-    AgentActivationResolutionResult, AgentActivationResolutionTicket,
+    AgentActivationBindScopeEvidence, AgentActivationCandidateCoverage,
+    AgentActivationResolutionDisposition, AgentActivationResolutionResult,
+    AgentActivationResolutionTicket, HostRequestEnvelope,
 };
 use eliot_security_contracts::PrivacyClass;
 use eliot_store_api::{NamedMutationOperation, PreparedTransition};
@@ -279,6 +280,13 @@ struct ScanDisclosureOwnerRpcRequest<'a> {
 #[derive(serde::Serialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum ScanDisclosureOwnerRpcAction<'a> {
+    InitialBindScopeDiscovery {
+        evidence: &'a AgentActivationBindScopeEvidence,
+        envelope: &'a HostRequestEnvelope,
+        explicit_root: &'a str,
+        root_identity_ref: &'a str,
+        allowed_reads: &'a [DiscoveryRead],
+    },
     IssueContour,
     IssueBinding,
     RetainDiscoveryLease {
@@ -319,6 +327,14 @@ enum ScanDisclosureOwnerRpcAction<'a> {
         binding: &'a eliot_workscope::ScanDisclosureOwnerBinding,
         limit: u16,
     },
+    QuarantineRetain {
+        binding: &'a eliot_workscope::ScanDisclosureOwnerBinding,
+        record: &'a ScanDisclosureQuarantineRecord,
+    },
+    QuarantineLoad {
+        binding: &'a eliot_workscope::ScanDisclosureOwnerBinding,
+        quarantine_key: &'a str,
+    },
 }
 
 #[derive(serde::Deserialize)]
@@ -332,6 +348,13 @@ struct ScanDisclosureOwnerRpcResponse {
 #[derive(serde::Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
 enum ScanDisclosureOwnerRpcResult {
+    InitialBindScopeDiscovery {
+        ticket: AgentActivationResolutionTicket,
+        lease: DiscoveryReadLease,
+    },
+    InitialBindScopeRootRequired {
+        ticket: AgentActivationResolutionTicket,
+    },
     Contour {
         contour: KernelScanDisclosureContour,
     },
@@ -351,6 +374,9 @@ enum ScanDisclosureOwnerRpcResult {
     },
     Records {
         records: Vec<ScanDisclosureOrsRecord>,
+    },
+    QuarantineRecord {
+        record: Option<ScanDisclosureQuarantineRecord>,
     },
     ReceiptReadFailure {
         failure: ScanDisclosureReadFailure,
@@ -665,6 +691,65 @@ impl ScanDisclosureRecordOwner for KernelScanDisclosureRecordOwner {
             )),
         }
     }
+
+    fn retain_scan_disclosure_quarantine(
+        &self,
+        record: &ScanDisclosureQuarantineRecord,
+    ) -> Result<ScanDisclosureQuarantineRecord, OrsError> {
+        if record.installation_id != self.binding.installation_id {
+            return Err(OrsError::Contract(
+                "quarantine installation conflicts with its owner binding".to_owned(),
+            ));
+        }
+        match self.request(ScanDisclosureOwnerRpcAction::QuarantineRetain {
+            binding: &self.binding,
+            record,
+        })? {
+            ScanDisclosureOwnerRpcResult::QuarantineRecord {
+                record: Some(retained),
+            } if retained == *record => Ok(retained),
+            ScanDisclosureOwnerRpcResult::QuarantineRecord { record: Some(_) } => {
+                Err(OrsError::DuplicateConflict)
+            }
+            ScanDisclosureOwnerRpcResult::ReceiptReadFailure { failure } => {
+                Err(OrsError::ScanDisclosureReadFailure(failure))
+            }
+            _ => Err(OrsError::Contract(
+                "Kernel returned an invalid quarantine retain result".to_owned(),
+            )),
+        }
+    }
+
+    fn load_scan_disclosure_quarantine(
+        &self,
+        quarantine_key: &str,
+    ) -> Result<Option<ScanDisclosureQuarantineRecord>, OrsError> {
+        if quarantine_key.trim().is_empty() {
+            return Err(OrsError::Contract(
+                "quarantine key is empty".to_owned(),
+            ));
+        }
+        match self.request(ScanDisclosureOwnerRpcAction::QuarantineLoad {
+            binding: &self.binding,
+            quarantine_key,
+        })? {
+            ScanDisclosureOwnerRpcResult::QuarantineRecord { record } => {
+                if record
+                    .as_ref()
+                    .is_some_and(|retained| retained.quarantine_key != quarantine_key)
+                {
+                    return Err(OrsError::DuplicateConflict);
+                }
+                Ok(record)
+            }
+            ScanDisclosureOwnerRpcResult::ReceiptReadFailure { failure } => {
+                Err(OrsError::ScanDisclosureReadFailure(failure))
+            }
+            _ => Err(OrsError::Contract(
+                "Kernel returned an invalid quarantine load result".to_owned(),
+            )),
+        }
+    }
 }
 
 /// Daemon-side adapter for the authenticated Kernel route that owns durable
@@ -826,6 +911,166 @@ pub fn request_scan_disclosure_binding(
         application_connection_id,
         activation_ticket_id,
     )
+}
+
+/// Authenticates the first explicit BIND_SCOPE discovery against the original
+/// Kernel ticket and lifecycle-retained lease before the first WorkScope owner
+/// CAS. `envelope` and `evidence` are the exact values returned by the original
+/// Task Controller claim; this function neither rebuilds them nor rewrites the
+/// caller's proposal.
+pub fn prepare_initial_bind_scope_discovery(
+    kernel: &super::DaemonKernelClient,
+    envelope: &HostRequestEnvelope,
+    evidence: &AgentActivationBindScopeEvidence,
+    proposal: &InitialWorkScopeBindingRequest,
+    now: u64,
+) -> Result<(AgentActivationResolutionTicket, ColdStartDiscoveryInput), TaskBindingError> {
+    let fail = |detail: &str| TaskBindingError::scope_incompatible(detail.to_owned());
+    if envelope.validate().is_err()
+        || evidence.validate().is_err()
+        || envelope.kind != eliot_protocol::HostRequestKind::Invocation
+        || envelope.identity.capability != "eliot.task-controller"
+        || envelope.connection_id.trim().is_empty()
+        || envelope.connection_id != evidence.session_id
+        || envelope.identity.session_id.as_deref() != Some(evidence.session_id.as_str())
+        || envelope.identity.task_id.as_deref() != Some(evidence.task_id.as_str())
+        || envelope.identity.work_scope_id.as_deref() != Some(evidence.work_scope_id.as_str())
+        || envelope.identity.deadline_unix_ms != evidence.ticket_deadline_unix_ms
+        || envelope.state_fence != evidence.state_fence
+        || proposal.validate_for_task_scope(&evidence.work_scope_id).is_err()
+        || proposal.binding.scope.scope_ref != evidence.work_scope_id
+        || proposal.descriptor.scope_ref != evidence.work_scope_id
+        || proposal.sources.scope_ref != evidence.work_scope_id
+        || proposal.descriptor.state_fence != evidence.state_fence
+        || proposal.admission_deadline == 0
+        || proposal.admission_deadline > evidence.ticket_deadline_unix_ms
+        || now == 0
+        || now > evidence.ticket_deadline_unix_ms
+    {
+        return Err(fail("BIND_SCOPE proposal or original claim/evidence is not exact and current"));
+    }
+    let explicit_root = proposal
+        .explicit_root
+        .to_str()
+        .filter(|path| Path::new(path).is_absolute())
+        .ok_or_else(|| fail("BIND_SCOPE requires one explicit absolute UTF-8 root"))?;
+    let (facts, observed) = observe_explicit_workspace_facts(
+        proposal.explicit_root.as_path(),
+        &evidence.state_fence,
+    )?;
+    let Some(instance) = observed.instances.first() else {
+        return Err(fail("Host observation returned no explicit workspace instance"));
+    };
+    if observed.instances.len() != 1
+        || proposal.binding.scope.root_identity != instance.root_identity
+        || proposal.binding.scope.instance_ref != instance.instance_ref
+        || proposal.descriptor.instances != observed.instances
+        || proposal.descriptor.root_identities != observed.root_identities
+        || proposal.descriptor.canonical_resource_refs != observed.canonical_resource_refs
+        || proposal.descriptor.external_resource_refs != observed.external_resource_refs
+        || proposal.descriptor.generation != observed.generation
+        || proposal.descriptor.kind != observed.kind
+        || proposal.descriptor.lineage != observed.lineage
+    {
+        return Err(fail("BIND_SCOPE owner proposal disagrees with independent Host root facts"));
+    }
+    let allowed_reads = initial_discovery_allowed_reads(&facts);
+    let payload = serde_json::to_value(ScanDisclosureOwnerRpcRequest {
+        wire_version: SCAN_DISCLOSURE_OWNER_WIRE_VERSION,
+        application_connection_id: &envelope.connection_id,
+        activation_ticket_id: &evidence.ticket_id,
+        action: ScanDisclosureOwnerRpcAction::InitialBindScopeDiscovery {
+            evidence,
+            envelope,
+            explicit_root,
+            root_identity_ref: &instance.root_identity,
+            allowed_reads: &allowed_reads,
+        },
+    })
+    .map_err(|error| fail(&format!("BIND_SCOPE owner request encoding failed: {error}")))?;
+    let value = kernel
+        .request_blocking(SCAN_DISCLOSURE_OWNER_OPERATION, payload)
+        .map_err(|error| fail(&format!("BIND_SCOPE owner request failed: {error}")))?;
+    let response: ScanDisclosureOwnerRpcResponse = serde_json::from_value(value)
+        .map_err(|error| fail(&format!("BIND_SCOPE owner response is invalid: {error}")))?;
+    if response.wire_version != SCAN_DISCLOSURE_OWNER_WIRE_VERSION {
+        return Err(fail("BIND_SCOPE owner returned another wire version"));
+    }
+    let (ticket, lease) = match response.result {
+        ScanDisclosureOwnerRpcResult::InitialBindScopeDiscovery { ticket, lease } => {
+            (ticket, lease)
+        }
+        ScanDisclosureOwnerRpcResult::InitialBindScopeRootRequired { ticket } => {
+            if ticket.ticket_id != evidence.ticket_id
+                || ticket.ticket_sha256 != evidence.ticket_sha256
+                || ticket.connection_id != envelope.connection_id
+                || ticket.state_fence != envelope.state_fence
+                || ticket.kernel_deadline_unix_ms != evidence.ticket_deadline_unix_ms
+                || ticket.workspace_selector.is_some()
+            {
+                return Err(fail("Kernel explicit-root prerequisite returned another ticket"));
+            }
+            return Err(TaskBindingError::selection_required(
+                "original activation ticket has no explicit workspace selector; submit a new explicit-root Attach",
+            ));
+        }
+        _ => return Err(fail("Kernel returned the wrong first-scope owner result")),
+    };
+    ticket
+        .validate()
+        .and_then(|()| evidence.validate_against(&ticket))
+        .map_err(|error| fail(&format!("original BIND_SCOPE ticket proof failed: {error}")))?;
+    if ticket.ticket_id != evidence.ticket_id
+        || ticket.ticket_sha256 != evidence.ticket_sha256
+        || ticket.connection_id != envelope.connection_id
+        || ticket.state_fence != envelope.state_fence
+        || ticket.kernel_deadline_unix_ms != evidence.ticket_deadline_unix_ms
+        || ticket.workspace_selector.as_deref() != Some(explicit_root)
+        || lease.validate().is_err()
+        || lease.proposer_ref != ticket.activation_request_id.as_str()
+        || lease.session_ref != ticket.connection_id
+        || lease.host_ref != ticket.peer_admission_receipt_sha256
+        || lease.deadline != ticket.kernel_deadline_unix_ms
+        || lease.candidate_root_ref != instance.root_identity
+        || lease.root_filesystem_identity_ref != instance.root_identity
+        || lease.allowed_reads != allowed_reads
+        || proposal
+            .discovery_lease
+            .as_ref()
+            .is_some_and(|proposed| proposed != &lease)
+    {
+        return Err(fail("Kernel-retained discovery lease or BIND_SCOPE proposal identity conflicts"));
+    }
+    let discovery = observe_cold_start_discovery(&ticket, &evidence.state_fence, now)?;
+    if discovery.lease != lease
+        || discovery.discovery.evidence != proposal.bootstrap_discovery.evidence
+        || discovery.discovery.observed != proposal.bootstrap_discovery.observed
+        || discovery.discovery.scan_ref != proposal.bootstrap_discovery.scan_ref
+        || discovery.discovery.proposed_kind != proposal.bootstrap_discovery.proposed_kind
+        || discovery.discovery.identity_fingerprint
+            != proposal.bootstrap_discovery.identity_fingerprint
+        || discovery.discovery.governing_source_refs
+            != proposal.bootstrap_discovery.governing_source_refs
+    {
+        return Err(fail(
+            "BIND_SCOPE bootstrap proposal differs from fresh Host discovery or retained lease",
+        ));
+    }
+    Ok((ticket, discovery))
+}
+
+fn initial_discovery_allowed_reads(facts: &WorkspaceInstanceFacts) -> Vec<DiscoveryRead> {
+    let mut allowed_reads = vec![
+        DiscoveryRead::FilesystemIdentity,
+        DiscoveryRead::GoverningSourceCandidates,
+    ];
+    if facts.has_git {
+        allowed_reads.push(DiscoveryRead::VcsIdentity);
+    }
+    if !facts.manifest_names.is_empty() {
+        allowed_reads.push(DiscoveryRead::ManifestNamesAndHashes);
+    }
+    allowed_reads
 }
 
 async fn request_scan_work_scope_revision(
@@ -3695,16 +3940,7 @@ pub fn observe_cold_start_discovery(
     let instance_ref = instance.instance_ref.clone();
     let root_identity = instance.root_identity.clone();
     let proposed_kind = observed.kind;
-    let mut allowed_reads = vec![
-        DiscoveryRead::FilesystemIdentity,
-        DiscoveryRead::GoverningSourceCandidates,
-    ];
-    if facts.has_git {
-        allowed_reads.push(DiscoveryRead::VcsIdentity);
-    }
-    if !facts.manifest_names.is_empty() {
-        allowed_reads.push(DiscoveryRead::ManifestNamesAndHashes);
-    }
+    let allowed_reads = initial_discovery_allowed_reads(&facts);
     let consumption_limit = u32::try_from(allowed_reads.len()).map_err(|_| {
         TaskBindingError::scope_incompatible(
             "Host discovery read count exceeds the lease consumption limit",
@@ -3716,7 +3952,7 @@ pub fn observe_cold_start_discovery(
         host_ref: ticket.peer_admission_receipt_sha256.clone(),
         candidate_root_ref: root_identity.clone(),
         root_filesystem_identity_ref: root_identity.clone(),
-        allowed_reads,
+        allowed_reads: allowed_reads.clone(),
         consumption_limit,
         deadline: ticket.kernel_deadline_unix_ms,
     };
