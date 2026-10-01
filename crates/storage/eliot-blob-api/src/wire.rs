@@ -245,11 +245,35 @@ pub enum BlobProcessStreamKernelOutcome {
         /// Original operation digest.
         operation_sha256: String,
     },
+    /// Kernel refused before consulting Store because the exact retained
+    /// capability, verified owner facts, current fence, or negotiated Blob
+    /// service was unavailable. This is not a proof that an earlier call did
+    /// not start and must not authorize a blind retry.
+    Unavailable {
+        /// Original operation digest.
+        operation_sha256: String,
+        /// Closed non-sensitive reason code.
+        reason: BlobProcessStreamUnavailableReason,
+    },
     /// Kernel cannot prove whether the original Store call completed.
     Unknown {
         /// Original operation digest.
         operation_sha256: String,
     },
+}
+
+/// Closed reason for a pre-effect Kernel capability refusal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BlobProcessStreamUnavailableReason {
+    /// No exact durable capability grant exists for the reference.
+    GrantUnavailable,
+    /// The grant lacks one or more verified owner facts needed by Store.
+    OwnerFactsUnavailable,
+    /// The retained grant is not current for this session/fence/generation.
+    StaleCapability,
+    /// The separately negotiated Blob process-stream service is not ready.
+    ServiceUnavailable,
 }
 
 /// Closed response to [`BlobProcessStreamKernelRequest`].
@@ -287,6 +311,10 @@ impl BlobProcessStreamKernelResponse {
                 response.validate()?;
             }
             BlobProcessStreamKernelOutcome::NotStarted { operation_sha256 }
+            | BlobProcessStreamKernelOutcome::Unavailable {
+                operation_sha256,
+                ..
+            }
             | BlobProcessStreamKernelOutcome::Unknown { operation_sha256 } => {
                 validate_digest("operation_sha256", operation_sha256)?;
             }
@@ -316,6 +344,10 @@ impl BlobProcessStreamKernelResponse {
                 ..
             }
             | BlobProcessStreamKernelOutcome::NotStarted { operation_sha256 }
+            | BlobProcessStreamKernelOutcome::Unavailable {
+                operation_sha256,
+                ..
+            }
             | BlobProcessStreamKernelOutcome::Unknown { operation_sha256 } => operation_sha256,
         };
         if operation_sha256 != &request.operation_sha256 {
