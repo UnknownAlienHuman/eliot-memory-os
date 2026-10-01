@@ -186,13 +186,16 @@ impl<E: BlobReadbackExchange> KernelBlobReadbackPort<E> {
                 || observed_fence
                     .as_ref()
                     .is_some_and(|value: &eliot_contracts::StateFence| value != &response_fence)
-                || observed_at.is_some_and(|value| value != observed_at_unix_ms)
+                || response_fence != request.fence
             {
                 return Err(integrity_error(stream));
             }
             owner_generation = Some(response_generation);
             readback_receipt_id = Some(response_receipt);
             observed_fence = Some(response_fence);
+            // This is the current read observation clock for this chunk. It
+            // may advance between chunks and is never substituted for the
+            // process capture or source commit clock.
             observed_at = Some(observed_at_unix_ms);
 
             let new_len = offset
