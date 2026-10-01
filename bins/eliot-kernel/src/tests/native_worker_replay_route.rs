@@ -270,6 +270,10 @@ fn registration_json(
         "execution_unit_schema_version": NATIVE_WORKER_EXECUTION_UNIT_SCHEMA_VERSION,
         "worker_artifact_digest": "a".repeat(64),
         "worker_config_digest": "b".repeat(64),
+        // I7.3 / issue #22 W1: the registration's owner facts must match the
+        // catalogue revision and cell carried by `test_join`.
+        "module_catalog_revision": 7,
+        "capability_cell": test_capability_cell(),
         "process_image_digest": "c".repeat(64),
         "installation_id": "installation-1",
         "principal_ref": "principal-1",
