@@ -4142,6 +4142,58 @@ async fn report_authority_revocation_ingress(
                     resume_blocked = pending.resume_blocked,
                 );
             }
+            let drive = {
+                let mut guard = composition.lock().await;
+                eliotd::authority_revocation_ingress::drive_pending_second_phases(
+                    &mut *guard,
+                    kernel,
+                    &report,
+                )
+                .await
+            };
+            match drive {
+                Ok(drive) => {
+                    for driven in drive.driven() {
+                        let canonical_receipt_id = driven
+                            .outcome
+                            .link()
+                            .map(|link| {
+                                eliotd::diagnostics::sanitize_identity(
+                                    link.canonical_receipt().receipt_id.as_str(),
+                                )
+                            })
+                            .unwrap_or_default();
+                        tracing::warn!(
+                            target: "eliotd::diagnostics",
+                            event = "eliotd.authority_revocation_second_phase_driven",
+                            grant_id = %eliotd::diagnostics::sanitize_identity(&driven.grant_id),
+                            closure_operation_id = %eliotd::diagnostics::sanitize_identity(
+                                &driven.closure_operation_id
+                            ),
+                            grant_graph_revision = report.revision(),
+                            outcome = if driven.outcome.is_linked() {
+                                "linked"
+                            } else {
+                                "still-pending"
+                            },
+                            canonical_receipt_id = %canonical_receipt_id,
+                            drive_note = driven.outcome.pending_reason().unwrap_or(
+                                "second phase proved linked by content",
+                            ),
+                        );
+                    }
+                }
+                Err(error) => {
+                    if failure_guard.should_emit() {
+                        let _ = eliotd::diagnostics::ErrorRecord::of(
+                            eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                            "authority-revocation-drive",
+                            &error.to_string(),
+                        )
+                        .emit();
+                    }
+                }
+            }
         }
         Err(error) => {
             if failure_guard.should_emit() {
