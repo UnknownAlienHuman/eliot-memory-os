@@ -308,6 +308,7 @@ pub const ADMITTED_OPERATIONS: &[&str] = &[
     "validation_snapshot",
     "recovery",
     "initialize_genesis",
+    "write_work_scope_owner",
     "dreamer_job",
     "startup",
     "launch_config",
@@ -676,6 +677,9 @@ impl BridgeIdentity {
                 .with_request(&context.request_id)
                 .with_operation(&request.operation_id)
                 .with_idempotency_ref(&request.idempotency_key),
+            Request::WriteWorkScopeOwner { context, request } => Self::new()
+                .with_request(&context.request_id)
+                .with_idempotency_ref(&request.canonical_request_hash),
             Request::DreamerJob { context, request } => Self::new()
                 .with_request(&context.request_id)
                 .with_operation(&request.request_identity.operation.operation_id)
@@ -726,6 +730,7 @@ impl BridgeIdentity {
             | Response::OrderingHeadReadbacks { .. }
             | Response::ValidationSnapshot { .. }
             | Response::Recovery { .. }
+            | Response::WorkScopeOwner { .. }
             | Response::DreamerJob { .. }
             | Response::Backup { .. }
             | Response::Error { .. } => Self::new(),
@@ -994,6 +999,7 @@ pub fn classify_response(response: &Response) -> RequestOutcome {
             | WriteReceiptStatus::DeadLetter
             | WriteReceiptStatus::Cancelled => RequestOutcome::TerminalNonCommit,
         },
+        Response::WorkScopeOwner { .. } => RequestOutcome::Committed,
         Response::Receipt { .. }
         | Response::Health { .. }
         | Response::Readiness { .. }
@@ -1186,6 +1192,7 @@ pub fn emit_dispatch_outcome(
         Response::Transaction { receipt } | Response::Genesis { receipt } => {
             event.receipt_status = Some(receipt.status);
         }
+        Response::WorkScopeOwner { .. } => {}
         Response::Failure { failure } => {
             let (reason, recovery) = project_failure_control(failure);
             event.reason = reason;
@@ -1267,6 +1274,7 @@ pub fn operation_name(request: &Request) -> &'static str {
         Request::ValidationSnapshot => "validation_snapshot",
         Request::Recovery { .. } => "recovery",
         Request::InitializeGenesis { .. } => "initialize_genesis",
+        Request::WriteWorkScopeOwner { .. } => "write_work_scope_owner",
         Request::DreamerJob { .. } => "dreamer_job",
     }
 }
@@ -1287,6 +1295,7 @@ pub fn dispatch_boundary(request: &Request) -> BridgeBoundary {
         Request::Backup { .. } => BridgeBoundary::BackupBoundary,
         Request::Recovery { .. } => BridgeBoundary::RecoveryBoundary,
         Request::InitializeGenesis { .. } => BridgeBoundary::GenesisBoundary,
+        Request::WriteWorkScopeOwner { .. } => BridgeBoundary::MutationResult,
         Request::DreamerJob { .. } => BridgeBoundary::DreamerLedger,
         Request::Health
         | Request::Readiness
