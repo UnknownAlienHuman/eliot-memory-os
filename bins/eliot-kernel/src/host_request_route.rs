@@ -7427,6 +7427,16 @@ impl KernelComposition {
                 .ors
                 .acknowledge_bridge_event_batch(&ors_request)
                 .map_err(|error| match error {
+                    OrsError::BridgeEventCapacityExceeded(_) => {
+                        // The acknowledgement advances cursors without
+                        // allocating a normal event slot (issue #2731,
+                        // item 6): genuine ack saturation surfaces as
+                        // `ProjectionLimitExceeded` above, so a capacity
+                        // report here fails closed with every other ack
+                        // error instead of shedding a valid session as
+                        // congested.
+                        TransportError::SessionFenced
+                    }
                     OrsError::ProjectionLimitExceeded | OrsError::PayloadTooLarge => {
                         TransportError::Backpressure
                     }
@@ -7479,6 +7489,31 @@ impl KernelComposition {
                         TransportError::AttributedBackpressure(
                             eliot_ipc::BACKPRESSURE_BRIDGE_RECOVERY_WINDOWS,
                         )
+                    }
+                    OrsError::BridgeEventCapacityExceeded(pressure) => {
+                        // The reconcile read resolves retained accounting
+                        // without allocating a normal event slot (issue
+                        // #2731, item 6): its reachable pressures carry the
+                        // exact exhausted dimension, so name the matching
+                        // recovery signal instead of fencing the admitted
+                        // session. Dimensions with no dedicated recovery
+                        // signal shed as unattributed saturation; the
+                        // dispatch shed retains the session for
+                        // duplicate-safe resubmission through these same
+                        // recovery legs.
+                        match pressure.dimension {
+                            eliot_contracts::BridgeEventCapacityDimension::PendingHandoffs => {
+                                TransportError::AttributedBackpressure(
+                                    eliot_ipc::BACKPRESSURE_BRIDGE_HANDOFF_ROWS,
+                                )
+                            }
+                            eliot_contracts::BridgeEventCapacityDimension::EventRecords => {
+                                TransportError::AttributedBackpressure(
+                                    eliot_ipc::BACKPRESSURE_BRIDGE_EVENT_RECORDS,
+                                )
+                            }
+                            _ => TransportError::Backpressure,
+                        }
                     }
                     OrsError::ProjectionLimitExceeded | OrsError::PayloadTooLarge => {
                         TransportError::Backpressure
