@@ -969,20 +969,30 @@ fn current_selection<'a>(
             return Err(ProfileReplayError::StageMismatch { field });
         }
     }
-    let retained_command =
-        stage
-            .stage_command
-            .as_ref()
-            .ok_or(ProfileReplayError::StageMismatch {
+    match stage.execution {
+        StageExecutionKind::Process => {
+            let retained_command =
+                stage
+                    .stage_command
+                    .as_ref()
+                    .ok_or(ProfileReplayError::StageMismatch {
+                        field: "stage_command",
+                    })?;
+            if retained_command.executable != selected.command.executable
+                || retained_command.argv != selected.command.argv
+                || retained_command.spec_digest != selected.spec_digest
+            {
+                return Err(ProfileReplayError::StageMismatch {
+                    field: "stage_command",
+                });
+            }
+        }
+        StageExecutionKind::DecoderOnly if stage.stage_command.is_none() => {}
+        StageExecutionKind::DecoderOnly => {
+            return Err(ProfileReplayError::StageMismatch {
                 field: "stage_command",
-            })?;
-    if retained_command.executable != selected.command.executable
-        || retained_command.argv != selected.command.argv
-        || retained_command.spec_digest != selected.spec_digest
-    {
-        return Err(ProfileReplayError::StageMismatch {
-            field: "stage_command",
-        });
+            });
+        }
     }
     let entry = provider_registry.resolve_current(&stage.invocation, freshness)?;
     let retained_freshness = stage
