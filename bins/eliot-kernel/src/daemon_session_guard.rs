@@ -9,7 +9,9 @@
 //! Forbidden authority: must not accept peer-owned identity, must not widen session scope, must not accept stale daemon caller.
 //! Ordinary module: I2.23 Capability-family topology and crate extraction decisions — ordinary single-file extraction (<10k LOC) owning only `caller_binding` and `KernelComposition::require_current_daemon_session` plus inseparable guard-only helper with zero external users beyond the guard.
 
-use super::front_door_session::{DOCTOR_MODULE_ID, NATIVE_MODULE_ID, TESTD_MODULE_ID};
+use super::front_door_session::{
+    DOCTOR_MODULE_ID, NATIVE_MODULE_ID, PROFILE_RESOLVER_MODULE_ID, TESTD_MODULE_ID,
+};
 use super::runtime_identity::stable_owner_principal_digest;
 use super::{
     ACTIVE_DAEMON_CALLER, Generation, KernelComposition, PeerIdentity, ProcessCallerSession,
@@ -101,6 +103,8 @@ fn process_session_class_for_module_inner(module_id: &str) -> Option<ProcessSess
         Some(ProcessSessionClass::TestdAttempt)
     } else if module_id == NATIVE_MODULE_ID {
         Some(ProcessSessionClass::NativeWorkerAttempt)
+    } else if module_id == PROFILE_RESOLVER_MODULE_ID {
+        Some(ProcessSessionClass::ProfileResolverSession)
     } else if module_id == DOCTOR_MODULE_ID {
         None
     } else {
@@ -206,7 +210,8 @@ impl KernelComposition {
             ProcessSessionClass::EliotdGeneration => self.admitted_eliotd_session_id()?,
             ProcessSessionClass::UserBrokerSession
             | ProcessSessionClass::TestdAttempt
-            | ProcessSessionClass::NativeWorkerAttempt => durable_caller_session_id(
+            | ProcessSessionClass::NativeWorkerAttempt
+            | ProcessSessionClass::ProfileResolverSession => durable_caller_session_id(
                 class,
                 module_id,
                 peer_sid,

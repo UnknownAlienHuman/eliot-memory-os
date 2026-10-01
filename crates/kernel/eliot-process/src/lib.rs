@@ -761,6 +761,8 @@ pub enum ProcessSessionClass {
     TestdAttempt,
     /// Native worker attempt (worker claim plus attempt lineage).
     NativeWorkerAttempt,
+    /// Bounded profile verification run authenticated to the Kernel front door.
+    ProfileResolverSession,
 }
 
 impl ProcessSessionClass {
@@ -771,6 +773,7 @@ impl ProcessSessionClass {
             Self::UserBrokerSession => "user_broker_session",
             Self::TestdAttempt => "testd_attempt",
             Self::NativeWorkerAttempt => "native_worker_attempt",
+            Self::ProfileResolverSession => "profile_resolver_session",
         }
     }
 }
@@ -4227,6 +4230,10 @@ mod tests {
             ProcessSessionClass::NativeWorkerAttempt.as_str(),
             "native_worker_attempt"
         );
+        assert_eq!(
+            ProcessSessionClass::ProfileResolverSession.as_str(),
+            "profile_resolver_session"
+        );
     }
 
     #[test]
@@ -4239,6 +4246,10 @@ mod tests {
                 ProcessSessionClass::NativeWorkerAttempt,
                 "eliot-native-worker",
             ),
+            (
+                ProcessSessionClass::ProfileResolverSession,
+                "eliot-profile-resolver",
+            ),
         ] {
             let admitted = caller_session(class, module, "session-1", 7, 1)?;
             assert_eq!(admitted.class(), class);
@@ -4249,6 +4260,23 @@ mod tests {
                 &caller_fence(7, 1)?,
             )?;
         }
+        Ok(())
+    }
+
+    #[test]
+    fn profile_resolver_session_rejects_a_foreign_owner() -> TestResult {
+        let admitted = caller_session(
+            ProcessSessionClass::ProfileResolverSession,
+            "eliot-profile-resolver",
+            "profile-session-1",
+            7,
+            1,
+        )?;
+        let foreign = caller_owner("eliot-testd", 7, 1)?;
+        assert_eq!(
+            validate_process_intent_session(&intent()?, &admitted, &foreign, &caller_fence(7, 1)?),
+            Err(ContractError::DispatchBindingMismatch)
+        );
         Ok(())
     }
 

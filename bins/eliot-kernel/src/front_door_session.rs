@@ -131,6 +131,13 @@ pub(crate) const TESTD_MODULE_ID: &str = "eliot-testd";
 /// [`KernelComposition::bind_watchdog_session`].
 pub(crate) const NATIVE_MODULE_ID: &str = "eliot-native-worker";
 
+/// Stable module identity for the bounded profile-resolver front-door session.
+///
+/// The module string selects this closed session contour only after the named
+/// pipe has authenticated its peer; Kernel then checks the presented
+/// generation, artifact, authority epoch, and fence against live policy.
+pub(crate) const PROFILE_RESOLVER_MODULE_ID: &str = "eliot-profile-resolver";
+
 /// Stable module identity of the independent supervision service.
 ///
 /// The Watchdog never self-asserts authority through this string:
@@ -746,6 +753,13 @@ impl KernelComposition {
             // policy inside; nothing client-asserted becomes authority.
             return self.bind_native_worker_session(connection_id, peer, client);
         }
+        if client.module_bridge_identity == PROFILE_RESOLVER_MODULE_ID {
+            // Profile verification gets its own server-derived process
+            // session class and only the closed stage-Blob selectors. The
+            // caller cannot turn the session into general process or Store
+            // authority by naming this module identity.
+            return self.bind_profile_resolver_session(connection_id, peer, client);
+        }
         if client.module_bridge_identity == WATCHDOG_MODULE_ID {
             // The independent supervision service binds at session scope over
             // its already pipe-authenticated Watchdog peer role. It presents
@@ -1231,6 +1245,90 @@ impl KernelComposition {
         client: &eliot_protocol::ClientHello,
     ) -> Result<(), TransportError> {
         if client.module_generation.generation != policy.module_generation.generation
+            || client.module_generation.artifact_id != policy.module_generation.artifact_id
+            || client.artifact_hash != policy.module_generation.artifact_id
+            || !client
+                .authority_epoch
+                .is_same_authority(&policy.module_generation.state_fence.authority_epoch)
+            || !client
+                .module_generation
+                .state_fence
+                .is_compatible_with(&policy.module_generation.state_fence)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(())
+    }
+
+    /// Binds one authenticated profile-resolver peer to the closed
+    /// verification-stage Blob contour. Process launch authority still comes
+    /// from a separate Kernel-owned stage admission; these session
+    /// capabilities only permit that admission and its retained Blob calls.
+    fn bind_profile_resolver_session(
+        &self,
+        connection_id: impl Into<String>,
+        peer: PeerIdentity,
+        client: &eliot_protocol::ClientHello,
+    ) -> Result<HandshakeResult, eliot_ipc::TransportError> {
+        observe_front_door_session("kernel.front_door_profile_resolver_bind", "attempt");
+        let connection_id = connection_id.into();
+        if connection_id.trim().is_empty()
+            || connection_id.chars().any(char::is_control)
+            || client.module_bridge_identity != PROFILE_RESOLVER_MODULE_ID
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        peer.validate()
+            .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+        let policy = self
+            .front_door_policy
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?
+            .clone();
+        Self::validate_profile_resolver_client_binding(&policy, client)?;
+        let mut session = Session::establish(connection_id, peer, client, policy.protocol_range)?;
+        session.capabilities = vec![
+            "eliot.kernel.verification-stage-open".to_owned(),
+            "eliot.kernel.verification-stage-call".to_owned(),
+            "eliot.kernel.verification-stage-reconcile".to_owned(),
+        ];
+        session
+            .privacy_classes
+            .retain(|class| policy.allowed_privacy_classes.contains(class));
+        session.effects.clear();
+        let server_hello = eliot_protocol::ServerHello {
+            selected_protocol: session.protocol_version,
+            session_principal_binding: policy.session_principal_binding.clone(),
+            allowed_capabilities: session.capabilities.clone(),
+            allowed_effects: Vec::new(),
+            config_snapshot: policy.config_snapshot.clone(),
+            heartbeat_ms: policy.heartbeat_ms,
+            control_channel: policy.control_channel.clone(),
+            rejection_reason: None,
+            authority_epoch: policy.module_generation.state_fence.authority_epoch.clone(),
+        };
+        server_hello
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        observe_front_door_session("kernel.front_door_profile_resolver_bind", "success");
+        Ok(HandshakeResult {
+            capabilities: session.capabilities.clone(),
+            privacy_classes: session.privacy_classes.clone(),
+            effects: Vec::new(),
+            session,
+            server_hello,
+        })
+    }
+
+    /// Checks every ProfileResolver `ClientHello` authority field against the
+    /// live Kernel policy. The module identity is only the closed route
+    /// selector and never supplies the artifact, generation, epoch, or fence.
+    fn validate_profile_resolver_client_binding(
+        policy: &ServerHandshakePolicy,
+        client: &eliot_protocol::ClientHello,
+    ) -> Result<(), TransportError> {
+        if client.module_bridge_identity != PROFILE_RESOLVER_MODULE_ID
+            || client.module_generation.generation != policy.module_generation.generation
             || client.module_generation.artifact_id != policy.module_generation.artifact_id
             || client.artifact_hash != policy.module_generation.artifact_id
             || !client

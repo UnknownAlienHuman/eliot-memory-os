@@ -16,7 +16,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-use eliot_contracts::{ContractError, ContractId, ContractVersion, StateFence, sha256_hex};
+use eliot_contracts::{
+    ContractError, ContractId, ContractVersion, StateFence, canonical_json_bytes, sha256_hex,
+};
 use eliot_instrument_api::{
     BuildClass, InstrumentAdmissionGrant, InstrumentAdmissionRequest, InstrumentKind,
 };
@@ -2440,6 +2442,13 @@ mod compile_only_profile_tests {
 pub struct AdmittedStage {
     /// Durable stage identity.
     pub stage_id: String,
+    /// Exact declared stage record from the admitted DAG.
+    ///
+    /// This preserves the distinction between a stage-specific command
+    /// override and the command inherited from its bound spec. Consumers that
+    /// bind an external capability to one stage must hash this declaration,
+    /// not reconstruct a similar-looking stage from the effective command.
+    pub declaration: StageDecl,
     /// Bound spec kind identity.
     pub spec: ContractId,
     /// Stage class.
@@ -2502,6 +2511,23 @@ pub struct AdmittedStage {
     /// Declared per-adapter maximum concurrency, bound into the process
     /// grant and enforced by the owning plane, never by a global pool.
     pub max_concurrency: u32,
+}
+
+impl AdmittedStage {
+    /// Returns the lowercase SHA-256 of this stage's exact canonical DAG declaration.
+    ///
+    /// The digest is derived from the same `StageDecl` that contributed to the
+    /// admitted profile DAG digest. It therefore preserves declared optional
+    /// fields and command overrides without maintaining a second stage-hash
+    /// interpretation in a consumer.
+    pub fn declaration_sha256(&self) -> Result<String, ProfileError> {
+        let bytes = canonical_json_bytes(&self.declaration).map_err(|error| {
+            ProfileError::Snapshot {
+                detail: format!("canonical stage declaration encoding failed: {error}"),
+            }
+        })?;
+        Ok(sha256_hex(&bytes))
+    }
 }
 
 /// Typed pre-launch admission failure (I10.8.3).
@@ -3077,6 +3103,7 @@ impl<'a> ProfileCompiler<'a> {
             let supply_receipt = self.registry.supply_chain(stage.spec.as_str()).cloned();
             stages.push(AdmittedStage {
                 stage_id: stage.stage_id.clone(),
+                declaration: stage.clone(),
                 spec: stage.spec.clone(),
                 kind: stage.kind,
                 required: stage.required,
