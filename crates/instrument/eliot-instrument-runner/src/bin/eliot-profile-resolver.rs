@@ -110,7 +110,8 @@ use eliot_instrument_runner::{
     InstrumentSpec, ParityVerdict, PlannedStage, ProfileAggregate, ProfileCompiler, ProviderDispatch,
     ProviderRegistry, RegistryEntry, RunnerError, StageEnvironment, StageEvidence, StageLauncher,
     StageOrchestrator, SupplyChainReceipt, TargetLayout, VerificationProfileReceipt,
-    VerificationRouteRequest, WorkScope, admitted_profile_for_alias, compose_provider_dispatch,
+    VerificationRouteRequest, VERIFICATION_REGISTRY_GENERATION, WorkScope,
+    admitted_profile_for_alias, compose_provider_dispatch,
     host_platform, parity_summary,
     profile::{PROFILE_ALIASES, TOOLCHAIN_PATH_ENV, builtin_specs},
     resolve_verification_route, verify_profile_parity,
@@ -143,14 +144,6 @@ const EXIT_REFUSED: i32 = 1;
 /// The one-shot context shape the `eliot-verifier-selfchange` bootstrap stores;
 /// no other revision is ever admitted here.
 const VALIDATION_REVISION: u64 = 1;
-
-/// Registry generation the shared verification registry is admitted at.
-///
-/// The route profiles ship at revision 1, and a supply-chain receipt is validated
-/// against the admitted spec digest at exactly the generation the registry is
-/// assembled with, so one fixed generation keeps an attested receipt and its
-/// registry bound together on either side of a parity comparison.
-const VERIFICATION_REGISTRY_GENERATION: u64 = 1;
 
 /// Authority epoch lineage of this one-shot resolution process.
 ///

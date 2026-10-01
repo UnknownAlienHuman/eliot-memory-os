@@ -37,6 +37,12 @@ pub const COMPILER_PROFILE: &str = "compiler";
 pub const TEST_PROFILE: &str = "test";
 /// Exact revision shipped for both builtin profiles.
 pub const BUILTIN_PROFILE_REVISION: u64 = 1;
+/// Current generation of the shared built-in verification registry.
+///
+/// Testd stage producers and replay build this exact registry locally; its
+/// generation is owned by the compiled registry definition, never by a
+/// retained stage request.
+pub const VERIFICATION_REGISTRY_GENERATION: u64 = 1;
 /// Stable wire name of the package verification route.
 pub const PACKAGE_VERIFICATION_ROUTE: &str = "package-verification";
 /// Stable wire name of the bundle verification route.

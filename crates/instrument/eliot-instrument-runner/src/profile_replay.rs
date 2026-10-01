@@ -30,16 +30,15 @@ use crate::{
     registry::{InvalidationSet, ProviderRegistry, RegistryEntry, RegistryError, RegistryFreshness},
 };
 
-/// Builds the exact builtin four-profile registry admitted for productive
-/// TestD execution at one local registry generation.
+/// Builds the exact builtin registry admitted for productive TestD execution.
 ///
-/// This is the production replay registry factory. Callers pass the stage's
-/// retained generation only as a selector; replay still compares the exact
-/// profile, registry, DAG, parser, and stage identities before dispatch.
-pub fn testd_builtin_profile_registry(
-    generation: u64,
-) -> Result<InstrumentRegistry, ProfileError> {
-    InstrumentRegistry::with_verification_route_profiles(generation, Vec::new())
+/// Its generation comes from the runner's compiled registry owner constant,
+/// never from a stage request being checked against that registry.
+pub fn testd_builtin_profile_registry() -> Result<InstrumentRegistry, ProfileError> {
+    InstrumentRegistry::with_verification_route_profiles(
+        crate::profile::VERIFICATION_REGISTRY_GENERATION,
+        Vec::new(),
+    )
 }
 
 /// Exact independent observations available at the governed process finish
