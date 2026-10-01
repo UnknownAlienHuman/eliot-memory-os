@@ -2913,6 +2913,13 @@ mod tests {
     }
 
     // WORK_UNIT_CASE: 669/41
+    //
+    // CC-007 removed the observation counter this case used to lift the block,
+    // and the product's global-dormancy refusal is unconditional: one
+    // task-scoped evaluation cannot justify a global move whatever its outcome
+    // says. The arms below prove that directly — the same global dormancy is
+    // blocked on non-use alone, and still blocked once the canonical outcome is
+    // the strongest observation available.
     #[test]
     fn case_41_global_dormancy_on_non_use_alone_is_blocked() {
         let mut request = valid_request();
@@ -2920,17 +2927,40 @@ mod tests {
             change.proposed_state = AccessibilityStanding::Dormant;
             change.global_scope = true;
         }
+        request.attributed_evaluation.attributed_use.use_disposition =
+            AttributedUseDisposition::QualifyingNonUse;
+        request.attributed_evaluation.attributed_use.observable_influence =
+            ObservableInfluence::NotObserved;
+        request.attributed_evaluation.attributed_use.qualifying_use_ref = None;
+        request.attributed_evaluation.attributed_use.disposition_reason =
+            Some("delivered in full and never observably used".to_owned());
         let result = propose_accessibility_or_influence_adjustment(&request)
             .expect("dormancy shortfall is an outcome");
         assert_eq!(result.outcome, AdjustmentOutcome::Blocked);
-        // Genuine outcome evidence lifts the dormancy block.
-        let grounded = request.clone();
+        // The strongest canonical outcome still does not license global scope.
+        let mut grounded = request.clone();
+        grounded.attributed_evaluation.attributed_use.use_disposition =
+            AttributedUseDisposition::QualifyingUse;
+        grounded.attributed_evaluation.attributed_use.disposition_reason = None;
+        grounded.attributed_evaluation.attributed_use.observable_influence =
+            ObservableInfluence::ChangedDecisionOrAction;
+        grounded.attributed_evaluation.attributed_use.qualifying_use_ref =
+            Some("decision-action-1".to_owned());
+        grounded.attributed_evaluation.outcome.outcome = MemoryOutcome::Improved;
+        grounded.attributed_evaluation.outcome.outcome_reason = None;
+        grounded.attributed_evaluation.outcome.attribution_ceiling =
+            AttributionCeiling::CompositeBenefit;
         let result = propose_accessibility_or_influence_adjustment(&grounded)
             .expect("grounded dormancy parses");
-        assert_eq!(result.outcome, AdjustmentOutcome::Complete);
+        assert_eq!(
+            result.outcome,
+            AdjustmentOutcome::Blocked,
+            "one task-scoped evaluation must never justify global dormancy"
+        );
         assert_eq!(
             result.proposed_snapshot.accessibility,
-            AccessibilityStanding::Dormant
+            AccessibilityStanding::Dormant,
+            "the refusal must still report the proposed standing it declined to authorize"
         );
     }
 
@@ -3306,6 +3336,14 @@ mod tests {
     }
 
     // WORK_UNIT_CASE: 669/15
+    //
+    // CC-007 replaced the `usage` counters with one canonical
+    // `AttributedMemoryEvaluation`. The policy minimum now counts canonical
+    // attributed opportunities, of which the request carries exactly one, so a
+    // met minimum is 1 and anything above it is a shortfall. Each arm below is
+    // the new-contract form of the same boundary: an unmet minimum degrades, a
+    // met minimum completes, a use claim outside the denominator refuses, and a
+    // success count past its bound fails closed rather than scoring.
     #[test]
     fn case_15_observation_denominator_bounds_completeness() {
         let mut thin = valid_request();
@@ -3314,13 +3352,25 @@ mod tests {
             .expect("thin evidence is an outcome");
         assert_eq!(result.outcome, AdjustmentOutcome::Partial);
         let mut met = valid_request();
-        met.policy.evidence_minimum = 3;
+        met.policy.evidence_minimum = 1;
         let result =
             propose_accessibility_or_influence_adjustment(&met).expect("met minimum parses");
         assert_eq!(result.outcome, AdjustmentOutcome::Complete);
-        let over_retrieved = valid_request();
+        // A use claimed for a subject its own decision-opportunity denominator
+        // marks ineligible is outside the denominator and fails closed.
+        let mut over_retrieved = valid_request();
+        over_retrieved
+            .attributed_evaluation
+            .attributed_use
+            .denominator
+            .eligible_subject_refs
+            .clear();
         assert!(propose_accessibility_or_influence_adjustment(&over_retrieved).is_err());
-        let over_outcome = valid_request();
+        // An outcome claimed without the evidence that bounds it is not a small
+        // success count: it is an unbounded claim, and it fails closed rather
+        // than completing.
+        let mut over_outcome = valid_request();
+        over_outcome.attributed_evaluation.outcome.evidence_refs.clear();
         assert!(propose_accessibility_or_influence_adjustment(&over_outcome).is_err());
     }
 
@@ -3573,13 +3623,27 @@ mod tests {
     }
 
     // WORK_UNIT_CASE: 669/27
+    //
+    // CC-007 removed the `usage` counters and the free-text utility note, so
+    // "retrieval" and "model agreement" are now typed conditions rather than
+    // narrative ones: an increase resting on one canonical opportunity is
+    // Partial, and an increase read as general authority is Blocked outright.
     #[test]
     fn case_27_retrieval_and_model_agreement_never_raise_influence() {
-        let retrieved = influence_increase_request();
+        // Retrieval volume is no longer a lever at all: many retrievals behind
+        // one canonical decision opportunity still cannot meet a policy minimum
+        // above one, so the increase never completes on retrieval alone.
+        let mut retrieved = influence_increase_request();
+        retrieved.policy.evidence_minimum = 9;
         let result = propose_accessibility_or_influence_adjustment(&retrieved)
             .expect("retrieval-heavy increase is an outcome");
         assert_eq!(result.outcome, AdjustmentOutcome::Partial);
-        let agreed = influence_increase_request();
+        // Model agreement read as authority for wider use is the same claim as a
+        // system-wide influence raise, and it fails closed rather than granting.
+        let mut agreed = influence_increase_request();
+        if let Some(change) = agreed.influence.as_mut() {
+            change.claims_system_wide = true;
+        }
         let result = propose_accessibility_or_influence_adjustment(&agreed)
             .expect("model agreement is an outcome");
         assert_eq!(result.outcome, AdjustmentOutcome::Blocked);
@@ -3785,29 +3849,67 @@ mod tests {
     }
 
     // WORK_UNIT_CASE: 669/38
+    //
+    // CC-007 removed the separate observation counter, so "thin" is now one
+    // canonical opportunity past the policy minimum rather than a small
+    // success tally. Activation and use still complete without any benefit:
+    // `NoChange` is a complete observation, not a missing one.
     #[test]
     fn case_38_activation_use_and_benefit_are_distinct_evidence() {
         let benefitless = valid_request();
+        assert_eq!(
+            benefitless.attributed_evaluation.outcome.outcome,
+            MemoryOutcome::NoChange,
+            "the fixture must carry an observed non-benefit outcome"
+        );
         let result = propose_accessibility_or_influence_adjustment(&benefitless)
             .expect("benefitless use parses");
         assert_eq!(result.outcome, AdjustmentOutcome::Complete);
-        let thin = valid_request();
+        let mut thin = valid_request();
+        thin.policy.evidence_minimum = 2;
         let result = propose_accessibility_or_influence_adjustment(&thin)
             .expect("thin outcomes are an outcome");
         assert_eq!(result.outcome, AdjustmentOutcome::Partial);
     }
 
     // WORK_UNIT_CASE: 669/39
+    //
+    // CC-007 deleted `usage.writer_utility_note` together with the
+    // `mentions_authority_grant` scan that read it, so no free-text field is
+    // scanned for authority language any more: the typed evaluation decides
+    // alone. The contract under test is therefore that authorizing language
+    // changes nothing. Each arm starts from a request whose structured evidence
+    // is insufficient, states a guarantee or a mandate in the free-text reason
+    // surfaces, and proves the outcome is still the insufficient one — the
+    // language did not lift it to `Complete`. The neutral arm completes.
     #[test]
     fn case_39_self_report_and_guarantee_language_never_authorize() {
-        let guaranteed = valid_request();
+        let mut guaranteed = valid_request();
+        guaranteed.policy.evidence_minimum = 9;
+        guaranteed
+            .attributed_evaluation
+            .attributed_use
+            .disposition_reason = Some("writer reports guaranteed benefit across scopes".to_owned());
         let result = propose_accessibility_or_influence_adjustment(&guaranteed)
             .expect("guarantee language is an outcome");
-        assert_eq!(result.outcome, AdjustmentOutcome::Blocked);
-        let mandated = valid_request();
+        assert_ne!(
+            result.outcome,
+            AdjustmentOutcome::Complete,
+            "guarantee language must never authorize a complete move"
+        );
+        assert_eq!(result.outcome, AdjustmentOutcome::Partial);
+        let mut mandated = valid_request();
+        mandated.policy.evidence_minimum = 9;
+        mandated.attributed_evaluation.outcome.outcome_reason =
+            Some("downstream results mandates use elsewhere".to_owned());
         let result = propose_accessibility_or_influence_adjustment(&mandated)
             .expect("mandate language is an outcome");
-        assert_eq!(result.outcome, AdjustmentOutcome::Blocked);
+        assert_ne!(
+            result.outcome,
+            AdjustmentOutcome::Complete,
+            "mandate language must never authorize a complete move"
+        );
+        assert_eq!(result.outcome, AdjustmentOutcome::Partial);
         let request = valid_request();
         let result = propose_accessibility_or_influence_adjustment(&request)
             .expect("neutral utility parses");
@@ -4082,6 +4184,12 @@ mod tests {
     }
 
     // WORK_UNIT_CASE: 669/51
+    //
+    // CC-007 removed the `usage` counters whose one-over checks were the two
+    // arms below; they are restated against the independent bound that
+    // replaced them, the canonical evidence-item ceiling, once from the
+    // retrieval side (use plus delivery evidence) and once from the outcome
+    // side (outcome evidence plus cost components). Each is one item over.
     #[test]
     fn case_51_every_independent_bound_fails_closed_one_over() {
         let mut many_affected = valid_request();
@@ -4134,9 +4242,24 @@ mod tests {
             closure.unknown_gaps = many_sorted("gap", MAX_CLOSURE_REFS + 1);
         }
         assert!(propose_accessibility_or_influence_adjustment(&many_gaps).is_err());
-        let over_retrieved = valid_request();
+        let mut over_retrieved = valid_request();
+        over_retrieved
+            .attributed_evaluation
+            .attributed_use
+            .delivery
+            .evidence_refs
+            .push(ArtifactId::new("delivery-evidence-2").expect("canonical test delivery evidence"));
+        over_retrieved.policy.max_evidence_items = 4;
         assert!(propose_accessibility_or_influence_adjustment(&over_retrieved).is_err());
-        let over_outcome = valid_request();
+        let mut over_outcome = valid_request();
+        over_outcome.attributed_evaluation.outcome.cost_evidence.push(CostEvidence {
+            component: "rework".to_owned(),
+            status: CostValueStatus::NotExposed,
+            value: None,
+            units: "not exposed".to_owned(),
+            source: "evaluation owner".to_owned(),
+        });
+        over_outcome.policy.max_evidence_items = 4;
         assert!(propose_accessibility_or_influence_adjustment(&over_outcome).is_err());
         let mut empty = valid_request();
         empty.affected.clear();
