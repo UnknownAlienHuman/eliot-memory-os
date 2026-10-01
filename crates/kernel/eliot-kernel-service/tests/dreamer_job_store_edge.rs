@@ -376,6 +376,14 @@ fn edge_requirement_for(fence: &StateFence) -> HostStoreBootstrapRequirement {
     }
 }
 
+fn session_principal_binding(requirement: &HostStoreBootstrapRequirement) -> String {
+    format!(
+        "sid={};session={}",
+        requirement.expected_peer_sid.as_str(),
+        requirement.expected_peer_session_id
+    )
+}
+
 #[derive(Clone)]
 enum DreamerReply {
     Fixed(StoreResponse),
@@ -405,7 +413,7 @@ impl ScriptedPeer {
     fn hello_frame(&self) -> Frame {
         let hello = ServerHello {
             selected_protocol: ProtocolVersion::CURRENT,
-            session_principal_binding: "edge-store-session".to_owned(),
+            session_principal_binding: session_principal_binding(&self.requirement),
             allowed_capabilities: CAPABILITIES
                 .iter()
                 .map(|value| (*value).to_owned())
@@ -1460,6 +1468,7 @@ mod gateway_cases {
     async fn serve_loopback(
         mut server: NamedPipeServer,
         connection_id: String,
+        session_principal_binding: String,
         artifact_hash: String,
         config_hash: String,
         authority_epoch: EpochId,
@@ -1474,7 +1483,7 @@ mod gateway_cases {
         assert_eq!(frame.kind, FrameKind::Control, "loopback expects EBP hello");
         let hello = ServerHello {
             selected_protocol: ProtocolVersion::CURRENT,
-            session_principal_binding: "loopback-store-session".to_owned(),
+            session_principal_binding,
             allowed_capabilities: CAPABILITIES
                 .iter()
                 .map(|value| (*value).to_owned())
@@ -1646,10 +1655,12 @@ mod gateway_cases {
         let artifact = requirement.approved_artifact_hash.as_str().to_owned();
         let config = requirement.approved_config_hash.as_str().to_owned();
         let connection_id = requirement.connection_id.as_str().to_owned();
+        let session_principal_binding = session_principal_binding(&requirement);
         let log = Arc::new(Mutex::new(LoopbackLog::default()));
         let server_task = tokio::spawn(serve_loopback(
             server,
             connection_id,
+            session_principal_binding,
             artifact,
             config,
             live.authority_epoch.clone(),
