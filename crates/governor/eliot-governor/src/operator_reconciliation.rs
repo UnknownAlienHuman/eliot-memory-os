@@ -208,7 +208,7 @@ pub fn operator_command_envelope(
         // per-correction idempotency key.
         write_intent_id: crate::write_intent::admission_write_intent(
             "operator-action-reconciliation",
-            &action_digest,
+            action_digest,
         )
         .ok_or_else(|| owner_refused("operator action has no owner-issued subject to declare"))?,
         write_envelope_protocol_version:
