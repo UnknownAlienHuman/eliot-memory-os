@@ -1,6 +1,7 @@
+using System.Buffers;
 using System.Security.Cryptography;
+using System.Globalization;
 using System.Text;
-using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Eliot.Operator.Protocol.Generated;
@@ -282,6 +283,23 @@ internal static class UserAutomationNormalizationReceiptEnvelope
                 "state_fence")
             || !core.TryGetProperty("request", out var request)
             || !HasExactProperties(request, "metadata", "state_fence")
+            || !request.TryGetProperty("metadata", out var metadata)
+            || !HasExactProperties(
+                metadata,
+                "request_id",
+                "session_id",
+                "task_id",
+                "product_id",
+                "source_id",
+                "state_fence",
+                "clock")
+            || !metadata.TryGetProperty("clock", out var clock)
+            || !HasExactProperties(
+                clock,
+                "valid_time_ms",
+                "known_time_ms",
+                "transaction_sequence",
+                "monotonic_ns")
             || !TryReadBoundedText(operation, "operation_kind", OperatorScheduleContract.MAX_TEXT_BYTES, out var operationKind)
             || !string.Equals(operationKind, expectedOperationKind, StringComparison.Ordinal))
         {
@@ -351,12 +369,7 @@ internal static class UserAutomationNormalizationReceiptEnvelope
         try
         {
             using var bytes = new MemoryStream();
-            using (var writer = new Utf8JsonWriter(
-                bytes,
-                new JsonWriterOptions { Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping }))
-            {
-                WriteCanonicalJson(core, writer);
-            }
+            WriteCanonicalJson(core, bytes);
 
             var digest = Convert.ToHexString(SHA256.HashData(bytes.ToArray())).ToLowerInvariant();
             return string.Equals(canonicalSha256, digest, StringComparison.Ordinal)
@@ -372,37 +385,47 @@ internal static class UserAutomationNormalizationReceiptEnvelope
         }
     }
 
-    private static void WriteCanonicalJson(JsonElement value, Utf8JsonWriter writer)
+    private static void WriteCanonicalJson(JsonElement value, Stream writer)
     {
         switch (value.ValueKind)
         {
             case JsonValueKind.Object:
-                writer.WriteStartObject();
+                writer.WriteByte((byte)'{');
+                var firstProperty = true;
                 foreach (var property in value.EnumerateObject().OrderBy(
                     property => property.Name,
-                    StringComparer.Ordinal))
+                    CanonicalJsonPropertyNameComparer.Instance))
                 {
-                    writer.WritePropertyName(property.Name);
+                    if (!firstProperty) writer.WriteByte((byte)',');
+                    firstProperty = false;
+                    WriteCanonicalString(property.Name, writer);
+                    writer.WriteByte((byte)':');
                     WriteCanonicalJson(property.Value, writer);
                 }
-                writer.WriteEndObject();
+                writer.WriteByte((byte)'}');
                 break;
             case JsonValueKind.Array:
-                writer.WriteStartArray();
-                foreach (var item in value.EnumerateArray()) WriteCanonicalJson(item, writer);
-                writer.WriteEndArray();
+                writer.WriteByte((byte)'[');
+                var firstItem = true;
+                foreach (var item in value.EnumerateArray())
+                {
+                    if (!firstItem) writer.WriteByte((byte)',');
+                    firstItem = false;
+                    WriteCanonicalJson(item, writer);
+                }
+                writer.WriteByte((byte)']');
                 break;
             case JsonValueKind.String:
-                writer.WriteStringValue(value.GetString());
+                WriteCanonicalString(value.GetString() ?? string.Empty, writer);
                 break;
             case JsonValueKind.Number:
                 if (value.TryGetInt64(out var signed))
                 {
-                    writer.WriteNumberValue(signed);
+                    WriteCanonicalAscii(writer, signed.ToString(CultureInfo.InvariantCulture));
                 }
                 else if (value.TryGetUInt64(out var unsigned))
                 {
-                    writer.WriteNumberValue(unsigned);
+                    WriteCanonicalAscii(writer, unsigned.ToString(CultureInfo.InvariantCulture));
                 }
                 else
                 {
@@ -413,16 +436,119 @@ internal static class UserAutomationNormalizationReceiptEnvelope
                 }
                 break;
             case JsonValueKind.True:
-                writer.WriteBooleanValue(true);
+                WriteCanonicalAscii(writer, "true");
                 break;
             case JsonValueKind.False:
-                writer.WriteBooleanValue(false);
+                WriteCanonicalAscii(writer, "false");
                 break;
             case JsonValueKind.Null:
-                writer.WriteNullValue();
+                WriteCanonicalAscii(writer, "null");
                 break;
             default:
                 throw new InvalidOperationException("receipt core contains an unsupported JSON value");
+        }
+    }
+
+    private static void WriteCanonicalString(string value, Stream writer)
+    {
+        writer.WriteByte((byte)'"');
+        var offset = 0;
+        Span<byte> utf8 = stackalloc byte[4];
+        Span<byte> escapedControl = stackalloc byte[6];
+        while (offset < value.Length)
+        {
+            if (Rune.DecodeFromUtf16(value.AsSpan(offset), out var rune, out var consumed)
+                != OperationStatus.Done)
+            {
+                throw new InvalidOperationException("receipt core contains invalid Unicode text");
+            }
+            offset += consumed;
+
+            switch (rune.Value)
+            {
+                case '"':
+                    WriteCanonicalAscii(writer, "\\\"");
+                    break;
+                case '\\':
+                    WriteCanonicalAscii(writer, "\\\\");
+                    break;
+                case '\b':
+                    WriteCanonicalAscii(writer, "\\b");
+                    break;
+                case '\t':
+                    WriteCanonicalAscii(writer, "\\t");
+                    break;
+                case '\n':
+                    WriteCanonicalAscii(writer, "\\n");
+                    break;
+                case '\f':
+                    WriteCanonicalAscii(writer, "\\f");
+                    break;
+                case '\r':
+                    WriteCanonicalAscii(writer, "\\r");
+                    break;
+                default:
+                    if (rune.Value <= 0x1f)
+                    {
+                        escapedControl[0] = (byte)'\\';
+                        escapedControl[1] = (byte)'u';
+                        escapedControl[2] = (byte)'0';
+                        escapedControl[3] = (byte)'0';
+                        escapedControl[4] = HexDigit((rune.Value >> 4) & 0xf);
+                        escapedControl[5] = HexDigit(rune.Value & 0xf);
+                        writer.Write(escapedControl);
+                    }
+                    else
+                    {
+                        var encodedLength = rune.EncodeToUtf8(utf8);
+                        writer.Write(utf8[..encodedLength]);
+                    }
+                    break;
+            }
+        }
+        writer.WriteByte((byte)'"');
+    }
+
+    private static byte HexDigit(int value) => (byte)(value < 10 ? '0' + value : 'a' + value - 10);
+
+    private static void WriteCanonicalAscii(Stream writer, string value) =>
+        writer.Write(Encoding.ASCII.GetBytes(value));
+
+    /// <summary>
+    /// Rust string ordering compares UTF-8 bytes, which is Unicode scalar
+    /// ordering. Ordinal .NET string ordering compares UTF-16 code units and
+    /// differs when supplementary-plane names are compared with some BMP
+    /// names, so canonical member ordering must compare decoded scalar values.
+    /// </summary>
+    private sealed class CanonicalJsonPropertyNameComparer : IComparer<string>
+    {
+        internal static CanonicalJsonPropertyNameComparer Instance { get; } = new();
+
+        public int Compare(string? left, string? right)
+        {
+            if (ReferenceEquals(left, right)) return 0;
+            if (left is null) return -1;
+            if (right is null) return 1;
+
+            var leftOffset = 0;
+            var rightOffset = 0;
+            while (leftOffset < left.Length && rightOffset < right.Length)
+            {
+                if (Rune.DecodeFromUtf16(left.AsSpan(leftOffset), out var leftRune, out var leftConsumed)
+                        != OperationStatus.Done
+                    || Rune.DecodeFromUtf16(right.AsSpan(rightOffset), out var rightRune, out var rightConsumed)
+                        != OperationStatus.Done)
+                {
+                    throw new InvalidOperationException("receipt core contains an invalid Unicode property name");
+                }
+
+                var comparison = leftRune.Value.CompareTo(rightRune.Value);
+                if (comparison != 0) return comparison;
+                leftOffset += leftConsumed;
+                rightOffset += rightConsumed;
+            }
+
+            return (left.Length - leftOffset).CompareTo(right.Length - rightOffset);
         }
     }
 }
