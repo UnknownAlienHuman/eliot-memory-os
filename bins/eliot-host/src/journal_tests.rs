@@ -244,6 +244,13 @@ struct ReadinessFixture {
     kernel_artifact: PlatformHandle,
     store_artifact: PlatformHandle,
     config: PlatformHandle,
+    // I14.16 (#1953): the candidate Kernel takes its contour's exclusive
+    // owner object before it adopts any lineage and holds it for the process
+    // lifetime. No Kernel process runs in these tests, so the fixture holds
+    // the contour's lease exactly as the candidate Kernel would; dropping
+    // the fixture releases it. Without this, `driver.active()` must refuse
+    // to publish Active.
+    kernel_owner: eliot_platform_windows::KernelOwnerLease,
 }
 
 #[cfg(windows)]
@@ -358,6 +365,15 @@ fn active_readiness_fixture() -> Result<ReadinessFixture, TestError> {
         health: HealthVector::healthy(),
         evidence_refs: vec![PlatformHandle::new("initial-ready-proof")?],
     };
+    // I14.16 (#1953): the candidate Kernel takes its contour's exclusive
+    // owner object before it adopts any lineage and holds it for the process
+    // lifetime. No Kernel process runs in these tests, so the fixture holds
+    // the contour's lease exactly as the candidate Kernel would; `active()`
+    // below must observe it held.
+    let kernel_owner = eliot_platform_windows::KernelOwnerLease::acquire(
+        &candidate.installation_id,
+        &candidate.activation_id,
+    )?;
     driver.active(&candidate, &activation, &initial_ready)?;
     drop(driver);
     let requirement = HostStoreBootstrapRequirement {
@@ -384,6 +400,7 @@ fn active_readiness_fixture() -> Result<ReadinessFixture, TestError> {
         kernel_artifact,
         store_artifact,
         config,
+        kernel_owner,
     })
 }
 
@@ -2948,6 +2965,13 @@ fn reconciled_active_readiness_failure_preserves_contour_then_recovers() -> Test
         health: HealthVector::healthy(),
         evidence_refs: vec![PlatformHandle::new("reconcile-ready-evidence")?],
     };
+    // I14.16 (#1953): same owner-lease gate as `active_readiness_fixture` —
+    // this test drives `active()` directly, so it holds the contour lease
+    // exactly as the candidate Kernel would.
+    let kernel_owner = eliot_platform_windows::KernelOwnerLease::acquire(
+        &candidate.installation_id,
+        &candidate.activation_id,
+    )?;
     driver.active(&candidate, &activation_receipt, &ready)?;
     drop(driver);
     let active = journal
@@ -2984,6 +3008,7 @@ fn reconciled_active_readiness_failure_preserves_contour_then_recovers() -> Test
         kernel_artifact,
         store_artifact,
         config,
+        kernel_owner,
     };
     let contour = readiness_contour(&fixture)?;
     let mut gate = HostReadinessGate::with_cadence(ReadinessCadence::default());
