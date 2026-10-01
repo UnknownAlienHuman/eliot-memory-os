@@ -38,7 +38,7 @@ use eliot_store_api::{
     NamedReadRequest, NamedReadResponse, OperationId, OperationIdentity, OrderingHead,
     OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RequestMeta,
     ReservedWriteRequest, RestoreValidationReceipt, RevisionHead, RevisionHeadExpectation,
-    RevisionKey, SnapshotBeginRequest, SnapshotCursor, SnapshotEndReceipt, SnapshotHandle,
+    RevisionKey, SequenceDispositionRequest, SnapshotBeginRequest, SnapshotCursor, SnapshotEndReceipt, SnapshotHandle,
     SnapshotPage, StoreBackupStatus, StoreBackupStatusOutcome, StoreError, StoreHealth,
     WriteReceipt, decode_request_frame_with_authority, generated_operation_manifests,
     genesis_manifest, verify_canonical_request_hash,
@@ -831,6 +831,46 @@ impl StoreComposition {
         let outcome = CanonicalStoreClient::apply_reserved_write(&self.store, request)
             .await
             .map_err(StoreCompositionError::Store);
+        if matches!(
+            outcome,
+            Err(StoreCompositionError::Store(StoreError::Unavailable))
+        ) {
+            self.mark_broken_and_recover(ClientClass::Write).await;
+        }
+        outcome
+    }
+
+    /// Commits a separately identified, Governor-prepared sequence-gap
+    /// control transition through the canonical Store owner (issue #1684).
+    /// The request bypasses the reserved-write scheduler because that queue
+    /// is blocked by the very position this control transition resolves; the
+    /// adapter must validate the complete gap and every current head inside
+    /// its atomic transaction before it can issue a receipt.
+    pub async fn apply_sequence_disposition(
+        &self,
+        context: &RequestMeta,
+        request: SequenceDispositionRequest,
+    ) -> Result<WriteReceipt, StoreCompositionError> {
+        context
+            .validate()
+            .map_err(StoreError::Foundation)
+            .map_err(StoreCompositionError::Store)?;
+        request.validate().map_err(StoreCompositionError::Store)?;
+        if context.state_fence != self.state_fence || context.state_fence != request.state_fence {
+            return Err(StoreCompositionError::Store(StoreError::FenceMismatch));
+        }
+        let lease = self
+            .connections
+            .try_acquire(ClientClass::Write)
+            .map_err(StoreCompositionError::Store)?;
+        let _access = self.connections.validate_lease(&lease)?;
+        let outcome = CanonicalStoreClient::apply_sequence_disposition(
+            &self.store,
+            context,
+            request,
+        )
+        .await
+        .map_err(StoreCompositionError::Store);
         if matches!(
             outcome,
             Err(StoreCompositionError::Store(StoreError::Unavailable))

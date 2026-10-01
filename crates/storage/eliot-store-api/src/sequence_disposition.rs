@@ -96,8 +96,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    MAX_WRITE_ADMISSION_LABEL_BYTES, MAX_WRITE_ADMISSION_SCOPES, OperationId, OrderingScopeId,
-    ReservedScopeBinding, StoreError, WriterEpochBinding, canonical_json_bytes, sha256_hex,
+    MAX_WRITE_ADMISSION_LABEL_BYTES, MAX_WRITE_ADMISSION_SCOPES, NamedMutationOperation,
+    OperationId, OrderingHeadExpectation, OrderingScopeId, PreparedTransition,
+    ReservedScopeBinding, RevisionHeadExpectation, StoreError, TransitionClass,
+    WriterEpochBinding, canonical_json_bytes, sha256_hex,
 };
 use eliot_contracts::StateFence;
 
@@ -106,7 +108,7 @@ use eliot_contracts::StateFence;
 ///
 /// Additive change is preferred: an unknown version fails closed instead of
 /// decoding through a compatibility fallback.
-pub const SEQUENCE_DISPOSITION_CONTRACT_VERSION: u16 = 1;
+pub const SEQUENCE_DISPOSITION_CONTRACT_VERSION: u16 = 2;
 
 /// Maximum dependent operations recorded in one `cancel_dependents`
 /// disposition.
@@ -649,6 +651,17 @@ pub struct SequenceDispositionRequest {
     pub operation: PoisonOperationRecord,
     /// The chosen authorized disposition.
     pub choice: SequenceDispositionChoice,
+    /// The separately identified, Governor-prepared control transition that
+    /// records the disposition and its Problem-owner consequence. Its own
+    /// immutable receipt is the handoff evidence ORS consumes; it must never
+    /// reuse the original dead-letter operation identity.
+    pub control_transition: PreparedTransition,
+    /// Exact revision heads admitted by the control transition.
+    pub expected_revision_heads: Vec<RevisionHeadExpectation>,
+    /// Exact canonical ordering heads observed before the control transition.
+    /// The Store rechecks both these sequence values and the recorded head
+    /// digests inside the same transaction that commits the disposition.
+    pub expected_ordering_heads: Vec<OrderingHeadExpectation>,
 }
 
 impl SequenceDispositionRequest {
@@ -673,6 +686,55 @@ impl SequenceDispositionRequest {
             .map_err(StoreError::Foundation)?;
         self.operation.validate()?;
         self.choice.validate(&self.operation.original)?;
+        self.control_transition.validate()?;
+        if self.control_transition.state_fence != self.state_fence
+            || self.control_transition.identity.operation_id
+                == self.operation.original.operation_id
+            || self.control_transition.identity.idempotency_key
+                == self.operation.original.idempotency_key
+            || self.control_transition.transition_class != TransitionClass::RecoverySchema
+            || self.control_transition.named_operations.len() != 1
+            || self.control_transition.named_operations[0].operation
+                != NamedMutationOperation::ApplyProblemOwnerState
+        {
+            return Err(StoreError::InvalidField {
+                field: "disposition.control_transition",
+                reason: "must be a separately identified, fenced Problem-owner control transition",
+            });
+        }
+        let mut expected_heads: Vec<_> = self
+            .operation
+            .affected_scopes
+            .iter()
+            .map(|scope| (scope.reserved.scope.clone(), scope.expected_head_sequence))
+            .collect();
+        expected_heads.sort();
+        let mut supplied_heads: Vec<_> = self
+            .expected_ordering_heads
+            .iter()
+            .map(|head| (head.scope.clone(), head.expected_sequence))
+            .collect();
+        supplied_heads.sort();
+        if !self.control_transition.ordering_scopes.is_empty()
+            || supplied_heads != expected_heads
+        {
+            return Err(StoreError::InvalidField {
+                field: "disposition.control_transition.ordering_heads",
+                reason: "the control transition must bypass the blocked queue and separately carry every exact observed head",
+            });
+        }
+        for head in &self.expected_ordering_heads {
+            head.validate()?;
+            if head.state_fence != self.state_fence {
+                return Err(StoreError::FenceMismatch);
+            }
+        }
+        for head in &self.expected_revision_heads {
+            head.validate()?;
+            if head.state_fence != self.state_fence {
+                return Err(StoreError::FenceMismatch);
+            }
+        }
         if !self.choice.dispositions_reserved_position()
             && !matches!(
                 self.choice,

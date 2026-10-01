@@ -419,6 +419,11 @@ fn mutation_failure_context(request: &Request) -> Option<StoreFailureIdentityCon
             request.transition.identity.operation_id.clone(),
             request.transition.identity.idempotency_key.clone(),
         )),
+        Request::SequenceDisposition { context, request } => Some(failure_context_for_operation(
+            context,
+            request.control_transition.identity.operation_id.clone(),
+            request.control_transition.identity.idempotency_key.clone(),
+        )),
         Request::Backup { request } => Some(failure_context_for_backup(request)),
         Request::InitializeGenesis { context, request } => Some(failure_context_for_operation(
             context,
@@ -662,6 +667,17 @@ impl StoreDispatchBackend for StoreComposition {
                     request.transition.identity.idempotency_key.clone(),
                 );
                 match Box::pin(self.apply_reserved_write(request)).await {
+                    Ok(receipt) => response_for_transaction_receipt(receipt, failure_context),
+                    Err(error) => map_composition_error(error, failure_context),
+                }
+            }
+            Request::SequenceDisposition { context, request } => {
+                let failure_context = failure_context_for_operation(
+                    &context,
+                    request.control_transition.identity.operation_id.clone(),
+                    request.control_transition.identity.idempotency_key.clone(),
+                );
+                match self.apply_sequence_disposition(&context, request).await {
                     Ok(receipt) => response_for_transaction_receipt(receipt, failure_context),
                     Err(error) => map_composition_error(error, failure_context),
                 }
