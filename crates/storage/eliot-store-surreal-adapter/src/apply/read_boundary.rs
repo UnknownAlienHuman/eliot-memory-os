@@ -356,17 +356,10 @@ async fn named_read_payload(
             evidence_pack_payload(query, state_fence, &rows, &suppression)
                 .map_err(AdapterError::Store)
         }
-        NamedReadOperation::GetTaskState => {
-            let rows = read_authority_records(db, &adapter.config).await?;
-            task_state_payload(query, state_fence, &rows).map_err(AdapterError::Store)
-        }
-        NamedReadOperation::GetAttentionAndProblems => {
-            let rows = read_authority_records(db, &adapter.config).await?;
-            attention_problems_payload(query, state_fence, &rows).map_err(AdapterError::Store)
-        }
-        NamedReadOperation::GetUnderstandingProjectionInputs => {
-            let rows = read_authority_records(db, &adapter.config).await?;
-            understanding_inputs_payload(query, state_fence, &rows).map_err(AdapterError::Store)
+        NamedReadOperation::GetTaskState
+        | NamedReadOperation::GetAttentionAndProblems
+        | NamedReadOperation::GetUnderstandingProjectionInputs => {
+            cognitive_authority_payload(db, &adapter.config, query, state_fence).await
         }
         NamedReadOperation::GetCapabilityEvidenceState => {
             let rows = read_authority_records(db, &adapter.config).await?;
@@ -386,6 +379,9 @@ async fn named_read_payload(
         }
         NamedReadOperation::GetResourceSnapshot => {
             resource_snapshot_payload(db, &adapter.config, query, state_fence).await
+        }
+        NamedReadOperation::GetInstrumentRegistryState => {
+            instrument_registry_payload(db, &adapter.config, query, state_fence).await
         }
         NamedReadOperation::GetUserAutomationState => {
             automation_state_payload(db, &adapter.config, query, state_fence, read_heads).await
@@ -416,6 +412,37 @@ async fn named_read_payload(
         }
         NamedReadOperation::GetAuditRange => {
             audit_range_payload(db, &adapter.config, query, state_fence).await
+        }
+        other => Err(AdapterError::NamedOperationUnavailable {
+            operation: format!("{other:?}"),
+        }),
+    }
+}
+
+/// Serves the authority-record-backed cognitive reads through one shared fetch.
+///
+/// `GetTaskState`, `GetAttentionAndProblems`, and
+/// `GetUnderstandingProjectionInputs` project different views over the same
+/// sealed authority rows; fetching once here keeps the dispatch above a pure
+/// projection choice instead of repeating the read per arm. Behavior is the
+/// dispatch it replaces: the same fetch, the same per-operation projection,
+/// and the same typed errors.
+async fn cognitive_authority_payload(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    query: &NamedReadRequest,
+    state_fence: &StateFence,
+) -> Result<Value, AdapterError> {
+    let rows = read_authority_records(db, config).await?;
+    match query.operation {
+        NamedReadOperation::GetTaskState => {
+            task_state_payload(query, state_fence, &rows).map_err(AdapterError::Store)
+        }
+        NamedReadOperation::GetAttentionAndProblems => {
+            attention_problems_payload(query, state_fence, &rows).map_err(AdapterError::Store)
+        }
+        NamedReadOperation::GetUnderstandingProjectionInputs => {
+            understanding_inputs_payload(query, state_fence, &rows).map_err(AdapterError::Store)
         }
         other => Err(AdapterError::NamedOperationUnavailable {
             operation: format!("{other:?}"),
@@ -2348,6 +2375,41 @@ async fn resource_snapshot_payload(
     }))
 }
 
+/// Reads the instrument-registry head row and projects the same-fence
+/// canonical snapshot view (issue #1814 W1.2).
+///
+/// Row shape mirrors the writer (verbatim opaque `snapshot_json`,
+/// `revision`, `state_fence`). An absent head (or a head from another
+/// fence) projects explicit absence (null snapshot, revision 0) — never
+/// fabricated bytes. Digest agreement was proven at write time and is
+/// re-checked by the consumer (`InstrumentRegistry::recover`) against
+/// the returned bytes.
+async fn instrument_registry_payload(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    query: &NamedReadRequest,
+    state_fence: &StateFence,
+) -> Result<Value, AdapterError> {
+    eliot_store_api::validate_typed_read_parameters(
+        NamedReadOperation::GetInstrumentRegistryState,
+        &query.parameters,
+    )
+    .map_err(AdapterError::Store)?;
+    if query.state_fence != *state_fence {
+        return Err(AdapterError::Store(StoreError::FenceMismatch));
+    }
+    let row = super::surreal_instrument_registry::read_head_for_read(db, config).await?;
+    let (snapshot_json, revision) = match row {
+        Some(row) if row.state_fence == *state_fence => (json!(row.snapshot_json), row.revision),
+        _ => (Value::Null, 0),
+    };
+    Ok(json!({
+        "snapshot_json": snapshot_json,
+        "revision": revision,
+        "state_fence": state_fence,
+    }))
+}
+
 /// Reads automation rows and projects the same-fence canonical views
 /// (issue #1779).
 ///
@@ -2396,8 +2458,85 @@ async fn automation_state_payload(
         eliot_store_api::AUTOMATION_QUERY_FAILURE => {
             automation_failure_payload(db, config, state_fence, &decoded).await
         }
+        eliot_store_api::AUTOMATION_QUERY_NORMALIZATION => {
+            automation_normalization_payload(db, config, query, state_fence, &decoded).await
+        }
         _ => Err(AdapterError::Store(StoreError::UnknownOperation)),
     }
+}
+
+/// Reads one independently retained normalized revision by exact identity,
+/// scope, and fence. This projection is not an activation or current-pointer
+/// read.
+async fn automation_normalization_payload(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    query: &NamedReadRequest,
+    state_fence: &StateFence,
+    decoded: &eliot_store_api::DecodedAutomationRead,
+) -> Result<Value, AdapterError> {
+    let scope_id =
+        query
+            .scope_id
+            .as_ref()
+            .ok_or(AdapterError::Store(StoreError::InvalidField {
+                field: "scope_id",
+                reason: "normalization reads require the exact automation scope",
+            }))?;
+    if scope_id.as_str() != eliot_store_api::USER_AUTOMATION_SCOPE {
+        return Err(AdapterError::Store(StoreError::InvalidField {
+            field: "scope_id",
+            reason: "normalization read scope does not match the canonical automation scope",
+        }));
+    }
+    let automation_id =
+        decoded
+            .automation_id
+            .as_deref()
+            .ok_or(AdapterError::Store(StoreError::InvalidField {
+                field: "automation.automation_id",
+                reason: "exact automation selector is required",
+            }))?;
+    let revision = decoded
+        .requested_revision
+        .as_deref()
+        .ok_or(AdapterError::Store(StoreError::InvalidField {
+            field: "automation.revision",
+            reason: "exact revision selector is required",
+        }))?;
+    let entries = match super::surreal_automation::read_normalization_for_read(
+        db,
+        config,
+        automation_id,
+        revision,
+    )
+    .await?
+    {
+        None => Vec::new(),
+        Some(row) => {
+            if row.automation_id != automation_id || row.revision != revision {
+                return Err(AdapterError::Store(StoreError::IdentityConflict));
+            }
+            if row.state_fence != *state_fence || row.scope_id != scope_id.as_str() {
+                Vec::new()
+            } else {
+                vec![json!({
+                    "automation_id": row.automation_id,
+                    "revision": row.revision,
+                    "normalization_request_json": row.normalization_request_json,
+                    "revision_json": row.revision_json,
+                    "normalization_receipt_json": row.normalization_receipt_json,
+                    "operation_id": row.operation_id,
+                    "idempotency_key": row.idempotency_key,
+                    "canonical_request_hash": row.canonical_request_hash,
+                    "state_fence": row.state_fence,
+                    "scope_id": row.scope_id,
+                    "task_id": row.task_id,
+                })]
+            }
+        }
+    };
+    Ok(json!({"entries": entries, "state_fence": state_fence}))
 }
 
 /// Projects the automation list from current pointers.

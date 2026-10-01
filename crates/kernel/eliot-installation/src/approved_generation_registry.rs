@@ -421,6 +421,127 @@ pub struct AgentBridgePreparedBinding {
     pub pair_digest: PlatformHandle,
 }
 
+/// Durable proof for the protected User Broker front-door record pair.
+///
+/// The broker's front door presents a `ClientHello` whose capability set the
+/// serving Kernel admits exactly, so the declaration must exist as an
+/// installed, digest-bound leaf rather than a recomputed value. This record
+/// carries the two installation-derived paths and the two readback digests the
+/// same way `AgentBridgePreparedBinding` carries the bridge pair, so a later
+/// generation cutover can admit *only* the previous installation's own recorded
+/// bytes for replacement. It carries no PID, session, principal, token, or
+/// mutable fence: this is a Phase-B static record, nothing more.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserBrokerPreparedBinding {
+    /// Explicit binding wire discriminator.
+    pub wire: PlatformHandle,
+    /// Installation identity that produced the protected record pair.
+    pub installation_id: PlatformHandle,
+    /// Installation-owned profile identity carried by the protected profile.
+    pub profile_id: PlatformHandle,
+    /// Protected installation profile path.
+    pub profile_path: PlatformHandle,
+    /// SHA-256 of the protected profile bytes.
+    pub profile_digest: PlatformHandle,
+    /// Protected static client declaration path.
+    pub declaration_path: PlatformHandle,
+    /// SHA-256 of the protected declaration bytes.
+    pub declaration_digest: PlatformHandle,
+    /// Domain-separated digest binding the protected pair.
+    pub pair_digest: PlatformHandle,
+}
+
+impl UserBrokerPreparedBinding {
+    /// Current User Broker Phase-B binding wire.
+    pub const WIRE: &'static str = "eliot.host.user-broker-phase-b.v1";
+
+    /// Constructs the binding after exact profile/declaration observations.
+    pub fn new(
+        installation_id: PlatformHandle,
+        profile_id: PlatformHandle,
+        profile_path: PlatformHandle,
+        profile_digest: PlatformHandle,
+        declaration_path: PlatformHandle,
+        declaration_digest: PlatformHandle,
+    ) -> Result<Self, InstallationError> {
+        let mut value = Self {
+            wire: PlatformHandle::new(Self::WIRE).map_err(|error| {
+                InstallationError::InvalidField {
+                    field: "user_broker.binding.wire".to_owned(),
+                    reason: error.to_string(),
+                }
+            })?,
+            installation_id,
+            profile_id,
+            profile_path,
+            profile_digest,
+            declaration_path,
+            declaration_digest,
+            pair_digest: PlatformHandle::new("pending").map_err(|error| {
+                InstallationError::InvalidField {
+                    field: "user_broker.binding.pair_digest".to_owned(),
+                    reason: error.to_string(),
+                }
+            })?,
+        };
+        value.pair_digest = value.computed_pair_digest()?;
+        value.validate()?;
+        Ok(value)
+    }
+
+    /// Computes the domain-separated profile/declaration pair digest.
+    pub fn computed_pair_digest(&self) -> Result<PlatformHandle, InstallationError> {
+        let bytes = canonical_json_bytes(&(
+            "eliot.host.user-broker.profile-declaration-pair.v1\0",
+            self.installation_id.as_str(),
+            self.profile_id.as_str(),
+            self.profile_path.as_str(),
+            self.profile_digest.as_str(),
+            self.declaration_path.as_str(),
+            self.declaration_digest.as_str(),
+        ))
+        .map_err(|error| InstallationError::InvalidField {
+            field: "user_broker.binding.pair_digest".to_owned(),
+            reason: error.to_string(),
+        })?;
+        PlatformHandle::new(sha256_hex(&bytes)).map_err(|error| InstallationError::InvalidField {
+            field: "user_broker.binding.pair_digest".to_owned(),
+            reason: error.to_string(),
+        })
+    }
+
+    /// Validates the protected-pair proof. Both digests and the pair binding
+    /// are exact; a substituted path, identity, or digest is a conflict.
+    pub fn validate(&self) -> Result<(), InstallationError> {
+        if self.wire.as_str() != Self::WIRE {
+            return Err(InstallationError::MigrationRequired {
+                reason: "user-broker Phase-B binding requires explicit re-stage".to_owned(),
+            });
+        }
+        for (value, field) in [
+            (&self.installation_id, "user_broker.installation_id"),
+            (&self.profile_id, "user_broker.profile_id"),
+            (&self.profile_path, "user_broker.profile_path"),
+            (&self.declaration_path, "user_broker.declaration_path"),
+        ] {
+            handle(value, field)?;
+        }
+        for (value, field) in [
+            (&self.profile_id, "user_broker.profile_id"),
+            (&self.profile_digest, "user_broker.profile_digest"),
+            (&self.declaration_digest, "user_broker.declaration_digest"),
+            (&self.pair_digest, "user_broker.pair_digest"),
+        ] {
+            sha256_handle(value, field)?;
+        }
+        if self.pair_digest != self.computed_pair_digest()? {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(())
+    }
+}
+
 /// Durable identity and descriptor proof for the complete protected contour.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -884,6 +1005,8 @@ pub struct HostPhaseBPreparedMaterialization {
     pub launch: RuntimeLaunchDescriptor,
     /// Optional bridge stage/pair proof. `None` preserves legacy Phase-B.
     pub agent_bridge: Option<AgentBridgePreparedBinding>,
+    /// Protected User Broker front-door record pair for this contour.
+    pub user_broker: Option<UserBrokerPreparedBinding>,
     /// Digest of all prepared fields except this digest.
     pub prepared_digest: PlatformHandle,
 }
@@ -894,8 +1017,11 @@ impl HostPhaseBPreparedMaterialization {
     /// The owner-epoch identity domain is sequence-bound as of v2. A
     /// persisted v1 preparation therefore cannot be replayed as a current
     /// proof after a Host restart; its discriminator is rejected before any
-    /// destination readback or mutation.
-    pub const WIRE: &'static str = "eliot.host.phase-b-prepared.v4";
+    /// destination readback or mutation. v5 additionally binds the protected
+    /// User Broker front-door pair, so a persisted v4 preparation cannot be
+    /// replayed as a proof of a contour whose broker declaration it never
+    /// recorded.
+    pub const WIRE: &'static str = "eliot.host.phase-b-prepared.v5";
 
     /// Recomputes the prepared record digest without its self-reference.
     pub fn computed_digest(&self) -> Result<PlatformHandle, InstallationError> {
@@ -924,6 +1050,7 @@ impl HostPhaseBPreparedMaterialization {
                 self.semantic_config_hash.as_str(),
                 &self.launch,
                 &self.agent_bridge,
+                &self.user_broker,
             ),
         ))
         .map_err(|error| InstallationError::InvalidField {
@@ -1012,6 +1139,21 @@ impl HostPhaseBPreparedMaterialization {
         if let Some(bridge) = self.agent_bridge.as_ref() {
             bridge.validate_prepared()?;
         }
+        if let Some(broker) = self.user_broker.as_ref() {
+            broker.validate()?;
+            // The protected pair is installation-derived, never a Host-invented
+            // name: the two leaves must be exactly the ones this contour's Host
+            // state root yields, published under this installation.
+            let expected = crate::derive_user_broker_protected_paths(
+                &self.launch.runtime_state_roots.host_state_root,
+            )?;
+            if broker.installation_id != self.launch.installation_epoch.installation
+                || broker.profile_path != expected.profile_path
+                || broker.declaration_path != expected.client_declaration_path
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+        }
         if self.launch.authority_descriptor_digest != self.authority_descriptor_digest
             || self.launch.store_bootstrap_descriptor_digest
                 != self.store_bootstrap_descriptor_digest
@@ -1077,6 +1219,8 @@ pub struct PhaseBLiveBinding {
     pub provisioned_supervision_authority: ProvisionedSupervisionAuthority,
     /// Final immutable bridge proof retained for active rebinds.
     pub agent_bridge: Option<AgentBridgePhaseBBinding>,
+    /// Protected User Broker front-door record pair observed live.
+    pub user_broker: Option<UserBrokerPreparedBinding>,
 }
 
 impl PhaseBLiveBinding {
@@ -1139,6 +1283,9 @@ impl PhaseBLiveBinding {
             })?;
         if let Some(bridge) = self.agent_bridge.as_ref() {
             bridge.validate()?;
+        }
+        if let Some(broker) = self.user_broker.as_ref() {
+            broker.validate()?;
         }
         Ok(())
     }

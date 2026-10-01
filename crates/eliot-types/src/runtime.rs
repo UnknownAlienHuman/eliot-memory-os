@@ -92,6 +92,7 @@ pub struct RuntimeLocalConfig {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceRuntimeStatus {
+    #[serde(deserialize_with = "deserialize_service_name")]
     pub service_name: String,
     pub health: ServiceHealthState,
     pub started: bool,
@@ -114,6 +115,7 @@ pub struct RuntimeHealthReport {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SchemaRef {
+    #[serde(deserialize_with = "deserialize_schema_id")]
     pub schema_id: String,
     pub version: String,
 }
@@ -206,6 +208,7 @@ pub enum EndpointDirection {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModuleEndpoint {
+    #[serde(deserialize_with = "deserialize_endpoint_id")]
     pub endpoint_id: String,
     pub name: String,
     pub direction: EndpointDirection,
@@ -291,10 +294,105 @@ pub struct ModuleRegistryReport {
     pub generated_at: OffsetDateTime,
 }
 
+// The single envelope version this build owns. It is the spelling the envelope
+// minting path writes today, so exactly one value decodes and an envelope from
+// another generation is refused instead of being routed on an authority,
+// causality and payload-hash shape it was never minted with. The constant is
+// private because the accepted version has no consumer outside this decoder.
+const EXCHANGE_ENVELOPE_SCHEMA_VERSION: &str = "1";
+
+// Bounded refusal for an envelope schema version this build does not own. The
+// message is fixed and never echoes the received version back onto an operator
+// surface, mirroring the control-wal refusals in `runtime_supervision`.
+fn unsupported_schema_version<E>(expected: &str) -> E
+where
+    E: serde::de::Error,
+{
+    E::custom(format!("unsupported schema version; expected {expected}"))
+}
+
+fn deserialize_exchange_envelope_schema_version<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value == EXCHANGE_ENVELOPE_SCHEMA_VERSION {
+        Ok(value)
+    } else {
+        Err(unsupported_schema_version(EXCHANGE_ENVELOPE_SCHEMA_VERSION))
+    }
+}
+
+// Bounded refusal for a protected runtime identifier that decoded empty.
+//
+// The envelope, trace and service names below are the identity a message is
+// routed, attributed and counted by. An empty string is not a weaker name, it
+// is an absent one, so it must refuse at the decoder instead of becoming a
+// current key. Absence already refuses through the missing-field path; this
+// closes the spelled-out-empty spelling of the same defect. The message is
+// fixed and never echoes the received value onto an operator surface.
+fn empty_protected_identifier<E>(field: &'static str) -> E
+where
+    E: serde::de::Error,
+{
+    E::custom(format!("empty protected identifier: {field}"))
+}
+
+fn deserialize_protected_string<'de, D>(
+    deserializer: D,
+    field: &'static str,
+) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.is_empty() {
+        return Err(empty_protected_identifier(field));
+    }
+    Ok(value)
+}
+
+fn deserialize_envelope_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_protected_string(deserializer, "envelope_id")
+}
+
+fn deserialize_trace_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_protected_string(deserializer, "trace_id")
+}
+
+fn deserialize_service_name<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_protected_string(deserializer, "service_name")
+}
+
+fn deserialize_schema_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_protected_string(deserializer, "schema_id")
+}
+
+fn deserialize_endpoint_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_protected_string(deserializer, "endpoint_id")
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EliotExchangeEnvelope<T> {
+    #[serde(deserialize_with = "deserialize_envelope_id")]
     pub envelope_id: String,
+    #[serde(deserialize_with = "deserialize_exchange_envelope_schema_version")]
     pub schema_version: String,
     pub project_id: ProjectId,
     pub task_id: Option<TaskId>,
@@ -336,6 +434,7 @@ pub enum ExchangeKind {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CausalityHeader {
+    #[serde(deserialize_with = "deserialize_trace_id")]
     pub trace_id: String,
     pub parent_envelope_id: Option<String>,
     pub causation_id: Option<String>,

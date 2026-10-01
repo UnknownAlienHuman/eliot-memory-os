@@ -78,7 +78,7 @@ use eliot_store_api::{
 #[cfg(test)]
 use eliot_store_surreal_adapter::SchemaGeneration;
 use eliot_store_surreal_adapter::{
-    AdapterError, MigrationReceipt, SemanticReadiness, SurrealStoreAdapter,
+    AdapterError, ClientSetLimits, MigrationReceipt, SemanticReadiness, SurrealStoreAdapter,
 };
 #[cfg(test)]
 use secrecy::SecretString;
@@ -180,6 +180,29 @@ pub enum StoreCompositionError {
         /// Bounded provider reason, not a success claim.
         reason: String,
     },
+}
+
+/// Resolves the one bounded provider session profile this composition binds to
+/// both the bridge's connection manager and the adapter's session pool.
+///
+/// The three per-role counts are the bridge's own already-validated bounds
+/// (`DEFAULT_READ_CLIENTS`, the Kernel-configured store transaction limit, and
+/// the isolated single health/admin client). They are converted, never
+/// clamped: `ClientSetLimits::new` owns the closed 1..=8 per-role bound, and a
+/// configured write limit outside it is refused here so composition never
+/// starts a bridge whose own lease bound exceeds the provider session bound
+/// the adapter will enforce.
+fn bounded_client_set_limits(write_limit: usize) -> Result<ClientSetLimits, String> {
+    let write_sessions = u8::try_from(write_limit).map_err(|_| {
+        "configured Store writer lanes exceed the bounded client-set profile".to_owned()
+    })?;
+    let read_sessions = u8::try_from(DEFAULT_READ_CLIENTS)
+        .map_err(|_| "Store read client bound exceeds the bounded client-set profile".to_owned())?;
+    let health_sessions = u8::try_from(DEFAULT_HEALTH_CLIENTS).map_err(|_| {
+        "Store health client bound exceeds the bounded client-set profile".to_owned()
+    })?;
+    ClientSetLimits::new(read_sessions, write_sessions, health_sessions)
+        .map_err(|error| format!("invalid Store client-set profile: {error}"))
 }
 
 fn map_adapter_error(error: AdapterError) -> StoreCompositionError {
@@ -472,11 +495,6 @@ impl StoreComposition {
         state_fence
             .validate()
             .map_err(|error| format!("invalid Store state fence: {error}"))?;
-        let store = SurrealStoreAdapter::new(
-            materialize_adapter_config(config, password, provider_bootstrap_password)?,
-            provider_process_lease,
-        )
-        .map_err(|error| format!("compose canonical provider adapter: {error}"))?;
         // I5.9/I5.7 (issue #1933): fixed bounded read, write, and
         // health/admin client sets. Write concurrency is bound to the
         // Kernel's configured store transaction limit; read/health bounds
@@ -486,6 +504,19 @@ impl StoreComposition {
         let write_limit = config
             .store_transaction_limit
             .unwrap_or_else(default_store_transaction_limit_usize);
+        // One bounded profile, resolved once and bound to BOTH sides of the
+        // vendor edge. This is load-bearing, not bookkeeping: the adapter's
+        // `install_concurrent_execution` validates generation lanes against the
+        // adapter's own write-session bound, so an adapter left on the
+        // pre-pool compatibility profile could only ever admit a single-lane
+        // generation no matter what write bound this composition configured.
+        let client_limits = bounded_client_set_limits(write_limit)?;
+        let store = SurrealStoreAdapter::new_with_limits(
+            materialize_adapter_config(config, password, provider_bootstrap_password)?,
+            provider_process_lease,
+            client_limits,
+        )
+        .map_err(|error| format!("compose canonical provider adapter: {error}"))?;
         let connections = StoreConnectionManager::from_configured_limits(
             DEFAULT_READ_CLIENTS,
             write_limit,

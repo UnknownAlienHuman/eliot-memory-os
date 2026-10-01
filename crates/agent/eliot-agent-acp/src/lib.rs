@@ -1503,8 +1503,14 @@ pub enum AcpResultOutcome {
     Completed,
     /// The operation was cancelled.
     Cancelled,
-    /// The provider reported a failure.
-    Failed { reason: String },
+    /// The provider reported a failure. `reason` is untrusted provider prose
+    /// (sanitized at the adapter boundary); `code` is the distinct typed
+    /// [`AcpRpcError::code`] when the failure arrived as a wire error, `None`
+    /// when the assembler has no wire code. The code travels typed through
+    /// assembly and is rendered alongside — never through — the redacted
+    /// display text, so default-deny keeps distinct codes distinct instead of
+    /// merging them into one generic result.
+    Failed { reason: String, code: Option<i64> },
     /// The outcome could not be established.
     Unknown { reason: String },
 }
@@ -1540,11 +1546,31 @@ impl AcpResultEnvelope {
         Ok(())
     }
 
+    /// Checks that this envelope answers the bound attempt (issue #2641 W4):
+    /// the envelope attempt identity must equal the bound attempt identity by
+    /// typed `==`, so a foreign-attempt envelope cannot ride a valid binding
+    /// on any adoption path. Route/session agreement stays with
+    /// [`Self::check_acp_result_binding`], never merged into this check.
+    fn check_envelope_attempt_binding(
+        &self,
+        binding: &ProviderExecutionBinding,
+    ) -> Result<(), AcpAdapterError> {
+        if self.attempt_id != binding.attempt_id {
+            return Err(AcpAdapterError::ContractValidation(
+                eliot_agent_api::ContractError::BindingMismatch,
+            ));
+        }
+        Ok(())
+    }
+
     fn acp_result_disposition(outcome: AcpResultOutcome) -> (ResultDisposition, Option<String>) {
         match outcome {
             AcpResultOutcome::Completed => (ResultDisposition::DegradedNoProof, None),
             AcpResultOutcome::Cancelled => (ResultDisposition::CancelledObserved, None),
-            AcpResultOutcome::Failed { reason } => {
+            AcpResultOutcome::Failed { reason, .. } => {
+                // Disposition keys on the failure kind, never on the wire
+                // code: distinct codes stay distinct in the display text
+                // below, they never fork dispositions.
                 (ResultDisposition::FailedVerification, Some(reason))
             }
             AcpResultOutcome::Unknown { reason } => {
@@ -1591,6 +1617,30 @@ impl AcpResultEnvelope {
         }
     }
 
+    /// Renders a typed wire failure code alongside sanitized display text
+    /// (issue #2641 AUD6): the code is formatted from the typed `i64` after
+    /// sanitization, never parsed from untrusted prose, so redaction cannot
+    /// destroy it and provider text cannot forge it. The sanitized base is
+    /// shortened only by suffix removal to respect the public-field bound,
+    /// which cannot introduce markers, controls, or blank content.
+    fn acp_failure_display_with_code(base: &str, code: i64) -> String {
+        let suffix = format!(" [rpc-code:{code}]");
+        let keep = eliot_agent_api::MAX_SAFE_ERROR_CHARS.saturating_sub(suffix.chars().count());
+        let truncated: String = base.chars().take(keep).collect();
+        format!("{truncated}{suffix}")
+    }
+
+    /// Appends the typed wire code captured before the outcome moved to
+    /// sanitized text after sanitization, so default-deny redaction keeps
+    /// distinct codes distinct instead of merging them into one generic
+    /// result. `None` leaves the text untouched.
+    fn append_wire_code(sanitized: String, error_code: Option<i64>) -> String {
+        match error_code {
+            Some(code) => Self::acp_failure_display_with_code(&sanitized, code),
+            None => sanitized,
+        }
+    }
+
     pub fn into_agent_result(
         self,
         route: RouteFingerprint,
@@ -1613,17 +1663,33 @@ impl AcpResultEnvelope {
             return Err(AcpAdapterError::InvalidInput("operation_id"));
         }
         Self::check_acp_result_binding(&route, binding, self.session_id.as_ref())?;
+        self.check_envelope_attempt_binding(binding)?;
+        // The typed wire code travels beside the outcome, not inside the
+        // untrusted prose: it is captured here and rendered only after the
+        // sanitizer below has run, so default-deny redaction keeps distinct
+        // codes distinct instead of merging them into one generic result.
+        let error_code = match &outcome {
+            AcpResultOutcome::Failed { code, .. } => *code,
+            _ => None,
+        };
         let (disposition, unknown_reason) = Self::acp_result_disposition(outcome);
         // Adapter-boundary sanitization (issues #369 and #2641): provider
         // prose is untrusted even when it byte-matches a fixed ELIOT reason.
         // Only the real ACP terminal assembly site supplies caller provenance
         // for its fixed non-terminal reason; generic/wire bytes never supply
         // caller provenance and cannot qualify through exact text equality.
+        // A typed wire code, when present, is appended after sanitization so
+        // redaction never destroys it; both public fields below inherit it.
         let unknown_reason = unknown_reason.map(|reason| {
-            let trusted_diagnostic = diagnostic_caller.and_then(|caller| {
-                eliot_agent_api::route_receipts::resolve_trusted_adapter_diagnostic(caller, &reason)
-            });
-            sanitize_adapter_error(trusted_diagnostic.unwrap_or(""))
+            let sanitized = {
+                let trusted_diagnostic = diagnostic_caller.and_then(|caller| {
+                    eliot_agent_api::route_receipts::resolve_trusted_adapter_diagnostic(
+                        caller, &reason,
+                    )
+                });
+                sanitize_adapter_error(trusted_diagnostic.unwrap_or(""))
+            };
+            Self::append_wire_code(sanitized, error_code)
         });
         let usage = UsageReceipt {
             input_tokens: None,
@@ -1727,9 +1793,11 @@ impl AcpResultEnvelope {
     ///   Finish authority.
     ///
     /// Fail-closed before delegation: the envelope attempt identity must equal
-    /// the bound attempt identity by typed `==` (`into_agent_result` checks
-    /// route and session agreement but never the envelope attempt itself, so
-    /// a foreign-attempt envelope cannot ride a valid binding here).
+    /// the bound attempt identity by typed `==`
+    /// ([`Self::check_envelope_attempt_binding`], also enforced centrally by
+    /// [`Self::into_agent_result`], which checks route, session and envelope
+    /// attempt agreement — so a foreign-attempt envelope cannot ride a valid
+    /// binding on any adoption path).
     /// Cancellation and provider-reported failure carry caller reasons the
     /// envelope does not record; assembling those stays on
     /// [`Self::into_agent_result`] with an explicit [`AcpResultOutcome`].
@@ -1739,11 +1807,9 @@ impl AcpResultEnvelope {
         binding: &ProviderExecutionBinding,
         admission: &AdmittedRouteReceipt,
     ) -> Result<AgentResult, AcpAdapterError> {
-        if self.attempt_id != binding.attempt_id {
-            return Err(AcpAdapterError::ContractValidation(
-                eliot_agent_api::ContractError::BindingMismatch,
-            ));
-        }
+        // The single envelope-attempt binding check also runs centrally in
+        // `into_agent_result` below; this site keeps its fail-closed order.
+        self.check_envelope_attempt_binding(binding)?;
         let (outcome, diagnostic_caller) = if self.terminal {
             (AcpResultOutcome::Completed, None)
         } else {
@@ -1794,7 +1860,8 @@ pub struct AcpWireResultIds {
 ///   output still maps to candidate-only `DegradedNoProof`);
 /// - `Response` with `error` keeps the error payload and drains through
 ///   [`AcpResultEnvelope::into_agent_result`] with an explicit
-///   [`AcpResultOutcome::Failed`] reason (sanitized at the adapter boundary);
+///   [`AcpResultOutcome::Failed`] reason (sanitized at the adapter boundary)
+///   carrying the distinct typed wire code alongside the redacted text;
 /// - `Notification` is non-terminal provider output and drains through
 ///   `assemble_candidate_result` to `UnknownOutcome` with its recovery handle;
 /// - `Request` is an inbound call and never a result: rejected.
@@ -1803,10 +1870,23 @@ pub struct AcpWireResultIds {
 /// `eliot-agent-coordinator::AgentCoordinator::submit_result` (candidate
 /// intake only, never Finish authority).
 ///
-/// STITCH (#370 W29/A21): the future live caller feeds one real received
-/// ACP message with its admitted wire identities; BLOCKED-BY the
-/// native-worker provider-runtime driver (no production caller exists).
+/// LIVE CALLER (issues #228 W2/W5, #2641 W4/AUD3): [`AcpWire::receive_result`]
+/// is the in-crate production caller: it feeds one real received ACP message
+/// with its admitted wire identities. End-to-end hookup from the
+/// native-worker provider-runtime driver (which owns the transport and the
+/// receiving-owner identities) is still BLOCKED-BY that driver slice.
 /// Forbidden: a synthetic or test-only message to manufacture a caller.
+///
+/// Receiving-owner lookup (issue #2641 AUD3): `receiving_owner` carries the
+/// existing durable journal handle plus the owner-issued key/receipt for this
+/// `recovery_ref` (all sourced from the owning driver slice, never minted or
+/// constructed here). The journal check runs read-only; on acceptance the
+/// owner disposition travels verbatim (`Applied` stays success as
+/// candidate-only `CandidateSucceeded`, `Rejected` stays terminal
+/// `FailedVerification`, `Unknown` never upgrades). Absence, a
+/// `receiving_operation` mismatch, or a lookup failure keeps the existing
+/// typed result unchanged (fail-closed, never fabricated). Typed
+/// [`AcpAdapterError`] failures propagate unchanged.
 ///
 /// # Errors
 ///
@@ -1819,11 +1899,16 @@ pub fn drain_wire_result(
     route: RouteFingerprint,
     binding: &ProviderExecutionBinding,
     admission: &AdmittedRouteReceipt,
+    receiving_owner: Option<(
+        &DurableHostEventJournal,
+        &EventKey,
+        &durable_host_event_ingest::ReceivingOwnerAcceptance,
+    )>,
 ) -> Result<AgentResult, AcpAdapterError> {
     if ids.operation_id.trim().is_empty() {
         return Err(AcpAdapterError::InvalidInput("operation_id"));
     }
-    match message {
+    let base: Result<AgentResult, AcpAdapterError> = match message {
         AcpJsonRpcMessage::Request(_) => Err(AcpAdapterError::InvalidInput(
             "acp request is never a result",
         )),
@@ -1852,6 +1937,9 @@ pub fn drain_wire_result(
                     admission,
                     AcpResultOutcome::Failed {
                         reason: error.message.clone(),
+                        // Distinct typed wire code carried alongside the
+                        // sanitized message (issue #2641 AUD6).
+                        code: Some(error.code),
                     },
                 )
             } else if let Some(result) = &response.result {
@@ -1869,7 +1957,33 @@ pub fn drain_wire_result(
                 ))
             }
         }
+    };
+    let mut result = base?;
+    if let Some((journal, key, receipt)) = receiving_owner {
+        let recovery_matches = result
+            .actual_route
+            .recovery_ref
+            .as_deref()
+            .is_some_and(|recovery| recovery == receipt.receiving_operation.as_str());
+        if recovery_matches
+            && let Ok(disposition) = journal.check_receiving_owner_acceptance(key, receipt)
+        {
+            match disposition {
+                durable_host_event_ingest::ReceivingOwnerDisposition::Applied => {
+                    if result.disposition != ResultDisposition::CancelledObserved {
+                        result.disposition = ResultDisposition::CandidateSucceeded;
+                    }
+                }
+                durable_host_event_ingest::ReceivingOwnerDisposition::Rejected => {
+                    if result.disposition != ResultDisposition::CancelledObserved {
+                        result.disposition = ResultDisposition::FailedVerification;
+                    }
+                }
+                durable_host_event_ingest::ReceivingOwnerDisposition::Unknown => {}
+            }
+        }
     }
+    Ok(result)
 }
 
 /// Short result alias.
@@ -2122,6 +2236,51 @@ impl<T: AcpTransport> AcpWire<T> {
             };
             let frames = self.codec.feed(&chunk)?;
             self.pending.extend(frames);
+        }
+    }
+
+    /// Receives one complete JSON-RPC message on the live wire and drains it
+    /// into a provider-neutral candidate result (issue #2641 W4/AUD3/AUD6):
+    /// the in-crate production caller of [`drain_wire_result`].
+    ///
+    /// Receiving-owner lookup: `ids` carries the owner-issued
+    /// operation/attempt/session identities the drained message answers (this
+    /// crate never mints them); they travel unchanged into
+    /// [`drain_wire_result`], so `recovery_ref` resolves to the exact
+    /// unmodified owner-issued `operation_id`, never to sanitized display
+    /// prose. A typed wire failure code travels beside the prose through
+    /// [`AcpResultOutcome::Failed`] and is rendered only after sanitization,
+    /// so default-deny keeps distinct codes distinct instead of merging them
+    /// into one generic result.
+    ///
+    /// A transport close before completion stays an explicit
+    /// [`AcpOutcome::Unknown`] naming the receiving owner's operation: this
+    /// path never fabricates a result, never proves failure or no-effect,
+    /// and never turns `UNKNOWN_OUTCOME` into success. A blank owner
+    /// operation identity fails closed before any byte is read.
+    pub async fn receive_result(
+        &mut self,
+        ids: AcpWireResultIds,
+        route: RouteFingerprint,
+        binding: &ProviderExecutionBinding,
+        admission: &AdmittedRouteReceipt,
+    ) -> Result<AcpOutcome<AgentResult>, AcpAdapterError> {
+        if ids.operation_id.trim().is_empty() {
+            return Err(AcpAdapterError::InvalidInput("operation_id"));
+        }
+        match self.receive().await? {
+            AcpOutcome::Completed(message) => {
+                let result = drain_wire_result(&message, ids, route, binding, admission, None)?;
+                Ok(AcpOutcome::Completed(result))
+            }
+            AcpOutcome::Unknown(unknown) => Ok(AcpOutcome::Unknown(AcpUnknownOutcome {
+                operation_id: ids.operation_id,
+                reason: unknown.reason,
+                session_id: ids.session_id,
+            })),
+            AcpOutcome::Unavailable { operation, reason } => {
+                Ok(AcpOutcome::Unavailable { operation, reason })
+            }
         }
     }
 }
@@ -2650,6 +2809,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let failed = project_result(AcpResultOutcome::Failed {
             reason: "provider rejected request".into(),
+            code: None,
         })?;
         assert_eq!(failed.disposition, ResultDisposition::FailedVerification);
         assert_eq!(

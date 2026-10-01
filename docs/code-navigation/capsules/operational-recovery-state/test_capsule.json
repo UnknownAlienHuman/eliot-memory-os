@@ -39,7 +39,23 @@
       "value": null
     },
     "forbidden_pattern_hits": [],
-    "inline_cfg_test_modules": 5
+    "inline_cfg_test_modules": 5,
+    "test_only_modules": {
+      "classification_rule": "A module reachable only through cfg(test) module edges or from a test target root is test source; a path component named `tests` is not evidence of anything. Coverage is preserved: classified test-only modules stay in the test slice and their test attributes are still counted.",
+      "paths": [
+        "crates/kernel/eliot-ors/src/tests.rs"
+      ]
+    },
+    "unresolved_cfg_or_module_cases": {
+      "rule": "A cfg predicate that mentions `test` but can also hold without it is neither test-only nor an unconditional production edge. It is reported here as explicit uncertainty and the file stays production-reachable, so no path is renamed and no test is removed to shrink a context estimate.",
+      "cases": [
+        {
+          "path": "crates/kernel/eliot-ors/src/test_support.rs",
+          "reason": "module edge gate mentions `test` but can be satisfied without it, so it is neither test-only nor an unconditional production edge: feature = \"test-support\""
+        }
+      ]
+    },
+    "unselected_package_files": []
   },
   "unit_property_model_tests": {
     "declared_proof_surface": {
@@ -49,11 +65,24 @@
     },
     "selected_tests": [
       {
+        "path": "crates/kernel/eliot-ors/src/tests.rs",
+        "bytes": 150098,
+        "sha256": "cdda08c18e95ba50462c6046443bd946daa12e2dc609cd5fbf846546447496e2",
+        "test_attributes": 46,
+        "inline_cfg_test": false,
+        "test_only_module": true,
+        "classes": [
+          "edge_profile",
+          "fault_restart_replay"
+        ]
+      },
+      {
         "path": "crates/kernel/eliot-ors/tests/doctor-ledger.rs",
         "bytes": 6258,
         "sha256": "c7390ae92b7d917440ab7f3721749e32a7b0513edc562346920c91f9e269ee31",
         "test_attributes": 4,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "edge_profile",
           "fault_restart_replay"
@@ -65,6 +94,7 @@
         "sha256": "c37bee015644b46e61f460f82585811d4fec00bb7490fd11b3bbfd90de018af9",
         "test_attributes": 1,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "edge_profile",
           "fault_restart_replay"
@@ -76,6 +106,7 @@
         "sha256": "6816574bec81fbdf7deac08db8d40b501337e43270025edeaf2441b1e1ba4a72",
         "test_attributes": 2,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "edge_profile",
           "fault_restart_replay"
@@ -87,6 +118,7 @@
         "sha256": "d0d71473dc5b25739872fe1e071b9c7558cedf7d459b80586838994e5cd78cac",
         "test_attributes": 3,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "edge_profile",
           "fault_restart_replay"
@@ -98,6 +130,7 @@
         "sha256": "a76c9df87187b9492e37d4ebc1ebd2c5eb3622becdf0a2656f57d2bf2fafb18d",
         "test_attributes": 16,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "edge_profile",
           "fault_restart_replay"
@@ -115,6 +148,7 @@
       "bins/eliot-host",
       "bins/eliot-kernel",
       "bins/eliot-watchdog",
+      "bins/eliotd",
       "crates/governor/eliot-governor",
       "crates/kernel/eliot-kernel-core",
       "crates/kernel/eliot-kernel-service",
@@ -127,6 +161,7 @@
       "value": null
     },
     "edge_profile_tests": [
+      "crates/kernel/eliot-ors/src/tests.rs",
       "crates/kernel/eliot-ors/tests/doctor-ledger.rs",
       "crates/kernel/eliot-ors/tests/doctor-lineage-cutover.rs",
       "crates/kernel/eliot-ors/tests/doctor_redb.rs",
@@ -141,6 +176,7 @@
       "value": null
     },
     "selected_cases": [
+      "crates/kernel/eliot-ors/src/tests.rs",
       "crates/kernel/eliot-ors/tests/doctor-ledger.rs",
       "crates/kernel/eliot-ors/tests/doctor-lineage-cutover.rs",
       "crates/kernel/eliot-ors/tests/doctor_redb.rs",
@@ -172,16 +208,12 @@
   "expected_nonzero_test_count": {
     "method": "count of #[test]/#[tokio::test] attributes in the selected test slice",
     "test_attribute_count": 114,
-    "test_stu": 24261,
+    "test_stu": 74293,
     "nonzero": true
   },
-  "bound_contract_digest": "f44a488d4723dfcc81532b5999a221f5f029953bfbb633b0caa240e419fe3ead",
+  "bound_contract_digest": "f0f817c31b0daaf2",
   "source_provenance": {
-    "input_digests": {
-      "workspace_manifest": {
-        "path": "Cargo.toml",
-        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
-      },
+    "contract_semantic_inputs": {
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
         "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
@@ -196,20 +228,33 @@
       },
       "package_manifest": {
         "path": "crates/kernel/eliot-ors/Cargo.toml",
-        "sha256": "564afdef1066fc8be240f2842a49ec90e6a48cbf7fb2ad04a5a770d243206372"
+        "sha256": "208c27b8f4fa1cf67ddbb731271e08782c02f5566a80472905f6b4c47e056166"
       },
-      "module_manifest": null,
-      "selected_source": {
-        "path_count": 28,
-        "sha256": "d5e1960189cbd69b830420dfe12f2740ba4f5853439995eb64a85e1b7ece7c9d"
+      "module_manifest": null
+    },
+    "exact_provenance": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "f2ab651b76ac9f5870f8268c52d1db5839cdb957f5939cd0d8e3a2edcd91fe45"
+      },
+      "physical_source_inventory": {
+        "path_count": 36,
+        "sha256": "77453f639d0818d9b75e0b4a755a0e32be404b937fb2f08e90df7204e25e8ed3"
+      },
+      "selected_workset": {
+        "allocation_scope": "PACKAGE_WIDE",
+        "allocation_state": "EXPLICIT_PACKAGE_WIDE",
+        "path_count": 36,
+        "sha256": "77453f639d0818d9b75e0b4a755a0e32be404b937fb2f08e90df7204e25e8ed3"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
-    "generator_version": "1.0.0"
+    "generator_version": "1.0.0",
+    "note": "A change under exact_provenance moves artifact_digest only. It is not a public API or semantic-contract change and is not an instruction to re-read or re-test every cell."
   },
-  "artifact_digest": "aaed054a7bc0df6580707ed1869107da505ad8dba158c7b95e868a3e8a889050",
+  "artifact_digest": "540193c2ef00d10f0a158b7f639cb8d508164d3eae05dd6a4ad5107a7a061672",
   "contract_revision": {
-    "derivation": "first 16 hex characters of the artifact digest",
-    "value": "aaed054a7bc0df65"
+    "derivation": "first 16 hex characters of the SHA-256 over the namespaced canonical contract-semantic body (artifact_digest, contract_revision and source_provenance excluded)",
+    "value": "d874d82a1f33c0fc"
   }
 }

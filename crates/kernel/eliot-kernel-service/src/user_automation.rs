@@ -1,4 +1,4 @@
-//! Authenticated UserAutomation operator orchestration.
+//! Authenticated `UserAutomation` operator orchestration.
 //!
 //! This module is a stateless service over the existing canonical Store and
 //! Durable Job/WakeIntent owners. It validates the authenticated request and
@@ -28,10 +28,10 @@ pub const USER_AUTOMATION_SERVICE_CONTRACT_NAME: &str = "eliot.kernel.user-autom
 /// Current service contract revision.
 pub const USER_AUTOMATION_SERVICE_CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
 
-/// Errors raised before a UserAutomation service response can be returned.
+/// Errors raised before a `UserAutomation` service response can be returned.
 #[derive(Debug, Error)]
 pub enum UserAutomationServiceError {
-    /// A request or response failed the closed UserAutomation contract.
+    /// A request or response failed the closed `UserAutomation` contract.
     #[error("UserAutomation service contract: {0}")]
     Contract(#[from] UserAutomationError),
     /// The authenticated request metadata is invalid.
@@ -83,6 +83,50 @@ impl UserAutomationServiceRequest {
         if self.intent.principal_ref != self.authenticated_principal {
             return Err(UserAutomationServiceError::PrincipalMismatch);
         }
+        if !operation_revisions_are_owned_by(&self.intent.operation, &self.authenticated_principal)
+        {
+            return Err(UserAutomationServiceError::PrincipalMismatch);
+        }
+        Ok(())
+    }
+
+    /// Validates the authenticated, pre-seal schedule-normalization request.
+    ///
+    /// Normalization is a read-only owner operation, so it has no canonical
+    /// Store transition from which to derive `canonical_request_hash`. Its
+    /// retry identity is still validated and the hash must remain empty until a
+    /// later Create/Edit transition seals the exact returned receipt bytes.
+    pub fn validate_for_schedule_normalization(&self) -> Result<(), UserAutomationError> {
+        self.context
+            .validate()
+            .map_err(|_| UserAutomationError::Invalid("request.context"))?;
+        self.intent.validate_for_normalization_submission()?;
+        if self.identity.idempotency_key.trim().is_empty()
+            || self.identity.idempotency_key.len() > 256
+            || self.identity.idempotency_key.chars().any(char::is_control)
+            || self.identity.operation_id.as_str().trim().is_empty()
+            || !self.identity.canonical_request_hash.is_empty()
+        {
+            return Err(UserAutomationError::Invalid(
+                "request.schedule_normalization.identity",
+            ));
+        }
+        if self.intent.state_fence != self.context.state_fence {
+            return Err(UserAutomationError::Invalid(
+                "request.schedule_normalization.state_fence",
+            ));
+        }
+        if self.intent.principal_ref != self.authenticated_principal {
+            return Err(UserAutomationError::Invalid(
+                "request.schedule_normalization.principal",
+            ));
+        }
+        if !operation_revisions_are_owned_by(&self.intent.operation, &self.authenticated_principal)
+        {
+            return Err(UserAutomationError::Invalid(
+                "request.schedule_normalization.owner_principal",
+            ));
+        }
         Ok(())
     }
 
@@ -106,7 +150,7 @@ pub struct UserAutomationStoreRequest {
     pub authenticated_principal: String,
     /// Canonical Store operation/idempotency/request identity.
     pub identity: OperationIdentity,
-    /// Closed UserAutomation operation selected by the authenticated caller.
+    /// Closed `UserAutomation` operation selected by the authenticated caller.
     pub intent: UserAutomationOperatorIntent,
 }
 
@@ -122,6 +166,10 @@ impl UserAutomationStoreRequest {
         if self.intent.principal_ref != self.authenticated_principal {
             return Err(UserAutomationServiceError::PrincipalMismatch);
         }
+        if !operation_revisions_are_owned_by(&self.intent.operation, &self.authenticated_principal)
+        {
+            return Err(UserAutomationServiceError::PrincipalMismatch);
+        }
         if self.intent.state_fence != self.context.state_fence {
             return Err(UserAutomationServiceError::FenceMismatch);
         }
@@ -129,7 +177,34 @@ impl UserAutomationStoreRequest {
     }
 }
 
-/// Read projections returned by the canonical UserAutomation owner.
+/// Keeps caller-supplied immutable revision ownership inside the authenticated
+/// principal that is about to normalize or mutate it. Both sides of an Edit
+/// lineage are checked because the predecessor is part of the admitted
+/// operator request too; a caller cannot relabel another owner's automation
+/// by supplying a matching revision identifier.
+fn operation_revisions_are_owned_by(operation: &UserAutomationOperation, principal: &str) -> bool {
+    let owned_by_principal =
+        |revision: &UserAutomationRevision| revision.owner_principal.as_str() == principal;
+    match operation {
+        UserAutomationOperation::Create { revision, .. }
+        | UserAutomationOperation::NormalizeSchedule { revision, .. } => {
+            owned_by_principal(revision)
+        }
+        UserAutomationOperation::Edit {
+            previous_revision,
+            revision,
+            ..
+        }
+        | UserAutomationOperation::MigrateLegacySchedule {
+            previous_revision,
+            revision,
+            ..
+        } => owned_by_principal(previous_revision) && owned_by_principal(revision),
+        _ => true,
+    }
+}
+
+/// Read projections returned by the canonical `UserAutomation` owner.
 ///
 /// The revision, execution and failure payloads are boxed because the read
 /// vocabulary mixes one 24-byte list with projections that inline a whole
@@ -171,7 +246,7 @@ pub enum UserAutomationReadResult {
     },
 }
 
-/// Mutation projections returned by the canonical UserAutomation owner.
+/// Mutation projections returned by the canonical `UserAutomation` owner.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum UserAutomationMutationResult {
@@ -228,14 +303,14 @@ pub struct UserAutomationStoreResponse {
     pub outcome: UserAutomationStoreOutcome,
 }
 
-/// Adapter over the existing CanonicalStoreClient.
+/// Adapter over the existing `CanonicalStoreClient`.
 ///
 /// Implementations must use the existing Store named-operation/transaction
 /// and receipt paths. This port is a service seam, not a second persistence
 /// or lifecycle owner.
 #[allow(async_fn_in_trait)]
 pub trait UserAutomationStorePort: Send + Sync {
-    /// Executes one authenticated UserAutomation read or mutation.
+    /// Executes one authenticated `UserAutomation` read or mutation.
     async fn execute_user_automation(
         &self,
         request: UserAutomationStoreRequest,
@@ -245,7 +320,7 @@ pub trait UserAutomationStorePort: Send + Sync {
     async fn receipt(&self, operation_id: OperationId) -> Result<Option<WriteReceipt>, StoreError>;
 }
 
-/// Stateless UserAutomation service over one canonical Store port.
+/// Stateless `UserAutomation` service over one canonical Store port.
 pub struct UserAutomationService<'a, P: ?Sized> {
     port: &'a P,
 }
@@ -429,7 +504,9 @@ fn validate_mutation_result(
 ) -> Result<(), UserAutomationServiceError> {
     match (operation, result) {
         (
-            UserAutomationOperation::Create { revision: expected },
+            UserAutomationOperation::Create {
+                revision: expected, ..
+            },
             UserAutomationMutationResult::Revision {
                 revision,
                 cancelled_wake_ids,
@@ -439,6 +516,7 @@ fn validate_mutation_result(
             UserAutomationOperation::Edit {
                 previous_revision,
                 revision: expected,
+                ..
             },
             UserAutomationMutationResult::Revision {
                 revision,

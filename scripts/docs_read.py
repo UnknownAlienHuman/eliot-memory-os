@@ -56,9 +56,27 @@ def changed_paths(root: Path, changed_from: str) -> list[str]:
         for line in completed.stdout.splitlines()
         if line.strip()
     ]
-    if not paths:
-        raise ReadError(f"no changed paths found from {changed_from} to HEAD")
+    # An empty delta is a real, reportable outcome (the work is already done,
+    # or the branch legitimately changes nothing), not a router failure. It is
+    # returned to the caller so it can say so honestly instead of failing with
+    # DOC_READ_FAIL and forcing a hand-built --path list to look like work.
     return sorted(set(paths))
+
+
+EMPTY_DELTA_EXIT = 2
+
+
+def report_empty_delta(changed_from: str) -> int:
+    print(
+        f"DOC_READ_EMPTY_DELTA: no changed paths from {changed_from} to HEAD; "
+        "the branch has no delta, so there is no mutation to authorize and no "
+        "reading evidence to produce. This is not a pass and not a failure: "
+        "record the empty delta as the outcome. If this branch does mutate "
+        "something, commit or stage it and re-run, or name the path family "
+        "explicitly with --path.",
+        file=sys.stderr,
+    )
+    return EMPTY_DELTA_EXIT
 
 
 def verified_item(root: Path, item: dict[str, Any]) -> tuple[dict[str, Any], str]:
@@ -101,6 +119,56 @@ def verified_item(root: Path, item: dict[str, Any]) -> tuple[dict[str, Any], str
     if item.get("anchors"):
         record["anchors"] = list(item["anchors"])
     return record, text
+
+
+def assert_governing_fragments(
+    root: Path, route: dict[str, Any], verified: Sequence[dict[str, Any]]
+) -> list[str]:
+    """Prove every title-named governing fragment is present in the bundle.
+
+    The router resolves the governing fragment from the causal property's prose
+    title and puts it in `required`. This re-derives that resolution from the
+    handle index and fails closed unless each governing fragment is a REQUIRED
+    item of the rendered bundle, at its indexed path, with the handle attached
+    and the current on-disk hash. A silent gap becomes a loud one: a bundle that
+    does not actually contain the fragment governing the requested topic cannot
+    pass, whatever the route claims.
+    """
+    handles = docs_router.read_json(root / docs_router.DEFAULT_INDEX).get("handles", {})
+    if not isinstance(handles, dict) or not handles:
+        raise ReadError("handle index has no handles")
+    expected = docs_router.governing_handles(handles, str(route.get("topic", "")))
+    if not expected:
+        return []
+    required = {
+        str(item["path"]): item for item in verified if item.get("kind") == "fragment"
+    }
+    absent: list[str] = []
+    for handle in expected:
+        record = handles[handle]
+        index_path = str(record["path"])
+        item = required.get(index_path)
+        if item is None:
+            absent.append(f"{handle} -> {index_path} (not a required bundle item)")
+            continue
+        if handle not in item.get("handles", ()):
+            absent.append(
+                f"{handle} -> {index_path} (required item carries handles "
+                f"{item.get('handles', [])})"
+            )
+            continue
+        if str(item["sha256"]) != str(record["fragment_sha256"]):
+            absent.append(f"{handle} -> {index_path} (bundle hash is not the indexed hash)")
+            continue
+        if sha256_bytes((root / index_path).read_bytes()) != str(record["fragment_sha256"]):
+            absent.append(f"{handle} -> {index_path} (stale on disk)")
+    if absent:
+        raise ReadError(
+            "governing fragments named by the causal property are absent from the "
+            "verified bundle; re-run the router or widen the causal property "
+            "until each governs this work: " + "; ".join(absent)
+        )
+    return expected
 
 
 def language_for(path: str) -> str:
@@ -148,6 +216,7 @@ def build_read_bundle(root: Path, route: dict[str, Any]) -> tuple[str, dict[str,
         verified.append(record)
         chunks.append(render_item(record, text))
     bundle = "".join(chunks)
+    governing = assert_governing_fragments(root, route, verified)
     receipt_core = {
         "schema_version": SCHEMA,
         "route_receipt_id": str(route.get("receipt_id", "")),
@@ -155,6 +224,7 @@ def build_read_bundle(root: Path, route: dict[str, Any]) -> tuple[str, dict[str,
         "paths": list(route.get("paths", [])),
         "topic": str(route.get("topic", "")),
         "matched_routes": list(route.get("matched_routes", [])),
+        "governing_handles": governing,
         "required": verified,
         "bundle_sha256": sha256_bytes(bundle.encode("utf-8")),
         "bundle_bytes": len(bundle.encode("utf-8")),
@@ -177,6 +247,28 @@ def self_test() -> None:
         target.parent.mkdir(parents=True)
         target.write_text("# Fragment\nExact text.\n", encoding="utf-8", newline="")
         raw = target.read_bytes()
+        # The governing-fragment self-check reads the handle index, so the
+        # fixture must carry one before any bundle is built.
+        index_path = root / docs_router.DEFAULT_INDEX
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+        index_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": docs_router.INDEX_SCHEMA,
+                    "handles": {
+                        "I9.9": {
+                            "title": "I9.9. Unrelated placeholder",
+                            "path": "docs/unrelated.md",
+                            "fragment_sha256": "0" * 64,
+                            "fragment_bytes": 0,
+                            "anchor": "i99",
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+            newline="",
+        )
         item = {
             "kind": "fragment",
             "role": "required",
@@ -215,7 +307,73 @@ def self_test() -> None:
                 raise
         else:
             raise ReadError("legacy compatibility map was accepted")
-    print("DOC_READ_SELF_TEST: PASS cases=3")
+
+        # The governing-fragment self-check must fire on a route that resolved
+        # the governing handle but left it out of the required set (#929, #958,
+        # #1730, #2970). A silent gap must be a loud failure.
+        target.write_text("# Fragment\nExact text.\n", encoding="utf-8", newline="")
+        raw = target.read_bytes()
+        handles = {
+            "I5.13": {
+                "title": "I5.13. Backup and restore",
+                "path": "docs/fragment.md",
+                "fragment_sha256": sha256_bytes(raw),
+                "fragment_bytes": len(raw),
+                "anchor": "i513",
+            }
+        }
+        index_path.write_text(
+            json.dumps({"schema_version": docs_router.INDEX_SCHEMA, "handles": handles}),
+            encoding="utf-8",
+            newline="",
+        )
+        governing_item = dict(item)
+        governing_item["handles"] = ["I5.13"]
+        governing_item["anchors"] = ["i513"]
+        governing_route = {
+            "receipt_id": "sha256:" + "3" * 64,
+            "pair_key": "sha256:" + "2" * 64,
+            "paths": ["src/lib.rs"],
+            "topic": "backup and restore of host state",
+            "matched_routes": ["test"],
+            "required": [governing_item],
+        }
+        # The satisfied route proves the governing fragment and passes.
+        satisfied_bundle, satisfied_receipt = build_read_bundle(root, governing_route)
+        if satisfied_receipt["governing_handles"] != ["I5.13"]:
+            raise ReadError("governing handle was not recorded in the read receipt")
+        if "docs/fragment.md" not in satisfied_bundle:
+            raise ReadError("governing fragment was not rendered into the bundle")
+        if docs_router.governing_handles(handles, "backup and restore of host state") != ["I5.13"]:
+            raise ReadError("governing fragment resolution self-test failed")
+        # The incomplete route required a fragment that is NOT the governing one.
+        # This is the known-incomplete shape that previously passed silently.
+        incomplete_route = dict(governing_route)
+        incomplete_route["required"] = [
+            {
+                "kind": "file",
+                "role": "required",
+                "path": "AGENTS.md",
+                "sha256": "0" * 64,
+                "bytes": 0,
+            }
+        ]
+        (root / "AGENTS.md").write_text("root\n", encoding="utf-8", newline="")
+        try:
+            assert_governing_fragments(root, incomplete_route, [
+                {
+                    "kind": "file",
+                    "path": "AGENTS.md",
+                    "sha256": "0" * 64,
+                    "bytes": 4,
+                }
+            ])
+        except ReadError as exc:
+            if "absent from the verified bundle" not in str(exc):
+                raise
+        else:
+            raise ReadError("missing governing fragment did not fail closed")
+    print("DOC_READ_SELF_TEST: PASS cases=6")
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
@@ -242,8 +400,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         root = args.root.resolve()
         paths = list(args.path)
+        delta_empty = False
         if args.changed_from:
-            paths.extend(changed_paths(root, args.changed_from))
+            delta = changed_paths(root, args.changed_from)
+            if not delta:
+                delta_empty = True
+            paths.extend(delta)
+        if not paths:
+            # An empty delta with no explicit --path has no scope to route. Say
+            # so precisely rather than raising the router's "at least one
+            # --path" error, which reads as a configuration fault.
+            if delta_empty:
+                return report_empty_delta(args.changed_from)
+            raise ReadError("no --path and no --changed-from scope was given")
         config = docs_router.load_config(root)
         route = docs_router.route_payload(root, config, paths, args.topic)
         bundle, receipt = build_read_bundle(root, route)
@@ -262,9 +431,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 receipt_out,
                 json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
             )
+        governing = receipt.get("governing_handles", [])
         print(
             f"DOC_READ: PASS receipt={receipt['read_receipt_id']} "
             f"route={receipt['route_receipt_id']} required={len(receipt['required'])} "
+            f"governing={','.join(governing) if governing else '-'} "
             f"bundle_sha256={receipt['bundle_sha256']}",
             file=sys.stderr,
         )

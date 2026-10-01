@@ -7,6 +7,7 @@ use eliot_contracts::{EpochId, RequestId, StateFence};
 use eliot_process::{
     FencingToken, Generation, OperationId, ProcessRequest, ProcessTreeId, ResourceLimits,
 };
+use eliot_receipts::EffectClass;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -692,6 +693,14 @@ impl CapabilityLivenessRequest {
 #[serde(deny_unknown_fields)]
 pub struct EffectAdmissionRequest {
     proposal: ProposedEffect,
+    /// Shared domain class projected from the carried proposal.
+    ///
+    /// Derived in [`EffectAdmissionRequest::new`] via the agent-API
+    /// projection; names the exact `eliot-receipts::EffectClass` the worker
+    /// admitted under its ceiling. Inert data: coverage is enforced by
+    /// `WorkerCore::authorize_effect` before the admission owner is
+    /// consulted, and rank stays with the Governor `ImpactClass` check.
+    effect_class: EffectClass,
     attempt_id: AttemptId,
     admission_id: String,
     admission_revision: String,
@@ -707,8 +716,10 @@ impl EffectAdmissionRequest {
         attempt_id: AttemptId,
         grant: &CapabilityGrant,
     ) -> Self {
+        let effect_class = proposal.kind.to_effect_class();
         Self {
             proposal,
+            effect_class,
             attempt_id,
             admission_id: grant.admission_id.clone(),
             admission_revision: grant.admission_revision.clone(),
@@ -722,6 +733,11 @@ impl EffectAdmissionRequest {
     #[must_use]
     pub const fn proposal(&self) -> &ProposedEffect {
         &self.proposal
+    }
+
+    #[must_use]
+    pub const fn effect_class(&self) -> EffectClass {
+        self.effect_class
     }
 
     #[must_use]

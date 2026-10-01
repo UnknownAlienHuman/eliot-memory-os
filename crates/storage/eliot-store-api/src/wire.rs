@@ -42,10 +42,10 @@ pub const CAPABILITY_APPLY: &str = "store.apply";
 ///
 /// The wire variant selects this capability through
 /// [`StoreRequest::capability`], but it is deliberately absent from
-/// [`CAPABILITIES`]: API enum presence is not readiness, and the capability
-/// stays unadvertised until the actual scheduler backend is accepted. A
-/// session without this admitted capability rejects the operation before
-/// dispatch.
+/// [`CAPABILITIES`]: that array is a static baseline both the store handshake
+/// and the Kernel `ClientHello` consume unchanged, so it can only name
+/// capabilities every store process can serve, and this one is served only
+/// by an adapter that owns a concurrent execution generation.
 pub const CAPABILITY_RESERVED_WRITE: &str = "store.reserved_write";
 /// Capability for the backup operation (issue #975).
 ///
@@ -881,6 +881,21 @@ impl StoreBackupRequest {
     /// `PrepareDestination` carries no operation identity in its payload, so
     /// the envelope identity is validated against the canonical operation
     /// projection derived from the exact destination payload.
+    ///
+    /// # Fence binding is separate from the payload (issue #975, W10)
+    ///
+    /// `Begin` is the only capture payload that transports its own State
+    /// Fence: [`SnapshotBeginRequest::scope`] is a `ScopeRevisionView`, and
+    /// `ScopeRevisionView::validate` proves only that its heads agree with
+    /// *its own* fence. Without the arm below, a `Begin` could name a
+    /// consistency scope fenced at a different authority epoch or resource
+    /// generation than the authenticated transport fence, and the capture
+    /// would be admitted against a fence the Host never approved. That is
+    /// exactly the binding W10 requires to stay beside the payload rather
+    /// than inside it: the transported `context` is the fence authority, and
+    /// the payload's scope fence must equal it. This mirrors the
+    /// `RestoreBatch`/`Validate` arm below, which already binds every
+    /// expected head fence to `self.context.state_fence`.
     pub fn validate(&self) -> Result<(), StoreError> {
         self.context.validate().map_err(StoreError::Foundation)?;
         self.identity.validate()?;
@@ -892,6 +907,13 @@ impl StoreBackupRequest {
                         field: "backup.identity",
                         reason: "envelope identity does not match the admitted begin operation",
                     });
+                }
+                // The authenticated transport fence is the capture's fence
+                // authority; the payload's scope fence is a separate transported
+                // field and must not name a different authority epoch or
+                // resource generation (issue #975, W10).
+                if request.scope.state_fence != self.context.state_fence {
+                    return Err(StoreError::FenceMismatch);
                 }
                 Ok(())
             }
@@ -994,6 +1016,17 @@ impl StoreBackupRequest {
             ));
         }
         match &self.operation {
+            // The capture's scope fence is a separately transported field and
+            // must equal the authenticated request fence, exactly like the
+            // restore batch's expected heads below (issue #975, W10).
+            StoreBackupOperation::Begin(request) => {
+                if request.scope.state_fence != identity.request.state_fence {
+                    return Err(StoreWireError::Identity(
+                        "backup capture scope fence does not match request identity".to_owned(),
+                    ));
+                }
+                Ok(())
+            }
             StoreBackupOperation::RestoreBatch(batch) | StoreBackupOperation::Validate(batch) => {
                 for head in &batch.expected_revision_heads {
                     if head.state_fence != identity.request.state_fence {

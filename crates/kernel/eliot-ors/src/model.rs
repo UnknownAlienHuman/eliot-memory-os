@@ -6160,9 +6160,21 @@ pub enum LegacyTwoValueRelationBackupVerificationClass {
 /// reason [`LegacyUnscopedBackupVerificationRow`] is not: its only job is to
 /// recognise a shape the current record cannot decode, and a partial shape cannot
 /// drift into a second source of truth for old fields. The discriminator is the
-/// pair (`profile_version == 1`, a `target_compatibility` value in the legacy
-/// two-value vocabulary) together with the `v1` idempotency namespace, which no
-/// current row carries.
+/// nested (`identity.profile_version == 1`, a `target_compatibility` value in
+/// the legacy two-value vocabulary) together with the `v1` idempotency
+/// namespace, which no current row carries.
+///
+/// The version and the namespace are read from the NESTED `identity`, and that
+/// is not a stylistic choice. `v1` is the profile #2883 introduced when it
+/// replaced the flat `idempotency_key` with the nested
+/// [`BackupVerifyRequestIdentity`], so a `v1` row has never carried them at the
+/// top level: `profile_version` and `idempotency_namespace` live under `identity`
+/// in every byte a `v1` install wrote. A flat read is not a lenient read of the
+/// same shape, it is a read of a shape that cannot exist, and it fails in the
+/// worst direction: every genuine `v1` row misses, the recogniser reports
+/// `Unreadable`, and the route fails closed while reporting intact evidence as
+/// corrupt. It is the same reason
+/// [`LegacyFenceBoundBackupVerificationRow`] reads its own version nested.
 ///
 /// Unknown fields are TOLERATED on purpose. The `v1` row carried more fields than
 /// these three, and denying them would reject a genuine legacy row and turn it
@@ -6170,13 +6182,22 @@ pub enum LegacyTwoValueRelationBackupVerificationClass {
 /// corruption for evidence that is perfectly intact and merely old.
 #[derive(Deserialize)]
 struct LegacyTwoValueRelationBackupVerificationRow {
+    /// The nested request identity, read only far enough to pin the row to the
+    /// pre-#2863 profile.
+    identity: LegacyTwoValueRelationBackupVerificationIdentity,
+    /// The legacy two-value answer, present in both legacy spellings.
+    target_compatibility: String,
+}
+
+/// Nested identity terms of one pre-#2863 row. See
+/// [`LegacyTwoValueRelationBackupVerificationRow`].
+#[derive(Deserialize)]
+struct LegacyTwoValueRelationBackupVerificationIdentity {
     /// The `v1` profile version the row was written under.
     profile_version: u16,
     /// The `v1` row's idempotency namespace, which pins the row to the old
     /// vocabulary independently of the profile version number.
     idempotency_namespace: String,
-    /// The legacy two-value answer, present in both legacy spellings.
-    target_compatibility: String,
 }
 
 /// Returns whether stored bytes are a pre-#2863 two-value scoped row.
@@ -6190,8 +6211,8 @@ fn is_legacy_two_value_backup_verification_row(bytes: &str) -> bool {
     let Ok(row) = serde_json::from_str::<LegacyTwoValueRelationBackupVerificationRow>(bytes) else {
         return false;
     };
-    row.profile_version == 1
-        && row.idempotency_namespace == LEGACY_BACKUP_VERIFY_IDEMPOTENCY_NAMESPACE
+    row.identity.profile_version == 1
+        && row.identity.idempotency_namespace == LEGACY_BACKUP_VERIFY_IDEMPOTENCY_NAMESPACE
         && matches!(
             row.target_compatibility.as_str(),
             LEGACY_TWO_VALUE_FENCE_RELATION_CURRENT_SESSION

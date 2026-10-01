@@ -68,6 +68,7 @@ use eliot_observation_contracts::{
 use eliot_protocol::RequestIdentity;
 use eliot_read::{
     NamedParameters, ReadApi, ReadError, ReadOrderingBinding, ReadService, StateRequest,
+    prove_page_state_fence,
 };
 use eliot_receipts::{RequestBinding, WorkScopeId};
 use eliot_store_api::{
@@ -621,6 +622,21 @@ pub async fn run_experience_quality_event(
         None => (None, None),
     };
     let mut ledger = ExperienceRevisionLedger::new();
+    // #1144: both edge-supplied range pages are owner-minted
+    // `ExperienceRangePage` payloads, so the read owner's coverage gate applies
+    // to them even though the edge performed the read rather than this entry.
+    // Each page's fence is proved FIRST, before any coverage member of that
+    // page is read: `bank_records_from_range_payload` below reads `records`
+    // and `range_next_cursor` reads `next_cursor`, and a truncation or cursor
+    // member on a page projected under another fence describes that other
+    // fence's rows. The proof is the owner's own rule, called rather than
+    // restated, so an absent or foreign `state_fence` member is
+    // `ReadError::CoverageFenceUnproven` and stays distinct from `Unknown`
+    // (the source answered) and from `Partial` (nothing claims rows past the
+    // bound). The bound compared against is `ctx.state_fence`, the same fence
+    // every projection below is assembled at.
+    prove_page_state_fence(&event.bank.payload, &ctx.state_fence)?;
+    prove_page_state_fence(&event.feedback.payload, &ctx.state_fence)?;
     let bank_records = bank_records_from_range_payload(&event.bank.payload)?;
     let bank_live = supply_bank_projection_from_store(
         &mut ledger,

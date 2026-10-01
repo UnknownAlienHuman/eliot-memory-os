@@ -328,6 +328,66 @@ pub struct RecordDisposition {
     pub acked: bool,
 }
 
+/// Receiving-owner durable acceptance disposition (issue #2731 I1/I5).
+///
+/// APPLIED, REJECTED and UNKNOWN are never interchangeable: a receiving
+/// owner's durable acceptance reports exactly one of them, and this journal
+/// never upgrades one into another. In particular UNKNOWN never counts as
+/// application success, and a local commit, acknowledgement, or
+/// reconciled/response-hash memo never fabricates APPLIED here.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ReceivingOwnerDisposition {
+    /// The receiving owner durably accepted and applied the event.
+    Applied,
+    /// The receiving owner durably rejected the event (terminal, not
+    /// retryable as the same occurrence).
+    Rejected,
+    /// The receiving owner's outcome is not yet known; the obligation stays
+    /// pending and must never be retired as complete.
+    Unknown,
+}
+
+/// Receiving-owner durable acceptance receipt (issue #2731 I1/I5): the exact
+/// owner evidence the retirement path consumes.
+///
+/// This is receiving-owner evidence, not local bookkeeping. The journal's
+/// source facts (`transport_hash`/stored bytes), normalization facts
+/// (`envelope_digest`/projection linkage), application facts
+/// (`applied_count`/`applied_receipt`) and pending-page facts
+/// (`committed`/`phase`) each prove only their own local leg; the local
+/// `acked` flag and any reconciled/response-hash memo are producer-side
+/// acknowledgement metadata in the same sense as the ORS `reconciled` row,
+/// never proof of downstream durable acceptance. Only a receipt binding the
+/// stream, the receiving owner's incarnation, the event identity and sequence,
+/// the content commitment, the receiving operation and the retained
+/// source/projection references authorizes retirement, and then only under
+/// its own carried disposition.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReceivingOwnerAcceptance {
+    /// Owning stream identifier; must equal the retained record's stream.
+    pub stream_id: String,
+    /// Receiving owner's stream incarnation, carried for the retirement owner
+    /// to match against its admitted owner epoch. Must be nonzero; the
+    /// journal never invents or equates it.
+    pub incarnation: u64,
+    /// Owner-minted event identity; must equal the retained envelope's event.
+    pub event_id: String,
+    /// Monotonic sequence within the stream; must equal the retained record.
+    pub sequence: u64,
+    /// Canonical content commitment; must equal the retained envelope digest
+    /// (which seals the normalized projection).
+    pub envelope_digest: LowercaseSha256,
+    /// Retained source reference; must equal the retained transport hash.
+    pub transport_hash: LowercaseSha256,
+    /// Receiving operation that durably accepted the event (owner-meaningful
+    /// operation reference, never a local response hash).
+    pub receiving_operation: String,
+    /// The owner's reported outcome, preserved verbatim by the check.
+    pub disposition: ReceivingOwnerDisposition,
+}
+
 /// One durable host-event record: the immutable transport hash, the stored
 /// raw-or-redacted bytes, the normalized envelope, lineage/version/route
 /// facts, and the disposition, stored together as the commit unit.
@@ -1176,6 +1236,66 @@ impl DurableHostEventJournal {
         }
         Self::check_retained_route_evidence(record)?;
         Ok(record.route_evidence.clone())
+    }
+
+    /// Checks one receiving-owner durable acceptance receipt against the
+    /// retained record (issue #2731 I1/I5) for the retirement path.
+    ///
+    /// Only committed records check: a staged-but-uncommitted record reports
+    /// [`IngestError::NotCommitted`], mirroring the intake and application
+    /// gates. The receipt must bind the retained stream, event identity and
+    /// sequence, the canonical content commitment (`envelope_digest`), the
+    /// retained source reference (`transport_hash`), a nonzero receiving-owner
+    /// incarnation, and a nonempty receiving operation; any drift fails
+    /// closed with a typed error. The carried disposition returns verbatim —
+    /// APPLIED, REJECTED and UNKNOWN stay distinct, UNKNOWN never retires as
+    /// success, and nothing here mutates `applied_count`, `applied_receipt`,
+    /// `acked`, or the durable phase. A local acknowledgement or a
+    /// reconciled/response-hash memo is not a parameter at all and can never
+    /// substitute for this owner receipt.
+    pub fn check_receiving_owner_acceptance(
+        &self,
+        key: &EventKey,
+        receipt: &ReceivingOwnerAcceptance,
+    ) -> Result<ReceivingOwnerDisposition, IngestError> {
+        let record = self
+            .records
+            .get(&(key.stream_id.clone(), key.sequence))
+            .ok_or(IngestError::UnknownRecord)?;
+        if !record.disposition.committed {
+            return Err(IngestError::NotCommitted);
+        }
+        validate_stream_id(&receipt.stream_id)?;
+        if receipt.incarnation == 0 {
+            return Err(IngestError::InvalidInput("receipt.incarnation"));
+        }
+        if receipt.sequence == 0 {
+            return Err(IngestError::InvalidInput("receipt.sequence"));
+        }
+        if receipt.event_id.trim().is_empty()
+            || receipt.event_id.len() > MAX_STREAM_ID_BYTES
+            || receipt.event_id.chars().any(char::is_control)
+        {
+            return Err(IngestError::InvalidInput("receipt.event_id"));
+        }
+        if receipt.receiving_operation.trim().is_empty()
+            || receipt.receiving_operation.len() > MAX_STREAM_ID_BYTES
+            || receipt.receiving_operation.chars().any(char::is_control)
+        {
+            return Err(IngestError::InvalidInput("receipt.receiving_operation"));
+        }
+        if receipt.stream_id != record.stream_id
+            || receipt.sequence != record.sequence
+            || receipt.event_id != record.envelope.event_id.as_str()
+        {
+            return Err(IngestError::EnvelopeMismatch("receipt.event"));
+        }
+        if receipt.envelope_digest != record.envelope_digest
+            || receipt.transport_hash != record.transport_hash
+        {
+            return Err(IngestError::EnvelopeMismatch("receipt.content"));
+        }
+        Ok(receipt.disposition)
     }
 
     /// Readback-validates the retained route-evidence relation of one record

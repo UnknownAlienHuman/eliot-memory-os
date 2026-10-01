@@ -1641,7 +1641,7 @@ use eliot_installation::{
     InstallerServiceRegistrationApproval, InstallerServiceRole, LOCAL_SERVICE_SID,
     PHASE_B_PENDING_MARKER, PendingActivationState, PhaseBLiveBinding,
     ProvisionedSupervisionAuthority, RedbInstallationRegistry, RuntimeLaunchDescriptor,
-    StoreCredentialProvider, StoreCredentialScope,
+    StoreCredentialProvider, StoreCredentialScope, UserBrokerPreparedBinding,
     phase_b_credential_receipt_digest as installation_phase_b_credential_receipt_digest,
     phase_b_host_state_root_digest as installation_phase_b_host_state_root_digest,
     phase_b_scm_selector, phase_b_static_template_for_candidate,
@@ -2226,6 +2226,8 @@ pub enum HostBranchDisposition {
 
 #[cfg(windows)]
 mod readiness_gate;
+#[cfg(windows)]
+mod user_mode_launcher;
 #[cfg(all(windows, test))]
 use readiness_gate::{DEFAULT_READINESS_CADENCE, ReadinessFailureKind};
 #[cfg(windows)]
@@ -2233,6 +2235,8 @@ use readiness_gate::{
     HostReadinessGate, ReadinessCadence, ReadinessContourIdentity, ReadinessGateAction,
     readiness_failure_kind, reconcile_authenticated_readiness,
 };
+#[cfg(windows)]
+pub use user_mode_launcher::register_user_mode_launcher;
 
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5662,6 +5666,9 @@ pub struct HostPhaseBMaterialization {
     agent_bridge: Option<AgentBridgePreparedBinding>,
     /// Final provider proof, populated only after `FinalizePhaseB` CAS.
     agent_bridge_final: Option<AgentBridgePhaseBBinding>,
+    /// Protected User Broker front-door record pair published and read back for
+    /// this contour. Never synthesized from a manifest or runtime descriptor.
+    user_broker: Option<UserBrokerPreparedBinding>,
     file_identities: [FileIdentity; 4],
     launch: RuntimeLaunchDescriptor,
 }
@@ -5748,6 +5755,13 @@ impl HostPhaseBMaterialization {
     #[must_use]
     pub const fn final_agent_bridge(&self) -> Option<&AgentBridgePhaseBBinding> {
         self.agent_bridge_final.as_ref()
+    }
+
+    /// Returns the published User Broker front-door record pair, when this
+    /// Phase-B materialization published one.
+    #[must_use]
+    pub const fn user_broker(&self) -> Option<&UserBrokerPreparedBinding> {
+        self.user_broker.as_ref()
     }
 }
 
@@ -7815,6 +7829,28 @@ impl HostComposition {
     #[must_use]
     pub const fn host_epoch(&self) -> &HostInstallationEpoch {
         &self.host
+    }
+
+    /// Returns the completed Phase-B materialization retained by this
+    /// composition, when one exists.
+    ///
+    /// This is the post-publication record: its
+    /// `authority_descriptor_digest` is the digest Host read back from the
+    /// published `authority.json`, not a value recomputed by the caller. The
+    /// current-user launcher registration (#1771 AUD4) reads it from here and
+    /// joins it to the durable committed Phase-B binding before it registers.
+    #[cfg(windows)]
+    pub(crate) fn phase_b_materialization(&self) -> Option<&HostPhaseBMaterialization> {
+        self.phase_b.as_ref()
+    }
+
+    /// Returns the retained canonical Host state root for this composition.
+    ///
+    /// Durable receipts published under it stay inside the selected profile's
+    /// own current-user contour; no `UserMode` receipt ever leaves it.
+    #[cfg(windows)]
+    pub(crate) fn launch_state_root(&self) -> &Path {
+        self.launch_options.host_state_root()
     }
 
     /// Creates the credential control only from this live Host composition's
@@ -11464,6 +11500,23 @@ impl HostComposition {
         true
     }
 
+    /// I1.5 drain-cancel resume gate: a `Draining` activation whose drain was
+    /// cancelled before the durable linearization point still owns a
+    /// revalidation attempt. The `Cancelled` record plus the absent
+    /// `DrainCommitRecord` prove the point has not passed; every other
+    /// non-`Active` state fails closed at the caller.
+    #[cfg(windows)]
+    fn cancelled_drain_awaits_revalidation(
+        activation: &eliot_host_state::EliotActivationRecord,
+        drain: Option<&eliot_host_state::DrainRecord>,
+        drain_commit: Option<&eliot_host_state::DrainCommitRecord>,
+    ) -> bool {
+        use eliot_host_state::{ActivationState, DrainState};
+        activation.state == ActivationState::Draining
+            && drain_commit.is_none()
+            && drain.is_some_and(|drain| drain.state == DrainState::Cancelled)
+    }
+
     #[cfg(windows)]
     fn reconcile_branch_readiness_at(
         &mut self,
@@ -11507,12 +11560,21 @@ impl HostComposition {
             return disposition;
         }
         // A late Store recovery result is not proof that Host supervision
-        // recovered.  Require the exact current Active activation generation
-        // before any fresh positive readiness observation is appended; a
-        // Starting, DegradedRecovery, missing, or unreadable activation remains
-        // a visible recovery boundary.
-        let activation = match self.journal.snapshot() {
-            Ok(state) => state.activation,
+        // recovered.  Require the exact current activation generation before
+        // any fresh positive readiness observation is appended. The generation
+        // may attempt the proof while `Active`, or while `Draining` with a
+        // pre-commit `Cancelled` drain awaiting revalidation: I1.5 requires a
+        // pre-linearization observable-use trigger to return the same
+        // generation to `ACTIVE` after readiness revalidation, and that
+        // revalidation is this exact authenticated proof — never the
+        // cancellation itself. Every other state (Starting,
+        // DegradedRecovery, missing, unreadable, committed, or still
+        // `Draining` behind a live drain) remains a visible recovery
+        // boundary, and the proof below is unchanged: a complete contour
+        // under the exact generation fence, a fresh Watchdog observation,
+        // and the gate grant.
+        let snapshot = match self.journal.snapshot() {
+            Ok(state) => state,
             Err(error) => {
                 self.readiness_gate.fail(
                     None,
@@ -11522,7 +11584,7 @@ impl HostComposition {
                 return HostBranchDisposition::ReadinessDegraded;
             }
         };
-        let Some(activation) = activation else {
+        let Some(activation) = snapshot.activation.as_ref() else {
             self.readiness_gate.fail(
                 None,
                 readiness_failure_kind(&HostError::OwnerLeaseRecovery(
@@ -11532,13 +11594,26 @@ impl HostComposition {
             );
             return HostBranchDisposition::ReadinessDegraded;
         };
-        if activation.state != ActivationState::Active
-            || activation.fence.activation_generation != self.activation_generation
+        // I1.5 drain-cancel resume: `note_observable_use` appends
+        // `Drain(Cancelled)` while leaving the activation `Draining`, and
+        // only `resume_cancelled_drain` — fed by the `Healthy` this proof
+        // produces on the live SCM tick — moves it back to `Active`. The
+        // `Cancelled` record plus the absent `DrainCommitRecord` prove the
+        // linearization point has not passed, so this attempt is the
+        // norm-mandated revalidation, not a second admission.
+        let cancelled_drain_awaits_revalidation = Self::cancelled_drain_awaits_revalidation(
+            activation,
+            snapshot.drain.as_ref(),
+            snapshot.drain_commit.as_ref(),
+        );
+        if activation.fence.activation_generation != self.activation_generation
+            || !(activation.state == ActivationState::Active || cancelled_drain_awaits_revalidation)
         {
             self.readiness_gate.fail(
                 None,
                 readiness_failure_kind(&HostError::RecoveryRequired(
-                    "fresh readiness requires the exact current Active Host activation".to_owned(),
+                    "fresh readiness requires the exact current Active Host activation or its pre-commit cancelled drain"
+                        .to_owned(),
                 )),
                 now,
             );

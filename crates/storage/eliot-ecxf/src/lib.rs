@@ -95,6 +95,8 @@ pub enum EcxfError {
     Duplicate { field: &'static str },
     #[error("ECXF export fence is not coherent")]
     InconsistentBoundary,
+    #[error("ECXF export fence member {member} carries no source-store observation")]
+    UnobservedSourceMember { member: &'static str },
     #[error("ECXF digest mismatch for {subject}")]
     DigestMismatch { subject: String },
     #[error("ECXF serialization failed: {0}")]
@@ -137,20 +139,98 @@ impl EventRange {
     }
 }
 
+/// Where one export-fence value was observed (issue #1871, A2).
+///
+/// I05-10 requires the fence's generation and blob reachability values to be
+/// "checkable against the source Store". A bare value carries no observer and no
+/// boundary, so a fence could hold a well-formed generation string or an empty
+/// residency-key set that no store ever produced and every check would still
+/// hold. This type is the smallest record that makes such a claim falsifiable:
+/// it names the source store that observed the value and the state fence it was
+/// observed at, and both are compared against positions this crate already
+/// validates independently — the fence's own `state_fence`
+/// ([`ExportFence::validate`]) and the manifest's own `source_adapter`
+/// ([`EcxfManifest::validate`]).
+///
+/// The same rule applies to both fenced values that need a source, so they share
+/// one vocabulary instead of each inventing a provenance of its own.
+///
+/// ASSUMPTION: no document names the fields of a fence observation.
+/// `observed_by` is the manifest's existing `source_adapter` identity and
+/// `observed_at` is the fence's existing `state_fence`, chosen because those are
+/// positions the package already records and already re-checks; a third field
+/// here could only introduce a source of truth nothing else compares.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceObservation {
+    /// Store adapter identity that read the value at the export boundary.
+    pub observed_by: String,
+    /// State fence the value was read at.
+    pub observed_at: StateFence,
+}
+
+impl SourceObservation {
+    /// Rejects an observation that names no source or no valid boundary.
+    fn validate(&self) -> Result<(), EcxfError> {
+        text(&self.observed_by, "observation.observed_by")?;
+        self.observed_at
+            .validate()
+            .map_err(|error| EcxfError::Store(error.to_string()))?;
+        Ok(())
+    }
+}
+
+/// The source store's own observation of its schema generation (issue #1871, A2).
+///
+/// I05-10 puts "schema/store generation" inside the `ExportFence` and requires it
+/// to be checkable against the source Store. `ExportFence::validate` rejects a
+/// fence that carries no such observation instead of reading an absent
+/// observation as any generation at all.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SchemaGenerationObservation {
+    /// Schema generation the source store read at the export boundary.
+    pub generation: String,
+    /// Which source read it, and at which boundary.
+    pub observation: SourceObservation,
+}
+
+/// The source store's own observation of its reachable blob residency keys.
+///
+/// I05-10 calls this the "blob residency/reachability manifest" and I05-12 makes
+/// the live set the union of canonical references under a stable revision fence,
+/// unresolved staged-operation blob references, active transfer leases and
+/// retention/purge holds — a set only the store can observe. It is carried as an
+/// observation rather than a bare list so that "the store declared this set" and
+/// "nobody said" cannot be written the same way.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlobReachabilityObservation {
+    /// Opaque residency-key digests the source store declared reachable
+    /// (issue #1871, D1: I05-13 forbids merging records whose content digests
+    /// match, so reachability is keyed on residency and not on content).
+    pub residency_key_digests: Vec<String>,
+    /// Which source declared them, and at which boundary.
+    pub observation: SourceObservation,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExportFence {
     pub export_id: String,
-    pub schema_generation: String,
+    /// Schema generation observed at the bound consistency point, with the
+    /// source that observed it. `None` means no source observed one, which is a
+    /// refusal and is never read as an empty generation.
+    pub schema_generation: Option<SchemaGenerationObservation>,
     pub store_generation: String,
     pub state_fence: StateFence,
     pub scope_id: Option<ScopeId>,
     pub revision_heads: Vec<RevisionHead>,
     pub ordering_heads: Vec<OrderingHead>,
     pub event_range: EventRange,
-    /// Opaque residency-key digests of every reachable exported blob
-    /// (issue #1871, D1: I05-13 forbids merging records whose content digests
-    /// match, so reachability is keyed on residency and not on content).
+    /// Reachability the source store declared at this boundary, with the source
+    /// that declared it. `None` means no source declared one, which is a refusal
+    /// and is never read as an empty reachable set.
     // ASSUMPTION: the fence keeps one opaque residency-key digest per reachable
     // blob instead of a full residency record. I05-10 only calls this a "blob
     // residency/reachability manifest" and I05-13 requires the full residency
@@ -158,14 +238,62 @@ pub struct ExportFence {
     // fence is a set identity, so a digest per residency key is the smallest
     // change that makes a set comparison against the source store meaningful
     // when equal bytes exist in two domains.
-    pub blob_reachability_manifest: Vec<String>,
+    pub blob_reachability_manifest: Option<BlobReachabilityObservation>,
     pub consistent: bool,
 }
 
 impl ExportFence {
+    /// Returns the observed schema generation, refusing a fence whose schema
+    /// generation no source store observed.
+    ///
+    /// The comparison is between two recorded positions: the boundary the
+    /// generation was read at and the boundary this fence claims. A generation
+    /// read at a different moment describes a different store, so the fence
+    /// cannot carry both.
+    fn observed_schema_generation(&self) -> Result<&SchemaGenerationObservation, EcxfError> {
+        let Some(observed) = self.schema_generation.as_ref() else {
+            return Err(EcxfError::UnobservedSourceMember {
+                member: "schema_generation",
+            });
+        };
+        observed.observation.validate()?;
+        text(&observed.generation, "schema_generation.generation")?;
+        if observed.observation.observed_at != self.state_fence {
+            return Err(EcxfError::InconsistentBoundary);
+        }
+        Ok(observed)
+    }
+
+    /// Returns the declared reachability, refusing a fence whose live set no
+    /// source store observed.
+    ///
+    /// The same boundary comparison as [`Self::observed_schema_generation`]
+    /// applies: a reachable set read at a different moment is not the live set of
+    /// the boundary this fence claims. An empty set inside an observation stays
+    /// representable — that is a store statement that nothing is reachable — and
+    /// only an absent observation is refused.
+    fn observed_blob_reachability(&self) -> Result<&BlobReachabilityObservation, EcxfError> {
+        let Some(observed) = self.blob_reachability_manifest.as_ref() else {
+            return Err(EcxfError::UnobservedSourceMember {
+                member: "blob_reachability_manifest",
+            });
+        };
+        observed.observation.validate()?;
+        if observed.observation.observed_at != self.state_fence {
+            return Err(EcxfError::InconsistentBoundary);
+        }
+        for entry in &observed.residency_key_digests {
+            digest(entry, "blob_reachability_manifest.value")?;
+        }
+        unique(
+            observed.residency_key_digests.iter().cloned(),
+            "blob_reachability_manifest",
+        )?;
+        Ok(observed)
+    }
+
     pub fn validate(&self) -> Result<(), EcxfError> {
         text(&self.export_id, "export_id")?;
-        text(&self.schema_generation, "schema_generation")?;
         text(&self.store_generation, "store_generation")?;
         self.state_fence
             .validate()
@@ -174,6 +302,12 @@ impl ExportFence {
             return Err(EcxfError::InconsistentBoundary);
         }
         self.event_range.validate()?;
+        // The two fence values that need a source (issue #1871, A2). Each is
+        // refused when absent, so neither can be satisfied by a shape-only value
+        // nobody observed, and each is refused when it was read at a boundary
+        // other than the one this fence claims.
+        self.observed_schema_generation()?;
+        self.observed_blob_reachability()?;
         unique(
             self.revision_heads.iter().map(|head| head.key.clone()),
             "revision_heads",
@@ -196,13 +330,6 @@ impl ExportFence {
                 return Err(EcxfError::InconsistentBoundary);
             }
         }
-        for entry in &self.blob_reachability_manifest {
-            digest(entry, "blob_reachability_manifest.value")?;
-        }
-        unique(
-            self.blob_reachability_manifest.iter().cloned(),
-            "blob_reachability_manifest",
-        )?;
         Ok(())
     }
 }
@@ -680,6 +807,24 @@ impl EcxfManifest {
         if self.scope_id != self.export_fence.scope_id {
             return Err(EcxfError::InconsistentBoundary);
         }
+        // Issue #1871, A2: the fence's schema generation and blob reachability are
+        // carried as observations (see [`SourceObservation`]), so each names the
+        // source that read it. This manifest names the store adapter the package
+        // came from. Those are two recorded positions that can disagree, and this
+        // is the comparing consumer `schema_generation` had none of while it was a
+        // bare string: a fence that credits one observer under a manifest header
+        // naming another is refused. It runs on the emitted manifest alone, so it
+        // holds on import, where no source store is present.
+        if let Some(generation) = &self.export_fence.schema_generation
+            && generation.observation.observed_by != self.source_adapter
+        {
+            return Err(EcxfError::InconsistentBoundary);
+        }
+        if let Some(reachability) = &self.export_fence.blob_reachability_manifest
+            && reachability.observation.observed_by != self.source_adapter
+        {
+            return Err(EcxfError::InconsistentBoundary);
+        }
         for (name, checksum) in &self.checksums {
             text(name, "checksums.name")?;
             digest(checksum, "checksums.value")?;
@@ -818,12 +963,33 @@ pub struct EcxfExportInput {
     pub privacy_purge_ledger: Vec<PurgeLedgerEntry>,
 }
 
-/// Compares the fence reachability set with the exported residency keys
+/// Compares the fence's declared reachability with the exported residency keys
 /// (issue #1871, D1: both sides are residency-keyed, so equal bytes in two
 /// domains stay two distinct reachable objects per I05-13).
+///
+/// # WHY THE DECLARED SIDE CARRIES A PROVENANCE (issue #1871, A2)
+///
+/// This check used to read a bare `Vec<String>` from the fence, so its two sides
+/// were two copies of one source: the fence's set was filled from the same view
+/// as the delivered blobs, and a fence declaring nothing matched a package
+/// delivering nothing. Such a check can never detect a missing source — it is the
+/// self-shadow the exporter's own module warns about when it compares a declared
+/// range against its own record list instead of the store's rows.
+///
+/// The declared side is therefore an observation, not a list.
+/// [`ExportFence::observed_blob_reachability`] refuses a fence that carries none
+/// at all, so "nobody said" is a typed refusal rather than an empty set that
+/// matches an empty package. What remains is representable and different: a
+/// store that observed an empty live set declares an empty list *inside* an
+/// observation naming the source and the boundary, and that declaration is then
+/// compared with the delivered blobs exactly as before.
+///
+/// An empty set on its own is therefore never enough to pass here, and nothing
+/// in this path invents a default that would make an absent source pass.
 fn check_reachability(export_fence: &ExportFence, blobs: &[EcxfBlob]) -> Result<(), EcxfError> {
     let expected: BTreeSet<_> = export_fence
-        .blob_reachability_manifest
+        .observed_blob_reachability()?
+        .residency_key_digests
         .iter()
         .cloned()
         .collect();
@@ -1480,19 +1646,22 @@ pub fn import_ecxf_package(
             residency: residency.clone(),
         });
     }
-    // The export fence's reachability set and the manifest's projected
+    // The export fence's declared reachability and the manifest's projected
     // residency set are recorded by different steps of the export; a
     // disagreement means one of them lost a reachable blob. This is a
     // coherence check between two recorded sets, not the completeness check
     // above, which compares a recorded set against the actual member bytes.
-    if recorded_reachability
-        != manifest
-            .export_fence
-            .blob_reachability_manifest
-            .iter()
-            .cloned()
-            .collect()
-    {
+    // The declared side is read through the fence's own accessor, so a fence
+    // that carries no observation is a typed refusal here too rather than an
+    // empty set that happens to match an empty residency list.
+    let declared_reachability: BTreeSet<String> = manifest
+        .export_fence
+        .observed_blob_reachability()?
+        .residency_key_digests
+        .iter()
+        .cloned()
+        .collect();
+    if recorded_reachability != declared_reachability {
         return Err(EcxfError::InconsistentBoundary);
     }
 

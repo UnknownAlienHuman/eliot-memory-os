@@ -35,6 +35,14 @@ use eliot_protocol::{
     RequestIdentity,
 };
 
+/// Projects one owner-issued non-`Resolved` denial detail through the
+/// generated `BRIDGE_DENIAL_PROJECTION` table instead of a hand-maintained
+/// per-code triple: the detail variant selects the canonical catalogue key
+/// (the same keying the in-crate `OpenAgentBridgeActivationDisposition`
+/// consumer uses), and the reason, closed disposition, and typed directive
+/// all come from that row. A `Resolved` detail is never a denial; an unknown
+/// catalogue key or vocabulary member fails closed (`None`, surfaced as
+/// `SessionFenced` by the caller) rather than emitting a stale triple.
 fn canonical_activation_denial(
     detail: &AgentActivationResolutionDisposition,
 ) -> Option<(
@@ -42,40 +50,58 @@ fn canonical_activation_denial(
     AgentResponseDisposition,
     AgentActivationDirectiveKind,
 )> {
-    let (code, disposition, directive) = match detail {
+    let canonical = match detail {
         AgentActivationResolutionDisposition::Resolved { .. } => return None,
-        AgentActivationResolutionDisposition::TaskSelectionRequired { .. } => (
-            "TASK_SELECTION_REQUIRED",
-            AgentResponseDisposition::InvalidRequest,
-            AgentActivationDirectiveKind::CandidateRecoveryNoAutoSelection,
-        ),
-        AgentActivationResolutionDisposition::ScopeSelectionRequired { .. } => (
-            "TASK_SCOPE_INCOMPATIBLE",
-            AgentResponseDisposition::InvalidRequest,
-            AgentActivationDirectiveKind::CandidateRecoveryNoAutoSelection,
-        ),
-        AgentActivationResolutionDisposition::ScopeAmbiguous { .. } => (
-            "AMBIGUOUS_RESULT",
-            AgentResponseDisposition::StaleOrConflict,
-            AgentActivationDirectiveKind::CandidateRecoveryNoAutoSelection,
-        ),
-        AgentActivationResolutionDisposition::NotReady { .. } => (
-            "DEFERRED_CAPACITY",
-            AgentResponseDisposition::UnavailableOrCapacity,
-            AgentActivationDirectiveKind::RetryRequiresNewTicket,
-        ),
-        AgentActivationResolutionDisposition::StaleFence { .. } => (
-            "STALE_STATE_FENCE",
-            AgentResponseDisposition::StaleOrConflict,
-            AgentActivationDirectiveKind::StaleFenceFailClosed,
-        ),
-        AgentActivationResolutionDisposition::FailedInternal { .. } => (
-            "RUNTIME_FAILED",
-            AgentResponseDisposition::Failed,
-            AgentActivationDirectiveKind::FailureCapsule,
-        ),
+        AgentActivationResolutionDisposition::TaskSelectionRequired { .. } => {
+            "TASK_SELECTION_REQUIRED"
+        }
+        AgentActivationResolutionDisposition::ScopeSelectionRequired { .. } => {
+            "TASK_SCOPE_INCOMPATIBLE"
+        }
+        AgentActivationResolutionDisposition::ScopeAmbiguous { .. } => "AMBIGUOUS_RESULT",
+        AgentActivationResolutionDisposition::NotReady { .. } => "DEFERRED_CAPACITY",
+        AgentActivationResolutionDisposition::StaleFence { .. } => "STALE_STATE_FENCE",
+        AgentActivationResolutionDisposition::FailedInternal { .. } => "RUNTIME_FAILED",
     };
-    eliot_protocol::agent_reason_code(code).map(|entry| (entry.code, disposition, directive))
+    let row = eliot_protocol::canonical_denial_projection(canonical)?;
+    let code = eliot_protocol::agent_reason_code(row.canonical).map(|entry| entry.code)?;
+    Some((
+        code,
+        disposition_from_projection(row.disposition)?,
+        directive_from_projection(row.directive)?,
+    ))
+}
+
+/// Parses one closed I7.20 disposition vocabulary member from its generated
+/// projection wire value. This parses the vocabulary itself, not denial
+/// codes: any current or future table row carrying a valid member resolves
+/// without a code change, and an unknown member fails closed.
+fn disposition_from_projection(value: &str) -> Option<AgentResponseDisposition> {
+    match value {
+        "INVALID_REQUEST" => Some(AgentResponseDisposition::InvalidRequest),
+        "DENIED" => Some(AgentResponseDisposition::Denied),
+        "STALE_OR_CONFLICT" => Some(AgentResponseDisposition::StaleOrConflict),
+        "NEEDS_EVIDENCE" => Some(AgentResponseDisposition::NeedsEvidence),
+        "UNAVAILABLE_OR_CAPACITY" => Some(AgentResponseDisposition::UnavailableOrCapacity),
+        "RECOVERY_REQUIRED" => Some(AgentResponseDisposition::RecoveryRequired),
+        "FAILED" => Some(AgentResponseDisposition::Failed),
+        _ => None,
+    }
+}
+
+/// Parses one closed typed directive kind from its generated projection wire
+/// value. Vocabulary parser, not a denial-code table: unknown values fail
+/// closed.
+fn directive_from_projection(value: &str) -> Option<AgentActivationDirectiveKind> {
+    match value {
+        "candidate-recovery-no-auto-selection" => {
+            Some(AgentActivationDirectiveKind::CandidateRecoveryNoAutoSelection)
+        }
+        "retry-requires-new-ticket" => Some(AgentActivationDirectiveKind::RetryRequiresNewTicket),
+        "stale-fence-fail-closed" => Some(AgentActivationDirectiveKind::StaleFenceFailClosed),
+        "failure-capsule" => Some(AgentActivationDirectiveKind::FailureCapsule),
+        _ => None,
+    }
 }
 
 fn observe_bridge(event: &'static str, outcome: &'static str) {

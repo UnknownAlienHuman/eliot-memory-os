@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+mod destination_manifest_evidence;
 mod ecxf_export;
 mod isolated_restore;
 mod owner_adapters;
@@ -35,6 +36,10 @@ mod restore_journal_admission;
 mod restore_runner;
 mod watchdog_spool_restore;
 
+pub use destination_manifest_evidence::{
+    DestinationAdmissionOperation, DestinationManifestAdmission, DurableDestinationRecord,
+    RestoreDestinationAdmissionOwner,
+};
 pub use ecxf_export::{
     CoherentSourceExport, EcxfExportReport, EcxfExportRequest, EcxfSourceStore, SealedBlobEntry,
     WRITE_RECEIPT_RECORD_TYPE, export_ecxf_package,
@@ -4349,3 +4354,10 @@ mod backup_verify_tests_948 {
         ));
     }
 }
+
+// Issue #2569 item 2: the kernel `ExportFence`'s refusal vocabulary for the
+// interchange-fence projection. Re-exported here (rather than folded into the
+// `ecxf_export` group above) so the append shifts no frozen serde-boundary
+// inventory anchor in this file; see
+// `crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml`.
+pub use ecxf_export::FenceBridgeRefusal;

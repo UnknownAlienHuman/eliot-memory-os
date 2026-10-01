@@ -6065,6 +6065,87 @@ impl AgentBridgeCore {
         ))
     }
 
+    /// Records a first truncated delivery on one evaluated tool-exposure
+    /// receipt from the attach-scoped truncation measurement (issue #1945,
+    /// I7.24).
+    ///
+    /// The admission skeleton arrives from its owner and is never minted
+    /// here; the delivery evidence (produced digest recomputed over the
+    /// exact full result bytes bound to the retained handle, exact inline
+    /// preview with its own digest and byte count) is measured by this
+    /// seam against the retained handle. The recorded receipt keeps
+    /// `transport_completed` as `Some(true)` with `result_delivery` as
+    /// `TRUNCATED`, so it never satisfies complete-evidence or verifier
+    /// requirements. Observable use and the terminal outcome reference stay
+    /// unrecorded for their owners, and the token observation stays
+    /// explicitly unavailable: no tokenizer runs on the hot-view path. The
+    /// per-evaluation join that supplies the skeleton and retains the
+    /// receipt is the STITCH caller. The boxed error keeps the large
+    /// `BridgeError` off the return without collapsing typed failures.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed [`BridgeError`] when the bridge is not attached, the
+    /// view is not truncated, the presented bytes do not bind the retained
+    /// handle, or the resulting receipt is inconsistent.
+    pub fn record_truncated_tool_delivery(
+        &self,
+        receipt: eliot_receipts::ToolExposureReceiptV2,
+        view: &HotResourceView,
+        full_result_bytes: &[u8],
+    ) -> Result<eliot_receipts::ToolExposureReceiptV2, Box<BridgeError>> {
+        self.require_attached()?;
+        if !view.is_truncated() {
+            return Err(Box::new(BridgeError::InvalidContract {
+                field: "receipt.result_delivery",
+                reason: "a hot view that withheld nothing is never recorded as a truncated delivery",
+            }));
+        }
+        let produced_digest = mcp_correlation::sha256_hex(full_result_bytes);
+        if produced_digest != view.handle().digest() {
+            return Err(Box::new(BridgeError::InvalidContract {
+                field: "receipt.produced_result.result_digest",
+                reason: "retained handle does not bind the presented result bytes",
+            }));
+        }
+        let preview = view.preview();
+        let byte_count = u64::try_from(preview.len()).map_err(|_| {
+            Box::new(BridgeError::InvalidContract {
+                field: "receipt.delivered_representation.byte_count",
+                reason: "delivered byte count exceeds the addressable bound",
+            })
+        })?;
+        let handle_uri = view.handle().uri().as_str().to_owned();
+        receipt
+            .record_truncated_delivery(
+                eliot_receipts::tool_exposure::ProducedToolResultIdentity {
+                    result_digest: produced_digest,
+                    artifact_ref: None,
+                    source_handle: Some(handle_uri.clone()),
+                },
+                eliot_receipts::tool_exposure::DeliveredToolRepresentation {
+                    representation_digest: mcp_correlation::sha256_hex(preview),
+                    source_handle: handle_uri,
+                    byte_count,
+                    token_observation: eliot_receipts::TokenCountObservation::Unavailable {
+                        reason: eliot_receipts::TokenCountUnavailableReason::MeasurementUnavailable,
+                    },
+                    prior_delivery_receipt_id: None,
+                },
+            )
+            .map_err(|error| {
+                Box::new(match error {
+                    eliot_receipts::ToolExposureError::InvalidField { field, reason } => {
+                        BridgeError::InvalidContract { field, reason }
+                    }
+                    _ => BridgeError::InvalidContract {
+                        field: "receipt.result_delivery",
+                        reason: "truncated delivery fact failed its owner validation",
+                    },
+                })
+            })
+    }
+
     /// Number of immutable snapshots retained in the attach-scoped resource
     /// projection. The registry is cleared on every new attach, so this
     /// count describes only the live attach.

@@ -2403,8 +2403,13 @@ fn handle_stop(runner: &BridgeRunner) -> Response {
 /// Pre-activation reports `not-attached`. An attached row marks the retained
 /// binding current only after the live Heartbeat/Health exchange succeeds;
 /// failure remains an explicit unknown Kernel status while preserving the
-/// local attach facts for recovery. Exact-pair rehydration remains a separate
-/// open port-composition contour; a replacement connection always requires a
+/// local attach facts for recovery. The event/gap forwarder is additionally
+/// reported ready only after an exact real host operation settles through
+/// the host-request client (an admitted invoke/cancel reply, an
+/// owner-resolved durable winner, or an exact reconcile-probe success): the
+/// Health exchange alone creates no operation identity and never advertises
+/// forwarding readiness. Exact-pair rehydration remains a separate open
+/// port-composition contour; a replacement connection always requires a
 /// new admission.
 fn status_response(
     profile: Profile,
@@ -2432,6 +2437,15 @@ fn status_response(
             resources: None,
         },
         Some(view) => {
+            // Forwarding readiness observes probe history, never the Health
+            // exchange alone: the Health probe creates no operation identity,
+            // so `true` here means an exact real host operation has settled
+            // (issue #77 W8). Read before the binding probe so the mutable
+            // client borrow below stays sequential.
+            let operation_probe_settled = match client.as_ref() {
+                Some(client) => client.has_settled_host_operation(),
+                None => false,
+            };
             let probe = match client {
                 Some(client) => client.check_kernel_binding(),
                 None => Err(PortFailure::TransportBindingRejected {
@@ -2447,11 +2461,17 @@ fn status_response(
                 Ok(()) => (
                     "kernel-binding-current: live Kernel Health probe succeeded; session-bound dispatch joins the admitted Kernel session",
                     None,
-                    "live Kernel binding confirmed; reconnect with the current connection, session, generation, epoch, and fence nonce; stale targets fail closed; a replacement connection requires a new admission".to_owned(),
+                    if operation_probe_settled {
+                        "live Kernel binding confirmed; reconnect with the current connection, session, generation, epoch, and fence nonce; stale targets fail closed; a replacement connection requires a new admission".to_owned()
+                    } else {
+                        "live Kernel binding confirmed; forwarding readiness is not advertised until one exact host invoke/cancel operation settles; dispatch one host operation, then re-read Status; stale targets fail closed; a replacement connection requires a new admission".to_owned()
+                    },
                     if view.reconciliation_required() {
                         "reconciliation-required: ordinary event and gap forwarding remains gated until recovery completes"
-                    } else {
+                    } else if operation_probe_settled {
                         "admitted: live Kernel binding and composed event/gap forwarder are ready; acceptance does not claim Governor normalization or application"
+                    } else {
+                        "not-probed: live Kernel binding is current but no exact real host operation has settled yet; forwarding readiness is not advertised until one exact invoke/cancel probe succeeds"
                     },
                 ),
                 Err(error) => (
@@ -3102,6 +3122,7 @@ fn run_mcp_front_door(
                 if let Err(error) = eliot_agent_bridge::mcp_correlation::observe_mcp_emission(
                     runner,
                     &request,
+                    &response,
                     request.get("method").and_then(Value::as_str).unwrap_or(""),
                     None,
                     observed,
@@ -3773,6 +3794,43 @@ fn handle_mcp_initialize(
     };
     if let Err(error) = runner.attach(AttachRequest::managed(demand, connection)) {
         *provider_failure |= matches!(error, BridgeError::PlanGap(_));
+        // Issue #66 W5/A8: a typed activation denial must reach the MCP
+        // surface with its I7.20 legs intact (disposition, exact reason_code,
+        // directive, operation identity, and the owner-issued
+        // candidate/recovery detail). `bridge_error` already projects
+        // `ActivationDenied` onto the existing `Response::ActivationDenied`
+        // shape that the private `op` loop serializes losslessly; the MCP
+        // envelope carries that same content in `data` instead of collapsing
+        // it to the generic BRIDGE_REQUEST_REJECTED pair below. No new
+        // mapping is computed here: code, reason, disposition, directive, and
+        // detail come straight from that existing projection, and the
+        // operation identity from the denial report it was built from.
+        if let Response::ActivationDenied {
+            code,
+            reason_code,
+            disposition,
+            directive_kind,
+            detail,
+        } = bridge_error(&error)
+        {
+            let operation = match &error {
+                BridgeError::ActivationDenied(report) => Some(report.operation().to_owned()),
+                _ => None,
+            };
+            return render_error(
+                Some(id),
+                WIRE_INTERNAL_ERROR,
+                "attach was refused",
+                serde_json::json!({
+                    "code": code,
+                    "reason_code": reason_code,
+                    "disposition": disposition,
+                    "directive_kind": directive_kind,
+                    "operation": operation,
+                    "detail": detail,
+                }),
+            );
+        }
         let (code, message) = bridge_error_code(&error);
         return render_error(
             Some(id),

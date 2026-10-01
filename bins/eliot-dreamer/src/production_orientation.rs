@@ -116,7 +116,7 @@ use eliot_context_candidates::{
 };
 use eliot_context_contracts::{
     AdmittedContextSet, CanonicalProjectionSet, ContextError, ContextRecipe, QualityScorecard,
-    SerializedContextMeasurement,
+    ResolvedContextRecipe, SerializedContextMeasurement,
 };
 use eliot_contracts::StateFence;
 use eliot_cue_activation::ActivationProfile;
@@ -279,6 +279,13 @@ pub struct OrientationSupply<'a> {
     pub admitted_context_set: &'a AdmittedContextSet,
     /// Recipe the admitted set must satisfy (understanding stage).
     pub recipe: &'a ContextRecipe,
+    /// APPROVED revision the understanding stage executes under (#1724).
+    ///
+    /// The caller owns this resolution. No production caller constructs this
+    /// supply yet, so nothing here supplies, derives or defaults the value: the
+    /// field is present so the route that eventually does construct it must
+    /// name where the approved revision comes from.
+    pub approved: &'a ResolvedContextRecipe,
     /// Quality scorecard bound to the admitted binding (understanding stage).
     pub quality: &'a QualityScorecard,
     /// Caller-owned immutable assembly parameters (understanding stage).
@@ -414,6 +421,7 @@ pub(crate) fn resolve_production_inputs<'a>(
         understanding: UnderstandingStage {
             admitted: supply.admitted_context_set,
             recipe: supply.recipe,
+            approved: supply.approved,
             quality: supply.quality.clone(),
             policy: supply.assembly_policy,
             measure: supply.measure,

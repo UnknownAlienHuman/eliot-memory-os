@@ -13,6 +13,7 @@ mod error;
 mod journal;
 mod legacy;
 mod model;
+mod model_preferences;
 mod reactive_context;
 mod redb_journal;
 mod redb_store;
@@ -52,6 +53,12 @@ pub use model::{
     RecoveryLineageReason, ServiceSafetyClass, StoreRebindRecord, StoreRebindState,
     WakeCancellationBatchEntry, WakeCancellationBatchRecord, WakeDisposition, WakeRecord,
     host_owner_epoch_digest,
+};
+pub use model_preferences::{
+    MAX_MODEL_PREFERENCE_DOCUMENT_BYTES, MODEL_PREFERENCE_ENVELOPE_VERSION,
+    MODEL_PREFERENCE_STORE_MAGIC, ModelPreferenceCasOutcome, ModelPreferencePublication,
+    ModelPreferencePublicationReceipt, ModelPreferenceStore, ModelPreferenceStoreError,
+    PreferenceCasExpected, StoredModelPreferenceEnvelope,
 };
 pub use reactive_context::{
     DEFAULT_REACTIVE_CONTEXT_MAX_ATTEMPT_ITEMS, DEFAULT_REACTIVE_CONTEXT_MAX_BYTES,

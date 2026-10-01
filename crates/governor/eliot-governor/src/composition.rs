@@ -4901,6 +4901,24 @@ impl<P: KernelDurableJobPort + ?Sized> GovernorOwners<P> {
             } else {
                 authority_snapshot
             };
+        // W6 (#1142): this is the SYNCHRONOUS Kernel recovery composition,
+        // and it is where a restore rehydrates the authority owner on the
+        // daemon's live recovery path. It holds no CURRENT durable
+        // revocation history: `recover_from_kernel` reads owner records
+        // through the sync `KernelRecoveryPort`, while the only durable
+        // revocation ledger is served by the async `GetAuthorityRevocationHistory`
+        // named read that `owner_closure_feed::synchronize_owner_feed`
+        // drives. So the constructor below is the fail-closed one: it
+        // restores the genesis authority owner and REFUSES any payload
+        // carrying grant lineage or effect authorizations, instead of
+        // reinstating a snapshot's own `revoked` list as if it were
+        // current. Restoring authority that could have been revoked since
+        // the backup is a revocation that never happened, and "this route
+        // could not read the ledger" is not "nothing was revoked." The
+        // non-empty owner is restored through
+        // `AuthorityOwner::from_snapshot_with_revocation_history`, which
+        // re-derives every closure against the current committed history
+        // before any grant becomes effective.
         let authority = AuthorityOwner::from_snapshot(&authority_snapshot, state_fence)?;
         let budget_read_revision = recovery.owner_read(RecoveryOwner::Budget)?.revision;
         let budget_snapshot: BudgetOwnerSnapshot =
@@ -7198,6 +7216,110 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         )
     }
 
+    /// Admits one Kernel-side change observation transfer into the live
+    /// Governor change-monitor owner (issue #1824, I10.21 AUD7).
+    ///
+    /// This is the Governor head of the Kernel-to-Governor observation
+    /// bridge: the transfer carries the hint, the previously admitted
+    /// original, two independent direct content reads, and the read-only
+    /// Git receipts, and admission runs the existing
+    /// [`ChangeMonitor::confirm_kernel_readback`](eliot_change_monitor::ChangeMonitor::confirm_kernel_readback)
+    /// owner path with its validators, so a failed transfer stays a pending
+    /// hint and governed acceptance stays blocked (fail-closed). The daemon
+    /// bridge that builds the transfer from Kernel evidence is the remaining
+    /// caller.
+    ///
+    /// Live-state hydration only: [`Self::refresh_from_kernel`] rebuilds
+    /// every owner from the Store named-read snapshot, so transfers admitted
+    /// here persist across restart only once the snapshot write-back leg
+    /// persists [`ChangeMonitor::snapshot`](eliot_change_monitor::ChangeMonitor::snapshot)
+    /// through a Store owner mutation (no such mutation exists yet; the
+    /// Store record still carries the genesis default).
+    pub fn ingest_kernel_change_transfer(
+        &mut self,
+        transfer: &eliot_change_monitor::KernelHintReadback,
+    ) -> Result<eliot_change_monitor::ChangeHintConfirmation, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        self.owners
+            .change_monitor
+            .confirm_kernel_readback(transfer)
+            .map_err(|error| {
+                CompositionError::Recovery(format!(
+                    "governor change-monitor transfer refused: {error}"
+                ))
+            })
+    }
+
+    /// Resolves one anchored-review item's current location against the
+    /// live Governor change-monitor owner and returns the published
+    /// evidence-bearing observation (issue #1823 W3; resolver from issue
+    /// #1824, I10.21 AUD6).
+    ///
+    /// This is the production review caller: the item resolves exclusively
+    /// through `EvolvingAnchorResolver::resolve_anchored_review`, never
+    /// through a parallel scheme. Candidates are constructed from the
+    /// owner's own admitted after-states for the item's original target
+    /// through
+    /// [`AnchorCandidate::from_admitted_after_state`](eliot_change_monitor::AnchorCandidate::from_admitted_after_state),
+    /// in snapshot insertion order, with caller-supplied extra candidates
+    /// (VCS/content/code-intelligence adapters own that discovery)
+    /// appended; the resolution itself runs the existing deterministic
+    /// order over the live snapshot. The returned observation records the
+    /// item's seven-status result (`exact`/`moved`/`modified`/`ambiguous`/
+    /// `stale`/`deleted`/`unavailable`) with the algorithm version, every
+    /// input, the matching evidence tier, and confidence, and is
+    /// serializable through the contract identity schema set. `ambiguous`
+    /// stays explicit with no chosen target, `deleted` stays historically
+    /// addressable through admitted deletion evidence, and no status is
+    /// ever auto-attached or refused silently here: attachment stays with
+    /// the anchored-review route through
+    /// `AnchoredReviewItem::validate_resolution`, which I10.18 forbids from
+    /// creating a second store. The daemon review trigger that supplies the
+    /// review item and persists the returned observation next to the review
+    /// it justifies is the remaining caller.
+    pub fn resolve_anchored_review(
+        &self,
+        item: &eliot_change_monitor::AnchoredReviewItem,
+        extra_candidates: &[eliot_change_monitor::AnchorCandidate],
+    ) -> Result<eliot_change_monitor::AnchorResolutionObservation, CompositionError> {
+        let snapshot = self.owners.change_monitor.snapshot();
+        let mut candidates = Vec::new();
+        for record in &snapshot.observations {
+            let Some(after) = record.observation.after.as_ref() else {
+                continue;
+            };
+            if after.resource_ref != item.original_target.target.id.as_str() {
+                continue;
+            }
+            let candidate = eliot_change_monitor::AnchorCandidate::from_admitted_after_state(
+                &item.original_target,
+                after,
+                None,
+                false,
+            )
+            .map_err(|error| {
+                CompositionError::Recovery(format!(
+                    "governor anchor candidate refused admitted state: {error}"
+                ))
+            })?;
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        }
+        for candidate in extra_candidates {
+            if !candidates.contains(candidate) {
+                candidates.push(candidate.clone());
+            }
+        }
+        eliot_change_monitor::EvolvingAnchorResolver
+            .resolve_anchored_review(item, &candidates, &snapshot)
+            .map_err(|error| {
+                CompositionError::Recovery(format!("governor anchor resolution refused: {error}"))
+            })
+    }
+
     /// Returns the terminal product-proof record this composition's
     /// ProductProof/FinishService acceptance owner builds for the parked
     /// Windows acceptance item (issue #1903).
@@ -9277,7 +9399,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         Ok((lease, surface))
     }
 
-    fn cold_start_readiness_terminal_for_claim(
+    pub(crate) fn cold_start_readiness_terminal_for_claim(
         &self,
         claim: &ColdStartReadinessClaim,
         now: u64,

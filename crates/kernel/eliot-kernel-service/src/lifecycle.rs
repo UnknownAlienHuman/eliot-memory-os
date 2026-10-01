@@ -1947,7 +1947,7 @@ impl KernelService {
                     "durable claim cannot reproduce its receipt identity".to_owned(),
                 )
             })?;
-            return Ok(NativeWorkerClaimResponse::Admitted(receipt));
+            return Ok(NativeWorkerClaimResponse::Admitted(Box::new(receipt)));
         }
         // A durable `Requested` row with our exact binding means either our
         // own fresh intent or an interrupted earlier admit that never issued
@@ -1993,14 +1993,14 @@ impl KernelService {
                     )
                 })?;
                 let receipt = native_worker_claim_receipt(request, admitted_at)?;
-                return Ok(NativeWorkerClaimResponse::Admitted(receipt));
+                return Ok(NativeWorkerClaimResponse::Admitted(Box::new(receipt)));
             }
             Err(error) => return Err(native_worker_claim_store_error(&error)),
         }
         receipt.validate().map_err(|_| {
             KernelServiceError::Platform("issued admission receipt is not well-formed".to_owned())
         })?;
-        Ok(NativeWorkerClaimResponse::Admitted(receipt))
+        Ok(NativeWorkerClaimResponse::Admitted(Box::new(receipt)))
     }
 
     /// Reconciles an unknown claim-admission delivery without admitting again.
@@ -2271,7 +2271,7 @@ impl KernelService {
                     "durable claim cannot reproduce its receipt identity".to_owned(),
                 )
             })?;
-            return Ok(NativeWorkerClaimResponse::Admitted(receipt));
+            return Ok(NativeWorkerClaimResponse::Admitted(Box::new(receipt)));
         }
         if durable.state != NativeWorkerClaimState::Admitted {
             return Ok(rejected(
@@ -2296,7 +2296,7 @@ impl KernelService {
                 "durable claim cannot reproduce its receipt identity".to_owned(),
             )
         })?;
-        Ok(NativeWorkerClaimResponse::Admitted(receipt))
+        Ok(NativeWorkerClaimResponse::Admitted(Box::new(receipt)))
     }
 
     fn transition(&mut self, next: KernelServiceState) -> Result<(), KernelServiceError> {

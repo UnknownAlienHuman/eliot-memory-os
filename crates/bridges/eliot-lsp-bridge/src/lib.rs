@@ -26,14 +26,26 @@
 
 #![forbid(unsafe_code)]
 
+mod generation;
+mod removal;
 mod scip_cache;
 
+pub use generation::{
+    ActiveGeneration, AdmittedLine, CanaryVerdict, GenerationError, InFlightLedger,
+    StagedGeneration, shadow_admits,
+};
+pub use removal::{
+    BridgeStatusProjection, ObservedHealth, OperationStatusRow, OwnedSidecar, RemovalError,
+    RemovalPhase, RemovalPlan, RemovalReceipt, RevocationKind, RevocationRecord,
+};
 pub use scip_cache::{
     CachedProjection, CachedScipItems, ScipIndexerProvenance, ScipProjectionCache,
 };
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use eliot_evidence::{
     AbsenceVerdict, EvidenceCoverage, EvidenceFreshness, UnknownOutcome,
@@ -1624,6 +1636,176 @@ pub fn lsp_application_obligations() -> LspApplicationObligations {
     }
 }
 
+/// Revision of the versioned lsp-bridge declaration schema.
+///
+/// Stamped into every [`LspBridgeDeclaration`] and every staged and admitted
+/// generation. A declaration-schema change mints a new revision; generations
+/// staged under another revision are refused as updates, never reinterpreted.
+pub const LSP_DECLARATION_REVISION: u64 = 1;
+
+/// Reports whether a caller-attested upstream artifact digest is well shaped:
+/// exactly 64 hexadecimal characters (SHA-256 hex).
+pub(crate) fn is_artifact_digest(value: &str) -> bool {
+    value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Versioned, artifact-bound bridge declaration for the analyzer application.
+///
+/// This is the A1 declaration for the lsp bridge: the I10.13 obligations
+/// above plus the exact bound artifact (route executable, caller-observed
+/// upstream identity line, caller-attested upstream artifact digest) under one
+/// declaration revision, with a binding digest over the whole. The snapshot
+/// of admitted operations comes from [`lsp_application_obligations`], so the
+/// declaration and the generation staged from it cannot drift apart. Unknown
+/// required metadata stays a refusal (typed error), never a qualification
+/// silently absorbed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LspBridgeDeclaration {
+    revision: u64,
+    route_executable: String,
+    upstream_version_line: String,
+    upstream_artifact_digest: String,
+    admitted_operations: Vec<String>,
+    binding_digest: String,
+}
+
+impl LspBridgeDeclaration {
+    /// Admits a declaration for one caller-observed upstream artifact.
+    ///
+    /// Records the observed `rust-analyzer --version` identity line (in its
+    /// parser-validated form) and the attested artifact digest; installs and
+    /// probes nothing. The admitted-operation snapshot is taken from
+    /// [`lsp_application_obligations`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GenerationError::BlankField`] on a blank identity line or
+    /// digest, [`GenerationError::ArtifactDigestShape`] on a malformed
+    /// digest, or [`GenerationError::UpstreamIdentity`] when the line is not
+    /// an exact analyzer version line. No authority, operation identity, or
+    /// task decision is created.
+    pub fn admit(
+        upstream_version_line: impl Into<String>,
+        upstream_artifact_digest: impl Into<String>,
+    ) -> Result<Self, GenerationError> {
+        let upstream_version_line = upstream_version_line.into();
+        let upstream_artifact_digest = upstream_artifact_digest.into();
+        if upstream_version_line.trim().is_empty() {
+            return Err(GenerationError::BlankField {
+                field: "upstream_version_line",
+            });
+        }
+        if upstream_artifact_digest.trim().is_empty() {
+            return Err(GenerationError::BlankField {
+                field: "upstream_artifact_digest",
+            });
+        }
+        if !is_artifact_digest(&upstream_artifact_digest) {
+            return Err(GenerationError::ArtifactDigestShape {
+                detail: "upstream_artifact_digest must be 64 hexadecimal characters".to_owned(),
+            });
+        }
+        let upstream_version_line = parse_version_output(upstream_version_line.as_bytes())
+            .map_err(|error| GenerationError::UpstreamIdentity {
+                detail: error.to_string(),
+            })?;
+        let obligations = lsp_application_obligations();
+        let admitted_operations: Vec<String> = obligations
+            .supported_operations
+            .iter()
+            .map(|operation| (*operation).to_owned())
+            .collect();
+        let binding_digest = Self::compute_binding_digest(
+            LSP_DECLARATION_REVISION,
+            RUST_ANALYZER_EXECUTABLE,
+            &upstream_version_line,
+            &upstream_artifact_digest,
+            &admitted_operations,
+        );
+        Ok(Self {
+            revision: LSP_DECLARATION_REVISION,
+            route_executable: RUST_ANALYZER_EXECUTABLE.to_owned(),
+            upstream_version_line,
+            upstream_artifact_digest,
+            admitted_operations,
+            binding_digest,
+        })
+    }
+
+    /// Computes the binding digest over one declaration snapshot.
+    ///
+    /// The encoding is fixed (`revision`, route, upstream identity line,
+    /// artifact digest, admitted operations in declaration order), so the
+    /// digest binds the exact contract the loader and the gate recheck.
+    fn compute_binding_digest(
+        revision: u64,
+        route_executable: &str,
+        upstream_version_line: &str,
+        upstream_artifact_digest: &str,
+        admitted_operations: &[String],
+    ) -> String {
+        let mut canonical = format!(
+            "lsp-bridge-declaration\nrevision: {revision}\nroute: {route_executable}\n\
+             upstream-version-line: {upstream_version_line}\nupstream-artifact-digest: {upstream_artifact_digest}\n\
+             operations:\n"
+        );
+        for operation in admitted_operations {
+            canonical.push_str(operation);
+            canonical.push('\n');
+        }
+        hex_bytes(Sha256::digest(canonical.as_bytes()).as_slice())
+    }
+
+    /// Recomputes the binding digest and reports whether it still covers
+    /// this declaration exactly.
+    #[must_use]
+    pub fn binding_verifies(&self) -> bool {
+        Self::compute_binding_digest(
+            self.revision,
+            &self.route_executable,
+            &self.upstream_version_line,
+            &self.upstream_artifact_digest,
+            &self.admitted_operations,
+        ) == self.binding_digest
+    }
+
+    /// Returns the declaration schema revision.
+    #[must_use]
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Returns the bound route executable.
+    #[must_use]
+    pub fn route_executable(&self) -> &str {
+        &self.route_executable
+    }
+
+    /// Returns the parser-validated upstream identity line.
+    #[must_use]
+    pub fn upstream_version_line(&self) -> &str {
+        &self.upstream_version_line
+    }
+
+    /// Returns the caller-attested upstream artifact digest.
+    #[must_use]
+    pub fn upstream_artifact_digest(&self) -> &str {
+        &self.upstream_artifact_digest
+    }
+
+    /// Returns the admitted operation snapshot bound to this declaration.
+    #[must_use]
+    pub fn admitted_operations(&self) -> &[String] {
+        &self.admitted_operations
+    }
+
+    /// Returns the binding digest over this declaration snapshot.
+    #[must_use]
+    pub fn binding_digest(&self) -> &str {
+        &self.binding_digest
+    }
+}
+
 /// Reports whether `executable` names the admitted analyzer route.
 ///
 /// Explicit pinning (`C:/tools/rust-analyzer.exe`, `./rust-analyzer`) is
@@ -1742,12 +1924,138 @@ fn gate_lsp_call(
 /// no CodeCortex-private execution path around it.
 pub struct LspBridge<E> {
     executor: Arc<E>,
+    stitch: Mutex<StitchState>,
+}
+
+/// Dispatch-held stitch state for the generation/removal sequence.
+///
+/// The bridge never stages generations or attests canaries itself: staged
+/// values come from [`lsp_application_obligations`] through
+/// [`LspBridge::stage_generation`] or [`LspBridge::load_admitted`] with a
+/// caller-observed upstream identity line and a caller-attested artifact
+/// digest, and the canary-gated switch stays with the composition owner
+/// holding the [`AdmittedLine`]. What dispatch owns is fence consultation,
+/// exact-identity in-flight tracking across the launch/reconcile boundary
+/// (a launch notes the operation identity with its admitted first-argv
+/// token; reconcile settles it and feeds the observed exit), and
+/// receipt-exit evidence — recorded here under one lock that is never held
+/// across an executor call. A poisoned lock fails the call that still needs
+/// the state; paths whose outcome is already decided settle best-effort
+/// instead.
+#[derive(Debug, Default)]
+struct StitchState {
+    removal: RemovalPlan,
+    ledger: InFlightLedger,
+    pending_tokens: BTreeMap<String, String>,
+    per_operation_exits: BTreeMap<String, i32>,
+    last_exit: Option<i32>,
 }
 
 impl<E> LspBridge<E> {
     /// Creates a bridge over the supplied process implementation.
     pub fn new(executor: Arc<E>) -> Self {
-        Self { executor }
+        Self {
+            executor,
+            stitch: Mutex::new(StitchState::default()),
+        }
+    }
+
+    /// Stages one generation candidate bound to this bridge's declaration.
+    ///
+    /// The admitted-operation snapshot comes from
+    /// [`lsp_application_obligations`], so the declaration and the staged
+    /// generation cannot drift apart. The upstream identity line is the
+    /// caller-observed `rust-analyzer --version` output, validated through
+    /// the original identity parser, and `upstream_artifact_digest` is the
+    /// caller-attested digest of the bound artifact (64 hexadecimal
+    /// characters): staging records both and never installs
+    /// anything. The route is the default analyzer executable; an explicitly
+    /// pinned route is staged directly by the composition owner holding the
+    /// [`AdmittedLine`], as is the canary-gated switch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GenerationError::BlankField`] on a blank identity line or
+    /// digest, [`GenerationError::ArtifactDigestShape`] on a malformed
+    /// digest, or [`GenerationError::UpstreamIdentity`] when the line is not
+    /// an exact analyzer version line.
+    pub fn stage_generation(
+        upstream_version_line: &str,
+        upstream_artifact_digest: &str,
+    ) -> Result<StagedGeneration, GenerationError> {
+        let obligations = lsp_application_obligations();
+        StagedGeneration::stage(
+            RUST_ANALYZER_EXECUTABLE,
+            upstream_version_line,
+            upstream_artifact_digest,
+            obligations.supported_operations,
+        )
+    }
+
+    /// Loads the admitted generation line from a versioned declaration.
+    ///
+    /// This is the artifact-bound loader for the lsp bridge: it consumes the
+    /// presented [`LspBridgeDeclaration`], refuses revision, route, digest,
+    /// or operation-set drift against the live bridge declaration with a
+    /// typed error, and only then admits the initial generation. The
+    /// canary-gated switch to a later generation stays with the composition
+    /// owner holding the returned [`AdmittedLine`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GenerationError::RouteMismatch`] when the declaration names
+    /// another route, [`GenerationError::OperationsMismatch`] on revision or
+    /// operation-set drift, [`GenerationError::ArtifactDigestShape`] on a
+    /// malformed digest, [`GenerationError::UpstreamIdentity`] on an
+    /// unrecognized identity line, or [`GenerationError::BlankField`] on a
+    /// blank input. Nothing is admitted on these paths.
+    pub fn load_admitted(
+        declaration: &LspBridgeDeclaration,
+    ) -> Result<AdmittedLine, GenerationError> {
+        if declaration.route_executable() != RUST_ANALYZER_EXECUTABLE {
+            return Err(GenerationError::RouteMismatch {
+                staged: declaration.route_executable().to_owned(),
+                admitted: RUST_ANALYZER_EXECUTABLE.to_owned(),
+            });
+        }
+        if declaration.revision() != LSP_DECLARATION_REVISION {
+            return Err(GenerationError::OperationsMismatch {
+                detail: format!(
+                    "presented declaration revision {} does not match bridge revision {}",
+                    declaration.revision(),
+                    LSP_DECLARATION_REVISION
+                ),
+            });
+        }
+        if !declaration.binding_verifies() {
+            return Err(GenerationError::OperationsMismatch {
+                detail: "presented declaration binding digest does not cover its snapshot"
+                    .to_owned(),
+            });
+        }
+        let obligations = lsp_application_obligations();
+        let live: Vec<String> = obligations
+            .supported_operations
+            .iter()
+            .map(|operation| (*operation).to_owned())
+            .collect();
+        if declaration.admitted_operations() != live.as_slice() {
+            return Err(GenerationError::OperationsMismatch {
+                detail: format!(
+                    "presented declaration admits {} operations, bridge admits {}",
+                    declaration.admitted_operations().len(),
+                    live.len()
+                ),
+            });
+        }
+        let admitted: Vec<&str> = live.iter().map(String::as_str).collect();
+        let staged = StagedGeneration::stage(
+            declaration.route_executable(),
+            declaration.upstream_version_line(),
+            declaration.upstream_artifact_digest(),
+            &admitted,
+        )?;
+        Ok(AdmittedLine::admit_initial(staged))
     }
 }
 
@@ -1769,15 +2077,26 @@ impl<E: ProcessExecutor + 'static> LspBridge<E> {
         if !command.matches_request(&request) {
             return Err(BridgeError::CommandMismatch);
         }
+        let Some(first) = command.arguments.first() else {
+            return Err(BridgeError::OperationNotAdmitted {
+                operation: "<empty argv>".to_owned(),
+            });
+        };
         let operation_id = request.operation_id().clone();
+        let identity = operation_id.as_str().to_owned();
+        self.note_launched(&identity, first)?;
         let request_digest = request.invocation_digest().to_owned();
         let generation = request.generation().get();
-        let receipt = self.executor.start(request, sink).await.map_err(|error| {
-            BridgeError::ProcessLaunch {
-                invocation: command.describe(),
-                error,
+        let receipt = match self.executor.start(request, sink).await {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                self.settle_unstarted(&identity);
+                return Err(BridgeError::ProcessLaunch {
+                    invocation: command.describe(),
+                    error,
+                });
             }
-        })?;
+        };
         if receipt.operation_id() != &operation_id
             || receipt.request_digest() != request_digest
             || receipt.accepted_generation().get() != generation
@@ -1810,8 +2129,141 @@ impl<E: ProcessExecutor + 'static> LspBridge<E> {
     }
 
     /// Reconciles durable process evidence without inventing analyzer output.
+    ///
+    /// Settling is exact-identity: the operation noted at launch is settled
+    /// here and its observed exit feeds the per-operation evidence. An
+    /// identity this bridge never launched (or already reconciled) still
+    /// returns its evidence unmodified — evidence readback repeats under the
+    /// same identity, but only this bridge's own launches attribute exits.
     pub async fn reconcile(&self, operation: &OperationId) -> Result<ProcessEvidence, BridgeError> {
-        Ok(self.executor.reconcile(operation.clone()).await?)
+        let evidence = self.executor.reconcile(operation.clone()).await?;
+        self.settle_reconciled(operation.as_str(), &evidence);
+        Ok(evidence)
+    }
+
+    /// Refuses fenced launches and notes one exact operation identity with
+    /// its admitted first-argv token.
+    ///
+    /// Runs after the call gate and the request match, before the executor
+    /// start, so refused calls are never noted and noted calls always reach
+    /// the executor. The token lets [`LspBridge::reconcile`] attribute the
+    /// observed exit to the admitted operation that produced it.
+    fn note_launched(&self, identity: &str, token: &str) -> Result<(), BridgeError> {
+        let mut stitch = self.stitch.lock().map_err(|_| {
+            BridgeError::Process(ProcessExecutionError::Unavailable(
+                "bridge stitch state lock poisoned".to_owned(),
+            ))
+        })?;
+        if stitch.removal.blocks_new_calls() {
+            return Err(BridgeError::RemovalFenced);
+        }
+        stitch.ledger.note_dispatched(identity);
+        stitch
+            .pending_tokens
+            .insert(identity.to_owned(), token.to_owned());
+        Ok(())
+    }
+
+    /// Settles one noted launch whose executor start never completed.
+    ///
+    /// Best-effort: the start was refused atomically, so nothing was
+    /// dispatched and there is nothing to reconcile. The pending token goes
+    /// back with the identity; a later reconcile under the same identity
+    /// still returns its evidence unmodified, only without exit attribution.
+    fn settle_unstarted(&self, identity: &str) {
+        let Ok(mut stitch) = self.stitch.lock() else {
+            return;
+        };
+        stitch.pending_tokens.remove(identity);
+        let _ = stitch.ledger.note_settled(identity);
+    }
+
+    /// Settles one launched identity against its reconciled evidence,
+    /// feeding the observed exit into the per-operation evidence.
+    ///
+    /// Only launches this bridge noted attribute exits: an identity with no
+    /// pending token is either already reconciled or belongs to another
+    /// bridge sharing the executor, so its evidence is returned untouched
+    /// and nothing is recorded. Exit recording itself is total — an evidence
+    /// without an observed exit code leaves the previous evidence in place.
+    fn settle_reconciled(&self, identity: &str, evidence: &ProcessEvidence) {
+        let Ok(mut stitch) = self.stitch.lock() else {
+            return;
+        };
+        let Some(token) = stitch.pending_tokens.remove(identity) else {
+            return;
+        };
+        let _ = stitch.ledger.note_settled(identity);
+        if let Some(code) = Self::exit_code(evidence) {
+            stitch.per_operation_exits.insert(token, code);
+            stitch.last_exit = Some(code);
+        }
+    }
+
+    /// Fences new launches for removal.
+    ///
+    /// Held by the composition owner: dispatch consults
+    /// [`RemovalPlan::blocks_new_calls`] on every launch and refuses fenced
+    /// launches with [`BridgeError::RemovalFenced`] before any process
+    /// starts. Draining, owner revocation, and artifact release stay with
+    /// the owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BridgeError::Removal`] when the plan is already fenced, or
+    /// [`BridgeError::Process`] when the stitch lock is poisoned.
+    pub fn fence_new_calls(&self) -> Result<(), BridgeError> {
+        self.stitch
+            .lock()
+            .map_err(|_| {
+                BridgeError::Process(ProcessExecutionError::Unavailable(
+                    "bridge stitch state lock poisoned".to_owned(),
+                ))
+            })?
+            .removal
+            .fence_new_calls()?;
+        Ok(())
+    }
+
+    /// Projects declared-versus-observed status against the owner's line.
+    ///
+    /// The declaration side comes from the caller-held [`AdmittedLine`], and
+    /// the presented [`LspBridgeDeclaration`] must bind that live generation
+    /// (revision, route, identity line, artifact digest, and operation set);
+    /// the evidence side (overall and per-operation exits) is dispatch's own
+    /// reconciled evidence recorded on this bridge. Operations with no
+    /// observed exit stay explicitly unknown instead of inheriting bridge
+    /// health.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BridgeError::Declaration`] when the presented declaration
+    /// does not bind the live generation, or [`BridgeError::Process`] when
+    /// the stitch lock is poisoned.
+    pub fn status_against(
+        &self,
+        line: &AdmittedLine,
+        declaration: &LspBridgeDeclaration,
+    ) -> Result<BridgeStatusProjection, BridgeError> {
+        line.check_bound(
+            declaration.revision(),
+            declaration.route_executable(),
+            declaration.upstream_version_line(),
+            declaration.upstream_artifact_digest(),
+            declaration.admitted_operations(),
+        )
+        .map_err(BridgeError::Declaration)?;
+        let stitch = self.stitch.lock().map_err(|_| {
+            BridgeError::Process(ProcessExecutionError::Unavailable(
+                "bridge stitch state lock poisoned".to_owned(),
+            ))
+        })?;
+        Ok(BridgeStatusProjection::project(
+            line.current(),
+            line.retained(),
+            ObservedHealth::from_last_exit(stitch.last_exit),
+            &stitch.per_operation_exits,
+        ))
     }
 
     /// Returns captured stdout preview bytes, or an empty slice when the
@@ -1948,6 +2400,16 @@ pub enum BridgeError {
     /// Shared process layer failed.
     #[error(transparent)]
     Process(#[from] ProcessExecutionError),
+    /// Removal fenced new launches: dispatch refused before any process ran.
+    #[error("bridge fenced for removal: new launches refused")]
+    RemovalFenced,
+    /// A presented bridge declaration does not bind the live generation:
+    /// admission or status was refused before any process ran.
+    #[error("declaration does not bind the bridge: {0}")]
+    Declaration(GenerationError),
+    /// A removal-plan step refused the call.
+    #[error(transparent)]
+    Removal(#[from] RemovalError),
 }
 
 impl From<eliot_instrument_scip::ScipError> for BridgeError {

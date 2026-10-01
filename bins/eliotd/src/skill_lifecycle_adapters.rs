@@ -583,19 +583,26 @@ impl<T> ForwardingSkillLifecycle<T> {
 
     /// Reconciles installed entries against the live canonical tool source,
     /// marking changed bases and drifted versions stale (issue #1882,
-    /// `I7.13`).
+    /// `I7.13`; issue #1944 A3 for the semantic-profile leg).
     ///
     /// Production startup/refresh driver: the caller supplies the live
     /// tool-owner source plus alias table (hook-built in production), and
-    /// every installed entry is checked twice — declared `body.tool_refs`
-    /// must still resolve through the versioned projection, and the entry's
-    /// recorded admitted version must still equal the live bound version.
-    /// Either drift marks the entry stale with its reason, so entries
-    /// installed under an older registry cannot stay generally deliverable
-    /// without a display call ever reaching them. Quarantined entries are
-    /// left untouched; already-stale entries report no change. Returns the
-    /// count of newly staled entries. Synchronous: each guard is taken and
-    /// dropped in a closed scope and never crosses an await.
+    /// every installed entry is checked three ways — declared
+    /// `body.tool_refs` must still resolve through the versioned projection,
+    /// the entry's recorded admitted definition version must still equal the
+    /// live bound version, and every referenced tool's live semantic-profile
+    /// version must still equal the profile version the entry was admitted
+    /// under (pinned at versioned admit time by
+    /// `eliot_skill::canonical_tools::record_semantic_profile_admission`).
+    /// Any drift marks the entry stale with its reason, so entries installed
+    /// under an older registry or an older semantic profile cannot stay
+    /// generally deliverable without a display call ever reaching them. A
+    /// pure semantic-profile version change — definition version untouched —
+    /// therefore withholds the entry before Material reuse exactly like a
+    /// definition move does. Quarantined entries are left untouched;
+    /// already-stale entries report no change. Returns the count of newly
+    /// staled entries. Synchronous: each guard is taken and dropped in a
+    /// closed scope and never crosses an await.
     pub(crate) fn reconcile_tool_basis(
         &self,
         source: &dyn CanonicalToolSource,
@@ -616,13 +623,20 @@ impl<T> ForwardingSkillLifecycle<T> {
                             .iter()
                             .any(|name| !tools.knows_tool(name))
                             || entry.admitted_definition_version != live
+                            || !Self::profile_drifted_tools(
+                                skill_id,
+                                &entry.body.tool_refs,
+                                source,
+                                aliases,
+                            )
+                            .is_empty()
                     })
                 })
                 .collect()
         };
         let mut marked = 0_usize;
         for skill_id in &stale_ids {
-            let (missing, drifted, entry_admitted) = {
+            let (missing, drifted, entry_admitted, profile_drifted) = {
                 let catalogue = self.lock_catalogue();
                 let Some(entry) = catalogue.get(skill_id) else {
                     continue;
@@ -641,11 +655,24 @@ impl<T> ForwardingSkillLifecycle<T> {
                     missing,
                     entry.admitted_definition_version != live,
                     entry.admitted_definition_version.clone(),
+                    Self::profile_drifted_tools(skill_id, &entry.body.tool_refs, source, aliases),
                 )
             };
             let mut catalogue = self.lock_catalogue();
             let newly_stale = if missing.is_empty() {
-                drifted && catalogue.mark_definition_drift_stale(skill_id, live, &entry_admitted)?
+                if drifted {
+                    catalogue.mark_definition_drift_stale(skill_id, live, &entry_admitted)?
+                } else if profile_drifted.is_empty() {
+                    false
+                } else {
+                    // Semantic-profile drift reuses the tool-basis mark path:
+                    // the admitted (tool, profile_version) basis no longer
+                    // matches the live canonical view, so the named tools
+                    // mark the entry stale exactly like a changed tool basis.
+                    // The entry stays catalogued under `Stale` — never
+                    // deleted — until reinstall re-pins it.
+                    catalogue.mark_tool_basis_stale(skill_id, &profile_drifted)?
+                }
             } else {
                 catalogue.mark_tool_basis_stale(skill_id, &missing)?
             };
@@ -654,6 +681,40 @@ impl<T> ForwardingSkillLifecycle<T> {
             }
         }
         Ok(marked)
+    }
+
+    /// Collects one entry's declared tools whose live semantic-profile
+    /// version no longer equals the version the entry was admitted under
+    /// (issue #1944 A3).
+    ///
+    /// Each declared ref resolves through the alias table to its canonical
+    /// name first — the same resolution the admit-time pin uses — then the
+    /// live profile version from the tool-owner source is compared against
+    /// the admit-time record. Any difference is drift: a moved profile
+    /// version, a live version appearing where no admission was ever
+    /// recorded, or a recorded admission the live source no longer reports.
+    /// The comparison is plain string inequality — the same "any version
+    /// edit is a semantic change" rule the Tool Definition owner enforces in
+    /// `invalidation_on_profile_change` — applied here through the existing
+    /// stale machinery rather than a second invalidation record. This helper
+    /// only reports drift; the caller marks stale, never deleting.
+    fn profile_drifted_tools(
+        skill_id: &str,
+        tool_refs: &[String],
+        source: &dyn CanonicalToolSource,
+        aliases: &ToolAliasTable,
+    ) -> Vec<String> {
+        tool_refs
+            .iter()
+            .filter(|name| {
+                let canonical = aliases.resolve(name);
+                source.semantic_profile_version(canonical)
+                    != eliot_skill::canonical_tools::admitted_semantic_profile_version(
+                        skill_id, canonical,
+                    )
+            })
+            .cloned()
+            .collect()
     }
 
     /// Binds the runtime receiver's ack to its exact receipt, then displays.

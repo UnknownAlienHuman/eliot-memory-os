@@ -2658,12 +2658,20 @@ async fn publish_maintenance_source_results(
             // The summary states only what coverage is, never what utility is: a
             // fully covered set means every declared result observation is
             // admitted, not that the maintained subsystem improved.
+            //
+            // The two counts are deliberately not the same unit and are labelled
+            // apart: `declared_jobs` is how many identities the owner's records
+            // declared, while `observed_results`/`outstanding_results` count
+            // source results. One declared job can owe several observations — a
+            // failure, an unknown outcome, a reconciliation and a completion are
+            // each one — so the result counts may exceed the job count, and
+            // reporting the job count beside them would understate what is owed.
             tracing::info!(
                 target: "eliotd::diagnostics",
                 event = "eliotd.maintenance_outcome_observation_coverage",
-                declared = expected.len(),
-                observed = coverage.observed.len(),
-                outstanding = coverage.outstanding.len(),
+                declared_jobs = expected.len(),
+                observed_results = coverage.observed.len(),
+                outstanding_results = coverage.outstanding.len(),
                 complete = coverage.is_complete(),
             );
             for outstanding in coverage.outstanding {
@@ -3453,31 +3461,52 @@ fn resolve_valid_ticket(
                 ticket.ticket_id
             )
         })?;
-    let mut cold_start_discovery =
-        if result.resolved_binding().is_some() && ticket.workspace_selector.is_some() {
-            Some(
-                eliotd::task_binding_admission::observe_cold_start_discovery(
-                    &ticket,
-                    &ticket.state_fence,
-                    now.max(1),
-                )
-                .map_err(|error| {
+    // The I4.4.1 trigger fires per cold-start event, not per Resolved
+    // activation: every disposition that names a trigger event carries its
+    // Host discovery forward when the ticket names an explicit workspace
+    // selector. The agent-facing question still attaches only to Resolved
+    // results (the protocol forbids it on negative dispositions); the other
+    // events reach the agent through their own disposition payloads and reach
+    // the operator through the trigger surface emitted after acceptance.
+    let mut cold_start_discovery = if classify_cold_start_trigger(&result.disposition, false)
+        .is_some()
+        && ticket.workspace_selector.is_some()
+    {
+        let observed = eliotd::task_binding_admission::observe_cold_start_discovery(
+            &ticket,
+            &ticket.state_fence,
+            now.max(1),
+        );
+        match (result.resolved_binding().is_some(), observed) {
+            (true, Ok(observed)) => Some(observed),
+            (true, Err(error)) => {
+                return Err(format!(
+                    "daemon activation discovery ticket {}: {error}",
+                    ticket.ticket_id
+                ));
+            }
+            // A negative disposition carries no agent question, so a failed
+            // Host observation only skips its trigger: the disposition itself
+            // still travels to the agent with its own recovery payload.
+            (false, Ok(observed)) => Some(observed),
+            (false, Err(_)) => None,
+        }
+    } else {
+        None
+    };
+    let result = if result.resolved_binding().is_some() {
+        if let Some(observed) = cold_start_discovery.as_mut() {
+            DaemonComposition::attach_cold_start_question(result, observed, None).map_err(
+                |error| {
                     format!(
-                        "daemon activation discovery ticket {}: {error}",
+                        "daemon activation cold-start question ticket {}: {error}",
                         ticket.ticket_id
                     )
-                })?,
-            )
+                },
+            )?
         } else {
-            None
-        };
-    let result = if let Some(observed) = cold_start_discovery.as_mut() {
-        DaemonComposition::attach_cold_start_question(result, observed, None).map_err(|error| {
-            format!(
-                "daemon activation cold-start question ticket {}: {error}",
-                ticket.ticket_id
-            )
-        })?
+            result
+        }
     } else {
         result
     };
@@ -4046,20 +4075,28 @@ async fn run_owner_feed_sync(
 }
 
 /// Reports the durable grant-closure second phases that are still pending
-/// (#686).
+/// (#686) and tenders every owner-admitted resume handoff.
 ///
 /// This is the production driver for
 /// [`eliotd::authority_revocation_ingress`]. It is deliberately separate from
-/// the owner-feed restore above and runs after it, so the closure read can
+/// the owner-feed restore above and runs after it on every pass — including
+/// the first pass after a restart — so the closure read can
 /// never delay, reorder, or fail a restore that is already proven correct: a
 /// degraded ingress pass only emits a bounded diagnostic on this stream's
 /// existing failure guard and the next tick retries it, exactly like the
 /// owner-feed pass itself. The ingress never gates readiness and never fails
 /// the daemon.
 ///
-/// Pending second phases are a real durable obligation that nothing in the
-/// shipped daemon can currently finish, so they are reported with the exact
-/// missing owner named rather than left implied by an absence.
+/// Restart contract (issue #2100 item 7): this driver scans the whole bounded
+/// candidate denominator through the owner re-admission path before any
+/// affected descendant or introduction can regain effect authority downstream
+/// of the restored feed. An exhausted denominator stays
+/// pending/recovery-required — an owner-refused row is never reported as
+/// complete — and only an owner-admitted row carries authority forward to the
+/// Governor second-phase-only resume entry.
+///
+/// Pending second phases are a real durable obligation, so they are reported
+/// with the exact remaining gap named rather than left implied by an absence.
 async fn report_authority_revocation_ingress(
     kernel: &Arc<DaemonKernelClient>,
     composition: SharedComposition,
@@ -4075,6 +4112,8 @@ async fn report_authority_revocation_ingress(
     };
     match report {
         Ok(report) => {
+            let admitted = report.admitted_revocations().len();
+            let refused = report.refused_second_phase();
             for pending in report.pending_second_phase() {
                 tracing::warn!(
                     target: "eliotd::diagnostics",
@@ -4091,6 +4130,16 @@ async fn report_authority_revocation_ingress(
                     grant_graph_revision = report.revision(),
                     candidates_examined = report.candidates_examined(),
                     committed_closures = report.committed_closures(),
+                    admitted_second_phase = admitted,
+                    refused_second_phase = refused,
+                    admission = if pending.admission.is_admitted() {
+                        "admitted"
+                    } else {
+                        "refused"
+                    },
+                    admission_reason = pending.admission.refusal_reason().unwrap_or(
+                        "owner re-admitted the exact committed operation",
+                    ),
                     resume_blocked = pending.resume_blocked,
                 );
             }
@@ -7123,7 +7172,9 @@ async fn dispatch_agent_activation_result(
                 &kernel,
                 Arc::clone(&composition),
                 ticket,
+                &result,
                 cold_start_discovery,
+                false,
             )
             .await;
             Ok(())
@@ -7164,7 +7215,9 @@ async fn dispatch_agent_activation_result(
                 &kernel,
                 Arc::clone(&composition),
                 ticket,
+                &result,
                 cold_start_discovery,
+                true,
             )
             .await;
             Ok(())
@@ -7172,17 +7225,184 @@ async fn dispatch_agent_activation_result(
     }
 }
 
+/// Names the I4.4.1 cold-start event one activation resolution is (issue
+/// #1790 W3-trigger, daemon trigger owner).
+///
+/// The mapping uses only the live resolution the daemon already holds: a
+/// stale fence is the observed stale scope generation; a scope the resolver
+/// cannot select for an explicit workspace is the unknown-workspace event; a
+/// task-selection hold on the lost-acknowledgement reconcile path is resume
+/// without a current task; every other attach/launch outcome is the
+/// attach/launch event. `resumed` is true only on the accepted reconciliation
+/// of a possibly-lost acknowledgement (the reconnect resume) and false on the
+/// direct-accept path. `NotReady` (Kernel-owned retry) and `FailedInternal`
+/// name no I4.4.1 event and yield `None`: no trigger fires for them.
+///
+/// Assumption (docs silent): `ScopeSelectionRequired` maps to
+/// `UnknownWorkspace` — the resolver's unbound-scope signal for an explicit
+/// workspace is this driver's only live unknown-workspace evidence, and
+/// whether it is the *first* such event is not established here; the
+/// downstream single-flight join coalesces repeats. `ScopeAmbiguous` keeps
+/// `AttachOrLaunch`: ambiguity is a downstream lease state, not a trigger
+/// kind. `FirstProjectOpen` (first UI project open) and `OnboardingRequest`
+/// (explicit intake) have no producer in this driver: the daemon observes no
+/// UI-open signal and no explicit onboarding intake (STITCH: UI/bridge
+/// first-open transport; explicit intake transport for `TaskIntakeCandidate`
+/// promotion).
+fn classify_cold_start_trigger(
+    disposition: &AgentActivationResolutionDisposition,
+    resumed: bool,
+) -> Option<eliot_workscope::ColdStartTrigger> {
+    match disposition {
+        AgentActivationResolutionDisposition::StaleFence { .. } => {
+            Some(eliot_workscope::ColdStartTrigger::StaleGeneration)
+        }
+        AgentActivationResolutionDisposition::ScopeSelectionRequired { .. } => {
+            Some(eliot_workscope::ColdStartTrigger::UnknownWorkspace)
+        }
+        AgentActivationResolutionDisposition::TaskSelectionRequired { .. } if resumed => {
+            Some(eliot_workscope::ColdStartTrigger::ResumeWithoutTask)
+        }
+        AgentActivationResolutionDisposition::NotReady { .. }
+        | AgentActivationResolutionDisposition::FailedInternal { .. } => None,
+        _ => Some(eliot_workscope::ColdStartTrigger::AttachOrLaunch),
+    }
+}
+
+/// Readiness surface of one accepted I4.4.1 trigger (issue #1790 W6-surface).
+///
+/// This is the daemon trigger owner's projection of the live trigger
+/// outcome, not the durable terminal receipt: readiness is the I4.4.1
+/// lifecycle token the trigger reached (`SCANNING` once the controller's
+/// scanner pass ran, `UNSEEN` when the trigger was refused before the
+/// scanner), and the smallest missing question is the scanner's own
+/// discriminative question verbatim. No lease is minted and no receipt is
+/// compiled here.
+struct ColdStartTriggerSurface {
+    trigger: eliot_workscope::ColdStartTrigger,
+    readiness: &'static str,
+    question_code: Option<String>,
+    smallest_missing_question: Option<String>,
+    scan_receipt_ref: Option<String>,
+    refusal: Option<String>,
+}
+
+/// Projects one accepted trigger's scanner outcome onto its readiness
+/// surface. A privacy-boundary hold keeps the scanner's discriminative
+/// question; a completed scan keeps its durable receipt reference; a refused
+/// trigger keeps the refusal and stays `UNSEEN`.
+fn project_cold_start_trigger_surface(
+    trigger: eliot_workscope::ColdStartTrigger,
+    outcome: &Result<eliot_workscope::BootstrapScanOutcome, String>,
+) -> ColdStartTriggerSurface {
+    match outcome {
+        Ok(eliot_workscope::BootstrapScanOutcome::PrivacyBoundaryRequired {
+            code,
+            discriminative_question,
+        }) => ColdStartTriggerSurface {
+            trigger,
+            readiness: "SCANNING",
+            question_code: Some(code.clone()),
+            smallest_missing_question: Some(discriminative_question.clone()),
+            scan_receipt_ref: None,
+            refusal: None,
+        },
+        Ok(eliot_workscope::BootstrapScanOutcome::Completed { persisted, .. }) => {
+            ColdStartTriggerSurface {
+                trigger,
+                readiness: "SCANNING",
+                question_code: None,
+                smallest_missing_question: None,
+                scan_receipt_ref: Some(persisted.receipt_ref.clone()),
+                refusal: None,
+            }
+        }
+        Err(refusal) => ColdStartTriggerSurface {
+            trigger,
+            readiness: "UNSEEN",
+            question_code: None,
+            smallest_missing_question: None,
+            scan_receipt_ref: None,
+            refusal: Some(refusal.clone()),
+        },
+    }
+}
+
+/// Emits one accepted I4.4.1 trigger's readiness surface on the operator
+/// diagnostics channel (issue #1790 W6-surface, Human caller in the daemon
+/// trigger owner).
+///
+/// I4.4.1 requires the current readiness state to reach the agent and Human
+/// surface instead of staying buried in a setup log. The agent already
+/// receives the trigger's smallest missing question on its resolved
+/// activation result (`attach_cold_start_question` → `cold_start_question` →
+/// bridge agent responses); this emission is the operator/Human side: one
+/// structured `eliotd::diagnostics` record per accepted trigger carrying the
+/// trigger, the projected readiness token, and the smallest missing question
+/// (or the durable scan receipt, or the fail-closed refusal). The durable
+/// terminal receipt surface is NOT projected here:
+/// `DaemonComposition::read_cold_start_surface_for_attach` needs the
+/// Governor-built full lease/surface/claim tuple the attach ingress has not
+/// supplied (STITCH: attach-transport, `ScopeAttachIngress` carries no
+/// discovery or onboarding lease), and the bridge `note_owner_surface` intake
+/// needs the same terminal (STITCH: bridge-transport, `main.rs` bootstrap
+/// supply plus the #8 producer). Nothing here mints a lease, compiles a
+/// receipt, or extends a deadline.
+fn emit_cold_start_trigger_surface(ticket_id: &str, surface: &ColdStartTriggerSurface) {
+    let ticket = eliotd::diagnostics::sanitize_identity(ticket_id);
+    let smallest_missing_question = surface.smallest_missing_question.as_deref().unwrap_or("");
+    let question_code = surface.question_code.as_deref().unwrap_or("");
+    let scan_receipt = surface.scan_receipt_ref.as_deref().unwrap_or("");
+    let refusal = surface.refusal.as_deref().unwrap_or("");
+    if surface.refusal.is_some() {
+        tracing::warn!(
+            target: "eliotd::diagnostics",
+            event = "eliotd.cold_start_trigger_surface",
+            ticket = %ticket,
+            trigger = ?surface.trigger,
+            readiness = %surface.readiness,
+            smallest_missing_question = %smallest_missing_question,
+            question_code = %question_code,
+            scan_receipt = %scan_receipt,
+            refusal = %refusal,
+        );
+    } else {
+        tracing::info!(
+            target: "eliotd::diagnostics",
+            event = "eliotd.cold_start_trigger_surface",
+            ticket = %ticket,
+            trigger = ?surface.trigger,
+            readiness = %surface.readiness,
+            smallest_missing_question = %smallest_missing_question,
+            question_code = %question_code,
+            scan_receipt = %scan_receipt,
+            refusal = %refusal,
+        );
+    }
+}
+
 /// Runs the I4.4.1 trigger after either direct acceptance or an accepted
 /// reconciliation of a possibly-lost result acknowledgement. The exact Host
 /// lease/key/evidence stays attached to this resolved dispatch across both
-/// paths.
+/// paths, and the fired trigger is the one the live resolution names
+/// ([`classify_cold_start_trigger`]): the reconcile path resumes, so a
+/// task-selection hold there fires `ResumeWithoutTask`.
+///
+/// Every accepted trigger outcome is projected onto its readiness surface and
+/// emitted to the operator diagnostics channel; the scanner's smallest
+/// missing question is no longer dropped to an unstructured log.
 async fn trigger_accepted_cold_start(
     kernel: &Arc<DaemonKernelClient>,
     composition: SharedComposition,
     ticket: &AgentActivationResolutionTicket,
+    result: &AgentActivationResolutionResult,
     discovery: Option<eliotd::task_binding_admission::ColdStartDiscoveryInput>,
+    resumed: bool,
 ) {
     if let Some(discovery) = discovery {
+        let Some(trigger) = classify_cold_start_trigger(&result.disposition, resumed) else {
+            return;
+        };
         let kernel = Arc::clone(kernel);
         let ticket_id = ticket.ticket_id.clone();
         let worker_ticket = ticket.clone();
@@ -7229,7 +7449,13 @@ async fn trigger_accepted_cold_start(
             );
         }
         tokio::task::spawn_blocking(move || {
-            trigger_cold_start_controller(&kernel, &worker_ticket, discovery, contour_result)
+            trigger_cold_start_controller(
+                trigger,
+                &kernel,
+                &worker_ticket,
+                discovery,
+                contour_result,
+            )
         })
         .await
         .map_or_else(
@@ -7240,51 +7466,32 @@ async fn trigger_accepted_cold_start(
                     "accepted activation's I4.4.1 scanner trigger worker failed closed"
                 );
             },
-            |trigger_result| match trigger_result {
-                Err(refusal) => {
-                    tracing::warn!(
-                        ticket = %eliotd::diagnostics::sanitize_identity(&ticket_id),
-                        refusal = %refusal,
-                        "accepted activation's I4.4.1 scanner trigger refused"
-                    );
-                }
-                Ok(eliot_workscope::BootstrapScanOutcome::PrivacyBoundaryRequired {
-                    code, ..
-                }) => {
-                    tracing::info!(
-                        ticket = %eliotd::diagnostics::sanitize_identity(&ticket_id),
-                        question_code = %code,
-                        "accepted activation's I4.4.1 scanner retained its privacy question"
-                    );
-                }
-                Ok(eliot_workscope::BootstrapScanOutcome::Completed { persisted, .. }) => {
-                    tracing::info!(
-                        ticket = %eliotd::diagnostics::sanitize_identity(&ticket_id),
-                        scan_receipt = %persisted.receipt_ref,
-                        "accepted activation's I4.4.1 scanner retained its owner receipt"
-                    );
-                }
+            |trigger_result| {
+                let surface = project_cold_start_trigger_surface(trigger, &trigger_result);
+                emit_cold_start_trigger_surface(&ticket_id, &surface);
             },
         );
     }
 }
 
-/// Fires the I4.4.1 `AttachOrLaunch` trigger only after Kernel accepted the
-/// exact typed activation result. The same retained Host lease/evidence is
-/// passed to `ColdStartController`; no second filesystem observation or new
-/// lease is created. The accepted ticket now binds the authenticated readiness
-/// transport adapter to the installation contour. The current Host discovery
-/// still lacks admitted privacy-boundary and governing-source digest evidence,
-/// so it can deliver its typed smallest-question result but cannot construct a
-/// durable readiness claim, join a lease, or compile a terminal receipt.
+/// Fires one I4.4.1 trigger only after Kernel accepted the exact typed
+/// activation result. The caller names the trigger for its live event
+/// ([`classify_cold_start_trigger`]); the same retained Host lease/evidence
+/// is passed to `ColdStartController` and no second filesystem observation
+/// or new lease is created. The accepted ticket now binds the authenticated
+/// readiness transport adapter to the installation contour. The current Host
+/// discovery still lacks admitted privacy-boundary and governing-source
+/// digest evidence, so it can deliver its typed smallest-question result but
+/// cannot construct a durable readiness claim, join a lease, or compile a
+/// terminal receipt.
 fn trigger_cold_start_controller(
+    trigger: eliot_workscope::ColdStartTrigger,
     kernel: &Arc<DaemonKernelClient>,
     ticket: &AgentActivationResolutionTicket,
     mut discovery: eliotd::task_binding_admission::ColdStartDiscoveryInput,
     contour_result: Result<eliot_governor::InstallationScanContour, String>,
 ) -> Result<eliot_workscope::BootstrapScanOutcome, String> {
     let now = unix_ms(SystemTime::now())?;
-    let trigger = eliot_workscope::ColdStartTrigger::AttachOrLaunch;
     let controller_result = eliot_workscope::ColdStartController::check_discovery_with_scan(
         trigger,
         &discovery.lease,
@@ -7319,7 +7526,7 @@ fn trigger_cold_start_controller(
             .map(|read| format!("{read:?}"))
             .collect::<Vec<_>>();
         return Err(format!(
-            "I4.4.1 AttachOrLaunch refused before scanner: trigger discovery lease/evidence rejected by ColdStartController ({controller:?}); required reads missing from the lease or evidence: {missing_reads:?}; Kernel contour owner: {contour_status}; Kernel binding owner: {binding_status}",
+            "I4.4.1 {trigger:?} refused before scanner: trigger discovery lease/evidence rejected by ColdStartController ({controller:?}); required reads missing from the lease or evidence: {missing_reads:?}; Kernel contour owner: {contour_status}; Kernel binding owner: {binding_status}",
         ));
     }
 
@@ -7372,7 +7579,7 @@ fn trigger_cold_start_controller(
         discovery.discovery.governing_source_refs.clone(),
         now,
     )
-    .map_err(|error| format!("I4.4.1 AttachOrLaunch scanner failed closed: {error}"))
+    .map_err(|error| format!("I4.4.1 {trigger:?} scanner failed closed: {error}"))
 }
 
 /// Builds the lost-acknowledgement reconcile query from the single retained

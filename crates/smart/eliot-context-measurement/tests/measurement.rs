@@ -57,9 +57,6 @@ fn params(context: &ContextBinding) -> MeasurementParams {
     MeasurementParams {
         measurement_id: id("measurement"),
         context: context.clone(),
-        serializer_id: "fixture-serde-v1".to_owned(),
-        serializer_version: "1".to_owned(),
-        serializer_options_digest: digest(),
         route_id: "route".to_owned(),
         model_id: "model".to_owned(),
         capacity: capacity(),

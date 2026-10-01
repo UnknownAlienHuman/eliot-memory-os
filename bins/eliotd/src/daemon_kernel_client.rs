@@ -1658,6 +1658,15 @@ impl DaemonKernelClient {
         // #740 A2/A14: the span above renders nothing under the installed
         // subscriber, so the handshake state and the owning failure record
         // are real records emitted once per operation outcome beside it.
+        //
+        // Exactly ONE of the two fires per outcome, not both: the `Ok` arm
+        // emits the handshake record, the `Err` arm the owning failure record.
+        // The handshake record is reachable only under `#[cfg(windows)]`,
+        // because the `#[cfg(not(windows))]` arm below returns
+        // `KernelClientError::Unsupported` unconditionally and so can only ever
+        // produce the `Err` arm. This function has one call site,
+        // `daemon_runtime::run` in `daemon_runtime.rs`, which `main` calls at
+        // startup, so both arms are production-reached on the target platform.
         let outcome = (|| -> Result<Arc<Self>, super::DaemonError> {
             // #791 (W4/W17): one shutdown broadcast per client. The sending half
             // is retained so `request_shutdown` can publish; the receiving half is
@@ -2163,8 +2172,26 @@ impl DaemonKernelClient {
             }
         })();
         // #740 A14: owning error record at the readiness boundary, once per
-        // failed operation. The pre-admission retry inside stays silent; only
-        // the operation outcome records.
+        // failed operation.
+        //
+        // The pre-admission retry inside is NOT silent. `retry_pre_admission`
+        // loops on `report_ready_with_pre_admission_retry`, which reaches
+        // `receive_frame_or_shutdown`; that sibling emits a `KernelDisconnect`
+        // record of its own on `TransportError::Io` and
+        // `TransportError::UnknownOutcome`, per attempt rather than once per
+        // outcome. A retried pre-admission transport failure therefore records
+        // N disconnect records for the one readiness failure recorded here.
+        // The two are different records over different conditions and neither
+        // replaces the other.
+        //
+        // The error record below fires on every `Err` outcome. Under
+        // `#[cfg(not(windows))]` the closure's only arm returns
+        // `KernelClientError::Unsupported` unconditionally, so on a
+        // non-Windows build every call records that refusal; under
+        // `#[cfg(windows)]` the arm is the real exchange. This function has one
+        // call site, `daemon_runtime.rs`, inside a
+        // `core_readiness_prerequisites_satisfied()` guard, so it is
+        // production-reached.
         if let Err(error) = &outcome {
             let _ = crate::diagnostics::ErrorRecord::of_daemon_error(error).emit();
         }
@@ -2799,6 +2826,30 @@ impl DaemonKernelClient {
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
         let value = self
             .transact_async("local_read_result", serde_json::json!({ "result": body }))
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        parse_local_read_submit_outcome(&value).map_err(super::DaemonError::Kernel)
+    }
+
+    /// Submits one daemon-produced `eliot.state` result body for its waiting
+    /// host request (issue #2564).
+    ///
+    /// Deliberately a SEPARATE operation name from
+    /// [`Self::submit_local_read_result_async`]. Both travel the same transport
+    /// and the same persistence owner, but the Kernel binds each to the exact
+    /// carrier form the pair was retained under, so a state result can never
+    /// complete a query claim and a query result can never complete a state
+    /// claim. Routing a state result through the query operation would defeat
+    /// the form binding the carrier exists to enforce.
+    #[cfg(windows)]
+    pub async fn submit_local_state_result_async(
+        &self,
+        body: &HostRequestResultBody,
+    ) -> Result<LocalReadSubmitOutcome, super::DaemonError> {
+        body.validate()
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let value = self
+            .transact_async("local_state_result", serde_json::json!({ "result": body }))
             .await
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
         parse_local_read_submit_outcome(&value).map_err(super::DaemonError::Kernel)

@@ -100,6 +100,14 @@ impl GovernorStoreFailureProjection {
     /// conflicting identity. Request, fence, and idempotency pinning stay
     /// owned by the Kernel exchange and ORS retention and are not re-decided
     /// here.
+    ///
+    /// # Live status
+    ///
+    /// `caller: NONE`. There is no production caller: `git grep -n
+    /// from_failure_for_operation` returns only this definition. The live
+    /// projection is [`Self::from_failure`], which does not re-decide the
+    /// operation identity. Whether this operation-pinned constructor is wired
+    /// to a call site or retired is an owner decision.
     pub fn from_failure_for_operation(
         failure: &StoreFailure,
         operation_id: &OperationId,
@@ -220,6 +228,14 @@ impl GovernorStoreFailureProjection {
     ///
     /// A reconciling projection is neither unavailable, failed, absent, nor
     /// safe-to-retry.
+    ///
+    /// # Live status
+    ///
+    /// `caller: NONE`. There is no production caller: `git grep -n is_reconciling`
+    /// returns only this definition. The live consumers branch on
+    /// [`Self::requires_exact_operation_reconcile`] and
+    /// [`Self::may_retry_same_identity`] instead. Whether this predicate is
+    /// wired to a call site or retired is an owner decision.
     #[must_use]
     pub fn is_reconciling(&self) -> bool {
         self.failure.disposition == StoreFailureDisposition::UnknownOutcome
@@ -257,6 +273,12 @@ impl GovernorStoreFailureProjection {
     /// True only for the typed retryable directive. Unknown-outcome
     /// projections always report `false` here: they must reconcile first and
     /// are never safe-to-retry.
+    ///
+    /// # Live status
+    ///
+    /// `caller: NONE`. There is no production caller: `git grep -n
+    /// may_retry_same_identity` returns only this definition. Whether this
+    /// predicate is wired to a call site or retired is an owner decision.
     #[must_use]
     pub fn may_retry_same_identity(&self) -> bool {
         self.failure.retry_directive == StoreRetryDirective::RetrySameIdentityAfterBackoff
@@ -270,6 +292,14 @@ impl GovernorStoreFailureProjection {
     /// operation, an invalid envelope, or a receipt offered for a
     /// non-reconciling projection is rejected. This never fabricates a
     /// `Committed` outcome and never promotes task state.
+    ///
+    /// # Live status
+    ///
+    /// `caller: NONE`. There is no production caller: `git grep -n
+    /// verify_reconciled_receipt` returns only this definition. It is the only
+    /// consumer of [`Self::reconcile_operation_id`], which is in turn read
+    /// only here. Whether this verification seam is wired to a call site or
+    /// retired is an owner decision.
     pub fn verify_reconciled_receipt(
         &self,
         receipt: &WriteReceipt,

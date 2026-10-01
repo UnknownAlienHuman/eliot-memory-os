@@ -24,11 +24,25 @@
   },
   "source_token_estimate": {
     "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
-    "source_stu": 554953,
-    "test_stu": 106686,
+    "scope": "the selected decision workset of this cell",
+    "source_stu": 560563,
+    "test_stu": 101076,
     "selected_file_count": 89,
+    "physical_source_stu": 661639,
+    "physical_file_count": 89,
     "inline_cfg_test_modules": 10,
     "qualification": "planning estimate only; not a qualified Context Envelope (I2.16)"
+  },
+  "workset_allocation": {
+    "scope": "PACKAGE_WIDE",
+    "state": "EXPLICIT_PACKAGE_WIDE",
+    "declared_by": "[package.metadata.eliot].functional_cell_refs / functional_cell / module.toml|module_id, plus [package.metadata.eliot].functional_cell_source",
+    "rationale": "This package declares exactly one functional cell, so the complete package source is the cell's decision workset. That is a deliberate cohesive-unit choice, not an unresolved allocation (I2.20).",
+    "unresolved_reason": null,
+    "required_common_inputs": [
+      "crates/smart/eliot-dreamer-contracts/src/lib.rs"
+    ],
+    "observation": null
   },
   "selected_source_and_tests": {
     "selected_source": [
@@ -535,6 +549,13 @@
         "sha256": "820b5925037d9328a4c530b27cb4e86cacea0711a3489c3d1604ae406c54d6ce",
         "stu": 1799,
         "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/tests/support/grounding.rs",
+        "bytes": 16829,
+        "sha256": "d02dec343f67dcb3153235f5b4b1d410b562f69244bd02c8998c19b3d20eded8",
+        "stu": 5610,
+        "inline_cfg_test": false
       }
     ],
     "selected_tests": [
@@ -544,6 +565,7 @@
         "sha256": "cc04906a882496ece24a47bd1992208e4b8c0d6b38c83c386818dcf25e65f00b",
         "test_attributes": 6,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "fault_restart_replay"
         ]
@@ -554,6 +576,7 @@
         "sha256": "c075050dd9306e8a8baed09e864077bd08bb5d25483cf147cbbbd59022dba344",
         "test_attributes": 9,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "fault_restart_replay"
         ]
@@ -564,6 +587,7 @@
         "sha256": "54ae3907e1aa2ff4107b9f8273e9379f11cb9ded4a9bbdb43c932d8b94f8697c",
         "test_attributes": 4,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "fault_restart_replay"
         ]
@@ -574,6 +598,7 @@
         "sha256": "3387c72bcc72992222622b6158c296d8e6dbfa80bd6c2fdc5e84e0c4ca6cb9b5",
         "test_attributes": 2,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "fault_restart_replay"
         ]
@@ -584,6 +609,7 @@
         "sha256": "df726966e79a2c7a4848540ee6e56f05a04417e2aba31758d19deb0bf6096119",
         "test_attributes": 3,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "edge_profile",
           "fault_restart_replay"
@@ -595,6 +621,7 @@
         "sha256": "1e2433910bbbe96510a786381ec6793ee704f279be1066d859a8a8d5a6936376",
         "test_attributes": 3,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "fault_restart_replay"
         ]
@@ -605,6 +632,7 @@
         "sha256": "0b618955031351f1cdf1aa09b401eff72ae52e755c04ad6f2510483ac30f1ac5",
         "test_attributes": 6,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": []
       },
       {
@@ -613,6 +641,7 @@
         "sha256": "4191a53f155b6094e6d18ed92920c62ab274f64a4645fa90ffdce8913a74728c",
         "test_attributes": 12,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "fault_restart_replay"
         ]
@@ -623,6 +652,7 @@
         "sha256": "26044c94a5b7d3b87c451547e91eca05a53459cf7ed3b7998c1a0a5a6bf318d9",
         "test_attributes": 7,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": []
       },
       {
@@ -631,6 +661,7 @@
         "sha256": "86fce0c5dcedf2861c30c247b258ad11bf71ad07cd613987a5ddaa73f5230bf5",
         "test_attributes": 8,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "fault_restart_replay"
         ]
@@ -641,6 +672,7 @@
         "sha256": "4da4af6a2d312903308ec4cef7babf4053902d64e1f0af3fbc6cb637076cf14c",
         "test_attributes": 3,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "edge_profile"
         ]
@@ -651,6 +683,7 @@
         "sha256": "e10fef904d852135f16e529739be126e69203cc744f0bdd065a61133baf6f3f9",
         "test_attributes": 5,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "fault_restart_replay"
         ]
@@ -661,6 +694,7 @@
         "sha256": "c0303b2b6564b0ddb56538d760a7047076b21dd2743f4779d4a276c148755e26",
         "test_attributes": 24,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "edge_profile",
           "fault_restart_replay"
@@ -672,18 +706,9 @@
         "sha256": "55567b5f98d2c3a13c2827b3d2f83d86ddce07c06944715316a6cd0a476cbff9",
         "test_attributes": 12,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "edge_profile",
-          "fault_restart_replay"
-        ]
-      },
-      {
-        "path": "crates/smart/eliot-dreamer-contracts/tests/support/grounding.rs",
-        "bytes": 16829,
-        "sha256": "d02dec343f67dcb3153235f5b4b1d410b562f69244bd02c8998c19b3d20eded8",
-        "test_attributes": 0,
-        "inline_cfg_test": false,
-        "classes": [
           "fault_restart_replay"
         ]
       },
@@ -693,6 +718,7 @@
         "sha256": "29725abe7a702d429009bfb32f79ead8e6b54c984d89bb4f2f8d25e0aa24fcab",
         "test_attributes": 7,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": []
       },
       {
@@ -701,10 +727,17 @@
         "sha256": "5a1f79dc2a0f9e3a737d44a2eceb8f65a6c98d0ccef9884b23fb50ac864ba08e",
         "test_attributes": 1,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": []
       }
     ],
     "source_selection_digest": "3abe84cf6fa1deb05ead8ec0694c040981fc3d736d1bae03daeebfa04bf28003"
+  },
+  "unselected_package_files": {
+    "physical_inventory_file_count": 89,
+    "physical_inventory_digest": "3abe84cf6fa1deb05ead8ec0694c040981fc3d736d1bae03daeebfa04bf28003",
+    "unselected_files": [],
+    "note": "Physical package inventory beyond this cell's selected workset. No file is dropped: an unlinked or unresolved file is reported here with the reason it was not selected."
   },
   "one_hop_providers": [
     "blake3",
@@ -784,51 +817,61 @@
   },
   "omitted_material_and_handles": {
     "unresolved_contract_refs": [],
-    "omitted": "Files outside the package source/test selection, exact route tokenizer measurement, executed edge and Product Pulse results, and every runtime, store, and live-state observation."
+    "omitted": "Files outside the cell's selected workset, exact route tokenizer measurement, executed edge and Product Pulse results, and every runtime, store, and live-state observation."
   },
   "effective_context_profile": {
     "estimate": "planning_estimate_only",
     "qualification": "UNVALIDATED (I2.16, I0.5)",
     "reference_capsule_handle": "I2.20"
   },
-  "bound_contract_digest": "955a3040aa3f00e219b7fbc87fddf2afbd94293b0631dfb43c25162fb23fe135",
+  "bound_contract_digest": "6e5bad90d5807811",
   "source_provenance": {
     "input_digests": {
-      "workspace_manifest": {
-        "path": "Cargo.toml",
-        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
+      "contract_semantic_inputs": {
+        "contract_catalogue": {
+          "path": "docs/architecture/handle-index.json",
+          "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
+        },
+        "architecture_boundaries": {
+          "path": "config/architecture-boundaries.toml",
+          "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
+        },
+        "logical_block_config": {
+          "path": "docs/code-navigation/logical-blocks.toml",
+          "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+        },
+        "package_manifest": {
+          "path": "crates/smart/eliot-dreamer-contracts/Cargo.toml",
+          "sha256": "a65d44513c701ba3476107d77aea296a69271e88087b004fae1a8c90931dc084"
+        },
+        "module_manifest": {
+          "path": "crates/smart/eliot-dreamer-contracts/module.toml",
+          "sha256": "900a9a17974c107f920a17b06d3c70cfd976feb872c24027dc362998808ab4f5"
+        }
       },
-      "contract_catalogue": {
-        "path": "docs/architecture/handle-index.json",
-        "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
-      },
-      "architecture_boundaries": {
-        "path": "config/architecture-boundaries.toml",
-        "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
-      },
-      "logical_block_config": {
-        "path": "docs/code-navigation/logical-blocks.toml",
-        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
-      },
-      "package_manifest": {
-        "path": "crates/smart/eliot-dreamer-contracts/Cargo.toml",
-        "sha256": "a65d44513c701ba3476107d77aea296a69271e88087b004fae1a8c90931dc084"
-      },
-      "module_manifest": {
-        "path": "crates/smart/eliot-dreamer-contracts/module.toml",
-        "sha256": "900a9a17974c107f920a17b06d3c70cfd976feb872c24027dc362998808ab4f5"
-      },
-      "selected_source": {
-        "path_count": 89,
-        "sha256": "3abe84cf6fa1deb05ead8ec0694c040981fc3d736d1bae03daeebfa04bf28003"
+      "exact_provenance": {
+        "workspace_manifest": {
+          "path": "Cargo.toml",
+          "sha256": "f2ab651b76ac9f5870f8268c52d1db5839cdb957f5939cd0d8e3a2edcd91fe45"
+        },
+        "physical_source_inventory": {
+          "path_count": 89,
+          "sha256": "3abe84cf6fa1deb05ead8ec0694c040981fc3d736d1bae03daeebfa04bf28003"
+        },
+        "selected_workset": {
+          "allocation_scope": "PACKAGE_WIDE",
+          "allocation_state": "EXPLICIT_PACKAGE_WIDE",
+          "path_count": 89,
+          "sha256": "3abe84cf6fa1deb05ead8ec0694c040981fc3d736d1bae03daeebfa04bf28003"
+        }
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "e724327f075c9cc66a52d19cf62ff33badbd7aad2f3002f551e0940a3d366bbb",
+  "artifact_digest": "7c3eb23771bc6e8584e46b442d0499a746f30d5c05180e6219b9de55241775d9",
   "contract_revision": {
-    "derivation": "first 16 hex characters of the artifact digest",
-    "value": "e724327f075c9cc6"
+    "derivation": "first 16 hex characters of the SHA-256 over the namespaced canonical contract-semantic body (artifact_digest, contract_revision and source_provenance excluded)",
+    "value": "5248c946cc848fb6"
   }
 }

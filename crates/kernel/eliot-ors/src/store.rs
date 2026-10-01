@@ -3096,6 +3096,8 @@ struct BridgeEventPrivacyAuthorization {
     scope_ref: String,
     source_class: Option<String>,
     recipient_grant: Vec<String>,
+    provider_restriction: eliot_workscope::BridgeIngestPolicyLeg,
+    retention_terms: eliot_workscope::BridgeIngestPolicyLeg,
 }
 
 /// Resolved I7.23 disclosure staging for canonical envelope bytes.
@@ -12281,6 +12283,49 @@ impl RedbRecoveryStore {
             } else {
                 current.owner_readback = Some(evidence.clone());
             }
+            // Issue #2970 A10: settling with exact owner-readback evidence
+            // persists the `ResponseReceived` custody boundary carrying the
+            // retained result commitment when no such observation exists, so
+            // the terminal `ResultReceived` phase is never committed without
+            // its response boundary and the retained answer stays decodable
+            // from the observation history. Earlier observations are never
+            // rewritten and an existing `ResponseReceived` observation is
+            // never duplicated.
+            let response_already_observed =
+                current
+                    .transport_observations
+                    .last()
+                    .is_some_and(|observation| {
+                        observation.boundary
+                            == crate::HostRequestTransportBoundary::ResponseReceived
+                    });
+            if !response_already_observed {
+                if current.transport_observations.len() >= 3 {
+                    return Err(OrsError::ProjectionLimitExceeded);
+                }
+                let Some(first) = current.transport_observations.first() else {
+                    return Err(OrsError::InvalidTransition);
+                };
+                let channel_binding_sha256 = first.channel_binding_sha256.clone();
+                let transport_request_sha256 = first.transport_request_sha256.clone();
+                let observation = crate::HostRequestTransportObservation {
+                    operation_id: record.operation_id.clone(),
+                    request_digest: record.request_digest.clone(),
+                    attempt_id: current.attempt_id.clone(),
+                    attempt_generation: current.generation,
+                    boundary: crate::HostRequestTransportBoundary::ResponseReceived,
+                    channel_binding_sha256,
+                    transport_request_sha256,
+                    request_commitment_sha256: record.request_digest.clone(),
+                    payload_commitment_sha256: record.payload_digest.clone(),
+                    delivery_receipt: None,
+                    response_commitment_sha256: Some(evidence.result_commitment_sha256.clone()),
+                    response_source: Some(crate::HostRequestResponseSource::AuthenticatedTransport),
+                    no_send_proof: None,
+                };
+                observation.validate_for(&record, &current)?;
+                current.transport_observations.push(observation);
+            }
             current.phase = crate::HostRequestAttemptPhase::ResponseReceived;
         }
         if current.phase != crate::HostRequestAttemptPhase::ResponseReceived {
@@ -12821,9 +12866,15 @@ impl RedbRecoveryStore {
     /// source bytes, the scope, and the policy revision
     /// (`privacy_authorization`: `verdict`, `source_sha256`, `scope`,
     /// `policy_revision`, plus the decided evidence `scope_ref`,
-    /// `source_class`, and `recipient_grant`). A presented verdict is
-    /// accepted only when it equals the owner rule's verdict for the staged
-    /// evidence and names the owner's current policy revision; anything else
+    /// `source_class`, `recipient_grant`, and the Governor-owned
+    /// `provider_restriction` and `retention_terms` legs). The legs enter the
+    /// owner rule as deny-only gates — undecided provider restriction or
+    /// undecided retention terms withhold raw persistence before any grant
+    /// membership can admit — and the stage entry re-resolves the rule with
+    /// those same staged legs, so a verdict that misstates them fails closed.
+    /// A presented verdict is accepted only when it equals the owner rule's
+    /// verdict for the staged evidence and names the owner's current policy
+    /// revision; anything else
     /// — including a caller that cannot present an owner verdict for these
     /// exact bytes — gets a rejected disposition, never an inferred
     /// `allowed`. The conservative deny scan still runs inside the stage entry
@@ -13262,9 +13313,10 @@ impl RedbRecoveryStore {
     /// is an `Err`: a verdict reached about other bytes cannot authorize
     /// these. A verdict decided under another policy revision is an `Err` as
     /// well: only the owner's current rule revision authorizes persistence.
-    /// The decided evidence (`scope_ref`, `source_class`, `recipient_grant`)
-    /// is required so the stage entry can re-resolve the owner verdict for
-    /// the staged bytes instead of trusting the presented disposition.
+    /// The decided evidence (`scope_ref`, `source_class`, `recipient_grant`,
+    /// plus the Governor-owned `provider_restriction` and `retention_terms`
+    /// legs) is required so the stage entry can re-resolve the owner verdict
+    /// for the staged bytes instead of trusting the presented disposition.
     fn presented_privacy_authorization(
         authorization: Option<&serde_json::Value>,
         transport_hash: &str,
@@ -13344,6 +13396,8 @@ impl RedbRecoveryStore {
             crate::model::validate_text(class, "privacy_authorization.recipient_grant")?;
             grant.push(class.to_owned());
         }
+        let provider_restriction = Self::bridge_privacy_policy_leg(value, "provider_restriction")?;
+        let retention_terms = Self::bridge_privacy_policy_leg(value, "retention_terms")?;
         Ok(Some(BridgeEventPrivacyAuthorization {
             verdict,
             scope,
@@ -13352,7 +13406,32 @@ impl RedbRecoveryStore {
             scope_ref,
             source_class,
             recipient_grant: grant,
+            provider_restriction,
+            retention_terms,
         }))
+    }
+
+    /// Reads one Governor-owned policy leg out of a presented privacy
+    /// authorization (issue #1934, I7.23).
+    ///
+    /// The spelling is validated as text through the existing validator and
+    /// must equal the owner vocabulary
+    /// ([`eliot_workscope::BridgeIngestPolicyLeg::as_str`]): mere presence of
+    /// the field proves nothing, so any other spelling is a typed rejection
+    /// before any durable write.
+    fn bridge_privacy_policy_leg(
+        value: &serde_json::Value,
+        field: &'static str,
+    ) -> Result<eliot_workscope::BridgeIngestPolicyLeg, OrsError> {
+        let spelling = bridge_text(value, field)?;
+        if spelling == eliot_workscope::BridgeIngestPolicyLeg::Unavailable.as_str() {
+            Ok(eliot_workscope::BridgeIngestPolicyLeg::Unavailable)
+        } else {
+            Err(OrsError::InvalidField {
+                field,
+                reason: "privacy owner policy leg must name owner-decided evidence availability",
+            })
+        }
     }
 
     /// Re-resolves the `WorkScope` privacy owner's verdict for the staged
@@ -13360,7 +13439,8 @@ impl RedbRecoveryStore {
     ///
     /// This is the re-verification that keeps a self-asserted disposition out
     /// of durable state: the owner rule runs again over the staged scope
-    /// reference, source class, and recipient grant, and the presented
+    /// reference, source class, recipient grant, and the Governor-owned
+    /// provider-restriction and retention-terms legs, and the presented
     /// `verdict` and `declared_class` must match what the owner decides for
     /// that evidence. A mismatch fails closed before any durable write; the
     /// conservative deny scan still applies separately and can only deny.
@@ -13371,6 +13451,8 @@ impl RedbRecoveryStore {
             &grant.scope_ref,
             grant.source_class.as_deref(),
             &grant.recipient_grant,
+            grant.provider_restriction,
+            grant.retention_terms,
         )
         .map_err(|_| OrsError::InvalidField {
             field: "privacy_authorization",
@@ -20029,17 +20111,13 @@ impl RedbRecoveryStore {
                 owner.incarnation,
                 BridgeStreamRight::Append,
             )?;
+            // The active handoff charge covers only a genuinely new row:
+            // an idempotent duplicate needs no normal slot, so the
+            // table-global bound is enforced at insert time below,
+            // beside the retained-window (retired) answer — never
+            // before identity resolution (issue #2731, item 4).
             let existing: Option<BridgeEventHandoffRow> = {
                 let handoffs = write.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
-                if handoffs.len().map_err(storage)? >= MAX_BRIDGE_EVENT_HANDOFFS as u64
-                    && handoffs.get(key.as_str()).map_err(storage)?.is_none()
-                {
-                    return Err(OrsError::BridgeEventCapacityExceeded(
-                        eliot_contracts::BridgeEventCapacityPressure::pending_handoffs(
-                            eliot_contracts::BridgeEventLocalPhase::Durable,
-                        ),
-                    ));
-                }
                 handoffs
                     .get(key.as_str())
                     .map_err(storage)?
@@ -20069,6 +20147,47 @@ impl RedbRecoveryStore {
                     || row.sequence != sequence
                 {
                     return Err(OrsError::DuplicateConflict);
+                }
+                // Quiet-stream retire-first at saturation (issue #2731,
+                // item 4; audit 5847810833 defect 1): terminal
+                // receipt-complete rows hold retained replay/history
+                // evidence, not active charge. One bounded retirement
+                // page for this stream advances its compacted boundary
+                // without requiring future events on it; the retirement
+                // eligibility gate keeps every pending/unknown row
+                // non-evictable, and retirement itself allocates no
+                // handoff slot, so recovery/terminalization capacity is
+                // preserved. Only a still-full table after that page
+                // returns typed pending-handoff backpressure.
+                {
+                    let full = write
+                        .open_table(BRIDGE_EVENT_HANDOFFS)
+                        .map_err(storage)?
+                        .len()
+                        .map_err(storage)?
+                        >= MAX_BRIDGE_EVENT_HANDOFFS as u64;
+                    if full {
+                        Self::retire_bridge_handoffs_in(
+                            &write,
+                            &access.namespace,
+                            owner.revision,
+                            owner.incarnation,
+                            MAX_BRIDGE_HANDOFF_RETIRE_PER_RECOVERY,
+                        )?;
+                        let still_full = write
+                            .open_table(BRIDGE_EVENT_HANDOFFS)
+                            .map_err(storage)?
+                            .len()
+                            .map_err(storage)?
+                            >= MAX_BRIDGE_EVENT_HANDOFFS as u64;
+                        if still_full {
+                            return Err(OrsError::BridgeEventCapacityExceeded(
+                                eliot_contracts::BridgeEventCapacityPressure::pending_handoffs(
+                                    eliot_contracts::BridgeEventLocalPhase::Durable,
+                                ),
+                            ));
+                        }
+                    }
                 }
                 let row = BridgeEventHandoffRow {
                     contract_version: crate::CONTRACT_VERSION,
@@ -21293,8 +21412,8 @@ impl RedbRecoveryStore {
         Ok(())
     }
 
-    /// Re-anchors a missing or stale-view drain resume at the certified prefix
-    /// start (issue #2730, audit 5845038022): the scan restarts at
+    /// Re-anchors a missing or stale-view drain resume at the certified window
+    /// (issue #2730, audit 5845038022): the scan restarts at
     /// `after = 0` while an earlier entry already drained and deleted the
     /// certified prefix below the first retained position, so the
     /// `resume + 1` guard would stop forever on the first entry and
@@ -21302,11 +21421,24 @@ impl RedbRecoveryStore {
     /// row and never updated, and a sequence at or below the compacted
     /// boundary is never re-admitted as fresh
     /// (`check_bridge_retained_replay_in` answers the retired disposition
-    /// there), so a leading gap fully covered by the certified compacted
-    /// range of this exact owner incarnation and stream is already-drained
-    /// history: resume past it. A leading gap the certified range does not
-    /// cover keeps the fail-closed resume, so an unexplained hole is never
-    /// skipped and no deletion ever leaves the certified boundary.
+    /// there, keyed on `cursor.last_compacted_sequence`, untouched here),
+    /// so a leading gap below the first retained position inside the
+    /// certified window of this exact owner incarnation and stream is
+    /// already-drained history: resume past it. The stored row is windowed
+    /// per extension (`certify_bridge_compacted_range_in` overwrites it as
+    /// `[caller_start..=end]` chained via `predecessor_end_sequence`, so
+    /// cycle 2 is `{start:65,end:128}`, not cumulative from 1); requiring
+    /// `start <= after + 1` would demand `65 <= 1` forever from cycle 2 on.
+    /// The predicate therefore covers the certified window (`start <= first`
+    /// with `first - 1 <= end`) instead of the stale `after` origin: genesis
+    /// starts at 1 and each extension continues exactly at
+    /// `stored.end + 1`, so `[1..=end]` is contiguously certified by
+    /// induction and any gap below `first` is deleted history from an
+    /// earlier slice. A leading gap the certified range does not cover
+    /// (`first - 1 > end`, wrong owner/incarnation/stream) keeps the
+    /// fail-closed resume, so an unexplained hole is never skipped and no
+    /// deletion ever leaves the certified boundary (the drain still only
+    /// removes `<= compacted` rows whose record and handoff are both gone).
     fn anchor_drain_resume_to_certified_prefix(
         write: &redb::WriteTransaction,
         access: &BridgeStreamAccess,
@@ -21336,7 +21468,7 @@ impl RedbRecoveryStore {
                 range.owner_namespace == access.namespace
                     && range.stream_id == owner.local_stream
                     && range.owner_incarnation == owner.incarnation
-                    && range.start_sequence <= after.saturating_add(1)
+                    && range.start_sequence <= first
                     && first.saturating_sub(1) <= range.end_sequence
             }
             None => false,
@@ -21487,16 +21619,18 @@ impl RedbRecoveryStore {
     }
 
     /// Retires one namespace's handoffs inside the recovery transaction
-    /// (issue #2731, items 4 and 5) over a contiguous eligible prefix
+    /// (issue #2731, items 1, 4, and 5) over a contiguous eligible prefix
     /// (issue #2885, item 6). Eligibility is evaluated per row by
     /// [`BridgeEventHandoffRow::retirement_eligible`] against the retiring
-    /// operation's admitted owner and acknowledged receipt, and the first
-    /// gap-covered, unknown-handoff, nonterminal, or missing position
-    /// stops the prefix instead of being skipped to free space. The
+    /// operation's admitted owner and acknowledged receipt, joined to the
+    /// handoff's exact receiving-owner receipt, and the first
+    /// gap-covered, unknown-handoff, nonterminal, receipt-less, or missing
+    /// position stops the prefix instead of being skipped to free space. The
     /// stored reconcile tuple is the admitting owner's frontier/owner
-    /// evidence: it retires a row only when it names the currently
-    /// admitted owner epoch with a covering frontier inside the
-    /// acknowledged receipt. A terminalized prefix is
+    /// evidence: it is necessary but insufficient, counting only when it
+    /// names the currently admitted owner epoch with a covering frontier
+    /// inside the acknowledged receipt — producer acknowledgement alone
+    /// never retires an unconsumed event. A terminalized prefix is
     /// certified as a cumulative compacted range binding owner
     /// namespace/incarnation, interval, predecessor, ack frontier,
     /// segment commitment, schema version, and retention revision (issue
@@ -21586,6 +21720,10 @@ impl RedbRecoveryStore {
         let mut terminalized_boundary = compacted;
         let mut earliest_terminalized_sequence = None;
         let mut terminalized_leaves: Vec<(u64, String, String, String)> = Vec::new();
+        // First eligible sequence whose receiving-owner receipt is still
+        // missing (issue #2731, item 1); the prefix stops there instead of
+        // disposing the handoff.
+        let mut receipt_blocked_at: Option<u64> = None;
         for (_, key, row) in &eligible {
             let record_key = format!("{}::{}", access.namespace, row.event_id);
             let record: Option<BridgeEventRow> = {
@@ -21616,8 +21754,42 @@ impl RedbRecoveryStore {
                 });
             }
             Self::require_bridge_event_relation_in(write, &record, record_key.as_str())?;
+            // Issue #2731 item 6 (retire-arm exact match): the page already
+            // stops at the first non-eligible row, so this re-check stops the
+            // contiguous prefix instead of skipping past its blocker to free
+            // space. Only the exact witnessed owner-bound covering evidence
+            // retires; legacy bare-state rows never retire on their state
+            // string, and the receiving-owner terminal disposition stays
+            // BLOCKED-BY #1934/#2561 and is never fabricated here. Saturation
+            // keeps typed Backpressure at admission; cursors are never reset.
             if !row.retirement_eligible(&owner, acked) {
-                continue;
+                break;
+            }
+            // Issue #2731 item 1 (I6 residual): the producer reconcile tuple
+            // checked above is necessary but insufficient — it records local
+            // staging plus producer receipt acknowledgement, never the
+            // receiving owner's durable acceptance. Retirement additionally
+            // requires the exact owner receipt binding stream, incarnation,
+            // event identity and sequence, the content commitment, the
+            // receiving operation, and the retained source/projection
+            // references, carrying its own APPLIED, REJECTED, or UNKNOWN
+            // disposition. The three stay distinct by construction here: no
+            // disposition is inferred from the reconciled flag or the
+            // response digest, so UNKNOWN can never retire as success and a
+            // legacy reconciled row never retires on its bare state string.
+            // Join flag for the kernel receipt route: set once the route
+            // records the handoff's receipt and this arm joins it by handoff
+            // key. The handoff row retains no receiving-operation or
+            // disposition columns — reconcile_key is a response digest,
+            // never an owner operation — so no retained row presents the
+            // receipt yet and the flag stays clear. The prefix stops here
+            // instead of disposing the handoff: the obligation stays pending
+            // with its source, projection, and replay identity intact.
+            // Nothing here fabricates acceptance.
+            let owner_receipt_joined = false;
+            if !owner_receipt_joined {
+                receipt_blocked_at = Some(row.sequence);
+                break;
             }
             let commitment = Self::bridge_replay_commitment_for(&record, now_ms, acked);
             Self::write_bridge_commitment_in(write, &commitment)?;
@@ -21683,6 +21855,11 @@ impl RedbRecoveryStore {
             )?;
             cursor.last_compacted_sequence = terminalized_boundary;
         }
+        // A receipt-blocked prefix still has work behind its blocker, and
+        // resumes at the blocker so the next bounded entry re-meets the
+        // same handoff instead of stranding it behind the page cursor.
+        let retirement_continuation = retirement_continuation || receipt_blocked_at.is_some();
+        let receipt_resume_after = receipt_blocked_at.map(|blocked| blocked.saturating_sub(1));
         let mut next_scan = if retirement_continuation {
             let scan = scan.as_ref().ok_or(OrsError::IntegrityProblem {
                 record_type: "bridge_event_position",
@@ -21692,10 +21869,13 @@ impl RedbRecoveryStore {
                 owner_revision: scan.owner_revision,
                 owner_incarnation: scan.owner_incarnation,
                 recovery_revision: scan.recovery_revision,
-                after_sequence: eligible_after.ok_or(OrsError::IntegrityProblem {
-                    record_type: "bridge_event_position",
-                    reason: "bounded retirement continuation has no processed position".to_owned(),
-                })?,
+                after_sequence: receipt_resume_after.or(eligible_after).ok_or(
+                    OrsError::IntegrityProblem {
+                        record_type: "bridge_event_position",
+                        reason: "bounded retirement continuation has no processed position"
+                            .to_owned(),
+                    },
+                )?,
                 upper_sequence: scan.upper_sequence,
             })
         } else {
@@ -28541,6 +28721,26 @@ impl RedbRecoveryStore {
     ) -> Result<(Self, OrsStoreIdentity), OrsError> {
         let (store, record) =
             Self::open_inner(path, Arc::new(RejectUnboundEvidence), Some(installation_id))?;
+        Ok((store, record.installed_identity()?))
+    }
+
+    /// Opens ORS for one Host-authenticated installation with the
+    /// composition-owned canonical/readback authenticator, preserving the
+    /// same installation binding and durable object-generation checks as
+    /// [`Self::open_for_installation`].
+    ///
+    /// This is the only ORS-owned seam through which a production
+    /// installation-scoped composition can reach a bound provider. It binds
+    /// no evidence itself: `evidence` must be a composition-supplied
+    /// authenticator that really validates every requested ordering head, and
+    /// the caller-created-receipt path never bypasses it. The two entry points
+    /// above keep `RejectUnboundEvidence` and continue to fail closed.
+    pub fn open_for_installation_with_evidence(
+        path: impl AsRef<Path>,
+        installation_id: &str,
+        evidence: Arc<dyn CanonicalEvidenceProvider>,
+    ) -> Result<(Self, OrsStoreIdentity), OrsError> {
+        let (store, record) = Self::open_inner(path, evidence, Some(installation_id))?;
         Ok((store, record.installed_identity()?))
     }
 

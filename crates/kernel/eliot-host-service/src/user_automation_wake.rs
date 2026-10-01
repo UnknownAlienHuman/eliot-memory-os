@@ -955,19 +955,37 @@ fn map_journal_error(error: JournalError) -> UserAutomationRuntimeError {
     }
 }
 
+/// Maps one exact batch-query outcome to the closed readback result of issue
+/// #2970: settle (the returned `Ok`), conflict, or inconclusive.
+///
+/// A batch the journal binds to different request bytes, or contradictory
+/// journal evidence about this operation, answers for another request and is
+/// exposed as [`UserAutomationRuntimeError::IdentityConflict`] rather than
+/// folded into an unknown outcome: the caller must be able to tell "another
+/// request owns this operation" from "the owner could not answer". A malformed
+/// query is refused before any journal read as
+/// [`UserAutomationRuntimeError::Rejected`]; no owner was consulted, so it is
+/// not transport uncertainty. Every other outcome — an absent batch, a legacy
+/// batch without its request commitment, a missing commit receipt, or an
+/// unreadable journal — stays [`UserAutomationRuntimeError::UnknownOutcome`]:
+/// the original operation remains reconciling and no non-issuance is inferred.
 fn map_cancellation_query_error(
     error: &WakeCancellationBatchQueryError,
 ) -> UserAutomationRuntimeError {
     match error {
+        WakeCancellationBatchQueryError::RequestCommitmentMismatch
+        | WakeCancellationBatchQueryError::Contradictory => {
+            UserAutomationRuntimeError::IdentityConflict
+        }
+        WakeCancellationBatchQueryError::Invalid(reason) => {
+            rejected(format!("wake cancellation batch query is invalid: {reason}"))
+        }
         WakeCancellationBatchQueryError::NotFound
         | WakeCancellationBatchQueryError::LegacyUnbound
-        | WakeCancellationBatchQueryError::RequestCommitmentMismatch
-        | WakeCancellationBatchQueryError::Contradictory
         | WakeCancellationBatchQueryError::MissingReceipt
-        | WakeCancellationBatchQueryError::Invalid(_)
         | WakeCancellationBatchQueryError::Journal(_) => {
             UserAutomationRuntimeError::UnknownOutcome(
-                "the exact Host cancellation batch is absent, conflicting, or unreadable; the original operation remains reconciling"
+                "the exact Host cancellation batch is absent, unbound, or unreadable; the original operation remains reconciling"
                     .to_owned(),
             )
         }

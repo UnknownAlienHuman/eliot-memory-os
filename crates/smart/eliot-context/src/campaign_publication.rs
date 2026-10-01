@@ -6,7 +6,6 @@
 
 use eliot_context_contracts::{
     ApprovedRecipeCatalogue, ContextError as ContractContextError, ContextRecipe,
-    EXECUTED_CONTEXT_STAGE, EXECUTED_REPETITION_POLICY, EXECUTED_SECTION_DEGRADATION,
     ReactiveInputError, RecipeExecutionSupport, RecipeResolutionRefusal, SafetyFloorIdentity,
     SessionDeliverySnapshot,
 };
@@ -24,36 +23,31 @@ use crate::{ContextError, ContextInput};
 /// from the values the compiling and rendering cells actually use:
 ///
 /// - the stage is the single whole-unit compile-and-render stage;
-/// - the ordering revision is `eliot_context_assembly::ASSEMBLY_ORDERING_REVISION`,
-///   the revision `assemble_active_view` renders under, read from that crate
-///   rather than restated here;
-/// - the repetition treatment is `EXECUTED_REPETITION_POLICY`, which is what
-///   the renderer does today: project each admitted record once, with
-///   `AdmittedContextSet::validate` refusing a repeated atom identity;
-/// - the section degradation is `EXECUTED_SECTION_DEGRADATION`, which is what
-///   admission and assembly do today: refuse the dependent operation rather
-///   than narrow a section behind a declared degradation;
-/// - the optional-feature disable is `false`, because neither cell has one.
+/// - the ordering SCHEME revision is `eliot_context_assembly::ASSEMBLY_ORDERING_REVISION`,
+///   the scheme `assemble_active_view` renders under, read from that crate rather
+///   than restated here. The specific role ORDER is no longer a member of this
+///   record because it is no longer the execution owner's to state: the renderer
+///   applies the approved revision's own `layout.role_positions`, so the order is a
+///   function of the recipe and `require_executable` cross-checks only the scheme
+///   under which the recipe's order is applied;
+/// - the repetition treatment, the section degradation and the absence of an
+///   optional-feature disable are the contract's own executed facts, read by
+///   [`RecipeExecutionSupport::for_context_compiler`].
 ///
-/// A policy declaring anything outside this record is refused at publication
-/// and at every re-derivation of the body digest, instead of being certified
-/// into a digest while being ignored.
+/// #1724 W4: that constructor is the SINGLE construction of this record. The
+/// assembly path runs the same checks against the same record and previously had
+/// to build a second copy of these four values to do so, which is exactly the
+/// drift `require_executable` exists to catch. One constructor, two call sites,
+/// each supplying only its own ordering-scheme spelling.
+///
+/// A policy declaring anything outside this record is refused at publication,
+/// at every re-derivation of the body digest, and on the assembly path itself,
+/// instead of being certified into a digest while being ignored.
 fn context_execution_support() -> Result<RecipeExecutionSupport, ContextPublicationError> {
-    let stage = ArtifactId::new(EXECUTED_CONTEXT_STAGE)
-        .map_err(|error| ContextPublicationError::Serialization(error.to_string()))?;
     let ordering_revision = ArtifactId::new(eliot_context_assembly::ASSEMBLY_ORDERING_REVISION)
         .map_err(|error| ContextPublicationError::Serialization(error.to_string()))?;
-    let support = RecipeExecutionSupport {
-        executed_stage: stage,
-        ordering_revision,
-        repetition: EXECUTED_REPETITION_POLICY,
-        section_degradation: EXECUTED_SECTION_DEGRADATION,
-        supports_feature_disable: false,
-    };
-    support
-        .validate()
-        .map_err(ContextPublicationError::Recipe)?;
-    Ok(support)
+    RecipeExecutionSupport::for_context_compiler(ordering_revision)
+        .map_err(ContextPublicationError::Recipe)
 }
 
 /// Resolve, authorize and require the selected revision to be executable by the

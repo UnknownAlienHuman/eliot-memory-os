@@ -93,7 +93,9 @@ fn is_identity_text(value: &str) -> bool {
 ///
 /// This is intent only. Liveness, readiness and capacity are joined from
 /// capability evidence by [`CapabilityRouteRegistry::admit_route`]; they are
-/// not mutable state inside the route definition.
+/// not mutable state inside the route definition. That joining entry is itself
+/// uncalled — see its `# Live status` — so the separation described here is a
+/// property of the code as written, not one any live path currently relies on.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeRoute {
@@ -447,6 +449,17 @@ impl RouteBehaviorFingerprint {
     /// execution identity and the User Broker class it is delegated to,
     /// account/credential mode, retention/network policy, session locator
     /// semantics, and workspace/scope policy).
+    ///
+    /// # Live status
+    ///
+    /// No production caller. Its one call site is `prior.diverging_layers(...)`
+    /// in the private `derive_admission`, whose only caller
+    /// [`CapabilityRouteRegistry::admit_route`] is itself uncalled. One of two
+    /// distinct `diverging_layers` inherent methods in this file — this one is
+    /// on `RouteBehaviorFingerprint` and compares two fingerprints; the other,
+    /// on `ObservedRoute`, compares an observed route against a requested one.
+    /// Because both are `pub` methods on re-exported `pub` types, `rustc`
+    /// reports neither, so the compiler cannot confirm this.
     #[must_use]
     pub fn diverging_layers(&self, other: &Self) -> Vec<RouteIdentityLayer> {
         let mut layers = Vec::new();
@@ -658,6 +671,14 @@ pub struct ObservedRoute {
 
 impl ObservedRoute {
     /// Returns the layers the runtime did not expose.
+    ///
+    /// # Live status
+    ///
+    /// No production caller. Its one call site is
+    /// `receipt.observed.unknown_layers()` in the private `derive_admission`,
+    /// whose only caller [`CapabilityRouteRegistry::admit_route`] is itself
+    /// uncalled. A `pub` method on a re-exported `pub` type, so `rustc` does
+    /// not report it.
     #[must_use]
     pub fn unknown_layers(&self) -> Vec<RouteIdentityLayer> {
         let mut layers = Vec::new();
@@ -680,6 +701,18 @@ impl ObservedRoute {
     ///
     /// Divergence is reported, never repaired: an observed route that differs
     /// from the request is a fact about the runtime, and the two stay separate.
+    ///
+    /// # Live status
+    ///
+    /// No production caller. Its one call site is
+    /// `receipt.observed.diverging_layers(&receipt.requested)` in the private
+    /// `derive_admission`, whose only caller
+    /// [`CapabilityRouteRegistry::admit_route`] is itself uncalled. This is the
+    /// second of the two distinct `diverging_layers` inherent methods in this
+    /// file; it sits on `ObservedRoute` and compares an observation against a
+    /// [`RuntimeRoute`], while the other sits on `RouteBehaviorFingerprint`.
+    /// Because both are `pub` methods on re-exported `pub` types, `rustc`
+    /// reports neither.
     #[must_use]
     pub fn diverging_layers(&self, requested: &RuntimeRoute) -> Vec<RouteIdentityLayer> {
         let mut layers = Vec::new();
@@ -785,6 +818,24 @@ impl ActualRouteReceipt {
     /// dimension admission compares. When any of them is `unknown` the scope
     /// is `None`: a scope assembled from the request instead would be exactly
     /// the silent inference I3.4 forbids.
+    ///
+    /// # Live status
+    ///
+    /// No production caller, and the absence is already recorded rather than
+    /// worked around. Its one call site is `receipt.current_scope()` in the
+    /// private `derive_admission`, whose only caller
+    /// [`CapabilityRouteRegistry::admit_route`] is itself uncalled. The
+    /// module-level note on `capability_evidence_commit` (a private module,
+    /// named in backticks rather than linked, so no `private_intra_doc_links`
+    /// fires) already discloses the stronger consequence: this method needs an
+    /// `ActualRouteReceipt` that no production path supplies, so the
+    /// positive-minting capability-evidence producer is still absent. That
+    /// disclosure is correct and was deliberately left unedited.
+    ///
+    /// The other `current_scope` bindings in the repository
+    /// (`crates/eliot-engine/src/context.rs`) are unrelated local variables,
+    /// not references to this method; the apparent hits there are value
+    /// positions with no `(` and resolve to nothing.
     #[must_use]
     pub fn current_scope(&self) -> Option<RouteScopeFingerprint> {
         self.observed
@@ -1183,7 +1234,7 @@ impl CapabilityRouteRegistry {
         Ok(())
     }
 
-    /// Records one route attempt and derives its production admission.
+    /// Records one route attempt and derives its admission.
     ///
     /// Admission is derived, never asserted. The receipt's requested route
     /// becomes configured intent, the observed route is retained separately,
@@ -1195,7 +1246,7 @@ impl CapabilityRouteRegistry {
     /// predicates of [`CapabilityRegistry::admit_production_route`] instead of
     /// re-deriving admissibility here.
     ///
-    /// The launch is authorized on this path itself, not only at the bridge
+    /// On this path the launch is authorized here, not only at the bridge
     /// contour. `delegated_user_broker_class` names the User Broker class the
     /// launch resolved to, or `None` when the daemon or Kernel launches the
     /// route directly. An `interactive_user` attempt that bypasses its declared
@@ -1234,6 +1285,38 @@ impl CapabilityRouteRegistry {
     /// well-formed route observation, when an `interactive_user` route
     /// bypasses its declared User Broker, or when the complete effective
     /// route key of the current fingerprint cannot be built.
+    ///
+    /// # Live status
+    ///
+    /// No production caller. Measured on this tree, this method has exactly
+    /// zero call sites in any crate: the only other occurrence of the name
+    /// `admit_route` anywhere in the repository is the intra-doc link on
+    /// [`RuntimeRoute`], not code. This is a `pub` inherent method on a
+    /// re-exported `pub` type, so `rustc`'s `dead_code` never reports it and
+    /// the compiler neither confirms nor denies the finding here; the census
+    /// is textual.
+    ///
+    /// Two limits on that measurement. This crate sets no `publish` key, so a
+    /// `pub` item could in principle have an out-of-repo consumer; the finding
+    /// is weighted for the in-repo tree only. And no macro-expansion analysis
+    /// was performed, so a `macro_rules!`-generated caller would be invisible —
+    /// that can only hide this finding, never invent one.
+    ///
+    /// The cluster below is therefore transitively dead with it:
+    /// `derive_admission` is private and called only from here, and
+    /// `RouteBehaviorFingerprint::diverging_layers`,
+    /// `ObservedRoute::diverging_layers`, `ObservedRoute::unknown_layers`,
+    /// and `ActualRouteReceipt::current_scope` are each called only from
+    /// `derive_admission`. `record_receipt` and `authorize_launch`, which
+    /// this method calls, *are* live elsewhere
+    /// (`bins/eliot-agent-bridge/src/lib.rs` and
+    /// `bins/eliot-agent-bridge/src/route_identity_gate.rs`) — but that does
+    /// not make this entry live, because those callers reach them directly.
+    ///
+    /// Every sentence above describes the code as written, not a behaviour any
+    /// live path enforces today. No caller was invented to close the gap;
+    /// whether this entry is wired to the bridge contour or retired is an
+    /// owner decision.
     pub fn admit_route(
         &mut self,
         evidence: &CapabilityRegistry,
@@ -1265,6 +1348,15 @@ impl CapabilityRouteRegistry {
     /// effective route key of the current fingerprint cannot be built; the
     /// decision is then not produced at all, rather than reported under a
     /// placeholder key.
+    ///
+    /// # Live status
+    ///
+    /// No production caller. This private helper has exactly one call site,
+    /// `Self::derive_admission` inside `admit_route`, and that method has none.
+    /// It is the root of the four-member cluster disclosed on
+    /// [`CapabilityRouteRegistry::admit_route`]: every divergence and scope
+    /// computation the admission decision performs is reached only through
+    /// this uncalled helper.
     fn derive_admission(
         evidence: &CapabilityRegistry,
         receipt: &ActualRouteReceipt,

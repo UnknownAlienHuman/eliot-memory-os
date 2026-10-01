@@ -26,19 +26,33 @@
   },
   "source_token_estimate": {
     "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
-    "source_stu": 57175,
+    "scope": "the selected decision workset of this cell",
+    "source_stu": 59221,
     "test_stu": 0,
     "selected_file_count": 3,
+    "physical_source_stu": 59221,
+    "physical_file_count": 3,
     "inline_cfg_test_modules": 2,
     "qualification": "planning estimate only; not a qualified Context Envelope (I2.16)"
+  },
+  "workset_allocation": {
+    "scope": "PACKAGE_WIDE",
+    "state": "UNRESOLVED_ALLOCATION",
+    "declared_by": "[package.metadata.eliot].functional_cell_refs / functional_cell / module.toml|module_id, plus [package.metadata.eliot].functional_cell_source",
+    "rationale": null,
+    "unresolved_reason": "crates/foundation/eliot-bootstrap declares 3 functional cells (foundation.bootstrap.current-system-evidence, foundation.bootstrap.rule-catalogue, foundation.bootstrap.work-unit-brief) but no accepted cell/source allocation separates them. The selection below is package-wide and is NOT a demonstrated minimal causal workset for foundation.bootstrap.rule-catalogue.",
+    "required_common_inputs": [
+      "crates/foundation/eliot-bootstrap/src/lib.rs"
+    ],
+    "observation": "Where no sound narrower allocation exists, selection stays PACKAGE_WIDE and unresolved rather than inventing independence."
   },
   "selected_source_and_tests": {
     "selected_source": [
       {
         "path": "crates/foundation/eliot-bootstrap/src/capture.rs",
-        "bytes": 45700,
-        "sha256": "c1a217085342918bc143bc162f892ebfc884b65d106da6c14d53e09ae2442707",
-        "stu": 15234,
+        "bytes": 51838,
+        "sha256": "e98d4705c5d00c7b79b17fcaae08316e77ddc2355743607876c17cd6a6bb2906",
+        "stu": 17280,
         "inline_cfg_test": true
       },
       {
@@ -57,7 +71,13 @@
       }
     ],
     "selected_tests": [],
-    "source_selection_digest": "b315ac765013d8f7057d069844632ca95364b81330d9159008f3dec70bcd5166"
+    "source_selection_digest": "c70eac5cc9893fdfc60050c1c3fec03d7e23a3e5f7fee2b7fd6fe628222d162b"
+  },
+  "unselected_package_files": {
+    "physical_inventory_file_count": 3,
+    "physical_inventory_digest": "c70eac5cc9893fdfc60050c1c3fec03d7e23a3e5f7fee2b7fd6fe628222d162b",
+    "unselected_files": [],
+    "note": "Physical package inventory beyond this cell's selected workset. No file is dropped: an unlinked or unresolved file is reported here with the reason it was not selected."
   },
   "one_hop_providers": [
     "eliot-agent-api",
@@ -99,48 +119,58 @@
   },
   "omitted_material_and_handles": {
     "unresolved_contract_refs": [],
-    "omitted": "Files outside the package source/test selection, exact route tokenizer measurement, executed edge and Product Pulse results, and every runtime, store, and live-state observation."
+    "omitted": "Files outside the cell's selected workset, exact route tokenizer measurement, executed edge and Product Pulse results, and every runtime, store, and live-state observation."
   },
   "effective_context_profile": {
     "estimate": "planning_estimate_only",
     "qualification": "UNVALIDATED (I2.16, I0.5)",
     "reference_capsule_handle": "I2.20"
   },
-  "bound_contract_digest": "fe5a4952bebf428764a00603c47a5c335ff80a9e73011e18332d6020c62d1e12",
+  "bound_contract_digest": "d6495d1479d35100",
   "source_provenance": {
     "input_digests": {
-      "workspace_manifest": {
-        "path": "Cargo.toml",
-        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
+      "contract_semantic_inputs": {
+        "contract_catalogue": {
+          "path": "docs/architecture/handle-index.json",
+          "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
+        },
+        "architecture_boundaries": {
+          "path": "config/architecture-boundaries.toml",
+          "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
+        },
+        "logical_block_config": {
+          "path": "docs/code-navigation/logical-blocks.toml",
+          "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+        },
+        "package_manifest": {
+          "path": "crates/foundation/eliot-bootstrap/Cargo.toml",
+          "sha256": "6b2404bc38ecb260cb534660e80cc0b2d27d6eca5b48f619711efaabe13a4847"
+        },
+        "module_manifest": null
       },
-      "contract_catalogue": {
-        "path": "docs/architecture/handle-index.json",
-        "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
-      },
-      "architecture_boundaries": {
-        "path": "config/architecture-boundaries.toml",
-        "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
-      },
-      "logical_block_config": {
-        "path": "docs/code-navigation/logical-blocks.toml",
-        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
-      },
-      "package_manifest": {
-        "path": "crates/foundation/eliot-bootstrap/Cargo.toml",
-        "sha256": "6b2404bc38ecb260cb534660e80cc0b2d27d6eca5b48f619711efaabe13a4847"
-      },
-      "module_manifest": null,
-      "selected_source": {
-        "path_count": 3,
-        "sha256": "b315ac765013d8f7057d069844632ca95364b81330d9159008f3dec70bcd5166"
+      "exact_provenance": {
+        "workspace_manifest": {
+          "path": "Cargo.toml",
+          "sha256": "f2ab651b76ac9f5870f8268c52d1db5839cdb957f5939cd0d8e3a2edcd91fe45"
+        },
+        "physical_source_inventory": {
+          "path_count": 3,
+          "sha256": "c70eac5cc9893fdfc60050c1c3fec03d7e23a3e5f7fee2b7fd6fe628222d162b"
+        },
+        "selected_workset": {
+          "allocation_scope": "PACKAGE_WIDE",
+          "allocation_state": "UNRESOLVED_ALLOCATION",
+          "path_count": 3,
+          "sha256": "c70eac5cc9893fdfc60050c1c3fec03d7e23a3e5f7fee2b7fd6fe628222d162b"
+        }
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "7addeb062fac6ad99115576d28b7145e1f39db060c39ee2851c2c874ecf7e7ee",
+  "artifact_digest": "cfe2580e8a1ffdaf43e06df323ed54dbdb685d5349fa34cca3ae1a0d78a23530",
   "contract_revision": {
-    "derivation": "first 16 hex characters of the artifact digest",
-    "value": "7addeb062fac6ad9"
+    "derivation": "first 16 hex characters of the SHA-256 over the namespaced canonical contract-semantic body (artifact_digest, contract_revision and source_provenance excluded)",
+    "value": "46fb89b5c73ac843"
   }
 }

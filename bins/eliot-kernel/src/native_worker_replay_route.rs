@@ -412,7 +412,7 @@ impl KernelComposition {
             .validate_presented_under_registration(
                 &Self::replay_require_op_id(registration, "registration_id")?,
                 Self::replay_require_nonzero_u64(registration, "worker_generation")?,
-                registration_fence.authority_epoch.clone(),
+                &registration_fence.authority_epoch,
                 &registration_fence,
             )
             .map_err(|_| NativeWorkerRouteError::Fence {

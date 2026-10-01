@@ -50,7 +50,9 @@ use serde::{Deserialize, Serialize};
 
 use super::NativeWorkerError;
 use crate::AdmittedLifecycle;
-use crate::job_envelope::{ConsumptionAttribution, require_consumption_attribution};
+use crate::job_envelope::{
+    ConsumptionAttribution, require_consumption_attribution, require_paid_start_eligible,
+};
 
 /// Registers (or renews) one worker generation. Paired with the Kernel route.
 pub const NATIVE_WORKER_REGISTRATION_OPERATION: &str = "native_worker.registration";
@@ -539,6 +541,32 @@ impl KernelNativeWorkerClient {
         envelope: &NativeResultEnvelope,
         attribution: &ConsumptionAttribution,
     ) -> Result<serde_json::Value, NativeWorkerError> {
+        require_consumption_attribution(claim, attribution)?;
+        self.submit_result(claim, envelope)
+    }
+
+    /// Submits one task/job-bound result only while the owner still permits paid work.
+    ///
+    /// Issue #1912 W3 production result path: refuses first against the
+    /// owner's ready-or-blocked verdict ([`require_paid_start_eligible`]
+    /// fails closed on every `Blocked` dimension, including a
+    /// Governor-issued exhaustion verdict surfaced as `Blocked`), so no
+    /// receipt rides a result after cancellation or exhaustion and no new
+    /// paid work starts under a refused attempt; then binds the
+    /// provider/tool consumption attribution to the originating
+    /// task/job/claim/attempt/operation before the governed result submit
+    /// runs. The attribution's opaque refs arrive with the adapter-produced
+    /// receipt and are never minted here; cost accounting stays
+    /// Governor-side (A14.7). Adapter producers call this instead of
+    /// [`Self::submit_result`] directly.
+    pub fn submit_eligible_bound_result(
+        &mut self,
+        readiness: &ReadinessSubmission,
+        claim: &NativeWorkerClaim,
+        envelope: &NativeResultEnvelope,
+        attribution: &ConsumptionAttribution,
+    ) -> Result<serde_json::Value, NativeWorkerError> {
+        require_paid_start_eligible(readiness)?;
         require_consumption_attribution(claim, attribution)?;
         self.submit_result(claim, envelope)
     }

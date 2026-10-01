@@ -353,11 +353,24 @@ pub(super) fn validate_effect_profile(
                 ))
             }
         }
+        // #1771 AUD4: the privileged profile needs Phase-B for its SCM bootstrap, and
+        // `UserMode` needs it for a different reason: its supervision is a
+        // current-user launcher plus a Task Scheduler task that may only be
+        // registered against a real authority descriptor, and only Host Phase-B
+        // publishes one. The second disjunct therefore admits
+        // `MaterializePhaseB` for `UserMode` *alone* — never `RegisterService`,
+        // `StartService` or `ProvisionStoreCredential`, which stay
+        // `SystemService`-only, so no non-service profile reaches SCM or a
+        // `LocalService` credential. The marker-until-published discipline is
+        // unchanged, no placeholder is admitted, and `PortableDev` still falls
+        // through to the `MaterializePhaseB` refusal below.
         InstallerEffectPlan::RegisterService { .. }
         | InstallerEffectPlan::StartService { .. }
         | InstallerEffectPlan::ProvisionStoreCredential { .. }
         | InstallerEffectPlan::MaterializePhaseB { .. }
-            if profile == InstallationProfile::SystemService =>
+            if profile == InstallationProfile::SystemService
+                || (profile == InstallationProfile::UserMode
+                    && matches!(plan, InstallerEffectPlan::MaterializePhaseB { .. })) =>
         {
             Ok(())
         }

@@ -18,12 +18,14 @@ use eliot_agent_contracts::{
     SwarmPlanAdmission, SwarmPlanAdmissionDisposition, SwarmPlanDefinition, SwarmPlanView,
     WorkItemId, check_owner_join, contract_shape_digest,
 };
+use eliot_kernel_core::CapacityClass;
 use eliot_receipts::ProofCeiling;
 use serde::Serialize;
 
 use crate::SNAPSHOT_SCHEMA_VERSION;
 use crate::fair_pull_loop::{
-    FAIR_PULL_LOOP_PROOF_CEILING, FairPullLoop, FairPullOutcome, FairPullStart,
+    FAIR_PULL_LOOP_PROOF_CEILING, FairPullLoop, FairPullOutcome, FairPullStaleRefusal,
+    FairPullStart, stale_selection_disposition,
 };
 use crate::model::{
     AdmissionId, AttemptRecord, CancelCommand, CancellationFinalReceipt, CancellationReceipt,
@@ -312,9 +314,137 @@ struct ObservedHostEventEntry {
     event: NormalizedHostEventEnvelope,
 }
 
+/// Every capacity partition the coordinator can be asked to count against
+/// (issue #1683 W4).
+///
+/// This is a *list of the frozen [`CapacityClass`] variants*, not a second
+/// vocabulary: every reader passes each entry straight into
+/// [`RoutePartitionDemand::get`] / [`RoutePartitionDemand::add`] /
+/// [`RoutePartitionDemand::tighten`], whose matches over `CapacityClass` have no
+/// wildcard arm. A new partition therefore cannot be added here without failing
+/// to compile in those matches first — the same compile-time gate
+/// [`crate::model::WorkClass::capacity_class`] uses for a new work class.
+const CAPACITY_PARTITIONS: [CapacityClass; 3] = [
+    CapacityClass::NormalWorkload,
+    CapacityClass::ProtectedControl,
+    CapacityClass::EmergencyLastResort,
+];
+
+/// A count or a limit kept separately for each capacity partition (issue #1683
+/// W4).
+///
+/// One field per [`CapacityClass`] variant. There is deliberately no array and
+/// no numeric index, so there is no width or mapping that can drift out of step
+/// with the enum; the three matches in [`Self::get`], [`Self::add`] and
+/// [`Self::tighten`] are the single place a partition is named, and each is a
+/// no-wildcard match over `CapacityClass`. That makes a new partition a
+/// compile error rather than a silently uncounted partition.
+///
+/// Every count here saturates: an overflow keeps the partition at its maximum
+/// rather than wrapping to zero, so a saturated partition still refuses.
+#[derive(Clone, Copy, Debug, Default)]
+struct RoutePartitionDemand {
+    normal_workload: usize,
+    protected_control: usize,
+    emergency_last_resort: usize,
+}
+
+impl RoutePartitionDemand {
+    /// A demand of `count` in exactly one partition and zero in the others.
+    ///
+    /// Every single-item route request ([`AgentCoordinator::start_attempt`] and
+    /// [`AgentCoordinator::reassign`]) attributes its addition through it, so an
+    /// addition is always charged to the partition its own work class declares
+    /// and never to whichever partition the count happens to fit in.
+    const fn of(partition: CapacityClass, count: usize) -> Self {
+        // Written out rather than `Self::default()`: `Default::default` is not a
+        // `const fn`, and this constructor has to be one so the demand a caller
+        // attributes is a fixed value rather than a runtime-computed one.
+        let mut demand = Self {
+            normal_workload: 0,
+            protected_control: 0,
+            emergency_last_resort: 0,
+        };
+        demand.add(partition, count);
+        demand
+    }
+
+    /// Every partition set to the same value. Used to seed the effective limit
+    /// from [`CoordinatorConfig::max_active_per_route`] so a partition with no
+    /// active attempt on the route still carries the configured budget instead
+    /// of an implicit zero.
+    const fn uniform(value: usize) -> Self {
+        Self {
+            normal_workload: value,
+            protected_control: value,
+            emergency_last_resort: value,
+        }
+    }
+
+    /// The count or limit held for one partition.
+    const fn get(self, partition: CapacityClass) -> usize {
+        match partition {
+            CapacityClass::NormalWorkload => self.normal_workload,
+            CapacityClass::ProtectedControl => self.protected_control,
+            CapacityClass::EmergencyLastResort => self.emergency_last_resort,
+        }
+    }
+
+    /// Adds `count` to one partition, saturating rather than wrapping.
+    const fn add(&mut self, partition: CapacityClass, count: usize) {
+        match partition {
+            CapacityClass::NormalWorkload => {
+                self.normal_workload = self.normal_workload.saturating_add(count);
+            }
+            CapacityClass::ProtectedControl => {
+                self.protected_control = self.protected_control.saturating_add(count);
+            }
+            CapacityClass::EmergencyLastResort => {
+                self.emergency_last_resort = self.emergency_last_resort.saturating_add(count);
+            }
+        }
+    }
+
+    /// Narrows one partition's effective limit to `limit`, never widening it.
+    ///
+    /// The narrowing is written as an explicit conditional rather than
+    /// `.min(limit)` because `Ord::min` is not const-stable on this toolchain
+    /// and a `const fn` cannot call it (`E0658`). On `usize`,
+    /// `if held < limit { held } else { limit }` **is** `min`: the tie takes the
+    /// `else` branch and yields `limit`, which equals `held` there, so the
+    /// result is identical at every input and the limit-fold arithmetic is
+    /// unchanged.
+    const fn tighten(&mut self, partition: CapacityClass, limit: usize) {
+        match partition {
+            CapacityClass::NormalWorkload => {
+                self.normal_workload = if self.normal_workload < limit {
+                    self.normal_workload
+                } else {
+                    limit
+                };
+            }
+            CapacityClass::ProtectedControl => {
+                self.protected_control = if self.protected_control < limit {
+                    self.protected_control
+                } else {
+                    limit
+                };
+            }
+            CapacityClass::EmergencyLastResort => {
+                self.emergency_last_resort = if self.emergency_last_resort < limit {
+                    self.emergency_last_resort
+                } else {
+                    limit
+                };
+            }
+        }
+    }
+}
+
+/// One route's capacity claim in a single call, kept per partition.
 #[derive(Clone, Debug)]
 struct RouteCapacityRequest {
-    requested: usize,
+    requested: RoutePartitionDemand,
     capacity_identity: String,
     capacity_revision: RevisionId,
     capacity_limit: usize,
@@ -627,6 +757,12 @@ fn offer_class_head(
 /// terminally, so a scope's holder is always the only non-terminal attempt on
 /// that scope and is never a different admitted item. A second check here
 /// could not fail, so it is not written.
+///
+/// What that argument covers is the *ownership* of an exact `mutation_scope`
+/// string. It does not make the string a deliverable identity: two spellings of
+/// one deliverable are two keys and therefore two holders, so this per-class
+/// view is not where the alias/overlap half of W4 is decided. See
+/// [`DeliverableClaim`](crate::DeliverableClaim) for that boundary.
 fn item_block(
     view: &ClassPullView<'_>,
     attempt: &AttemptRecord,
@@ -775,11 +911,32 @@ fn choose_fair_head<'a, 'profile>(
 ///   [`offer_class_head`], including `max_concurrency`, so a protected class
 ///   already at its concurrency ceiling offers no head and this returns `None`.
 ///   The reserve therefore cannot be over-consumed; the ceiling refuses first.
-/// - It does not let control borrow normal capacity. The partition is decided by
-///   [`WorkClass::capacity_class`], and the Kernel enforces the same split
-///   physically in `eliot_kernel_core::ControlReserve`. This function adds no
-///   new capacity notion; it only stops the *rotation* from spending control's
+/// - It does not let control borrow normal capacity *in the rotation*. The
+///   partition is decided by [`WorkClass::capacity_class`], so the eight normal
+///   classes cannot spend a control item's turn. This function adds no new
+///   capacity notion; it only stops the *rotation* from spending control's
 ///   service opportunities.
+///
+///   Stated as a boundary rather than left implied, because the reserve is a
+///   bound on **selection** and not on admission or route capacity, and those
+///   two are shared pools whose key does not contain the partition:
+///
+///   - [`Self::validate_route_capacity`] counts every non-terminal attempt on a
+///     route against `min(max_active_per_route, capacity_limit)` with no
+///     `CapacityClass` in the key, and [`Self::active_attempt_count`] counts
+///     every non-terminal attempt against the single `max_admitted_attempts`.
+///     So a saturated normal class can still fill a route reservation, or the
+///     whole admitted budget, and a control item is then refused
+///     [`CoordinatorError::Backpressure`] at `admit` or `reassign` — I14.3's
+///     "Normal workload cannot consume it" does not hold at those two
+///     boundaries today.
+///   - Partitioning either pool here would be a second reserve scheme inside
+///     the coordinator, and the physical split is already owned elsewhere:
+///     `eliot_kernel_core::ControlReserve` charges `try_acquire_normal` and
+///     `try_acquire_protected` against disjoint counters. The owner of the
+///     route and admission budget vectors is the admission/kernel owner
+///     (issue #1678); this crate reads and re-checks their claims and must not
+///     re-partition them.
 /// - It does not starve the normal classes. Control takes at most one pull per
 ///   ready control item, and its own `max_concurrency` ceiling bounds how many
 ///   such items can be in flight, so a permanently-ready control class still
@@ -996,13 +1153,19 @@ impl AgentCoordinator {
     /// The `capability` is plain validated data extracted by the daemon
     /// caller from its authenticated Kernel session (durable ORS claim row
     /// plus observed Governor currentness): the coordinator performs no I/O
-    /// and launches nothing. Every proof re-runs the T9-04 pure Kernel
-    /// verifier, so stale, revoked, foreign, or conflicting evidence fails
-    /// closed exactly like the plan-only gap, but with live Kernel backing.
+    /// and launches nothing. The capability must carry its factory-witnessed
+    /// durable owner row; a rowless capability fails closed with
+    /// [`CoordinatorError::StaleProviderBinding`] before any verifier is
+    /// built, so no caller half can reach an effecting proof unwitnessed.
+    /// Every proof re-runs the T9-04 pure Kernel verifier against the
+    /// retained row per call, so stale, revoked, foreign, or conflicting
+    /// evidence fails closed exactly like the plan-only gap, but with live
+    /// Kernel backing.
     pub fn new_with_admitted_provider(
         config: CoordinatorConfig,
         capability: AdmittedProviderCapability,
     ) -> Result<Self, CoordinatorError> {
+        crate::factory::require_witnessed_binding(&capability)?;
         Self::with_provider(config, Box::new(KernelProviderVerifier::new(capability)))
     }
 
@@ -1952,7 +2115,11 @@ impl AgentCoordinator {
                 return Err(CoordinatorError::MutatingWriterConflict(scope.clone()));
             }
             let capacity = RouteCapacityRequest {
-                requested: 1,
+                // Issue #1683 W4: the addition is charged to the partition this
+                // lane's own work class declares, not to a route-wide counter, so
+                // one admission touching several classes is counted once per
+                // partition and no partition is under-counted.
+                requested: RoutePartitionDemand::of(lane.work_class.capacity_class(), 1),
                 capacity_identity: candidate_lane.capacity_identity.clone(),
                 capacity_revision: candidate_lane.capacity_revision.clone(),
                 capacity_limit: candidate_lane.capacity_limit,
@@ -1963,13 +2130,17 @@ impl AgentCoordinator {
                 }
                 std::collections::btree_map::Entry::Occupied(mut entry) => {
                     let current = entry.get_mut();
+                    // Route evidence agreement is still a per-route check, so two
+                    // lanes on one route in different partitions must still agree
+                    // on identity, revision and limit or the whole admission is
+                    // refused. Only the *count* became per partition.
                     if current.capacity_identity != capacity.capacity_identity
                         || current.capacity_revision != capacity.capacity_revision
                         || current.capacity_limit != capacity.capacity_limit
                     {
                         return Err(CoordinatorError::RouteEvidence);
                     }
-                    current.requested = current.requested.saturating_add(1);
+                    current.requested.add(lane.work_class.capacity_class(), 1);
                 }
             }
         }
@@ -2112,6 +2283,31 @@ impl AgentCoordinator {
     ///   **normal** weights. Control's own per-class ceilings still apply and
     ///   still refuse first; the reserve changes which partition a pull draws
     ///   from, not whether a ceiling can be exceeded.
+    ///
+    ///   The reservation is real on both halves of a pull, not only the
+    ///   selection half. Service is reserved because the rotation excludes the
+    ///   protected class; *capacity* is reserved because the physical route
+    ///   budget is counted per partition at
+    ///   [`Self::validate_route_capacity`], which is the same function
+    ///   [`Self::start_attempt`] re-runs before it spends this selection. A
+    ///   saturated `normal_background` / `model_jobs` / `swarm` class therefore
+    ///   reaches this selector with its own partition full, and cannot have
+    ///   filled the protected partition's budget on the way.
+    ///
+    ///   What the reservation does **not** reach, stated so this is not
+    ///   overclaimed: `interactive` and `verification` map to
+    ///   [`CapacityClass::NormalWorkload`] by
+    ///   [`WorkClass::capacity_class`], exactly as the frozen contracts say
+    ///   (`NormalWorkClass::Interactive` and `NormalWorkClass::Verification` both
+    ///   admit `NormalWorkload`), so they share the normal partition with the
+    ///   eight classes above and receive a reservation of service only through
+    ///   their `weight / W` share. Giving them a partition of their own would
+    ///   need a new [`CapacityClass`] variant and a third counter in the
+    ///   Kernel's `ControlReserve` — a contracts change outside this crate — so
+    ///   this selector does not pretend to have it. I14.8's remaining
+    ///   "background/model/swarm admission pauses under interactive/control
+    ///   pressure" is likewise not claimed here: it needs a live pressure view
+    ///   this crate does not yet read.
     /// - **round share**: over any complete round of `W = sum(weight)` pulls
     ///   among the normal classes, class `i` is selected exactly `weight_i`
     ///   times, so `weight / W` is the share it receives in a round. In a window
@@ -2272,6 +2468,53 @@ impl AgentCoordinator {
     /// also stops at the first pull that selects nothing, so re-polling an
     /// unchanged projection costs exactly one pull instead of spinning.
     ///
+    /// **A stale selection is re-read against a fresh bounded pull rather than
+    /// propagated** (issue #1683 W3/W5, I14.8). `start_attempt` refuses a
+    /// selection whose owner evidence went stale between the pull and the
+    /// start; propagating that refusal ended the whole drive, so the capacity
+    /// the caller had just released did not pull the next eligible item until
+    /// some later event or cadence tick told the coordinator to look again —
+    /// which is exactly the "mechanical queue progress never depends on an
+    /// LLM remembering to start another agent" failure I14.8 names. So a
+    /// **staleness** refusal now spends one fresh pull over the live view and
+    /// the drive continues with whatever that read offers. The refusal is not
+    /// lost on the way: it is published in
+    /// [`FairPullOutcome::stale_refusals`] with its exact typed disposition
+    /// ([`crate::FairPullStaleDisposition`]), which is what keeps A8/W7's
+    /// exact-disposition requirement true across the retry instead of trading
+    /// it for silence.
+    ///
+    /// Three properties keep that a bounded re-read and not a retry loop, and
+    /// none of them is a constant chosen here:
+    ///
+    /// 1. **The bound is the one that already existed.** An attempt is
+    ///    *spent* at most once per drive — it is either started or refused
+    ///    stale — so the re-read is charged against the same `poll_bound` the
+    ///    starts are, and `pulls_performed` stays at most `poll_bound + 1`.
+    ///    `select_ready` offers only `Admitted` items (`class_views`), so the
+    ///    set of attempts a drive can spend is a subset of the non-terminal
+    ///    admitted set `poll_bound` counts.
+    /// 2. **A re-read that finds the same item again ends the drive.** A
+    ///    refused start mutates nothing — all three owner checks run before any
+    ///    write — and this drive is the only writer on this call, so spending
+    ///    that item again would produce the identical refusal. The drive stops
+    ///    instead, and says so through
+    ///    `FairPullStaleRefusal::repull_reselected_same_item`.
+    /// 3. **Only staleness re-reads.** A refusal that means "nothing more is
+    ///    eligible" — [`CoordinatorError::Backpressure`] naming a route already
+    ///    at its effective limit, or a variant saying this coordinator's own
+    ///    records disagree ([`CoordinatorError::IdentityConflict`],
+    ///    [`CoordinatorError::ProviderVerification`],
+    ///    [`CoordinatorError::InvalidAttemptState`], and the rest) — propagates
+    ///    unchanged and ends the drive. `Backpressure` in particular carries
+    ///    its exact `active`, `requested` and `limit` to the caller that way,
+    ///    which is A8's demand for a quota/pressure refusal.
+    ///
+    /// The re-read is the same selector over the same projection, later, with
+    /// the same [`SchedulingProfile`] the caller passed and the same fairness
+    /// credit the drive has been advancing; it is not a second selection
+    /// scheme and it mints nothing.
+    ///
     /// A missed wake cannot strand work, and a restart cannot renew an age.
     /// [`Self::note_selection_inputs_changed`] arms the loop from the seven
     /// transitions that change the projection, and the published cursor is the
@@ -2330,9 +2573,12 @@ impl AgentCoordinator {
     ///
     /// Returns the profile's own validation failure when it is not a valid
     /// versioned nine-class set — the drive is then refused whole rather than
-    /// run without per-class partitions — and any owner rejection from
-    /// [`Self::start_attempt`], which is the same rejection a caller driving
-    /// the pull by hand would receive.
+    /// run without per-class partitions — and any **non-staleness** owner
+    /// rejection from [`Self::start_attempt`], unchanged: a quota/pressure
+    /// [`CoordinatorError::Backpressure`] reaches the caller with its exact
+    /// `active`/`requested`/`limit`, and an inconsistency reaches it as itself.
+    /// A staleness rejection does not appear here; it is re-read over and
+    /// published in [`FairPullOutcome::stale_refusals`] instead.
     pub fn drive_fair_pull(
         &mut self,
         profile: &SchedulingProfile,
@@ -2343,6 +2589,14 @@ impl AgentCoordinator {
         let cursor = self.fair_pull_loop.cursor();
         let poll_bound = self.active_attempt_count();
         let mut started = Vec::new();
+        let mut stale_refusals = Vec::new();
+        // Issue #1683 W3/W5: every attempt this drive has already spent, whether
+        // it started or was refused stale. Membership is what makes the fresh
+        // bounded read terminating rather than spinning: `select_ready` offers
+        // only `Admitted` items, and a refused `start_attempt` mutates nothing,
+        // so a read that re-offers a spent attempt can only produce the refusal
+        // that item already produced.
+        let mut spent = BTreeSet::new();
         let mut pulls_performed = 0usize;
         let mut last_selection = self.select_ready(Some(profile), true);
         pulls_performed += 1;
@@ -2350,6 +2604,13 @@ impl AgentCoordinator {
             if started.len() >= poll_bound {
                 break;
             }
+            if spent.contains(&attempt_id) {
+                // The fresh bounded read offered an item this drive already
+                // spent. Re-spending it would re-derive the refusal it already
+                // produced, so the drive ends here rather than spins.
+                break;
+            }
+            spent.insert(attempt_id.clone());
             // The selected attempt is `Admitted`, so it carries a stored
             // record, a canonical enqueue ordinal and the admission receipt
             // that admitted it. All three are read; none is constructed.
@@ -2371,15 +2632,38 @@ impl AgentCoordinator {
                 .clone();
             let work_class = record.work_class;
             let admission_id = record.admission_id.clone();
-            self.start_attempt(ExecutionContext::from(&receipt), attempt_id.clone())?;
-            started.push(FairPullStart {
-                attempt_id,
-                admission_id,
-                work_class,
-                enqueue_sequence,
-            });
-            pulls_performed += 1;
-            last_selection = self.select_ready(Some(profile), true);
+            match self.start_attempt(ExecutionContext::from(&receipt), attempt_id.clone()) {
+                Ok(_) => {
+                    started.push(FairPullStart {
+                        attempt_id,
+                        admission_id,
+                        work_class,
+                        enqueue_sequence,
+                    });
+                    last_selection = self.select_ready(Some(profile), true);
+                    pulls_performed += 1;
+                }
+                Err(refusal) => {
+                    // The owner's exact refusal, never a summary of it. A drive
+                    // that re-read does so over a refusal it still reports; a
+                    // drive that cannot re-read returns the refusal itself.
+                    let Some(disposition) = stale_selection_disposition(&refusal) else {
+                        return Err(refusal);
+                    };
+                    last_selection = self.select_ready(Some(profile), true);
+                    pulls_performed += 1;
+                    let repull_reselected_same_item =
+                        last_selection.selected_attempt_id.as_ref() == Some(&attempt_id);
+                    stale_refusals.push(FairPullStaleRefusal {
+                        attempt_id,
+                        admission_id,
+                        work_class,
+                        enqueue_sequence,
+                        disposition,
+                        repull_reselected_same_item,
+                    });
+                }
+            }
         }
         Ok(FairPullOutcome {
             algorithm: FAIR_PULL_ALGORITHM,
@@ -2393,6 +2677,7 @@ impl AgentCoordinator {
             poll_bound,
             pulls_performed,
             started,
+            stale_refusals,
             last_selection,
         })
     }
@@ -2543,6 +2828,19 @@ impl AgentCoordinator {
     ///   boundary that can fail against evidence this coordinator does not
     ///   hold.
     ///
+    ///   **The reserved partition is enforced here, not only at admission**
+    ///   (issue #1683 W4, checklist A1). The re-count is per
+    ///   [`WorkClass::capacity_class`] partition, not per route, so a ready
+    ///   `control` item's start is decided against the protected partition's own
+    ///   budget and cannot be refused as `Backpressure` merely because saturated
+    ///   `normal_background` / `model_jobs` / `swarm` work filled the route's
+    ///   normal-workload budget. This is the boundary at which a selection is
+    ///   actually spent, so it is where the reservation becomes a bound rather
+    ///   than a published label. It stays a **refusal**: a partition over its
+    ///   limit is still `Backpressure`, never clamped, dropped or reported as
+    ///   success. Derivation and the exact per-partition limit on
+    ///   [`Self::validate_route_capacity`].
+    ///
     /// Nothing is minted, re-derived or synthesized: the receipt, the proof
     /// reference and the canonical bytes are all read from the coordinator's own
     /// stored admission, the admission lane and reassignment receipt from that
@@ -2639,10 +2937,19 @@ impl AgentCoordinator {
         // an existing slot from queued to in-flight and adds no new one.
         // Requesting 1 here would double-count the item against its own route
         // and refuse a start that admission legitimately reserved.
+        //
+        // The zero is charged to the item's own partition
+        // ([`WorkClass::capacity_class`], issue #1683 W4), so what is
+        // re-asserted here is that *its* partition is still within its budget
+        // rather than that the whole route is. This is the boundary where a
+        // selection is actually spent, so it is the boundary at which the
+        // reserved partition becomes real: bulk work that filled the normal
+        // partition cannot make a ready control item's start refuse as
+        // `Backpressure`.
         self.validate_route_capacity(BTreeMap::from([(
             route_key(&current.route),
             RouteCapacityRequest {
-                requested: 0,
+                requested: RoutePartitionDemand::of(current.work_class.capacity_class(), 0),
                 capacity_identity: current.capacity_identity.clone(),
                 capacity_revision: current.capacity_revision.clone(),
                 capacity_limit: current.capacity_limit,
@@ -3078,7 +3385,11 @@ impl AgentCoordinator {
         self.validate_route_capacity(BTreeMap::from([(
             route_key(&old.route),
             RouteCapacityRequest {
-                requested: 1,
+                // Issue #1683 W4: the replacement is charged to the partition the
+                // old attempt's own work class declares, the same partition the
+                // original was counted in, so a reassignment cannot borrow the
+                // reserved partition from the normal one or vice versa.
+                requested: RoutePartitionDemand::of(old.work_class.capacity_class(), 1),
                 capacity_identity: old.capacity_identity.clone(),
                 capacity_revision: old.capacity_revision.clone(),
                 capacity_limit: old.capacity_limit,
@@ -3890,15 +4201,20 @@ impl AgentCoordinator {
     /// issue #1108).
     ///
     /// The daemon re-queries Kernel and passes a fresh `capability`: the
-    /// snapshot's stored binding must equal the live binding derived from it,
-    /// and every replayed event re-verifies through the T9-04 pure verifier,
-    /// so a serialized `Verified` label alone never restores authority and
-    /// revoked or stale Kernel evidence fails closed.
+    /// capability must carry its factory-witnessed durable owner row, else
+    /// restore fails closed with [`CoordinatorError::StaleProviderBinding`]
+    /// before any replay, so missing provider evidence stays blocked and
+    /// never silently resumes effecting operations. The snapshot's stored
+    /// binding must equal the live binding derived from it, and every
+    /// replayed event re-verifies through the T9-04 pure verifier reading the
+    /// retained row per call, so a serialized `Verified` label alone never
+    /// restores authority and revoked or stale Kernel evidence fails closed.
     pub fn restore_with_admitted_provider(
         snapshot: CoordinatorSnapshot,
         live_config: CoordinatorConfig,
         capability: AdmittedProviderCapability,
     ) -> Result<Self, CoordinatorError> {
+        crate::factory::require_witnessed_binding(&capability)?;
         Self::restore_with_provider(
             snapshot,
             live_config,
@@ -3957,11 +4273,17 @@ impl AgentCoordinator {
     /// misdirected result wires fail with structured errors before any replay.
     /// Every replayed event then re-verifies through the admitted provider
     /// exactly as [`Self::restore_with_admitted_provider`] does.
-    /// STITCH (#370 W24/W25/W26/A2/A28): the daemon JSON-restore path
-    /// stitches its real persisted-snapshot ingress here; BLOCKED-BY the
-    /// durable fabric-restore driver (#1108 lane). Forbidden: serializing
-    /// an already-typed snapshot and reparsing it (no-op shim, not a
-    /// live ingress).
+    /// Live durable ingress (#370 W24/W25/W26/A2/A28): the production daemon
+    /// recovery poll restores the coordinator through this entry, from the
+    /// coordinator document selected out of the persisted projection FILE
+    /// bytes after that file's envelope is verified —
+    /// `bins/eliotd/src/solo_agent_driver.rs::load_verified_projection` ->
+    /// `restore_solo_fabric_async` ->
+    /// `DaemonComposition::agent_fabric_restore_verified_async` ->
+    /// `AgentFabric::restore_durable_snapshot_with_admitted_provider` -> here.
+    /// The in-memory snapshot is a state carrier there, never the byte source.
+    /// Forbidden: serializing an already-typed snapshot and reparsing it (no-op
+    /// shim, not a live ingress).
     pub fn restore_snapshot_json(
         json: &str,
         live_config: CoordinatorConfig,
@@ -4340,6 +4662,61 @@ impl AgentCoordinator {
             .count()
     }
 
+    /// Refuses a route addition whose partition is already at its live limit
+    /// (issue #1683 W4).
+    ///
+    /// The count and the limit are both **per capacity partition**, decided by
+    /// [`WorkClass::capacity_class`] on the stored attempt's own work class. That
+    /// is the whole point of this function and it is what was missing: before
+    /// this change `active` was one route-wide counter with no partition term,
+    /// so every non-terminal attempt on the route — whatever class it belonged
+    /// to — was charged against the same budget. The reserved protected
+    /// partition was therefore declared but never checked here, and normal
+    /// workload could consume it outright: with `max_active_per_route = L` and
+    /// `L` running `normal_background` attempts on a route shared with a control
+    /// lane, the `L`-th normal admit succeeded and the control admit was refused
+    /// [`CoordinatorError::Backpressure`] by normal-workload consumption — the
+    /// same at the [`Self::start_attempt`] reserve leg and at [`Self::reassign`].
+    /// I14.3's "Normal workload cannot consume it" and I14.8's "strong
+    /// reviewer/arbitration reserve protected from bulk workers" were unenforced
+    /// on the coordinator's own physical route budget even though
+    /// [`WorkClass::capacity_class`] published `ProtectedControl` for that item.
+    /// Counting per partition is the same split the Kernel already holds
+    /// physically in `eliot_kernel_core::ControlReserve`, whose
+    /// `normal_in_flight` and `protected_in_flight` are disjoint counters.
+    ///
+    /// What the per-partition count does and does not change, stated rather than
+    /// implied:
+    ///
+    /// - The effective limit is
+    ///   `min(CoordinatorConfig::max_active_per_route, addition.capacity_limit)`
+    ///   seeded for every partition and then narrowed by the `capacity_limit` of
+    ///   the attempts **in that same partition** only. Folding in another
+    ///   partition's narrower limit would let a bulk attempt silently tighten
+    ///   the reserved partition, which is the same defect read backwards, so it
+    ///   is deliberately not done.
+    /// - Because each partition carries its own budget, a route's total active
+    ///   attempts can reach the sum of the budgets of the partitions actually in
+    ///   use. That is the arithmetic of
+    ///   `ControlReserve::partitioned(normal_capacity, protected_capacity)`,
+    ///   which likewise lets each partition fill independently. It is a
+    ///   deliberate, bounded consequence of the reservation — bounded by
+    ///   `max_active_per_route` per partition — and it is not a silent overflow:
+    ///   nothing is clamped, nothing is dropped, and a partition over its limit
+    ///   is still refused.
+    /// - Route **evidence** is still validated across every attempt on the
+    ///   route, in every partition: a mismatched `capacity_identity`,
+    ///   `capacity_revision` or zero `capacity_limit` is still
+    ///   [`CoordinatorError::StaleCapacity`], and the addition's own
+    ///   `capacity_limit` is still folded into every partition's seed.
+    ///
+    /// Refusal stays typed and is never a clamp. Each partition is compared
+    /// independently and the **first** partition over its limit is refused with
+    /// that partition's own `active`, `requested` and `limit`, so the report
+    /// names the partition that is full rather than a route-wide total that no
+    /// single class could act on. Both the count and the additions saturate, so
+    /// an overflowing partition stays at its maximum and still refuses instead
+    /// of wrapping to zero and admitting.
     fn validate_route_capacity(
         &self,
         route_additions: BTreeMap<String, RouteCapacityRequest>,
@@ -4351,11 +4728,12 @@ impl AgentCoordinator {
             {
                 return Err(CoordinatorError::StaleCapacity);
             }
-            let mut active = 0usize;
-            let mut effective_limit = self
-                .config
-                .max_active_per_route
-                .min(addition.capacity_limit);
+            let mut active = RoutePartitionDemand::default();
+            let mut effective_limit = RoutePartitionDemand::uniform(
+                self.config
+                    .max_active_per_route
+                    .min(addition.capacity_limit),
+            );
             for attempt in self.attempts.values().filter(|attempt| {
                 !attempt.state.is_terminal() && route_key(&attempt.route) == route
             }) {
@@ -4365,15 +4743,21 @@ impl AgentCoordinator {
                 {
                     return Err(CoordinatorError::StaleCapacity);
                 }
-                active = active.saturating_add(1);
-                effective_limit = effective_limit.min(attempt.capacity_limit);
+                let partition = attempt.work_class.capacity_class();
+                active.add(partition, 1);
+                effective_limit.tighten(partition, attempt.capacity_limit);
             }
-            if active.saturating_add(addition.requested) > effective_limit {
-                return Err(CoordinatorError::Backpressure {
-                    active,
-                    requested: addition.requested,
-                    limit: effective_limit,
-                });
+            for partition in CAPACITY_PARTITIONS {
+                let requested = addition.requested.get(partition);
+                let active_in_partition = active.get(partition);
+                let limit = effective_limit.get(partition);
+                if active_in_partition.saturating_add(requested) > limit {
+                    return Err(CoordinatorError::Backpressure {
+                        active: active_in_partition,
+                        requested,
+                        limit,
+                    });
+                }
             }
         }
         Ok(())

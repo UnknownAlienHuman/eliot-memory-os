@@ -171,16 +171,33 @@ fn main() {
     match run_ordinary_request_loop() {
         // The ordinary result publisher already emitted the versioned
         // result-event stream on stdout; this branch emits no second
-        // summary object (#2787 step 2). Reader audit, re-run 2026-09-29
-        // against this tree rather than inherited: a repository-wide search
-        // for `eliot.wasm.host-result`, `WASM_HOST_RESULT_WIRE_ID` and
-        // `ordinary-request-complete` still finds no process or Kernel
-        // reader of the ordinary result stream — the only references remain
-        // this crate's own definition, its re-export, and this removed
-        // call. The Kernel demand-starts this binary
-        // (`start_wasm_host_parent`) but records the child's streams as
-        // process evidence, not as decoded result events. So no diagnostic
-        // moved to stderr and no consumer migration was required here.
+        // summary object (#2787 step 2). Reader audit, re-run against this
+        // tree rather than inherited, and the earlier claim that the only
+        // references were this crate's definition, its re-export, and this
+        // removed call is no longer true: there is now a REAL readback
+        // consumer of this wire family inside the producer, and it is the
+        // production replay-publication path rather than a local helper.
+        // `run_ordinary_request_loop`'s `StagedDeliveryState::Replay` arm
+        // reads the #2786 served-result record back through
+        // `dispatch_material::read_served_result`, decodes each retained
+        // event with `WasmHostResultFrame`, proves the decode re-encodes to
+        // the stored bytes, rejects every event with `validate_frame` and the
+        // whole sequence with `validate_result_stream`, classifies the result
+        // into `ServedResultReadback`'s four distinct states, and republishes
+        // only a `Complete` sequence through the sole ordinary emitter
+        // (`DeliverySetChannel::replay_only`). That is the same decode-and-
+        // reject rule an external consumer owes this wire, applied to the
+        // exact recorded bytes rather than to a recomputed substitute.
+        //
+        // What the re-run still finds is no EXTERNAL process or Kernel
+        // consumer: `eliot.wasm.host-result`, `WASM_HOST_RESULT_WIRE_ID` and
+        // `WasmHostResultFrame` resolve only inside this crate, and the Kernel
+        // demand-starts this binary (`start_wasm_host_parent`) but records the
+        // child's streams as process evidence (digest and locator, through
+        // `OrsProcessEvidenceSink`), never as decoded result events. So no
+        // diagnostic moved to stderr and no in-tree consumer migration was
+        // required here; an external consumer of a captured stdout stream is
+        // still a migration this issue cannot discharge on its own.
         //
         // The consequence is recorded rather than left implicit: the
         // consumer-side rejection rule (mixed versions, duplicate terminal

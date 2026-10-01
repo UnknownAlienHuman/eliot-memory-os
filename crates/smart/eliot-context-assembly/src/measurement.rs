@@ -3,7 +3,7 @@
 use eliot_context_contracts::{
     ActiveUnderstandingView, AdmittedContextSet, CONTEXT_CONTRACT_VERSION, CapacityLimits,
     ContextBinding, ContextError, ContextRecipe, MeasurementStatus, QualityScorecard, RenderedAtom,
-    SerializedContextMeasurement,
+    ResolvedContextRecipe, SerializedContextMeasurement,
 };
 use eliot_context_measurement::{MeasurementParams, measure_exact_utf8};
 use eliot_contracts::{ContractVersion, canonical_json_bytes, sha256_hex};
@@ -101,6 +101,17 @@ pub(crate) fn verify(
 /// through `params`; nothing here synthesizes an identity, digest, capacity
 /// number, revision or timestamp.
 ///
+/// #1862 BLOCK-2: `params` no longer carries a serializer identity at all. The
+/// codec identity in the returned measurement is stamped by the Context
+/// contracts owner (`canonical_render_serializer`), and the composing route's
+/// `policy` triple is bound to that same owner record by
+/// `require_context_render_codec` in
+/// `bins/eliotd/src/kernel_context_read_client.rs` before any byte is
+/// rendered, so `verify` below compares the render owner against the render
+/// owner rather than two
+/// caller-declared triples that could agree with each other on a codec neither
+/// of them renders with.
+///
 /// The returned measurement is still bound to the canonical rendered payload
 /// by this module's `verify` - unchanged and still authoritative - and a
 /// `ContextError` from the owner stays typed as [`AssemblyError::Contract`]
@@ -120,11 +131,12 @@ pub(crate) fn verify(
 pub fn assemble_active_view_with_measurement(
     admitted: &AdmittedContextSet,
     recipe: &ContextRecipe,
+    approved: &ResolvedContextRecipe,
     quality: QualityScorecard,
     policy: &AssemblyPolicy,
     params: &MeasurementParams,
 ) -> Result<ActiveUnderstandingViewResult, AssemblyError> {
-    assemble_active_view(admitted, recipe, quality, policy, |bytes| {
+    assemble_active_view(admitted, recipe, approved, quality, policy, |bytes| {
         measure_exact_utf8(bytes, params)
     })
 }

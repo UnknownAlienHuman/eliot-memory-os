@@ -2471,6 +2471,19 @@ impl AdmittedStage {
                 ),
             });
         }
+        // The observed argv must be the argv this spec admits. The executable
+        // digest alone cannot witness which arguments ran: two stages of the
+        // same tool share one content digest, so without this check an
+        // observation carrying substituted argv would be admitted under the
+        // admitted identity. `binds_argv` compares argv to argv only.
+        if !observed.binds_argv(&self.verification_command) {
+            return Err(AdmissionError::ExecutableMismatch {
+                detail: format!(
+                    "observed argv {:?} is not the admitted verification command {:?}",
+                    observed.arguments, self.verification_command,
+                ),
+            });
+        }
         if let Some(pinned) = self.executable_version.as_deref()
             && observed.tool_version.as_deref() != Some(pinned)
         {
@@ -2501,10 +2514,29 @@ impl AdmittedStage {
     /// owner-observed executable identity; an empty content digest never
     /// yields a launchable grant. The requested arguments must equal the
     /// admitted fixed template exactly; an empty admitted template admits
-    /// only the empty argument vector. Success seals every bound field,
-    /// including the observed canonical path and the admitted supply-chain
-    /// receipt digest, into an [`InstrumentAdmissionGrant`] whose digest the
-    /// launch receipt records.
+    /// only the empty argument vector.
+    ///
+    /// The sealed `grant.arguments` is the stage's admitted verification
+    /// command, NOT `request.arguments`. Those are different facts: a
+    /// caller's `InstrumentInvocation.arguments` is an instrument-level filter
+    /// that every builtin admits only as the empty vector, while the argv the
+    /// stage actually runs is the spec's `verification_command` (issue #1914,
+    /// audit 5918718113 item 3 — "an empty argument template or a tool's
+    /// default/help output is not package verification"). Sealing the request's
+    /// empty vector into the grant left
+    /// `InstrumentRunner::launch_admitted` comparing the sealed request's real
+    /// argv (`cargo build --message-format=json --locked --all-targets`) against
+    /// an empty `grant.arguments` and refusing every launch with
+    /// `RunnerError::ReceiptMismatch`, so no stage of a verification route could
+    /// ever reach a recorded tool identity. The grant is also the identity the
+    /// launch receipt records, so binding the wrong argv there is what makes the
+    /// argv unsubstantiated: a run whose argv differed from the admitted command
+    /// would still carry a self-consistent grant digest.
+    ///
+    /// Success seals every bound field, including the observed canonical path,
+    /// the admitted verification argv, and the admitted supply-chain receipt
+    /// digest, into an [`InstrumentAdmissionGrant`] whose digest the launch
+    /// receipt records.
     ///
     /// # Errors
     ///
@@ -2556,6 +2588,11 @@ impl AdmittedStage {
                 detail: "requested arguments differ from the admitted fixed template".to_owned(),
             });
         }
+        // The argv this stage is ADMITTED to run is the spec's declared
+        // verification command, validated here exactly as `request.arguments`
+        // is: it is sealed into the grant, so a value carrying shell text must
+        // fail closed here rather than reach a sealed process request.
+        reject_shell_text(&self.verification_command)?;
         let Some(identity) = observed else {
             return Err(AdmissionError::UnresolvedObservation {
                 instrument: self.spec.as_str().to_owned(),
@@ -2578,7 +2615,7 @@ impl AdmittedStage {
                 .as_ref()
                 .map(SupplyChainReceipt::digest)
                 .unwrap_or_default(),
-            arguments: request.arguments.clone(),
+            arguments: self.verification_command.clone(),
             environment_class: self.environment_class.clone(),
             scope_class: ADMITTED_SCOPE_CLASS.to_owned(),
             credential_policy: self.credential_policy.clone(),

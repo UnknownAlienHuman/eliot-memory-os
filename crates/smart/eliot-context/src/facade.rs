@@ -51,7 +51,7 @@
 //!
 //! | caller | classification |
 //! |---|---|
-//! | `ContextCompiler::compile`, `compile_with_revocation` | bounded compatibility consumer; `#[deprecated]`, `LegacyFrozen`, and only `tests/admission_integrity.rs` calls them |
+//! | `ContextCompiler::compile`, `compile_with_revocation` | bounded compatibility consumer; `#[deprecated]`, `LegacyFrozen`, and no binary reaches them. Two in-crate test files call `compile` — `tests/admission_integrity.rs` and `tests/cue_kind_boundary.rs` — so the zero-consumer denominator is those two files, not one. `compile_with_revocation` has no caller other than `compile`, which delegates to it at `lib.rs:531` |
 //! | `ContextCompiler::compile_with_campaign_learning_state` | bounded compatibility consumer; zero product callers, recorded in `cognitive-donor-map.toml` and `cognitive-edge-map.toml` |
 //! | `CampaignCompiledContext`, `CampaignLearningStateCompileInput`, `CampaignContextRolePolicy`, `CampaignContextCompileError` | bounded compatibility consumer; zero callers outside this crate |
 //! | `compile_plan`/`compile_control_unfinalized` in `crates/eliot-engine` and `crates/eliot-app` | NOT this surface; those are `eliot_engine::context::ContextCompiler`, a different type with its own owner, and they never name a crate-root item here |
@@ -457,10 +457,12 @@ pub fn adapt_admit_context(
 
 /// Assembles one admitted set through A-18 exactly once.
 ///
-/// The caller supplies the admitted set, recipe, quality verdict, policy, and
+/// The caller supplies the admitted set, recipe, the owner-resolved approved
+/// policy revision this compilation is pinned to, quality verdict, policy, and
 /// measurement callback; the facade re-runs no admission and invents no
-/// measurement. The returned envelope must echo the exact admitted set before
-/// it is handed back unchanged.
+/// measurement. `approved` is the revision whose declared `layout.role_positions`
+/// the renderer applies (#1724 W4), not a hint about the order. The returned
+/// envelope must echo the exact admitted set before it is handed back unchanged.
 ///
 /// # Errors
 ///
@@ -470,6 +472,7 @@ pub fn adapt_admit_context(
 pub fn adapt_assemble_view<F>(
     admitted: &eliot_context_contracts::AdmittedContextSet,
     recipe: &eliot_context_contracts::ContextRecipe,
+    approved: &eliot_context_contracts::ResolvedContextRecipe,
     quality: eliot_context_contracts::QualityScorecard,
     policy: &eliot_context_assembly::AssemblyPolicy,
     measure: F,
@@ -482,8 +485,9 @@ where
         eliot_context_contracts::ContextError,
     >,
 {
-    let result =
-        eliot_context_assembly::assemble_active_view(admitted, recipe, quality, policy, measure)?;
+    let result = eliot_context_assembly::assemble_active_view(
+        admitted, recipe, approved, quality, policy, measure,
+    )?;
     if result.admitted != *admitted {
         return Err(FacadeError::ResponseIdentityMismatch {
             what: "assembly.admitted",

@@ -4977,20 +4977,155 @@ pub struct AuditedClaim {
     pub excerpts: Vec<crate::admitted_excerpt::AdmittedExcerpt>,
 }
 
+/// Named arguments for [`AuditedClaim::freeze_identity`].
+///
+/// These are the three condition inputs a claim cannot state on its own, and
+/// each is passed from a **different owner** than the claim itself:
+///
+/// - the [`SourceRecord`] whose temporal facts and content digest are the
+///   version the statement is about;
+/// - the Kernel-admitted denominator digest the run was admitted under;
+/// - the [`CoverageAccount`] that declared the denominator's members.
+///
+/// An [`AuditedClaim`] is prose plus citations. It holds no clock reading, no
+/// denominator and no member count, because a claim is not where those are
+/// established — and a frozen identity that stated a time, a definition or a
+/// denominator the claim invented would be exactly the self-issued attestation
+/// this module refuses everywhere else. Passing the owners in also means a
+/// caller cannot freeze an identity against a record other than the one its
+/// single citation resolves to.
+#[derive(Clone, Copy, Debug)]
+pub struct ClaimConditionSources<'a> {
+    /// The exact admitted record this claim is about.
+    ///
+    /// Its `content_digest` is the revision identity, and its `published_ms`,
+    /// `observed_ms`, `retrieved_ms` and `freshness_boundary_ms` are the only
+    /// instants any owner observed. `None` on one of them is rendered as an
+    /// explicit unrecorded state, never as a substituted reading.
+    pub record: &'a SourceRecord,
+    /// Kernel-admitted digest of the declared denominator.
+    pub admitted_denominator_digest: &'a str,
+    /// The exact coverage accounting published over that denominator.
+    pub account: &'a CoverageAccount,
+}
+
+/// Declared spelling domain of a frozen claim `time_version`.
+///
+/// Bound into the rendered value so a change to how a time version is spelled
+/// changes the identity it appears in, instead of leaving two spellings
+/// describing the same revision indistinguishable.
+pub const CLAIM_TIME_VERSION_DOMAIN: &str = "claim-time-version/v1";
+
+/// Declared spelling domain of a frozen claim `definition_unit_denominator`.
+///
+/// Bound for the same reason as [`CLAIM_TIME_VERSION_DOMAIN`]: the denominator
+/// condition is part of what an opposition relation is compared against, so two
+/// different spellings of the same denominator must not be able to pass as one.
+pub const CLAIM_DEFINITION_UNIT_DOMAIN: &str = "claim-definition-unit/v1";
+
+/// Canonical spelling of one declared instant.
+///
+/// `unrecorded` is a statement about the record, not a substitute for a
+/// reading. A record that declares no publication time had no publication time
+/// observed, and rendering it as a clock value would put an instant into a
+/// frozen identity that no owner ever saw.
+fn declared_instant(value: Option<i64>) -> String {
+    value.map_or_else(|| "unrecorded".to_owned(), |ms| ms.to_string())
+}
+
+/// The time window and version one claim is stated about, read off the record
+/// that claim cites.
+///
+/// This is the revision the statement is about, not the moment the audit ran.
+/// The revision identity is the record's own `content_digest` — the same value
+/// `audit_claim_with_excerpts` compares retained bytes against, so the window
+/// and the bytes a reader can check are one statement. The instants are the
+/// record's own declared `published_ms` / `observed_ms` / `retrieved_ms` /
+/// `freshness_boundary_ms`, each rendered as `unrecorded` when the record
+/// declares none. Nothing here is a reading of the current time: a claim about
+/// a past revision stays bound to that revision's window, which is the whole
+/// reason this field is not "when we audited it".
+fn claim_time_version(record: &SourceRecord) -> String {
+    format!(
+        "{CLAIM_TIME_VERSION_DOMAIN};published_ms={};observed_ms={};retrieved_ms={};\
+         freshness_boundary_ms={};revision={}",
+        declared_instant(record.published_ms),
+        declared_instant(record.observed_ms),
+        declared_instant(record.retrieved_ms),
+        declared_instant(record.freshness_boundary_ms),
+        record.content_digest
+    )
+}
+
+/// The definition, unit and denominator one claim is measured in, read off the
+/// denominator its run was admitted under.
+///
+/// The denominator is the Kernel-admitted digest — the same value the run's own
+/// [`AuthorizedManifest`] is frozen with, so the claim cannot be measured
+/// against a denominator its audit was not authorized for. The unit is the
+/// coverage account's own declared member count and account digest, so "measured
+/// in" names a countable population rather than asserting one.
+fn claim_definition_unit_denominator(
+    admitted_denominator_digest: &str,
+    account: &CoverageAccount,
+) -> String {
+    format!(
+        "{CLAIM_DEFINITION_UNIT_DOMAIN};denominator={admitted_denominator_digest};\
+         declared_members={};account={}",
+        account.denominator_size(),
+        account.digest()
+    )
+}
+
 impl AuditedClaim {
-    /// Named constructor for a claim audited without a frozen identity.
+    /// Freezes the claim identity this claim's released wording can be audited
+    /// under.
     ///
     /// A claim that carries no [`FrozenClaimIdentity`] cannot be released as
     /// supported, because there is nothing to check its wording and revision
-    /// against. This constructor makes that state explicit rather than leaving it
-    /// to a caller to remember: it is the shape a claim arrives in before it has
-    /// been frozen, and the audit says so instead of guessing.
+    /// against. This is the shape a claim arrives in before it has been frozen,
+    /// built here rather than trusted from a caller so the conditions are read
+    /// off the owners named by `sources`.
+    ///
+    /// # The three conditions, and where each value comes from
+    ///
+    /// `population_scope` is the claim's own admitted domain. `time_version`
+    /// and `definition_unit_denominator` are rendered by the two helpers above
+    /// from `sources`, because an [`AuditedClaim`] holds no clock reading and
+    /// no denominator — see [`ClaimConditionSources`]. Both were empty strings
+    /// here before, which is not a neutral value: `freeze` requires each one
+    /// non-blank, so every run with a non-empty material-claim roster was
+    /// refused with `Blank { field: "claim_identity.time_version" }` before the
+    /// audit could reach a verdict at all.
+    ///
+    /// `modality` stays [`ClaimModality::Descriptive`]: the claim released here
+    /// asserts what the retained artifact contains, and nothing on this path
+    /// establishes a predictive, normative or causal reading of it.
+    ///
+    /// `claim_revision` is `1` because the run releases this wording for the
+    /// first time; there is no prior revision of a released statement on this
+    /// path to supersede.
+    ///
+    /// `digest` is left empty on purpose. [`FrozenClaimIdentity::freeze`]
+    /// clears it and recomputes the canonical digest from the rest of the
+    /// identity, and the field is `#[serde(skip)]` so it is excluded from the
+    /// canonical bytes in the first place — an empty preimage here is the
+    /// required input to that computation, not a missing value.
     ///
     /// # Errors
     ///
-    /// Propagates every refusal the frozen identity raises. Returns `Ok(None)`
-    /// never — a caller that has no identity uses [`Self::unfrozen`].
-    pub fn freeze_identity(&self) -> Result<FrozenClaimIdentity, PortfolioError> {
+    /// Propagates every refusal the frozen identity raises, and additionally
+    /// [`PortfolioError::IncompleteDenominator`] when the coverage account
+    /// declares no members, which is a run that was obliged to close nothing.
+    pub fn freeze_identity(
+        &self,
+        sources: ClaimConditionSources<'_>,
+    ) -> Result<FrozenClaimIdentity, PortfolioError> {
+        if sources.account.denominator_size() == 0 {
+            return Err(PortfolioError::IncompleteDenominator {
+                field: "claim_identity.definition_unit_denominator",
+            });
+        }
         FrozenClaimIdentity::freeze(FrozenClaimIdentity {
             claim_id: self.claim_id.clone(),
             statement: self.statement.clone(),
@@ -5002,8 +5137,11 @@ impl AuditedClaim {
             subject: self.domain.clone(),
             conditions: ClaimConditions {
                 population_scope: self.domain.clone(),
-                time_version: String::new(),
-                definition_unit_denominator: String::new(),
+                time_version: claim_time_version(sources.record),
+                definition_unit_denominator: claim_definition_unit_denominator(
+                    sources.admitted_denominator_digest,
+                    sources.account,
+                ),
                 modality: ClaimModality::Descriptive,
             },
             artifact_digest: self.statement_artifact_digest(),
@@ -7179,6 +7317,17 @@ pub fn audit_claim(
     // a silent skip. The four-argument form is kept as the surface that does
     // *not* have a governed source-admission/persistence owner in hand, and
     // `audit_claim_with_excerpts` is the entry point that takes one.
+    //
+    // A claim reaching this entry point can therefore never come out
+    // `Supported`: its `excerpt_supports_requirement` obligation is
+    // `Unsatisfied` either because it offered no exact excerpt or because no
+    // retained revision was supplied to check the one it did, and
+    // `releasable_as_supported` reads that obligation directly. What the empty
+    // map does *not* do is decide the terminal class on its own — the excerpt
+    // finding is reported after the support-gap and stale findings, so a claim
+    // that is also missing a whole cited source still reports that as the more
+    // specific reason. This is the fail-closed direction: it refuses to release,
+    // it does not misreport why.
     audit_claim_with_retained(claim, portfolio, binding, now_ms, &BTreeMap::new())
 }
 
@@ -7501,13 +7650,19 @@ fn audit_claim_with_retained(
     // all.
     let excerpt_obligation =
         crate::admitted_excerpt::excerpt_requirement_from_checks(&excerpt_checks);
-    // Any excerpt that did not verify is a support gap, and the fail-closed
-    // arm is what turns it into a terminal class. `Unknown` (every excerpt
-    // verified for occurrence and context, semantic sufficiency still
-    // unexamined) is deliberately NOT a gap here: it is already carried by
-    // `requirements`, and it blocks a `Supported` promotion through
-    // `requirements_complete` and `releasable_as_supported` rather than by
-    // flattening the terminal class. Making it a gap as well would turn the
+    // Any excerpt that did not verify is a gap, and the fail-closed arm below
+    // is what turns it into a terminal class. This flag means exactly one
+    // thing: the excerpt obligation came back `Unsatisfied`. It is recorded
+    // independently of the support gaps — `support_gap` is derived from the
+    // dispositions of whole cited sources, and a claim can fail either without
+    // the other — so the two are separate findings and the terminal chain
+    // reports the more specific one first.
+    //
+    // `Unknown` (every excerpt verified for occurrence and context, semantic
+    // sufficiency still unexamined) is deliberately NOT a gap here: it is
+    // already carried by `requirements`, and it blocks a `Supported` promotion
+    // through `requirements_complete` and `releasable_as_supported` rather than
+    // by flattening the terminal class. Making it a gap as well would turn the
     // honest "occurrence verified, semantics unknown" state into a claim about
     // the evidence that the audit did not measure.
     let excerpt_gap = excerpt_obligation.outcome == RequirementOutcome::Unsatisfied;
@@ -7544,19 +7699,6 @@ fn audit_claim_with_retained(
         ClaimOutcome::Contradicted
     } else if !unverifiable.is_empty() {
         ClaimOutcome::NotVerifiableInScope
-    } else if excerpt_gap {
-        // The cited source satisfies the requirement, but the exact words the
-        // claim quotes do not verify against the admitted revision — they are
-        // absent, cropped of a governing negation, stitched across sections, or
-        // were never compared with the original because no retained revision was
-        // supplied. I21.8's `excerpt_supports_requirement` is the separate
-        // obligation that catches exactly this, and an admitted source containing
-        // relevant material with an insufficient or wrong excerpt must not yield
-        // a supported claim. This sits after the support-gap arms so a claim that
-        // is *also* missing a whole source still reports the missing source as
-        // the more specific finding; it sits before the `stale_hit` arm so a
-        // stale source is not reported when the quote is additionally wrong.
-        ClaimOutcome::PartiallySupported
     } else if lineage_gap || precision_gap || support_gap {
         if stale_hit && supporting.is_empty() {
             ClaimOutcome::StaleLimited
@@ -7567,6 +7709,30 @@ fn audit_claim_with_retained(
         }
     } else if stale_hit {
         ClaimOutcome::StaleLimited
+    } else if excerpt_gap {
+        // The cited source satisfies the requirement, but the exact words the
+        // claim quotes do not verify against the admitted revision — they are
+        // absent, cropped of a governing negation, stitched across sections, or
+        // were never compared with the original because no retained revision was
+        // supplied. I21.8's `excerpt_supports_requirement` is the separate
+        // obligation that catches exactly this, and an admitted source containing
+        // relevant material with an insufficient or wrong excerpt must not yield
+        // a supported claim. It sits after the support-gap and stale arms so a
+        // claim that is *also* missing a whole cited source, or carrying a stale
+        // one, still reports that as the more specific finding rather than this
+        // one.
+        //
+        // It is placed there by this change rather than above the support-gap
+        // arms as it was: read in that position it reported a quote failure for
+        // a claim whose excerpts were never the thing being audited, replacing a
+        // more specific finding (a citation outside the claim's domain, a claim
+        // recording no citations at all) with the weaker one. The flag itself is
+        // unchanged and still means exactly what it says — the excerpt
+        // obligation was `Unsatisfied` — so `requirements`,
+        // `requirement_outcome` and `releasable_as_supported` read the same
+        // value they did before; only which terminal class names it changed, and
+        // only for a claim that fails some other obligation too.
+        ClaimOutcome::PartiallySupported
     } else if !unknowns.is_empty()
         || unfrozen_material_claim
         || (claim.material && claim.citations.is_empty() && counterevidence.is_empty())

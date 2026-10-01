@@ -149,11 +149,12 @@ pub use installer_authority_key::{
     WindowsInstallationAuthorityKeyProvider, WindowsInstallationAuthorityKeyStore,
 };
 pub use installer_root::{
-    InstallerProtectedFileReadback, InstallerRootAbsentSnapshot, InstallerRootCreateAttempt,
-    InstallerRootCreateDisposition, InstallerRootError, InstallerRootObjectSnapshot,
-    InstallerRootPrimitiveCreate, InstallerRootPrimitiveObservation, InstallerRootPrimitiveSpec,
-    InstallerRootProfile, InstallerRootStage, WindowsInstallerRootPrimitive, is_process_elevated,
-    windows_path_identity_digest, windows_paths_equal,
+    ISOLATED_RESTORE_ROOT_DIR, InstallerProtectedFileReadback, InstallerRootAbsentSnapshot,
+    InstallerRootCreateAttempt, InstallerRootCreateDisposition, InstallerRootError,
+    InstallerRootObjectSnapshot, InstallerRootPrimitiveCreate, InstallerRootPrimitiveObservation,
+    InstallerRootPrimitiveSpec, InstallerRootProfile, InstallerRootStage,
+    WindowsInstallerRootPrimitive, is_process_elevated, windows_path_identity_digest,
+    windows_paths_equal,
 };
 pub use kernel_front_door_expectation::{KernelFrontDoorAclMode, KernelFrontDoorServerExpectation};
 #[cfg(test)]
@@ -316,9 +317,10 @@ pub use terminal_containment::{
     TERMINAL_CONTAINMENT_RECORD_BYTES, TERMINAL_CONTAINMENT_RECORD_VERSION,
     TERMINAL_CONTAINMENT_SITE_MAX_BYTES, TerminalContainmentError, TerminalContainmentReadback,
     TerminalContainmentRecord, TerminalContainmentSink, TerminalContainmentUnresolved,
-    TerminalSubmission, fail_stop_with_terminal_containment, prepare_terminal_containment,
-    submit_terminal_containment, terminal_containment_operation_digest,
-    validate_terminal_containment_readback, validate_terminal_containment_readback_for,
+    TerminalRestartGate, TerminalSubmission, fail_stop_with_terminal_containment,
+    gate_terminal_restart_for, prepare_terminal_containment, submit_terminal_containment,
+    terminal_containment_operation_digest, validate_terminal_containment_readback,
+    validate_terminal_containment_readback_for,
 };
 pub(crate) use user_owned_leases::current_process_sid;
 #[cfg(any(test, feature = "test-support"))]
@@ -2510,58 +2512,96 @@ pub fn open_no_follow_directory(
 pub fn ensure_agent_bridge_directory(
     host_state_root: &Path,
 ) -> Result<FileIdentity, WindowsAdapterError> {
-    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ADD_SUBDIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    };
-    let mut options = std::fs::OpenOptions::new();
-    options
-        .read(true)
-        .access_mode(FILE_GENERIC_READ | FILE_ADD_SUBDIRECTORY)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
-    let parent = options.open(host_state_root).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            WindowsAdapterError::NotFound
-        } else if error.kind() == std::io::ErrorKind::PermissionDenied {
-            WindowsAdapterError::PermissionDenied
-        } else {
-            WindowsAdapterError::Failed
-        }
-    })?;
-    let metadata = parent.metadata().map_err(|_| WindowsAdapterError::Failed)?;
-    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return Err(WindowsAdapterError::IdentityMismatch);
-    }
-    let child = match directory_publication::create_owned_directory_relative(
-        &parent,
-        "agent-bridge",
-        std::ptr::null_mut(),
-    ) {
-        Ok(child) => child,
-        Err(DirectoryPublicationError::AlreadyExists) => {
-            directory_publication::open_owned_directory_relative(&parent, "agent-bridge")
-                .map_err(|_| WindowsAdapterError::IdentityMismatch)?
-        }
-        Err(DirectoryPublicationError::ReparsePoint) => {
-            return Err(WindowsAdapterError::IdentityMismatch);
-        }
-        Err(_) => return Err(WindowsAdapterError::Failed),
-    };
-    let metadata = child.metadata().map_err(|_| WindowsAdapterError::Failed)?;
-    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return Err(WindowsAdapterError::IdentityMismatch);
-    }
-    file_identity_from_handle(&child).map_err(|_| WindowsAdapterError::Failed)
+    ensure_owned_protected_child_directory(host_state_root, "agent-bridge")
 }
 
 #[cfg(not(windows))]
 pub fn ensure_agent_bridge_directory(
     host_state_root: &Path,
 ) -> Result<FileIdentity, WindowsAdapterError> {
-    let _ = host_state_root;
-    Err(WindowsAdapterError::Unavailable)
+    ensure_owned_protected_child_directory(host_state_root, "agent-bridge")
+}
+
+/// Creates the User Broker child directory only when absent, retaining the
+/// returned object identity.
+///
+/// This is the broker counterpart of [`ensure_agent_bridge_directory`] and
+/// shares its one implementation: the directory the two protected front-door
+/// leaves are published into is *created and retained by this operation*,
+/// never merely named by a predictable path. An existing object is reopened
+/// without following reparse points and is never replaced, so a substituted
+/// directory fails closed instead of receiving installation-owned bytes.
+#[cfg(windows)]
+pub fn ensure_user_broker_directory(
+    host_state_root: &Path,
+) -> Result<FileIdentity, WindowsAdapterError> {
+    ensure_owned_protected_child_directory(host_state_root, "user-broker")
+}
+
+#[cfg(not(windows))]
+pub fn ensure_user_broker_directory(
+    host_state_root: &Path,
+) -> Result<FileIdentity, WindowsAdapterError> {
+    ensure_owned_protected_child_directory(host_state_root, "user-broker")
+}
+
+/// Retained single implementation of the protected child-directory owner.
+fn ensure_owned_protected_child_directory(
+    host_state_root: &Path,
+    child_name: &str,
+) -> Result<FileIdentity, WindowsAdapterError> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ADD_SUBDIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .access_mode(FILE_GENERIC_READ | FILE_ADD_SUBDIRECTORY)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+        let parent = options.open(host_state_root).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                WindowsAdapterError::NotFound
+            } else if error.kind() == std::io::ErrorKind::PermissionDenied {
+                WindowsAdapterError::PermissionDenied
+            } else {
+                WindowsAdapterError::Failed
+            }
+        })?;
+        let metadata = parent.metadata().map_err(|_| WindowsAdapterError::Failed)?;
+        if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
+        let child = match directory_publication::create_owned_directory_relative(
+            &parent,
+            child_name,
+            std::ptr::null_mut(),
+        ) {
+            Ok(child) => child,
+            Err(DirectoryPublicationError::AlreadyExists) => {
+                directory_publication::open_owned_directory_relative(&parent, child_name)
+                    .map_err(|_| WindowsAdapterError::IdentityMismatch)?
+            }
+            Err(DirectoryPublicationError::ReparsePoint) => {
+                return Err(WindowsAdapterError::IdentityMismatch);
+            }
+            Err(_) => return Err(WindowsAdapterError::Failed),
+        };
+        let metadata = child.metadata().map_err(|_| WindowsAdapterError::Failed)?;
+        if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
+        file_identity_from_handle(&child).map_err(|_| WindowsAdapterError::Failed)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (host_state_root, child_name);
+        Err(WindowsAdapterError::Unavailable)
+    }
 }
 
 /// Deletes one retained regular file object by handle after checking its

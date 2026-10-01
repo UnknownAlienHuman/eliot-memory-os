@@ -48,6 +48,7 @@
 #![allow(clippy::result_large_err)]
 
 use std::collections::BTreeMap;
+use std::sync::{Mutex, OnceLock};
 
 use eliot_skills::{
     MaterializationPorts, MaterializationScope, MissingVerificationProvider,
@@ -129,6 +130,23 @@ pub trait CanonicalToolSource {
     /// resolves `(canonical_name, definition_version)`. No fallback, no
     /// substring match, no prose synthesis.
     fn knows_canonical_tool(&self, canonical_name: &str) -> bool;
+
+    /// Live semantic-profile version the source binds for one canonical
+    /// method (issue #1944 A3).
+    ///
+    /// The Tool Definition owner versions each method's `ToolSemanticProfile`
+    /// independently of the registry definition version: a pure
+    /// semantic-profile edit moves this version while [`definition_version`](Self::definition_version)
+    /// stands still. Sources that bind versioned semantic profiles report
+    /// the live profile version here so versioned admission can pin it and
+    /// the refresh reconcile can invalidate entries admitted under an older
+    /// profile before Material reuse. The default reports no profile data
+    /// (`None`): definition-only sources keep their existing behavior, and
+    /// every existing implementer compiles unchanged until its owner reports
+    /// profile versions.
+    fn semantic_profile_version(&self, _canonical_name: &str) -> Option<String> {
+        None
+    }
 }
 
 /// Neutral projection of one canonical source plus its alias table onto the
@@ -161,6 +179,94 @@ impl KnownTools for VersionBoundTools<'_> {
     fn knows_tool(&self, name: &str) -> bool {
         self.source.knows_canonical_tool(self.aliases.resolve(name))
     }
+}
+
+/// Admitted semantic-profile versions per installed Skill tool basis (issue
+/// #1944 A3).
+///
+/// The catalogue entry schema pins the admitted Tool Definition version but
+/// carries no semantic-profile term, so the versioned admit boundary pins
+/// `(skill_id, canonical_tool) → admitted profile_version` here, alongside
+/// the definition version recorded on the entry itself. The ledger is
+/// process-shared because the daemon composition builds a fresh forwarding
+/// adapter per seam call around the one shared catalogue handle: per-adapter
+/// state would lose admissions between the install call and the refresh
+/// reconcile. Keys share the catalogue's `skill_id` space, so reconcile joins
+/// the record without a second identity.
+///
+/// Fail-closed, never deleting: a recorded admission is kept until the Skill
+/// is re-admitted under a new profile version. A live profile version that
+/// differs from the recorded admission — including a live version appearing
+/// where no admission was ever recorded, or a recorded admission the live
+/// source no longer reports — is drift, and the reconcile caller marks the
+/// entry stale through the existing stale machinery. Entries stay in the
+/// catalogue under `Stale` until revalidation; nothing here removes them.
+static ADMITTED_SEMANTIC_PROFILES: OnceLock<Mutex<BTreeMap<String, BTreeMap<String, String>>>> =
+    OnceLock::new();
+
+/// Locks the admitted-profile ledger, recovering from a poisoned mutex the
+/// same way the daemon catalogue handle does: a previous holder panicked, so
+/// the held state is returned rather than bricking the skill path on a stale
+/// poison flag.
+fn lock_admitted_semantic_profiles()
+-> std::sync::MutexGuard<'static, BTreeMap<String, BTreeMap<String, String>>> {
+    ADMITTED_SEMANTIC_PROFILES
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Records the live semantic-profile versions one installed Skill is admitted
+/// under (issue #1944 A3).
+///
+/// Called at versioned admit time for the installed entry's declared tool
+/// basis: every referenced tool is resolved through the alias table to its
+/// canonical name first, and each canonical tool whose source reports a live
+/// profile version pins that version for the Skill. Tools the source reports
+/// nothing for leave no row: definition-only sources admit exactly as before.
+/// A blank or control-character version from the owner fails closed —
+/// `crate::text` refuses it — so a malformed owner version can never
+/// pin an admission. Existing rows update per tool (reinstall re-pins); rows
+/// for tools the source stopped reporting are kept, so the reconcile gap
+/// reads as drift rather than silent agreement.
+pub fn record_semantic_profile_admission(
+    skill_id: &str,
+    tool_refs: &[String],
+    source: &dyn CanonicalToolSource,
+    aliases: &ToolAliasTable,
+) -> Result<(), SkillError> {
+    let mut pinned: Vec<(String, String)> = Vec::new();
+    for tool_ref in tool_refs {
+        let canonical = aliases.resolve(tool_ref);
+        if let Some(profile_version) = source.semantic_profile_version(canonical) {
+            crate::text(&profile_version, "tools.semantic_profile_version")?;
+            pinned.push((canonical.to_owned(), profile_version));
+        }
+    }
+    if pinned.is_empty() {
+        return Ok(());
+    }
+    let mut ledger = lock_admitted_semantic_profiles();
+    let entry = ledger.entry(skill_id.to_owned()).or_default();
+    for (canonical, profile_version) in pinned {
+        entry.insert(canonical, profile_version);
+    }
+    Ok(())
+}
+
+/// Reads the semantic-profile version one Skill was admitted under for one
+/// canonical tool (issue #1944 A3).
+///
+/// Returns `None` when the Skill never pinned that tool — admitted through a
+/// definition-only source, admitted before profile pinning existed, or never
+/// admitted — so the reconcile caller treats the gap as unbound, never as
+/// agreement.
+#[must_use]
+pub fn admitted_semantic_profile_version(skill_id: &str, canonical_tool: &str) -> Option<String> {
+    lock_admitted_semantic_profiles()
+        .get(skill_id)
+        .and_then(|tools| tools.get(canonical_tool))
+        .cloned()
 }
 
 /// Mirrors the sealed observation rule at the delivery boundary.
@@ -330,9 +436,23 @@ pub fn readiness_names_known_to_source(
 /// change on the tool-owner side therefore blocks installation until the
 /// composition re-admits — the invalidation half of the frozen consumer rule
 /// ("any profile-version edit invalidates dependents before Material reuse")
-/// applied at the install boundary. On agreement, binds the presented
-/// materialization to its exact accepted candidate and then projects and
-/// inserts through [`install_package`] with the [`VersionBoundTools`]
+/// applied at the install boundary.
+///
+/// On success the installed entry's declared tool basis also pins the live
+/// semantic-profile versions it was admitted under through
+/// [`record_semantic_profile_admission`] (issue #1944 A3): each referenced
+/// tool resolves through the alias table first, so a pure semantic-profile
+/// version change later — definition version untouched — reads as drift at
+/// the refresh reconcile and marks the entry stale before Material reuse.
+/// Definition-only sources pin nothing and install exactly as before.
+///
+/// Before the gate, the observed source marks the presented Skill's standing
+/// entry through [`mark_standing_against_observed_source`]:
+/// a changed Tool Definition version or tool view marks the entry stale even
+/// when the install below refuses, so a refused install never leaves old pins
+/// looking current against the newly observed source. On agreement, binds the
+/// presented materialization to its exact accepted candidate and then projects
+/// and inserts through [`install_package`] with the [`VersionBoundTools`]
 /// projection, so install, delivery, and activation all share one versioned
 /// membership.
 // The install boundary carries every owner term explicitly (catalogue,
@@ -356,14 +476,71 @@ pub fn install_package_versioned(
     )?;
     let bound = source.definition_version();
     crate::text(bound, "tools.definition_version")?;
+    let tools = VersionBoundTools::new(source, aliases);
+    mark_standing_against_observed_source(
+        catalogue,
+        &package.registration.skill_id,
+        bound,
+        &tools,
+    )?;
     if bound != admitted_definition_version {
         return Err(SkillError::InvalidField {
             field: "tools.definition_version",
             reason: "the tool source binds a definition version the composition did not admit",
         });
     }
-    let tools = VersionBoundTools::new(source, aliases);
-    install_package(catalogue, candidate, package, inputs, context, &tools)
+    let installed = install_package(catalogue, candidate, package, inputs, context, &tools)?;
+    let tool_refs = catalogue
+        .get(&installed)
+        .map(|entry| entry.body.tool_refs.clone())
+        .unwrap_or_default();
+    record_semantic_profile_admission(&installed, &tool_refs, source, aliases)?;
+    Ok(installed)
+}
+
+/// Marks one standing entry stale against the actually observed canonical
+/// tool source (`I7.13`, issue #1882 A2).
+///
+/// Registration observes the live Tool Definition version and the live tool
+/// view. A standing entry pinned under an older definition version, or whose
+/// declared tool refs the live view no longer knows, is stale — even when the
+/// install below refuses (unadmitted version): a refused install must not
+/// leave old pins looking current against the newly observed source (same
+/// pre-action marking as [`install_package`]). Only the presented Skill is
+/// visited: the dependency set and host/profile legs have no observed terms
+/// at this boundary, so they stay with the full-world sweep
+/// (`SkillCatalogue::reconcile_staleness`) instead of invented versions. The
+/// mark binds standing pins against the observed source only and never
+/// depends on the presented package, so it also fires when the package below
+/// fails its own binding. Quarantined and already-stale entries report no
+/// change through the existing mark paths; recovery stays
+/// reinstall-revalidation (wholesale replace) or explicit scoped/provisional
+/// (`SkillCatalogue::revalidate_stale_to_provisional`).
+fn mark_standing_against_observed_source(
+    catalogue: &mut SkillCatalogue,
+    skill_id: &str,
+    live_definition_version: &str,
+    tools: &dyn KnownTools,
+) -> Result<(), SkillError> {
+    let (admitted, tool_refs) = match catalogue.get(skill_id) {
+        Some(standing) => (
+            standing.admitted_definition_version.clone(),
+            standing.body.tool_refs.clone(),
+        ),
+        None => return Ok(()),
+    };
+    if admitted != live_definition_version {
+        catalogue.mark_definition_drift_stale(skill_id, live_definition_version, &admitted)?;
+    }
+    let missing: Vec<String> = tool_refs
+        .iter()
+        .filter(|tool| !tools.knows_tool(tool))
+        .cloned()
+        .collect();
+    if !missing.is_empty() {
+        catalogue.mark_tool_basis_stale(skill_id, &missing)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

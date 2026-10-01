@@ -168,6 +168,24 @@ fn build_context_tool_policy_record(
     })
 }
 
+/// The immutable owner-record content digest the Context owner re-derives for
+/// this exact recipe body, through its own publication, from the recipe,
+/// catalogue and compiler input it validated.
+///
+/// #1862: this is the domain the immutable campaign view records for its
+/// `ContextRecipe` source row — a `CampaignSourceRecord` content digest — and
+/// therefore the only value the candidate, admission and assembly cells can
+/// compare that row against. `context_recipe_body_digest` digests the recipe
+/// body alone, which is what `validate_context_owner_bodies` and the stored
+/// document body are compared against; handing that to the cells would compare
+/// two different objects and make their load-bearing-revision refusal
+/// unsatisfiable for every view, including a current one.
+pub(crate) fn derive_context_recipe_record_digest(
+    recipe_body: &ContextCampaignRecipeBody,
+) -> Result<String, String> {
+    Ok(derive_context_recipe_record(recipe_body)?.content_digest)
+}
+
 /// Derive the exact recipe owner row for candidate validation before its
 /// authenticated current row is read.
 pub(crate) fn derive_context_recipe_record(

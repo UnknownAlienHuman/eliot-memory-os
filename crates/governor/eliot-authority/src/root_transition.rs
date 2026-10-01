@@ -27,9 +27,10 @@
 //!    constructor re-verifies the retained semantic decision, the Kernel
 //!    activation receipt, and the CURRENT owner state (parent/child
 //!    commitments recomputed from the live grants, the current graph
-//!    revision, and the current State Fence) before the crossing can enter a
-//!    graph. A public deserializer therefore cannot produce the type that
-//!    [`GrantGraph`](crate::GrantGraph) executes, and a caller-authored
+//!    revision, the current State Fence, the current policy revision, and the
+//!    current owner-retained semantic decision set) before the crossing can
+//!    enter a graph. A public deserializer therefore cannot produce the type
+//!    that [`GrantGraph`](crate::GrantGraph) executes, and a caller-authored
 //!    structural record authorizes nothing.
 //!
 //! # Purity boundary: this crate reads no Store, mints no canonical receipt,
@@ -39,6 +40,8 @@
 //! that an admitted crossing is replay-stable under one operation identity,
 //! conflicting under changed same-identity content, and unreadable as active
 //! authority until the owner chain has presented that evidence.
+
+use std::collections::BTreeMap;
 
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_receipts::{AuthorityBinding, AuthorityRequestSubject, EffectClass};
@@ -489,6 +492,54 @@ impl RootTransitionActivationReceipt {
     }
 }
 
+/// The CURRENT owner snapshot values one root-transition admission reads back
+/// that the presented record cannot supply for itself.
+///
+/// `policy_revision` is the revision the owner serves NOW, and
+/// `semantic_decisions` is the owner's currently retained semantic decision
+/// set keyed by decision reference. Both are read from the live owner snapshot
+/// at the activation boundary, which is what makes them readback rather than
+/// self-consistency: binding either field into the canonical request digest
+/// proves only that the values supplied in one function call agreed with each
+/// other, never that they still agree with the owner. A caller that cannot
+/// read the current policy revision or the retained decision set has no
+/// transition to admit, and the admission fails closed.
+///
+/// Both borrows share the struct's ONE lifetime `'a` on purpose. The two
+/// values must be a coherent snapshot from a single owner read at the
+/// activation boundary: a policy revision observed at one moment and a
+/// retained decision set observed at another is exactly the split-read this
+/// boundary exists to forbid, and a type that let the two come from unrelated
+/// lifetimes could not rule it out. Cloning into owned values would let a
+/// caller outlive the owner read and keep admitting against a snapshot it
+/// already owns, which is a weaker guarantee than reading a live owner state;
+/// `'static` would not describe this value at all, since both fields are
+/// borrows of a caller-owned owner snapshot.
+#[derive(Clone, Copy, Debug)]
+pub struct CurrentTransitionReadback<'a> {
+    /// Policy revision the owner serves at this admission.
+    pub policy_revision: &'a str,
+    /// Semantic decisions the owner currently retains, keyed by the exact
+    /// decision reference a record names.
+    pub semantic_decisions: &'a BTreeMap<String, RootTransitionRecord>,
+}
+
+impl<'a> CurrentTransitionReadback<'a> {
+    /// Builds one readback from the owner's live snapshot values, borrowing
+    /// both under the same lifetime so they cannot describe two different
+    /// moments.
+    #[must_use]
+    pub const fn new(
+        policy_revision: &'a str,
+        semantic_decisions: &'a BTreeMap<String, RootTransitionRecord>,
+    ) -> Self {
+        Self {
+            policy_revision,
+            semantic_decisions,
+        }
+    }
+}
+
 /// Admitted root-transition evidence: the ONLY transition input executable
 /// graph construction accepts.
 ///
@@ -496,8 +547,10 @@ impl RootTransitionActivationReceipt {
 /// public constructor other than the verified admission below, and no
 /// `Deserialize`/`Serialize` derive, so neither a decoded
 /// [`RootTransitionRecord`] nor a caller-authored literal can produce it. Its
-/// admission re-reads CURRENT owner state, so stored field equality is never
-/// readback and moved heads refuse instead of activating old evidence.
+/// admission re-reads CURRENT owner state — including the current policy
+/// revision and the current owner-retained semantic decision — so stored field
+/// equality and canonical-digest binding are never readback and moved heads
+/// refuse instead of activating old evidence.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdmittedRootTransition {
     record: RootTransitionRecord,
@@ -522,9 +575,13 @@ impl AdmittedRootTransition {
     ///
     /// The readback is deliberately against arguments the caller cannot
     /// satisfy by repeating its own request: `parent` and `child` are the
-    /// CURRENT grants, `current_revision` is the CURRENT graph revision, and
-    /// `current_fence` is the CURRENT owner fence. A stale record therefore
-    /// fails closed instead of authorizing a crossing.
+    /// CURRENT grants, `current_revision` is the CURRENT graph revision,
+    /// `current_fence` is the CURRENT owner fence, and `readback` carries the
+    /// policy revision the owner serves now plus the CURRENT owner-retained
+    /// semantic decision set the `semantic_decision_ref` must resolve inside. A
+    /// stale record therefore fails closed instead of authorizing a crossing,
+    /// and a record whose policy revision or retained semantic decision has
+    /// moved refuses instead of activating old evidence.
     ///
     /// # Errors
     ///
@@ -538,7 +595,11 @@ impl AdmittedRootTransition {
     /// [`AuthorityError::InvalidField`] for a record that does not describe
     /// exactly this parent/child edge and root pair, and
     /// [`AuthorityError::StaleTransitionEvidence`] when the operation was
-    /// admitted against moved graph revisions.
+    /// admitted against moved graph revisions, when its policy revision is not
+    /// the current one, or when its retained semantic decision no longer
+    /// resolves. [`AuthorityError::IdentityConflict`] when the retained
+    /// semantic decision the owner still holds under the record's reference is
+    /// not this exact record.
     pub fn admit(
         request: &RootTransitionActivationRequest,
         receipt: &RootTransitionActivationReceipt,
@@ -546,6 +607,7 @@ impl AdmittedRootTransition {
         child: &CapabilityGrant,
         current_revision: u64,
         current_fence: &StateFence,
+        readback: CurrentTransitionReadback<'_>,
     ) -> Result<Self, AuthorityError> {
         receipt.validate(request)?;
         let admitted = Self::admit_record(
@@ -558,6 +620,7 @@ impl AdmittedRootTransition {
             child,
             current_revision,
             current_fence,
+            readback,
         )?;
         if receipt.admitted_graph_revision < request.record().predecessor_graph_revision
             || request.record().expected_next_graph_revision != current_revision + 1
@@ -572,8 +635,9 @@ impl AdmittedRootTransition {
     /// Admits one restored admitted-evidence row into executable graph state
     /// under CURRENT owner evidence: the caller presents the CURRENT
     /// validated activation receipt for the stored operation together with
-    /// the CURRENT parent/child grants, graph revision, and owner fence.
-    /// The stored row alone — however self-consistent — authorizes nothing.
+    /// the CURRENT parent/child grants, graph revision, owner fence, policy
+    /// revision, and retained semantic decisions. The stored row alone —
+    /// however self-consistent — authorizes nothing.
     ///
     /// # Errors
     ///
@@ -588,6 +652,7 @@ impl AdmittedRootTransition {
         child: &CapabilityGrant,
         current_revision: u64,
         current_fence: &StateFence,
+        readback: CurrentTransitionReadback<'_>,
     ) -> Result<Self, AuthorityError> {
         receipt.validate_restored(row)?;
         let admitted = Self::admit_record(
@@ -600,6 +665,7 @@ impl AdmittedRootTransition {
             child,
             current_revision,
             current_fence,
+            readback,
         )?;
         if receipt.admitted_graph_revision < row.record.predecessor_graph_revision {
             return Err(AuthorityError::StaleTransitionEvidence(
@@ -666,13 +732,20 @@ impl AdmittedRootTransition {
         self.record.admitted_at_revision
     }
 
-    /// Shared admission body: structural shape, exact edge/root correspondence,
-    /// issuer, narrowing, fence/epoch readback, effect ceiling, grant
-    /// commitments recomputed from CURRENT grants, and revision currency.
+    /// Shared admission body: structural shape, retained semantic decision and
+    /// current policy readback, exact edge/root correspondence, issuer,
+    /// narrowing, fence/epoch readback, effect ceiling, grant commitments
+    /// recomputed from CURRENT grants, and revision currency.
     ///
     /// `disposition` is the presenting owner receipt's own reconciled value,
     /// passed through untouched: this body records what the owner concluded
     /// and does not derive, upgrade, or default it.
+    ///
+    /// `readback` carries the two owner values the record cannot supply for
+    /// itself: the policy revision the owner serves NOW and the CURRENT
+    /// owner-retained decision set keyed by decision reference. Both come from
+    /// the live owner snapshot, so neither can be satisfied by restating the
+    /// request.
     #[allow(
         clippy::too_many_arguments,
         reason = "one fail-closed readback covers the whole committed record"
@@ -687,6 +760,7 @@ impl AdmittedRootTransition {
         child: &CapabilityGrant,
         current_revision: u64,
         current_fence: &StateFence,
+        readback: CurrentTransitionReadback<'_>,
     ) -> Result<Self, AuthorityError> {
         record.validate_shape()?;
         validate_digest(
@@ -695,6 +769,25 @@ impl AdmittedRootTransition {
         )?;
         validate_text(kernel_activation_id, "root_transition.kernel_activation_id")?;
         validate_text(ors_record_ref, "root_transition.ors_record_ref")?;
+        // Retained semantic decision readback, not self-consistency: the
+        // decision reference must resolve in the CURRENT owner-retained
+        // decisions, and the decision the owner still retains under it must be
+        // byte-identical to this record. Binding the reference into the
+        // canonical request digest proves only that one call's arguments
+        // agreed, so a substituted or superseded reference is caught here, at
+        // the same admission, with the same shape the quarantine evidence path
+        // already uses for its retained decisions.
+        let Some(retained_decision) = readback
+            .semantic_decisions
+            .get(&record.semantic_decision_ref)
+        else {
+            return Err(AuthorityError::StaleTransitionEvidence(
+                "root_transition.semantic_decision_unretained",
+            ));
+        };
+        if retained_decision != record {
+            return Err(AuthorityError::IdentityConflict);
+        }
         if child.grant_id.as_str() != record.child_grant_id
             || child.parent_grant_id.as_ref() != Some(&parent.grant_id)
         {
@@ -726,6 +819,21 @@ impl AdmittedRootTransition {
         if child.binding.state_fence != *current_fence {
             return Err(AuthorityError::StaleTransitionEvidence(
                 "root_transition.current_fence",
+            ));
+        }
+        // Policy readback against the CURRENT owner value, in the same shape as
+        // the fence/epoch and revision reads beside it. The record's
+        // `policy_revision` is bound into the canonical request digest, but a
+        // digest binding is equality among values supplied in one function call,
+        // not a comparison with the revision the owner serves now: a crossing
+        // taken under a superseded policy revision would otherwise enter an
+        // effective path whose policy intersection is no longer the current one
+        // (I6.15 "path effective = root -> grant_1 -> ... -> current policy ->
+        // State Fence"). A moved policy head refuses as stale evidence here
+        // instead of activating the old decision.
+        if record.policy_revision != readback.policy_revision {
+            return Err(AuthorityError::StaleTransitionEvidence(
+                "root_transition.current_policy_revision",
             ));
         }
         if record.parent_grant_commitment != grant_commitment(parent)?

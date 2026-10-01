@@ -24,201 +24,33 @@
   },
   "source_token_estimate": {
     "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
-    "source_stu": 1000343,
-    "test_stu": 113832,
-    "selected_file_count": 55,
-    "inline_cfg_test_modules": 22,
+    "scope": "the selected decision workset of this cell",
+    "source_stu": 18407,
+    "test_stu": 240012,
+    "selected_file_count": 18,
+    "physical_source_stu": 1295072,
+    "physical_file_count": 60,
+    "inline_cfg_test_modules": 1,
     "qualification": "planning estimate only; not a qualified Context Envelope (I2.16)"
+  },
+  "workset_allocation": {
+    "scope": "PER_CELL",
+    "state": "ACCEPTED_ALLOCATION",
+    "declared_by": "workstreams/core-daemons/assignments/*.toml::scope.primary_paths",
+    "rationale": null,
+    "unresolved_reason": null,
+    "required_common_inputs": [
+      "crates/kernel/eliot-kernel-service/src/lib.rs"
+    ],
+    "observation": "An accepted assignment names the bounded source slice for this cell; the selected workset is that slice plus the package production target roots and the production module closure the slice itself declares, because an allocated file cannot be read without them. Everything else in the package is reported as unallocated rather than silently selected."
   },
   "selected_source_and_tests": {
     "selected_source": [
       {
-        "path": "crates/kernel/eliot-kernel-service/src/capacity_evidence.rs",
-        "bytes": 45107,
-        "sha256": "8eff5dd103ae8b338c911ed2bfc5697b599abcb4cdee606a4afedede426f6dc6",
-        "stu": 15036,
-        "inline_cfg_test": true
-      },
-      {
-        "path": "crates/kernel/eliot-kernel-service/src/commit_recovery.rs",
-        "bytes": 74037,
-        "sha256": "e0ad832797e784aa7525b3117bd8c7feb45e0955a4b0028e4b7297b93fc4ed82",
-        "stu": 24679,
-        "inline_cfg_test": false
-      },
-      {
-        "path": "crates/kernel/eliot-kernel-service/src/contract_rejection_gate.rs",
-        "bytes": 34674,
-        "sha256": "6c912f5a0d292c2f9cd7d001f672c908877b16e0650d85de78c90073273495ce",
-        "stu": 11558,
-        "inline_cfg_test": true
-      },
-      {
-        "path": "crates/kernel/eliot-kernel-service/src/doctor.rs",
-        "bytes": 133826,
-        "sha256": "c4df619c9d993e361d30bdd1f6f41b3b2241c13ae9d5e16b6ba3fcdd7f479d66",
-        "stu": 44609,
-        "inline_cfg_test": true
-      },
-      {
-        "path": "crates/kernel/eliot-kernel-service/src/doctor_front_door.rs",
-        "bytes": 15182,
-        "sha256": "e574293574858cfc81abc97c605054df70f69bb86907e1c4c7e1c193d99c95d3",
-        "stu": 5061,
-        "inline_cfg_test": true
-      },
-      {
-        "path": "crates/kernel/eliot-kernel-service/src/host_request_binding.rs",
-        "bytes": 84888,
-        "sha256": "a74c2db5193cd36eac7702a716ac3af55743149b8b3d847223c8dc36f32c1971",
-        "stu": 28296,
-        "inline_cfg_test": true
-      },
-      {
         "path": "crates/kernel/eliot-kernel-service/src/lib.rs",
-        "bytes": 22426,
-        "sha256": "ed10ab3224e91e8d3d785ae43322c73697c0679cffe87824d735217883a31af4",
-        "stu": 7476,
-        "inline_cfg_test": true
-      },
-      {
-        "path": "crates/kernel/eliot-kernel-service/src/lifecycle.rs",
-        "bytes": 122854,
-        "sha256": "c800cb9e479fa909499d81c8556eecd7b2ad718589e86846d39e0793d29c696a",
-        "stu": 40952,
-        "inline_cfg_test": true
-      },
-      {
-        "path": "crates/kernel/eliot-kernel-service/src/lifecycle_admission.rs",
-        "bytes": 21676,
-        "sha256": "a8cbefa2936ca6119bf6917e1694878c1cd79dc46c3c3e050d0c0d9a6095e217",
-        "stu": 7226,
-        "inline_cfg_test": false
-      },
-      {
-        "path": "crates/kernel/eliot-kernel-service/src/lifecycle_persist.rs",
-        "bytes": 44741,
-        "sha256": "62cf0b0ce7a243ec9d58009b7d88ee5163bdc11f29c0db39da3f80fd0442250a",
-        "stu": 14914,
-        "inline_cfg_test": false
-      },
-      {
-        "path": "crates/kernel/eliot-kernel-service/src/lifecycle_persist_tests.rs",
-        "bytes": 56673,
-        "sha256": "6e36cb5a3c4f0895b203b3daeae837336bdba7336020ac3453c4cf00c2f49dcc",
-        "stu": 18891,
-        "inline_cfg_test": false
-      },
-      {
-        "path": "crates/kernel/eliot-kernel-service/src/notification_state.rs",
-        "bytes": 35208,
-        "sha256": "e912600facfb91995bc86140937848d210a84fe6af5780e934e27eaab156c6e5",
-        "stu": 11736,
-        "inline_cfg_test": false
-      },
-      {
-        "path": "crates/kernel/eliot-kernel-service/src/notification_state_tests.rs",
-        "bytes": 26848,
-        "sha256": "ca378acb20394432dbea01f11948d38cefc8db71902237365aa9ec70e574098f",
-        "stu": 8950,
-        "inline_cfg_test": false
-      },
-      {
-        "path": "crates/kernel/eliot-kernel-service/src/notify_grant.rs",
-        "bytes": 20491,
-        "sha256": "5a7cf62e5177cc02ed3c22baa88e31cce4ecdb3e4eb13a83667e41f335b99175",
-        "stu": 6831,
-        "inline_cfg_test": true
-      },
-      {
-        "path": "crates/kernel/eliot-kernel-service/src/owner_history.rs",
-        "bytes": 26699,
-        "sha256": "b33554a36c8c39cba5cc17e096eb88edafc59afd444374bf6061cc1f26f90361",
-        "stu": 8900,
-        "inline_cfg_test": false
-      },
-      {
-        "path": "crates/kernel/eliot-kernel-service/src/process_execution_client.rs",
-        "bytes": 5741,
-        "sha256": "2ad17733566907ab10abdc61a91e91222bd32ddfeb03f858b4e146c44a0da305",
-        "stu": 1914,
-        "inline_cfg_test": false
-      },
-      {
-        "path": "crates/kernel/eliot-kernel-service/src/protocol.rs",
-        "bytes": 209408,
-        "sha256": "b0a4aeed3cb546f24fbcbe5364662c4804979ba8ade7724b093e511af1641ebc",
-        "stu": 69803,
-        "inline_cfg_test": true
-      },
-      {
-        "path": "crates/kernel/eliot-kernel-service/src/protocol/native_worker_claim.rs",
-        "bytes": 67651,
-        "sha256": "30a34e7a5d006288294ff8c4c4c875a7bab06a7194285485d310e4a5b1e90bba",
-        "stu": 22551,
-        "inline_cfg_test": true
-      },
-      {
-        "path": "crates/kernel/eliot-kernel-service/src/protocol/native_worker_replay.rs",
-        "bytes": 85722,
-        "sha256": "01dcfee40bd470d31bbda40c73ff96b2d769214b0c34274770aafb7a9d329f54",
-        "stu": 28574,
-        "inline_cfg_test": true
-      },
-      {
-        "path": "crates/kernel/eliot-kernel-service/src/protocol/process_authority_handoff.rs",
-        "bytes": 9193,
-        "sha256": "2908a6c7128f6c94dae618f235fe9713fbdd53e33102e0c8d0de632f4f7177d3",
-        "stu": 3065,
-        "inline_cfg_test": false
-      },
-      {
-        "path": "crates/kernel/eliot-kernel-service/src/protocol/provider_capability.rs",
-        "bytes": 21804,
-        "sha256": "da8c21d4e6e548a10a2cfdf78055137b2a850868f18bad0c4fe33684e572327c",
-        "stu": 7268,
-        "inline_cfg_test": true
-      },
-      {
-        "path": "crates/kernel/eliot-kernel-service/src/protocol/research_provider.rs",
-        "bytes": 21578,
-        "sha256": "8a66de155d31b4133de706ee8a38acc34023ecddf00fb21180b563655088e076",
-        "stu": 7193,
-        "inline_cfg_test": false
-      },
-      {
-        "path": "crates/kernel/eliot-kernel-service/src/reactive_state.rs",
-        "bytes": 33871,
-        "sha256": "dcd26bff2f2f21c0fb1b885b04c6b3a2fa5a4a23821543c92e2e79be7ef3fe55",
-        "stu": 11291,
-        "inline_cfg_test": false
-      },
-      {
-        "path": "crates/kernel/eliot-kernel-service/src/reactive_state_tests.rs",
-        "bytes": 25070,
-        "sha256": "fa80cfe74aa34e83935904dc416f413946c2addccfc8f4429266ac4842772588",
-        "stu": 8357,
-        "inline_cfg_test": false
-      },
-      {
-        "path": "crates/kernel/eliot-kernel-service/src/storage_replacement.rs",
-        "bytes": 64267,
-        "sha256": "372cb70b2ed2351bbf56b204273e80713a65582b8538e179064b4e4c73981ba4",
-        "stu": 21423,
-        "inline_cfg_test": false
-      },
-      {
-        "path": "crates/kernel/eliot-kernel-service/src/store_backup_client.rs",
-        "bytes": 35657,
-        "sha256": "95715710069aef3d072f76fcb360e24cadc841b9750a3c6512e6c556905da271",
-        "stu": 11886,
-        "inline_cfg_test": false
-      },
-      {
-        "path": "crates/kernel/eliot-kernel-service/src/store_client.rs",
-        "bytes": 118097,
-        "sha256": "e4dfa1f3b3849b3278063e13891f382fb85c6900357de6eee5c1dbf70e06a4e1",
-        "stu": 39366,
+        "bytes": 28944,
+        "sha256": "77093c59f0db4ccca8672a06952bae3502597f274a993cb989f3f06b4fc21583",
+        "stu": 9648,
         "inline_cfg_test": true
       },
       {
@@ -227,141 +59,106 @@
         "sha256": "4e2de36d5d57023a39add5e9df9811a67206b24e8d4aaeefd702cdd0d97aef6f",
         "stu": 8759,
         "inline_cfg_test": false
+      }
+    ],
+    "selected_tests": [
+      {
+        "path": "crates/kernel/eliot-kernel-service/src/lifecycle_persist_tests.rs",
+        "bytes": 56707,
+        "sha256": "c71d749fe88f4b068cbd25b36da92547613fc091bd1272109c1d5f383904e6b3",
+        "test_attributes": 7,
+        "inline_cfg_test": false,
+        "test_only_module": true,
+        "classes": [
+          "edge_profile",
+          "fake_port_contract",
+          "fault_restart_replay"
+        ]
       },
       {
-        "path": "crates/kernel/eliot-kernel-service/src/store_gateway.rs",
-        "bytes": 378082,
-        "sha256": "6e9f11be4fb91734155346f3e185f36d451b3ab75eb576670d7499b8160878cd",
-        "stu": 126028,
-        "inline_cfg_test": true
+        "path": "crates/kernel/eliot-kernel-service/src/notification_state_tests.rs",
+        "bytes": 26848,
+        "sha256": "ca378acb20394432dbea01f11948d38cefc8db71902237365aa9ec70e574098f",
+        "test_attributes": 7,
+        "inline_cfg_test": false,
+        "test_only_module": true,
+        "classes": [
+          "edge_profile",
+          "fake_port_contract",
+          "fault_restart_replay"
+        ]
       },
       {
-        "path": "crates/kernel/eliot-kernel-service/src/store_receipt_gateway.rs",
-        "bytes": 5877,
-        "sha256": "040299a25e7d2d367efc0847b74f99a7d1efaa6ce1cc9c6c7d811b5b0a9a5b4c",
-        "stu": 1959,
-        "inline_cfg_test": false
-      },
-      {
-        "path": "crates/kernel/eliot-kernel-service/src/store_write_reservation.rs",
-        "bytes": 110424,
-        "sha256": "4bafd8e6a6e97afd96120c24a028868d74924d8e55a7a3f283e4a6e97a868214",
-        "stu": 36808,
-        "inline_cfg_test": true
+        "path": "crates/kernel/eliot-kernel-service/src/reactive_state_tests.rs",
+        "bytes": 25070,
+        "sha256": "fa80cfe74aa34e83935904dc416f413946c2addccfc8f4429266ac4842772588",
+        "test_attributes": 6,
+        "inline_cfg_test": false,
+        "test_only_module": true,
+        "classes": [
+          "edge_profile",
+          "fake_port_contract",
+          "fault_restart_replay"
+        ]
       },
       {
         "path": "crates/kernel/eliot-kernel-service/src/store_write_reservation_tests.rs",
-        "bytes": 178247,
-        "sha256": "6bb590392efd8332ab5e341ef34a42cb9a73a89942fa9bb28c8170ea1d4640b2",
-        "stu": 59416,
-        "inline_cfg_test": true
-      },
-      {
-        "path": "crates/kernel/eliot-kernel-service/src/testd_front_door.rs",
-        "bytes": 62649,
-        "sha256": "ff25245f0c622ff0313e65c836ecee7378005a9931efea0ed0c4fa55d91124da",
-        "stu": 20883,
-        "inline_cfg_test": true
-      },
-      {
-        "path": "crates/kernel/eliot-kernel-service/src/user_automation.rs",
-        "bytes": 27094,
-        "sha256": "579c5f6871d5abdc99ee538bf16b8e95c9550bfc3962354636918db0497b4028",
-        "stu": 9032,
-        "inline_cfg_test": true
-      },
-      {
-        "path": "crates/kernel/eliot-kernel-service/src/user_automation_execution.rs",
-        "bytes": 184380,
-        "sha256": "f78705e9409f8fec57f1f4a390c785ea503aadc8b761c685e8bbccf033a6eea5",
-        "stu": 61460,
-        "inline_cfg_test": true
-      },
-      {
-        "path": "crates/kernel/eliot-kernel-service/src/user_automation_execution_client.rs",
-        "bytes": 65075,
-        "sha256": "1f24f755fd8ef4043fb8833f0f5885cef9b7285b2d09825b7633626229c8e910",
-        "stu": 21692,
-        "inline_cfg_test": false
-      },
-      {
-        "path": "crates/kernel/eliot-kernel-service/src/user_automation_failure_history.rs",
-        "bytes": 13742,
-        "sha256": "574c50f8db755ce7ef7eedaf5cd96ef70d9734094415d69a8b90cf8fc8b491c2",
-        "stu": 4581,
-        "inline_cfg_test": false
+        "bytes": 178308,
+        "sha256": "6e9d5a7b15c65b623f6aa4fe91ea8616045663980285a0ec0045f5634d9a99bd",
+        "test_attributes": 38,
+        "inline_cfg_test": true,
+        "test_only_module": true,
+        "classes": [
+          "edge_profile",
+          "fake_port_contract",
+          "fault_restart_replay"
+        ]
       },
       {
         "path": "crates/kernel/eliot-kernel-service/src/user_automation_failure_history_tests.rs",
-        "bytes": 31464,
-        "sha256": "7bc38466d76d1f17378e3f4eecccda23a088e1e193d1200a4e2ebe65f6428464",
-        "stu": 10488,
-        "inline_cfg_test": false
-      },
-      {
-        "path": "crates/kernel/eliot-kernel-service/src/user_automation_orchestration.rs",
-        "bytes": 37009,
-        "sha256": "2def1b654763df756d7ee395c104ee9690cd9739a16c2da313df61e21e238c2f",
-        "stu": 12337,
-        "inline_cfg_test": false
-      },
-      {
-        "path": "crates/kernel/eliot-kernel-service/src/user_automation_runtime_handoff.rs",
-        "bytes": 37370,
-        "sha256": "096a639e506ded57d4f0c88494d4440c5f91b5f418d1e81fa06f39935355c61c",
-        "stu": 12457,
-        "inline_cfg_test": false
-      },
-      {
-        "path": "crates/kernel/eliot-kernel-service/src/user_automation_store.rs",
-        "bytes": 90121,
-        "sha256": "bad379dab30a0d23ed89185b4543f81e6723e1a29da9958c2c81f1545f604847",
-        "stu": 30041,
-        "inline_cfg_test": true
+        "bytes": 32427,
+        "sha256": "3df6d983511de187b67337f3f66fac2c189692771afcb0e486168a51b4109f76",
+        "test_attributes": 4,
+        "inline_cfg_test": false,
+        "test_only_module": true,
+        "classes": [
+          "edge_profile",
+          "fake_port_contract",
+          "fault_restart_replay"
+        ]
       },
       {
         "path": "crates/kernel/eliot-kernel-service/src/user_automation_store_tests.rs",
-        "bytes": 32989,
-        "sha256": "68e333793c4ddc8c6217aedecf36e0c225de63034d91da85f29bae6c55aedc66",
-        "stu": 10997,
-        "inline_cfg_test": false
-      },
-      {
-        "path": "crates/kernel/eliot-kernel-service/src/wasm_control.rs",
-        "bytes": 69914,
-        "sha256": "d187da9cb20b03f7fd7780cb429cdd76bafe3a7c4fd3e3140afae84c2c36158d",
-        "stu": 23305,
-        "inline_cfg_test": false
-      },
-      {
-        "path": "crates/kernel/eliot-kernel-service/src/wasm_dispatch.rs",
-        "bytes": 122118,
-        "sha256": "3fc0d54354f778b5b000d5e559d5e37c04acdca9927f389ef49608443efd6fdc",
-        "stu": 40706,
-        "inline_cfg_test": true
-      },
-      {
-        "path": "crates/kernel/eliot-kernel-service/src/write_coordinator.rs",
-        "bytes": 43115,
-        "sha256": "7a7f68bc5ed5da4a4504b1d04561724820d4d89ee9513ab2d9255374b00715de",
-        "stu": 14372,
-        "inline_cfg_test": true
+        "bytes": 33962,
+        "sha256": "355bbe6000610fb8ec6ccbdc83d0ad0574624641bc7bd54a0fe8caa512419cb5",
+        "test_attributes": 5,
+        "inline_cfg_test": false,
+        "test_only_module": true,
+        "classes": [
+          "edge_profile",
+          "fake_port_contract",
+          "fault_restart_replay"
+        ]
       },
       {
         "path": "crates/kernel/eliot-kernel-service/src/write_coordinator/tests.rs",
         "bytes": 21692,
         "sha256": "732eca2011a58cdd71c22b32ef95ec4118c159a2c4cbb1cfc47762b3b8c9ed71",
-        "stu": 7231,
-        "inline_cfg_test": false
-      }
-    ],
-    "selected_tests": [
+        "test_attributes": 5,
+        "inline_cfg_test": false,
+        "test_only_module": true,
+        "classes": [
+          "edge_profile",
+          "fault_restart_replay"
+        ]
+      },
       {
         "path": "crates/kernel/eliot-kernel-service/tests/commit_recovery_unknown_commit.rs",
         "bytes": 16128,
         "sha256": "b4491e278fe1fa7f97dd3eeb35800407bc7d4319b4b29bde50f9f0464774f319",
         "test_attributes": 5,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "edge_profile",
           "fault_restart_replay"
@@ -373,6 +170,7 @@
         "sha256": "5aec1c2a4ebd81c4c3b81dc78e45d6c1699d6a7150a9fb82ccc258eae6df19f3",
         "test_attributes": 5,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "edge_profile",
           "fault_restart_replay"
@@ -384,6 +182,7 @@
         "sha256": "8a148d860a3797bab2f34fa64bcf504dff2ffc24f30eacab28ee5bca60c7aef8",
         "test_attributes": 4,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "edge_profile",
           "fault_restart_replay"
@@ -395,6 +194,7 @@
         "sha256": "e8a87b18116ad71a1b75fd05f036dd9c2f3c68698fba6f80de16dff7125a7415",
         "test_attributes": 5,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "edge_profile",
           "fault_restart_replay"
@@ -402,10 +202,11 @@
       },
       {
         "path": "crates/kernel/eliot-kernel-service/tests/dreamer_job_store_edge.rs",
-        "bytes": 72484,
-        "sha256": "12dfdf7e8daec21361b560f047935ffc65813c1176eff4736c6526cc1a385c2e",
+        "bytes": 74897,
+        "sha256": "63f739e4cefa6b6b49f541bdcc12d2ada4499d83a740af8d3a3eee1950eed703",
         "test_attributes": 24,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "edge_profile",
           "fault_restart_replay"
@@ -417,6 +218,7 @@
         "sha256": "d2c75ea2539aae0d86d0c3025d5e14d383bbd97f69820f5d06c9f4b2291dfa95",
         "test_attributes": 23,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "edge_profile",
           "fault_restart_replay"
@@ -424,10 +226,11 @@
       },
       {
         "path": "crates/kernel/eliot-kernel-service/tests/reserved_write_client.rs",
-        "bytes": 33150,
-        "sha256": "377641747e6cf4d1345d5c830e394419c3abb3d9b7ec5f7bb6e999154b3aeb59",
+        "bytes": 33211,
+        "sha256": "81a3b67466098aacffc040b765e7a353fe7c22e6ae73aefbdf2e752edd1d6b35",
         "test_attributes": 9,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "edge_profile",
           "fake_port_contract",
@@ -436,10 +239,11 @@
       },
       {
         "path": "crates/kernel/eliot-kernel-service/tests/sconc994_kernel_route.rs",
-        "bytes": 42899,
-        "sha256": "39502eed08c0707b0586cfcdd4ec34b417f79091af1926cc5e898e0b47150b21",
+        "bytes": 43952,
+        "sha256": "4f084570facea64a08da5f181e9dfd9ee2f4f64617b3d43582c42330a22a45a4",
         "test_attributes": 2,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "edge_profile",
           "fake_port_contract",
@@ -452,19 +256,238 @@
         "sha256": "ff42c187db253d2b413d1c68b073cc047b92cba708b223731821055dc243dbdc",
         "test_attributes": 4,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "edge_profile",
           "fault_restart_replay"
         ]
       }
     ],
-    "source_selection_digest": "8b2d5b7b8908d97ace4d252741d8d3f474f762edda66e221f19094f5fe84fdb2"
+    "source_selection_digest": "4e7ac857fb443e14c65de93da3ea131ac6cf3438d75e4989a7df867513cdd06a"
+  },
+  "unselected_package_files": {
+    "physical_inventory_file_count": 60,
+    "physical_inventory_digest": "469b6fe48274ba93d69d8420f5f643e3462e151b9e631619cca0e70ddda42cf3",
+    "unselected_files": [
+      {
+        "path": "crates/kernel/eliot-kernel-service/src/capacity_evidence.rs",
+        "bytes": 45107,
+        "reason": "production source not allocated to this cell"
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-service/src/commit_recovery.rs",
+        "bytes": 74037,
+        "reason": "production source not allocated to this cell"
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-service/src/contract_rejection_gate.rs",
+        "bytes": 46237,
+        "reason": "production source not allocated to this cell"
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-service/src/doctor.rs",
+        "bytes": 133826,
+        "reason": "production source not allocated to this cell"
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-service/src/doctor_front_door.rs",
+        "bytes": 15182,
+        "reason": "production source not allocated to this cell"
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-service/src/host_request_binding.rs",
+        "bytes": 92678,
+        "reason": "production source not allocated to this cell"
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-service/src/lifecycle.rs",
+        "bytes": 127570,
+        "reason": "production source not allocated to this cell"
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-service/src/lifecycle_admission.rs",
+        "bytes": 21676,
+        "reason": "production source not allocated to this cell"
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-service/src/lifecycle_persist.rs",
+        "bytes": 44537,
+        "reason": "production source not allocated to this cell"
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-service/src/maintenance_trigger_claim.rs",
+        "bytes": 13771,
+        "reason": "production source not allocated to this cell"
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-service/src/maintenance_trigger_delivery.rs",
+        "bytes": 70129,
+        "reason": "production source not allocated to this cell"
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-service/src/notification_state.rs",
+        "bytes": 34708,
+        "reason": "production source not allocated to this cell"
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-service/src/notify_grant.rs",
+        "bytes": 20491,
+        "reason": "production source not allocated to this cell"
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-service/src/operator_session_token.rs",
+        "bytes": 15236,
+        "reason": "production source not allocated to this cell"
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-service/src/owner_history.rs",
+        "bytes": 36097,
+        "reason": "production source not allocated to this cell"
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-service/src/process_execution_client.rs",
+        "bytes": 5741,
+        "reason": "production source not allocated to this cell"
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-service/src/protocol.rs",
+        "bytes": 219551,
+        "reason": "production source not allocated to this cell"
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-service/src/protocol/native_worker_claim.rs",
+        "bytes": 72561,
+        "reason": "production source not allocated to this cell"
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-service/src/protocol/native_worker_replay.rs",
+        "bytes": 85722,
+        "reason": "production source not allocated to this cell"
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-service/src/protocol/process_authority_handoff.rs",
+        "bytes": 9193,
+        "reason": "production source not allocated to this cell"
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-service/src/protocol/provider_capability.rs",
+        "bytes": 22650,
+        "reason": "production source not allocated to this cell"
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-service/src/protocol/research_provider.rs",
+        "bytes": 21578,
+        "reason": "production source not allocated to this cell"
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-service/src/reactive_state.rs",
+        "bytes": 31925,
+        "reason": "production source not allocated to this cell"
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-service/src/storage_replacement.rs",
+        "bytes": 100251,
+        "reason": "production source not allocated to this cell"
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-service/src/store_backup_client.rs",
+        "bytes": 41924,
+        "reason": "production source not allocated to this cell"
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-service/src/store_client.rs",
+        "bytes": 118485,
+        "reason": "production source not allocated to this cell"
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-service/src/store_gateway.rs",
+        "bytes": 554909,
+        "reason": "production source not allocated to this cell"
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-service/src/store_receipt_gateway.rs",
+        "bytes": 5877,
+        "reason": "production source not allocated to this cell"
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-service/src/store_write_reservation.rs",
+        "bytes": 110424,
+        "reason": "production source not allocated to this cell"
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-service/src/store_write_status.rs",
+        "bytes": 11324,
+        "reason": "production source not allocated to this cell"
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-service/src/testd_front_door.rs",
+        "bytes": 62649,
+        "reason": "production source not allocated to this cell"
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-service/src/user_automation.rs",
+        "bytes": 29807,
+        "reason": "production source not allocated to this cell"
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-service/src/user_automation_compiler.rs",
+        "bytes": 10884,
+        "reason": "production source not allocated to this cell"
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-service/src/user_automation_execution.rs",
+        "bytes": 221791,
+        "reason": "production source not allocated to this cell"
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-service/src/user_automation_execution_client.rs",
+        "bytes": 88515,
+        "reason": "production source not allocated to this cell"
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-service/src/user_automation_failure_history.rs",
+        "bytes": 13803,
+        "reason": "production source not allocated to this cell"
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-service/src/user_automation_orchestration.rs",
+        "bytes": 37009,
+        "reason": "production source not allocated to this cell"
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-service/src/user_automation_runtime_handoff.rs",
+        "bytes": 94168,
+        "reason": "production source not allocated to this cell"
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-service/src/user_automation_store.rs",
+        "bytes": 112788,
+        "reason": "production source not allocated to this cell"
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-service/src/wasm_control.rs",
+        "bytes": 69914,
+        "reason": "production source not allocated to this cell"
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-service/src/wasm_dispatch.rs",
+        "bytes": 122118,
+        "reason": "production source not allocated to this cell"
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-service/src/write_coordinator.rs",
+        "bytes": 43115,
+        "reason": "production source not allocated to this cell"
+      }
+    ],
+    "note": "Physical package inventory beyond this cell's selected workset. No file is dropped: an unlinked or unresolved file is reported here with the reason it was not selected."
   },
   "one_hop_providers": [
     "eliot-contracts",
     "eliot-doctor-core",
     "eliot-epistemic",
     "eliot-evidence",
+    "eliot-host-state",
     "eliot-influence",
     "eliot-ipc",
     "eliot-kernel-core",
@@ -483,6 +506,7 @@
     "serde_json",
     "sha2",
     "thiserror",
+    "time",
     "tokio"
   ],
   "one_hop_consumers": [
@@ -510,6 +534,13 @@
   ],
   "failure_fingerprints": [],
   "edge_tests": [
+    "crates/kernel/eliot-kernel-service/src/lifecycle_persist_tests.rs",
+    "crates/kernel/eliot-kernel-service/src/notification_state_tests.rs",
+    "crates/kernel/eliot-kernel-service/src/reactive_state_tests.rs",
+    "crates/kernel/eliot-kernel-service/src/store_write_reservation_tests.rs",
+    "crates/kernel/eliot-kernel-service/src/user_automation_failure_history_tests.rs",
+    "crates/kernel/eliot-kernel-service/src/user_automation_store_tests.rs",
+    "crates/kernel/eliot-kernel-service/src/write_coordinator/tests.rs",
     "crates/kernel/eliot-kernel-service/tests/commit_recovery_unknown_commit.rs",
     "crates/kernel/eliot-kernel-service/tests/doctor-admission.rs",
     "crates/kernel/eliot-kernel-service/tests/doctor-front-door.rs",
@@ -527,48 +558,58 @@
   },
   "omitted_material_and_handles": {
     "unresolved_contract_refs": [],
-    "omitted": "Files outside the package source/test selection, exact route tokenizer measurement, executed edge and Product Pulse results, and every runtime, store, and live-state observation."
+    "omitted": "Files outside the cell's selected workset, exact route tokenizer measurement, executed edge and Product Pulse results, and every runtime, store, and live-state observation."
   },
   "effective_context_profile": {
     "estimate": "planning_estimate_only",
     "qualification": "UNVALIDATED (I2.16, I0.5)",
     "reference_capsule_handle": "I2.20"
   },
-  "bound_contract_digest": "6839b358969269310e5f3cb6ce89957f75c6c3985707f765ca0936fc9b0ce7cb",
+  "bound_contract_digest": "5ea02eabb3332172",
   "source_provenance": {
     "input_digests": {
-      "workspace_manifest": {
-        "path": "Cargo.toml",
-        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
+      "contract_semantic_inputs": {
+        "contract_catalogue": {
+          "path": "docs/architecture/handle-index.json",
+          "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
+        },
+        "architecture_boundaries": {
+          "path": "config/architecture-boundaries.toml",
+          "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
+        },
+        "logical_block_config": {
+          "path": "docs/code-navigation/logical-blocks.toml",
+          "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+        },
+        "package_manifest": {
+          "path": "crates/kernel/eliot-kernel-service/Cargo.toml",
+          "sha256": "7be52ae9d28248044ba4ad82498cc2cc4aba1366097160b2b832ece52a58b3b2"
+        },
+        "module_manifest": null
       },
-      "contract_catalogue": {
-        "path": "docs/architecture/handle-index.json",
-        "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
-      },
-      "architecture_boundaries": {
-        "path": "config/architecture-boundaries.toml",
-        "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
-      },
-      "logical_block_config": {
-        "path": "docs/code-navigation/logical-blocks.toml",
-        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
-      },
-      "package_manifest": {
-        "path": "crates/kernel/eliot-kernel-service/Cargo.toml",
-        "sha256": "a19e484ac1c6996c825ca326d9fd9733d4df83166d6b7bc1557603a7445a6242"
-      },
-      "module_manifest": null,
-      "selected_source": {
-        "path_count": 55,
-        "sha256": "8b2d5b7b8908d97ace4d252741d8d3f474f762edda66e221f19094f5fe84fdb2"
+      "exact_provenance": {
+        "workspace_manifest": {
+          "path": "Cargo.toml",
+          "sha256": "f2ab651b76ac9f5870f8268c52d1db5839cdb957f5939cd0d8e3a2edcd91fe45"
+        },
+        "physical_source_inventory": {
+          "path_count": 60,
+          "sha256": "469b6fe48274ba93d69d8420f5f643e3462e151b9e631619cca0e70ddda42cf3"
+        },
+        "selected_workset": {
+          "allocation_scope": "PER_CELL",
+          "allocation_state": "ACCEPTED_ALLOCATION",
+          "path_count": 18,
+          "sha256": "4e7ac857fb443e14c65de93da3ea131ac6cf3438d75e4989a7df867513cdd06a"
+        }
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "19eb6257d785af965030ca1da517431e14d2c29a05f9d18b08c23992057f4a92",
+  "artifact_digest": "4f9feb4c5e42217e187950e7a6b1bb368c441d496a6bd90c542d22f977f00649",
   "contract_revision": {
-    "derivation": "first 16 hex characters of the artifact digest",
-    "value": "19eb6257d785af96"
+    "derivation": "first 16 hex characters of the SHA-256 over the namespaced canonical contract-semantic body (artifact_digest, contract_revision and source_provenance excluded)",
+    "value": "9ecd7eeec495b53c"
   }
 }

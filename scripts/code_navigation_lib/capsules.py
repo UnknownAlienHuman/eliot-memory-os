@@ -10,14 +10,35 @@ The triad is generated only from existing machine-checked metadata:
 the documentation contract catalogue `docs/architecture/handle-index.json`,
 the logical responsibility blocks, the runtime/process/tracked-debt records in
 `config/architecture-boundaries.toml`, the `#1811` standalone dispositions,
-and the source/test selection observed in the package itself. A field that
-cannot be derived from those sources is emitted as an explicit `UNDECLARED`
-semantic field naming the origin it would have to be declared in; it is never
-defaulted from a crate name or copied from a sibling capability.
+the accepted Agent Work Unit briefs in
+`workstreams/core-daemons/assignments/`, and the module/`cfg` evidence and
+source/test selection observed in the package itself. A field that cannot be
+derived from those sources is emitted as an explicit `UNDECLARED` semantic
+field naming the origin it would have to be declared in; it is never defaulted
+from a crate name or copied from a sibling capability.
 
-Every artifact carries stable identity, a contract revision, its own SHA-256
-digest, and the digests of the metadata and selected source it was generated
-from. `classify_capsule_set` never reports `ImplementationSupport` above
+Four things I2.20 keeps apart are kept apart here:
+
+- the **physical package inventory**, every `.rs` file the package owns plus
+  the module/`cfg` reachability that classifies each one;
+- the **selected decision workset** of one cell, either an accepted per-cell
+  allocation or an explicitly reported `PACKAGE_WIDE`/unresolved selection;
+- the **contract-semantic inputs** the contract body is built from, which are
+  what `contract_revision` digests;
+- the **final artifact identity**, `artifact_digest`, which also covers the
+  exact byte provenance.
+
+`contract_revision` therefore moves only for a contract-semantic change. A
+private sibling edit or a comment-only global metadata change still updates
+`source_provenance` and `artifact_digest`, so exact provenance stays exact and
+stale detection stays strict, without masquerading as a public-contract change
+or an instruction to re-read and re-test every cell.
+
+Where no sound narrower allocation exists, the selection is reported as
+`PACKAGE_WIDE` or unresolved rather than an invented independence. Every
+artifact carries stable identity, a contract revision, its own SHA-256 digest,
+and the digests of the metadata and selected source it was generated from.
+`classify_capsule_set` never reports `ImplementationSupport` above
 `CURRENT_UNVERIFIED` for a cell whose triad is absent, stale, or lacks an
 executable proof entrypoint (I2.20, `ARCH-MOD-03`).
 """
@@ -34,6 +55,7 @@ from .blocks import load_blocks
 from .cargo import (
     discover_manifests,
     expand_workspace_paths,
+    inferred_targets,
     iter_dependency_specs,
     package_metadata,
     resolve_dependency_path,
@@ -58,6 +80,9 @@ CAPSULE_ROOT = "docs/code-navigation/capsules"
 INDEX_PATH = f"{CAPSULE_ROOT}/index.json"
 BOUNDARIES_PATH = "config/architecture-boundaries.toml"
 DISPOSITIONS_PATH = "workstreams/security/standalone-crate-dispositions.toml"
+ASSIGNMENTS_PATH = "workstreams/core-daemons/assignments"
+ASSIGNMENT_SCHEMA = "eliot.agent-work-unit.v1"
+ASSIGNMENT_ACTIVE_PREFIX = "READY_FOR_"
 CONTRACT_HANDLE = "I2.20"
 CONTRACT_FRAGMENT = (
     "docs/architecture/"
@@ -95,6 +120,34 @@ FAULT_CASE_RE = re.compile(
 )
 CORPUS_DIRS = ("data", "fixtures", "golden", "corpus", "snapshot", "snapshots")
 
+# Cargo target kinds that build production code, and the ones that only ever
+# build test code. A `.rs` file is production source only when it is reachable
+# from a production target root, and test code only when every path to it is
+# gated by `cfg(test)` or starts at a test target root.
+PRODUCTION_TARGET_KINDS = ("lib", "bin", "build")
+TEST_TARGET_KINDS = ("test", "bench", "example")
+
+# `mod name;` with optional visibility, the attribute line immediately above it,
+# and the two Rust constructs that pull a file in without a `mod` edge.
+MODULE_DECL_RE = re.compile(
+    r"(?:pub(?:\s*\([^)\n]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;",
+    re.MULTILINE,
+)
+CFG_ATTRIBUTE_RE = re.compile(r"#\s*\[\s*cfg\s*\((?P<body>[^\]\n]*)\)\s*\]", re.MULTILINE)
+INCLUDE_MACRO_RE = re.compile(r"include!\s*\(\s*(?:r#)?\"([^\"]+)\"\s*\)")
+PATH_ATTRIBUTE_RE = re.compile(r"#\s*\[\s*path\s*=\s*(?:r#)?\"([^\"]+)\"\s*\]")
+
+# Workset allocation states. `PER_CELL` is only ever reported when an accepted
+# declaration says which sources belong to the cell; otherwise the honest
+# answer is `PACKAGE_WIDE`, and `UNDECLARED` when even that is not stated.
+ALLOCATION_PER_CELL = "PER_CELL"
+ALLOCATION_PACKAGE_WIDE = "PACKAGE_WIDE"
+CELL_SOURCE_ORIGIN = "[package.metadata.eliot].functional_cell_source"
+CELL_ALLOCATION_ORIGIN = (
+    "[package.metadata.eliot].functional_cell_refs / functional_cell / "
+    "module.toml|module_id, plus [package.metadata.eliot].functional_cell_source"
+)
+
 
 # ---------------------------------------------------------------------------
 # Deterministic serialization helpers
@@ -111,23 +164,96 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _digest(value: object) -> str:
+    return _sha256(_canonical(value))
+
+
+# `artifact_digest` and `contract_revision` are identities of the revision, not
+# content of it; including either would make recomputation unsatisfiable.
+_REVISION_IDENTITY_KEYS = frozenset({"artifact_digest", "contract_revision"})
+
+# `source_provenance` is exact provenance by construction (audit 5924848350).
+_PROVENANCE_ONLY_KEYS = _REVISION_IDENTITY_KEYS | {"source_provenance"}
+
+# Body sections whose content is derived from source bytes: the selected
+# production/test file lists, their digests, their STU and the counters and
+# class projections computed from them. They are exact provenance, so they move
+# `artifact_digest` and stay out of `contract_revision`. A private sibling edit
+# or a comment-only global manifest change therefore updates provenance without
+# masquerading as a public-contract change, while a real shared-contract change
+# still moves every cell bound to it.
+_SOURCE_DERIVED_KEYS: dict[str, frozenset[str]] = {
+    "ModuleContractKit": frozenset(),
+    "CrateContextCapsule": frozenset(
+        {
+            "source_token_estimate",
+            "selected_source_and_tests",
+            "unselected_package_files",
+            "edge_tests",
+        }
+    ),
+    "ModuleTestCapsule": frozenset(
+        {
+            "shape_checks",
+            "unit_property_model_tests",
+            "parser_or_golden_corpus",
+            "fake_port_contract_tests",
+            "real_edge_profiles",
+            "fault_restart_replay_cases",
+            "expected_nonzero_test_count",
+        }
+    ),
+}
+
+
+def _revision_input(body: dict[str, Any], kind: str, *, provenance: bool) -> dict[str, Any]:
+    excluded = (
+        _REVISION_IDENTITY_KEYS
+        if provenance
+        else _PROVENANCE_ONLY_KEYS | _SOURCE_DERIVED_KEYS.get(kind, frozenset())
+    )
+    return {key: value for key, value in body.items() if key not in excluded}
+
+
+def contract_revision_of(kind: str, body: dict[str, Any]) -> str:
+    """The contract-semantic revision of one artifact body.
+
+    I2.20 keeps `contract_revision` separate from artifact identity. It digests
+    the contract-semantic body alone: cell identity, purpose and invariants,
+    public types and schemas, owned state and effects, dependency ports,
+    compatibility rules, negative cases, known unknowns and oracle origins,
+    plus the declared proof surface, ceiling and acceptance declarations.
+
+    Exact provenance - physical source digests, the selected workset and its
+    STU, and the global metadata files - is carried separately and moves
+    `artifact_digest` only. That keeps a shared-contract change invalidating
+    both dependent cells, without making an unrelated sibling edit or a
+    comment-only manifest change look like a semantic compatibility change or an
+    instruction to re-read and re-test everything.
+    """
+    return _digest(
+        {"kind": kind, "schema": SCHEMA, "body": _revision_input(body, kind, provenance=False)}
+    )[:16]
+
+
 def render(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2) + "\n"
 
 
 def digest_of(kind: str, body: dict[str, Any]) -> str:
-    """One plain SHA-256 over the namespaced canonical body.
+    """One plain SHA-256 over the namespaced canonical artifact body.
 
     `artifact_digest` is excluded because it is the digest itself, and
-    `contract_revision` is excluded because it is derived from that digest;
-    including either would make recomputation unsatisfiable.
+    `contract_revision` is excluded because it is derived from this body;
+    including either would make recomputation unsatisfiable. `source_provenance`
+    IS included here: the artifact identity is exact, so a provenance change
+    makes the artifact stale even when the contract revision is unchanged.
     """
-    body = {
-        key: value
-        for key, value in body.items()
-        if key not in {"artifact_digest", "contract_revision"}
-    }
-    return _sha256(_canonical({"kind": kind, "schema": SCHEMA, "body": body}))
+    return _sha256(
+        _canonical(
+            {"kind": kind, "schema": SCHEMA, "body": _revision_input(body, kind, provenance=True)}
+        )
+    )
 
 
 def _text(value: Any) -> str:
@@ -502,6 +628,610 @@ def _bins_reachable(packages: dict[str, dict[str, Any]]) -> set[str]:
     return seen
 
 
+def _assignment_paths(root: Path) -> list[Path]:
+    directory = root / ASSIGNMENTS_PATH
+    if not directory.is_dir():
+        return []
+    return sorted(path for path in directory.glob("*.toml") if path.is_file())
+
+
+def _accepted_cell_allocations(
+    root: Path, packages: dict[str, dict[str, Any]]
+) -> dict[str, dict[str, Any]]:
+    """Accepted cell/source allocation from the workstream assignment briefs.
+
+    `workstreams/core-daemons/assignments/*.toml` (`eliot.agent-work-unit.v1`)
+    is the one allocation surface that already assigns a bounded source slice to
+    a named active work unit. An assignment with a `READY_FOR_*` status whose
+    concrete `scope.primary_paths` entries fall inside one package is read as an
+    accepted allocation of those files to that package's capability. This is
+    the already-assigned active Kernel slice the audit points at, used as the
+    first concrete allocation instead of inventing per-agent source lists.
+
+    This is deliberately narrow. It never invents independence for a package
+    that declares no cell, and a package with no matching assignment keeps the
+    honest `PACKAGE_WIDE` state. The briefs are
+    `NON_NORMATIVE_IMPLEMENTATION_CONTRACT` routing records, so the allocation is
+    reported as accepted routing evidence with its exact source paths, never as
+    semantic or runtime authority (I0.3).
+    """
+    allocations: dict[str, dict[str, Any]] = {}
+    by_depth = sorted(packages, key=lambda value: (-len(PurePosixPath(value).parts), value))
+    for path in _assignment_paths(root):
+        payload = read_toml(path)
+        if _text(payload.get("schema")) != ASSIGNMENT_SCHEMA:
+            continue
+        status = _text(payload.get("status"))
+        if not status.startswith(ASSIGNMENT_ACTIVE_PREFIX):
+            continue
+        scope = payload.get("scope")
+        primary = _strings(scope.get("primary_paths")) if isinstance(scope, dict) else []
+        concrete = sorted(
+            {
+                path_text
+                for path_text in primary
+                if "/" in path_text
+                and " " not in path_text
+                and not any(
+                    part in {"*", "?", "["} for part in PurePosixPath(path_text).parts
+                )
+            }
+        )
+        if not concrete:
+            continue
+        owner = _owning_package(by_depth, concrete)
+        if owner not in packages:
+            continue
+        record = {
+            "assignment": f"{ASSIGNMENTS_PATH}/{path.name}",
+            "issue": payload.get("issue"),
+            "status": status,
+            "declared_source_paths": concrete,
+            "declared_primary_paths": primary,
+            "authority": _text(payload.get("authority")),
+        }
+        declared = _declared_cells(packages[owner])
+        named = _text(payload.get("functional_cell"))
+        if not named:
+            # A brief that names no cell bounds its slice to the package. Every
+            # declared cell of that package inherits the same allocation, and a
+            # package that declares no cell keeps it as a package-level
+            # projection rather than an invented cell allocation.
+            allocations[_cell_allocation_key(owner, None)] = record
+            continue
+        # A cell-scoped allocation applies only to a cell the package already
+        # declares, so no independence is invented from a brief.
+        if named in declared:
+            allocations[_cell_allocation_key(owner, named)] = record
+    return allocations
+
+
+def _owning_package(by_depth: list[str], sources: list[str]) -> str:
+    """The deepest package root that contains every concrete source path."""
+    for package_root in by_depth:
+        if all(
+            source.startswith(package_root.rstrip("/") + "/") for source in sources
+        ):
+            return package_root
+    return ""
+
+
+def _allocated_paths(root: Path, allocation: dict[str, Any] | None) -> set[str]:
+    """The exact existing files one accepted allocation selects."""
+    if not allocation:
+        return set()
+    selected: set[str] = set()
+    for source in allocation["declared_source_paths"]:
+        candidate = root / source
+        if candidate.is_file() and source.endswith(".rs"):
+            selected.add(normalize_repo_path(source))
+    return selected
+
+
+def _sorted_existing(root: Path, paths: list[str]) -> list[str]:
+    """Keep only the declared paths that exist, in deterministic order."""
+    return [path for path in sorted(set(paths)) if (root / path).is_file()]
+
+
+def _cell_allocation_key(package_root: str, cell: str | None) -> str:
+    return f"{package_root}::{cell or ''}"
+
+
+ATTRIBUTE_CONTINUATION_ENDINGS = (",", "(", "[", "]", "=")
+
+
+def _attribute_block_above(text: str, position: int) -> str:
+    """The contiguous `#[...]` attribute lines immediately above `position`.
+
+    Attribute blocks may span several lines, so continuation lines are absorbed
+    while they look like attribute content. Anything else ends the block, which
+    is the conservative direction: an unrecognised attribute leaves the edge
+    production-reachable instead of hiding production source behind a test.
+    """
+    block: list[str] = []
+    cursor = text.rfind("\n", 0, position) + 1
+    while cursor > 0:
+        previous_start = text.rfind("\n", 0, cursor - 1) + 1
+        line = text[previous_start : cursor - 1].strip()
+        if not line:
+            break
+        if line.startswith("#") or line.endswith(ATTRIBUTE_CONTINUATION_ENDINGS):
+            block.append(line)
+            cursor = previous_start
+            continue
+        break
+    return "\n".join(reversed(block))
+
+
+def _module_gate(attributes: str) -> tuple[bool, str]:
+    """Classify one module edge gate as test-only, production, or uncertain.
+
+    Returns `(is_test_only, unresolved_reason)`. `cfg(test)` alone makes an edge
+    test-only; any other gate stays production-reachable. A gate this generator
+    cannot resolve to one of those two cases - a `cfg` mixing `test` with a
+    feature or a negation - is reported as explicit uncertainty and stays
+    production-reachable, so ambiguous cfg cases are never silently resolved.
+    """
+    if not attributes:
+        return False, ""
+    cfgs = [" ".join(match.group("body").split()) for match in CFG_ATTRIBUTE_RE.finditer(attributes)]
+    if not cfgs:
+        return False, ""
+    # `cfg(all(test, ...))` still requires `test`, so it is a test-only edge.
+    # A negation, or an `any(...)` that offers a non-test alternative, is a
+    # genuine mixed gate and is preserved as explicit uncertainty.
+    if all(_requires_test(cfg) for cfg in cfgs):
+        return True, ""
+    if any(
+        re.search(r"\btest\b", cfg) and not _requires_test(cfg) for cfg in cfgs
+    ):
+        return False, (
+            "module edge gate mentions `test` but can be satisfied without it, "
+            f"so it is neither test-only nor an unconditional production edge: "
+            f"{'; '.join(cfgs)}"
+        )
+    return False, ""
+
+
+def _requires_test(cfg: str) -> bool:
+    """Whether one `cfg(...)` predicate list cannot hold without `test`.
+
+    `cfg` accepts several comma-separated predicates that must all hold, so
+    `test, windows` requires `test`. Within one predicate, `test` alone and
+    `all(...)` whose every conjunct requires `test` require it; `any(...)` with
+    a non-test alternative and `not(...)` do not. A feature name that merely
+    contains the word `test`, such as `test-support`, does not require `test`.
+    """
+    return any(_predicate_requires_test(part) for part in _split_cfg(cfg.strip()))
+
+
+def _predicate_requires_test(predicate: str) -> bool:
+    body = predicate.strip()
+    if body.startswith("all(") and body.endswith(")"):
+        inner = body[len("all(") : -1]
+        # `all(...)` holds only when every conjunct holds, so one conjunct that
+        # requires `test` is enough to make the whole predicate require it.
+        return bool(inner) and any(
+            _predicate_requires_test(part) for part in _split_cfg(inner)
+        )
+    if body.startswith(("any(", "not(")):
+        return False
+    return body == "test"
+
+
+def _split_cfg(body: str) -> list[str]:
+    """Split one `cfg(...)` argument list on its top-level commas."""
+    parts: list[str] = []
+    depth = 0
+    current = ""
+    for character in body:
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+        if character == "," and depth == 0:
+            parts.append(current)
+            current = ""
+            continue
+        current += character
+    if current.strip():
+        parts.append(current)
+    return [part.strip() for part in parts if part.strip()]
+
+
+def _module_declarations(text: str, module_path: str) -> list[tuple[str, bool, str]]:
+    """Return `(child relative path, is_test_only, unresolved_reason)` per edge.
+
+    Module edges are the evidence that separates production source from
+    test-only source. Only the module graph decides this: a path component
+    named `tests` is not evidence, so `src/tests.rs` reached exclusively through
+    `#[cfg(test)] mod tests;` is test source while a `tests.rs` compiled in
+    production stays production source.
+    """
+    base = PurePosixPath(module_path)
+    module_name = base.stem
+    # A crate root (`src/lib.rs`, `src/main.rs`) and a directory module
+    # (`src/foo/mod.rs`) hold their submodules in their own directory; a plain
+    # module file (`src/foo.rs`) holds them in a sibling directory named after
+    # the module. This is the Rust 2018 module layout rule.
+    if module_name in {"lib", "main", "mod"}:
+        directory = base.parent
+    else:
+        directory = base.parent / module_name
+    edges: list[tuple[str, bool, str]] = []
+    for match in MODULE_DECL_RE.finditer(text):
+        attributes = _attribute_block_above(text, match.start())
+        is_test_only, reason = _module_gate(attributes)
+        override = PATH_ATTRIBUTE_RE.search(attributes)
+        if override is not None:
+            children = (base.parent / override.group(1),)
+        else:
+            children = (
+                directory / f"{match.group(1)}.rs",
+                directory / match.group(1) / "mod.rs",
+            )
+        for child in children:
+            try:
+                edges.append((normalize_repo_path(child.as_posix()), is_test_only, reason))
+            except NavigationError:
+                continue
+    for match in INCLUDE_MACRO_RE.finditer(text):
+        try:
+            edges.append(
+                (normalize_repo_path((base.parent / match.group(1)).as_posix()), False, "")
+            )
+        except NavigationError:
+            continue
+    return edges
+
+
+def _module_graph(root: Path, record: dict[str, Any]) -> dict[str, Any]:
+    """Reachability of every package `.rs` file from its Cargo target roots.
+
+    Returns `(production, test_only, unlinked, unresolved)` file sets. A file is
+    production only when it is reachable from a lib/bin/build target through
+    production module edges; test-only when every path to it is a `cfg(test)`
+    edge or starts at a test target root; unlinked when no target root reaches
+    it at all; unresolved when the evidence itself could not be read.
+    """
+    manifest = read_toml(root / record["manifest_path"])
+    package_root = root / record["root_path"]
+    production_roots: list[str] = []
+    test_roots: list[str] = []
+    for target in inferred_targets(package_root, manifest, strict=False):
+        relative = normalize_repo_path(f"{record['root_path']}/{target['path']}")
+        if target["kind"] in TEST_TARGET_KINDS:
+            test_roots.append(relative)
+        else:
+            production_roots.append(relative)
+
+    known = set(record["rust_files"])
+    test_roots = [item for item in test_roots if item in known]
+    production_roots = [item for item in production_roots if item in known]
+
+    production: set[str] = set(production_roots)
+    test_only: set[str] = set(test_roots)
+    unresolved: dict[str, str] = {}
+    frontier: list[tuple[str, bool]] = [(item, True) for item in test_roots]
+    frontier.extend((item, False) for item in production_roots)
+    while frontier:
+        current, gated = frontier.pop()
+        path = root / current
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            unresolved.setdefault(current, f"source file is not readable UTF-8: {exc}")
+            continue
+        for child, child_test_only, reason in _module_declarations(text, current):
+            if child not in known:
+                continue
+            if reason:
+                unresolved.setdefault(child, reason)
+            if child_test_only:
+                if child not in production:
+                    test_only.add(child)
+                frontier.append((child, True))
+            elif child in test_only:
+                # Reachable in production too: it is not test-only after all.
+                test_only.discard(child)
+                production.add(child)
+                frontier.append((child, False))
+            elif child not in production:
+                production.add(child)
+                frontier.append((child, False))
+    return {
+        "production": production,
+        "test_only": test_only,
+        "unlinked": known - production - test_only - set(unresolved),
+        "unresolved": unresolved,
+        "production_target_roots": sorted(production_roots),
+        "test_target_roots": sorted(test_roots),
+    }
+
+
+def _allocated_module_closure(
+    root: Path, record: dict[str, Any], allocated: set[str]
+) -> set[str]:
+    """The production module closure of one accepted allocation.
+
+    A cell's allocated file cannot be read without the modules that file itself
+    declares, so those files are required common inputs of the cell rather than
+    unallocated siblings. Only production (non-`cfg(test)`) module edges are
+    followed, and only inside the same package, so the workset never widens past
+    what the allocation itself needs and a test-only subtree stays in the test
+    slice.
+    """
+    package_prefix = f"{record['root_path']}/"
+    known = set(record["rust_files"])
+    closure: set[str] = set()
+    frontier = sorted(allocated)
+    while frontier:
+        current = frontier.pop()
+        if current in closure:
+            continue
+        closure.add(current)
+        try:
+            text = (root / current).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        for child, child_test_only, _reason in _module_declarations(text, current):
+            if (
+                not child_test_only
+                and child in known
+                and child.startswith(package_prefix)
+                and child not in closure
+            ):
+                frontier.append(child)
+    return closure
+
+
+def _cell_allocation(
+    root: Path,
+    record: dict[str, Any],
+    cells: list[str],
+    cell: str,
+    allocated: set[str],
+    graph: dict[str, Any],
+) -> dict[str, Any]:
+    """How this cell's source selection was chosen, stated explicitly.
+
+    I2.20 distinguishes the physical source STU from the loaded slice and agent
+    workset profiles. Whole-package context is legitimate for a cohesive unit,
+    so the distinction this records is between an allocation that says a cell
+    owns a subset and one that is explicitly `PACKAGE_WIDE`. When neither an
+    accepted allocation nor a single-cell declaration exists, the selection is
+    reported as unresolved rather than as a demonstrated minimal causal
+    workset.
+    """
+    package_root = record["root_path"]
+    if allocated:
+        # The selected workset of an accepted allocation is the allocation plus
+        # what it cannot be read without: the package's production target roots
+        # and the production module closure the allocated files themselves
+        # declare. Without that closure the cell would be handed a file whose
+        # own submodules are reported as unallocated, which is not a usable
+        # decision workset. The allocated files are not repeated as common
+        # inputs; they are already the allocation.
+        common_inputs = (
+            set(graph["production_target_roots"])
+            | _allocated_module_closure(root, record, allocated)
+        ) - set(allocated)
+        return {
+            "scope": ALLOCATION_PER_CELL,
+            "state": "ACCEPTED_ALLOCATION",
+            "declared_by": f"{ASSIGNMENTS_PATH}/*.toml::scope.primary_paths",
+            "authority": (
+                "NON_NORMATIVE_IMPLEMENTATION_CONTRACT routing record, not "
+                "semantic or runtime authority (I0.3)"
+            ),
+            "allocated_source_paths": sorted(allocated),
+            "unallocated_source_paths": sorted(
+                path
+                for path in record["rust_files"]
+                if path.startswith(f"{package_root}/")
+                and path not in allocated
+                and path not in common_inputs
+            ),
+            "required_common_inputs": sorted(common_inputs),
+            "observation": (
+                "An accepted assignment names the bounded source slice for this "
+                "cell; the selected workset is that slice plus the package "
+                "production target roots and the production module closure the "
+                "slice itself declares, because an allocated file cannot be read "
+                "without them. Everything else in the package is reported as "
+                "unallocated rather than silently selected."
+            ),
+        }
+    if len(cells) == 1:
+        return {
+            "scope": ALLOCATION_PACKAGE_WIDE,
+            "state": "EXPLICIT_PACKAGE_WIDE",
+            "declared_by": CELL_ALLOCATION_ORIGIN,
+            "rationale": (
+                "This package declares exactly one functional cell, so the "
+                "complete package source is the cell's decision workset. That "
+                "is a deliberate cohesive-unit choice, not an unresolved "
+                "allocation (I2.20)."
+            ),
+            "required_common_inputs": sorted(graph["production_target_roots"]),
+        }
+    return {
+        "scope": ALLOCATION_PACKAGE_WIDE,
+        "state": "UNRESOLVED_ALLOCATION",
+        "declared_by": CELL_ALLOCATION_ORIGIN,
+        "unresolved_reason": (
+            f"{package_root} declares {len(cells)} functional cells "
+            f"({', '.join(cells)}) but no accepted cell/source allocation "
+            f"separates them. The selection below is package-wide and is NOT "
+            f"a demonstrated minimal causal workset for {cell}."
+        ),
+        "required_common_inputs": sorted(graph["production_target_roots"]),
+        "observation": (
+            "Where no sound narrower allocation exists, selection stays "
+            "PACKAGE_WIDE and unresolved rather than inventing independence."
+        ),
+    }
+
+
+def _source_selection(
+    root: Path,
+    record: dict[str, Any],
+    consumer_names: list[str],
+    allocation: dict[str, Any],
+    graph: dict[str, Any],
+) -> dict[str, Any]:
+    """Derive the selected production source, focused tests, and the STU estimate.
+
+    Selection follows the cell allocation: an allocated cell selects its
+    accepted source slice plus the package's production target roots, and every
+    other package file is reported as unallocated. Test-only modules are
+    selected as tests rather than charged as production source, and no file is
+    dropped: unlinked and unresolved files are reported explicitly.
+    """
+    acceptance = record["module"].get("acceptance")
+    forbidden = _strings(acceptance.get("forbidden_patterns")) if isinstance(acceptance, dict) else []
+    package_prefix = f"{record['root_path']}/"
+    selected_source_paths = {
+        path
+        for path in allocation.get("allocated_source_paths", [])
+        if path.startswith(package_prefix)
+    } | set(allocation.get("required_common_inputs", []))
+    production_candidates = (
+        selected_source_paths
+        if allocation["scope"] == ALLOCATION_PER_CELL
+        else {
+            path
+            for path in record["rust_files"]
+            if path in graph["production"] or path.startswith(package_prefix)
+        }
+    )
+
+    production: list[dict[str, Any]] = []
+    tests: list[dict[str, Any]] = []
+    unselected: list[dict[str, Any]] = []
+    digests: list[tuple[str, str]] = []
+    production_bytes = test_bytes = test_attributes = inline_cfg_tests = 0
+    physical_bytes = 0
+    forbidden_hits: list[dict[str, str]] = []
+    for relative in record["rust_files"]:
+        path = root / relative
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            raise NavigationError(f"cannot read source file {relative}: {exc}") from exc
+        digests.append((relative, _sha256(data)))
+        physical_bytes += len(data)
+        parts = PurePosixPath(relative).parts
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            text = ""
+        in_package = relative.startswith(package_prefix)
+        is_production_reachable = relative in graph["production"]
+        is_test_only = relative in graph["test_only"]
+        is_test_target = relative in set(graph["test_target_roots"])
+        attributes = len(TEST_ATTRIBUTE_RE.findall(text))
+        has_cfg_test = bool(CFG_TEST_RE.search(text))
+        entry: dict[str, Any] = {
+            "path": relative,
+            "bytes": len(data),
+            "sha256": digests[-1][1],
+        }
+        # A test target root, or a module reachable only through cfg(test)
+        # edges, is test source. A path component named `tests` is not evidence
+        # of anything: `src/tests.rs` reached through `#[cfg(test)] mod tests;`
+        # is test source, and one reachable in production is production source.
+        is_test = not in_package or is_test_target or (is_test_only and not is_production_reachable)
+        if not in_package:
+            unselected.append(
+                {"path": relative, "bytes": len(data), "reason": "outside the selected package root"}
+            )
+        elif allocation["scope"] == ALLOCATION_PER_CELL and not is_test and relative not in production_candidates:
+            unselected.append(
+                {
+                    "path": relative,
+                    "bytes": len(data),
+                    "reason": "production source not allocated to this cell",
+                }
+            )
+        elif is_test:
+            test_bytes += len(data)
+            entry["test_attributes"] = attributes
+            entry["inline_cfg_test"] = has_cfg_test
+            entry["test_only_module"] = is_test_only and not is_test_target
+            entry["classes"] = sorted(
+                {
+                    "fake_port_contract" if FAKE_PORT_RE.search(text) else "",
+                    "fault_restart_replay" if FAULT_CASE_RE.search(text) else "",
+                    "parser_or_golden_corpus"
+                    if any(part in CORPUS_DIRS for part in parts)
+                    else "",
+                    "edge_profile" if any(name in text for name in consumer_names) else "",
+                }
+                - {""}
+            )
+            tests.append(entry)
+        elif is_production_reachable:
+            production_bytes += len(data)
+            entry["stu"] = -(-len(data) // 3)
+            entry["inline_cfg_test"] = has_cfg_test
+            production.append(entry)
+            if has_cfg_test:
+                inline_cfg_tests += 1
+        else:
+            unselected.append(
+                {
+                    "path": relative,
+                    "bytes": len(data),
+                    "reason": (
+                        "not reachable from any Cargo target root of this package"
+                        if relative not in graph["unresolved"]
+                        else graph["unresolved"][relative]
+                    ),
+                }
+            )
+        test_attributes += attributes
+        for pattern in forbidden:
+            if pattern in text:
+                forbidden_hits.append({"pattern": pattern, "path": relative})
+    production.sort(key=lambda item: item["path"])
+    tests.sort(key=lambda item: item["path"])
+    unselected.sort(key=lambda item: item["path"])
+    forbidden_hits.sort(key=lambda item: (item["pattern"], item["path"]))
+    digests.sort()
+    selected_digests = [
+        (entry["path"], entry["sha256"])
+        for entry in [*production, *tests]
+    ]
+    # An ambiguous module/cfg gate is an explicit uncertainty of this
+    # classification, not a silent guess, so it is reported for every cell
+    # rather than only for a package with no declared cell. The file stays
+    # production-reachable, which is the conservative direction: an
+    # unrecognised gate never hides production source behind a test.
+    unresolved_cases = [
+        {"path": path, "reason": graph["unresolved"][path]}
+        for path in sorted(graph["unresolved"])
+        if path.startswith(package_prefix)
+    ]
+    return {
+        "selected_source": production,
+        "selected_tests": tests,
+        "unselected_files": unselected,
+        "unresolved_cfg_or_module_cases": unresolved_cases,
+        "allocation": allocation,
+        "source_stu": -(-production_bytes // 3),
+        "test_stu": -(-test_bytes // 3),
+        "physical_source_stu": -(-physical_bytes // 3),
+        "test_attribute_count": test_attributes,
+        "inline_cfg_test_modules": inline_cfg_tests,
+        "source_selection_digest": _sha256(_canonical(sorted(selected_digests))),
+        "physical_inventory_digest": _sha256(_canonical(digests)),
+        "physical_file_count": len(digests),
+        "selected_file_count": len(production) + len(tests),
+        "forbidden_pattern_hits": forbidden_hits,
+    }
+
+
 def _declared_cells(record: dict[str, Any]) -> list[str]:
     """Cell ids declared by `functional_cell_refs`, `functional_cell`, `module_id`."""
     metadata = record["metadata"]
@@ -527,81 +1257,6 @@ def _declared_cells(record: dict[str, Any]) -> list[str]:
     return sorted(cells)
 
 
-def _source_selection(
-    root: Path, record: dict[str, Any], consumer_names: list[str]
-) -> dict[str, Any]:
-    """Derive production source, focused tests, and the STU estimate."""
-    acceptance = record["module"].get("acceptance")
-    forbidden = _strings(acceptance.get("forbidden_patterns")) if isinstance(acceptance, dict) else []
-    production: list[dict[str, Any]] = []
-    tests: list[dict[str, Any]] = []
-    digests: list[tuple[str, str]] = []
-    production_bytes = test_bytes = test_attributes = inline_cfg_tests = 0
-    forbidden_hits: list[dict[str, str]] = []
-    for relative in record["rust_files"]:
-        path = root / relative
-        try:
-            data = path.read_bytes()
-        except OSError as exc:
-            raise NavigationError(f"cannot read source file {relative}: {exc}") from exc
-        digests.append((relative, _sha256(data)))
-        parts = PurePosixPath(relative).parts
-        is_test = "tests" in parts
-        try:
-            text = data.decode("utf-8")
-        except UnicodeDecodeError:
-            is_test, text = True, ""
-        attributes = len(TEST_ATTRIBUTE_RE.findall(text))
-        has_cfg_test = bool(CFG_TEST_RE.search(text))
-        entry: dict[str, Any] = {
-            "path": relative,
-            "bytes": len(data),
-            "sha256": digests[-1][1],
-        }
-        if is_test:
-            test_bytes += len(data)
-            entry["test_attributes"] = attributes
-            entry["inline_cfg_test"] = has_cfg_test
-            entry["classes"] = sorted(
-                {
-                    "fake_port_contract" if FAKE_PORT_RE.search(text) else "",
-                    "fault_restart_replay" if FAULT_CASE_RE.search(text) else "",
-                    "parser_or_golden_corpus"
-                    if any(part in CORPUS_DIRS for part in parts)
-                    else "",
-                    "edge_profile" if any(name in text for name in consumer_names) else "",
-                }
-                - {""}
-            )
-            tests.append(entry)
-        else:
-            production_bytes += len(data)
-            entry["stu"] = -(-len(data) // 3)
-            entry["inline_cfg_test"] = has_cfg_test
-            production.append(entry)
-            if has_cfg_test:
-                inline_cfg_tests += 1
-        test_attributes += attributes
-        for pattern in forbidden:
-            if pattern in text:
-                forbidden_hits.append({"pattern": pattern, "path": relative})
-    production.sort(key=lambda item: item["path"])
-    tests.sort(key=lambda item: item["path"])
-    forbidden_hits.sort(key=lambda item: (item["pattern"], item["path"]))
-    digests.sort()
-    return {
-        "selected_source": production,
-        "selected_tests": tests,
-        "source_stu": -(-production_bytes // 3),
-        "test_stu": -(-test_bytes // 3),
-        "test_attribute_count": test_attributes,
-        "inline_cfg_test_modules": inline_cfg_tests,
-        "source_selection_digest": _sha256(_canonical(digests)),
-        "selected_file_count": len(digests),
-        "forbidden_pattern_hits": forbidden_hits,
-    }
-
-
 def _input_digests(
     root: Path,
     record: dict[str, Any],
@@ -609,11 +1264,18 @@ def _input_digests(
     selection: dict[str, Any],
     excluded: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    digests: dict[str, Any] = {
-        "workspace_manifest": {
-            "path": "Cargo.toml",
-            "sha256": inventory["workspace_manifest_sha256"],
-        },
+    """Split the exact inputs into contract-semantic inputs and provenance.
+
+    Contract-semantic inputs are the ones a public-contract revision depends
+    on: the package and module manifests, the contract catalogue, the boundary
+    record, the logical-block configuration and the accepted contract
+    references. Everything else - the workspace manifest, the physical source
+    inventory and the selected workset digests - is exact provenance. A
+    comment-only workspace manifest edit therefore moves `artifact_digest`
+    without moving any cell's `contract_revision`, while a shared-contract edit
+    moves both.
+    """
+    contract_semantic: dict[str, Any] = {
         "contract_catalogue": {
             "path": DEFAULT_HANDLE_INDEX,
             "sha256": sha256_file(root / DEFAULT_HANDLE_INDEX),
@@ -642,17 +1304,31 @@ def _input_digests(
             if record["module_path"]
             else None
         ),
-        "selected_source": {
-            "path_count": selection["selected_file_count"],
-            "sha256": selection["source_selection_digest"],
-        },
     }
     if excluded is not None:
-        digests["excluded_disposition"] = {
+        contract_semantic["excluded_disposition"] = {
             "path": excluded["source"],
             "sha256": sha256_file(root / excluded["source"]),
         }
-    return digests
+    return {
+        "contract_semantic_inputs": contract_semantic,
+        "exact_provenance": {
+            "workspace_manifest": {
+                "path": "Cargo.toml",
+                "sha256": inventory["workspace_manifest_sha256"],
+            },
+            "physical_source_inventory": {
+                "path_count": selection["physical_file_count"],
+                "sha256": selection["physical_inventory_digest"],
+            },
+            "selected_workset": {
+                "allocation_scope": selection["allocation"]["scope"],
+                "allocation_state": selection["allocation"]["state"],
+                "path_count": selection["selected_file_count"],
+                "sha256": selection["source_selection_digest"],
+            },
+        },
+    }
 
 
 def _logic_block_refs(
@@ -849,15 +1525,25 @@ def _contract_kit(
             ),
         },
         "source_provenance": {
-            "input_digests": input_digests,
+            "contract_semantic_inputs": input_digests["contract_semantic_inputs"],
+            "exact_provenance": input_digests["exact_provenance"],
             "generator": GENERATOR,
             "generator_version": GENERATOR_VERSION,
+            "note": (
+                "A change under exact_provenance moves artifact_digest only. It "
+                "is not a public API or semantic-contract change and is not an "
+                "instruction to re-read or re-test every cell."
+            ),
         },
     }
     body["artifact_digest"] = digest_of("ModuleContractKit", body)
     body["contract_revision"] = {
-        "derivation": "first 16 hex characters of the artifact digest",
-        "value": body["artifact_digest"][:16],
+        "derivation": (
+            "first 16 hex characters of the SHA-256 over the namespaced canonical "
+            "contract-semantic body (artifact_digest, contract_revision and "
+            "source_provenance excluded)"
+        ),
+        "value": contract_revision_of("ModuleContractKit", body),
     }
     return body
 
@@ -906,16 +1592,40 @@ def _context_capsule(
         },
         "source_token_estimate": {
             "method": STU_METHOD,
+            "scope": "the selected decision workset of this cell",
             "source_stu": selection["source_stu"],
             "test_stu": selection["test_stu"],
             "selected_file_count": selection["selected_file_count"],
+            "physical_source_stu": selection["physical_source_stu"],
+            "physical_file_count": selection["physical_file_count"],
             "inline_cfg_test_modules": selection["inline_cfg_test_modules"],
             "qualification": "planning estimate only; not a qualified Context Envelope (I2.16)",
+        },
+        "workset_allocation": {
+            "scope": selection["allocation"]["scope"],
+            "state": selection["allocation"]["state"],
+            "declared_by": selection["allocation"]["declared_by"],
+            "rationale": selection["allocation"].get("rationale"),
+            "unresolved_reason": selection["allocation"].get("unresolved_reason"),
+            "required_common_inputs": selection["allocation"].get(
+                "required_common_inputs", []
+            ),
+            "observation": selection["allocation"].get("observation"),
         },
         "selected_source_and_tests": {
             "selected_source": selection["selected_source"],
             "selected_tests": selection["selected_tests"],
             "source_selection_digest": selection["source_selection_digest"],
+        },
+        "unselected_package_files": {
+            "physical_inventory_file_count": selection["physical_file_count"],
+            "physical_inventory_digest": selection["physical_inventory_digest"],
+            "unselected_files": selection["unselected_files"],
+            "note": (
+                "Physical package inventory beyond this cell's selected workset. "
+                "No file is dropped: an unlinked or unresolved file is reported "
+                "here with the reason it was not selected."
+            ),
         },
         "one_hop_providers": one_hop_providers,
         "one_hop_consumers": list(record["consumers"]),
@@ -932,9 +1642,9 @@ def _context_capsule(
         "omitted_material_and_handles": {
             "unresolved_contract_refs": unresolved,
             "omitted": (
-                "Files outside the package source/test selection, exact route "
-                "tokenizer measurement, executed edge and Product Pulse results, and "
-                "every runtime, store, and live-state observation."
+                "Files outside the cell's selected workset, exact route "
+                "tokenizer measurement, executed edge and Product Pulse results, "
+                "and every runtime, store, and live-state observation."
             ),
         },
         "effective_context_profile": {
@@ -951,8 +1661,12 @@ def _context_capsule(
     }
     body["artifact_digest"] = digest_of("CrateContextCapsule", body)
     body["contract_revision"] = {
-        "derivation": "first 16 hex characters of the artifact digest",
-        "value": body["artifact_digest"][:16],
+        "derivation": (
+            "first 16 hex characters of the SHA-256 over the namespaced canonical "
+            "contract-semantic body (artifact_digest, contract_revision and "
+            "source_provenance excluded)"
+        ),
+        "value": contract_revision_of("CrateContextCapsule", body),
     }
     return body
 
@@ -1016,6 +1730,30 @@ def _test_capsule(
             ),
             "forbidden_pattern_hits": selection["forbidden_pattern_hits"],
             "inline_cfg_test_modules": selection["inline_cfg_test_modules"],
+            "test_only_modules": {
+                "classification_rule": (
+                    "A module reachable only through cfg(test) module edges or "
+                    "from a test target root is test source; a path component "
+                    "named `tests` is not evidence of anything. Coverage is "
+                    "preserved: classified test-only modules stay in the test "
+                    "slice and their test attributes are still counted."
+                ),
+                "paths": sorted(
+                    entry["path"] for entry in selection["selected_tests"] if entry["test_only_module"]
+                ),
+            },
+            "unresolved_cfg_or_module_cases": {
+                "rule": (
+                    "A cfg predicate that mentions `test` but can also hold "
+                    "without it is neither test-only nor an unconditional "
+                    "production edge. It is reported here as explicit "
+                    "uncertainty and the file stays production-reachable, so "
+                    "no path is renamed and no test is removed to shrink a "
+                    "context estimate."
+                ),
+                "cases": selection["unresolved_cfg_or_module_cases"],
+            },
+            "unselected_package_files": selection["unselected_files"],
         },
         "unit_property_model_tests": {
             "declared_proof_surface": _declared(module.get("proof_surface"), "module.toml|proof_surface"),
@@ -1065,15 +1803,25 @@ def _test_capsule(
         },
         "bound_contract_digest": contract_digest,
         "source_provenance": {
-            "input_digests": input_digests,
+            "contract_semantic_inputs": input_digests["contract_semantic_inputs"],
+            "exact_provenance": input_digests["exact_provenance"],
             "generator": GENERATOR,
             "generator_version": GENERATOR_VERSION,
+            "note": (
+                "A change under exact_provenance moves artifact_digest only. It "
+                "is not a public API or semantic-contract change and is not an "
+                "instruction to re-read or re-test every cell."
+            ),
         },
     }
     body["artifact_digest"] = digest_of("ModuleTestCapsule", body)
     body["contract_revision"] = {
-        "derivation": "first 16 hex characters of the artifact digest",
-        "value": body["artifact_digest"][:16],
+        "derivation": (
+            "first 16 hex characters of the SHA-256 over the namespaced canonical "
+            "contract-semantic body (artifact_digest, contract_revision and "
+            "source_provenance excluded)"
+        ),
+        "value": contract_revision_of("ModuleTestCapsule", body),
     }
     return body
 
@@ -1100,13 +1848,25 @@ def _artifacts_block(
 
 
 def _undeclared_capability(
-    record: dict[str, Any], reachability: str, excluded: dict[str, Any] | None
+    record: dict[str, Any],
+    reachability: str,
+    excluded: dict[str, Any] | None,
+    workset: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """A workspace package that declares no capability cell is still represented.
 
     The issue forbids silent omission: a package whose cell id is undeclared is
     carried with an explicit `UNDECLARED` cell identity, no triad artifacts,
     and `TARGET` support, rather than disappearing from the denominator.
+
+    It also carries the package-level workset surface an active writer needs
+    today. `bins/eliot-kernel` on this tree declares no cell and has no
+    `module.toml`, so the committed index listed it with nothing at all. This
+    is a physical package inventory and an accepted-assignment projection, not
+    a per-cell workset: a cell allocation that does not exist is reported as
+    `UNDECLARED` with the origin it would have to be declared in, and the entry
+    never claims a precise cell workset or a triad. Active writers are not made
+    to wait for a project-wide metadata inventory (I2.20, I0.5).
     """
     support = classify_capsule_set(None, None, None, _adoption(record))
     return {
@@ -1125,6 +1885,51 @@ def _undeclared_capability(
         "implementation_support": "TARGET",
         "implementation_support_detail": support,
         "artifacts": None,
+        "package_workset_surface": _package_workset_surface(record, workset),
+    }
+
+
+def _package_workset_surface(
+    record: dict[str, Any], workset: dict[str, Any] | None
+) -> dict[str, Any]:
+    """What can honestly be said about a package with no declared cell.
+
+    The surface names exactly one claim it cannot make: the cell allocation is
+    `UNDECLARED`, because `[package.metadata.eliot]` carries no
+    `functional_cell*` field and no `module.toml` exists. Everything else -
+    physical source STU, module/cfg classification and any accepted assignment
+    already naming a bounded slice of this package - is real evidence, and is
+    reported as such.
+    """
+    if workset is None:
+        return {
+            "cell_allocation": _declared(None, CELL_ALLOCATION_ORIGIN),
+            "physical_source_inventory": _declared(None, "package .rs source files"),
+            "observation": (
+                "No cell is declared for this package, so no per-cell workset is "
+                "claimed. The package is still represented as an UNDECLARED-cell "
+                "capability at TARGET support (I2.20)."
+            ),
+        }
+    return {
+        "cell_allocation": _declared(None, CELL_ALLOCATION_ORIGIN),
+        "physical_source_inventory": {
+            "method": STU_METHOD,
+            "file_count": workset["physical_file_count"],
+            "source_stu": workset["physical_source_stu"],
+            "sha256": workset["physical_inventory_digest"],
+        },
+        "source_classification": workset["source_classification"],
+        "accepted_assignments": workset["accepted_assignments"],
+        "observation": (
+            "This package declares no functional capability cell, so no "
+            "ModuleContractKit/CrateContextCapsule/ModuleTestCapsule triad and no "
+            "per-cell workset exist for it. The physical inventory and any "
+            "accepted assignment below are a package-level projection, not a "
+            "cell allocation and not evidence that any agent is running this "
+            "capsule. Declaring the cell is the owner's step; this entry does not "
+            "wait for a project-wide metadata inventory to represent the package."
+        ),
     }
 
 
@@ -1163,6 +1968,10 @@ def _build_cell(
     kit = _contract_kit(
         root, cell, record, handles, boundaries, blocks, excluded, input_digests
     )
+    # The bound contract is the kit's contract-semantic revision, not its exact
+    # artifact digest: a private sibling edit must not reach the context and
+    # test capsules as if it were a contract change.
+    bound_revision = kit["contract_revision"]["value"]
     context = _context_capsule(
         root,
         cell,
@@ -1172,10 +1981,10 @@ def _build_cell(
         selection,
         input_digests,
         handles,
-        kit["artifact_digest"],
+        bound_revision,
     )
     capsule = _test_capsule(
-        cell, record, selection, boundaries, input_digests, kit["artifact_digest"]
+        cell, record, selection, boundaries, input_digests, bound_revision
     )
     adoption = _adoption(record, force_nonmember)
     support = classify_capsule_set(kit, context, capsule, adoption)
@@ -1189,10 +1998,98 @@ def _build_cell(
         "workspace_admission": adoption,
         "excluded_scope": excluded,
         "declared_in_module_manifest": bool(record["module_path"]),
+        "workset_allocation": {
+            "scope": selection["allocation"]["scope"],
+            "state": selection["allocation"]["state"],
+            "declared_by": selection["allocation"]["declared_by"],
+        },
         "artifacts": _artifacts_block(cell, kit, context, capsule),
         "implementation_support": support,
     }
     return kit, context, capsule, entry
+
+
+def _package_allocation(
+    record: dict[str, Any], allocation: dict[str, Any] | None, graph: dict[str, Any]
+) -> dict[str, Any]:
+    """The allocation record for a package that declares no capability cell.
+
+    An accepted brief bounding a slice of this package is reported as the first
+    concrete allocation, so an active writer is not blocked on a project-wide
+    cell-metadata inventory. Without one the package-level selection is labelled
+    `UNDECLARED_ALLOCATION`: real evidence, honestly scoped.
+    """
+    if allocation is not None:
+        return {
+            "scope": ALLOCATION_PER_CELL,
+            "state": "ACCEPTED_ASSIGNMENT_WITHOUT_CELL",
+            "declared_by": f"{ASSIGNMENTS_PATH}/*.toml::scope.primary_paths",
+            "authority": (
+                "NON_NORMATIVE_IMPLEMENTATION_CONTRACT routing record, not "
+                "semantic or runtime authority (I0.3)"
+            ),
+            "allocated_source_paths": allocation["declared_source_paths"],
+            "required_common_inputs": sorted(graph["production_target_roots"]),
+            "observation": (
+                f"An accepted work unit bounds this slice of {record['root_path']}, "
+                "but the package declares no functional capability cell, so this "
+                "is a package-level assignment projection and not a cell workset."
+            ),
+        }
+    return {
+        "scope": ALLOCATION_PACKAGE_WIDE,
+        "state": "UNDECLARED_ALLOCATION",
+        "declared_by": CELL_ALLOCATION_ORIGIN,
+        "unresolved_reason": (
+            f"{record['root_path']} declares no functional capability cell, so "
+            "no cell/source allocation can be resolved for it. The selection "
+            "below is a package-level physical inventory, not a cell workset."
+        ),
+        "required_common_inputs": sorted(graph["production_target_roots"]),
+    }
+
+
+def _package_workset(
+    root: Path,
+    record: dict[str, Any],
+    consumer_names: list[str],
+    allocation: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Physical package inventory plus any accepted assignment over this package.
+
+    This is what a package with no declared cell can honestly report. The
+    selection is package-wide by construction and is labelled as such; an
+    accepted Agent Work Unit brief already naming concrete source files of this
+    package is reported as the first concrete allocation, so an active writer is
+    not blocked on a project-wide cell-metadata inventory.
+    """
+    graph = _module_graph(root, record)
+    effective = _package_allocation(record, allocation, graph)
+    selection = _source_selection(root, record, consumer_names, effective, graph)
+    test_only = [
+        entry["path"] for entry in selection["selected_tests"] if entry["test_only_module"]
+    ]
+    return {
+        "physical_file_count": selection["physical_file_count"],
+        "physical_source_stu": selection["physical_source_stu"],
+        "physical_inventory_digest": selection["physical_inventory_digest"],
+        "source_classification": {
+            "production_source_file_count": len(selection["selected_source"]),
+            "test_file_count": len(selection["selected_tests"]),
+            "test_only_module_paths": test_only,
+            "unselected_file_count": len(selection["unselected_files"]),
+            "unselected_files": selection["unselected_files"],
+            "unresolved_cfg_or_module_cases": selection["unresolved_cfg_or_module_cases"],
+            "note": (
+                "Classification is derived from Cargo target roots and module/cfg "
+                "reachability, never from a path component name. An ambiguous "
+                "cfg/module gate is listed as explicit uncertainty and stays "
+                "production-reachable."
+            ),
+        },
+        "accepted_assignments": [allocation] if allocation else [],
+        "cell_allocation": effective,
+    }
 
 
 def build_capsules(root: Path) -> dict[str, Any]:
@@ -1225,41 +2122,70 @@ def build_capsules(root: Path) -> dict[str, Any]:
     registry_defects: list[str] = []
     member_paths = sorted(packages)
     undeclared_cells: list[dict[str, Any]] = []
+    accepted_allocations = _accepted_cell_allocations(root, packages)
 
     for root_path in member_paths:
         record = packages[root_path]
         if root_path in standalone_set:
             # Carried by the excluded-scope pass below, never twice.
             continue
-        selection = _source_selection(root, record, consumer_names[root_path])
         excluded = dispositions.get(root_path)
+        declared_cells = _declared_cells(record)
+        package_allocation = accepted_allocations.get(_cell_allocation_key(root_path, None))
         if record["bins_reachable"]:
             reachability = "REACHABLE"
         elif excluded or record["declared_exclude"]:
             reachability = "EXCLUDED"
         else:
             reachability = "UNREACHABLE"
-        for cell in _declared_cells(record):
-            if cell in claimed:
-                registry_defects.append(f"{cell}: claimed by {claimed[cell]} and {root_path}")
-                continue
-            claimed[cell] = root_path
-            kit, context, capsule, entry = _build_cell(
-                root, cell, record, selection, handles, boundaries, blocks,
-                inventory, excluded, reachability, False,
+        if declared_cells:
+            graph = _module_graph(root, record)
+            # Per-cell selection: each cell resolves its own allocation and its
+            # own module/cfg evidence, so two independent cells in one package
+            # keep distinct selected worksets plus the required common inputs.
+            for cell in declared_cells:
+                if cell in claimed:
+                    registry_defects.append(f"{cell}: claimed by {claimed[cell]} and {root_path}")
+                    continue
+                claimed[cell] = root_path
+                allocation = accepted_allocations.get(
+                    _cell_allocation_key(root_path, cell)
+                ) or package_allocation
+                cell_allocation = _cell_allocation(
+                    root,
+                    record,
+                    declared_cells,
+                    cell,
+                    _allocated_paths(root, allocation),
+                    graph,
+                )
+                selection = _source_selection(
+                    root, record, consumer_names[root_path], cell_allocation, graph
+                )
+                kit, context, capsule, entry = _build_cell(
+                    root, cell, record, selection, handles, boundaries, blocks,
+                    inventory, excluded, reachability, False,
+                )
+                artifacts[cell] = {
+                    "contract_kit": kit,
+                    "context_capsule": context,
+                    "test_capsule": capsule,
+                }
+                cells.append(entry)
+        else:
+            undeclared_cells.append(
+                _undeclared_capability(
+                    record,
+                    reachability,
+                    excluded,
+                    _package_workset(root, record, consumer_names[root_path], package_allocation),
+                )
             )
-            artifacts[cell] = {
-                "contract_kit": kit,
-                "context_capsule": context,
-                "test_capsule": capsule,
-            }
-            cells.append(entry)
-        if not _declared_cells(record):
-            undeclared_cells.append(_undeclared_capability(record, reachability, excluded))
 
     for root_path in standalone:
         record = packages[root_path]
-        selection = _source_selection(root, record, consumer_names.get(root_path, []))
+        declared_cells = _declared_cells(record)
+        package_allocation = accepted_allocations.get(_cell_allocation_key(root_path, None))
         excluded = dispositions.get(root_path)
         if excluded is None:
             registry_defects.append(
@@ -1271,16 +2197,37 @@ def build_capsules(root: Path) -> dict[str, Any]:
                 "workspace_admission": "undeclared; fail-closed until dispositioned",
                 "source": DISPOSITIONS_PATH,
             }
-        declared = _declared_cells(record)
-        if not declared:
+        graph = _module_graph(root, record)
+        if not declared_cells:
             undeclared_cells.append(
-                _undeclared_capability(record, "EXCLUDED", excluded)
+                _undeclared_capability(
+                    record,
+                    "EXCLUDED",
+                    excluded,
+                    _package_workset(
+                        root, record, consumer_names.get(root_path, []), package_allocation
+                    ),
+                )
             )
-        for cell in declared:
+        for cell in declared_cells:
             if cell in claimed:
                 registry_defects.append(f"{cell}: claimed by {claimed[cell]} and {root_path}")
                 continue
             claimed[cell] = root_path
+            allocation = accepted_allocations.get(
+                _cell_allocation_key(root_path, cell)
+            ) or package_allocation
+            cell_allocation = _cell_allocation(
+                root,
+                record,
+                declared_cells,
+                cell,
+                _allocated_paths(root, allocation),
+                graph,
+            )
+            selection = _source_selection(
+                root, record, consumer_names.get(root_path, []), cell_allocation, graph
+            )
             kit, context, capsule, entry = _build_cell(
                 root, cell, record, selection, handles, boundaries, blocks,
                 inventory, excluded, "EXCLUDED", True,
@@ -1304,6 +2251,7 @@ def build_capsules(root: Path) -> dict[str, Any]:
             "workspace_admission": cell["workspace_admission"],
             "excluded_scope": cell["excluded_scope"],
             "declared_in_module_manifest": cell["declared_in_module_manifest"],
+            "workset_allocation": cell["workset_allocation"],
             "implementation_support": cell["implementation_support"]["implementation_support"],
             "artifacts": cell["artifacts"],
         }
@@ -1347,6 +2295,32 @@ def build_capsules(root: Path) -> dict[str, Any]:
             ],
             "reachability_tally": dict(sorted(reachability_tally.items())),
             "support_tally": dict(sorted(support_tally.items())),
+            "cell_allocation_tally": dict(
+                sorted(
+                    (scope, sum(1 for cell in cells if cell["workset_allocation"]["scope"] == scope))
+                    for scope in {cell["workset_allocation"]["scope"] for cell in cells}
+                )
+            ),
+            "accepted_cell_allocations": [
+                {
+                    "package": key.split("::", 1)[0],
+                    "cell": key.split("::", 1)[1] or None,
+                    "assignment": record["assignment"],
+                    "issue": record["issue"],
+                    "status": record["status"],
+                    "authority": record["authority"],
+                    "allocated_source_paths": _sorted_existing(root, record["declared_source_paths"]),
+                }
+                for key, record in sorted(accepted_allocations.items())
+            ],
+            "allocation_note": (
+                "Where an accepted cell/source allocation exists the selection is "
+                "PER_CELL; otherwise it is PACKAGE_WIDE and labelled EXPLICIT "
+                "for a single declared cell or UNRESOLVED for a package with "
+                "several. A package-wide selection is never presented as a "
+                "minimal causal workset, and a cell with no allocation is "
+                "represented at TARGET rather than invented."
+            ),
             "coverage_note": (
                 "Reachable, unreachable, and currently excluded workspace "
                 "capabilities are all represented. An excluded capability may "

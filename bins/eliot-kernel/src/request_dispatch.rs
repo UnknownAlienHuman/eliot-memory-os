@@ -5,16 +5,21 @@
 //! the operation string, each validated to its exact payload shape before any
 //! owner is named. `backup.verify` reaches the real capture owner and answers
 //! from it, and `backup.restore-test` reaches the real restore owner through
-//! [`KernelComposition::backup_restore_with_ors_journal`] and answers with the
-//! owner's own receipt; `backup.create` is the remaining owner-blocked leg, and
+//! [`KernelComposition::backup_restore_with_ors_journal`] and is answered by the
+//! owner itself; `backup.create` is the remaining owner-blocked leg, and
 //! `backup.restore-store` is the fourth selector, which carries the admitted
 //! #950 carrier itself and reaches the admitted destination only through the
 //! composition's retained `KernelStoreGateway`. None of the four performs a
 //! coordination commit, and none performs any activation, retirement or
-//! cutover. `backup.restore-test` does perform the isolated store import — that
-//! is what the rehearsal is — and performs it in rehearsal posture, in which
+//! cutover. `backup.restore-test` does reach the isolated store import — that
+//! is what the rehearsal is — and reaches it in rehearsal posture, in which
 //! cutover qualification refuses (A13.7: "Cutover requires separate
-//! authority"). Missing owners refuse as typed replies
+//! authority"). It does not COMPLETE that import on this front door: since the
+//! destination-admission gate (#955) an unadmitted bundle is refused with the
+//! owner's own `DestinationNotAdmitted` before a destination root is
+//! constructed, because #958's owner-issued destination binding has no channel
+//! here. The command is therefore fail-closed today rather than silent, and
+//! opening that seam is the #958 decision. Missing owners refuse as typed replies
 //! (`refused`/`blocked` with `code = plan_gap`), never as fake success and
 //! never silently, and on an owner-reaching arm `plan_gap` names only the owner
 //! capability this front door holds no channel to — never the successful
@@ -31,15 +36,16 @@
 //!   what has to exist rather than that "admitted capture is not implemented":
 //!   `KernelBackupCapture::capture` consumes a caller-issued
 //!   `CaptureCallerAuth`, a `PublicationPort` that publishes exactly once, and
-//!   an already-accepted `CaptureRequest` evidence bundle, and NEITHER the port
-//!   nor the bundle has a production producer on this tree (the port's only
-//!   implementation is `MemPublisher` inside
-//!   `bins/eliot-kernel/tests/backup_capture.rs`; `request_from_ports` and
-//!   `EbpCanonicalStoreClient::backup_begin`/`backup_page`/`backup_end` have no
-//!   production caller). Admitting capture here would invent authority, so the
-//!   item's "any missing capture-owner behavior remains with #959" holds and
-//!   this route refuses a typed owner-absence instead of a receipt for having
-//!   read its own arguments.
+//!   an already-accepted `CaptureRequest` evidence bundle. The port DOES have a
+//!   production implementation now - #959's
+//!   `eliot_blob::BlobArchivePublicationOwner` - but nothing can BIND it,
+//!   because it takes an `eliot_blob::BlobStoreService` that no production code
+//!   constructs; and the bundle still has no producer at all
+//!   (`request_from_ports` and `EbpCanonicalStoreClient::backup_begin`/
+//!   `backup_page`/`backup_end` have no production caller). Admitting capture
+//!   here would invent authority, so the item's "any missing capture-owner
+//!   behavior remains with #959" holds and this route refuses a typed
+//!   owner-absence instead of a receipt for having read its own arguments.
 //! - `backup.verify` admits the bounded inline bundle bytes, then decodes and
 //!   validates them through the real capture owner
 //!   ([`KernelBackupCapture::verify_only`], bound on the composition by #959
@@ -99,12 +105,18 @@
 //!   which is genuinely ambiguous; this implementation reads it as per-PRINCIPAL and
 //!   discloses the reading on `BackupVerifyRequestIdentity` for the owner to settle.
 //!
-//!   Three consequences are load-bearing and are each a typed answer rather than a
+//!   Four consequences are load-bearing and are each a typed answer rather than a
 //!   silent one: a cross-principal or cross-scope hit on one key is refused with a
 //!   bounded typed refusal that projects nothing; a row written under the pre-#2883
 //!   raw text key is quarantined as unscoped legacy evidence and is never certified,
 //!   re-keyed or projected, while bytes under that key that decode as NEITHER shape
-//!   fail closed instead of being read as absent; and a caller that is NOT the
+//!   fail closed instead of being read as absent; a row written under an EARLIER
+//!   verify PROFILE is addressed at that profile's own namespace key — `v2` by
+//!   #2862, `v1` by #2863 — and is quarantined as legacy unqualified evidence
+//!   with its own reason, because a profile bump moves the
+//!   `idempotency_namespace` and therefore the key, so reading a superseded row
+//!   as "absent" would let the caller stage a SECOND row for one operation
+//!   identity that already holds a stored answer; and a caller that is NOT the
 //!   principal owning an operation may read that operation's stored answer only by
 //!   presenting the caller-presented evidence pair that names it exactly — the
 //!   predecessor's durable namespace digest plus its canonical request hash — and
@@ -115,7 +127,23 @@
 //!   (`owner_reproves_predecessor_operation`). That
 //!   is the ONLY case `successor_of` exists for: the key cannot otherwise separate a
 //!   non-owner from the operation it wants to read. The verify payload is therefore
-//!   `{bundle_hex}` or `{bundle_hex, successor_of}`.
+//!   a CLOSED TWO-ARM UNION keyed on whether the EXISTING protocol
+//!   `BackupArchiveVerification` is present: `{bundle_hex}` /
+//!   `{bundle_hex, successor_of}` is the inline arm, and `{bundle_hex,
+//!   verification}` / `{bundle_hex, successor_of, verification}` is the protocol
+//!   arm, whose request is admitted verbatim through the one closed wrapper
+//!   `backup_verify_provenance::BackupVerifyAdmittedRequest` and mapped into the
+//!   accepted ORS identity by the exhaustive checked adapter
+//!   `backup_verify_provenance::bind_protocol_request`. The inline arm carries no
+//!   protocol request and therefore can never reach a provenance-qualified verdict
+//!   (#2862 I2). The protocol arm is admitted in full — decoded through that
+//!   wrapper and validated by the protocol's own `BackupArchiveVerification::validate`
+//!   — and then refused by naming the one absent owner,
+//!   `backup-retained-archive-owner (#2862)`, through the `refused`/`plan_gap`
+//!   refusal the operator surface already projects for this route. It is NOT an
+//!   `invalid` field: the request is well-formed, so a field would report the
+//!   caller's own correct input as their mistake. See
+//!   `request_dispatch.rs::VerifyAdmissionRefusal`.
 //!
 //!   The succession evidence is CALLER-PRESENTED, not owner-issued, and the route
 //!   does not pretend otherwise. It is a POINTER, never an authorization: the pair
@@ -129,21 +157,41 @@
 //!   (#959)`, OPEN. What it CAN do, and does, is force the owner to re-decide the
 //!   named operation: nothing here invents
 //!   a capability, a receipt type, or an owner value to paper over that.
-//! - `backup.restore-test` runs the FULL isolated rehearsal, not a shape
-//!   report: the shape gates run for real (bounded decode, exact shapes, digest
-//!   shapes, lineage admissibility, provisioning shape, store-level isolation
-//!   inequality), the archive is decoded and the plan compiled by the owners'
-//!   own gates, the owner-issued `RestoreJournalAdmission` is obtained from the
-//!   durable ORS owner through
+//! - `backup.restore-test` runs the FULL isolated rehearsal PATH, not a shape
+//!   report — though since the destination-admission gate (#955) that path
+//!   ends in the owner's own typed refusal on this front door, for the reason
+//!   stated below. The shape gates run for real (bounded decode, exact shapes,
+//!   digest shapes, lineage admissibility, provisioning shape, store-level
+//!   isolation inequality), the archive is decoded and the plan compiled by the
+//!   owners' own gates, the owner-issued `RestoreJournalAdmission` is obtained
+//!   from the durable ORS owner through
 //!   `KernelBackupRestore::admit_restore_journal`, and the engine runs through
 //!   [`KernelComposition::backup_restore_with_ors_journal`] on this
-//!   composition's own durable journal, answering `ok` with the owner's own
-//!   `RestoreReceipt`, its exact `evidence_level`, the evidence document the
-//!   owner finalized and the applied phase log. `plan_gap` survives on this arm
-//!   for exactly ONE genuinely absent owner capability — the destination-side
-//!   key and blob-scope admission named by
+//!   composition's own durable journal. When the destination is ADMITTED that
+//!   run answers `ok` with the owner's own `RestoreReceipt`, its exact
+//!   `evidence_level`, the evidence document the owner finalized and the applied
+//!   phase log. On this front door it is not admitted — the bundle is built with
+//!   `manifest_evidence: None`, because #958's owner-issued PREPARED, UNACTIVATED
+//!   destination binding has no channel here to issue one — and since the
+//!   destination-admission gate (#955) the owner therefore REFUSES it with its
+//!   own `DestinationNotAdmitted` before it compiles the plan or constructs
+//!   `<work_root>/.eliot/restore-isolated/<label>`. So today the answer is a
+//!   typed owner refusal, never the receipt: this is a fail-closed route and an
+//!   advertised command that is not yet functional, and that is stated here
+//!   rather than left for a reader to infer from the gates list.
+//!
+//!   `plan_gap` survives on this arm for exactly ONE genuinely absent owner
+//!   capability — the destination-side key and blob-scope admission named by
 //!   [`BACKUP_RESTORE_TEST_MISSING_OWNER`] — and is never the endpoint of a
-//!   command that reached its owner.
+//!   command that reached its owner. It is narrower than that name suggests: the
+//!   owner runs the key-material and blob-scope gates BEFORE the
+//!   destination-admission gate, so a blob-carrying archive is answered `plan_gap`
+//!   and never reaches the destination refusal, while a blob-free archive has no
+//!   capability to be missing and is answered the destination refusal instead
+//!   (`refused`, `code = restore-destination-not-admitted`, and no
+//!   `missing_owner` field, because that name is reported only for the owner's
+//!   own `CapabilityMissing`). Both answers are the owner refusing a front door
+//!   that holds no admission channel.
 //!
 //!   Two gates are reported as NOT admitted on every answer this arm gives, and
 //!   they are named rather than implied: `cutover-qualification`, which this
@@ -154,6 +202,8 @@
 //!   establishes: the declared destination is re-proved by the owner against
 //!   the destination the execution constructs and against the durable stream
 //!   row, but it is not pinned by an owner admission this route can obtain, and
+//!   since #955 the owner refuses before it constructs any destination at all
+//!   rather than importing into an unpinned one.
 //!   [`handle_backup_restore_test`] says so where it is implemented rather than
 //!   claiming the conjunct. The gates that ran are reported in `gates_passed`
 //!   and the gates that did not run are reported in `gates_not_admitted`; the
@@ -200,7 +250,8 @@ use eliot_ors::{
     BACKUP_VERIFY_PROFILE_VERSION, BACKUP_VERIFY_RETENTION_WINDOW, BackupVerificationDisposition,
     BackupVerificationResultRecord, BackupVerifyRequestIdentity,
     CONTRACT_VERSION as ORS_CONTRACT_VERSION, LegacyFenceBoundBackupVerificationClass,
-    LegacyUnscopedBackupVerificationClass, OrsError, RestoreJournalArchiveClass,
+    LegacyTwoValueRelationBackupVerificationClass, LegacyUnscopedBackupVerificationClass, OrsError,
+    RestoreJournalArchiveClass,
 };
 use eliot_protocol::backup::BackupClassWire;
 use eliot_protocol::{Frame, FrameKind, MessageType, ProtocolPayload};
@@ -215,7 +266,10 @@ use super::backup_restore::{KernelBackupRestore, KernelRestoreOutcome};
 use super::backup_restore_ports::{
     KernelRestoreError, OrsRestoreBinding, RESTORE_JOURNAL_WRITER_ID, RestorePorts,
 };
-use super::backup_verify_provenance::{OwnerProvenanceEvidence, check_provenance_binding};
+use super::backup_verify_provenance::{
+    BackupVerifyAdmittedRequest, BackupVerifySuccessorPointer, OwnerProvenanceEvidence,
+    bind_protocol_request, check_provenance_binding,
+};
 use super::composition_bootstrap::DAEMON_FRONT_DOOR_CAPABILITY;
 use super::{
     CaptureCallerAuth, CaptureReport, CaptureState, KernelCaptureError, KernelComposition,
@@ -390,13 +444,22 @@ const RESTORE_TEST_SHAPE_GATES_ADMITTED: [&str; 6] = [
 /// split exists to make impossible.
 ///
 /// The first entry is structural: the Host-side destination manifest binding
-/// (#958) reaches no owner channel on this front door, so the rehearsal runs
-/// with `RestorePorts::manifest_evidence == None` — the shape that type's own
-/// doc names as "a bundle with no Host admission", under which isolated import
-/// still runs, prepare pins nothing, and cutover qualification refuses for want
-/// of a pinned owner admission. The second is the no-cutover boundary this
-/// command may never cross (A13.7: "Cutover requires separate authority"): the
-/// route never calls `qualify_cutover`, so that gate is reported as not admitted
+/// (#958) reaches no owner channel on this front door, so this route builds
+/// `RestorePorts` with `manifest_evidence == None` — a bundle with no Host
+/// admission. Since the destination-admission gate (#955) that is NOT a shape
+/// the isolated import survives: the owner requires the record and refuses with
+/// `KernelRestoreError::DestinationNotAdmitted` before it compiles a plan and
+/// before `KernelIsolatedDestination::open` constructs
+/// `<work_root>/.eliot/restore-isolated/<label>`. So prepare pins nothing
+/// because nothing is prepared, no destination byte is written, and cutover
+/// qualification is never reached rather than refused at its own gate. It is
+/// listed on every reply this route builds because the list is seeded before the
+/// owner is called; whether the gate is actually REACHED depends on which
+/// earlier gate refused first — the key-material and blob-scope gates run before
+/// it, so a blob-carrying archive stops one step earlier. The second entry is
+/// the no-cutover boundary this command may never cross (A13.7: "Cutover
+/// requires separate authority"): the route never calls `qualify_cutover`, so
+/// that gate is reported as not admitted
 /// on every answer, successful or not. The two gates in
 /// [`RESTORE_TEST_BLOB_GATES_NOT_ADMITTED`] are appended to this list only for an
 /// archive that carries blobs, and they are the owner capability
@@ -765,14 +828,14 @@ fn cancellation_reply(idempotency_key: &str, owner_reason: &str) -> Value {
 ///    production caller, and the accepted read is ASYNC while
 ///    `KernelComposition::dispatch_backup_frame` is the synchronous frame
 ///    route.
-/// 2. a production `PublicationPort`. `capture` publishes exactly once through
-///    it and reconciles a lost response by operation identity through it; the
-///    only implementation in the repository is `MemPublisher` inside
-///    `bins/eliot-kernel/tests/backup_capture.rs`.
+/// 2. a BINDABLE production `PublicationPort`. `capture` publishes exactly once
+///    through it. #959 supplied `eliot_blob::BlobArchivePublicationOwner`, but it
+///    binds an `eliot_blob::BlobStoreService` no production code constructs.
 /// 3. a `FrozenCapturePlan` whose `build_digest` and `policy_digest` are
 ///    owner-ISSUED approved 64-hex digests. This route holds no such digest and
-///    will not synthesise one, because a plausible digest in that field is the
-///    laundered-absence this item names.
+///    will not synthesise one: `gate_approved_manifest_digests` binds each to a
+///    carried artifact's OWN recorded digest, so a digest read off the artifacts
+///    it gates compares one caller list with itself and binds nothing.
 ///
 /// So the create arm does what the item says to do with an absent owner: it
 /// returns a TYPED FAILURE NAMING THE ABSENT OWNER BEHAVIOUR. It emits no
@@ -877,9 +940,10 @@ fn handle_backup_create(
         idempotency_key,
         "plan_gap",
         BACKUP_CREATE_MISSING_OWNER,
-        "capture owner entry KernelBackupCapture::capture is unreachable: no \
-         production PublicationPort and no producer of the accepted \
-         CaptureRequest evidence; #959 owns both",
+        "capture owner entry KernelBackupCapture::capture is unreachable: \
+         #959's BlobArchivePublicationOwner cannot be bound because no \
+         production BlobStoreService exists, and no producer supplies the \
+         accepted CaptureRequest evidence",
     ))
 }
 
@@ -983,13 +1047,29 @@ fn bounded_reason(reason: &str) -> String {
 ///
 /// The operator surface admits exactly four verify statuses: `ok`, `invalid`,
 /// a `plan_gap` refusal, and `cancelled`. It treats any other `code` on a
-/// `refused` or `cancelled` reply as a result mismatch. Verify has no missing
-/// owner left to name, so every other owner refusal - an unadmitted caller, an
-/// incoherent archive relation, an unsupported class, a budget or publication
-/// failure - is reported as a typed `invalid` naming the causal class. The
-/// reason is the OWNER's own `Display` text, bounded: this route never invents
-/// a second reason vocabulary next to the owner's, and never renders an owner
-/// state as a Rust `Debug` name on the operator wire.
+/// `refused` or `cancelled` reply as a result mismatch. So a `plan_gap`
+/// refusal is NOT an open vocabulary on this route — it is one of the four, and
+/// `eliot_cli::backup::backup_verify` already projects it by reading
+/// `code`, `missing_owner` and `reason`. The one verify refusal that names an
+/// absent owner therefore belongs in it, and since #2862 that is
+/// [`BACKUP_VERIFY_MISSING_OWNER`]: the retained-archive owner the
+/// retained-archive arm of the payload needs and this tree does not have. It is
+/// produced by [`admit_verify_bundle`] and rendered by
+/// [`VerifyAdmissionRefusal::into_reply`].
+///
+/// Every OTHER owner refusal - an unadmitted caller, an incoherent archive
+/// relation, an unsupported class, a budget or publication failure - is
+/// reported as a typed `invalid` naming the causal class, because each of those
+/// IS a fault of the request or of the presented archive. The reason is the
+/// OWNER's own `Display` text, bounded: this route never invents a second
+/// reason vocabulary next to the owner's, and never renders an owner state as a
+/// Rust `Debug` name on the operator wire.
+///
+/// The split is a real distinction, not a cosmetic one. An `invalid` reply
+/// carries a `field`, and the CLI turns that field into
+/// `missing_obligations = ["invalid field: ..."]` — so rendering the absent
+/// owner as `invalid` reported a missing owner as something the caller typed
+/// wrongly, and told them to look at a field that is already correct.
 ///
 /// [`KernelCaptureError::Cancelled`] is the one refusal that is NOT a
 /// field-shape failure, so it is answered by [`cancellation_reply`] from its
@@ -1041,10 +1121,11 @@ fn capture_error_reply(idempotency_key: &str, error: &KernelCaptureError) -> Val
 /// `backup_id` and `class` are text the archive declares about itself and the
 /// owner re-validates for internal consistency, and `archive_sha256` is computed by
 /// the archive format itself (`BackupBundle::bundle_sha256`) — none of the three is
-/// proved against a capture owner, because no production `impl PublicationPort`
-/// exists on this path and `verify_only` therefore always answers
-/// `StructurallyValidCandidate`. That is exactly why the surface reports a
-/// structurally valid archive as a `candidate` and never as `verified`.
+/// proved against a capture owner: `verify_only` publishes nothing and reads no
+/// retained receipt, so no production publication owner issues one on this path
+/// and `verify_only` always answers `StructurallyValidCandidate`. That is exactly
+/// why the surface reports a structurally valid archive as a `candidate` and
+/// never as `verified`.
 ///
 /// The other three fields are DERIVED from the accepted request identity, not owner
 /// answers, and are called out as such in their own field docs: `request_digest` is
@@ -1106,6 +1187,20 @@ struct VerifiedProjection {
     /// Owner-issued publication receipt, explicitly absent when the owner
     /// issued none.
     capture_receipt: Option<String>,
+    /// #2862 (item A1): the canonical digest of the verifier-issued
+    /// `BackupArchiveValidityAttestation` for this archive, or `None` when no
+    /// owner channel authenticated as `BackupRole::Verifier` and issued one.
+    ///
+    /// This is the TYPED attestation's own RECORDED digest, not a level, not a
+    /// free string and not something derived from the structural answer: the
+    /// value behind it was checked by the protocol's own
+    /// `BackupArchiveValidityAttestation::validate_against` against THIS
+    /// operation's protocol request identity and the authenticated verifier role
+    /// before it could reach a row, so a value here names a validated typed
+    /// attestation rather than asserting one. It is projected from the accepted
+    /// identity on the fresh path and from the stored record on the replay path,
+    /// so an exact replay returns the same reference instead of re-deriving one.
+    validity_attestation_digest: Option<String>,
     /// Derived, not an owner answer: the canonical request hash of the accepted
     /// request identity, which since #2883 is a hash over the whole accepted
     /// request and not over one archive field.
@@ -1184,9 +1279,9 @@ fn verified_reply(
         );
     }
     // Explicitly null, never omitted: no retained-artifact owner issues a
-    // capture receipt on this path. The missing symbol is a production
-    // `impl PublicationPort`; the only implementation is `MemPublisher` inside
-    // `bins/eliot-kernel/tests/backup_capture.rs`.
+    // capture receipt on this path. The missing symbol is a BINDABLE production
+    // publication owner: #959's `eliot_blob::BlobArchivePublicationOwner` exists
+    // but needs a production `BlobStoreService`, and no production code builds one.
     let capture_receipt = projection
         .capture_receipt
         .clone()
@@ -1255,6 +1350,23 @@ fn verified_reply(
                     .map_or(Value::Null, Value::String),
             ),
             ("capture_receipt", capture_receipt),
+            // #2862 (item A1): the TYPED validity attestation this answer rests
+            // on, by its own recorded canonical digest. Explicitly null rather
+            // than omitted, and deliberately NOT a level string and not a bool:
+            // the value behind it was validated against THIS operation's protocol
+            // request identity and the authenticated `BackupRole::Verifier`
+            // before it could be recorded, so a reader that sees a digest here
+            // knows a verifier attested and can resolve the attestation through
+            // the owner's record. No verifier session issues one on this product,
+            // so this is null on every answer today and the structural
+            // `verification_level` beside it remains the only level claim.
+            (
+                "validity_attestation_digest",
+                projection
+                    .validity_attestation_digest
+                    .clone()
+                    .map_or(Value::Null, Value::String),
+            ),
             ("event_count", Value::from(projection.event_count)),
             ("receipt_count", Value::from(projection.receipt_count)),
             ("blob_count", Value::from(projection.blob_count)),
@@ -1313,6 +1425,7 @@ fn projection_from_report(
         receipt_count: member_domain_count(report, MEMBER_DOMAIN_RECEIPT),
         blob_count: member_domain_count(report, MEMBER_DOMAIN_BLOB),
         capture_receipt: report.receipt_identity.clone(),
+        validity_attestation_digest: identity.validity_attestation_digest.clone(),
         request_digest,
         operation_namespace,
     })
@@ -1354,6 +1467,7 @@ fn projection_from_record(
         receipt_count: record.receipt_count,
         blob_count: record.blob_count,
         capture_receipt: record.capture_receipt.clone(),
+        validity_attestation_digest: record.validity_attestation_digest.clone(),
         request_digest: record.request_digest.clone(),
         operation_namespace,
     })
@@ -1455,6 +1569,14 @@ fn record_from_projection(
 ///   `backup_verify_provenance::check_provenance_binding` before this function
 ///   runs. Nothing here re-derives a digest, and an absent owner answer stays
 ///   `None`.
+/// - `presented_bytes` is the exact byte sequence the capture owner just decoded
+///   and re-validated, and `protocol_request` is the EXISTING
+///   `BackupArchiveVerification` the frame presented, if any. The pair is what
+///   `backup_verify_provenance::bind_protocol_request` binds: it requires the
+///   protocol request to name THIS operation and THESE bytes, and it is the
+///   second writer of `archive_handle`, so the durable identity commits to the
+///   handle the protocol request names rather than to a path, a URL or a
+///   caller-spelled digest. `None` is the inline arm's own answer.
 /// - `operation_id` is the caller-provided idempotency text. It is the only
 ///   caller-authored value in the identity, and it is namespaced: it can never be
 ///   a durable key on its own.
@@ -1497,7 +1619,9 @@ fn backup_verify_identity(
     session: &Session,
     caller: &CaptureCallerAuth,
     report: &CaptureReport,
+    presented_bytes: &[u8],
     provenance: &OwnerProvenanceEvidence,
+    protocol_request: Option<&BackupVerifyAdmittedRequest>,
     idempotency_key: &str,
 ) -> Result<BackupVerifyRequestIdentity, String> {
     let mut identity = backup_verify_admitted_identity(session, caller, idempotency_key)?;
@@ -1547,6 +1671,24 @@ fn backup_verify_identity(
     provenance
         .bind_into(&mut identity)
         .map_err(|error| format!("{}: {}", error.field(), error.reason()))?;
+    // The EXHAUSTIVE CHECKED ADAPTER for the EXISTING protocol request, and the
+    // SECOND writer of `archive_handle`. It runs AFTER `bind_into` on purpose:
+    // the protocol request names the handle THIS operation vouches for, so it is
+    // the value that lands, and the gate has already refused any case where the
+    // owner-issued handle is not that same value. `None` on the inline arm is
+    // that arm's own answer — an inline structural candidate carries no protocol
+    // request — and it is not a default: the gate refuses a handle or a receipt
+    // that arrived without one.
+    if let Some(admitted) = protocol_request {
+        bind_protocol_request(
+            &admitted.verification,
+            &mut identity,
+            &session.module_generation.state_fence,
+            report,
+            presented_bytes,
+        )
+        .map_err(|error| format!("{}: {}", error.field(), error.reason()))?;
+    }
     identity
         .with_computed_digest()
         .map_err(|error| error.to_string())
@@ -1615,13 +1757,14 @@ fn backup_verify_admitted_identity(
         capture_receipt: None,
         // #2862: the three owner-evidence commitments. Absent here for the same
         // reason the eight terms above are empty, and the absence is
-        // load-bearing rather than a placeholder: no production
-        // `impl PublicationPort` resolves a retained handle on this path (the
-        // only implementation is `MemPublisher` in
-        // `bins/eliot-kernel/tests/backup_capture.rs`), and no
+        // load-bearing rather than a placeholder: no BINDABLE production
+        // publication owner resolves a retained handle on this path, and no
         // `BackupRole::Verifier` session issues a capture receipt or an archive
-        // validity attestation on this product at all. They are recorded as the
-        // owner's own answer and are never filled from caller text; ORS
+        // validity attestation on this product at all. The owner #959 did land
+        // is `eliot_blob::BlobArchivePublicationOwner`, the one production
+        // `PublicationPort`, and it binds to an `eliot_blob::BlobStoreService`
+        // that no production path constructs. They are recorded as the owner's
+        // own answer and are never filled from caller text; ORS
         // `validate()` requires each to be either a well-formed digest or absent.
         // #2862 also left them absent HERE, and `backup_verify_identity` is where
         // they are filled: from the owner's recorded evidence through
@@ -2072,6 +2215,42 @@ fn legacy_unqualified_evidence_reply(idempotency_key: &str) -> Value {
     )
 }
 
+/// Projects the typed refusal for a PRE-#2863 (`v1`) durable row, whose
+/// archived-fence answer is the retired two-value vocabulary (#2863).
+///
+/// It is a THIRD sentence, distinct from
+/// [`legacy_unscoped_evidence_reply`] and
+/// [`legacy_unqualified_evidence_reply`], because the fact the caller needs
+/// about this row is a third fact:
+///
+/// - the pre-#2883 row carries no ownership at all;
+/// - the pre-#2862 row is fully scoped but carries no owner-evidence
+///   commitments;
+/// - THIS row is fully scoped and its `target_compatibility` field held
+///   `current-session` or `historical-authority`, an authority-epoch-only
+///   relation published under the name of a TARGET COMPATIBILITY answer. That
+///   name was wrong about what it measured, which is the whole reason #2863
+///   replaced it with a typed `archive_fence_relation` plus its own proof
+///   ceiling and left `target_compatibility` to the restore owner (A13.7). So
+///   the refusal must NOT tell the caller its stored answer was a target
+///   compatibility finding, and must NOT present the row as merely
+///   un-provenanced.
+///
+/// The refusal states the class and nothing read out of the row: no stored
+/// fence, no stored relation spelling, no stored digest, no archive identity and
+/// no store error. It answers the second branch of issue #2863's instruction 8
+/// — the row does not replay as a current-profile answer, so the caller must
+/// submit a NEW explicit verification operation, which is a new `operation_id`
+/// and therefore a different `v1` key that reads `Absent`.
+fn legacy_two_value_evidence_reply(idempotency_key: &str) -> Value {
+    invalid_reply(
+        BACKUP_VERIFY_OPERATION,
+        idempotency_key,
+        "backup.verify",
+        "this operation already holds a durable verification result written under a pre-fence-relation verify profile, whose archived-fence answer used a retired two-value vocabulary published as a target compatibility; it is quarantined as legacy unqualified evidence, is neither upgraded, re-keyed nor projected here, and its stored bytes are not reinterpreted under the current relation vocabulary; submit a new explicit verification operation to obtain the current result",
+    )
+}
+
 /// Returns whether one durable-store failure is the I5.27 identity conflict
 /// rather than an outage.
 ///
@@ -2168,12 +2347,15 @@ fn undecided_report_reply(report: &CaptureReport, idempotency_key: &str) -> Opti
 ///
 /// `Absent` is a positive fact about the store, not an unknown answer: nothing is
 /// stored under this identity's namespace digest AND nothing is stored under the
-/// caller's raw text in any of the three probe classes. It is never produced from a
-/// store failure, because a failure that degraded to `Absent` would answer `ok` for
-/// a result nothing recorded. `LegacyUnscoped` is the quarantined pre-#2883 class,
-/// neither replayable nor stageable, and `Unreadable` is the fail-closed arm for
-/// bytes that decode as neither shape. The bound record is boxed so this shape stays
-/// small next to the three unit answers.
+/// caller's raw text, the pre-#2862 `v2` key or the pre-#2863 `v1` key. It is
+/// never produced from a store failure, because a failure that degraded to
+/// `Absent` would answer `ok` for a result nothing recorded. `LegacyUnscoped` is
+/// the quarantined pre-#2883 class, neither replayable nor stageable,
+/// `LegacyUnqualified` and `LegacyTwoValueUnqualified` are the two quarantined
+/// scoped legacy classes (each with its own arm and its own reason, because they
+/// are distinguishable rows), and `Unreadable` is the fail-closed arm for bytes
+/// that decode as neither shape. The bound record is boxed so this shape stays
+/// small next to the four unit answers.
 enum PriorVerification {
     /// No durable row owns this scoped verification identity, and no pre-#2883
     /// row owns the caller's raw text either.
@@ -2193,6 +2375,33 @@ enum PriorVerification {
     /// the owner-evidence level submits a NEW explicit verification operation —
     /// a new `operation_id`, hence a different legacy key that reads `Absent`.
     LegacyUnqualified,
+    /// A PRE-#2863 (`v1`) row owns this operation under verify profile `v1`'s
+    /// idempotency namespace (#2863). It is a SEPARATE arm from
+    /// [`Self::LegacyUnqualified`] and it is not a second label on it, because
+    /// the two rows are distinguishable in a way the caller must act on:
+    ///
+    /// - it is addressable: the key is reconstructed from this operation's own
+    ///   eight key components through
+    ///   [`BackupVerifyRequestIdentity::legacy_two_value_namespace_digest`],
+    ///   which is exact because #2863 changed no key component — only the
+    ///   `idempotency_namespace`;
+    /// - its archived-fence answer is the TWO-VALUE vocabulary
+    ///   (`current-session` / `historical-authority`), which reported an
+    ///   authority-epoch-only relation under the field name
+    ///   `target_compatibility`. That is a MISLEADING name for what it measured,
+    ///   which is why the current profile reports the typed
+    ///   `archive_fence_relation` with its own proof ceiling and leaves
+    ///   `target_compatibility` to the restore owner (issue #2863, instruction 6).
+    ///   So the row cannot be projected under the current vocabulary at all, and
+    ///   it must not be read as if it had said something about target
+    ///   compatibility.
+    ///
+    /// Neither arm's row is rewritten, re-keyed, upgraded, backfilled or
+    /// projected; both are quarantined. The distinction exists because the
+    /// REASON a caller must submit a NEW operation differs, and because
+    /// collapsing them would make an intact, addressable, two-value row
+    /// indistinguishable from one that never bound a fence digest at all.
+    LegacyTwoValueUnqualified,
     /// Bytes are stored under the caller's raw text and decode as NEITHER the
     /// current contract nor the pre-#2883 shape. The durable row is unreadable, so
     /// the route fails closed and answers no verification result at all. This arm
@@ -2204,6 +2413,27 @@ enum PriorVerification {
     /// A durable owner-backed result already owns this scoped verification
     /// identity, validated under the same accepted request identity.
     Bound(Box<BackupVerificationResultRecord>),
+}
+
+impl PriorVerification {
+    /// Folds one pre-#2862 (fence-bound) probe class into this enum, so the
+    /// [`KernelComposition::load_prior_verification`] probe chain can ask "is
+    /// anything decided here yet?" without every probe restating the fold.
+    ///
+    /// `None` means exactly `Absent` — the `v2` key is free, so the next,
+    /// older probe must still be asked before anything may be staged. It never
+    /// means "unknown": a store failure is returned as `Err` by the probe
+    /// itself and never reaches this fold, so this cannot turn an outage into a
+    /// decision to continue.
+    fn from_fence_bound_class(class: LegacyFenceBoundBackupVerificationClass) -> Option<Self> {
+        match class {
+            LegacyFenceBoundBackupVerificationClass::Absent => None,
+            LegacyFenceBoundBackupVerificationClass::LegacyUnqualified => {
+                Some(Self::LegacyUnqualified)
+            }
+            LegacyFenceBoundBackupVerificationClass::Unreadable => Some(Self::Unreadable),
+        }
+    }
 }
 
 /// Optional caller-presented succession evidence for a reconciliation verify
@@ -2259,9 +2489,27 @@ enum PriorVerification {
 /// trade is taken deliberately, and for the fact that the successor path has no
 /// operator surface today.
 ///
-/// The pair is a POINTER, never an authorization on its own: both halves were
-/// already on the wire in the predecessor's own `ok` reply, so their shape and
-/// even their value prove nothing by themselves. What authorizes the
+/// The verify shape the INLINE arm admits: the decoded inline bundle bytes and
+/// the optional succession evidence naming a predecessor operation.
+///
+/// The successor pair itself moved to
+/// `super::backup_verify_provenance::BackupVerifySuccessorPointer` so the two
+/// arms of the admitted payload each have one closed owning type; the field
+/// names, the shape check and every use are unchanged.
+///
+/// # WHAT THE PAIR IS, AND IS NOT
+///
+/// #2802 requires that a lost or unknown response be reconciled against the
+/// operation that actually committed, and this is the pointer that selects it:
+/// the predecessor operation's durable namespace key plus its full
+/// accepted-identity digest. Reading the NAMED row and comparing the whole of
+/// this frame's own owner decision against what that row holds is what
+/// authorizes the reconciliation — not the pair, and not the fact that the pair
+/// was well-formed.
+///
+/// It is a POINTER, never an authorization on its own: both halves were already
+/// on the wire in the predecessor's own `ok` reply, so their shape and even
+/// their value prove nothing by themselves. What authorizes the
 /// reconciliation is [`owner_reproves_predecessor_operation`] — the capture
 /// owner, re-deciding the presented bytes on this call, must land on exactly the
 /// operation the named row holds — together with the scope, lineage and
@@ -2276,76 +2524,317 @@ enum PriorVerification {
 /// "the owner did not authorise this reconciliation": the owner does re-prove
 /// that the reconciled operation IS the named operation, and it does so over the
 /// whole archive content, not over a correlation the caller chose.
-struct VerifySuccessorEvidence {
-    /// The predecessor operation's durable namespace key.
-    predecessor_namespace_digest: String,
-    /// The predecessor operation's full accepted-identity digest.
-    predecessor_identity_digest: String,
+/// The EXACT key sets this route admits for one `backup.verify` payload.
+///
+/// A CLOSED TWO-ARM UNION keyed on whether the protocol request is present, and
+/// nothing else (issue #2862, item I2). There is no third arm, no
+/// partially-populated arm and no fallback between them:
+///
+/// - the INLINE arm carries `bundle_hex` and NO protocol request, so it can
+///   never reach a provenance-qualified verdict. It is what the operator surface
+///   has always sent and it is what acceptance requires to stay a durably
+///   replayable structural candidate;
+/// - the PROTOCOL arm carries `bundle_hex` AND the EXISTING
+///   `BackupArchiveVerification`, embedded verbatim by
+///   [`BackupVerifyAdmittedRequest`]. The protocol request is REQUIRED once its
+///   key appears — it is never admitted as an absent or defaulted member — and
+///   the bytes beside it are the bytes the request's handle must equal, checked
+///   by exact digest and length in `super::backup_verify_provenance`.
+///
+/// `successor_of` rides on either arm, so four key sets are admitted and nothing
+/// else. `require_exact_keys` refuses any other key, so an unknown member is a
+/// shape refusal rather than an ignored field.
+const VERIFY_INLINE_KEYS: &[&str] = &["bundle_hex"];
+const VERIFY_INLINE_SUCCESSOR_KEYS: &[&str] = &["bundle_hex", "successor_of"];
+const VERIFY_PROTOCOL_KEYS: &[&str] = &["bundle_hex", "verification"];
+const VERIFY_PROTOCOL_SUCCESSOR_KEYS: &[&str] = &["bundle_hex", "successor_of", "verification"];
+
+/// The INLINE arm's admitted `backup.verify` work (issue #2862, item I2).
+///
+/// One admitted `backup.verify` request: the inline archive bytes and the
+/// optional succession evidence, for the INLINE arm only.
+///
+/// The PROTOCOL arm does not appear here, and that is deliberate rather than
+/// incomplete. It is fully admitted — decoded through
+/// [`BackupVerifyAdmittedRequest`] and validated by the protocol's own
+/// `BackupArchiveVerification::validate` — inside
+/// [`admit_verify_bundle`], which then refuses it, because the arm's next step
+/// is to resolve an owner-issued handle into the exact bytes to verify and the
+/// retained-archive owner that would do that does not exist on this product.
+/// Returning an `AdmittedVerifyBundle` for an arm that cannot reach the capture
+/// owner would mean carrying bytes this route does not have, and returning the
+/// request itself would mean carrying a value no caller of the admission reads.
+/// So the arm is a typed refusal at the seam that owns it, and this alias is the
+/// inline arm's admitted work. The refusal is
+/// [`VerifyAdmissionRefusal::RetainedOwnerAbsent`], which names
+/// [`BACKUP_VERIFY_MISSING_OWNER`] rather than a payload field.
+type AdmittedVerifyBundle = (Vec<u8>, Option<BackupVerifySuccessorPointer>);
+
+/// The ONE owner capability the retained-archive arm of `backup.verify` cannot
+/// reach, re-measured on this tree (issue #2862, item A1).
+///
+/// This is a [`refused_reply`] `missing_owner` token, NOT a payload field, and
+/// the distinction is the point of this constant. The caller presented a
+/// WELL-FORMED [`BackupArchiveVerification`] — it is decoded through
+/// [`BackupVerifyAdmittedRequest`] and passed through the protocol's own
+/// `BackupArchiveVerification::validate` first — and then the arm is refused
+/// because one named OWNER is absent. Reporting that through `invalid_reply`
+/// would put a `field` on the wire and let
+/// `crates/surfaces/eliot-cli/src/backup.rs::backup_verify` project it as
+/// `"invalid field: ..."`, i.e. it would report an absent owner as the caller's
+/// mistake. The operator surface already admits `refused` + `code: plan_gap` +
+/// `missing_owner` on this exact route (the `BACKUP_STATE_REFUSED` arm there),
+/// so the honest answer uses the vocabulary that already exists rather than a
+/// new one.
+///
+/// Mirrors [`BACKUP_CREATE_MISSING_OWNER`] in shape — a bounded owner token, not
+/// a sentence — and names a DIFFERENT owner, because this is not the capture
+/// owner that #959 addressed: resolving an owner-issued `BackupArtifactHandle`
+/// into exact bytes is retained-archive-owner work, and this token is the one
+/// bounded name that fact has on this route.
+pub(crate) const BACKUP_VERIFY_MISSING_OWNER: &str = "backup-retained-archive-owner (#2862)";
+
+/// Bounded reason the retained-archive refusal names.
+///
+/// It states the one absent owner and nothing about the archive, so a caller
+/// learns that the arm is unavailable without learning anything about the bytes
+/// its request named, and without a hint that resubmitting the same request
+/// differently would help.
+const BACKUP_VERIFY_RETAINED_OWNER_REASON: &str = "the retained-archive owner that resolves a protocol archive handle into bytes does not exist yet";
+
+/// Typed refusal from the closed `backup.verify` admission.
+///
+/// # WHY THIS EXISTS RATHER THAN A `(&str, String)` PAIR
+///
+/// The admission has exactly two refusal CLASSES and they must not be rendered
+/// the same way, because they are not the same fact:
+///
+/// - [`Self::Shape`] is the caller's payload: a non-object, an unexpected or
+///   missing key, a non-string or non-hex `bundle_hex`, empty bytes, a
+///   `verification` member the protocol's own `validate()` rejects, or a
+///   `successor_of` that is not an object of exactly two 64-hex digests. Every
+///   one of those is answered by [`invalid_reply`] with a `field`, which is
+///   correct: the caller can correct it.
+/// - [`Self::RetainedOwnerAbsent`] is NOT the caller's payload. The protocol
+///   request is fully decoded and validated before this variant is produced, so
+///   the caller did nothing wrong and a `field` would be a false accusation. It
+///   is answered by [`refused_reply`] with `missing_owner`, which is the
+///   vocabulary `eliot_cli::backup::backup_verify` already projects for a
+///   `plan_gap` on this route.
+///
+/// Collapsing the two into one tuple — which is what the tuple signature did —
+/// forced the second class onto the first class's rendering, and that is exactly
+/// how an absent owner comes to read as a malformed request.
+#[derive(Debug)]
+enum VerifyAdmissionRefusal {
+    /// A payload-shape failure the caller can correct.
+    Shape {
+        /// Stable field path that failed.
+        field: &'static str,
+        /// Bounded reason for that field.
+        reason: String,
+    },
+    /// The admitted protocol request is well-formed and the one owner that could
+    /// resolve its handle into bytes does not exist on this product.
+    RetainedOwnerAbsent {
+        /// Bounded owner token naming the absent owner.
+        missing_owner: &'static str,
+        /// Bounded reason naming that absent owner and nothing about the archive.
+        reason: &'static str,
+    },
 }
 
-/// The verify shape this route admits: the decoded inline bundle bytes and the
-/// optional succession evidence naming a predecessor operation.
-type AdmittedVerifyBundle = (Vec<u8>, Option<VerifySuccessorEvidence>);
+impl VerifyAdmissionRefusal {
+    /// Renders this refusal through the reply constructor its own class owns.
+    ///
+    /// This is the ONE place a refusal from this admission becomes a reply, so
+    /// the class-to-rendering relation cannot drift between the two arms. The
+    /// `match` is exhaustive over both variants and carries no third arm: a new
+    /// refusal class has to choose its rendering here rather than inheriting one.
+    fn into_reply(self, idempotency_key: &str) -> Value {
+        match self {
+            Self::Shape { field, reason } => {
+                invalid_reply(BACKUP_VERIFY_OPERATION, idempotency_key, field, &reason)
+            }
+            Self::RetainedOwnerAbsent {
+                missing_owner,
+                reason,
+            } => refused_reply(
+                BACKUP_VERIFY_OPERATION,
+                idempotency_key,
+                "plan_gap",
+                missing_owner,
+                reason,
+            ),
+        }
+    }
+}
 
-/// Admits the bounded inline bundle bytes one verify frame presents, and its
-/// optional succession evidence.
+/// Admits the bounded inline bundle bytes one verify frame presents and the
+/// optional succession evidence, or admits and then refuses the EXISTING
+/// protocol verification request.
 ///
-/// Every refusal here is a shape failure decided before any owner is named: a
-/// non-object payload, an unexpected or missing key, a non-string or non-hex
-/// `bundle_hex`, empty bytes, and a `successor_of` that is not an object of
-/// exactly two 64-hex digests. The returned field and reason are the route's own
-/// shape vocabulary; the owner's refusal vocabulary is never used for a shape the
-/// owner never saw.
+/// Almost every refusal here is a shape failure decided before any owner is
+/// named, and it is a [`VerifyAdmissionRefusal::Shape`]: a non-object payload,
+/// an unexpected or missing key, a non-string or non-hex `bundle_hex`, empty
+/// bytes, a `verification` member that is not the protocol's own
+/// `BackupArchiveVerification`, and a `successor_of` that is not an object of
+/// exactly two 64-hex digests. Those are the CALLER's to fix, so they name a
+/// `field`.
 ///
-/// `successor_of` is admitted only when present, so the payload is `{bundle_hex}`
-/// or `{bundle_hex, successor_of}` and nothing else. The presence of the key
-/// SELECTS which of the two route bodies runs — a fresh verification or a
-/// reconciliation read of a named predecessor — and no accepted request identity is
-/// constructed at all on the reconciliation path, so it is not accurate to say the
-/// evidence "changes the accepted request identity". What it does change is which
-/// durable row is read and what the answer means, and the two are distinguishable
-/// on the wire: a reconciliation's `operation_id` and `operation_namespace` carry
-/// the PREDECESSOR's values while the envelope correlation stays the caller's own
-/// key.
+/// The one refusal that is NOT a shape failure is the PROTOCOL arm's, and it is
+/// a [`VerifyAdmissionRefusal::RetainedOwnerAbsent`]: it names an absent OWNER
+/// rather than a field the caller can correct, and it is rendered by
+/// [`refused_reply`] as `code: plan_gap` + `missing_owner`, which
+/// `eliot_cli::backup::backup_verify` already projects on this route. See
+/// [`VerifyAdmissionRefusal`] for why the two classes must not share a
+/// rendering.
 ///
-/// Admitting the shape here proves nothing about the caller. The two digests are
-/// only checked for 64-hex shape. Every check that decides whether the named
-/// operation may be observed happens AFTER the real store read, and not all of it
-/// is in one function: the `WorkScope` and authority-lineage joins are in
-/// [`successor_may_observe`], while the principal comparison and the
-/// digest-and-archive equality are in [`answer_successor_verification`].
-fn admit_verify_bundle(payload: &Value) -> Result<AdmittedVerifyBundle, (&'static str, String)> {
+/// # THE PROTOCOL ARM (issue #2862, item I2)
+///
+/// A payload carrying `verification` is decoded into
+/// [`BackupVerifyAdmittedRequest`], which embeds the EXISTING
+/// `BackupArchiveVerification` by value — no field redefined, none dropped.
+/// Deserialising through that type rather than reading members out of the JSON
+/// object is what makes the admission CLOSED: the wrapper is
+/// `deny_unknown_fields`, and so is every type nested in it, so an unknown key at
+/// any depth is a refusal instead of a silently ignored field. The protocol's own
+/// `BackupArchiveVerification::validate` then runs at this seam, which is where
+/// the wire identity, the `VerifyArchive` operation binding, the request identity,
+/// the retained handle and both canonical digests are decided by the protocol
+/// owner rather than by a second set of shape rules written here.
+///
+/// The arm is then REFUSED, and the refusal names the absent OWNER through
+/// [`BACKUP_VERIFY_MISSING_OWNER`] rather than a payload field. What it needs
+/// next is the exact bytes its owner-issued handle names, and only the
+/// retained-archive owner can supply them; none exists on this product, for the
+/// reasons enumerated in `super::backup_verify_provenance`'s module docs. Falling
+/// back to the caller's inline bytes instead would make the handle decorative and
+/// would let a caller present the very bytes the handle is meant to stand for, so
+/// there is no fallback: the arm refuses here, before the capture owner is
+/// called and before any request identity is built.
+///
+/// That refusal is a real, visible answer and not a stub: the protocol request is
+/// fully decoded and validated first, so a caller learns that its request is
+/// well-formed and that the ARM is what is unavailable. A future retained-archive
+/// owner replaces the `Err` with the owner's byte resolution and the rest of the
+/// route is already built for it — [`backup_verify_provenance::bind_protocol_request`]
+/// is the adapter that joins such a request to the archive, and
+/// [`check_provenance_binding`] is the gate that would then require the owner to
+/// stand behind it.
+///
+/// `successor_of` is admitted only when present and is unchanged in meaning: it
+/// is a POINTER that only selects which durable row is read, and every check that
+/// decides whether the named operation may be observed still happens AFTER the
+/// real store read, in [`successor_may_observe`] and
+/// [`answer_successor_verification`].
+fn admit_verify_bundle(payload: &Value) -> Result<AdmittedVerifyBundle, VerifyAdmissionRefusal> {
     let Some(object) = payload.as_object() else {
-        return Err(("backup.verify", "payload must be a JSON object".to_owned()));
+        return Err(VerifyAdmissionRefusal::Shape {
+            field: "backup.verify",
+            reason: "payload must be a JSON object".to_owned(),
+        });
     };
-    let admitted_keys: &[&str] = if object.contains_key("successor_of") {
-        &["bundle_hex", "successor_of"]
-    } else {
-        &["bundle_hex"]
+    // The arm is decided by whether the protocol request is present, and the key
+    // set is then exact: an unexpected member refuses on either arm.
+    let admitted_keys: &[&str] = match (
+        object.contains_key("verification"),
+        object.contains_key("successor_of"),
+    ) {
+        (false, false) => VERIFY_INLINE_KEYS,
+        (false, true) => VERIFY_INLINE_SUCCESSOR_KEYS,
+        (true, false) => VERIFY_PROTOCOL_KEYS,
+        (true, true) => VERIFY_PROTOCOL_SUCCESSOR_KEYS,
     };
     if let Err(reason) = require_exact_keys(object, admitted_keys) {
-        return Err(("backup.verify", reason));
+        return Err(VerifyAdmissionRefusal::Shape {
+            field: "backup.verify",
+            reason,
+        });
     }
     let bundle_hex = match get_str(object, "bundle_hex") {
         Ok(bundle_hex) => bundle_hex,
-        Err(reason) => return Err(("backup.bundle_hex", reason)),
+        Err(reason) => {
+            return Err(VerifyAdmissionRefusal::Shape {
+                field: "backup.bundle_hex",
+                reason,
+            });
+        }
     };
     let bundle_raw = match hex_bytes(bundle_hex, "backup.bundle_hex", BACKUP_WIRE_BYTES_MAX) {
         Ok(bundle_raw) => bundle_raw,
-        Err(reason) => return Err(("backup.bundle_hex", reason)),
+        Err(reason) => {
+            return Err(VerifyAdmissionRefusal::Shape {
+                field: "backup.bundle_hex",
+                reason,
+            });
+        }
     };
     if bundle_raw.is_empty() {
-        return Err((
-            "backup.bundle_hex",
-            "bundle bytes must be non-empty".to_owned(),
-        ));
+        return Err(VerifyAdmissionRefusal::Shape {
+            field: "backup.bundle_hex",
+            reason: "bundle bytes must be non-empty".to_owned(),
+        });
     }
+    let successor = admit_verify_successor(object)?;
+    if !object.contains_key("verification") {
+        return Ok((bundle_raw, successor));
+    }
+    // A malformed protocol request is the CALLER's mistake and is refused as a
+    // shape failure naming the payload member — including a `null` for a
+    // required field and an unknown key nested inside the request, both of which
+    // `deny_unknown_fields` and the protocol's own `validate()` reject here.
+    let request: BackupVerifyAdmittedRequest =
+        serde_json::from_value(Value::Object(object.clone())).map_err(|error| {
+            VerifyAdmissionRefusal::Shape {
+                field: "backup.verification",
+                reason: format!("is not an admitted archive-verification request: {error}"),
+            }
+        })?;
+    request
+        .verification
+        .validate()
+        .map_err(|error| VerifyAdmissionRefusal::Shape {
+            field: "backup.verification",
+            reason: format!("is not a valid archive-verification request: {error}"),
+        })?;
+    // And a WELL-FORMED protocol request is refused as an absent OWNER, never as
+    // a field the caller can edit. This is the one refusal in this function that
+    // is not the caller's to fix, and it reaches the wire through
+    // `VerifyAdmissionRefusal::into_reply`'s `refused_reply` arm so the operator
+    // surface projects it as a `plan_gap` naming
+    // `BACKUP_VERIFY_MISSING_OWNER` instead of reading it as `"invalid field"`.
+    Err(VerifyAdmissionRefusal::RetainedOwnerAbsent {
+        missing_owner: BACKUP_VERIFY_MISSING_OWNER,
+        reason: BACKUP_VERIFY_RETAINED_OWNER_REASON,
+    })
+}
+
+/// Admits the optional succession pointer and checks both of its digests for the
+/// route's own 64-hex shape.
+///
+/// The digests are only checked for shape here. Every check that decides whether
+/// the NAMED operation may be observed happens after the real store read, and not
+/// all of it is in one place: the `WorkScope` and authority-lineage joins are in
+/// [`successor_may_observe`], while the principal comparison and the
+/// digest-and-archive equality are in [`answer_successor_verification`]. A
+/// pointer's shape proves nothing about the operation it names.
+fn admit_verify_successor(
+    object: &Map<String, Value>,
+) -> Result<Option<BackupVerifySuccessorPointer>, VerifyAdmissionRefusal> {
+    // Every refusal below is a SHAPE failure and belongs to the caller's payload:
+    // the pointer is two bounded 64-hex digests and nothing else.
     if !object.contains_key("successor_of") {
-        return Ok((bundle_raw, None));
+        return Ok(None);
     }
     let successor = match get_object(object, "successor_of") {
         Ok(successor) => successor,
-        Err(reason) => return Err(("backup.successor_of", reason)),
+        Err(reason) => {
+            return Err(VerifyAdmissionRefusal::Shape {
+                field: "backup.successor_of",
+                reason,
+            });
+        }
     };
     if let Err(reason) = require_exact_keys(
         successor,
@@ -2354,7 +2843,10 @@ fn admit_verify_bundle(payload: &Value) -> Result<AdmittedVerifyBundle, (&'stati
             "predecessor_namespace_digest",
         ],
     ) {
-        return Err(("backup.successor_of", reason));
+        return Err(VerifyAdmissionRefusal::Shape {
+            field: "backup.successor_of",
+            reason,
+        });
     }
     let mut digests = [String::new(), String::new()];
     for (index, key) in [
@@ -2366,20 +2858,25 @@ fn admit_verify_bundle(payload: &Value) -> Result<AdmittedVerifyBundle, (&'stati
     {
         let value = match get_str(successor, key) {
             Ok(value) => value.to_owned(),
-            Err(reason) => return Err(("backup.successor_of", reason)),
+            Err(reason) => {
+                return Err(VerifyAdmissionRefusal::Shape {
+                    field: "backup.successor_of",
+                    reason,
+                });
+            }
         };
         if let Err(shape) = sha256_digest_shape(&value, "backup.successor_of") {
-            return Err(("backup.successor_of", shape.reason));
+            return Err(VerifyAdmissionRefusal::Shape {
+                field: "backup.successor_of",
+                reason: shape.reason,
+            });
         }
         digests[index] = value;
     }
-    Ok((
-        bundle_raw,
-        Some(VerifySuccessorEvidence {
-            predecessor_namespace_digest: digests[1].clone(),
-            predecessor_identity_digest: digests[0].clone(),
-        }),
-    ))
+    Ok(Some(BackupVerifySuccessorPointer {
+        predecessor_namespace_digest: digests[1].clone(),
+        predecessor_identity_digest: digests[0].clone(),
+    }))
 }
 
 /// Answers from the durable owner-backed result that owns this operation.
@@ -2504,7 +3001,20 @@ impl KernelComposition {
     /// historical structural-candidate result it was, and no code upgrade makes it
     /// provenance-bound, because it contains no owner evidence to promote. A NEW
     /// explicit verification operation is what produces a row under the current
-    /// profile. See [`Self::load_prior_verification`] for the probe order.
+    /// profile.
+    ///
+    /// #2863 adds the FOURTH, for the same reason: it bumped `v1` to `v2` because
+    /// the identity gained `archived_fence_digest` and `observed_fence_digest`, so
+    /// a pre-#2863 `v1` row sits under yet another key this route's own
+    /// `record_key` can never address. It is QUARANTINED the same way — never
+    /// rewritten on read, and its retired two-value `target_compatibility` bytes
+    /// never reinterpreted as a current typed `archive_fence_relation`. So both
+    /// legacy scopes take the second branch of instruction 8: no replay as a
+    /// current-profile answer, and the caller is pointed at a NEW explicit
+    /// verification operation. See [`Self::load_prior_verification`] for the probe
+    /// order, which is exhaustive over every profile version precisely so that
+    /// `Absent` — the only value that stages — means no stored answer exists under
+    /// any of them.
     ///
     /// `successor_of` is therefore for exactly one case: a caller that is NOT the
     /// principal owning the operation, which the namespace key cannot otherwise
@@ -2539,22 +3049,57 @@ impl KernelComposition {
     /// The command stays read-only in every other respect: no restore, no
     /// activation, no cutover, no key availability, no Product readiness and no
     /// installation mutation. The added effect is one durable readback row.
+    ///
+    /// #2862 (item I2) makes the admitted payload a CLOSED TWO-ARM UNION rather
+    /// than one inline-bytes shape, and both arms are decided in
+    /// [`admit_verify_bundle`]. The INLINE arm is byte-for-byte what it was:
+    /// caller-presented bytes, no protocol request, no owner provenance, a
+    /// durably replayable structural candidate. It is the only arm that reaches
+    /// this function.
+    ///
+    /// The PROTOCOL arm carries the EXISTING `BackupArchiveVerification`, and it
+    /// is admitted as a whole — the request is REQUIRED once its key appears,
+    /// decoded into `BackupVerifyAdmittedRequest` so an unknown field at any depth
+    /// is refused, and validated by the protocol's own
+    /// `BackupArchiveVerification::validate` — and then refused there, because the
+    /// step it needs next is the resolution of an owner-issued handle into exact
+    /// bytes and the retained-archive owner that would do that does not exist on
+    /// this product. That refusal is upstream of this function on purpose: the
+    /// handler below has no bytes to decode and no owner to decode them with, so
+    /// a refusal here is the only truthful answer, and it is one the caller can
+    /// see rather than a silent downgrade to the inline arm. Falling back to the
+    /// caller's bytes would let a caller supply the very bytes the handle is meant
+    /// to stand for, which is the parallel shape this item exists to remove.
+    ///
+    /// It is a `refused`/`plan_gap` refusal naming
+    /// [`BACKUP_VERIFY_MISSING_OWNER`], not an `invalid` field — see
+    /// [`VerifyAdmissionRefusal`]. The request is well-formed, so naming a field
+    /// would accuse the caller of a fault they do not have.
+    ///
+    /// What is already built for the arm's eventual owner is unchanged and still
+    /// on this route: `super::backup_verify_provenance::bind_protocol_request`
+    /// joins a protocol request to the archive and the operation, and
+    /// `check_provenance_binding` requires the owner to have issued the very
+    /// handle that request names, the capture operation and capture-owner role
+    /// behind the receipt, and the verifier role behind the attestation. Both take
+    /// the admitted request as a parameter, so a retained-archive owner supplies
+    /// bytes here and the rest of the route proceeds with no new shape.
     fn handle_backup_verify(
         &self,
         session: &Session,
         payload: &Value,
         idempotency_key: &str,
     ) -> Result<Value, TransportError> {
+        // The PROTOCOL arm is admitted and refused inside the admission, so this
+        // destructuring is the INLINE arm only and there is no second admission
+        // path to keep in step with it. The refusal is rendered by
+        // `VerifyAdmissionRefusal::into_reply`, which is what keeps a caller
+        // payload fault (`invalid`, with a `field`) distinguishable from the
+        // absent retained-archive owner (`refused`/`plan_gap`, with
+        // `missing_owner`): the second is not the caller's to correct.
         let (bundle_raw, successor) = match admit_verify_bundle(payload) {
             Ok(admitted) => admitted,
-            Err((field, reason)) => {
-                return Ok(invalid_reply(
-                    BACKUP_VERIFY_OPERATION,
-                    idempotency_key,
-                    field,
-                    &reason,
-                ));
-            }
+            Err(refusal) => return Ok(refusal.into_reply(idempotency_key)),
         };
         let caller = admit_backup_caller(session)?;
         let report = match self.backup_capture().verify_only(
@@ -2607,17 +3152,26 @@ impl KernelComposition {
         // to the archive the capture owner just reported, BEFORE any verdict is
         // produced. On today's tree the answer is
         // `OwnerProvenanceEvidence::unissued` — no admitted owner resolves a
-        // retained handle and no `BackupRole::Verifier` session issues a capture
-        // receipt or an archive validity attestation (the measured reasons are
-        // enumerated in `backup_verify_provenance`'s module docs) — so this
-        // check is the reason a mismatched receipt can never reach a
-        // provenance-qualified verdict rather than an incidental guard: the
-        // refusal path is the same structural `invalid_reply` an
-        // archive-invalid frame already gets, and it carries no ceiling and no
-        // class claim. It runs AFTER the successor branch on purpose, so I10's
-        // caller-presented `successor_of` behaviour is byte-for-byte unchanged.
+        // retained handle and no owner channel authenticates as
+        // `BackupRole::CaptureOwner` or `BackupRole::Verifier` for a backup
+        // archive (the measured reasons are enumerated in
+        // `backup_verify_provenance`'s module docs) — so this check is the reason
+        // a mismatched receipt can never reach a provenance-qualified verdict
+        // rather than an incidental guard: the refusal path is the same
+        // structural `invalid_reply` an archive-invalid frame already gets, and
+        // it carries no ceiling and no class claim. It runs AFTER the successor
+        // branch on purpose, so I10's caller-presented `successor_of` behaviour
+        // is byte-for-byte unchanged.
+        //
+        // The admitted protocol request is a GATE argument, not a fallback: a
+        // frame that presented one has an owner-issued handle and receipt
+        // REQUIRED, and a frame that presented none must have issued none, so
+        // neither arm can borrow the other's evidence. On the INLINE arm — the
+        // only arm that reaches this point — that argument is `None`, and `None`
+        // is this arm's own answer rather than a default: it is exactly what makes
+        // the gate require the owner to have issued nothing.
         let provenance = OwnerProvenanceEvidence::unissued();
-        if let Err(refusal) = check_provenance_binding(&provenance, &report, &bundle_raw) {
+        if let Err(refusal) = check_provenance_binding(&provenance, None, &report, &bundle_raw) {
             return Ok(invalid_reply(
                 BACKUP_VERIFY_OPERATION,
                 idempotency_key,
@@ -2625,18 +3179,25 @@ impl KernelComposition {
                 &bounded_reason(&refusal.reason()),
             ));
         }
-        let identity =
-            match backup_verify_identity(session, &caller, &report, &provenance, idempotency_key) {
-                Ok(identity) => identity,
-                Err(reason) => {
-                    return Ok(invalid_reply(
-                        BACKUP_VERIFY_OPERATION,
-                        idempotency_key,
-                        "backup.verify",
-                        &bounded_reason(&reason),
-                    ));
-                }
-            };
+        let identity = match backup_verify_identity(
+            session,
+            &caller,
+            &report,
+            &bundle_raw,
+            &provenance,
+            None,
+            idempotency_key,
+        ) {
+            Ok(identity) => identity,
+            Err(reason) => {
+                return Ok(invalid_reply(
+                    BACKUP_VERIFY_OPERATION,
+                    idempotency_key,
+                    "backup.verify",
+                    &bounded_reason(&reason),
+                ));
+            }
+        };
         let Ok(request_digest) = backup_verify_request_digest(&identity) else {
             return Ok(verification_not_recorded_reply(idempotency_key));
         };
@@ -2712,8 +3273,9 @@ impl KernelComposition {
     }
 
     /// Reads the durable verification result already bound to this scoped
-    /// identity, and quarantines a pre-#2883 row on the caller's raw text and a
-    /// pre-#2862 row under the previous profile's namespace.
+    /// identity, and quarantines a pre-#2883 row on the caller's raw text, a
+    /// pre-#2862 row under the previous profile's namespace and a pre-#2863 row
+    /// under the profile before that.
     ///
     /// `record_key` is the accepted identity's 64-hex namespace digest, not caller
     /// text. A scoped lookup that finds nothing is NOT proof that nothing is stored
@@ -2733,12 +3295,32 @@ impl KernelComposition {
     /// [`BackupVerifyRequestIdentity::legacy_fence_bound_namespace_digest`], and its
     /// class decides the answer.
     ///
-    /// The order is: current key, then the raw caller text, then the legacy
-    /// profile key. It is exhaustive over the three durable states this operation
-    /// can be in, and each probe is asked only when every stricter one has already
-    /// come back clean, so no probe can mask a row the previous one found.
+    /// #2863 adds the FOURTH probe, for the same reason one version earlier and
+    /// with the same severity: that issue bumped `v1` to `v2` because the identity
+    /// gained `archived_fence_digest` and `observed_fence_digest`, so a `v1` row
+    /// also sits under a key `record_key` can never address. Its key is
+    /// reconstructed exactly by
+    /// [`BackupVerifyRequestIdentity::legacy_two_value_namespace_digest`] — the
+    /// same eight key components with exactly one preimage entry forced, which is
+    /// sound precisely because #2863 changed no OTHER key component — and its
+    /// class decides the answer through
+    /// [`RedbRecoveryStore::legacy_two_value_backup_verification_class`]. A row
+    /// there is QUARANTINED, which is the second branch issue #2863's instruction 8
+    /// permits ("replay as legacy unqualified results OR require an explicit new
+    /// verification operation"): it is never rewritten on read and its
+    /// two-value `target_compatibility` bytes are never reinterpreted as a current
+    /// typed relation.
     ///
-    /// All three probes return store failures rather than degrading, because a store
+    /// The order is: current key, then the raw caller text, then the `v2` profile
+    /// key, then the `v1` profile key. It is exhaustive over the durable states
+    /// this operation can be in under ANY profile version, and each probe is asked
+    /// only when every stricter one has already come back clean, so no probe can
+    /// mask a row the previous one found. That exhaustiveness is the load-bearing
+    /// property: [`PriorVerification::Absent`] is the ONLY value that reaches
+    /// `stage_backup_verification`, so a stored answer under any profile version
+    /// refuses rather than producing a second row for one operation identity.
+    ///
+    /// All four probes return store failures rather than degrading, because a store
     /// outage that silently downgraded to a non-persisted answer would let this route
     /// answer `ok` for a verification with no durable result behind it, which A0.3
     /// classifies as a false proof claim.
@@ -2764,16 +3346,36 @@ impl KernelComposition {
             }
         }
         let legacy_key = identity.legacy_fence_bound_namespace_digest()?;
+        let fence_bound = self
+            .p07_ors
+            .legacy_fence_bound_backup_verification_class(legacy_key.as_str())?;
+        if let Some(prior) = PriorVerification::from_fence_bound_class(fence_bound) {
+            return Ok(prior);
+        }
+        // #2863 adds the FOURTH probe, and it is the one this profile's own
+        // history makes mandatory rather than merely prudent. #2863 bumped the
+        // verify profile `v1` -> `v2` because the identity gained the two fence
+        // digests, so a `v1` row sits under a key this route's `record_key` can
+        // never address. Reading that as "absent" is the fail-OPEN outcome: the
+        // caller re-runs an operation that already holds a durable answer and
+        // stages a SECOND row beside it under the current key, so one operation
+        // identity ends up with two durable answers. The key is reconstructed
+        // exactly, through
+        // [`BackupVerifyRequestIdentity::legacy_two_value_namespace_digest`],
+        // which reuses this identity's own key preimage and changes exactly one
+        // entry — `idempotency_namespace` — because #2863 changed no other key
+        // component.
+        let two_value_key = identity.legacy_two_value_namespace_digest()?;
         Ok(
             match self
                 .p07_ors
-                .legacy_fence_bound_backup_verification_class(legacy_key.as_str())?
+                .legacy_two_value_backup_verification_class(two_value_key.as_str())?
             {
-                LegacyFenceBoundBackupVerificationClass::Absent => PriorVerification::Absent,
-                LegacyFenceBoundBackupVerificationClass::LegacyUnqualified => {
-                    PriorVerification::LegacyUnqualified
+                LegacyTwoValueRelationBackupVerificationClass::Absent => PriorVerification::Absent,
+                LegacyTwoValueRelationBackupVerificationClass::LegacyUnqualified => {
+                    PriorVerification::LegacyTwoValueUnqualified
                 }
-                LegacyFenceBoundBackupVerificationClass::Unreadable => {
+                LegacyTwoValueRelationBackupVerificationClass::Unreadable => {
                     PriorVerification::Unreadable
                 }
             },
@@ -2932,7 +3534,7 @@ impl KernelComposition {
         &self,
         session: &Session,
         report: &CaptureReport,
-        successor: &VerifySuccessorEvidence,
+        successor: &BackupVerifySuccessorPointer,
         idempotency_key: &str,
     ) -> Value {
         let Ok(Some(stored)) = self
@@ -3006,6 +3608,17 @@ impl KernelComposition {
             // profile.
             PriorVerification::LegacyUnqualified => {
                 legacy_unqualified_evidence_reply(idempotency_key)
+            }
+            // #2863: a pre-#2863 `v1` row, whose stored answer used the retired
+            // two-value relation vocabulary. It is quarantined like the `v2` case
+            // and equally NEVER staged: reaching the `stage_backup_verification`
+            // arm from here would put a SECOND durable row under the current key
+            // for one operation identity that already holds a stored answer, which
+            // is the fail-open outcome both legacy probes exist to prevent. The
+            // next step is the alternative the issue permits — a NEW explicit
+            // verification operation under a new `operation_id`.
+            PriorVerification::LegacyTwoValueUnqualified => {
+                legacy_two_value_evidence_reply(idempotency_key)
             }
             // Fail closed: bytes are stored under this caller's text and decode as
             // neither shape. Staging over them would destroy evidence and answer
@@ -3385,9 +3998,16 @@ fn require_object<'a>(
 /// ([`OrsRestoreBinding::from_composition`]), and runs the full isolated
 /// rehearsal through
 /// [`KernelComposition::backup_restore_with_ors_journal`]
-/// (#960) on the composition-owned durable ORS journal. It answers with the
-/// owner's own receipt and evidence level, so the reply carries the persisted
-/// rehearsal result rather than a refusal.
+/// (#960) on the composition-owned durable ORS journal. When the destination is
+/// ADMITTED it answers with the owner's own receipt and evidence level, so the
+/// reply carries the persisted rehearsal result rather than a refusal. On THIS
+/// front door it is not admitted — the bundle is built with
+/// `manifest_evidence: None`, because #958's owner-issued PREPARED, UNACTIVATED
+/// destination binding has no channel here to issue one — so since the
+/// destination-admission gate (#955) the owner's answer is a typed refusal and
+/// never the receipt. That is the honest current state of an advertised
+/// command, reported here rather than left for a reader to infer from the gates
+/// list this route reports.
 ///
 /// ## The execution identity: what is owner-derived and what is only re-proved
 ///
@@ -3424,7 +4044,11 @@ fn require_object<'a>(
 /// [`RESTORE_TEST_GATES_NOT_ADMITTED`], which names
 /// `destination-manifest-admission` on every answer this route gives rather
 /// than papering over the difference. Opening that seam is #958/A13.7's
-/// governance decision, not a wiring choice made here.
+/// governance decision, not a wiring choice made here. Since the
+/// destination-admission gate (#955) that absent conjunct is no longer something
+/// the engine tolerates: the owner refuses an unadmitted bundle rather than
+/// importing into a root nothing admitted, so the gap is closed on the refusal
+/// side and the channel is still missing.
 ///
 /// ## What the ports carry, and what they deliberately do not
 ///
@@ -3444,9 +4068,15 @@ fn require_object<'a>(
 /// no key owner" is decided by the owner's own gate and reported, never guessed.
 /// `manifest_evidence` is `None` for the reason
 /// [`RESTORE_TEST_GATES_NOT_ADMITTED`] states: the Host-side manifest binding
-/// reaches no owner channel here, and `None` is the shape that type's own doc
-/// names as a bundle with no Host admission — under which isolated import still
-/// runs and cutover qualification refuses.
+/// reaches no owner channel here, and `None` is a bundle with no Host
+/// admission. Since the destination-admission gate (#955) such a bundle no
+/// longer imports at all: the owner requires the record and raises
+/// [`KernelRestoreError::DestinationNotAdmitted`] before `compile_plan` and
+/// before `KernelIsolatedDestination::open` constructs the root, so this route
+/// is fail-closed today and produces no destination byte, no pinned admission,
+/// no `DESTINATION_ADMISSION_FILE` and no evidence document. `rehearsal: true`
+/// does not stand in for the record — the posture is not a reason to refuse, but
+/// it is equally not an admission.
 ///
 /// `rehearsal` is `true`, because this is a rehearsal: the engine then validates
 /// the admission instead of demanding production durable recovery, activates
@@ -3462,12 +4092,35 @@ fn require_object<'a>(
 /// the finalized evidence document when this execution wrote one, the exact
 /// applied phase log, and the admitted journal owner behind the run. A typed
 /// owner refusal is answered with the owner's own causal class, bounded, and
-/// keeps the executed route so a reader can see how far it got. `plan_gap`
-/// survives for exactly one case — the owner's own
-/// [`KernelRestoreError::CapabilityMissing`] for a destination owner admission
-/// this front door holds no channel to, named by
-/// [`BACKUP_RESTORE_TEST_MISSING_OWNER`] — and never as the endpoint of a
-/// command that reached its owner.
+/// keeps the executed route so a reader can see how far it got.
+///
+/// `plan_gap` survives for exactly one case — the owner's own
+/// [`KernelRestoreError::CapabilityMissing`] for `blob_key_material` or
+/// `blob-destination-scope`, named by [`BACKUP_RESTORE_TEST_MISSING_OWNER`] —
+/// and it is narrower than the name suggests, because the owner runs the
+/// key-material and blob-scope gates BEFORE the destination-admission gate. The
+/// two refusals therefore never both answer, and which one a caller receives
+/// depends on the archive rather than on this route:
+/// - a BLOB-CARRYING archive has no key owner and no blob scope here, so it
+///   stops at `CapabilityMissing` and is answered `blocked` with
+///   `code = plan_gap` and the `missing_owner` named above. The
+///   destination-admission gate is never reached for it, so this arm says
+///   nothing about whether that destination was admitted.
+/// - a BLOB-FREE archive has no capability to be missing, so it passes the key
+///   gates and falls through to the destination gate, where the absent Host
+///   admission is refused as `refused` with
+///   `code = restore-destination-not-admitted` and the owner's own reason. It
+///   carries NO `missing_owner` field: `restore_test_refusal` names a missing
+///   owner only for the owner's own `CapabilityMissing`, and inventing one here
+///   would be exactly the fabricated owner answer this route exists to stop
+///   reporting.
+///
+/// Neither answer is the endpoint of a command that reached its owner and
+/// succeeded. Both are the owner refusing a front door that holds no admission
+/// channel, which is the fail-closed state #958 has not yet resolved. Neither is
+/// a claim about which refusal is "the" destination gate: the order above is the
+/// owner's own, read from `restore_with_owner`, and this route reports it rather
+/// than reordering it.
 #[allow(
     clippy::too_many_lines,
     reason = "one linear admission sequence per rehearsal gate; splitting it would hide the exact order the executed route reports"
@@ -3813,7 +4466,8 @@ const fn restore_error_code(error: &KernelRestoreError) -> &'static str {
         KernelRestoreError::OwnerEvidenceInvalid(_) => "restore-owner-evidence-invalid",
         KernelRestoreError::CutoverNotAuthorized => "cutover-not-authorized",
         KernelRestoreError::TargetFailed(_)
-        | KernelRestoreError::StagedCleanupIncomplete { .. } => "restore-engine-failed",
+        | KernelRestoreError::StagedCleanupIncomplete { .. }
+        | KernelRestoreError::RetainedForResume { .. } => "restore-engine-failed",
     }
 }
 
@@ -3944,10 +4598,13 @@ impl KernelComposition {
     /// [`KernelComposition::backup_restore_with_ors_journal`], and no second
     /// dispatch entry is introduced. `backup.create` admits its caller through the
     /// same [`admit_backup_caller`] gate and then returns a typed refusal naming the
-    /// exact absent capture-owner behaviour, and `backup.restore-test` reports the
-    /// owner's own receipt — or, for the one destination owner capability this front
-    /// door holds no channel to, the plan gap naming it. Binding the receiver
-    /// changes no other behaviour.
+    /// exact absent capture-owner behaviour, and `backup.restore-test` reports
+    /// whatever the owner answers: its receipt when the destination is admitted,
+    /// and today a typed owner refusal — `plan_gap` for a blob-carrying archive
+    /// (the one destination-side key and blob-scope capability this front door
+    /// holds no channel to) or `restore-destination-not-admitted` for a
+    /// blob-free one, because #958's destination binding has no channel here
+    /// either. Binding the receiver changes no other behaviour.
     ///
     /// `backup.restore-store` is the one selector that does not answer here:
     /// it admits the same front-door caller gate and then the typed #950

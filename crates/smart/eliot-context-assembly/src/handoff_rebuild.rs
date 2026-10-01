@@ -39,6 +39,7 @@ use eliot_agent_contracts::{
 };
 use eliot_context_contracts::{
     AdmittedContextSet, ContextRecipe, DecisionContextIncomplete, QualityScorecard,
+    ResolvedContextRecipe,
 };
 use eliot_context_measurement::MeasurementParams;
 use eliot_contracts::{StateFence, fences_match_exact};
@@ -63,6 +64,11 @@ pub struct HandoffRebuildCurrent<'a> {
     pub admitted: &'a AdmittedContextSet,
     /// Current approved recipe content the compiler must run under.
     pub recipe: &'a ContextRecipe,
+    /// Owner-resolved approved policy revision this compilation is pinned to.
+    ///
+    /// #1724 W4: this is the revision whose declared `layout.role_positions` the
+    /// renderer applies, so it is the executed order rather than a hint about it.
+    pub approved: &'a ResolvedContextRecipe,
     /// Quality evidence for the current compilation.
     pub quality: &'a QualityScorecard,
     /// Caller-owned immutable projection parameters.
@@ -243,6 +249,7 @@ pub fn rebuild_handoff_view(
     let result = match assemble_active_view_with_measurement(
         current.admitted,
         current.recipe,
+        current.approved,
         current.quality.clone(),
         current.policy,
         current.params,

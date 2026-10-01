@@ -81,6 +81,7 @@ impl HostComposition {
                 .map_err(HostError::Installation)?
                 .clone(),
             agent_bridge: receipt.agent_bridge.clone(),
+            user_broker: prepared.user_broker.clone(),
         })
     }
 

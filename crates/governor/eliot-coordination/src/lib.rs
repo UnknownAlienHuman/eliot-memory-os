@@ -30,35 +30,38 @@ pub use handoff_persistence::{
 pub use handoff_resume::resume_from_retained_handoff;
 
 pub use integration_candidate::{
+    ArtifactProvenance, CandidateProvenance, CorrelatedCandidate, CorrelatedReview,
     IntegrationCandidate, IntegrationCandidateDraft, IntegrationCandidateReceipt,
     IntegrationCandidateRevision, IntegrationCandidateStatus, IntegrationQueue,
-    StaleIntegrationCandidateRequest,
+    RetainedArtifactRevision, StaleIntegrationCandidateRequest,
 };
 
 pub use peer_communication::{
     AdmitArtifactRevision, AnchorResolution, AnchoredReview, ArgumentAcceptability, AssertedEffect,
     BoardAnchor, BoardCompactionPolicy, BoardCompactionReceipt, BoardEntry, BoardEntryReceipt,
     BoardEntrySummary, BoardOmission, BoardPage, BoardTombstone, ConflictCandidate,
-    ConflictCandidateDraft, EmbeddedMarker, EmbeddedMarkerDraft, EmbeddedMarkerKind,
-    EnqueuePeerMessage, ExternalResolutionReceipt, LIVE_PEER_REJECTION_PLAN_MISMATCH,
-    LiveDeltaKind, LivePeerHelpfulnessObservation, LivePeerHelpfulnessReceipt, LivePeerObligation,
-    LivePeerObligationKind, LivePeerRejection, LivePeerUseObservation, LivePeerUseReceipt,
-    MAX_BOARD_ENTRIES_PER_SCOPE, MAX_BOARD_PAGE_SIZE, MAX_BOARD_REVISIONS_PER_ENTRY,
-    MAX_PEER_ATTEMPT_HISTORY, MAX_PEER_INLINE_TEXT, MAX_PEER_MESSAGE_BYTES,
-    MAX_PEER_OUTSTANDING_PER_RECIPIENT, MAX_PEER_OUTSTANDING_PER_SENDER, MAX_PEER_REFERENCES,
-    MAX_PEER_STREAM_DEPTH, MarkerDisposition, OPTIONAL_PEER_ENVELOPE_FIELDS, PEER_CHANNEL_REVISION,
-    PEER_MESSAGE_SCHEMA, PeerAckReceipt, PeerArtifactHead, PeerAttemptRecord, PeerClockPort,
-    PeerConflict, PeerConflictDimension, PeerConflictReceipt, PeerConflictState, PeerConflictType,
-    PeerConsumeReceipt, PeerCursor, PeerCursorKey, PeerDeliveryAttempt, PeerDeliveryPort,
-    PeerDeliveryReceipt, PeerDeliveryTarget, PeerDurability, PeerDurabilityAttestation,
-    PeerDurabilityPort, PeerEndpointLossReport, PeerEnqueueReceipt, PeerEnvelopeHeader,
-    PeerMessage, PeerMessageDiagnostic, PeerMessageKind, PeerMessageState, PeerReconnectReport,
-    PeerReviewAckReceipt, PeerReviewAdvance, PeerReviewBatch, PeerReviewDenominator,
-    PeerReviewLifecycle, PeerReviewObligation, PeerReviewReceipt, PeerReviewStanding,
-    PeerSafeBoundaryPort, PeerStreamHead, PeerStreamId, PostBoardEntry, PrivacyClass,
-    REQUIRED_PEER_ENVELOPE_FIELDS, RawField, RecordPeerConflict, ReviewCompleteness, ReviewKind,
-    ReviewRecommendation, ReviewTargetKind, ReviseBoardEntry, SubmitPeerReview,
-    decode_peer_envelope, peer_digest_hex,
+    ConflictCandidateDraft, CorrectPeerReviewAnchor, EmbeddedMarker, EmbeddedMarkerDraft,
+    EmbeddedMarkerKind, EnqueuePeerMessage, EscalateReviewBlocker, ExternalResolutionReceipt,
+    LIVE_PEER_REJECTION_PLAN_MISMATCH, LiveDeltaKind, LivePeerHelpfulnessObservation,
+    LivePeerHelpfulnessReceipt, LivePeerObligation, LivePeerObligationKind, LivePeerRejection,
+    LivePeerUseObservation, LivePeerUseReceipt, MAX_BOARD_ENTRIES_PER_SCOPE, MAX_BOARD_PAGE_SIZE,
+    MAX_BOARD_REVISIONS_PER_ENTRY, MAX_PEER_ATTEMPT_HISTORY, MAX_PEER_INLINE_TEXT,
+    MAX_PEER_MESSAGE_BYTES, MAX_PEER_OUTSTANDING_PER_RECIPIENT, MAX_PEER_OUTSTANDING_PER_SENDER,
+    MAX_PEER_REFERENCES, MAX_PEER_STREAM_DEPTH, MarkerDisposition, OPTIONAL_PEER_ENVELOPE_FIELDS,
+    PEER_CHANNEL_REVISION, PEER_MESSAGE_SCHEMA, PeerAckReceipt, PeerArtifactHead,
+    PeerAttemptRecord, PeerClockPort, PeerConflict, PeerConflictDimension, PeerConflictReceipt,
+    PeerConflictState, PeerConflictType, PeerConsumeReceipt, PeerCursor, PeerCursorKey,
+    PeerDeliveryAttempt, PeerDeliveryPort, PeerDeliveryReceipt, PeerDeliveryTarget, PeerDurability,
+    PeerDurabilityAttestation, PeerDurabilityPort, PeerEndpointLossReport, PeerEnqueueReceipt,
+    PeerEnvelopeHeader, PeerMessage, PeerMessageDiagnostic, PeerMessageKind, PeerMessageState,
+    PeerReconnectReport, PeerReviewAckReceipt, PeerReviewAdvance, PeerReviewBatch,
+    PeerReviewBatchReceipt, PeerReviewCorrection, PeerReviewCorrectionReceipt,
+    PeerReviewDenominator, PeerReviewLifecycle, PeerReviewObligation, PeerReviewReceipt,
+    PeerReviewStanding, PeerSafeBoundaryPort, PeerStreamHead, PeerStreamId, PostBoardEntry,
+    PrivacyClass, REQUIRED_PEER_ENVELOPE_FIELDS, RawField, RecordPeerConflict,
+    ReviewBlockerEscalationReceipt, ReviewCompleteness, ReviewKind, ReviewRecommendation,
+    ReviewTargetKind, ReviseBoardEntry, SubmitPeerReview, decode_peer_envelope, peer_digest_hex,
+    review_is_blocker,
 };
 
 pub use eliot_contracts::{BoardEntryState, PeerBoardKind};
@@ -607,6 +610,13 @@ pub struct CoordinationOwner {
     peer_review_requests: BTreeMap<String, String>,
     #[serde(default)]
     peer_review_expectations: BTreeMap<String, u64>,
+    /// Retained resolver verdicts per review: non-attaching resolution
+    /// statuses recorded without touching the immutable original anchor
+    /// (issue #1823 A2). Only `ambiguous`, `stale`, `deleted` and
+    /// `unavailable` are ever recorded here; attaching verdicts stay with
+    /// the digest-bound derivation and the correction path.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    peer_review_resolutions: BTreeMap<String, peer_communication::AnchorResolution>,
     #[serde(default)]
     peer_artifact_heads: BTreeMap<String, peer_communication::PeerArtifactHead>,
     #[serde(default)]
@@ -679,6 +689,17 @@ impl CoordinationOwner {
                     .as_deref()
                     .is_none_or(|reason| reason.trim().is_empty())
         }) {
+            return Err(CoordinationError::InvalidState);
+        }
+        if snapshot
+            .peer_review_resolutions
+            .values()
+            .any(AnchorResolution::satisfies_required_review)
+            || snapshot
+                .peer_review_resolutions
+                .keys()
+                .any(|review_id| !snapshot.peer_reviews.contains_key(review_id))
+        {
             return Err(CoordinationError::InvalidState);
         }
         snapshot.validate_active_bindings()?;
@@ -2038,6 +2059,108 @@ impl CoordinationOwner {
             event,
         })
     }
+
+    /// Routes a retained requested change through the normal owner, effect,
+    /// and verifier paths (issue #1823 W5; I10.18 anchored review items).
+    ///
+    /// A review item carrying [`ReviewKind::RequestedChange`] is a candidate
+    /// only: a comment/request grants no write, effect, goal, or acceptance
+    /// authority, so this entry admits the supplied draft through
+    /// [`Self::submit_integration_candidate`] — the same owner submission
+    /// seam every other change uses — and mutates nothing on the review
+    /// record itself (no lifecycle advance, no write conversion on the
+    /// review contract). Declared effects ride the draft's normal
+    /// `declared_read_effects`/`declared_write_effects` declaration and take
+    /// effect solely through the candidate lease/acceptance path behind the
+    /// admitted candidate; verifier handles ride `verification_refs` as
+    /// evidence the owner never decides. `RequestedChange` stays a candidate
+    /// kind: only a retained `RequestedChange` review in a live obligation
+    /// lifecycle (`PendingDelivery`/`Delivered`/`Answered`) routes, and every
+    /// refusal is a typed [`CoordinationError`].
+    /// STITCH (#1823 W5): the future live caller is the owner-side driver
+    /// that builds a real [`IntegrationCandidateDraft`] from admitted
+    /// work-item/session material for an answered `RequestedChange` review;
+    /// BLOCKED-BY the review-to-candidate driver (no live draft producer
+    /// exists). Forbidden: a draft built from fabricated or test-only input
+    /// to manufacture a caller.
+    pub fn route_review_requested_change(
+        &mut self,
+        review_id: &str,
+        draft: IntegrationCandidateDraft,
+    ) -> Result<IntegrationCandidateReceipt, CoordinationError> {
+        text(review_id, "review_id")?;
+        let (kind, lifecycle) = self
+            .peer_reviews
+            .get(review_id)
+            .map(|review| (review.kind, review.lifecycle))
+            .ok_or_else(|| CoordinationError::NotFound {
+                kind: "peer_review",
+                id: review_id.to_owned(),
+            })?;
+        if kind != ReviewKind::RequestedChange {
+            return Err(CoordinationError::InvalidState);
+        }
+        if !matches!(
+            lifecycle,
+            PeerReviewLifecycle::PendingDelivery
+                | PeerReviewLifecycle::Delivered
+                | PeerReviewLifecycle::Answered
+        ) {
+            return Err(CoordinationError::InvalidState);
+        }
+        self.submit_integration_candidate(draft)
+    }
+
+    /// Submits a retained requested change's effects through the normal
+    /// effect owner (issue #1823 A4; I10.18 anchored review items).
+    ///
+    /// A review never writes: there is deliberately no direct-write
+    /// conversion on this path. Effects flow only through
+    /// [`Self::acquire_integration`] — the same single-writer lease seam
+    /// every other change uses — and only when the retained review is an
+    /// answered `RequestedChange` whose routed candidate already carries
+    /// verifier evidence (`verification_refs` is non-empty). Any other
+    /// review kind, any unanswered or disposed review, and any candidate
+    /// without verifier evidence is refused with a typed
+    /// [`CoordinationError`], so a requested change produces no direct
+    /// write until the normal effect owner accepts (lease claim) and
+    /// verifies it. The review record itself is read, never mutated.
+    /// STITCH (#1823 A4): the future live caller is the session/work-item
+    /// integration driver holding a real [`IntegrationLeaseRequest`] for
+    /// the routed candidate plus admitted verifier evidence; BLOCKED-BY
+    /// that driver (no live lease producer exists). Forbidden: lease
+    /// material built from fabricated or test-only input to manufacture a
+    /// caller.
+    pub fn submit_review_effects(
+        &mut self,
+        review_id: &str,
+        req: IntegrationLeaseRequest,
+    ) -> Result<IntegrationLeaseDecision, CoordinationError> {
+        text(review_id, "review_id")?;
+        let (kind, lifecycle) = self
+            .peer_reviews
+            .get(review_id)
+            .map(|review| (review.kind, review.lifecycle))
+            .ok_or_else(|| CoordinationError::NotFound {
+                kind: "peer_review",
+                id: review_id.to_owned(),
+            })?;
+        if kind != ReviewKind::RequestedChange {
+            return Err(CoordinationError::InvalidState);
+        }
+        if lifecycle != PeerReviewLifecycle::Answered {
+            return Err(CoordinationError::InvalidState);
+        }
+        let verified = self
+            .integration_candidates
+            .get(&req.candidate_id)
+            .is_some_and(|candidate| !candidate.verification_refs.is_empty());
+        if !verified {
+            return Err(CoordinationError::InvalidState);
+        }
+        self.acquire_integration(req)
+    }
+
     /// Acquires the single integration writer for a target scope.
     pub fn acquire_integration(
         &mut self,

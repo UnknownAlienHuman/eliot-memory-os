@@ -77,9 +77,28 @@ pub struct PresentedLearning<'a> {
     pub requesting_campaign_id: &'a str,
     pub requesting_task_id: &'a str,
     /// Wall clock both expiries enforce against. MUST be sourced from the
-    /// owner/host clock live at the call (the composed entry re-sources it
-    /// itself); never accept this value from requester envelopes — a
-    /// backdated stamp defeats mark and overlay expiry.
+    /// owner/host clock live at the call; never accept this value from
+    /// requester envelopes — a backdated stamp defeats mark and overlay
+    /// expiry, and this ONE number is what both expiries are decided against.
+    ///
+    /// Nothing in the type enforces that. `PresentedLearning` is `Copy` with
+    /// all-public fields, so a caller can rebuild it from its own parts with any
+    /// `now_unix_secs` it likes, and every expiry below would then be decided
+    /// against a caller-chosen number.
+    ///
+    /// So it is the composed host entry that re-sources it, at the point of
+    /// use, and ignores whatever the caller wrote — each of them rebuilds this
+    /// value with `now_unix_secs` set from its own live owner clock before any
+    /// screen runs:
+    ///
+    /// - `eliot_context_compiler_wasm::compose_governed_compilation`
+    ///   ([`OffsetDateTime::now_utc`]);
+    /// - `eliot_wasm_host::admit_governed_host` and
+    ///   `eliot_wasm_host::check_governed_host_output` (the host's `live_now_secs`);
+    /// - `KernelContextReadClient::compile_context_packet` (`crate::unix_ms`).
+    ///
+    /// A caller that reaches [`check_governed_carriage`] or a screen directly,
+    /// outside one of those compositions, MUST pass owner-sourced time itself.
     pub now_unix_secs: u64,
 }
 

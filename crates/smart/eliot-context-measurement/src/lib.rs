@@ -61,7 +61,7 @@ pub use stu::{bytes_for_stu, stu_for_bytes};
 
 use eliot_context_contracts::{
     CONTEXT_CONTRACT_VERSION, CapacityLimits, ContextBinding, ContextError, MeasurementStatus,
-    SerializedContextMeasurement, StuEstimate, TokenizerObservation,
+    SerializedContextMeasurement, StuEstimate, TokenizerObservation, canonical_render_serializer,
 };
 use eliot_contracts::{ArtifactId, ContractVersion, sha256_hex};
 
@@ -85,18 +85,27 @@ pub const MAX_IDENTITY_TEXT_BYTES: usize = 1_048_576;
 /// Supply `None` unless the value was empirically observed for this payload;
 /// this crate never derives an STU estimate from the byte count and never
 /// synthesizes a tokenizer observation.
+///
+/// #1862 BLOCK-2: there are deliberately NO serializer-identity fields here.
+/// The three members of the I2.16 `serializer_id_version_and_options` record
+/// are issued by the owner of the codec that produced the bytes — Context
+/// contracts' `canonical_render_serializer`, which names
+/// `eliot_contracts::canonical_json_bytes` over the canonical rendered payload
+/// and digests the options actually in force — and
+/// [`measure_exact_utf8`] stamps that owner record into the measurement it
+/// produces. A caller-supplied triple could only ever have been a second
+/// unverified spelling of the same fact, so a route could make the measurement
+/// and the assembly policy agree with each other on a codec neither of them
+/// renders with. The policy side is bound to the same owner record by the
+/// packet composition's `require_context_render_codec` in
+/// `bins/eliotd/src/kernel_context_read_client.rs`, so both sides of that
+/// comparison now name the owner rather than each other.
 #[derive(Clone, Debug)]
 pub struct MeasurementParams {
     /// Stable identity for the produced measurement record.
     pub measurement_id: ArtifactId,
     /// Task/scope/fence binding the measured payload must satisfy.
     pub context: ContextBinding,
-    /// Required serializer identity, matching the assembly route policy.
-    pub serializer_id: String,
-    /// Required serializer revision, matching the assembly route policy.
-    pub serializer_version: String,
-    /// Required serializer-options digest (lowercase SHA-256 hex).
-    pub serializer_options_digest: String,
     /// Required route identity.
     pub route_id: String,
     /// Required model/tokenizer route identity.
@@ -132,6 +141,13 @@ fn preflight_text(value: &str, field: &'static str) -> Result<(), ContextError> 
 /// The caller-supplied `stu_estimate` and `tokenizer` are preserved as data
 /// and never influence the byte count.
 ///
+/// #1862 BLOCK-2: `serializer_id`, `serializer_version` and
+/// `serializer_options_digest` are stamped from the codec owner
+/// ([`canonical_render_serializer`]) and are no longer caller inputs, so a
+/// measurement can never describe a codec other than the one that renders the
+/// canonical payload it measured. The owner's own validation runs first, so a
+/// malformed owner record is a typed refusal rather than a stamped value.
+///
 /// Use as the assembly callback by capturing the parameters:
 /// `|bytes| measure_exact_utf8(bytes, &params)`.
 pub fn measure_exact_utf8(
@@ -158,18 +174,23 @@ pub fn measure_exact_utf8(
         .map_err(|_| ContextError::InvalidField("measurement.payload_utf8"))?;
     params.context.validate()?;
     params.capacity.validate()?;
-    preflight_text(&params.serializer_id, "measurement.serializer_id")?;
-    preflight_text(&params.serializer_version, "measurement.serializer_version")?;
     preflight_text(&params.route_id, "measurement.route_id")?;
     preflight_text(&params.model_id, "measurement.model_id")?;
+    // #1862 BLOCK-2: the owner-issued codec identity, not a caller triple. The
+    // measurement's `serializer_id_version_and_options` is the value the codec
+    // owner published for the codec it renders with, so `measurement::verify`
+    // compares the render owner against the render owner instead of one route's
+    // three strings against another route's three strings.
+    let serializer = canonical_render_serializer()?;
+    serializer.validate()?;
     let measurement = SerializedContextMeasurement {
         measurement_id: params.measurement_id.clone(),
         context: params.context.clone(),
         schema_version: CONTEXT_CONTRACT_VERSION,
         envelope_digest: sha256_hex(payload),
-        serializer_id: params.serializer_id.clone(),
-        serializer_version: params.serializer_version.clone(),
-        serializer_options_digest: params.serializer_options_digest.clone(),
+        serializer_id: serializer.serializer_id().to_owned(),
+        serializer_version: serializer.serializer_version().to_owned(),
+        serializer_options_digest: serializer.serializer_options_digest().to_owned(),
         route_id: params.route_id.clone(),
         model_id: params.model_id.clone(),
         rendered_utf8_bytes: rendered,

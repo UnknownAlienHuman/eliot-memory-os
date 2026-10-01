@@ -18,6 +18,7 @@ use eliot_process::{
 };
 use thiserror::Error;
 
+pub mod admission_submission;
 pub mod build_projection;
 pub mod cache_lane;
 pub mod capsule_binding;
@@ -33,6 +34,7 @@ pub mod testd_port;
 pub mod testd_profile_dispatch;
 pub mod verification_profile;
 
+pub use admission_submission::{AdmissionSubmission, submit_admission_snapshot};
 pub use build_projection::{
     AffectedEdge, BuildCacheDecision, BuildCancellation, BuildClaimOrder, BuildCleanupPass,
     BuildProjectionError, CargoOrigin, CargoScopeRefusal, ClaimedBuild, CleanupCandidate,

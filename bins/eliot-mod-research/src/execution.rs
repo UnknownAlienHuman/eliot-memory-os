@@ -207,6 +207,20 @@ pub struct ProviderExecution {
     pub outcome: ProviderOutcome,
     /// Immutable raw evidence (stdout/stderr/exit/lineage digests).
     pub evidence: RawProviderEvidence,
+    /// The provider's exact captured stdout PREFIX — the byte string
+    /// `evidence.stdout.sha256` was computed over.
+    ///
+    /// W2 (`#1765`) requires the retained ORIGINAL to be retained before
+    /// synthesis is admitted and names the refused substitutes: "An in-memory
+    /// clone or hash of unavailable bytes is insufficient."
+    /// `StreamRecord::stdout` holds a digest and a byte count with no content,
+    /// so it cannot satisfy that on its own. This is the same `CapturedStream`
+    /// prefix `RawProviderEvidence::materialize` digested one step above, not a
+    /// re-read and not a reconstruction, so the retained revision and the
+    /// receipt's recorded content digest describe one byte string. `None` when
+    /// the executor supplied no stream handle, which `StreamRecord` states
+    /// independently as `StreamOmission::NoHandle`.
+    pub retained_stdout: Option<Vec<u8>>,
     /// Provider-local job reference (correlation only, never identity).
     pub provider_job_ref: String,
     /// Cancellation receipt, retained when cancellation was actually issued.
@@ -731,6 +745,13 @@ impl ProviderBridge {
             job_id: bound.operation.as_str().to_owned(),
             outcome,
             evidence: *evidence,
+            // The very `CapturedStream` prefix `RawProviderEvidence::materialize`
+            // digested, gated on the same `captured` flag that decides whether a
+            // `StreamRecord` carries a digest at all. Gating on the same flag
+            // rather than on "is there anything to retain" is what keeps an
+            // observed EMPTY stream (`Some(sha256 of b"")`) distinguishable from a
+            // stream that was never captured.
+            retained_stdout: stdout.captured.then(|| stdout.bytes.clone()),
             provider_job_ref: ack.provider_job_id,
             cancellation: None,
             result_frame,

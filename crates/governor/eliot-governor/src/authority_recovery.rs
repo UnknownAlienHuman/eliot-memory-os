@@ -131,6 +131,15 @@ impl GrantGraphLegacyMigration {
     /// The digest is computed over the decoded value's canonical bytes, which
     /// is the exact v1 contract shape, so the retained digest identifies the
     /// migrated record rather than any ELIOT-authored reinterpretation of it.
+    ///
+    /// # Live status
+    ///
+    /// `caller: NONE`. There is no production caller: `git grep -n
+    /// from_legacy_v1` returns only this definition. The live recovery path
+    /// rebuilds the owner through `AuthorityOwnerSnapshot::new` and
+    /// [`Self::validate`], which never mints a legacy-migration record. Whether
+    /// this constructor is wired to a decoded-payload call site or retired is an
+    /// owner decision.
     pub fn from_legacy_v1(snapshot: &GrantGraphRecoverySnapshot) -> Result<Self, CompositionError> {
         let bytes = canonical_json_bytes(snapshot).map_err(|error| {
             CompositionError::Recovery(format!(
@@ -626,19 +635,59 @@ pub struct AuthorityRestoreOutcome {
 }
 
 impl AuthorityOwner {
+    /// Restores the authority owner on the SYNCHRONOUS Kernel recovery
+    /// composition route, which carries no CURRENT revocation-history
+    /// evidence.
+    ///
+    /// This route can prove neither a grant's current disposition nor a
+    /// dependent effect's current contest state, so it restores authority
+    /// ONLY where there is nothing to prove: an owner that grants nothing
+    /// and admits no effect. The genesis authority owner restores exactly
+    /// as before.
+    ///
+    /// Any durable payload carrying grant lineage, a recorded revoked set,
+    /// admitted root transitions, inert cross-root quarantine, or a restored
+    /// effect-authorization ledger REFUSES. The refusal is the security
+    /// property, not a limitation of this constructor: a snapshot's own
+    /// `revoked` list is the backup's list, so restoring it without
+    /// CURRENT durable history would reinstate exactly the grants a later
+    /// revocation removed, and `EffectAuthorizer`'s restore deliberately
+    /// resets contest state to empty (I12.20: revocation is re-propagated
+    /// from the live revoked set, never resurrected from backup), so every
+    /// restored authorization would read back `Admissible` regardless.
+    /// "Could not check" is not "nothing was revoked."
+    ///
+    /// The one constructor that may install a non-empty authority owner is
+    /// [`Self::from_snapshot_with_revocation_history`], reached from the
+    /// live-history read in `owner_closure_feed::synchronize_owner_feed`
+    /// and from `OwnerClosureProvider::restore_with_*`.
     pub(super) fn from_snapshot(
         snapshot: &AuthorityOwnerSnapshot,
         expected_fence: &StateFence,
     ) -> Result<Self, CompositionError> {
         let snapshot = AuthorityOwnerSnapshot::canonical_durable_snapshot(snapshot)?;
         snapshot.validate_against(expected_fence)?;
+        let graph = &snapshot.grant_graph;
+        let effects = &snapshot.effect_authorizer.records;
+        if !graph.grants.is_empty()
+            || !graph.revoked.is_empty()
+            || !graph.admitted_root_transitions.is_empty()
+            || !graph.quarantined_cross_root.is_empty()
+            || !effects.is_empty()
+        {
+            return Err(CompositionError::Recovery(
+                "authority owner recovery carries grant lineage or effect authorizations but no \
+                 CURRENT revocation history; unavailable history is not absence of revocation"
+                    .to_owned(),
+            ));
+        }
         let grants = GrantGraph::from_recovery_snapshot(&snapshot.grant_graph)
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-        let effects = EffectAuthorizer::from_snapshot(snapshot.effect_authorizer.clone())
+        let restored_effects = EffectAuthorizer::from_snapshot(snapshot.effect_authorizer.clone())
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         Ok(Self {
             state_fence: snapshot.state_fence.clone(),
-            effects,
+            effects: restored_effects,
             grants,
             owner_hydrations: snapshot.owner_hydrations.clone(),
             effect_obligations: BTreeMap::new(),
@@ -1572,6 +1621,15 @@ impl AuthorityOwner {
     /// original's observation. An already-reconciled obligation refuses: the
     /// linked outcome evidence is appended once and terminal history is
     /// never overwritten. Reconciliation releases the same-scope fence.
+    ///
+    /// # Live status
+    ///
+    /// `caller: NONE`. There is no production caller: `git grep -n
+    /// reconcile_effect_outcome` returns only this definition. The live
+    /// recovery path publishes effects through the sibling
+    /// [`Self::note_activated`] / [`Self::note_unknown_outcome`] notes, which
+    /// do not reconcile an existing obligation. Whether this reconciliation seam
+    /// is wired or retired is an owner decision.
     pub fn reconcile_effect_outcome(
         &mut self,
         idempotency_key: &str,
@@ -1614,9 +1672,15 @@ impl AuthorityOwner {
     /// Both identities must carry their own retained authorization: the
     /// compensation is a separately authorized, separately observed action,
     /// never an implicit reopening of the original. The link is audit
-    /// lineage only — it never advances the original's progress and never
+    /// lineage only - it never advances the original's progress and never
     /// erases original uncertainty. Only [`Self::reconcile_effect_outcome`]
     /// with the proper observed disposition releases the original fence.
+    ///
+    /// # Live status
+    ///
+    /// `caller: NONE`. There is no production caller: `git grep -n
+    /// link_effect_compensation` returns only this definition. Whether this
+    /// lineage seam is wired or retired is an owner decision.
     pub fn link_effect_compensation(
         &mut self,
         original_key: &str,
@@ -1673,6 +1737,12 @@ impl AuthorityOwner {
     /// parent reconciles; retrying the parent under a new operation identity
     /// still requires the documented rollback/relationship and fresh
     /// admission.
+    ///
+    /// # Live status
+    ///
+    /// `caller: NONE`. There is no production caller: `git grep -n
+    /// link_effect_descendant` returns only this definition. Whether this
+    /// lineage seam is wired or retired is an owner decision.
     pub fn link_effect_descendant(
         &mut self,
         parent_key: &str,
@@ -1702,7 +1772,8 @@ impl AuthorityOwner {
         Ok(())
     }
 
-    /// Per-identity dispatch fence, consulted before dependent dispatch.
+    /// Per-identity dispatch fence, defined for consultation before dependent
+    /// dispatch.
     ///
     /// Returns true (blocked) when no retained authorization exists for the
     /// identity, when CURRENT revocation evidence was never rebuilt for this
@@ -1715,6 +1786,16 @@ impl AuthorityOwner {
     /// never-dispatched authorization on a history-bound owner reports
     /// false. A retried operation needs its own explicitly linked
     /// new-operation identity and fresh admission.
+    ///
+    /// # Live status
+    ///
+    /// `caller: NONE`. There is no production caller: `git grep -n
+    /// effect_dispatch_blocked` returns only this definition, so no dispatch
+    /// route consults this fence today. The live Material/Critical gate is
+    /// `KernelComposition::admit_material_authority_for_governor_issued_fence`
+    /// in the `eliot-kernel` binary, which reads the Governor-issued projection
+    /// rather than this per-identity predicate. Whether this fence is wired
+    /// into a dispatch route or retired is an owner decision.
     #[must_use]
     pub fn effect_dispatch_blocked(&self, idempotency_key: &str) -> bool {
         if self.last_revocation_source_revision.is_none() {
@@ -1751,6 +1832,14 @@ impl AuthorityOwner {
     /// blocked. An empty obligation map before rebuild is missing state —
     /// never proof that no dependent work is outstanding — so restart keeps
     /// dependent dispatch fenced until the rebuild completes.
+    ///
+    /// # Live status
+    ///
+    /// `caller: NONE`. There is no production caller: `git grep -n
+    /// dependent_scope_blocked` returns only this definition, so no dependent
+    /// route reads this fence today. The predicates above describe what this
+    /// method reports; they are not currently consulted. Whether this fence is
+    /// wired into a dependent-dispatch route or retired is an owner decision.
     #[must_use]
     pub fn dependent_scope_blocked(&self, resource_ref: &str) -> bool {
         if !self.effect_obligations_rebuilt {
@@ -1861,8 +1950,15 @@ impl AuthorityOwner {
     }
 
     /// Idempotency keys with at least one pending reconciliation item, in
-    /// obligation order. Drives the status-path sweep without implying
-    /// execution permission for any key.
+    /// obligation order. Intended to drive the status-path sweep without
+    /// implying execution permission for any key.
+    ///
+    /// # Live status
+    ///
+    /// `caller: NONE`. There is no production caller: `git grep -n
+    /// pending_effect_keys` returns only this definition, so no status path
+    /// sweeps these keys today. Whether this enumeration is wired into a
+    /// status path or retired is an owner decision.
     #[must_use]
     pub fn pending_effect_keys(&self) -> Vec<String> {
         self.effect_obligations
@@ -1881,6 +1977,13 @@ impl AuthorityOwner {
     /// CURRENT history evidence: applicability is visibly incomplete and
     /// dependent reuse must stay fenced until a history-bound restore
     /// completes.
+    ///
+    /// # Live status
+    ///
+    /// `caller: NONE`. There is no production caller: `git grep -n
+    /// authority_applicability` returns only this definition, so no consumer
+    /// reads this applicability projection today. Whether it is wired to a
+    /// diagnostic or admission surface or retired is an owner decision.
     #[must_use]
     pub fn authority_applicability(&self) -> EffectAuthorityApplicability {
         EffectAuthorityApplicability {

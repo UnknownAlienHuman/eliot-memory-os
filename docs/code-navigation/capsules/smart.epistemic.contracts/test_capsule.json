@@ -48,7 +48,18 @@
         "path": "crates/smart/eliot-epistemic-contracts/src/tests.rs"
       }
     ],
-    "inline_cfg_test_modules": 1
+    "inline_cfg_test_modules": 1,
+    "test_only_modules": {
+      "classification_rule": "A module reachable only through cfg(test) module edges or from a test target root is test source; a path component named `tests` is not evidence of anything. Coverage is preserved: classified test-only modules stay in the test slice and their test attributes are still counted.",
+      "paths": [
+        "crates/smart/eliot-epistemic-contracts/src/tests.rs"
+      ]
+    },
+    "unresolved_cfg_or_module_cases": {
+      "rule": "A cfg predicate that mentions `test` but can also hold without it is neither test-only nor an unconditional production edge. It is reported here as explicit uncertainty and the file stays production-reachable, so no path is renamed and no test is removed to shrink a context estimate.",
+      "cases": []
+    },
+    "unselected_package_files": []
   },
   "unit_property_model_tests": {
     "declared_proof_surface": {
@@ -64,11 +75,23 @@
     },
     "selected_tests": [
       {
+        "path": "crates/smart/eliot-epistemic-contracts/src/tests.rs",
+        "bytes": 123443,
+        "sha256": "6f2c3f686aa98c97399098c0922e7fbe38b31a7a3fc71f586c2a5143cd0cf850",
+        "test_attributes": 50,
+        "inline_cfg_test": false,
+        "test_only_module": true,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      },
+      {
         "path": "crates/smart/eliot-epistemic-contracts/tests/consumer_fixtures.rs",
         "bytes": 14166,
         "sha256": "648d11908965a0ecdf8eefa6ae3af209ac850fe751b0e3bbedf86e8ed64dc0ca",
         "test_attributes": 1,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "fault_restart_replay"
         ]
@@ -123,6 +146,7 @@
       "value": "Reject malformed or version-incompatible values without inventing a position."
     },
     "selected_cases": [
+      "crates/smart/eliot-epistemic-contracts/src/tests.rs",
       "crates/smart/eliot-epistemic-contracts/tests/consumer_fixtures.rs"
     ]
   },
@@ -150,16 +174,12 @@
   "expected_nonzero_test_count": {
     "method": "count of #[test]/#[tokio::test] attributes in the selected test slice",
     "test_attribute_count": 51,
-    "test_stu": 4722,
+    "test_stu": 45870,
     "nonzero": true
   },
-  "bound_contract_digest": "9747e399209b67a21a7690f3f608a675dc576a6665a54d76277bb8918024df0c",
+  "bound_contract_digest": "9f7ac267ed255b5c",
   "source_provenance": {
-    "input_digests": {
-      "workspace_manifest": {
-        "path": "Cargo.toml",
-        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
-      },
+    "contract_semantic_inputs": {
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
         "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
@@ -179,18 +199,31 @@
       "module_manifest": {
         "path": "crates/smart/eliot-epistemic-contracts/module.toml",
         "sha256": "cbe0f4b473c6cd08ddcf9c61850a3034ea61f2c02725b44dfbfa1fdf8835f0dc"
+      }
+    },
+    "exact_provenance": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "f2ab651b76ac9f5870f8268c52d1db5839cdb957f5939cd0d8e3a2edcd91fe45"
       },
-      "selected_source": {
+      "physical_source_inventory": {
+        "path_count": 24,
+        "sha256": "7303be1bff5711287d45d658d8f1fb7c35bec83910295d1a34819b3b7cab35a4"
+      },
+      "selected_workset": {
+        "allocation_scope": "PACKAGE_WIDE",
+        "allocation_state": "EXPLICIT_PACKAGE_WIDE",
         "path_count": 24,
         "sha256": "7303be1bff5711287d45d658d8f1fb7c35bec83910295d1a34819b3b7cab35a4"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
-    "generator_version": "1.0.0"
+    "generator_version": "1.0.0",
+    "note": "A change under exact_provenance moves artifact_digest only. It is not a public API or semantic-contract change and is not an instruction to re-read or re-test every cell."
   },
-  "artifact_digest": "ea34cb6df2a7f4e7fe293ef1dc8de42bd502eeaea3a0500dbcb488b172258eed",
+  "artifact_digest": "7d12123b054de76fa009c67ac3513fedf418bc0951de398903e7461ea17118be",
   "contract_revision": {
-    "derivation": "first 16 hex characters of the artifact digest",
-    "value": "ea34cb6df2a7f4e7"
+    "derivation": "first 16 hex characters of the SHA-256 over the namespaced canonical contract-semantic body (artifact_digest, contract_revision and source_provenance excluded)",
+    "value": "611558670ab39ef4"
   }
 }

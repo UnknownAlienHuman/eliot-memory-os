@@ -2067,10 +2067,13 @@ impl KernelComposition {
         let backup_owner_clients = BackupOwnerClients::bind_production()
             .map_err(|error| KernelBuildError::Service(error.to_string()))?;
         // Issue #959: hold the Kernel-owned cross-owner backup capture
-        // coordinator on the composition. It binds the work root only;
-        // captures consume already-accepted owner evidence per execution,
-        // so no live owner channel is opened here.
-        let backup_capture = KernelBackupCapture::bind(work_root.clone());
+        // coordinator on the composition. Issue #960 (A14) binds the purge
+        // OWNER alongside the work root: every capture declares the owner's own
+        // ledger-wide revision, so the coordinator reads it from the same
+        // composition-owned ORS the restore applies ledgers through instead of
+        // taking a caller's number. No new database is opened — `ors` is the
+        // one store already constructed above.
+        let backup_capture = KernelBackupCapture::bind(work_root.clone(), Arc::clone(&ors));
         // Issue #1837: open the single durable audit chain below the
         // canonical work root and seal the restart boundary. A corrupt
         // retained chain fails construction closed: the Kernel never runs

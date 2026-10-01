@@ -56,6 +56,7 @@ pub mod canonical_config_precedence;
 mod capability_admission;
 mod capability_evidence_wiring;
 pub mod capability_outcome;
+pub mod causal_outcome_caller;
 pub mod cell_declaration_registry;
 /// Issue #2857 W1/W2/W4: the live `eliot.query` `ContextReconstruction`
 /// route. This is the one production edge that resolves the closed selector set
@@ -177,7 +178,8 @@ pub use agent_fabric::{
     FabricError, FabricPorts, FabricSnapshot, LedgerEntry, ModelRegistryPort, PREREQ_PORTS,
     PeerChannelPort, PeerMessage, PeerReceipt, Reservation, RouteRequirements, SwarmControlPort,
     SwarmDefinition, SwarmEntryReceipt, VerifiedProviderMaterial, WorkerAck,
-    daemon_coordinator_config, plan_candidate, prepare_swarm_definition_admission_candidate,
+    admit_swarm_definition_candidate, begin_swarm_execution_candidate, daemon_coordinator_config,
+    launch_swarm_child_candidate, plan_candidate, prepare_swarm_definition_admission_candidate,
     prereq_ports,
 };
 use agent_fabric::{FabricOperation, FabricPortId, MissingPortResidual, PortBindingState};
@@ -3619,6 +3621,88 @@ impl DaemonComposition {
             .map_err(|error| DaemonError::Lifecycle(error.to_string()))
     }
 
+    /// Admits one prepared swarm definition through the Governor admission owner
+    /// on the admitted daemon path (issue #1699).
+    ///
+    /// Readiness gates the call; admission delegates to
+    /// [`admit_swarm_definition_candidate`], so the production caller and the
+    /// wired tests share one implementation. The Governor-issued admission
+    /// receipt and the injected receipt verifier travel as caller-supplied
+    /// ports: nothing is minted here, no durable write occurs, and nothing is
+    /// launched. Launch stays with the existing injected
+    /// admission/activation/dispatch ports.
+    pub fn agent_fabric_admit_swarm_definition(
+        &self,
+        prep: &eliot_agent_coordinator::SwarmDefinitionAdmissionPrep,
+        proposal: &eliot_swarm::SwarmPlanProposal,
+        maps: &eliot_swarm::SealedIndependentMaps,
+        admission_receipt: eliot_receipts::ReceiptEnvelope,
+        verifier: Option<&dyn eliot_swarm::ReceiptVerificationPort>,
+    ) -> Result<eliot_swarm::AdmittedSwarmPlan, DaemonError> {
+        let _span = tracing::info_span!("eliotd.fabric_admit_swarm_definition").entered();
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        let config = daemon_coordinator_config()
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        admit_swarm_definition_candidate(&config, prep, proposal, maps, admission_receipt, verifier)
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))
+    }
+
+    /// Begins provider-owned P3 execution for one admitted swarm plan through
+    /// the injected A-02 activation port on the admitted daemon path (issue
+    /// #1699).
+    ///
+    /// Readiness gates the call; activation delegates to
+    /// [`begin_swarm_execution_candidate`], so the production caller and the
+    /// wired tests share one implementation. The route provider and receipt
+    /// verifier travel as caller-supplied injected ports: this performs no
+    /// durable write and starts no process.
+    pub fn agent_fabric_begin_swarm_execution(
+        &self,
+        plan: &eliot_swarm::AdmittedSwarmPlan,
+        a02: Option<&dyn eliot_swarm::AgentRouteProvider>,
+        verifier: Option<&dyn eliot_swarm::ReceiptVerificationPort>,
+    ) -> Result<eliot_swarm::ExecutionState, DaemonError> {
+        let _span = tracing::info_span!("eliotd.fabric_begin_swarm_execution").entered();
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        let config = daemon_coordinator_config()
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        begin_swarm_execution_candidate(&config, plan, a02, verifier)
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))
+    }
+
+    /// Dispatches one sealed swarm child through the existing injected
+    /// dispatch ports on the admitted daemon path (issue #1699).
+    ///
+    /// Readiness gates the call; dispatch delegates to
+    /// [`launch_swarm_child_candidate`], so the production caller and the
+    /// wired tests share one implementation. The store and executor travel as
+    /// caller-supplied injected ports that pin the owner-side feeding seam:
+    /// the returned intent is candidate-only, and persisting it through the
+    /// owner-side append path BEFORE calling the executor stays with the
+    /// Kernel writer owner. This performs no store append, no executor call,
+    /// and no scheduler step.
+    pub fn agent_fabric_launch_swarm_child(
+        &self,
+        plan: &eliot_swarm::AdmittedSwarmPlan,
+        attachment: &eliot_swarm::durable_dispatch::DurableJobAttachment,
+        inputs: eliot_swarm::adapter_launch::SealedChildInputs<'_>,
+        store: &dyn eliot_swarm::durable_work::DurableWorkStore,
+        executor: &dyn eliot_swarm::durable_work::WorkExecutor,
+    ) -> Result<eliot_swarm::adapter_launch::SealedChildLaunch, DaemonError> {
+        let _span = tracing::info_span!("eliotd.fabric_launch_swarm_child").entered();
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        let config = daemon_coordinator_config()
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        launch_swarm_child_candidate(&config, plan, attachment, inputs, store, executor)
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))
+    }
+
     /// Resolves one admitted provider capability from live session-observed
     /// owner currentness (issue #1108, production composition caller for
     /// W4/A1/A2).
@@ -3977,8 +4061,8 @@ impl DaemonComposition {
     /// (`DaemonKernelClient::verify_provider_binding_async`) before the
     /// capability is rebuilt, so a stored snapshot or a stored `Verified`
     /// label alone restores nothing. Restores through
-    /// `AgentFabric::restore_with_admitted_provider` over the daemon state
-    /// root store: missing, stale, or revoked evidence stays
+    /// `AgentFabric::restore_durable_snapshot_with_admitted_provider` over the
+    /// daemon state root store: missing, stale, or revoked evidence stays
     /// plan-only/blocked instead of silently resuming effecting operations
     /// (ARCH-RES-01). The #265 `health` half rides input-only and never
     /// mints admission.
@@ -3988,7 +4072,17 @@ impl DaemonComposition {
     /// Returns the session-resolution rejection (not ready, no live session,
     /// stale expectation epoch), the Kernel verifier rejection, the
     /// capability construction rejection, the coordinator owner restore
-    /// rejection, or a stale-config conflict unchanged, each typed.
+    /// rejection from the durable document, or a stale-config conflict
+    /// unchanged, each typed.
+    ///
+    /// `coordinator_document` is the coordinator snapshot JSON selected out of
+    /// the persisted projection FILE bytes by
+    /// `solo_agent_driver::load_verified_projection` after that file's
+    /// envelope was verified; the coordinator is restored from it rather than
+    /// from the in-memory `snapshot` (issue #370 W24/W25/W26/A2/A28). This adds
+    /// no second capability build and no second recovery path: the one
+    /// `build_production_provider_capability` result drives both, and the
+    /// typed snapshot stays the fabric state carrier.
     pub async fn agent_fabric_restore_verified_async(
         &self,
         kernel: &Arc<DaemonKernelClient>,
@@ -3996,6 +4090,7 @@ impl DaemonComposition {
         ports: FabricPorts,
         material: VerifiedProviderMaterial,
         claimed: &crate::solo_agent_driver::SoloClaimedHalves,
+        coordinator_document: &str,
     ) -> Result<AgentFabric, DaemonError> {
         let _span = tracing::info_span!("eliotd.fabric_restore_verified_async").entered();
         let material = self.resolve_verified_material(kernel, material)?;
@@ -4017,13 +4112,16 @@ impl DaemonComposition {
         .await?;
         let config = daemon_coordinator_config()?;
         let store = crate::semantic_revision_store::SemanticRevisionStore::new(self.state_root());
-        Ok(AgentFabric::restore_with_admitted_provider(
-            snapshot,
-            config,
-            ports,
-            Some(&store),
-            capability,
-        )?)
+        Ok(
+            AgentFabric::restore_durable_snapshot_with_admitted_provider(
+                snapshot,
+                config,
+                ports,
+                Some(&store),
+                coordinator_document,
+                capability,
+            )?,
+        )
     }
 
     /// Enqueues one validated solo delegate intake for the runtime poll hook

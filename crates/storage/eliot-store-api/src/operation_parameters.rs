@@ -886,12 +886,12 @@ static APPLY_INSTRUMENT_REGISTRY_PARAMETERS: [ParameterDeclaration; 1] = [Parame
     required: true,
 }];
 
-/// Owner-approved user-automation mutation fields (issue #1779): the leg
-/// discriminator, the always-present automation identity, and the
-/// conditionally-required leg payloads. Leg completeness (which payload
-/// each leg requires) is enforced by the automation-state contract; every
-/// name here is optional at the declaration level so one closed table
-/// serves all six legs.
+/// Owner-approved user-automation mutation fields (issue #1779 and #2865):
+/// the leg discriminator, the always-present automation identity, and the
+/// conditionally-required leg payloads. Leg completeness (which payload each
+/// leg requires) is enforced by the automation-state contract; every name
+/// here is optional at the declaration level so one closed table serves all
+/// legs.
 ///
 /// `normalization_receipt_json` is the owner-issued schedule normalization
 /// envelope a create/edit leg retains beside its own immutable revision, and
@@ -902,8 +902,9 @@ static APPLY_INSTRUMENT_REGISTRY_PARAMETERS: [ParameterDeclaration; 1] = [Parame
 /// automation-state contract plus the backends decide its shape and its
 /// retention. Absence is never a synthesized receipt: a revision that
 /// retained no envelope leaves its compiled occurrence set unadmitted by name
-/// downstream.
-static APPLY_USER_AUTOMATION_PARAMETERS: [ParameterDeclaration; 10] = [
+/// downstream. `normalization_request_json` is the original authenticated
+/// producer request retained only by the internal normalization leg.
+static APPLY_USER_AUTOMATION_PARAMETERS: [ParameterDeclaration; 11] = [
     ParameterDeclaration {
         name: "operation",
         shape: ParameterShape::Subject,
@@ -936,6 +937,11 @@ static APPLY_USER_AUTOMATION_PARAMETERS: [ParameterDeclaration; 10] = [
     },
     ParameterDeclaration {
         name: "normalization_receipt_json",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: "normalization_request_json",
         shape: ParameterShape::Subject,
         required: false,
     },
@@ -2030,6 +2036,31 @@ fn validate_campaign_source_publications(value: &Value) -> Result<(), StoreError
         }
     }
     Ok(())
+}
+
+/// Decodes one validated `ApplyInstrumentRegistryState` parameter map.
+///
+/// Runs the shared snapshot acceptance boundary first (JSON string with
+/// the supported schema/version), then returns the verbatim snapshot
+/// bytes. Both store contours share this decoder so neither backend
+/// interprets instrument admission on its own.
+pub fn decode_instrument_registry_mutation(
+    parameters: &BTreeMap<String, Value>,
+) -> Result<String, StoreError> {
+    let value = parameters
+        .get("snapshot_json")
+        .ok_or(StoreError::InvalidField {
+            field: "instrument_registry.snapshot_json",
+            reason: "instrument registry mutation requires snapshot_json",
+        })?;
+    validate_instrument_registry_snapshot(value)?;
+    value
+        .as_str()
+        .map(str::to_owned)
+        .ok_or(StoreError::InvalidField {
+            field: "instrument_registry.snapshot_json",
+            reason: "instrument registry snapshot must be a JSON string",
+        })
 }
 
 fn validate_instrument_registry_snapshot(value: &Value) -> Result<(), StoreError> {

@@ -53,6 +53,10 @@ pub(crate) mod table {
     /// carrying the verbatim Kernel-owned revision document. Create-only;
     /// divergent rewrites fail closed.
     pub(crate) const AUTOMATION_REVISION: &str = "automation_revision";
+    /// Independently retained owner-normalized revision and original receipt
+    /// (issue #2865). One immutable row per automation/revision identity;
+    /// it does not move the current pointer or record occurrence history.
+    pub(crate) const AUTOMATION_NORMALIZATION: &str = "automation_normalization";
     /// Current automation pointer per automation (issue #1779). One row
     /// per `automation_id` carrying the current revision plus the closed
     /// admission state. Compare-and-set on the observed revision.
@@ -90,6 +94,13 @@ pub(crate) mod table {
     /// digest is a new row, never an in-place rewrite.
     pub(crate) const LEARNING_RECORD: &str = "learning_record";
 
+    /// Singleton instrument-registry snapshot head (issue #1814 W1.2). One
+    /// row under the fixed `head` key carrying the verbatim opaque
+    /// snapshot bytes with a store-issued revision. Replaced verbatim
+    /// with a bumped revision on each admitted apply under the same
+    /// fence+revision compare-and-set contract as the reactive tables.
+    pub(crate) const INSTRUMENT_REGISTRY: &str = "instrument_registry";
+
     /// Every physical table *name* this single owner declares, in declaration
     /// order.
     ///
@@ -117,9 +128,11 @@ pub(crate) mod table {
     ///   name that no baseline DDL ever creates is dispositioned and passed
     ///   like any other. `automation_failure`, `automation_last_failure`, and
     ///   `automation_continuation` are declared without generation DDL;
+    ///   failure tables are ensured on their explicit owner path and
     ///   continuations create their schemaless table only during explicit
-    ///   truncated-page issuance.
-    pub(crate) const ALL_TABLES: [&str; 25] = [
+    ///   truncated-page issuance. `automation_normalization` has an explicit
+    ///   owner DDL body but remains outside admitted schema-generation migrations.
+    pub(crate) const ALL_TABLES: [&str; 27] = [
         SCHEMA_META,
         WRITE_RECEIPT,
         REVISION_HEAD,
@@ -137,6 +150,7 @@ pub(crate) mod table {
         REACTIVE_SESSION,
         RESOURCE_SNAPSHOT,
         AUTOMATION_REVISION,
+        AUTOMATION_NORMALIZATION,
         AUTOMATION_CURRENT,
         AUTOMATION_INVOCATION,
         AUTOMATION_FAILURE,
@@ -145,6 +159,7 @@ pub(crate) mod table {
         EXPERIENCE_BANK,
         EXPERIENCE_FEEDBACK,
         LEARNING_RECORD,
+        INSTRUMENT_REGISTRY,
     ];
 }
 
@@ -255,9 +270,17 @@ pub(crate) const SCHEMA_MIGRATION_V1_TO_V2_DDL: &str = RECOVERY_TABLES_DDL;
 /// `erasure_transaction_bindings` (`operation_id`, `subject`, `payload_ref`,
 /// `encryption_key_ref`, `deadline_unix_ms`, `scope_id`, `surfaces`,
 /// `state_fence`, `operation_count`), and `erasure_outcome`
-/// carries the sealed per-surface outcomes (`operation_id`, `outcomes`).
-/// `operation_id` is unique in each table; one intent row plus its single
-/// outcome seal per operation — never a second ledger.
+/// carries the sealed per-surface outcomes (`operation_id`, `scope_id`,
+/// `outcomes`). `operation_id` is unique in each table; one intent row plus its
+/// single outcome seal per operation — never a second ledger.
+///
+/// `erasure_outcome.scope_id` is the *sealed* row's own copy of the single
+/// admitted scope, copied verbatim from the frozen intent that opened the
+/// transaction by `erasure_transaction_bindings` and never derived. A privacy
+/// purge ledger is read per scope, so a seal carrying only `operation_id` could
+/// not attribute its own outcomes to the scope whose data they purged. The
+/// scope the seal's identity rests on is still the intent row's, which
+/// `TX_ERASURE_INTENT` compares in the same transaction.
 pub(crate) const ERASURE_TABLES_DDL: &str = r"
 DEFINE TABLE erasure_intent SCHEMALESS;
 DEFINE FIELD operation_id ON erasure_intent TYPE string;
@@ -273,6 +296,7 @@ DEFINE INDEX ei_operation ON erasure_intent FIELDS operation_id UNIQUE;
 
 DEFINE TABLE erasure_outcome SCHEMALESS;
 DEFINE FIELD operation_id ON erasure_outcome TYPE string;
+DEFINE FIELD scope_id ON erasure_outcome TYPE string;
 DEFINE FIELD outcomes ON erasure_outcome TYPE array;
 DEFINE INDEX eo_operation ON erasure_outcome FIELDS operation_id UNIQUE;
 ";
@@ -325,10 +349,13 @@ DEFINE FIELD task_id ON resource_snapshot TYPE option<string>;
 DEFINE INDEX snapshot_uri ON resource_snapshot FIELDS uri UNIQUE;
 ";
 
-/// Automation revision, pointer, and invocation tables (issue #1779).
-/// Additive delta in the notification style: `automation_revision`
-/// carries one immutable row per joined automation/revision key with the
-/// verbatim revision document; `automation_current` carries one
+/// Automation revision, normalization, pointer, and invocation tables
+/// (issues #1779/#2865). `automation_revision` carries one immutable row per
+/// joined automation/revision key with the verbatim revision document;
+/// `automation_normalization` independently retains the exact owner
+/// normalization request, normalized revision, original receipt, and
+/// `PreparedTransition` provenance without activating an automation;
+/// `automation_current` carries one
 /// compare-and-set pointer per automation with the current revision and
 /// the closed admission state; `automation_invocation` carries one
 /// create-only row per occurrence identity with the verbatim invocation
@@ -342,6 +369,20 @@ DEFINE FIELD revision_json ON automation_revision TYPE string;
 DEFINE FIELD state_fence ON automation_revision TYPE object;
 DEFINE FIELD scope_id ON automation_revision TYPE string;
 DEFINE FIELD task_id ON automation_revision TYPE option<string>;
+
+DEFINE TABLE automation_normalization SCHEMALESS;
+DEFINE FIELD automation_id ON automation_normalization TYPE string;
+DEFINE FIELD revision ON automation_normalization TYPE string;
+DEFINE FIELD revision_json ON automation_normalization TYPE string;
+DEFINE FIELD normalization_receipt_json ON automation_normalization TYPE object;
+DEFINE FIELD normalization_request_json ON automation_normalization TYPE string;
+DEFINE FIELD operation_id ON automation_normalization TYPE string;
+DEFINE FIELD idempotency_key ON automation_normalization TYPE string;
+DEFINE FIELD canonical_request_hash ON automation_normalization TYPE string;
+DEFINE FIELD state_fence ON automation_normalization TYPE object;
+DEFINE FIELD scope_id ON automation_normalization TYPE string;
+DEFINE FIELD task_id ON automation_normalization TYPE option<string>;
+DEFINE INDEX automation_normalization_identity ON automation_normalization FIELDS automation_id, revision UNIQUE;
 
 DEFINE TABLE automation_current SCHEMALESS;
 DEFINE FIELD automation_id ON automation_current TYPE string;
@@ -554,9 +595,175 @@ DEFINE INDEX ei_operation ON erasure_intent FIELDS operation_id UNIQUE;
 
 DEFINE TABLE erasure_outcome SCHEMALESS;
 DEFINE FIELD operation_id ON erasure_outcome TYPE string;
+DEFINE FIELD scope_id ON erasure_outcome TYPE string;
 DEFINE FIELD outcomes ON erasure_outcome TYPE array;
 DEFINE INDEX eo_operation ON erasure_outcome FIELDS operation_id UNIQUE;
 ";
+
+/// Reports whether `ddl` declares a field whose *whole* name is `column`.
+///
+/// Both boundaries are identifier-byte boundaries, so this is a whole-name
+/// match, never a substring one. `encryption` must not be satisfied by
+/// `encryption_key_ref`, and `export_receipt` must not be satisfied by a longer
+/// `export_receipt_digest`: an absence proven by a substring match is not an
+/// absence, and an evidence column "found" inside a different field's name is a
+/// fabricated observation rather than a measured one.
+///
+/// Const-evaluable so the negative inventory below is checked by `cargo check`
+/// rather than by a test that can be skipped.
+pub(crate) const fn declares_column_name(ddl: &str, column: &str) -> bool {
+    let haystack = ddl.as_bytes();
+    let needle = column.as_bytes();
+    if needle.is_empty() {
+        return false;
+    }
+    let mut start = 0;
+    while start + needle.len() <= haystack.len() {
+        let mut offset = 0;
+        while offset < needle.len() {
+            if haystack[start + offset] != needle[offset] {
+                break;
+            }
+            offset += 1;
+        }
+        if offset == needle.len() {
+            let end = start + needle.len();
+            let left_clear = start == 0 || !is_identifier_byte(haystack[start - 1]);
+            let right_clear = end == haystack.len() || !is_identifier_byte(haystack[end]);
+            if left_clear && right_clear {
+                return true;
+            }
+        }
+        start += 1;
+    }
+    false
+}
+
+/// Whether `byte` may appear inside a `SurrealQL` field name.
+///
+/// Deliberately the *identifier* set, not the alphanumeric set: `encryption`
+/// must not match `encryption_key_ref`, so `_` has to count as a name
+/// character here or the boundary check would pass a longer field.
+const fn is_identifier_byte(byte: u8) -> bool {
+    byte == b'_'
+        || (byte >= b'0' && byte <= b'9')
+        || (byte >= b'a' && byte <= b'z')
+        || (byte >= b'A' && byte <= b'Z')
+}
+
+/// The five ECXF capture-evidence column groups this owner does **not** define,
+/// and the real owner of each value.
+///
+/// This is a *negative* inventory, and it is the schema owner's half of the
+/// answer to "why does the ECXF capture report five evidence gaps". Each entry
+/// is the exact field name `eliot_ecxf` already uses, so the vocabulary stays the
+/// consumer's own and this file introduces no second set of names. For each,
+/// this module was checked for a *differently named* column that carries the same
+/// evidence; the const block below is the compiled proof that no such column
+/// exists in any baseline this owner ships, and the per-entry notes record which
+/// near-miss was examined and why it is a different quantity.
+///
+/// No entry is a `DEFINE FIELD`, deliberately. A declared column that no write
+/// path populates is a certified no-op: it would make a reader believe an
+/// evidence value exists when every real row reads back `NONE`, which is the
+/// "claimed but unbacked" defect class rather than a fix for it. The adapter
+/// crate contains no writer for any of these names today (`git grep` finds zero
+/// occurrences of all seven identifiers under `crates/storage/eliot-store-surreal-adapter`),
+/// so adding the field would back a claim with nothing. Each value below is
+/// therefore owned by the component that actually mints it, and closing its gap
+/// means that owner supplies the evidence, not that this file declares an empty
+/// column.
+pub(crate) const ECXF_UNDEFINED_CAPTURE_EVIDENCE: &[(&str, &str)] = &[
+    (
+        "architecture_source_digest",
+        "minted by the Architecture/Kernel compatibility handshake \
+         (crates/kernel/eliot-kernel-core/src/module/compatibility_handshake.rs); \
+         sealed outside the store, so no baseline can define it",
+    ),
+    (
+        "normative_pair_identity_receipt_digest",
+        "the `NormativePair` identity receipt, sealed by the same handshake \
+         owner; it is a receipt *about* this store, not a column of it",
+    ),
+    (
+        "export_receipt",
+        "a source-side ECXF export receipt; the exporter mints the package \
+         receipt at emit time and no store row records that an export happened",
+    ),
+    (
+        "store_generation",
+        "the store's own generation. The two near-misses were examined and \
+         rejected: `schema_meta.generation` is the SCHEMA generation, and \
+         `StateFence::resource_generation` is the generation relevant to one \
+         decision, not the store's aggregate",
+    ),
+    (
+        "source_adapter",
+        "this adapter's identity. `schema_meta.migration_id` names the \
+         *migration*, not the adapter, and `crate::ADAPTER_NAME` is a build \
+         constant of the running binary rather than an observation of the \
+         source store",
+    ),
+    (
+        "source_adapter_version",
+        "same owner and same rejection as `source_adapter`; the adapter declares \
+         no version column of its own",
+    ),
+    (
+        "compression",
+        "the codec profile of the EMITTED package. The only encryption-adjacent \
+         field, `erasure_intent.encryption_key_ref`, is a key *reference* on a \
+         table the admitted generation does not define, not a package profile",
+    ),
+];
+
+/// Compile-time proof that no baseline this owner ships defines any name in
+/// [`ECXF_UNDEFINED_CAPTURE_EVIDENCE`].
+///
+/// Both admitted baselines are covered (`SCHEMA_DDL_V2`, the generation a v2
+/// pin admits, and `SCHEMA_DDL_V3`), plus the first-generation baseline and
+/// every additive delta, so a gap cannot be closed by a table this owner already
+/// declares in some other generation or migration body.
+///
+/// This asserts a *negative*, and a negative assertion is the one direction that
+/// is safe to hard-wire: it can only ever fail if a real column is added, which
+/// is precisely the moment the owner must revisit the corresponding gap entry
+/// above. It can never make a gap report itself closed on its own, because it
+/// proves absence and never presence.
+const _: () = {
+    // Every baseline body this module defines, in declaration order:
+    // SCHEMA_DDL, SCHEMA_DDL_V2, SCHEMA_DDL_V3, RECOVERY_TABLES_DDL,
+    // ERASURE_TABLES_DDL, NOTIFICATION_TABLES_DDL, REACTIVE_TABLES_DDL,
+    // AUTOMATION_TABLES_DDL, EXPERIENCE_TABLES_DDL and LEARNING_TABLES_DDL.
+    let baselines: [&str; 10] = [
+        SCHEMA_DDL,
+        SCHEMA_DDL_V2,
+        SCHEMA_DDL_V3,
+        RECOVERY_TABLES_DDL,
+        ERASURE_TABLES_DDL,
+        NOTIFICATION_TABLES_DDL,
+        REACTIVE_TABLES_DDL,
+        AUTOMATION_TABLES_DDL,
+        EXPERIENCE_TABLES_DDL,
+        LEARNING_TABLES_DDL,
+    ];
+    let mut baseline_index = 0;
+    while baseline_index < baselines.len() {
+        let ddl = baselines[baseline_index];
+        let mut entry_index = 0;
+        while entry_index < ECXF_UNDEFINED_CAPTURE_EVIDENCE.len() {
+            let column = ECXF_UNDEFINED_CAPTURE_EVIDENCE[entry_index].0;
+            assert!(
+                !declares_column_name(ddl, column),
+                "a schema baseline this owner ships now defines a column recorded \
+                 here as absent; update ECXF_UNDEFINED_CAPTURE_EVIDENCE \
+                 deliberately rather than letting the record and the DDL disagree"
+            );
+            entry_index += 1;
+        }
+        baseline_index += 1;
+    }
+};
 
 /// Transaction delimiters for a single atomic apply.
 pub(crate) const TX_BEGIN: &str = "BEGIN TRANSACTION;";

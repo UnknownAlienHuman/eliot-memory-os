@@ -10,6 +10,10 @@
 //!   capacity-profile compiler joining owner-produced evidence into one
 //!   canonical row per frozen bottleneck, kept separate from the front-door
 //!   slice because it describes no front-door capacity of its own;
+//! - [`control_reserve_ors_evidence`] — the I14.3 Kernel composition join
+//!   validating the ORS owner's two published rows into compiler-ready
+//!   evidence records, kept separate from the compiler because it copies
+//!   owner quantities rather than compiling the profile;
 //! - [`recovery_state_view`] — the role-filtered, non-semantic recovery view;
 //! - [`notification_state`] — canonical persistent notification records;
 //! - [`compatibility_handshake`] — the versioned I1.12 process-handshake
@@ -25,6 +29,7 @@
 
 pub mod compatibility_handshake;
 pub mod control_reserve_front_door;
+pub mod control_reserve_ors_evidence;
 pub mod control_reserve_profile_compiler;
 pub mod epoch_and_fence;
 pub mod generation_readiness;

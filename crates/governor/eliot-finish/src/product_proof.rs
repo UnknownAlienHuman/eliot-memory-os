@@ -23,9 +23,15 @@
 //!
 //! The fail-closed pass rule is not relaxed: a rollup reaches `Pass` only
 //! when the record validates, its outcome is `PASS`, and the required
-//! installed-route execution was actually observed. Every other case returns
-//! the exact refusal carrying outcome, reason, authority, and required
-//! missing evidence.
+//! installed-route execution was actually observed. The record itself refuses a
+//! `PASS` that carries no attempt, an attempt that did not succeed, or no
+//! runtime-domain live evidence handle, so those cases never reach the rollup.
+//! Every other case returns the exact refusal carrying outcome, reason,
+//! authority, and required missing evidence.
+//!
+//! Every evidence handle the record publishes is inside the canonical bytes its
+//! source digest is computed over, so the digest distinguishes two records that
+//! differ in any retained identity rather than colliding on a subset of them.
 
 #![forbid(unsafe_code)]
 
@@ -116,18 +122,6 @@ impl FinishService {
     ) -> Result<ProductProofStatus, ProductProofRecordError> {
         text_field(inputs.finish_authority_ref, "finish_authority_ref")?;
         text_field(inputs.proof_ceiling, "proof_ceiling")?;
-        // The source revision is bound through `ReportInputRevision::new`, so
-        // the recorded digest is the digest of the exact retained finish
-        // bytes rather than a digest copied from, or invented for, a caller.
-        // The absence of an accepted decision is itself the retained fact, so
-        // its bytes are the recorded absence marker, not a substitute receipt.
-        let observed_by = ReportInputRevision::new(
-            ReportInputSource::ProductSupport,
-            inputs.finish_authority_ref,
-            1,
-            retained_source_bytes(inputs).as_bytes(),
-        )
-        .map_err(|error| ProductProofRecordError::Record(error.to_string()))?;
         let retained = ProductProofRetainedEvidence {
             raw_log_refs: inputs.raw_log_refs.to_vec(),
             executable: inputs.executable.clone(),
@@ -138,6 +132,24 @@ impl FinishService {
                 installed_route: installed_route_receipt(None),
             },
         };
+        retained_identities(&retained)?;
+        // The retained evidence is built first and the source digest is taken
+        // from it second, so the binding is computed over state that already
+        // exists rather than over a subset chosen before the record was
+        // assembled. The absence of an accepted decision stays an absent
+        // optional in the canonical bytes, so it is recorded as an absence
+        // rather than folded into a substitute value.
+        let source_bytes = retained_source_bytes(inputs, &retained)?;
+        // The source revision is bound through `ReportInputRevision::new`, so
+        // the recorded digest is the digest of the exact retained finish
+        // bytes rather than a digest copied from, or invented for, a caller.
+        let observed_by = ReportInputRevision::new(
+            ReportInputSource::ProductSupport,
+            inputs.finish_authority_ref,
+            1,
+            &source_bytes,
+        )
+        .map_err(|error| ProductProofRecordError::Record(error.to_string()))?;
         // Read the observation back off the retained stage rather than carrying
         // a second literal `false` beside it, so the one place that decides the
         // parked stage is the only place the fact can come from.
@@ -179,9 +191,13 @@ impl FinishService {
     /// factual reason, the still-missing evidence, and the updated retained
     /// evidence. Identity, authority, and build evidence are carried forward
     /// from `previous`, so one acceptance item keeps one record across
-    /// attempts rather than accumulating a parallel one. The fail-closed pass
-    /// rule is unchanged: `PASS` still requires an observed installed-route
-    /// execution, no missing evidence, and a succeeded run.
+    /// attempts rather than accumulating a parallel one. An installed-route
+    /// receipt that a prior attempt actually observed is carried forward too,
+    /// because an observation the owner really made is not retracted by a later
+    /// attempt that carried no receipt of its own. The fail-closed pass rule is
+    /// unchanged: `PASS` still requires an observed installed-route execution,
+    /// no missing evidence, a succeeded run, and at least one runtime-domain
+    /// live evidence handle.
     #[allow(
         clippy::unused_self,
         reason = "the ProductProof/FinishService boundary is the record's owner, not a state reader"
@@ -194,6 +210,25 @@ impl FinishService {
         previous
             .validate()
             .map_err(|error| ProductProofRecordError::Record(error.to_string()))?;
+        // An observed installed-route receipt is a retained observation, not a
+        // per-attempt claim: it names the installed-route execution that
+        // actually ran, so it stays observed once it has been observed. A later
+        // revision that dropped it would silently retract an observation that
+        // nothing ever proved false, and would leave a record that had already
+        // observed the route reading that it had not. The observation is
+        // therefore carried forward unless this very revision re-establishes it
+        // from its own receipt, and a record carrying an observation must also
+        // carry live evidence on the runtime domain or the rollup is refused.
+        let retained = if revision.retained.installed_route_observed() {
+            revision.retained
+        } else if previous.retained.installed_route_observed() {
+            let mut carried = revision.retained;
+            carried.stage_receipts.installed_route =
+                previous.retained.stage_receipts.installed_route.clone();
+            carried
+        } else {
+            revision.retained
+        };
         let status = previous
             .record_attempt(
                 revision.attempt,
@@ -201,7 +236,7 @@ impl FinishService {
                 revision.reason,
                 revision.missing_evidence,
                 revision.live_evidence,
-                revision.retained,
+                retained,
             )
             .map_err(|error| ProductProofRecordError::Record(error.to_string()))?;
         fail_closed_rollup(&status.rollup(), &status)?;
@@ -238,22 +273,71 @@ fn text_field(value: &str, field: &'static str) -> Result<(), ProductProofRecord
     Ok(())
 }
 
-/// The exact retained finish bytes this record was read from.
+/// The exact retained finish bytes this record is read from and bound to.
 ///
-/// These are the identities the owner already recorded for this evaluation:
-/// the accepted decision's receipt digest and the retained runtime receipt
-/// reference, each rendered as the literal `absent` marker when the owner holds
-/// no such receipt. Binding the source revision to this text means the record
-/// cites what the owner actually held. No stage value, digest, or timestamp is
-/// produced here — only the presence or absence of an owner-held receipt.
-fn retained_source_bytes(inputs: &ProductProofStageInputs<'_>) -> String {
-    format!(
-        "finish-authority={}|decision-receipt={}|runtime-receipt={}|proof-ceiling={}",
-        inputs.finish_authority_ref,
-        inputs.decision_receipt_digest.unwrap_or("absent"),
-        inputs.runtime_receipt_ref.unwrap_or("absent"),
-        inputs.proof_ceiling,
-    )
+/// The digest this record carries must bind the evidence it is published
+/// beside, not a subset of it. The previous preimage named only four receipt
+/// identities, so the retained executable identity, the environment identity
+/// and every retained raw log handle fell outside the digest: two parked
+/// records built from a different executable, a different environment or a
+/// different log handle set produced a byte-identical preimage and therefore a
+/// byte-identical `input_digest`, while the records themselves differed in the
+/// very identities a product proof exists to publish. A digest that cannot
+/// distinguish those records detects nothing about them.
+///
+/// The preimage is therefore the canonical serialisation of the retained
+/// evidence itself, plus the finish identities that are not part of it. This
+/// reuses the existing [`ReportInputRevision`] digest helper and the existing
+/// `eliot_contracts::canonical_json_bytes` canonicaliser: no new digest
+/// scheme, no new domain-separation constant and no parallel hasher is
+/// introduced. Canonical JSON sorts object keys recursively, so field order
+/// cannot produce two digests for one record, and an absent optional
+/// serialises as JSON `null` rather than as the literal string `absent`, so an
+/// absent receipt is distinguishable from a receipt whose identity is the
+/// seven characters `absent`.
+///
+/// The digest is computed over state that already exists — the retained
+/// evidence is assembled before this is called — so the binding is not
+/// evaluated over partially-populated input.
+fn retained_source_bytes(
+    inputs: &ProductProofStageInputs<'_>,
+    retained: &ProductProofRetainedEvidence,
+) -> Result<Vec<u8>, ProductProofRecordError> {
+    eliot_contracts::canonical_json_bytes(&serde_json::json!({
+        "finish_authority_ref": inputs.finish_authority_ref,
+        "proof_ceiling": inputs.proof_ceiling,
+        "decision_receipt_digest": inputs.decision_receipt_digest,
+        "runtime_receipt_ref": inputs.runtime_receipt_ref,
+        "retained": retained,
+    }))
+    .map_err(|error| ProductProofRecordError::Record(error.to_string()))
+}
+
+/// Refuses retained identities that cannot bind anything.
+///
+/// The digest above is computed over these identities, so an empty one would
+/// let an unbound record hash exactly like a bound one. The record's own
+/// `validate()` already refuses blank and control-bearing text for the
+/// executable name, the platform and every log handle; this checks the two
+/// optional halves that `validate()` admits as `None` and that therefore have
+/// no text to refuse, so a caller cannot drop an optional identity and still
+/// receive a digest that claims to cover it.
+fn retained_identities(
+    retained: &ProductProofRetainedEvidence,
+) -> Result<(), ProductProofRecordError> {
+    if let Some(executable) = &retained.executable {
+        text_field(&executable.executable_name, "retained.executable_name")?;
+        if let Some(content_digest) = &executable.content_digest {
+            text_field(content_digest, "retained.executable.content_digest")?;
+        }
+    }
+    if let Some(environment) = &retained.environment {
+        text_field(&environment.platform, "retained.environment.platform")?;
+        if let Some(installation_id) = &environment.installation_id {
+            text_field(installation_id, "retained.environment.installation_id")?;
+        }
+    }
+    Ok(())
 }
 
 /// Derives the installed-route stage receipt from the retained runtime receipt.

@@ -25,14 +25,14 @@ use eliot_kernel_core::{
 use eliot_store_api::epistemic_revision::{EpistemicCommit, position_key};
 use eliot_store_api::{
     AUTOMATION_QUERY_CURRENT, AUTOMATION_QUERY_FAILURE, AUTOMATION_QUERY_HISTORY,
-    AUTOMATION_QUERY_INVOCATIONS, AUTOMATION_QUERY_LIST, AUTOMATION_STATE_RETIRED,
-    CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, CommitId,
-    DecodedAutomationMutation, DecodedNotificationMutation, DecodedReactiveMutation,
-    ERASURE_PARAM_DEADLINE_UNIX_MS, ERASURE_PARAM_ENCRYPTION_KEY_REF, ERASURE_PARAM_OPERATION_ID,
-    ERASURE_PARAM_PAYLOAD_REF, ERASURE_PARAM_SUBJECT, ERASURE_PARAM_SURFACES,
-    EVIDENCE_PACK_MAX_RECORDS, EventId, EventProjectionRelationIntents, MAX_RECOVERY_RECORD_BYTES,
-    NamedMutationOperation, NamedReadOperation, NamedReadRequest, NamedReadResponse,
-    OWNER_SNAPSHOT_SCHEMA, OperationId, OperationManifestDigest, OrderingHead,
+    AUTOMATION_QUERY_INVOCATIONS, AUTOMATION_QUERY_LIST, AUTOMATION_QUERY_NORMALIZATION,
+    AUTOMATION_STATE_RETIRED, CanonicalRequestView, CanonicalStoreClient,
+    CanonicalValidationSnapshot, CommitId, DecodedAutomationMutation, DecodedNotificationMutation,
+    DecodedReactiveMutation, ERASURE_PARAM_DEADLINE_UNIX_MS, ERASURE_PARAM_ENCRYPTION_KEY_REF,
+    ERASURE_PARAM_OPERATION_ID, ERASURE_PARAM_PAYLOAD_REF, ERASURE_PARAM_SUBJECT,
+    ERASURE_PARAM_SURFACES, EVIDENCE_PACK_MAX_RECORDS, EventId, EventProjectionRelationIntents,
+    MAX_RECOVERY_RECORD_BYTES, NamedMutationOperation, NamedReadOperation, NamedReadRequest,
+    NamedReadResponse, OWNER_SNAPSHOT_SCHEMA, OperationId, OperationManifestDigest, OrderingHead,
     OrderingHeadExpectation, OrderingScopeId, OutboxId, OutboxIntent, OutboxState,
     PreparedTransition, ProjectionMode, ProjectionPublicationId, ProjectionPublicationRecord,
     ProjectionStatus, RecoveryRecord, RecoveryRecordKey, RequestMeta, Resubmission, RevisionDelta,
@@ -41,13 +41,13 @@ use eliot_store_api::{
     StoreRecoveryRequest, StoreRecoverySnapshot, TransitionClass, WriteReceipt, WriteReceiptStatus,
     audit_heads_digest, bind_issue18_receipt, bind_policy_config_schema_versions,
     canonical_json_bytes, canonical_request_hash, decode_automation_mutation,
-    decode_erasure_surfaces, decode_notification_mutation, decode_reactive_mutation,
-    decode_resource_content, generated_operation_manifests, genesis_manifest, genesis_transition,
-    is_genesis_fence, issue_genesis_receipt_envelope, issue_store_receipt_envelope,
-    named_mutation_operation_name, sha256_hex, validate_automation_read_params,
-    validate_genesis_receipt_envelope, validate_reactive_ledger_read_params,
-    validate_resource_snapshot_read_params, validate_store_receipt_envelope,
-    verify_canonical_request_hash, verify_ordering_scope_binding,
+    decode_erasure_surfaces, decode_instrument_registry_mutation, decode_notification_mutation,
+    decode_reactive_mutation, decode_resource_content, generated_operation_manifests,
+    genesis_manifest, genesis_transition, is_genesis_fence, issue_genesis_receipt_envelope,
+    issue_store_receipt_envelope, named_mutation_operation_name, sha256_hex,
+    validate_automation_read_params, validate_genesis_receipt_envelope,
+    validate_reactive_ledger_read_params, validate_resource_snapshot_read_params,
+    validate_store_receipt_envelope, verify_canonical_request_hash, verify_ordering_scope_binding,
 };
 use schemars::JsonSchema;
 use serde::de::Error as _;
@@ -397,6 +397,12 @@ impl MemoryStore {
         // the learning legs and before the receipt is built, so the row, the
         // receipt, and the outbox intents still commit atomically below.
         dispatch_apply_capability_evidence(&mut state, &transition, &mut plan)?;
+        // Issue #1814 W1.2: admitted instrument-registry legs execute here,
+        // beside the capability-evidence legs and before the receipt is
+        // built, so the receipt's outbox references include the appended
+        // instrument-registry outbox intents. Head, receipt, and outbox
+        // still commit atomically below.
+        dispatch_apply_instrument_registry_state(&mut state, &transition, &mut plan)?;
         dispatch_apply_module_registry_snapshot(&mut state, &transition)?;
         dispatch_apply_finish_evidence(&mut state, &transition)?;
         dispatch_apply_finish_decision(&mut state, &transition)?;
@@ -1093,6 +1099,90 @@ fn dispatch_apply_reactive_state(
     Ok(())
 }
 
+/// Executes admitted instrument-registry legs on already-locked state
+/// (issue #1814 W1.2).
+///
+/// Runs beside [`dispatch_apply_reactive_state`] under the same lock as
+/// the receipt commit: one identity, one receipt, recoverable replay
+/// without duplicate work. Each apply replaces the singleton snapshot
+/// head verbatim with a bumped store revision; the bytes stay opaque
+/// here (the store never interprets instrument admission) and each
+/// command appends one outbox intent bound to the resulting bytes, so
+/// the head and its outbox intents commit atomically via
+/// [`commit_transaction`]. Non-instrument transitions are a no-op here.
+fn dispatch_apply_instrument_registry_state(
+    state: &mut MemoryState,
+    transition: &PreparedTransition,
+    plan: &mut TransactionPlan,
+) -> Result<(), StoreError> {
+    let has_instrument_op = transition
+        .named_operations
+        .iter()
+        .any(|command| command.operation == NamedMutationOperation::ApplyInstrumentRegistryState);
+    if !has_instrument_op {
+        return Ok(());
+    }
+    if transition.transition_class != TransitionClass::InstrumentRegistry {
+        return Err(StoreError::TransitionClassExceeded);
+    }
+    let operation_key = transition.identity.operation_id.to_string();
+    let mut instrument_index = 0_usize;
+    for command in &transition.named_operations {
+        if command.operation != NamedMutationOperation::ApplyInstrumentRegistryState {
+            continue;
+        }
+        let snapshot_json = decode_instrument_registry_mutation(&command.parameters)?;
+        let revision = match state.instrument_registry.as_ref() {
+            Some(existing) => {
+                if existing.state_fence != transition.state_fence {
+                    return Err(StoreError::FenceMismatch);
+                }
+                existing
+                    .revision
+                    .checked_add(1)
+                    .ok_or(StoreError::InvalidField {
+                        field: "instrument_registry.revision",
+                        reason: "owner revision overflow",
+                    })?
+            }
+            None => 1,
+        };
+        let row = InstrumentRegistryRow {
+            snapshot_json: snapshot_json.clone(),
+            revision,
+            state_fence: transition.state_fence.clone(),
+            scope_id: transition.scope_id.to_string(),
+            task_id: transition.task_id.clone(),
+        };
+        state.instrument_registry = Some(row);
+        let row_json = serde_json::to_value(&snapshot_json)
+            .map_err(|error| StoreError::Serialization(error.to_string()))?;
+        let payload_digest = sha256_hex(
+            &canonical_json_bytes(&row_json)
+                .map_err(|error| StoreError::Serialization(error.to_string()))?,
+        );
+        let sequence = plan.next_outbox_sequence;
+        plan.next_outbox_sequence =
+            checked_increment(sequence, "outbox.sequence", "sequence overflow")?;
+        let outbox = OutboxIntent {
+            outbox_id: OutboxId::new(format!(
+                "outbox-{operation_key}-instrument-registry-{instrument_index}"
+            ))?,
+            operation_id: transition.identity.operation_id.clone(),
+            sequence,
+            payload_digest,
+            state_fence: transition.state_fence.clone(),
+            arrival_fence: format!("arrival-{operation_key}"),
+            claim_fence: None,
+            state: OutboxState::Arrived,
+        };
+        outbox.validate()?;
+        plan.outbox_records.push(outbox);
+        instrument_index = instrument_index.saturating_add(1);
+    }
+    Ok(())
+}
+
 /// Joins one revision-row address. Collision-free by the same
 /// control-character argument as the Surreal contour: neither half may
 /// contain `\x1f` per the wire contract.
@@ -1246,6 +1336,21 @@ fn apply_automation_leg(
             &occurrence_id,
             &failure,
             &failure_json,
+        ),
+        DecodedAutomationMutation::RetainNormalization {
+            automation_id,
+            revision,
+            revision_json,
+            normalization_request_json,
+            normalization_receipt_json,
+        } => retain_automation_normalization(
+            state,
+            transition,
+            automation_id,
+            revision,
+            revision_json,
+            normalization_request_json,
+            normalization_receipt_json,
         ),
     }
 }
@@ -1477,6 +1582,51 @@ fn retain_automation_revision(
                 },
             );
             Ok(())
+        }
+    }
+}
+
+/// Retains one immutable, owner-normalized revision independently of the
+/// activated automation revision and its current pointer.
+///
+/// The original revision/request bytes and generic validated receipt stay
+/// intact; the request is opaque and is never reconstructed from the result.
+/// The row is create-only over the exact automation/revision address; replay
+/// succeeds only when the content and the producing transition provenance
+/// are unchanged.
+fn retain_automation_normalization(
+    state: &mut MemoryState,
+    transition: &PreparedTransition,
+    automation_id: String,
+    revision: String,
+    revision_json: String,
+    normalization_request_json: String,
+    normalization_receipt_json: Value,
+) -> Result<Value, StoreError> {
+    let normalization_receipt_json =
+        validate_automation_normalization_envelope(Some(normalization_receipt_json))?
+            .ok_or(StoreError::InvalidReceipt)?;
+    let row = AutomationNormalizationRow {
+        automation_id,
+        revision,
+        revision_json,
+        normalization_request_json,
+        normalization_receipt_json,
+        operation_id: transition.identity.operation_id.to_string(),
+        idempotency_key: transition.identity.idempotency_key.clone(),
+        canonical_request_hash: transition.identity.canonical_request_hash.clone(),
+        state_fence: transition.state_fence.clone(),
+        scope_id: transition.scope_id.to_string(),
+        task_id: transition.task_id.clone(),
+    };
+    let key = automation_revision_key(&row.automation_id, &row.revision);
+    match state.automation_normalizations.get(&key) {
+        Some(existing) if existing != &row => Err(StoreError::IdentityConflict),
+        Some(existing) => serde_json::to_value(existing)
+            .map_err(|error| StoreError::Serialization(error.to_string())),
+        None => {
+            state.automation_normalizations.insert(key, row.clone());
+            serde_json::to_value(row).map_err(|error| StoreError::Serialization(error.to_string()))
         }
     }
 }
@@ -2364,6 +2514,30 @@ fn resource_snapshot_payload(
     }))
 }
 
+/// Builds the same-fence instrument-registry read payload (issue #1814 W1.2).
+///
+/// Same error contract as [`reactive_ledger_payload`]: parameters are
+/// pre-validated by the catalogue gate (this read declares none), and an
+/// absent head (or a head from another fence) projects explicit absence,
+/// never fabricated bytes. The snapshot travels verbatim (a JSON string),
+/// identically to the Surreal contour, so a readback is byte-identical to
+/// the admitted write.
+fn instrument_registry_payload(
+    state: &MemoryState,
+    _query: &NamedReadRequest,
+    fence: &StateFence,
+) -> Result<Value, serde_json::Error> {
+    let (snapshot_json, revision) = match state.instrument_registry.as_ref() {
+        Some(row) if row.state_fence == *fence => (json!(row.snapshot_json), row.revision),
+        _ => (Value::Null, 0),
+    };
+    serde_json::to_value(json!({
+        "snapshot_json": snapshot_json,
+        "revision": revision,
+        "state_fence": fence,
+    }))
+}
+
 /// Builds the same-fence, same-scope experience range payload (issue #223).
 ///
 /// Errors surface as serialization failures with the underlying message:
@@ -2691,6 +2865,51 @@ fn automation_state_payload(
     fence: &StateFence,
 ) -> Result<Value, StoreError> {
     let decoded = validate_automation_read_params(&query.parameters)?;
+    if decoded.query == AUTOMATION_QUERY_NORMALIZATION {
+        let automation_id = decoded
+            .automation_id
+            .as_deref()
+            .ok_or(StoreError::InvalidField {
+                field: "automation.automation_id",
+                reason: "exact automation selector is required",
+            })?;
+        let revision = decoded
+            .requested_revision
+            .as_deref()
+            .ok_or(StoreError::InvalidField {
+                field: "automation.revision",
+                reason: "exact revision selector is required",
+            })?;
+        let scope_id = query.scope_id.as_ref().ok_or(StoreError::InvalidField {
+            field: "scope_id",
+            reason: "normalization read requires scope_id",
+        })?;
+        let entries = state
+            .automation_normalizations
+            .get(&automation_revision_key(automation_id, revision))
+            .filter(|row| row.state_fence == *fence && row.scope_id == scope_id.as_str())
+            .map(|row| {
+                json!({
+                    "automation_id": row.automation_id,
+                    "revision": row.revision,
+                    "revision_json": row.revision_json,
+                    "normalization_request_json": row.normalization_request_json,
+                    "normalization_receipt_json": row.normalization_receipt_json,
+                    "operation_id": row.operation_id,
+                    "idempotency_key": row.idempotency_key,
+                    "canonical_request_hash": row.canonical_request_hash,
+                    "state_fence": row.state_fence,
+                    "scope_id": row.scope_id,
+                    "task_id": row.task_id,
+                })
+            })
+            .into_iter()
+            .collect::<Vec<_>>();
+        return Ok(json!({
+            "entries": entries,
+            "state_fence": fence,
+        }));
+    }
     let limit = usize::from(decoded.max_records.max(1));
     match decoded.query.as_str() {
         AUTOMATION_QUERY_LIST => {
@@ -4258,7 +4477,9 @@ impl MemoryStore {
     /// `notification_id` / `include_resolved` / `page_limit` / `cursor`
     /// selectors. Issue #1941 C4 adds `GetReactiveInjectionState` with its
     /// exact `session_id` selector and `GetResourceSnapshot` with its exact
-    /// `uri` selector. Issue #1779 adds `GetUserAutomationState` with its
+    /// `uri` selector. Issue #1814 W1.2 adds `GetInstrumentRegistryState`
+    /// with no selectors (the singleton snapshot head). Issue #1779 adds
+    /// `GetUserAutomationState` with its
     /// closed query discriminator and exact selectors. Issue #223 adds
     /// `GetExperienceBankRange` and `GetAgentFeedbackRange` with the
     /// `max_records` bound, scope-addressed through the request envelope.
@@ -4277,6 +4498,7 @@ impl MemoryStore {
                 | NamedReadOperation::GetNotificationState
                 | NamedReadOperation::GetReactiveInjectionState
                 | NamedReadOperation::GetResourceSnapshot
+                | NamedReadOperation::GetInstrumentRegistryState
                 | NamedReadOperation::GetUserAutomationState
                 | NamedReadOperation::GetExperienceBankRange
                 | NamedReadOperation::GetAgentFeedbackRange
@@ -4370,6 +4592,9 @@ impl MemoryStore {
             }
             NamedReadOperation::GetResourceSnapshot => {
                 resource_snapshot_payload(state, query, fence)
+            }
+            NamedReadOperation::GetInstrumentRegistryState => {
+                instrument_registry_payload(state, query, fence)
             }
             NamedReadOperation::GetExperienceBankRange => {
                 experience_range_payload(state, query, fence, true)
@@ -5316,6 +5541,20 @@ struct ResourceSnapshotRow {
     task_id: Option<String>,
 }
 
+/// One durable instrument-registry snapshot head: the verbatim opaque
+/// snapshot bytes with a store-issued revision, admission fence, and
+/// task-binding provenance (issue #1814 W1.2). The singleton head is
+/// replaced verbatim with a bumped revision on each admitted apply; the
+/// store never interprets instrument admission.
+#[derive(Clone, Debug, PartialEq)]
+struct InstrumentRegistryRow {
+    snapshot_json: String,
+    revision: u64,
+    state_fence: StateFence,
+    scope_id: String,
+    task_id: Option<String>,
+}
+
 /// One immutable experience-bank row: the verbatim Governor-admitted
 /// record document for one handle + owner revision with its presented
 /// digest, admission fence, and task-binding provenance (issue #223).
@@ -5406,6 +5645,27 @@ struct AutomationRevisionRow {
     task_id: Option<String>,
 }
 
+/// One independently retained immutable normalization result keyed by
+/// `(automation_id, revision)`. It preserves the exact revision, original
+/// request, and receipt carried by the admitted retention transition plus
+/// that transition's original identity and applicability metadata. The
+/// request bytes preserve the original authenticated input, including its
+/// legacy predecessor and historical request metadata.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct AutomationNormalizationRow {
+    automation_id: String,
+    revision: String,
+    revision_json: String,
+    normalization_request_json: String,
+    normalization_receipt_json: Value,
+    operation_id: String,
+    idempotency_key: String,
+    canonical_request_hash: String,
+    state_fence: StateFence,
+    scope_id: String,
+    task_id: Option<String>,
+}
+
 /// One current automation pointer: the revision an automation names plus
 /// the closed admission state, fence, and provenance (issue #1779).
 #[derive(Clone, Debug, PartialEq)]
@@ -5488,6 +5748,10 @@ struct MemoryState {
     /// revision documents, driven only through the closed automation legs
     /// under the held transaction lock.
     automation_revisions: BTreeMap<String, AutomationRevisionRow>,
+    /// Independently immutable owner-normalized records keyed by joined
+    /// `(automation_id, revision)`. These records do not activate a schedule,
+    /// move its current pointer, or enter occurrence history.
+    automation_normalizations: BTreeMap<String, AutomationNormalizationRow>,
     /// Current automation pointers keyed by automation (issue #1779).
     /// Compare-and-set revision plus closed admission state, driven only
     /// through the closed automation legs under the held transaction lock.
@@ -5538,6 +5802,11 @@ struct MemoryState {
     /// `revision` the fenced CAS advances, which is the owner-issued
     /// immutable revision the Governor registry orders same-key evidence by.
     capability_evidence_rows: BTreeMap<RecoveryRecordKey, CapabilityEvidenceRow>,
+    /// Durable instrument-registry snapshot head (issue #1814 W1.2).
+    /// Verbatim opaque snapshot bytes with a store-issued revision, driven
+    /// only through the closed instrument-registry legs under the held
+    /// transaction lock.
+    instrument_registry: Option<InstrumentRegistryRow>,
     next_commit_sequence: u64,
     next_outbox_sequence: u64,
 }
@@ -5569,6 +5838,7 @@ impl PartialEq for MemoryState {
             && self.reactive_sessions == other.reactive_sessions
             && self.resource_snapshots == other.resource_snapshots
             && self.automation_revisions == other.automation_revisions
+            && self.automation_normalizations == other.automation_normalizations
             && self.automation_currents == other.automation_currents
             && self.automation_invocations == other.automation_invocations
             && self.automation_failures == other.automation_failures
@@ -5577,6 +5847,7 @@ impl PartialEq for MemoryState {
             && self.experience_feedback_rows == other.experience_feedback_rows
             && self.learning_record_rows == other.learning_record_rows
             && self.capability_evidence_rows == other.capability_evidence_rows
+            && self.instrument_registry == other.instrument_registry
             && self.next_commit_sequence == other.next_commit_sequence
             && self.next_outbox_sequence == other.next_outbox_sequence
             && self.notifications.iter().collect::<Vec<_>>()
@@ -5610,6 +5881,7 @@ impl Default for MemoryState {
             reactive_sessions: BTreeMap::new(),
             resource_snapshots: BTreeMap::new(),
             automation_revisions: BTreeMap::new(),
+            automation_normalizations: BTreeMap::new(),
             automation_currents: BTreeMap::new(),
             automation_invocations: BTreeMap::new(),
             automation_failures: BTreeMap::new(),
@@ -5622,6 +5894,7 @@ impl Default for MemoryState {
             experience_feedback_rows: BTreeMap::new(),
             learning_record_rows: BTreeMap::new(),
             capability_evidence_rows: BTreeMap::new(),
+            instrument_registry: None,
             next_commit_sequence: 1,
             next_outbox_sequence: 1,
         }
@@ -5646,8 +5919,10 @@ impl MemoryState {
             && self.reactive_sessions.is_empty()
             && self.resource_snapshots.is_empty()
             && self.automation_revisions.is_empty()
+            && self.automation_normalizations.is_empty()
             && self.automation_currents.is_empty()
             && self.automation_invocations.is_empty()
+            && self.instrument_registry.is_none()
     }
 
     fn snapshot(&self) -> MemorySnapshot {
@@ -6849,7 +7124,7 @@ mod tests {
     fn exact_replay_binds_recomputed_digest_and_is_byte_identical() -> Result<(), StoreError> {
         // Proves cross-crate stability: the store recompute uses the same
         // shared helper as Slice A (golden vector
-        // `55e62e405f35c7f137fe9fcdf177c66a1cba54a5b75fb547deaa11f001a89ec1`
+        // `21b8b2be1415dae7f905e202725e0eb02c953d06afef64a946db7d2a19bd601c`
         // is produced by `canonical_request_hash` in `eliot-store-api`).
         // Here the memory path binds its own recomputed digest and replays
         // byte-identically.

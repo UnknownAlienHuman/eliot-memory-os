@@ -51,11 +51,13 @@ use eliot_contracts::{
     StateFence, canonical_json_bytes, sha256_hex,
 };
 use eliot_mcp::{
-    ApplicationRequest, HostCancellationPortOutcome, HostCancellationRequest,
-    HostInvocationPortOutcome, HostInvocationRequest, HostOperationHandle, KernelGovernorPort,
-    KernelHostRequestPort, MAX_HOST_DEADLINE_PREFERENCE_MS, McpCore, McpResponse, PortFailure,
-    QueryInput, QueryIntent, QueryMode, RequestSecurityContext, ResponseKind, ToolRequest,
-    TransportRequestContext, plan_evidence_pack_query, project_evidence_pack_projection,
+    ApplicationRequest, ClientCapabilities, HostCancellationPortOutcome, HostCancellationRequest,
+    HostCorrelationId, HostInvocationPortOutcome, HostInvocationRequest, HostObservedContext,
+    HostOperationHandle, KernelGovernorPort, KernelHostRequestPort,
+    MAX_HOST_DEADLINE_PREFERENCE_MS, McpCore, McpProtocolVersion, McpResponse, NoProviderPort,
+    PortFailure, QueryInput, QueryIntent, QueryMode, RequestSecurityContext, ResponseKind,
+    ToolRequest, TransportProfile, TransportRequestContext, plan_evidence_pack_query,
+    project_evidence_pack_projection,
 };
 use eliot_ors::{
     CONTRACT_VERSION as ORS_CONTRACT_VERSION, HostRequestKind as OrsHostRequestKind,
@@ -693,9 +695,15 @@ impl<'a, P: KernelGovernorPort + ?Sized> KernelHostRequestBinder<'a, P> {
 
     /// Builds the Kernel-owned application request for one admitted envelope.
     ///
-    /// Every identity comes from the envelope or the authenticated session.
-    /// The host DTO contributes only the validated tool payload and
-    /// presentation-only client capabilities.
+    /// Every identity comes from the envelope or the authenticated session,
+    /// except the absolute deadline, which the Kernel derives at admission:
+    /// the validated host preference is clamped to
+    /// `MAX_HOST_DEADLINE_PREFERENCE_MS` and added to the Kernel admission
+    /// clock (`now_ms`), never copied from the Bridge-stamped envelope sum.
+    /// An absent preference keeps the admitted envelope absolute capped at
+    /// the same Kernel-owned ceiling. The host DTO otherwise contributes
+    /// only the validated tool payload and presentation-only client
+    /// capabilities.
     fn build_application(
         &self,
         request: &HostInvocationRequest,
@@ -732,13 +740,30 @@ impl<'a, P: KernelGovernorPort + ?Sized> KernelHostRequestBinder<'a, P> {
             .map_err(|_| PortFailure::TransportBindingRejected {
                 reason: "kernel request metadata is invalid; re-attach".to_owned(),
             })?;
+        // Issue #77 W2: the absolute deadline is Kernel-owned. The admitted
+        // preference is clamped to the Kernel-admitted maximum and added to
+        // the Kernel admission clock, never copied from the Bridge-stamped
+        // envelope sum. An absent preference (e.g. the read leg, which
+        // presents no new preference) keeps the admitted envelope absolute
+        // capped at the same Kernel-owned ceiling, so repeated invokes can
+        // never hold an operation open beyond Kernel policy.
+        let kernel_deadline_unix_ms = match request.deadline_preference_ms {
+            Some(preference) => {
+                check_deadline_preference(Some(preference))?;
+                now_ms.saturating_add(preference.min(MAX_HOST_DEADLINE_PREFERENCE_MS))
+            }
+            None => envelope
+                .identity
+                .deadline_unix_ms
+                .min(now_ms.saturating_add(MAX_HOST_DEADLINE_PREFERENCE_MS)),
+        };
         let identity = RequestIdentity {
             request: RequestBinding {
                 metadata,
                 state_fence: self.session.state_fence().clone(),
             },
             idempotency_key: envelope.identity.idempotency_key.clone(),
-            deadline_unix_ms: envelope.identity.deadline_unix_ms,
+            deadline_unix_ms: kernel_deadline_unix_ms,
             cancellation_id: envelope.identity.cancellation_id.clone(),
         };
         identity
@@ -889,6 +914,147 @@ impl<P: KernelGovernorPort + ?Sized> KernelHostRequestPort for KernelHostRequest
             | HostRequestState::Conflicted
             | HostRequestState::Cancelled
             | HostRequestState::Terminal => Ok(HostCancellationPortOutcome::AlreadyTerminal),
+        }
+    }
+}
+
+/// Production binder-leg disposition for one admitted invoke-read envelope
+/// (issue #77 W2).
+///
+/// Closed ternary: the full [`PortFailure`] stays inside this crate, while a
+/// caller outside the MCP surface (the Kernel frame path) branches through
+/// [`HostBinderLegDisposition::is_dispatched`] without naming port types. The
+/// caller keeps its existing serve path on both non-dispatched variants; only
+/// `Dispatched` changes downstream handling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostBinderLegDisposition {
+    /// The owner leg dispatched the admitted operation and stored its bounded
+    /// answer through the single ORS durability owner.
+    Dispatched,
+    /// The fail-closed owner gap stands: no admitted Governor provider is
+    /// injected, so the existing serve path applies unchanged.
+    OwnerGap,
+    /// The leg rejected before dispatch (validation, linkage, admission, or
+    /// deadline). The caller's own admission verdict stands.
+    Rejected,
+}
+
+impl HostBinderLegDisposition {
+    /// Returns whether the owner leg dispatched and stored the bounded answer.
+    ///
+    /// The only branch the frame-path caller acts on: a dispatched operation
+    /// must be served from the owner-stored record, never queued twice.
+    #[must_use]
+    pub const fn is_dispatched(self) -> bool {
+        matches!(self, Self::Dispatched)
+    }
+}
+
+/// Fail-closed owner for the admitted bind/dispatch leg (issue #77 W2). It
+/// carries no state, so a promoted const borrow outlives any single frame
+/// where a local borrow cannot satisfy the binder lifetime unified with the
+/// caller's store borrow.
+const NO_PROVIDER_OWNER: NoProviderPort = NoProviderPort;
+
+impl<'a> KernelHostRequestBinder<'a, NoProviderPort> {
+    /// Runs the Kernel-owned bind/dispatch leg for one admitted invoke-read
+    /// envelope (issue #77 W2).
+    ///
+    /// Production construction and production entry for
+    /// [`KernelHostRequestBinder::invoke_admitted`]: derives the host DTO from
+    /// the admitted envelope plus the presented canonical tool bytes with
+    /// existing serde and validators only, binds [`AuthenticatedHostSession`]
+    /// from live Kernel state, and runs the envelope path with the existing
+    /// fail-closed owner port ([`NoProviderPort`]) and the single ORS
+    /// durability owner. No second identity scheme exists here: the envelope
+    /// digest is proven with the existing [`HostRequestEnvelope::validate`],
+    /// the tool linkage is re-proven with the existing gate before
+    /// [`McpCore`] dispatch, and [`McpCore`] remains the sole semantic
+    /// dispatcher.
+    ///
+    /// Every derived value comes from Kernel-retained state or the admitted
+    /// envelope, never from new caller authority:
+    /// - transport profile is [`TransportProfile::Stdio`]: this front door is
+    ///   the documented stdio-shim bridge (I1.3), and the frame path carries
+    ///   no loopback-HTTP profile;
+    /// - connection identity is the admitted envelope's connection, already
+    ///   joined to the retained presenting Session by the frame gateway;
+    /// - transport generation is the retained admission descriptor's
+    ///   generation: the exact value [`AuthenticatedHostSession::bind`]
+    ///   compares against live activation lineage, presented by the Kernel
+    ///   from its own retained state rather than accepted as a caller claim;
+    /// - the credential scope reference is that same retained connection
+    ///   identity: the stdio profile carries no separate credential sheath,
+    ///   and the reference names the admitted connection whose credential
+    ///   material is the retained peer admission (peer proof, descriptor,
+    ///   receipt) resolvable through the Kernel's existing connection table —
+    ///   never raw secret data;
+    /// - the host DTO contributes only the validated tool payload and
+    ///   presentation-only defaults: correlation re-encoded from the admitted
+    ///   projection (which the contract requires to equal the correlation
+    ///   text), the single-variant protocol profile [`McpCore`] admits,
+    ///   default client capabilities, no new deadline preference (the absolute
+    ///   deadline travels in the Kernel-enforced envelope), and an empty
+    ///   non-authoritative observation context.
+    ///
+    /// With [`NoProviderPort`] — the existing production fail-closed owner —
+    /// dispatch ends in the typed plan gap and maps to
+    /// [`HostBinderLegDisposition::OwnerGap`]; the caller keeps its existing
+    /// serve path per the fail-closed capability-gap contract. When a real
+    /// Governor port is injected, this same leg dispatches for real with no
+    /// call-site change. Only `Invocation` envelopes carrying presented tool
+    /// bytes can run this leg: digest-only submits name no bytes to link, so
+    /// their linkage owner stays the route's invoke-read payload gate.
+    pub fn run_admitted_read_leg(
+        service: &KernelService,
+        store: &'a dyn OperationalRecoveryStore,
+        admission: &AgentBridgeAdmissionDescriptor,
+        connection_id: &str,
+        envelope: &HostRequestEnvelope,
+        peer_receipt: &AgentBridgePeerAdmissionReceipt,
+        tool: &serde_json::Value,
+    ) -> HostBinderLegDisposition {
+        if !matches!(envelope.kind, HostRequestKind::Invocation) {
+            return HostBinderLegDisposition::Rejected;
+        }
+        if envelope.validate().is_err() {
+            return HostBinderLegDisposition::Rejected;
+        }
+        let decoded_tool: ToolRequest = match serde_json::from_value(tool.clone()) {
+            Ok(tool) => tool,
+            Err(_) => return HostBinderLegDisposition::Rejected,
+        };
+        let Some(projection) = envelope.identity.correlation_projection.clone() else {
+            return HostBinderLegDisposition::Rejected;
+        };
+        let Ok(correlation_id) = HostCorrelationId::new(projection.occurrence_text()) else {
+            return HostBinderLegDisposition::Rejected;
+        };
+        let request = HostInvocationRequest {
+            protocol_version: McpProtocolVersion::default(),
+            correlation_id,
+            correlation_projection: Some(projection),
+            client_capabilities: ClientCapabilities::default(),
+            tool: decoded_tool,
+            deadline_preference_ms: None,
+            observed_context: HostObservedContext::default(),
+        };
+        let transport = TransportRequestContext {
+            profile: TransportProfile::Stdio,
+            connection_id: connection_id.to_owned(),
+            scoped_credential_ref: connection_id.to_owned(),
+            transport_generation: admission.generation.value(),
+        };
+        let Ok(session) = AuthenticatedHostSession::bind(service, admission, transport) else {
+            return HostBinderLegDisposition::Rejected;
+        };
+        let mut binder = Self::new(session, &NO_PROVIDER_OWNER, store);
+        match binder.invoke_admitted(service, envelope, peer_receipt, None, &request) {
+            Ok(HostInvocationPortOutcome::Responded { .. }) => HostBinderLegDisposition::Dispatched,
+            Ok(HostInvocationPortOutcome::Accepted { .. }) | Err(PortFailure::PlanGap { .. }) => {
+                HostBinderLegDisposition::OwnerGap
+            }
+            Err(_) => HostBinderLegDisposition::Rejected,
         }
     }
 }

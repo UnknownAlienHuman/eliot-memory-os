@@ -5494,7 +5494,7 @@ pub fn prepare_native_worker_launch(
         ));
     }
     let receipt = match response {
-        NativeWorkerClaimResponse::Admitted(receipt) => receipt,
+        NativeWorkerClaimResponse::Admitted(receipt) => *receipt,
         refused => return Ok(PreparedNativeWorkerLaunch::Refused(Box::new(refused))),
     };
     require_digest(

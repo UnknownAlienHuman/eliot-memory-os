@@ -39,7 +39,8 @@ use eliot_authority::{
     GrantClosureDelegation, GrantGraphRecoverySnapshot, GrantId, GrantRecoveryRecord, GrantStatus,
     MechanicalAuthoritySubset, MechanicalSubsetConstraints, QuarantineEnforcementRef,
     QuarantineEvidenceStatus, RevocationClosureState, RevocationClosureVerdict,
-    RevocationHistoryEvidence, RevocationOperationIdentity, VerifiedQuarantineBinding,
+    RevocationHistoryEvidence, RevocationOperationIdentity, RootTransitionRecord,
+    VerifiedQuarantineBinding,
 };
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_influence::RevocationBounds;
@@ -94,6 +95,20 @@ pub struct OwnerClosureProvider {
     /// the authentic receipt map. Presented evidence is never retained
     /// here: retaining a claim would certify it vacuously.
     retained_quarantine_decisions: BTreeMap<String, CrossRootQuarantineEvidence>,
+    /// Typed retained semantic **transition** decisions keyed by semantic
+    /// decision reference, supplied by the durable boundary only.
+    ///
+    /// A crossing is admitted only when the decision its record names resolves
+    /// here and is byte-identical to that record, so this map is the
+    /// owner-readback half of
+    /// [`CurrentTransitionReadback`](eliot_authority::CurrentTransitionReadback)
+    /// the activation boundary reads. The same durable-boundary-only rule as
+    /// the quarantine decisions above applies unchanged: presented transition
+    /// evidence is never retained here, because retaining a claim would
+    /// certify it vacuously. An owner that retains nothing under a record's
+    /// reference leaves that crossing unretained, and the readback refuses it
+    /// as typed stale evidence rather than admitting it.
+    retained_transition_decisions: BTreeMap<String, RootTransitionRecord>,
     /// Exact retained mechanical enforcement results keyed by durable ORS
     /// record reference, supplied by the durable boundary only. A claimed
     /// ORS reference must resolve here before any receipt readback can
@@ -356,7 +371,9 @@ impl OwnerClosureProvider {
     /// happens per verdict and per explicit admission, never at restore.
     /// No retained semantic decisions are supplied, so presented evidence
     /// proves nothing yet: verdicts stay partial and the fencing gate
-    /// refuses until the retained readback facts arrive.
+    /// refuses until the retained readback facts arrive. The same holds for
+    /// retained transition decisions: this entry point retains none, so a
+    /// crossing read back here stays unretained and refuses.
     pub fn restore_with_quarantine_evidence(
         snapshot: AuthorityOwnerSnapshot,
         history: Option<RevocationHistoryEvidence>,
@@ -373,16 +390,25 @@ impl OwnerClosureProvider {
             quarantine_evidence,
             BTreeMap::new(),
             BTreeMap::new(),
+            BTreeMap::new(),
             operation,
         )
     }
 
     /// Restores the provider with canonical second-phase links, owner
-    /// quarantine evidence records, and the retained semantic decisions
-    /// plus exact enforcement results read from the durable boundary.
-    /// Evidence shape and map identity are proven here; CURRENT
-    /// qualification happens per verdict and per explicit admission,
+    /// quarantine evidence records, and the retained semantic quarantine and
+    /// transition decisions plus exact enforcement results read from the
+    /// durable boundary. Evidence shape and map identity are proven here;
+    /// CURRENT qualification happens per verdict and per explicit admission,
     /// never at restore.
+    ///
+    /// `retained_transition_decisions` is owner readback, not request
+    /// material: it is keyed by the exact semantic decision reference a
+    /// transition record names, and the admission boundary still requires the
+    /// retained decision to be byte-identical to the presented record. A
+    /// caller with no durable transition owner supplies none, and a reference
+    /// that then fails to resolve refuses as stale evidence rather than
+    /// admitting the crossing.
     ///
     /// `operation` is the admitted revocation operation identity the origin-
     /// bound closure recheck and every served closure verdict run under. It
@@ -394,7 +420,7 @@ impl OwnerClosureProvider {
     /// sparse, identity may not be absent.
     #[allow(
         clippy::too_many_arguments,
-        reason = "the retained restore carries the snapshot, history, fence, canonical second-phase links, quarantine evidence, retained semantic decisions and the admitted operation identity as one fail-closed construction"
+        reason = "the retained restore carries the snapshot, history, fence, canonical second-phase links, quarantine evidence, retained semantic quarantine and transition decisions and the admitted operation identity as one fail-closed construction"
     )]
     pub fn restore_with_retained_quarantine_decisions(
         snapshot: AuthorityOwnerSnapshot,
@@ -403,12 +429,14 @@ impl OwnerClosureProvider {
         canonical_receipts: BTreeMap<String, ReceiptIdentity>,
         quarantine_evidence: BTreeMap<String, CrossRootQuarantineEvidence>,
         retained_quarantine_decisions: BTreeMap<String, CrossRootQuarantineEvidence>,
+        retained_transition_decisions: BTreeMap<String, RootTransitionRecord>,
         retained_quarantine_enforcements: BTreeMap<String, QuarantineEnforcementRef>,
         operation: RevocationOperationIdentity,
     ) -> Result<Self, CompositionError> {
         validate_canonical_receipt_links(&canonical_receipts)?;
         validate_quarantine_evidence_links(&quarantine_evidence)?;
         validate_retained_decision_links(&retained_quarantine_decisions)?;
+        validate_retained_transition_decision_links(&retained_transition_decisions)?;
         validate_retained_enforcement_links(&retained_quarantine_enforcements)?;
         snapshot.validate()?;
         if snapshot.state_fence != *expected_fence {
@@ -466,6 +494,7 @@ impl OwnerClosureProvider {
             canonical_receipts,
             quarantine_evidence,
             retained_quarantine_decisions,
+            retained_transition_decisions,
             retained_quarantine_enforcements,
             admitted_operation: operation,
         };
@@ -1048,8 +1077,8 @@ impl OwnerClosureProvider {
     /// the provider revision: durable snapshot, CURRENT history, admitted
     /// members, roots, introductions, preserved survivors, canonical
     /// receipts, the typed quarantine evidence map, and the retained
-    /// semantic decisions plus exact enforcement results the mirror
-    /// revalidates against.
+    /// semantic quarantine and transition decisions plus exact enforcement
+    /// results the mirror revalidates against.
     ///
     /// A fully closed graph may legitimately have no current grant hydrations;
     /// its graph roots and durable history still reach the Kernel so revoked
@@ -1091,6 +1120,7 @@ impl OwnerClosureProvider {
             canonical_receipts: self.canonical_receipts.clone(),
             quarantine_evidence: self.quarantine_evidence.clone(),
             retained_quarantine_decisions: self.retained_quarantine_decisions.clone(),
+            retained_transition_decisions: self.retained_transition_decisions.clone(),
             retained_quarantine_enforcements: self.retained_quarantine_enforcements.clone(),
         })
     }
@@ -2022,6 +2052,40 @@ fn validate_retained_decision_links(
         {
             return Err(CompositionError::Recovery(
                 "retained quarantine decision operation identity is bound to more than one decision"
+                    .to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validates owner-retained semantic transition decisions before the restore
+/// becomes a trust anchor: map identity against the semantic decision
+/// reference, closed structural shape, and operation identity uniqueness.
+/// CURRENT qualification is proven per admission against the live owner
+/// readback, never here, and an empty map is the honest state of an owner
+/// that retains no decision: it never resolves a reference, so a crossing
+/// read back against it refuses instead of being admitted.
+fn validate_retained_transition_decision_links(
+    links: &BTreeMap<String, RootTransitionRecord>,
+) -> Result<(), CompositionError> {
+    let mut operation_ids = BTreeSet::new();
+    let mut idempotency_keys = BTreeSet::new();
+    for (decision_ref, retained) in links {
+        if decision_ref != &retained.semantic_decision_ref {
+            return Err(CompositionError::Recovery(
+                "retained transition decision map key disagrees with the decision reference"
+                    .to_owned(),
+            ));
+        }
+        retained
+            .validate_shape()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if !operation_ids.insert(retained.operation_id.clone())
+            || !idempotency_keys.insert(retained.idempotency_key.clone())
+        {
+            return Err(CompositionError::Recovery(
+                "retained transition decision operation identity is bound to more than one decision"
                     .to_owned(),
             ));
         }

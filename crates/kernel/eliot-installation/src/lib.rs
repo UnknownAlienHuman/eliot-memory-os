@@ -163,7 +163,8 @@ pub use approved_generation_registry::{
     AgentBridgePreparedBinding, AgentBridgeSecurityContour, AgentBridgeStagePrepared,
     ApprovedGeneration, ApprovedGenerationRegistry, CommittedCutoverActivation,
     HostPhaseBPreparedMaterialization, PendingActivation, PendingActivationState,
-    PhaseBDigestState, PhaseBLiveBinding, phase_b_digest_state, phase_b_scm_selector,
+    PhaseBDigestState, PhaseBLiveBinding, UserBrokerPreparedBinding, phase_b_digest_state,
+    phase_b_scm_selector,
 };
 use approved_generation_registry::{
     ActiveVerifiedReceiptBinding, PendingActivationAbortReceipt, PendingActivationTerminal,
@@ -198,8 +199,8 @@ pub use managed_change_plan::{
 
 pub use survey::{
     InstallationSurvey, SurveyCandidate, SurveyFamilyReport, SurveyInputObservation,
-    SurveyObservationSource, SurveyProbeAdmission, SurveyProbeAnswer, SurveyStage,
-    SurveyStageOutcome, SurveyStageResult, survey_installation,
+    SurveyObservationSource, SurveyProbeAnswer, SurveyStage, SurveyStageOutcome, SurveyStageResult,
+    survey_installation,
 };
 
 pub use activation::{
@@ -10938,6 +10939,106 @@ where
         Ok(readback)
     }
 
+    /// Verifies the ordered Watchdog is an exact transaction-created
+    /// convergence for owner rollback, proved current by its own
+    /// authoritative readback.
+    ///
+    /// A Watchdog outside `Applied` needs no verification.  Otherwise the
+    /// readback must observe `Absent` with no lineage, `Absent` with the
+    /// recorded lineage, or `Matching` with the recorded identity and no
+    /// foreign lineage; any foreign or mismatched ownership refuses
+    /// fail-closed with `IdentityConflict`, and any residual unknown refuses
+    /// with `IncompleteObservation`.  The intent is kept in every refusal.
+    /// This never executes an effect: reconciliation is read-only.
+    fn verify_watchdog_convergence_for_owner_rollback(
+        &mut self,
+        transaction: &InstallationTransaction,
+        watchdog_index: usize,
+    ) -> Result<(), InstallationError> {
+        if let InstallationEffectProgressState::Applied {
+            disposition: InstallationEffectDisposition::CreatedByTransaction,
+            external_identity,
+            ..
+        } = &transaction.effect_progress[watchdog_index].state
+        {
+            let proof = transaction.effect_progress[watchdog_index]
+                .service_start_proof
+                .as_ref()
+                .ok_or(InstallationError::IdentityConflict)?;
+            let lineage = proof.process_lineage.as_ref().ok_or_else(|| {
+                InstallationError::IncompleteObservation(
+                    "service start reconciliation requires the transaction-created Watchdog process lineage"
+                        .to_owned(),
+                )
+            })?;
+            if transaction.effect_progress[watchdog_index]
+                .service_start_deadline_ms
+                .is_none()
+            {
+                return Err(InstallationError::IncompleteObservation(
+                    "service start reconciliation requires the transaction-created Watchdog start deadline"
+                        .to_owned(),
+                ));
+            }
+            transaction.recorded_service_registration_identity(InstallerServiceRole::Watchdog)?;
+            let request = effect_request(
+                transaction,
+                watchdog_index,
+                1,
+                InstallationEffectAction::Rollback,
+                Some(external_identity.clone()),
+            )?;
+            let observed = match self.port.reconcile(&request) {
+                PortOutcome::Known(observed) => {
+                    observed.validate()?;
+                    observed.validate_for_effect(&transaction.installer_effects[watchdog_index])?;
+                    observed
+                }
+                other => {
+                    return Err(InstallationError::IncompleteObservation(format!(
+                        "service start reconciliation stays unknown for effect {}: {}",
+                        transaction.effect_progress[watchdog_index]
+                            .effect_id
+                            .as_str(),
+                        port_pending(other).as_str(),
+                    )));
+                }
+            };
+            match observed {
+                InstallationEffectObservation::Absent {
+                    service_runtime_lineage: None,
+                    ..
+                } => {}
+                InstallationEffectObservation::Absent {
+                    service_runtime_lineage: Some(seen),
+                    ..
+                } if seen == *lineage => {}
+                InstallationEffectObservation::Matching {
+                    disposition: InstallationEffectDisposition::CreatedByTransaction,
+                    external_identity: seen,
+                    service_runtime_lineage,
+                    ..
+                } if seen == *external_identity => {
+                    if let Some(seen_lineage) = service_runtime_lineage
+                        && seen_lineage != *lineage
+                    {
+                        return Err(InstallationError::IdentityConflict);
+                    }
+                }
+                // A residual foreign lineage on an otherwise absent Watchdog and any
+                // foreign or mismatched Watchdog ownership share the same fail-closed
+                // disposition: the reconciliation can never adopt an unknown process,
+                // and the intent is kept for recovery/forward-repair.
+                InstallationEffectObservation::Absent { .. }
+                | InstallationEffectObservation::Matching { .. }
+                | InstallationEffectObservation::Mismatch { .. } => {
+                    return Err(InstallationError::IdentityConflict);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Recovery-only readback reconciliation for a first-install service-start
     /// timeout, called before the Host registry abort in
     /// `rollback_with_activation_owner`.
@@ -10945,10 +11046,14 @@ where
     /// `Activating` with the exact pending suffix needs no reconciliation and
     /// yields no indexes.  `RollbackRequired` with the retained intent yields
     /// the unsettled start indexes only after an authoritative port readback
-    /// observes every one of them `Absent`; the reset to `Pending` itself
+    /// observes every one of them `Absent`; the ordered Watchdog alone may
+    /// instead be an exact transaction-created convergence that is proved
+    /// current by its own authoritative readback and kept `Applied` for the
+    /// exact-effect rollback loop below.  The reset to `Pending` itself
     /// happens later inside the single intent-clearing CAS, so a failed
-    /// readback persists nothing and keeps the intent.  Any present service,
-    /// any residual unknown, or any contour outside the timeout shape refuses
+    /// readback persists nothing and keeps the intent.  Any present Host
+    /// service, any foreign/mismatched Watchdog ownership, any residual
+    /// unknown, or any contour outside the timeout shape refuses
     /// with recovery/forward-repair rather than quarantining or dropping the
     /// intent.  This never executes an effect: reconciliation is read-only.
     ///
@@ -10975,6 +11080,17 @@ where
             return Ok(Vec::new());
         }
         let candidates = transaction.recoverable_timeout_start_indexes()?;
+        if let Some(watchdog_index) = transaction.installer_effects.iter().position(|effect| {
+            matches!(
+                effect,
+                InstallerEffectPlan::StartService {
+                    role: InstallerServiceRole::Watchdog,
+                    ..
+                }
+            )
+        }) {
+            self.verify_watchdog_convergence_for_owner_rollback(transaction, watchdog_index)?;
+        }
         for index in &candidates {
             let role = match &transaction.installer_effects[*index] {
                 InstallerEffectPlan::StartService { role, .. } => *role,
