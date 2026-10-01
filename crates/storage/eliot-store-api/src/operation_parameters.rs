@@ -484,16 +484,31 @@ static RECORD_WORK_SCOPE_SNAPSHOT_PARAMETERS: [ParameterDeclaration; 3] = [
 ];
 /// The initial signed Config/Policy owner image, committed against both its
 /// prior named-owner revision and original canonical value digest.
-static RECORD_POLICY_SNAPSHOT_PARAMETERS: [ParameterDeclaration; 3] = [
+static RECORD_POLICY_SNAPSHOT_PARAMETERS: [ParameterDeclaration; 6] = [
     ParameterDeclaration {
-        name: "expected_policy_revision",
+        name: "expected_policy_state",
         shape: ParameterShape::Subject,
         required: true,
     },
     ParameterDeclaration {
+        name: "expected_policy_revision",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+    ParameterDeclaration {
         name: "expected_policy_digest",
         shape: ParameterShape::Subject,
-        required: true,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: "absence_read_response_json",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: "absence_read_response_sha256",
+        shape: ParameterShape::Subject,
+        required: false,
     },
     ParameterDeclaration {
         name: "snapshot_json",
@@ -1390,6 +1405,7 @@ pub const fn named_read_operation_name(operation: NamedReadOperation) -> &'stati
         NamedReadOperation::GetCapabilityEvidenceRecordRange => "GetCapabilityEvidenceRecordRange",
         NamedReadOperation::GetTaskContractAcceptanceSet => "GetTaskContractAcceptanceSet",
         NamedReadOperation::GetBlobProcessSourceAdmission => "GetBlobProcessSourceAdmission",
+        NamedReadOperation::GetPolicyOwnerSnapshot => "GetPolicyOwnerSnapshot",
     }
 }
 
@@ -1432,6 +1448,7 @@ pub const fn named_read_operation_by_name(name: &str) -> Option<NamedReadOperati
         }
         b"GetTaskContractAcceptanceSet" => Some(NamedReadOperation::GetTaskContractAcceptanceSet),
         b"GetBlobProcessSourceAdmission" => Some(NamedReadOperation::GetBlobProcessSourceAdmission),
+        b"GetPolicyOwnerSnapshot" => Some(NamedReadOperation::GetPolicyOwnerSnapshot),
         _ => None,
     }
 }
@@ -1595,6 +1612,7 @@ pub const fn declared_read_parameters(
         NamedReadOperation::GetBlobProcessSourceAdmission => {
             &GET_BLOB_PROCESS_SOURCE_ADMISSION_PARAMETERS
         }
+        NamedReadOperation::GetPolicyOwnerSnapshot => &NO_PARAMETERS,
         NamedReadOperation::GetRevisionHeads
         | NamedReadOperation::GetScopeRevisionView
         | NamedReadOperation::GetOrderingHeads

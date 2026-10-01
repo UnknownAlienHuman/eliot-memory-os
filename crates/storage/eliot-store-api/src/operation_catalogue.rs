@@ -286,7 +286,7 @@ struct ActivatedReadDescriptor {
 /// against (issue #325 P1, I7.9: the obligation set belongs to the task's own
 /// contract rather than to a caller's scope, and it must be read at one exact
 /// contract revision rather than at whatever happens to be current).
-const ACTIVATED_READS: [ActivatedReadDescriptor; 24] = [
+const ACTIVATED_READS: [ActivatedReadDescriptor; 25] = [
     ActivatedReadDescriptor {
         operation: NamedReadOperation::GetCurrentEpistemicPosition,
         requires_scope_id: true,
@@ -407,11 +407,16 @@ const ACTIVATED_READS: [ActivatedReadDescriptor; 24] = [
         requires_scope_id: false,
         scope_kind: SCOPE_KIND_NONE,
     },
+    ActivatedReadDescriptor {
+        operation: NamedReadOperation::GetPolicyOwnerSnapshot,
+        requires_scope_id: false,
+        scope_kind: SCOPE_KIND_NONE,
+    },
 ];
 
 /// Returns the activated read operations in canonical declaration order.
 #[must_use]
-pub const fn activated_read_operations() -> [NamedReadOperation; 24] {
+pub const fn activated_read_operations() -> [NamedReadOperation; 25] {
     [
         ACTIVATED_READS[0].operation,
         ACTIVATED_READS[1].operation,
@@ -437,6 +442,7 @@ pub const fn activated_read_operations() -> [NamedReadOperation; 24] {
         ACTIVATED_READS[21].operation,
         ACTIVATED_READS[22].operation,
         ACTIVATED_READS[23].operation,
+        ACTIVATED_READS[24].operation,
     ]
 }
 
@@ -1046,20 +1052,117 @@ fn validate_policy_snapshot_transition(
                 reason: "missing required text parameter",
             })
     };
-    let expected_revision = text("expected_policy_revision")?
-        .parse::<u64>()
-        .map_err(|_| StoreError::InvalidField {
-            field: "policy.expected_revision",
-            reason: "must be the exact non-zero decimal revision returned by the named owner read",
-        })?;
-    if expected_revision == 0 {
-        return Err(StoreError::InvalidField {
-            field: "policy.expected_revision",
-            reason: "must name the current non-zero Policy owner revision",
-        });
-    }
-    let expected_digest = text("expected_policy_digest")?;
-    validate_digest(expected_digest, "policy.expected_digest")?;
+    let optional_text = |name: &'static str| {
+        parameters
+            .get(name)
+            .map(|value| {
+                value.as_str().ok_or(StoreError::InvalidField {
+                    field: "policy.snapshot",
+                    reason: "optional parameter must be text",
+                })
+            })
+            .transpose()
+    };
+    let state = text("expected_policy_state")?;
+    let (expected_revision, expected_digest) = match state {
+        "physical_absence" => {
+            if optional_text("expected_policy_revision")?.is_some()
+                || optional_text("expected_policy_digest")?.is_some()
+            {
+                return Err(StoreError::InvalidField {
+                    field: "policy.expected_state",
+                    reason: "physical absence cannot carry revision or digest sentinels",
+                });
+            }
+            let response_json = optional_text("absence_read_response_json")?.ok_or(
+                StoreError::InvalidField {
+                    field: "policy.absence_read_response_json",
+                    reason: "physical absence requires the exact named-read response",
+                },
+            )?;
+            let response_digest = optional_text("absence_read_response_sha256")?.ok_or(
+                StoreError::InvalidField {
+                    field: "policy.absence_read_response_sha256",
+                    reason: "physical absence requires the exact response digest",
+                },
+            )?;
+            validate_digest(response_digest, "policy.absence_read_response_sha256")?;
+            let response_value: serde_json::Value = serde_json::from_str(response_json).map_err(|_| {
+                StoreError::InvalidField {
+                    field: "policy.absence_read_response_json",
+                    reason: "must be canonical named-read response JSON",
+                }
+            })?;
+            if !response_value.is_object()
+                || canonical_json_bytes(&response_value)
+                    .map_err(|error| StoreError::Serialization(error.to_string()))?
+                    != response_json.as_bytes()
+                || sha256_hex(response_json.as_bytes()) != response_digest
+            {
+                return Err(StoreError::InvalidField {
+                    field: "policy.absence_read_response_json",
+                    reason: "must match its canonical named-read response digest",
+                });
+            }
+            let response: NamedReadResponse = serde_json::from_value(response_value)
+                .map_err(|_| StoreError::InvalidField {
+                    field: "policy.absence_read_response_json",
+                    reason: "must be a closed named-read response",
+                })?;
+            if response.operation != NamedReadOperation::GetPolicyOwnerSnapshot
+                || response.state_fence != transition.state_fence
+            {
+                return Err(StoreError::InvalidField {
+                    field: "policy.absence_read_response_json",
+                    reason: "must be the exact policy-owner read under this transition fence",
+                });
+            }
+            let result: PolicyOwnerSnapshotReadResult = serde_json::from_value(response.payload)
+                .map_err(|_| StoreError::InvalidField {
+                    field: "policy.absence_read_response_json",
+                    reason: "must carry the typed policy owner lookup result",
+                })?;
+            result.validate(&transition.state_fence)?;
+            if !matches!(result, PolicyOwnerSnapshotReadResult::Absent { .. }) {
+                return Err(StoreError::InvalidField {
+                    field: "policy.absence_read_response_json",
+                    reason: "must prove physical owner-row absence",
+                });
+            }
+            (None, None)
+        }
+        "existing" => {
+            if optional_text("absence_read_response_json")?.is_some()
+                || optional_text("absence_read_response_sha256")?.is_some()
+            {
+                return Err(StoreError::InvalidField {
+                    field: "policy.expected_state",
+                    reason: "existing-row CAS cannot carry physical-absence proof",
+                });
+            }
+            let revision = text("expected_policy_revision")?
+                .parse::<u64>()
+                .map_err(|_| StoreError::InvalidField {
+                    field: "policy.expected_revision",
+                    reason: "must be the exact non-zero decimal revision returned by the named owner read",
+                })?;
+            if revision == 0 {
+                return Err(StoreError::InvalidField {
+                    field: "policy.expected_revision",
+                    reason: "must name the current non-zero Policy owner revision",
+                });
+            }
+            let digest = text("expected_policy_digest")?;
+            validate_digest(digest, "policy.expected_digest")?;
+            (Some(revision), Some(digest.to_owned()))
+        }
+        _ => {
+            return Err(StoreError::InvalidField {
+                field: "policy.expected_state",
+                reason: "must select physical_absence or existing",
+            });
+        }
+    };
     let snapshot_json = text("snapshot_json")?;
     let row: serde_json::Value =
         serde_json::from_str(snapshot_json).map_err(|_| StoreError::InvalidField {
@@ -1083,12 +1186,13 @@ fn validate_policy_snapshot_transition(
             field: "policy.revision",
             reason: "must be a positive integer",
         })?;
-    let next_revision = expected_revision
-        .checked_add(1)
-        .ok_or(StoreError::InvalidField {
+    let next_revision = match expected_revision {
+        Some(revision) => revision.checked_add(1).ok_or(StoreError::InvalidField {
             field: "policy.revision",
             reason: "revision overflow",
-        })?;
+        })?,
+        None => 1,
+    };
     let expected_fence = serde_json::to_value(&transition.state_fence)
         .map_err(|error| StoreError::Serialization(error.to_string()))?;
     if revision != next_revision || row.get("state_fence") != Some(&expected_fence) {
