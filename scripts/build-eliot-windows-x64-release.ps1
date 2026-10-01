@@ -979,7 +979,7 @@ function Resolve-GovernorApprovalContext([string]$Repo, [string]$SourceCommit, [
                 -not [string]::IsNullOrWhiteSpace($OwnerReceiptPath)) {
                 $receiptBytes = Read-GovernorRetirementDetachedBytes $OwnerReceiptPath ([string]$issuerReadback.receipt_sha256) 'detached owner retirement receipt'
                 $receiptVerification = Test-GovernorRetirementOwnerReceiptSignature `
-                    ([byte[]]$receiptBytes.bytes) $issuerReadback $trustPolicy.body $approvalInput.body $null
+                    ([byte[]]$receiptBytes.bytes) $issuerReadback $trustPolicy.body $approvalInput.body
             }
         }
         $issuer = Resolve-GovernorRetirementIssuer $trustPolicy.body `
