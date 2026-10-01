@@ -487,14 +487,17 @@ pub fn run_setup_apply(args: &SetupApplyArgs) -> Result<i32> {
 
 /// Runs `setup show`: inspects every default through the same typed path,
 /// reversibly. With a configured state file holding an applied decision,
-/// the stored decision is shown; otherwise the compiled-safe defaults are
-/// shown. A present-but-invalid state file fails closed.
+/// the stored decision is shown; with a configured state file but no applied
+/// decision yet, the compiled-safe defaults are shown labeled
+/// `never-configured` so they are never mistaken for applied state; without
+/// a configured state file, the compiled-safe defaults are shown as a
+/// projection. A present-but-invalid state file fails closed.
 pub fn run_setup_show() -> Result<i32> {
     let state_path = setup_state_path()?;
     let (decision, source, owner_ref) = match &state_path {
         Some(path) => match load_stored_decision(path)? {
             Some((decision, owner)) => (decision, "stored", Some(owner)),
-            None => (FirstRunDecision::defaults(), "compiled-defaults", None),
+            None => (FirstRunDecision::defaults(), "never-configured", None),
         },
         None => (FirstRunDecision::defaults(), "compiled-defaults", None),
     };
