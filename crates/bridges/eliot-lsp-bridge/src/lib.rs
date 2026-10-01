@@ -4231,6 +4231,7 @@ fn validate_instrument_spec(spec: &InstrumentSpec) -> Result<(), BridgeError> {
         network_policy: spec.network_policy.clone(),
         limits: spec.limits,
         max_concurrency: spec.max_concurrency,
+        verification_command: spec.verification_command.clone(),
     })
     .map_err(|error| BridgeError::InstrumentIdentity(error.to_string()))?;
     if rebuilt != *spec {
