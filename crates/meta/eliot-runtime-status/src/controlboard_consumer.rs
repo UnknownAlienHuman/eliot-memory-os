@@ -90,9 +90,8 @@ use thiserror::Error;
 
 use super::controlboard_projection::{
     ControlBoardContour, ControlBoardProjectionBindings, ControlBoardReviewDetail,
-    ControlBoardStatusRow, ReviewCorrectionAction, ReviewProvenanceDirection,
-    accepted_disposition, read_code_provenance, read_controlboard_contour,
-    read_review_batch_status, read_review_detail,
+    ControlBoardStatusRow, ReviewCorrectionAction, ReviewProvenanceDirection, accepted_disposition,
+    read_code_provenance, read_controlboard_contour, read_review_batch_status, read_review_detail,
 };
 
 /// Stable contract identity for this read-only consumer rendering.
