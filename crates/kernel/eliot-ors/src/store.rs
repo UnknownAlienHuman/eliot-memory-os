@@ -82,7 +82,8 @@ use crate::{
     GenerationTransition, GenerationTransitionReceipt, GrantClosureCommit,
     GrantClosureCommitReceipt, GrantClosureFenceReceipt, GrantClosureFenceRequest,
     GrantClosureProjection, GrantClosureState, HostRequestRecord, HostRequestState, JobCheckpoint,
-    KernelAuthoritySnapshot, LegacyFenceBoundBackupVerificationClass,
+    InitialSetupAuthorityPhase, InitialSetupAuthorityRecord, KernelAuthoritySnapshot,
+    LegacyFenceBoundBackupVerificationClass,
     LegacyTwoValueRelationBackupVerificationClass, LegacyUnscopedBackupVerificationClass,
     MaintenanceTriggerStagingReceipt, MaintenanceTriggerStagingRequest, NativeWorkerClaimAdmission,
     NativeWorkerClaimRecord, NativeWorkerClaimStageOutcome, NativeWorkerClaimState, OpaqueLabel,
@@ -164,6 +165,10 @@ const BLOB_PROCESS_STREAM_CALLS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_blob_process_stream_calls_v1");
 const BLOB_PROCESS_STREAM_OWNER_FACTS_PULLS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_blob_process_stream_owner_facts_pulls_v1");
+const INITIAL_SETUP_AUTHORITIES: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_initial_setup_authorities_v1");
+const INITIAL_SETUP_AUTHORITY_POLICY_RECEIPTS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_initial_setup_authority_policy_receipts_v1");
 const AUTHORITY_HANDOFFS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_authority_handoffs_v1");
 const PROCESS_EVIDENCE: TableDefinition<&str, &str> =
@@ -4887,6 +4892,346 @@ pub struct RuntimeLeaseCensusRows {
 }
 
 impl RedbRecoveryStore {
+    /// Retains the Policy's exact root grant and paired receipt bindings
+    /// before the first canonical Policy Store effect.
+    ///
+    /// An exact retry returns the existing row at its current phase; changed
+    /// authority, causal, request or grant evidence under the same operation
+    /// identity is an immutable conflict. This is Kernel provenance, not an
+    /// ORS authority decision.
+    pub fn stage_initial_setup_authority(
+        &self,
+        prepared: &InitialSetupAuthorityRecord,
+    ) -> Result<InitialSetupAuthorityRecord, OrsError> {
+        prepared.validate()?;
+        if prepared.phase != InitialSetupAuthorityPhase::Prepared {
+            return Err(OrsError::InvalidField {
+                field: "initial_setup_authority_phase",
+                reason: "initial setup authority must be retained before the Policy effect",
+            });
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let result = {
+            let grants = write.open_table(OPERATIONAL_CURRENT).map_err(storage)?;
+            let grant_key = Self::operational_key(
+                OperationalKind::CapabilityGrant,
+                &prepared.root_grant_subject_id,
+            );
+            let grant: DurableOperationalRecord = grants
+                .get(grant_key.as_str())
+                .map_err(storage)?
+                .map(|value| decode_named(value.value(), "operational_current"))
+                .transpose()?
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "initial_setup_authority",
+                    reason: "referenced setup-root grant is not retained".to_owned(),
+                })?;
+            if grant.kind != OperationalKind::CapabilityGrant
+                || grant.input.subject_id != prepared.root_grant_subject_id
+                || grant.phase != OperationalPhase::Active
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "initial_setup_authority",
+                    reason: "referenced setup-root grant is not active".to_owned(),
+                });
+            }
+            grant.input.validate()?;
+            if Self::receipt_for(&grant)? != prepared.root_grant_receipt {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "initial_setup_authority",
+                    reason: "setup-root grant receipt does not match its current ORS row"
+                        .to_owned(),
+                });
+            }
+            let mut authorities = write
+                .open_table(INITIAL_SETUP_AUTHORITIES)
+                .map_err(storage)?;
+            let key = prepared.policy_operation.operation_id.as_str();
+            match authorities.get(key).map_err(storage)? {
+                Some(value) => {
+                    let existing: InitialSetupAuthorityRecord = decode_named(
+                        value.value(),
+                        "initial_setup_authority",
+                    )?;
+                    existing.validate()?;
+                    if !existing.same_setup(prepared) {
+                        return Err(OrsError::DuplicateConflict);
+                    }
+                    existing
+                }
+                None => {
+                    let payload = encode(prepared)?;
+                    authorities.insert(key, payload.as_str()).map_err(storage)?;
+                    prepared.clone()
+                }
+            }
+        };
+        write.commit().map_err(storage)?;
+        Ok(result)
+    }
+
+    /// Attaches the actual committed canonical Policy receipt to the exact
+    /// retained pre-effect setup authority row.
+    pub fn commit_initial_setup_policy(
+        &self,
+        committed: &InitialSetupAuthorityRecord,
+    ) -> Result<InitialSetupAuthorityRecord, OrsError> {
+        committed.validate()?;
+        if committed.phase != InitialSetupAuthorityPhase::PolicyCommitted {
+            return Err(OrsError::InvalidField {
+                field: "initial_setup_authority_phase",
+                reason: "Policy completion requires the PolicyCommitted phase",
+            });
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let result = {
+            let mut authorities = write
+                .open_table(INITIAL_SETUP_AUTHORITIES)
+                .map_err(storage)?;
+            let key = committed.policy_operation.operation_id.as_str();
+            let existing: InitialSetupAuthorityRecord = authorities
+                .get(key)
+                .map_err(storage)?
+                .map(|value| decode_named(value.value(), "initial_setup_authority"))
+                .transpose()?
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "initial_setup_authority",
+                    reason: "Policy receipt has no pre-effect authority row".to_owned(),
+                })?;
+            existing.validate()?;
+            if !existing.same_setup(committed) {
+                return Err(OrsError::DuplicateConflict);
+            }
+            match existing.phase {
+                InitialSetupAuthorityPhase::Prepared => {}
+                InitialSetupAuthorityPhase::PolicyCommitted
+                | InitialSetupAuthorityPhase::WorkScopePrepared
+                | InitialSetupAuthorityPhase::WorkScopeCommitted
+                    if existing.policy_write_receipt == committed.policy_write_receipt =>
+                {
+                    return Ok(existing);
+                }
+                _ => return Err(OrsError::DuplicateConflict),
+            }
+            let receipt = committed
+                .policy_write_receipt
+                .as_ref()
+                .ok_or(OrsError::InvalidReceipt)?;
+            committed.validate_policy_receipt(receipt)?;
+            let payload = encode(committed)?;
+            authorities
+                .insert(key, payload.as_str())
+                .map_err(storage)?;
+            let receipt_id = receipt
+                .envelope
+                .as_ref()
+                .ok_or(OrsError::InvalidReceipt)?
+                .identity
+                .receipt_id
+                .as_str();
+            let mut receipt_index = write
+                .open_table(INITIAL_SETUP_AUTHORITY_POLICY_RECEIPTS)
+                .map_err(storage)?;
+            match receipt_index.get(receipt_id).map_err(storage)? {
+                Some(value) if value.value() != key => {
+                    return Err(OrsError::DuplicateConflict);
+                }
+                Some(_) => {}
+                None => {
+                    receipt_index
+                        .insert(receipt_id, key)
+                        .map_err(storage)?;
+                }
+            }
+            committed.clone()
+        };
+        write.commit().map_err(storage)?;
+        Ok(result)
+    }
+
+    /// Retains the exact WorkScope successor write before its Store effect.
+    /// The only accepted predecessor is the committed Policy phase; retries
+    /// must carry the same operation, identity, request bytes and causal link.
+    pub fn prepare_initial_setup_work_scope(
+        &self,
+        prepared: &InitialSetupAuthorityRecord,
+    ) -> Result<InitialSetupAuthorityRecord, OrsError> {
+        prepared.validate()?;
+        if prepared.phase != InitialSetupAuthorityPhase::WorkScopePrepared {
+            return Err(OrsError::InvalidField {
+                field: "initial_setup_authority_phase",
+                reason: "WorkScope preparation requires the WorkScopePrepared phase",
+            });
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let result = {
+            let mut authorities = write
+                .open_table(INITIAL_SETUP_AUTHORITIES)
+                .map_err(storage)?;
+            let key = prepared.policy_operation.operation_id.as_str();
+            let existing: InitialSetupAuthorityRecord = authorities
+                .get(key)
+                .map_err(storage)?
+                .map(|value| decode_named(value.value(), "initial_setup_authority"))
+                .transpose()?
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "initial_setup_authority",
+                    reason: "WorkScope preparation has no retained Policy authority row".to_owned(),
+                })?;
+            existing.validate()?;
+            if !existing.same_setup(prepared)
+                || existing.policy_write_receipt != prepared.policy_write_receipt
+            {
+                return Err(OrsError::DuplicateConflict);
+            }
+            match existing.phase {
+                InitialSetupAuthorityPhase::PolicyCommitted => {}
+                InitialSetupAuthorityPhase::WorkScopePrepared
+                | InitialSetupAuthorityPhase::WorkScopeCommitted
+                    if existing.same_work_scope_request(prepared) =>
+                {
+                    return Ok(existing);
+                }
+                _ => return Err(OrsError::DuplicateConflict),
+            }
+            let payload = encode(prepared)?;
+            authorities
+                .insert(key, payload.as_str())
+                .map_err(storage)?;
+            prepared.clone()
+        };
+        write.commit().map_err(storage)?;
+        Ok(result)
+    }
+
+    /// Attaches the exact normal WorkScope receipt to its retained pre-effect
+    /// request and causal successor.
+    pub fn commit_initial_setup_work_scope(
+        &self,
+        committed: &InitialSetupAuthorityRecord,
+    ) -> Result<InitialSetupAuthorityRecord, OrsError> {
+        committed.validate()?;
+        if committed.phase != InitialSetupAuthorityPhase::WorkScopeCommitted {
+            return Err(OrsError::InvalidField {
+                field: "initial_setup_authority_phase",
+                reason: "WorkScope completion requires the WorkScopeCommitted phase",
+            });
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let result = {
+            let mut authorities = write
+                .open_table(INITIAL_SETUP_AUTHORITIES)
+                .map_err(storage)?;
+            let key = committed.policy_operation.operation_id.as_str();
+            let existing: InitialSetupAuthorityRecord = authorities
+                .get(key)
+                .map_err(storage)?
+                .map(|value| decode_named(value.value(), "initial_setup_authority"))
+                .transpose()?
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "initial_setup_authority",
+                    reason: "WorkScope receipt has no retained Policy authority row".to_owned(),
+                })?;
+            existing.validate()?;
+            if !existing.same_setup(committed)
+                || !existing.same_work_scope_request(committed)
+            {
+                return Err(OrsError::DuplicateConflict);
+            }
+            match existing.phase {
+                InitialSetupAuthorityPhase::WorkScopePrepared => {}
+                InitialSetupAuthorityPhase::WorkScopeCommitted
+                    if existing.work_scope_write_receipt == committed.work_scope_write_receipt =>
+                {
+                    return Ok(existing);
+                }
+                _ => return Err(OrsError::DuplicateConflict),
+            }
+            let payload = encode(committed)?;
+            authorities
+                .insert(key, payload.as_str())
+                .map_err(storage)?;
+            committed.clone()
+        };
+        write.commit().map_err(storage)?;
+        Ok(result)
+    }
+
+    /// Loads the exact setup lineage by its original Policy operation id.
+    pub fn load_initial_setup_authority(
+        &self,
+        policy_operation_id: &str,
+    ) -> Result<Option<InitialSetupAuthorityRecord>, OrsError> {
+        crate::model::validate_text(policy_operation_id, "initial_setup_policy_operation_id")?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let authorities = read
+            .open_table(INITIAL_SETUP_AUTHORITIES)
+            .map_err(storage)?;
+        authorities
+            .get(policy_operation_id)
+            .map_err(storage)?
+            .map(|value| {
+                let record: InitialSetupAuthorityRecord =
+                    decode_named(value.value(), "initial_setup_authority")?;
+                record.validate()?;
+                if record.policy_operation.operation_id.as_str() != policy_operation_id {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "initial_setup_authority",
+                        reason: "Policy operation id does not match its ORS key".to_owned(),
+                    });
+                }
+                Ok(record)
+            })
+            .transpose()
+    }
+
+    /// Resolves the unique setup lineage named by the actual Policy receipt id.
+    pub fn load_initial_setup_authority_by_policy_receipt_id(
+        &self,
+        policy_receipt_id: &str,
+    ) -> Result<Option<InitialSetupAuthorityRecord>, OrsError> {
+        crate::model::validate_text(policy_receipt_id, "initial_setup_policy_receipt_id")?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let receipt_index = read
+            .open_table(INITIAL_SETUP_AUTHORITY_POLICY_RECEIPTS)
+            .map_err(storage)?;
+        let Some(operation_id) = receipt_index
+            .get(policy_receipt_id)
+            .map_err(storage)?
+        else {
+            return Ok(None);
+        };
+        let operation_id = operation_id.value().to_owned();
+        let authorities = read
+            .open_table(INITIAL_SETUP_AUTHORITIES)
+            .map_err(storage)?;
+        let record: InitialSetupAuthorityRecord = authorities
+            .get(operation_id.as_str())
+            .map_err(storage)?
+            .map(|value| decode_named(value.value(), "initial_setup_authority"))
+            .transpose()?
+            .ok_or_else(|| OrsError::IntegrityProblem {
+                record_type: "initial_setup_authority",
+                reason: "Policy receipt index names a missing setup authority".to_owned(),
+            })?;
+        record.validate()?;
+        let receipt = record
+            .policy_write_receipt
+            .as_ref()
+            .and_then(|receipt| receipt.envelope.as_ref())
+            .map(|envelope| envelope.identity.receipt_id.as_str());
+        if record.policy_operation.operation_id.as_str() != operation_id
+            || receipt != Some(policy_receipt_id)
+            || record.phase == InitialSetupAuthorityPhase::Prepared
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "initial_setup_authority",
+                reason: "Policy receipt index does not match a committed lineage".to_owned(),
+            });
+        }
+        Ok(Some(record))
+    }
+
     /// Exports one coherent backup page under a single read transaction.
     ///
     /// Delegates to the ORS-owned `backup_snapshot` projection; binds the

@@ -5,8 +5,8 @@ use eliot_contracts::{
 use eliot_platform::{PlatformHandle, SecretReference};
 use eliot_process::ProcessStreamKind;
 use eliot_receipts::{
-    AuthorityBinding, GrantClosureAuthorityReceiptRef, GrantClosureDeclaration, ProofCeiling,
-    ReceiptDisposition, ReceiptEnvelope, ReceiptIdentity,
+    AuthorityBinding, CausalBinding, GrantClosureAuthorityReceiptRef, GrantClosureDeclaration,
+    ProofCeiling, ReceiptDisposition, ReceiptEnvelope, ReceiptIdentity,
 };
 pub use eliot_receipts::{
     GRANT_CLOSURE_SCHEMA, GRANT_CLOSURE_VERSION, GrantClosureAlternatePath,
@@ -3767,6 +3767,380 @@ impl CapabilityGrantProjection {
     /// Returns the store-issued integrity receipt for this row.
     pub const fn receipt(&self) -> &OperationalMutationReceipt {
         &self.receipt
+    }
+}
+
+/// Durable stage for the one first-run Policy owner lineage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum InitialSetupAuthorityPhase {
+    /// The exact Kernel-reserved Policy write is prepared, before Store effect.
+    Prepared,
+    /// The normal Policy write committed and its original receipt is retained.
+    PolicyCommitted,
+    /// The exact WorkScope child write is prepared, before its Store effect.
+    WorkScopePrepared,
+    /// The initial WorkScope write committed with its Policy-receipt successor.
+    WorkScopeCommitted,
+}
+
+/// Non-semantic ORS binding between the signed setup-root grant and the first
+/// Policy/WorkScope writes.
+///
+/// ORS does not interpret the opaque grant payload or create authority. It
+/// retains exact operation/request identities, the paired receipt bindings,
+/// the active grant's store-issued receipt tuple, and the actual canonical
+/// Policy receipt. Kernel independently loads the referenced capability grant
+/// and compares the exact bindings before either effect is admitted.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InitialSetupAuthorityRecord {
+    /// ORS contract version.
+    pub contract_version: u16,
+    /// State progression for this one immutable setup lineage.
+    pub phase: InitialSetupAuthorityPhase,
+    /// Exact Policy operation/idempotency/request hash reserved by Kernel.
+    pub policy_operation: eliot_store_api::OperationIdentity,
+    /// Exact canonical authenticated Policy RequestIdentity bytes.
+    pub policy_request_identity_json: String,
+    /// SHA-256 of `policy_request_identity_json`.
+    pub policy_request_identity_sha256: String,
+    /// Exact canonical Kernel-to-Store Policy request bytes.
+    pub policy_request_json: String,
+    /// SHA-256 of `policy_request_json`.
+    pub policy_request_sha256: String,
+    /// Exact fence shared by the setup grant and first two writes.
+    pub state_fence: StateFence,
+    /// Existing ORS capability-grant subject selected by Governor's checked
+    /// setup-root decision. It is a lookup reference, not authority by itself.
+    pub root_grant_subject_id: OpaqueLabel,
+    /// Exact existing store-issued receipt from the root capability grant.
+    pub root_grant_receipt: OperationalMutationReceipt,
+    /// Exact root AuthorityBinding carried by the Policy transition.
+    pub authority_binding: AuthorityBinding,
+    /// Exact genesis CausalBinding carried by the Policy transition.
+    pub policy_causal_binding: CausalBinding,
+    /// Actual normal canonical Policy WriteReceipt, absent until commit.
+    pub policy_write_receipt: Option<eliot_store_api::WriteReceipt>,
+    /// SHA-256 of the canonical exact `policy_write_receipt` bytes.
+    pub policy_write_receipt_sha256: Option<String>,
+    /// Exact CausalBinding of the initial WorkScope successor, absent until
+    /// that normal write commits.
+    pub work_scope_causal_binding: Option<CausalBinding>,
+    /// Exact WorkScope operation/idempotency/request hash reserved by Kernel.
+    pub work_scope_operation: Option<eliot_store_api::OperationIdentity>,
+    /// Exact canonical authenticated WorkScope RequestIdentity bytes.
+    pub work_scope_request_identity_json: Option<String>,
+    /// SHA-256 of `work_scope_request_identity_json`.
+    pub work_scope_request_identity_sha256: Option<String>,
+    /// Exact canonical Kernel-to-Store WorkScope request bytes.
+    pub work_scope_request_json: Option<String>,
+    /// SHA-256 of `work_scope_request_json`.
+    pub work_scope_request_sha256: Option<String>,
+    /// Actual normal canonical WorkScope WriteReceipt, absent until commit.
+    pub work_scope_write_receipt: Option<eliot_store_api::WriteReceipt>,
+}
+
+impl InitialSetupAuthorityRecord {
+    /// Validates canonical request bytes, original grant tuple and phase shape.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        if self.contract_version != crate::CONTRACT_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        self.policy_operation.validate().map_err(|_| OrsError::IntegrityProblem {
+            record_type: "initial_setup_authority",
+            reason: "Policy operation identity is malformed".to_owned(),
+        })?;
+        self.state_fence.validate()?;
+        validate_bounded_canonical_json(
+            &self.policy_request_identity_json,
+            MAX_BLOB_PROCESS_STREAM_OWNER_FACTS_JSON_BYTES,
+            "initial_setup_policy_request_identity_json",
+        )?;
+        validate_digest(
+            &self.policy_request_identity_sha256,
+            "initial_setup_policy_request_identity_sha256",
+        )?;
+        validate_digest(&self.policy_request_sha256, "initial_setup_policy_request_sha256")?;
+        validate_bounded_canonical_json(
+            &self.policy_request_json,
+            MAX_BLOB_PROCESS_STREAM_OWNER_FACTS_JSON_BYTES,
+            "initial_setup_policy_request_json",
+        )?;
+        if sha256_hex(self.policy_request_identity_json.as_bytes())
+            != self.policy_request_identity_sha256
+            || sha256_hex(self.policy_request_json.as_bytes()) != self.policy_request_sha256
+        {
+            return Err(OrsError::InvalidField {
+                field: "initial_setup_policy_request_digest",
+                reason: "request bytes or operation digest disagree",
+            });
+        }
+        validate_text(
+            self.root_grant_subject_id.as_str(),
+            "initial_setup_root_grant_subject_id",
+        )?;
+        if self.root_grant_receipt.subject_id() != &self.root_grant_subject_id
+            || self.root_grant_receipt.phase() != OperationalPhase::Active
+            || self.root_grant_receipt.operation_order() == 0
+        {
+            return Err(OrsError::InvalidField {
+                field: "initial_setup_root_grant",
+                reason: "setup root must reference an active retained grant",
+            });
+        }
+        validate_digest(
+            self.root_grant_receipt.state_sha256(),
+            "initial_setup_root_grant_state_sha256",
+        )?;
+        if self.authority_binding.state_fence != self.state_fence
+            || self.policy_causal_binding.state_fence != self.state_fence
+            || self.policy_causal_binding.parent_receipt_id.is_some()
+            || !self.policy_causal_binding.predecessor_receipt_ids.is_empty()
+            || self.policy_causal_binding.transaction_sequence.value() != 1
+        {
+            return Err(OrsError::FenceMismatch);
+        }
+        match (
+            self.phase,
+            self.policy_write_receipt.as_ref(),
+            self.policy_write_receipt_sha256.as_ref(),
+            self.work_scope_causal_binding.as_ref(),
+            self.work_scope_operation.as_ref(),
+            self.work_scope_request_identity_json.as_ref(),
+            self.work_scope_request_identity_sha256.as_ref(),
+            self.work_scope_request_json.as_ref(),
+            self.work_scope_request_sha256.as_ref(),
+            self.work_scope_write_receipt.as_ref(),
+        ) {
+            (
+                InitialSetupAuthorityPhase::Prepared,
+                None, None, None, None, None, None, None, None, None,
+            ) => {}
+            (
+                InitialSetupAuthorityPhase::PolicyCommitted,
+                Some(receipt),
+                Some(digest),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ) => {
+                self.validate_policy_receipt_digest(receipt, digest)?;
+                self.validate_policy_receipt(receipt)?;
+            }
+            (
+                InitialSetupAuthorityPhase::WorkScopePrepared,
+                Some(receipt),
+                Some(digest),
+                Some(child),
+                Some(operation),
+                Some(identity_json),
+                Some(identity_digest),
+                Some(request_json),
+                Some(request_digest),
+                None,
+            ) => {
+                self.validate_policy_receipt_digest(receipt, digest)?;
+                self.validate_policy_receipt(receipt)?;
+                self.validate_work_scope_request(
+                    receipt,
+                    child,
+                    operation,
+                    identity_json,
+                    identity_digest,
+                    request_json,
+                    request_digest,
+                )?;
+            }
+            (
+                InitialSetupAuthorityPhase::WorkScopeCommitted,
+                Some(receipt),
+                Some(digest),
+                Some(child),
+                Some(operation),
+                Some(identity_json),
+                Some(identity_digest),
+                Some(request_json),
+                Some(request_digest),
+                Some(work_scope_receipt),
+            ) => {
+                self.validate_policy_receipt_digest(receipt, digest)?;
+                self.validate_policy_receipt(receipt)?;
+                self.validate_work_scope_request(
+                    receipt,
+                    child,
+                    operation,
+                    identity_json,
+                    identity_digest,
+                    request_json,
+                    request_digest,
+                )?;
+                work_scope_receipt
+                    .validate()
+                    .map_err(|_| OrsError::InvalidReceipt)?;
+                let child_envelope = work_scope_receipt
+                    .envelope
+                    .as_ref()
+                    .ok_or(OrsError::InvalidReceipt)?;
+                if work_scope_receipt.status != eliot_store_api::WriteReceiptStatus::Committed
+                    || work_scope_receipt.operation_id != operation.operation_id
+                    || work_scope_receipt.idempotency_key != operation.idempotency_key
+                    || work_scope_receipt.canonical_request_hash != operation.canonical_request_hash
+                    || work_scope_receipt.state_fence != self.state_fence
+                    || child_envelope.core.authority != self.authority_binding
+                    || child_envelope.core.causal != *child
+                {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "initial_setup_authority",
+                        reason: "WorkScope receipt does not match the retained successor binding"
+                            .to_owned(),
+                    });
+                }
+            }
+            _ => {
+                return Err(OrsError::InvalidField {
+                    field: "initial_setup_authority_phase",
+                    reason: "phase and committed receipts disagree",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_work_scope_request(
+        &self,
+        policy_receipt: &eliot_store_api::WriteReceipt,
+        child: &CausalBinding,
+        operation: &eliot_store_api::OperationIdentity,
+        identity_json: &str,
+        identity_digest: &str,
+        request_json: &str,
+        request_digest: &str,
+    ) -> Result<(), OrsError> {
+        operation.validate().map_err(|_| OrsError::IntegrityProblem {
+            record_type: "initial_setup_authority",
+            reason: "WorkScope operation identity is malformed".to_owned(),
+        })?;
+        validate_bounded_canonical_json(
+            identity_json,
+            MAX_BLOB_PROCESS_STREAM_OWNER_FACTS_JSON_BYTES,
+            "initial_setup_work_scope_request_identity_json",
+        )?;
+        validate_bounded_canonical_json(
+            request_json,
+            MAX_BLOB_PROCESS_STREAM_OWNER_FACTS_JSON_BYTES,
+            "initial_setup_work_scope_request_json",
+        )?;
+        validate_digest(identity_digest, "initial_setup_work_scope_request_identity_sha256")?;
+        validate_digest(request_digest, "initial_setup_work_scope_request_sha256")?;
+        if sha256_hex(identity_json.as_bytes()) != identity_digest
+            || sha256_hex(request_json.as_bytes()) != request_digest
+        {
+            return Err(OrsError::InvalidField {
+                field: "initial_setup_work_scope_request_digest",
+                reason: "request bytes and their digests disagree",
+            });
+        }
+        let parent = policy_receipt
+            .envelope
+            .as_ref()
+            .ok_or(OrsError::InvalidReceipt)?
+            .identity
+            .receipt_id
+            .clone();
+        if child.state_fence != self.state_fence
+            || child.parent_receipt_id.as_ref() != Some(&parent)
+            || child.predecessor_receipt_ids.as_slice() != [parent]
+            || child.transaction_sequence.value()
+                != self
+                    .policy_causal_binding
+                    .transaction_sequence
+                    .value()
+                    .checked_add(1)
+                    .ok_or(OrsError::PayloadTooLarge)?
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "initial_setup_authority",
+                reason: "WorkScope causal binding is not the exact Policy successor".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Checks the exact committed Policy receipt against the staged operation.
+    pub fn validate_policy_receipt(
+        &self,
+        receipt: &eliot_store_api::WriteReceipt,
+    ) -> Result<(), OrsError> {
+        receipt.validate().map_err(|_| OrsError::InvalidReceipt)?;
+        let envelope = receipt.envelope.as_ref().ok_or(OrsError::InvalidReceipt)?;
+        if receipt.status != eliot_store_api::WriteReceiptStatus::Committed
+            || receipt.operation_id != self.policy_operation.operation_id
+            || receipt.idempotency_key != self.policy_operation.idempotency_key
+            || receipt.canonical_request_hash != self.policy_operation.canonical_request_hash
+            || receipt.state_fence != self.state_fence
+            || envelope.core.authority != self.authority_binding
+            || envelope.core.causal != self.policy_causal_binding
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "initial_setup_authority",
+                reason: "Policy receipt does not match the exact staged authority lineage"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_policy_receipt_digest(
+        &self,
+        receipt: &eliot_store_api::WriteReceipt,
+        digest: &str,
+    ) -> Result<(), OrsError> {
+        validate_digest(digest, "initial_setup_policy_write_receipt_sha256")?;
+        let bytes = canonical_json_bytes(receipt).map_err(|error| OrsError::IntegrityProblem {
+            record_type: "initial_setup_authority",
+            reason: format!("Policy receipt cannot be canonically encoded: {error}"),
+        })?;
+        if sha256_hex(&bytes) != digest {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "initial_setup_authority",
+                reason: "Policy receipt digest does not match the canonical receipt".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Identifies immutable setup inputs while permitting the owner phase to advance.
+    pub fn same_setup(&self, other: &Self) -> bool {
+        self.contract_version == other.contract_version
+            && self.policy_operation == other.policy_operation
+            && self.policy_request_identity_json == other.policy_request_identity_json
+            && self.policy_request_identity_sha256 == other.policy_request_identity_sha256
+            && self.policy_request_json == other.policy_request_json
+            && self.policy_request_sha256 == other.policy_request_sha256
+            && self.state_fence == other.state_fence
+            && self.root_grant_subject_id == other.root_grant_subject_id
+            && self.root_grant_receipt == other.root_grant_receipt
+            && self.authority_binding == other.authority_binding
+            && self.policy_causal_binding == other.policy_causal_binding
+    }
+
+    /// Compares exact retained WorkScope operation material while allowing
+    /// the owner phase to move from prepared to committed.
+    pub fn same_work_scope_request(&self, other: &Self) -> bool {
+        self.same_setup(other)
+            && self.policy_write_receipt == other.policy_write_receipt
+            && self.work_scope_causal_binding == other.work_scope_causal_binding
+            && self.work_scope_operation == other.work_scope_operation
+            && self.work_scope_request_identity_json == other.work_scope_request_identity_json
+            && self.work_scope_request_identity_sha256
+                == other.work_scope_request_identity_sha256
+            && self.work_scope_request_json == other.work_scope_request_json
+            && self.work_scope_request_sha256 == other.work_scope_request_sha256
     }
 }
 
