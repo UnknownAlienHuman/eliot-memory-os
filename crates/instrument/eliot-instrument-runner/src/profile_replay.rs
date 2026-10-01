@@ -12,7 +12,9 @@ use eliot_bootstrap::{
     normative::{NormativePairReceiptIdentity, parse_normative_pair_receipt_identity},
 };
 use eliot_contracts::{ArtifactId, ClockReading, StateFence, canonical_json_bytes, sha256_hex};
-use eliot_instrument_api::{EvidenceCoverage, RawEvidence, RawEvidenceSource, VerificationOutcome};
+use eliot_instrument_api::{
+    EvidenceCoverage, InstrumentKind, RawEvidence, RawEvidenceSource, VerificationOutcome,
+};
 use eliot_instrument_cargo::{CONTRACT_NAME as CARGO_INSTRUMENT, parse_jsonl as parse_cargo_jsonl};
 use eliot_instrument_dotnet::{CONTRACT_ID as DOTNET_INSTRUMENT, parse_build_output};
 use eliot_instrument_nextest::{
@@ -919,6 +921,7 @@ fn replay_profile_stream_inner(
             source,
             verified,
             bytes,
+            stage.kind,
             entry,
             parser_revision,
             terminal,
@@ -1362,6 +1365,7 @@ fn dotnet_receipt(
     source: &TestdStreamEvidenceBinding,
     verified: VerifiedSource<'_>,
     bytes: &EphemeralSourceBytes,
+    kind: InstrumentKind,
     entry: &RegistryEntry,
     parser_revision: String,
     terminal: Option<&ExitStatus>,
@@ -1380,13 +1384,33 @@ fn dotnet_receipt(
             );
         }
     };
+    let (parsed_outcome, policy) = if kind == InstrumentKind::Test {
+        let build = report.outcome();
+        let tests = report.test_outcome();
+        let outcome = match (build, tests) {
+            (VerificationOutcome::Fail, _) | (_, VerificationOutcome::Fail) => {
+                VerificationOutcome::Fail
+            }
+            (VerificationOutcome::Pass, VerificationOutcome::Pass) => VerificationOutcome::Pass,
+            _ => VerificationOutcome::Unknown,
+        };
+        (
+            outcome,
+            "msbuild-and-nonempty-vstest-summary-with-terminal-outcome",
+        )
+    } else {
+        (
+            report.outcome(),
+            "msbuild-console-diagnostic-summary-and-terminal-outcome",
+        )
+    };
     evaluated_report_receipt(
         source,
         verified,
         entry,
         parser_revision,
-        terminal_outcome(report.outcome(), terminal),
-        "msbuild-console-diagnostic-summary-and-terminal-outcome",
+        terminal_outcome(parsed_outcome, terminal),
+        policy,
         finished_at,
     )
 }
