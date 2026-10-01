@@ -1377,16 +1377,18 @@ fn projection_family_exclusions() -> Vec<DispositionedTable> {
     ]
 }
 
-/// The three #1885 effect-replay tables: retained authority over a past
-/// execution, not history a restore may re-establish.
+/// The four effect-replay and restart-reconciliation tables: retained authority
+/// over a past execution, not history a restore may re-establish.
 ///
-/// Each is `ForensicOnly` for the same reason the
+/// Three are #1885's and one is #1884's restart twin; they are one list because
+/// they are one kind of row — a durable record that something was REFUSED —
+/// and each is `ForensicOnly` for the same reason the
 /// [`RowFamilyKind::UnknownCommitRecovery`] sibling is: none of them has a
 /// durable `import_*_suspended` path in this crate, so `Restorable` would
 /// advertise a re-import that does not exist, while every one of them is
 /// genuinely evidence about a past execution. They were created on every open
-/// since #1885 and carried no disposition at all, which is what made the census
-/// refuse every export of a real store.
+/// and carried no disposition at all, which is what made the census refuse every
+/// export of a real store.
 fn effect_replay_family_exclusions() -> Vec<DispositionedTable> {
     vec![
         // One row per exact already-authorized effect the Kernel may replay,
@@ -1421,6 +1423,24 @@ fn effect_replay_family_exclusions() -> Vec<DispositionedTable> {
             super::EFFECT_REPLAY_RECONCILIATIONS,
             RowDisposition::ForensicOnly,
             "an effect-replay reconciliation row records that a replay was denied; a restored row reports a refusal this installation never received and would suppress the destination's own adjudication of that operation identity",
+        ),
+        // #1884, the restart twin of the row above and its exact sibling in every
+        // respect that matters here: one row per REFUSED restart, keyed
+        // `{module_id}::{generation}`, carrying a durable escalation item and a
+        // visibly degraded generation. It cannot ride the effect-replay family —
+        // `store.rs` records that a restart is not an effect replay, so these items
+        // name no operation identity — and this crate has no
+        // `import_kernel_restart_reconciliation_suspended` path, so `Restorable`
+        // would advertise a re-import that does not exist. `ForensicOnly` for the
+        // same reason as its sibling, with the same consequence for a restore: a
+        // restored row would report a refused restart this installation never
+        // received and suppress the destination's own adjudication of that
+        // generation. Materialised empty on every open since #1884, which is what
+        // made the omission refuse every export of a real store.
+        excluded(
+            super::KERNEL_RESTART_RECONCILIATIONS,
+            RowDisposition::ForensicOnly,
+            "a manifest-side restart reconciliation row records that a restart was refused and carries its durable escalation; a restored row reports a refusal this installation never received and would suppress the destination's own adjudication of that generation",
         ),
     ]
 }
