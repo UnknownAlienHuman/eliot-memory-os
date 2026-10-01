@@ -213,6 +213,11 @@ pub enum TestdIpcError {
     /// The exchange violated the closed contract before any effect.
     #[error("kernel testd exchange violated the closed contract: {0}")]
     Contract(String),
+    /// The current one-use Blob token is already bound to another exact
+    /// operation body. Only the SourceReadback caller may resolve a completed
+    /// prior call and then use the Kernel-issued successor for a fresh read.
+    #[error("current Blob call token is bound to a different exact operation")]
+    BlobCallOperationConflict,
     /// The submit reply was lost: the request may have reached the Kernel,
     /// but its outcome was not proven by an exact typed reply. Carry the
     /// exact submit identity so a later invocation can reconcile under the
@@ -1156,10 +1161,7 @@ impl KernelBlobStreamCallSequence {
             // consumed or reserved. Recover only that exact retained result;
             // never bind the token to this newly constructed semantic body.
             if existing.operation_sha256 != operation_sha256 {
-                return Err(TestdIpcError::Contract(
-                    "the current Blob token is already bound to a different exact operation"
-                        .to_owned(),
-                ));
+                return Err(TestdIpcError::BlobCallOperationConflict);
             }
             return self.reconcile_exact(
                 BlobProcessStreamCallToken {
@@ -1325,6 +1327,47 @@ impl KernelBlobStreamCallSequence {
             },
             &record.operation_sha256,
         )
+    }
+
+    /// Resolves an old consumed call before issuing a fresh SourceReadback
+    /// when a restart changed only its operation deadline. This path is
+    /// specific to the owner-backed read operation: it first observes the
+    /// exact retained token/digest, requires a Completed result and its
+    /// Kernel-issued successor, then uses that successor for a new fresh
+    /// read. It never resends the old operation or reuses old response bytes.
+    pub fn read_source_chunk(
+        &self,
+        request: eliot_blob_api::wire::BlobProcessStreamKernelSourceReadbackRequest,
+    ) -> Result<BlobProcessStreamKernelResponse, TestdIpcError> {
+        let operation = BlobProcessStreamKernelOperationRequest::SourceReadback {
+            request: request.clone(),
+        };
+        match self.exchange(operation.clone()) {
+            Err(TestdIpcError::BlobCallOperationConflict) => {
+                // The exact original call must remain reconcilable under the
+                // live Kernel grant/fence before allocating a fresh read.
+                self.deadline_for_budget(1)?;
+                let retained = self.reconcile_current_call()?;
+                match &retained.outcome {
+                    BlobProcessStreamKernelOutcome::Completed { .. }
+                        if retained.next_call_token.is_some() => {}
+                    BlobProcessStreamKernelOutcome::Unknown { operation_sha256 } => {
+                        return Err(TestdIpcError::UnknownOutcome {
+                            job_id: self.job_id.clone(),
+                            request_digest: operation_sha256.clone(),
+                        });
+                    }
+                    _ => {
+                        return Err(TestdIpcError::Contract(
+                            "the prior Blob call has no completed owner result and successor token"
+                                .to_owned(),
+                        ));
+                    }
+                }
+                self.exchange(operation)
+            }
+            result => result,
+        }
     }
 
     fn reconcile_exact(

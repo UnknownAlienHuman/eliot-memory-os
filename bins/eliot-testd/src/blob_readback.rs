@@ -9,7 +9,6 @@ use std::future::Future;
 use std::pin::Pin;
 
 use eliot_blob_api::wire::{
-    BlobProcessStreamKernelOperationRequest as KernelOperation,
     BlobProcessStreamKernelSourceReadbackRequest as KernelSourceRequest,
     BlobProcessStreamKernelResponse, BlobProcessStreamKernelOutcome,
     BlobProcessStreamOperationResponse,
@@ -62,7 +61,7 @@ impl BlobReadbackExchange for KernelBlobStreamCallSequence {
         let stream = request.stream;
         Box::pin(async move {
             match tokio::task::spawn_blocking(move || {
-                calls.exchange(KernelOperation::SourceReadback { request })
+                calls.read_source_chunk(request)
             })
             .await
             {
