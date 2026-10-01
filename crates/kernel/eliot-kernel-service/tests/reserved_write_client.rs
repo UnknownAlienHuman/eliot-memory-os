@@ -701,7 +701,9 @@ async fn missing_foreign_or_malformed_receipt_cannot_be_success() {
     .unwrap();
     assert_eq!(
         malformed_client.apply_reserved_write(request.clone()).await,
-        Err(StoreError::MissingReceiptEnvelope)
+        Err(StoreError::UnknownOutcome {
+            operation_id: request.transition.identity.operation_id.clone(),
+        })
     );
     assert_eq!(
         malformed_counters
@@ -780,7 +782,9 @@ async fn uncertain_send_preserves_unknown_outcome_with_no_second_send() {
     .unwrap();
     assert_eq!(
         client.apply_reserved_write(request.clone()).await,
-        Err(StoreError::MissingReceiptEnvelope)
+        Err(StoreError::UnknownOutcome {
+            operation_id: request.transition.identity.operation_id.clone(),
+        })
     );
     assert_eq!(counters.reserved_write_calls.load(Ordering::SeqCst), 1);
     assert_eq!(
@@ -835,7 +839,9 @@ async fn deterministic_conflict_stays_distinct_from_unknown_commit() {
     .unwrap();
     assert_eq!(
         unknown_client.apply_reserved_write(request.clone()).await,
-        Err(StoreError::MissingReceiptEnvelope)
+        Err(StoreError::UnknownOutcome {
+            operation_id: request.transition.identity.operation_id.clone(),
+        })
     );
     assert_eq!(
         unknown_counters.reserved_write_calls.load(Ordering::SeqCst),
