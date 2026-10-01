@@ -55,6 +55,7 @@ mod store_gateway;
 mod store_write_reservation;
 #[cfg(test)]
 mod store_write_reservation_tests;
+mod store_write_status;
 mod testd_front_door;
 mod user_automation;
 mod user_automation_compiler;
@@ -267,6 +268,10 @@ pub use store_write_reservation::{
     reconcile_pending_at_startup, reconcile_receipt, reconcile_staged_writes_at_startup,
     recovery_page, reserve_for_transition, unresolved_reservations, writer_epoch_for_fence,
     writer_epoch_for_fence_from_epoch,
+};
+pub use store_write_status::{
+    CanonicalStoreWriteStatus, CanonicalStoreWriteStatusRefusal,
+    project_canonical_store_write_status,
 };
 pub use testd_front_door::{
     AuthenticatedTestdSession, TESTD_ADMISSION_ADVERTISED, TESTD_ADMISSION_WIRE_ID,
