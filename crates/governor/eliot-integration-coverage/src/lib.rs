@@ -837,7 +837,11 @@ impl GovernorCoverageDerivation {
         let fingerprint = admitted_adapter
             .as_ref()
             .map(|adapter| adapter.descriptor_sha256.clone())
-            .or_else(|| self.current.as_ref().map(|profile| profile.fingerprint.clone()));
+            .or_else(|| {
+                self.current
+                    .as_ref()
+                    .map(|profile| profile.fingerprint.clone())
+            });
         let Some(fingerprint) = fingerprint else {
             return Ok(None);
         };
@@ -1124,7 +1128,10 @@ fn validate_adapter_identity(identity: &AdapterAdmissionIdentity) -> Result<(), 
 }
 
 fn validate_roster(roster: &ObservationRosterPage) -> Result<(), CoverageError> {
-    validate_text(&roster.authority_lineage, "observation.roster.authority_lineage")?;
+    validate_text(
+        &roster.authority_lineage,
+        "observation.roster.authority_lineage",
+    )?;
     validate_text(&roster.principal, "observation.roster.principal")?;
     if roster.owners.len() > usize::try_from(roster.owner_total).unwrap_or(usize::MAX) {
         return Err(CoverageError::InvalidField(
@@ -1148,11 +1155,17 @@ fn validate_roster(roster: &ObservationRosterPage) -> Result<(), CoverageError> 
 
 fn validate_owner(owner: &ObservationOwner) -> Result<(), CoverageError> {
     validate_text(&owner.owner_namespace, "observation.owner.namespace")?;
-    validate_text(&owner.authority_lineage, "observation.owner.authority_lineage")?;
+    validate_text(
+        &owner.authority_lineage,
+        "observation.owner.authority_lineage",
+    )?;
     validate_text(&owner.principal, "observation.owner.principal")?;
     validate_text(&owner.producer_id, "observation.owner.producer_id")?;
     validate_text(&owner.local_stream, "observation.owner.local_stream")?;
-    validate_text(&owner.creating_connection, "observation.owner.creating_connection")?;
+    validate_text(
+        &owner.creating_connection,
+        "observation.owner.creating_connection",
+    )?;
     validate_text(
         &owner.creating_launch_nonce,
         "observation.owner.creating_launch_nonce",
@@ -1200,10 +1213,19 @@ fn validate_event_page(page: &ObservationEventPage) -> Result<(), CoverageError>
             "observation.record.staging_connection",
         )?;
         validate_text(&record.phase, "observation.record.phase")?;
-        validate_optional_text(&record.authority_epoch, "observation.record.authority_epoch")?;
-        validate_optional_text(&record.admitted_source, "observation.record.admitted_source")?;
+        validate_optional_text(
+            &record.authority_epoch,
+            "observation.record.authority_epoch",
+        )?;
+        validate_optional_text(
+            &record.admitted_source,
+            "observation.record.admitted_source",
+        )?;
         validate_optional_text(&record.admitted_scope, "observation.record.admitted_scope")?;
-        validate_optional_text(&record.adapter_version, "observation.record.adapter_version")?;
+        validate_optional_text(
+            &record.adapter_version,
+            "observation.record.adapter_version",
+        )?;
         validate_optional_text(
             &record.stored_envelope_bytes,
             "observation.record.stored_envelope_bytes",
@@ -1212,15 +1234,24 @@ fn validate_event_page(page: &ObservationEventPage) -> Result<(), CoverageError>
             &record.normalized_projection_bytes,
             "observation.record.normalized_projection_bytes",
         )?;
-        validate_optional_text(&record.redaction_reason, "observation.record.redaction_reason")?;
-        validate_optional_text(&record.redaction_marker, "observation.record.redaction_marker")?;
+        validate_optional_text(
+            &record.redaction_reason,
+            "observation.record.redaction_reason",
+        )?;
+        validate_optional_text(
+            &record.redaction_marker,
+            "observation.record.redaction_marker",
+        )?;
         for class in &record.redacted_classes {
             validate_optional_text(class, "observation.record.redacted_classes.item")?;
         }
         for warning in &record.normalization_warnings {
             validate_text(warning, "observation.record.normalization_warnings.item")?;
         }
-        validate_optional_text(&record.requested_route, "observation.record.requested_route")?;
+        validate_optional_text(
+            &record.requested_route,
+            "observation.record.requested_route",
+        )?;
         validate_optional_text(&record.actual_route, "observation.record.actual_route")?;
     }
     Ok(())

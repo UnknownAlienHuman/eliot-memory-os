@@ -71,7 +71,10 @@ use crate::{
     AuthorityActivationReceipt, AuthorityHandoffBegin, AuthorityHandoffRecord,
     AuthorityHandoffState, AuthorityRevocation, AuthorityRevocationReceipt,
     AuthoritySnapshotReceipt, BACKUP_VERIFICATION_RESULT_RECORD_TYPE,
-    BackupVerificationDisposition, BackupVerificationResultRecord, CanonicalDisposition,
+    BackupVerificationDisposition, BackupVerificationResultRecord,
+    BridgeEventObservationCursorBounds, BridgeEventObservationGap, BridgeEventObservationOwner,
+    BridgeEventObservationPage, BridgeEventObservationQuery, BridgeEventObservationRecord,
+    BridgeEventObservationRosterPage, BridgeEventObservationRosterQuery, CanonicalDisposition,
     CanonicalReconciliation, CapabilityGrantActivation, CapabilityGrantProjection,
     CapabilityGrantRevocation, CapabilityIntroductionActivation, CapabilityIntroductionFence,
     CapabilityIntroductionProjection, CapabilityIntroductionReceipt, DeliveryAcknowledgement,
@@ -97,11 +100,7 @@ use crate::{
     RecoveryInboxRecoveryPage, RecoveryInventorySnapshot, RecoveryInventorySource, RecoveryPage,
     RecoveryPayload, RecoveryPayloadEnvelope, RecoveryProblem, RecoveryProblemKind,
     RecoveryProblemRecoveryCursor, RecoveryProblemRecoveryPage, RecoveryWriteBinding,
-    BridgeEventObservationCursorBounds, BridgeEventObservationGap,
-    BridgeEventObservationOwner, BridgeEventObservationPage, BridgeEventObservationQuery,
-    BridgeEventObservationRecord, BridgeEventObservationRosterPage,
-    BridgeEventObservationRosterQuery, ReservationRecord, ReservationRequest, ReservationState,
-    ReservedScope, RetryState,
+    ReservationRecord, ReservationRequest, ReservationState, ReservedScope, RetryState,
     RootTransitionCommit, RootTransitionCommitProjection, ScopeTerminalReceipt, ScopeTerminalView,
     SessionBindingReceipt, SessionDetach, StageReceipt, StagedOperation, StateFenceSnapshot,
     StreamRecoveryActivation, StreamRecoveryReconciliationState, SupervisionLeaseCommitTicket,
@@ -17979,12 +17978,15 @@ impl RedbRecoveryStore {
         let latest_cutoff = {
             let meta = read.open_table(META).map_err(storage)?;
             match meta.get(BRIDGE_OWNER_LIST_SEQUENCE_KEY).map_err(storage)? {
-                Some(value) => value.value().parse::<u64>().map_err(|_| {
-                    OrsError::IntegrityProblem {
-                        record_type: "bridge_stream_owner_list_sequence",
-                        reason: "owner-list sequence is not an unsigned integer".to_owned(),
-                    }
-                })?,
+                Some(value) => {
+                    value
+                        .value()
+                        .parse::<u64>()
+                        .map_err(|_| OrsError::IntegrityProblem {
+                            record_type: "bridge_stream_owner_list_sequence",
+                            reason: "owner-list sequence is not an unsigned integer".to_owned(),
+                        })?
+                }
                 None => 0,
             }
         };
@@ -18029,11 +18031,12 @@ impl RedbRecoveryStore {
                 })?;
             if sequence == 0
                 || sequence > snapshot_cutoff
-                || key != Self::bridge_owner_list_index_key(
-                    &scope,
-                    BRIDGE_STREAM_OWNER_KIND_STREAM,
-                    sequence,
-                )
+                || key
+                    != Self::bridge_owner_list_index_key(
+                        &scope,
+                        BRIDGE_STREAM_OWNER_KIND_STREAM,
+                        sequence,
+                    )
             {
                 return Err(OrsError::IntegrityProblem {
                     record_type: "bridge_stream_owner_list_index",
@@ -18242,9 +18245,7 @@ impl RedbRecoveryStore {
             let (key, value) = entry.map_err(storage)?;
             let key = key.value();
             let (key_namespace, sequence) = Self::parse_bridge_position_key(key)?;
-            if key_namespace != namespace
-                || key != Self::bridge_position_key(namespace, sequence)
-            {
+            if key_namespace != namespace || key != Self::bridge_position_key(namespace, sequence) {
                 return Err(OrsError::IntegrityProblem {
                     record_type: "bridge_event_position",
                     reason: "position key does not match its exact owner namespace".to_owned(),
@@ -18273,7 +18274,8 @@ impl RedbRecoveryStore {
                 if sequence > cursor.compacted_sequence {
                     return Err(OrsError::IntegrityProblem {
                         record_type: "bridge_event_record",
-                        reason: "position above compacted boundary has no committed source row".to_owned(),
+                        reason: "position above compacted boundary has no committed source row"
+                            .to_owned(),
                     });
                 }
                 continue;
@@ -18303,7 +18305,8 @@ impl RedbRecoveryStore {
             if !projection.binds_record(&row) {
                 return Err(OrsError::IntegrityProblem {
                     record_type: "bridge_event_projection",
-                    reason: "normalized projection does not bind the committed source row".to_owned(),
+                    reason: "normalized projection does not bind the committed source row"
+                        .to_owned(),
                 });
             }
             page_records.push(BridgeEventObservationRecord {

@@ -2964,14 +2964,14 @@ impl KernelComposition {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
-            .map(|profile| {
-                super::startup_coordinator::GovernorObservationAdmissionIdentity {
+            .map(
+                |profile| super::startup_coordinator::GovernorObservationAdmissionIdentity {
                     descriptor_sha256: profile.admission.descriptor_sha256.clone(),
                     profile_id: profile.admission.profile_id.as_str().to_owned(),
                     profile_sha256: profile.admission.profile_sha256.clone(),
                     executable_sha256: profile.admission.executable_sha256.clone(),
-                }
-            });
+                },
+            );
         let readback = self
             .startup_coordinator
             .lock()
@@ -3056,7 +3056,8 @@ impl KernelComposition {
                         self.p07_ors
                             .load_bridge_event_observation_page_checked(&query)
                             .is_ok_and(|page| page == *retained_page)
-                    }) && snapshot.streams.len() == snapshot.roster.owners.len();
+                    })
+                    && snapshot.streams.len() == snapshot.roster.owners.len();
                 if !source_still_matches {
                     // Refuse this AVAILABLE projection without consuming its
                     // readback. The daemon can reset cursors and retry with
@@ -3157,14 +3158,15 @@ impl KernelComposition {
             page_limit: operation.page_limit,
         };
         let bridge_peer_set_revision = self.agent_bridge_peer_set_revision();
-        let session_matches = |readback: &super::startup_coordinator::GovernorAuthorityObservationReadback| {
-            readback.connection_id == session.connection_id
-                && readback.launch_nonce == session.launch_nonce
-                && readback.session_epoch == session.session_epoch
-                && readback.state_fence == session.module_generation.state_fence
-                && readback.bridge_peer_set_revision == bridge_peer_set_revision
-                && readback.admission == admission_identity
-        };
+        let session_matches =
+            |readback: &super::startup_coordinator::GovernorAuthorityObservationReadback| {
+                readback.connection_id == session.connection_id
+                    && readback.launch_nonce == session.launch_nonce
+                    && readback.session_epoch == session.session_epoch
+                    && readback.state_fence == session.module_generation.state_fence
+                    && readback.bridge_peer_set_revision == bridge_peer_set_revision
+                    && readback.admission == admission_identity
+            };
         let unavailable = |reason: &'static str| -> Result<serde_json::Value, TransportError> {
             self.startup_coordinator
                 .lock()
@@ -3200,9 +3202,8 @@ impl KernelComposition {
         if self.validate_active_bridge_profile(&admission).is_err() {
             return unavailable("active_original_admission_not_validated");
         }
-        let authority_lineage = eliot_ors::OpaqueLabel::new(
-            admission.state_fence.authority_epoch.lineage_id.as_str(),
-        );
+        let authority_lineage =
+            eliot_ors::OpaqueLabel::new(admission.state_fence.authority_epoch.lineage_id.as_str());
         let principal = eliot_ors::OpaqueLabel::new(admission.approved_user_sid.as_str());
         let (Ok(authority_lineage), Ok(principal)) = (authority_lineage, principal) else {
             return unavailable("active_source_scope_invalid");
@@ -3212,7 +3213,8 @@ impl KernelComposition {
             .lock()
             .map_err(|_| TransportError::SessionFenced)?
             .governor_authority_observation_readback();
-        let continuation = operation.after_owner_sequence != 0 || operation.after_event_sequence != 0;
+        let continuation =
+            operation.after_owner_sequence != 0 || operation.after_event_sequence != 0;
         let (owner_cutoff, owner_total) = if continuation {
             let Some(prior) = prior.as_ref() else {
                 return unavailable("source_continuation_binding_missing");
