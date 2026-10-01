@@ -358,6 +358,8 @@ pub enum ExclusiveOpKind {
     SchemaReplacement,
     /// Provider/execution generation cutover.
     GenerationCutover,
+    /// Durable WorkScope owner compare-and-swap.
+    WorkScopeOwner,
 }
 
 /// Report for one completed exclusive drain.

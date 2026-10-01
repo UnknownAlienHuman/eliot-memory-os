@@ -676,6 +676,10 @@ impl BridgeIdentity {
                 .with_request(&context.request_id)
                 .with_operation(&request.operation_id)
                 .with_idempotency_ref(&request.idempotency_key),
+            Request::WriteWorkScopeOwner { context, request } => Self::new()
+                .with_request(&context.request_id)
+                .with_operation(&request.operation_id)
+                .with_idempotency_ref(&request.idempotency_key),
             Request::DreamerJob { context, request } => Self::new()
                 .with_request(&context.request_id)
                 .with_operation(&request.request_identity.operation.operation_id)
@@ -724,6 +728,7 @@ impl BridgeIdentity {
             | Response::OrderingHeads { .. }
             | Response::ValidationSnapshot { .. }
             | Response::Recovery { .. }
+            | Response::WorkScopeOwner { .. }
             | Response::DreamerJob { .. }
             | Response::Backup { .. }
             | Response::Error { .. } => Self::new(),
@@ -992,6 +997,7 @@ pub fn classify_response(response: &Response) -> RequestOutcome {
             | WriteReceiptStatus::DeadLetter
             | WriteReceiptStatus::Cancelled => RequestOutcome::TerminalNonCommit,
         },
+        Response::WorkScopeOwner { .. } => RequestOutcome::Committed,
         Response::Receipt { .. }
         | Response::Health { .. }
         | Response::Readiness { .. }
@@ -1000,6 +1006,7 @@ pub fn classify_response(response: &Response) -> RequestOutcome {
         | Response::OrderingHeads { .. }
         | Response::ValidationSnapshot { .. }
         | Response::Recovery { .. }
+        | Response::WorkScopeOwner { .. }
         | Response::DreamerJob { .. } => RequestOutcome::ReadCompleted,
         Response::Backup { response } => match response {
             StoreBackupResponse::Status { report } => match report.outcome {
@@ -1197,6 +1204,7 @@ pub fn emit_dispatch_outcome(
         | Response::OrderingHeads { .. }
         | Response::ValidationSnapshot { .. }
         | Response::Recovery { .. }
+        | Response::WorkScopeOwner { .. }
         | Response::DreamerJob { .. }
         | Response::Backup { .. }
         | Response::Unknown { .. }
@@ -1262,6 +1270,7 @@ pub fn operation_name(request: &Request) -> &'static str {
         Request::ValidationSnapshot => "validation_snapshot",
         Request::Recovery { .. } => "recovery",
         Request::InitializeGenesis { .. } => "initialize_genesis",
+        Request::WriteWorkScopeOwner { .. } => "store_work_scope_owner",
         Request::DreamerJob { .. } => "dreamer_job",
     }
 }
@@ -1282,6 +1291,7 @@ pub fn dispatch_boundary(request: &Request) -> BridgeBoundary {
         Request::Backup { .. } => BridgeBoundary::BackupBoundary,
         Request::Recovery { .. } => BridgeBoundary::RecoveryBoundary,
         Request::InitializeGenesis { .. } => BridgeBoundary::GenesisBoundary,
+        Request::WriteWorkScopeOwner { .. } => BridgeBoundary::MutationResult,
         Request::DreamerJob { .. } => BridgeBoundary::DreamerLedger,
         Request::Health
         | Request::Readiness

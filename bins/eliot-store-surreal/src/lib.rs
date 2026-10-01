@@ -1933,6 +1933,9 @@ fn enforce_admitted_operation_with_log(
                 .validate_for_context(context)
                 .map_err(|error| error.to_string())
         }
+        Request::WriteWorkScopeOwner { context, request } => request
+            .validate_for_context(context)
+            .map_err(|error| error.to_string()),
         // Store backup edge (issue #975): the wire decode already ran the
         // closed backup shape plus transport identity binding, and
         // `validate_request_frame` already enforced the exact backup

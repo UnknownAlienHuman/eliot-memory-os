@@ -1129,16 +1129,10 @@ impl DaemonComposition {
         // `TASK_SCOPE_INCOMPATIBLE`. Neither rejection changes a task or
         // reaches the store, and no task is ever silently selected.
         //
-        // This method has zero production call sites, so the typed evidence
-        // leg is not yet on a live path: the daemon runtime driver never calls
-        // it. The blocking symbol is the compiled receipt — the repository's
-        // only production constructor of it,
-        // `eliot_workscope::ColdStartController::compile`, is reached only
-        // through `eliot_workscope::OnboardingSingleFlight::compile_and_publish`
-        // and therefore only through
-        // `eliot_governor::GovernorComposition::compile_cold_start_at_trigger`,
-        // which also has zero call sites. See `task_binding_admission`'s
-        // "Measured reachability" section for the full measurement.
+        // The live Task Controller caller supplies the exact guarded readiness
+        // returned by the Governor owner and the original WorkScope binding
+        // observation/source closure. The accepted attach path publishes the
+        // durable terminal before that caller can reach this gate.
         // Issue #1782 (I11.11 line 42): a Material canonical write is refused
         // while a retained external-attach receipt has no attributed
         // continuation, so an unreconciled attach of an already-running
@@ -4368,6 +4362,241 @@ impl DaemonComposition {
             .install_admitted_work_scope_owner(owner)
             .map_err(DaemonError::Composition)?;
         Ok((receipt, snapshot))
+    }
+
+    /// Admits one authenticated initial WorkScope binding through the
+    /// Governor owner. The caller must already have independently observed
+    /// the explicit root and read the durable owner row used for the CAS.
+    pub async fn admit_initial_scope_binding(
+        &self,
+        request: eliot_governor::InitialScopeBindingAdmissionRequest<'_>,
+    ) -> Result<eliot_governor::WorkScopeBindingOwner, DaemonError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        self.governor
+            .admit_initial_scope_binding(request)
+            .await
+            .map_err(DaemonError::Composition)
+    }
+
+    /// Installs the exact Governor-created WorkScope owner after its durable
+    /// Store CAS and independent readback have matched the admitted snapshot.
+    pub fn install_initial_scope_binding_owner(
+        &mut self,
+        owner: eliot_governor::WorkScopeBindingOwner,
+    ) -> Result<eliot_governor::WorkScopeBindingSnapshot, DaemonError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        self.governor
+            .install_admitted_work_scope_owner(owner)
+            .map_err(DaemonError::Composition)
+    }
+
+    /// Installs a later immutable WorkScope owner revision only after its
+    /// authenticated Kernel CAS and independent readback have completed.
+    pub fn install_admitted_work_scope_owner(
+        &mut self,
+        owner: eliot_governor::WorkScopeBindingOwner,
+    ) -> Result<eliot_governor::WorkScopeBindingSnapshot, DaemonError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        self.governor
+            .install_admitted_work_scope_owner(owner)
+            .map_err(DaemonError::Composition)
+    }
+
+    /// Builds the Governor-owned next WorkScope revision for the original
+    /// Kernel discovery lease. The daemon persists and independently reads
+    /// back the exact snapshot before installing the returned owner.
+    pub async fn prepare_cold_start_discovery_lease_owner(
+        &self,
+        lease: eliot_workscope::DiscoveryReadLease,
+        now: u64,
+    ) -> Result<eliot_governor::WorkScopeBindingOwner, DaemonError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        self.governor
+            .attach_cold_start_discovery_lease(lease, now)
+            .await
+            .map_err(DaemonError::Composition)
+    }
+
+    /// Builds the Governor-owned next WorkScope revision for the exact
+    /// consumed discovery lease and durable scan receipt. The daemon persists
+    /// and independently reads back the exact snapshot before installation.
+    pub async fn prepare_cold_start_scan_evidence_owner(
+        &self,
+        trigger: eliot_workscope::ColdStartTrigger,
+        discovery_lease: eliot_workscope::DiscoveryReadLease,
+        evidence: eliot_workscope::BootstrapScanEvidence,
+        scan_binding: &eliot_workscope::ScanDisclosureOwnerBinding,
+        scan_receipt: &eliot_workscope::ScanReceiptHandle,
+        now: u64,
+    ) -> Result<eliot_governor::WorkScopeBindingOwner, DaemonError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        self.governor
+            .attach_cold_start_scan_evidence(
+                trigger,
+                discovery_lease,
+                evidence,
+                scan_binding,
+                scan_receipt,
+                now,
+            )
+            .await
+            .map_err(DaemonError::Composition)
+    }
+
+    /// Admits the exact installation contour and durable scan owner once for
+    /// both the trigger scanner and restart-safe readiness readback.
+    pub fn bind_installation_scan_store(
+        &mut self,
+        installation_id: &str,
+        ors_object_ref: &str,
+        ors_generation: u64,
+        owner: Arc<dyn eliot_governor::ScanDisclosureRecordOwner>,
+    ) -> Result<eliot_governor::InstallationScanDisclosureStore, DaemonError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        self.governor
+            .bind_installation_scan_store(installation_id, ors_object_ref, ors_generation, owner)
+            .map_err(DaemonError::Composition)
+    }
+
+    /// Runs one trigger through the Governor-bound installation scan owner.
+    /// No caller-supplied store or disclosure binding can replace that owner.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_cold_start_trigger_scan(
+        &self,
+        trigger: eliot_workscope::ColdStartTrigger,
+        discovery_lease: &mut eliot_workscope::DiscoveryReadLease,
+        lease_key: &eliot_workscope::DiscoveryLeaseKey,
+        binding: &eliot_workscope::ScanDisclosureOwnerBinding,
+        candidate_privacy: eliot_workscope::PrivacyClass,
+        privacy_boundary: Option<&eliot_workscope::PrivacyBoundary>,
+        evidence: &eliot_workscope::BootstrapScanEvidence,
+        proposed_kind: eliot_workscope::ScopeKind,
+        identity_fingerprint: &str,
+        verifier_candidates: &[String],
+        governing_source_refs: Vec<String>,
+        now: u64,
+    ) -> Result<eliot_workscope::BootstrapScanOutcome, DaemonError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        self.governor
+            .run_cold_start_trigger_scan(
+                trigger,
+                discovery_lease,
+                lease_key,
+                binding,
+                candidate_privacy,
+                privacy_boundary,
+                evidence,
+                proposed_kind,
+                identity_fingerprint,
+                verifier_candidates,
+                governing_source_refs,
+                now,
+            )
+            .map_err(DaemonError::Composition)
+    }
+
+    /// Compiles the durable terminal from the exact persisted WorkScope
+    /// admission and installation receipt after the second owner revision has
+    /// been independently read back and installed.
+    pub async fn compile_cold_start_from_owner_inputs(
+        &mut self,
+        trigger: eliot_workscope::ColdStartTrigger,
+        principal_ref: &str,
+        session_ref: &str,
+        explicit_root_identity: &str,
+        discovery_lease: &eliot_workscope::DiscoveryReadLease,
+        scan: &eliot_workscope::BootstrapScanEvidence,
+        scan_binding: &eliot_workscope::ScanDisclosureOwnerBinding,
+        scan_receipt: &eliot_workscope::ScanReceiptHandle,
+        now: u64,
+    ) -> Result<eliot_workscope::LeaseJoin, DaemonError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        self.governor
+            .compile_cold_start_from_owner_inputs(
+                trigger,
+                principal_ref,
+                session_ref,
+                explicit_root_identity,
+                discovery_lease,
+                scan,
+                scan_binding,
+                scan_receipt,
+                now,
+            )
+            .await
+            .map_err(DaemonError::Composition)
+    }
+
+    /// Selects task evidence from the current Governor owners for the exact
+    /// authenticated cold-start identity and fence.
+    pub async fn select_current_task_binding_for_cold_start(
+        &self,
+        now: u64,
+        principal_ref: &str,
+        session_ref: &str,
+        scope_ref: &str,
+        state_fence: &eliot_contracts::StateFence,
+        expected_task_ref: &str,
+        expected_task_revision: Option<u64>,
+    ) -> Result<eliot_workscope::TaskBindingInput, DaemonError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        self.governor
+            .select_current_task_binding_for_cold_start(
+                now,
+                principal_ref,
+                session_ref,
+                scope_ref,
+                state_fence,
+                expected_task_ref,
+                expected_task_revision,
+            )
+            .await
+            .map_err(DaemonError::Composition)
+    }
+
+    /// Reconstructs readiness only from the retained original WorkScope
+    /// admission, installation scan receipt, and durable terminal owner.
+    pub async fn read_guarded_cold_start_readiness(
+        &self,
+        principal_ref: &str,
+        session_ref: &str,
+        scope_ref: &str,
+        task_selection: &eliot_observation::TaskSelectionEvidence,
+        state_fence: &eliot_contracts::StateFence,
+        now: u64,
+    ) -> Result<eliot_governor::GuardedColdStartReadiness, DaemonError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        self.governor
+            .read_guarded_cold_start_readiness(
+                principal_ref,
+                session_ref,
+                scope_ref,
+                task_selection,
+                state_fence,
+                now,
+            )
+            .await
+            .map_err(DaemonError::Composition)
     }
 
     /// Resolves the current, applicable task selection for admission from the

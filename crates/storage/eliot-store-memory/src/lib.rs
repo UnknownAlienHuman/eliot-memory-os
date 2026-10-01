@@ -38,7 +38,8 @@ use eliot_store_api::{
     ProjectionStatus, RecoveryRecord, RecoveryRecordKey, RequestMeta, Resubmission, RevisionDelta,
     RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, SplitView,
     StateFence, StoreError, StoreGenesisRequest, StoreHealth, StoreHealthStatus,
-    StoreRecoveryRequest, StoreRecoverySnapshot, TransitionClass, WriteReceipt, WriteReceiptStatus,
+    StoreRecoveryRequest, StoreRecoverySnapshot, StoreWorkScopeOwnerRequest,
+    StoreWorkScopeOwnerResponse, TransitionClass, WriteReceipt, WriteReceiptStatus,
     audit_heads_digest, bind_issue18_receipt, bind_policy_config_schema_versions,
     canonical_json_bytes, canonical_request_hash, decode_automation_mutation,
     decode_erasure_surfaces, decode_notification_mutation, decode_reactive_mutation,
@@ -5117,6 +5118,46 @@ impl MemoryStore {
             .insert(request.operation_id.to_string(), receipt.clone());
         Ok(receipt)
     }
+
+    fn write_work_scope_owner_sync(
+        &self,
+        context: &RequestMeta,
+        request: &StoreWorkScopeOwnerRequest,
+    ) -> Result<StoreWorkScopeOwnerResponse, StoreError> {
+        request.validate_for_context(context)?;
+        let mut state = self.lock_state()?;
+        if state.fences.as_ref() != Some(&request.state_fence) {
+            return Err(StoreError::FenceMismatch);
+        }
+        let key = request.owner_record.record_key();
+        let current = state
+            .recovery_records
+            .get(&key)
+            .ok_or(StoreError::IdentityConflict)?;
+        current.validate()?;
+        if current.state_fence != request.state_fence {
+            return Err(StoreError::FenceMismatch);
+        }
+        if current == &request.owner_record {
+            return Ok(StoreWorkScopeOwnerResponse { record: current.clone() });
+        }
+        if current.revision != request.expected_owner_revision
+            || current.namespace != request.owner_record.namespace
+            || current.key != request.owner_record.key
+            || current.schema != request.owner_record.schema
+        {
+            return Err(StoreError::IdentityConflict);
+        }
+        state.recovery_records.insert(key, request.owner_record.clone());
+        let readback = state
+            .recovery_records
+            .get(&request.owner_record.record_key())
+            .cloned()
+            .ok_or(StoreError::Unavailable)?;
+        let response = StoreWorkScopeOwnerResponse { record: readback };
+        response.validate_for_request(request)?;
+        Ok(response)
+    }
 }
 
 impl CanonicalStoreClient for MemoryStore {
@@ -5148,6 +5189,14 @@ impl CanonicalStoreClient for MemoryStore {
         request: StoreGenesisRequest,
     ) -> Result<WriteReceipt, StoreError> {
         self.initialize_genesis_sync(context, &request)
+    }
+
+    async fn write_work_scope_owner(
+        &self,
+        context: &RequestMeta,
+        request: StoreWorkScopeOwnerRequest,
+    ) -> Result<StoreWorkScopeOwnerResponse, StoreError> {
+        self.write_work_scope_owner_sync(context, &request)
     }
 
     async fn receipt(&self, operation_id: OperationId) -> Result<Option<WriteReceipt>, StoreError> {

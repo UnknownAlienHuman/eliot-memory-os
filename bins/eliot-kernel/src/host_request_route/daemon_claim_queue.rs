@@ -21,11 +21,15 @@
 
 use std::collections::BTreeMap;
 
+use eliot_contracts::{
+    ClockReading, ProductId, RequestId, RequestMetadata, SessionId, SourceId, TaskId,
+};
 use eliot_ors::{HostRequestState, OperationIdentity, OrsError};
+use eliot_receipts::RequestBinding;
 use eliot_protocol::{
     FinishAttempt, FinishResultBody, HOST_REQUEST_INVOKE_READ_WIRE_ID, HostRequestEnvelope,
     HostRequestInvokeReadPayload, HostRequestResultBody, TaskControllerAttempt,
-    TaskControllerInvocation, TaskControllerResultBody, host_request_operation_id,
+    RequestIdentity, TaskControllerInvocation, TaskControllerResultBody, host_request_operation_id,
 };
 use eliot_store_api::ScopeId;
 
@@ -40,6 +44,54 @@ use super::{
     MAX_QUEUED_LOCAL_READS, StaleLocalReadObservation, StaleLocalReadReason,
     check_local_read_admission,
 };
+
+/// Kernel-issued stable identity for the admitted Task Controller operation.
+/// The immutable host envelope is the source of request/session/task,
+/// idempotency, deadline, cancellation and fence; absent original clock data
+/// stays explicitly unknown (`ClockReading::default`) instead of being
+/// refreshed on each claim retry.
+fn task_controller_request_identity(
+    envelope: &HostRequestEnvelope,
+) -> Result<RequestIdentity, TransportError> {
+    let session_id = envelope
+        .identity
+        .session_id
+        .clone()
+        .map(SessionId::new)
+        .transpose()
+        .map_err(|_| TransportError::SessionFenced)?;
+    let request_id = RequestId::new(envelope.identity.request_id.as_str().to_owned())
+        .map_err(|_| TransportError::SessionFenced)?;
+    let task_id = envelope
+        .identity
+        .task_id
+        .clone()
+        .map(TaskId::new)
+        .transpose()
+        .map_err(|_| TransportError::SessionFenced)?;
+    let metadata = RequestMetadata {
+        request_id,
+        session_id,
+        task_id,
+        product_id: ProductId::new("eliotd").map_err(|_| TransportError::SessionFenced)?,
+        source_id: SourceId::new("eliotd").map_err(|_| TransportError::SessionFenced)?,
+        state_fence: envelope.state_fence.clone(),
+        clock: ClockReading::default(),
+    };
+    let identity = RequestIdentity {
+        request: RequestBinding {
+            metadata,
+            state_fence: envelope.state_fence.clone(),
+        },
+        idempotency_key: envelope.identity.idempotency_key.clone(),
+        deadline_unix_ms: envelope.identity.deadline_unix_ms,
+        cancellation_id: envelope.identity.cancellation_id.clone(),
+    };
+    identity
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
+    Ok(identity)
+}
 
 /// Refuses a campaign-packet staging candidate that repeats retained work.
 ///
@@ -176,6 +228,7 @@ impl KernelComposition {
                 campaign_packet_attempt,
                 task_controller_envelope: None,
                 task_controller_tool: None,
+                task_controller_request_identity: None,
                 task_controller_attempt: LocalReadAttemptState::default(),
                 finish_envelope: None,
                 finish_tool: None,
@@ -210,6 +263,7 @@ impl KernelComposition {
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
         let operation_id = host_request_operation_id(envelope);
+        let request_identity = task_controller_request_identity(envelope)?;
         let existing_connection = index.iter().find_map(|(connection_id, refs)| {
             refs.iter()
                 .find(|candidate| {
@@ -222,16 +276,24 @@ impl KernelComposition {
             if existing_connection != envelope.connection_id {
                 return Err(TransportError::IdentityConflict);
             }
-            if index
-                .get(existing_connection)
+            if let Some(candidate) = index
+                .get_mut(existing_connection)
                 .into_iter()
                 .flatten()
-                .any(|candidate| {
+                .find(|candidate| {
                     candidate.operation_id == operation_id
                         && candidate.request_digest == envelope.envelope_sha256
                         && candidate.task_controller_envelope.is_some()
                 })
             {
+                if candidate
+                    .task_controller_request_identity
+                    .as_ref()
+                    .is_some_and(|retained| retained != &request_identity)
+                {
+                    return Err(TransportError::IdentityConflict);
+                }
+                candidate.task_controller_request_identity = Some(request_identity);
                 return Ok(());
             }
         }
@@ -267,6 +329,14 @@ impl KernelComposition {
         }) {
             candidate.task_controller_envelope = Some(envelope.clone());
             candidate.task_controller_tool = Some(tool.clone());
+            if candidate
+                .task_controller_request_identity
+                .as_ref()
+                .is_some_and(|retained| retained != &request_identity)
+            {
+                return Err(TransportError::IdentityConflict);
+            }
+            candidate.task_controller_request_identity = Some(request_identity);
             candidate.task_controller_attempt = task_controller_attempt;
         } else {
             refs.push(HostRequestOperationRef {
@@ -285,6 +355,7 @@ impl KernelComposition {
                 campaign_packet_attempt: LocalReadAttemptState::default(),
                 task_controller_envelope: Some(envelope.clone()),
                 task_controller_tool: Some(tool.clone()),
+                task_controller_request_identity: Some(request_identity),
                 task_controller_attempt,
                 finish_envelope: None,
                 finish_tool: None,
@@ -377,6 +448,8 @@ impl KernelComposition {
             serde_json::Value,
             TaskControllerInvocation,
             TaskControllerAttempt,
+            String,
+            RequestIdentity,
         )>,
         TransportError,
     > {
@@ -405,6 +478,22 @@ impl KernelComposition {
                 if !self.application_binding_live_for_claim(envelope, &admission_owner, true)? {
                     continue;
                 }
+                // Keep the authenticated application identity from the
+                // retained activation binding; a daemon channel or request
+                // label cannot supply this owner key.
+                let authenticated_principal = self
+                    .agent_bridge_connections
+                    .lock()
+                    .map_err(|_| TransportError::SessionFenced)?
+                    .get(&envelope.connection_id)
+                    .and_then(|connection| connection.activated_binding.as_ref())
+                    .map(|binding| binding.principal_id.clone())
+                    .filter(|principal| {
+                        !principal.trim().is_empty()
+                            && principal.trim() == principal
+                            && !principal.chars().any(char::is_control)
+                    })
+                    .ok_or(TransportError::SessionFenced)?;
                 if !candidate.task_controller_attempt.is_owned_by(session) {
                     let generation = candidate
                         .task_controller_attempt
@@ -457,10 +546,115 @@ impl KernelComposition {
                 attempt
                     .validate()
                     .map_err(|_| TransportError::SessionFenced)?;
-                return Ok(Some((envelope.clone(), tool.clone(), invocation, attempt)));
+                let request_identity = candidate
+                    .task_controller_request_identity
+                    .clone()
+                    .ok_or(TransportError::SessionFenced)?;
+                return Ok(Some((
+                    envelope.clone(),
+                    tool.clone(),
+                    invocation,
+                    attempt,
+                    authenticated_principal,
+                    request_identity,
+                )));
             }
         }
         Ok(None)
+    }
+
+    /// Revalidates the live, original BIND_SCOPE claim before its owner
+    /// snapshot is written to canonical recovery. Only the exact retained
+    /// attempt identity crosses this boundary.
+    pub(crate) fn admit_task_controller_work_scope_owner_write(
+        &self,
+        session: &Session,
+        operation_id: &str,
+        request_sha256: &str,
+        presented_attempt: &TaskControllerAttempt,
+    ) -> Result<
+        (
+            HostRequestEnvelope,
+            TaskControllerInvocation,
+            serde_json::Value,
+            String,
+        ),
+        TransportError,
+    > {
+        presented_attempt
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if presented_attempt.operation_id != operation_id {
+            return Err(TransportError::SessionFenced);
+        }
+        let _transition = self.agent_bridge_transition_read()?;
+        let admission_owner = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let index = self
+            .host_request_connection_index
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let candidate = index
+            .values()
+            .flatten()
+            .find(|candidate| {
+                candidate.operation_id == operation_id
+                    && candidate.request_digest == request_sha256
+                    && candidate.task_controller_envelope.is_some()
+                    && candidate.task_controller_tool.is_some()
+            })
+            .ok_or(TransportError::UnknownRequest)?;
+        let envelope = candidate
+            .task_controller_envelope
+            .clone()
+            .ok_or(TransportError::UnknownRequest)?;
+        let tool = candidate
+            .task_controller_tool
+            .clone()
+            .ok_or(TransportError::UnknownRequest)?;
+        let state = &candidate.task_controller_attempt;
+        let invocation = task_controller_admission(&envelope, &tool)?;
+        if invocation.action != eliot_protocol::TaskControllerAction::BindScope
+            || host_request_operation_id(&envelope) != operation_id
+            || envelope.envelope_sha256 != request_sha256
+            || activation_deadline_expired(unix_ms(), envelope.identity.deadline_unix_ms)
+            || !state.is_owned_by(session)
+            || !state.is_live()
+            || presented_attempt.attempt_id != state.attempt_id
+            || presented_attempt.fencing_generation != state.generation
+            || presented_attempt.task_id.as_str()
+                != envelope.identity.task_id.as_deref().ok_or(TransportError::SessionFenced)?
+            || presented_attempt.scope_id
+                != envelope.identity.work_scope_id.as_deref().ok_or(TransportError::SessionFenced)?
+            || presented_attempt.session_id
+                != envelope.identity.session_id.as_deref().ok_or(TransportError::SessionFenced)?
+            || presented_attempt.expires_at_unix_ms != envelope.identity.deadline_unix_ms
+            || presented_attempt.state_fence != envelope.state_fence
+            || !presented_attempt.authority_epoch.is_same_authority(&envelope.state_fence.authority_epoch)
+            || session.module_generation.state_fence != envelope.state_fence
+            || !session.authority_epoch.is_same_authority(&envelope.state_fence.authority_epoch)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        if !self.application_binding_live_for_claim(&envelope, &admission_owner, true)? {
+            return Err(TransportError::SessionFenced);
+        }
+        let principal = self
+            .agent_bridge_connections
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?
+            .get(&envelope.connection_id)
+            .and_then(|connection| connection.activated_binding.as_ref())
+            .map(|binding| binding.principal_id.clone())
+            .filter(|principal| {
+                !principal.trim().is_empty()
+                    && principal.trim() == principal
+                    && !principal.chars().any(char::is_control)
+            })
+            .ok_or(TransportError::SessionFenced)?;
+        Ok((envelope, invocation, tool, principal))
     }
 
     pub(super) fn enqueue_finish_pair_under_transition(
@@ -553,6 +747,7 @@ impl KernelComposition {
                 campaign_packet_attempt: LocalReadAttemptState::default(),
                 task_controller_envelope: None,
                 task_controller_tool: None,
+                task_controller_request_identity: None,
                 task_controller_attempt: LocalReadAttemptState::default(),
                 finish_envelope: Some(envelope.clone()),
                 finish_tool: Some(tool.clone()),

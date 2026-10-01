@@ -23,182 +23,53 @@
 //! stays cold. A contaminated selection (canonical crossover marker) never
 //! promotes: captures stay cold and task-bound promotion rejects.
 //!
-//! # Daemon ingress entries, and which of them are live (issue #1929)
+//! # Live daemon ingress (issue #1929 and #2900)
 //!
-//! Without an entry below this module was unreachable from the daemon: the
-//! `eliotd` ingress admitted a capture or a task-relative write and only the
-//! downstream store gate could object, so the daemon itself was a bypass
-//! around I5.5. Three entries were added to close that chain:
+//! The composition-root `admit_canonical_write` runs on the live Task
+//! Controller material path after `commit_task_controller_transition` reads
+//! current task selection and durable readiness. Its input is the original
+//! `CanonicalWriteEnvelope` and identity from the Governor-prepared transition;
+//! readiness, original WorkScope binding observation, and source/privacy
+//! closure come from the guarded owner readback. `admit_named_mutation_capture`
+//! remains the transport edge: task-free captures may remain cold and
+//! task-relative writes still require the composition-root gate and downstream
+//! proof-handle enforcement.
 //!
-//! - [`admit_canonical_write`] — the composition-root named-mutation intake.
-//!   The caller presents its compiled
-//!   [`OnboardingReadinessReceipt`](eliot_workscope::OnboardingReadinessReceipt),
-//!   so this is the only entry that can see its task binding. The receipt
-//!   carries the owner-proven selection source/evidence from the promoting
-//!   task-intake owner, which [`resolve_task_selection`] validates into
-//!   [`TaskSelectionEvidence`]. No source is synthesized from an unrelated
-//!   profile or receipt handle. I5.6 step 4 verbatim — "resolve `TaskSelectionEvidence`
-//!   and `TaskContract` compatibility when the command is task-relative".
-//! - [`admit_named_mutation_capture`] — the transport edge
-//!   (`DaemonKernelClient::apply_prepared`). No typed selection exists there, so
-//!   a task-free `CaptureObservation` is admitted here as a cold unbound
-//!   candidate and is never treated as task-bound, while any transition naming
-//!   a task — with or without a capture — is reported as task-relative for the
-//!   selection-owning ingress and the store gate. It deliberately does not
-//!   restate the store bridge's presence/agreement rule for task-bearing
-//!   writes; that rule belongs to
-//!   `eliot-store-surreal::task_binding_gate`, which re-derives it from the
-//!   opaque proof handles before provider I/O. Neither replaces the other.
-//! - [`observe_explicit_workspace`] — the daemon half of the `WorkScope`
-//!   attach trigger. The daemon observes the explicit root mechanically; the
-//!   Governor stays the receipt/admission owner
-//!   (`GovernorComposition::admit_observed_scope_attach`), so this module
-//!   mints no receipt of its own.
+//! `observe_explicit_workspace` remains the mechanical Host observation used
+//! by the authenticated BIND_SCOPE owner admission. It creates no WorkScope
+//! receipt or semantic selection. Governor validates the original bootstrap,
+//! source, privacy, Policy, task, and fence inputs before the daemon persists
+//! the exact snapshot through Kernel's WorkScope owner CAS/readback route.
 //!
-//! - [`bind_current_task_selection`] — the applicability recheck admission
-//!   needs (issue #1746, W4). It refuses a current task until the readiness
-//!   receipt carries owner-proven selection source/evidence. The owner
-//!   producer is `GovernorComposition::current_task_selection_for_claim`
-//!   (retained terminal plus unique live activation, never request-supplied
-//!   evidence); its full-claim composition caller is
-//!   `DaemonComposition::resolve_current_task_selection` (STITCH: no live
-//!   dispatch ingress holds the full claim yet). The dispatch entry
-//!   (`DaemonComposition::commit_canonical_and_refresh`) instead supplies
-//!   partial lease-key terms to the partial-key
-//!   `GovernorComposition::current_task_selection`, which fail-closes by
-//!   owner decision (#1790), so task-relative admission withholds until the
-//!   full-claim route supplies the snapshot. Structural validation of
-//!   request-supplied `TaskSelectionEvidence` is never sufficient.
-//! - [`admit_canonical_write_with_activation`] — the W4 join (issue #1746,
-//!   W4/A2): [`admit_canonical_write`] preceded by
-//!   [`bind_current_task_selection`], so a structurally valid receipt that
-//!   disagrees with the live activation fails closed before any admission.
-//!   The snapshot arrives through the full-claim owner route
-//!   (`GovernorComposition::current_task_selection_for_claim`), never
-//!   from the request; the partial-key lookup fail-closes by owner decision
-//!   (#1790), so the positive path withholds until the full claim is
-//!   supplied. Live caller
-//!   [`DaemonComposition::commit_canonical_and_refresh`](super::DaemonComposition),
-//!   for task-relative envelopes only (see [`envelope_is_task_relative`]): the
-//!   caller passes the presented readiness lease terms to the Governor owner
-//!   (`GovernorComposition::current_task_selection`), never the request, and
-//!   that partial-key lookup withholds per the paragraph above. Captures and
-//!   non-task-relative writes stay on the
-//!   receipt-only [`admit_canonical_write`] leg so permitted raw capture
-//!   remains cold without a retained terminal.
-//! - [`require_material_bootstrap_for_task_bound`] — the W5/A4 join
-//!   (issue #1746): a sealed [`DispatchedBinding`] proceeds toward the #1742
-//!   Material gate only on a `Material` [`BootstrapAdmission`] naming the
-//!   same task/scope/fence/receipt-revision/governance profile. A diagnostic
-//!   bootstrap (always the no-task case) is never Material authority.
-//!   Designated caller
-//!   [`DaemonComposition::commit_canonical_and_refresh`](super::DaemonComposition);
-//!   STITCH until that gate passes the admitted bootstrap.
+//! # Measured reachability (issue #1929 and #2900)
 //!
-//! No entry creates a second write path, re-derives a downstream layer's
-//! decision, or accepts a task the caller did not name.
+//! The production path is now live. `daemon_runtime::trigger_accepted_cold_start`
+//! asks Governor to attach the accepted discovery lease, persists that exact
+//! owner snapshot through Kernel CAS and readback, and only then requests the
+//! installation scan binding. `GovernorComposition::run_cold_start_trigger_scan`
+//! scans through its bound installation owner; the caller then retains the
+//! consumed lease, original evidence, binding and receipt handle as another
+//! WorkScope revision before `compile_cold_start_from_owner_inputs` publishes
+//! the durable terminal readiness owner.
 //!
-//! # Measured reachability (issue #1929)
+//! Task Controller material writes use one guarded path:
+//! `campaign_task_controller::commit_task_controller_transition` resolves the
+//! current owner task selection, requires exact `Selected` evidence, reads the
+//! guarded durable readiness and original WorkScope observation, then invokes
+//! `DaemonComposition::commit_canonical_and_refresh` once with the prepared
+//! transition's unchanged request identity and original envelope. That envelope
+//! retains the expected revision and ordering heads; there is no direct
+//! `PreparedTaskTransition::exchange` bypass on this path. Unknown Store outcomes
+//! retain the original operation identity for canonical reconciliation, and a
+//! committed receipt remains reportable if dependent-view refresh degrades.
 //!
-//! Recorded because a checklist item satisfied against call-graph-dead code is
-//! exactly the defect this issue audits. Measured on this tree by symbol, not
-//! inferred:
-//!
-//! - [`admit_canonical_write`] has **one** production call site:
-//!   [`DaemonComposition::commit_canonical_and_refresh`](super::DaemonComposition).
-//!   An earlier revision of this file recorded *zero* call sites for it; that
-//!   was false and is corrected here.
-//! - [`admit_canonical_write_with_activation`] has **one** caller: the same
-//!   [`DaemonComposition::commit_canonical_and_refresh`](super::DaemonComposition),
-//!   on its task-relative leg only (see [`envelope_is_task_relative`]). The
-//!   snapshot it passes is resolved from the presented readiness lease through
-//!   the Governor owner (`GovernorComposition::current_task_selection`), never
-//!   from the request; captures and non-task-relative writes stay on the
-//!   receipt-only [`admit_canonical_write`] leg, so the cold path never needs
-//!   a retained terminal.
-//! - [`refuse_ready_string_without_evidence`] has **one** production call site:
-//!   [`admit_canonical_write`] for its task-relative leg (after
-//!   [`refuse_task_identity_conflict`], before [`admit_task_bound`]), reached
-//!   through [`admit_canonical_write_with_activation`] from
-//!   [`DaemonComposition::commit_canonical_and_refresh`](super::DaemonComposition).
-//!   A READY string, handshake, or DTO shape alone never passes: without owner
-//!   evidence the write fails closed with `TASK_SELECTION_REQUIRED`, and the
-//!   READY token is never even read.
-//! - [`require_material_bootstrap_for_task_bound`] has **zero call sites**: the
-//!   designated caller is the same composition, between the admission
-//!   projection and the #1742 material gate, passing the bootstrap admitted
-//!   for the same lease at the write fence.
-//! - `DaemonComposition::commit_canonical_and_refresh` itself has **zero**
-//!   production call sites — its only in-tree mentions are documentation and a
-//!   source-string assertion in `bins/eliotd/tests/agent_fabric_wiring.rs`. It
-//!   is the composition-root canonical-commit entry and nothing in production
-//!   calls it yet, so the typed evidence leg this module owns is reached from
-//!   no live daemon path.
-//! - [`admit_named_mutation_capture`] **is** live, through the neutral
-//!   transport port: `PreparedKernelExchange::exchange` calls
-//!   `KernelTransitionPort::apply_prepared`, implemented by
-//!   `DaemonKernelClient` in `bins/eliotd/src/kernel_transition_client.rs`,
-//!   whose `check_identity_binding` calls this entry before any transport is
-//!   touched. The daemon run loop drives that port for its `TestD` terminal
-//!   finish legs.
-//! - [`observe_and_admit_task`] has **zero call sites**, so
-//!   [`admit_task_bound_with_observed_scope`] is transitively dead with it.
-//! - [`admit_bootstrap_context`] has **zero call sites** as well. Both of its
-//!   designated callers are themselves uncalled —
-//!   `DaemonComposition::read_cold_start_surface_for_attach` (`caller: STITCH`)
-//!   and [`DaemonComposition::commit_canonical_and_refresh`](super::DaemonComposition)
-//!   (zero production call sites, above) — so no live path carries an admitted
-//!   bootstrap toward the #1742 Material gate.
-//! - [`revalidate_dispatched_binding`] has **zero call sites** — stronger than
-//!   the "no live caller passes that retained/observed pair" recorded under
-//!   [`revalidate_task_bound_for_effect`] below, which describes why no caller
-//!   can supply the pair. Its designated caller is the same uncalled
-//!   `commit_canonical_and_refresh`, so its private `material_effect_guard_detail`
-//!   helper is dead with it too.
-//! - [`revalidate_task_bound_for_effect`] **is** live: its one production call
-//!   site is the pre-commit effect gate in
-//!   [`DaemonComposition::commit_canonical_and_refresh`](super::DaemonComposition),
-//!   which passes the sealed binding's admitted task/scope/presented fence
-//!   against the live Governor kernel-snapshot fence. Its caller seals through
-//!   [`admit_canonical_write`], so the fence leg of the W6/A5 dispatch
-//!   revalidation runs on the direct-internal entrypoint. The fuller
-//!   [`revalidate_dispatched_binding`] (live task/scope plus bootstrap/profile/projection
-//!   revision plus the `MaterialEffect` scope-identity legs over the
-//!   gate-supplied retained/observed bindings and source closure) stays STITCH:
-//!   no live caller passes that retained/observed pair — the daemon holds no
-//!   retained `ScopeBinding` — so the owner legs run wired-but-unreached.
-//! - [`DaemonComposition::admit_scope_attach`](super::DaemonComposition) — the
-//!   only caller of [`ScopeAttachIngress`] — has **zero call sites**, and
-//!   `GovernorComposition::admit_observed_scope_attach` fails closed unless a
-//!   `WorkScope` owner is *already* retained, so the entry is additionally
-//!   circular: its only producer of the state it requires is itself.
-//!
-//! The single blocking symbol for the evidence leg is the compiled readiness
-//! receipt. `TaskSelectionEvidence` needs a non-zero `task_revision` and a
-//! lowercase `acceptance_digest`, and this repository has exactly one
-//! production constructor of [`OnboardingReadinessReceipt`](eliot_workscope::OnboardingReadinessReceipt):
-//! `eliot_workscope::ColdStartController::compile`. Its only production caller
-//! is `eliot_workscope::OnboardingSingleFlight::compile_and_publish`, so the
-//! receipt is reachable only through
-//! `eliot_governor::GovernorComposition::compile_cold_start_at_trigger`, which
-//! itself has zero call sites. No carrier on the write path holds the receipt
-//! or the evidence: `eliot_protocol::RequestIdentity`,
-//! `eliot_store_api::PreparedTransition`, `eliot_canonical::CanonicalWriteEnvelope`,
-//! `DaemonKernelClient`, and `GovernorComposition`'s retained
-//! `WorkScopeBindingOwner` all carry at most a bare `task_id`, and
-//! `WorkScopeBindingSnapshot` is documented as carrying "no task, plan, session,
-//! principal or kernel-generation authority".
-//!
-//! Consequence, stated rather than hidden: because `commit_canonical_and_refresh`
-//! is not called, the typed task-bound leg of [`admit_canonical_write`] is
-//! currently unreachable from the daemon. The two stable codes remain enforced
-//! on the real write path by `eliot_store_surreal::task_binding_gate::gate_apply`,
-//! which re-derives them from the opaque proof handles the transition actually
-//! carries, and the live transport edge reports `ColdUnbound`, which is the
-//! complete and honest answer for a task-free capture. Threading a selection
-//! onto the transport edge requires the receipt owner above to exist first; it
-//! must never be filled with a synthesized, reconstructed, or defaulted
-//! selection.
+//! The Kernel-issued RequestIdentity is retained at the authenticated Task
+//! Controller enqueue owner and returned unchanged on each claim. The BIND_SCOPE
+//! caller persists its original admitted WorkScope binding through the same
+//! typed owner CAS/readback path; subsequent activation stages use separate
+//! owner-issued child operations keyed to the original activation identity and
+//! exact expected WorkScope revision. No task selector or claimed transport
+//! field supplies a readiness receipt, task revision, or scan receipt.
 //!
 //! # Where a cold unbound candidate is retained (issue #1929)
 //!
@@ -247,10 +118,11 @@ use eliot_security_contracts::PrivacyClass;
 use eliot_store_api::{NamedMutationOperation, PreparedTransition};
 use eliot_workscope::{
     BootstrapDiscoveryInputs, BootstrapScanEvidence, DiscoveryLeaseKey, DiscoveryLeaseRequest,
-    DiscoveryRead, DiscoveryReadLease, GoverningSourceCandidateEvidence, GoverningSourceRole,
-    ManifestEvidence, ObservedScopeResources, OnboardingLease, OnboardingReadinessReceipt,
-    ReadinessLifecycle, ScopeBindingDisposition, ScopeResolutionState, TaskBindingState,
-    issue_discovery_lease, task_selection_required,
+    DiscoveryRead, DiscoveryReadLease, GoverningSourceCandidate, GoverningSourceCandidateEvidence,
+    GoverningSourceRole, ManifestEvidence, ObservedScopeResources, OnboardingLease,
+    OnboardingReadinessReceipt, PrecedenceDeclaration, ReadinessLifecycle,
+    ScopeBindingDisposition, ScopeResolutionState, TaskBindingState, issue_discovery_lease,
+    task_selection_required, WorkScopeBindingSnapshot,
 };
 
 /// Authenticated activation's bounded filesystem/VCS observation and its
@@ -262,6 +134,107 @@ pub struct ColdStartDiscoveryInput {
     pub lease: DiscoveryReadLease,
     pub key: DiscoveryLeaseKey,
     pub discovery: BootstrapDiscoveryInputs,
+}
+
+/// Caller-declared WorkScope data carried by the authenticated `BIND_SCOPE`
+/// Task Controller action. These values are validated against Governor-owned
+/// sources and privacy before they can become retained owner state.
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InitialWorkScopeBindingRequest {
+    pub explicit_root: PathBuf,
+    /// Original bounded Host discovery payload. The full typed payload is
+    /// retained by Governor so the original privacy boundary and scan
+    /// evidence can be independently joined after restart.
+    pub bootstrap_discovery: BootstrapDiscoveryInputs,
+    pub descriptor: WorkScopeDescriptor,
+    pub binding: ScopeBinding,
+    pub sources: GoverningSourceSet,
+    pub privacy: PrivacyProfile,
+    pub source_candidates: Vec<GoverningSourceCandidate>,
+    pub declared_precedences: Vec<PrecedenceDeclaration>,
+    pub absence_reason_ref: Option<String>,
+    pub admission_deadline: u64,
+    /// Kernel-issued discovery lease when the accepted activation has reached
+    /// the post-admission scan stage. Initial BIND_SCOPE may happen first.
+    #[serde(default)]
+    pub discovery_lease: Option<DiscoveryReadLease>,
+}
+
+impl InitialWorkScopeBindingRequest {
+    pub fn validate_for_task_scope(&self, work_scope_id: &str) -> Result<(), String> {
+        if !self.explicit_root.is_absolute() {
+            return Err("explicit_root must be an absolute Host observation selector".to_owned());
+        }
+        self.descriptor
+            .validate()
+            .map_err(|error| format!("WorkScope descriptor is invalid: {error}"))?;
+        self.binding
+            .validate()
+            .map_err(|error| format!("WorkScope binding is invalid: {error}"))?;
+        self.privacy
+            .validate()
+            .map_err(|error| format!("WorkScope privacy profile is invalid: {error}"))?;
+        if let Some(discovery_lease) = &self.discovery_lease {
+            discovery_lease
+                .validate()
+                .map_err(|error| format!("discovery lease is invalid: {error}"))?;
+        }
+        self.bootstrap_discovery
+            .evidence
+            .validate()
+            .map_err(|error| format!("bootstrap discovery evidence is invalid: {error}"))?;
+        if let Some(boundary) = &self.bootstrap_discovery.privacy_boundary {
+            boundary
+                .validate()
+                .map_err(|error| format!("bootstrap privacy boundary is invalid: {error}"))?;
+            if self
+                .bootstrap_discovery
+                .candidate_privacy
+                .is_some_and(|class| !boundary.admits(class))
+            {
+                return Err("bootstrap privacy boundary excludes the admitted class".to_owned());
+            }
+        }
+        if let Some(policy) = &self.bootstrap_discovery.policy {
+            policy
+                .validate()
+                .map_err(|error| format!("bootstrap descriptor policy is invalid: {error}"))?;
+        }
+        if self.descriptor.scope_ref != work_scope_id
+            || self.binding.scope.scope_ref != work_scope_id
+            || self.sources.scope_ref != work_scope_id
+            || self
+                .discovery_lease
+                .as_ref()
+                .is_some_and(|lease| lease.candidate_root_ref != self.binding.scope.root_identity)
+            || self.bootstrap_discovery.evidence.attested_reads.iter().any(|read| {
+                self.discovery_lease
+                    .as_ref()
+                    .is_some_and(|lease| !lease.allowed_reads.contains(read))
+            })
+        {
+            return Err("WorkScope request does not match the admitted task scope/root".to_owned());
+        }
+        if self.descriptor.scope_ref != self.binding.scope.scope_ref {
+            return Err("WorkScope descriptor and resolved binding disagree".to_owned());
+        }
+        if self.admission_deadline == 0
+            || self.source_candidates.iter().any(|candidate| {
+                candidate.validate().is_err()
+                    || candidate.applicable_scope_ref != work_scope_id
+                    || candidate.applicable_generation != self.binding.scope.generation
+            })
+            || self.declared_precedences.iter().any(|precedence| {
+                precedence.validate().is_err() || precedence.scope_ref != work_scope_id
+            })
+        {
+            return Err("WorkScope source admission inputs are invalid".to_owned());
+        }
+        self.sources
+            .validate_for(&self.binding.scope, &self.privacy)
+            .map_err(|error| format!("WorkScope source/privacy closure is invalid: {error}"))
+    }
 }
 
 /// The exact installation-owned scan result retained across the accepted
@@ -279,19 +252,10 @@ pub struct ColdStartScanOwnerReceipt {
     pub store: eliot_governor::InstallationScanDisclosureStore,
 }
 
-/// Why a durable scan receipt did not advance to compiled cold-start
-/// readiness. A successful scan is not a readiness receipt: profile and
-/// projection provenance must come from their own current owners.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ColdStartReadinessRefusal {
-    CompilerProfileOwnerUnavailable,
-}
-
 pub enum ColdStartTriggerResult {
     Question(eliot_workscope::BootstrapScanOutcome),
     Persisted {
         scan: ColdStartScanOwnerReceipt,
-        readiness_refusal: ColdStartReadinessRefusal,
     },
 }
 
@@ -313,6 +277,19 @@ struct ScanDisclosureOwnerRpcRequest<'a> {
 enum ScanDisclosureOwnerRpcAction<'a> {
     IssueContour,
     IssueBinding,
+    RetainDiscoveryLease {
+        expected_owner_revision: u64,
+        lease: &'a DiscoveryReadLease,
+        snapshot: &'a WorkScopeBindingSnapshot,
+    },
+    RetainScanEvidence {
+        expected_owner_revision: u64,
+        discovery_lease: &'a DiscoveryReadLease,
+        evidence: &'a BootstrapScanEvidence,
+        binding: &'a eliot_workscope::ScanDisclosureOwnerBinding,
+        receipt_handle: &'a eliot_workscope::ScanReceiptHandle,
+        snapshot: &'a WorkScopeBindingSnapshot,
+    },
     Stage {
         binding: &'a eliot_workscope::ScanDisclosureOwnerBinding,
         record: &'a ScanDisclosureOrsRecord,
@@ -356,6 +333,10 @@ enum ScanDisclosureOwnerRpcResult {
     },
     Binding {
         binding: eliot_workscope::ScanDisclosureOwnerBinding,
+    },
+    WorkScopeOwnerRevision {
+        owner_revision: u64,
+        state_fence: eliot_contracts::StateFence,
     },
     Staged {
         stored: bool,
@@ -794,6 +775,97 @@ pub fn request_scan_disclosure_binding(
         application_connection_id,
         activation_ticket_id,
     )
+}
+
+async fn request_scan_work_scope_revision(
+    kernel: &super::DaemonKernelClient,
+    application_connection_id: &str,
+    activation_ticket_id: &str,
+    action: ScanDisclosureOwnerRpcAction<'_>,
+    expected_snapshot: &WorkScopeBindingSnapshot,
+) -> Result<(), String> {
+    let payload = serde_json::to_value(ScanDisclosureOwnerRpcRequest {
+        wire_version: SCAN_DISCLOSURE_OWNER_WIRE_VERSION,
+        application_connection_id,
+        activation_ticket_id,
+        action,
+    })
+    .map_err(|error| error.to_string())?;
+    let value = kernel
+        .transact_async(SCAN_DISCLOSURE_OWNER_OPERATION, payload)
+        .await
+        .map_err(|error| error.to_string())?;
+    let response: ScanDisclosureOwnerRpcResponse =
+        serde_json::from_value(value).map_err(|error| error.to_string())?;
+    if response.wire_version != SCAN_DISCLOSURE_OWNER_WIRE_VERSION {
+        return Err("Kernel scan disclosure owner returned another wire version".to_owned());
+    }
+    match response.result {
+        ScanDisclosureOwnerRpcResult::WorkScopeOwnerRevision {
+            owner_revision,
+            state_fence,
+        } if owner_revision == expected_snapshot.owner_revision
+            && state_fence == expected_snapshot.state_fence => Ok(()),
+        ScanDisclosureOwnerRpcResult::WorkScopeOwnerRevision { .. } => Err(
+            "Kernel WorkScope owner CAS acknowledged another revision or fence".to_owned(),
+        ),
+        _ => Err("Kernel scan disclosure owner returned an unexpected result".to_owned()),
+    }
+}
+
+/// Persists the Governor's exact lease-stage WorkScope snapshot through the
+/// authenticated scan owner route and accepts only the matching durable
+/// revision acknowledgement.
+pub async fn retain_scan_discovery_lease_owner_revision(
+    kernel: &super::DaemonKernelClient,
+    application_connection_id: &str,
+    activation_ticket_id: &str,
+    expected_owner_revision: u64,
+    lease: &DiscoveryReadLease,
+    snapshot: &WorkScopeBindingSnapshot,
+) -> Result<(), String> {
+    request_scan_work_scope_revision(
+        kernel,
+        application_connection_id,
+        activation_ticket_id,
+        ScanDisclosureOwnerRpcAction::RetainDiscoveryLease {
+            expected_owner_revision,
+            lease,
+            snapshot,
+        },
+        snapshot,
+    )
+    .await
+}
+
+/// Persists the Governor's exact post-scan WorkScope revision, including the
+/// consumed discovery lease and its exact durable receipt binding.
+pub async fn retain_scan_evidence_owner_revision(
+    kernel: &super::DaemonKernelClient,
+    application_connection_id: &str,
+    activation_ticket_id: &str,
+    expected_owner_revision: u64,
+    discovery_lease: &DiscoveryReadLease,
+    evidence: &BootstrapScanEvidence,
+    binding: &eliot_workscope::ScanDisclosureOwnerBinding,
+    receipt_handle: &eliot_workscope::ScanReceiptHandle,
+    snapshot: &WorkScopeBindingSnapshot,
+) -> Result<(), String> {
+    request_scan_work_scope_revision(
+        kernel,
+        application_connection_id,
+        activation_ticket_id,
+        ScanDisclosureOwnerRpcAction::RetainScanEvidence {
+            expected_owner_revision,
+            discovery_lease,
+            evidence,
+            binding,
+            receipt_handle,
+            snapshot,
+        },
+        snapshot,
+    )
+    .await
 }
 
 /// Stable rejection code when task-bound promotion lacks current evidence.

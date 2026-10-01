@@ -59,7 +59,8 @@ use eliot_store_api::{
     OrderingScopeId, PreparedTransition, RequestMeta, ReservedWriteRequest, RevisionHead,
     RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, SnapshotBeginRequest,
     SnapshotCursor, SnapshotEndReceipt, SnapshotHandle, SnapshotPage, StateFence, StoreError,
-    StoreGenesisRequest, StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt,
+    StoreGenesisRequest, StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot,
+    StoreWorkScopeOwnerRequest, StoreWorkScopeOwnerResponse, WriteReceipt,
     generated_operation_manifests, operation_manifest_set_digest,
 };
 pub use error::AdapterError;
@@ -665,6 +666,16 @@ impl CanonicalStoreClient for SurrealStoreAdapter {
         request: StoreGenesisRequest,
     ) -> Result<WriteReceipt, StoreError> {
         apply::initialize_genesis(self, context, request)
+            .await
+            .map_err(AdapterError::into_store_error)
+    }
+
+    async fn write_work_scope_owner(
+        &self,
+        context: &RequestMeta,
+        request: StoreWorkScopeOwnerRequest,
+    ) -> Result<StoreWorkScopeOwnerResponse, StoreError> {
+        apply::write_work_scope_owner(self, context, request)
             .await
             .map_err(AdapterError::into_store_error)
     }
