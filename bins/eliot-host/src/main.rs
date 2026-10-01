@@ -273,11 +273,13 @@ fn console_process_exit_code() -> i32 {
 // (wire bytes, exit codes, SCM fallback, cleanup counts) is unchanged. New
 // callsites use entrypoint observations with static nonsecret words only: no
 // argv/env/nonce/credentials, no raw request lines, no error text (I15.4,
-// I07.20). The single HOST-0 terminal record for the console path is
-// preserved verbatim and stays the only terminal emission in this file:
-// lib.rs owns child-failure terminals, so main correlates without re-emitting
-// (single-terminal rule); the SCM-dispatcher failure is likewise a stage
-// detail, keeping stderr/capsule/exit 1066 as its receipt.
+// I07.20). The HOST-0 terminal record stays the single terminal for the
+// console path; the SCM-dispatcher failure owns the second terminal
+// emission in this file (B3, exactly one shared-facade record per failed
+// dispatch). lib.rs owns child-failure terminals, so main otherwise
+// correlates without re-emitting (single-terminal rule); B14 service-entry
+// failures stay subordinate projections, keeping stderr/capsule/SCM status
+// as their terminal receipt.
 //
 // B1  process bootstrap capture (`PROCESS_BOOTSTRAP.set`, Startup): cached
 //     only; a static outcome word, never launch material. The #889
@@ -286,7 +288,11 @@ fn console_process_exit_code() -> i32 {
 // B3  SCM dispatcher contour (windows-only, ScmDispatch): the `Ok(true)`
 //     service path stays unobserved (SCM owns the process); `Ok(false)`
 //     console fallback vs `Err` dispatcher failure stay distinct, and no
-//     fallback is added where none existed. No projection here.
+//     fallback is added where none existed. The `Err` arm emits the one
+//     designated dispatcher-failed shared-facade terminal plus a single
+//     subordinate failed projection (operation, admitted identities when
+//     the bootstrap parsed, terminal exit); stderr/capsule/exit 1066 keep
+//     their identical receipt.
 // B4  console terminal exit (HOST-0 reference): preserved verbatim, plus a
 //     typed #889 projection subordinate (INFO, not a second terminal).
 // B5  console launch parse (ConsoleLoop/LaunchConfig): the Error frame plus
@@ -310,7 +316,17 @@ fn console_process_exit_code() -> i32 {
 //     single `host.stop()` call is preserved; the `Ok`/`Stopped` outcomes
 //     are distinguished with identical results; drain outcome observed only.
 // B13 terminal exit codes (`console_process_exit_code`): unchanged.
-// B14 start-failure capsule/stderr/SCM status: untouched receipt owners.
+// B14 service-entry start failures (windows-only, ScmDispatch): the
+//     `service_main` sites that never cross lib.rs. Each named site below
+//     keeps its exact stderr/capsule/SCM-status receipt and adds one bounded
+//     subordinate failed projection (operation plus installation and
+//     generation only where launch options are actually held; never
+//     argv/env/nonce text, never raw error payloads). Covered sites:
+//     ScmRegisterNull, InvalidScmArgvOrBootstrap, InvalidRegistration,
+//     ReporterStartFailed, ReporterProgressFailed, SpawnCredentialFailed,
+//     SpawnRuntimeFailed. The open/credential-control/runtime-control and
+//     durable-shutdown arms keep their existing receipt with no projection
+//     added here (outside this item's named set).
 
 /// Reads the admitted profile supervisor switch from the process arguments,
 /// leaving every other launch argument untouched.
@@ -417,19 +433,39 @@ fn main() {
             );
         }
         Err(error) => {
-            // F-LOG-HOST-7 B3 (issue #982): dispatcher failure as stage detail
-            // only, so the HOST-0 terminal record below stays singular per the
-            // #889 contract; stderr, capsule, and exit 1066 still own the
-            // terminal receipt with identical text and codes.
+            // F-LOG-HOST-7 B3 (issue #982): dispatcher failure. The stage
+            // detail above correlates; the designated dispatcher-failed
+            // shared-facade terminal below is the single terminal record
+            // for this failed dispatch (the HOST-0 console terminal stays
+            // untouched). stderr, capsule, and exit 1066 keep their
+            // identical receipt.
             eliot_host::host_diagnostics::observe_entrypoint_with_detail(
                 eliot_host::host_diagnostics::EntrypointStage::ScmDispatch,
                 "dispatcher_failed",
+            );
+            eliot_host::host_diagnostics::observe_terminal_error(
+                eliot_host::host_diagnostics::HOST_TERMINAL_CODE_DISPATCHER_FAILED,
             );
             let detail = format!(
                 "StartServiceCtrlDispatcherW failed with Win32 error {error} (0x{error:08X})"
             );
             let _ = writeln!(io::stderr().lock(), "eliot-host: {detail}");
             let cached = captured_bootstrap_snapshot();
+            // F-LOG-HOST-7 B3: subordinate typed projection for the failed
+            // dispatch (INFO, not a second terminal): operation plus the
+            // admitted identities when the bootstrap parsed, with the
+            // terminal process exit this arm takes below. The Win32 error
+            // is not Host-typed, so the reason stays explicitly missing;
+            // the numeric code travels in the stderr/capsule receipt only.
+            let mut dispatcher = HostRequestProjection::failed_without_reason(
+                eliot_host::host_diagnostics::EntrypointStage::ScmDispatch,
+            )
+            .with_operation(AdmittedEvent::ServiceStart)
+            .with_terminal_exit(HOST_CONSOLE_PROCESS_EXIT_CODE);
+            if let Some(options) = cached.as_ref() {
+                dispatcher = dispatcher.with_launch_options(options);
+            }
+            observe_host_request(&dispatcher);
             persist_host_start_failure(
                 HostStopCode::DispatcherFailed,
                 "dispatcher",
@@ -1429,6 +1465,27 @@ impl Drop for HostStartPendingReporter {
     }
 }
 
+/// #889 projection: main-owned SCM service-entry failure for the start
+/// operation at the ScmDispatch boundary (issue #982 B14).
+///
+/// Bounded typed subordinate (INFO, never a terminal): operation and phase
+/// plus only owner state actually held here — installation and generation
+/// from launch options when this site holds admitted options or a parsed
+/// bootstrap snapshot. Never argv/env/nonce text, never raw error payloads
+/// (I15.4, I07.20). Observation only; the stderr/capsule/SCM-status
+/// receipt at the same site still owns the terminal outcome.
+#[cfg(windows)]
+fn observe_service_entry_failure(launch_options: Option<&HostLaunchOptions>) {
+    let mut projection = HostRequestProjection::failed_without_reason(
+        eliot_host::host_diagnostics::EntrypointStage::ScmDispatch,
+    )
+    .with_operation(AdmittedEvent::ServiceStart);
+    if let Some(options) = launch_options {
+        projection = projection.with_launch_options(options);
+    }
+    observe_host_request(&projection);
+}
+
 #[cfg(windows)]
 #[allow(
     clippy::too_many_arguments,
@@ -1476,6 +1533,9 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
             );
             let _ = writeln!(io::stderr().lock(), "eliot-host: {detail}");
             let cached = captured_bootstrap_snapshot();
+            // F-LOG-HOST-7 B14 (issue #982): bounded typed projection;
+            // the receipt below is unchanged.
+            observe_service_entry_failure(cached.as_ref());
             persist_host_start_failure(
                 HostStopCode::ScmRegisterNull,
                 "none",
@@ -1508,6 +1568,9 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
             let detail = format!("invalid SCM launch argv or process bootstrap: {error}");
             let _ = writeln!(io::stderr().lock(), "eliot-host: {detail}");
             let cached = captured_bootstrap_snapshot();
+            // F-LOG-HOST-7 B14 (issue #982): bounded typed projection;
+            // the receipt below is unchanged.
+            observe_service_entry_failure(cached.as_ref());
             fail_host_service(
                 &handle,
                 &mut report,
@@ -1522,6 +1585,9 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
     if let Err(error) = eliot_host::validate_host_scm_bootstrap(&launch_options) {
         let detail = format!("invalid SCM registration: {error}");
         let _ = writeln!(io::stderr().lock(), "eliot-host: {detail}");
+        // F-LOG-HOST-7 B14 (issue #982): bounded typed projection;
+        // the receipt below is unchanged.
+        observe_service_entry_failure(Some(&launch_options));
         fail_host_service(
             &handle,
             &mut report,
@@ -1537,6 +1603,9 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
         Err(error) => {
             let detail = format!("SCM start-pending reporter could not start: {error}");
             let _ = writeln!(io::stderr().lock(), "eliot-host: {detail}");
+            // F-LOG-HOST-7 B14 (issue #982): bounded typed projection;
+            // the receipt below is unchanged.
+            observe_service_entry_failure(Some(&launch_options));
             fail_host_service(
                 &handle,
                 &mut report,
@@ -1571,6 +1640,9 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
         let detail = "SCM start-pending progress could not be published";
         let _ = writeln!(io::stderr().lock(), "eliot-host: {detail}");
         let _ = host.stop();
+        // F-LOG-HOST-7 B14 (issue #982): bounded typed projection;
+        // the receipt below is unchanged.
+        observe_service_entry_failure(Some(&capsule_bootstrap));
         fail_host_service(
             &handle,
             &mut report,
@@ -1605,6 +1677,9 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
             let detail = format!("SCM credential-control thread could not start: {error}");
             let _ = writeln!(io::stderr().lock(), "eliot-host: {detail}");
             let _ = host.stop();
+            // F-LOG-HOST-7 B14 (issue #982): bounded typed projection;
+            // the receipt below is unchanged.
+            observe_service_entry_failure(Some(&capsule_bootstrap));
             fail_host_service(
                 &handle,
                 &mut report,
@@ -1640,6 +1715,9 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
             let detail = format!("SCM runtime-control thread could not start: {error}");
             let _ = writeln!(io::stderr().lock(), "eliot-host: {detail}");
             let _ = host.stop();
+            // F-LOG-HOST-7 B14 (issue #982): bounded typed projection;
+            // the receipt below is unchanged.
+            observe_service_entry_failure(Some(&capsule_bootstrap));
             fail_host_service(
                 &handle,
                 &mut report,

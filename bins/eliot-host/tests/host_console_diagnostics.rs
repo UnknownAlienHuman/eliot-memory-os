@@ -20,7 +20,10 @@ fn host_console_boundaries_are_complete_and_singular() {
         assert!(MAIN.contains(m), "marker missing: {m}");
     }
     assert_eq!(MAIN.matches("install_host_diagnostics").count(), 1);
-    assert_eq!(MAIN.matches("observe_terminal_error").count(), 1);
+    // Item 3 (#982 audit 5910117501): exactly two terminal emissions — the
+    // HOST-0 console reference plus the single designated dispatcher-failed
+    // terminal. No other production path emits a terminal.
+    assert_eq!(MAIN.matches("observe_terminal_error").count(), 2);
     assert_eq!(MAIN.matches("write_response(&").count(), 4);
     assert_eq!(MAIN.matches("std::process::exit(").count(), 2);
     assert_eq!(MAIN.matches("match host.stop()").count(), 2);
@@ -54,4 +57,64 @@ fn host_console_binary_keeps_protocol_on_stdout_only() {
         assert!(!stdout.contains(m), "diagnostics on stdout: {m}");
     }
     assert!(!stderr.contains("\"status\""), "protocol on stderr");
+}
+// WORK_UNIT_CASE: 982/4, 982/10
+#[test]
+fn host_service_entry_failures_project_typed_and_singular() {
+    // Item 3 positive: the dispatcher-failed vocabulary is designated
+    // exactly once in production, as the single shared-facade terminal
+    // for the failed dispatch; the HOST-0 console terminal is the only
+    // other emission (see the count in
+    // host_console_boundaries_are_complete_and_singular).
+    assert_eq!(
+        MAIN.matches("HOST_TERMINAL_CODE_DISPATCHER_FAILED").count(),
+        1
+    );
+    // Item 3 receipt preservation (case 4): the dispatcher stderr text,
+    // capsule class, and exit path are unchanged alongside the terminal.
+    assert!(MAIN.contains("StartServiceCtrlDispatcherW failed with Win32 error"));
+    assert!(MAIN.contains("HostStopCode::DispatcherFailed"));
+    // Item 4 positive: each named B14 service-entry failure carries one
+    // bounded typed projection at its own boundary — 7 callsites plus the
+    // single helper definition, no per-site copies.
+    assert_eq!(MAIN.matches("observe_service_entry_failure").count(), 8);
+    for site in [
+        "HostStopCode::ScmRegisterNull",
+        "HostStopCode::InvalidScmArgvOrBootstrap",
+        "HostStopCode::InvalidRegistration",
+        "HostStopCode::ReporterStartFailed",
+        "HostStopCode::ReporterProgressFailed",
+        "HostStopCode::SpawnCredentialFailed",
+        "HostStopCode::SpawnRuntimeFailed",
+    ] {
+        assert!(MAIN.contains(site), "B14 site missing: {site}");
+    }
+}
+// WORK_UNIT_CASE: 982/13
+#[test]
+fn host_service_entry_projections_carry_no_payloads() {
+    // Items 3-4 refusal (complements the entrypoint-line canary scan
+    // above, which does not cover these lines): the new terminal and
+    // projection lines carry only static vocabulary and already-held
+    // owner state — no formatted payloads, no argv/env/nonce text, no
+    // raw error/detail values.
+    const REFUSED: [&str; 9] = [
+        "format!",
+        "to_string()",
+        "{error}",
+        "{detail}",
+        "&detail",
+        "&error",
+        "argv",
+        "env::",
+        "nonce",
+    ];
+    for line in MAIN
+        .lines()
+        .filter(|l| l.contains("observe_service_entry_failure") || l.contains("observe_terminal_error"))
+    {
+        for token in REFUSED {
+            assert!(!line.contains(token), "payload on diagnostic line: {line}");
+        }
+    }
 }
