@@ -259,83 +259,14 @@ fn validate_schema_meta_record_in_state(
     {
         return Err(AdapterError::PartialOutcome);
     }
-    if record.generation == schema::GENERATION_V1 {
-        if record.migrations.len() != 1 {
-            return Err(AdapterError::PartialOutcome);
-        }
-        let first = &record.migrations[0];
-        let expected = v1_identity();
-        if first.migration_id != expected.migration_id
-            || first.migration_checksum_sha256 != expected.migration_checksum_sha256
-            || first.generation != expected.generation
-        {
-            return Err(AdapterError::PartialOutcome);
-        }
-        if record.migration_id != schema::MIGRATION_ID_V1
-            || record.migration_checksum_sha256 != expected.migration_checksum_sha256
-        {
-            return Err(AdapterError::PartialOutcome);
-        }
-    } else if record.generation == schema::GENERATION_V2 {
-        if record.migrations.len() != 2 {
-            return Err(AdapterError::PartialOutcome);
-        }
-        let first = &record.migrations[0];
-        let expected_v1 = v1_identity();
-        if first.migration_id != expected_v1.migration_id
-            || first.migration_checksum_sha256 != expected_v1.migration_checksum_sha256
-            || first.generation != expected_v1.generation
-        {
-            return Err(AdapterError::PartialOutcome);
-        }
-        let last = &record.migrations[1];
-        if last.generation != schema::GENERATION_V2 {
-            return Err(AdapterError::PartialOutcome);
-        }
-        if !is_admitted_v2_entry(last) {
-            return Err(AdapterError::PartialOutcome);
-        }
-        if record.migration_id != last.migration_id
-            || record.migration_checksum_sha256 != last.migration_checksum_sha256
-        {
-            return Err(AdapterError::PartialOutcome);
-        }
-    } else if record.generation == schema::GENERATION_V3 {
-        // The third generation is additive over the second, so its history is
-        // the complete admitted v1 and v2 evidence plus exactly one v2-to-v3
-        // entry. Every position is compared against the published identity it
-        // must carry and the recorded head must equal the last entry, so a v3
-        // row can neither skip a generation nor claim a head the chain did not
-        // reach. A record of any other length, or whose second entry is not one
-        // of the two admitted ways of reaching generation 2, is refused rather
-        // than accepted as a shorter or differently-arrived history.
-        if record.migrations.len() != 3 {
-            return Err(AdapterError::PartialOutcome);
-        }
-        let first = &record.migrations[0];
-        let expected_v1 = v1_identity();
-        if first.migration_id != expected_v1.migration_id
-            || first.migration_checksum_sha256 != expected_v1.migration_checksum_sha256
-            || first.generation != expected_v1.generation
-        {
-            return Err(AdapterError::PartialOutcome);
-        }
-        let second = &record.migrations[1];
-        if second.generation != schema::GENERATION_V2 || !is_admitted_v2_entry(second) {
-            return Err(AdapterError::PartialOutcome);
-        }
-        let last = &record.migrations[2];
-        if !is_admitted_v3_entry(last) {
-            return Err(AdapterError::PartialOutcome);
-        }
-        if record.migration_id != last.migration_id
-            || record.migration_checksum_sha256 != last.migration_checksum_sha256
-        {
-            return Err(AdapterError::PartialOutcome);
-        }
-    } else {
-        return Err(AdapterError::PartialOutcome);
-    }
+    // Everything above is shared by every generation. What distinguishes one
+    // recorded row from another is the history its own generation was reached
+    // by, so that is dispatched to one arm per generation: the third
+    // generation is a peer of the first and second here rather than a fourth
+    // block appended to this function, and a generation this owner does not
+    // publish is refused rather than falling through with the shared checks
+    // above as though they were enough.
+    validate_generation_history(record)?;
     for entry in &record.migrations {
         if !non_blank(&entry.migration_id)
             || !non_blank(&entry.migration_checksum_sha256)
@@ -343,6 +274,115 @@ fn validate_schema_meta_record_in_state(
         {
             return Err(AdapterError::PartialOutcome);
         }
+    }
+    Ok(())
+}
+
+/// Reports whether one recorded history entry is the admitted first-generation
+/// baseline identity.
+///
+/// The comparison is against [`v1_identity`], the identity this owner publishes
+/// for generation 1, never against the entry being checked. Every generation
+/// whose history is a chain rather than a single baseline begins with this
+/// entry, so the later generations are checked against the same published
+/// evidence the first-generation record was, not against a restatement of it.
+fn is_admitted_v1_entry(entry: &SchemaMigrationIdentity) -> bool {
+    let expected = v1_identity();
+    entry.migration_id == expected.migration_id
+        && entry.migration_checksum_sha256 == expected.migration_checksum_sha256
+        && entry.generation == expected.generation
+}
+
+/// Dispatches to the one history validator the record's own generation admits.
+///
+/// A generation this owner does not publish has no arm and is refused: the
+/// shared shape, bridge and head checks that ran before this dispatch are not
+/// sufficient on their own, so falling through to them would admit a record
+/// whose history was never validated at all.
+fn validate_generation_history(record: &SchemaMetaRecord) -> Result<(), AdapterError> {
+    match record.generation.as_str() {
+        schema::GENERATION_V1 => validate_v1_history(record),
+        schema::GENERATION_V2 => validate_v2_history(record),
+        schema::GENERATION_V3 => validate_v3_history(record),
+        _ => Err(AdapterError::PartialOutcome),
+    }
+}
+
+/// Validates the recorded history of a first-generation row.
+///
+/// Generation 1 is reached only by its fresh-database baseline, so its history
+/// is exactly that one published identity and the recorded head is that same
+/// identity rather than any other plan's values.
+fn validate_v1_history(record: &SchemaMetaRecord) -> Result<(), AdapterError> {
+    let expected = v1_identity();
+    if record.migrations.len() != 1 {
+        return Err(AdapterError::PartialOutcome);
+    }
+    if !is_admitted_v1_entry(&record.migrations[0]) {
+        return Err(AdapterError::PartialOutcome);
+    }
+    if record.migration_id != schema::MIGRATION_ID_V1
+        || record.migration_checksum_sha256 != expected.migration_checksum_sha256
+    {
+        return Err(AdapterError::PartialOutcome);
+    }
+    Ok(())
+}
+
+/// Validates the recorded history of a second-generation row.
+///
+/// Generation 2 is reached either by its own fresh-database baseline or by the
+/// additive v1-to-v2 delta, so its history is the first-generation identity
+/// followed by one of the two admitted ways of closing generation 2, and the
+/// recorded head is that closing entry.
+fn validate_v2_history(record: &SchemaMetaRecord) -> Result<(), AdapterError> {
+    if record.migrations.len() != 2 {
+        return Err(AdapterError::PartialOutcome);
+    }
+    if !is_admitted_v1_entry(&record.migrations[0]) {
+        return Err(AdapterError::PartialOutcome);
+    }
+    let last = &record.migrations[1];
+    if last.generation != schema::GENERATION_V2 || !is_admitted_v2_entry(last) {
+        return Err(AdapterError::PartialOutcome);
+    }
+    if record.migration_id != last.migration_id
+        || record.migration_checksum_sha256 != last.migration_checksum_sha256
+    {
+        return Err(AdapterError::PartialOutcome);
+    }
+    Ok(())
+}
+
+/// Validates the recorded history of a third-generation row.
+///
+/// The third generation is additive over the second, so its history is the
+/// complete admitted v1 and v2 evidence plus exactly one v2-to-v3 entry. Every
+/// position is compared against the published identity it must carry and the
+/// recorded head must equal the last entry, so a v3 row can neither skip a
+/// generation nor claim a head the chain did not reach. A record of any other
+/// length, or whose second entry is not one of the two admitted ways of
+/// reaching generation 2, is refused rather than accepted as a shorter or
+/// differently-arrived history.
+fn validate_v3_history(record: &SchemaMetaRecord) -> Result<(), AdapterError> {
+    if record.migrations.len() != 3 {
+        return Err(AdapterError::PartialOutcome);
+    }
+    if !is_admitted_v1_entry(&record.migrations[0]) {
+        return Err(AdapterError::PartialOutcome);
+    }
+    let second = &record.migrations[1];
+    if second.generation != schema::GENERATION_V2 || !is_admitted_v2_entry(second) {
+        return Err(AdapterError::PartialOutcome);
+    }
+    let last = &record.migrations[2];
+    if !is_admitted_v3_entry(last) {
+        return Err(AdapterError::PartialOutcome);
+    }
+    if record.migration_id != last.migration_id
+        || record.migration_checksum_sha256 != last.migration_checksum_sha256
+    {
+        return Err(AdapterError::PartialOutcome);
     }
     Ok(())
 }
