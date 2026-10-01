@@ -51,6 +51,34 @@
 //! attempt and not a provider result binding. The ceiling below is therefore the
 //! strongest thing this route can say, and it is enforced by the owner, not by
 //! this type.
+//!
+//! # Why the typed result cannot be driven further from here (issue #370 R1)
+//!
+//! The remaining leg — a typed `eliot_agent_api::AgentResult` reaching
+//! `AgentCoordinator::submit_result` — has no owner to write it at, and that is
+//! a measured fact about this tree rather than an unstated gap:
+//!
+//! - `AgentCoordinator::submit_result` resolves its attempt out of the
+//!   coordinator's own `attempts` map and refuses `UnknownAttempt` when the
+//!   attempt is absent
+//!   (`crates/agent/eliot-agent-coordinator/src/core.rs:3495`);
+//! - the only writer of that map is `AgentCoordinator::admit`
+//!   (`crates/agent/eliot-agent-coordinator/src/core.rs:2193`), which requires a
+//!   provider-verified `ProviderAdmissionReceipt`;
+//! - every construction site of that receipt in the workspace is either its own
+//!   definition (`crates/agent/eliot-agent-coordinator/src/model.rs:404`) or a
+//!   test fixture (`src/tests.rs:538`,
+//!   `src/core/admission_normalization_tests.rs:371`,
+//!   `tests/coordinator.rs:301`, `tests/coordinator.rs:536`), and `admit` runs
+//!   it through the sealed per-proof verifier before any state moves
+//!   (`crates/agent/eliot-agent-coordinator/src/core.rs:2011`).
+//!
+//! So a producer written here would be a producer whose every frame fails closed
+//! at `UnknownAttempt`: a caller with no admitted attempt, not a live ingress.
+//! This lane therefore stops at the strongest thing this route can actually
+//! admit — a candidate artifact reference bound to one admitted attempt's own
+//! recorded result bytes — and names the admission-receipt issuer (#1678) as the
+//! owner a typed producer must be written at, rather than minting one here.
 
 use eliot_contracts::{EpochId, StateFence};
 use eliot_governor::{AgentResultDraft, CompositionError, ResultAdmissionCeiling};

@@ -5626,7 +5626,7 @@ async fn run_task_controller_poll(
                 eliotd::campaign_task_controller::record_task_controller_coordination_candidate(
                     &mut guard,
                     &coordination_source,
-                    &body.result_digest,
+                    &body,
                     now,
                 ),
             )
