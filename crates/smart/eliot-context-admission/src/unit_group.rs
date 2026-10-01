@@ -6,9 +6,10 @@
 //! This module binds that rule to the owner-issued unit/member metadata of
 //! #1727 ([`BoundaryMetadataSet`]) and to nothing else.
 //!
-//! Two properties are established here, and both are consumed by the existing
-//! `prepare_floor` -> `select_required` -> `select_optional` path rather than
-//! by a second whole-unit selection:
+//! Three properties are established here. The first two are consumed by the
+//! existing `prepare_floor` -> `select_required` -> `select_optional` path
+//! rather than by a second whole-unit selection; the third is checked after
+//! that one selection has finished, on the `Complete` arm only:
 //!
 //! 1. **Group closure.** An atom that belongs to an indivisible unit is selected
 //!    together with every member the owner declares for that unit. The
