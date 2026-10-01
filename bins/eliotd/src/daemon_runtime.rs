@@ -4970,6 +4970,11 @@ struct StatePairSelectors {
     scope: eliot_store_api::ScopeId,
     /// Exact bounded `include` projection-field list; empty means the default
     /// projection (authenticated discovery with no field filter).
+    ///
+    /// The list narrows the emitted `facts` members: a named member is included
+    /// only when its field name appears here, and an empty list means every
+    /// member. It is applied when the response is built, so the answer is the
+    /// projection that was asked for rather than the full one.
     include: Vec<String>,
 }
 
@@ -5057,8 +5062,11 @@ fn state_pair_selectors(
 ///    but re-read from the claim the Kernel just minted;
 /// 3. the owner-backed bounded reads through the existing Governor
 ///    [`ReadService::bound_state`] over the daemon's real read client - the
-///    Task Controller task state, the Problem Owner attention/problems set, and
-///    the epistemic position - each projected to its own typed outcome;
+///    Task Controller task state, the scope revision view, and the Problem Owner
+///    attention/problems set - each projected to its own typed outcome. The
+///    independent Kernel health/session members the issue also requires have no
+///    typed read owner on this path yet and are emitted as EXPLICIT unresolved
+///    outcomes, never omitted and never as a healthy empty fact;
 /// 4. the result body binding, whose class follows the OUTCOME: an
 ///    owner-observed preview is an existing-evidence read, and a preview with
 ///    any partial or unavailable fact is a retained delivery record so it can
@@ -5106,10 +5114,24 @@ async fn serve_local_state_pair(
         .revision_heads(vec![scope_key.clone()])
         .await
         .map_err(|error| format!("state scope revision head: {error}"))?;
-    let minimum = observed
-        .iter()
-        .find(|head| head.key == scope_key)
+    // The head is bound to the fence this preview is served under, exactly as
+    // `context_reconstruction_route::scope_dependency_revisions` binds it. A
+    // head observed under a DIFFERENT fence, a zero revision, a duplicate, or a
+    // head that fails its own validation is refused here rather than becoming a
+    // dependency minimum: accepting one would let a retired authority's head
+    // pass as current, which is the stale-serving failure the comment above
+    // names.
+    let mut matching = observed.iter().filter(|head| head.key == scope_key);
+    let minimum = matching
+        .next()
         .ok_or_else(|| "state scope revision head is not observed".to_owned())?;
+    if matching.next().is_some()
+        || minimum.revision == 0
+        || minimum.state_fence != retained_fence
+        || minimum.validate().is_err()
+    {
+        return Err("state scope revision head is not a current bound head".to_owned());
+    }
     let mut dependency_revisions = std::collections::BTreeMap::new();
     dependency_revisions.insert(scope_key, minimum.revision);
     // The read service is built over the same per-call client AFTER the head
@@ -5141,7 +5163,7 @@ async fn serve_local_state_pair(
         None => StateFactOutcome::Observed(serde_json::Value::Null),
     };
 
-    // Attention/problems and the epistemic position carry no task binding: an
+    // Attention/problems and the scope revision view carry no task binding: an
     // authenticated discovery reads them exactly like a task-bound request
     // does, so a no-task preview is a complete selection/intake state rather
     // than an absence of one.
@@ -5185,24 +5207,71 @@ async fn serve_local_state_pair(
     let complete = task_fact.is_observed()
         && attention_fact.is_observed()
         && scope_revision_fact.is_observed();
+    // The admitted `include` list narrows the emitted facts. Every fact is still
+    // READ, so a member that is filtered out is not silently absent-because-
+    // unread; the verdict below still accounts for all of them, and a filtered
+    // member is omitted from the projection rather than reported as observed.
+    let mut facts = serde_json::Map::new();
+    let mut project = |facts: &mut serde_json::Map<String, serde_json::Value>,
+                       field: &str,
+                       value: serde_json::Value| {
+        if selectors.include.is_empty() || selectors.include.iter().any(|name| name == field) {
+            facts.insert(field.to_owned(), value);
+        }
+    };
+    project(
+        &mut facts,
+        "task_state",
+        if selected_task.is_some() {
+            task_fact.into_json("GetTaskState")
+        } else {
+            serde_json::json!({
+                "operation": "GetTaskState",
+                "status": "not_applicable",
+                "reason": "authenticated discovery selected no task",
+            })
+        },
+    );
+    project(
+        &mut facts,
+        "scope_revision",
+        scope_revision_fact.into_json("GetScopeRevisionView"),
+    );
+    project(
+        &mut facts,
+        "attention",
+        attention_fact.into_json("GetAttentionAndProblems"),
+    );
+    // The issue requires independent Kernel health/session facts in this
+    // projection. No typed owner read for them exists yet: there is no
+    // `NamedReadOperation` for Kernel health or Kernel session in
+    // `eliot-store-api`, and no `kernel_health` surface in
+    // `bins/eliot-kernel/src` to read one from. The members are therefore
+    // emitted as EXPLICIT unresolved outcomes, never omitted by default and
+    // never rendered as a healthy empty fact - a silently absent member would
+    // read as a complete projection, which is exactly the gap the issue
+    // forbids. Writing the owner is the remaining work, named rather than
+    // faked with an invented value.
+    for (field, operation) in [
+        ("kernel_health", "GetKernelHealth"),
+        ("kernel_session", "GetKernelSession"),
+    ] {
+        project(
+            &mut facts,
+            field,
+            serde_json::json!({
+                "operation": operation,
+                "status": "unavailable",
+                "reason": "no typed Kernel health/session read owner exists on this path yet",
+            }),
+        );
+    }
     let response = serde_json::json!({
         "capability": STATE_PAIR_CAPABILITY,
         "scope_id": selectors.scope.as_str(),
         "include": selectors.include,
         "task_selection": task_selection,
-        "facts": {
-            "task_state": if selected_task.is_some() {
-                task_fact.into_json("GetTaskState")
-            } else {
-                serde_json::json!({
-                    "operation": "GetTaskState",
-                    "status": "not_applicable",
-                    "reason": "authenticated discovery selected no task",
-                })
-            },
-            "scope_revision": scope_revision_fact.into_json("GetScopeRevisionView"),
-            "attention": attention_fact.into_json("GetAttentionAndProblems"),
-        },
+        "facts": facts,
         "read_state_fence": retained_fence,
     });
     state_result_body(envelope, attempt, response, complete)
