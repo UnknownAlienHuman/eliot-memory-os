@@ -8827,6 +8827,45 @@ impl NativeWorkerClaimRecord {
             && self.capability_cell_registry_digest == other.capability_cell_registry_digest
     }
 
+    /// Validates retained per-kind receipt-payload digests (issue #1108, A5).
+    ///
+    /// Absent (pre-column or not-yet-recorded) payload slots decode as
+    /// `None` and carry no owner evidence; a retained payload digest must
+    /// be an exact digest.
+    fn validate_receipt_payloads(&self) -> Result<(), OrsError> {
+        for (digest, field) in [
+            (
+                &self.receipt_payloads.admission_payload_sha256,
+                "native_worker_claim_admission_payload_sha256",
+            ),
+            (
+                &self.receipt_payloads.cancellation_payload_sha256,
+                "native_worker_claim_cancellation_payload_sha256",
+            ),
+            (
+                &self.receipt_payloads.worker_fence_payload_sha256,
+                "native_worker_claim_worker_fence_payload_sha256",
+            ),
+            (
+                &self.receipt_payloads.reassignment_payload_sha256,
+                "native_worker_claim_reassignment_payload_sha256",
+            ),
+            (
+                &self.receipt_payloads.result_payload_sha256,
+                "native_worker_claim_result_payload_sha256",
+            ),
+            (
+                &self.receipt_payloads.unknown_outcome_payload_sha256,
+                "native_worker_claim_unknown_outcome_payload_sha256",
+            ),
+        ] {
+            if let Some(digest) = digest {
+                validate_digest(digest, field)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Validates identity shape and state/receipt coherence.
     pub fn validate(&self) -> Result<(), OrsError> {
         if self.contract_version != CONTRACT_VERSION {
@@ -8869,39 +8908,7 @@ impl NativeWorkerClaimRecord {
                 "native_worker_claim_executable_binding_digest",
             )?;
         }
-        // Absent (pre-column or not-yet-recorded) payload slots decode as
-        // `None` and carry no owner evidence; a retained payload digest must
-        // be an exact digest.
-        for (digest, field) in [
-            (
-                &self.receipt_payloads.admission_payload_sha256,
-                "native_worker_claim_admission_payload_sha256",
-            ),
-            (
-                &self.receipt_payloads.cancellation_payload_sha256,
-                "native_worker_claim_cancellation_payload_sha256",
-            ),
-            (
-                &self.receipt_payloads.worker_fence_payload_sha256,
-                "native_worker_claim_worker_fence_payload_sha256",
-            ),
-            (
-                &self.receipt_payloads.reassignment_payload_sha256,
-                "native_worker_claim_reassignment_payload_sha256",
-            ),
-            (
-                &self.receipt_payloads.result_payload_sha256,
-                "native_worker_claim_result_payload_sha256",
-            ),
-            (
-                &self.receipt_payloads.unknown_outcome_payload_sha256,
-                "native_worker_claim_unknown_outcome_payload_sha256",
-            ),
-        ] {
-            if let Some(digest) = digest {
-                validate_digest(digest, field)?;
-            }
-        }
+        self.validate_receipt_payloads()?;
         match (&self.capability_cell, &self.capability_cell_registry_digest) {
             (Some(cell), Some(registry_digest)) => {
                 validate_text(cell.as_str(), "native_worker_claim_capability_cell")?;
