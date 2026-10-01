@@ -21,6 +21,10 @@ use eliot_contracts::{
     ArtifactId, ClockReading, ContractId, ContractVersion, ProductId, RequestId, RequestMetadata,
     SourceId, canonical_json_bytes, sha256_hex,
 };
+use eliot_evaluation_contracts::{
+    EvaluationContractError, InstallationChannelCoverage, InstallationCoverageBinding,
+    ObservationCoverageManifest,
+};
 use eliot_protocol::{
     ClientHello, EliotPipeName, EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload,
     ProtocolRange, ProtocolVersion, WATCHDOG_SPOOL_BATCH_ROUTE,
@@ -39,12 +43,14 @@ use eliot_watchdog_core::{
     validate_batch_freshness,
 };
 
+use crate::observation_coverage::ChannelIntervalCoverage;
 use crate::watchdog_spool::intent::{
     IntentSubmissionDisposition, PendingWatchdogIntent, WatchdogIntentSubmission,
 };
 use crate::{
     IndependentKernelSensor, SERVICE_NAME, SpoolError, WatchdogSpoolExportLimits, current_unix_ms,
 };
+use super::WatchdogSpoolFence;
 
 const WATCHDOG_FRONT_DOOR_MODULE_ID: &str = "eliot-watchdog";
 
@@ -180,6 +186,98 @@ pub fn watchdog_entry_views(batch: &WatchdogSpoolExportBatch) -> Vec<WatchdogEnt
 #[must_use]
 pub fn watchog_entry_views(batch: &WatchdogSpoolExportBatch) -> Vec<WatchdogEntryView> {
     watchdog_entry_views(batch)
+}
+
+/// Joins the fence-retained per-channel interval coverage into the
+/// evaluation-contracts manifest owner, without changing ownership.
+///
+/// This is the STITCH caller the manifest owner names: the fence keeps the
+/// per-channel [`ChannelIntervalCoverage`] records and the operational
+/// cursor/high-water state, and this caller maps each record 1:1 into an
+/// [`InstallationChannelCoverage`] input, then invokes
+/// [`ObservationCoverageManifest::for_installation_interval`]. The field image
+/// is exact — channel name, competent source, expected classes, observed live
+/// classes, replayed count, dropped-sample count, interval-close state, wire
+/// disposition and gap reasons each carry the record's own value — so the
+/// manifest constructor's typed validation sees the same evidence the spool
+/// owner derived the disposition from. A retained manifest is evidence, not
+/// resolution: export acknowledgement semantics stay with the spool/export
+/// owner, and losing the daemon never discards the fenced report this
+/// manifest was joined from.
+///
+/// A fence that retains no coverage yet (no interval has closed) yields
+/// `Ok(None)`: an absent report is not a failed join. The binding carries the
+/// caller-resolved installation identity and allowed-manifest digest; its
+/// sensor-map revision and declared window must agree with the retained
+/// report, otherwise the join would mislabel the evidence it binds.
+///
+/// # Errors
+///
+/// Returns [`EvaluationContractError`] when the binding disagrees with the
+/// retained report (revision or window), when the retained report is not
+/// internally consistent with the sensor map and its own samples, or when the
+/// joined denominator does not validate.
+pub fn stitch_installation_coverage_manifest(
+    fence: &WatchdogSpoolFence,
+    binding: &InstallationCoverageBinding,
+) -> Result<Option<ObservationCoverageManifest>, EvaluationContractError> {
+    let Some(report) = fence.channel_coverage() else {
+        return Ok(None);
+    };
+    if report.sensor_map_revision() != binding.sensor_map_revision {
+        return Err(EvaluationContractError::EvidenceState {
+            field: "installation_binding.sensor_map_revision",
+            reason: "binding revision disagrees with the retained coverage report",
+        });
+    }
+    let window = report.interval();
+    if binding.interval_start_ms != window.start_ms || binding.interval_end_ms != window.end_ms {
+        return Err(EvaluationContractError::EvidenceState {
+            field: "installation_binding.interval_start/end_ms",
+            reason: "binding window disagrees with the retained coverage report",
+        });
+    }
+    if !report.valid() {
+        return Err(EvaluationContractError::EvidenceState {
+            field: "watchdog_interval_coverage.report",
+            reason: "retained coverage report disagrees with the sensor map and its own samples",
+        });
+    }
+    let channels: Vec<InstallationChannelCoverage> =
+        report.records().iter().map(project_installation_channel).collect();
+    ObservationCoverageManifest::for_installation_interval(binding, &channels).map(Some)
+}
+
+/// Maps one spool-owned channel record into its owner-neutral manifest input.
+///
+/// Every field carries the record's own value unchanged: the channel wire
+/// name, the competent source, the expected and observed-live class wire
+/// names, the replayed-observation count (always zero until the journal-replay
+/// adapter lands, refused typed above zero by the constructor), the
+/// dropped-sample count, the interval-close state, the wire disposition and
+/// the gap reasons. No health result crosses here: a live sample of an absent
+/// or degraded subject stays `CONTINUOUS` coverage of a bad health result, and
+/// health itself remains in the `HostObservationState` path.
+fn project_installation_channel(record: &ChannelIntervalCoverage) -> InstallationChannelCoverage {
+    InstallationChannelCoverage {
+        channel: record.channel().as_str().to_owned(),
+        expected_source: record.expected_source().to_owned(),
+        expected_classes: record
+            .expected_classes()
+            .iter()
+            .map(|class| class.as_str().to_owned())
+            .collect(),
+        observed_classes: record
+            .observed_classes()
+            .iter()
+            .map(|class| class.as_str().to_owned())
+            .collect(),
+        observed_replayed_observations: record.observed_replayed_observations(),
+        dropped_samples: record.dropped_samples(),
+        interval_closed: record.interval_closed(),
+        disposition: record.disposition().as_str().to_owned(),
+        gap_reasons: record.gaps().iter().map(|gap| gap.reason.to_owned()).collect(),
+    }
 }
 
 /// Kernel acknowledgement of one fenced Watchdog intent submission.
