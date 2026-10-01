@@ -867,7 +867,7 @@ fn partial_payload_write_keeps_known_versus_unknown_progress() {
         assert!(failure.validate().is_ok());
         assert!(
             !has_suffix(&platform, ".commit"),
-            "case {expected}: attempted bytes are not committed bytes"
+            "case {case}: attempted bytes are not committed bytes"
         );
     }
 }
