@@ -4067,6 +4067,15 @@ async fn run_owner_feed_sync(
 /// Pending second phases are a real durable obligation that nothing in the
 /// shipped daemon can currently finish, so they are reported with the exact
 /// missing owner named rather than left implied by an absence.
+///
+/// Item 3 hands each pending obligation to the owner after the owner re-admits
+/// the exact operation (audit 5924750035 items 3+7): the scan stays first and
+/// a diagnostic tick alone stays non-authoritative — the canonical second
+/// phase resumes only under a re-admitted owner decision through
+/// `resume_all_pending_second_phases`, which never re-strikes the Kernel-first
+/// revoke, never re-presents a fenced grant to P-07, touches no second graph
+/// and no daemon ORS. With no admitted decision available the closure stays
+/// pending, exactly as reported.
 async fn report_authority_revocation_ingress(
     kernel: &Arc<DaemonKernelClient>,
     composition: SharedComposition,
@@ -4077,11 +4086,13 @@ async fn report_authority_revocation_ingress(
         eliotd::capture_authority_revocation_ingress_plan(&guard)
     };
     let report = match plan {
-        Ok(plan) => eliotd::scan_authority_revocation_ingress(plan, kernel).await,
+        Ok(plan) => eliotd::scan_authority_revocation_ingress(plan.clone(), kernel)
+            .await
+            .map(|report| (plan, report)),
         Err(error) => Err(error),
     };
     match report {
-        Ok(report) => {
+        Ok((plan, report)) => {
             for pending in report.pending_second_phase() {
                 tracing::warn!(
                     target: "eliotd::diagnostics",
@@ -4100,6 +4111,96 @@ async fn report_authority_revocation_ingress(
                     committed_closures = report.committed_closures(),
                     resume_blocked = pending.resume_blocked,
                 );
+            }
+            // #2100 item 3 (audit 5924750035 items 3+7): hand each pending
+            // obligation to the owner. The owner resumes only the exact
+            // operation it re-admits through
+            // `authority_revocation_ingress::admit_owner_revocation_request`:
+            // target grant, owner snapshot, `AuthorityBinding` and the admitted
+            // revocation operation identity must arrive from the authenticated
+            // Human/Policy maintenance-request ingress (or its canonical
+            // admitted equivalent) — never derived from the restored graph or
+            // a diagnostic row — and the resume below additionally runs under
+            // the ORIGINAL retained canonical operation/request identities. A
+            // diagnostic tick alone stays non-authoritative.
+            //
+            // Authenticated source searched in this function: the shipped
+            // maintenance ingress holds `explicit_request = false` fail-closed
+            // (`maintenance_trigger_evaluator.rs`, #1692 — `eliotd` exposes no
+            // authenticated Human UI/CLI maintenance-request ingress), and
+            // neither the daemon composition nor the recovered snapshot holds
+            // an admitted revocation decision for any pending target. No owner
+            // decision can therefore be built without fabricating one, so the
+            // decisions set is empty by owner proof and every closure stays
+            // pending: the per-obligation diagnostics above already name the
+            // exact missing owner instead of implying the obligation was
+            // discharged.
+            let decisions: Vec<
+                eliotd::authority_revocation_ingress::OwnerSecondPhaseDecision,
+            > = Vec::new();
+            if !decisions.is_empty() {
+                // Scan-first is preserved: the scan above already proved the
+                // durable state on this same bound plan, and this resume
+                // re-reads that plan and resumes only the
+                // `Revoked`-without-canonical-receipt closures carrying a
+                // matching owner decision — never a fresh revoke, never a
+                // re-presented fenced grant, no second graph, no daemon ORS.
+                // Exact replay and typed dispositions are the resume entry's
+                // own contract; a resume failure stays typed here and never
+                // degrades to an empty success.
+                let mut guard = composition.lock().await;
+                match eliotd::authority_revocation_ingress::resume_all_pending_second_phases(
+                    &mut *guard,
+                    kernel,
+                    &plan,
+                    &decisions,
+                )
+                .await
+                {
+                    Ok(resume) => {
+                        for resumed in resume.resumed() {
+                            tracing::info!(
+                                target: "eliotd::diagnostics",
+                                event = "eliotd.authority_revocation_second_phase_resumed",
+                                grant_id = %eliotd::diagnostics::sanitize_identity(&resumed.grant_id),
+                                closure_operation_id = %eliotd::diagnostics::sanitize_identity(
+                                    &resumed.closure_operation_id
+                                ),
+                                canonical_receipt_id = %eliotd::diagnostics::sanitize_identity(
+                                    &resumed.canonical_receipt_id
+                                ),
+                                grant_graph_revision = resume.revision(),
+                            );
+                        }
+                        for pending in resume.still_pending() {
+                            tracing::warn!(
+                                target: "eliotd::diagnostics",
+                                event = "eliotd.authority_revocation_second_phase_pending",
+                                grant_id = %eliotd::diagnostics::sanitize_identity(&pending.grant_id),
+                                closure_operation_id = %eliotd::diagnostics::sanitize_identity(
+                                    &pending.closure_operation_id
+                                ),
+                                authority_receipt_id = %eliotd::diagnostics::sanitize_identity(
+                                    &pending.authority_receipt_id
+                                ),
+                                snapshot_id = %eliotd::diagnostics::sanitize_identity(&pending.snapshot_id),
+                                recovered_status = ?pending.recovered_status,
+                                grant_graph_revision = resume.revision(),
+                                resume_blocked = pending.resume_blocked,
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        if failure_guard.should_emit() {
+                            let _ = eliotd::diagnostics::ErrorRecord::of(
+                                eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                                "authority-revocation-resume",
+                                &error.to_string(),
+                            )
+                            .emit();
+                        }
+                    }
+                }
             }
         }
         Err(error) => {
