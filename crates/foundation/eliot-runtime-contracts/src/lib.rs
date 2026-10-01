@@ -26,6 +26,7 @@ mod hot_path_profile;
 mod i14_backpressure;
 mod installation_activation;
 mod module_graph;
+mod module_io;
 mod module_manifest;
 mod restart_policy;
 mod runtime_live;
@@ -114,6 +115,7 @@ pub use module_graph::{
     CapabilityRole, ExternalCapabilityBinding, RequiredCapabilityEdge, RequiredCapabilityGraph,
     UnresolvedCapability, resolve_required_capability_graph,
 };
+pub use module_io::{ModuleIoBinding, ModuleProtocolRanges, ProtocolRangeDeclaration};
 pub use module_manifest::{
     AdmittedModuleManifest, MODULE_MANIFEST_FILE_STEM, MODULE_MANIFEST_SCHEMA_VERSION,
     ModuleManifest, admit_module_manifest, admitted_manifest_path, compare_published_projection,
