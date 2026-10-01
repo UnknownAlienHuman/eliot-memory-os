@@ -296,8 +296,14 @@ pub use governor_local_read::{
     serve_admitted_local_read,
 };
 pub use governor_observe_serve::{
-    ObserveDeferral, ObserveOwnerRoute, ObserveSuboperation, decode_observe_suboperation,
-    observe_suboperation_owner, serve_admitted_observe,
+    OBSERVE_CLAIM_CONFLICTS_OWNER_AUTHORITY, OBSERVE_PENDING_RECEIPT_OWNER,
+    OBSERVE_TASK_CONTRACT_REQUIRED, ObserveDeferral, ObserveEffectCeiling, ObserveOperationClass,
+    ObserveOwnerRoute, ObserveServeOutcome, ObserveSuboperation, OutcomeLayer,
+    PendingObserveHandle, decode_observation_capture, decode_observe_suboperation,
+    observation_base_operation, observation_pending_handle, observation_request_identity,
+    observation_result_body, observation_unavailable_outcome, observe_effect_ceiling_for,
+    observe_operation_class, observe_serve_outcome, observe_suboperation_owner,
+    resolve_observe_operation_authority, serve_admitted_observe,
 };
 pub use improvement_candidate_dispatch::{
     ImprovementRouteDispatch, ImprovementRouteOutcome, commit_unknown_effect_obligation,
@@ -2079,6 +2085,53 @@ impl DaemonComposition {
         .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
         AgentActivationOwnerReadback::from_evidence(evidence, now.max(1))
             .map_err(|error| DaemonError::Lifecycle(error.to_string()))
+    }
+
+    /// Reads the one coherent semantic activation the #1746 activation /
+    /// task-selection owner resolved, for the front-door per-operation authority
+    /// resolution on the `eliot.observe` carrier (issue #2565 W2).
+    ///
+    /// This is the same bounded owner read the existing activation-resolution
+    /// spine already performs (`read_unique_agent_activation`, the source of
+    /// `current_activation_owner_readback` above): it proves one unique live work
+    /// lease, then requires the task, `WorkScope` and canonical owners to agree
+    /// on the exact fence and linked identities. It is NOT a second authority
+    /// source — no semantic identity is accepted from the caller.
+    ///
+    /// `Ok(None)` is the owner's honest "no unique live activation exists"
+    /// answer (no live work lease, no live task, or no live session). It is
+    /// deliberately not an error and not a default identity: a task-relative
+    /// operation that resolves to `None` has no task contract and must be
+    /// refused. Other composition/readiness refusals propagate as the owner's
+    /// typed [`DaemonError`].
+    pub fn current_activation_snapshot(
+        &self,
+        now: u64,
+    ) -> Result<Option<eliot_governor::GovernorActivationSnapshot>, DaemonError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        match self.governor.read_unique_agent_activation(now) {
+            Ok(snapshot) => Ok(Some(snapshot)),
+            // The owner's own "no unique live activation" refusals are its
+            // absence answer: a required task selection, an ambiguous scope, an
+            // unselected scope, or an activation observed at a fence that is no
+            // longer current. None of these is an activation, and none may be
+            // turned into one here — they are reported as absence so a
+            // task-relative operation resolves to "no task contract" and is
+            // refused, rather than being admitted as an unbound cold capture.
+            // Every other composition refusal still propagates as a real failure.
+            Err(
+                error @ (CompositionError::ActivationTaskSelectionRequired
+                | CompositionError::ActivationScopeSelectionRequired
+                | CompositionError::ActivationScopeAmbiguous { .. }
+                | CompositionError::ActivationStaleFence),
+            ) => {
+                let _ = error;
+                Ok(None)
+            }
+            Err(error) => Err(DaemonError::Composition(error)),
+        }
     }
 
     /// Single production resolver spine: resolves one Kernel-issued semantic
