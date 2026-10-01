@@ -1663,7 +1663,7 @@ use eliot_kernel_service::{
 };
 use eliot_observability_runtime::{
     CrashDigestAlgorithm, CrashOwnerHead, CrashOwnerHeadKind, CrashReportError,
-    CrashReporterHandle, CrashRuntimeContext,
+    CrashReporterHandle, CrashRuntimeContext, CrashRuntimeContextObservations,
 };
 use eliot_observation_contracts::{
     CoverageGap, GapDisposition, ObservationRecordEnvelope, ObservationRecordKind,
@@ -9258,14 +9258,16 @@ impl HostComposition {
             None
         };
         let mut context = CrashRuntimeContext::from_observations(
-            module_generation_ref,
-            process_generation_ref,
-            state_fence,
-            None,
-            None,
-            None,
-            Vec::new(),
-            journal_head,
+            CrashRuntimeContextObservations {
+                module_generation_ref,
+                process_generation_ref,
+                state_fence,
+                active_trace_ref: None,
+                work_scope_ref: None,
+                audit_head: None,
+                evidence_handles: Vec::new(),
+                journal_head,
+            },
         );
         context.journal_head_gap = journal_head_gap;
         context

@@ -663,7 +663,6 @@ struct KernelStoreRebindProductionBoundary;
 
 struct CrashReporterBinding {
     handle: CrashReporterHandle,
-    kernel_process_generation: Option<String>,
 }
 
 const fn probe_ready_state_admitted(state: KernelServiceState) -> bool {

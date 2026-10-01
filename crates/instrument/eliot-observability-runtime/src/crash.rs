@@ -262,6 +262,27 @@ pub struct CrashRuntimeContext {
     pub missing_fields: Vec<MissingCrashContextField>,
 }
 
+/// Original owner observations used to assemble one bounded context snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CrashRuntimeContextObservations {
+    /// Module generation supplied by its current authority owner.
+    pub module_generation_ref: Option<String>,
+    /// Process generation supplied by its current process-incarnation owner.
+    pub process_generation_ref: Option<String>,
+    /// Exact state fence supplied by the current authority owner.
+    pub state_fence: Option<StateFence>,
+    /// Active trace handle when an original trace owner supplies one.
+    pub active_trace_ref: Option<String>,
+    /// Active work-scope handle when an original scope owner supplies one.
+    pub work_scope_ref: Option<String>,
+    /// Exact audit head supplied by its durable owner.
+    pub audit_head: Option<CrashOwnerHead>,
+    /// Already-redacted handles supplied by their evidence owner.
+    pub evidence_handles: Vec<RedactedEvidenceHandle>,
+    /// Exact state-journal head supplied by its durable owner.
+    pub journal_head: Option<CrashOwnerHead>,
+}
+
 impl CrashRuntimeContext {
     /// Makes an explicit pre-composition context with every required slot
     /// declared missing.
@@ -291,16 +312,17 @@ impl CrashRuntimeContext {
     /// Builds a snapshot from owner-supplied facts and explicitly declares
     /// every absent required observation.
     #[must_use]
-    pub fn from_observations(
-        module_generation_ref: Option<String>,
-        process_generation_ref: Option<String>,
-        state_fence: Option<StateFence>,
-        active_trace_ref: Option<String>,
-        work_scope_ref: Option<String>,
-        audit_head: Option<CrashOwnerHead>,
-        evidence_handles: Vec<RedactedEvidenceHandle>,
-        journal_head: Option<CrashOwnerHead>,
-    ) -> Self {
+    pub fn from_observations(observations: CrashRuntimeContextObservations) -> Self {
+        let CrashRuntimeContextObservations {
+            module_generation_ref,
+            process_generation_ref,
+            state_fence,
+            active_trace_ref,
+            work_scope_ref,
+            audit_head,
+            evidence_handles,
+            journal_head,
+        } = observations;
         let authority_epoch = state_fence
             .as_ref()
             .map(|fence| fence.authority_epoch.clone());
@@ -337,6 +359,14 @@ impl CrashRuntimeContext {
 
     /// Rejects over-bound or internally inconsistent runtime snapshots.
     pub fn validate(&self) -> Result<(), CrashReportError> {
+        self.validate_identity_slots()?;
+        self.validate_authority_fence()?;
+        self.validate_owner_heads()?;
+        self.validate_evidence_handles()?;
+        self.validate_missing_fields()
+    }
+
+    fn validate_identity_slots(&self) -> Result<(), CrashReportError> {
         for (value, field) in [
             (&self.module_generation_ref, "module_generation_ref"),
             (&self.process_generation_ref, "process_generation_ref"),
@@ -347,6 +377,10 @@ impl CrashRuntimeContext {
                 validate_identity(value, field)?;
             }
         }
+        Ok(())
+    }
+
+    fn validate_authority_fence(&self) -> Result<(), CrashReportError> {
         if let Some(fence) = &self.state_fence {
             fence
                 .validate()
@@ -363,6 +397,10 @@ impl CrashRuntimeContext {
                 "runtime_context.authority_fence_pair",
             ));
         }
+        Ok(())
+    }
+
+    fn validate_owner_heads(&self) -> Result<(), CrashReportError> {
         if self.journal_head_gap && self.journal_head.is_some() {
             return Err(CrashReportError::InvalidMetadata(
                 "runtime_context.journal_head_gap",
@@ -395,6 +433,10 @@ impl CrashRuntimeContext {
             }
             validate_digest(&head.digest, field)?;
         }
+        Ok(())
+    }
+
+    fn validate_evidence_handles(&self) -> Result<(), CrashReportError> {
         if self.evidence_handles.len() > MAX_EVIDENCE_HANDLES {
             return Err(CrashReportError::InvalidMetadata(
                 "runtime_context.evidence_handles",
@@ -403,6 +445,10 @@ impl CrashRuntimeContext {
         for handle in &self.evidence_handles {
             handle.validate()?;
         }
+        Ok(())
+    }
+
+    fn validate_missing_fields(&self) -> Result<(), CrashReportError> {
         for field in [
             (
                 self.module_generation_ref.is_some(),
@@ -628,7 +674,7 @@ struct CrashTelemetryGapRecord<'a> {
 }
 
 enum CrashCapture {
-    Report(CrashReport),
+    Report(Box<CrashReport>),
     Gap {
         report_id: String,
         process: String,
@@ -907,7 +953,7 @@ pub fn install_crash_reporter(
     let worker_state = Arc::clone(&state);
     thread::Builder::new()
         .name("eliot-crash-evidence".to_owned())
-        .spawn(move || crash_writer_loop(receiver, worker_state))
+        .spawn(move || crash_writer_loop(&receiver, &worker_state))
         .map_err(|_| CrashReportError::InvalidMetadata("crash_writer_unavailable"))?;
 
     let prior_hook = std::panic::take_hook();
@@ -948,26 +994,24 @@ impl CrashReporterState {
 
     fn capture_panic(&self) {
         let report_id = self.next_report_id();
-        let symbol_artifact = match self.symbol_artifact.try_read() {
-            Ok(symbol_artifact) => symbol_artifact.clone(),
-            Err(_) => {
-                self.enqueue_gap(report_id, CrashTelemetryGapReason::SymbolBindingUnavailable);
-                return;
-            }
+        let symbol_artifact = if let Ok(symbol_artifact) = self.symbol_artifact.try_read() {
+            symbol_artifact.clone()
+        } else {
+            self.enqueue_gap(report_id, CrashTelemetryGapReason::SymbolBindingUnavailable);
+            return;
         };
         let Some(symbol_artifact) = symbol_artifact else {
             self.enqueue_gap(report_id, CrashTelemetryGapReason::SymbolBindingUnavailable);
             return;
         };
-        let runtime_profile = match self.runtime_profile.try_read() {
-            Ok(runtime_profile) => runtime_profile.clone(),
-            Err(_) => {
-                self.enqueue_gap(
-                    report_id,
-                    CrashTelemetryGapReason::RuntimeProfileUnavailable,
-                );
-                return;
-            }
+        let runtime_profile = if let Ok(runtime_profile) = self.runtime_profile.try_read() {
+            runtime_profile.clone()
+        } else {
+            self.enqueue_gap(
+                report_id,
+                CrashTelemetryGapReason::RuntimeProfileUnavailable,
+            );
+            return;
         };
         let Some(runtime_profile) = runtime_profile else {
             self.enqueue_gap(
@@ -983,15 +1027,14 @@ impl CrashReporterState {
             );
             return;
         }
-        let context = match self.context.try_read() {
-            Ok(context) => context.clone(),
-            Err(_) => {
-                self.enqueue_gap(
-                    report_id,
-                    CrashTelemetryGapReason::RuntimeContextUnavailable,
-                );
-                return;
-            }
+        let context = if let Ok(context) = self.context.try_read() {
+            context.clone()
+        } else {
+            self.enqueue_gap(
+                report_id,
+                CrashTelemetryGapReason::RuntimeContextUnavailable,
+            );
+            return;
         };
         if self.context_gap.load(Ordering::Acquire) {
             self.enqueue_gap(
@@ -1017,7 +1060,7 @@ impl CrashReporterState {
             runtime_context: context,
         };
         let capture = match CrashReport::new(&report_id, metadata) {
-            Ok(report) => CrashCapture::Report(report),
+            Ok(report) => CrashCapture::Report(Box::new(report)),
             Err(error) => CrashCapture::Gap {
                 report_id,
                 process: self.process.clone(),
@@ -1070,7 +1113,7 @@ impl CrashReporterState {
     }
 }
 
-fn crash_writer_loop(receiver: mpsc::Receiver<CrashCapture>, state: Arc<CrashReporterState>) {
+fn crash_writer_loop(receiver: &mpsc::Receiver<CrashCapture>, state: &CrashReporterState) {
     while let Ok(capture) = receiver.recv() {
         match capture {
             CrashCapture::Report(report) => {
@@ -1083,7 +1126,7 @@ fn crash_writer_loop(receiver: mpsc::Receiver<CrashCapture>, state: Arc<CrashRep
                         CrashTelemetryOutcome::ReportWritten.as_u8(),
                         Ordering::Release,
                     ),
-                    Err(reason) => state.write_gap(report.report_id, reason),
+                    Err(reason) => state.write_gap(&report.report_id, reason),
                 }
             }
             CrashCapture::Gap {
@@ -1136,17 +1179,15 @@ impl CrashReporterState {
             Ok(RollingLogAppendOutcome::RetentionFailure) => {
                 Err(CrashTelemetryGapReason::RetentionFailure)
             }
-            Ok(RollingLogAppendOutcome::StorageFailure) => {
-                Err(CrashTelemetryGapReason::ReportWriteFailed)
-            }
-            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
+            Ok(RollingLogAppendOutcome::StorageFailure)
+            | Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
                 Err(CrashTelemetryGapReason::ReportWriteFailed)
             }
         }
     }
 
-    fn write_gap(&self, report_id: String, reason: CrashTelemetryGapReason) {
-        self.write_gap_for(&report_id, &self.process, reason);
+    fn write_gap(&self, report_id: &str, reason: CrashTelemetryGapReason) {
+        self.write_gap_for(report_id, &self.process, reason);
     }
 
     fn write_gap_for(&self, report_id: &str, process: &str, reason: CrashTelemetryGapReason) {

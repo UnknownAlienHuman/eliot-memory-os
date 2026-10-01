@@ -414,10 +414,7 @@ async fn main() {
             reporter.invalidate_runtime_context();
             None
         } else {
-            Some(kernel.attach_crash_reporter(
-                reporter.clone(),
-                Some(startup_binding.approved_generation.clone()),
-            ))
+            Some(kernel.attach_crash_reporter(reporter.clone()))
         };
         let attachment_failed = attachment_result.is_some_and(|result| result.is_err());
         if attachment_failed {

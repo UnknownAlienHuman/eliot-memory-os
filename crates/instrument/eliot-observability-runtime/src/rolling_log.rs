@@ -120,10 +120,10 @@ impl RollingLogWriter {
     }
 }
 
-/// Durable outcome returned by the rolling writer for one acknowledged line.
+/// Outcome returned by the rolling writer for one acknowledged line.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RollingLogAppendOutcome {
-    /// The line was appended and configured generation retention succeeded.
+    /// The acknowledged line was appended, synced, and retained successfully.
     Written,
     /// The line was refused or configured generation retention failed.
     RetentionFailure,
@@ -297,15 +297,14 @@ fn run_writer(
             while active.written.saturating_add(size) > policy.max_bytes_per_generation
                 && rotations <= policy.max_generations
             {
-                match rotate(&mut active, policy) {
-                    Ok(retention_ok) => retention_failed |= !retention_ok,
-                    Err(_) => {
-                        retention_failed = true;
-                        if record.acknowledgement.is_some() {
-                            write_allowed = false;
-                        }
-                        break;
+                if let Ok(retention_ok) = rotate(&mut active, policy) {
+                    retention_failed |= !retention_ok;
+                } else {
+                    retention_failed = true;
+                    if record.acknowledgement.is_some() {
+                        write_allowed = false;
                     }
+                    break;
                 }
                 rotations = rotations.saturating_add(1);
             }
@@ -319,7 +318,12 @@ fn run_writer(
         if write_allowed {
             if active.file.write_all(payload.as_bytes()).is_ok() {
                 active.written = active.written.saturating_add(size);
-                if retention_failed
+                // Acknowledged records are crash evidence. Their receipt is
+                // issued only after the exact active file has synced; ordinary
+                // operational log lines retain the nonblocking write policy.
+                if record.acknowledgement.is_some() && active.file.sync_all().is_err() {
+                    outcome = RollingLogAppendOutcome::StorageFailure;
+                } else if retention_failed
                     || outcome == RollingLogAppendOutcome::Written
                         && active.written > policy.max_bytes_per_generation
                 {

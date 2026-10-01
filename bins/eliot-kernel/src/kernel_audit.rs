@@ -3019,9 +3019,9 @@ impl crate::KernelComposition {
             .map(|policy| policy.module_generation.state_fence.clone())
     }
 
-    /// Attaches the reporter after the binary has validated the exact
-    /// Host-injected Kernel generation. Dynamic snapshots thereafter come
-    /// from the current admitted module fence and the Kernel audit owner.
+    /// Attaches the reporter before startup. Dynamic snapshots thereafter
+    /// come from the current admitted candidate's Host-journal incarnation,
+    /// module fence, and Kernel audit owner.
     ///
     /// # Errors
     ///
@@ -3030,7 +3030,6 @@ impl crate::KernelComposition {
     pub fn attach_crash_reporter(
         &self,
         handle: eliot_observability_runtime::CrashReporterHandle,
-        kernel_process_generation: Option<String>,
     ) -> Result<(), eliot_observability_runtime::CrashReportError> {
         let attached = match self.crash_reporter.lock() {
             Ok(binding) => binding.is_some(),
@@ -3052,7 +3051,7 @@ impl crate::KernelComposition {
             );
         }
         if let Err(error) = handle
-            .update_context(self.crash_runtime_context(kernel_process_generation.as_deref(), false))
+            .update_context(self.crash_runtime_context(false))
         {
             handle.invalidate_runtime_context();
             return Err(error);
@@ -3076,16 +3075,12 @@ impl crate::KernelComposition {
                 ),
             );
         }
-        *binding = Some(crate::CrashReporterBinding {
-            handle,
-            kernel_process_generation,
-        });
+        *binding = Some(crate::CrashReporterBinding { handle });
         Ok(())
     }
 
     fn crash_runtime_context(
         &self,
-        kernel_process_generation: Option<&str>,
         try_only: bool,
     ) -> eliot_observability_runtime::CrashRuntimeContext {
         let policy_available = if try_only {
@@ -3124,7 +3119,8 @@ impl crate::KernelComposition {
                 .lock()
                 .ok()
                 .map(|chain| (chain.head_seq(), chain.head_hash().to_owned()))
-        };
+        }
+        .filter(|(sequence, _)| *sequence > 0);
         let audit_head =
             head.map(
                 |(sequence, digest)| eliot_observability_runtime::CrashOwnerHead {
@@ -3134,33 +3130,50 @@ impl crate::KernelComposition {
                     digest,
                 },
             );
+        let process_generation_ref = if try_only {
+            self.service
+                .try_lock()
+                .ok()
+                .and_then(|service| service.candidate_binding().map(|candidate| {
+                    format!(
+                        "{}:{}",
+                        candidate.supervision_incarnation.kernel_generation.lineage_id,
+                        candidate.supervision_incarnation.kernel_generation.sequence
+                    )
+                }))
+        } else {
+            self.service.lock().ok().and_then(|service| {
+                service.candidate_binding().map(|candidate| {
+                    format!(
+                        "{}:{}",
+                        candidate.supervision_incarnation.kernel_generation.lineage_id,
+                        candidate.supervision_incarnation.kernel_generation.sequence
+                    )
+                })
+            })
+        };
         eliot_observability_runtime::CrashRuntimeContext::from_observations(
-            module_generation_ref,
-            kernel_process_generation.map(str::to_owned),
-            state_fence,
-            None,
-            None,
-            audit_head,
-            Vec::new(),
-            None,
+            eliot_observability_runtime::CrashRuntimeContextObservations {
+                module_generation_ref,
+                process_generation_ref,
+                state_fence,
+                active_trace_ref: None,
+                work_scope_ref: None,
+                audit_head,
+                evidence_handles: Vec::new(),
+                journal_head: None,
+            },
         )
     }
 
     pub(crate) fn publish_crash_context(&self) {
-        let binding = self.crash_reporter.lock().ok().and_then(|binding| {
-            binding.as_ref().map(|binding| {
-                (
-                    binding.handle.clone(),
-                    binding.kernel_process_generation.clone(),
-                )
-            })
-        });
-        if let Some((handle, kernel_process_generation)) = binding {
-            if handle
-                .update_context(
-                    self.crash_runtime_context(kernel_process_generation.as_deref(), true),
-                )
-                .is_err()
+        let handle = self
+            .crash_reporter
+            .lock()
+            .ok()
+            .and_then(|binding| binding.as_ref().map(|binding| binding.handle.clone()));
+        if let Some(handle) = handle {
+            if handle.update_context(self.crash_runtime_context(true)).is_err()
             {
                 tracing::warn!(
                     target: "eliot::crash_reporter",
