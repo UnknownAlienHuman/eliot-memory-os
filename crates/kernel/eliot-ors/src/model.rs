@@ -7734,6 +7734,16 @@ fn validate_unique_texts(values: &[String], field: &'static str) -> Result<(), O
     Ok(())
 }
 
+/// One exact durable revision of a host request's owner-observed stop boundary.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostRequestStopBoundaryRevision {
+    /// Exact protocol JSON retained by ORS.
+    pub payload: Value,
+    /// SHA-256 of the canonical payload bytes.
+    pub digest: String,
+}
+
 /// Durable P-04 host-request operation record.
 ///
 /// Every identity is opaque to ORS: Session, task, scope, capability, fence,
@@ -7814,6 +7824,11 @@ pub struct HostRequestRecord {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_boundary_digest: Option<String>,
+    /// Append-only stop boundary revisions. The existing payload/digest fields
+    /// remain the current retry intent for compatibility with recovery callers.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub stop_boundary_history: Vec<HostRequestStopBoundaryRevision>,
     pub capability_ref: OpaqueLabel,
     pub fence_digest: String,
     /// Lineage-aware authority epoch (Implements #64).
@@ -7955,6 +7970,127 @@ impl HostRequestRecord {
         }
     }
 
+    fn validate_stop_boundary_history(&self) -> Result<(), OrsError> {
+        if self.stop_boundary_history.is_empty() {
+            return Ok(());
+        }
+        let mut previous: Option<(&HostRequestStopBoundaryRevision, String, u64)> = None;
+        for revision in &self.stop_boundary_history {
+            validate_digest(&revision.digest, "host_request_stop_boundary_history.digest")?;
+            let bytes = canonical_json_bytes(&revision.payload).map_err(|_| OrsError::InvalidField {
+                field: "host_request_stop_boundary_history.payload",
+                reason: "boundary payload could not be canonicalized",
+            })?;
+            if sha256_hex(&bytes) != revision.digest {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_stop_boundary_history.digest",
+                    reason: "does not bind the original boundary payload",
+                });
+            }
+            let stop_id = revision
+                .payload
+                .get("stop_id")
+                .and_then(Value::as_str)
+                .ok_or(OrsError::InvalidField {
+                    field: "host_request_stop_boundary_history.stop_id",
+                    reason: "owner record has no stable stop identity",
+                })?
+                .to_owned();
+            let revision_number = revision
+                .payload
+                .get("revision")
+                .and_then(Value::as_u64)
+                .unwrap_or(1);
+            let previous_digest = revision
+                .payload
+                .get("previous_revision_sha256")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let observed_binding = revision
+                .payload
+                .get("admission_binding")
+                .cloned()
+                .and_then(|value| {
+                    serde_json::from_value::<eliot_contracts::StopBoundaryAdmissionBinding>(value)
+                        .ok()
+                });
+            if observed_binding != self.stop_admission_binding {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_stop_boundary_history.admission_binding",
+                    reason: "revision does not retain this row's exact admission association",
+                });
+            }
+            let binding = observed_binding.as_ref().ok_or(OrsError::InvalidField {
+                field: "host_request_stop_boundary_history.admission_binding",
+                reason: "revision has no independently typed admission association",
+            })?;
+            let expected_fence = serde_json::to_value(&binding.state_fence).map_err(|_| {
+                OrsError::InvalidField {
+                    field: "host_request_stop_boundary_history.state_fence",
+                    reason: "owner fence could not be encoded",
+                }
+            })?;
+            let expected_admission_revision = binding.admission_owner_revision.to_string();
+            if revision.payload.get("task_id").and_then(Value::as_str)
+                != Some(binding.task_id.as_str())
+                || revision.payload.get("attempt_id").and_then(Value::as_str)
+                    != Some(binding.attempt_id.as_str())
+                || revision.payload.get("expected_admission_revision").and_then(Value::as_str)
+                    != Some(expected_admission_revision.as_str())
+                || revision.payload.get("state_fence") != Some(&expected_fence)
+            {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_stop_boundary_history.identity",
+                    reason: "stop task, attempt, revision, or full fence differs from its owner association",
+                });
+            }
+            if let Some((prior, prior_id, prior_revision)) = &previous {
+                let expected_revision = prior_revision.checked_add(1).ok_or_else(|| {
+                    OrsError::InvalidField {
+                        field: "host_request_stop_boundary_history.revision",
+                        reason: "revision overflow",
+                    }
+                })?;
+                for key in ["task_id", "attempt_id", "state_fence", "source"] {
+                    if revision.payload.get(key) != prior.payload.get(key) {
+                        return Err(OrsError::InvalidField {
+                            field: "host_request_stop_boundary_history.identity",
+                            reason: "successor changed the original stop identity or source binding",
+                        });
+                    }
+                }
+                if stop_id != *prior_id
+                    || revision_number != expected_revision
+                    || previous_digest.as_deref() != Some(prior.digest.as_str())
+                {
+                    return Err(OrsError::InvalidField {
+                        field: "host_request_stop_boundary_history.revision",
+                        reason: "revision is not linked to the exact preceding payload",
+                    });
+                }
+            } else if revision_number != 1 || previous_digest.is_some() {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_stop_boundary_history.revision",
+                    reason: "first retained revision must start at one with no predecessor",
+                });
+            }
+            previous = Some((revision, stop_id, revision_number));
+        }
+        let last = self.stop_boundary_history.last().ok_or(OrsError::InvalidField {
+            field: "host_request_stop_boundary_history",
+            reason: "history unexpectedly empty",
+        })?;
+        if self.stop_boundary_payload.as_ref() != Some(&last.payload)
+            || self.stop_boundary_digest.as_deref() != Some(last.digest.as_str())
+        {
+            return Err(OrsError::InvalidField {
+                field: "host_request_stop_boundary_history",
+                reason: "current retry intent differs from the latest immutable revision",
+            });
+        }
+        Ok(())
+    }
+
     /// Validates identity shape and state/result coherence.
     pub fn validate(&self) -> Result<(), OrsError> {
         self.validate_identity_and_cancellation_binding()?;
@@ -8033,6 +8169,7 @@ impl HostRequestRecord {
                 });
             }
         }
+        self.validate_stop_boundary_history()?;
         // `EpochId` is always validated; only generation retains a scalar check.
         if self.generation == 0 {
             return Err(OrsError::InvalidField {

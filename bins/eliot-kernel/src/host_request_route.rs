@@ -2600,7 +2600,11 @@ impl KernelComposition {
             .as_ref()
             .ok_or(TransportError::SessionFenced)?;
         let Some(binding) = retained.stop_admission_binding.clone() else {
-            return Ok(None);
+            return if envelope.kind == HostRequestKind::Invocation {
+                Err(TransportError::SessionFenced)
+            } else {
+                Ok(None)
+            };
         };
         binding
             .validate()
@@ -6302,6 +6306,7 @@ pub(crate) fn requested_host_request_record(
         stop_admission_binding: None,
         stop_boundary_payload: None,
         stop_boundary_digest: None,
+        stop_boundary_history: Vec::new(),
         capability_ref: label(&envelope.identity.capability)?,
         fence_digest: sha256_json(&envelope.state_fence)
             .map_err(|_| TransportError::SessionFenced)?,
@@ -6406,6 +6411,8 @@ fn fence_one_host_request(
             wire_id: STOP_BOUNDARY_RECORD_WIRE_ID.to_owned(),
             wire_version: STOP_BOUNDARY_RECORD_WIRE_VERSION,
             stop_id: format!("{}:disconnect", operation_ref.operation_id),
+            revision: 1,
+            previous_revision_sha256: None,
             observed_at: eliot_contracts::ClockReading {
                 valid_time_ms: Some(observed_at),
                 known_time_ms: Some(observed_at),
@@ -8632,6 +8639,7 @@ fn watchdog_export_projection_record(
         stop_admission_binding: None,
         stop_boundary_payload: None,
         stop_boundary_digest: None,
+        stop_boundary_history: Vec::new(),
         capability_ref: label(WATCHDOG_EXPORT_CAPABILITY)?,
         fence_digest: sha256_json(&submitted_fence).map_err(|_| TransportError::SessionFenced)?,
         authority_epoch: submitted_fence.authority_epoch.clone(),
@@ -8880,6 +8888,7 @@ fn watchdog_intent_projection_record(
         stop_admission_binding: None,
         stop_boundary_payload: None,
         stop_boundary_digest: None,
+        stop_boundary_history: Vec::new(),
         capability_ref: label(WATCHDOG_INTENT_CAPABILITY)?,
         fence_digest: sha256_json(&submitted_fence).map_err(|_| TransportError::SessionFenced)?,
         authority_epoch: submitted_fence.authority_epoch.clone(),

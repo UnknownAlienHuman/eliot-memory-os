@@ -1763,6 +1763,19 @@ impl KernelComposition {
             .filter(|revision| revision.to_string() == binding.task_revision)
             .and_then(|revision| eliot_contracts::TaskRevision::new(revision).ok())
             .ok_or(TransportError::SessionFenced)?;
+        let stop_binding = binding
+            .stop_admission_binding
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        stop_binding
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if stop_binding.task_id.as_str() != binding.task_id
+            || stop_binding.task_revision != binding.task_revision
+            || stop_binding.state_fence != pending.ticket.state_fence
+        {
+            return Err(TransportError::IdentityConflict);
+        }
         let principal_id = binding.principal_id.trim();
         if principal_id.is_empty()
             || principal_id.chars().any(char::is_control)

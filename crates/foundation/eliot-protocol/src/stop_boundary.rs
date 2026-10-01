@@ -14,7 +14,7 @@
 
 use std::collections::BTreeSet;
 
-use eliot_contracts::{ClockReading, OperationId, StateFence, TaskId, canonical_json_bytes};
+use eliot_contracts::{ClockReading, OperationId, StateFence, TaskId, canonical_json_bytes, sha256_hex};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -25,7 +25,11 @@ pub use eliot_contracts::StopBoundaryAdmissionBinding;
 /// Stable identity for one stop-boundary wire record.
 pub const STOP_BOUNDARY_RECORD_WIRE_ID: &str = "eliot.protocol.stop-boundary-record";
 /// Current stop-boundary record wire version.
-pub const STOP_BOUNDARY_RECORD_WIRE_VERSION: u16 = 1;
+pub const STOP_BOUNDARY_RECORD_WIRE_VERSION: u16 = 2;
+
+fn initial_stop_revision() -> u64 {
+    1
+}
 
 fn text(value: &str, field: &'static str) -> Result<(), ProtocolError> {
     if value.is_empty() || value.trim() != value {
@@ -462,6 +466,14 @@ pub struct StopBoundaryRecord {
     pub wire_version: u16,
     /// Stable identity allocated by the existing observing owner.
     pub stop_id: String,
+    /// Monotonic revision within the stable stop identity. Later owner
+    /// observations append a revision and preserve the earlier causal cut.
+    #[serde(default = "initial_stop_revision")]
+    pub revision: u64,
+    /// Digest of the exact immediately preceding record for this stop ID.
+    /// `None` is valid only for revision one.
+    #[serde(default)]
+    pub previous_revision_sha256: Option<String>,
     /// Owner-observed time and available clock readings.
     pub observed_at: ClockReading,
     /// Owner-supplied identity of the clock domain used for this observation.
@@ -501,7 +513,7 @@ impl StopBoundaryRecord {
     /// task completion.
     pub fn validate_shape(&self) -> Result<(), ProtocolError> {
         if self.wire_id != STOP_BOUNDARY_RECORD_WIRE_ID
-            || self.wire_version != STOP_BOUNDARY_RECORD_WIRE_VERSION
+            || !matches!(self.wire_version, 1 | STOP_BOUNDARY_RECORD_WIRE_VERSION)
         {
             return Err(ProtocolError::InvalidField {
                 field: "stop_boundary.wire",
@@ -509,6 +521,28 @@ impl StopBoundaryRecord {
             });
         }
         text(&self.stop_id, "stop_boundary.stop_id")?;
+        if self.revision == 0
+            || (self.revision == 1) != self.previous_revision_sha256.is_none()
+            || (self.wire_version == 1
+                && (self.revision != 1 || self.previous_revision_sha256.is_some()))
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "stop_boundary.revision",
+                reason: "revision one has no predecessor; later revisions link the prior record",
+            });
+        }
+        if let Some(previous_digest) = &self.previous_revision_sha256 {
+            if previous_digest.len() != 64
+                || !previous_digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            {
+                return Err(ProtocolError::InvalidField {
+                    field: "stop_boundary.previous_revision_sha256",
+                    reason: "must be lowercase SHA-256",
+                });
+            }
+        }
         self.observed_at.validate()?;
         text(&self.clock_domain, "stop_boundary.clock_domain")?;
         self.source.validate_shape()?;
@@ -550,6 +584,15 @@ impl StopBoundaryRecord {
         self.validate_operation_ids()?;
         self.validate_descendant_ids()?;
         self.validate_frame_size()
+    }
+
+    /// Computes the link value for the next revision over these exact record
+    /// bytes. The owning publisher still checks this against its retained
+    /// predecessor before accepting a successor.
+    pub fn content_digest(&self) -> Result<String, ProtocolError> {
+        let bytes = canonical_json_bytes(self)
+            .map_err(|error| ProtocolError::Json(error.to_string()))?;
+        Ok(sha256_hex(&bytes))
     }
 
     fn validate_operation_ids(&self) -> Result<(), ProtocolError> {

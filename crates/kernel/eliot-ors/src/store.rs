@@ -10161,6 +10161,12 @@ impl RedbRecoveryStore {
         next.state = crate::HostRequestState::Unknown;
         next.stop_boundary_payload = Some(payload.clone());
         next.stop_boundary_digest = Some(digest.to_owned());
+        if next.stop_boundary_history.is_empty() {
+            next.stop_boundary_history.push(crate::HostRequestStopBoundaryRevision {
+                payload: payload.clone(),
+                digest: digest.to_owned(),
+            });
+        }
         next.validate()?;
         let encoded = encode(&next)?;
         let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
@@ -10195,13 +10201,9 @@ impl RedbRecoveryStore {
         if let (Some(current_payload), Some(current_digest)) =
             (&existing.stop_boundary_payload, &existing.stop_boundary_digest)
         {
-            if current_payload != payload || current_digest != digest {
-                return Err(OrsError::HostRequestIdentityConflict {
-                    operation_id: operation_id.as_str().to_owned(),
-                    request_digest: request_digest.to_owned(),
-                });
+            if current_payload == payload && current_digest == digest {
+                return Ok(Some(existing));
             }
-            return Ok(Some(existing));
         }
         if existing.stop_admission_binding.is_none() || existing.state.is_terminal() {
             return Err(OrsError::InvalidTransition);
@@ -10217,6 +10219,20 @@ impl RedbRecoveryStore {
             });
         }
         let mut next = existing.clone();
+        if next.stop_boundary_history.is_empty() {
+            if let (Some(previous_payload), Some(previous_digest)) =
+                (&next.stop_boundary_payload, &next.stop_boundary_digest)
+            {
+                next.stop_boundary_history.push(crate::HostRequestStopBoundaryRevision {
+                    payload: previous_payload.clone(),
+                    digest: previous_digest.clone(),
+                });
+            }
+        }
+        next.stop_boundary_history.push(crate::HostRequestStopBoundaryRevision {
+            payload: payload.clone(),
+            digest: digest.to_owned(),
+        });
         next.stop_boundary_payload = Some(payload.clone());
         next.stop_boundary_digest = Some(digest.to_owned());
         next.validate()?;
@@ -37431,6 +37447,7 @@ mod host_request_result_tests {
             stop_admission_binding: None,
             stop_boundary_payload: None,
             stop_boundary_digest: None,
+            stop_boundary_history: Vec::new(),
             capability_ref: label("eliot.query"),
             fence_digest: "c".repeat(64),
             authority_epoch: test_epoch(),

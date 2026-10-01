@@ -4268,7 +4268,20 @@ impl AgentFabric {
             Some(admission.epoch.clone()),
         )?;
         let key = format!("{admission_key}/{}", attempt_id.as_str());
+        // Resolve the complete durable Governor admission association before
+        // asking the Kernel activation owner to create any effecting session.
+        // A missing semantic join must refuse here; an activation that later
+        // cannot be represented in stop history would otherwise escape the
+        // stop fence's admitted attempt set.
+        let stop_binding = self
+            .verified_stop_admission_binding(admission_id, attempt_id)?
+            .binding;
         if let Some(existing) = self.activations.get(&key).cloned() {
+            if existing.stop_boundary_admission.as_ref() != Some(&stop_binding) {
+                return Err(FabricError::IdentityConflict(
+                    "replayed activation does not retain the exact verified stop admission".to_owned(),
+                ));
+            }
             self.record("activation_replayed", &key);
             return Ok(existing);
         }
@@ -4300,18 +4313,7 @@ impl AgentFabric {
             ));
         }
         validate_text(&evidence.activation_digest, "activation_digest")?;
-        let has_semantic_binding = self.semantic_admissions.values().any(|semantic| {
-            semantic.definition_id.as_str() == admission.definition_id.as_str()
-                && semantic.definition_digest == admission.definition_digest
-        });
-        evidence.stop_boundary_admission = if has_semantic_binding {
-            Some(
-                self.verified_stop_admission_binding(admission_id, attempt_id)?
-                    .binding,
-            )
-        } else {
-            None
-        };
+        evidence.stop_boundary_admission = Some(stop_binding);
         self.activations.insert(key.clone(), evidence.clone());
         self.attempt_states
             .insert(attempt_id.as_str().to_owned(), AttemptLifecycle::Activated);
@@ -4448,17 +4450,56 @@ impl AgentFabric {
             ));
         }
         let key = record.stop_id.clone();
-        if let Some(existing) = self.stop_boundaries.get(&key) {
-            if existing.last() == Some(&record) {
+        let prior = self
+            .stop_boundaries
+            .get(&key)
+            .and_then(|revisions| revisions.last())
+            .cloned();
+        if let Some(previous) = &prior {
+            if previous == &record {
                 return Ok(());
             }
-            return Err(FabricError::IdentityConflict(
-                "stop identity was reused with different observed bytes".to_owned(),
-            ));
+            let expected_revision = previous.revision.checked_add(1).ok_or_else(|| {
+                FabricError::IdentityConflict("stop revision overflow".to_owned())
+            })?;
+            let previous_digest = previous
+                .content_digest()
+                .map_err(|error| FabricError::Contract(error.to_string()))?;
+            if record.revision != expected_revision
+                || record.previous_revision_sha256.as_deref()
+                    != Some(previous_digest.as_str())
+                || previous.task_id != record.task_id
+                || previous.attempt_id != record.attempt_id
+                || previous.admission_binding != record.admission_binding
+                || previous.state_fence != record.state_fence
+                || previous.source.channel_id != record.source.channel_id
+                || previous.source.producer_id != record.source.producer_id
+                || previous.source.session_id != record.source.session_id
+                || previous.source.generation != record.source.generation
+            {
+                return Err(FabricError::IdentityConflict(
+                    "stop revision does not append to the exact retained causal boundary".to_owned(),
+                ));
+            }
+            self.stop_boundaries
+                .get_mut(&key)
+                .ok_or_else(|| FabricError::Contract("stop revision history vanished".to_owned()))?
+                .push(record);
+        } else {
+            if record.revision != 1 || record.previous_revision_sha256.is_some() {
+                return Err(FabricError::IdentityConflict(
+                    "first stop revision must start at revision one".to_owned(),
+                ));
+            }
+            self.stop_boundaries.insert(key.clone(), vec![record]);
         }
-        self.stop_boundaries.insert(key.clone(), vec![record]);
         if let Err(error) = self.publish_semantic_revision() {
-            self.stop_boundaries.remove(&key);
+            if let Some(revisions) = self.stop_boundaries.get_mut(&key) {
+                revisions.pop();
+                if revisions.is_empty() {
+                    self.stop_boundaries.remove(&key);
+                }
+            }
             return Err(error);
         }
         self.record("stop_boundary_published", &key);
@@ -4514,6 +4555,17 @@ impl AgentFabric {
             .ok_or_else(|| {
                 FabricError::NotActivated(format!("no activation for {activation_key}"))
             })?;
+        if evidence.stop_boundary_admission.as_ref().is_some_and(|binding| {
+            self.stop_boundaries.values().any(|revisions| {
+                revisions
+                    .last()
+                    .is_some_and(|boundary| &boundary.admission_binding == binding)
+            })
+        }) {
+            return Err(FabricError::IdentityConflict(
+                "dispatch is fenced by a stop boundary for this exact semantic admission attempt".to_owned(),
+            ));
+        }
         // #1700 AUD3: dispatch consumes the committed admission and the
         // activation evidence, so both predecessor owners are revalidated
         // here alongside the duplicate guards below. A retained intent

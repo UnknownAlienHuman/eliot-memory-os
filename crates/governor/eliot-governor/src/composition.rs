@@ -3639,18 +3639,41 @@ impl CanonicalAdmissionSnapshot {
                 ));
             }
         }
-        let mut stop_ids = BTreeSet::new();
+        let mut stop_revisions = BTreeMap::new();
         for boundary in &self.stop_boundary_records {
             boundary
                 .validate_shape()
                 .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-            if boundary.state_fence != self.state_fence
-                || !stop_ids.insert(boundary.stop_id.as_str())
-            {
+            if boundary.state_fence != self.state_fence {
                 return Err(CompositionError::Recovery(
-                    "stop boundary history contains a stale fence or repeated stop identity".to_owned(),
+                    "stop boundary history contains a stale State Fence".to_owned(),
                 ));
             }
+            if let Some(previous) = stop_revisions.get(boundary.stop_id.as_str()) {
+                let previous: &eliot_protocol::StopBoundaryRecord = previous;
+                let expected_revision = previous.revision.checked_add(1).ok_or_else(|| {
+                    CompositionError::Recovery("stop revision overflow".to_owned())
+                })?;
+                let digest = previous
+                    .content_digest()
+                    .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+                if boundary.revision != expected_revision
+                    || boundary.previous_revision_sha256.as_deref() != Some(digest.as_str())
+                    || boundary.task_id != previous.task_id
+                    || boundary.attempt_id != previous.attempt_id
+                    || boundary.admission_binding != previous.admission_binding
+                    || boundary.source != previous.source
+                {
+                    return Err(CompositionError::Recovery(
+                        "stop boundary revision is not linked to the exact prior causal cut".to_owned(),
+                    ));
+                }
+            } else if boundary.revision != 1 || boundary.previous_revision_sha256.is_some() {
+                return Err(CompositionError::Recovery(
+                    "first stop boundary revision must start at revision one".to_owned(),
+                ));
+            }
+            stop_revisions.insert(boundary.stop_id.as_str(), boundary);
         }
         if let Some(fact) = &self.verifier_execution_fact {
             fact.validate(&self.state_fence)?;
@@ -4075,6 +4098,30 @@ impl CanonicalAdmissionOwner {
                 "stop admission binding is not a successor to the current semantic admission".to_owned(),
             ));
         }
+        if let Some(previous) = &self.snapshot.stop_admission_binding
+            && previous != &binding
+        {
+            let mut prior_boundaries = self
+                .snapshot
+                .stop_boundary_records
+                .iter()
+                .filter(|record| &record.admission_binding == previous)
+                .fold(BTreeMap::new(), |mut latest, record| {
+                    latest.insert(record.stop_id.as_str(), record);
+                    latest
+                })
+                .into_values()
+                .collect::<Vec<_>>();
+            if prior_boundaries.is_empty()
+                || prior_boundaries.iter().any(|record| {
+                    !stop_boundary_follow_up_resolved(record)
+                })
+            {
+                return Err(CompositionError::Recovery(
+                    "a successor admission requires the prior attempt's retained stop boundary and resolved follow-up".to_owned(),
+                ));
+            }
+        }
         let owner_revision = self.snapshot.owner_revision.checked_add(1).ok_or_else(|| {
             CompositionError::Recovery("canonical owner revision overflow".to_owned())
         })?;
@@ -4117,17 +4164,36 @@ impl CanonicalAdmissionOwner {
                 "stop boundary publication is stale or foreign to the current Governor admission".to_owned(),
             ));
         }
-        if let Some(previous) = self
+        let previous = self
             .snapshot
             .stop_boundary_records
             .iter()
-            .find(|previous| previous.stop_id == boundary.stop_id)
-        {
+            .filter(|previous| previous.stop_id == boundary.stop_id)
+            .last();
+        if let Some(previous) = previous {
             if previous == &boundary {
                 return Ok(None);
             }
+            let expected_revision = previous.revision.checked_add(1).ok_or_else(|| {
+                CompositionError::Recovery("stop revision overflow".to_owned())
+            })?;
+            let previous_digest = previous
+                .content_digest()
+                .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+            if boundary.revision != expected_revision
+                || boundary.previous_revision_sha256.as_deref()
+                    != Some(previous_digest.as_str())
+                || boundary.task_id != previous.task_id
+                || boundary.attempt_id != previous.attempt_id
+                || boundary.source != previous.source
+            {
+                return Err(CompositionError::Recovery(
+                    "stop boundary successor does not preserve the prior observation identity".to_owned(),
+                ));
+            }
+        } else if boundary.revision != 1 || boundary.previous_revision_sha256.is_some() {
             return Err(CompositionError::Recovery(
-                "stop identity was reused with changed observation bytes".to_owned(),
+                "first stop boundary revision must start at revision one".to_owned(),
             ));
         }
         let owner_revision = self.snapshot.owner_revision.checked_add(1).ok_or_else(|| {
@@ -4162,16 +4228,15 @@ impl CanonicalAdmissionOwner {
                 "stop boundary read used a stale State Fence".to_owned(),
             ));
         }
-        Ok(self
-            .snapshot
-            .stop_boundary_records
-            .iter()
-            .filter(|record| {
-                &record.task_id == task_id
-                    && record.admission_binding.task_revision == task_revision.to_string()
-            })
-            .cloned()
-            .collect())
+        let mut latest = BTreeMap::new();
+        for record in &self.snapshot.stop_boundary_records {
+            if &record.task_id == task_id
+                && record.admission_binding.task_revision == task_revision.to_string()
+            {
+                latest.insert(record.stop_id.as_str(), record.clone());
+            }
+        }
+        Ok(latest.into_values().collect())
     }
 
     /// Builds the next canonical admission owner image after a Governor-owned
@@ -4231,6 +4296,49 @@ impl CanonicalAdmissionOwner {
         evidence.validate(state_fence)?;
         Ok(evidence)
     }
+}
+
+fn stop_boundary_follow_up_resolved(
+    record: &eliot_protocol::StopBoundaryRecord,
+) -> bool {
+    use eliot_protocol::{
+        StopBoundaryActionCoverage, StopBoundaryCursorState,
+        StopBoundaryEffectDisposition, StopBoundaryEnumeration,
+        StopBoundaryPositionState, StopBoundarySourceContent,
+    };
+
+    matches!(&record.operations.enumeration, StopBoundaryEnumeration::CompleteInline)
+        && record.operations.items.iter().all(|operation| {
+            matches!(
+                &operation.effect,
+                StopBoundaryEffectDisposition::ObservedCompleted
+                    | StopBoundaryEffectDisposition::ObservedNoEffect
+            )
+        })
+        && matches!(&record.descendants.enumeration, StopBoundaryEnumeration::CompleteInline)
+        && record.descendants.items.iter().all(|descendant| {
+            matches!(
+                &descendant.effect,
+                StopBoundaryEffectDisposition::ObservedCompleted
+                    | StopBoundaryEffectDisposition::ObservedNoEffect
+            )
+        })
+        && record.action_plan.coverage == StopBoundaryActionCoverage::Complete
+        && record.action_plan.required_actions.is_empty()
+        && !matches!(&record.source_cursor, StopBoundaryCursorState::Unknown { .. })
+        && !matches!(
+            &record.event_positions.last_durable,
+            StopBoundaryPositionState::Unknown { .. }
+        )
+        && !matches!(
+            &record.event_positions.last_normalized,
+            StopBoundaryPositionState::Unknown { .. }
+        )
+        && !matches!(
+            &record.event_positions.last_applied,
+            StopBoundaryPositionState::Unknown { .. }
+        )
+        && !matches!(&record.source_content, StopBoundarySourceContent::Unknown { .. })
 }
 
 /// Config projection bound to the Host-approved generation.
@@ -6291,7 +6399,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         identity
             .validate()
             .map_err(|error| FinishAttemptError::Serialization(error.to_string()))?;
-        let activation = self.read_unique_agent_activation(now)?;
+        let activation = self.read_unique_agent_activation_with_stop_binding(now, false)?;
         if activation.state_fence != binding.state_fence
             || activation.task_id != binding.task_id
             || activation.task_revision.to_string() != binding.task_revision
@@ -10878,6 +10986,14 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         &self,
         now: u64,
     ) -> Result<GovernorActivationSnapshot, CompositionError> {
+        self.read_unique_agent_activation_with_stop_binding(now, true)
+    }
+
+    fn read_unique_agent_activation_with_stop_binding(
+        &self,
+        now: u64,
+        require_stop_binding: bool,
+    ) -> Result<GovernorActivationSnapshot, CompositionError> {
         if self.readiness != CompositionReadiness::Ready {
             return Err(CompositionError::NotReady);
         }
@@ -10892,6 +11008,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .snapshot
             .stop_admission_binding
             .clone();
+        if require_stop_binding && stop_admission_binding.is_none() {
+            return Err(CompositionError::Recovery(
+                "activation is missing its Governor-issued stop admission association".to_owned(),
+            ));
+        }
         if let Some(binding) = &stop_admission_binding
             && (binding.task_id != task_id
                 || binding.task_revision != task.revision.to_string()
