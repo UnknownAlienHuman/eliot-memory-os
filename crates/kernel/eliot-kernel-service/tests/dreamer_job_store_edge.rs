@@ -1298,6 +1298,7 @@ mod gateway_cases {
     use eliot_contracts::AuthorityEpoch;
     use eliot_ipc::{NamedPipeServer, NamedPipeTransport, PeerIdentity, server_hello_frame};
     use eliot_kernel_core::{GenerationRoute, RouteScope};
+    use eliot_ors::test_support::KernelRouteStoreFixture;
     use eliot_kernel_service::{
         CommitRecoveryError, DreamerJobGatewayError, HostFileIdentity, HostJobBinding,
         HostJobIdentity, HostJobRoot, HostKernelCandidateBinding, HostProcessBinding,
@@ -1671,6 +1672,7 @@ mod gateway_cases {
         gateway: Arc<KernelStoreGateway>,
         log: Arc<Mutex<LoopbackLog>>,
         server_task: tokio::task::JoinHandle<()>,
+        _ors_fixture: KernelRouteStoreFixture,
     }
 
     async fn loopback_setup(reply: LoopbackReply, tag: &str) -> LoopbackSetup {
@@ -1762,16 +1764,23 @@ mod gateway_cases {
             route_epoch,
         )
         .expect("loopback route");
+        // Give every real gateway edge an exclusive, test-owned redb ORS for
+        // its full lifetime. Passing `None` made Dreamer writes stop at the
+        // missing commit owner before exercising their pause/reconciliation
+        // behavior.
+        let ors_fixture = KernelRouteStoreFixture::open(&format!("dreamer-edge-{tag}"))
+            .expect("loopback ORS fixture opens");
         let gateway = Arc::new(KernelStoreGateway::new(
             service,
             Arc::new(client),
             route,
-            None,
+            Some(Arc::clone(ors_fixture.store())),
         ));
         LoopbackSetup {
             gateway,
             log,
             server_task,
+            _ors_fixture: ors_fixture,
         }
     }
 
