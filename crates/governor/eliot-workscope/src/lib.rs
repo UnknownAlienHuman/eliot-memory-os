@@ -467,6 +467,8 @@ pub struct WorkScopeBindingSnapshot {
     pub owner_revision: u64,
     pub binding: ScopeBinding,
     pub guard_receipt: ScopeBindingGuardReceipt,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_closure: Option<(GoverningSourceSet, PrivacyProfile)>,
 }
 
 /// The canonical owner for one current `WorkScope` binding.
@@ -474,8 +476,6 @@ pub struct WorkScopeBindingSnapshot {
 #[serde(deny_unknown_fields)]
 pub struct WorkScopeBindingOwner {
     snapshot: WorkScopeBindingSnapshot,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    source_closure: Option<(GoverningSourceSet, PrivacyProfile)>,
 }
 
 /// Validation errors for the bounded core.
@@ -3269,7 +3269,25 @@ impl WorkScopeBindingSnapshot {
             owner_revision,
             binding,
             guard_receipt,
+            source_closure: None,
         };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    /// Constructs and retains the exact source/privacy closure accepted with
+    /// this binding. The closure is part of the serializable owner snapshot so
+    /// a canonical-owner restore can revalidate the original values.
+    pub fn new_with_source_closure(
+        state_fence: StateFence,
+        owner_revision: u64,
+        binding: ScopeBinding,
+        guard_receipt: ScopeBindingGuardReceipt,
+        sources: &GoverningSourceSet,
+        privacy: &PrivacyProfile,
+    ) -> Result<Self, WorkScopeError> {
+        let mut snapshot = Self::new(state_fence, owner_revision, binding, guard_receipt)?;
+        snapshot.source_closure = Some((sources.clone(), privacy.clone()));
         snapshot.validate()?;
         Ok(snapshot)
     }
@@ -3307,6 +3325,23 @@ impl WorkScopeBindingSnapshot {
         {
             return Err(WorkScopeError::BindingReceiptMismatch);
         }
+        if let Some((sources, privacy)) = &self.source_closure {
+            if sources.generation != self.binding.governing_source_generation {
+                return Err(WorkScopeError::SourceSetMismatch);
+            }
+            let current = ScopeBindingGuard.check(
+                &self.binding,
+                &self.binding,
+                sources,
+                privacy,
+            );
+            if current.disposition != ScopeBindingDisposition::Matched {
+                return Err(WorkScopeError::BindingReceiptNotMatched);
+            }
+            if current != self.guard_receipt {
+                return Err(WorkScopeError::BindingReceiptMismatch);
+            }
+        }
         Ok(())
     }
 }
@@ -3318,6 +3353,8 @@ struct WorkScopeBindingSnapshotWire {
     owner_revision: u64,
     binding: ScopeBinding,
     guard_receipt: ScopeBindingGuardReceipt,
+    #[serde(default)]
+    source_closure: Option<(GoverningSourceSet, PrivacyProfile)>,
 }
 
 impl<'de> Deserialize<'de> for WorkScopeBindingSnapshot {
@@ -3326,13 +3363,16 @@ impl<'de> Deserialize<'de> for WorkScopeBindingSnapshot {
         D: serde::Deserializer<'de>,
     {
         let wire = WorkScopeBindingSnapshotWire::deserialize(deserializer)?;
-        Self::new(
+        let mut snapshot = Self::new(
             wire.state_fence,
             wire.owner_revision,
             wire.binding,
             wire.guard_receipt,
         )
-        .map_err(serde::de::Error::custom)
+        .map_err(serde::de::Error::custom)?;
+        snapshot.source_closure = wire.source_closure;
+        snapshot.validate().map_err(serde::de::Error::custom)?;
+        Ok(snapshot)
     }
 }
 
@@ -3340,18 +3380,14 @@ impl WorkScopeBindingOwner {
     /// Creates the canonical owner after validating the persisted snapshot.
     pub fn new(snapshot: WorkScopeBindingSnapshot) -> Result<Self, WorkScopeError> {
         snapshot.validate()?;
-        Ok(Self {
-            snapshot,
-            source_closure: None,
-        })
+        Ok(Self { snapshot })
     }
 
     /// Creates an owner that retains the exact source/privacy values used by
     /// the successful binding admission.
     ///
     /// The supplied closure is revalidated against the admitted snapshot
-    /// before it is retained. The closure remains in-process owner state and
-    /// is not added to the legacy snapshot wire shape.
+    /// before it is retained in the serializable owner snapshot.
     pub fn new_with_source_closure(
         snapshot: WorkScopeBindingSnapshot,
         sources: &GoverningSourceSet,
@@ -3373,10 +3409,14 @@ impl WorkScopeBindingOwner {
         if receipt != snapshot.guard_receipt {
             return Err(WorkScopeError::BindingReceiptMismatch);
         }
-        Ok(Self {
-            snapshot,
-            source_closure: Some((sources.clone(), privacy.clone())),
-        })
+        if let Some((retained_sources, retained_privacy)) = &snapshot.source_closure {
+            if retained_sources != sources || retained_privacy != privacy {
+                return Err(WorkScopeError::BindingReceiptMismatch);
+            }
+        } else {
+            snapshot.source_closure = Some((sources.clone(), privacy.clone()));
+        }
+        Self::new(snapshot)
     }
 
     /// Recovers the owner through the same fail-closed validation path.
@@ -3410,6 +3450,7 @@ impl WorkScopeBindingOwner {
     ) -> Result<(GoverningSourceSet, PrivacyProfile), WorkScopeError> {
         self.read_current(state_fence)?;
         let (sources, privacy) = self
+            .snapshot
             .source_closure
             .as_ref()
             .ok_or(WorkScopeError::SourceClosureUnavailable)?;
