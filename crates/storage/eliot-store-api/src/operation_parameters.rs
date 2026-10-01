@@ -172,6 +172,8 @@ pub enum ParameterShape {
     BlackboardItemLookup,
     /// Closed typed blackboard item revision and predecessor CAS for issue #1822.
     BlackboardItemRevision,
+    /// Closed typed mailbox admission and stream-head CAS for issue #1820.
+    MailboxItemAdmission,
     /// Opaque, versioned `InstrumentRegistry` snapshot emitted by `persist`.
     InstrumentRegistrySnapshot,
     /// Closed canonical Problem candidate record for issue #1759 I2: the
@@ -203,6 +205,7 @@ impl ParameterShape {
             Self::SwarmOwnerRevision => "eliot.swarm.owner-revision.v1",
             Self::BlackboardItemLookup => "eliot.blackboard.item-lookup.v1",
             Self::BlackboardItemRevision => "eliot.blackboard.item-revision.v1",
+            Self::MailboxItemAdmission => "eliot.mailbox.item-admission.v1",
             Self::InstrumentRegistrySnapshot => "eliot.instrument.registry-snapshot@1.0.0",
             Self::ProblemOwnerState => crate::PROBLEM_OWNER_STATE_SCHEMA_V1,
             Self::TaskContractAcceptanceRecord => crate::TASK_CONTRACT_ACCEPTANCE_RECORD_SCHEMA_V1,
@@ -1277,6 +1280,11 @@ static APPLY_BLACKBOARD_ITEM_PARAMETERS: [ParameterDeclaration; 1] = [ParameterD
     shape: ParameterShape::BlackboardItemRevision,
     required: true,
 }];
+static ADMIT_MAILBOX_ITEM_PARAMETERS: [ParameterDeclaration; 1] = [ParameterDeclaration {
+    name: "admission",
+    shape: ParameterShape::MailboxItemAdmission,
+    required: true,
+}];
 
 /// Returns the canonical operation name bound into manifests and digests.
 ///
@@ -1383,6 +1391,7 @@ pub const fn named_mutation_operation_name(operation: NamedMutationOperation) ->
         NamedMutationOperation::CommitExperienceBank => "CommitExperienceBank",
         NamedMutationOperation::CommitAgentFeedback => "CommitAgentFeedback",
         NamedMutationOperation::ApplyBlackboardItem => "ApplyBlackboardItem",
+        NamedMutationOperation::AdmitMailboxMessage => "AdmitMailboxMessage",
         NamedMutationOperation::RecordLearningRecord => "RecordLearningRecord",
         NamedMutationOperation::RecordCapabilityEvidenceRecord => "RecordCapabilityEvidenceRecord",
         NamedMutationOperation::RecordTaskContractAcceptanceSet => {
@@ -1418,6 +1427,7 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
         b"CommitExperienceBank" => Some(NamedMutationOperation::CommitExperienceBank),
         b"CommitAgentFeedback" => Some(NamedMutationOperation::CommitAgentFeedback),
         b"ApplyBlackboardItem" => Some(NamedMutationOperation::ApplyBlackboardItem),
+        b"AdmitMailboxMessage" => Some(NamedMutationOperation::AdmitMailboxMessage),
         b"RecordLearningRecord" => Some(NamedMutationOperation::RecordLearningRecord),
         b"RecordCapabilityEvidenceRecord" => {
             Some(NamedMutationOperation::RecordCapabilityEvidenceRecord)
@@ -1559,6 +1569,8 @@ pub const fn declared_read_parameters(
 /// variant, digest re-proof at the Governor read edge);
 /// `ApplyBlackboardItem` declares the required typed `revision` candidate
 /// and predecessor CAS (issue #1822);
+/// `AdmitMailboxMessage` declares the required typed `admission` message
+/// and stream-head CAS (issue #1820);
 /// `RecordLearningRecord` declares the seven required commit fields
 /// (`record_kind` over the closed learning-kind set, `handle`,
 /// `record_json`, `record_digest`, `scope_digest`, `fence_digest`,
@@ -1587,6 +1599,7 @@ pub const fn declared_mutation_parameters(
         NamedMutationOperation::UpdateTaskState => &UPDATE_TASK_STATE_PARAMETERS,
         NamedMutationOperation::ApplySwarmOwnerRevisions => &APPLY_SWARM_OWNER_REVISION_PARAMETERS,
         NamedMutationOperation::ApplyBlackboardItem => &APPLY_BLACKBOARD_ITEM_PARAMETERS,
+        NamedMutationOperation::AdmitMailboxMessage => &ADMIT_MAILBOX_ITEM_PARAMETERS,
         NamedMutationOperation::RecordAuthorityRevocation => {
             &RECORD_AUTHORITY_REVOCATION_PARAMETERS
         }
@@ -1693,6 +1706,7 @@ pub fn verify_declaration_holds_no_payload_encoding(
         | ParameterShape::CampaignViewLookup
         | ParameterShape::SwarmOwnerRevision
         | ParameterShape::BlackboardItemRevision
+        | ParameterShape::MailboxItemAdmission
         | ParameterShape::InstrumentRegistrySnapshot
         | ParameterShape::ProblemOwnerState
         | ParameterShape::TaskContractAcceptanceRecord => true,
@@ -1856,6 +1870,11 @@ fn check_declared_shape(
             let revision: crate::BlackboardItemRevision = serde_json::from_value(value.clone())
                 .map_err(|error| StoreError::Serialization(error.to_string()))?;
             revision.validate()
+        }
+        ParameterShape::MailboxItemAdmission => {
+            let admission: crate::MailboxItemAdmission = serde_json::from_value(value.clone())
+                .map_err(|error| StoreError::Serialization(error.to_string()))?;
+            admission.validate()
         }
         ParameterShape::ProblemOwnerState => {
             // The candidate record's own bindings are compared by the
