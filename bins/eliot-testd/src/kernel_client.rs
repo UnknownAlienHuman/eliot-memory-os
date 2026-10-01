@@ -1418,7 +1418,7 @@ impl KernelProcessStreamSinkClient {
         if original_terminal.as_ref() != Some(&operation) {
             return Err(ProcessStreamSinkError::ProviderUnavailable);
         }
-        let ProcessStreamSinkWireResponse::Finalized { body } = owner else {
+        let ProcessStreamSinkWireResponse::Finalized { body, .. } = owner else {
             return Err(ProcessStreamSinkError::ProviderUnavailable);
         };
         terminal_from_projection(&session, TerminalCommand::Finalize(request), *body)
@@ -1499,7 +1499,7 @@ impl KernelProcessStreamSinkClient {
                     BlobProcessStreamOperationResponse::Sink { response } => response,
                 };
                 match owner {
-                    ProcessStreamSinkWireResponse::Finalized { body } => {
+                    ProcessStreamSinkWireResponse::Finalized { body, .. } => {
                         let operation = original_terminal
                             .as_ref()
                             .ok_or(ProcessStreamSinkError::ProviderUnavailable)?;
