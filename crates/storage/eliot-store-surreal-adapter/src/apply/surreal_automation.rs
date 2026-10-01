@@ -1419,12 +1419,17 @@ impl PrepareContext<'_> {
                 revision_json,
                 normalization_receipt_json,
                 normalization_request_json,
-            } => self
-                .apply_retain_normalization(
-                    writes, automation_id, revision, revision_json,
-                    normalization_receipt_json, normalization_request_json,
+            } => {
+                self.apply_retain_normalization(
+                    writes,
+                    automation_id,
+                    revision,
+                    revision_json,
+                    normalization_receipt_json,
+                    normalization_request_json,
                 )
-                .await,
+                .await
+            }
             DecodedAutomationMutation::Create {
                 automation_id,
                 revision,
