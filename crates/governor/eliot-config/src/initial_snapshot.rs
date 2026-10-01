@@ -236,6 +236,7 @@ fn prepare_initial_snapshot_payload_inner(
         key_identity: identity.key_identity.clone(),
         runtime_state_roots_digest: identity.runtime_state_roots_digest.clone(),
         setup_revision: identity.setup_revision,
+        governing_source_approval_json: None,
     };
     payload.validate()?;
     Ok(payload)
@@ -269,6 +270,12 @@ pub struct InitialSnapshotPayload {
     pub runtime_state_roots_digest: String,
     /// Setup binding revision at milestone 7.
     pub setup_revision: u64,
+    /// Canonical Governor-owned approval of the exact governing source pair.
+    /// When present, the bytes are covered by the existing detached signature.
+    /// Legacy payloads without approval remain readable but cannot establish
+    /// WorkScope source authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub governing_source_approval_json: Option<String>,
 }
 
 impl InitialSnapshotPayload {
@@ -291,6 +298,9 @@ impl InitialSnapshotPayload {
         )?;
         if self.setup_revision == 0 {
             return Err(invalid_field("setup_revision", "must be non-zero"));
+        }
+        if let Some(approval_json) = &self.governing_source_approval_json {
+            validate_canonical_json_object(approval_json, "governing_source_approval_json")?;
         }
         self.snapshot
             .validate()
@@ -360,6 +370,23 @@ impl InitialSnapshotPayload {
         })?;
         PrivacyChoice::parse(value)
     }
+}
+
+fn validate_canonical_json_object(
+    json: &str,
+    field: &'static str,
+) -> Result<(), InitialSnapshotError> {
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|error| invalid_field(field, format!("invalid JSON object: {error}")))?;
+    if !value.is_object() {
+        return Err(invalid_field(field, "must encode a JSON object"));
+    }
+    let canonical = canonical_json_bytes(&value)
+        .map_err(|error| InitialSnapshotError::Canonicalization(error.to_string()))?;
+    if canonical != json.as_bytes() {
+        return Err(invalid_field(field, "must use canonical JSON encoding"));
+    }
+    Ok(())
 }
 
 #[derive(Serialize)]
