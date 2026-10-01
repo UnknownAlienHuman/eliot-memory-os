@@ -16,10 +16,10 @@ use std::sync::Arc;
 
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_ors::{
-    ColdStartReadinessOrsRecord, ColdStartReadinessRecordOwner,
-    ColdStartReadinessStageOutcome, ColdStartReadinessTerminalDisposition, OrsError,
-    SCAN_DISCLOSURE_RECORD_TYPE, ScanDisclosureOrsRecord, ScanDisclosureReadFailure,
-    ScanDisclosureRecordOwner, ScanDisclosureRecordState, ScanDisclosureStageOutcome,
+    ColdStartReadinessOrsRecord, ColdStartReadinessRecordOwner, ColdStartReadinessStageOutcome,
+    ColdStartReadinessTerminalDisposition, OrsError, SCAN_DISCLOSURE_RECORD_TYPE,
+    ScanDisclosureOrsRecord, ScanDisclosureReadFailure, ScanDisclosureRecordOwner,
+    ScanDisclosureRecordState, ScanDisclosureStageOutcome,
 };
 use eliot_workscope::{
     LOOSE_SCAN_DISCLOSURE_PREFIX, LOOSE_SCAN_DISCLOSURE_SUFFIX, LooseScanQuarantine,

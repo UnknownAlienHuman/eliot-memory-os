@@ -43,9 +43,8 @@ use eliot_protocol::{
     HostRequestResultClass, HostRequestResultLineage, MessageType, ProtocolPayload,
     ProtocolVersion, REACTIVE_RESTORE_CAPABILITY, REACTIVE_RESTORE_OPERATION,
     REACTIVE_RESTORE_PAYLOAD_SCHEMA_ID, ReactiveRestoreQuery, ReactiveRestoreReply,
-    RequestIdentity, TASK_CONTROLLER_INVOCATION_WIRE_ID,
-    TASK_CONTROLLER_INVOCATION_WIRE_VERSION, TaskControllerAction, TaskControllerInvocation,
-    host_request_operation_id, restore_correlation,
+    RequestIdentity, TASK_CONTROLLER_INVOCATION_WIRE_ID, TASK_CONTROLLER_INVOCATION_WIRE_VERSION,
+    TaskControllerAction, TaskControllerInvocation, host_request_operation_id, restore_correlation,
 };
 use eliot_receipts::RequestBinding;
 use serde::Deserialize;
@@ -835,7 +834,9 @@ impl KernelHostRequestClient {
                         readback.recovery = Some(unknown_outcome(&envelope.envelope_sha256));
                         return Ok(readback);
                     };
-                    let status = owner_result.get("status").and_then(serde_json::Value::as_str);
+                    let status = owner_result
+                        .get("status")
+                        .and_then(serde_json::Value::as_str);
                     if status == Some("rejected") {
                         readback.owner_result = Some(owner_result);
                         return Ok(readback);
@@ -852,7 +853,8 @@ impl KernelHostRequestClient {
                                 .bytes()
                                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
                     });
-                    if status != Some("admitted") || result_revision.is_none_or(|value| value == 0)
+                    if status != Some("admitted")
+                        || result_revision.is_none_or(|value| value == 0)
                         || !valid_digest
                     {
                         readback.owner_result = Some(owner_result);
@@ -860,14 +862,14 @@ impl KernelHostRequestClient {
                         return Ok(readback);
                     }
                     readback.owner_result = Some(owner_result);
-                    readback.new_connection_id =
-                        match crate::reopen_kernel_transport(&self.shared) {
-                            Ok(connection_id) => Some(connection_id),
-                            Err(error) => {
-                                readback.recovery = Some(error);
-                                None
-                            }
-                        };
+                    readback.new_connection_id = match crate::reopen_kernel_transport(&self.shared)
+                    {
+                        Ok(connection_id) => Some(connection_id),
+                        Err(error) => {
+                            readback.recovery = Some(error);
+                            None
+                        }
+                    };
                     return Ok(readback);
                 }
                 HostRequestRecordState::Expired => {
@@ -932,8 +934,7 @@ impl KernelHostRequestClient {
             || envelope.peer_admission_receipt_sha256 != facts.receipt_sha256
             || envelope.identity.session_id.as_deref() != Some(evidence.session_id.as_str())
             || envelope.identity.task_id.as_deref() != Some(evidence.task_id.as_str())
-            || envelope.identity.work_scope_id.as_deref()
-                != Some(evidence.work_scope_id.as_str())
+            || envelope.identity.work_scope_id.as_deref() != Some(evidence.work_scope_id.as_str())
         {
             return Err(request_failure());
         }
@@ -941,12 +942,7 @@ impl KernelHostRequestClient {
             .validate_envelope(envelope)
             .map_err(|_| request_failure())?;
         let digest = envelope.envelope_sha256.clone();
-        let frame = host_request_rehydrate_frame(
-            envelope,
-            receipt,
-            &facts,
-            Some(evidence),
-        )?;
+        let frame = host_request_rehydrate_frame(envelope, receipt, &facts, Some(evidence))?;
         let reply = self
             .exchange(&frame)
             .map_err(|error| retain_agent_response(error, unknown_outcome(&digest)))?;
@@ -2141,11 +2137,8 @@ fn host_request_task_controller_frame(
     envelope: &HostRequestEnvelope,
     facts: &TransportFacts,
 ) -> Result<Frame, PortFailure> {
-    let mut frame = host_request_frame_for_envelope(
-        AGENT_HOST_REQUEST_INVOKE_READ_OPERATION,
-        envelope,
-        facts,
-    )?;
+    let mut frame =
+        host_request_frame_for_envelope(AGENT_HOST_REQUEST_INVOKE_READ_OPERATION, envelope, facts)?;
     let ProtocolPayload::Json(payload) = &mut frame.payload else {
         return Err(request_failure());
     };

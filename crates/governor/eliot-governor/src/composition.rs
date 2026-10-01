@@ -49,10 +49,10 @@ use crate::{
 };
 use eliot_authority::{
     CrossRootQuarantineEvidence, GrantActivationRequest, GrantId, GrantRecoveryRecord,
-    GrantRevocationRequest, GrantStatus, IntroductionActivationRequest, IntroductionId, IntroductionRevocationRequest,
-    IntroductionStatus, P07AuthorityPort, P07PortError, RevocationOperationIdentity,
-    RevocationOrigin, RevocationTransitionDisposition, RevocationTransitionRequest,
-    RootTransitionActivationReceipt, RootTransitionActivationRequest,
+    GrantRevocationRequest, GrantStatus, IntroductionActivationRequest, IntroductionId,
+    IntroductionRevocationRequest, IntroductionStatus, P07AuthorityPort, P07PortError,
+    RevocationOperationIdentity, RevocationOrigin, RevocationTransitionDisposition,
+    RevocationTransitionRequest, RootTransitionActivationReceipt, RootTransitionActivationRequest,
 };
 use eliot_budget::{BudgetLedger, BudgetLedgerRecoverySnapshot};
 use eliot_canonical::{
@@ -79,7 +79,6 @@ use eliot_finish::{
     DescendantClosure, FinishDecisionReceipt, FinishError, FinishLifecycleAction, FinishService,
 };
 use eliot_influence::RevocationBounds;
-use eliot_kernel_core::GrantActivationIntent;
 use eliot_instrument_api::{
     CaptureProvenance, EvidenceAxes, EvidenceCoverage, EvidenceFreshness, ExecutionStatus,
     InstrumentInvocation, InstrumentKind, NormalizedEvidence, RawEvidence, RawEvidenceSource,
@@ -88,6 +87,7 @@ use eliot_instrument_api::{
 use eliot_instrument_nextest::{
     NextestTestEvent, NextestTestStatus, catalog_test_id, parse_test_events,
 };
+use eliot_kernel_core::GrantActivationIntent;
 use eliot_maintenance::{
     AutomationDecision, AutomationTriggerDecision, MaintenanceController, MaintenanceError,
     MaintenanceFamily, MaintenanceJob, MaintenanceJobState, MaintenanceStateStore,
@@ -131,13 +131,13 @@ use eliot_workscope::{
     ReadinessLifecycle, RepositoryLineageIdentity, RequestedEffect, ResolutionAuthentication,
     ResolutionRequest, ScanDisclosureOwnerBinding, ScanDisclosureStore, ScanReceiptHandle,
     ScannerResolverInputs, ScopeBinding, ScopeBindingDisposition, ScopeBindingGuard, ScopeIdentity,
-    ScopeRelocationOrAttachReceipt, ScopeResolution, SourceAdmissionRequest,
-    SourceCandidateOrigin, TaskBindingInput, TaskBindingState, TaskIntakeCandidate,
-    TaskSelectionRequired, TriggerAdmission, TriggerReport, WorkScopeBindingOwner,
-    WorkScopeBindingSnapshot, WorkScopeCandidate, WorkScopeCandidateSet, WorkScopeDescriptor,
-    WorkScopeError, WorkScopeResolutionReceipt, WorkScopeResolver, WorkspaceInstanceIdentity,
-    admit_at_trigger, admit_initial_binding, check_at_trigger, evaluate_material_request,
-    issue_resolution_receipt, observed_scope_binding, produce_attach_receipt, rebind_with_receipt,
+    ScopeRelocationOrAttachReceipt, ScopeResolution, SourceAdmissionRequest, SourceCandidateOrigin,
+    TaskBindingInput, TaskBindingState, TaskIntakeCandidate, TaskSelectionRequired,
+    TriggerAdmission, TriggerReport, WorkScopeBindingOwner, WorkScopeBindingSnapshot,
+    WorkScopeCandidate, WorkScopeCandidateSet, WorkScopeDescriptor, WorkScopeError,
+    WorkScopeResolutionReceipt, WorkScopeResolver, WorkspaceInstanceIdentity, admit_at_trigger,
+    admit_initial_binding, check_at_trigger, evaluate_material_request, issue_resolution_receipt,
+    observed_scope_binding, produce_attach_receipt, rebind_with_receipt,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -12505,7 +12505,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         let work = self.prove_unique_activation_work(now, state_fence)?;
         let task_id = self.admit_activation_lifecycle_session(now, state_fence, &work)?;
         let task = self.admit_activation_task(&task_id, state_fence)?;
-        let plan = self.owners.canonical.read_current_activation_plan(state_fence)?;
+        let plan = self
+            .owners
+            .canonical
+            .read_current_activation_plan(state_fence)?;
         if task_id != plan.task_id
             || work.work_item.task_id != task_id.as_str()
             || work.work_item.state_fence != *state_fence

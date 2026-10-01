@@ -91,7 +91,9 @@ use kernel_activation_client::{
     activation_frame_for_request, build_neutral_activation_request, decode_activation_response,
 };
 use kernel_host_request_client::ReplayCacheEntry;
-pub use kernel_host_request_client::{BindScopeReadback, KernelHostRequestClient, OwnerDryRunPreview};
+pub use kernel_host_request_client::{
+    BindScopeReadback, KernelHostRequestClient, OwnerDryRunPreview,
+};
 pub use memory_handle_join::{ResolvedMemoryHandle, parse_memory_handle};
 pub use reactive_injection_receipts::{
     AdmissionBasis, AttentionItem, CueOrigin, DeliveryPoint, FiringEvidence, InjectionReceipt,
@@ -4841,22 +4843,23 @@ pub(crate) fn reopen_kernel_transport(
     shared: &SharedTransport,
 ) -> Result<String, eliot_mcp::PortFailure> {
     let (declaration_path, original_declaration) = {
-        let current = shared
-            .try_borrow()
-            .map_err(|_| eliot_mcp::PortFailure::TransportBindingRejected {
-                reason: "Kernel transport owner is busy during fresh admission".to_owned(),
-            })?;
+        let current =
+            shared
+                .try_borrow()
+                .map_err(|_| eliot_mcp::PortFailure::TransportBindingRejected {
+                    reason: "Kernel transport owner is busy during fresh admission".to_owned(),
+                })?;
         (
             current._loaded.path.clone(),
             current._loaded.declaration.clone(),
         )
     };
-    let (activation, fresh_client, forwarding) =
-        kernel_ports_with_declaration(&declaration_path).map_err(|error| {
-            eliot_mcp::PortFailure::TransportBindingRejected {
-                reason: format!("fresh declared Kernel admission failed: {error}"),
-            }
-        })?;
+    let (activation, fresh_client, forwarding) = kernel_ports_with_declaration(&declaration_path)
+        .map_err(|error| {
+        eliot_mcp::PortFailure::TransportBindingRejected {
+            reason: format!("fresh declared Kernel admission failed: {error}"),
+        }
+    })?;
     let fresh_shared = fresh_client.shared.clone();
     let fresh_declaration_matches = fresh_shared
         .try_borrow()
@@ -4868,7 +4871,8 @@ pub(crate) fn reopen_kernel_transport(
         == original_declaration;
     if !fresh_declaration_matches {
         return Err(eliot_mcp::PortFailure::TransportBindingRejected {
-            reason: "fresh Kernel admission did not retain the original client declaration".to_owned(),
+            reason: "fresh Kernel admission did not retain the original client declaration"
+                .to_owned(),
         });
     }
     let connection_id = fresh_shared
@@ -4880,16 +4884,17 @@ pub(crate) fn reopen_kernel_transport(
         .receipt
         .connection_id
         .clone();
-    let mut current = shared
-        .try_borrow_mut()
-        .map_err(|_| eliot_mcp::PortFailure::TransportBindingRejected {
-            reason: "Kernel transport owner is busy during replacement".to_owned(),
-        })?;
-    let mut fresh = fresh_shared
-        .try_borrow_mut()
-        .map_err(|_| eliot_mcp::PortFailure::TransportBindingRejected {
+    let mut current =
+        shared
+            .try_borrow_mut()
+            .map_err(|_| eliot_mcp::PortFailure::TransportBindingRejected {
+                reason: "Kernel transport owner is busy during replacement".to_owned(),
+            })?;
+    let mut fresh = fresh_shared.try_borrow_mut().map_err(|_| {
+        eliot_mcp::PortFailure::TransportBindingRejected {
             reason: "fresh Kernel transport owner is busy during replacement".to_owned(),
-        })?;
+        }
+    })?;
     std::mem::swap(&mut *current, &mut *fresh);
     drop(fresh);
     drop(current);
