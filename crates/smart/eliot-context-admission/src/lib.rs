@@ -220,7 +220,11 @@ pub struct HeadroomContext<'a> {
     /// The caller's observed clock, in Unix milliseconds.
     ///
     /// Staleness is decided against this value, never against a timestamp the
-    /// evidence carries about itself.
+    /// evidence carries about itself. This crate is a declared pure, effect-free
+    /// cell and reads no clock of its own, so the caller MUST observe it at the
+    /// moment of use: a reading captured earlier in the caller's own composition
+    /// predates the work this staleness check is meant to bound, and a backdated
+    /// reading can only make an expired reservation read as live.
     pub now_ms: u64,
 }
 

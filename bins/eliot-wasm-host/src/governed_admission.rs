@@ -42,7 +42,7 @@ use eliot_context_assembly::{
 };
 use eliot_context_contracts::{
     AdmissionInput, AdmissionResult, ContextError, ContextOutcome, ContextRecipe, QualityScorecard,
-    SerializedContextMeasurement,
+    ResolvedContextRecipe, SerializedContextMeasurement,
 };
 use eliot_governor::{Governor, LearningAdmissionClaim, issue_learning_admission};
 use eliot_improvement::candidate_bounds::{
@@ -177,6 +177,7 @@ pub fn admit_governed_host<F>(
     presented: PresentedLearning<'_>,
     mut input: AdmissionInput,
     recipe: &ContextRecipe,
+    approved: &ResolvedContextRecipe,
     quality: QualityScorecard,
     policy: &AssemblyPolicy,
     measure: F,
@@ -233,8 +234,10 @@ where
         .map_err(|error| HostAdmitError::Admission(error.to_string()))?;
     let view = match &admission.outcome {
         ContextOutcome::Complete(set) => Some(
-            assemble_active_view_with_learning(set, recipe, quality, policy, measure, presented)
-                .map_err(|error: AssemblyError| HostAdmitError::Assembly(error.to_string()))?,
+            assemble_active_view_with_learning(
+                set, recipe, approved, quality, policy, measure, presented,
+            )
+            .map_err(|error: AssemblyError| HostAdmitError::Assembly(error.to_string()))?,
         ),
         ContextOutcome::Incomplete(_) => None,
     };

@@ -28,7 +28,8 @@
 //! is gated with `#[cfg(not(target_arch = "wasm32"))]` at the crate root.
 
 use eliot_context_contracts::{
-    AdmittedContextSet, ContextError, ContextRecipe, QualityScorecard, SerializedContextMeasurement,
+    AdmittedContextSet, ContextError, ContextRecipe, QualityScorecard, ResolvedContextRecipe,
+    SerializedContextMeasurement,
 };
 use eliot_contracts::fences_match_exact;
 use eliot_improvement::{
@@ -47,6 +48,7 @@ use crate::{ActiveUnderstandingViewResult, AssemblyError, AssemblyPolicy, assemb
 pub fn assemble_active_view_with_learning<F>(
     admitted: &AdmittedContextSet,
     recipe: &ContextRecipe,
+    approved: &ResolvedContextRecipe,
     quality: QualityScorecard,
     policy: &AssemblyPolicy,
     measure: F,
@@ -81,5 +83,5 @@ where
     check_governed_carriage(&presented, &admitted.binding.state_fence, &marks)
         .map_err(bounds_to_context_error)
         .map_err(AssemblyError::Contract)?;
-    assemble_active_view(admitted, recipe, quality, policy, measure)
+    assemble_active_view(admitted, recipe, approved, quality, policy, measure)
 }
