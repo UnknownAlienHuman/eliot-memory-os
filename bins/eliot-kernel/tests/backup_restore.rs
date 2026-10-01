@@ -1,29 +1,35 @@
 //! Kernel production restore adapter tests (issue #960).
 //!
-//! Twenty substantive cases binding the coordinator to the accepted owner
+//! Twenty-two substantive cases binding the coordinator to the accepted owner
 //! contracts. The durable journal behind every execution is an injected
 //! `J: RestoreJournalPort`: memory/file fixtures below prove adapter
 //! mapping only and always carry fixture-marked admission, while production
 //! composition must supply the admitted persistent ORS owner (#957 via the
-//! #962 turn). No test executes here in the worker lane; product modules
-//! land first and the full gate runs at the Windows/WinUI build.
+//! #962 turn).
+//!
+//! Every case that reaches the engine carries owner-issued destination
+//! evidence from `admitted_evidence`, because the restore owner refuses a
+//! bundle that does not (`DestinationNotAdmitted`, raised before `compile_plan`
+//! and before a destination root exists). A case that omitted it would be
+//! asserting that refusal instead of the restore it is named for.
 
 use std::num::NonZeroU64;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use eliot_backup::{
     BackupBundle, BackupClass, BackupError, BackupInput, CutoverAuthorization, EventRange,
     ExportFence, ObservedLineageLimit, OwnerTrustBinding, RestoreContext, RestoreEvidenceLevel,
-    RestoreJournalAdmission, RestoreJournalPort, RestoreJournalRecord, RestoreObligationState,
-    RestoreStep, WrappedKeyEntry, WrappedKeyManifest,
+    RestoreJournalAdmission, RestoreJournalPort, RestoreJournalRecord, RestoreJournalState,
+    RestoreObligationState, RestoreStep, WrappedKeyEntry, WrappedKeyManifest,
 };
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence, sha256_hex};
 use eliot_kernel::{
     BlobOwnerClient, CanonicalOwnerClient, DESTINATION_ADMISSION_FILE, DestinationManifestEvidence,
     InvalidationKind, InvalidationOwnerClient, KernelBackupRestore, KernelIsolatedDestination,
     KernelRestoreError, PinnedDestinationAdmission, PurgeOwnerClient, RESTORE_ISOLATED_AREA,
-    RESTORE_JOURNAL_OWNER_LABEL, RestorePorts, backup_to_kernel, check_kernel_effect_fence,
-    phase_owner, require_production_admitted,
+    RESTORE_JOURNAL_OWNER_LABEL, RestorePorts, StagedCleanupOutcome, StagedCleanupRefusal,
+    TEMP_RESTORE_EXTENSION, backup_to_kernel, check_kernel_effect_fence, phase_owner,
+    require_production_admitted,
 };
 
 const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -131,15 +137,41 @@ fn assembled_banned_journal_tokens() -> Vec<String> {
     ]
 }
 
-fn manifest_evidence(work_root: &PathBuf) -> DestinationManifestEvidence {
-    let mut evidence: DestinationManifestEvidence =
+/// Builds destination admission through the EXISTING owner producer
+/// [`DestinationManifestEvidence::issue_from_owner_manifest`].
+///
+/// The test stands in for the Host-side active manifest binding (issue #962,
+/// AUDIT-7) by supplying the three values that binding issues, read from the
+/// fixture rather than invented here, and nothing else: the admitted work root
+/// is bound by the producer, which resolves it with `canonicalize` and then runs
+/// the type's own `validate()`. This is the seam the restore owner's admission
+/// gate requires, so a test that reached the engine any other way would be
+/// proving a shape the owner refuses — which is exactly what the pre-existing
+/// sixteen failures were doing by carrying `manifest_evidence: None`.
+///
+/// The fixture's own `kernel_work_root` is deliberately NOT read: it is a
+/// placeholder, and the admitted root is the one the producer binds.
+fn admitted_evidence(work_root: &Path) -> DestinationManifestEvidence {
+    let binding: serde_json::Value =
         serde_json::from_slice(&read_fixture("destination-manifest-evidence.json"))
-            .expect("manifest evidence fixture");
-    evidence.kernel_work_root = work_root.clone();
-    evidence
-        .validate()
-        .expect("manifest evidence validates against the temp work root");
-    evidence
+            .expect("owner manifest binding fixture");
+    let text = |field: &str| {
+        binding
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| panic!("owner manifest binding fixture carries {field}"))
+            .to_owned()
+    };
+    DestinationManifestEvidence::issue_from_owner_manifest(
+        &text("manifest_digest"),
+        &text("roots_digest"),
+        binding
+            .get("registry_revision")
+            .and_then(serde_json::Value::as_u64)
+            .expect("owner manifest binding fixture carries registry_revision"),
+        work_root,
+    )
+    .expect("owner-issued destination evidence validates against the temp work root")
 }
 
 /// In-memory fixture journal: adapter-mapping proof only. Never production:
@@ -149,6 +181,27 @@ fn manifest_evidence(work_root: &PathBuf) -> DestinationManifestEvidence {
 struct FixtureJournal {
     record: Option<RestoreJournalRecord>,
     fail_next_cas: bool,
+    /// Fail the compare-and-swap that persists `n` completed phases, counting
+    /// from 1, and never a different one.
+    ///
+    /// This is what makes "interrupted AFTER staging" a chosen point rather
+    /// than a lucky one. `fail_next_cas` refuses the FIRST swap, which happens
+    /// before any phase runs, so it can only ever produce a restore that
+    /// published nothing. Failing the swap that follows the Nth completed phase
+    /// refuses the engine at a point where N phases have already published
+    /// their material and the journal is mid-transaction.
+    fail_cas_after_completed: Option<u64>,
+}
+
+/// Completed phases a record already attests.
+fn completed_phases(record: &RestoreJournalRecord) -> u64 {
+    if record.completed_phases > 0 {
+        record.completed_phases
+    } else if matches!(record.state, RestoreJournalState::ReceiptPersisted) {
+        1
+    } else {
+        0
+    }
 }
 
 impl RestoreJournalPort for FixtureJournal {
@@ -172,6 +225,16 @@ impl RestoreJournalPort for FixtureJournal {
         if next.journal_key != journal_key
             || self.record.as_ref().map_or(0, |record| record.revision) != expected_revision
         {
+            return Err(BackupError::RestoreJournalCasConflict);
+        }
+        // One-shot, so the resume that follows observes a journal which then
+        // advances normally instead of failing at the same point forever.
+        if self.fail_cas_after_completed.is_some_and(|target| {
+            self.record
+                .as_ref()
+                .is_some_and(|current| completed_phases(current) == target)
+        }) {
+            self.fail_cas_after_completed = None;
             return Err(BackupError::RestoreJournalCasConflict);
         }
         self.record = Some(next);
@@ -230,16 +293,26 @@ impl RestoreJournalPort for FixtureFileJournal {
     }
 }
 
+/// The production ports bundle every case below runs on.
+///
+/// It carries the owner-issued destination evidence, because the restore owner
+/// REFUSES a bundle that does not: `KernelBackupRestore::restore` raises
+/// `DestinationNotAdmitted` before `compile_plan` and before
+/// `KernelIsolatedDestination::open` creates a root, so a bundle reaching the
+/// engine with `manifest_evidence: None` proves nothing about restore at all.
+/// The evidence is built per work root through the owner producer, so each
+/// case's admitted root is the root that case actually uses.
 fn production_ports<'a>(
     admission: &'a RestoreJournalAdmission,
     fence: &'a StateFence,
+    work_root: &Path,
 ) -> RestorePorts<'a> {
     RestorePorts {
         journal_admission: admission,
         kernel_fence: fence,
         keys: None,
         blob_scope: None,
-        manifest_evidence: None,
+        manifest_evidence: Some(admitted_evidence(work_root)),
         rehearsal: false,
     }
 }
@@ -255,7 +328,7 @@ fn exact_verified_archive_and_admitted_destination_restore() {
     assert!(check_kernel_effect_fence(&fence, &bundle).is_ok());
     let admission = production_admission();
     assert!(require_production_admitted(&admission).is_ok());
-    let ports = production_ports(&admission, &fence);
+    let ports = production_ports(&admission, &fence, &root);
     let coordinator = KernelBackupRestore::bind(root.clone());
     let mut journal = FixtureJournal::default();
     let outcome = coordinator
@@ -294,7 +367,7 @@ fn foreign_or_stale_destination_refused() {
     let admission = production_admission();
     let coordinator = KernelBackupRestore::bind(root.clone());
     // First restore pins the owner-approved admission.
-    let first_evidence = manifest_evidence(&root);
+    let first_evidence = admitted_evidence(&root);
     let first_ports = RestorePorts {
         journal_admission: &admission,
         kernel_fence: &fence,
@@ -314,9 +387,23 @@ fn foreign_or_stale_destination_refused() {
     )
     .expect("pinned admission parses");
     assert_eq!(pinned.target_id, target);
-    // A rotated manifest binding for the same transaction refuses as drift.
-    let mut second_evidence = manifest_evidence(&root);
-    second_evidence.registry_revision += 1;
+    // A rotated manifest binding for the same transaction refuses as drift. The
+    // rotated value is re-ISSUED through the same producer rather than produced
+    // by writing the struct's fields, so a drifted binding is a different owner
+    // issuance and not a hand-edited record.
+    let binding: serde_json::Value =
+        serde_json::from_slice(&read_fixture("destination-manifest-evidence.json"))
+            .expect("owner manifest binding fixture");
+    let revision = binding["registry_revision"]
+        .as_u64()
+        .expect("owner manifest binding fixture carries registry_revision");
+    let second_evidence = DestinationManifestEvidence::issue_from_owner_manifest(
+        &binding["manifest_digest"].as_str().expect("manifest_digest").to_owned(),
+        &binding["roots_digest"].as_str().expect("roots_digest").to_owned(),
+        revision + 1,
+        &root,
+    )
+    .expect("rotated owner-issued evidence validates");
     let second_ports = RestorePorts {
         journal_admission: &admission,
         kernel_fence: &fence,
@@ -330,8 +417,7 @@ fn foreign_or_stale_destination_refused() {
     assert!(matches!(drifted, Err(KernelRestoreError::FenceMismatch(_))));
     // A foreign admitted root (outside the Kernel work root) refuses before effects.
     let foreign_root = work_root("02-foreign");
-    let mut foreign_evidence = manifest_evidence(&foreign_root);
-    foreign_evidence.kernel_work_root = foreign_root.clone();
+    let foreign_evidence = admitted_evidence(&foreign_root);
     let foreign_ports = RestorePorts {
         journal_admission: &admission,
         kernel_fence: &fence,
@@ -392,12 +478,16 @@ fn missing_class_crypto_purge_capability_refuses_without_fallback() {
             wrapped_key_sha256: sha256_hex(&key_bytes),
         }],
     };
+    // Admitted destination, so the refusal observed here is the SURPLUS KEY
+    // MANIFEST and not the destination gate: with `None` this case would pass
+    // for the wrong reason, refused at admission before the key material was
+    // ever examined.
     let surplus_ports = RestorePorts {
         journal_admission: &admission,
         kernel_fence: &fence,
         keys: Some(&surplus),
         blob_scope: None,
-        manifest_evidence: None,
+        manifest_evidence: Some(admitted_evidence(&root)),
         rehearsal: false,
     };
     let coordinator = KernelBackupRestore::bind(root.clone());
@@ -454,7 +544,7 @@ fn absent_provider_cannot_produce_ok_or_known_zero() {
     let root = work_root("05");
     let fence = bundle.export_fence.state_fence.clone();
     let admission = production_admission();
-    let ports = production_ports(&admission, &fence);
+    let ports = production_ports(&admission, &fence, &root);
     let coordinator = KernelBackupRestore::bind(root.clone());
     let mut journal = FixtureJournal::default();
     let outcome = coordinator
@@ -511,7 +601,7 @@ fn unadmitted_or_fixture_journal_refuses_production_effects() {
         require_production_admitted(&fixture).unwrap_err(),
         KernelRestoreError::JournalNotAdmitted
     );
-    let ports = production_ports(&fixture, &fence);
+    let ports = production_ports(&fixture, &fence, &root);
     let coordinator = KernelBackupRestore::bind(root.clone());
     let mut journal = FixtureJournal::default();
     let refused = coordinator.restore(&bundle, context, &ports, &mut journal);
@@ -548,7 +638,7 @@ fn phase_source_destination_operation_fence_receipt_mismatch_rejected() {
     let root = work_root("07");
     let fence_a = bundle_a.export_fence.state_fence.clone();
     let admission = production_admission();
-    let ports_a = production_ports(&admission, &fence_a);
+    let ports_a = production_ports(&admission, &fence_a, &root);
     let coordinator = KernelBackupRestore::bind(root.clone());
     let mut journal = FixtureJournal::default();
     let outcome_a = coordinator
@@ -593,7 +683,7 @@ fn unknown_owner_outcome_propagates_without_new_identity_or_retry() {
     let root = work_root("08");
     let fence = bundle.export_fence.state_fence.clone();
     let admission = production_admission();
-    let ports = production_ports(&admission, &fence);
+    let ports = production_ports(&admission, &fence, &root);
     let coordinator = KernelBackupRestore::bind(root.clone());
     // A lost journal commit surfaces typed and is never retried blindly:
     // the failed swap stays failed and no receipt is fabricated.
@@ -628,12 +718,16 @@ fn kernel_effect_fence_required_before_any_phase() {
     );
     assert!(check_kernel_effect_fence(&foreign_fence, &bundle).is_err());
     let admission = production_admission();
+    // Admitted destination, so the refusal observed here is the FOREIGN FENCE
+    // and not the destination gate. The fence check runs before admission is
+    // consulted, so this case would also refuse without evidence — but it would
+    // then be unable to say WHICH check refused.
     let ports = RestorePorts {
         journal_admission: &admission,
         kernel_fence: &foreign_fence,
         keys: None,
         blob_scope: None,
-        manifest_evidence: None,
+        manifest_evidence: Some(admitted_evidence(&root)),
         rehearsal: false,
     };
     let coordinator = KernelBackupRestore::bind(root.clone());
@@ -653,7 +747,7 @@ fn independent_complete_reconciliation_denominators() {
     let root = work_root("10");
     let fence = bundle.export_fence.state_fence.clone();
     let admission = production_admission();
-    let ports = production_ports(&admission, &fence);
+    let ports = production_ports(&admission, &fence, &root);
     let coordinator = KernelBackupRestore::bind(root.clone());
     let mut journal = FixtureJournal::default();
     let outcome = coordinator
@@ -711,7 +805,7 @@ fn unknown_or_missing_member_prevents_readiness_not_partial_import() {
     let root = work_root("11");
     let fence = bundle.export_fence.state_fence.clone();
     let admission = production_admission();
-    let ports = production_ports(&admission, &fence);
+    let ports = production_ports(&admission, &fence, &root);
     let coordinator = KernelBackupRestore::bind(root.clone());
     let mut journal = FixtureJournal::default();
     let outcome = coordinator
@@ -775,7 +869,7 @@ fn old_lease_route_ui_session_invalidations_retained_individually() {
     let root = work_root("13");
     let fence = bundle.export_fence.state_fence.clone();
     let admission = production_admission();
-    let ports = production_ports(&admission, &fence);
+    let ports = production_ports(&admission, &fence, &root);
     let coordinator = KernelBackupRestore::bind(root.clone());
     let mut journal = FixtureJournal::default();
     let outcome = coordinator
@@ -817,7 +911,7 @@ fn current_purge_residency_reference_closure_preserved() {
     let root = work_root("14");
     let fence = bundle.export_fence.state_fence.clone();
     let admission = production_admission();
-    let ports = production_ports(&admission, &fence);
+    let ports = production_ports(&admission, &fence, &root);
     let coordinator = KernelBackupRestore::bind(root.clone());
     let mut journal = FixtureJournal::default();
     let outcome = coordinator
@@ -858,7 +952,7 @@ fn required_external_source_revalidation_cannot_be_a_stub() {
     let root = work_root("15");
     let fence = bundle.export_fence.state_fence.clone();
     let admission = production_admission();
-    let ports = production_ports(&admission, &fence);
+    let ports = production_ports(&admission, &fence, &root);
     let coordinator = KernelBackupRestore::bind(root.clone());
     let mut journal = FixtureJournal::default();
     let outcome = coordinator
@@ -906,12 +1000,17 @@ fn rehearsal_cannot_activate_cutover_or_retire_source() {
     std::fs::write(&sentinel, b"source-installation-bytes").expect("sentinel");
     let fence = bundle.export_fence.state_fence.clone();
     let fixture = fixture_admission();
+    // A rehearsal that HOLDS Host admission is a supported shape: the posture is
+    // not a reason to refuse and is not a substitute for admission. Fixture
+    // journal admission is accepted on the rehearsal branch, which is why this
+    // case runs at all, and the destination evidence is the owner-issued record
+    // the producer issues for this root.
     let ports = RestorePorts {
         journal_admission: &fixture,
         kernel_fence: &fence,
         keys: None,
         blob_scope: None,
-        manifest_evidence: None,
+        manifest_evidence: Some(admitted_evidence(&root)),
         rehearsal: true,
     };
     let coordinator = KernelBackupRestore::bind(root.clone());
@@ -949,7 +1048,7 @@ fn one_existing_phase_engine_with_exact_same_transaction_resumption() {
     let root = work_root("17");
     let fence = bundle.export_fence.state_fence.clone();
     let admission = production_admission();
-    let ports = production_ports(&admission, &fence);
+    let ports = production_ports(&admission, &fence, &root);
     let coordinator = KernelBackupRestore::bind(root.clone());
     let mut journal = FixtureJournal::default();
     let first = coordinator
@@ -993,7 +1092,7 @@ fn bounds_cancel_cleanup_and_primary_failure_preserved() {
     let context = test_context(target);
     let fence = bundle.export_fence.state_fence.clone();
     let admission = production_admission();
-    let ports = production_ports(&admission, &fence);
+    let ports = production_ports(&admission, &fence, &root);
     let coordinator = KernelBackupRestore::bind(root.clone());
     let mut journal = FixtureJournal::default();
     let outcome = coordinator
@@ -1015,7 +1114,7 @@ fn persistent_adapter_readback_across_handles_not_mock_only() {
     let root = work_root("19");
     let fence = bundle.export_fence.state_fence.clone();
     let admission = production_admission();
-    let ports = production_ports(&admission, &fence);
+    let ports = production_ports(&admission, &fence, &root);
     let coordinator = KernelBackupRestore::bind(root.clone());
     let journal_path = root.join("fixture-journal.json");
     // The file-backed fixture journal survives handle drops: the second
@@ -1120,4 +1219,170 @@ fn no_private_db_copy_reverse_import_local_mint_or_overclaim() {
     // Canonical-only imports stay canonical-only: no Product/Finish claim.
     // Live-store import is refused via the STORE_IMPORT channel marker.
     assert!(coordinator_src.contains("canonical-store-import"));
+}
+
+// WORK_UNIT_CASE: 960/21
+#[test]
+fn interrupted_after_staging_retains_published_material_for_resume() {
+    let target = "t960-21";
+    let bundle = test_bundle(target);
+    let context = test_context(target);
+    let root = work_root("21");
+    let fence = bundle.export_fence.state_fence.clone();
+    let admission = production_admission();
+    let ports = production_ports(&admission, &fence, &root);
+    let coordinator = KernelBackupRestore::bind(root.clone());
+    // The archive stages one phase's material, so the refusal below is refused
+    // with `RetainedForResume` rather than the plain `TargetFailed` an
+    // interruption BEFORE any phase would produce.
+    //
+    // Interrupted after PREPARE: `fail_cas_after_completed = 1` refuses the
+    // swap that follows the first receipt the journal persists, which is the
+    // first point at which published material and a durable receipt both exist.
+    let mut journal = FixtureJournal {
+        fail_cas_after_completed: Some(1),
+        ..FixtureJournal::default()
+    };
+    let interrupted = coordinator.restore(&bundle, context.clone(), &ports, &mut journal);
+    let error = interrupted.expect_err("interrupted restore fails typed");
+    let (primary, retained, cleanup) = match &error {
+        KernelRestoreError::RetainedForResume {
+            primary,
+            retained,
+            cleanup,
+        } => (*primary, retained.as_ref(), *cleanup),
+        other => panic!("published material is reported as retained, got {other}"),
+    };
+    // The engine's own typed failure is preserved as the cause, unchanged.
+    assert_eq!(
+        primary,
+        BackupError::RestoreJournalCasConflict,
+        "the engine failure is the cause and is never replaced"
+    );
+    // Bounded and counted from what this execution actually published.
+    assert!(
+        retained.members > 0,
+        "at least the prepare receipt is retained, got {retained}"
+    );
+    assert!(retained.bytes > 0, "retained bytes are counted: {retained}");
+    // The destination was CONSTRUCTED for this execution, so cleanup runs
+    // rather than refusing, and the temporaries this execution staged are its
+    // own to remove. What it never becomes is a removal of published material.
+    assert_eq!(
+        cleanup,
+        StagedCleanupOutcome::TemporariesRemoved,
+        "this execution's own unpublished temporaries are reaped, published material is not"
+    );
+    // The retained material is still on disk: the prepare phase published the
+    // pinned admission, and it survives the failure.
+    let destination_root = root.join(".eliot").join(RESTORE_ISOLATED_AREA).join(target);
+    let pinned_path = destination_root.join(DESTINATION_ADMISSION_FILE);
+    assert!(pinned_path.is_file(), "published admission survives");
+    let pinned: PinnedDestinationAdmission =
+        serde_json::from_slice(&std::fs::read(&pinned_path).expect("pinned bytes"))
+            .expect("pinned admission parses");
+    assert_eq!(pinned.target_id, target);
+    // No temporary survives a completed cleanup. Checked RECURSIVELY, because
+    // a member is staged under a subdirectory and a check of the destination
+    // root's own entries would pass while a temporary sat one level down.
+    fn temporaries_remaining(dir: &Path) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        entries.filter_map(Result::ok).any(|entry| {
+            let path = entry.path();
+            path.extension()
+                .is_some_and(|ext| ext == TEMP_RESTORE_EXTENSION)
+                || (path.is_dir() && temporaries_remaining(&path))
+        })
+    }
+    assert!(
+        !temporaries_remaining(&destination_root),
+        "cleanup reaped every unpublished temporary under the destination"
+    );
+    // RESUMING THE SAME TRANSACTION resumes rather than restarts: the phase log
+    // of the resumed run does not re-apply prepare, because the journal already
+    // records it applied and the receipt still attests the material.
+    let resumed = coordinator
+        .restore(&bundle, context, &ports, &mut journal)
+        .expect("the same transaction resumes");
+    assert!(
+        !resumed.phase_log.contains(&"prepare".to_owned()),
+        "a resume does not re-apply a phase the journal already recorded: {:?}",
+        resumed.phase_log
+    );
+    assert!(
+        !resumed.phase_log.is_empty(),
+        "the resume did carry the remaining phases forward"
+    );
+    resumed.receipt.validate().expect("resumed receipt validates");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// WORK_UNIT_CASE: 960/22
+#[test]
+fn unowned_temporary_with_this_owners_suffix_survives_cleanup_byte_for_byte() {
+    let target = "t960-22";
+    let bundle = test_bundle(target);
+    let context = test_context(target);
+    let root = work_root("22");
+    let fence = bundle.export_fence.state_fence.clone();
+    let admission = production_admission();
+    let ports = production_ports(&admission, &fence, &root);
+    let coordinator = KernelBackupRestore::bind(root.clone());
+    let destination_root = root.join(".eliot").join(RESTORE_ISOLATED_AREA).join(target);
+    // A file carrying EXACTLY the suffix this owner's staging uses, planted in
+    // the destination BEFORE the restore runs, so it is never a temporary this
+    // execution created.
+    //
+    // Predicting the suffix is not a way to claim the path: ownership comes
+    // from `staged_temporaries`, which `write_file` appends to before the first
+    // byte of THIS execution's own write. A planted path is absent from that
+    // set, so `is_owned_temporary` returns false for it and it is never a
+    // cleanup candidate — which is why `PathNotOurs` is unreachable from
+    // outside the owner and is not the reason asserted below.
+    let planted_bytes = b"planted-by-another-writer-960-22";
+    let planted = destination_root.join(format!("foreign-member.{TEMP_RESTORE_EXTENSION}"));
+    // The destination root is pre-created so this run is an ADMITTED RESUME:
+    // `KernelIsolatedDestination::open` classifies by whether the root already
+    // is a directory, and a resumed destination is exactly the shape the
+    // bounded cleanup must refuse rather than empty. `AdmittedResume` is
+    // therefore the reason this case observes, and the planted file is the
+    // thing that reason protects.
+    std::fs::create_dir_all(&destination_root).expect("destination exists before the restore");
+    std::fs::write(&planted, planted_bytes).expect("plant unowned temporary");
+    let mut journal = FixtureJournal {
+        fail_cas_after_completed: Some(1),
+        ..FixtureJournal::default()
+    };
+    let interrupted = coordinator.restore(&bundle, context, &ports, &mut journal);
+    let error = interrupted.expect_err("interrupted restore fails typed");
+    // The destination already existed when this execution opened it, so it is
+    // an ADMITTED RESUME rather than a fresh root, and the bounded cleanup
+    // refuses it outright: its contents are not provably this execution's.
+    //
+    // `AdmittedResume` is the observable proof that the planted file was never
+    // considered removable, and the byte comparison below is the guarantee
+    // itself: an unowned temporary survives byte for byte.
+    let cleanup = match &error {
+        KernelRestoreError::RetainedForResume { cleanup, .. } => *cleanup,
+        other => panic!("published material is reported as retained, got {other}"),
+    };
+    assert_eq!(
+        cleanup,
+        StagedCleanupOutcome::TemporariesPreserved(StagedCleanupRefusal::AdmittedResume),
+        "a resumed destination is refused rather than emptied"
+    );
+    assert_eq!(
+        std::fs::read(&planted).expect("planted file still readable"),
+        planted_bytes,
+        "an unowned temporary carrying this owner's suffix survives byte for byte"
+    );
+    // The published material this execution DID create is retained too, so the
+    // refusal to clean is not a refusal to report.
+    assert!(matches!(
+        &error,
+        KernelRestoreError::RetainedForResume { retained, .. } if retained.members > 0
+    ));
+    let _ = std::fs::remove_dir_all(&root);
 }

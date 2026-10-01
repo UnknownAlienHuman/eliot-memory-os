@@ -387,7 +387,14 @@ const ISOLATED_SKELETON_DIR: &str = "phase-receipts";
 /// name that a phase receipt and the durable journal may both attest, and it
 /// carries no such suffix. Single-sourced so the writer and the cleanup
 /// predicate cannot disagree about which side of the rename a path is on.
-const TEMP_RESTORE_EXTENSION: &str = "tmp-restore";
+///
+/// Published rather than private so a test can plant a file carrying this
+/// owner's EXACT staging suffix and observe that the bounded cleanup leaves it
+/// alone. A test that spelled the suffix out instead would be asserting against
+/// a copy of this constant, and the copy is what drifts: a rename of the suffix
+/// would leave such a test still "proving" a guarantee about a suffix the owner
+/// no longer writes. There is one suffix and every reader of it comes from here.
+pub const TEMP_RESTORE_EXTENSION: &str = "tmp-restore";
 
 /// Checked accumulation for the derived staged-output denominators. Overflow
 /// refuses the archive through the named ceiling rather than wrapping a byte
