@@ -5900,6 +5900,43 @@ impl RedbRecoveryStore {
                 reason: "must equal the prepared transition operation identity",
             });
         }
+        if prepared.named_operations.len() != 1
+            || prepared.named_operations[0].operation
+                != eliot_store_api::NamedMutationOperation::RecordBlobProcessSourceAdmission
+        {
+            return Err(OrsError::InvalidField {
+                field: "blob_ready_prepared_transition",
+                reason: "ReadyAttach must be the exact single source-admission CAS",
+            });
+        }
+        let ready_json = prepared.named_operations[0]
+            .parameters
+            .get("snapshot_json")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(OrsError::InvalidField {
+                field: "blob_ready_prepared_transition",
+                reason: "source-admission CAS lacks its exact snapshot bytes",
+            })?;
+        let ready: eliot_store_api::blob_process_source_admission::BlobProcessSourceAdmission =
+            serde_json::from_str(ready_json).map_err(|_| OrsError::InvalidField {
+                field: "blob_ready_prepared_transition",
+                reason: "source-admission snapshot is not the closed typed record",
+            })?;
+        ready.validate().map_err(|_| OrsError::InvalidField {
+            field: "blob_ready_prepared_transition",
+            reason: "source-admission Ready snapshot does not validate",
+        })?;
+        if ready.phase
+            != eliot_store_api::blob_process_source_admission::BlobProcessSourceAdmissionPhase::Ready
+            || ready.ready.as_ref().map(|receipt| receipt.ready_operation_id.as_str())
+                != Some(operation_id)
+            || ready.state_fence != prepared.state_fence
+        {
+            return Err(OrsError::InvalidField {
+                field: "blob_ready_prepared_transition",
+                reason: "source-admission snapshot does not bind this exact Ready CAS",
+            });
+        }
         let prepared_json = serde_json::to_string(prepared)
             .map_err(|error| OrsError::Encoding(error.to_string()))?;
         let prepared_sha256 = sha256_hex(prepared_json.as_bytes());
