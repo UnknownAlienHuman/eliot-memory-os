@@ -1679,6 +1679,7 @@ impl KernelComposition {
                     pending,
                     reason_code,
                     Some(result.disposition.clone()),
+                    result.bind_scope_evidence.as_ref(),
                 )
             }
         }
@@ -1914,18 +1915,25 @@ impl KernelComposition {
         pending: &AgentActivationPending,
         reason_code: AgentBridgeActivationDenialCode,
         detail: Option<AgentActivationResolutionDisposition>,
+        bind_scope_evidence: Option<&eliot_protocol::AgentActivationBindScopeEvidence>,
     ) -> Result<Frame, TransportError> {
         let response = if let Some(detail) = detail {
             let (code, disposition, directive) =
                 canonical_activation_denial(&detail).ok_or(TransportError::SessionFenced)?;
-            OpenAgentBridgeActivationResponse::canonical_denied(
+            let response = OpenAgentBridgeActivationResponse::canonical_denied(
                 &pending.request,
                 code.to_owned(),
                 disposition,
                 directive,
                 detail,
             )
-            .map_err(|_| TransportError::SessionFenced)?
+            .map_err(|_| TransportError::SessionFenced)?;
+            match bind_scope_evidence {
+                Some(evidence) => response
+                    .with_bind_scope_evidence(evidence.clone())
+                    .map_err(|_| TransportError::SessionFenced)?,
+                None => response,
+            }
         } else {
             let legacy = AgentBridgeActivationResponse::denied(&pending.request, reason_code, None)
                 .map_err(|_| TransportError::SessionFenced)?;
@@ -1945,6 +1953,7 @@ impl KernelComposition {
                     reason_code,
                     detail,
                 },
+                bind_scope_evidence: None,
                 response_sha256: String::new(),
             }
             .with_computed_digest()

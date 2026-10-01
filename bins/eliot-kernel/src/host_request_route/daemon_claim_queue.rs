@@ -252,11 +252,24 @@ impl KernelComposition {
         envelope: &HostRequestEnvelope,
         tool: &serde_json::Value,
     ) -> Result<(), TransportError> {
-        check_task_controller_admission(envelope, tool)?;
+        let invocation = task_controller_admission(envelope, tool)?;
         let _admission_owner = self
             .agent_activation_pending
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
+        if invocation.action == eliot_protocol::TaskControllerAction::BindScope {
+            let evidence = invocation
+                .bind_scope_evidence
+                .as_ref()
+                .ok_or(TransportError::SessionFenced)?;
+            if !self.pre_scope_bind_scope_evidence_still_retained_in(
+                &_admission_owner,
+                evidence,
+                envelope,
+            ) {
+                return Err(TransportError::SessionFenced);
+            }
+        }
         self.host_request_connection_gate_under_transition(envelope)?;
         let mut index = self
             .host_request_connection_index
@@ -475,25 +488,54 @@ impl KernelComposition {
                     continue;
                 }
                 let invocation = task_controller_admission(envelope, tool)?;
-                if !self.application_binding_live_for_claim(envelope, &admission_owner, true)? {
-                    continue;
-                }
-                // Keep the authenticated application identity from the
-                // retained activation binding; a daemon channel or request
-                // label cannot supply this owner key.
-                let authenticated_principal = self
-                    .agent_bridge_connections
-                    .lock()
-                    .map_err(|_| TransportError::SessionFenced)?
-                    .get(&envelope.connection_id)
-                    .and_then(|connection| connection.activated_binding.as_ref())
-                    .map(|binding| binding.principal_id.clone())
-                    .filter(|principal| {
-                        !principal.trim().is_empty()
-                            && principal.trim() == principal
-                            && !principal.chars().any(char::is_control)
-                    })
-                    .ok_or(TransportError::SessionFenced)?;
+                let authenticated_principal = if invocation.action
+                    == eliot_protocol::TaskControllerAction::BindScope
+                {
+                    let evidence = invocation
+                        .bind_scope_evidence
+                        .as_ref()
+                        .ok_or(TransportError::SessionFenced)?;
+                    if !self.pre_scope_bind_scope_evidence_still_retained_in(
+                        &admission_owner,
+                        evidence,
+                        envelope,
+                    ) {
+                        continue;
+                    }
+                    let connections = self
+                        .agent_bridge_connections
+                        .lock()
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    let Some(connection) = connections.get(&envelope.connection_id) else {
+                        continue;
+                    };
+                    if !connection.activation_completed
+                        || connection.session.is_some()
+                        || connection.activated_binding.is_some()
+                    {
+                        continue;
+                    }
+                    evidence.principal_id.clone()
+                } else {
+                    if !self.application_binding_live_for_claim(envelope, &admission_owner, true)? {
+                        continue;
+                    }
+                    // Keep the authenticated application identity from the
+                    // retained activation binding; a daemon channel or request
+                    // label cannot supply this owner key.
+                    self.agent_bridge_connections
+                        .lock()
+                        .map_err(|_| TransportError::SessionFenced)?
+                        .get(&envelope.connection_id)
+                        .and_then(|connection| connection.activated_binding.as_ref())
+                        .map(|binding| binding.principal_id.clone())
+                        .filter(|principal| {
+                            !principal.trim().is_empty()
+                                && principal.trim() == principal
+                                && !principal.chars().any(char::is_control)
+                        })
+                        .ok_or(TransportError::SessionFenced)?
+                };
                 if !candidate.task_controller_attempt.is_owned_by(session) {
                     let generation = candidate
                         .task_controller_attempt
@@ -654,22 +696,49 @@ impl KernelComposition {
         {
             return Err(TransportError::SessionFenced);
         }
-        if !self.application_binding_live_for_claim(&envelope, &admission_owner, true)? {
-            return Err(TransportError::SessionFenced);
-        }
-        let principal = self
-            .agent_bridge_connections
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)?
-            .get(&envelope.connection_id)
-            .and_then(|connection| connection.activated_binding.as_ref())
-            .map(|binding| binding.principal_id.clone())
-            .filter(|principal| {
-                !principal.trim().is_empty()
-                    && principal.trim() == principal
-                    && !principal.chars().any(char::is_control)
-            })
-            .ok_or(TransportError::SessionFenced)?;
+        let principal = if invocation.action == eliot_protocol::TaskControllerAction::BindScope {
+            let evidence = invocation
+                .bind_scope_evidence
+                .as_ref()
+                .ok_or(TransportError::SessionFenced)?;
+            if !self.pre_scope_bind_scope_evidence_still_retained_in(
+                &admission_owner,
+                evidence,
+                &envelope,
+            ) {
+                return Err(TransportError::SessionFenced);
+            }
+            let connections = self
+                .agent_bridge_connections
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            let connection = connections
+                .get(&envelope.connection_id)
+                .ok_or(TransportError::SessionFenced)?;
+            if !connection.activation_completed
+                || connection.session.is_some()
+                || connection.activated_binding.is_some()
+            {
+                return Err(TransportError::SessionFenced);
+            }
+            evidence.principal_id.clone()
+        } else {
+            if !self.application_binding_live_for_claim(&envelope, &admission_owner, true)? {
+                return Err(TransportError::SessionFenced);
+            }
+            self.agent_bridge_connections
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?
+                .get(&envelope.connection_id)
+                .and_then(|connection| connection.activated_binding.as_ref())
+                .map(|binding| binding.principal_id.clone())
+                .filter(|principal| {
+                    !principal.trim().is_empty()
+                        && principal.trim() == principal
+                        && !principal.chars().any(char::is_control)
+                })
+                .ok_or(TransportError::SessionFenced)?
+        };
         Ok((envelope, invocation, tool, principal))
     }
 
@@ -1487,7 +1556,7 @@ fn finish_stale_attempt(
 /// Validates the closed Task Controller invoke-read pair before it enters the
 /// Kernel-owned queue. The owner-native task payload remains opaque here; the
 /// daemon decodes it only after claiming the exact fenced attempt.
-fn task_controller_admission(
+pub(super) fn task_controller_admission(
     envelope: &HostRequestEnvelope,
     tool: &serde_json::Value,
 ) -> Result<TaskControllerInvocation, TransportError> {
@@ -1519,10 +1588,33 @@ fn task_controller_admission(
                 .work_scope_id
                 .as_deref()
                 .ok_or(TransportError::SessionFenced)?
-        || envelope.state_fence.task_revision.is_none()
-        || envelope.identity.session_id.is_none()
     {
         return Err(TransportError::SessionFenced);
+    }
+    match invocation.action {
+        eliot_protocol::TaskControllerAction::BindScope => {
+            let evidence = invocation
+                .bind_scope_evidence
+                .as_ref()
+                .ok_or(TransportError::SessionFenced)?;
+            evidence
+                .validate()
+                .map_err(|_| TransportError::SessionFenced)?;
+            if envelope.identity.session_id.as_deref() != Some(evidence.session_id.as_str())
+                || envelope.state_fence != evidence.state_fence
+                || envelope.identity.task_id.as_deref() != Some(evidence.task_id.as_str())
+                || envelope.identity.work_scope_id.as_deref()
+                    != Some(evidence.work_scope_id.as_str())
+            {
+                return Err(TransportError::SessionFenced);
+            }
+        }
+        _ if envelope.state_fence.task_revision.is_none()
+            || envelope.identity.session_id.is_none() =>
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        _ => {}
     }
     Ok(invocation)
 }

@@ -3448,6 +3448,35 @@ fn resolve_valid_ticket(
     } else {
         result
     };
+    let result = if matches!(
+        &result.disposition,
+        AgentActivationResolutionDisposition::ScopeSelectionRequired { .. }
+    ) {
+        match kernel_owner.as_ref() {
+            Ok(Some(kernel_owner)) => {
+                match composition
+                    .pre_scope_bind_scope_evidence(&ticket, kernel_owner.clone(), now)
+                    .await
+                {
+                    Ok(evidence) => result
+                        .with_bind_scope_evidence(evidence)
+                        .map_err(|error| {
+                            format!(
+                                "daemon pre-scope binding proof ticket {}: {error}",
+                                ticket.ticket_id
+                            )
+                        })?,
+                    // A negative activation remains reportable if an
+                    // independent pre-scope owner is unavailable. Without
+                    // this proof the Bridge cannot construct BIND_SCOPE.
+                    Err(_) => result,
+                }
+            }
+            Ok(None) | Err(_) => result,
+        }
+    } else {
+        result
+    };
     let semantic_owner = if matches!(
         &result.disposition,
         AgentActivationResolutionDisposition::Resolved { .. }

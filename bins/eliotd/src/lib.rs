@@ -22,6 +22,7 @@ use eliot_governor::{
 use eliot_kernel_core::Notification;
 use eliot_platform_windows::{ProtectedPathError, ProtectedRuntimePathLease};
 use eliot_protocol::{
+    AgentActivationBindScopeEvidence, AgentActivationKernelOwnerReadback,
     AgentActivationOwnerEvidence, AgentActivationOwnerReadback, AgentActivationResolutionResult,
     AgentActivationResolutionTicket, AgentActivationResolvedBinding, RequestIdentity,
 };
@@ -2069,6 +2070,58 @@ impl DaemonComposition {
         .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
         AgentActivationOwnerReadback::from_evidence(evidence, now.max(1))
             .map_err(|error| DaemonError::Lifecycle(error.to_string()))
+    }
+
+    /// Reads the authentic pre-WorkScope owner proof used only to construct
+    /// an explicit initial BIND_SCOPE invocation. This follows the original
+    /// WorkLease/session/task/canonical-plan/TaskContract reads; it never
+    /// creates an activated binding or treats the request as ready.
+    pub async fn pre_scope_bind_scope_evidence(
+        &self,
+        ticket: &AgentActivationResolutionTicket,
+        kernel_owner: AgentActivationKernelOwnerReadback,
+        now: u64,
+    ) -> Result<AgentActivationBindScopeEvidence, DaemonError> {
+        ticket
+            .validate()
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        if ticket.successor_of.is_some() {
+            return Err(DaemonError::Lifecycle(
+                "pre-scope binding evidence requires an initial activation ticket".to_owned(),
+            ));
+        }
+        kernel_owner
+            .validate()
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        let projection = self
+            .governor
+            .read_pre_scope_bind_scope_projection(now, &ticket.state_fence)
+            .await
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        let evidence = AgentActivationBindScopeEvidence {
+            owner_id: eliot_protocol::AGENT_ACTIVATION_OWNER_ID.to_owned(),
+            owner_revision: projection.owner_revision,
+            ticket_id: ticket.ticket_id.clone(),
+            ticket_sha256: ticket.ticket_sha256.clone(),
+            ticket_deadline_unix_ms: ticket.kernel_deadline_unix_ms,
+            state_fence: projection.state_fence,
+            principal_id: projection.principal_id,
+            session_id: projection.session_id,
+            work_lease_id: projection.work_lease_id,
+            work_item_id: projection.work_item_id,
+            task_id: projection.task_id.to_string(),
+            task_revision: projection.task_revision,
+            work_scope_id: projection.work_scope_id,
+            plan_id: projection.plan_id,
+            plan_revision: projection.plan_revision,
+            acceptance_digest: projection.acceptance_digest,
+            kernel_owner,
+            observed_at_unix_ms: now.max(1),
+        };
+        evidence
+            .validate_against(ticket)
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        Ok(evidence)
     }
 
     /// Single production resolver spine: resolves one Kernel-issued semantic

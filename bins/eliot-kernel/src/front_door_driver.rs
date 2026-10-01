@@ -726,8 +726,10 @@ async fn serve_agent_bridge_connection(
 /// rejection before revocation; any other violation (unexpected
 /// process/daemon actions, failed dispatch, failed send) revokes and fences.
 /// Connections without a retained admitted Session — including typed
-/// activation denials — serve no further frames: their next frame fences
-/// exactly as before, and their disconnect still closes clean. Capacity
+/// activation denials — serve only the explicit pre-scope BIND_SCOPE
+/// continuation when its exact accepted activation proof is present on the
+/// same connection. That lane never creates a Session; every other frame
+/// fences exactly as before, and disconnect still closes clean. Capacity
 /// saturation is the one dispatch failure that never revokes: a
 /// `Backpressure` error is answered with a typed pressure reply on the
 /// ordinary reply channel and the loop continues, so authorized
@@ -756,8 +758,26 @@ async fn serve_admitted_bridge_host_requests(
         let session = match kernel.host_request_bridge_session(&connection_id) {
             Ok(session) => session,
             Err(error) => {
-                kernel.revoke_agent_bridge(&connection_id);
-                return Err(error);
+                match kernel
+                    .dispatch_pre_scope_bind_scope_host_request_frame(&connection_id, &frame)
+                {
+                    Ok(KernelFrameAction::Reply(reply)) => {
+                        if let Err(send_error) = send_checked(&mut front_door, &reply, limits).await
+                        {
+                            kernel.revoke_agent_bridge(&connection_id);
+                            return Err(send_error);
+                        }
+                        continue;
+                    }
+                    Ok(_) => {
+                        kernel.revoke_agent_bridge(&connection_id);
+                        return Err(TransportError::SessionFenced);
+                    }
+                    Err(_) => {
+                        kernel.revoke_agent_bridge(&connection_id);
+                        return Err(error);
+                    }
+                }
             }
         };
         if let Err(error) = kernel
