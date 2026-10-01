@@ -433,6 +433,53 @@ pub struct RetainedClaudeCancellation {
     pub evidence_ref: Option<String>,
 }
 
+/// Cloneable handle used to inject the sole P-04 executor into both
+/// WorkerCore and the retained Claude sidecar adapter. Cloning this wrapper
+/// shares the same executor and operation/evidence tables.
+#[derive(Clone)]
+pub struct SharedWindowsProcessExecutor {
+    inner: Arc<WindowsProcessExecutor>,
+}
+
+impl SharedWindowsProcessExecutor {
+    /// Wraps the already composed sole process owner.
+    #[must_use]
+    pub fn new(inner: Arc<WindowsProcessExecutor>) -> Self {
+        Self { inner }
+    }
+}
+
+impl ProcessExecutor for SharedWindowsProcessExecutor {
+    async fn start(
+        &self,
+        request: ProcessRequest,
+        sink: Arc<dyn ProcessEvidenceSink>,
+    ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
+        self.inner.start(request, sink).await
+    }
+
+    async fn inspect(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<ProcessExecutionView, ProcessExecutionError> {
+        self.inner.inspect(operation_id).await
+    }
+
+    async fn cancel(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<eliot_process::CancellationReceipt, ProcessExecutionError> {
+        self.inner.cancel(operation_id).await
+    }
+
+    async fn reconcile(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<ProcessEvidence, ProcessExecutionError> {
+        self.inner.reconcile(operation_id).await
+    }
+}
+
 /// Launch one exact provider attempt after validating the daemon identity
 /// against the independently issued claim, handshake, sealed ProcessRequest,
 /// ProviderExecutionBinding, and AgentAttempt. The launch port and all route

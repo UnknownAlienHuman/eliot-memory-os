@@ -79,13 +79,15 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use eliot_process::{
-    ActionLeaseRef, DispatchAuthorityId, DispatchPermitAuthority, DispatchValidationContext,
-    FencingToken, KernelDispatchKey, PermitIssuance, ProcessExecutionError, ProcessIntent,
-    ProcessRequest, SuspendedProcessIdentity, ValidatedDispatch,
+    ActionLeaseRef, ContractError, DispatchAuthorityId, DispatchPermitAuthority,
+    DispatchValidationContext, FencingToken, KernelDispatchKey, PermitIssuance,
+    ProcessExecutionError, ProcessIntent, ProcessRequest, SuspendedProcessIdentity,
+    ValidatedDispatch,
 };
+use eliot_protocol::NativeWorkerProviderProcessIdentityV1;
 
 use crate::NativeWorkerError;
 
@@ -346,6 +348,122 @@ impl NativeWorkerDispatchAuthority {
             })?
             .validate_and_consume(request, observed, &current)
             .map_err(ProcessExecutionError::from)
+    }
+}
+
+/// Routes the single P-04 executor's validation call to the already-issued
+/// per-operation native-worker authority. The router owns no keys, grants, or
+/// lifecycle state; each entry is one existing `NativeWorkerDispatchAuthority`
+/// derived from its exact owner-issued operation tuple.
+pub struct NativeWorkerDispatchAuthorityRouter {
+    supervisor_operation_id: String,
+    authorities: Mutex<
+        BTreeMap<
+            String,
+            (
+                Option<NativeWorkerProviderProcessIdentityV1>,
+                Arc<NativeWorkerDispatchAuthority>,
+            ),
+        >,
+    >,
+}
+
+impl NativeWorkerDispatchAuthorityRouter {
+    /// Starts with the one supervisor authority already admitted by the
+    /// normal native-worker launch path.
+    #[must_use]
+    pub fn new(
+        supervisor_operation_id: impl Into<String>,
+        supervisor_authority: Arc<NativeWorkerDispatchAuthority>,
+    ) -> Self {
+        let supervisor_operation_id = supervisor_operation_id.into();
+        Self {
+            authorities: Mutex::new(BTreeMap::from([(
+                supervisor_operation_id.clone(),
+                (None, supervisor_authority),
+            )])),
+            supervisor_operation_id,
+        }
+    }
+
+    /// Retains one exact provider child authority beside the existing
+    /// supervisor operation. A claim can register at most one distinct child
+    /// operation; same-operation replay/reconciliation uses that retained
+    /// authority and the existing P-04 process table.
+    pub fn retain_provider_authority(
+        &self,
+        identity: NativeWorkerProviderProcessIdentityV1,
+        authority: Arc<NativeWorkerDispatchAuthority>,
+    ) -> Result<(), NativeWorkerError> {
+        identity.validate().map_err(|_| {
+            NativeWorkerError::KernelAdmissionRequired(
+                "provider-process authority identity is malformed".to_owned(),
+            )
+        })?;
+        if identity.provider_operation_id == self.supervisor_operation_id {
+            return Err(NativeWorkerError::KernelAdmissionRequired(
+                "provider process cannot reuse the supervisor operation".to_owned(),
+            ));
+        }
+        let mut authorities = self.authorities.lock().map_err(|_| {
+            NativeWorkerError::KernelAdmissionRequired(
+                "native-worker process authority router lock poisoned".to_owned(),
+            )
+        })?;
+        if let Some((Some(retained_identity), _)) =
+            authorities.get(identity.provider_operation_id.as_str())
+        {
+            if retained_identity == &identity {
+                return Ok(());
+            }
+            return Err(NativeWorkerError::KernelAdmissionRequired(
+                "provider-process operation is already retained with another owner identity"
+                    .to_owned(),
+            ));
+        }
+        if authorities.len() != 1 {
+            return Err(NativeWorkerError::KernelAdmissionRequired(
+                "native-worker claim already retains a provider process authority".to_owned(),
+            ));
+        }
+        authorities.insert(
+            identity.provider_operation_id.clone(),
+            (Some(identity), authority),
+        );
+        Ok(())
+    }
+}
+
+impl eliot_process_executor::DispatchValidationPort for NativeWorkerDispatchAuthorityRouter {
+    fn validate_and_consume(
+        &self,
+        request: ProcessRequest,
+        observed: SuspendedProcessIdentity,
+    ) -> Result<ValidatedDispatch, ProcessExecutionError> {
+        let operation_id = request.operation_id().as_str();
+        let authorities = self
+            .authorities
+            .lock()
+            .map_err(|_| {
+                ProcessExecutionError::Unavailable(
+                    "native-worker process authority router lock poisoned".to_owned(),
+                )
+            })?;
+        let Some((provider_identity, authority)) = authorities.get(operation_id) else {
+            return Err(ProcessExecutionError::Contract(
+                ContractError::DispatchAuthenticationFailed,
+            ));
+        };
+        if let Some(identity) = provider_identity {
+            if request.invocation_digest() != identity.provider_process_invocation_digest
+                || request.executable_sha256() != identity.provider_executable_digest
+            {
+                return Err(ProcessExecutionError::Contract(
+                    ContractError::DispatchBindingMismatch,
+                ));
+            }
+        }
+        authority.validate_and_consume(request, observed)
     }
 }
 
@@ -807,5 +925,94 @@ mod tests {
             other_process.invocation_digest(),
             "a distinct launch nonce must issue a distinct invocation digest"
         );
+    }
+
+    /// #22 Work/Acceptance positive: one exact provider operation can be
+    /// retained beside the supervisor authority and replayed by identity.
+    #[test]
+    fn router_retains_one_exact_provider_authority() {
+        let epoch_json = serde_json::json!({
+            "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+            "sequence": 3,
+        });
+        let supervisor = Arc::new(
+            NativeWorkerDispatchAuthority::new(
+                "claim-router-1",
+                "operation-supervisor-1",
+                7,
+                &epoch_json,
+                "launch-nonce-supervisor-1",
+            )
+            .expect("supervisor authority"),
+        );
+        let router = NativeWorkerDispatchAuthorityRouter::new(
+            "operation-supervisor-1",
+            supervisor,
+        );
+        let identity = NativeWorkerProviderProcessIdentityV1 {
+            provider_operation_id: "operation-provider-1".to_owned(),
+            provider_process_invocation_digest: "a".repeat(64),
+            provider_executable_digest: "b".repeat(64),
+            process_ref: "provider-process:1".to_owned(),
+        };
+        let authority = Arc::new(
+            NativeWorkerDispatchAuthority::new(
+                "claim-router-1",
+                "operation-provider-1",
+                7,
+                &epoch_json,
+                "launch-nonce-provider-1",
+            )
+            .expect("provider authority"),
+        );
+
+        router
+            .retain_provider_authority(identity.clone(), Arc::clone(&authority))
+            .expect("first exact provider authority is retained");
+        router
+            .retain_provider_authority(identity, authority)
+            .expect("same identity is idempotently retained");
+    }
+
+    /// #22 Work/Acceptance refusal: a provider identity cannot alias the
+    /// already admitted supervisor process operation.
+    #[test]
+    fn router_refuses_provider_authority_using_supervisor_operation() {
+        let epoch_json = serde_json::json!({
+            "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+            "sequence": 3,
+        });
+        let supervisor = Arc::new(
+            NativeWorkerDispatchAuthority::new(
+                "claim-router-2",
+                "operation-supervisor-2",
+                7,
+                &epoch_json,
+                "launch-nonce-supervisor-2",
+            )
+            .expect("supervisor authority"),
+        );
+        let router = NativeWorkerDispatchAuthorityRouter::new(
+            "operation-supervisor-2",
+            supervisor,
+        );
+        let identity = NativeWorkerProviderProcessIdentityV1 {
+            provider_operation_id: "operation-supervisor-2".to_owned(),
+            provider_process_invocation_digest: "c".repeat(64),
+            provider_executable_digest: "d".repeat(64),
+            process_ref: "provider-process:2".to_owned(),
+        };
+        let authority = Arc::new(
+            NativeWorkerDispatchAuthority::new(
+                "claim-router-2",
+                "operation-supervisor-2",
+                7,
+                &epoch_json,
+                "launch-nonce-provider-2",
+            )
+            .expect("provider authority"),
+        );
+
+        assert!(router.retain_provider_authority(identity, authority).is_err());
     }
 }

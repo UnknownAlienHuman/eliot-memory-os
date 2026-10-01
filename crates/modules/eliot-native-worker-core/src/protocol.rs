@@ -446,6 +446,11 @@ pub enum WorkerEventPayload {
         proposal: Box<ProposedEffect>,
         authorized_effect: Box<AuthorizedEffect>,
     },
+    /// Exact retained provider outcome from the original claim/attempt. This
+    /// is candidate or coverage evidence only; it cannot finish a task.
+    RetainedOperationOutcome {
+        outcome: Box<crate::NativeWorkerRetainedOperationOutcome>,
+    },
     Heartbeat,
     Health {
         state: ServiceProcessState,

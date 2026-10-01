@@ -898,7 +898,38 @@ where
             )?);
         }
         if let Some(execute_port) = self.execute_port.as_ref() {
-            execute_port.execute(frame, &request).await?;
+            if let Some(outcome) = execute_port.execute(frame, &request).await? {
+                outcome.validate()?;
+                if outcome.identity.attempt_id() != request.attempt_id.as_str()
+                    || outcome.identity.worker_generation != frame.producer_generation
+                    || outcome.identity.state_fence != frame.state_fence
+                    || outcome.identity.authority_epoch != frame.authority_epoch
+                {
+                    return Err(WorkerError::AdmissionMismatch(
+                        "retained_outcome_frame_identity",
+                    ));
+                }
+                let proof = match outcome.kind {
+                    NativeWorkerRetainedOutcomeKind::CandidateReady
+                    | NativeWorkerRetainedOutcomeKind::CandidatePartial
+                    | NativeWorkerRetainedOutcomeKind::CandidateFailed => {
+                        ProofCeiling::CandidateArtifact
+                    }
+                    NativeWorkerRetainedOutcomeKind::CancelledObserved
+                    | NativeWorkerRetainedOutcomeKind::UnknownOutcome
+                    | NativeWorkerRetainedOutcomeKind::Refused => ProofCeiling::Observation,
+                };
+                events.push(self.append_from_frame(
+                    frame,
+                    "worker.retained_operation_outcome",
+                    WorkerEventPayload::RetainedOperationOutcome {
+                        outcome: Box::new(outcome),
+                    },
+                    ReceiptDisposition::Success { proof },
+                    DeliveryClass::DurableObservation,
+                    true,
+                )?);
+            }
         }
         Ok(events)
     }

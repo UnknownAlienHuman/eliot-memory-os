@@ -5,8 +5,10 @@ use std::sync::Arc;
 
 use eliot_native_worker::{
     AdmittedLifecycle, BoundedEvidenceSink, KERNEL_ADMISSION_REQUIRED, KernelCheckpointPort,
-    KernelNativeWorkerClient, NativeWorker, NativeWorkerDispatchAuthority, NativeWorkerError,
+    KernelNativeWorkerClient, NativeWorker, NativeWorkerDispatchAuthority,
+    NativeWorkerDispatchAuthorityRouter, NativeWorkerError,
     PresentationEchoAdmission, SharedKernelTransport,
+    SharedWindowsProcessExecutor,
     AuthenticatedRetainedProviderExecutePort,
     admitted_material::{ValidatedAdmittedMaterial, read_admitted_material},
     derive_admitted_intent, dispatch_now_unix_ms, select_factory_for_admitted,
@@ -185,7 +187,12 @@ fn run() -> i32 {
         Ok(checkpoint) => checkpoint,
         Err(error) => return deny_invalid_material(&error.to_string()),
     };
-    let executor = WindowsProcessExecutor::new(authority);
+    let authority_router = Arc::new(NativeWorkerDispatchAuthorityRouter::new(
+        claim.operation_id.as_str(),
+        authority,
+    ));
+    let process_executor = Arc::new(WindowsProcessExecutor::new(authority_router.clone()));
+    let executor = SharedWindowsProcessExecutor::new(Arc::clone(&process_executor));
     // Issue #1912: the composition root keeps a handle to the exact admission
     // port it injects, so the terminal coverage-gap checkpoint frame binds the
     // granted epoch/fence/lease/revision the core sealed its live grant from
@@ -194,6 +201,8 @@ fn run() -> i32 {
     let execute_port = Arc::new(AuthenticatedRetainedProviderExecutePort::new(
         shared.clone(),
         claim,
+        Arc::clone(&process_executor),
+        Arc::clone(&authority_router),
     ));
     let mut worker = NativeWorker::new(WorkerCore::new(
         Some(executor),

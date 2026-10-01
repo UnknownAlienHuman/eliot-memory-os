@@ -701,20 +701,7 @@ impl KernelNativeWorkerClient {
             )
         })?;
         claim.validate().map_err(NativeWorkerError::from)?;
-        let request = NativeWorkerRetainedProviderMaterialResolveRequestV1 {
-            claim_id: claim.claim_id.as_str().to_owned(),
-            dispatch_operation_id: claim.operation_id.as_str().to_owned(),
-            attempt_id: claim.attempt_id.as_str().to_owned(),
-            binding_digest: claim.binding_digest.clone(),
-            worker_generation: claim.worker_generation,
-            state_fence: claim.state_fence.clone(),
-            authority_epoch: claim.authority_epoch.clone(),
-        };
-        request.validate().map_err(|error| {
-            NativeWorkerError::KernelAdmissionRequired(format!(
-                "retained provider material lookup request is invalid: {error}"
-            ))
-        })?;
+        let request = retained_provider_material_binding(claim)?;
         require_ready_claim_fence(&ready, claim)?;
         bind_request_identity(
             &mut self.client,
@@ -773,8 +760,14 @@ impl KernelNativeWorkerClient {
         require_ready_claim_fence(&ready, claim)?;
         validate_retained_provider_identity(claim, reference, provider_process)?;
         let request = NativeWorkerRetainedProviderMaterialReadRequestV1 {
+            binding: retained_provider_material_binding(claim)?,
             reference: reference.clone(),
         };
+        request.validate().map_err(|error| {
+            NativeWorkerError::KernelAdmissionRequired(format!(
+                "retained provider material read request is invalid: {error}"
+            ))
+        })?;
         bind_request_identity(
             &mut self.client,
             serde_json::to_value(&claim.state_fence)?,
@@ -834,9 +827,15 @@ impl KernelNativeWorkerClient {
         require_ready_claim_fence(&ready, claim)?;
         validate_retained_provider_identity(claim, reference, provider_process)?;
         let request = NativeWorkerProviderProcessReadRequestV1 {
+            binding: retained_provider_material_binding(claim)?,
             reference: reference.clone(),
             provider_process: provider_process.clone(),
         };
+        request.validate().map_err(|error| {
+            NativeWorkerError::KernelAdmissionRequired(format!(
+                "provider-process read request is invalid: {error}"
+            ))
+        })?;
         bind_request_identity(
             &mut self.client,
             serde_json::to_value(&claim.state_fence)?,
@@ -958,6 +957,26 @@ fn require_ready_claim_fence(
         ));
     }
     Ok(())
+}
+
+fn retained_provider_material_binding(
+    claim: &NativeWorkerClaim,
+) -> Result<NativeWorkerRetainedProviderMaterialResolveRequestV1, NativeWorkerError> {
+    let request = NativeWorkerRetainedProviderMaterialResolveRequestV1 {
+        claim_id: claim.claim_id.as_str().to_owned(),
+        dispatch_operation_id: claim.operation_id.as_str().to_owned(),
+        attempt_id: claim.attempt_id.as_str().to_owned(),
+        binding_digest: claim.binding_digest.clone(),
+        worker_generation: claim.worker_generation,
+        state_fence: claim.state_fence.clone(),
+        authority_epoch: claim.authority_epoch.clone(),
+    };
+    request.validate().map_err(|error| {
+        NativeWorkerError::KernelAdmissionRequired(format!(
+            "retained provider material request is invalid: {error}"
+        ))
+    })?;
+    Ok(request)
 }
 
 fn validate_retained_provider_identity(

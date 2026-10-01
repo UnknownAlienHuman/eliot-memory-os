@@ -11,6 +11,8 @@ use eliot_contracts::{EpochId, StateFence, sha256_hex};
 use eliot_protocol::{
     NativeWorkerProviderProcessIdentityV1, NativeWorkerRetainedProviderMaterialRefV1,
 };
+use std::fmt;
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -224,7 +226,7 @@ pub enum NativeWorkerRetainedOutcomeKind {
 /// contains exact owner-observed bytes for bridge projection; refs are
 /// locators, never proof by themselves. `owner_receipt_ref` is forwarded only
 /// when the actual owner supplies one, never synthesized here.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeWorkerRetainedOperationOutcome {
     /// The exact dispatch identity this result belongs to.
@@ -243,6 +245,28 @@ pub struct NativeWorkerRetainedOperationOutcome {
     pub process_evidence_digest: Option<String>,
     /// Receipt reference supplied by the canonical owner, when available.
     pub owner_receipt_ref: Option<String>,
+}
+
+impl fmt::Debug for NativeWorkerRetainedOperationOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativeWorkerRetainedOperationOutcome")
+            .field("identity", &"[retained operation identity]")
+            .field("kind", &self.kind)
+            .field(
+                "result_body",
+                &self
+                    .result_body
+                    .as_ref()
+                    .map(|body| format!("[redacted {} bytes]", body.len())),
+            )
+            .field("artifact_ref_count", &self.artifact_refs.len())
+            .field("evidence_ref_count", &self.evidence_refs.len())
+            .field("result_digest", &self.result_digest)
+            .field("process_evidence_digest", &self.process_evidence_digest)
+            .field("owner_receipt_ref_present", &self.owner_receipt_ref.is_some())
+            .finish()
+    }
 }
 
 impl NativeWorkerRetainedOperationOutcome {

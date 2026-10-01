@@ -50,7 +50,8 @@ pub mod governed_action;
 pub mod job_envelope;
 
 pub use dispatch_authority::{
-    NativeWorkerDispatchAuthority, ValidatedDispatchGrant, now_unix_ms as dispatch_now_unix_ms,
+    NativeWorkerDispatchAuthority, NativeWorkerDispatchAuthorityRouter, ValidatedDispatchGrant,
+    now_unix_ms as dispatch_now_unix_ms,
 };
 pub use job_envelope::{
     ConsumptionAttribution, CoverageGap, JobEnvelope, require_consumption_attribution,
@@ -68,6 +69,7 @@ pub use kernel_admission_client::{
     SharedKernelTransport,
 };
 pub use provider_execute_port::AuthenticatedRetainedProviderExecutePort;
+pub use retained_claude::SharedWindowsProcessExecutor;
 
 const MAX_FRAME_BYTES: u32 = 4 * 1024 * 1024;
 pub const KERNEL_ADMISSION_REQUIRED: &str = "KERNEL_ADMISSION_REQUIRED";

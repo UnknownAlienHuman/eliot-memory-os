@@ -859,7 +859,14 @@ impl NativeWorkerExecutePort for RecordingExecutePort {
         &'a self,
         _frame: &'a WorkerFrame,
         request: &'a WorkerRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<(), WorkerError>> + Send + 'a>> {
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<Option<NativeWorkerRetainedOperationOutcome>, WorkerError>,
+                > + Send
+                + 'a,
+        >,
+    > {
         Box::pin(async move {
             if request.attempt_id.as_str() != self.expected_attempt {
                 return Err(WorkerError::AdmissionMismatch("execute_port_attempt"));
@@ -868,8 +875,29 @@ impl NativeWorkerExecutePort for RecordingExecutePort {
                 .lock()
                 .map_err(|_| WorkerError::Provider("execute port lock failed".to_owned()))?
                 .push(request.attempt_id.as_str().to_owned());
-            Ok(())
+            Ok(None)
         })
+    }
+}
+
+struct ReturningExecutePort {
+    outcome: NativeWorkerRetainedOperationOutcome,
+}
+
+impl NativeWorkerExecutePort for ReturningExecutePort {
+    fn execute<'a>(
+        &'a self,
+        _frame: &'a WorkerFrame,
+        _request: &'a WorkerRequest,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<Option<NativeWorkerRetainedOperationOutcome>, WorkerError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move { Ok(Some(self.outcome.clone())) })
     }
 }
 
@@ -909,6 +937,97 @@ fn admitted_execute_port_refuses_a_foreign_attempt_before_provider_use() {
         Err(WorkerError::AdmissionMismatch("execute_port_attempt"))
     );
     assert!(port.calls.lock().expect("execute port calls").is_empty());
+}
+
+/// #22 Work/Acceptance positive: retained output follows accepted work in the
+/// ordinary durable event stream and preserves its result bytes.
+#[test]
+fn retained_execute_outcome_is_emitted_after_accepted_event() {
+    let (core, _, _, _, _) = fixture();
+    let outcome = retained_outcome_for_frame(&frame(
+        "execute-retained-positive",
+        WorkerFrameBody::Execute(execute_call(None)),
+    ));
+    let mut core = core.with_execute_port(Arc::new(ReturningExecutePort { outcome }));
+    start(&mut core);
+
+    let events = block_on(core.handle(frame(
+        "execute-retained-positive",
+        WorkerFrameBody::Execute(execute_call(None)),
+    )))
+    .expect("owner outcome is durably appended");
+
+    assert!(matches!(events[0].payload, WorkerEventPayload::Accepted { .. }));
+    match &events[1].payload {
+        WorkerEventPayload::RetainedOperationOutcome { outcome } => {
+            assert_eq!(outcome.result_body.as_deref(), Some(b"provider candidate".as_slice()));
+        }
+        other => panic!("expected retained provider outcome, received {other:?}"),
+    }
+}
+
+/// #22 Work/Acceptance refusal: a foreign retained attempt cannot be attached
+/// to the current Execute frame.
+#[test]
+fn retained_execute_outcome_refuses_foreign_attempt() {
+    let (core, _, _, _, _) = fixture();
+    let mut outcome = retained_outcome_for_frame(&frame(
+        "execute-retained-foreign",
+        WorkerFrameBody::Execute(execute_call(None)),
+    ));
+    outcome.identity.material_reference.attempt_id = "attempt-foreign".to_owned();
+    let mut core = core.with_execute_port(Arc::new(ReturningExecutePort { outcome }));
+    start(&mut core);
+
+    assert_eq!(
+        block_on(core.handle(frame(
+            "execute-retained-foreign",
+            WorkerFrameBody::Execute(execute_call(None)),
+        ))),
+        Err(WorkerError::AdmissionMismatch(
+            "retained_outcome_frame_identity"
+        ))
+    );
+}
+
+fn retained_outcome_for_frame(frame: &WorkerFrame) -> NativeWorkerRetainedOperationOutcome {
+    let body = b"provider candidate".to_vec();
+    NativeWorkerRetainedOperationOutcome {
+        identity: NativeWorkerRetainedOperationIdentity {
+            dispatch_id: "dispatch:claim-1".to_owned(),
+            task_id: "task-1".to_owned(),
+            material_reference: eliot_protocol::NativeWorkerRetainedProviderMaterialRefV1 {
+                claim_id: "claim-1".to_owned(),
+                dispatch_operation_id: "dispatch-operation-1".to_owned(),
+                attempt_id: "attempt-1".to_owned(),
+                binding_digest: "a".repeat(64),
+                material_ref: "material:claim-1".to_owned(),
+                material_sha256: "b".repeat(64),
+            },
+            provider_process: eliot_protocol::NativeWorkerProviderProcessIdentityV1 {
+                provider_operation_id: "provider-operation-1".to_owned(),
+                provider_process_invocation_digest: "c".repeat(64),
+                provider_executable_digest: "d".repeat(64),
+                process_ref: "process:provider-1".to_owned(),
+            },
+            route_class: "claude-sidecar".to_owned(),
+            route_ref: "route:claude-1".to_owned(),
+            worker_generation: frame.producer_generation,
+            executable_digest: "e".repeat(64),
+            expected_result_schema: "claude-candidate-v1".to_owned(),
+            deadline_unix_ms: frame.deadline_unix_ms,
+            cancellation_id: "cancel:provider-1".to_owned(),
+            state_fence: frame.state_fence.clone(),
+            authority_epoch: frame.authority_epoch.clone(),
+        },
+        kind: NativeWorkerRetainedOutcomeKind::CandidateReady,
+        result_digest: Some(sha256_hex(&body)),
+        result_body: Some(body),
+        artifact_refs: Vec::new(),
+        evidence_refs: vec!["evidence:provider-1".to_owned()],
+        process_evidence_digest: Some("f".repeat(64)),
+        owner_receipt_ref: None,
+    }
 }
 
 fn start(core: &mut TestCore) -> ProcessBindingSnapshot {

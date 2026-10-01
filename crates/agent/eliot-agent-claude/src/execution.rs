@@ -48,6 +48,7 @@ use eliot_process::{
     FencingToken, Generation, ProcessExecutionError, ProcessExecutionView, ProcessExecutor,
     ProcessLifecycle, ProcessRequest, SecretRef,
 };
+use eliot_protocol::NativeWorkerPromptRetentionReceiptV1;
 
 use crate::{
     CLAUDE_SIDECAR_ADAPTER_ID, CLAUDE_SIDECAR_HOST_FAMILY, CLAUDE_SIDECAR_PROTOCOL_VERSION,
@@ -225,6 +226,19 @@ pub struct ClaudeFactoryInput {
     pub descriptor: ClaudeAdapterDescriptor,
     /// Inert NDJSON request projection (query only).
     pub request: ClaudeSidecarRequest,
+    /// Exact original authenticated host request id, supplied by the
+    /// admission owner. It is distinct from the provider start request id in
+    /// `binding`.
+    pub source_host_request_id: String,
+    /// Owner reference to the exact original canonical requester bytes.
+    pub source_request_ref: String,
+    /// SHA-256 of the exact original canonical requester bytes.
+    pub source_request_sha256: String,
+    /// Governor-issued retention/privacy owner receipt binding the original
+    /// request source to this exact derived provider request. The receipt is
+    /// inert in this crate; Kernel must re-read its owner currentness before
+    /// this input reaches `prepare` and again before result submission.
+    pub prompt_retention_receipt: NativeWorkerPromptRetentionReceiptV1,
     /// Sealed X2 process binding; executable identity comes from admission.
     pub process_request: ProcessRequest,
     /// Credential reference only; never raw secret material.
@@ -246,7 +260,9 @@ impl std::fmt::Debug for ClaudeFactoryInput {
             .field("current_fence", &self.current_fence)
             .field("runtime_generation", &self.runtime_generation)
             .field("descriptor", &self.descriptor)
-            .field("request", &self.request)
+            .field("request", &"[redacted provider request]")
+            .field("source_request", &"[owner source reference]")
+            .field("prompt_retention_receipt", &"[owner retention receipt]")
             .field("process_request", &self.process_request)
             .field("credential", &"[redacted credential reference]")
             .field("prior", &self.prior)
@@ -273,7 +289,7 @@ impl std::fmt::Debug for ClaudePreparedAttempt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ClaudePreparedAttempt")
             .field("binding", &self.binding)
-            .field("request", &self.request)
+            .field("request", &"[redacted provider request]")
             .field("plan_digest", &self.plan_digest)
             .field("idempotency_key", &self.idempotency_key)
             .field("credential", &"[redacted credential reference]")
@@ -372,6 +388,7 @@ pub fn prepare(input: ClaudeFactoryInput) -> Result<ClaudeFactoryOutcome, Claude
     )
     .map_err(map_agent_contract)?;
     input.admitted.validate().map_err(map_agent_contract)?;
+    validate_prompt_retention_receipt(&input)?;
     input.descriptor.validate_for(&input.binding)?;
     input
         .process_request
@@ -429,6 +446,71 @@ pub fn prepare(input: ClaudeFactoryInput) -> Result<ClaudeFactoryOutcome, Claude
             process_request: Some(input.process_request),
         },
     )))
+}
+
+/// Validates the inert Governor retention receipt against independently
+/// supplied Claude factory identities before any process or credential effect.
+/// Fresh owner currentness is still the authenticated Kernel caller's
+/// responsibility; shape and identity agreement alone never make stale owner
+/// readbacks current.
+fn validate_prompt_retention_receipt(
+    input: &ClaudeFactoryInput,
+) -> Result<(), ClaudeSidecarError> {
+    let receipt = &input.prompt_retention_receipt;
+    receipt.validate_shape().map_err(|_| {
+        ClaudeSidecarError::AdmissionDenied(
+            "prompt-retention receipt is malformed or outside its owner bounds".to_owned(),
+        )
+    })?;
+    let request_json = serde_json::to_vec(&input.request)
+        .map_err(|_| ClaudeSidecarError::MalformedFrame("request not serializable"))?;
+    let request_digest = claude_local_digest_256_hex(&request_json);
+    let scope_ref = &input.admitted.work_unit.scope_ref;
+    let prompt_len = input
+        .request
+        .prompt
+        .as_ref()
+        .map_or(0, |prompt| prompt.len() as u64);
+    let effect_is_admitted = input
+        .admitted
+        .authority
+        .effect_ceiling
+        .permits_effect_class(receipt.effect_ceiling);
+    if receipt.source_host_request_id.as_str() != input.source_host_request_id.as_str()
+        || receipt.source_request_ref.as_str() != input.source_request_ref.as_str()
+        || receipt.source_request_sha256.as_str() != input.source_request_sha256.as_str()
+        || receipt.derived_prompt_sha256 != request_digest
+        || receipt.derived_prompt_sha256 != input.binding.start_request_sha256
+        || receipt.task_id.as_str() != input.admitted.task_id.as_str()
+        || receipt.work_id.as_str() != input.admitted.work_unit.id.as_str()
+        || receipt.work_scope_id.as_str() != scope_ref.as_str()
+        || receipt.work_scope_id.as_str() != input.admitted.authority.scope_ref.as_str()
+        || receipt.attempt_id.as_str() != input.binding.attempt_id.as_str()
+        || receipt.provider_id.as_str() != input.descriptor.route.provider.as_str()
+        || receipt.tool_name.as_str() != input.descriptor.adapter_id.as_str()
+        || receipt.state_fence != input.binding.state_fence
+        || receipt.authority_epoch != input.binding.state_fence.authority_epoch
+        || prompt_len > receipt.maximum_disclosure_bytes
+        || !effect_is_admitted
+    {
+        return Err(ClaudeSidecarError::AdmissionDenied(
+            "prompt-retention receipt does not bind the exact request, task, scope, attempt, route, fence, or admitted ceilings".to_owned(),
+        ));
+    }
+    let now_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| ClaudeSidecarError::AdmissionDenied("clock unavailable".to_owned()))?
+        .as_millis()
+        .try_into()
+        .map_err(|_| ClaudeSidecarError::AdmissionDenied("clock out of range".to_owned()))?;
+    if receipt.currentness_observed_at_unix_ms > now_unix_ms
+        || receipt.retention_expires_at_unix_ms <= now_unix_ms
+    {
+        return Err(ClaudeSidecarError::AdmissionDenied(
+            "prompt-retention receipt is outside its currentness window".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Render the exact NDJSON stdin line for a prepared attempt. The line is
@@ -1397,6 +1479,7 @@ mod tests {
     }
 
     fn binding_fixture() -> TestResult<ProviderExecutionBinding> {
+        let request_json = serde_json::to_vec(&request_fixture())?;
         Ok(ProviderExecutionBinding {
             attempt_id: AttemptId::new("attempt-claude-1")?,
             lease_id: lease_fixture("lease-claude-1")?,
@@ -1411,7 +1494,7 @@ mod tests {
             native_session: NativeSession::Native(NativeSessionLocator::new("claude-thread-1")?),
             execution_unit: eliot_agent_api::ExecutionUnit::new("claude", "claude-turn-1")?,
             start_request_id: eliot_agent_api::RequestId::new("req-claude-1")?,
-            start_request_sha256: eliot_contracts::sha256_hex(b"req-claude-1"),
+            start_request_sha256: claude_local_digest_256_hex(&request_json),
         })
     }
 
@@ -1596,6 +1679,7 @@ mod tests {
         let route = binding.route.clone();
         let fence = binding.state_fence.clone();
         let generation = binding.runtime_generation;
+        let prompt_retention_receipt = prompt_retention_fixture(&binding, &admitted, &request);
         ClaudeFactoryInput {
             binding,
             admitted,
@@ -1603,6 +1687,10 @@ mod tests {
             runtime_generation: generation,
             descriptor: ClaudeAdapterDescriptor::current(route),
             request,
+            source_host_request_id: "host-request-claude-1".to_owned(),
+            source_request_ref: "host-request:claude-fixture".to_owned(),
+            source_request_sha256: eliot_contracts::sha256_hex(b"original host request"),
+            prompt_retention_receipt,
             process_request,
             credential: eliot_process::SecretRef::new("test-broker", "claude-api-key")
                 .expect("valid test credential reference"),
@@ -1622,6 +1710,86 @@ mod tests {
             None,
             None,
         ))
+    }
+
+    /// #22 Work/Acceptance positive: the Governor receipt binds the exact
+    /// compact Claude request, original host request, task, scope, attempt,
+    /// provider, tool, and fence before preparation can reach a process.
+    #[test]
+    fn prompt_retention_receipt_accepts_exact_request_and_attempt() -> TestResult {
+        let input = fresh_input()?;
+        validate_prompt_retention_receipt(&input)?;
+        Ok(())
+    }
+
+    /// #22 Work/Acceptance refusal: changing the owner-committed provider
+    /// request digest blocks preparation before any process effect.
+    #[test]
+    fn prompt_retention_receipt_refuses_foreign_request_digest() -> TestResult {
+        let mut input = fresh_input()?;
+        input.prompt_retention_receipt.derived_prompt_sha256 = "0".repeat(64);
+        assert!(validate_prompt_retention_receipt(&input).is_err());
+        Ok(())
+    }
+
+    fn prompt_retention_fixture(
+        binding: &ProviderExecutionBinding,
+        admitted: &AgentAttempt,
+        request: &ClaudeSidecarRequest,
+    ) -> NativeWorkerPromptRetentionReceiptV1 {
+        let now: u64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test wall clock")
+            .as_millis()
+            .try_into()
+            .expect("test clock fits Unix milliseconds");
+        let request_json = serde_json::to_vec(request).expect("request serializes");
+        serde_json::from_value(serde_json::json!({
+            "contract_version": 1,
+            "source_host_request_id": "host-request-claude-1",
+            "source_request_ref": "host-request:claude-fixture",
+            "source_request_sha256": eliot_contracts::sha256_hex(b"original host request"),
+            "derived_prompt_ref": "provider-prompt:claude-fixture",
+            "derived_prompt_sha256": claude_local_digest_256_hex(&request_json),
+            "task_id": admitted.task_id.as_str(),
+            "work_id": admitted.work_unit.id.as_str(),
+            "work_scope_id": admitted.work_unit.scope_ref.as_str(),
+            "attempt_id": binding.attempt_id.as_str(),
+            "provider_id": binding.route.provider.as_str(),
+            "tool_name": CLAUDE_SIDECAR_ADAPTER_ID,
+            "task_owner_ref": "task-owner:claude-fixture",
+            "task_owner_revision": "task-revision-1",
+            "task_owner_sha256": "a".repeat(64),
+            "work_scope_owner_ref": "scope-owner:claude-fixture",
+            "work_scope_owner_revision": "scope-revision-1",
+            "work_scope_owner_sha256": "b".repeat(64),
+            "policy_owner_ref": "policy-owner:claude-fixture",
+            "policy_owner_revision": "policy-revision-1",
+            "policy_owner_sha256": "c".repeat(64),
+            "state_fence": &binding.state_fence,
+            "authority_epoch": &binding.state_fence.authority_epoch,
+            "privacy_class": "INTERNAL",
+            "visibility_policy_ref": "visibility-policy:claude-fixture",
+            "retention_policy_ref": "retention-policy:claude-fixture",
+            "retention_policy_revision": "retention-revision-1",
+            "retention_policy_sha256": "d".repeat(64),
+            "maximum_retained_bytes": 65536,
+            "retention_expires_at_unix_ms": now + 60_000,
+            "disclosure_policy_ref": "disclosure-policy:claude-fixture",
+            "disclosure_policy_revision": "disclosure-revision-1",
+            "disclosure_policy_sha256": "e".repeat(64),
+            "maximum_disclosure_bytes": 65536,
+            "effect_ceiling": "READ",
+            "issuer_operation_id": "prompt-retention-op:claude-fixture",
+            "issuer_identity": "governor:claude-fixture",
+            "issuer_idempotency_key": "prompt-retention-key:claude-fixture",
+            "owner_receipt_ref": "receipt:prompt-retention-claude-fixture",
+            "owner_receipt_sha256": "f".repeat(64),
+            "currentness_readback_ref": "readback:prompt-retention-claude-fixture",
+            "currentness_readback_sha256": "1".repeat(64),
+            "currentness_observed_at_unix_ms": now,
+        }))
+        .expect("valid prompt-retention receipt fixture")
     }
 
     fn usage_fixture() -> UsageReceipt {
