@@ -1103,6 +1103,9 @@ impl ProcessStreamSinkCapabilityRef {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessStreamSinkBindingRef {
+    /// Opaque Store-generated lookup reference bound to this authenticated
+    /// connection, Kernel capability, and exact Open request.
+    pub binding_ref: String,
     /// Owner-bound sink session identity.
     pub session_id: String,
     /// Owner-bound source identity.
@@ -1116,6 +1119,7 @@ pub struct ProcessStreamSinkBindingRef {
 impl ProcessStreamSinkBindingRef {
     /// Validates exact bounded sink identities.
     pub fn validate(&self) -> Result<(), WireValidationError> {
+        validate_text("binding_ref", &self.binding_ref)?;
         validate_text("session_id", &self.session_id)?;
         validate_text("source_id", &self.source_id)?;
         validate_text("terminal_id", &self.terminal_id)?;
