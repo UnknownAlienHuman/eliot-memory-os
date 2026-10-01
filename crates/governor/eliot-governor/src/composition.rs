@@ -7592,6 +7592,34 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         discovery_lease: &DiscoveryReadLease,
         now: u64,
     ) -> Result<ColdStartOwnerInputs, CompositionError> {
+        let inputs = self
+            .read_cold_start_owner_inputs_for_root(
+                principal_ref,
+                session_ref,
+                &discovery_lease.candidate_root_ref,
+                state_fence,
+                discovery_lease,
+                now,
+            )
+            .await?;
+        if inputs.descriptor.scope_ref != scope_ref {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        Ok(inputs)
+    }
+
+    /// Resolves the WorkScope identity from its retained owner snapshot after
+    /// authenticating the principal/session, observed root, lease and fence.
+    /// Caller selectors are not used as scope authority.
+    pub async fn read_cold_start_owner_inputs_for_root(
+        &self,
+        principal_ref: &str,
+        session_ref: &str,
+        explicit_root_identity: &str,
+        state_fence: &StateFence,
+        discovery_lease: &DiscoveryReadLease,
+        now: u64,
+    ) -> Result<ColdStartOwnerInputs, CompositionError> {
         let current_fence = self.snapshot.state_fence();
         if !fences_match_exact(&current_fence, state_fence) {
             return Err(CompositionError::ActivationStaleFence);
@@ -7604,7 +7632,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         if &inputs.principal_ref != principal_ref
             || &inputs.session_ref != session_ref
-            || inputs.descriptor.scope_ref != scope_ref
+            || inputs.explicit_root_identity != explicit_root_identity
             || inputs.state_fence != *state_fence
         {
             return Err(CompositionError::ActivationStaleFence);
@@ -7613,7 +7641,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .issue_task_selection_evidence_for_binding(
                 now,
                 (principal_ref, session_ref),
-                scope_ref,
+                &inputs.descriptor.scope_ref,
                 state_fence,
                 (
                     &inputs.task_selection.task_ref,
