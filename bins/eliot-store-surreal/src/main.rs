@@ -457,9 +457,26 @@ fn validate_source_readback_response(
         readback_receipt_id,
         observed_fence,
         observed_at_unix_ms,
+        owner_facts_json,
+        owner_facts_sha256,
+        module_catalog_owner_readback_json,
+        module_catalog_owner_readback_sha256,
+        generation_admission_json,
+        generation_admission_sha256,
+        process_source_admission_readback_json,
+        process_source_admission_readback_sha256,
+        source_admission_write_receipt_json,
+        source_admission_write_receipt_sha256,
     } = response
     {
         use sha2::{Digest, Sha256};
+        let expected_owner_facts_json = String::from_utf8(
+            eliot_contracts::canonical_json_bytes(&request.owner_facts)
+                .map_err(|error| format!("Blob owner-facts encoding failed: {error}"))?,
+        )
+        .map_err(|error| format!("Blob owner-facts encoding failed: {error}"))?;
+        let observed_owner_facts_sha256 =
+            format!("{:x}", Sha256::digest(owner_facts_json.as_bytes()));
         let chunk_sha256 = format!("{:x}", Sha256::digest(bytes));
         let chunk_end = chunk_offset
             .checked_add(*observed_byte_length)
@@ -476,6 +493,18 @@ fn validate_source_readback_response(
             || readback_receipt_id.trim().is_empty()
             || *observed_at_unix_ms == 0
             || observed_fence != &identity.request.state_fence
+            || owner_facts_json != &expected_owner_facts_json
+            || &observed_owner_facts_sha256 != owner_facts_sha256
+            || module_catalog_owner_readback_json != &request.module_catalog_owner_readback_json
+            || module_catalog_owner_readback_sha256 != &request.module_catalog_owner_readback_sha256
+            || generation_admission_json != &request.generation_admission_json
+            || generation_admission_sha256 != &request.generation_admission_sha256
+            || process_source_admission_readback_json
+                != &request.process_source_admission_readback_json
+            || process_source_admission_readback_sha256
+                != &request.process_source_admission_readback_sha256
+            || source_admission_write_receipt_json != &request.source_admission_write_receipt_json
+            || source_admission_write_receipt_sha256 != &request.source_admission_write_receipt_sha256
         {
             return Err("Blob source-readback evidence does not match the exact request".to_owned());
         }
