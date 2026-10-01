@@ -19,6 +19,8 @@ use eliot_ipc::{
 use eliot_kernel::kernel_diagnostics::{EntrypointStage, observe_entrypoint_with_detail};
 use eliot_kernel::{KernelComposition, KernelFrameAction};
 #[cfg(windows)]
+use eliot_kernel::KernelControlSessionContext;
+#[cfg(windows)]
 use eliot_kernel_service::ProcessExecutionResponse;
 use eliot_kernel_service::{
     KernelControlCommand, control_response_frame, decode_control_request_frame,
@@ -901,6 +903,7 @@ async fn serve_control_connection(
 ) -> Result<(), TransportError> {
     let limits = kernel.ipc_limits();
     let mut expected_sequence = 1_u64;
+    let mut control_session = KernelControlSessionContext::default();
     let mut frame = Some(first_frame);
     loop {
         let received = if let Some(first) = frame.take() {
@@ -913,8 +916,13 @@ async fn serve_control_connection(
         };
         let request = decode_control_request_frame(&received)?;
         let is_ready = matches!(&request.command, KernelControlCommand::ProbeReady);
-        let response =
-            Box::pin(kernel.apply_control_request(request, &peer, expected_sequence)).await?;
+        let response = Box::pin(kernel.apply_control_request_in_session(
+            request,
+            &peer,
+            expected_sequence,
+            &mut control_session,
+        ))
+        .await?;
         expected_sequence = expected_sequence.saturating_add(1);
         let response_frame = control_response_frame(&received.connection_id, &response)?;
         send_checked(&mut front_door, &response_frame, limits).await?;

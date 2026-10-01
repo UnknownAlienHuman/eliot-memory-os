@@ -23,6 +23,23 @@
 use super::*;
 use tracing::Instrument;
 
+/// Owner-local admission context retained only for one authenticated control
+/// connection. The freshness anchor is opened by the exact-fence revocation
+/// that immediately precedes a Host heartbeat attempt, then consumed by the
+/// next report on that same sequenced connection.
+#[derive(Default)]
+#[doc(hidden)]
+pub struct KernelControlSessionContext {
+    supervision_freshness: Option<KernelSupervisionFreshnessContext>,
+}
+
+struct KernelSupervisionFreshnessContext {
+    candidate_digest: String,
+    state_fence: StateFence,
+    revoke_sequence: u64,
+    anchored_at: Instant,
+}
+
 /// F-LOG-KERNEL-4 (#903): control-plane boundary observations.
 ///
 /// Observation only, via #895's facade: fixed `kernel.control.*` event names
@@ -245,6 +262,27 @@ impl KernelComposition {
         peer: &PeerIdentity,
         expected_sequence: u64,
     ) -> Result<KernelControlResponse, TransportError> {
+        let mut session = KernelControlSessionContext::default();
+        self.apply_control_request_in_session(
+            request,
+            peer,
+            expected_sequence,
+            &mut session,
+        )
+        .await
+    }
+
+    /// Applies an authenticated request while retaining context bound to the
+    /// original control connection. Production control dispatch uses this
+    /// path so a reconnect cannot move or refresh a heartbeat admission.
+    #[doc(hidden)]
+    pub async fn apply_control_request_in_session(
+        &self,
+        request: KernelControlRequest,
+        peer: &PeerIdentity,
+        expected_sequence: u64,
+        session: &mut KernelControlSessionContext,
+    ) -> Result<KernelControlResponse, TransportError> {
         let validated = request.validate().is_ok();
         let generation = validated.then(|| request.generation.value().to_string());
         let epoch = validated
@@ -265,9 +303,15 @@ impl KernelComposition {
             );
         }
         observe_control_in_context("kernel.control.request_received", "attempt", &context);
-        match Box::pin(self.apply_control_request_inner(request, peer, expected_sequence, &context))
-            .instrument(context.clone())
-            .await
+        match Box::pin(self.apply_control_request_inner(
+            request,
+            peer,
+            expected_sequence,
+            session,
+            &context,
+        ))
+        .instrument(context.clone())
+        .await
         {
             Ok(response) => {
                 observe_control_in_context("kernel.control.request_admitted", "success", &context);
@@ -311,6 +355,7 @@ impl KernelComposition {
         request: KernelControlRequest,
         peer: &PeerIdentity,
         expected_sequence: u64,
+        session: &mut KernelControlSessionContext,
         context: &tracing::Span,
     ) -> Result<KernelControlResponse, ControlRequestFailure> {
         request
@@ -441,11 +486,26 @@ impl KernelComposition {
             if let Some(heartbeat) = &evidence.supervision_heartbeat {
                 let target =
                     StateFence::new(request.candidate.kernel_epoch.clone(), request.generation);
+                let candidate_digest = request
+                    .candidate
+                    .compute_digest()
+                    .map_err(|_| TransportError::SessionFenced)?;
+                let freshness = session
+                    .supervision_freshness
+                    .as_ref()
+                    .filter(|freshness| {
+                        freshness.candidate_digest == candidate_digest
+                            && freshness.state_fence == target
+                            && freshness.revoke_sequence.checked_add(1)
+                                == Some(request.sequence)
+                    })
+                    .ok_or(TransportError::SessionFenced)?;
                 self.admit_host_observed_watchdog_branch(
                     &evidence.startup_evidence,
                     heartbeat,
                     &request.candidate,
                     &target,
+                    freshness.anchored_at,
                 )
                 .map_err(|_| TransportError::SessionFenced)?;
             }
@@ -474,6 +534,21 @@ impl KernelComposition {
             } else {
                 None
             };
+        if supervision_revocation.is_some() {
+            let candidate_digest = request
+                .candidate
+                .compute_digest()
+                .map_err(|_| TransportError::SessionFenced)?;
+            session.supervision_freshness = Some(KernelSupervisionFreshnessContext {
+                candidate_digest,
+                state_fence: StateFence::new(
+                    request.candidate.kernel_epoch.clone(),
+                    request.generation,
+                ),
+                revoke_sequence: request.sequence,
+                anchored_at: Instant::now(),
+            });
+        }
         if let Some(handoff) = bootstrap {
             self.install_store_bootstrap(handoff.clone())
                 .map_err(|_| TransportError::SessionFenced)?;
