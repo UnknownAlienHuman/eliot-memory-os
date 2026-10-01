@@ -1624,6 +1624,24 @@ impl AcpResultEnvelope {
         }
     }
 
+    /// Attempt-binding preservation (issue #2641 W4): the projected result
+    /// carries the envelope attempt as its identity while the observation
+    /// carries the bound attempt, so a foreign-attempt envelope fails closed
+    /// here rather than binding one attempt's outcome to another attempt's
+    /// execution. Typed `==`, same owner error as the assembly pre-check,
+    /// so every projection path preserves the binding.
+    fn check_envelope_attempt_binding(
+        &self,
+        binding: &ProviderExecutionBinding,
+    ) -> Result<(), AcpAdapterError> {
+        if self.attempt_id != binding.attempt_id {
+            return Err(AcpAdapterError::ContractValidation(
+                eliot_agent_api::ContractError::BindingMismatch,
+            ));
+        }
+        Ok(())
+    }
+
     pub fn into_agent_result(
         self,
         route: RouteFingerprint,
@@ -1645,6 +1663,7 @@ impl AcpResultEnvelope {
         if self.operation_id.trim().is_empty() {
             return Err(AcpAdapterError::InvalidInput("operation_id"));
         }
+        self.check_envelope_attempt_binding(binding)?;
         Self::check_acp_result_binding(&route, binding, self.session_id.as_ref())?;
         // The typed wire code travels beside the outcome, not inside the
         // untrusted prose: it is captured here and rendered only after the
@@ -1775,9 +1794,9 @@ impl AcpResultEnvelope {
     ///   Finish authority.
     ///
     /// Fail-closed before delegation: the envelope attempt identity must equal
-    /// the bound attempt identity by typed `==` (`into_agent_result` checks
-    /// route and session agreement but never the envelope attempt itself, so
-    /// a foreign-attempt envelope cannot ride a valid binding here).
+    /// the bound attempt identity by typed `==` (also enforced inside
+    /// `into_agent_result`, so a foreign-attempt envelope cannot ride a valid
+    /// binding on any projection path, including the wire-error arm).
     /// Cancellation and provider-reported failure carry caller reasons the
     /// envelope does not record; assembling those stays on
     /// [`Self::into_agent_result`] with an explicit [`AcpResultOutcome`].
