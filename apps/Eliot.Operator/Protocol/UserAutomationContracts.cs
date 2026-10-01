@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Eliot.Operator.Protocol.Generated;
@@ -249,12 +250,38 @@ internal static class UserAutomationNormalizationReceiptEnvelope
             || !envelope.TryGetProperty("identity", out var identity)
             || !HasExactProperties(identity, "receipt_id", "canonical_sha256")
             || !TryReadBoundedText(identity, "receipt_id", OperatorScheduleContract.MAX_TEXT_BYTES, out var receiptId)
-            || !TryReadLowerSha256(identity, "canonical_sha256", out _)
+            || !TryReadLowerSha256(identity, "canonical_sha256", out var canonicalSha256)
             || !envelope.TryGetProperty("core", out var core)
             || core.ValueKind != JsonValueKind.Object
+            || !HasExactProperties(
+                core,
+                "contract",
+                "kind",
+                "work_scope",
+                "task",
+                "session",
+                "causal",
+                "request",
+                "operation",
+                "authority",
+                "artifacts",
+                "verifier",
+                "problem",
+                "coordination",
+                "disposition")
+            || !MatchesCanonicalIdentity(receiptId, canonicalSha256, core)
             || !core.TryGetProperty("operation", out var operation)
             || operation.ValueKind != JsonValueKind.Object
-            || !HasUniqueProperties(operation)
+            || !HasExactProperties(
+                operation,
+                "operation_id",
+                "request_id",
+                "idempotency_key",
+                "operation_kind",
+                "effect",
+                "state_fence")
+            || !core.TryGetProperty("request", out var request)
+            || !HasExactProperties(request, "metadata", "state_fence")
             || !TryReadBoundedText(operation, "operation_kind", OperatorScheduleContract.MAX_TEXT_BYTES, out var operationKind)
             || !string.Equals(operationKind, expectedOperationKind, StringComparison.Ordinal))
         {
@@ -285,13 +312,6 @@ internal static class UserAutomationNormalizationReceiptEnvelope
         return actual.Count == names.Length && names.All(actual.Contains);
     }
 
-    private static bool HasUniqueProperties(JsonElement value)
-    {
-        if (value.ValueKind != JsonValueKind.Object) return false;
-        var names = new HashSet<string>(StringComparer.Ordinal);
-        return value.EnumerateObject().All(property => names.Add(property.Name));
-    }
-
     private static bool TryReadBoundedText(
         JsonElement value,
         string propertyName,
@@ -314,6 +334,96 @@ internal static class UserAutomationNormalizationReceiptEnvelope
             return false;
         }
         return digest.All(character => character is >= '0' and <= '9' or >= 'a' and <= 'f');
+    }
+
+    /// <summary>
+    /// Checks the content-derived receipt identity using the same canonical
+    /// JSON rule as the Rust receipt owner: recursively sorted object members,
+    /// preserved array order, and compact UTF-8 JSON. Full receipt semantics
+    /// remain Kernel-owned; this prevents a substituted self-identity from
+    /// being displayed as a successful normalization result.
+    /// </summary>
+    private static bool MatchesCanonicalIdentity(
+        string receiptId,
+        string canonicalSha256,
+        JsonElement core)
+    {
+        try
+        {
+            using var bytes = new MemoryStream();
+            using (var writer = new Utf8JsonWriter(
+                bytes,
+                new JsonWriterOptions { Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping }))
+            {
+                WriteCanonicalJson(core, writer);
+            }
+
+            var digest = Convert.ToHexString(SHA256.HashData(bytes.ToArray())).ToLowerInvariant();
+            return string.Equals(canonicalSha256, digest, StringComparison.Ordinal)
+                && string.Equals(receiptId, $"receipt-{digest}", StringComparison.Ordinal);
+        }
+        catch (InvalidOperationException)
+        {
+            return false;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
+    private static void WriteCanonicalJson(JsonElement value, Utf8JsonWriter writer)
+    {
+        switch (value.ValueKind)
+        {
+            case JsonValueKind.Object:
+                writer.WriteStartObject();
+                foreach (var property in value.EnumerateObject().OrderBy(
+                    property => property.Name,
+                    StringComparer.Ordinal))
+                {
+                    writer.WritePropertyName(property.Name);
+                    WriteCanonicalJson(property.Value, writer);
+                }
+                writer.WriteEndObject();
+                break;
+            case JsonValueKind.Array:
+                writer.WriteStartArray();
+                foreach (var item in value.EnumerateArray()) WriteCanonicalJson(item, writer);
+                writer.WriteEndArray();
+                break;
+            case JsonValueKind.String:
+                writer.WriteStringValue(value.GetString());
+                break;
+            case JsonValueKind.Number:
+                if (value.TryGetInt64(out var signed))
+                {
+                    writer.WriteNumberValue(signed);
+                }
+                else if (value.TryGetUInt64(out var unsigned))
+                {
+                    writer.WriteNumberValue(unsigned);
+                }
+                else
+                {
+                    // ReceiptCore uses integer numeric fields. Refuse any
+                    // number that cannot be represented in that closed shape
+                    // instead of guessing at cross-language float formatting.
+                    throw new InvalidOperationException("receipt core contains a non-integer number");
+                }
+                break;
+            case JsonValueKind.True:
+                writer.WriteBooleanValue(true);
+                break;
+            case JsonValueKind.False:
+                writer.WriteBooleanValue(false);
+                break;
+            case JsonValueKind.Null:
+                writer.WriteNullValue();
+                break;
+            default:
+                throw new InvalidOperationException("receipt core contains an unsupported JSON value");
+        }
     }
 }
 

@@ -288,7 +288,7 @@ impl<C> CanonicalUserAutomationStore<C> {
         automation_id: &str,
         revision: &str,
         request: &NamedReadRequest,
-        response: NamedReadResponse,
+        response: &NamedReadResponse,
     ) -> Result<Option<UserAutomationNormalizationRecord>, StoreError> {
         let expected = Self::normalization_read_request(
             request.state_fence.clone(),
@@ -298,7 +298,7 @@ impl<C> CanonicalUserAutomationStore<C> {
         if request != &expected {
             return Err(StoreError::IdentityConflict);
         }
-        validate_named_response(request, &response)?;
+        validate_named_response(request, response)?;
         let entries = response
             .payload
             .get(AUTOMATION_NORMALIZATION_ENTRIES)
@@ -1227,7 +1227,7 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
         )?;
         let response = self.client.execute_named(request.clone()).await?;
         let Some(record) =
-            Self::project_normalization_record(automation_id, revision, &request, response)?
+            Self::project_normalization_record(automation_id, revision, &request, &response)?
         else {
             return Ok(None);
         };

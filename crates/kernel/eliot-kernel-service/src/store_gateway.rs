@@ -2800,7 +2800,7 @@ impl KernelStoreGateway {
             .map_err(user_automation_gateway_unknown)?;
         let record = CanonicalUserAutomationStore::<
             EbpCanonicalStoreClient<NamedPipeTransport>,
-        >::project_normalization_record(automation_id, revision_id, &named, response)
+        >::project_normalization_record(automation_id, revision_id, &named, &response)
         .map_err(user_automation_gateway_unknown)?;
         if let Some(record) = &record {
             let receipt = self
@@ -3055,7 +3055,7 @@ impl KernelStoreGateway {
             &revision.automation_id,
             &revision.revision,
             &named,
-            response,
+            &response,
         )
         .map_err(|_| normalization_receipt_binding())?
         .ok_or_else(normalization_receipt_binding)?;
