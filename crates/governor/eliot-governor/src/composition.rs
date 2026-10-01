@@ -8429,7 +8429,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         Ok((lease, surface))
     }
 
-    fn cold_start_readiness_terminal_for_claim(
+    pub(crate) fn cold_start_readiness_terminal_for_claim(
         &self,
         claim: &ColdStartReadinessClaim,
         now: u64,
