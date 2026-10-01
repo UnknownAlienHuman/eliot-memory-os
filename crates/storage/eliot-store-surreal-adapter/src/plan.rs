@@ -1411,7 +1411,7 @@ mod tests {
         // recomputed digest), so the new validators bind the recomputed value.
         // Cross-crate stability: this uses the same `canonical_request_hash`
         // that yields the Slice A golden
-        // `55e62e405f35c7f137fe9fcdf177c66a1cba54a5b75fb547deaa11f001a89ec1`
+        // `21b8b2be1415dae7f905e202725e0eb02c953d06afef64a946db7d2a19bd601c`
         // in `eliot-store-api`.
         let (context, mut transition) = fixture()?;
         let recomputed = recomputed_canonical_request_hash(&context, &transition, &[], &[])?;

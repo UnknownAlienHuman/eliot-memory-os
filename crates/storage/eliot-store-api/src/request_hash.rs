@@ -651,24 +651,23 @@ mod tests {
         let view = golden_view();
         assert_eq!(
             canonical_request_hash(&view).expect("golden hash computes"),
-            "55e62e405f35c7f137fe9fcdf177c66a1cba54a5b75fb547deaa11f001a89ec1"
+            "21b8b2be1415dae7f905e202725e0eb02c953d06afef64a946db7d2a19bd601c"
         );
     }
-    // The pinned literal above is STALE and this assertion is expected to fail
-    // until the build owner regenerates it. It was frozen before `ordering_scopes`
-    // became hash-bound set-like input (2c22f4b45, #63/#4728), so adding the
-    // field to `golden_view` necessarily forks the digest: the view that
-    // produced this value was not the view the contract now defines.
+    // This literal was REGENERATED, not hand-written. Its predecessor
+    // `55e62e40…` was frozen in f1b8eb1cc before `ordering_scopes` became
+    // hash-bound set-like input (2c22f4b45, #63/#4728), so declaring the scope
+    // in `golden_view` necessarily forked the digest: the view that produced
+    // the old value was not the view the contract now defines.
     //
-    // It is deliberately left at its historical value rather than rewritten
-    // here. The correct replacement is whatever the compiled
-    // `canonical_request_hash` produces for this exact fixture, and that is a
-    // fact only an executed build can establish — a hand-written digest would be
-    // a guess presented as cross-crate evidence. The regeneration must also
-    // update the two cross-crate references that cite this vector by name
+    // The replacement is what the compiled `canonical_request_hash` returns for
+    // this exact fixture, read from the failing assertion of this very test
+    // (`cargo test -p eliot-store-api --lib
+    // request_hash::tests::golden_request_hash_is_stable_across_crates`), not a
+    // hand-computed value. The same regeneration updated the two cross-crate
+    // references that cite this vector by name
     // (`eliot-store-surreal-adapter/src/plan.rs`,
-    // `eliot-store-memory/src/lib.rs`), so it is one owner task, not a
-    // local edit. See issue #3977.
+    // `eliot-store-memory/src/lib.rs`). See issue #3977.
 
     #[test]
     fn load_bearing_mutations_change_the_hash_and_map_to_the_typed_error() {
