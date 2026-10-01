@@ -48,6 +48,7 @@ mod epistemic_composition;
 mod experience_commit;
 mod finish_attempt;
 mod governor_authority_projection;
+mod instrument_registry_registration;
 pub use attention_evaluation_commit::{
     ATTENTION_EVALUATION_OPERATION_PREFIX, AttentionEvaluationCommitError,
     AttentionEvaluationCommitIdentity, AttentionEvaluationInvalidatedRecord,
@@ -79,6 +80,12 @@ pub use finish_attempt::{
     PreparedKernelExchange,
 };
 pub use governor_authority_projection::{GovernorAuthorityProjection, LiveGovernorAuthority};
+pub use instrument_registry_registration::{
+    admit_instrument_registry_registration, commit_instrument_registry_registration,
+    instrument_registry_registration_action_payload, InstrumentRegistryRegistrationAdmission,
+    InstrumentRegistryRegistrationError, InstrumentRegistryRegistrationProof,
+    INSTRUMENT_REGISTRY_REGISTER_OPERATION,
+};
 pub use module_registry_admission::{ModuleCatalogOwnerReadback, ModuleRegistryAdmissionError};
 pub use negative_memory_activation::{
     NegativeMemoryActivationDocument, NegativeMemoryActivationEvidence,
@@ -323,6 +330,7 @@ pub use selection_chain::{
 pub use skill_lifecycle::{GovernorSkillLifecycle, canonical_skill_tool_source};
 pub(crate) use source_artifact_admission::issue_source_artifact_admission;
 pub use source_artifact_admission::{
+    ActiveReservationOwnerReadback, ActiveReservationUsePort, ActiveReservationUseRequest,
     SourceArtifactAdmission, SourceArtifactAdmissionError, SourceArtifactAdmissionRequest,
     SourceArtifactReadRequest,
 };

@@ -95,6 +95,8 @@ eliot-improvement = { path = "../../crates/meta/eliot-improvement", version = "0
 eliot-self-quality = { path = "../../crates/meta/eliot-self-quality", version = "0.1.0" }
 eliot-conformance-contracts.workspace = true
 eliot-instrument-api.workspace = true
+eliot-instrument-runner = { path = "../../crates/instrument/eliot-instrument-runner", version = "0.1.0" }
+eliot-process-executor.workspace = true
 eliot-integration-coverage.workspace = true
 eliot-testd-core.workspace = true
 eliot-types.workspace = true

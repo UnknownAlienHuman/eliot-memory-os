@@ -318,6 +318,13 @@ fn source_artifact_read_admission_request(
         causal: input.causal_binding.clone(),
         request: original.request_binding.clone(),
         request_identity: original.request_identity.clone(),
+        host_request_operation_id: eliot_ors::OperationIdentity::new(
+            original.host_operation_id.clone(),
+        )
+        .map_err(|_| SourceArtifactAdmissionError::Binding(
+            "original HostRequest operation identity is invalid",
+        ))?,
+        host_request_digest: input.envelope.envelope_sha256.clone(),
         operation,
         operation_name,
         resource_ref,

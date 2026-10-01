@@ -20,6 +20,8 @@ use eliot_receipts::{
 };
 use eliot_store_api::CapturedBlobPayloadRefV1;
 use thiserror::Error;
+use std::future::Future;
+use std::pin::Pin;
 
 use crate::AuthorityOwner;
 
@@ -63,6 +65,10 @@ pub struct SourceArtifactAdmissionRequest {
     pub causal: CausalBinding,
     pub request: RequestBinding,
     pub request_identity: RequestIdentity,
+    /// Exact original Kernel HostRequest selector retained by the caller.
+    pub host_request_operation_id: OperationIdentity,
+    /// Digest of the exact original HostRequest envelope.
+    pub host_request_digest: String,
     pub operation: OperationBinding,
     pub operation_name: String,
     pub resource_ref: String,
@@ -80,6 +86,52 @@ pub struct SourceArtifactAdmissionRequest {
     /// mutation. Absent only when `operation.effect` is `Read`.
     pub expected_proposed_attempt_id: Option<OperationIdentity>,
     pub now: LogicalTime,
+}
+
+/// Exact ORS bindings that the current Kernel owner must re-read immediately
+/// before a remote source mutation is semantically admitted.
+#[derive(Clone, Debug)]
+pub struct ActiveReservationUseRequest {
+    pub reservation_id: OperationIdentity,
+    pub work_item_id: OperationIdentity,
+    pub proposed_attempt_id: OperationIdentity,
+    pub work_scope_id: String,
+    /// LSP-specific claims the current owner was asked to stage. Every
+    /// reference and digest is compared with the original persisted ORS row.
+    pub claims: eliot_ors::AdmissionReservationClaims,
+    pub host_request_operation_id: OperationIdentity,
+    pub host_request_digest: String,
+    pub identity: RequestIdentity,
+}
+
+/// Original typed owner row returned by the authenticated Kernel read port.
+/// This is evidence carried beside the live port, never authority by itself.
+#[derive(Clone, Debug)]
+pub struct ActiveReservationOwnerReadback {
+    pub record: eliot_ors::AdmissionReservationRecord,
+    pub receipt: eliot_ors::OperationalMutationReceipt,
+    pub record_revision: u64,
+    pub state_fence: eliot_ors::StateFenceSnapshot,
+    pub work_scope_id: String,
+    /// Exact `ACTIVE` discriminant projected from the existing ORS verifier.
+    pub owner_disposition: String,
+    /// Original ORS validator output preserved as opaque owner evidence. It
+    /// is never deserialized into `ActiveAdmissionReservation` authority.
+    pub owner_verification: serde_json::Value,
+}
+
+/// Live authenticated capability for asking Kernel/ORS to recheck one current
+/// reservation at use. Implementations retain the authenticated Kernel client
+/// and original request binding; they do not return cached projection data.
+pub trait ActiveReservationUsePort: Send + Sync {
+    fn read_current_active<'a>(
+        &'a self,
+        request: &'a ActiveReservationUseRequest,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<ActiveReservationOwnerReadback, String>> + Send + 'a,
+        >,
+    >;
 }
 
 /// Same-stack, one-effect admission. The lease and authorized effect are the
@@ -236,7 +288,9 @@ pub enum SourceArtifactAdmissionError {
 /// compiles it through the original `EffectAuthorizer`, and retains the live
 /// `ActionLease`/`AuthorizedEffect` together with the exact request. A `Read`
 /// keeps the same authority bindings but carries no write-reservation or
-/// canonical-write receipts; a reversible mutation still requires all three.
+/// canonical-write receipts. Every mutation uses its own reservation-backed
+/// issuer path; a source snapshot publication cannot borrow a later LSP
+/// reservation or proceed without its own active reservation.
 pub(crate) fn issue_source_artifact_admission(
     authority: &mut AuthorityOwner,
     input: SourceArtifactAdmissionRequest,
@@ -244,6 +298,194 @@ pub(crate) fn issue_source_artifact_admission(
     validate_request(&input)?;
     let (reservation_id, canonical_receipt, activation_receipt) =
         validate_original_reservation_bindings(&input)?;
+
+    issue_source_artifact_admission_with_bindings(
+        authority,
+        input,
+        (reservation_id, canonical_receipt, activation_receipt),
+    )
+}
+
+/// Remote-owner sibling of [`issue_source_artifact_admission`]. It queries the
+/// original Kernel ORS owner immediately before the Governor effect decision,
+/// then compares the returned record, current receipt, revision, fence and
+/// every source request binding before it enters the same GrantGraph and
+/// EffectAuthorizer path as local-store callers.
+pub async fn issue_source_artifact_admission_with_use_port(
+    authority: &mut AuthorityOwner,
+    input: SourceArtifactAdmissionRequest,
+    reservation_identity: Option<&RequestIdentity>,
+    reservation_id: OperationIdentity,
+    claims: eliot_ors::AdmissionReservationClaims,
+    port: &dyn ActiveReservationUsePort,
+) -> Result<SourceArtifactAdmission, SourceArtifactAdmissionError> {
+    validate_request(&input)?;
+    if input.operation.effect != EffectClass::ReversibleMutation
+        || input.active_reservation.is_some()
+    {
+        return Err(SourceArtifactAdmissionError::Binding(
+            "remote current-reservation admission requires a reversible mutation without a deserialized Active typestate",
+        ));
+    }
+    let work_item_id = input
+        .expected_work_item_id
+        .clone()
+        .ok_or(SourceArtifactAdmissionError::MissingReservation)?;
+    let proposed_attempt_id = input
+        .expected_proposed_attempt_id
+        .clone()
+        .ok_or(SourceArtifactAdmissionError::MissingReservation)?;
+    let query = ActiveReservationUseRequest {
+        reservation_id: reservation_id.clone(),
+        work_item_id: work_item_id.clone(),
+        proposed_attempt_id: proposed_attempt_id.clone(),
+        work_scope_id: input.work_scope.scope_id.as_str().to_owned(),
+        claims,
+        host_request_operation_id: input.host_request_operation_id.clone(),
+        host_request_digest: input.host_request_digest.clone(),
+        // Current-use remains tied to the original HostRequest/saga identity
+        // S. A source effect may use a distinct Governor-issued identity E in
+        // `input.request_identity`; substituting E here would change the ORS
+        // row being checked.
+        identity: reservation_identity
+            .cloned()
+            .unwrap_or_else(|| input.request_identity.clone()),
+    };
+    let current = port
+        .read_current_active(&query)
+        .await
+        .map_err(SourceArtifactAdmissionError::Owner)?;
+    let bindings = validate_remote_reservation_readback(
+        &input,
+        &query,
+        current,
+    )?;
+    issue_source_artifact_admission_with_bindings(authority, input, bindings)
+}
+
+/// Completes a prepared source mutation with its own active E reservation.
+/// The pre-reservation action lease is retained from the same current
+/// AuthorityOwner and is compiled only after the Kernel has re-read the exact
+/// ACTIVE E row against the original S HostRequest lineage.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn issue_source_artifact_admission_with_prepared_lease(
+    authority: &mut AuthorityOwner,
+    input: SourceArtifactAdmissionRequest,
+    reservation_identity: &RequestIdentity,
+    reservation_id: OperationIdentity,
+    claims: eliot_ors::AdmissionReservationClaims,
+    port: &dyn ActiveReservationUsePort,
+    mut action_lease: ActionLease,
+    supporting_grant_path: Vec<GrantId>,
+    grant_graph_revision: u64,
+) -> Result<SourceArtifactAdmission, SourceArtifactAdmissionError> {
+    validate_request(&input)?;
+    if input.operation.effect != EffectClass::ReversibleMutation
+        || input.active_reservation.is_some()
+    {
+        return Err(SourceArtifactAdmissionError::Binding(
+            "prepared source mutation must use a distinct active E reservation",
+        ));
+    }
+    let work_item_id = input
+        .expected_work_item_id
+        .clone()
+        .ok_or(SourceArtifactAdmissionError::MissingReservation)?;
+    let proposed_attempt_id = input
+        .expected_proposed_attempt_id
+        .clone()
+        .ok_or(SourceArtifactAdmissionError::MissingReservation)?;
+    let query = ActiveReservationUseRequest {
+        reservation_id: reservation_id.clone(),
+        work_item_id: work_item_id.clone(),
+        proposed_attempt_id: proposed_attempt_id.clone(),
+        work_scope_id: input.work_scope.scope_id.as_str().to_owned(),
+        claims,
+        host_request_operation_id: input.host_request_operation_id.clone(),
+        host_request_digest: input.host_request_digest.clone(),
+        identity: reservation_identity.clone(),
+    };
+    let current = port
+        .read_current_active(&query)
+        .await
+        .map_err(SourceArtifactAdmissionError::Owner)?;
+    let bindings = validate_remote_reservation_readback(&input, &query, current)?;
+
+    let capability = authority.grants.snapshot(
+        input.snapshot_id.clone(),
+        &input.holder,
+        &input.work_scope,
+        &input.session,
+        input.now,
+    )?;
+    capability.validate_context(&input.work_scope, &input.session)?;
+    let current_path = capability
+        .supporting_path(
+            &input.operation_name,
+            &input.resource_ref,
+            input.operation.effect,
+        )?
+        .grant_path
+        .clone();
+    if capability.grant_graph_revision() != grant_graph_revision
+        || current_path != supporting_grant_path
+        || action_lease.lease_id != input.lease_id
+        || action_lease.holder != input.holder
+        || action_lease.exact_idempotency_key != input.operation.idempotency_key
+        || action_lease.work_scope != input.work_scope
+        || action_lease.session != input.session
+        || action_lease.authority_binding.state_fence != input.work_scope.state_fence
+        || action_lease.authority_binding.authority_epoch != input.session.authority_epoch
+        || action_lease.remaining_uses == 0
+        || action_lease.expires_at <= input.now
+        || !action_lease.authority_set.allows(
+            &input.operation_name,
+            &input.resource_ref,
+            input.operation.effect,
+        )
+    {
+        return Err(SourceArtifactAdmissionError::Binding(
+            "prepared source E ActionLease or original GrantGraph changed before current use",
+        ));
+    }
+    let compiled = authority.effects.compile_effectful_action(
+        &input.contract,
+        input.operation.clone(),
+        input.operation_name.clone(),
+        input.resource_ref.clone(),
+        input.executor_boundary.clone(),
+        &mut action_lease,
+        &input.work_scope,
+        &input.session,
+        input.now,
+    )?;
+    let authority_binding = action_lease.authority_binding.clone();
+    Ok(SourceArtifactAdmission {
+        action_lease,
+        authorized_effect: compiled.authorized().clone(),
+        holder: input.holder,
+        work_scope: input.work_scope,
+        task: input.task,
+        session: input.session,
+        causal: input.causal,
+        request: input.request,
+        operation: input.operation,
+        resource_ref: input.resource_ref,
+        request_identity: input.request_identity,
+        authority: authority_binding,
+        supporting_grant_path,
+        grant_graph_revision,
+        reservation_id: bindings.0,
+        canonical_admission_receipt: bindings.1,
+        activation_receipt: bindings.2,
+    })
+}
+
+fn issue_source_artifact_admission_with_bindings(
+    authority: &mut AuthorityOwner,
+    input: SourceArtifactAdmissionRequest,
+    (reservation_id, canonical_receipt, activation_receipt): OriginalReservationBindings,
+) -> Result<SourceArtifactAdmission, SourceArtifactAdmissionError> {
 
     let snapshot: EffectiveCapabilitySnapshot = authority.grants.snapshot(
         input.snapshot_id,
@@ -302,6 +544,67 @@ pub(crate) fn issue_source_artifact_admission(
         canonical_admission_receipt: canonical_receipt,
         activation_receipt,
     })
+}
+
+fn validate_remote_reservation_readback(
+    input: &SourceArtifactAdmissionRequest,
+    query: &ActiveReservationUseRequest,
+    current: ActiveReservationOwnerReadback,
+) -> Result<OriginalReservationBindings, SourceArtifactAdmissionError> {
+    let record = &current.record;
+    record
+        .validate()
+        .map_err(|_| SourceArtifactAdmissionError::Binding(
+            "current Kernel ORS reservation failed the original record validator",
+        ))?;
+    let expected_work_item = input
+        .expected_work_item_id
+        .as_ref()
+        .ok_or(SourceArtifactAdmissionError::MissingReservation)?;
+    let expected_attempt = input
+        .expected_proposed_attempt_id
+        .as_ref()
+        .ok_or(SourceArtifactAdmissionError::MissingReservation)?;
+    let fence_json = canonical_json_bytes(&input.work_scope.state_fence)
+        .map_err(|_| SourceArtifactAdmissionError::FenceEncoding)?;
+    let receipt = &current.receipt;
+    if current.owner_disposition != "ACTIVE"
+        || current.record_revision == 0
+        || current.record_revision != receipt.operation_order()
+        || current.state_fence != record.state_fence
+        || record.reservation_id != query.reservation_id
+        || record.work_item_id != *expected_work_item
+        || record.work_item_id != query.work_item_id
+        || record.proposed_attempt_id != *expected_attempt
+        || record.proposed_attempt_id != query.proposed_attempt_id
+        || record.claims != query.claims
+        || current.work_scope_id != query.work_scope_id
+        || record.state != AdmissionReservationState::Active
+        || record.state_fence.canonical_json.as_bytes() != fence_json.as_slice()
+        || record.state_fence.observed_authority_epoch
+            != input.work_scope.state_fence.authority_epoch.sequence.get()
+        || record.canonical_admission_receipt.is_none()
+        || record.activation_receipt.is_none()
+        || receipt.subject_id() != &record.reservation_id
+        || receipt.record_id() != &record.operation_id
+    {
+        return Err(SourceArtifactAdmissionError::Binding(
+            "current Kernel ORS owner readback differs from the exact source operation, WorkScope, work item, attempt, fence, revision, or receipt",
+        ));
+    }
+    let canonical_receipt = record
+        .canonical_admission_receipt
+        .clone()
+        .ok_or(SourceArtifactAdmissionError::MissingReservationReceipt)?;
+    let activation_receipt = record
+        .activation_receipt
+        .clone()
+        .ok_or(SourceArtifactAdmissionError::MissingReservationReceipt)?;
+    Ok((
+        Some(record.reservation_id.clone()),
+        Some(canonical_receipt),
+        Some(activation_receipt),
+    ))
 }
 
 fn validate_original_reservation_bindings(
@@ -377,6 +680,18 @@ fn validate_request(
     input: &SourceArtifactAdmissionRequest,
 ) -> Result<(), SourceArtifactAdmissionError> {
     let fence = &input.work_scope.state_fence;
+    if input.host_request_digest.len() != 64
+        || !input
+            .host_request_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || input.host_request_operation_id.as_str()
+            != format!("hostreq:{}", input.host_request_digest)
+    {
+        return Err(SourceArtifactAdmissionError::Binding(
+            "source admission lacks the exact original HostRequest operation and digest",
+        ));
+    }
     if input.contract.work_scope != input.work_scope {
         return Err(SourceArtifactAdmissionError::Binding(
             "ActionContract differs from the owner-resolved WorkScope",

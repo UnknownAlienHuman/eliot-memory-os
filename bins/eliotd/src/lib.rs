@@ -59,7 +59,13 @@ pub(crate) struct CapturedLspReadContext {
 #[cfg(windows)]
 pub struct LiveLspCaptureInvocation<'a, G, C> {
     pub identity: &'a RequestIdentity,
-    pub source_artifact_admission: &'a eliot_governor::SourceArtifactAdmission,
+    /// Original READ grant for the selected source and verified source-tree
+    /// artifact. This admission never authorizes Blob publication or process
+    /// effects.
+    pub source_read_admission: &'a eliot_governor::SourceArtifactAdmission,
+    /// Separate original ReversibleMutation grant for the exact retained LSP
+    /// observation publication and task-bound canonical capture.
+    pub observation_admission: &'a eliot_governor::SourceArtifactAdmission,
     /// Owner-formed canonical Store transition shell for this original
     /// request. The W1 wrapper replaces only its `CaptureObservation` payload
     /// pointer with the receipt returned by the live Blob publication.
@@ -434,6 +440,12 @@ pub mod improvement_intake;
 /// over a real maintenance observation and commits the owner-actionable
 /// artifact durably through the Governor `RecordLearningRecord` seam.
 pub mod improvement_intake_dispatch;
+#[cfg(windows)]
+mod instrument_registry_submission;
+#[cfg(windows)]
+mod lsp_launch_claims;
+#[cfg(windows)]
+mod instrument_registry_registration;
 mod kernel_authority_client;
 mod kernel_context_read_client;
 mod kernel_recovery_client;
@@ -985,6 +997,12 @@ pub struct DaemonComposition {
     /// identities. Volatile fast path only, like `operator_replay`: durable
     /// truth stays with the owner receipts, never with this map.
     committed_experience: BTreeMap<String, eliot_store_api::WriteReceipt>,
+    /// Original, Governor-issued Instrument Registry registration proof.
+    /// This is process-retained owner evidence from the separate registration
+    /// operation; selected-source stages may read it, but cannot replace it.
+    #[cfg(windows)]
+    instrument_registry_registration_proof:
+        Option<Arc<eliot_governor::InstrumentRegistryRegistrationProof>>,
     /// Already-validated Kernel-issued owner session facts threaded once by
     /// the daemon runtime where the concrete client and this composition meet
     /// (AUD-C02-B, Implements #1187). Facts only, never the client itself:
@@ -1397,6 +1415,8 @@ impl DaemonComposition {
             view_stale: false,
             cached_revision_fence,
             committed_experience: BTreeMap::new(),
+            #[cfg(windows)]
+            instrument_registry_registration_proof: None,
             operator_replay: SharedOperatorReplay::new(),
             owner_session: None,
             notification_snapshot: Vec::new(),
@@ -1413,6 +1433,29 @@ impl DaemonComposition {
                 eliot_governor::SwarmPlanAttachmentService::new(),
             ),
         })
+    }
+
+    /// Retains the exact proof returned by the original registration owner.
+    /// A second proof cannot replace the owner result inside this composition.
+    #[cfg(windows)]
+    pub fn retain_instrument_registry_registration_proof(
+        &mut self,
+        proof: eliot_governor::InstrumentRegistryRegistrationProof,
+    ) -> Result<(), eliot_governor::InstrumentRegistryRegistrationProof> {
+        if self.instrument_registry_registration_proof.is_some() {
+            return Err(proof);
+        }
+        self.instrument_registry_registration_proof = Some(Arc::new(proof));
+        Ok(())
+    }
+
+    /// Borrows the original registration result retained by the Governor
+    /// owner; absence remains a typed unavailable input for the stage gate.
+    #[cfg(windows)]
+    pub fn instrument_registry_registration_proof(
+        &self,
+    ) -> Option<&Arc<eliot_governor::InstrumentRegistryRegistrationProof>> {
+        self.instrument_registry_registration_proof.as_ref()
     }
 
     /// Commits one Canonical-admitted transition under the exact admitted
@@ -2405,6 +2448,92 @@ impl DaemonComposition {
             .map_err(CapturedLspAdoptionError::TaskSelection)
     }
 
+    /// Consumes one distinct authenticated Instrument Registry registration
+    /// HostRequest through current Governor owners. It obtains the current
+    /// task binding, issues the original AuthorityOwner/GrantGraph mutation
+    /// admission, then commits and retains the original canonical proof.
+    #[cfg(windows)]
+    pub async fn consume_instrument_registry_registration(
+        &mut self,
+        kernel: &DaemonKernelClient,
+        envelope: &eliot_protocol::HostRequestEnvelope,
+        invocation: &eliot_protocol::InstrumentRegistryRegistrationInvocation,
+        identity: &RequestIdentity,
+    ) -> Result<
+        (
+            eliot_store_api::WriteReceipt,
+            eliot_store_api::NamedReadResponse,
+        ),
+        String,
+    > {
+        invocation
+            .validate_for_envelope(envelope)
+            .map_err(|error| error.to_string())?;
+        identity.validate().map_err(|error| error.to_string())?;
+        if &invocation.request_identity != identity {
+            return Err(
+                "Instrument Registry registration payload changed the original admitted RequestIdentity".to_owned(),
+            );
+        }
+        let host = &envelope.identity;
+        let metadata = &identity.request.metadata;
+        if envelope.kind != eliot_protocol::HostRequestKind::InstrumentRegistryRegistration
+            || host.capability != "instrument_registry.register"
+            || host.request_id != metadata.request_id
+            || host.idempotency_key != identity.idempotency_key
+            || host.cancellation_id != identity.cancellation_id
+            || host.deadline_unix_ms != identity.deadline_unix_ms
+            || host.task_id != metadata.task_id.as_ref().map(ToString::to_string)
+            || host.session_id != metadata.session_id.as_ref().map(ToString::to_string)
+            || host.work_scope_id.is_none()
+            || envelope.state_fence != identity.request.state_fence
+            || envelope.state_fence != metadata.state_fence
+        {
+            return Err(
+                "Instrument Registry registration differs from its admitted HostRequest or original RequestIdentity".to_owned(),
+            );
+        }
+        let selected = self
+            .governor
+            .task_selection_evidence_for_authenticated_request(
+                || crate::try_unix_ms(SystemTime::now()).map_err(CompositionError::Clock),
+                host.session_id
+                    .as_deref()
+                    .ok_or_else(|| "registration HostRequest omitted Session".to_owned())?,
+                host.task_id
+                    .as_deref()
+                    .ok_or_else(|| "registration HostRequest omitted Task".to_owned())?,
+                host.work_scope_id
+                    .as_deref()
+                    .ok_or_else(|| "registration HostRequest omitted WorkScope".to_owned())?,
+                &metadata.state_fence,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let admitted = self
+            .governor
+            .admit_instrument_registry_registration(
+                envelope,
+                identity,
+                &selected,
+                &invocation.snapshot_json,
+            )
+            .map_err(|error| error.to_string())?;
+        let read = crate::instrument_registry_submission::IdentityBoundCanonicalReadClient::new(
+            kernel,
+            identity.clone(),
+        );
+        self.register_instrument_registry(&admitted, &read)
+            .await
+            .map_err(|error| error.to_string())?;
+        let proof = self
+            .instrument_registry_registration_proof()
+            .ok_or_else(|| {
+                "registration owner returned without retaining its original commit and readback proof".to_owned()
+            })?;
+        Ok((proof.receipt().clone(), proof.readback().clone()))
+    }
+
     /// Compiles exactly one Kernel-issued staged ProposedAttempt into the
     /// existing Governor canonical-write path, then invokes the existing ORS
     /// activation saga. The request, task binding, WorkItem/lease, source
@@ -2453,11 +2582,22 @@ impl DaemonComposition {
             .store_named_async(registry_request.clone())
             .await
             .map_err(CapturedLspAdoptionError::KernelTransition)?;
+        registry_response.validate().map_err(|_| {
+            CapturedLspAdoptionError::SelectedSourceCaptureRequest(
+                "Instrument Registry named readback failed the original Store response validator",
+            )
+        })?;
         if registry_response.operation != registry_request.operation
             || registry_response.state_fence != registry_request.state_fence
+            || registry_response
+                .payload
+                .get("state_fence")
+                .and_then(|value| serde_json::from_value::<StateFence>(value.clone()).ok())
+                .as_ref()
+                != Some(&registry_request.state_fence)
         {
             return Err(CapturedLspAdoptionError::SelectedSourceCaptureRequest(
-                "Instrument Registry owner readback changed the exact request operation or fence",
+                "Instrument Registry owner readback changed the exact request operation or payload fence",
             ));
         }
         let registry_json = registry_response
@@ -2676,6 +2816,52 @@ impl DaemonComposition {
         })
     }
 
+    /// Issues the exact selected-source READ admission after canonical ORS
+    /// activation, using the original envelope, owner selection, persisted
+    /// ProposedAttempt receipt, and physical source-byte observation.
+    #[cfg(windows)]
+    pub fn admit_selected_source_capture_read(
+        &mut self,
+        claimed: &crate::daemon_kernel_client::SelectedSourceCaptureClaimedInvocation,
+        selected: &eliot_governor::TaskSelectionAdmissionBinding,
+        canonical: &SelectedSourceCaptureCanonicalAdmission,
+        profile: &str,
+        profile_revision: u64,
+        instrument: &str,
+        configuration_digest: &str,
+        executable_path: &str,
+        executable_digest: &str,
+    ) -> Result<eliot_governor::SourceArtifactAdmission, eliot_governor::SourceArtifactAdmissionError> {
+        let current_source = crate::task_binding_admission::observe_bound_selected_source(
+            selected.work_scope(),
+            &claimed.host_request_envelope.state_fence,
+            &claimed.invocation.selected_relative_path,
+        )
+        .map_err(|_| eliot_governor::SourceArtifactAdmissionError::Binding(
+            "selected source could not be re-observed under its current original WorkScope root",
+        ))?;
+        if current_source.source_sha256 != canonical.source_workspace.source_sha256 {
+            return Err(eliot_governor::SourceArtifactAdmissionError::Binding(
+                "selected source bytes changed after canonical admission",
+            ));
+        }
+        self.governor.admit_selected_source_capture_read(
+            &claimed.host_request_envelope,
+            &claimed.request_identity,
+            selected,
+            &canonical.causal_receipt,
+            &claimed.invocation.selected_relative_path,
+            &current_source.source_sha256,
+            claimed.invocation.selector.as_deref(),
+            profile,
+            profile_revision,
+            instrument,
+            configuration_digest,
+            executable_path,
+            executable_digest,
+        )
+    }
+
     /// Runs the internal W1 one-shot LSP capture through the original
     /// current-source process owner, then publishes the bridge-minted live
     /// observation into the original source Blob owner. It attempts to commit
@@ -2701,7 +2887,8 @@ impl DaemonComposition {
     {
         let LiveLspCaptureInvocation {
             identity,
-            source_artifact_admission,
+            source_read_admission,
+            observation_admission,
             mut capture_envelope,
             governing_sources,
             privacy_profile,
@@ -2735,12 +2922,27 @@ impl DaemonComposition {
             .ok_or(CapturedLspAdoptionError::MissingTaskIdentity)?;
         crate::task_binding_admission::validate_lsp_capture_source_admission(
             identity,
-            source_artifact_admission,
+            observation_admission,
         )?;
-        let request_task = source_artifact_admission.task().task_id.as_str();
-        let request_session = source_artifact_admission.session().session_id.as_str();
-        let request_principal = source_artifact_admission.holder().as_str();
-        let request_scope = source_artifact_admission.work_scope().scope_id.as_str();
+        let read_metadata = &source_read_admission.request().metadata;
+        if source_read_admission.request_identity() != identity
+            || read_metadata != &identity.request.metadata
+            || source_read_admission.operation().request_id != identity.request.metadata.request_id
+            || source_read_admission.operation().operation_kind != "eliot.source-capture.read"
+            || source_read_admission.operation().effect != eliot_receipts::EffectClass::Read
+            || source_read_admission.work_scope() != observation_admission.work_scope()
+            || source_read_admission.task() != observation_admission.task()
+            || source_read_admission.session() != observation_admission.session()
+            || source_read_admission.holder() != observation_admission.holder()
+        {
+            return Err(CapturedLspAdoptionError::SelectedSourceCaptureRequest(
+                "source-tree READ grant and LSP observation mutation grant do not bind the same original request and owner scope",
+            ));
+        }
+        let request_task = observation_admission.task().task_id.as_str();
+        let request_session = observation_admission.session().session_id.as_str();
+        let request_principal = observation_admission.holder().as_str();
+        let request_scope = observation_admission.work_scope().scope_id.as_str();
         let request_fence = &identity.request.metadata.state_fence;
         let selection = self
             .governor
@@ -2763,7 +2965,7 @@ impl DaemonComposition {
         let profile = self
             .policy_owner()
             .ok_or(CapturedLspAdoptionError::MissingPolicyOwner)?
-            .source_artifact_blob_profile(source_artifact_admission)?;
+            .source_artifact_blob_profile(observation_admission)?;
         let started = bridge
             .launch_retained_with_source_artifact_proof(
                 command,
@@ -2802,7 +3004,7 @@ impl DaemonComposition {
 
         let publisher = DaemonLspSourceArtifactPublisher {
             owner: &self.source_artifact_owner,
-            admission: source_artifact_admission,
+            admission: observation_admission,
             profile: &profile,
         };
         let (record, projection, payload_ref) =
@@ -2865,7 +3067,7 @@ impl DaemonComposition {
                         .prepare(&capture_envelope)?;
                     let dispatched = crate::task_binding_admission::admit_lsp_capture_from_owner(
                         identity,
-                        source_artifact_admission,
+                        observation_admission,
                         &transition,
                         &selected,
                     )?;
@@ -2914,7 +3116,7 @@ impl DaemonComposition {
                                 transition,
                                 capture_envelope.expected_revision_heads,
                                 capture_envelope.expected_ordering_heads,
-                                source_artifact_admission,
+                                observation_admission,
                                 &dispatched,
                                 &current_selection,
                             )

@@ -49,8 +49,13 @@ use eliot_kernel_service::PROVIDER_CAPABILITY_WIRE_VERSION;
 use eliot_learning_contracts::LearningStateViewRecipe;
 use eliot_ors::OperationIdentity;
 #[cfg(windows)]
+use eliot_governor::{
+    ActiveReservationOwnerReadback, ActiveReservationUsePort, ActiveReservationUseRequest,
+};
+#[cfg(windows)]
 use eliot_ors::{
-    AdmissionReservationRecord, AdmissionReservationState, OperationalMutationReceipt,
+    AdmissionReservationClaims, AdmissionReservationRecord, AdmissionReservationState,
+    OperationalMutationReceipt,
 };
 use eliot_protocol::{
     AgentActivationClaimRequest, AgentActivationKernelOwnerReadback, AgentActivationOwnerReadback,
@@ -327,6 +332,121 @@ pub struct DaemonKernelClient {
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
 }
 
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActiveReservationCurrentUseWire {
+    record: Option<eliot_ors::AdmissionReservationRecord>,
+    receipt: Option<eliot_ors::OperationalMutationReceipt>,
+    record_revision: Option<u64>,
+    state_fence: eliot_ors::StateFenceSnapshot,
+    reservation_id: OperationIdentity,
+    work_item_id: OperationIdentity,
+    proposed_attempt_id: OperationIdentity,
+    work_scope_id: String,
+    owner_verification: serde_json::Value,
+}
+
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActiveReservationCurrentUseResponse {
+    current: ActiveReservationCurrentUseWire,
+}
+
+#[cfg(windows)]
+impl ActiveReservationUsePort for DaemonKernelClient {
+    fn read_current_active<'a>(
+        &'a self,
+        request: &'a ActiveReservationUseRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<ActiveReservationOwnerReadback, String>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let value = self
+                .transact_async_with_identity(
+                    "admission_reservation.current_use",
+                    serde_json::json!({
+                        "reservation_id": request.reservation_id,
+                        "work_item_id": request.work_item_id,
+                        "proposed_attempt_id": request.proposed_attempt_id,
+                        "work_scope_id": request.work_scope_id,
+                        "claims": request.claims,
+                        "host_request_operation_id": request.host_request_operation_id,
+                        "host_request_digest": request.host_request_digest,
+                    }),
+                    request.identity.clone(),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            let body = super::kind_value(&value, "admission_reservation_current_use")
+                .map_err(|error| error.to_string())?;
+            let response: ActiveReservationCurrentUseResponse =
+                serde_json::from_value(body.clone()).map_err(|error| error.to_string())?;
+            let current = response.current;
+            if current.reservation_id != request.reservation_id
+                || current.work_item_id != request.work_item_id
+                || current.proposed_attempt_id != request.proposed_attempt_id
+                || current.work_scope_id != request.work_scope_id
+            {
+                return Err("Kernel ORS readback differs from the exact live request".to_owned());
+            }
+            let record = current
+                .record
+                .ok_or_else(|| "Kernel ORS owner has no current reservation row".to_owned())?;
+            let receipt = current
+                .receipt
+                .ok_or_else(|| "Kernel ORS owner has no original mutation receipt".to_owned())?;
+            let record_revision = current
+                .record_revision
+                .ok_or_else(|| "Kernel ORS owner omitted the record revision".to_owned())?;
+            let owner_object = current
+                .owner_verification
+                .as_object()
+                .filter(|object| object.len() == 1)
+                .ok_or_else(|| "Kernel omitted the original ORS verifier disposition".to_owned())?;
+            let (variant, owner_payload) = owner_object
+                .iter()
+                .next()
+                .ok_or_else(|| "Kernel ORS verifier disposition is empty".to_owned())?;
+            let owner_disposition = if variant == "ACTIVE" {
+                let owner_payload = owner_payload.as_object().ok_or_else(|| {
+                    "Kernel ACTIVE verifier disposition omitted its original sealed payload".to_owned()
+                })?;
+                let owner_record = owner_payload
+                    .get("reservation")
+                    .ok_or_else(|| "Kernel ACTIVE verifier payload omitted its original row".to_owned())?;
+                let owner_receipt = owner_payload
+                    .get("receipt")
+                    .ok_or_else(|| "Kernel ACTIVE verifier payload omitted its original receipt".to_owned())?;
+                if owner_record != &serde_json::to_value(&record).map_err(|error| error.to_string())?
+                    || owner_receipt
+                        != &serde_json::to_value(&receipt).map_err(|error| error.to_string())?
+                {
+                    return Err("Kernel ACTIVE verifier payload differs from the original row or receipt".to_owned());
+                }
+                "ACTIVE"
+            } else {
+                "NOT_ACTIVE"
+            }
+            .to_owned();
+            Ok(ActiveReservationOwnerReadback {
+                record,
+                receipt,
+                record_revision,
+                state_fence: current.state_fence,
+                work_scope_id: current.work_scope_id,
+                owner_disposition,
+                owner_verification: current.owner_verification,
+            })
+        })
+    }
+}
+
 /// Already-validated Kernel-issued owner session facts for the single live
 /// owner session (AUD-C02-B, Implements #1187; single-owner decision #1376).
 ///
@@ -445,6 +565,23 @@ pub struct SelectedSourceCaptureClaimedInvocation {
     pub request_identity: RequestIdentity,
 }
 
+/// Exact executable data observed by the Kernel under a current admitted
+/// selected-source HostRequest. The native identity is retained as opaque
+/// owner data; callers cannot construct or deserialize it into authority.
+#[cfg(windows)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CurrentSourceExecutableObservation {
+    pub(crate) request_identity: RequestIdentity,
+    pub(crate) instrument: String,
+    pub(crate) canonical_path: String,
+    pub(crate) content_digest: String,
+    pub(crate) tool_version: Option<String>,
+    pub(crate) environment_digest: String,
+    pub(crate) arguments: Vec<String>,
+    pub(crate) native_file_identity: serde_json::Value,
+}
+
 /// Exact Kernel-owned inactive ORS stage returned for one selected-source
 /// claim. The receipt and staged row are returned as typed original owner
 /// readback, not reconstructed authority.
@@ -471,6 +608,51 @@ pub struct SelectedSourceCaptureActivation {
 }
 
 #[cfg(windows)]
+#[cfg(windows)]
+fn validate_source_snapshot_effect_request(
+    parent: &RequestIdentity,
+    child: &RequestIdentity,
+    parent_digest: &str,
+    work_scope_id: &str,
+    semantic_admission_revision: &str,
+    action_contract_sha256: &str,
+) -> Result<(), super::DaemonError> {
+    let valid_sha256 = |value: &str| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    parent
+        .validate()
+        .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+    child
+        .validate()
+        .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+    if !valid_sha256(parent_digest)
+        || !valid_sha256(action_contract_sha256)
+        || work_scope_id.trim().is_empty()
+        || work_scope_id.chars().any(char::is_control)
+        || semantic_admission_revision.trim().is_empty()
+        || semantic_admission_revision.chars().any(char::is_control)
+        || child.request.metadata.request_id == parent.request.metadata.request_id
+        || child.idempotency_key == parent.idempotency_key
+        || child.cancellation_id == parent.cancellation_id
+        || child.request.metadata.task_id != parent.request.metadata.task_id
+        || child.request.metadata.session_id != parent.request.metadata.session_id
+        || child.request.metadata.product_id != parent.request.metadata.product_id
+        || child.request.metadata.source_id != parent.request.metadata.source_id
+        || child.deadline_unix_ms > parent.deadline_unix_ms
+        || child.request.state_fence != parent.request.state_fence
+        || child.request.metadata.state_fence != parent.request.state_fence
+    {
+        return Err(super::DaemonError::Kernel(
+            "source snapshot E request is not a distinct child of the retained S identity and exact scope/fence binding".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn parse_selected_source_capture_activation(
     value: &serde_json::Value,
     staged: &SelectedSourceCaptureStagedAdmission,
@@ -636,6 +818,109 @@ pub fn parse_selected_source_capture_claimed_pair(
         invocation,
         request_identity,
     }))
+}
+
+/// Parses the bounded Kernel registration-claim projection without deriving
+/// any registration authority from its payload. The exact original request
+/// identity and envelope are retained for the Governor owner recheck.
+#[cfg(windows)]
+pub fn parse_instrument_registry_registration_claimed_pair(
+    value: &serde_json::Value,
+) -> Result<
+    Option<(
+        HostRequestEnvelope,
+        eliot_protocol::InstrumentRegistryRegistrationInvocation,
+        RequestIdentity,
+        LocalReadAttempt,
+    )>,
+    String,
+> {
+    let pair = value.get("pair").ok_or_else(|| {
+        "Kernel instrument_registry_registration_claim answer omits pair".to_owned()
+    })?;
+    if pair.is_null() {
+        return Ok(None);
+    }
+    if !pair.is_object() {
+        return Err(
+            "Kernel instrument_registry_registration_claim pair is neither an object nor null"
+                .to_owned(),
+        );
+    }
+    let decode = |field: &str| {
+        pair.get(field).cloned().ok_or_else(|| {
+            format!("Kernel instrument_registry_registration_claim pair omits {field}")
+        })
+    };
+    let envelope: HostRequestEnvelope = serde_json::from_value(decode("envelope")?)
+        .map_err(|error| {
+            format!(
+                "Kernel instrument_registry_registration_claim envelope does not decode: {error}"
+            )
+        })?;
+    envelope.validate_for_admission().map_err(|error| {
+        format!("Kernel instrument_registry_registration_claim envelope is invalid: {error}")
+    })?;
+    let invocation: eliot_protocol::InstrumentRegistryRegistrationInvocation =
+        serde_json::from_value(decode("invocation")?).map_err(|error| {
+            format!(
+                "Kernel instrument_registry_registration_claim invocation does not decode: {error}"
+            )
+        })?;
+    invocation
+        .validate_for_envelope(&envelope)
+        .map_err(|error| {
+            format!(
+                "Kernel instrument_registry_registration_claim invocation is invalid: {error}"
+            )
+        })?;
+    let identity: RequestIdentity = serde_json::from_value(decode("request_identity")?)
+        .map_err(|error| {
+            format!(
+                "Kernel instrument_registry_registration_claim RequestIdentity does not decode: {error}"
+            )
+        })?;
+    identity.validate().map_err(|error| {
+        format!(
+            "Kernel instrument_registry_registration_claim RequestIdentity is invalid: {error}"
+        )
+    })?;
+    let attempt: LocalReadAttempt = serde_json::from_value(decode("attempt")?)
+        .map_err(|error| {
+            format!(
+                "Kernel instrument_registry_registration_claim attempt does not decode: {error}"
+            )
+        })?;
+    attempt.validate().map_err(|error| {
+        format!(
+            "Kernel instrument_registry_registration_claim attempt is invalid: {error}"
+        )
+    })?;
+    if envelope.kind != eliot_protocol::HostRequestKind::InstrumentRegistryRegistration
+        || envelope.identity.capability != "instrument_registry.register"
+        || envelope.identity.payload_schema_id
+            != eliot_protocol::InstrumentRegistryRegistrationInvocation::PAYLOAD_SCHEMA_ID
+        || envelope.identity.request_id != identity.request.metadata.request_id
+        || envelope.identity.idempotency_key != identity.idempotency_key
+        || envelope.identity.cancellation_id != identity.cancellation_id
+        || envelope.identity.deadline_unix_ms != identity.deadline_unix_ms
+        || identity.request.state_fence != envelope.state_fence
+        || identity.request.metadata.state_fence != envelope.state_fence
+        || identity.request.metadata.task_id.as_ref().map(ToString::to_string)
+            != envelope.identity.task_id
+        || identity.request.metadata.session_id.as_ref().map(ToString::to_string)
+            != envelope.identity.session_id
+        || invocation.request_identity != identity
+        || attempt.operation_id != eliot_protocol::host_request_operation_id(&envelope)
+        || Some(&attempt.session_id) != envelope.identity.session_id.as_ref()
+        || envelope.identity.work_scope_id.as_deref() != Some(attempt.scope_id.as_str())
+        || attempt.authority_epoch != envelope.state_fence.authority_epoch
+    {
+        return Err(
+            "Kernel instrument_registry_registration_claim pair does not bind its typed invocation to the exact admitted HostRequest and original RequestIdentity".to_owned(),
+        );
+    }
+    Ok(Some((envelope, invocation, identity, attempt)))
 }
 
 /// Parses the original Kernel `source_capture.stage` response and compares
@@ -2647,6 +2932,165 @@ impl DaemonKernelClient {
         serde_json::from_value(value).map_err(|error| KernelClientError::Unknown(error.to_string()))
     }
 
+    /// Executes one closed Git source-snapshot P-03 operation as a distinct
+    /// child of the currently admitted selected-source request. The outer
+    /// authenticated frame retains the parent identity; the child identity
+    /// and original Start admission remain explicit payload data for Kernel
+    /// lineage validation.
+    #[cfg(windows)]
+    pub(super) async fn execute_current_source_git_process(
+        &self,
+        parent_identity: &RequestIdentity,
+        child_identity: &RequestIdentity,
+        admitted_task_id: &eliot_contracts::TaskId,
+        request: eliot_kernel_service::ProcessExecutionRequest,
+    ) -> Result<eliot_kernel_service::ProcessExecutionResponse, KernelClientError> {
+        parent_identity
+            .validate()
+            .map_err(|error| KernelClientError::Contract(error.to_string()))?;
+        child_identity
+            .validate()
+            .map_err(|error| KernelClientError::Contract(error.to_string()))?;
+        request
+            .validate()
+            .map_err(|error| KernelClientError::Contract(error.to_string()))?;
+        let operation_id = request.operation_id().ok_or_else(|| {
+            KernelClientError::Contract(
+                "current-source Git process request omitted its operation identity".to_owned(),
+            )
+        })?;
+        if parent_identity.request.metadata.task_id.as_ref() != Some(admitted_task_id)
+            || child_identity.request.metadata.task_id.as_ref() != Some(admitted_task_id)
+            || child_identity.request.metadata.request_id.as_str() != operation_id.as_str()
+            || child_identity.request.metadata.request_id
+                == parent_identity.request.metadata.request_id
+            || child_identity.request.metadata.product_id
+                != parent_identity.request.metadata.product_id
+            || child_identity.request.metadata.source_id
+                != parent_identity.request.metadata.source_id
+            || child_identity.request.metadata.session_id
+                != parent_identity.request.metadata.session_id
+            || child_identity.deadline_unix_ms != parent_identity.deadline_unix_ms
+            || child_identity.request.state_fence != parent_identity.request.state_fence
+            || child_identity.request.metadata.state_fence
+                != parent_identity.request.state_fence
+        {
+            return Err(KernelClientError::Contract(
+                "current-source Git child differs from the original request lineage".to_owned(),
+            ));
+        }
+        if let eliot_kernel_service::ProcessExecutionRequest::Start(admission) = &request
+            && (admission.deadline_unix_ms() != child_identity.deadline_unix_ms
+                || admission.intent().operation_id().as_str() != operation_id.as_str()
+                || admission.state_fence().authority_epoch()
+                    != &child_identity.request.state_fence.authority_epoch
+                || admission.state_fence().generation().get()
+                    != child_identity.request.state_fence.resource_generation.value())
+        {
+            return Err(KernelClientError::Contract(
+                "current-source Git Start differs from its original child identity".to_owned(),
+            ));
+        }
+        let value = self
+            .transact_async_with_identity(
+                "execute_current_source_git_process",
+                serde_json::json!({
+                    "parent_identity": parent_identity,
+                    "child_identity": child_identity,
+                    "admitted_task_id": admitted_task_id,
+                    "request": request,
+                }),
+                parent_identity.clone(),
+            )
+            .await?;
+        serde_json::from_value(value).map_err(|error| KernelClientError::Unknown(error.to_string()))
+    }
+
+    /// Asks the authenticated Kernel owner to reobserve the executable named
+    /// by the current selected-source request. The supplied profile identity
+    /// is only a locator/expected value: Kernel returns its own no-follow
+    /// native file identity and exact-byte digest while the original admitted
+    /// HostRequest is still current.
+    #[cfg(windows)]
+    pub(super) async fn observe_current_source_executable(
+        &self,
+        claimed: &SelectedSourceCaptureClaimedInvocation,
+        work_scope_root_locator: &str,
+        executable_root_locator: &str,
+        expected: &eliot_instrument_runner::ResolvedExecutableIdentity,
+        process_intent: &eliot_process::ProcessIntent,
+        child_identity: RequestIdentity,
+    ) -> Result<CurrentSourceExecutableObservation, KernelClientError> {
+        let operation_id = host_request_operation_id(&claimed.host_request_envelope);
+        let expected_instrument = match claimed.invocation.operation {
+            eliot_protocol::SelectedSourceCaptureOperation::Diagnostics => {
+                "eliot.instrument.rust-analyzer.diagnostics"
+            }
+            eliot_protocol::SelectedSourceCaptureOperation::ProbeVersion => {
+                "eliot.instrument.rust-analyzer.version"
+            }
+        };
+        let child_task = child_identity.request.metadata.task_id.as_ref();
+        if expected.canonical_path != process_intent.executable()
+            || expected.content_digest != process_intent.executable_sha256()
+            || expected.arguments != process_intent.argv()
+            || expected.environment_digest
+                != eliot_process_executor::environment_projection_digest(
+                    process_intent.environment(),
+                )
+            || child_task != claimed.request_identity.request.metadata.task_id.as_ref()
+            || child_identity.request.metadata.request_id
+                == claimed.request_identity.request.metadata.request_id
+            || child_identity.request.state_fence != claimed.request_identity.request.state_fence
+            || child_identity.request.metadata.state_fence
+                != claimed.request_identity.request.state_fence
+            || child_identity.deadline_unix_ms != claimed.request_identity.deadline_unix_ms
+        {
+            return Err(KernelClientError::Contract(
+                "executable observation inputs differ from the live selected-source profile or original request lineage".to_owned(),
+            ));
+        }
+        process_intent
+            .validate()
+            .map_err(|error| KernelClientError::Contract(error.to_string()))?;
+        child_identity
+            .validate()
+            .map_err(|error| KernelClientError::Contract(error.to_string()))?;
+        let value = self
+            .transact_async_with_identity(
+                "current_source_executable.observe",
+                serde_json::json!({
+                    "host_request_operation_id": operation_id,
+                    "host_request_digest": claimed.host_request_envelope.envelope_sha256,
+                    "work_scope_id": claimed.host_request_envelope.identity.work_scope_id,
+                    "work_scope_root_locator": work_scope_root_locator,
+                    "executable_locator": expected.canonical_path,
+                    "executable_root_locator": executable_root_locator,
+                    "admitted_content_sha256": expected.content_digest,
+                    "admitted_instrument": expected_instrument,
+                    "child_identity": child_identity,
+                    "process_intent": process_intent,
+                }),
+                claimed.request_identity.clone(),
+            )
+            .await?;
+        let observation: CurrentSourceExecutableObservation = serde_json::from_value(value)
+            .map_err(|error| KernelClientError::Unknown(error.to_string()))?;
+        if observation.request_identity != child_identity
+            || observation.instrument != expected_instrument
+            || observation.canonical_path != expected.canonical_path
+            || observation.content_digest != expected.content_digest
+            || observation.environment_digest != expected.environment_digest
+            || observation.arguments != expected.arguments
+            || !observation.native_file_identity.is_object()
+        {
+            return Err(KernelClientError::Contract(
+                "Kernel executable observation does not exactly match the admitted live profile".to_owned(),
+            ));
+        }
+        Ok(observation)
+    }
+
     #[cfg(windows)]
     pub(super) async fn transact_async_with_identity(
         &self,
@@ -3133,6 +3577,185 @@ impl DaemonKernelClient {
             .await
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
         parse_selected_source_capture_claimed_pair(&value).map_err(super::DaemonError::Kernel)
+    }
+
+    /// Claims one original Instrument Registry registration request from the
+    /// existing authenticated HostRequest queue. The returned invocation is
+    /// only the closed registration payload; Governor still resolves the live
+    /// Task/WorkScope/AuthorityOwner state and issues the original mutation
+    /// admission before any Store write.
+    #[cfg(windows)]
+    pub async fn claim_instrument_registry_registration_pair_async(
+        &self,
+    ) -> Result<
+        Option<(
+            HostRequestEnvelope,
+            eliot_protocol::InstrumentRegistryRegistrationInvocation,
+            RequestIdentity,
+            LocalReadAttempt,
+        )>,
+        super::DaemonError,
+    > {
+        let value = self
+            .transact_async(
+                "instrument_registry_registration_claim",
+                serde_json::json!({
+                    "operation": "instrument_registry_registration_claim"
+                }),
+            )
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        parse_instrument_registry_registration_claimed_pair(&value)
+            .map_err(super::DaemonError::Kernel)
+    }
+
+    /// Persists one Governor registration disposition against the Kernel's
+    /// original registration attempt. The body is checked before transport;
+    /// Kernel still rechecks the live claim generation and retains the exact
+    /// result under the original HostRequest row.
+    #[cfg(windows)]
+    pub async fn submit_instrument_registry_registration_result_async(
+        &self,
+        body: &HostRequestResultBody,
+    ) -> Result<LocalReadSubmitOutcome, super::DaemonError> {
+        body.validate()
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let value = self
+            .transact_async(
+                "instrument_registry_registration_result",
+                serde_json::json!({ "result": body }),
+            )
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        parse_local_read_submit_outcome(&value).map_err(super::DaemonError::Kernel)
+    }
+
+    /// Stages the distinct E reservation for one byte-bound source-snapshot
+    /// mutation. The authenticated outer frame carries the original S
+    /// RequestIdentity unchanged; E is an independently admitted child and
+    /// the Kernel derives the ORS reservation/stage identities.
+    #[cfg(windows)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn stage_source_snapshot_effect_reservation_async(
+        &self,
+        parent_identity: &RequestIdentity,
+        parent_operation_id: &OperationIdentity,
+        parent_request_digest: &str,
+        child_identity: &RequestIdentity,
+        work_scope_id: &str,
+        work_item_id: &OperationIdentity,
+        proposed_attempt_id: &OperationIdentity,
+        claims: &AdmissionReservationClaims,
+        semantic_admission_revision: &str,
+        action_contract_sha256: &str,
+        expires_at_unix_ms: u64,
+    ) -> Result<serde_json::Value, super::DaemonError> {
+        validate_source_snapshot_effect_request(
+            parent_identity,
+            child_identity,
+            parent_request_digest,
+            work_scope_id,
+            semantic_admission_revision,
+            action_contract_sha256,
+        )?;
+        claims
+            .validate()
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let body = serde_json::json!({
+            "operation": "admission_reservation.source_snapshot.stage",
+            "wire_id": "eliot.instrument-registry-effect-reservation.stage",
+            "wire_version": 1,
+            "parent_operation_id": parent_operation_id,
+            "parent_request_digest": parent_request_digest,
+            "child_request_identity": child_identity,
+            "work_scope_id": work_scope_id,
+            "work_item_id": work_item_id,
+            "proposed_attempt_id": proposed_attempt_id,
+            "claims": claims,
+            "semantic_admission_revision": semantic_admission_revision,
+            "action_contract_sha256": action_contract_sha256,
+            "expires_at_unix_ms": expires_at_unix_ms,
+        });
+        self.transact_async_with_identity(
+            "admission_reservation.source_snapshot.stage",
+            body,
+            parent_identity.clone(),
+        )
+        .await
+        .map_err(|error| super::DaemonError::Kernel(error.to_string()))
+    }
+
+    /// Activates the already staged E reservation only from the exact
+    /// original canonical mutation receipt and its original receipt
+    /// readback. Neither receipt is reconstructed from ORS labels.
+    #[cfg(windows)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn activate_source_snapshot_effect_reservation_async(
+        &self,
+        parent_identity: &RequestIdentity,
+        parent_operation_id: &OperationIdentity,
+        parent_request_digest: &str,
+        child_identity: &RequestIdentity,
+        work_scope_id: &str,
+        reservation_id: &OperationIdentity,
+        work_item_id: &OperationIdentity,
+        proposed_attempt_id: &OperationIdentity,
+        claims: &AdmissionReservationClaims,
+        semantic_admission_revision: &str,
+        action_contract_sha256: &str,
+        canonical_write_receipt: &WriteReceipt,
+        canonical_receipt_readback: &WriteReceipt,
+    ) -> Result<serde_json::Value, super::DaemonError> {
+        validate_source_snapshot_effect_request(
+            parent_identity,
+            child_identity,
+            parent_request_digest,
+            work_scope_id,
+            semantic_admission_revision,
+            action_contract_sha256,
+        )?;
+        claims
+            .validate()
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        canonical_write_receipt
+            .validate()
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        canonical_receipt_readback
+            .validate()
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        if canonical_write_receipt.status != eliot_store_api::WriteReceiptStatus::Committed
+            || canonical_write_receipt.commit_id.is_none()
+            || canonical_write_receipt != canonical_receipt_readback
+            || canonical_write_receipt.state_fence != parent_identity.request.metadata.state_fence
+        {
+            return Err(super::DaemonError::Kernel(
+                "source snapshot E activation lacks the exact committed canonical receipt/readback at the original S fence".to_owned(),
+            ));
+        }
+        let body = serde_json::json!({
+            "operation": "admission_reservation.source_snapshot.activate",
+            "wire_id": "eliot.instrument-registry-effect-reservation.activate",
+            "wire_version": 1,
+            "parent_operation_id": parent_operation_id,
+            "parent_request_digest": parent_request_digest,
+            "child_request_identity": child_identity,
+            "work_scope_id": work_scope_id,
+            "reservation_id": reservation_id,
+            "work_item_id": work_item_id,
+            "proposed_attempt_id": proposed_attempt_id,
+            "claims": claims,
+            "semantic_admission_revision": semantic_admission_revision,
+            "action_contract_sha256": action_contract_sha256,
+            "canonical_write_receipt": canonical_write_receipt,
+            "canonical_receipt_readback": canonical_receipt_readback,
+        });
+        self.transact_async_with_identity(
+            "admission_reservation.source_snapshot.activate",
+            body,
+            parent_identity.clone(),
+        )
+        .await
+        .map_err(|error| super::DaemonError::Kernel(error.to_string()))
     }
 
     /// Stages one distinct inactive ORS reservation for the exact claimed
@@ -4120,6 +4743,7 @@ mod tests {
             wire_version: HostRequestEnvelope::CONTRACT_VERSION,
             kind: HostRequestKind::Invocation,
             connection_id: "conn-test-1".to_owned(),
+            authenticated_source: None,
             identity: HostRequestIdentity {
                 request_id: eliot_contracts::RequestId::new("host-request-1")
                     .map_err(|error| format!("request id: {error}"))?,

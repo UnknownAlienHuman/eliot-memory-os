@@ -1672,6 +1672,11 @@ async fn run_loop(
     // real and independent: one authenticated claim, one Governor transition,
     // and one fenced result submit per tick.
     let mut task_controller_flight = TaskControllerFlight::Idle;
+    // The separate profile-registry operation has its own bounded claim and
+    // original Governor mutation admission. It never shares selected-source
+    // READ semantics or a Task Controller attempt.
+    let mut instrument_registry_registration_flight =
+        InstrumentRegistryRegistrationFlight::Idle;
     // Finish candidates ride the same bounded cadence with their own queue and
     // attempt type (issue #1741): one authenticated claim, one Governor finish
     // evaluation, and one fenced result submit per tick.
@@ -1812,6 +1817,10 @@ async fn run_loop(
                 // bounded budgets after the shared flights settle.
                 drain_campaign_packet_on_shutdown(&mut campaign_packet_flight).await?;
                 drain_task_controller_on_shutdown(&mut task_controller_flight).await?;
+                drain_instrument_registry_registration_on_shutdown(
+                    &mut instrument_registry_registration_flight,
+                )
+                .await?;
                 drain_finish_on_shutdown(&mut finish_flight).await?;
                 return Ok(exit);
             }
@@ -1842,6 +1851,11 @@ async fn run_loop(
                     &kernel,
                     &composition,
                     &mut task_controller_flight,
+                );
+                maybe_start_instrument_registry_registration_poll(
+                    &kernel,
+                    &composition,
+                    &mut instrument_registry_registration_flight,
                 );
                 // Finish uses a separate queue and attempt type; start it on the
                 // same cadence without sharing the local-read completion branch.
@@ -1948,6 +1962,14 @@ async fn run_loop(
                         &mut task_controller_flight,
                     )?;
                 }
+            registration_completion = next_instrument_registry_registration_completion(
+                &mut instrument_registry_registration_flight,
+            ) => {
+                settle_instrument_registry_registration_completion(
+                    registration_completion,
+                    &mut instrument_registry_registration_flight,
+                );
+            }
             finish_completion = next_finish_completion(&mut finish_flight) => {
                 settle_finish_completion(finish_completion, &mut finish_flight)?;
             }
@@ -5215,6 +5237,167 @@ fn settle_task_controller_completion(
             Ok(())
         }
         TaskControllerCompletion::Settled(Err(error)) => Err(error),
+    }
+}
+
+enum InstrumentRegistryRegistrationCompletion {
+    Settled(Result<(), String>),
+}
+
+struct InstrumentRegistryRegistrationFlightState {
+    future: Pin<
+        Box<
+            dyn std::future::Future<Output = InstrumentRegistryRegistrationCompletion>,
+        >,
+    >,
+}
+
+enum InstrumentRegistryRegistrationFlight {
+    Idle,
+    InFlight(InstrumentRegistryRegistrationFlightState),
+}
+
+fn start_instrument_registry_registration_poll(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: SharedComposition,
+) -> Pin<
+    Box<dyn std::future::Future<Output = InstrumentRegistryRegistrationCompletion>>,
+> {
+    let kernel = Arc::clone(kernel);
+    Box::pin(async move {
+        InstrumentRegistryRegistrationCompletion::Settled(
+            run_instrument_registry_registration_poll(&kernel, composition).await,
+        )
+    })
+}
+
+fn maybe_start_instrument_registry_registration_poll(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: &SharedComposition,
+    flight: &mut InstrumentRegistryRegistrationFlight,
+) {
+    if matches!(flight, InstrumentRegistryRegistrationFlight::Idle) {
+        *flight = InstrumentRegistryRegistrationFlight::InFlight(
+            InstrumentRegistryRegistrationFlightState {
+                future: start_instrument_registry_registration_poll(
+                    kernel,
+                    Arc::clone(composition),
+                ),
+            },
+        );
+    }
+}
+
+async fn next_instrument_registry_registration_completion(
+    flight: &mut InstrumentRegistryRegistrationFlight,
+) -> InstrumentRegistryRegistrationCompletion {
+    match flight {
+        InstrumentRegistryRegistrationFlight::Idle => {
+            std::future::pending::<InstrumentRegistryRegistrationCompletion>().await
+        }
+        InstrumentRegistryRegistrationFlight::InFlight(state) => (&mut state.future).await,
+    }
+}
+
+fn settle_instrument_registry_registration_completion(
+    completion: InstrumentRegistryRegistrationCompletion,
+    flight: &mut InstrumentRegistryRegistrationFlight,
+) {
+    match completion {
+        InstrumentRegistryRegistrationCompletion::Settled(Ok(())) => {
+            *flight = InstrumentRegistryRegistrationFlight::Idle;
+        }
+        InstrumentRegistryRegistrationCompletion::Settled(Err(error)) => {
+            *flight = InstrumentRegistryRegistrationFlight::Idle;
+            let _ = eliotd::diagnostics::RejectionRecord::of(
+                eliotd::diagnostics::RejectionReason::Refused,
+                eliotd::diagnostics::OwningComponent::Governor,
+                &format!("Instrument Registry registration admission was refused: {error}"),
+            )
+            .emit();
+        }
+    }
+}
+
+async fn run_instrument_registry_registration_poll(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: SharedComposition,
+) -> Result<(), String> {
+    let claimed = kernel
+        .claim_instrument_registry_registration_pair_async()
+        .await
+        .map_err(|error| format!("Kernel Instrument Registry registration claim: {error}"))?;
+    let Some((envelope, invocation, identity, attempt)) = claimed else {
+        return Ok(());
+    };
+    let mut composition = composition.lock().await;
+    let (receipt, readback) = composition
+        .consume_instrument_registry_registration(
+            kernel.as_ref(),
+            &envelope,
+            &invocation,
+            &identity,
+        )
+        .await
+        .map_err(|error| format!("Governor Instrument Registry registration: {error}"))
+        ?;
+    if receipt.status != eliot_store_api::WriteReceiptStatus::Committed
+        || receipt.commit_id.is_none()
+        || receipt.state_fence != envelope.state_fence
+        || readback.operation != eliot_store_api::NamedReadOperation::GetInstrumentRegistryState
+        || readback.state_fence != envelope.state_fence
+    {
+        return Err(
+            "Instrument Registry registration did not return its original committed receipt and exact-fence named readback".to_owned(),
+        );
+    }
+    let response = serde_json::json!({
+        "registered": true,
+        "registration_receipt": receipt,
+        "registry_readback": readback,
+    });
+    let result_digest = eliot_contracts::sha256_hex(
+        &eliot_contracts::canonical_json_bytes(&response)
+            .map_err(|error| format!("registration result canonicalization: {error}"))?,
+    );
+    let body = eliot_protocol::HostRequestResultBody {
+        wire_id: eliot_protocol::HOST_REQUEST_RESULT_BODY_WIRE_ID.to_owned(),
+        wire_version: eliot_protocol::HostRequestResultBody::CONTRACT_VERSION,
+        operation_id: attempt.operation_id.clone(),
+        request_sha256: envelope.envelope_sha256.clone(),
+        result_digest,
+        response,
+        attempt: Some(attempt),
+        lineage: None,
+        evidence: None,
+    };
+    body.validate()
+        .map_err(|error| format!("Instrument Registry registration result body: {error}"))?;
+    match kernel
+        .submit_instrument_registry_registration_result_async(&body)
+        .await
+        .map_err(|error| format!("Kernel Instrument Registry registration result: {error}"))?
+    {
+        LocalReadSubmitOutcome::Accepted => Ok(()),
+        LocalReadSubmitOutcome::Expired => {
+            Err("Instrument Registry registration result attempt expired before persistence".to_owned())
+        }
+        LocalReadSubmitOutcome::StaleAttempt => {
+            Err("Instrument Registry registration result attempt was superseded".to_owned())
+        }
+    }
+}
+
+async fn drain_instrument_registry_registration_on_shutdown(
+    flight: &mut InstrumentRegistryRegistrationFlight,
+) -> Result<RunLoopExit, String> {
+    let previous = std::mem::replace(flight, InstrumentRegistryRegistrationFlight::Idle);
+    let InstrumentRegistryRegistrationFlight::InFlight(state) = previous else {
+        return Ok(RunLoopExit::Shutdown);
+    };
+    match tokio::time::timeout(SHUTDOWN_ACTIVATION_DRAIN, state.future).await {
+        Ok(InstrumentRegistryRegistrationCompletion::Settled(Err(error))) => Err(error),
+        _ => Ok(RunLoopExit::Shutdown),
     }
 }
 

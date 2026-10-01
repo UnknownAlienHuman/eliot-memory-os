@@ -56,6 +56,10 @@ use eliot_store_api::{
 use serde::{Deserialize, Serialize};
 
 mod lsp_admission;
+#[cfg(windows)]
+mod current_source_executable;
+#[cfg(windows)]
+mod current_source_git;
 
 /// F-LOG-KERNEL-3 (#901): process-execution boundary observations.
 ///

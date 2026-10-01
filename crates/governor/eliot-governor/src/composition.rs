@@ -47,8 +47,10 @@ use crate::task_lifecycle::GovernorTaskLifecycle;
 use crate::{
     FinishAttemptError, Governor, GovernorConfig, GovernorFinishAttempt, GovernorState,
     QueueLimits, STARTUP_ORDER, ServiceId, ServiceObservation, SourceArtifactAdmission,
-    SourceArtifactAdmissionError, SourceArtifactAdmissionRequest, issue_source_artifact_admission,
+    SourceArtifactAdmissionError, SourceArtifactAdmissionRequest, ActiveReservationUsePort,
+    issue_source_artifact_admission, issue_source_artifact_admission_with_use_port,
 };
+use eliot_ors::OperationIdentity;
 use eliot_authority::{
     CrossRootQuarantineEvidence, GrantActivationRequest, GrantId, GrantRevocationRequest,
     GrantStatus, IntroductionActivationRequest, IntroductionId, IntroductionRevocationRequest,
@@ -171,6 +173,14 @@ pub use native_worker_binding::{
 
 #[path = "composition/source_artifact_read_admission.rs"]
 mod source_artifact_read_admission;
+#[path = "composition/selected_source_capture_read_admission.rs"]
+mod selected_source_capture_read_admission;
+pub use selected_source_capture_read_admission::PreparedSelectedSourceSnapshotMutation;
+#[path = "composition/instrument_registry_registration_admission.rs"]
+mod instrument_registry_registration_admission;
+#[path = "composition/current_source_git_process_admission.rs"]
+mod current_source_git_process_admission;
+pub use current_source_git_process_admission::CurrentSourceGitProcessAdmission;
 
 /// Canonical write result kept together with the negative-memory decision
 /// that admitted that exact request.
@@ -3783,6 +3793,10 @@ pub struct TaskSelectionAdmissionBinding {
     evidence_ref: String,
     /// Exact request/owner state fence.
     state_fence: StateFence,
+    /// Exact coherent Coordination owner rows that established the live
+    /// lease-to-work-item/session selection. This stays owner DATA, not a
+    /// transferable grant; later users must re-read and compare it.
+    active_work: ActiveWorkLeaseProjection,
 }
 
 impl TaskSelectionAdmissionBinding {
@@ -3790,6 +3804,13 @@ impl TaskSelectionAdmissionBinding {
     #[must_use]
     pub fn evidence(&self) -> &TaskSelectionEvidence {
         &self.evidence
+    }
+
+    /// Current coherent Coordination owner data for the selected Session,
+    /// WorkItem, and WorkLease.
+    #[must_use]
+    pub fn active_work(&self) -> &ActiveWorkLeaseProjection {
+        &self.active_work
     }
 
     /// Principal from the authenticated active session.
@@ -7718,6 +7739,107 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         issue_source_artifact_admission(&mut self.owners.authority, input)
     }
 
+    /// Admits the same source mutation through the original Governor owners,
+    /// while the Kernel ORS owner re-reads and validates its active reservation
+    /// through the supplied live capability immediately before effect issue.
+    /// The capability and returned ORS row/receipt stay on this same request
+    /// stack; no serialized active typestate is reconstructed.
+    pub async fn admit_source_artifact_effect_with_use_port(
+        &mut self,
+        input: SourceArtifactAdmissionRequest,
+        reservation_id: OperationIdentity,
+        claims: eliot_ors::AdmissionReservationClaims,
+        port: &dyn ActiveReservationUsePort,
+    ) -> Result<SourceArtifactAdmission, SourceArtifactAdmissionError> {
+        if input.operation.effect == eliot_receipts::EffectClass::Read {
+            return Err(SourceArtifactAdmissionError::Binding(
+                "source reads require the original context-request read admission",
+            ));
+        }
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(SourceArtifactAdmissionError::Owner(
+                "Governor composition is not ready".to_owned(),
+            ));
+        }
+        let state_fence = self.snapshot.state_fence();
+        let work_scope_owner = self.owners.work_scope.as_ref().ok_or_else(|| {
+            SourceArtifactAdmissionError::Owner("current WorkScope owner is unbound".to_owned())
+        })?;
+        let current_scope = work_scope_owner
+            .read_current(&state_fence)
+            .map_err(SourceArtifactAdmissionError::from)?;
+        ensure_snapshot_fresh(&current_scope, "source-effect WorkScope is not fresh")
+            .map_err(|error| SourceArtifactAdmissionError::OwnerComposition(Box::new(error)))?;
+        let current_binding = &current_scope.binding;
+        if input.work_scope.scope_id.as_str() != current_binding.scope.scope_ref
+            || input.work_scope.resource_generation.value() != current_binding.scope.generation
+            || input.work_scope.state_fence != state_fence
+            || input.work_scope.product_id != input.request_identity.request.metadata.product_id
+        {
+            return Err(SourceArtifactAdmissionError::Owner(
+                "source-effect WorkScope differs from the current retained binding/request product"
+                    .to_owned(),
+            ));
+        }
+        let task = self
+            .owners
+            .task
+            .task(&input.task.task_id)
+            .ok_or_else(|| SourceArtifactAdmissionError::Owner("task is absent".to_owned()))?;
+        if task.task_id != input.task.task_id
+            || task.revision != input.task.task_revision.value()
+            || state_fence
+                .task_revision
+                .is_some_and(|expected_revision| expected_revision.value() != task.revision)
+            || task.state_fence != state_fence
+            || input.task.state_fence != state_fence
+            || !task.state.is_active()
+        {
+            return Err(SourceArtifactAdmissionError::Owner(
+                "source-effect task binding is stale".to_owned(),
+            ));
+        }
+        let session = self
+            .owners
+            .session
+            .session(&input.session.session_id)
+            .ok_or_else(|| SourceArtifactAdmissionError::Owner("session is absent".to_owned()))?;
+        if session.status != eliot_session::SessionState::Active
+            || session.state_fence != state_fence
+            || session.authority_epoch != input.session.authority_epoch
+            || session.authority_epoch != state_fence.authority_epoch
+            || session.expires_at <= input.request_identity.deadline_unix_ms
+            || session
+                .task_scope
+                .as_deref()
+                .is_some_and(|task_scope| task_scope != input.task.task_id.to_string())
+        {
+            return Err(SourceArtifactAdmissionError::Owner(
+                "source-effect session is not the exact active current session".to_owned(),
+            ));
+        }
+        let authority_snapshot = self
+            .owners
+            .authority
+            .snapshot()
+            .map_err(|error| SourceArtifactAdmissionError::OwnerComposition(Box::new(error)))?;
+        if authority_snapshot.state_fence != state_fence {
+            return Err(SourceArtifactAdmissionError::Owner(
+                "source-effect AuthorityOwner is stale against the current Governor fence"
+                    .to_owned(),
+            ));
+        }
+        issue_source_artifact_admission_with_use_port(
+            &mut self.owners.authority,
+            input,
+            None,
+            reservation_id,
+            claims,
+            port,
+        )
+        .await
+    }
+
     /// Revalidates retained LSP envelopes with Blob-owner-authenticated read
     /// chunks and returns their bounded, historically stale evidence.
     pub fn consume_captured_lsp_observations(
@@ -11155,6 +11277,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             acceptance_digest,
             work_scope: pending.work_scope,
             state_fence: activation.state_fence,
+            active_work: selected,
         })
     }
 

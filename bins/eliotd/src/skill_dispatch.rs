@@ -1645,6 +1645,7 @@ mod tests {
             wire_version: HostRequestEnvelope::CONTRACT_VERSION,
             kind: HostRequestKind::Invocation,
             connection_id: "conn-test-1".to_owned(),
+            authenticated_source: None,
             identity: HostRequestIdentity {
                 request_id: eliot_contracts::RequestId::new("host-request-1").expect("request id"),
                 correlation_projection: None,
