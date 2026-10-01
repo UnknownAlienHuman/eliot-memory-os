@@ -593,9 +593,7 @@ mod cue_composition_tests {
     use eliot_contracts::RequestMetadata;
     use eliot_cue_contracts::Digest;
     use eliot_read::ReadIdentity;
-    use eliot_store_api::{
-        RevisionHead, RevisionKey, ScopeId, ScopeRevisionView,
-    };
+    use eliot_store_api::{RevisionHead, RevisionKey, ScopeId, ScopeRevisionView};
 
     type ProofResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
