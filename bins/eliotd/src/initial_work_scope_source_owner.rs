@@ -1,8 +1,8 @@
 //! Initial authenticated WorkScope source-owner transaction.
 //!
-//! This is the narrow task-free BindScope path: it issues an exact-root
-//! discovery lease before observation, asks the existing Host observer for
-//! the declared root, lets Governor capture and admit the approved source
+//! This is the narrow task-free BindScope path: it asks the existing Host
+//! observer for the declared root, issues an exact-root discovery lease before
+//! opening governing-source bytes, lets Governor capture and admit the approved source
 //! pair, and submits the ordinary canonical transition through the neutral
 //! Kernel write port. The caller must perform fresh named owner readback and
 //! install the returned owner only after both receipt and readback validation.
@@ -63,6 +63,17 @@ pub async fn apply_initial_work_scope_source_admission(
     let explicit_root_identity = explicit_root
         .to_str()
         .ok_or(InitialWorkScopeSourceOwnerError::NonUnicodeRoot)?;
+    // The Host observer reads only bounded workspace identity facts here; it
+    // does not open governing-source document bytes. It is tied to the
+    // caller's explicit root; cwd and nearby roots are never consulted.
+    let observed = task_binding_admission::observe_explicit_workspace(
+        explicit_root,
+        &identity.request.state_fence,
+    )
+    .map_err(|error| InitialWorkScopeSourceOwnerError::WorkspaceObservation(error.to_string()))?;
+
+    // The one-read lease is issued after workspace identity is known and
+    // before the Bootstrap parser opens any governing-source document bytes.
     let discovery_lease = issue_initial_work_scope_source_discovery_lease(
         identity,
         approval,
@@ -70,15 +81,6 @@ pub async fn apply_initial_work_scope_source_admission(
         lease_key,
         owner_clock(),
     )?;
-
-    // The lease exists before the host touches the workspace. This observation
-    // is tied to the caller's explicit root; cwd and nearby roots are never
-    // consulted.
-    let observed = task_binding_admission::observe_explicit_workspace(
-        explicit_root,
-        &identity.request.state_fence,
-    )
-    .map_err(|error| InitialWorkScopeSourceOwnerError::WorkspaceObservation(error.to_string()))?;
 
     let prepared = prepare_initial_work_scope_source_admission(
         identity,

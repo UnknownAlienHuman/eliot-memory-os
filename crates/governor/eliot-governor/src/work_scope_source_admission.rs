@@ -669,8 +669,8 @@ impl InitialWorkScopeAdmissionAuthority {
     }
 }
 
-/// Issues the exact-root, one-read discovery lease before the daemon observes
-/// the workspace or opens any governing-source bytes.
+/// Issues the exact-root, one-read discovery lease before the Bootstrap
+/// parser opens governing-source bytes.
 pub fn issue_initial_work_scope_source_discovery_lease(
     identity: &RequestIdentity,
     approval: &VerifiedGoverningSourceApproval,
@@ -972,8 +972,9 @@ pub enum WorkScopeSourceAdmissionError {
 /// guard itself. It never accepts caller-created source statuses, authority
 /// bases, guard receipts, or source capture. `approval` can only be
 /// constructed from the trust-anchor-verified first-run config snapshot. The
-/// caller must issue `lease` before observing the workspace or reading source
-/// bytes. This function then captures the exact observed root through the
+/// caller must issue `lease` before this function reads source bytes. The
+/// caller performs the bounded explicit-root workspace observation first;
+/// this function then captures the exact observed root through the
 /// Bootstrap parser under that lease, and joins those bytes against the signed
 /// approval before deriving the WorkScope source set. `lease_key` must come
 /// from the authenticated Kernel peer projection; this function binds its
