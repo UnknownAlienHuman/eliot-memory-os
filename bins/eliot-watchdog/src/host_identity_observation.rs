@@ -599,7 +599,12 @@ impl BoundedChallengeWait {
 /// coverage, a cancelled wait, or a non-live target stays an explicit
 /// uncertainty — never authenticated health and never automatic restart
 /// eligibility.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+///
+/// The wire form is the durable record of a named uncertainty in the Watchdog
+/// journal, so a stored row can say *what* was unknown instead of collapsing
+/// every insufficient signal into the timeout arm.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
 pub enum ChallengeUncertainty {
     /// The challenger could not authenticate to the owner path.
     Unauthenticated,
@@ -633,7 +638,12 @@ pub enum ChallengeAttemptOutcome {
 /// is reported as [`HostResponsiveness::AliveUnresponsive`], never as
 /// healthy. The positive case is established exclusively by the owner-path
 /// challenge/response correlation owned by the Host endpoint lane.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+///
+/// The wire form is the durable record of one challenge outcome in the Watchdog
+/// journal, so a stored row preserves which uncertainty was observed rather than
+/// only that the attempt did not resolve.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
 pub enum HostResponsiveness {
     /// The control owner answered the exact challenge within its bound.
     /// Established only by the owner-path correlation validator.
@@ -739,7 +749,12 @@ impl ApprovedRecoveryPolicy {
 /// permits requesting an SCM effect, and only through the fenced
 /// stop/start-separated operation record owned by the Host-state lane
 /// (`ScmOperationStore`); every other variant forbids effects.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+///
+/// The wire form is the durable record of the decision taken before an effect
+/// was requested, so a stored operation names the budget verdict it was opened
+/// under.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
 pub enum RecoveryBudgetDecision {
     /// No failure to recover: the owner answered.
     NoRecoveryRequired,
