@@ -83,7 +83,8 @@ use crate::{
     KernelAuthoritySnapshot, LegacyFenceBoundBackupVerificationClass,
     LegacyTwoValueRelationBackupVerificationClass, LegacyUnscopedBackupVerificationClass,
     MaintenanceTriggerStagingReceipt, MaintenanceTriggerStagingRequest, NativeWorkerClaimAdmission,
-    NativeWorkerClaimRecord, NativeWorkerClaimStageOutcome, NativeWorkerClaimState, OpaqueLabel,
+    NativeWorkerClaimReceiptPayloads, NativeWorkerClaimRecord, NativeWorkerClaimStageOutcome,
+    NativeWorkerClaimState, OpaqueLabel,
     OperationIdentity, OperationalCurrentRecoveryCursor, OperationalCurrentRecoveryEntry,
     OperationalCurrentRecoveryPage, OperationalMutationReceipt, OperationalPhase,
     OperationalRecordContext, OperationalRecordInput, OrsError, OrsSnapshotReceipt,
@@ -3436,6 +3437,63 @@ const ACTIVATION_LIFECYCLES: TableDefinition<&str, &str> =
     TableDefinition::new("ors_agent_activation_lifecycles_v1");
 const NATIVE_WORKER_CLAIMS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_native_worker_claims_v1");
+
+/// Owner-recorded provider receipt kind for one native-worker claim row
+/// (issue #1108, A5 recorder).
+///
+/// Names the six receipt slots on
+/// [`crate::NativeWorkerClaimReceiptPayloads`]: admission, cancellation,
+/// worker fence, reassignment, result, and unknown outcome. The
+/// executable-binding leg (`Binding` in the coordinator/Kernel proof
+/// vocabularies) is owned by the executable join, not by this column, so it
+/// has no variant here. Producers pass the kind alongside the receipt's
+/// ORIGINAL canonical bytes; the recorder validates those bytes and computes
+/// the retained digest itself, so a kind never aliases a caller echo.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeWorkerClaimReceiptKind {
+    Admission,
+    Cancellation,
+    WorkerFence,
+    Reassignment,
+    Result,
+    UnknownOutcome,
+}
+
+impl NativeWorkerClaimReceiptKind {
+    /// Returns the durable slot this kind records into.
+    fn slot(self, payloads: &NativeWorkerClaimReceiptPayloads) -> &Option<String> {
+        match self {
+            Self::Admission => &payloads.admission_payload_sha256,
+            Self::Cancellation => &payloads.cancellation_payload_sha256,
+            Self::WorkerFence => &payloads.worker_fence_payload_sha256,
+            Self::Reassignment => &payloads.reassignment_payload_sha256,
+            Self::Result => &payloads.result_payload_sha256,
+            Self::UnknownOutcome => &payloads.unknown_outcome_payload_sha256,
+        }
+    }
+
+    /// Returns the durable slot this kind records into for mutation.
+    fn slot_mut(self, payloads: &mut NativeWorkerClaimReceiptPayloads) -> &mut Option<String> {
+        match self {
+            Self::Admission => &mut payloads.admission_payload_sha256,
+            Self::Cancellation => &mut payloads.cancellation_payload_sha256,
+            Self::WorkerFence => &mut payloads.worker_fence_payload_sha256,
+            Self::Reassignment => &mut payloads.reassignment_payload_sha256,
+            Self::Result => &mut payloads.result_payload_sha256,
+            Self::UnknownOutcome => &mut payloads.unknown_outcome_payload_sha256,
+        }
+    }
+}
+
+/// Hard ceiling for one native-worker claim receipt's canonical bytes
+/// presented to the A5 recorder.
+///
+/// Receipts carry bounded references and identity only (every receipt schema
+/// is `deny_unknown_fields`); 64 KiB mirrors the scan-disclosure receipt
+/// ceiling for the same bounded-receipt class, so one oversized presentation
+/// fails closed before the claim write instead of stalling it. The row
+/// retains only the 64-hex digest, never these bytes.
+const MAX_NATIVE_WORKER_CLAIM_RECEIPT_PAYLOAD_BYTES: usize = 64 * 1024;
 const REPLAY_STREAMS: TableDefinition<&str, &str> = TableDefinition::new("ors_replay_streams_v1");
 const REPLAY_REQUESTS: TableDefinition<&str, &str> = TableDefinition::new("ors_replay_requests_v1");
 const REPLAY_EVENTS: TableDefinition<&str, &str> = TableDefinition::new("ors_replay_events_v1");
@@ -4464,6 +4522,23 @@ pub trait OperationalRecoveryStore: Send + Sync {
         claim_id: &crate::OperationIdentity,
         target: crate::NativeWorkerClaimState,
         admission: Option<&crate::NativeWorkerClaimAdmission>,
+    ) -> Result<Option<crate::NativeWorkerClaimRecord>, OrsError>;
+    /// Records the owner-computed canonical-payload digest for one provider
+    /// receipt kind on its claim row.
+    ///
+    /// The digest is computed here over the presented canonical bytes after
+    /// validating the ORIGINAL values; a caller-supplied digest is never
+    /// accepted. The first record wins per kind: an exact replay returns the
+    /// durable row unchanged, while a changed payload under one identity
+    /// fails with
+    /// [`OrsError::NativeWorkerClaimIdentityConflict`] and never overwrites.
+    /// An unknown claim returns `Ok(None)`; this method never invents a
+    /// record.
+    fn record_native_worker_claim_receipt_payload(
+        &self,
+        claim_id: &crate::OperationIdentity,
+        kind: NativeWorkerClaimReceiptKind,
+        canonical_payload: &str,
     ) -> Result<Option<crate::NativeWorkerClaimRecord>, OrsError>;
     /// Loads one claim by exact claim identity.
     fn load_native_worker_claim(
@@ -22654,31 +22729,42 @@ impl RedbRecoveryStore {
             });
         }
         let write = self.database.begin_write().map_err(storage)?;
-        let existing = {
+        let outcome = {
             let mut table = write.open_table(NATIVE_WORKER_CLAIMS).map_err(storage)?;
             let key = record.record_key();
             if let Some(existing) = table.get(key.as_str()).map_err(storage)? {
                 let existing: crate::NativeWorkerClaimRecord = decode(existing.value())?;
                 existing.validate()?;
-                if !existing.same_binding(record) {
+                // Owner-recorded per-kind payload evidence rides with the
+                // durable row, never with the staged intent: staging carries
+                // no payload evidence (the recorder owns the column), so the
+                // replay comparison holds durable evidence constant and a
+                // recorded row still replays exactly. Any other changed
+                // binding still conflicts. This path never writes.
+                let mut presented = record.clone();
+                presented.receipt_payloads = existing.receipt_payloads.clone();
+                if !existing.same_binding(&presented) {
                     return Err(OrsError::NativeWorkerClaimIdentityConflict {
                         claim_id: record.claim_id.as_str().to_owned(),
                     });
                 }
-                Some(existing)
+                crate::NativeWorkerClaimStageOutcome::Existing(existing)
             } else {
-                let payload = encode(record)?;
+                // A staged intent carries no payload evidence: the recorder
+                // binds digests only over validated canonical bytes, so
+                // presented slot values are never persisted here and no
+                // caller-echo digest can be planted at stage.
+                let mut fresh = record.clone();
+                fresh.receipt_payloads = Default::default();
+                let payload = encode(&fresh)?;
                 table
                     .insert(key.as_str(), payload.as_str())
                     .map_err(storage)?;
-                None
+                crate::NativeWorkerClaimStageOutcome::Stored(fresh)
             }
         };
         write.commit().map_err(storage)?;
-        Ok(match existing {
-            Some(durable) => crate::NativeWorkerClaimStageOutcome::Existing(durable),
-            None => crate::NativeWorkerClaimStageOutcome::Stored(record.clone()),
-        })
+        Ok(outcome)
     }
 
     /// Loads one native-worker claim by exact claim identity.
@@ -22873,6 +22959,91 @@ impl RedbRecoveryStore {
         if target.is_terminal() && next.commit_order == 0 {
             next.commit_order = Self::next_operational_order(&write)?;
         }
+        next.validate()?;
+        if next != existing {
+            let payload = encode(&next)?;
+            let mut table = write.open_table(NATIVE_WORKER_CLAIMS).map_err(storage)?;
+            table
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(Some(next))
+    }
+
+    /// Records the owner-computed canonical-payload digest for one provider
+    /// receipt kind on its claim row (issue #1108, A5 recorder).
+    ///
+    /// This is the advance-time recorder that activates the retained
+    /// per-kind enforcement: producers call it with the receipt's ORIGINAL
+    /// canonical bytes as each receipt is produced (admission, cancellation,
+    /// worker fence, reassignment, result, unknown outcome). The ORIGINAL
+    /// bytes are validated here — non-empty, within the bounded receipt
+    /// ceiling, well-formed JSON — and the retained digest is computed here
+    /// with the existing [`crate::model::sha256_hex`] over those exact
+    /// bytes; a caller-supplied digest is never accepted, so a caller echo
+    /// can never become owner evidence. The first record wins per kind: an
+    /// exact replay of recorded bytes returns the durable row unchanged,
+    /// while a changed payload under one identity fails with
+    /// [`OrsError::NativeWorkerClaimIdentityConflict`] and never overwrites
+    /// the durable binding. An unknown claim returns `Ok(None)`; this
+    /// method never invents a record, so rowlessness stays fail-closed at
+    /// the existing upstream gates. The coordinator's own per-kind replay
+    /// checks and the daemon's durable envelopes stay the backstop; this
+    /// column is the owner evidence they are checked against.
+    pub fn record_native_worker_claim_receipt_payload(
+        &self,
+        claim_id: &crate::OperationIdentity,
+        kind: NativeWorkerClaimReceiptKind,
+        canonical_payload: &str,
+    ) -> Result<Option<crate::NativeWorkerClaimRecord>, OrsError> {
+        if canonical_payload.is_empty() {
+            return Err(OrsError::InvalidField {
+                field: "native_worker_claim_receipt_payload",
+                reason: "receipt canonical bytes must be non-empty",
+            });
+        }
+        if canonical_payload.len() > MAX_NATIVE_WORKER_CLAIM_RECEIPT_PAYLOAD_BYTES {
+            return Err(OrsError::InvalidField {
+                field: "native_worker_claim_receipt_payload",
+                reason: "receipt canonical bytes exceed the bounded receipt ceiling",
+            });
+        }
+        serde_json::from_str::<Value>(canonical_payload).map_err(|_| OrsError::InvalidField {
+            field: "native_worker_claim_receipt_payload",
+            reason: "receipt canonical bytes must be JSON",
+        })?;
+        let digest = crate::model::sha256_hex(canonical_payload.as_bytes());
+        let write = self.database.begin_write().map_err(storage)?;
+        let key = claim_id.as_str().to_owned();
+        let existing: Option<crate::NativeWorkerClaimRecord> = {
+            let table = write.open_table(NATIVE_WORKER_CLAIMS).map_err(storage)?;
+            table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        };
+        let Some(existing) = existing else {
+            return Ok(None);
+        };
+        existing.validate()?;
+        if existing.claim_id != *claim_id {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "native_worker_claim",
+                reason: "claim record identity does not match its key".to_owned(),
+            });
+        }
+        if let Some(retained) = kind.slot(&existing.receipt_payloads) {
+            if retained == &digest {
+                return Ok(Some(existing));
+            }
+            return Err(OrsError::NativeWorkerClaimIdentityConflict {
+                claim_id: claim_id.as_str().to_owned(),
+            });
+        }
+        let mut next = existing.clone();
+        *kind.slot_mut(&mut next.receipt_payloads) = Some(digest);
         next.validate()?;
         if next != existing {
             let payload = encode(&next)?;
@@ -35499,6 +35670,20 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         RedbRecoveryStore::advance_native_worker_claim(self, claim_id, target, admission)
     }
 
+    fn record_native_worker_claim_receipt_payload(
+        &self,
+        claim_id: &crate::OperationIdentity,
+        kind: NativeWorkerClaimReceiptKind,
+        canonical_payload: &str,
+    ) -> Result<Option<crate::NativeWorkerClaimRecord>, OrsError> {
+        RedbRecoveryStore::record_native_worker_claim_receipt_payload(
+            self,
+            claim_id,
+            kind,
+            canonical_payload,
+        )
+    }
+
     fn load_native_worker_claim(
         &self,
         claim_id: &crate::OperationIdentity,
@@ -36180,6 +36365,18 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
     ) -> Result<Option<NativeWorkerClaimRecord>, OrsError> {
         self.store
             .advance_native_worker_claim(claim_id, target, admission)
+    }
+
+    /// Records the owner-computed canonical-payload digest for one provider
+    /// receipt kind on its claim row.
+    pub fn record_native_worker_claim_receipt_payload(
+        &self,
+        claim_id: &crate::OperationIdentity,
+        kind: NativeWorkerClaimReceiptKind,
+        canonical_payload: &str,
+    ) -> Result<Option<NativeWorkerClaimRecord>, OrsError> {
+        self.store
+            .record_native_worker_claim_receipt_payload(claim_id, kind, canonical_payload)
     }
 
     /// Loads one claim by exact claim identity.
