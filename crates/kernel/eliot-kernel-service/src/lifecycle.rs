@@ -11,8 +11,8 @@ use eliot_kernel_core::{
     KernelAuthorityKey, KernelError, NormalWorkClass, RouteScope,
 };
 use eliot_ors::{
-    NativeWorkerClaimAdmission, NativeWorkerClaimRecord, NativeWorkerClaimState, OpaqueLabel,
-    OperationIdentity, OperationalRecoveryStore, OrsError,
+    NativeWorkerClaimAdmission, NativeWorkerClaimReceiptKind, NativeWorkerClaimRecord,
+    NativeWorkerClaimState, OpaqueLabel, OperationIdentity, OperationalRecoveryStore, OrsError,
 };
 use eliot_protocol::{
     AgentActivationResolutionResult, AgentBridgeProcessBinding, HostRequestAdmissionReceipt,
@@ -1897,6 +1897,49 @@ impl KernelService {
         Self::stage_and_finish_native_worker_claim_admission(store, request, now_unix_ms)
     }
 
+    /// Records the ORIGINAL admission-receipt canonical bytes on the claim row.
+    ///
+    /// Owner-evidence wiring (issue #1108, A5 producer): every path below
+    /// that hands out an admission receipt first hands the receipt's exact
+    /// canonical bytes to the ORS advance-time recorder under
+    /// [`NativeWorkerClaimReceiptKind::Admission`]. The recorder validates
+    /// those bytes and computes the retained digest itself, so no caller
+    /// digest is ever accepted; the first record wins per kind, an exact
+    /// replay returns the durable row, changed bytes under one identity fail
+    /// closed, and an unknown row surfaces as a mechanical failure so
+    /// rowlessness never silently passes. Replay and lost-race paths record
+    /// the same deterministic bytes, which also backfills rows admitted
+    /// before the recorder existed.
+    fn record_admission_receipt_payload<S: OperationalRecoveryStore>(
+        store: &S,
+        claim_id: &OperationIdentity,
+        receipt: &NativeWorkerClaimReceipt,
+    ) -> Result<(), KernelServiceError> {
+        let bytes =
+            canonical_json_bytes(receipt).map_err(|_| KernelServiceError::InvalidField {
+                field: "native_worker_claim_receipt.canonical_payload",
+                reason: "cannot canonicalize admission receipt",
+            })?;
+        let canonical =
+            String::from_utf8(bytes).map_err(|_| KernelServiceError::InvalidField {
+                field: "native_worker_claim_receipt.canonical_payload",
+                reason: "admission receipt canonical bytes are not UTF-8",
+            })?;
+        store
+            .record_native_worker_claim_receipt_payload(
+                claim_id,
+                NativeWorkerClaimReceiptKind::Admission,
+                &canonical,
+            )
+            .map_err(|error| native_worker_claim_store_error(&error))?
+            .ok_or_else(|| {
+                KernelServiceError::Platform(
+                    "admitted claim disappeared before payload record".to_owned(),
+                )
+            })?;
+        Ok(())
+    }
+
     /// Stages one validated claim intent and binds its admission receipt.
     ///
     /// Persist-before-ack: the intent row is staged before any receipt is
@@ -1948,6 +1991,7 @@ impl KernelService {
                     "durable claim cannot reproduce its receipt identity".to_owned(),
                 )
             })?;
+            Self::record_admission_receipt_payload(store, &durable.claim_id, &receipt)?;
             return Ok(NativeWorkerClaimResponse::Admitted(Box::new(receipt)));
         }
         // A durable `Requested` row with our exact binding means either our
@@ -1994,6 +2038,7 @@ impl KernelService {
                     )
                 })?;
                 let receipt = native_worker_claim_receipt(request, admitted_at)?;
+                Self::record_admission_receipt_payload(store, &current.claim_id, &receipt)?;
                 return Ok(NativeWorkerClaimResponse::Admitted(Box::new(receipt)));
             }
             Err(error) => return Err(native_worker_claim_store_error(&error)),
@@ -2001,6 +2046,7 @@ impl KernelService {
         receipt.validate().map_err(|_| {
             KernelServiceError::Platform("issued admission receipt is not well-formed".to_owned())
         })?;
+        Self::record_admission_receipt_payload(store, &durable.claim_id, &receipt)?;
         Ok(NativeWorkerClaimResponse::Admitted(Box::new(receipt)))
     }
 
