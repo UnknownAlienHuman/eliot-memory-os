@@ -189,6 +189,8 @@ pub enum ParameterShape {
     /// record contract owns its task/revision binding and its obligation list,
     /// and the neutral acceptance-set validator proves the digest against it.
     TaskContractAcceptanceRecord,
+    /// One typed source-capture ProposedAttempt owner record.
+    ProposedAttemptRecord,
 }
 
 impl ParameterShape {
@@ -210,6 +212,7 @@ impl ParameterShape {
             Self::InstrumentRegistrySnapshot => "eliot.instrument.registry-snapshot@1.0.0",
             Self::ProblemOwnerState => crate::PROBLEM_OWNER_STATE_SCHEMA_V1,
             Self::TaskContractAcceptanceRecord => crate::TASK_CONTRACT_ACCEPTANCE_RECORD_SCHEMA_V1,
+            Self::ProposedAttemptRecord => crate::PROPOSED_ATTEMPT_RECORD_SCHEMA_V1,
         }
     }
 }
@@ -1245,6 +1248,12 @@ static RECORD_TASK_CONTRACT_ACCEPTANCE_SET_PARAMETERS: [ParameterDeclaration; 1]
         shape: ParameterShape::TaskContractAcceptanceRecord,
         required: true,
     }];
+static ADMIT_PROPOSED_ATTEMPT_PARAMETERS: [ParameterDeclaration; 1] =
+    [ParameterDeclaration {
+        name: "record",
+        shape: ParameterShape::ProposedAttemptRecord,
+        required: true,
+    }];
 /// Exact owner-acceptance selectors for `GetTaskContractAcceptanceSet`
 /// (issue #1741, I7.9).
 ///
@@ -1393,6 +1402,7 @@ pub const fn named_mutation_operation_name(operation: NamedMutationOperation) ->
         NamedMutationOperation::RecordTaskContractAcceptanceSet => {
             "RecordTaskContractAcceptanceSet"
         }
+        NamedMutationOperation::AdmitProposedAttempt => "AdmitProposedAttempt",
     }
 }
 
@@ -1430,6 +1440,7 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
         b"RecordTaskContractAcceptanceSet" => {
             Some(NamedMutationOperation::RecordTaskContractAcceptanceSet)
         }
+        b"AdmitProposedAttempt" => Some(NamedMutationOperation::AdmitProposedAttempt),
         _ => None,
     }
 }
@@ -1613,6 +1624,7 @@ pub const fn declared_mutation_parameters(
         NamedMutationOperation::RecordTaskContractAcceptanceSet => {
             &RECORD_TASK_CONTRACT_ACCEPTANCE_SET_PARAMETERS
         }
+        NamedMutationOperation::AdmitProposedAttempt => &ADMIT_PROPOSED_ATTEMPT_PARAMETERS,
     }
 }
 
@@ -1701,7 +1713,8 @@ pub fn verify_declaration_holds_no_payload_encoding(
         | ParameterShape::BlackboardItemRevision
         | ParameterShape::InstrumentRegistrySnapshot
         | ParameterShape::ProblemOwnerState
-        | ParameterShape::TaskContractAcceptanceRecord => true,
+        | ParameterShape::TaskContractAcceptanceRecord
+        | ParameterShape::ProposedAttemptRecord => true,
     };
     if structured && CONTROL_FIELD_DENYLIST.contains(&declaration.name) {
         return Err(StoreError::InvalidField {
@@ -1889,6 +1902,11 @@ fn check_declared_shape(
             // is the complete check. There is no sibling parameter to compare
             // it against, and inventing one would be a second scheme.
             let record: crate::TaskContractAcceptanceRecord = serde_json::from_value(value.clone())
+                .map_err(|error| StoreError::Serialization(error.to_string()))?;
+            record.validate()
+        }
+        ParameterShape::ProposedAttemptRecord => {
+            let record: crate::ProposedAttemptRecord = serde_json::from_value(value.clone())
                 .map_err(|error| StoreError::Serialization(error.to_string()))?;
             record.validate()
         }

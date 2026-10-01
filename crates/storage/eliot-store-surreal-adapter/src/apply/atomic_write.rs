@@ -143,6 +143,7 @@ const SEMANTIC_CONFLICT_MARKERS: &[&str] = &[
     "swarm_owner_revision_conflict",
     "blackboard_item_revision_conflict",
     "task_contract_acceptance_revision_conflict",
+    "proposed_attempt_identity_conflict",
     "notification_revision_conflict",
     "reactive_session_conflict",
     "reactive_snapshot_conflict",
@@ -952,6 +953,7 @@ fn build_apply_statements(
     append_swarm_owner_revision_statements(&mut sql, &mut bindings, transition)?;
     append_blackboard_item_statements(&mut sql, &mut bindings, transition)?;
     append_task_contract_acceptance_statements(&mut sql, &mut bindings, transition)?;
+    append_proposed_attempt_statements(&mut sql, &mut bindings, transition)?;
     // #1868 learning-record writes commit atomically beside the experience
     // rows under the same create-or-converge contract.
     append_learning_statements(&mut sql, &mut bindings, learning)?;
@@ -1577,6 +1579,24 @@ fn append_task_contract_acceptance_statements(
         if bindings.insert(name.clone(), value).is_some() {
             return Err(AdapterError::Serialization(
                 "task contract acceptance binding collided with a canonical binding".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn append_proposed_attempt_statements(
+    sql: &mut String,
+    bindings: &mut Map<String, Value>,
+    transition: &eliot_store_api::PreparedTransition,
+) -> Result<(), AdapterError> {
+    let (fragment, fragment_bindings) =
+        super::surreal_proposed_attempt::proposed_attempt_statements(transition)?;
+    sql.push_str(&fragment);
+    for (name, value) in fragment_bindings {
+        if bindings.insert(name.clone(), value).is_some() {
+            return Err(AdapterError::Serialization(
+                "proposed attempt binding collided with a canonical binding".to_owned(),
             ));
         }
     }
