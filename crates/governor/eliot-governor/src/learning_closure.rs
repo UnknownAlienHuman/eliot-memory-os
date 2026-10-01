@@ -74,8 +74,8 @@ use eliot_instrument_api::{ExecutionStatus, VerificationOutcome};
 use eliot_learning_contracts::{AgentAttemptId, CampaignId, OverlayId};
 use eliot_learning_delta::{
     AdmissionReceipt, AttemptCloseDisposition, ConsequentialBoundary, DeliveryRefusal,
-    LearningDeltaError, LifecycleActivity, RetryEquivalence, RetryEquivalenceBasis, RetryReason,
-    StoredLearningDelta, StoredRetryRelation, derive_boundaries,
+    LearningDeltaError, LifecycleActivity, RetryReason, StoredLearningDelta, StoredRetryRelation,
+    derive_boundaries,
 };
 use eliot_store_api::{
     OrderingHeadExpectation, OrderingScopeId, RevisionHeadExpectation, RevisionKey, StoreError,
@@ -504,7 +504,7 @@ impl LearningClosureService {
         } else {
             retry_relation_from_prior(
                 prior.as_ref(),
-                &identity.strategy_fingerprint,
+                &identity,
                 declared_retry_reason,
             )
         };
@@ -689,33 +689,18 @@ fn observed_evidence_refs(
 #[must_use]
 pub fn retry_relation_from_prior(
     prior: Option<&StoredLearningDelta>,
-    current_fingerprint: &str,
+    current: &StoredDeltaIdentity,
     declared_reason: Option<RetryReason>,
 ) -> Option<StoredRetryRelation> {
     let prior = prior?;
-    let basis = if prior.strategy_fingerprint == current_fingerprint {
-        RetryEquivalenceBasis::PriorFingerprintMatches
-    } else {
-        RetryEquivalenceBasis::PriorFingerprintDiffers
-    };
-    let (equivalence, unchanged_retry_reason) = match basis {
-        RetryEquivalenceBasis::PriorFingerprintDiffers => (RetryEquivalence::Distinct, None),
-        _ => match declared_reason {
-            Some(reason) => (RetryEquivalence::Equivalent, Some(reason)),
-            None => (RetryEquivalence::Unknown, None),
-        },
-    };
-    Some(StoredRetryRelation {
-        prior_attempt_id: prior.attempt_id.clone(),
-        prior_delta_artifact: prior.delta_artifact.clone(),
-        prior_delta_digest: prior.delta_digest.clone(),
-        prior_fingerprint: prior.strategy_fingerprint.clone(),
-        prior_observable_refs: prior.evidence_refs.clone(),
-        prior_evidence: prior.retry_canonical_evidence(),
-        basis,
-        equivalence,
-        unchanged_retry_reason,
-    })
+    prior.retry_relation_to(
+        &current.campaign_id,
+        &current.attempt_id,
+        &current.state_fence,
+        &current.strategy_fingerprint,
+        &current.evidence_refs,
+        declared_reason,
+    )
 }
 
 /// Delivery verdict for the prior attempt's proposal to the current attempt.

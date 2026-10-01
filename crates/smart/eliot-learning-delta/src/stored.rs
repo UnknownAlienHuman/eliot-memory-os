@@ -298,6 +298,62 @@ impl StoredLearningDelta {
         Ok(())
     }
 
+    /// Build retry lineage only when this exact committed record is eligible
+    /// for the current owner-derived attempt identity.
+    ///
+    /// The Governor calls this on the record it just read back from its
+    /// canonical campaign image. Campaign, attempt, fence, and current evidence
+    /// are checked before copying the prior artifact identity and digest into
+    /// the relation. A foreign campaign, repeated attempt identity, stale
+    /// fence, malformed prior record, or missing current/prior evidence returns
+    /// no relation; callers must preserve that absence rather than infer a
+    /// positive retry verdict.
+    #[must_use]
+    pub fn retry_relation_to(
+        &self,
+        campaign_id: &CampaignId,
+        attempt_id: &AgentAttemptId,
+        state_fence: &StateFence,
+        current_fingerprint: &str,
+        current_evidence: &[ArtifactId],
+        declared_reason: Option<RetryReason>,
+    ) -> Option<StoredRetryRelation> {
+        self.validate().ok()?;
+        if self.campaign_id != *campaign_id
+            || self.attempt_id == *attempt_id
+            || self.state_fence != *state_fence
+            || !is_lower_hex64(current_fingerprint)
+            || require_non_empty_unique(current_evidence, "retry.current_evidence").is_err()
+        {
+            return None;
+        }
+
+        let basis = if self.strategy_fingerprint == current_fingerprint {
+            RetryEquivalenceBasis::PriorFingerprintMatches
+        } else {
+            RetryEquivalenceBasis::PriorFingerprintDiffers
+        };
+        let (equivalence, unchanged_retry_reason) = match basis {
+            RetryEquivalenceBasis::PriorFingerprintDiffers => (RetryEquivalence::Distinct, None),
+            RetryEquivalenceBasis::PriorFingerprintMatches => match declared_reason {
+                Some(reason) => (RetryEquivalence::Equivalent, Some(reason)),
+                None => (RetryEquivalence::Unknown, None),
+            },
+            RetryEquivalenceBasis::PriorFingerprintUnavailable => (RetryEquivalence::Unknown, None),
+        };
+        Some(StoredRetryRelation {
+            prior_attempt_id: self.attempt_id.clone(),
+            prior_delta_artifact: self.delta_artifact.clone(),
+            prior_delta_digest: self.delta_digest.clone(),
+            prior_fingerprint: self.strategy_fingerprint.clone(),
+            prior_observable_refs: self.evidence_refs.clone(),
+            prior_evidence: self.retry_canonical_evidence(),
+            basis,
+            equivalence,
+            unchanged_retry_reason,
+        })
+    }
+
     /// The exact durable edge a retry's canonical evidence must reference.
     ///
     /// This is the prior attempt's lineage anchor: the artifact identity and
