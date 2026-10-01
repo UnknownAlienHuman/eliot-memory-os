@@ -28,7 +28,7 @@ use thiserror::Error;
 /// Stable contract name for the Kernel-owned UserAutomation domain.
 pub const USER_AUTOMATION_CONTRACT_NAME: &str = "eliot.kernel.user-automation";
 /// Current semantic contract revision.
-pub const USER_AUTOMATION_CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 2, 0);
+pub const USER_AUTOMATION_CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 3, 0);
 /// Selector used by authenticated Kernel/Host preflight reads.
 pub const USER_AUTOMATION_PREFLIGHT_SELECTOR: &str = "eliot.config.user_automation.v1";
 /// Operation marker used by the preflight read route.
@@ -41,18 +41,21 @@ pub const USER_AUTOMATION_SCOPE: &str = "user-automation";
 pub const USER_AUTOMATION_PREFLIGHT_CONTRACT_REVISION: &str = "eliot.user-automation.preflight.v1";
 /// Canonical operation kind for schedule normalization receipts.
 pub const USER_AUTOMATION_NORMALIZATION_OPERATION_KIND: &str = "user-automation.schedule.normalize";
+/// Canonical operation kind for explicit legacy schedule re-normalization.
+pub const USER_AUTOMATION_LEGACY_MIGRATION_OPERATION_KIND: &str =
+    "user-automation.schedule.migrate-legacy";
 /// Stable service authority that owns schedule normalization.
 pub const USER_AUTOMATION_NORMALIZATION_AUTHORITY_ID: &str =
     "eliot-user-automation:schedule-normalizer";
 /// Stable service principal that issues schedule normalization receipts.
 pub const USER_AUTOMATION_NORMALIZATION_AUTHORITY_OWNER: &str =
     "eliot-user-automation:schedule-normalizer";
-/// Verifier contract used for Gregorian UTC schedule compilation.
+/// Verifier contract used for pinned Gregorian schedule compilation.
 pub const USER_AUTOMATION_NORMALIZATION_VERIFIER_ID: &str =
-    "eliot.user-automation.schedule-compiler.gregorian-utc.v1";
+    "eliot.user-automation.schedule-compiler.pinned-gregorian.v2";
 /// Revision of the schedule compiler verifier contract.
 pub const USER_AUTOMATION_NORMALIZATION_VERIFIER_REVISION: ContractVersion =
-    ContractVersion::new(1, 0, 0);
+    ContractVersion::new(2, 0, 0);
 /// Canonical encoding of one owner-normalized calendar occurrence.
 ///
 /// One occurrence key is the `|`-separated, fixed-arity record
@@ -78,7 +81,7 @@ pub const USER_AUTOMATION_NORMALIZATION_VERIFIER_REVISION: ContractVersion =
 pub const NORMALIZED_OCCURRENCE_ENCODING: &str = "ELIOT/I11.12/OCCURRENCE/V4";
 const LEGACY_NORMALIZED_OCCURRENCE_ENCODING_V3: &str = "ELIOT/I11.12/OCCURRENCE/V3";
 const LEGACY_NORMALIZED_OCCURRENCE_ENCODING_V2: &str = "ELIOT/I11.12/OCCURRENCE/V2";
-const SCHEDULED_OCCURRENCE_IDENTITY_DOMAIN: &str = "ELIOT/I11.12/USER-AUTOMATION-OCCURRENCE/V3";
+const SCHEDULED_OCCURRENCE_IDENTITY_DOMAIN: &str = "ELIOT/I11.12/USER-AUTOMATION-OCCURRENCE/V4";
 const MANUAL_OCCURRENCE_IDENTITY_DOMAIN: &str = "ELIOT/I11.12/USER-AUTOMATION-OCCURRENCE/V1";
 const SCHEDULE_SOURCE_DIGEST_DOMAIN: &str = "ELIOT/I11.12/USER-AUTOMATION-SCHEDULE-SOURCE/V3";
 /// Domain separator for the canonical schedule normalization result digest.
@@ -279,6 +282,7 @@ pub struct NormalizedSchedule {
     pub end_at: Option<String>,
     /// Bounded, chronologically ordered owner-normalized occurrences in the
     /// [`NORMALIZED_OCCURRENCE_ENCODING`] encoding.
+    #[serde(default)]
     pub next_occurrences: Vec<String>,
     /// Store-issued receipt projection linking `next_occurrences` to a compiled
     /// result for this schedule's declared trigger contract. Create/Edit wire
@@ -431,6 +435,39 @@ impl NormalizedSchedule {
         Ok(sha256_hex(&bytes))
     }
 
+    /// Validates the owner input before the compiler has produced occurrences.
+    ///
+    /// A normalization request carries the effect-relevant schedule source but
+    /// no occurrence projection or receipt. Those are outputs of the admitted
+    /// owner operation and are rejected here when supplied by the caller.
+    pub fn validate_for_owner_normalization(&self) -> Result<(), UserAutomationError> {
+        text(&self.expression, "schedule.expression")?;
+        text(&self.calendar, "schedule.calendar")?;
+        text(&self.timezone, "schedule.timezone")?;
+        text(&self.start_at, "schedule.start_at")?;
+        if let Some(end_at) = &self.end_at {
+            text(end_at, "schedule.end_at")?;
+        }
+        if !self.next_occurrences.is_empty()
+            || !self.normalization_receipt.is_unissued_draft_projection()
+        {
+            return Err(UserAutomationError::Invalid(
+                "schedule.normalization.input_contains_owner_output",
+            ));
+        }
+        self.validate_timezone()?;
+        let start = parse_civil_instant(&self.start_at, "schedule.start_at")?;
+        let end = self
+            .end_at
+            .as_deref()
+            .map(|value| parse_civil_instant(value, "schedule.end_at"))
+            .transpose()?;
+        if end.is_some_and(|end| end < start) {
+            return Err(UserAutomationError::Invalid("schedule.end_at"));
+        }
+        Ok(())
+    }
+
     /// Returns the canonical digest over this schedule's ordered occurrence set.
     ///
     /// The digest binds the schedule's source digest, pinned zone-table format,
@@ -478,18 +515,27 @@ impl NormalizedSchedule {
         core: eliot_receipts::ReceiptCore,
         revision: &UserAutomationRevision,
     ) -> Result<Box<ScheduleNormalizationReceipt>, UserAutomationError> {
-        let occurrences_digest = self.compiled_occurrences_digest()?;
-        let normalizer_authority = core.authority.authority_owner.clone();
         let envelope = ReceiptEnvelope::issue(core)
             .map_err(|error| UserAutomationError::Receipt(error.to_string()))?;
+        self.project_normalization_receipt_envelope(&envelope, revision)
+    }
+
+    /// Projects the declared schedule receipt from the exact immutable owner
+    /// envelope that will be returned and retained by the existing Store path.
+    pub fn project_normalization_receipt_envelope(
+        &self,
+        envelope: &ReceiptEnvelope,
+        revision: &UserAutomationRevision,
+    ) -> Result<Box<ScheduleNormalizationReceipt>, UserAutomationError> {
+        let occurrences_digest = self.compiled_occurrences_digest()?;
         let declared = Box::new(ScheduleNormalizationReceipt {
             receipt_id: envelope.identity.receipt_id.as_str().to_owned(),
-            normalizer_authority,
+            normalizer_authority: envelope.core.authority.authority_owner.clone(),
             source_digest: self.source_digest()?,
             zone_database_revision: user_automation_zones::PINNED_ZONE_DATABASE_RELEASE.to_owned(),
             occurrences_digest,
         });
-        self.validate_normalization_receipt_envelope(&declared, &envelope, revision)?;
+        self.validate_normalization_receipt_envelope(&declared, envelope, revision)?;
         Ok(declared)
     }
 
@@ -502,7 +548,8 @@ impl NormalizedSchedule {
     /// The artifact and `WorkScope` must name the exact immutable revision. The
     /// normalization fence remains historical and is checked only for internal
     /// consistency, never against a later wake.
-    fn validate_normalization_receipt_envelope(
+    /// Validates exact owner receipt bytes against this schedule and revision.
+    pub fn validate_normalization_receipt_envelope(
         &self,
         declared: &ScheduleNormalizationReceipt,
         envelope: &ReceiptEnvelope,
@@ -531,7 +578,11 @@ impl NormalizedSchedule {
             || core.authority.authority_id.as_str() != USER_AUTOMATION_NORMALIZATION_AUTHORITY_ID
             || core.authority.authority_owner != USER_AUTOMATION_NORMALIZATION_AUTHORITY_OWNER
             || core.kind != eliot_receipts::ReceiptKind::Verification
-            || core.operation.operation_kind != USER_AUTOMATION_NORMALIZATION_OPERATION_KIND
+            || !matches!(
+                core.operation.operation_kind.as_str(),
+                USER_AUTOMATION_NORMALIZATION_OPERATION_KIND
+                    | USER_AUTOMATION_LEGACY_MIGRATION_OPERATION_KIND
+            )
             || core.operation.request_id != core.request.metadata.request_id
             || core.operation.effect != eliot_receipts::EffectClass::Read
             || core.request.metadata.product_id != core.work_scope.product_id
@@ -673,6 +724,230 @@ impl NormalizedSchedule {
         &self,
     ) -> Result<Vec<NormalizedOccurrence>, UserAutomationError> {
         self.decode_normalized_occurrences(false)
+    }
+
+    /// Replaces the empty owner-input projection with pinned-zone occurrences
+    /// for exact UTC instants independently compiled by the service owner.
+    ///
+    /// The service owns expression parsing and recurrence expansion. This core
+    /// method owns only the pinned zone lookup and canonical V4 evidence format,
+    /// and it validates the encoded result against the same table before
+    /// returning it. A UTC instant that lands in a repeated local clock is
+    /// admitted only when the declared fold policy names that exact side.
+    pub fn apply_compiled_utc_instants(
+        &mut self,
+        instant_seconds: &[i64],
+    ) -> Result<(), UserAutomationError> {
+        self.validate_for_owner_normalization()?;
+        if instant_seconds.is_empty() || instant_seconds.len() > MAX_REFERENCES {
+            return Err(UserAutomationError::Invalid(
+                "schedule.next_occurrences.count",
+            ));
+        }
+
+        let source_digest = self.source_digest()?;
+        let mut encoded = Vec::with_capacity(instant_seconds.len());
+        for instant in instant_seconds {
+            let offset_minutes = user_automation_zones::offset_minutes_at(&self.timezone, *instant)
+                .map_err(|error| map_zone_error(error, "schedule.occurrence_key.zone"))?;
+            let resolved_local_seconds = instant
+                .checked_add(i64::from(offset_minutes) * SECONDS_PER_MINUTE)
+                .ok_or(UserAutomationError::Invalid(
+                    "schedule.occurrence_key.instant",
+                ))?;
+            let local = civil_from_unix_seconds(resolved_local_seconds)?;
+            let local_text = format_civil_wall_clock(local);
+            let reality =
+                user_automation_zones::classify_local_clock(&self.timezone, resolved_local_seconds)
+                    .map_err(|error| map_zone_error(error, "schedule.occurrence_key.zone"))?;
+
+            let (transition, disposition) = match reality {
+                user_automation_zones::LocalClockReality::Unique {
+                    instant_seconds: unique,
+                    offset_minutes: unique_offset,
+                } if unique == *instant && unique_offset == offset_minutes => {
+                    ("-".to_owned(), "UNIQUE")
+                }
+                user_automation_zones::LocalClockReality::Fold {
+                    first_instant_seconds,
+                    transition,
+                    ..
+                } if first_instant_seconds == *instant && self.dst_fold == DstFoldPolicy::First => {
+                    (
+                        format_transition_offsets(
+                            transition.pre_offset_minutes,
+                            transition.post_offset_minutes,
+                        ),
+                        "FOLD_FIRST",
+                    )
+                }
+                user_automation_zones::LocalClockReality::Fold {
+                    second_instant_seconds,
+                    transition,
+                    ..
+                } if second_instant_seconds == *instant
+                    && self.dst_fold == DstFoldPolicy::Second =>
+                {
+                    (
+                        format_transition_offsets(
+                            transition.pre_offset_minutes,
+                            transition.post_offset_minutes,
+                        ),
+                        "FOLD_SECOND",
+                    )
+                }
+                user_automation_zones::LocalClockReality::Fold { .. } => {
+                    return Err(UserAutomationError::Invalid(
+                        "schedule.expression.fold_policy_mismatch",
+                    ));
+                }
+                user_automation_zones::LocalClockReality::Gap { .. } => {
+                    return Err(UserAutomationError::ZoneEvidence(
+                        "schedule.expression.utc_instant_resolved_to_gap",
+                    ));
+                }
+                user_automation_zones::LocalClockReality::Unique { .. } => {
+                    return Err(UserAutomationError::ZoneEvidence(
+                        "schedule.expression.utc_instant_zone_mismatch",
+                    ));
+                }
+            };
+
+            encoded.push(format!(
+                "{NORMALIZED_OCCURRENCE_ENCODING}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                self.timezone,
+                PINNED_ZONE_DATABASE_REVISION,
+                local_text,
+                local_text,
+                format_utc_offset(offset_minutes),
+                format_args!(
+                    "{}Z",
+                    format_civil_wall_clock(civil_from_unix_seconds(*instant)?)
+                ),
+                transition,
+                disposition,
+                source_digest,
+            ));
+        }
+
+        self.next_occurrences = encoded;
+        self.validated_occurrences_without_receipt()?;
+        Ok(())
+    }
+
+    /// Resolves owner-compiled local civil occurrences through the pinned zone
+    /// table and encodes their exact V4 fold/gap evidence.
+    ///
+    /// The service owns expression parsing and recurrence expansion. This core
+    /// method owns pinned timezone lookup and policy application, so no
+    /// ambient timezone database or caller-authored transition evidence enters
+    /// the normalized result.
+    pub fn apply_compiled_local_clock_seconds(
+        &mut self,
+        local_clock_seconds: &[i64],
+    ) -> Result<(), UserAutomationError> {
+        self.validate_for_owner_normalization()?;
+        if local_clock_seconds.is_empty() || local_clock_seconds.len() > MAX_REFERENCES {
+            return Err(UserAutomationError::Invalid(
+                "schedule.next_occurrences.count",
+            ));
+        }
+
+        let source_digest = self.source_digest()?;
+        let mut encoded = Vec::with_capacity(local_clock_seconds.len());
+        for local_seconds in local_clock_seconds {
+            let requested_local = civil_from_unix_seconds(*local_seconds)?;
+            let reality =
+                user_automation_zones::classify_local_clock(&self.timezone, *local_seconds)
+                    .map_err(|error| map_zone_error(error, "schedule.occurrence_key.zone"))?;
+            let (instant_seconds, offset_minutes, resolved_local_seconds, transition, disposition) =
+                match reality {
+                    user_automation_zones::LocalClockReality::Unique {
+                        instant_seconds,
+                        offset_minutes,
+                    } => (
+                        instant_seconds,
+                        offset_minutes,
+                        *local_seconds,
+                        "-".to_owned(),
+                        "UNIQUE",
+                    ),
+                    user_automation_zones::LocalClockReality::Fold {
+                        first_instant_seconds,
+                        first_offset_minutes,
+                        transition,
+                        ..
+                    } if self.dst_fold == DstFoldPolicy::First => (
+                        first_instant_seconds,
+                        first_offset_minutes,
+                        *local_seconds,
+                        format_transition_offsets(
+                            transition.pre_offset_minutes,
+                            transition.post_offset_minutes,
+                        ),
+                        "FOLD_FIRST",
+                    ),
+                    user_automation_zones::LocalClockReality::Fold {
+                        second_instant_seconds,
+                        second_offset_minutes,
+                        transition,
+                        ..
+                    } if self.dst_fold == DstFoldPolicy::Second => (
+                        second_instant_seconds,
+                        second_offset_minutes,
+                        *local_seconds,
+                        format_transition_offsets(
+                            transition.pre_offset_minutes,
+                            transition.post_offset_minutes,
+                        ),
+                        "FOLD_SECOND",
+                    ),
+                    user_automation_zones::LocalClockReality::Fold { .. } => {
+                        return Err(UserAutomationError::Invalid(
+                            "schedule.expression.fold_policy_rejected",
+                        ));
+                    }
+                    user_automation_zones::LocalClockReality::Gap {
+                        transition,
+                        shifted_local_unix_seconds,
+                        resolved_instant_seconds,
+                        post_offset_minutes,
+                        ..
+                    } if self.dst_gap == DstGapPolicy::ShiftForward => (
+                        resolved_instant_seconds,
+                        post_offset_minutes,
+                        shifted_local_unix_seconds,
+                        format_transition_offsets(
+                            transition.pre_offset_minutes,
+                            transition.post_offset_minutes,
+                        ),
+                        "GAP_SHIFT_FORWARD",
+                    ),
+                    user_automation_zones::LocalClockReality::Gap { .. } => {
+                        return Err(UserAutomationError::Invalid(
+                            "schedule.expression.gap_policy_rejected",
+                        ));
+                    }
+                };
+            let resolved_local = civil_from_unix_seconds(resolved_local_seconds)?;
+            let instant = civil_from_unix_seconds(instant_seconds)?;
+            encoded.push(format!(
+                "{NORMALIZED_OCCURRENCE_ENCODING}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                self.timezone,
+                PINNED_ZONE_DATABASE_REVISION,
+                format_civil_wall_clock(requested_local),
+                format_civil_wall_clock(resolved_local),
+                format_utc_offset(offset_minutes),
+                format_args!("{}Z", format_civil_wall_clock(instant)),
+                transition,
+                disposition,
+                source_digest,
+            ));
+        }
+
+        self.next_occurrences = encoded;
+        self.validated_occurrences_without_receipt()?;
+        Ok(())
     }
 
     fn decode_normalized_occurrences(
@@ -1050,6 +1325,79 @@ fn days_from_civil(year: u32, month: u32, day: u32) -> i64 {
     let day_of_year = (153 * month_position + 2) / 5 + i64::from(day) - 1;
     let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
     era * DAYS_PER_CIVIL_ERA + day_of_era - CIVIL_EPOCH_DAY_OFFSET
+}
+
+/// Converts exact Unix seconds into the contract's proleptic Gregorian fields.
+///
+/// Euclidean division keeps the conversion correct for local clocks a few
+/// hours before the Unix epoch, which can occur at the inclusive zone-table
+/// start in a negative-offset zone.
+fn civil_from_unix_seconds(seconds: i64) -> Result<CivilDateTime, UserAutomationError> {
+    let days = seconds.div_euclid(SECONDS_PER_DAY);
+    let second_of_day = seconds.rem_euclid(SECONDS_PER_DAY);
+    let shifted_days =
+        days.checked_add(CIVIL_EPOCH_DAY_OFFSET)
+            .ok_or(UserAutomationError::Invalid(
+                "schedule.occurrence_key.instant",
+            ))?;
+    let era = shifted_days.div_euclid(DAYS_PER_CIVIL_ERA);
+    let day_of_era = shifted_days - era * DAYS_PER_CIVIL_ERA;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_position = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_position + 2) / 5 + 1;
+    let month = month_position + if month_position < 10 { 3 } else { -9 };
+    if month <= 2 {
+        year += 1;
+    }
+    let year = u32::try_from(year)
+        .map_err(|_| UserAutomationError::Invalid("schedule.occurrence_key.instant"))?;
+    let month = u32::try_from(month)
+        .map_err(|_| UserAutomationError::Invalid("schedule.occurrence_key.instant"))?;
+    let day = u32::try_from(day)
+        .map_err(|_| UserAutomationError::Invalid("schedule.occurrence_key.instant"))?;
+    if !(MIN_CIVIL_YEAR..=MAX_CIVIL_YEAR).contains(&year) {
+        return Err(UserAutomationError::Invalid(
+            "schedule.occurrence_key.instant",
+        ));
+    }
+    Ok(CivilDateTime {
+        year,
+        month,
+        day,
+        hour: u32::try_from(second_of_day / SECONDS_PER_HOUR)
+            .map_err(|_| UserAutomationError::Invalid("schedule.occurrence_key.instant"))?,
+        minute: u32::try_from((second_of_day % SECONDS_PER_HOUR) / SECONDS_PER_MINUTE)
+            .map_err(|_| UserAutomationError::Invalid("schedule.occurrence_key.instant"))?,
+        second: u32::try_from(second_of_day % SECONDS_PER_MINUTE)
+            .map_err(|_| UserAutomationError::Invalid("schedule.occurrence_key.instant"))?,
+    })
+}
+
+/// Formats the one canonical local civil representation carried by V4 keys.
+fn format_civil_wall_clock(value: CivilDateTime) -> String {
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+        value.year, value.month, value.day, value.hour, value.minute, value.second
+    )
+}
+
+/// Formats the canonical signed minute offset carried by V4 keys.
+fn format_utc_offset(offset_minutes: i32) -> String {
+    let sign = if offset_minutes < 0 { '-' } else { '+' };
+    let absolute = i64::from(offset_minutes).abs();
+    format!("{sign}{:02}:{:02}", absolute / 60, absolute % 60)
+}
+
+/// Formats the pinned pre/post offset pair carried for a fold or gap.
+fn format_transition_offsets(pre_offset: i32, post_offset: i32) -> String {
+    format!(
+        "{}~{}",
+        format_utc_offset(pre_offset),
+        format_utc_offset(post_offset)
+    )
 }
 
 /// Returns whether one proleptic Gregorian year is a leap year.
@@ -1969,6 +2317,18 @@ impl UserAutomationRevision {
         &self,
         require_schedule_receipt: bool,
     ) -> Result<(), UserAutomationError> {
+        self.validate_revision_fields_without_schedule()?;
+        if require_schedule_receipt {
+            self.schedule.validate_normalized_occurrences()?;
+        } else {
+            self.schedule.validate_for_normalization_submission()?;
+        }
+        Ok(())
+    }
+
+    /// Validates revision metadata and capability policy independently of its
+    /// schedule evidence.
+    fn validate_revision_fields_without_schedule(&self) -> Result<(), UserAutomationError> {
         text(&self.automation_id, "automation_id")?;
         text(&self.revision, "revision")?;
         if self.supersedes.as_deref() == Some(self.revision.as_str()) {
@@ -1977,11 +2337,6 @@ impl UserAutomationRevision {
         text(&self.owner_principal, "owner_principal")?;
         self.work_scope.validate()?;
         text(&self.natural_language_intent, "natural_language_intent")?;
-        if require_schedule_receipt {
-            self.schedule.validate_normalized_occurrences()?;
-        } else {
-            self.schedule.validate_for_normalization_submission()?;
-        }
         self.task.validate()?;
         list_text(
             &self.portable_skill_package_revision_refs,
@@ -2049,6 +2404,33 @@ impl UserAutomationRevision {
         Ok(())
     }
 
+    /// Validates a revision whose schedule source is awaiting its first
+    /// owner-generated V4 occurrence set.
+    pub fn validate_for_schedule_normalization(&self) -> Result<(), UserAutomationError> {
+        self.validate_revision_fields_without_schedule()?;
+        self.schedule.validate_for_owner_normalization()
+    }
+
+    /// Validates the non-schedule part of a legacy revision for an explicit
+    /// migration request. Its old projection must be uniformly retired; a
+    /// partially current or malformed projection is not silently repaired.
+    pub fn validate_legacy_for_schedule_migration(&self) -> Result<(), UserAutomationError> {
+        self.validate_revision_fields_without_schedule()?;
+        self.schedule.validate()?;
+        if self.schedule.next_occurrences.iter().any(|occurrence| {
+            !is_legacy_occurrence_key(occurrence)
+                && !occurrence
+                    .split(NORMALIZED_OCCURRENCE_FIELD_SEPARATOR)
+                    .next()
+                    .is_some_and(is_legacy_normalized_occurrence_encoding)
+        }) {
+            return Err(UserAutomationError::Invalid(
+                "schedule.migration.previous_revision_not_legacy",
+            ));
+        }
+        Ok(())
+    }
+
     /// Derives the immutable canonical digest used by query/read contracts.
     pub fn digest(&self) -> Result<String, UserAutomationError> {
         self.validate()?;
@@ -2078,6 +2460,40 @@ impl UserAutomationRevision {
     ) -> Result<(), UserAutomationError> {
         self.validate_for_normalization_submission()?;
         old.validate()?;
+        if self.automation_id != old.automation_id
+            || self.revision == old.revision
+            || self.supersedes.as_deref() != Some(old.revision.as_str())
+        {
+            return Err(UserAutomationError::InvalidSupersession);
+        }
+        Ok(())
+    }
+
+    /// Validates a migration candidate against an immutable legacy predecessor.
+    pub fn validate_migration_supersedes(
+        &self,
+        old: &UserAutomationRevision,
+    ) -> Result<(), UserAutomationError> {
+        self.validate_for_schedule_normalization()?;
+        old.validate_legacy_for_schedule_migration()?;
+        if self.automation_id != old.automation_id
+            || self.revision == old.revision
+            || self.supersedes.as_deref() != Some(old.revision.as_str())
+        {
+            return Err(UserAutomationError::InvalidSupersession);
+        }
+        Ok(())
+    }
+
+    /// Validates an owner-normalized replacement of an immutable legacy revision.
+    /// Draft validation belongs to the preceding migration request; Edit must
+    /// retain the owner's generated occurrence and receipt projection.
+    pub fn validate_normalized_migration_supersedes(
+        &self,
+        old: &UserAutomationRevision,
+    ) -> Result<(), UserAutomationError> {
+        self.validate()?;
+        old.validate_legacy_for_schedule_migration()?;
         if self.automation_id != old.automation_id
             || self.revision == old.revision
             || self.supersedes.as_deref() != Some(old.revision.as_str())
@@ -3549,6 +3965,27 @@ pub enum UserAutomationOperation {
         /// unboxed one, so the wire bytes and the required-field decode
         /// behavior are unchanged.
         revision: Box<UserAutomationRevision>,
+        /// Exact Kernel normalization envelope returned for this revision.
+        normalization_receipt_envelope: Box<ReceiptEnvelope>,
+    },
+    /// Read the live authenticated context and State Fence through this route.
+    GetContext,
+    /// Ask the Kernel owner to normalize one revision draft.
+    NormalizeSchedule {
+        /// Revision metadata and schedule source. The schedule projection and
+        /// receipt must be absent so the owner is the only issuer of V4 bytes.
+        revision: Box<UserAutomationRevision>,
+        /// Explicit bounded number of occurrences to compile.
+        occurrence_count: u16,
+    },
+    /// Explicitly migrate a legacy schedule into a new immutable revision.
+    MigrateLegacySchedule {
+        /// Immutable legacy predecessor; migration never rewrites it.
+        previous_revision: Box<UserAutomationRevision>,
+        /// New revision that must supersede the legacy predecessor.
+        revision: Box<UserAutomationRevision>,
+        /// Explicit bounded number of occurrences to compile.
+        occurrence_count: u16,
     },
     /// List visible revisions.
     List {
@@ -3589,6 +4026,8 @@ pub enum UserAutomationOperation {
         ///
         /// Boxed for the same storage reason as [`Self::Create::revision`].
         revision: Box<UserAutomationRevision>,
+        /// Exact Kernel normalization envelope returned for this revision.
+        normalization_receipt_envelope: Box<ReceiptEnvelope>,
     },
     /// Run once using an explicit nonce without mutating the schedule.
     RunNow {
@@ -3642,8 +4081,26 @@ impl UserAutomationOperation {
     /// Validates the closed operator operation and revision lineage.
     pub fn validate(&self) -> Result<(), UserAutomationError> {
         match self {
-            Self::Create { revision } => revision.validate(),
-            Self::List { .. } => Ok(()),
+            Self::Create {
+                revision,
+                normalization_receipt_envelope,
+            } => validate_create_normalization_binding(revision, normalization_receipt_envelope),
+            Self::GetContext | Self::List { .. } => Ok(()),
+            Self::NormalizeSchedule {
+                revision,
+                occurrence_count,
+            } => {
+                revision.validate_for_schedule_normalization()?;
+                validate_normalization_occurrence_count(*occurrence_count)
+            }
+            Self::MigrateLegacySchedule {
+                previous_revision,
+                revision,
+                occurrence_count,
+            } => {
+                revision.validate_migration_supersedes(previous_revision)?;
+                validate_normalization_occurrence_count(*occurrence_count)
+            }
             Self::Status { automation_id }
             | Self::History { automation_id }
             | Self::InspectLastFailure { automation_id } => {
@@ -3667,7 +4124,12 @@ impl UserAutomationOperation {
             Self::Edit {
                 previous_revision,
                 revision,
-            } => revision.validate_supersedes(previous_revision),
+                normalization_receipt_envelope,
+            } => validate_edit_normalization_binding(
+                previous_revision,
+                revision,
+                normalization_receipt_envelope,
+            ),
             Self::RunNow {
                 automation_id,
                 automation_revision,
@@ -3699,17 +4161,60 @@ impl UserAutomationOperation {
     }
 
     /// Validates operator input before the Store compiles a Create/Edit schedule.
-    /// All other operation variants retain their ordinary strict validation.
+    /// Normalization outputs must already carry the exact owner receipt.
     pub fn validate_for_normalization_submission(&self) -> Result<(), UserAutomationError> {
-        match self {
-            Self::Create { revision } => revision.validate_for_normalization_submission(),
-            Self::Edit {
-                previous_revision,
-                revision,
-            } => revision.validate_supersedes_for_normalization_submission(previous_revision),
-            _ => self.validate(),
-        }
+        self.validate()
     }
+}
+
+fn validate_create_normalization_binding(
+    revision: &UserAutomationRevision,
+    envelope: &ReceiptEnvelope,
+) -> Result<(), UserAutomationError> {
+    revision.validate()?;
+    if envelope.core.operation.operation_kind != USER_AUTOMATION_NORMALIZATION_OPERATION_KIND {
+        return Err(UserAutomationError::ReceiptBinding);
+    }
+    revision.schedule.validate_normalization_receipt_envelope(
+        &revision.schedule.normalization_receipt,
+        envelope,
+        revision,
+    )
+}
+
+fn validate_edit_normalization_binding(
+    previous_revision: &UserAutomationRevision,
+    revision: &UserAutomationRevision,
+    envelope: &ReceiptEnvelope,
+) -> Result<(), UserAutomationError> {
+    let legacy_predecessor = previous_revision.validate().is_err()
+        && previous_revision
+            .validate_legacy_for_schedule_migration()
+            .is_ok();
+    let operation_kind = if legacy_predecessor {
+        revision.validate_normalized_migration_supersedes(previous_revision)?;
+        USER_AUTOMATION_LEGACY_MIGRATION_OPERATION_KIND
+    } else {
+        revision.validate_supersedes(previous_revision)?;
+        USER_AUTOMATION_NORMALIZATION_OPERATION_KIND
+    };
+    if envelope.core.operation.operation_kind != operation_kind {
+        return Err(UserAutomationError::ReceiptBinding);
+    }
+    revision.schedule.validate_normalization_receipt_envelope(
+        &revision.schedule.normalization_receipt,
+        envelope,
+        revision,
+    )
+}
+
+fn validate_normalization_occurrence_count(count: u16) -> Result<(), UserAutomationError> {
+    if count == 0 || usize::from(count) > MAX_REFERENCES {
+        return Err(UserAutomationError::Invalid(
+            "schedule.normalization.occurrence_count",
+        ));
+    }
+    Ok(())
 }
 
 /// Authenticated Human operator intent; the owner service persists it through

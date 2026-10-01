@@ -83,6 +83,50 @@ impl UserAutomationServiceRequest {
         if self.intent.principal_ref != self.authenticated_principal {
             return Err(UserAutomationServiceError::PrincipalMismatch);
         }
+        if !operation_revisions_are_owned_by(&self.intent.operation, &self.authenticated_principal)
+        {
+            return Err(UserAutomationServiceError::PrincipalMismatch);
+        }
+        Ok(())
+    }
+
+    /// Validates the authenticated, pre-seal schedule-normalization request.
+    ///
+    /// Normalization is a read-only owner operation, so it has no canonical
+    /// Store transition from which to derive `canonical_request_hash`. Its
+    /// retry identity is still validated and the hash must remain empty until a
+    /// later Create/Edit transition seals the exact returned receipt bytes.
+    pub fn validate_for_schedule_normalization(&self) -> Result<(), UserAutomationError> {
+        self.context
+            .validate()
+            .map_err(|_| UserAutomationError::Invalid("request.context"))?;
+        self.intent.validate_for_normalization_submission()?;
+        if self.identity.idempotency_key.trim().is_empty()
+            || self.identity.idempotency_key.len() > 256
+            || self.identity.idempotency_key.chars().any(char::is_control)
+            || self.identity.operation_id.as_str().trim().is_empty()
+            || !self.identity.canonical_request_hash.is_empty()
+        {
+            return Err(UserAutomationError::Invalid(
+                "request.schedule_normalization.identity",
+            ));
+        }
+        if self.intent.state_fence != self.context.state_fence {
+            return Err(UserAutomationError::Invalid(
+                "request.schedule_normalization.state_fence",
+            ));
+        }
+        if self.intent.principal_ref != self.authenticated_principal {
+            return Err(UserAutomationError::Invalid(
+                "request.schedule_normalization.principal",
+            ));
+        }
+        if !operation_revisions_are_owned_by(&self.intent.operation, &self.authenticated_principal)
+        {
+            return Err(UserAutomationError::Invalid(
+                "request.schedule_normalization.owner_principal",
+            ));
+        }
         Ok(())
     }
 
@@ -122,10 +166,41 @@ impl UserAutomationStoreRequest {
         if self.intent.principal_ref != self.authenticated_principal {
             return Err(UserAutomationServiceError::PrincipalMismatch);
         }
+        if !operation_revisions_are_owned_by(&self.intent.operation, &self.authenticated_principal)
+        {
+            return Err(UserAutomationServiceError::PrincipalMismatch);
+        }
         if self.intent.state_fence != self.context.state_fence {
             return Err(UserAutomationServiceError::FenceMismatch);
         }
         Ok(())
+    }
+}
+
+/// Keeps caller-supplied immutable revision ownership inside the authenticated
+/// principal that is about to normalize or mutate it. Both sides of an Edit
+/// lineage are checked because the predecessor is part of the admitted
+/// operator request too; a caller cannot relabel another owner's automation
+/// by supplying a matching revision identifier.
+fn operation_revisions_are_owned_by(operation: &UserAutomationOperation, principal: &str) -> bool {
+    let owned_by_principal =
+        |revision: &UserAutomationRevision| revision.owner_principal.as_str() == principal;
+    match operation {
+        UserAutomationOperation::Create { revision, .. }
+        | UserAutomationOperation::NormalizeSchedule { revision, .. } => {
+            owned_by_principal(revision)
+        }
+        UserAutomationOperation::Edit {
+            previous_revision,
+            revision,
+            ..
+        }
+        | UserAutomationOperation::MigrateLegacySchedule {
+            previous_revision,
+            revision,
+            ..
+        } => owned_by_principal(previous_revision) && owned_by_principal(revision),
+        _ => true,
     }
 }
 
@@ -429,7 +504,9 @@ fn validate_mutation_result(
 ) -> Result<(), UserAutomationServiceError> {
     match (operation, result) {
         (
-            UserAutomationOperation::Create { revision: expected },
+            UserAutomationOperation::Create {
+                revision: expected, ..
+            },
             UserAutomationMutationResult::Revision {
                 revision,
                 cancelled_wake_ids,
@@ -439,6 +516,7 @@ fn validate_mutation_result(
             UserAutomationOperation::Edit {
                 previous_revision,
                 revision: expected,
+                ..
             },
             UserAutomationMutationResult::Revision {
                 revision,
