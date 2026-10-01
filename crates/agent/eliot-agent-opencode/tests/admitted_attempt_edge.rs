@@ -17,10 +17,10 @@ use eliot_agent_api::{
     WorkUnitId, candidate_digest_for,
 };
 use eliot_agent_opencode::{
-    AdmittedAttemptCandidate, AdmittedAttemptError, AdmittedOpenCodeAttempt, AuthorityCeiling,
-    BasicAuth, LoopbackEndpoint, ModelSelection, NoAuthorityRunResult, OpenCodeClient,
-    OpenCodeRunPolicy, OpenCodeWireRouteReceipt, QuotaAvailability, ReadOnlyRunRequest, RunStatus,
-    UsageAvailability,
+    AdmittedAttemptCandidate, AdmittedAttemptError, AdmittedObservation,
+    AdmittedObservationKind, AdmittedOpenCodeAttempt, AuthorityCeiling, BasicAuth,
+    LoopbackEndpoint, ModelSelection, NoAuthorityRunResult, OpenCodeClient, OpenCodeRunPolicy,
+    OpenCodeWireRouteReceipt, QuotaAvailability, ReadOnlyRunRequest, RunStatus, UsageAvailability,
 };
 use eliot_contracts::{
     DecisionId, EpochId, EpochLineageId, LowercaseSha256, ResourceGeneration, StateFence, TaskId,
@@ -74,6 +74,17 @@ async fn admitted_happy_path_seals_replay_stable_candidate()
     }
 
     let candidate = &outcome.candidate;
+    let terminal = serde_json::from_value::<AdmittedObservation>(
+        outcome
+            .run
+            .extra
+            .get("admitted_terminal_observation")
+            .cloned()
+            .ok_or("seal preimage must retain the terminal observation")?,
+    )?;
+    assert_eq!(terminal.attempt_id, candidate.attempt_id);
+    assert_eq!(terminal.kind, AdmittedObservationKind::Terminal);
+    assert_eq!(terminal.detail, "terminal candidate outcome observed");
     assert_eq!(candidate.attempt_id, AttemptId::new("attempt-487")?);
     assert_eq!(
         candidate.admitted_route_digest,
