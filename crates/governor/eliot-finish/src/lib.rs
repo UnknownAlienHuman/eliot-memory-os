@@ -284,7 +284,7 @@ impl FinishAttempt {
     pub fn validate(&self) -> Result<(), FinishError> {
         text(&self.attempt_id, "finish_attempt.attempt_id")?;
         self.state_fence.validate()?;
-        self.draft.validate()?;
+        self.draft.validate().map_err(CanonicalError::from)?;
         validate_closure_intent(self.draft.requested_outcome, self.closure_intent)
     }
 
