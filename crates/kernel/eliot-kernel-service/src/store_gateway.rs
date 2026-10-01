@@ -8232,6 +8232,46 @@ impl KernelStoreGateway {
         result
     }
 
+    /// Reads the WorkScope row immediately before CAS and recognizes only an
+    /// exact same-fence replay or the exact requested current revision.
+    async fn work_scope_owner_cas_replay_or_ready(
+        &self,
+        request: &StoreWorkScopeOwnerRequest,
+    ) -> Result<Option<StoreWorkScopeOwnerResponse>, NamedReadGatewayError> {
+        let current = self
+            .store
+            .recovery(StoreRecoveryRequest {
+                contract_version: request.contract_version,
+                state_fence: request.state_fence.clone(),
+                records: vec![eliot_store_api::RecoveryRecordKey::new(
+                    "owner",
+                    "work_scope",
+                )?],
+                include_receipts: false,
+                include_jobs: false,
+            })
+            .await?;
+        if current.state_fence != request.state_fence {
+            return Err(NamedReadGatewayError::Store(StoreError::FenceMismatch));
+        }
+        let expected_record = &request.owner_record;
+        let next_revision = expected_record.revision;
+        match current.owner_records.as_slice() {
+            [record] if record == expected_record && record.revision == next_revision => {
+                Ok(Some(StoreWorkScopeOwnerResponse {
+                    record: record.clone(),
+                }))
+            }
+            [record] if record.revision == request.expected_owner_revision => Ok(None),
+            [record]
+                if record.revision == next_revision && record != expected_record =>
+            {
+                Err(NamedReadGatewayError::Store(StoreError::IdentityConflict))
+            }
+            _ => Err(NamedReadGatewayError::Store(StoreError::RevisionConflict)),
+        }
+    }
+
     /// Replaces the one durable WorkScope owner row by a fenced CAS and
     /// returns only after the exact canonical record is visible on a same-
     /// fence named recovery read. The Store remains the owner of persistence;
@@ -8284,36 +8324,10 @@ impl KernelStoreGateway {
                 "canonical-store gateway is fenced for rebind".to_owned(),
             ));
         }
-        let current = self
-            .store
-            .recovery(StoreRecoveryRequest {
-                contract_version: request.contract_version,
-                state_fence: request.state_fence.clone(),
-                records: vec![eliot_store_api::RecoveryRecordKey::new(
-                    "owner",
-                    "work_scope",
-                )?],
-                include_receipts: false,
-                include_jobs: false,
-            })
-            .await?;
-        if current.state_fence != request.state_fence {
-            return Err(NamedReadGatewayError::Store(StoreError::FenceMismatch));
+        if let Some(replay) = self.work_scope_owner_cas_replay_or_ready(&request).await? {
+            return Ok(replay);
         }
         let expected_record = request.owner_record.clone();
-        let next_revision = expected_record.revision;
-        match current.owner_records.as_slice() {
-            [record] if record == &expected_record && record.revision == next_revision => {
-                return Ok(StoreWorkScopeOwnerResponse {
-                    record: record.clone(),
-                });
-            }
-            [record] if record.revision == request.expected_owner_revision => {}
-            [record] if record.revision == next_revision && record != &expected_record => {
-                return Err(NamedReadGatewayError::Store(StoreError::IdentityConflict));
-            }
-            _ => return Err(NamedReadGatewayError::Store(StoreError::RevisionConflict)),
-        }
         let response = self
             .store
             .write_work_scope_owner(context, request.clone())

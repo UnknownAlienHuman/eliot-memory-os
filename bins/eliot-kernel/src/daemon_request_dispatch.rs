@@ -9324,7 +9324,8 @@ impl KernelComposition {
         let context = &identity.request.metadata;
         if context.product_id.as_str() != ACTIVE_DAEMON_CALLER
             || context.source_id.as_str() != ACTIVE_DAEMON_CALLER
-            || context.session_id.as_deref() != Some(operation.attempt.session_id.as_str())
+            || context.session_id.as_ref().map(SessionId::as_str)
+                != Some(operation.attempt.session_id.as_str())
             || context.task_id.as_ref() != Some(&operation.attempt.task_id)
             || identity.request.state_fence != operation.attempt.state_fence
             || identity.deadline_unix_ms != operation.attempt.expires_at_unix_ms
