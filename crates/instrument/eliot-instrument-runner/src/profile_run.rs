@@ -1,8 +1,8 @@
 //! Deterministic stage orchestration, durable run records, and aggregation.
 //!
-//! This module extends [`InstrumentRunner`](crate::InstrumentRunner) toward
-//! deterministic stage-DAG orchestration for issue #1813 without changing any
-//! existing launch, inspection, or verdict behavior. The
+//! This module extends [`InstrumentRunner`](crate::InstrumentRunner) with
+//! deterministic stage-DAG orchestration and, for governed verification runs,
+//! terminal supervision and immutable-source evaluation. The
 //! [`StageOrchestrator`] walks an admitted profile DAG in topological order,
 //! launches each external stage through the existing runner primitives, and
 //! assembles one [`InstrumentRun`] per stage plus a [`ProfileAggregate`] that
@@ -15,22 +15,28 @@
 //! finish decision), and never conceals missing or failed stages (unobserved
 //! stages become explicit [`StageEvidence::Missing`] runs).
 //!
-//! A retained stage binds more than the kept bytes: [`StageEvidence::Retained`]
-//! also carries the [`RetainedToolIdentity`] that produced them, so the exact
-//! tool command, the environment projection, and the terminal exit outcome
-//! travel with the artifact handle instead of being reconstructed from it
-//! later.
+//! A retained stage binds more than kept bytes: retained evidence carries the
+//! tool identity and, for verified process streams, both owner-read-back source
+//! identities. Exact command, environment, exit, Ready-receipt, and readback
+//! facts travel with the stage instead of being reconstructed later.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
 
-use eliot_contracts::{ModuleRuntimeClass, sha256_hex};
+use eliot_contracts::{ClockReading, ModuleRuntimeClass, StateFence, sha256_hex};
 use eliot_instrument_api::{
     BuildClass, ExecutionStatus, InstrumentAdmissionGrant, InstrumentAdmissionRequest,
-    InstrumentInvocation, InstrumentKind, TARGET_LAYOUT_REVISION,
+    InstrumentInvocation, InstrumentKind, TARGET_LAYOUT_REVISION, VerificationOutcome,
 };
-use eliot_process::{ExitDisposition, ProcessEvidenceSink, ProcessExecutor, ProcessRequest};
+use eliot_process::{
+    DurableProcessStreamSource, DurableStreamRepresentation, ExitDisposition, ProcessEvidence,
+    ProcessEvidenceSink, ProcessExecutionBinding, ProcessExecutor, ProcessLifecycle,
+    ProcessRequest, ProcessStreamEvidence, ProcessStreamKind, StreamPersistenceStatus,
+    StreamTransportStatus,
+};
 use eliot_process_executor::ExecutableObservation;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -85,6 +91,19 @@ pub enum ProfileRunError {
     InvalidExitOutcome {
         /// Observed disposition that the exit code contradicts.
         disposition: String,
+    },
+    /// One immutable stream source is not complete enough to identify a full
+    /// source that a parser could safely consume.
+    #[error("{stream} stream does not carry a complete immutable source")]
+    IncompleteStreamSource {
+        /// Stream whose source was absent or partial.
+        stream: &'static str,
+    },
+    /// One owner-issued readback identity is incomplete.
+    #[error("readback identity field {field} is invalid")]
+    InvalidReadbackIdentity {
+        /// Readback identity field that failed validation.
+        field: &'static str,
     },
 }
 
@@ -395,6 +414,17 @@ pub enum StageEvidence {
         /// Exact tool identity under which those bytes were produced.
         tool: RetainedToolIdentity,
     },
+    /// Full stdout and stderr immutable sources that were read back and
+    /// verified against their original process evidence before evaluation.
+    RetainedProcessStreams {
+        /// Exact stdout source and owner-issued readback identity.
+        stdout: RetainedProcessStreamIdentity,
+        /// Exact stderr source and owner-issued readback identity.
+        stderr: RetainedProcessStreamIdentity,
+        /// Exact executable, argv, environment projection, and process exit,
+        /// when the observed disposition carries an admissible exit identity.
+        tool: Option<RetainedToolIdentity>,
+    },
     /// Material output absent for an explicit, typed reason.
     Omitted {
         /// Why the output is absent.
@@ -406,6 +436,223 @@ pub enum StageEvidence {
         /// Exact missing proof (I10.8.11).
         reason: String,
     },
+}
+
+/// Identity of one immutable process stream after successful owner readback.
+///
+    /// `evidence_digest` binds the entire original raw `ProcessStreamEvidence`,
+/// including its operation binding, policy, transport, and gaps. `source`
+/// carries the exact locator, Ready receipt, digest, and byte length. The
+    /// owner-issued readback receipt, fence, and observation clock identify the
+    /// read that supplied parser input; the bytes themselves remain ephemeral
+    /// and are never stored in an `InstrumentRun`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedProcessStreamIdentity {
+    /// Stdout or stderr.
+    stream: ProcessStreamKind,
+    /// Exact process binding carried by the original stream evidence.
+    binding: ProcessExecutionBinding,
+    /// Original immutable source admitted by the process evidence.
+    source: DurableProcessStreamSource,
+    /// Canonical identity digest of the original raw process stream evidence.
+    evidence_digest: String,
+    /// Owner-issued receipt for this exact readback.
+    readback_receipt_id: String,
+    /// Current owner-authorized fence the readback satisfied.
+    readback_fence: StateFence,
+    /// Clock observed by the readback owner.
+    readback_observed_at: ClockReading,
+}
+
+impl RetainedProcessStreamIdentity {
+    /// Returns whether this identity is stdout or stderr.
+    pub const fn stream(&self) -> ProcessStreamKind {
+        self.stream
+    }
+
+    /// Returns the original Ready-receipted immutable source.
+    pub const fn source(&self) -> &DurableProcessStreamSource {
+        &self.source
+    }
+
+    /// Returns the exact process binding carried by the raw stream evidence.
+    pub const fn binding(&self) -> &ProcessExecutionBinding {
+        &self.binding
+    }
+
+    /// Returns the identity digest of original raw stream evidence.
+    pub fn evidence_digest(&self) -> &str {
+        &self.evidence_digest
+    }
+
+    /// Returns the owner-issued readback receipt identity.
+    pub fn readback_receipt_id(&self) -> &str {
+        &self.readback_receipt_id
+    }
+
+    /// Returns the current fence the readback owner satisfied.
+    pub const fn readback_fence(&self) -> &StateFence {
+        &self.readback_fence
+    }
+
+    /// Returns the clock observed by the readback owner.
+    pub const fn readback_observed_at(&self) -> &ClockReading {
+        &self.readback_observed_at
+    }
+
+    /// Whether this record is a complete exact-byte owner readback identity.
+    /// The live adopter additionally correlates it with the original stream
+    /// evidence; receipt validation can recheck only the persisted identity.
+    pub fn is_complete_owner_readback(&self) -> bool {
+        self.source.representation() == DurableStreamRepresentation::ExactTransportBytes
+            && validate_digest(&self.evidence_digest, "evidence_digest").is_ok()
+            && validate_text(&self.readback_receipt_id, "readback_receipt_id").is_ok()
+            && self.readback_fence.validate().is_ok()
+            && self.readback_observed_at.validate().is_ok()
+    }
+
+    /// Canonical digest over this exact source and its owner readback proof.
+    #[must_use]
+    pub fn digest(&self) -> String {
+        sha256_hex(
+            format!(
+                "{:?}\0{:?}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{:?}\0{:?}",
+                self.stream,
+                serde_json::to_string(&self.binding).unwrap_or_default(),
+                self.source.kind(),
+                self.source.locator(),
+                self.source.ready_receipt_ref(),
+                self.source.sha256(),
+                self.source.byte_length(),
+                self.readback_receipt_id,
+                self.evidence_digest,
+                self.readback_fence,
+                self.readback_observed_at,
+            )
+            .as_bytes(),
+        )
+    }
+
+}
+
+/// Full immutable-source readback and evaluator result for one stage.
+///
+/// A PASS claim is accepted only when both stream identities are present and
+/// bind to the original process evidence. Refusals may retain one or no stream
+/// identities and remain explicit non-PASS outcomes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StageTerminalEvaluation {
+    /// Parser/evaluator outcome over resolved immutable stream bytes.
+    outcome: VerificationOutcome,
+    /// Readback identity for each stream that reached full verified sources.
+    streams: Vec<RetainedProcessStreamIdentity>,
+    /// Exact parser, evaluator, or readback refusal when the result is not PASS.
+    detail: Option<String>,
+}
+
+impl StageTerminalEvaluation {
+    /// Returns the semantic evaluator outcome.
+    pub const fn outcome(&self) -> VerificationOutcome {
+        self.outcome
+    }
+
+    /// Returns owner-verified immutable source identities.
+    pub fn streams(&self) -> &[RetainedProcessStreamIdentity] {
+        &self.streams
+    }
+
+    /// Returns the exact non-PASS detail, when present.
+    pub fn detail(&self) -> Option<&str> {
+        self.detail.as_deref()
+    }
+
+    /// Creates one explicit terminal evaluation from owner-verified streams.
+    pub fn new(
+        outcome: VerificationOutcome,
+        streams: Vec<RetainedProcessStreamIdentity>,
+        detail: Option<String>,
+    ) -> Result<Self, ProfileRunError> {
+        if let Some(detail) = &detail {
+            validate_text(detail, "terminal_evaluation_detail")?;
+        }
+        let mut seen = BTreeSet::new();
+        for stream in &streams {
+            validate_digest(&stream.evidence_digest, "evidence_digest")?;
+            validate_text(&stream.readback_receipt_id, "readback_receipt_id")?;
+            if stream.readback_fence.validate().is_err()
+                || stream.readback_observed_at.validate().is_err()
+            {
+                return Err(ProfileRunError::InvalidReadbackIdentity {
+                    field: "readback_observation",
+                });
+            }
+            if !seen.insert(stream.stream) {
+                return Err(ProfileRunError::InvalidReadbackIdentity {
+                    field: "duplicate_stream",
+                });
+            }
+        }
+        if outcome == VerificationOutcome::Pass
+            && (streams.len() != 2
+                || !seen.contains(&ProcessStreamKind::Stdout)
+                || !seen.contains(&ProcessStreamKind::Stderr))
+        {
+            return Err(ProfileRunError::IncompleteStreamSource {
+                stream: "stdout and stderr",
+            });
+        }
+        Ok(Self {
+            outcome,
+            streams,
+            detail,
+        })
+    }
+
+    /// Creates a terminal non-PASS for source, parser, or evaluator refusal.
+    pub fn refused(outcome: VerificationOutcome, detail: impl Into<String>) -> Self {
+        let detail = detail.into();
+        Self {
+            outcome: if outcome == VerificationOutcome::Pass {
+                VerificationOutcome::Unknown
+            } else {
+                outcome
+            },
+            streams: Vec::new(),
+            detail: Some(detail),
+        }
+    }
+
+    fn streams_in_order(
+        &self,
+    ) -> Option<(&RetainedProcessStreamIdentity, &RetainedProcessStreamIdentity)> {
+        let stdout = self
+            .streams
+            .iter()
+            .find(|stream| stream.stream == ProcessStreamKind::Stdout)?;
+        let stderr = self
+            .streams
+            .iter()
+            .find(|stream| stream.stream == ProcessStreamKind::Stderr)?;
+        Some((stdout, stderr))
+    }
+}
+
+/// Evaluates one stage only after its process reaches a terminal view and its
+/// exact `ProcessEvidence` has been reconciled by the same runner executor.
+///
+/// Production implementations resolve the evidence collector's real typed
+/// stdout/stderr sources through the owner readback port, then run the parser
+/// and evaluator bound by the admitted stage. Returning PASS without complete
+/// stream identities is refused by the orchestrator.
+pub trait StageTerminalEvaluator: Send + Sync {
+    /// Reads back and evaluates one terminal process evidence record.
+    fn evaluate_terminal(
+        &self,
+        stage: &PlannedStage,
+        launch: &InstrumentStartReceipt,
+        evidence: &ProcessEvidence,
+    ) -> Result<StageTerminalEvaluation, String>;
 }
 
 impl StageEvidence {
@@ -597,6 +844,8 @@ pub struct InstrumentRun {
     pub execution: ExecutionStatus,
     /// Raw evidence state.
     pub evidence: StageEvidence,
+    /// Semantic parser/evaluator result, separate from process execution.
+    pub verification: Option<VerificationOutcome>,
     /// Machine-derived executable identity digest, when observed.
     pub executable_digest: Option<String>,
     /// Process grant digest sealed by pre-launch admission, when admitted.
@@ -606,6 +855,14 @@ pub struct InstrumentRun {
     /// carries no grant. It travels into the aggregate digest so a changed
     /// executable/argument combination can never reuse an earlier receipt.
     pub grant_digest: Option<String>,
+    /// Exact process evidence returned by reconciliation after terminal
+    /// supervision. This retains the launch binding, terminal process view,
+    /// and original raw stdout/stderr evidence alongside the grant digest.
+    /// A launched process without a terminal reconciliation keeps this absent.
+    pub terminal_process_evidence: Option<ProcessEvidence>,
+    /// Most recent exact executor observation retained when supervision did
+    /// not reach reconciliation, or the reconciled terminal view otherwise.
+    pub last_process_observation: Option<eliot_process::ProcessExecutionView>,
     /// Candidate/configuration identity inherited from the stage plan, when
     /// this run belongs to a candidate-bound plan.
     pub candidate_identity: Option<String>,
@@ -696,8 +953,11 @@ impl InstrumentRun {
                 reason: "launched; terminal observation is owned by the supervising lane"
                     .to_owned(),
             },
+            verification: None,
             executable_digest: Some(observed_executable_digest.to_owned()),
             grant_digest: Some(grant.grant_digest.clone()),
+            terminal_process_evidence: None,
+            last_process_observation: None,
             candidate_identity: None,
             target_layout,
         })
@@ -753,8 +1013,11 @@ impl InstrumentRun {
             evidence: StageEvidence::Missing {
                 reason: reason.into(),
             },
+            verification: None,
             executable_digest: None,
             grant_digest: None,
+            terminal_process_evidence: None,
+            last_process_observation: None,
             candidate_identity: None,
             target_layout: None,
         }
@@ -798,8 +1061,11 @@ impl InstrumentRun {
                 byte_len,
                 tool,
             },
+            verification: None,
             executable_digest: Some(executable_digest),
             grant_digest: Some(grant.grant_digest.clone()),
+            terminal_process_evidence: None,
+            last_process_observation: None,
             candidate_identity: None,
             target_layout,
         })
@@ -811,10 +1077,154 @@ impl InstrumentRun {
     /// observed executable identity. Anything else stays visible in the
     /// aggregate instead of collapsing into success.
     pub fn is_success(&self) -> bool {
-        self.execution == ExecutionStatus::Succeeded
-            && matches!(self.evidence, StageEvidence::Retained { .. })
-            && self.executable_digest.is_some()
+        if self.execution != ExecutionStatus::Succeeded || self.executable_digest.is_none() {
+            return false;
+        }
+        match &self.evidence {
+            StageEvidence::Retained { .. } => true,
+            StageEvidence::RetainedProcessStreams {
+                stdout,
+                stderr,
+                tool,
+            } => {
+                stdout.stream == ProcessStreamKind::Stdout
+                    && stderr.stream == ProcessStreamKind::Stderr
+                    && stdout.is_complete_owner_readback()
+                    && stderr.is_complete_owner_readback()
+                    && tool.is_some()
+                    && self.has_reconciled_terminal_success(stdout, stderr, tool.as_ref())
+                    && self.verification == Some(VerificationOutcome::Pass)
+            }
+            StageEvidence::Omitted { .. } | StageEvidence::Missing { .. } => false,
+        }
     }
+
+    /// Whether this stage has a parser/evaluator PASS over complete immutable
+    /// stdout and stderr sources and a successful process exit.
+    pub fn is_verified_success(&self) -> bool {
+        matches!(self.evidence, StageEvidence::RetainedProcessStreams { .. })
+            && self.execution == ExecutionStatus::Succeeded
+            && self.verification == Some(VerificationOutcome::Pass)
+            && self.executable_digest.is_some()
+            && self.is_success()
+    }
+
+    fn adopt_terminal_evaluation(
+        &mut self,
+        execution: ExecutionStatus,
+        process: &ProcessEvidence,
+        evaluation: StageTerminalEvaluation,
+        tool: Option<RetainedToolIdentity>,
+    ) {
+        self.execution = execution;
+        self.terminal_process_evidence = Some(process.clone());
+        self.last_process_observation = Some(process.view().clone());
+        let outcome = match execution {
+            ExecutionStatus::Succeeded => evaluation.outcome,
+            ExecutionStatus::Cancelled => VerificationOutcome::Cancelled,
+            ExecutionStatus::Failed => VerificationOutcome::Fail,
+            ExecutionStatus::Running | ExecutionStatus::Accepted => VerificationOutcome::Unknown,
+            ExecutionStatus::Partial
+            | ExecutionStatus::Unknown
+            | ExecutionStatus::Blocked => VerificationOutcome::Unknown,
+        };
+        let stdout = evaluation
+            .streams_in_order()
+            .filter(|(stdout, stderr)| {
+                stream_identity_matches(stdout, process.stdout())
+                    && stream_identity_matches(stderr, process.stderr())
+            });
+        if let Some((stdout, stderr)) = stdout {
+            self.evidence = StageEvidence::RetainedProcessStreams {
+                stdout: stdout.clone(),
+                stderr: stderr.clone(),
+                tool,
+            };
+        } else {
+            self.evidence = StageEvidence::Omitted {
+                reason: evaluation.detail.unwrap_or_else(|| {
+                    "terminal process evidence did not resolve to two complete immutable streams"
+                        .to_owned()
+                }),
+            };
+        }
+        self.verification = Some(if outcome == VerificationOutcome::Pass
+            && !matches!(self.evidence, StageEvidence::RetainedProcessStreams { tool: Some(_), .. })
+        {
+            VerificationOutcome::Unknown
+        } else {
+            outcome
+        });
+    }
+
+    fn has_reconciled_terminal_success(
+        &self,
+        stdout: &RetainedProcessStreamIdentity,
+        stderr: &RetainedProcessStreamIdentity,
+        tool: Option<&RetainedToolIdentity>,
+    ) -> bool {
+        let (Some(operation_id), Some(process), Some(tool)) = (
+            self.stage.operation_id.as_deref(),
+            self.terminal_process_evidence.as_ref(),
+            tool,
+        ) else {
+            return false;
+        };
+        if self
+            .grant_digest
+            .as_deref()
+            .is_none_or(|digest| validate_digest(digest, "grant_digest").is_err())
+            || process.validate().is_err()
+            || process.operation_id().as_str() != operation_id
+            || process.view().lifecycle() != ProcessLifecycle::Exited
+            || self.last_process_observation.as_ref() != Some(process.view())
+        {
+            return false;
+        }
+        let Some(exit) = process.view().exit() else {
+            return false;
+        };
+        exit.disposition() == ExitDisposition::Completed
+            && observed_exit_code(exit) == Some(0)
+            && tool.exit.disposition == ExitDisposition::Completed
+            && tool.exit.code == Some(0)
+            && stream_identity_matches(stdout, process.stdout())
+            && stream_identity_matches(stderr, process.stderr())
+    }
+}
+
+/// Confirms that one owner readback identity preserves its exact raw stream.
+fn stream_identity_matches(
+    identity: &RetainedProcessStreamIdentity,
+    evidence: Option<&ProcessStreamEvidence>,
+) -> bool {
+    let Some(evidence) = evidence else {
+        return false;
+    };
+    let Some(source) = evidence.source() else {
+        return false;
+    };
+    evidence.stream() == identity.stream
+        && evidence.binding() == identity.binding()
+        && identity.is_complete_owner_readback()
+        && source == &identity.source
+        && evidence.transport() == StreamTransportStatus::Complete
+        && evidence.persistence() == StreamPersistenceStatus::CompleteSource
+        && evidence.gaps().is_empty()
+        && source.representation() == DurableStreamRepresentation::ExactTransportBytes
+        && source.sha256() == evidence.observed_sha256()
+        && source.byte_length() == evidence.observed_bytes()
+        && evidence
+            .identity_sha256()
+            .is_ok_and(|digest| digest == identity.evidence_digest)
+        && validate_digest(&identity.evidence_digest, "evidence_digest").is_ok()
+        && !identity.readback_receipt_id.trim().is_empty()
+        && !identity
+            .readback_receipt_id
+            .chars()
+            .any(char::is_control)
+        && identity.readback_fence.validate().is_ok()
+        && identity.readback_observed_at.validate().is_ok()
 }
 
 /// Aggregate status over one profile run.
@@ -876,6 +1286,20 @@ impl ProfileAggregate {
     /// ignored, and declared stages without a run become explicit missing
     /// proofs.
     pub fn assemble(plan: &StagePlan, runs: Vec<InstrumentRun>) -> Self {
+        Self::assemble_with_verification_requirement(plan, runs, false)
+    }
+
+    /// Assembles a profile whose required stages need terminal parser/evaluator
+    /// PASS over verified immutable stdout and stderr sources.
+    pub fn assemble_verified(plan: &StagePlan, runs: Vec<InstrumentRun>) -> Self {
+        Self::assemble_with_verification_requirement(plan, runs, true)
+    }
+
+    fn assemble_with_verification_requirement(
+        plan: &StagePlan,
+        runs: Vec<InstrumentRun>,
+        require_verification: bool,
+    ) -> Self {
         let mut observed = BTreeMap::new();
         for run in runs {
             if run.candidate_identity != plan.candidate_identity {
@@ -907,7 +1331,7 @@ impl ProfileAggregate {
                 ordered.push(missing);
             }
         }
-        let status = aggregate_status(plan, &ordered);
+        let status = aggregate_status(plan, &ordered, require_verification);
         let mut material = format!(
             "{}\0{}\0{}\0{}\0",
             plan.profile, plan.revision, plan.profile_digest, plan.dag_digest,
@@ -937,14 +1361,42 @@ impl ProfileAggregate {
                     material.push('\0');
                     material.push_str(&tool.digest());
                 }
+                StageEvidence::RetainedProcessStreams {
+                    stdout,
+                    stderr,
+                    tool,
+                } => {
+                    append_stream_identity(&mut material, stdout);
+                    append_stream_identity(&mut material, stderr);
+                    material.push('\0');
+                    material.push_str(
+                        &tool.as_ref().map_or_else(String::new, RetainedToolIdentity::digest),
+                    );
+                }
                 StageEvidence::Omitted { reason } | StageEvidence::Missing { reason } => {
                     material.push_str(reason);
                 }
             }
             material.push('\0');
+            material.push_str(
+                &run
+                    .verification
+                    .map_or_else(String::new, |outcome| format!("{outcome:?}")),
+            );
+            material.push('\0');
             material.push_str(run.executable_digest.as_deref().unwrap_or(""));
             material.push('\0');
             material.push_str(run.grant_digest.as_deref().unwrap_or(""));
+            material.push('\0');
+            if let Some(process) = &run.terminal_process_evidence {
+                // `ProcessEvidence` is a validated, serializable owner DTO.
+                // Hash its serialized bytes so the aggregate binds the exact
+                // reconciled binding, lifecycle view, exit observation, and
+                // raw process stream records retained below.
+                if let Ok(bytes) = serde_json::to_vec(process) {
+                    material.push_str(&sha256_hex(bytes));
+                }
+            }
             material.push('\0');
         }
         Self {
@@ -965,15 +1417,28 @@ impl ProfileAggregate {
     }
 }
 
+fn append_stream_identity(material: &mut String, stream: &RetainedProcessStreamIdentity) {
+    material.push_str(&stream.digest());
+}
+
 /// Computes the aggregate status with required-stage dominance.
 ///
 /// A missing required stage dominates a failed one, which dominates an
 /// unknown one; optional stages can only downgrade success to partial
 /// failure, never the reverse.
-fn aggregate_status(plan: &StagePlan, runs: &[InstrumentRun]) -> AggregateStatus {
+fn aggregate_status(
+    plan: &StagePlan,
+    runs: &[InstrumentRun],
+    require_verification: bool,
+) -> AggregateStatus {
     let mut required_failure: Option<AggregateStatus> = None;
     for (planned, run) in plan.stages.iter().zip(runs.iter()) {
-        if !planned.stage.required || run.is_success() {
+        let successful = if require_verification {
+            run.is_verified_success()
+        } else {
+            run.is_success()
+        };
+        if !planned.stage.required || successful {
             continue;
         }
         let failure = if run.evidence.is_missing() {
@@ -981,6 +1446,13 @@ fn aggregate_status(plan: &StagePlan, runs: &[InstrumentRun]) -> AggregateStatus
         } else if matches!(
             run.execution,
             ExecutionStatus::Failed | ExecutionStatus::Cancelled | ExecutionStatus::Blocked
+        ) || matches!(
+            run.verification,
+            Some(
+                VerificationOutcome::Fail
+                    | VerificationOutcome::Cancelled
+                    | VerificationOutcome::Blocked
+            )
         ) {
             AggregateStatus::Failed
         } else {
@@ -1001,7 +1473,14 @@ fn aggregate_status(plan: &StagePlan, runs: &[InstrumentRun]) -> AggregateStatus
         .stages
         .iter()
         .zip(runs.iter())
-        .any(|(planned, run)| !planned.stage.required && !run.is_success());
+        .any(|(planned, run)| {
+            !planned.stage.required
+                && if require_verification {
+                    !run.is_verified_success()
+                } else {
+                    !run.is_success()
+                }
+        });
     if optional_failure {
         AggregateStatus::PartialFailure
     } else {
@@ -1074,7 +1553,7 @@ impl StageOrchestrator {
         plan: &StagePlan,
         launcher: &dyn StageLauncher,
     ) -> Vec<InstrumentRun> {
-        Self::launch_all(runner, None, plan, launcher).await
+        Self::launch_all(runner, None, plan, launcher, None, Duration::ZERO, Duration::ZERO, Duration::ZERO).await
     }
 
     /// Launches every planned stage with new admission checked against the
@@ -1108,7 +1587,63 @@ impl StageOrchestrator {
                 })
                 .collect();
         }
-        Self::launch_all(runner, Some(registry), plan, launcher).await
+        Self::launch_all(runner, Some(registry), plan, launcher, None, Duration::ZERO, Duration::ZERO, Duration::ZERO).await
+    }
+
+    /// Launches, supervises, reconciles, and evaluates every stage before any
+    /// dependent stage is admitted. PASS requires terminal success plus a
+    /// parser/evaluator PASS over owner-read-back immutable stdout and stderr.
+    pub async fn launch_plan_live_supervised<E: ProcessExecutor + 'static>(
+        runner: &InstrumentRunner<E>,
+        registry: &InstrumentRegistry,
+        plan: &StagePlan,
+        launcher: &dyn StageLauncher,
+        evaluator: &dyn StageTerminalEvaluator,
+        stage_deadline: Duration,
+        poll_interval: Duration,
+        cancellation_grace: Duration,
+    ) -> Vec<InstrumentRun> {
+        if stage_deadline.is_zero() || poll_interval.is_zero() || cancellation_grace.is_zero() {
+            return plan
+                .stages
+                .iter()
+                .map(|planned| {
+                    let mut run = InstrumentRun::missing(
+                        &planned.route,
+                        "stage supervision bounds must be non-zero",
+                    );
+                    run.candidate_identity.clone_from(&plan.candidate_identity);
+                    run
+                })
+                .collect();
+        }
+        if plan.registry_generation != registry.generation()
+            || plan.registry_digest != registry.digest()
+        {
+            return plan
+                .stages
+                .iter()
+                .map(|planned| {
+                    let mut run = InstrumentRun::missing(
+                        &planned.route,
+                        "stage plan was compiled against a different registry generation",
+                    );
+                    run.candidate_identity.clone_from(&plan.candidate_identity);
+                    run
+                })
+                .collect();
+        }
+        Self::launch_all(
+            runner,
+            Some(registry),
+            plan,
+            launcher,
+            Some(evaluator),
+            stage_deadline,
+            poll_interval,
+            cancellation_grace,
+        )
+        .await
     }
 
     /// Walks one plan in topological order, with the live registry when the
@@ -1118,6 +1653,10 @@ impl StageOrchestrator {
         live: Option<&InstrumentRegistry>,
         plan: &StagePlan,
         launcher: &dyn StageLauncher,
+        evaluator: Option<&dyn StageTerminalEvaluator>,
+        stage_deadline: Duration,
+        poll_interval: Duration,
+        cancellation_grace: Duration,
     ) -> Vec<InstrumentRun> {
         let mut runs = Vec::with_capacity(plan.stages.len());
         let mut unlaunched: BTreeSet<String> = BTreeSet::new();
@@ -1127,20 +1666,45 @@ impl StageOrchestrator {
                 .stage
                 .depends_on
                 .iter()
-                .find(|dependency| unlaunched.contains(*dependency));
+                .find(|dependency| {
+                    unlaunched.contains(*dependency)
+                        || evaluator.is_some_and(|_| {
+                            !runs
+                                .iter()
+                                .find(|run| run.stage.stage_id == **dependency)
+                                .is_some_and(InstrumentRun::is_verified_success)
+                        })
+                });
             if let Some(dependency) = blocked_by {
                 let mut run = InstrumentRun::missing(
                     route,
-                    format!("blocked by unlaunched dependency '{dependency}'"),
+                    if evaluator.is_some() {
+                        format!("blocked by dependency '{dependency}' without terminal verified PASS")
+                    } else {
+                        format!("blocked by unlaunched dependency '{dependency}'")
+                    },
                 );
                 run.candidate_identity.clone_from(&plan.candidate_identity);
                 runs.push(run);
                 unlaunched.insert(route.stage().stage_id.clone());
                 continue;
             }
-            let mut run = Self::launch_one(runner, live, plan, planned, launcher).await;
+            let mut run = Self::launch_one(
+                runner,
+                live,
+                plan,
+                planned,
+                launcher,
+                evaluator,
+                stage_deadline,
+                poll_interval,
+                cancellation_grace,
+            )
+            .await;
             run.candidate_identity.clone_from(&plan.candidate_identity);
-            if run.evidence.is_missing() {
+            if run.evidence.is_missing()
+                || evaluator.is_some_and(|_| !run.is_verified_success())
+            {
                 unlaunched.insert(route.stage().stage_id.clone());
             }
             runs.push(run);
@@ -1318,6 +1882,10 @@ impl StageOrchestrator {
         plan: &StagePlan,
         planned: &PlannedStage,
         launcher: &dyn StageLauncher,
+        evaluator: Option<&dyn StageTerminalEvaluator>,
+        stage_deadline: Duration,
+        poll_interval: Duration,
+        cancellation_grace: Duration,
     ) -> InstrumentRun {
         let route = &planned.route;
         if !route.external() {
@@ -1456,14 +2024,66 @@ impl StageOrchestrator {
                 // lane observed over the exact bytes it admitted
                 // (`observe_from_intent` re-hashed the file and refused on
                 // mismatch), not a value copied from the request or the plan.
-                InstrumentRun::launched_in_plan(
+                let mut run = InstrumentRun::launched_in_plan(
                     route,
                     operation,
                     &grant,
                     identity.content_digest.as_str(),
                     Some(target_layout),
                     plan,
+                );
+                if run.evidence.is_missing() {
+                    return run;
+                }
+                let Some(evaluator) = evaluator else {
+                    return run;
+                };
+                match await_reconciled_terminal(
+                    runner,
+                    &binding,
+                    receipt.process.binding(),
+                    stage_deadline,
+                    poll_interval,
+                    cancellation_grace,
                 )
+                .await
+                {
+                    Ok(evidence) => {
+                        let evaluation = evaluator
+                            .evaluate_terminal(planned, &receipt, &evidence)
+                            .unwrap_or_else(|reason| {
+                                StageTerminalEvaluation::refused(
+                                    VerificationOutcome::Unknown,
+                                    format!("terminal source readback or evaluation refused: {reason}"),
+                                )
+                            });
+                        let tool = retained_tool_identity(
+                            &grant,
+                            &identity,
+                            &receipt,
+                            evidence.view(),
+                        );
+                        run.adopt_terminal_evaluation(
+                            terminal_execution_status(&evidence),
+                            &evidence,
+                            evaluation,
+                            tool,
+                        );
+                        run
+                    }
+                    Err(failure) => {
+                        run.execution = ExecutionStatus::Unknown;
+                        run.verification = Some(VerificationOutcome::Unknown);
+                        run.last_process_observation = failure.last_view;
+                        run.evidence = StageEvidence::Omitted {
+                            reason: format!(
+                                "stage did not reach reconciled terminal evidence: {}",
+                                failure.detail
+                            ),
+                        };
+                        run
+                    }
+                }
             }
             Err(error) => InstrumentRun::missing(route, format!("stage launch failed: {error}")),
         }
@@ -1594,6 +2214,245 @@ pub fn stage_request(
             }
         }),
     })
+}
+
+/// Polls the launch's exact binding through the runner's original executor,
+/// requests cancellation once after the stage deadline, and reconciles only
+/// after a terminal lifecycle is observed.
+async fn await_reconciled_terminal<E: ProcessExecutor + 'static>(
+    runner: &InstrumentRunner<E>,
+    binding: &InstrumentBinding,
+    expected_binding: &ProcessExecutionBinding,
+    deadline: Duration,
+    poll_interval: Duration,
+    cancellation_grace: Duration,
+) -> Result<ProcessEvidence, ProcessSupervisionFailure> {
+    let started = Instant::now();
+    let mut cancellation_started = None;
+    let mut cancellation_detail = None;
+    let mut last_view = None;
+    loop {
+        let observation = match runner.inspect(binding).await {
+            Ok(observation) => observation,
+            Err(error) => {
+                return Err(ProcessSupervisionFailure {
+                    detail: format!("terminal inspect refused: {error}"),
+                    last_view,
+                });
+            }
+        };
+        if observation.view.binding() != expected_binding {
+            return Err(ProcessSupervisionFailure {
+                detail: "inspect returned a different process binding".to_owned(),
+                last_view: Some(observation.view),
+            });
+        }
+        last_view = Some(observation.view.clone());
+        if observation.view.lifecycle().is_terminal() {
+            let evidence = match runner.reconcile(binding).await {
+                Ok(evidence) => evidence,
+                Err(error) => {
+                    return Err(ProcessSupervisionFailure {
+                        detail: format!("terminal reconcile refused: {error}"),
+                        last_view,
+                    });
+                }
+            };
+            if let Err(error) = evidence.validate() {
+                return Err(ProcessSupervisionFailure {
+                    detail: format!("reconcile returned invalid process evidence: {error}"),
+                    last_view: Some(evidence.view().clone()),
+                });
+            }
+            if evidence.binding() != expected_binding {
+                return Err(ProcessSupervisionFailure {
+                    detail: "reconcile returned evidence for a different process binding"
+                        .to_owned(),
+                    last_view: Some(evidence.view().clone()),
+                });
+            }
+            if !evidence.view().lifecycle().is_terminal() {
+                return Err(ProcessSupervisionFailure {
+                    detail: format!(
+                        "reconcile returned non-terminal lifecycle {:?}",
+                        evidence.view().lifecycle()
+                    ),
+                    last_view: Some(evidence.view().clone()),
+                });
+            }
+            return Ok(evidence);
+        }
+        if cancellation_started.is_none() && started.elapsed() >= deadline {
+            cancellation_started = Some(Instant::now());
+            if let Err(error) = runner.cancel(binding).await {
+                cancellation_detail = Some(format!("deadline cancellation refused: {error}"));
+            }
+        }
+        if let Some(cancelled_at) = cancellation_started
+            && cancelled_at.elapsed() >= cancellation_grace
+        {
+            let detail = cancellation_detail
+                .map(|detail| format!("; {detail}"))
+                .unwrap_or_default();
+            return Err(ProcessSupervisionFailure {
+                detail: format!(
+                    "lifecycle {:?} remained non-terminal after deadline and cancellation grace{detail}",
+                    observation.view.lifecycle()
+                ),
+                last_view: Some(observation.view),
+            });
+        }
+        let sleep_for = if let Some(cancelled_at) = cancellation_started {
+            cancellation_grace
+                .saturating_sub(cancelled_at.elapsed())
+                .min(poll_interval)
+        } else {
+            deadline.saturating_sub(started.elapsed()).min(poll_interval)
+        };
+        thread::sleep(sleep_for);
+    }
+}
+
+struct ProcessSupervisionFailure {
+    detail: String,
+    last_view: Option<eliot_process::ProcessExecutionView>,
+}
+
+fn retained_tool_identity(
+    grant: &InstrumentAdmissionGrant,
+    executable: &ResolvedExecutableIdentity,
+    receipt: &InstrumentStartReceipt,
+    terminal: &eliot_process::ProcessExecutionView,
+) -> Option<RetainedToolIdentity> {
+    let exit = terminal.exit()?;
+    let code = observed_exit_code(exit);
+    let disposition = exit.disposition();
+    let outcome = match disposition {
+        ExitDisposition::Completed if code.is_some() => RetainedExitOutcome {
+            disposition,
+            code,
+        },
+        ExitDisposition::Unknown if code.is_none() => RetainedExitOutcome {
+            disposition,
+            code: None,
+        },
+        _ => return None,
+    };
+    RetainedToolIdentity::sealed(
+        &grant.executable_path,
+        &receipt.argv,
+        &executable.environment_digest,
+        outcome,
+    )
+    .ok()
+}
+
+/// Maps only a reconciled terminal physical observation onto the execution
+/// axis. Parser success remains a separate evaluator result.
+fn terminal_execution_status(process: &ProcessEvidence) -> ExecutionStatus {
+    let view = process.view();
+    let exit = view
+        .exit()
+        .map(|exit| (exit.disposition(), observed_exit_code(exit)));
+    terminal_execution_status_from_observation(view.lifecycle(), exit)
+}
+
+fn terminal_execution_status_from_observation(
+    lifecycle: ProcessLifecycle,
+    exit: Option<(ExitDisposition, Option<i32>)>,
+) -> ExecutionStatus {
+    match lifecycle {
+        ProcessLifecycle::Failed => return ExecutionStatus::Failed,
+        ProcessLifecycle::Quarantined => return ExecutionStatus::Blocked,
+        ProcessLifecycle::Created
+        | ProcessLifecycle::Starting
+        | ProcessLifecycle::Running
+        | ProcessLifecycle::Cancelling
+        | ProcessLifecycle::UnknownOutcome => return ExecutionStatus::Unknown,
+        ProcessLifecycle::Exited => {}
+        ProcessLifecycle::Reconciled => return ExecutionStatus::Unknown,
+    }
+
+    let Some((disposition, code)) = exit else {
+        return ExecutionStatus::Unknown;
+    };
+    match disposition {
+        ExitDisposition::Completed => match code {
+            Some(0) => ExecutionStatus::Succeeded,
+            Some(_) => ExecutionStatus::Failed,
+            None => ExecutionStatus::Unknown,
+        },
+        ExitDisposition::Cancelled => ExecutionStatus::Cancelled,
+        ExitDisposition::Signalled | ExitDisposition::ResourceLimit => ExecutionStatus::Failed,
+        ExitDisposition::Unknown => ExecutionStatus::Unknown,
+    }
+}
+
+/// Reads the optional exit code from the process contract's serialized view.
+/// `ExitStatus` intentionally exposes disposition without a code accessor.
+fn observed_exit_code(exit: &eliot_process::ExitStatus) -> Option<i32> {
+    serde_json::to_value(exit)
+        .ok()?
+        .get("code")?
+        .as_i64()
+        .and_then(|value| i32::try_from(value).ok())
+}
+
+#[cfg(test)]
+mod terminal_supervision_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_success_requires_exited_zero_code() {
+        assert_eq!(
+            terminal_execution_status_from_observation(
+                ProcessLifecycle::Exited,
+                Some((ExitDisposition::Completed, Some(0))),
+            ),
+            ExecutionStatus::Succeeded
+        );
+        assert_eq!(
+            terminal_execution_status_from_observation(
+                ProcessLifecycle::Exited,
+                Some((ExitDisposition::Completed, Some(7))),
+            ),
+            ExecutionStatus::Failed
+        );
+    }
+
+    #[test]
+    fn missing_nonterminal_cancelled_and_unknown_outcomes_never_pass() {
+        assert_eq!(
+            terminal_execution_status_from_observation(ProcessLifecycle::Running, None),
+            ExecutionStatus::Unknown
+        );
+        assert_eq!(
+            terminal_execution_status_from_observation(ProcessLifecycle::Exited, None),
+            ExecutionStatus::Unknown
+        );
+        assert_eq!(
+            terminal_execution_status_from_observation(
+                ProcessLifecycle::Exited,
+                Some((ExitDisposition::Cancelled, None)),
+            ),
+            ExecutionStatus::Cancelled
+        );
+        assert_eq!(
+            terminal_execution_status_from_observation(
+                ProcessLifecycle::Reconciled,
+                Some((ExitDisposition::Completed, Some(0))),
+            ),
+            ExecutionStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn parser_pass_requires_both_owner_verified_full_streams() {
+        assert!(matches!(
+            StageTerminalEvaluation::new(VerificationOutcome::Pass, Vec::new(), None),
+            Err(ProfileRunError::IncompleteStreamSource { .. })
+        ));
+    }
 }
 
 impl<E: ProcessExecutor + 'static> InstrumentRunner<E> {

@@ -1274,7 +1274,12 @@ pub fn confirm_dev_fast_finish(
         .iter()
         .filter_map(|run| match &run.evidence {
             StageEvidence::Retained { artifact, .. } => Some(artifact.as_str().to_owned()),
-            StageEvidence::Omitted { .. } | StageEvidence::Missing { .. } => None,
+            // Dev-fast raw refs remain artifact handles from its existing
+            // retention owner. Verification-profile stream readbacks are a
+            // separate evidence path and are not promoted into this record.
+            StageEvidence::RetainedProcessStreams { .. }
+            | StageEvidence::Omitted { .. }
+            | StageEvidence::Missing { .. } => None,
         })
         .collect::<Vec<_>>();
     VerificationProfileRun::assemble(
