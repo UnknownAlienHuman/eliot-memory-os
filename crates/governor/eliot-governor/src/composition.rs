@@ -9844,8 +9844,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 request,
                 closure,
                 &commit,
-                pending_snapshot,
-                pending_revocation,
+                pending_snapshot.clone(),
+                pending_revocation.clone(),
                 link,
             )
             .await?;
