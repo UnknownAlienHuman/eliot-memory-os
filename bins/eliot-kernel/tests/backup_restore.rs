@@ -5,8 +5,61 @@
 //! `J: RestoreJournalPort`: memory/file fixtures below prove adapter
 //! mapping only and always carry fixture-marked admission, while production
 //! composition must supply the admitted persistent ORS owner (#957 via the
-//! #962 turn). No test executes here in the worker lane; product modules
-//! land first and the full gate runs at the Windows/WinUI build.
+//! #962 turn).
+//!
+//! # Why the cases that call `restore` are red, and why that is not a test bug
+//!
+//! The twenty cases predate two refusals that landed after them (#955,
+//! PR #4803 and PR #4519), and this file has been rewritten to assert the
+//! PRE-refusal contract. Every case below that expects `restore(...)` to
+//! succeed therefore stops at the FIRST refusal, and the one case in this
+//! file that already satisfies the first refusal stops at the SECOND. Both
+//! refusals are load-bearing and correct; neither is reachable-around, and
+//! neither is a defect to be patched in a test.
+//!
+//! Refusal 1 — no owner-admitted destination.
+//! [`KernelBackupRestore::restore`] reaches
+//! `let Some(evidence) = ports.manifest_evidence.as_ref() else { return
+//! Err(DestinationNotAdmitted) }` (`src/backup_restore.rs`). `production_ports`
+//! below supplies `manifest_evidence: None`, because the Kernel cannot mint
+//! the record: it observes no Host manifest binding. Satisfying this from a
+//! test would mean presenting fixture digests, which is precisely what
+//! `eliot_backup::destination_manifest_evidence` exists to reject — two
+//! well-formed 64-hex strings typed at a call site have already decided the
+//! question the record answers. [`manifest_evidence`] below already does this
+//! for exactly one case, and that case is not green either (see refusal 2).
+//!
+//! Refusal 2 — an uncorroborated purge-ledger revision, which is INDEPENDENT
+//! of refusal 1 and is the reason refusal 1 is not the whole blocker.
+//! [`test_bundle`] declares `purge_ledger_revision: 1` over an EMPTY ledger,
+//! and these cases drive the no-ORS [`restore`] entry, so
+//! `apply_purge_entries` answers `owner_revision: None`. Then
+//! `check_purge_revision_closure` compares `None` against the declared `1`
+//! and refuses `FenceMismatch { subject: "purge ledger revision" }`. This is
+//! measured, not predicted: `foreign_or_stale_destination_refused` is the one
+//! case here that passes owner-issued destination evidence, and it fails at
+//! exactly this check, reported as
+//! `RetainedForResume { primary: FenceMismatch { subject: "purge ledger
+//! revision" }, .. }`. The check is deliberate: an archive declares the
+//! ledger position its SOURCE reached, and the destination holds that
+//! position only if a purge owner says so.
+//!
+//! So re-pointing [`production_ports`] at fixture evidence does not turn
+//! these cases green; it relocates every one of them to refusal 2. The
+//! remaining link is a production seam, not a test edit: a restore whose
+//! destination admission is owner-issued AND whose purge-ledger declaration
+//! is corroborated by a real owner — i.e. the composition path through
+//! [`KernelBackupRestore::restore_with_ors_journal`] with a live
+//! `RedbRecoveryStore`. These cases deliberately prove adapter mapping with
+//! injected fixture journals, so rewriting them onto a live ORS owner would
+//! be a different twenty cases, not a fix to these ones.
+//!
+//! No expectation here is weakened to accommodate either refusal, and
+//! `DestinationManifestAdmission` / `RestoreDestinationAdmissionOwner`
+//! (`eliot_backup`) are NOT the seam for either one: the trait has no
+//! implementation anywhere in the workspace, the Kernel never constructs the
+//! admission, and no code path from these tests reaches it. Implementing it
+//! would not change a single result in this file.
 
 use std::num::NonZeroU64;
 use std::path::PathBuf;
@@ -230,6 +283,14 @@ impl RestoreJournalPort for FixtureFileJournal {
     }
 }
 
+/// The common bundle shape these cases drive.
+///
+/// `manifest_evidence` is `None` because the Kernel cannot mint the record it
+/// requires — it observes no Host manifest binding — and presenting fixture
+/// digests is the fabrication `eliot_backup::destination_manifest_evidence`
+/// exists to prevent. That is refusal 1 in the module docs, and it is not
+/// bypassed here. See those docs for why supplying evidence anyway does not
+/// make these cases pass.
 fn production_ports<'a>(
     admission: &'a RestoreJournalAdmission,
     fence: &'a StateFence,
