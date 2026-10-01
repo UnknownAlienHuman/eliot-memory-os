@@ -25,10 +25,10 @@
   "source_token_estimate": {
     "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
     "scope": "the selected decision workset of this cell",
-    "source_stu": 77626,
+    "source_stu": 77879,
     "test_stu": 42805,
     "selected_file_count": 8,
-    "physical_source_stu": 120431,
+    "physical_source_stu": 120684,
     "physical_file_count": 8,
     "inline_cfg_test_modules": 0,
     "qualification": "planning estimate only; not a qualified Context Envelope (I2.16)"
@@ -48,9 +48,9 @@
     "selected_source": [
       {
         "path": "crates/smart/eliot-context-admission/src/campaign_view.rs",
-        "bytes": 9745,
-        "sha256": "e3b1e6dc66504d8a4986aa4af3508d78b4fe466c6ff6156ca9595213c1dbbd9d",
-        "stu": 3249,
+        "bytes": 10148,
+        "sha256": "210909dfd0263307a7e87fc751ac7ad083f58506b6726b94bf13492bec96ff14",
+        "stu": 3383,
         "inline_cfg_test": false
       },
       {
@@ -76,9 +76,9 @@
       },
       {
         "path": "crates/smart/eliot-context-admission/src/lib.rs",
-        "bytes": 92462,
-        "sha256": "10833417115356010c44493c993e1ca8c811a74309ebda622a0d553a4eb5c4a3",
-        "stu": 30821,
+        "bytes": 92817,
+        "sha256": "087ee46052fdb8b5e3466f4ddab8b37d6daf754274d6b9f5074d8b290390bdfd",
+        "stu": 30939,
         "inline_cfg_test": false
       },
       {
@@ -111,11 +111,11 @@
         ]
       }
     ],
-    "source_selection_digest": "ea4c068f007afa35083c86c9724a16d5efcefbfd03b72fef76ed404fb4209d7e"
+    "source_selection_digest": "d7333d1ab4c6675208d0f333637980a77760be148b2929cb998543b287f4b626"
   },
   "unselected_package_files": {
     "physical_inventory_file_count": 8,
-    "physical_inventory_digest": "ea4c068f007afa35083c86c9724a16d5efcefbfd03b72fef76ed404fb4209d7e",
+    "physical_inventory_digest": "d7333d1ab4c6675208d0f333637980a77760be148b2929cb998543b287f4b626",
     "unselected_files": [],
     "note": "Physical package inventory beyond this cell's selected workset. No file is dropped: an unlinked or unresolved file is reported here with the reason it was not selected."
   },
@@ -193,20 +193,20 @@
         },
         "physical_source_inventory": {
           "path_count": 8,
-          "sha256": "ea4c068f007afa35083c86c9724a16d5efcefbfd03b72fef76ed404fb4209d7e"
+          "sha256": "d7333d1ab4c6675208d0f333637980a77760be148b2929cb998543b287f4b626"
         },
         "selected_workset": {
           "allocation_scope": "PACKAGE_WIDE",
           "allocation_state": "EXPLICIT_PACKAGE_WIDE",
           "path_count": 8,
-          "sha256": "ea4c068f007afa35083c86c9724a16d5efcefbfd03b72fef76ed404fb4209d7e"
+          "sha256": "d7333d1ab4c6675208d0f333637980a77760be148b2929cb998543b287f4b626"
         }
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "8ec29c6a2accb131ce13599d81f6e048bc5b3fcaf26f06526344fb3a31389216",
+  "artifact_digest": "8ddcf4557e5f661248d539088f4d82cae46d2e1afc0d0e4ffd0903467ed3c59e",
   "contract_revision": {
     "derivation": "first 16 hex characters of the SHA-256 over the namespaced canonical contract-semantic body (artifact_digest, contract_revision and source_provenance excluded)",
     "value": "450462e44a43c833"

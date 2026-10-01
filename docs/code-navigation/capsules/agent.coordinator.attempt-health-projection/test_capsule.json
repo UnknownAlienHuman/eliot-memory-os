@@ -50,6 +50,10 @@
         "crates/agent/eliot-agent-coordinator/src/tests.rs"
       ]
     },
+    "unresolved_cfg_or_module_cases": {
+      "rule": "A cfg predicate that mentions `test` but can also hold without it is neither test-only nor an unconditional production edge. It is reported here as explicit uncertainty and the file stays production-reachable, so no path is renamed and no test is removed to shrink a context estimate.",
+      "cases": []
+    },
     "unselected_package_files": []
   },
   "unit_property_model_tests": {
@@ -326,21 +330,21 @@
         "sha256": "f2ab651b76ac9f5870f8268c52d1db5839cdb957f5939cd0d8e3a2edcd91fe45"
       },
       "physical_source_inventory": {
-        "path_count": 36,
-        "sha256": "eb5037a39de9c97ad122ffbe142f643826d14de868b127a1937bfe34b9753f46"
+        "path_count": 37,
+        "sha256": "f71dc5adcebac77fc92cac7c3a47266831143181edce1121876415ec3bd0bf6d"
       },
       "selected_workset": {
         "allocation_scope": "PACKAGE_WIDE",
         "allocation_state": "UNRESOLVED_ALLOCATION",
-        "path_count": 36,
-        "sha256": "eb5037a39de9c97ad122ffbe142f643826d14de868b127a1937bfe34b9753f46"
+        "path_count": 37,
+        "sha256": "f71dc5adcebac77fc92cac7c3a47266831143181edce1121876415ec3bd0bf6d"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0",
     "note": "A change under exact_provenance moves artifact_digest only. It is not a public API or semantic-contract change and is not an instruction to re-read or re-test every cell."
   },
-  "artifact_digest": "7d1cb6dc44d9e9ff8f9fc282d8f0b9d26cc32bda7de216625deadc0c15f453c5",
+  "artifact_digest": "76d3410ef4159db20d0d355f95d7651743d469089a43c3c3a3b24df6f1800a28",
   "contract_revision": {
     "derivation": "first 16 hex characters of the SHA-256 over the namespaced canonical contract-semantic body (artifact_digest, contract_revision and source_provenance excluded)",
     "value": "ac1b32ae18357610"

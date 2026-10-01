@@ -288,7 +288,7 @@
       },
       "package_manifest": {
         "path": "bins/eliotd/Cargo.toml",
-        "sha256": "710e97442794438631d2344b3f423d6dd82d26b0d00d1cc0ea23deed50cee444"
+        "sha256": "acba1fd649d8e5962b7cca70223ac251bbc263fb8d2455a89cd3c4bc48a84f2c"
       },
       "module_manifest": null
     },
@@ -299,20 +299,20 @@
       },
       "physical_source_inventory": {
         "path_count": 94,
-        "sha256": "4c0023db216c9464d8840ec19c6bf08932482b687712f4679a9019f7478a5c41"
+        "sha256": "efa8620ea08be5d3edb178258aa56b0f7999e13aafc97eb0d6dd1f31dd36c8d3"
       },
       "selected_workset": {
         "allocation_scope": "PACKAGE_WIDE",
         "allocation_state": "UNRESOLVED_ALLOCATION",
         "path_count": 94,
-        "sha256": "4c0023db216c9464d8840ec19c6bf08932482b687712f4679a9019f7478a5c41"
+        "sha256": "efa8620ea08be5d3edb178258aa56b0f7999e13aafc97eb0d6dd1f31dd36c8d3"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0",
     "note": "A change under exact_provenance moves artifact_digest only. It is not a public API or semantic-contract change and is not an instruction to re-read or re-test every cell."
   },
-  "artifact_digest": "fd097034bf788691875c495186a5b73d4c5e3d298ed80bb012722f008cc05572",
+  "artifact_digest": "3c589919b26f2faa2180aa7e7a28f8c2d0b9b74703541b0f91bc9558b162ce53",
   "contract_revision": {
     "derivation": "first 16 hex characters of the SHA-256 over the namespaced canonical contract-semantic body (artifact_digest, contract_revision and source_provenance excluded)",
     "value": "d1f99a3503bcf210"

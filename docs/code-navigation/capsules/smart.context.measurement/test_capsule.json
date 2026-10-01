@@ -48,6 +48,10 @@
       "classification_rule": "A module reachable only through cfg(test) module edges or from a test target root is test source; a path component named `tests` is not evidence of anything. Coverage is preserved: classified test-only modules stay in the test slice and their test attributes are still counted.",
       "paths": []
     },
+    "unresolved_cfg_or_module_cases": {
+      "rule": "A cfg predicate that mentions `test` but can also hold without it is neither test-only nor an unconditional production edge. It is reported here as explicit uncertainty and the file stays production-reachable, so no path is renamed and no test is removed to shrink a context estimate.",
+      "cases": []
+    },
     "unselected_package_files": []
   },
   "unit_property_model_tests": {
@@ -66,8 +70,8 @@
     "selected_tests": [
       {
         "path": "crates/smart/eliot-context-measurement/tests/measurement.rs",
-        "bytes": 56785,
-        "sha256": "e61e9893f4dbabe2f382eb1b046010b8f01188582b89ee5a53386e676e84aaa5",
+        "bytes": 56642,
+        "sha256": "3d5dc9118a9b47bde03ebeb6ffcb23da875259a4e9b71b6d49ed8cbd843461a6",
         "test_attributes": 51,
         "inline_cfg_test": false,
         "test_only_module": false,
@@ -126,7 +130,7 @@
   "expected_nonzero_test_count": {
     "method": "count of #[test]/#[tokio::test] attributes in the selected test slice",
     "test_attribute_count": 51,
-    "test_stu": 18929,
+    "test_stu": 18881,
     "nonzero": true
   },
   "bound_contract_digest": "3228265e138337f0",
@@ -160,20 +164,20 @@
       },
       "physical_source_inventory": {
         "path_count": 8,
-        "sha256": "478e473172053f71561625cd398082ad289a8db385167042b79a214e3d040870"
+        "sha256": "432dafb36bdd9442dbbb841a1ae5e0f37aa8b1c11dec10a6cf3b437ead75eddf"
       },
       "selected_workset": {
         "allocation_scope": "PACKAGE_WIDE",
         "allocation_state": "EXPLICIT_PACKAGE_WIDE",
         "path_count": 8,
-        "sha256": "478e473172053f71561625cd398082ad289a8db385167042b79a214e3d040870"
+        "sha256": "432dafb36bdd9442dbbb841a1ae5e0f37aa8b1c11dec10a6cf3b437ead75eddf"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0",
     "note": "A change under exact_provenance moves artifact_digest only. It is not a public API or semantic-contract change and is not an instruction to re-read or re-test every cell."
   },
-  "artifact_digest": "239bc99c8caa0fabb2a9dfe343594dca907d077a5c006c78051a19b3a2344a09",
+  "artifact_digest": "00402bba060d5bb4316135e8baf61e3247ee1f7e4cfc2f0578461d9a3d687666",
   "contract_revision": {
     "derivation": "first 16 hex characters of the SHA-256 over the namespaced canonical contract-semantic body (artifact_digest, contract_revision and source_provenance excluded)",
     "value": "d7afbc6278b9c035"

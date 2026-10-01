@@ -267,20 +267,20 @@
       },
       "physical_source_inventory": {
         "path_count": 1,
-        "sha256": "d5525751a31e32c4afdfd5c3abb7a966809fd6000c549398e456e37395ef7915"
+        "sha256": "791c49cd46b39b2836f8b9140b259a6c8a65764a2be4923de57668e0bc5f7cd7"
       },
       "selected_workset": {
         "allocation_scope": "PACKAGE_WIDE",
         "allocation_state": "EXPLICIT_PACKAGE_WIDE",
         "path_count": 1,
-        "sha256": "d5525751a31e32c4afdfd5c3abb7a966809fd6000c549398e456e37395ef7915"
+        "sha256": "791c49cd46b39b2836f8b9140b259a6c8a65764a2be4923de57668e0bc5f7cd7"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0",
     "note": "A change under exact_provenance moves artifact_digest only. It is not a public API or semantic-contract change and is not an instruction to re-read or re-test every cell."
   },
-  "artifact_digest": "6242a3b8296a9c4d2bbaf7a400ba81b80f4aaf1f0ed362af133a828ab7318cb7",
+  "artifact_digest": "93a83e2790ce624e6fb59842d74e51415593f007cc6b29d041853a1c1022c84e",
   "contract_revision": {
     "derivation": "first 16 hex characters of the SHA-256 over the namespaced canonical contract-semantic body (artifact_digest, contract_revision and source_provenance excluded)",
     "value": "ad23c6c8c9853ab7"

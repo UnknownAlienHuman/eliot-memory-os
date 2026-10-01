@@ -52,6 +52,10 @@
         "crates/kernel/eliot-kernel-service/src/write_coordinator/tests.rs"
       ]
     },
+    "unresolved_cfg_or_module_cases": {
+      "rule": "A cfg predicate that mentions `test` but can also hold without it is neither test-only nor an unconditional production edge. It is reported here as explicit uncertainty and the file stays production-reachable, so no path is renamed and no test is removed to shrink a context estimate.",
+      "cases": []
+    },
     "unselected_package_files": [
       {
         "path": "crates/kernel/eliot-kernel-service/src/capacity_evidence.rs",
@@ -80,12 +84,12 @@
       },
       {
         "path": "crates/kernel/eliot-kernel-service/src/host_request_binding.rs",
-        "bytes": 85180,
+        "bytes": 92678,
         "reason": "production source not allocated to this cell"
       },
       {
         "path": "crates/kernel/eliot-kernel-service/src/lifecycle.rs",
-        "bytes": 127520,
+        "bytes": 127570,
         "reason": "production source not allocated to this cell"
       },
       {
@@ -105,7 +109,7 @@
       },
       {
         "path": "crates/kernel/eliot-kernel-service/src/maintenance_trigger_delivery.rs",
-        "bytes": 66121,
+        "bytes": 70129,
         "reason": "production source not allocated to this cell"
       },
       {
@@ -140,7 +144,7 @@
       },
       {
         "path": "crates/kernel/eliot-kernel-service/src/protocol/native_worker_claim.rs",
-        "bytes": 72553,
+        "bytes": 72561,
         "reason": "production source not allocated to this cell"
       },
       {
@@ -170,12 +174,12 @@
       },
       {
         "path": "crates/kernel/eliot-kernel-service/src/storage_replacement.rs",
-        "bytes": 77345,
+        "bytes": 100251,
         "reason": "production source not allocated to this cell"
       },
       {
         "path": "crates/kernel/eliot-kernel-service/src/store_backup_client.rs",
-        "bytes": 40228,
+        "bytes": 41924,
         "reason": "production source not allocated to this cell"
       },
       {
@@ -185,7 +189,7 @@
       },
       {
         "path": "crates/kernel/eliot-kernel-service/src/store_gateway.rs",
-        "bytes": 551132,
+        "bytes": 554909,
         "reason": "production source not allocated to this cell"
       },
       {
@@ -200,7 +204,7 @@
       },
       {
         "path": "crates/kernel/eliot-kernel-service/src/store_write_status.rs",
-        "bytes": 5011,
+        "bytes": 11324,
         "reason": "production source not allocated to this cell"
       },
       {
@@ -210,7 +214,7 @@
       },
       {
         "path": "crates/kernel/eliot-kernel-service/src/user_automation.rs",
-        "bytes": 29789,
+        "bytes": 29807,
         "reason": "production source not allocated to this cell"
       },
       {
@@ -220,12 +224,12 @@
       },
       {
         "path": "crates/kernel/eliot-kernel-service/src/user_automation_execution.rs",
-        "bytes": 221721,
+        "bytes": 221791,
         "reason": "production source not allocated to this cell"
       },
       {
         "path": "crates/kernel/eliot-kernel-service/src/user_automation_execution_client.rs",
-        "bytes": 88485,
+        "bytes": 88515,
         "reason": "production source not allocated to this cell"
       },
       {
@@ -245,7 +249,7 @@
       },
       {
         "path": "crates/kernel/eliot-kernel-service/src/user_automation_store.rs",
-        "bytes": 112551,
+        "bytes": 112788,
         "reason": "production source not allocated to this cell"
       },
       {
@@ -604,20 +608,20 @@
       },
       "physical_source_inventory": {
         "path_count": 60,
-        "sha256": "da03f277ceba4f8fba4e4cf8aba3bbbf3fa175e6048d0ba5ab79f711b1a607bd"
+        "sha256": "0b0f29576c040592433f1f73229eee7ff6eb1f41a0a4205be602f5d86beecc83"
       },
       "selected_workset": {
         "allocation_scope": "PER_CELL",
         "allocation_state": "ACCEPTED_ALLOCATION",
         "path_count": 18,
-        "sha256": "0f404574000cdc7fab19513d4b31940dcf02f831dca31b05ec7c949c11a329bd"
+        "sha256": "1b457d8c1f6fb659d27e2deede7c13d24c7c7937911efd9fd4d024b79d04f4d9"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0",
     "note": "A change under exact_provenance moves artifact_digest only. It is not a public API or semantic-contract change and is not an instruction to re-read or re-test every cell."
   },
-  "artifact_digest": "f3ce75dd2c220308e6783811f9a957909eb492a22e2f729ceaa099ac4faba9ce",
+  "artifact_digest": "25955db3e9c89b42481cb29df5b5f05f9ab4aabacb41d7f10bf7e6819cc88e2f",
   "contract_revision": {
     "derivation": "first 16 hex characters of the SHA-256 over the namespaced canonical contract-semantic body (artifact_digest, contract_revision and source_provenance excluded)",
     "value": "01d9f1c2f17c8fc4"

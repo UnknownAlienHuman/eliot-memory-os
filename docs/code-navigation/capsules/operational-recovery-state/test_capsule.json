@@ -46,6 +46,15 @@
         "crates/kernel/eliot-ors/src/tests.rs"
       ]
     },
+    "unresolved_cfg_or_module_cases": {
+      "rule": "A cfg predicate that mentions `test` but can also hold without it is neither test-only nor an unconditional production edge. It is reported here as explicit uncertainty and the file stays production-reachable, so no path is renamed and no test is removed to shrink a context estimate.",
+      "cases": [
+        {
+          "path": "crates/kernel/eliot-ors/src/test_support.rs",
+          "reason": "module edge gate mentions `test` but can be satisfied without it, so it is neither test-only nor an unconditional production edge: feature = \"test-support\""
+        }
+      ]
+    },
     "unselected_package_files": []
   },
   "unit_property_model_tests": {
@@ -230,20 +239,20 @@
       },
       "physical_source_inventory": {
         "path_count": 36,
-        "sha256": "00f7f1521bbdb3cc7d71126d46a2258fabe1863a9e4fbfccc46744b72b81f9cc"
+        "sha256": "323a71215104a98679096160463cbca60dd5f1a9122d93afd9518180d75ee652"
       },
       "selected_workset": {
         "allocation_scope": "PACKAGE_WIDE",
         "allocation_state": "EXPLICIT_PACKAGE_WIDE",
         "path_count": 36,
-        "sha256": "00f7f1521bbdb3cc7d71126d46a2258fabe1863a9e4fbfccc46744b72b81f9cc"
+        "sha256": "323a71215104a98679096160463cbca60dd5f1a9122d93afd9518180d75ee652"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0",
     "note": "A change under exact_provenance moves artifact_digest only. It is not a public API or semantic-contract change and is not an instruction to re-read or re-test every cell."
   },
-  "artifact_digest": "269231679b48134f4deaa8770d18f07d27f5bf7b148a6c5f13d732f4d0be20ac",
+  "artifact_digest": "d5e3e85cecf5bcd0a52576040e732b31ded6481cd4e462c70783e5e687d39f2b",
   "contract_revision": {
     "derivation": "first 16 hex characters of the SHA-256 over the namespaced canonical contract-semantic body (artifact_digest, contract_revision and source_provenance excluded)",
     "value": "d874d82a1f33c0fc"
