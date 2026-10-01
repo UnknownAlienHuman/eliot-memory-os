@@ -2620,7 +2620,7 @@ fn admit_packet_candidates(
     headroom: &HeadroomContext<'_>,
     presented: Option<PresentedLearning<'_>>,
 ) -> Result<(AdmittedContextSet, MaterialRankTraceDelivery), PacketCompositionError> {
-// #1725 AUD3: the entry is chosen from owner-derived evidence, never assumed.
+    // #1725 AUD3: the entry is chosen from owner-derived evidence, never assumed.
     // `Some` exists only when the Governor issued a learning admission AND the
     // caller re-verified it live, and `VerifiedLearningAdmission` has a private
     // field with no other constructor. `admit_context_governed` with
@@ -2641,14 +2641,13 @@ fn admit_packet_candidates(
         ),
         None => admit_context_traced_with_headroom(input, headroom),
     };
-    let (result, traces) = guarded
-        .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?
-    {
-        HeadroomAdmissionOutcome::Admitted { result, traces, .. } => (*result, traces),
-        HeadroomAdmissionOutcome::Refused(refusal) => {
-            return Err(PacketCompositionError::HeadroomRefused { refusal });
-        }
-    };
+    let (result, traces) =
+        match guarded.map_err(|error| PacketCompositionError::Admission(Box::new(error)))? {
+            HeadroomAdmissionOutcome::Admitted { result, traces, .. } => (*result, traces),
+            HeadroomAdmissionOutcome::Refused(refusal) => {
+                return Err(PacketCompositionError::HeadroomRefused { refusal });
+            }
+        };
     result
         .validate_for(input)
         .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
