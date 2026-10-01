@@ -83,13 +83,13 @@ use eliotd::{
     DaemonConfig, DaemonKernelClient, DaemonStatus, FinishSubmitOutcome,
     GovernorAuthorityDriveOutcome, GovernorAuthorityDriver, KernelContextReadClient,
     LocalReadSubmitOutcome, MaintenanceObservation, MaintenanceTriggerOrigin,
-    OBSERVE_TASK_CONTRACT_REQUIRED, ObserveDeferOutcome, ObserveOperationAuthority, ObserveServeOutcome,
-    ObserveSubmitOutcome, ObserveSuboperation, OutcomeLayer, PROTOCOL_VERSION, SELF_OBSERVED_FAMILY,
-    SERVICE_NAME, TaskControllerSubmitOutcome, decode_observation_capture, forward_admitted_local_read,
-    observation_base_operation, observation_pending_handle, observation_request_identity,
-    observation_result_body, observation_unavailable_outcome, observe_operation_class,
-    observe_serve_outcome, resolve_observe_operation_authority, serve_admitted_observe,
-    terminal_for_invalid_ticket,
+    OBSERVE_TASK_CONTRACT_REQUIRED, ObserveDeferOutcome, ObserveOperationAuthority,
+    ObserveServeOutcome, ObserveSubmitOutcome, ObserveSuboperation, OutcomeLayer, PROTOCOL_VERSION,
+    SELF_OBSERVED_FAMILY, SERVICE_NAME, TaskControllerSubmitOutcome, decode_observation_capture,
+    forward_admitted_local_read, observation_base_operation, observation_pending_handle,
+    observation_request_identity, observation_result_body, observation_unavailable_outcome,
+    observe_operation_class, resolve_observe_operation_authority,
+    serve_admitted_observe, terminal_for_invalid_ticket,
 };
 use serde::Serialize;
 use tokio::time::{Instant, Interval, MissedTickBehavior};
@@ -5142,17 +5142,19 @@ async fn execute_observation_capture(
     // task-selection owner evidence through the composition, never the
     // envelope's claimed task text, and it happens under the same composition
     // guard the owner borrow below takes.
+    // One reading of the daemon's own activation clock, taken once for the whole
+    // capture and shared by the authority resolution and the identity below, so
+    // the identity cannot disagree with the reading the authority decision was
+    // taken at. This is the one clock `current_activation_snapshot` is already
+    // read with on the activation-resolution spine, and it fails closed on a
+    // pre-epoch or out-of-range reading instead of clamping a bogus time into
+    // the owner authority decision.
+    let observed_unix_ms_u64 = unix_ms(SystemTime::now())
+        .map_err(|error| format!("daemon observe authority clock: {error}"))?;
     let authority = {
         let guard = composition.lock().await;
-        // The daemon's own activation clock owns this reading: it is the one
-        // clock `current_activation_snapshot` is already read with on the
-        // activation-resolution spine, and it fails closed on a pre-epoch or
-        // out-of-range reading instead of clamping a bogus time into the owner
-        // authority decision.
-        let now = unix_ms(SystemTime::now())
-            .map_err(|error| format!("daemon observe authority clock: {error}"))?;
         let activation = guard
-            .current_activation_snapshot(now)
+            .current_activation_snapshot(observed_unix_ms_u64)
             .map_err(|error| format!("daemon observe authority resolution: {error}"))?;
         let live_fence = guard.kernel_snapshot().state_fence().clone();
         resolve_observe_operation_authority(
@@ -5175,8 +5177,18 @@ async fn execute_observation_capture(
     // It is not admitted as an unbound cold capture, and nothing executes.
     if !authority.is_admitting() {
         let (class, code, reason) = match &authority {
-            ObserveOperationAuthority::TaskContractRequired { class, code, reason, .. }
-            | ObserveOperationAuthority::ConflictingClaim { class, code, reason, .. } => {
+            ObserveOperationAuthority::TaskContractRequired {
+                class,
+                code,
+                reason,
+                ..
+            }
+            | ObserveOperationAuthority::ConflictingClaim {
+                class,
+                code,
+                reason,
+                ..
+            } => {
                 // `ObserveOperationClass` and `code` are both `Copy` (the class
                 // is a closed fieldless enum, the code is a `&'static str`), so
                 // neither is cloned; only the owned reason text is moved out.
@@ -5206,14 +5218,12 @@ async fn execute_observation_capture(
                 format!("daemon observe authority refusal not retained: {submit_error}")
             });
     }
-    // Same daemon activation clock, one reading, so the identity the owner
-    // admits under cannot disagree with the reading the authority resolution
-    // above was taken at. The signed conversion is the one honest projection of
-    // a `u64` millisecond clock into the contract's `i64` clock reading.
-    let observed_unix_ms = i64::try_from(unix_ms(SystemTime::now()).map_err(|error| {
-        format!("daemon observe identity clock: {error}")
-    })?)
-    .map_err(|_| "daemon observe identity clock exceeds the signed millisecond range".to_owned())?;
+    // Same single reading the authority resolution above was taken at; the
+    // signed conversion is the one honest projection of the daemon's `u64`
+    // millisecond clock into the contract's `i64` clock reading.
+    let observed_unix_ms = i64::try_from(observed_unix_ms_u64).map_err(|_| {
+        "daemon observe identity clock exceeds the signed millisecond range".to_owned()
+    })?;
     let identity = observation_request_identity(envelope, &capture, &authority, observed_unix_ms)
         .map_err(|error| format!("daemon observe identity: {error}"))?;
     let base_operation = observation_base_operation(envelope)?;
@@ -5226,7 +5236,12 @@ async fn execute_observation_capture(
         base_operation.as_str(),
         capture.observation_identity()
     );
-    let receipt = {
+    // The owner's returned receipt is deliberately NOT bound here: the flight
+    // re-reads the exact owner operation through the handle's read/wait verb
+    // below, so the completion it claims is the one the owner's own receipt
+    // route still holds rather than the value the admission call happened to
+    // return.
+    {
         let guard = composition.lock().await;
         let owner = guard
             .observation_reconciliation()
@@ -5257,12 +5272,7 @@ async fn execute_observation_capture(
                     });
             }
         }
-    };
-    // The owner's returned receipt is deliberately NOT the retained result
-    // here: the flight re-reads the exact owner operation through the
-    // handle's read/wait verb below, so the completion it claims is the one
-    // the owner's own receipt route still holds rather than the value the
-    // admission call happened to return.
+    }
     // W5: before claiming a retained completion, resolve the owner's own
     // operation through the pending handle's read/wait verb. A committed owner
     // operation is submitted as the completion; an owner that admitted the
@@ -5371,8 +5381,9 @@ fn outcome_owner_operation(outcome: &ObserveServeOutcome) -> Option<&str> {
         // nothing, so there is no owner operation to reconcile against. It is
         // named here beside the unavailable arm for exactly that reason, and it
         // is never folded into an operation identity it never received.
-        ObserveServeOutcome::Unavailable { .. }
-        | ObserveServeOutcome::AuthorityRefused { .. } => None,
+        ObserveServeOutcome::Unavailable { .. } | ObserveServeOutcome::AuthorityRefused { .. } => {
+            None
+        }
     }
 }
 
