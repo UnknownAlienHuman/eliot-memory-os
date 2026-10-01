@@ -525,6 +525,8 @@ pub enum WorkScopeError {
     BindingReceiptNotMatched,
     #[error("scope binding guard receipt does not match the retained binding")]
     BindingReceiptMismatch,
+    #[error("scope quarantine retains unresolved conflicting identity evidence; rebind or resolve before scope-sensitive work")]
+    ScopeQuarantineUnresolved,
     #[error("scan disclosure storage contour is not admitted by the installation owner")]
     ScanContourNotAdmitted,
     #[error("scan disclosure identity conflicts with the retained owner record")]
@@ -3279,6 +3281,91 @@ impl WorkScopeBindingOwner {
     #[must_use]
     pub fn unresolved_quarantine(&self) -> &[QuarantinedScopeRecord] {
         &self.snapshot.unresolved_quarantine
+    }
+
+    /// Routes one evaluated trigger report into the owner's durable
+    /// unresolved section and returns the owner-issued write receipt
+    /// (issue #1787, AUD1).
+    ///
+    /// This is the single routing point from guard evaluation to durable
+    /// retention: the record is built from the caller-supplied ORIGINAL
+    /// bindings and report through [`QuarantinedScopeRecord::for_report`]
+    /// (a blank reference fails here, never as a silent drop) and written
+    /// through [`Self::record_scope_quarantine`], so the stable
+    /// operation/idempotency identity dedupes the same conflicting evidence
+    /// and the receipt reports `Committed` for a newly or already retained
+    /// record and `Retired` when bounded eviction retired an older one.
+    /// Fence-exact readback stays the reader's proof: reconcile the receipt
+    /// with [`Self::readback_scope_quarantine`] at the current fence rather
+    /// than inferring durability from the write alone. The retained binding,
+    /// task state, and project memory are untouched: routing records a
+    /// conflict, it never rebinds and never admits the observed scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the record or the resulting snapshot is invalid.
+    pub fn record_quarantine_for_report(
+        &mut self,
+        expected: &ScopeBinding,
+        observed: &ScopeBinding,
+        report: &TriggerReport,
+        fence_generation: u64,
+    ) -> Result<ScopeQuarantineReceipt, WorkScopeError> {
+        let record =
+            QuarantinedScopeRecord::for_report(expected, observed, report, fence_generation)?;
+        self.record_scope_quarantine(record)
+    }
+
+    /// Admits one scope-sensitive effect against the owner's retained state
+    /// (issue #1787, W5).
+    ///
+    /// Project-specific memory reuse, canonical writes, and Material effects
+    /// share this single admission point: the owner must be readable at the
+    /// exact `fence` (a generation change fails closed here until an explicit
+    /// authorized rebind completes), the retained guard receipt must be
+    /// `MATCHED` and agree with the retained binding on every identity field
+    /// and governing-source generation, and the durable unresolved section
+    /// must hold no conflicting evidence. Any drift blocks the effect; it
+    /// never selects another candidate and never transfers task state or
+    /// project memory. An authorized rebind or relocation clears this gate
+    /// by installing a fresh `MATCHED` binding whose owner retains no
+    /// unresolved conflict.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkScopeError::InvalidStateFence`] or
+    /// [`WorkScopeError::StateFenceMismatch`] when the fence is malformed or
+    /// disagrees with the retained binding,
+    /// [`WorkScopeError::BindingReceiptNotMatched`] when the retained guard
+    /// receipt is not `MATCHED`,
+    /// [`WorkScopeError::BindingReceiptMismatch`] when the receipt drifted
+    /// from the retained binding, and
+    /// [`WorkScopeError::ScopeQuarantineUnresolved`] while the owner retains
+    /// any unresolved conflicting identity evidence.
+    pub fn require_effect_admission(
+        &self,
+        fence: &StateFence,
+    ) -> Result<WorkScopeBindingSnapshot, WorkScopeError> {
+        let snapshot = self.read_current(fence)?;
+        let receipt = &snapshot.guard_receipt;
+        let binding = &snapshot.binding;
+        if receipt.disposition != ScopeBindingDisposition::Matched {
+            return Err(WorkScopeError::BindingReceiptNotMatched);
+        }
+        if receipt.expected_scope_ref != binding.scope.scope_ref
+            || receipt.observed_scope_ref != binding.scope.scope_ref
+            || receipt.expected_lineage_ref != binding.scope.lineage_ref
+            || receipt.observed_lineage_ref != binding.scope.lineage_ref
+            || receipt.expected_instance_ref != binding.scope.instance_ref
+            || receipt.observed_instance_ref != binding.scope.instance_ref
+            || receipt.source_generation != binding.governing_source_generation
+        {
+            return Err(WorkScopeError::BindingReceiptMismatch);
+        }
+        if !snapshot.unresolved_quarantine.is_empty() {
+            return Err(WorkScopeError::ScopeQuarantineUnresolved);
+        }
+        Ok(snapshot)
     }
 }
 
