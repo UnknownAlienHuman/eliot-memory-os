@@ -835,6 +835,91 @@ pub fn prepare_swarm_definition_admission_candidate(
     Ok(coordinator.prepare_swarm_definition_admission(proposal, maps)?)
 }
 
+/// Admits one prepared swarm definition through the Governor admission owner
+/// without performing any durable write (issue #1699).
+///
+/// Load-bearing order continues
+/// [`prepare_swarm_definition_admission_candidate`]: the caller supplies the
+/// candidate-only prep plus the exact presented definition, the
+/// Governor-issued admission receipt, and the injected receipt verifier, and
+/// this function only forwards them through the real coordinator owner
+/// ([`AgentCoordinator::admit_swarm_definition`]) onto the existing
+/// `eliot_swarm::admit_plan` admission port. No Governor receipt is minted,
+/// no durable write occurs, and nothing is launched: an unavailable
+/// prerequisite port fails typed through the coordinator boundary and the
+/// definition stays in preparation instead of being presented as admitted.
+pub fn admit_swarm_definition_candidate(
+    config: &CoordinatorConfig,
+    prep: &SwarmDefinitionAdmissionPrep,
+    proposal: &eliot_swarm::SwarmPlanProposal,
+    maps: &eliot_swarm::SealedIndependentMaps,
+    admission_receipt: eliot_receipts::ReceiptEnvelope,
+    verifier: Option<&dyn eliot_swarm::ReceiptVerificationPort>,
+) -> Result<eliot_swarm::AdmittedSwarmPlan, FabricError> {
+    let _span = tracing::info_span!("eliotd.fabric_admit_swarm_definition").entered();
+    let coordinator = AgentCoordinator::new(
+        config.clone(),
+        PlanGap::G11Unavailable {
+            reason: FABRIC_PLAN_GAP_REASON.to_owned(),
+        },
+    )?;
+    Ok(coordinator.admit_swarm_definition(prep, proposal, maps, admission_receipt, verifier)?)
+}
+
+/// Begins provider-owned P3 execution for one admitted swarm plan through the
+/// injected A-02 activation port (issue #1699).
+///
+/// The caller supplies the admitted plan plus the injected route provider and
+/// receipt verifier, and this function only forwards them through the real
+/// coordinator owner ([`AgentCoordinator::begin_swarm_execution`]) onto the
+/// existing `eliot_swarm::begin_execution` activation port. This performs no
+/// durable write and starts no process: a missing route provider or verifier
+/// fails typed through the coordinator boundary.
+pub fn begin_swarm_execution_candidate(
+    config: &CoordinatorConfig,
+    plan: &eliot_swarm::AdmittedSwarmPlan,
+    a02: Option<&dyn eliot_swarm::AgentRouteProvider>,
+    verifier: Option<&dyn eliot_swarm::ReceiptVerificationPort>,
+) -> Result<eliot_swarm::ExecutionState, FabricError> {
+    let _span = tracing::info_span!("eliotd.fabric_begin_swarm_execution").entered();
+    let coordinator = AgentCoordinator::new(
+        config.clone(),
+        PlanGap::G11Unavailable {
+            reason: FABRIC_PLAN_GAP_REASON.to_owned(),
+        },
+    )?;
+    Ok(coordinator.begin_swarm_execution(plan, a02, verifier)?)
+}
+
+/// Dispatches one sealed swarm child through the existing injected dispatch
+/// ports without performing any durable write (issue #1699).
+///
+/// The caller supplies the admitted plan, the durable-job attachment, the
+/// sealed child inputs, and the injected store/executor ports, and this
+/// function only forwards them through the real coordinator owner
+/// ([`AgentCoordinator::launch_swarm_child`]) onto the existing
+/// `eliot_swarm::adapter_launch` dispatch path. The returned intent is
+/// candidate-only: persisting it through the owner-side append path BEFORE
+/// calling the executor stays with the Kernel writer owner, so this performs
+/// no store append, no executor call, and no scheduler step.
+pub fn launch_swarm_child_candidate(
+    config: &CoordinatorConfig,
+    plan: &eliot_swarm::AdmittedSwarmPlan,
+    attachment: &eliot_swarm::durable_dispatch::DurableJobAttachment,
+    inputs: eliot_swarm::adapter_launch::SealedChildInputs<'_>,
+    store: &dyn eliot_swarm::durable_work::DurableWorkStore,
+    executor: &dyn eliot_swarm::durable_work::WorkExecutor,
+) -> Result<eliot_swarm::adapter_launch::SealedChildLaunch, FabricError> {
+    let _span = tracing::info_span!("eliotd.fabric_launch_swarm_child").entered();
+    let coordinator = AgentCoordinator::new(
+        config.clone(),
+        PlanGap::G11Unavailable {
+            reason: FABRIC_PLAN_GAP_REASON.to_owned(),
+        },
+    )?;
+    Ok(coordinator.launch_swarm_child(plan, attachment, inputs, store, executor)?)
+}
+
 /// Frozen Task-Controller definition as accepted at the admitted boundary.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
