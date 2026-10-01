@@ -18,15 +18,16 @@ use eliot_ipc::ApplicationSessionState;
 use eliot_ipc::{Session, TransportError};
 use eliot_ors::{
     ColdStartReadinessOrsRecord, ColdStartReadinessOwnerKey, ColdStartReadinessStageOutcome,
-    ColdStartReadinessTerminalDisposition, ScanDisclosureOrsRecord, ScanDisclosureReadFailure,
-    ScanDisclosureStageOutcome,
+    ColdStartReadinessTerminalDisposition, ScanDisclosureOrsRecord,
+    ScanDisclosureQuarantineRecord, ScanDisclosureReadFailure, ScanDisclosureStageOutcome,
 };
 #[cfg(windows)]
 use eliot_store_api::{
     RecoveryRecord, RecoveryRecordKey, StoreRecoveryRequest, StoreWorkScopeOwnerRequest,
 };
 use eliot_workscope::{
-    BootstrapScanEvidence, DiscoveryReadLease, ScanReceiptHandle, WorkScopeBindingSnapshot,
+    BootstrapScanEvidence, DiscoveryLeaseRequest, DiscoveryRead, DiscoveryReadLease,
+    ScanReceiptHandle, WorkScopeBindingSnapshot, issue_discovery_lease,
 };
 #[cfg(windows)]
 use eliot_workscope::{ColdStartOwnerInputs, WorkScopeBindingOwner};
@@ -58,6 +59,16 @@ pub(crate) struct ScanDisclosureOwnerRequest {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum ScanDisclosureOwnerAction {
+    /// Authenticate the original explicit BIND_SCOPE continuation, issue its
+    /// first discovery lease, and return only the immutable lifecycle row
+    /// readback. This path deliberately has no application Session.
+    InitialBindScopeDiscovery {
+        evidence: Box<eliot_protocol::AgentActivationBindScopeEvidence>,
+        envelope: Box<eliot_protocol::HostRequestEnvelope>,
+        explicit_root: String,
+        root_identity_ref: String,
+        allowed_reads: Vec<DiscoveryRead>,
+    },
     /// Return the Kernel-owned installation/ORS contour.
     IssueContour,
     /// Issue one scanner binding from the current retained activation owners.
@@ -108,6 +119,16 @@ pub(crate) enum ScanDisclosureOwnerAction {
     List {
         binding: ScanDisclosureOwnerBinding,
         limit: u16,
+    },
+    /// Retain an exact legacy capture in the separate quarantine row family.
+    QuarantineRetain {
+        binding: ScanDisclosureOwnerBinding,
+        record: Box<ScanDisclosureQuarantineRecord>,
+    },
+    /// Read one exact quarantine row without exposing it as a scan receipt.
+    QuarantineLoad {
+        binding: ScanDisclosureOwnerBinding,
+        quarantine_key: String,
     },
     /// Atomically claim or join one exact durable cold-start lease key.
     ReadinessClaim {
@@ -185,6 +206,13 @@ pub(crate) struct ScanDisclosureOwnerResponse {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum ScanDisclosureOwnerValue {
+    InitialBindScopeDiscovery {
+        ticket: eliot_protocol::AgentActivationResolutionTicket,
+        lease: DiscoveryReadLease,
+    },
+    InitialBindScopeRootRequired {
+        ticket: eliot_protocol::AgentActivationResolutionTicket,
+    },
     Contour {
         contour: InstallationScanContour,
     },
@@ -205,6 +233,9 @@ pub(crate) enum ScanDisclosureOwnerValue {
     },
     Records {
         records: Vec<ScanDisclosureOrsRecord>,
+    },
+    QuarantineRecord {
+        record: Option<ScanDisclosureQuarantineRecord>,
     },
     ReadinessClaimed {
         outcome: ColdStartReadinessStageOutcome,
@@ -268,6 +299,17 @@ impl KernelComposition {
         payload: &Value,
     ) -> Result<Value, TransportError> {
         let request = self.authenticated_scan_disclosure_owner_request(session, payload)?;
+        if matches!(
+            &request.action,
+            ScanDisclosureOwnerAction::InitialBindScopeDiscovery { .. }
+        ) {
+            let value = self.initial_bind_scope_discovery(&request)?;
+            return serde_json::to_value(ScanDisclosureOwnerResponse {
+                wire_version: WIRE_VERSION,
+                value,
+            })
+            .map_err(|_| TransportError::SessionFenced);
+        }
         let current = self.current_scan_disclosure_activation(
             &request.application_connection_id,
             &request.activation_ticket_id,
@@ -320,6 +362,195 @@ impl KernelComposition {
     }
 
     #[cfg(windows)]
+    fn initial_bind_scope_discovery(
+        &self,
+        request: &ScanDisclosureOwnerRequest,
+    ) -> Result<ScanDisclosureOwnerValue, TransportError> {
+        let ScanDisclosureOwnerAction::InitialBindScopeDiscovery {
+            evidence,
+            envelope,
+            explicit_root,
+            root_identity_ref,
+            allowed_reads,
+        } = &request.action
+        else {
+            return Err(TransportError::SessionFenced);
+        };
+        if request.application_connection_id != envelope.connection_id
+            || request.activation_ticket_id != evidence.ticket_id
+            || envelope.validate().is_err()
+            || evidence.validate().is_err()
+            || explicit_root.trim().is_empty()
+            || explicit_root.chars().any(char::is_control)
+            || root_identity_ref.trim().is_empty()
+            || root_identity_ref.chars().any(char::is_control)
+            || !matches!(
+                allowed_reads.as_slice(),
+                [DiscoveryRead::FilesystemIdentity, DiscoveryRead::GoverningSourceCandidates]
+                    | [
+                        DiscoveryRead::FilesystemIdentity,
+                        DiscoveryRead::GoverningSourceCandidates,
+                        DiscoveryRead::VcsIdentity
+                    ]
+                    | [
+                        DiscoveryRead::FilesystemIdentity,
+                        DiscoveryRead::GoverningSourceCandidates,
+                        DiscoveryRead::ManifestNamesAndHashes
+                    ]
+                    | [
+                        DiscoveryRead::FilesystemIdentity,
+                        DiscoveryRead::GoverningSourceCandidates,
+                        DiscoveryRead::VcsIdentity,
+                        DiscoveryRead::ManifestNamesAndHashes
+                    ]
+            )
+        {
+            return Err(TransportError::SessionFenced);
+        }
+
+        // Hold the activation transition read through the immutable lifecycle
+        // first-issue CAS/readback so the accepted result and P-07 projection
+        // cannot move between proof validation and lease retention.
+        let _transition = self.agent_bridge_transition_read()?;
+        let pending = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if !self.pre_scope_bind_scope_evidence_still_retained_in(
+            &pending,
+            evidence.as_ref(),
+            envelope.as_ref(),
+        ) {
+            return Err(TransportError::SessionFenced);
+        }
+        let local = pending
+            .results
+            .get(&evidence.ticket_id)
+            .ok_or(TransportError::SessionFenced)?;
+        if local.phase != AgentActivationResultPhase::AcceptedTerminal
+            || local.result.bind_scope_evidence.as_ref() != Some(evidence.as_ref())
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let local_result = local.result.clone();
+        let pending_entry = pending.entries.get(&evidence.ticket_id).cloned();
+        drop(pending);
+
+        let (ticket, result) = self.load_scan_disclosure_activation_payloads(
+            &request.application_connection_id,
+            &request.activation_ticket_id,
+            &local_result,
+        )?;
+        evidence
+            .validate_against(&ticket)
+            .map_err(|_| TransportError::SessionFenced)?;
+        if result != local_result
+            || !matches!(
+                &result.disposition,
+                eliot_protocol::AgentActivationResolutionDisposition::ScopeSelectionRequired { .. }
+            )
+            || super::unix_ms() > ticket.kernel_deadline_unix_ms
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        let (session_epoch, activated_binding) = self.validate_scan_disclosure_accepted_connection(
+            &request.application_connection_id,
+            &ticket,
+            pending_entry.as_ref(),
+        )?;
+        if session_epoch.is_some() || activated_binding.is_some() {
+            return Err(TransportError::SessionFenced);
+        }
+        let Some(ticket_root) = ticket.workspace_selector.as_deref() else {
+            return Ok(ScanDisclosureOwnerValue::InitialBindScopeRootRequired { ticket });
+        };
+        if ticket_root != explicit_root {
+            return Err(TransportError::IdentityConflict);
+        }
+
+        let consumption_limit = u32::try_from(allowed_reads.len())
+            .map_err(|_| TransportError::SessionFenced)?;
+        let lease_request = DiscoveryLeaseRequest {
+            proposer_ref: ticket.activation_request_id.as_str().to_owned(),
+            session_ref: ticket.connection_id.clone(),
+            host_ref: ticket.peer_admission_receipt_sha256.clone(),
+            candidate_root_ref: root_identity_ref.clone(),
+            root_filesystem_identity_ref: root_identity_ref.clone(),
+            allowed_reads: allowed_reads.clone(),
+            consumption_limit,
+            deadline: ticket.kernel_deadline_unix_ms,
+        };
+        let issued = issue_discovery_lease(&lease_request)
+            .map_err(|_| TransportError::SessionFenced)?;
+        issued
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if issued.deadline != evidence.ticket_deadline_unix_ms
+            || issued.proposer_ref != ticket.activation_request_id.as_str()
+            || issued.session_ref != request.application_connection_id
+            || issued.host_ref != ticket.peer_admission_receipt_sha256
+            || issued.root_filesystem_identity_ref != *root_identity_ref
+            || issued.candidate_root_ref != *root_identity_ref
+            || issued.allowed_reads != *allowed_reads
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+
+        let lifecycle = self
+            .generation_gateway
+            .ors
+            .load_activation_lifecycle(&ticket.ticket_id)
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::SessionFenced)?;
+        let result_sha256 = lifecycle
+            .result_sha256
+            .as_deref()
+            .ok_or(TransportError::SessionFenced)?;
+        if lifecycle.state != eliot_ors::ActivationLifecycleState::ResultAccepted
+            || lifecycle.ticket_id != ticket.ticket_id
+            || lifecycle.ticket_sha256 != ticket.ticket_sha256
+            || lifecycle.connection_id != ticket.connection_id
+            || lifecycle.kernel_deadline_unix_ms != ticket.kernel_deadline_unix_ms
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        let lease_bytes = eliot_contracts::canonical_json_bytes(&issued)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let lease_json = String::from_utf8(lease_bytes).map_err(|_| TransportError::SessionFenced)?;
+        let retained = self
+            .generation_gateway
+            .ors
+            .retain_initial_discovery_lease(&ticket.ticket_id, &ticket.ticket_sha256, &lease_json)
+            .map_err(|error| match error {
+                eliot_ors::OrsError::DuplicateConflict => TransportError::IdentityConflict,
+                _ => TransportError::SessionFenced,
+            })?;
+        let mut expected_lifecycle = lifecycle.clone();
+        expected_lifecycle.initial_discovery_lease = Some(lease_json.clone());
+        if retained != expected_lifecycle || retained.result_sha256.as_deref() != Some(result_sha256) {
+            return Err(TransportError::IdentityConflict);
+        }
+        let retained_ticket = serde_json::from_str::<
+            eliot_protocol::AgentActivationResolutionTicket,
+        >(&retained.ticket_payload)
+        .map_err(|_| TransportError::SessionFenced)?;
+        let retained_lease = serde_json::from_str::<DiscoveryReadLease>(
+            retained
+                .initial_discovery_lease
+                .as_deref()
+                .ok_or(TransportError::SessionFenced)?,
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        if retained_ticket != ticket || retained_lease != issued {
+            return Err(TransportError::IdentityConflict);
+        }
+        Ok(ScanDisclosureOwnerValue::InitialBindScopeDiscovery {
+            ticket: retained_ticket,
+            lease: retained_lease,
+        })
+    }
+
+    #[cfg(windows)]
     fn require_scan_disclosure_action_session(
         &self,
         action: &ScanDisclosureOwnerAction,
@@ -352,6 +583,9 @@ impl KernelComposition {
         action: ScanDisclosureOwnerAction,
     ) -> Result<ScanDisclosureOwnerValue, ScanDisclosureOwnerActionError> {
         match action {
+            ScanDisclosureOwnerAction::InitialBindScopeDiscovery { .. } => {
+                Err(TransportError::SessionFenced.into())
+            }
             ScanDisclosureOwnerAction::IssueContour => {
                 let contour = self.issue_scan_disclosure_contour(current)?;
                 Ok(ScanDisclosureOwnerValue::Contour { contour })
@@ -438,6 +672,21 @@ impl KernelComposition {
             ScanDisclosureOwnerAction::List { binding, limit } => {
                 self.list_scan_disclosure_owner(current, &binding, limit)
                     .await
+            }
+            ScanDisclosureOwnerAction::QuarantineRetain { binding, record } => {
+                self.retain_scan_disclosure_quarantine_owner(current, &binding, record.as_ref())
+                    .await
+            }
+            ScanDisclosureOwnerAction::QuarantineLoad {
+                binding,
+                quarantine_key,
+            } => {
+                self.load_scan_disclosure_quarantine_owner(
+                    current,
+                    &binding,
+                    &quarantine_key,
+                )
+                .await
             }
             ScanDisclosureOwnerAction::ReadinessClaim { key } => {
                 self.claim_cold_start_readiness_owner(current, key.as_ref())
@@ -847,6 +1096,112 @@ impl KernelComposition {
             })
             .collect();
         Ok(ScanDisclosureOwnerValue::Records { records })
+    }
+
+    #[cfg(windows)]
+    async fn retain_scan_disclosure_quarantine_owner(
+        &self,
+        current: &CurrentScanDisclosureActivation,
+        binding: &ScanDisclosureOwnerBinding,
+        record: &ScanDisclosureQuarantineRecord,
+    ) -> Result<ScanDisclosureOwnerValue, ScanDisclosureOwnerActionError> {
+        self.validate_scan_disclosure_binding(current, binding)
+            .await?;
+        let contour = self.issue_scan_disclosure_contour(current)?;
+        Self::validate_scan_disclosure_quarantine_record(&contour, record)?;
+        let retained = self
+            .p07_ors
+            .retain_scan_disclosure_quarantine(record)
+            .map_err(|error| match error {
+                eliot_ors::OrsError::DuplicateConflict
+                | eliot_ors::OrsError::PayloadIntegrityMismatch
+                | eliot_ors::OrsError::IntegrityProblem {
+                    record_type: eliot_ors::SCAN_DISCLOSURE_QUARANTINE_RECORD_TYPE,
+                    ..
+                } => {
+                    TransportError::IdentityConflict
+                }
+                _ => TransportError::SessionFenced,
+            })?;
+        Self::validate_scan_disclosure_quarantine_record(&contour, &retained)?;
+        if !retained.same_binding(record) {
+            return Err(TransportError::IdentityConflict.into());
+        }
+        Ok(ScanDisclosureOwnerValue::QuarantineRecord {
+            record: Some(retained),
+        })
+    }
+
+    #[cfg(windows)]
+    async fn load_scan_disclosure_quarantine_owner(
+        &self,
+        current: &CurrentScanDisclosureActivation,
+        binding: &ScanDisclosureOwnerBinding,
+        quarantine_key: &str,
+    ) -> Result<ScanDisclosureOwnerValue, ScanDisclosureOwnerActionError> {
+        self.validate_scan_disclosure_binding(current, binding)
+            .await?;
+        let contour = self.issue_scan_disclosure_contour(current)?;
+        let key_prefix = format!("scan-disclosure-quarantine:{}:", contour.installation_id);
+        if !quarantine_key.starts_with(&key_prefix) {
+            return Err(TransportError::IdentityConflict.into());
+        }
+        let record = self
+            .p07_ors
+            .load_scan_disclosure_quarantine(quarantine_key)
+            .map_err(|error| match error {
+                eliot_ors::OrsError::IntegrityProblem { .. }
+                | eliot_ors::OrsError::PayloadIntegrityMismatch => {
+                    TransportError::IdentityConflict
+                }
+                _ => TransportError::SessionFenced,
+            })?;
+        if let Some(record) = record.as_ref() {
+            Self::validate_scan_disclosure_quarantine_record(&contour, record)?;
+            if record.quarantine_key != quarantine_key {
+                return Err(TransportError::IdentityConflict.into());
+            }
+        }
+        Ok(ScanDisclosureOwnerValue::QuarantineRecord { record })
+    }
+
+    #[cfg(windows)]
+    fn validate_scan_disclosure_quarantine_record(
+        contour: &InstallationScanContour,
+        record: &ScanDisclosureQuarantineRecord,
+    ) -> Result<(), TransportError> {
+        record.validate().map_err(|error| match error {
+            eliot_ors::OrsError::IntegrityProblem { .. }
+            | eliot_ors::OrsError::PayloadIntegrityMismatch
+            | eliot_ors::OrsError::DuplicateConflict => TransportError::IdentityConflict,
+            _ => TransportError::SessionFenced,
+        })?;
+        let digest = record
+            .file_name
+            .strip_prefix(eliot_workscope::LOOSE_SCAN_DISCLOSURE_PREFIX)
+            .and_then(|name| name.strip_suffix(eliot_workscope::LOOSE_SCAN_DISCLOSURE_SUFFIX));
+        if record.installation_id != contour.installation_id
+            || record.ors_generation != contour.ors_generation
+            || record.file_name.contains('/')
+            || record.file_name.contains('\\')
+            || !digest.is_some_and(|value| {
+                value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+            || eliot_workscope::quarantine_loose_scan_disclosure(&record.file_name).is_err()
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        let expected_writer_receipt = format!(
+            "ors:{}:{}:{}:{}",
+            contour.ors_object_ref,
+            contour.ors_generation,
+            record.quarantine_key,
+            record.request_hash
+        );
+        if record.writer_receipt != expected_writer_receipt {
+            return Err(TransportError::IdentityConflict);
+        }
+        Ok(())
     }
 
     #[cfg(not(windows))]
