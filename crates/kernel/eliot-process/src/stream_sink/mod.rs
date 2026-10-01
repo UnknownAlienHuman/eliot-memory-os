@@ -248,10 +248,47 @@ pub enum ProcessStreamSinkError {
     TerminalCommandStateMismatch,
     #[error("terminal/evidence invariant failed: {reason}")]
     EvidenceInvariant { reason: String },
+    #[error("storage capacity exhausted at {stage} ({cause:?}); possible_effect={possible_effect}")]
+    StorageCapacity {
+        stage: &'static str,
+        cause: ProcessStreamSinkCapacityCause,
+        attempted_bytes: Option<u64>,
+        possible_effect: bool,
+    },
+    #[error("storage authority was fenced: {reason}")]
+    AdmissionFenced { reason: ProcessStreamSinkFenceReason },
+    #[error("stored source integrity failed: {reason}")]
+    IntegrityFailure { reason: ProcessStreamSinkIntegrityReason },
+    #[error("storage effect remains possible and unresolved at {operation}")]
+    PossibleEffectUnknown { operation: &'static str },
     #[error("provider unavailable before an exact session result")]
     ProviderUnavailable,
     #[error("serialization failed for {field}: {reason}")]
     Serialization { field: &'static str, reason: String },
+}
+
+/// Platform-qualified capacity cause retained without depending on the Blob
+/// storage crate's provider vocabulary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcessStreamSinkCapacityCause {
+    StorageFull,
+    PosixEnospc { code: i32 },
+    WindowsDiskFull { code: u32 },
+    WindowsHandleDiskFull { code: u32 },
+}
+
+/// Why the exact sink authority was rejected.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcessStreamSinkFenceReason {
+    StaleOrRevoked,
+    OwnerConflict,
+}
+
+/// Integrity category preserved from the storage owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcessStreamSinkIntegrityReason {
+    AuthenticationOrDigest,
+    MetadataPayloadBinding,
 }
 
 impl From<ProcessStreamEvidenceError> for ProcessStreamSinkError {
