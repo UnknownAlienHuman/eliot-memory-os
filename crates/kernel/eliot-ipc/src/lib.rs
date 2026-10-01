@@ -551,11 +551,22 @@ pub fn dispatch_lifecycle_cancel(
 /// module-lifecycle owner (W4: I7.4 `Quiesce`/`Checkpoint`/`RestoreCheckpoint`/
 /// `DrainStatus`/`Shutdown`/`Fatal` as explicit I7.2 control flows).
 ///
-/// The frame is routed through [`eliot_protocol::ModuleLifecycle::apply`]:
-/// validation, phase gating, checkpoint retention and drain reporting all
-/// live in that owner, and non-control messages are rejected with the typed
-/// protocol failure. This dispatcher never infers phase from process state
-/// and never touches any other owner.
+/// Each of the six control flows is an explicit arm below: a validated
+/// `Quiesce` frame quiesces, a validated `Checkpoint` frame records, a
+/// validated `RestoreCheckpoint` frame restores, a validated `DrainStatus`
+/// frame reports, a validated `Shutdown` frame terminates, and a validated
+/// `Fatal` frame records failure. Every arm binds to the single live owner
+/// [`eliot_protocol::ModuleLifecycle::apply`]: validation, phase gating,
+/// checkpoint retention and drain reporting all live in that owner, and
+/// non-control messages are rejected with the typed protocol failure. This
+/// dispatcher never infers phase from process state and never touches any
+/// other owner.
+///
+/// STITCH: transport-loop invocation stays out of scope. No transport or
+/// session receive loop calls this dispatcher repo-wide; the loops that will
+/// invoke it — the `FrameDecoder`-fed transport receive path and the
+/// `ApplicationSession`-bound session receive path — are named here, not
+/// built here.
 ///
 /// # Errors
 ///
@@ -565,7 +576,18 @@ pub fn dispatch_lifecycle_control(
     frame: &Frame,
     lifecycle: &mut eliot_protocol::ModuleLifecycle,
 ) -> Result<eliot_protocol::ModuleControlEffect, TransportError> {
-    lifecycle.apply(frame).map_err(TransportError::Protocol)
+    match frame.message_type {
+        MessageType::Quiesce => lifecycle.apply(frame).map_err(TransportError::Protocol),
+        MessageType::Checkpoint => lifecycle.apply(frame).map_err(TransportError::Protocol),
+        MessageType::RestoreCheckpoint => lifecycle.apply(frame).map_err(TransportError::Protocol),
+        MessageType::DrainStatus => lifecycle.apply(frame).map_err(TransportError::Protocol),
+        MessageType::Shutdown => lifecycle.apply(frame).map_err(TransportError::Protocol),
+        MessageType::Fatal => lifecycle.apply(frame).map_err(TransportError::Protocol),
+        _ => Err(TransportError::Protocol(ProtocolError::InvalidField {
+            field: "message_type",
+            reason: "not a module lifecycle control message",
+        })),
+    }
 }
 
 /// Transport failures are deliberately distinct from application outcomes.
