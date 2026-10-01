@@ -240,6 +240,7 @@ internal static class UserAutomationNormalizationReceiptEnvelope
     {
         ArgumentNullException.ThrowIfNull(revision);
         if (envelope.ValueKind != JsonValueKind.Object
+            || !UserAutomationOutcomeClassifier.HasUniqueObjectPropertiesRecursively(envelope)
             || !HasExactProperties(envelope, "identity", "core")
             || !envelope.TryGetProperty("identity", out var identity)
             || !HasExactProperties(identity, "receipt_id", "canonical_sha256")
